@@ -1,18 +1,18 @@
 # Benchmarking and Negative Tests
 
-Recipes for writing tests that verify scheduler performance gates
+Recipes for writing tests that check scheduler performance gates
 (positive tests) and confirm that degraded schedulers fail those gates
 (negative tests).
 
-## Using Assert for verification
+## Using Assert for checking
 
-`Assert` carries all verification thresholds. Every field is `Option`;
+`Assert` carries all checking thresholds. Every field is `Option`;
 `None` means "inherit from parent layer."
 
 - In the merge chain: `Assert::default_checks()` -> `Scheduler.assert`
   -> per-test `#[ktstr_test]` attributes. Use with `execute_steps_with()`
   for ops-based scenarios. See
-  [Verification](../concepts/verification.md#merge-layers).
+  [Checking](../concepts/checking.md#merge-layers).
 
 - For direct report checking: call `Assert::assert_cgroup(reports, cpuset)`.
 
@@ -23,7 +23,7 @@ let result = a.assert_cgroup(&reports, None);
 
 ## Positive benchmarking test
 
-Verify that a scheduler passes performance gates under
+Check that a scheduler passes performance gates under
 `performance_mode`. Use `#[ktstr_test]` with Assert thresholds:
 
 ```rust,ignore
@@ -62,7 +62,7 @@ Key points:
 
 ## Negative test pattern
 
-Verify that intentionally degraded scheduling fails the same gates.
+Check that intentionally degraded scheduling fails the same gates.
 This confirms that the gates actually catch regressions rather than
 passing vacuously.
 

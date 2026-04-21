@@ -135,8 +135,16 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
         }
     }
 
-    // 4. Installed kernel build dir.
-    if let Some(rel) = _kernel_release() {
+    // 4. Installed kernel build dir. Read `/proc/sys/kernel/osrelease`
+    // directly instead of shelling out to `uname -r`; the procfs entry
+    // is the same value the kernel exposes via the uname(2) syscall
+    // (see linux/kernel/sys.c: override_release()) and costs only a
+    // read of a small text file.
+    if let Some(rel) = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         let p = std::path::PathBuf::from(format!("/lib/modules/{rel}/build"));
         if p.is_dir() {
             return Some(p);
@@ -240,7 +248,9 @@ pub fn find_image_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 /// build trees or host paths.
 ///
 /// `release`: kernel release string (e.g. from `uname -r`). When
-/// `None`, falls back to running `uname -r` via `Command`.
+/// `None`, falls back to reading `/proc/sys/kernel/osrelease` — the
+/// same value the kernel exposes via the `uname(2)` syscall, without
+/// the shell-out cost.
 ///
 /// Without `kernel_dir`, searches local build trees (`./linux`,
 /// `../linux`), `/lib/modules/{release}/build`, then host paths
@@ -264,12 +274,18 @@ pub fn find_image(kernel_dir: Option<&str>, release: Option<&str>) -> Option<std
         return Some(img);
     }
 
-    // Host fallback paths.
+    // Host fallback paths. When `release` is not supplied, read the
+    // running kernel release from `/proc/sys/kernel/osrelease` rather
+    // than shelling out to `uname -r` — it's the same value the
+    // kernel exposes via uname(2) and needs only a small file read.
     let owned_release;
     let rel = match release {
         Some(r) => Some(r),
         None => {
-            owned_release = _kernel_release();
+            owned_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             owned_release.as_deref()
         }
     };
@@ -333,17 +349,6 @@ fn _has_kernel_artifacts(dir: &std::path::Path) -> bool {
     false
 }
 
-/// Get the running kernel release string (equivalent to `uname -r`).
-#[allow(dead_code)]
-fn _kernel_release() -> Option<String> {
-    std::process::Command::new("uname")
-        .arg("-r")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +383,50 @@ mod tests {
         // ./linux, ../linux, then /lib/modules. The result depends on
         // the host, but the function must not panic.
         let _ = resolve_kernel(None);
+    }
+
+    #[test]
+    fn kernel_path_resolve_none_returns_osrelease_build_dir_when_present() {
+        // resolve_kernel(None) reads `/proc/sys/kernel/osrelease` and
+        // checks `/lib/modules/{rel}/build` as its last fallback. The
+        // earlier branches (`./linux`, `../linux`) cannot be controlled
+        // from a parallel-safe unit test (`set_current_dir` is process-
+        // wide), so this test is strong only when those local trees are
+        // absent. When `/lib/modules/{rel}/build` is absent on the host
+        // (typical CI without installed kernel headers), skip via early
+        // return — the panic-free contract is already covered by
+        // `kernel_path_resolve_none_falls_through`.
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("host /proc/sys/kernel/osrelease must be readable for this test")
+            .trim()
+            .to_string();
+        let expected = std::path::PathBuf::from(format!("/lib/modules/{release}/build"));
+        if !expected.is_dir() {
+            return;
+        }
+
+        let resolved = resolve_kernel(None).unwrap_or_else(|| {
+            panic!(
+                "resolve_kernel(None) must return Some when {} exists",
+                expected.display(),
+            )
+        });
+        assert!(
+            resolved.is_dir(),
+            "resolved path must be a directory, got {}",
+            resolved.display(),
+        );
+        // Strong pin only when no earlier branch (`./linux`, `../linux`)
+        // shadowed the osrelease path. When an earlier branch matched,
+        // the panic-free + valid-dir contract above is what we get.
+        let local_shadowed = std::path::PathBuf::from("./linux").is_dir()
+            || std::path::PathBuf::from("../linux").is_dir();
+        if !local_shadowed {
+            assert_eq!(
+                resolved, expected,
+                "with no local trees, resolve_kernel(None) must return the osrelease build dir",
+            );
+        }
     }
 
     #[test]
@@ -598,16 +647,32 @@ mod tests {
         let _ = find_image(Some("/nonexistent/image/dir/xyz"), None);
     }
 
-    // -- _kernel_release --
-
     #[test]
-    fn kernel_path_kernel_release_returns_string() {
-        let rel = _kernel_release();
-        // uname -r should succeed on any Linux host.
-        assert!(rel.is_some());
-        let s = rel.unwrap();
-        assert!(!s.is_empty());
-        assert!(!s.contains('\n'));
+    fn kernel_path_find_image_release_none_matches_osrelease() {
+        // The `/proc/sys/kernel/osrelease` path is hardcoded in
+        // find_image and cannot be mocked, so the fallback can only
+        // be verified by equivalence: read osrelease the way the
+        // function does, then assert that find_image(None, None)
+        // equals find_image(None, Some(<that value>)). Identical
+        // post-`rel` logic in both calls means equal outputs prove
+        // the None branch derived `rel` from osrelease (or both
+        // short-circuited via resolve_kernel(None), which is also
+        // a contract — no panic, no divergence).
+        let host_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("host /proc/sys/kernel/osrelease must be readable for this test")
+            .trim()
+            .to_string();
+        assert!(
+            !host_release.is_empty(),
+            "/proc/sys/kernel/osrelease must be non-empty for this test",
+        );
+
+        let derived = find_image(None, None);
+        let explicit = find_image(None, Some(&host_release));
+        assert_eq!(
+            derived, explicit,
+            "find_image(None, None) must equal find_image(None, Some(osrelease)); fallback diverged",
+        );
     }
 
     // -- KernelId parsing --

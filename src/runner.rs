@@ -4,7 +4,7 @@
 //! and returns `Result<Vec<ScenarioResult>>` — one per (scenario, flag
 //! profile) pair, carrying pass/fail verdict, per-check details, and
 //! run metadata. [`RunConfig`] controls flag selection, duration, and
-//! verification behavior.
+//! checking behavior.
 //!
 //! See the [Running Tests](https://likewhatevs.github.io/ktstr/guide/running-tests.html)
 //! chapter of the guide.
@@ -21,7 +21,7 @@ use crate::topology::TestTopology;
 
 /// Full configuration for a scenario run session.
 ///
-/// Controls flag selection, durations, and verification behavior.
+/// Controls flag selection, durations, and checking behavior.
 /// The scheduler is managed externally -- `ktstr run` does not
 /// start or stop schedulers.
 #[derive(Debug, Clone)]
@@ -142,7 +142,6 @@ pub struct ScenarioResult {
     pub details: Vec<AssertDetail>,
     /// Aggregate statistics merged across all cgroups and workers for
     /// this scenario.
-    #[serde(default)]
     pub stats: ScenarioStats,
 }
 
@@ -298,8 +297,7 @@ impl Runner {
                     let param_names = crate::probe::output::build_param_names(&btf_funcs);
                     let render_hints = crate::probe::output::build_render_hints(&btf_funcs);
                     let stop_clone = probe_stop.clone();
-                    let probes_ready =
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let probes_ready = std::sync::Arc::new(crate::probe::process::Latch::new());
                     let probes_ready_thread = probes_ready.clone();
                     let handle = std::thread::spawn(move || {
                         crate::probe::process::run_probe_skeleton(
@@ -311,9 +309,7 @@ impl Runner {
                             None,
                         )
                     });
-                    while !probes_ready.load(std::sync::atomic::Ordering::Acquire) {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
+                    probes_ready.wait();
                     Some(SkeletonHandle {
                         thread: handle,
                         func_names,
@@ -428,16 +424,6 @@ mod tests {
         assert_eq!(r.details, r2.details);
         assert_eq!(r.stats.worst_gap_ms, r2.stats.worst_gap_ms);
         assert_eq!(r.stats.total_workers, r2.stats.total_workers);
-    }
-
-    #[test]
-    fn scenario_result_default_stats() {
-        let json =
-            r#"{"scenario_name":"t","passed":true,"skipped":false,"duration_s":1.0,"details":[]}"#;
-        let r: ScenarioResult = serde_json::from_str(json).unwrap();
-        assert!(r.passed);
-        assert_eq!(r.stats.total_workers, 0);
-        assert_eq!(r.stats.cgroups.len(), 0);
     }
 
     #[test]
@@ -604,26 +590,6 @@ mod tests {
         // Verify stats default to zero, not garbage.
         assert_eq!(r2.stats.worst_spread, 0.0);
         assert_eq!(r2.stats.worst_gap_ms, 0);
-    }
-
-    #[test]
-    fn scenario_result_serde_missing_stats_uses_default_values() {
-        // JSON without "stats" field — serde #[serde(default)] should fill defaults.
-        let json = r#"{"scenario_name":"missing_stats","passed":true,"skipped":false,"duration_s":1.0,"details":[{"kind":"Other","message":"ok"}]}"#;
-        let r: ScenarioResult = serde_json::from_str(json).unwrap();
-        assert_eq!(r.scenario_name, "missing_stats");
-        assert!(r.passed);
-        assert_eq!(r.details.len(), 1);
-        assert_eq!(r.details[0].message, "ok");
-        assert_eq!(r.details[0].kind, crate::assert::DetailKind::Other);
-        // Verify every stats field gets its Default value, not just total_workers.
-        assert_eq!(r.stats.total_workers, 0);
-        assert_eq!(r.stats.total_cpus, 0);
-        assert_eq!(r.stats.total_migrations, 0);
-        assert_eq!(r.stats.worst_spread, 0.0);
-        assert_eq!(r.stats.worst_gap_ms, 0);
-        assert_eq!(r.stats.worst_gap_cpu, 0);
-        assert!(r.stats.cgroups.is_empty());
     }
 
     #[test]

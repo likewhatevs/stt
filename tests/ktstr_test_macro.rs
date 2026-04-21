@@ -3,7 +3,7 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 
-/// Minimal ktstr_test that verifies the macro compiles and the generated
+/// Minimal ktstr_test that checks the macro compiles and the generated
 /// linkme registration + test wrapper resolve correctly from an
 /// integration test.
 ///
@@ -316,7 +316,7 @@ fn entry_topo_inherit_partial() {
     assert_eq!(entry.topology.threads_per_core, 2);
 }
 
-/// Test with performance_mode — verifies macro sets the field.
+/// Test with performance_mode — checks macro sets the field.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, performance_mode = true)]
 fn performance_mode_compile(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;

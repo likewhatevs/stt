@@ -183,14 +183,14 @@ Equivalent to `execute_steps(ctx, vec![Step::with_defs(defs, HoldSpec::FULL)])`.
    `Loop` steps reverse this: setup runs once before the loop, then
    ops repeat at the specified interval.
 2. Check scheduler liveness between steps.
-3. After all steps: collect worker reports and run verification.
+3. After all steps: collect worker reports and run checks.
 4. Writes stimulus events to the SHM ring buffer for timeline analysis.
 
 ## execute_steps_with
 
 `execute_steps_with(ctx, steps, assertions)` is the same as
 `execute_steps` but accepts an explicit
-[`Assert`](verification.md#assert-struct) for worker checks.
+[`Assert`](checking.md#assert-struct) for worker checks.
 `execute_steps` is a convenience wrapper that passes `None`.
 
 ```rust,ignore

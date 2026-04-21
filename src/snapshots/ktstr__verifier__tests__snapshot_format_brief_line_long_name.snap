@@ -1,5 +1,0 @@
----
-source: src/verifier.rs
-expression: "format_brief_line(\"bpf_struct_ops_sched_ext_ops_dispatch_very_long_name\",\n99999)"
----
-  bpf_struct_ops_sched_ext_ops_dispatch_very_long_name verified_insns=99999

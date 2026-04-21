@@ -6,7 +6,7 @@
 it does not build or run on other platforms.
 
 - Linux host with KVM access (`/dev/kvm`)
-- Rust toolchain (stable, >= 1.88)
+- Rust toolchain (stable, >= 1.95; pinned via `rust-toolchain.toml`)
 - clang (BPF skeleton compilation)
 - pkg-config, make, gcc
 - autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
@@ -226,7 +226,7 @@ Every test automatically checks for worker starvation, scheduling
 fairness, scheduling gaps, and host-side runqueue health (including imbalance,
 stalls, dispatch queue depth). These defaults come from
 `Assert::default_checks()` and can be overridden per-scheduler or
-per-test. See [Verification](concepts/verification.md) for the full
+per-test. See [Checking](concepts/checking.md) for the full
 list of checks and thresholds.
 
 ## Run
@@ -303,7 +303,7 @@ details.
 
 ## Next steps
 
-To understand scenarios, flags, and verification:
+To understand scenarios, flags, and checking:
 [Core Concepts](concepts.md).
 
 To write new tests: [Writing Tests](writing-tests.md).

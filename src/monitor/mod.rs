@@ -1,11 +1,3 @@
-// Monitor exposes BPF map discovery, introspection, and value readers
-// that scheduler-level tests and the `cargo ktstr verifier` path reach
-// for from outside the crate. The module is `pub(crate)` for now, so
-// rustc sees every public helper as unused; lifting the allow to the
-// module root keeps the dead-code check at a narrower scope than the
-// old blanket in lib.rs.
-#![allow(dead_code)]
-
 //! Host-side guest memory monitor and BPF map introspection.
 //!
 //! Reads per-CPU runqueue structures from guest VM memory via BTF-resolved
@@ -44,6 +36,19 @@ pub(crate) struct Cr3Pa(pub u64);
 /// Newtype around `u64`; see [`Cr3Pa`] for the rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PageOffset(pub u64);
+
+/// Kernel virtual address. Newtype around `u64` so a KVA can't be
+/// mistaken for a guest DRAM offset (`PA`) or for the base values
+/// [`Cr3Pa`]/[`PageOffset`] at any page-walk call site. `Display`
+/// renders as `0x<hex>` for tracing output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct Kva(pub u64);
+
+impl std::fmt::Display for Kva {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#x}", self.0)
+    }
+}
 
 /// DSQ depth above this value indicates uninitialized guest memory.
 /// Real kernels never queue this many tasks on a single CPU's local DSQ.
@@ -248,7 +253,6 @@ pub struct MonitorReport {
     /// vCPU preemption threshold (ns) derived from the guest kernel's
     /// CONFIG_HZ at the time the VM ran. Used by evaluate() to gate
     /// stall detection. 0 means use a default.
-    #[serde(default)]
     pub preemption_threshold_ns: u64,
     /// Post-write readback of the scx_sched.watchdog_timeout field.
     /// Framework-internal regression guard that the host-side override
@@ -550,28 +554,20 @@ pub struct ScxEventCounters {
     /// `SCX_EV_ENQ_SKIP_MIGRATION_DISABLED`: enqueue skipped because migration is disabled.
     pub enq_skip_migration_disabled: i64,
     /// `SCX_EV_REENQ_IMMED`: task re-enqueued because CPU was unavailable for immediate execution.
-    #[serde(default)]
     pub reenq_immed: i64,
     /// `SCX_EV_REENQ_LOCAL_REPEAT`: recursive local DSQ re-enqueue from `SCX_ENQ_IMMED` race.
-    #[serde(default)]
     pub reenq_local_repeat: i64,
     /// `SCX_EV_REFILL_SLICE_DFL`: time slice refilled with `SCX_SLICE_DFL`.
-    #[serde(default)]
     pub refill_slice_dfl: i64,
     /// `SCX_EV_BYPASS_DURATION`: total bypass mode duration in nanoseconds.
-    #[serde(default)]
     pub bypass_duration: i64,
     /// `SCX_EV_BYPASS_DISPATCH`: tasks dispatched during bypass mode.
-    #[serde(default)]
     pub bypass_dispatch: i64,
     /// `SCX_EV_BYPASS_ACTIVATE`: bypass mode activations.
-    #[serde(default)]
     pub bypass_activate: i64,
     /// `SCX_EV_INSERT_NOT_OWNED`: attempts to insert a non-owned task into a DSQ.
-    #[serde(default)]
     pub insert_not_owned: i64,
     /// `SCX_EV_SUB_BYPASS_DISPATCH`: tasks from bypassing descendants scheduled from sub_bypass_dsq.
-    #[serde(default)]
     pub sub_bypass_dispatch: i64,
 }
 
@@ -588,13 +584,10 @@ pub struct MonitorSummary {
     /// samples. Idle CPUs (`nr_running == 0` in both samples) are exempt.
     pub stall_detected: bool,
     /// Average imbalance ratio across valid samples.
-    #[serde(default)]
     pub avg_imbalance_ratio: f64,
     /// Average nr_running per CPU across valid samples.
-    #[serde(default)]
     pub avg_nr_running: f64,
     /// Average local DSQ depth per CPU across valid samples.
-    #[serde(default)]
     pub avg_local_dsq_depth: f64,
     /// Aggregate event counter deltas over the monitoring window.
     /// None when event counters are not available.
@@ -669,28 +662,20 @@ pub struct ScxEventDeltas {
     /// Total enq_skip_migration_disabled events.
     pub total_enq_skip_migration_disabled: i64,
     /// Total reenq_immed events.
-    #[serde(default)]
     pub total_reenq_immed: i64,
     /// Total reenq_local_repeat events.
-    #[serde(default)]
     pub total_reenq_local_repeat: i64,
     /// Total refill_slice_dfl events.
-    #[serde(default)]
     pub total_refill_slice_dfl: i64,
     /// Total bypass_duration in nanoseconds.
-    #[serde(default)]
     pub total_bypass_duration: i64,
     /// Total bypass_dispatch events.
-    #[serde(default)]
     pub total_bypass_dispatch: i64,
     /// Total bypass_activate events.
-    #[serde(default)]
     pub total_bypass_activate: i64,
     /// Total insert_not_owned events.
-    #[serde(default)]
     pub total_insert_not_owned: i64,
     /// Total sub_bypass_dispatch events.
-    #[serde(default)]
     pub total_sub_bypass_dispatch: i64,
 }
 

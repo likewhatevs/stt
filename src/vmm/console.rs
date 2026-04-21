@@ -97,6 +97,7 @@ impl Serial {
     }
 
     /// Queue input bytes for host->guest communication.
+    #[allow(dead_code)]
     pub fn queue_input(&mut self, bytes: &[u8]) {
         let _ = self.inner.enqueue_raw_bytes(bytes);
     }
@@ -109,12 +110,6 @@ impl Serial {
     /// Get all captured output as a string.
     pub fn output(&self) -> String {
         String::from_utf8_lossy(self.inner.writer()).to_string()
-    }
-
-    /// Get output bytes.
-    #[cfg(test)]
-    pub fn output_bytes(&self) -> &[u8] {
-        self.inner.writer()
     }
 
     /// Clear captured output.

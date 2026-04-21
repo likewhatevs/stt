@@ -1,7 +1,8 @@
-//! Ready-made [`Payload`](ktstr::Payload) fixtures for the two
+//! Ready-made [`Payload`](ktstr::Payload) fixtures for the
 //! benchmark binaries that dominate scheduler-regression testing:
-//! `fio` (disk IO throughput, emits JSON) and `stress-ng`
-//! (synthetic CPU/memory stressors, exit-code only).
+//! `fio` (disk IO throughput, emits JSON), `stress-ng`
+//! (synthetic CPU/memory stressors, exit-code only), and
+//! `schbench` (latency percentiles, routed through LlmExtract).
 //!
 //! Each fixture is declared via
 //! [`#[derive(Payload)]`](ktstr::Payload), the same path downstream
@@ -13,15 +14,16 @@
 //! These fixtures live under `tests/common/` rather than inside the
 //! library's `src/` tree because they are TEST SCAFFOLDING, not
 //! shipped API. A downstream scheduler author who wants the same
-//! `fio` / `stress-ng` shapes should either copy the declarations
-//! below into their own crate or write their own via
-//! `#[derive(Payload)]`. The library does not ship fio or stress-ng
-//! binaries — the `kind = PayloadKind::Binary(name)` just declares
-//! the name; host-side include-files resolution picks the path up
-//! at test time.
+//! `fio` / `stress-ng` / `schbench` shapes should either copy the
+//! declarations below into their own crate or write their own via
+//! `#[derive(Payload)]`. The library does not ship fio, stress-ng,
+//! or schbench binaries — the `kind = PayloadKind::Binary(name)`
+//! just declares the name; host-side include-files resolution picks
+//! the path up at test time.
 //!
-//! The two fixtures illustrate the two ends of the
-//! [`OutputFormat`](ktstr::test_support::OutputFormat) spectrum:
+//! The fixtures cover all three
+//! [`OutputFormat`](ktstr::test_support::OutputFormat) variants
+//! — plus the hinted subvariant of `LlmExtract`:
 //!
 //! - [`FIO`] and [`FIO_JSON`] declare `OutputFormat::Json` with a
 //!   set of [`MetricHint`](ktstr::test_support::MetricHint)s
@@ -31,10 +33,25 @@
 //!   `exit_code_eq(0)` default — stress-ng reports via exit code
 //!   (bogo_ops land in stderr and are not machine-extractable
 //!   without `--metrics-brief --yaml`).
+//! - [`SCHBENCH`] uses `OutputFormat::LlmExtract(None)` — schbench
+//!   emits human-readable percentile tables, so extraction is
+//!   routed through the local LLM pipeline rather than the JSON
+//!   walker.
+//! - [`SCHBENCH_HINTED`] declares
+//!   `OutputFormat::LlmExtract(Some("wakeup latency percentiles"))`
+//!   — identical to [`SCHBENCH`] in every other field, exercising
+//!   the derive's `LlmExtract("hint")` call form and the
+//!   hint-threading path through
+//!   [`extract_via_llm`](ktstr::test_support::model::extract_via_llm).
 //!
-//! Both fixtures use short, stable `name` fields (`"fio"`,
-//! `"stress-ng"`) matching the binary names that ktstr's
-//! include-files infrastructure resolves inside the guest.
+//! All fixtures use short, stable `name` fields matching their
+//! binary names — except FIO_JSON (`"fio_json"`) and
+//! SCHBENCH_HINTED (`"schbench_hinted"`), which use distinct
+//! names so they can coexist with FIO and SCHBENCH respectively
+//! under the pairwise-dedup rule on `#[ktstr_test(workloads =
+//! [...])]`. The binary names themselves (`"fio"`, `"stress-ng"`,
+//! `"schbench"`) are what ktstr's include-files infrastructure
+//! resolves inside the guest.
 
 use ktstr::Payload;
 
@@ -74,12 +91,11 @@ pub struct FioPayload;
 /// Compared to [`FIO`], this fixture differs in exactly two
 /// fields:
 ///
-/// 1. **`name`** — `"fio_json"` instead of `"fio"`. The distinct
-///    name lets both fixtures register as workloads in the same
-///    `#[ktstr_test(workloads = [FIO, FIO_JSON])]` attribute
-///    without hitting the pairwise-dedup rejection. The `binary`
-///    field (the name resolved by the include-files
-///    infrastructure) is still `"fio"` in both.
+/// 1. **`name`** — `"fio_json"` instead of `"fio"`. Uses a
+///    distinct name so sidecar files and log output can
+///    disambiguate the two fixtures. The `binary` field (the name
+///    resolved by the include-files infrastructure) is still
+///    `"fio"` in both.
 /// 2. **`default_args`** — `&["--output-format=json"]` instead of
 ///    `&[]`. Everything else — `kind`, `output`, `default_checks`,
 ///    `metrics` — is character-for-character identical to [`FIO`].
@@ -133,3 +149,43 @@ pub struct FioJsonPayload;
 #[default_check(exit_code_eq(0))]
 #[allow(dead_code)]
 pub struct StressNgPayload;
+
+/// Latency-focused scheduler benchmark. Uses `LlmExtract` to
+/// exercise the LLM extraction pipeline (schbench supports `--json`
+/// but this fixture intentionally uses the third acquisition path).
+#[derive(Payload)]
+#[payload(binary = "schbench", output = LlmExtract)]
+#[default_args("--runtime", "30", "--message-threads", "2")]
+#[default_check(exit_code_eq(0))]
+#[allow(dead_code)]
+pub struct SchbenchPayload;
+
+/// Hint-carrying sibling of [`SCHBENCH`] — identical in every
+/// field except `name` (uses a distinct name so sidecar files and
+/// log output can disambiguate the two fixtures) and `output`.
+///
+/// Declares `output = LlmExtract("wakeup latency percentiles")`.
+/// The derive macro translates the call form into
+/// [`OutputFormat::LlmExtract(Some(...))`](ktstr::test_support::OutputFormat::LlmExtract),
+/// and the stored `&'static str` is inserted between the template
+/// and the stdout block as a `Focus:` directive by
+/// [`extract_via_llm`](ktstr::test_support::model::extract_via_llm)
+/// when the fixture runs — steering the model toward the stat the
+/// scheduler regression cares about instead of whatever numeric
+/// leaf the model picks first.
+///
+/// Exists as a fixture (rather than only as an ad-hoc
+/// `#[derive(Payload)]` inside the test file) so downstream
+/// scheduler-author crates have a copy-ready template for the
+/// hint-carrying shape — the bare [`SCHBENCH`] covers the
+/// no-hint form, this fixture covers the with-hint form.
+#[derive(Payload)]
+#[payload(
+    binary = "schbench",
+    name = "schbench_hinted",
+    output = LlmExtract("wakeup latency percentiles"),
+)]
+#[default_args("--runtime", "30", "--message-threads", "2")]
+#[default_check(exit_code_eq(0))]
+#[allow(dead_code)]
+pub struct SchbenchHintedPayload;

@@ -10,7 +10,7 @@ Standalone examples for common tasks. Each recipe is self-contained.
   run and compare
 - [Write a dynamic scenario](recipes/dynamic-scenario.md) -- ops/steps
   with CgroupDef
-- [Customize verification](recipes/custom-verification.md) -- scheduler
+- [Customize checking](recipes/custom-checking.md) -- scheduler
   thresholds, per-test overrides
 - [Benchmarking and negative tests](recipes/benchmarking-tests.md) --
-  performance gates, intentional degradation, Assert verification
+  performance gates, intentional degradation, Assert checks

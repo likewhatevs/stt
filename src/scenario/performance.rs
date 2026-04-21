@@ -96,11 +96,11 @@ pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult>
 /// wake-to-run latency. A second cgroup runs CpuSpin workers to create
 /// CPU contention. Checks wake latency CV to catch inconsistent
 /// receiver placement.
-pub fn custom_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
+pub fn custom_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
     let fan_out = 4usize;
     let group_size = fan_out + 1;
     // Round down to nearest multiple of group_size, at least one group.
-    let n_fanout = (ctx.workers_per_cgroup / group_size).max(1) * group_size;
+    let n_fan_out = (ctx.workers_per_cgroup / group_size).max(1) * group_size;
 
     let checks = Assert::default_checks()
         .max_wake_latency_cv(10.0)
@@ -109,7 +109,7 @@ pub fn custom_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0")
-                .workers(n_fanout)
+                .workers(n_fan_out)
                 .work_type(WorkType::futex_fan_out(fan_out, 1024)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
@@ -119,17 +119,17 @@ pub fn custom_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-/// Schbench-style messenger/worker workload.
+/// Fan-out messenger/worker with compute workload.
 ///
-/// One cgroup runs SchBench workers: each group has 1 messenger that
+/// One cgroup runs FanOutCompute workers: each group has 1 messenger that
 /// stamps a wake timestamp then wakes 4 receivers via FUTEX_WAKE.
 /// Receivers measure wake-to-run latency, sleep, and do matrix multiply
 /// work. A second cgroup runs CpuSpin workers to create CPU contention.
 /// Checks wake latency CV to catch inconsistent receiver placement.
-pub fn custom_schbench_style(ctx: &Ctx) -> Result<AssertResult> {
+pub fn custom_fan_out_compute(ctx: &Ctx) -> Result<AssertResult> {
     let fan_out = 4usize;
     let group_size = fan_out + 1;
-    let n_schbench = (ctx.workers_per_cgroup / group_size).max(1) * group_size;
+    let n_workers = (ctx.workers_per_cgroup / group_size).max(1) * group_size;
 
     let checks = Assert::default_checks()
         .max_wake_latency_cv(10.0)
@@ -138,8 +138,8 @@ pub fn custom_schbench_style(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
             CgroupDef::named("cg_0")
-                .workers(n_schbench)
-                .work_type(WorkType::schbench(fan_out, 256, 5, 100)),
+                .workers(n_workers)
+                .work_type(WorkType::fan_out_compute(fan_out, 256, 5, 100)),
             CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
         ],
         HoldSpec::Fixed(ctx.settle + ctx.duration),

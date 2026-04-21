@@ -12,12 +12,52 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use super::btf::{BtfFunc, RenderHint, STRUCT_FIELDS};
 use super::stack::StackFunction;
 
 use crate::bpf_skel::types;
+
+/// One-shot signal from a producer thread to one or more waiters.
+///
+/// `set` flips the state and wakes every waiter currently blocked in
+/// `wait`; subsequent waiters return immediately. Uses
+/// `Mutex<bool> + Condvar` under the hood so waiters block in the
+/// kernel instead of spinning. Replaces the `Arc<AtomicBool>` +
+/// `while !flag { thread::sleep(10ms) }` pattern the probe pipeline
+/// used to hand off readiness between the worker thread and the
+/// dispatch paths in `test_support::probe` and `runner`.
+#[derive(Default)]
+pub struct Latch {
+    set: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Latch {
+    /// Create a new latch in the unset state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the latch and wake every waiter. Idempotent: a second call
+    /// is a no-op beyond re-notifying, matching the previous
+    /// `AtomicBool::store(true, Release)` semantics.
+    pub fn set(&self) {
+        let mut guard = self.set.lock().unwrap();
+        *guard = true;
+        self.cv.notify_all();
+    }
+
+    /// Block until `set` is called. Returns immediately if already set.
+    pub fn wait(&self) {
+        let mut guard = self.set.lock().unwrap();
+        while !*guard {
+            guard = self.cv.wait(guard).unwrap();
+        }
+    }
+}
 
 /// Input for Phase B probe attachment (BPF fentry/fexit).
 ///
@@ -35,8 +75,9 @@ pub struct PhaseBInput {
     pub bpf_prog_fds: std::collections::HashMap<u32, i32>,
     /// BTF-resolved function signatures for BPF callbacks and kernel callers.
     pub btf_funcs: Vec<BtfFunc>,
-    /// Set to true when Phase B attachment is complete.
-    pub done: Arc<AtomicBool>,
+    /// Signaled by the probe worker thread once Phase B attachment
+    /// completes so the dispatch path can proceed past its wait.
+    pub done: Arc<Latch>,
     /// Starting func_idx for Phase B functions. Must equal the number
     /// of functions in Phase A to avoid index collisions in the shared
     /// `func_meta_map` and `probe_data` maps.
@@ -78,7 +119,6 @@ pub struct ProbeDiagnostics {
     /// Whether the trigger fired.
     pub trigger_fired: bool,
     /// Which trigger mechanism attached ("tp_btf").
-    #[serde(default)]
     pub trigger_type: String,
     /// Error from tp_btf/sched_ext_exit attach failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,10 +416,11 @@ pub fn open_bpf_prog_fds(functions: &[StackFunction]) -> std::collections::HashM
 ///
 /// The fentry skeleton exposes four indexed programs
 /// (`ktstr_fentry_0`..`ktstr_fentry_3`) matching the 4-slot batch
-/// model in `bpf/ktstr.bpf.c`. Six call sites across this file
-/// previously spelled the full 4-arm `match slot { ... }` inline;
-/// routing through this helper keeps the dispatch in one place so a
-/// future slot addition is a one-line change instead of six.
+/// model in `bpf/ktstr.bpf.c`. Call sites previously spelled the
+/// full 4-arm `match slot { ... }` inline; routing through this
+/// family of helpers keeps the dispatch in one place so a future
+/// slot addition is a one-line change per helper instead of
+/// scattered across every batch.
 ///
 /// Returns `None` for slot indices outside 0..=3, matching the
 /// existing `continue;` behaviour at call sites.
@@ -412,6 +453,99 @@ fn attach_fexit_by_slot(
     })
 }
 
+/// Borrow the open fentry program in slot 0..=3 for pre-load
+/// configuration (`set_attach_target`, `set_autoload`).
+///
+/// Pre-load sibling of [`attach_fentry_by_slot`]: operates on
+/// [`OpenFentryProbeSkel`] before [`OpenSkel::load`] consumes it.
+/// Returns `None` for slot indices outside 0..=3, matching the
+/// existing `continue;` behaviour at call sites.
+///
+/// [`OpenFentryProbeSkel`]: crate::bpf_skel::fentry::OpenFentryProbeSkel
+/// [`OpenSkel::load`]: libbpf_rs::skel::OpenSkel::load
+fn fentry_prog_mut_by_slot<'a, 'obj>(
+    open_skel: &'a mut crate::bpf_skel::fentry::OpenFentryProbeSkel<'obj>,
+    slot: usize,
+) -> Option<&'a mut libbpf_rs::OpenProgramMut<'obj>> {
+    Some(match slot {
+        0 => &mut open_skel.progs.ktstr_fentry_0,
+        1 => &mut open_skel.progs.ktstr_fentry_1,
+        2 => &mut open_skel.progs.ktstr_fentry_2,
+        3 => &mut open_skel.progs.ktstr_fentry_3,
+        _ => return None,
+    })
+}
+
+/// Borrow the open fexit program in slot 0..=3 for pre-load
+/// configuration. Pre-load sibling of [`attach_fexit_by_slot`];
+/// see [`fentry_prog_mut_by_slot`] for the routing rationale.
+fn fexit_prog_mut_by_slot<'a, 'obj>(
+    open_skel: &'a mut crate::bpf_skel::fentry::OpenFentryProbeSkel<'obj>,
+    slot: usize,
+) -> Option<&'a mut libbpf_rs::OpenProgramMut<'obj>> {
+    Some(match slot {
+        0 => &mut open_skel.progs.ktstr_fexit_0,
+        1 => &mut open_skel.progs.ktstr_fexit_1,
+        2 => &mut open_skel.progs.ktstr_fexit_2,
+        3 => &mut open_skel.progs.ktstr_fexit_3,
+        _ => return None,
+    })
+}
+
+/// Disable autoload on both the fentry and fexit programs for
+/// slot 0..=3 so the verifier skips them at
+/// [`OpenSkel::load`][libbpf_rs::skel::OpenSkel::load]. Used for
+/// unused batch slots and slots whose
+/// [`set_attach_target`][libbpf_rs::OpenProgramMut::set_attach_target]
+/// call failed — either leaves the skeleton with placeholder
+/// targets the verifier would reject.
+///
+/// No-op for slot indices outside 0..=3.
+fn disable_slot_programs(
+    open_skel: &mut crate::bpf_skel::fentry::OpenFentryProbeSkel<'_>,
+    slot: usize,
+) {
+    if let Some(p) = fentry_prog_mut_by_slot(open_skel, slot) {
+        p.set_autoload(false);
+    }
+    if let Some(p) = fexit_prog_mut_by_slot(open_skel, slot) {
+        p.set_autoload(false);
+    }
+}
+
+/// Write the per-slot rodata fields (`ktstr_fentry_func_idx_N`,
+/// `ktstr_fentry_is_kernel_N`) for slot 0..=3. Mirrors the BPF
+/// side's positional `rodata` layout in `bpf/ktstr.bpf.c`.
+///
+/// No-op for slot indices outside 0..=3.
+fn set_rodata_slot(
+    rodata: &mut crate::bpf_skel::fentry::types::rodata,
+    slot: usize,
+    idx: u32,
+    is_kernel: bool,
+) {
+    let k = is_kernel as u8;
+    match slot {
+        0 => {
+            rodata.ktstr_fentry_func_idx_0 = idx;
+            rodata.ktstr_fentry_is_kernel_0 = k;
+        }
+        1 => {
+            rodata.ktstr_fentry_func_idx_1 = idx;
+            rodata.ktstr_fentry_is_kernel_1 = k;
+        }
+        2 => {
+            rodata.ktstr_fentry_func_idx_2 = idx;
+            rodata.ktstr_fentry_is_kernel_2 = k;
+        }
+        3 => {
+            rodata.ktstr_fentry_func_idx_3 = idx;
+            rodata.ktstr_fentry_is_kernel_3 = k;
+        }
+        _ => {}
+    }
+}
+
 /// Run the BPF probe skeleton for auto-repro.
 ///
 /// Operates in two modes depending on `phase_b_rx`:
@@ -441,7 +575,7 @@ pub fn run_probe_skeleton(
     btf_funcs: &[BtfFunc],
     stop: &AtomicBool,
     bpf_prog_fds: &std::collections::HashMap<u32, i32>,
-    ready: &AtomicBool,
+    ready: &Latch,
     phase_b_rx: Option<std::sync::mpsc::Receiver<PhaseBInput>>,
 ) -> (
     Option<Vec<ProbeEvent>>,
@@ -464,7 +598,7 @@ pub fn run_probe_skeleton(
         Err(e) => {
             tracing::error!(%e, "probe skeleton open failed");
             diag.trigger_attach_error = Some(format!("skeleton open: {e}"));
-            ready.store(true, Ordering::Release);
+            ready.set();
             return (None, diag, Vec::new());
         }
     };
@@ -480,7 +614,7 @@ pub fn run_probe_skeleton(
         Err(e) => {
             tracing::error!(%e, "probe skeleton load failed");
             diag.trigger_attach_error = Some(format!("skeleton load: {e}"));
-            ready.store(true, Ordering::Release);
+            ready.set();
             return (None, diag, Vec::new());
         }
     };
@@ -542,7 +676,7 @@ pub fn run_probe_skeleton(
         tracing::warn!("no kprobe IPs resolved and no BPF functions for fentry");
         diag.trigger_attach_error =
             Some("no functions resolved — kprobes and trigger skipped".to_string());
-        ready.store(true, Ordering::Release);
+        ready.set();
         return (None, diag, Vec::new());
     }
     if func_ips.is_empty() && (phase_b_rx.is_some() || !bpf_funcs.is_empty()) {
@@ -673,37 +807,14 @@ pub fn run_probe_skeleton(
             if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
                 rodata.ktstr_enabled = true;
                 for t in &targets {
-                    let k = t.is_kernel as u8;
-                    match t.slot {
-                        0 => {
-                            rodata.ktstr_fentry_func_idx_0 = t.idx;
-                            rodata.ktstr_fentry_is_kernel_0 = k;
-                        }
-                        1 => {
-                            rodata.ktstr_fentry_func_idx_1 = t.idx;
-                            rodata.ktstr_fentry_is_kernel_1 = k;
-                        }
-                        2 => {
-                            rodata.ktstr_fentry_func_idx_2 = t.idx;
-                            rodata.ktstr_fentry_is_kernel_2 = k;
-                        }
-                        3 => {
-                            rodata.ktstr_fentry_func_idx_3 = t.idx;
-                            rodata.ktstr_fentry_is_kernel_3 = k;
-                        }
-                        _ => {}
-                    }
+                    set_rodata_slot(rodata, t.slot, t.idx, t.is_kernel);
                 }
             }
 
             for t in targets.iter_mut() {
                 // Set fentry attach target.
-                let fentry_prog = match t.slot {
-                    0 => &mut fentry_open.progs.ktstr_fentry_0,
-                    1 => &mut fentry_open.progs.ktstr_fentry_1,
-                    2 => &mut fentry_open.progs.ktstr_fentry_2,
-                    3 => &mut fentry_open.progs.ktstr_fentry_3,
-                    _ => continue,
+                let Some(fentry_prog) = fentry_prog_mut_by_slot(&mut fentry_open, t.slot) else {
+                    continue;
                 };
                 match fentry_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
                     Ok(()) => {
@@ -722,12 +833,8 @@ pub fn run_probe_skeleton(
                     }
                 }
                 // Set fexit attach target on the same function.
-                let fexit_prog = match t.slot {
-                    0 => &mut fentry_open.progs.ktstr_fexit_0,
-                    1 => &mut fentry_open.progs.ktstr_fexit_1,
-                    2 => &mut fentry_open.progs.ktstr_fexit_2,
-                    3 => &mut fentry_open.progs.ktstr_fexit_3,
-                    _ => continue,
+                let Some(fexit_prog) = fexit_prog_mut_by_slot(&mut fentry_open, t.slot) else {
+                    continue;
                 };
                 if let Err(e) = fexit_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
                     tracing::debug!(slot = t.slot, func = t.name, %e, "fexit: set_attach_target failed (entry-only)");
@@ -750,25 +857,7 @@ pub fn run_probe_skeleton(
                 targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
             for slot in 0..FENTRY_BATCH {
                 if !used_slots.contains(&slot) {
-                    match slot {
-                        0 => {
-                            fentry_open.progs.ktstr_fentry_0.set_autoload(false);
-                            fentry_open.progs.ktstr_fexit_0.set_autoload(false);
-                        }
-                        1 => {
-                            fentry_open.progs.ktstr_fentry_1.set_autoload(false);
-                            fentry_open.progs.ktstr_fexit_1.set_autoload(false);
-                        }
-                        2 => {
-                            fentry_open.progs.ktstr_fentry_2.set_autoload(false);
-                            fentry_open.progs.ktstr_fexit_2.set_autoload(false);
-                        }
-                        3 => {
-                            fentry_open.progs.ktstr_fentry_3.set_autoload(false);
-                            fentry_open.progs.ktstr_fexit_3.set_autoload(false);
-                        }
-                        _ => {}
-                    }
+                    disable_slot_programs(&mut fentry_open, slot);
                 }
             }
             tracing::debug!(
@@ -931,26 +1020,7 @@ pub fn run_probe_skeleton(
         if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
             rodata.ktstr_enabled = true;
             for t in &targets {
-                let k = t.is_kernel as u8;
-                match t.slot {
-                    0 => {
-                        rodata.ktstr_fentry_func_idx_0 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_0 = k;
-                    }
-                    1 => {
-                        rodata.ktstr_fentry_func_idx_1 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_1 = k;
-                    }
-                    2 => {
-                        rodata.ktstr_fentry_func_idx_2 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_2 = k;
-                    }
-                    3 => {
-                        rodata.ktstr_fentry_func_idx_3 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_3 = k;
-                    }
-                    _ => {}
-                }
+                set_rodata_slot(rodata, t.slot, t.idx, t.is_kernel);
             }
         }
 
@@ -958,22 +1028,14 @@ pub fn run_probe_skeleton(
         // (entry capture is handled by the kprobe skeleton).
         for t in targets.iter_mut() {
             // Disable fentry for kernel functions (kprobe handles entry).
-            let fentry_prog = match t.slot {
-                0 => &mut fentry_open.progs.ktstr_fentry_0,
-                1 => &mut fentry_open.progs.ktstr_fentry_1,
-                2 => &mut fentry_open.progs.ktstr_fentry_2,
-                3 => &mut fentry_open.progs.ktstr_fentry_3,
-                _ => continue,
+            let Some(fentry_prog) = fentry_prog_mut_by_slot(&mut fentry_open, t.slot) else {
+                continue;
             };
             fentry_prog.set_autoload(false);
 
             // Set fexit attach target with fd=0 (vmlinux BTF).
-            let fexit_prog = match t.slot {
-                0 => &mut fentry_open.progs.ktstr_fexit_0,
-                1 => &mut fentry_open.progs.ktstr_fexit_1,
-                2 => &mut fentry_open.progs.ktstr_fexit_2,
-                3 => &mut fentry_open.progs.ktstr_fexit_3,
-                _ => continue,
+            let Some(fexit_prog) = fexit_prog_mut_by_slot(&mut fentry_open, t.slot) else {
+                continue;
             };
             match fexit_prog.set_attach_target(0, Some(t.name.to_string())) {
                 Ok(()) => {
@@ -995,18 +1057,20 @@ pub fn run_probe_skeleton(
             continue;
         }
 
-        // Disable fexit for unused slots.
+        // Disable fexit for unused slots. Fentry for these slots was
+        // left at its default by the `targets` loop above (which
+        // disables fentry only for slots that have a target); no
+        // attach_target was set for them either, so libbpf loads
+        // them with a NULL target. Disabling fexit here keeps the
+        // behaviour as it was before the slot helpers were
+        // introduced.
         let used_slots: std::collections::HashSet<usize> =
             targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
         for slot in 0..FENTRY_BATCH {
-            if !used_slots.contains(&slot) {
-                match slot {
-                    0 => fentry_open.progs.ktstr_fexit_0.set_autoload(false),
-                    1 => fentry_open.progs.ktstr_fexit_1.set_autoload(false),
-                    2 => fentry_open.progs.ktstr_fexit_2.set_autoload(false),
-                    3 => fentry_open.progs.ktstr_fexit_3.set_autoload(false),
-                    _ => {}
-                }
+            if !used_slots.contains(&slot)
+                && let Some(p) = fexit_prog_mut_by_slot(&mut fentry_open, slot)
+            {
+                p.set_autoload(false);
             }
         }
 
@@ -1075,7 +1139,7 @@ pub fn run_probe_skeleton(
             let msg = format!("auto-repro requires kernel with sched_ext_exit tracepoint: {e}");
             tracing::error!(%msg, "trigger attach failed");
             diag.trigger_attach_error = Some(msg);
-            ready.store(true, Ordering::Release);
+            ready.set();
             return (None, diag, Vec::new());
         }
     }
@@ -1130,7 +1194,7 @@ pub fn run_probe_skeleton(
         0
     }) {
         tracing::error!(%e, "failed to register ring buffer callback");
-        ready.store(true, Ordering::Release);
+        ready.set();
         return (None, diag, Vec::new());
     }
 
@@ -1138,7 +1202,7 @@ pub fn run_probe_skeleton(
         Ok(rb) => rb,
         Err(e) => {
             tracing::error!(%e, "failed to build ring buffer");
-            ready.store(true, Ordering::Release);
+            ready.set();
             return (None, diag, Vec::new());
         }
     };
@@ -1158,7 +1222,7 @@ pub fn run_probe_skeleton(
     // Signal Phase A probes attached (kprobes + kernel fexit +
     // trigger). When phase_b_rx is None, this means all probes.
     // When Some, BPF fentry is deferred to Phase B.
-    ready.store(true, Ordering::Release);
+    ready.set();
 
     // Phase B: receive BPF fentry targets and attach them while
     // polling the ring buffer. The channel is consumed once; after
@@ -1196,7 +1260,7 @@ pub fn run_probe_skeleton(
                         &mut links,
                         &mut diag,
                     );
-                    pb.done.store(true, Ordering::Release);
+                    pb.done.set();
                     phase_b_done = true;
                     // Drop the receiver to release the channel.
                     phase_b_rx = None;
@@ -1556,45 +1620,18 @@ fn attach_phase_b_fentry(
         if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
             rodata.ktstr_enabled = true;
             for t in &targets {
-                let k = t.is_kernel as u8;
-                match t.slot {
-                    0 => {
-                        rodata.ktstr_fentry_func_idx_0 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_0 = k;
-                    }
-                    1 => {
-                        rodata.ktstr_fentry_func_idx_1 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_1 = k;
-                    }
-                    2 => {
-                        rodata.ktstr_fentry_func_idx_2 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_2 = k;
-                    }
-                    3 => {
-                        rodata.ktstr_fentry_func_idx_3 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_3 = k;
-                    }
-                    _ => {}
-                }
+                set_rodata_slot(rodata, t.slot, t.idx, t.is_kernel);
             }
         }
 
         for t in targets.iter_mut() {
-            let fentry_prog = match t.slot {
-                0 => &mut fentry_open.progs.ktstr_fentry_0,
-                1 => &mut fentry_open.progs.ktstr_fentry_1,
-                2 => &mut fentry_open.progs.ktstr_fentry_2,
-                3 => &mut fentry_open.progs.ktstr_fentry_3,
-                _ => continue,
+            let Some(fentry_prog) = fentry_prog_mut_by_slot(&mut fentry_open, t.slot) else {
+                continue;
             };
             fentry_prog.set_autoload(false);
 
-            let fexit_prog = match t.slot {
-                0 => &mut fentry_open.progs.ktstr_fexit_0,
-                1 => &mut fentry_open.progs.ktstr_fexit_1,
-                2 => &mut fentry_open.progs.ktstr_fexit_2,
-                3 => &mut fentry_open.progs.ktstr_fexit_3,
-                _ => continue,
+            let Some(fexit_prog) = fexit_prog_mut_by_slot(&mut fentry_open, t.slot) else {
+                continue;
             };
             match fexit_prog.set_attach_target(0, Some(t.name.to_string())) {
                 Ok(()) => {
@@ -1611,17 +1648,15 @@ fn attach_phase_b_fentry(
             continue;
         }
 
+        // Disable fexit for unused slots (see the matching single-phase
+        // kernel-fexit batch for the fentry-left-at-default rationale).
         let used_slots: std::collections::HashSet<usize> =
             targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
         for slot in 0..FENTRY_BATCH {
-            if !used_slots.contains(&slot) {
-                match slot {
-                    0 => fentry_open.progs.ktstr_fexit_0.set_autoload(false),
-                    1 => fentry_open.progs.ktstr_fexit_1.set_autoload(false),
-                    2 => fentry_open.progs.ktstr_fexit_2.set_autoload(false),
-                    3 => fentry_open.progs.ktstr_fexit_3.set_autoload(false),
-                    _ => {}
-                }
+            if !used_slots.contains(&slot)
+                && let Some(p) = fexit_prog_mut_by_slot(&mut fentry_open, slot)
+            {
+                p.set_autoload(false);
             }
         }
 
@@ -1737,36 +1772,13 @@ fn attach_phase_b_fentry(
         if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
             rodata.ktstr_enabled = true;
             for t in &targets {
-                let k = t.is_kernel as u8;
-                match t.slot {
-                    0 => {
-                        rodata.ktstr_fentry_func_idx_0 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_0 = k;
-                    }
-                    1 => {
-                        rodata.ktstr_fentry_func_idx_1 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_1 = k;
-                    }
-                    2 => {
-                        rodata.ktstr_fentry_func_idx_2 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_2 = k;
-                    }
-                    3 => {
-                        rodata.ktstr_fentry_func_idx_3 = t.idx;
-                        rodata.ktstr_fentry_is_kernel_3 = k;
-                    }
-                    _ => {}
-                }
+                set_rodata_slot(rodata, t.slot, t.idx, t.is_kernel);
             }
         }
 
         for t in targets.iter_mut() {
-            let fentry_prog = match t.slot {
-                0 => &mut fentry_open.progs.ktstr_fentry_0,
-                1 => &mut fentry_open.progs.ktstr_fentry_1,
-                2 => &mut fentry_open.progs.ktstr_fentry_2,
-                3 => &mut fentry_open.progs.ktstr_fentry_3,
-                _ => continue,
+            let Some(fentry_prog) = fentry_prog_mut_by_slot(&mut fentry_open, t.slot) else {
+                continue;
             };
             match fentry_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
                 Ok(()) => {
@@ -1779,12 +1791,8 @@ fn attach_phase_b_fentry(
                     continue;
                 }
             }
-            let fexit_prog = match t.slot {
-                0 => &mut fentry_open.progs.ktstr_fexit_0,
-                1 => &mut fentry_open.progs.ktstr_fexit_1,
-                2 => &mut fentry_open.progs.ktstr_fexit_2,
-                3 => &mut fentry_open.progs.ktstr_fexit_3,
-                _ => continue,
+            let Some(fexit_prog) = fexit_prog_mut_by_slot(&mut fentry_open, t.slot) else {
+                continue;
             };
             if let Err(e) = fexit_prog.set_attach_target(t.fd, Some(t.name.to_string())) {
                 tracing::debug!(slot = t.slot, func = t.name, %e, "phase_b fexit: set_attach_target failed (entry-only)");
@@ -1803,25 +1811,7 @@ fn attach_phase_b_fentry(
             targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
         for slot in 0..FENTRY_BATCH {
             if !used_slots.contains(&slot) {
-                match slot {
-                    0 => {
-                        fentry_open.progs.ktstr_fentry_0.set_autoload(false);
-                        fentry_open.progs.ktstr_fexit_0.set_autoload(false);
-                    }
-                    1 => {
-                        fentry_open.progs.ktstr_fentry_1.set_autoload(false);
-                        fentry_open.progs.ktstr_fexit_1.set_autoload(false);
-                    }
-                    2 => {
-                        fentry_open.progs.ktstr_fentry_2.set_autoload(false);
-                        fentry_open.progs.ktstr_fexit_2.set_autoload(false);
-                    }
-                    3 => {
-                        fentry_open.progs.ktstr_fentry_3.set_autoload(false);
-                        fentry_open.progs.ktstr_fexit_3.set_autoload(false);
-                    }
-                    _ => {}
-                }
+                disable_slot_programs(&mut fentry_open, slot);
             }
         }
 

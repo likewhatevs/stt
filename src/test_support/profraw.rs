@@ -196,7 +196,7 @@ pub(crate) fn target_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::ENV_LOCK;
+    use super::super::test_helpers::{EnvVarGuard, lock_env};
     use super::*;
     use crate::vmm::shm_ring::parse_shm_params_from_str;
 
@@ -278,68 +278,28 @@ mod tests {
 
     #[test]
     fn target_dir_with_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let key = "LLVM_COV_TARGET_DIR";
-        let prev = std::env::var(key).ok();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe { std::env::set_var(key, "/tmp/my-cov-dir") };
+        let _lock = lock_env();
+        let _env = EnvVarGuard::set("LLVM_COV_TARGET_DIR", "/tmp/my-cov-dir");
         let dir = target_dir();
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
         assert_eq!(dir, PathBuf::from("/tmp/my-cov-dir"));
     }
 
     #[test]
     fn target_dir_from_llvm_profile_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let key_cov = "LLVM_COV_TARGET_DIR";
-        let key_prof = "LLVM_PROFILE_FILE";
-        let prev_cov = std::env::var(key_cov).ok();
-        let prev_prof = std::env::var(key_prof).ok();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe {
-            std::env::remove_var(key_cov);
-            std::env::set_var(key_prof, "/tmp/cov-target/ktstr-%p-%m.profraw");
-        }
+        let _lock = lock_env();
+        let _env_cov = EnvVarGuard::remove("LLVM_COV_TARGET_DIR");
+        let _env_prof =
+            EnvVarGuard::set("LLVM_PROFILE_FILE", "/tmp/cov-target/ktstr-%p-%m.profraw");
         let dir = target_dir();
-        unsafe {
-            match prev_cov {
-                Some(v) => std::env::set_var(key_cov, v),
-                None => std::env::remove_var(key_cov),
-            }
-            match prev_prof {
-                Some(v) => std::env::set_var(key_prof, v),
-                None => std::env::remove_var(key_prof),
-            }
-        }
         assert_eq!(dir, PathBuf::from("/tmp/cov-target"));
     }
 
     #[test]
     fn target_dir_without_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let key_cov = "LLVM_COV_TARGET_DIR";
-        let key_prof = "LLVM_PROFILE_FILE";
-        let prev_cov = std::env::var(key_cov).ok();
-        let prev_prof = std::env::var(key_prof).ok();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe {
-            std::env::remove_var(key_cov);
-            std::env::remove_var(key_prof);
-        }
+        let _lock = lock_env();
+        let _env_cov = EnvVarGuard::remove("LLVM_COV_TARGET_DIR");
+        let _env_prof = EnvVarGuard::remove("LLVM_PROFILE_FILE");
         let dir = target_dir();
-        unsafe {
-            match prev_cov {
-                Some(v) => std::env::set_var(key_cov, v),
-                None => std::env::remove_var(key_cov),
-            }
-            match prev_prof {
-                Some(v) => std::env::set_var(key_prof, v),
-                None => std::env::remove_var(key_prof),
-            }
-        }
         // Falls back to current_exe parent + "llvm-cov-target".
         assert!(
             dir.ends_with("llvm-cov-target"),

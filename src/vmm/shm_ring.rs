@@ -119,6 +119,7 @@ pub const DUMP_REQ_SYSRQ_D: u8 = b'D';
 pub const STALL_REQ_OFFSET: usize = 13;
 
 /// Value written to STALL_REQ_OFFSET to request a scheduler stall.
+#[allow(dead_code)]
 pub const STALL_REQ_ACTIVATE: u8 = b'S';
 
 /// Base offset within the SHM region for numbered signal slots.

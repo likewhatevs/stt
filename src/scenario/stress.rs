@@ -239,7 +239,7 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
 
 /// LLC-specific cpusets + tight flip loop. Uses Instant::now() deadline
 /// loop and LLC-aligned BTreeSets computed at runtime. Not Op/Step compatible.
-pub fn custom_cgroup_cpuset_crossllc_race(ctx: &Ctx) -> Result<AssertResult> {
+pub fn custom_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
     // Need at least 2 LLCs to flip cpusets across LLC boundaries.
     if ctx.topo.num_llcs() < 2 {
         return Ok(AssertResult::skip("skipped: need >=2 LLCs"));

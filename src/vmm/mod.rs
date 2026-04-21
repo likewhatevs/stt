@@ -1,11 +1,3 @@
-// VMM contains the KVM boot path, console/SHM ring helpers, and
-// gauntlet entry points used by `ktstr run`, `cargo ktstr verifier`,
-// `cargo ktstr shell`, and the `#[ktstr_test]` dispatch harness. It
-// stays `pub(crate)` to avoid freezing the public surface while the
-// auto-repro and monitor pipelines continue to evolve; the allow is
-// narrowed here to replace the blanket in lib.rs.
-#![allow(dead_code)]
-
 //! Virtual machine monitor for booting Linux kernels in KVM to host
 //! scheduler test scenarios.
 //!
@@ -23,13 +15,24 @@
 //! for the isolation options the builder exposes.
 
 pub mod console;
+mod exit_dispatch;
 pub mod host_topology;
 pub mod initramfs;
+mod memory_budget;
 pub(crate) mod numa_mem;
+mod pi_mutex;
 pub(crate) mod rust_init;
 pub mod shm_ring;
+mod terminal;
 pub mod topology;
 pub(crate) mod virtio_console;
+mod vmlinux;
+
+pub(crate) use exit_dispatch::{ExitAction, classify_exit, vcpu_run_loop_unified};
+pub(crate) use memory_budget::{MemoryBudget, initramfs_min_memory_mb, read_kernel_init_size};
+pub(crate) use pi_mutex::PiMutex;
+pub(crate) use terminal::TerminalRawGuard;
+pub(crate) use vmlinux::find_vmlinux;
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
@@ -82,141 +85,6 @@ pub(crate) fn create_vm_with_retry(kvm: &kvm_ioctls::Kvm) -> Result<kvm_ioctls::
                 std::thread::sleep(std::time::Duration::from_micros(1 << attempts));
             }
             Err(e) => break Err(e).context("create VM"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PiMutex — priority-inheritance mutex via pthread_mutex + PTHREAD_PRIO_INHERIT
-// ---------------------------------------------------------------------------
-
-/// Mutex that uses the kernel's priority-inheritance protocol to avoid
-/// priority inversion between RT and non-RT threads.
-///
-/// When a SCHED_FIFO thread blocks on a PiMutex held by a SCHED_OTHER
-/// thread, the kernel temporarily boosts the holder to the waiter's
-/// priority, ensuring the critical section completes without unbounded
-/// delay.
-///
-/// Uses `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` which maps
-/// to `FUTEX_LOCK_PI` in the kernel. On systems where the kernel is
-/// built without `CONFIG_FUTEX_PI`, `setprotocol` returns `ENOTSUP`
-/// and the mutex degrades to the default `PTHREAD_PRIO_NONE` protocol
-/// — mutual exclusion is preserved, but priority inheritance is not
-/// active. PI is a performance hint, not a correctness invariant, so
-/// the degraded mode is safe for every caller in this crate.
-///
-/// # Panics
-///
-/// * `PiMutex::new` panics if `pthread_mutexattr_init` or
-///   `pthread_mutex_init` fails, or if
-///   `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` returns any
-///   nonzero value OTHER than `ENOTSUP` — the `ENOTSUP` case is
-///   logged and handled gracefully (see the degradation note above).
-///   The alternative on real init failures (a partially initialized
-///   mutex) would have undefined lock/unlock semantics.
-/// * `PiMutex::lock` panics if `pthread_mutex_lock` fails.
-///   Returning a guard on an unlocked mutex would let the caller
-///   obtain `&mut T` without exclusive access — a data race and
-///   undefined behaviour — so this mirrors `std::sync::Mutex`.
-/// * `PiMutexGuard::drop` calls `libc::abort()` if
-///   `pthread_mutex_unlock` fails (typical cause: `EPERM` — the
-///   current thread does not own the mutex, indicating a violated
-///   guard-ownership invariant elsewhere). Drop cannot propagate
-///   errors; releasing the `&mut T` contract on a still-locked
-///   mutex is worse than abort, because another thread could then
-///   observe the interior mutably while we also reference it.
-pub(crate) struct PiMutex<T> {
-    inner: std::cell::UnsafeCell<T>,
-    mutex: std::cell::UnsafeCell<libc::pthread_mutex_t>,
-}
-
-// SAFETY: PiMutex provides mutual exclusion via pthread_mutex_lock/unlock.
-// The UnsafeCell<T> is only accessed while the mutex is held.
-unsafe impl<T: Send> Send for PiMutex<T> {}
-unsafe impl<T: Send> Sync for PiMutex<T> {}
-
-impl<T> PiMutex<T> {
-    /// Create a new PI mutex wrapping `value`.
-    pub(crate) fn new(value: T) -> Self {
-        unsafe {
-            let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
-            let rc = libc::pthread_mutexattr_init(&mut attr);
-            assert_eq!(rc, 0, "pthread_mutexattr_init failed: {rc}");
-            let rc = libc::pthread_mutexattr_setprotocol(&mut attr, libc::PTHREAD_PRIO_INHERIT);
-            // PI protocol is a performance hint, not a correctness
-            // invariant for ktstr — priority inversion on the host
-            // only matters when SCHED_FIFO threads are in play. On a
-            // kernel built without CONFIG_FUTEX_PI, `setprotocol`
-            // returns ENOTSUP; degrade silently to the default
-            // PRIO_NONE protocol instead of aborting startup. Any
-            // other nonzero rc is a programmer error (EINVAL from a
-            // bad attr pointer) and is still asserted.
-            if rc == libc::ENOTSUP {
-                tracing::warn!(
-                    "PTHREAD_PRIO_INHERIT unsupported (errno {}); PiMutex degrading to non-PI protocol",
-                    rc
-                );
-            } else {
-                assert_eq!(
-                    rc, 0,
-                    "pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT) failed: {rc}"
-                );
-            }
-            let mut mutex: libc::pthread_mutex_t = std::mem::zeroed();
-            let rc = libc::pthread_mutex_init(&mut mutex, &attr);
-            libc::pthread_mutexattr_destroy(&mut attr);
-            assert_eq!(rc, 0, "pthread_mutex_init failed: {rc}");
-            PiMutex {
-                inner: std::cell::UnsafeCell::new(value),
-                mutex: std::cell::UnsafeCell::new(mutex),
-            }
-        }
-    }
-
-    /// Lock the mutex and return a guard providing `&mut T`.
-    pub(crate) fn lock(&self) -> PiMutexGuard<'_, T> {
-        unsafe {
-            let rc = libc::pthread_mutex_lock(self.mutex.get());
-            assert_eq!(rc, 0, "pthread_mutex_lock failed: {rc}");
-        }
-        PiMutexGuard { mutex: self }
-    }
-}
-
-impl<T> Drop for PiMutex<T> {
-    fn drop(&mut self) {
-        unsafe {
-            libc::pthread_mutex_destroy(self.mutex.get());
-        }
-    }
-}
-
-pub(crate) struct PiMutexGuard<'a, T> {
-    mutex: &'a PiMutex<T>,
-}
-
-impl<T> std::ops::Deref for PiMutexGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        unsafe { &*self.mutex.inner.get() }
-    }
-}
-
-impl<T> std::ops::DerefMut for PiMutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.mutex.inner.get() }
-    }
-}
-
-impl<T> Drop for PiMutexGuard<'_, T> {
-    fn drop(&mut self) {
-        unsafe {
-            let rc = libc::pthread_mutex_unlock(self.mutex.mutex.get());
-            if rc != 0 {
-                eprintln!("pthread_mutex_unlock failed: {rc}");
-                libc::abort();
-            }
         }
     }
 }
@@ -314,7 +182,7 @@ impl BaseKey {
 
         // Hash include files: archive paths (sorted for determinism),
         // content hashes, and shared lib hashes for ELF includes (their
-        // shared libs are packed by create_initramfs_base).
+        // shared libs are packed by build_initramfs_base).
         let mut sorted: Vec<(&str, &Path)> = include_files
             .iter()
             .map(|(a, p)| (a.as_str(), p.as_path()))
@@ -399,11 +267,11 @@ pub(crate) fn get_or_build_base(
             // We won the race — build, write, release.
             tracing::debug!("initramfs shm: builder (O_EXCL won)");
             let t0 = std::time::Instant::now();
-            let data = initramfs::create_initramfs_base(payload, extras, include_files, busybox)?;
+            let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
                 bytes = data.len(),
-                "create_initramfs_base",
+                "build_initramfs_base",
             );
 
             // Write data to the segment and release the exclusive lock.
@@ -448,12 +316,12 @@ pub(crate) fn get_or_build_base(
 
     // 3. Fallback: build without SHM coordination.
     let t0 = std::time::Instant::now();
-    let data = initramfs::create_initramfs_base(payload, extras, include_files, busybox)?;
+    let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
     let arc = Arc::new(data);
     tracing::debug!(
         elapsed_us = t0.elapsed().as_micros(),
         bytes = arc.len(),
-        "create_initramfs_base (fallback)",
+        "build_initramfs_base (fallback)",
     );
 
     base_cache()
@@ -594,212 +462,6 @@ fn shm_write_and_release(fd: std::os::fd::OwnedFd, data: &[u8], seg_name: &str) 
     // with the final mmap before the fd-drop close hits.
     let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
     // fd drops here → close(fd). OwnedFd::drop ignores errors.
-}
-
-// ---------------------------------------------------------------------------
-// Initramfs memory floor
-// ---------------------------------------------------------------------------
-
-/// Parameters for computing minimum guest memory.
-pub(crate) struct MemoryBudget {
-    /// Uncompressed initramfs size (base + suffix cpio) in bytes.
-    pub uncompressed_initramfs_bytes: u64,
-    /// LZ4-compressed initrd size in bytes. The compressed initrd
-    /// is memblock-reserved in guest physical memory from load until
-    /// free_initrd_mem() releases it after extraction.
-    pub compressed_initrd_bytes: u64,
-    /// Kernel `init_size` from bzImage setup_header (offset 0x260).
-    /// The kernel's declared contiguous memory requirement during
-    /// boot decompression. Includes compressed payload, decompressed
-    /// kernel, and decompression workspace. Overestimates resident
-    /// kernel (init sections and workspace are freed post-boot),
-    /// absorbing percpu and misc boot allocations.
-    pub kernel_init_size: u64,
-    /// SHM region carved from the top of guest memory (E820 gap on
-    /// x86_64, FDT /reserved-memory and /memreserve/ on aarch64).
-    pub shm_bytes: u64,
-}
-
-/// Read the kernel's declared memory footprint from the image file.
-///
-/// x86_64 bzImage: reads `init_size` from setup_header at file offset
-/// 0x260 (setup_header starts at 0x1F1, `init_size` is at byte 111
-/// within it). This is the kernel's declared contiguous memory
-/// requirement during boot decompression.
-///
-/// aarch64 Image: reads `image_size` from the arm64 image header at
-/// file offset 16 (after code0 + code1 + text_offset). For gzip-
-/// compressed vmlinuz, falls back to file size * 4 as a conservative
-/// estimate of the decompressed Image size.
-pub(crate) fn read_kernel_init_size(kernel_path: &Path) -> Result<u64> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(kernel_path)
-        .with_context(|| format!("open kernel for init_size: {}", kernel_path.display()))?;
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // setup_header starts at 0x1F1, init_size at offset 111.
-        f.seek(SeekFrom::Start(0x260))
-            .context("seek to init_size in bzImage")?;
-        let mut buf = [0u8; 4];
-        f.read_exact(&mut buf)
-            .context("read init_size from bzImage")?;
-        Ok(u32::from_le_bytes(buf) as u64)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Check for gzip magic (0x1f 0x8b).
-        let mut magic = [0u8; 2];
-        f.read_exact(&mut magic).context("read kernel magic")?;
-        if magic == [0x1f, 0x8b] {
-            // Compressed vmlinuz — decompress header to read image_size.
-            f.seek(SeekFrom::Start(0))
-                .context("seek vmlinuz to start")?;
-            let mut decoder = flate2::read::GzDecoder::new(&mut f);
-            let mut header = [0u8; 24];
-            decoder
-                .read_exact(&mut header)
-                .context("decompress arm64 vmlinuz header for image_size")?;
-            return Ok(u64::from_le_bytes(header[16..24].try_into().unwrap()));
-        }
-        // Raw PE Image: image_size is a little-endian u64 at offset 16.
-        f.seek(SeekFrom::Start(16))
-            .context("seek to image_size in arm64 Image")?;
-        let mut buf = [0u8; 8];
-        f.read_exact(&mut buf)
-            .context("read image_size from arm64 Image")?;
-        Ok(u64::from_le_bytes(buf))
-    }
-}
-
-/// Minimum guest memory (in MB) needed to boot, extract the initramfs,
-/// and run the test workload.
-///
-/// ```text
-/// total = computed_boot_requirement + WORKLOAD_MB + shm
-/// ```
-///
-/// ## Computed boot requirement
-///
-/// Every term is derived from values known at allocation time. The model
-/// follows the kernel's boot memory layout.
-///
-/// **memblock-reserved regions** (excluded from `totalram_pages`):
-///
-/// - `kernel_init_size`: bzImage setup_header `init_size` field (offset
-///   0x260) — the kernel's declared contiguous memory requirement during
-///   boot decompression. Includes compressed payload, decompressed
-///   vmlinux, and decompression workspace. Overestimates resident kernel
-///   since init sections (`free_initmem`, `init/main.c`) and the
-///   decompression workspace are freed post-boot. The slack absorbs
-///   percpu allocations (`pcpu_embed_first_chunk` in `mm/percpu.c`
-///   reserves `static_size + reserved_size + dyn_size` per CPU via
-///   memblock, ~220KB/CPU with ktstr's kconfig which disables LOCKDEP)
-///   and misc boot allocations (page tables, slab bootstrap, hash tables).
-///
-/// - `compressed_initrd`: memblock-reserved by `reserve_initrd_mem()`
-///   (`init/initramfs.c:642`: `memblock_reserve(start, size)`) until
-///   `free_initrd_mem()` after `unpack_to_rootfs` completes.
-///
-/// - struct page array: `P / 64` bytes. Each 4KB page requires a
-///   `struct page` descriptor. On x86_64: base size = 56 bytes
-///   (flags:8 + 5-word union:40 + _mapcount:4 + _refcount:4), rounded
-///   to 64 by `CONFIG_HAVE_ALIGNED_STRUCT_PAGE` (16-byte alignment,
-///   `include/linux/mm_types.h`). Valid for x86_64 without `CONFIG_KMSAN`.
-///
-/// **tmpfs constraint** (the binding limit for initramfs extraction):
-///
-/// The rootfs tmpfs is mounted by `init_mount_tree()` (`fs/namespace.c`)
-/// via `vfs_kern_mount(&rootfs_fs_type, 0, ...)` — flags=0, NOT
-/// `SB_KERNMOUNT`. `alloc_super` (`fs/super.c`) sets `s->s_flags = flags`,
-/// so `SB_KERNMOUNT` is not set. In `shmem_fill_super` (`mm/shmem.c`),
-/// the `!(sb->s_flags & SB_KERNMOUNT)` branch runs, and since no
-/// `size=` mount option was parsed (`SHMEM_SEEN_BLOCKS` unset), it
-/// falls through to `ctx->blocks = shmem_default_max_blocks()` =
-/// `totalram_pages() / 2` (`mm/shmem.c:146`).
-///
-/// `initramfs_options=size=90%` on the cmdline is consumed by
-/// `init_mount_tree()` (`fs/namespace.c`) when mounting the rootfs
-/// tmpfs. This raises the tmpfs block limit from 50% to 90% of
-/// `totalram_pages`, preventing ENOSPC on large initramfs payloads.
-///
-/// Note: `rootflags=size=90%` would set `root_mount_data`
-/// (`init/do_mounts.c:109`), consumed only by `do_mount_root()` via
-/// `prepare_namespace()`. With `rdinit=`, `kernel_init_freeable`
-/// (`init/main.c`) skips `prepare_namespace()` when `init_eaccess`
-/// succeeds, so `rootflags=` is never applied to the rootfs.
-///
-/// The `SB_KERNMOUNT` (unlimited) tmpfs is the separate `shm_mnt`
-/// created by `shmem_init()` via `kern_mount()` — used for anonymous
-/// shared memory (`shmem_file_setup`), not the rootfs.
-///
-/// With `initramfs_options=size=90%`, the tmpfs limit is 90% of
-/// `totalram_pages` (not the default 50%):
-///
-/// ```text
-/// totalram_pages(P) = (P - init_size - compressed - P/64) / 4096
-/// tmpfs_max_pages = totalram_pages * 9 / 10
-/// constraint: tmpfs_max_pages >= uncompressed / 4096
-///
-/// Solving for P:
-/// (P - init_size - compressed - P/64) * 9/10 >= uncompressed
-/// P * 63/64 >= uncompressed * 10/9 + init_size + compressed
-/// P >= (uncompressed * 10/9 + init_size + compressed) * 64/63
-/// ```
-///
-/// In practice, `ceil(uncompressed * 10/9)` is used to ensure
-/// integer rounding does not underallocate.
-///
-/// ## Workload budget
-///
-/// 256 MB for scheduler execution, test scenarios, and runtime
-/// allocations (cgroup memory, BPF maps, process stacks, slab caches).
-/// This is a deliberate budget for post-boot workload, not a guess at
-/// kernel overhead.
-///
-/// ## SHM region
-///
-/// Carved from the top of guest physical memory. Not part of usable
-/// RAM (E820 gap on x86_64, FDT /reserved-memory and /memreserve/ on aarch64).
-///
-/// ```text
-/// total = boot_requirement + 256 + shm
-/// ```
-///
-/// Workload budget (MB): scheduler execution, test scenarios, cgroup
-/// memory, BPF maps, and runtime allocations.
-const WORKLOAD_MB: u64 = 256;
-
-pub(crate) fn initramfs_min_memory_mb(budget: &MemoryBudget) -> u32 {
-    let ceil_mb = |bytes: u64| -> u64 { (bytes + (1 << 20) - 1) >> 20 };
-
-    let init_size_mb = ceil_mb(budget.kernel_init_size);
-    let compressed_mb = ceil_mb(budget.compressed_initrd_bytes);
-    let shm_mb = ceil_mb(budget.shm_bytes);
-    let uncompressed_mb = ceil_mb(budget.uncompressed_initramfs_bytes);
-
-    // Boot requirement: initramfs_options=size=90% sets the rootfs
-    // tmpfs limit to 90% of totalram_pages.
-    //
-    // Constraint: totalram_pages * 9/10 >= uncompressed_pages.
-    // totalram_pages = (P - reserved) / PAGE_SIZE.
-    // reserved = init_size + compressed + struct_page(P).
-    // struct_page(P) = P/64.
-    //
-    // Solving:
-    //   (P - init_size - compressed - P/64) * 9/10 >= uncompressed
-    //   P * 63/64 >= uncompressed * 10/9 + init_size + compressed
-    //   P >= (ceil(uncompressed * 10/9) + init_size + compressed) * 64/63
-    let uncompressed_scaled = (uncompressed_mb * 10).div_ceil(9);
-    let content_mb = uncompressed_scaled + init_size_mb + compressed_mb;
-
-    // struct page overhead: P/64 is part of reserved, creating a
-    // circular dependency. Solve: P = content * 64/63.
-    let boot_mb = (content_mb * 64).div_ceil(63);
-
-    // total = computed boot requirement + workload budget + SHM gap.
-    (boot_mb + WORKLOAD_MB + shm_mb) as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +607,7 @@ pub struct VmResult {
     /// Data drained from the SHM ring buffer after VM exit.
     pub shm_data: Option<shm_ring::ShmDrainResult>,
     /// Stimulus events extracted from SHM ring entries.
+    #[allow(dead_code)]
     pub stimulus_events: Vec<shm_ring::StimulusEvent>,
     /// BPF verifier stats collected from host-side memory reads.
     pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierStats>,
@@ -968,6 +631,7 @@ pub struct KvmStatsTotals {
 /// Covers VM exit rate, halt-polling behavior, preemption notifications,
 /// signal-driven exits, and hypercall counts; all fields scheduler
 /// authors typically correlate with scx decisions.
+#[allow(dead_code)]
 pub const KVM_INTERESTING_STATS: &[&str] = &[
     "exits",
     "halt_exits",
@@ -1172,6 +836,21 @@ struct BpfMapWriteParams {
 impl KtstrVm {
     pub fn builder() -> KtstrVmBuilder {
         KtstrVmBuilder::default()
+    }
+
+    /// Borrow this VM's per-invocation initramfs-suffix inputs into an
+    /// [`initramfs::SuffixParams`]. Centralizes the `run_args` /
+    /// `sched_args` / sched-enable / sched-disable / `exec_cmd`
+    /// bundling so both x86_64 and aarch64 paths construct the suffix
+    /// from the same source of truth.
+    fn suffix_params(&self) -> initramfs::SuffixParams<'_> {
+        initramfs::SuffixParams {
+            args: &self.run_args,
+            sched_args: &self.sched_args,
+            sched_enable: &self.sched_enable_cmds,
+            sched_disable: &self.sched_disable_cmds,
+            exec_cmd: self.exec_cmd.as_deref(),
+        }
     }
 
     /// Boot the VM, run until shutdown/timeout, return captured output.
@@ -1870,16 +1549,7 @@ impl KtstrVm {
         let base_bytes: &[u8] = base.as_ref();
 
         let t0 = Instant::now();
-        let enable_refs: Vec<&str> = self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
-        let disable_refs: Vec<&str> = self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
-        let suffix = initramfs::build_suffix_full(
-            base_bytes.len(),
-            &self.run_args,
-            &self.sched_args,
-            &enable_refs,
-            &disable_refs,
-            self.exec_cmd.as_deref(),
-        )?;
+        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
         let uncompressed_size = base_bytes.len() + suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
@@ -1942,16 +1612,7 @@ impl KtstrVm {
         let base_bytes: &[u8] = base.as_ref();
 
         let t0 = Instant::now();
-        let enable_refs: Vec<&str> = self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
-        let disable_refs: Vec<&str> = self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
-        let suffix = initramfs::build_suffix_full(
-            base_bytes.len(),
-            &self.run_args,
-            &self.sched_args,
-            &enable_refs,
-            &disable_refs,
-            self.exec_cmd.as_deref(),
-        )?;
+        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
         let uncompressed_size = base_bytes.len() + suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
@@ -3299,26 +2960,13 @@ impl KtstrVm {
                     .join()
                     .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
                 let base_bytes: &[u8] = base.as_ref();
-                let enable_refs: Vec<&str> =
-                    self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
-                let disable_refs: Vec<&str> =
-                    self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
-                let suffix = initramfs::build_suffix_full(
-                    base_bytes.len(),
-                    &self.run_args,
-                    &self.sched_args,
-                    &enable_refs,
-                    &disable_refs,
-                    self.exec_cmd.as_deref(),
-                )?;
+                let suffix =
+                    initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
                 let uncompressed_size = base_bytes.len() + suffix.len();
 
                 // Compress before computing memory so the formula uses
                 // actual compressed size.
-                let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
-                full.extend_from_slice(base_bytes);
-                full.extend_from_slice(&suffix);
-                let initrd_data = initramfs::lz4_legacy_compress(&full);
+                let initrd_data = initramfs::lz4_compress_combined(base_bytes, &suffix);
                 let total_size = initrd_data.len() as u64;
 
                 let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0);
@@ -3363,22 +3011,9 @@ impl KtstrVm {
                     .join()
                     .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
                 let base_bytes: &[u8] = base.as_ref();
-                let enable_refs: Vec<&str> =
-                    self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
-                let disable_refs: Vec<&str> =
-                    self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
-                let suffix = initramfs::build_suffix_full(
-                    base_bytes.len(),
-                    &self.run_args,
-                    &self.sched_args,
-                    &enable_refs,
-                    &disable_refs,
-                    self.exec_cmd.as_deref(),
-                )?;
-                let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
-                full.extend_from_slice(base_bytes);
-                full.extend_from_slice(&suffix);
-                let initrd_data = initramfs::lz4_legacy_compress(&full);
+                let suffix =
+                    initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
+                let initrd_data = initramfs::lz4_compress_combined(base_bytes, &suffix);
                 let total_size = initrd_data.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
                 initramfs::load_initramfs_parts(&vm.guest_mem, &[&initrd_data], load_addr)?;
@@ -3506,358 +3141,6 @@ impl KtstrVm {
         // APs start powered off via PSCI — no register setup needed.
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------------------
-// aarch64 MMIO dispatch — serial and virtio over MMIO
-// ---------------------------------------------------------------------------
-
-/// Dispatch an MMIO write to serial and virtio devices.
-/// Returns `true` if the caller should exit (shutdown detected).
-#[cfg(target_arch = "aarch64")]
-fn dispatch_mmio_write(
-    com1: &PiMutex<console::Serial>,
-    com2: &PiMutex<console::Serial>,
-    virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
-    addr: u64,
-    data: &[u8],
-) -> bool {
-    if let Some(offset) = mmio_serial_offset(addr, kvm::SERIAL_MMIO_BASE) {
-        if let Some(&byte) = data.first() {
-            com1.lock().inner_write(offset, byte);
-        }
-    } else if let Some(offset) = mmio_serial_offset(addr, kvm::SERIAL2_MMIO_BASE)
-        && let Some(&byte) = data.first()
-    {
-        com2.lock().inner_write(offset, byte);
-    } else if let Some(vc) = virtio_con {
-        let base = kvm::VIRTIO_CONSOLE_MMIO_BASE;
-        if addr >= base && addr < base + virtio_console::VIRTIO_MMIO_SIZE {
-            vc.lock().mmio_write(addr - base, data);
-        }
-    }
-    false
-}
-
-/// Dispatch an MMIO read from serial and virtio-console devices.
-#[cfg(target_arch = "aarch64")]
-fn dispatch_mmio_read(
-    com1: &PiMutex<console::Serial>,
-    com2: &PiMutex<console::Serial>,
-    virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
-    addr: u64,
-    data: &mut [u8],
-) {
-    if let Some(offset) = mmio_serial_offset(addr, kvm::SERIAL_MMIO_BASE) {
-        if let Some(first) = data.first_mut() {
-            *first = com1.lock().inner_read(offset);
-        }
-    } else if let Some(offset) = mmio_serial_offset(addr, kvm::SERIAL2_MMIO_BASE) {
-        if let Some(first) = data.first_mut() {
-            *first = com2.lock().inner_read(offset);
-        }
-    } else if let Some(vc) = virtio_con
-        && (kvm::VIRTIO_CONSOLE_MMIO_BASE
-            ..kvm::VIRTIO_CONSOLE_MMIO_BASE + virtio_console::VIRTIO_MMIO_SIZE)
-            .contains(&addr)
-    {
-        vc.lock()
-            .mmio_read(addr - kvm::VIRTIO_CONSOLE_MMIO_BASE, data);
-    } else {
-        for b in data.iter_mut() {
-            *b = 0xff;
-        }
-    }
-}
-
-/// Compute register offset for an MMIO address within a serial region.
-#[cfg(target_arch = "aarch64")]
-fn mmio_serial_offset(addr: u64, base: u64) -> Option<u8> {
-    let size = kvm::SERIAL_MMIO_SIZE;
-    if addr >= base && addr < base + size {
-        Some((addr - base) as u8)
-    } else {
-        None
-    }
-}
-
-/// Unified per-vCPU KVM_RUN loop for AP threads.
-///
-/// HLT on APs: check kill + continue on both arches (KVM delivers
-/// interrupts to wake the vCPU). Shutdown sets the kill flag so all
-/// other vCPUs exit.
-fn vcpu_run_loop_unified(
-    vcpu: &mut kvm_ioctls::VcpuFd,
-    com1: &Arc<PiMutex<console::Serial>>,
-    com2: &Arc<PiMutex<console::Serial>>,
-    virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
-    kill: &Arc<AtomicBool>,
-) {
-    loop {
-        if kill.load(Ordering::Acquire) {
-            break;
-        }
-
-        match vcpu.run() {
-            Ok(mut exit) => {
-                if matches!(exit, VcpuExit::Hlt) {
-                    if kill.load(Ordering::Acquire) {
-                        break;
-                    }
-                    continue;
-                }
-                match classify_exit(com1, com2, virtio_con.map(|a| a.as_ref()), &mut exit) {
-                    Some(ExitAction::Continue) | None => {}
-                    Some(ExitAction::Shutdown) => {
-                        kill.store(true, Ordering::Release);
-                        break;
-                    }
-                    Some(ExitAction::Fatal(_)) => break,
-                }
-            }
-            Err(e) => {
-                if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN {
-                    vcpu.set_kvm_immediate_exit(0);
-                    if kill.load(Ordering::Acquire) {
-                        break;
-                    }
-                    continue;
-                }
-                if kill.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-        }
-
-        if kill.load(Ordering::Acquire) {
-            break;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// I/O dispatch — shared between BSP and AP run loops
-// ---------------------------------------------------------------------------
-
-const KVM_SYSTEM_EVENT_SHUTDOWN: u32 = 1;
-const KVM_SYSTEM_EVENT_RESET: u32 = 2;
-
-/// Classified vCPU exit action from `classify_exit`.
-enum ExitAction {
-    /// Continue running (I/O handled, etc.).
-    Continue,
-    /// Clean shutdown (system reset, VcpuExit::Shutdown, etc.).
-    Shutdown,
-    /// Fatal error. `Some(reason)` for FailEntry, `None` for InternalError.
-    Fatal(Option<u64>),
-}
-
-/// Classify a VcpuExit into an ExitAction, dispatching arch-specific I/O.
-///
-/// Returns `None` for HLT (caller handles: check kill flag, continue).
-/// Takes the exit by mutable reference so IoIn/MmioRead data buffers
-/// can be written back.
-///
-/// On aarch64, serial and virtio-console are dispatched via MMIO.
-/// On x86_64, serial is dispatched via port I/O; virtio-console via MMIO.
-fn classify_exit(
-    com1: &PiMutex<console::Serial>,
-    com2: &PiMutex<console::Serial>,
-    virtio_con: Option<&PiMutex<virtio_console::VirtioConsole>>,
-    exit: &mut VcpuExit,
-) -> Option<ExitAction> {
-    match exit {
-        #[cfg(target_arch = "x86_64")]
-        VcpuExit::IoOut(port, data) => {
-            if dispatch_io_out(com1, com2, *port, data) {
-                Some(ExitAction::Shutdown)
-            } else {
-                Some(ExitAction::Continue)
-            }
-        }
-        #[cfg(target_arch = "x86_64")]
-        VcpuExit::IoIn(port, data) => {
-            dispatch_io_in(com1, com2, *port, data);
-            Some(ExitAction::Continue)
-        }
-        #[cfg(target_arch = "aarch64")]
-        VcpuExit::MmioWrite(addr, data) => {
-            if dispatch_mmio_write(com1, com2, virtio_con, *addr, data) {
-                Some(ExitAction::Shutdown)
-            } else {
-                Some(ExitAction::Continue)
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        VcpuExit::MmioRead(addr, data) => {
-            dispatch_mmio_read(com1, com2, virtio_con, *addr, data);
-            Some(ExitAction::Continue)
-        }
-        VcpuExit::Hlt => None,
-        VcpuExit::Shutdown => Some(ExitAction::Shutdown),
-        VcpuExit::SystemEvent(event_type, _) => {
-            if *event_type == KVM_SYSTEM_EVENT_SHUTDOWN || *event_type == KVM_SYSTEM_EVENT_RESET {
-                Some(ExitAction::Shutdown)
-            } else {
-                Some(ExitAction::Continue)
-            }
-        }
-        VcpuExit::FailEntry(reason, _cpu) => Some(ExitAction::Fatal(Some(*reason))),
-        VcpuExit::InternalError => Some(ExitAction::Fatal(None)),
-        #[cfg(target_arch = "x86_64")]
-        VcpuExit::MmioRead(addr, data) => {
-            if let Some(vc) = virtio_con {
-                let base = kvm::VIRTIO_CONSOLE_MMIO_BASE;
-                if *addr >= base && *addr < base + virtio_console::VIRTIO_MMIO_SIZE {
-                    vc.lock().mmio_read(*addr - base, data);
-                    return Some(ExitAction::Continue);
-                }
-            }
-            for b in data.iter_mut() {
-                *b = 0xff;
-            }
-            Some(ExitAction::Continue)
-        }
-        #[cfg(target_arch = "x86_64")]
-        VcpuExit::MmioWrite(addr, data) => {
-            if let Some(vc) = virtio_con {
-                let base = kvm::VIRTIO_CONSOLE_MMIO_BASE;
-                if *addr >= base && *addr < base + virtio_console::VIRTIO_MMIO_SIZE {
-                    vc.lock().mmio_write(*addr - base, data);
-                    return Some(ExitAction::Continue);
-                }
-            }
-            Some(ExitAction::Continue)
-        }
-        _ => None,
-    }
-}
-
-/// I8042 ports and commands — minimal emulation for x86 guest reboot.
-/// The kernel's default reboot method (`reboot=k`) writes CMD_RESET_CPU
-/// (0xFE) to the i8042 command port (0x64).
-#[cfg(target_arch = "x86_64")]
-const I8042_DATA_PORT: u16 = 0x60;
-#[cfg(target_arch = "x86_64")]
-const I8042_CMD_PORT: u16 = 0x64;
-#[cfg(target_arch = "x86_64")]
-const I8042_CMD_RESET_CPU: u8 = 0xFE;
-
-/// Dispatch an I/O out to serial ports or system devices.
-/// Returns `true` if the caller should exit (system reset detected).
-#[cfg(target_arch = "x86_64")]
-fn dispatch_io_out(
-    com1: &PiMutex<console::Serial>,
-    com2: &PiMutex<console::Serial>,
-    port: u16,
-    data: &[u8],
-) -> bool {
-    // I8042 reset: kernel writes 0xFE to port 0x64 during reboot.
-    if port == I8042_CMD_PORT && data.first() == Some(&I8042_CMD_RESET_CPU) {
-        return true;
-    }
-    // Only lock the matching serial port based on port range.
-    if (console::COM1_BASE..console::COM1_BASE + 8).contains(&port) {
-        com1.lock().handle_out(port, data);
-    } else if (console::COM2_BASE..console::COM2_BASE + 8).contains(&port) {
-        com2.lock().handle_out(port, data);
-    }
-    false
-}
-
-/// Dispatch an I/O in from serial ports or system devices.
-/// Handles i8042 reads to satisfy the kernel's keyboard probe.
-#[cfg(target_arch = "x86_64")]
-fn dispatch_io_in(
-    com1: &PiMutex<console::Serial>,
-    com2: &PiMutex<console::Serial>,
-    port: u16,
-    data: &mut [u8],
-) {
-    match port {
-        // I8042 status: return 0 (no data, buffer empty).
-        I8042_CMD_PORT => {
-            if let Some(b) = data.first_mut() {
-                *b = 0;
-            }
-        }
-        // I8042 data: return 0 (no keypress).
-        I8042_DATA_PORT => {
-            if let Some(b) = data.first_mut() {
-                *b = 0;
-            }
-        }
-        // Only lock the matching serial port based on port range.
-        p if (console::COM1_BASE..console::COM1_BASE + 8).contains(&p) => {
-            com1.lock().handle_in(port, data);
-        }
-        p if (console::COM2_BASE..console::COM2_BASE + 8).contains(&p) => {
-            com2.lock().handle_in(port, data);
-        }
-        _ => {}
-    }
-}
-
-// ---------------------------------------------------------------------------
-// vCPU run loop — Firecracker/CH hybrid pattern
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// vmlinux discovery
-// ---------------------------------------------------------------------------
-
-/// Find the vmlinux ELF next to a kernel image path.
-///
-/// Shared across x86_64 and aarch64. Both architectures follow the
-/// kernel build's `<root>/arch/<arch>/boot/<image>` layout, so
-/// stepping 3 directories up from `kernel_path` lands on `<root>`
-/// where `vmlinux` sits. Distro paths diverge: x86_64 ships debug
-/// vmlinux at `/usr/lib/debug/boot/vmlinux-<version>`, aarch64 splits
-/// between `/boot/vmlinux-<version>` and
-/// `/lib/modules/<version>/build/vmlinux`. Both distro layouts are
-/// probed regardless of arch — the arch-specific filename prefix
-/// (`bzImage` vs `Image`) only tells us where to look, not which
-/// layout owns the match.
-pub(crate) fn find_vmlinux(kernel_path: &Path) -> Option<PathBuf> {
-    let dir = kernel_path.parent()?;
-    let candidate = dir.join("vmlinux");
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    // Kernel build tree: <root>/arch/<arch>/boot/<image> -> <root>/vmlinux.
-    if let Ok(root) = dir.join("../../..").canonicalize() {
-        let candidate = root.join("vmlinux");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    // Distro layouts keyed by the image's version suffix
-    // (`vmlinuz-<version>`).
-    if let Some(name) = kernel_path.file_name().and_then(|n| n.to_str()) {
-        let version = name.strip_prefix("vmlinuz-").unwrap_or(name);
-        for candidate in [
-            PathBuf::from(format!("/usr/lib/debug/boot/vmlinux-{version}")),
-            PathBuf::from(format!("/boot/vmlinux-{version}")),
-            PathBuf::from(format!("/lib/modules/{version}/build/vmlinux")),
-        ] {
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    // `/lib/modules/<version>/vmlinuz` layout: version is the parent
-    // directory name, and the sibling `build/vmlinux` is the target.
-    if let Some(parent_name) = dir.file_name().and_then(|n| n.to_str()) {
-        for candidate in [
-            dir.join("build/vmlinux"),
-            PathBuf::from(format!("/boot/vmlinux-{parent_name}")),
-        ] {
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -4399,215 +3682,6 @@ fn acquire_slot_with_locks(
     }))
 }
 
-// ---------------------------------------------------------------------------
-// TerminalRawGuard — raw mode with RAII restore + signal safety
-// ---------------------------------------------------------------------------
-
-/// Stdin fd for signal handler. Set by TerminalRawGuard::enter, cleared by Drop.
-///
-/// The signal handler's Acquire load on this fd is the single gate for
-/// touching `SAVED_TERMIOS`: the `fd >= 0` observation happens-after
-/// the Release stores of the termios pointer and INSTALLED flag.
-static SAVED_TERMIOS_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-/// Pointer to a boxed termios used by the signal handler for restore.
-/// Written exclusively by `TerminalRawGuard::enter` after the
-/// `SAVED_TERMIOS_INSTALLED` CAS succeeds; read by the signal handler.
-/// Drop does NOT free the backing allocation — a signal may be
-/// dispatched concurrently on another thread between our
-/// `SAVED_TERMIOS_FD = -1` store and the handler's Acquire load, and
-/// freeing would create a use-after-free.
-///
-/// The leak is bounded per enter/drop cycle: each successful
-/// `enter()` allocates exactly one `sizeof(libc::termios)` and Drop
-/// never frees it, so total process-lifetime allocation grows linearly
-/// with the number of raw-mode install cycles. In practice that count
-/// is small (each full `ktstr` invocation installs raw mode at most
-/// once for interactive I/O), so the leak is negligible — but it is
-/// O(N) in cycles, not O(1). If a future caller drives repeated
-/// enter/drop cycles in a tight loop, the leak becomes observable and
-/// a more sophisticated reclamation scheme (hazard pointer, epoch
-/// reclamation) would be required.
-static SAVED_TERMIOS: std::sync::atomic::AtomicPtr<libc::termios> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-/// Single-writer guard for SAVED_TERMIOS. `enter()` performs a
-/// CAS(false → true) before any state installation; re-entry fails
-/// with an error rather than stomping a previously-installed termios
-/// (which would leak the prior pointer AND desynchronize the signal
-/// handler). Drop clears this so a subsequent `enter()` may install.
-static SAVED_TERMIOS_INSTALLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Signal handler that restores terminal state then re-raises.
-/// Async-signal-safe: uses only libc::tcsetattr (POSIX async-signal-safe)
-/// and libc::raise. SA_RESETHAND restores SIG_DFL before entry, so the
-/// re-raised signal terminates normally.
-extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
-    // Gate 1: FD >= 0. Acquire-loads the fd stored last in enter(); if
-    // negative (never installed, or Drop already cleared it) we have
-    // nothing to restore and skip straight to re-raise.
-    let fd = SAVED_TERMIOS_FD.load(std::sync::atomic::Ordering::Acquire);
-    if fd >= 0 {
-        // Gate 2: non-null termios pointer. The Acquire load pairs with
-        // the Release store in enter() (ordered before the FD store),
-        // so observing fd >= 0 implies a valid termios write
-        // happens-before the pointer load. Drop stores null here AFTER
-        // clearing FD, so a concurrent handler that saw fd >= 0 is
-        // guaranteed to observe a still-valid pointer (the leak policy
-        // on SAVED_TERMIOS ensures the allocation outlives any
-        // in-flight handler invocation).
-        //
-        // SA_RESETHAND ensures this handler runs at most once per
-        // delivered signal; we cannot race with ourselves on the same
-        // thread.
-        let ptr = SAVED_TERMIOS.load(std::sync::atomic::Ordering::Acquire);
-        if !ptr.is_null() {
-            // SAFETY: ptr was produced by Box::into_raw in enter() and
-            // is never freed (see SAVED_TERMIOS static doc). tcsetattr
-            // is POSIX async-signal-safe.
-            unsafe {
-                libc::tcsetattr(fd, libc::TCSANOW, ptr);
-            }
-        }
-    }
-    // SA_RESETHAND already restored SIG_DFL; re-raise terminates.
-    // SAFETY: libc::raise is POSIX async-signal-safe.
-    unsafe {
-        libc::raise(sig);
-    }
-}
-
-/// Sets stdin to raw mode on creation, restores original termios on drop.
-/// Handles panic paths via Drop. Installs signal handlers for SIGINT,
-/// SIGTERM, SIGQUIT with SA_RESETHAND that restore termios via raw
-/// libc::tcsetattr (async-signal-safe) before the default handler runs.
-struct TerminalRawGuard {
-    original: nix::sys::termios::Termios,
-    fd: std::os::unix::io::RawFd,
-    /// Previous signal actions, restored on drop.
-    prev_sigint: libc::sigaction,
-    prev_sigterm: libc::sigaction,
-    prev_sigquit: libc::sigaction,
-}
-
-impl TerminalRawGuard {
-    /// Set stdin to raw mode. Returns the guard that restores on drop.
-    fn enter() -> Result<Self> {
-        use nix::sys::termios::{self, SetArg};
-        use std::os::unix::io::AsRawFd;
-
-        // Structural single-writer enforcement: only one
-        // TerminalRawGuard may hold the termios-restore statics at a
-        // time. CAS false → true before touching ANY terminal state,
-        // so a second concurrent enter() fails here instead of
-        // silently leaking the prior boxed termios.
-        if SAVED_TERMIOS_INSTALLED
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_err()
-        {
-            anyhow::bail!(
-                "TerminalRawGuard already installed; only one raw-mode guard may be live at a time"
-            );
-        }
-
-        let fd = std::io::stdin().as_raw_fd();
-        // SAFETY: stdin fd is valid for the lifetime of this process.
-        let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) };
-        let original = match termios::tcgetattr(borrowed).context("tcgetattr") {
-            Ok(t) => t,
-            Err(e) => {
-                // Release the installation guard so a subsequent caller
-                // can try again; we haven't written any statics yet.
-                SAVED_TERMIOS_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
-                return Err(e);
-            }
-        };
-        let mut raw = original.clone();
-        termios::cfmakeraw(&mut raw);
-        if let Err(e) = termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw).context("tcsetattr raw")
-        {
-            SAVED_TERMIOS_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
-            return Err(e);
-        }
-
-        // Leak the termios into the AtomicPtr. Drop does not free
-        // (see static doc on SAVED_TERMIOS) — a concurrent signal
-        // handler may still be reading the pointer when Drop runs.
-        let boxed: Box<libc::termios> = Box::new(original.clone().into());
-        let ptr = Box::into_raw(boxed);
-        // Store pointer and fd with Release so the handler's Acquire
-        // load of FD happens-after the pointer is visible. INSTALLED
-        // was already set by the CAS above.
-        SAVED_TERMIOS.store(ptr, std::sync::atomic::Ordering::Release);
-        SAVED_TERMIOS_FD.store(fd, std::sync::atomic::Ordering::Release);
-
-        // Install signal handlers with SA_RESETHAND. Matches the raw libc
-        // pattern used by register_vcpu_signal_handler.
-        let mut prev_sigint: libc::sigaction = unsafe { std::mem::zeroed() };
-        let mut prev_sigterm: libc::sigaction = unsafe { std::mem::zeroed() };
-        let mut prev_sigquit: libc::sigaction = unsafe { std::mem::zeroed() };
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = terminal_restore_signal_handler as *const () as usize;
-            sa.sa_flags = libc::SA_RESETHAND;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(libc::SIGINT, &sa, &mut prev_sigint);
-            libc::sigaction(libc::SIGTERM, &sa, &mut prev_sigterm);
-            libc::sigaction(libc::SIGQUIT, &sa, &mut prev_sigquit);
-        }
-
-        Ok(Self {
-            original,
-            fd,
-            prev_sigint,
-            prev_sigterm,
-            prev_sigquit,
-        })
-    }
-}
-
-impl Drop for TerminalRawGuard {
-    fn drop(&mut self) {
-        // Disable the signal handler before restoring termios to prevent
-        // a stale restore racing with our own restore below.
-        SAVED_TERMIOS_FD.store(-1, std::sync::atomic::Ordering::Release);
-
-        // Restore original termios.
-        // SAFETY: fd was valid at construction, stdin persists for process lifetime.
-        let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(self.fd) };
-        let _ = nix::sys::termios::tcsetattr(
-            borrowed,
-            nix::sys::termios::SetArg::TCSANOW,
-            &self.original,
-        );
-
-        // Clear the pointer and installation guard, but DO NOT free
-        // the boxed termios: a signal handler dispatched on another
-        // thread may still be executing between its Acquire load of
-        // SAVED_TERMIOS_FD (before the store above retired) and its
-        // subsequent load of SAVED_TERMIOS. Freeing here would create
-        // a use-after-free window. The leak is one termios per
-        // enter/drop cycle — total process-lifetime allocation grows
-        // O(N) in cycles, not O(1). See the SAVED_TERMIOS static doc
-        // for the full policy.
-        SAVED_TERMIOS.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
-        SAVED_TERMIOS_INSTALLED.store(false, std::sync::atomic::Ordering::Release);
-
-        // Restore previous signal handlers.
-        unsafe {
-            libc::sigaction(libc::SIGINT, &self.prev_sigint, std::ptr::null_mut());
-            libc::sigaction(libc::SIGTERM, &self.prev_sigterm, std::ptr::null_mut());
-            libc::sigaction(libc::SIGQUIT, &self.prev_sigquit, std::ptr::null_mut());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5117,57 +4191,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn find_vmlinux_from_bzimage_path() {
-        // Create a temp dir simulating <root>/arch/x86/boot/bzImage with vmlinux at <root>.
-        let tmp = std::env::temp_dir().join("ktstr-find-vmlinux-test");
-        let boot_dir = tmp.join("arch/x86/boot");
-        std::fs::create_dir_all(&boot_dir).unwrap();
-        let vmlinux = tmp.join("vmlinux");
-        std::fs::write(&vmlinux, b"ELF").unwrap();
-        let bzimage = boot_dir.join("bzImage");
-        std::fs::write(&bzimage, b"kernel").unwrap();
-
-        let found = find_vmlinux(&bzimage);
-        assert_eq!(found, Some(vmlinux));
-
-        std::fs::remove_dir_all(&tmp).unwrap();
-    }
-
-    #[test]
-    fn find_vmlinux_sibling() {
-        // vmlinux in the same directory as the kernel image.
-        let tmp = std::env::temp_dir().join("ktstr-find-vmlinux-sibling");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let vmlinux = tmp.join("vmlinux");
-        std::fs::write(&vmlinux, b"ELF").unwrap();
-        let kernel = tmp.join("bzImage");
-        std::fs::write(&kernel, b"kernel").unwrap();
-
-        let found = find_vmlinux(&kernel);
-        assert_eq!(found, Some(vmlinux));
-
-        std::fs::remove_dir_all(&tmp).unwrap();
-    }
-
-    #[test]
-    fn find_vmlinux_bare_filename() {
-        // A bare filename — parent is "" so no vmlinux sibling found.
-        assert_eq!(find_vmlinux(Path::new("vmlinuz")), None);
-    }
-
-    #[test]
-    fn find_vmlinux_root_parent() {
-        // /vmlinuz has parent "/" — no vmlinux there (or if there is, fine).
-        // The function should not panic.
-        let result = find_vmlinux(Path::new("/vmlinuz"));
-        // /vmlinux almost certainly doesn't exist; if it does, that's still valid.
-        if !Path::new("/vmlinux").exists() {
-            assert_eq!(result, None);
-        }
-    }
-
-    #[test]
     #[should_panic(expected = "invalid Topology")]
     fn builder_rejects_zero_llcs() {
         KtstrVmBuilder::default().topology(1, 0, 2, 2);
@@ -5247,18 +4270,6 @@ mod tests {
         assert!(r.timed_out);
         assert_eq!(r.exit_code, 1);
         assert_eq!(r.stderr, "kernel panic");
-    }
-
-    #[test]
-    fn find_vmlinux_missing_returns_none() {
-        let tmp = std::env::temp_dir().join("ktstr-find-vmlinux-none");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let kernel = tmp.join("bzImage");
-        std::fs::write(&kernel, b"kernel").unwrap();
-
-        assert_eq!(find_vmlinux(&kernel), None);
-
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     /// Boot a kernel with vmlinux available and verify the monitor
@@ -5879,111 +4890,6 @@ mod tests {
         initramfs::shm_unlink_base(hash);
     }
 
-    // -- dispatch_io_out / dispatch_io_in tests --
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dispatch_io_out_i8042_reset_is_shutdown_signal() {
-        // The BSP relies on I8042 reset (port 0x64, 0xFE) for shutdown
-        // detection instead of VcpuExit::Hlt. Verify that dispatch_io_out
-        // returns true for the reset command.
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        assert!(
-            dispatch_io_out(&com1, &com2, I8042_CMD_PORT, &[I8042_CMD_RESET_CPU]),
-            "I8042 reset (0xFE to port 0x64) must signal shutdown"
-        );
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dispatch_io_out_i8042_non_reset() {
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        assert!(!dispatch_io_out(&com1, &com2, I8042_CMD_PORT, &[0x00]));
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dispatch_io_out_serial_com1() {
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        // Write 'A' to COM1 THR — should not trigger reset.
-        assert!(!dispatch_io_out(&com1, &com2, console::COM1_BASE, b"A"));
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dispatch_io_out_serial_com2() {
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        assert!(!dispatch_io_out(&com1, &com2, console::COM2_BASE, b"B"));
-        let output = com2.lock().output();
-        assert!(output.contains('B'));
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dispatch_io_out_unknown_port() {
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        assert!(!dispatch_io_out(&com1, &com2, 0x1234, &[0xFF]));
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dispatch_io_in_i8042_status() {
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        let mut data = [0xFFu8; 1];
-        dispatch_io_in(&com1, &com2, I8042_CMD_PORT, &mut data);
-        assert_eq!(data[0], 0);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dispatch_io_in_i8042_data() {
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        let mut data = [0xFFu8; 1];
-        dispatch_io_in(&com1, &com2, I8042_DATA_PORT, &mut data);
-        assert_eq!(data[0], 0);
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dispatch_io_in_unknown_port() {
-        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
-        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
-        let mut data = [0xFFu8; 1];
-        dispatch_io_in(&com1, &com2, 0x1234, &mut data);
-        assert_eq!(data[0], 0xFF, "unknown port should not modify data");
-    }
-
-    // -- PiMutex tests --
-
-    #[test]
-    fn pi_mutex_lock_unlock() {
-        let m = PiMutex::new(42u32);
-        {
-            let mut guard = m.lock();
-            assert_eq!(*guard, 42);
-            *guard = 99;
-        }
-        assert_eq!(*m.lock(), 99);
-    }
-
-    #[test]
-    fn pi_mutex_cross_thread() {
-        let m = Arc::new(PiMutex::new(0u32));
-        let m2 = m.clone();
-        let handle = std::thread::spawn(move || {
-            *m2.lock() += 1;
-        });
-        handle.join().unwrap();
-        assert_eq!(*m.lock(), 1);
-    }
-
     // -- builder watchdog_timeout --
 
     #[test]
@@ -6183,150 +5089,6 @@ mod tests {
         assert_eq!(initramfs::shm_load_base(h2).unwrap().as_ref(), &d2[..]);
         initramfs::shm_unlink_base(h1);
         initramfs::shm_unlink_base(h2);
-    }
-
-    #[test]
-    fn pi_mutex_concurrent_increment() {
-        let m = Arc::new(PiMutex::new(0u64));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let m = m.clone();
-                std::thread::spawn(move || {
-                    for _ in 0..1000 {
-                        *m.lock() += 1;
-                    }
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().unwrap();
-        }
-        assert_eq!(*m.lock(), 8000);
-    }
-
-    #[test]
-    fn pi_mutex_contention_10_threads_increments_correctly() {
-        // N-thread contention: 10 × 1000 increments through
-        // PiMutexGuard's DerefMut. If `lock()` ever returned a guard
-        // without holding the mutex (the pre-fix debug_assert bug in
-        // release builds), concurrent increments would race and the
-        // final count would be < 10_000. The unconditional assert
-        // panics on lock failure and the abort() in Drop panics on
-        // unlock failure, so any guard-violation surfaces loudly.
-        let m = Arc::new(PiMutex::new(0u64));
-        let threads: Vec<_> = (0..10)
-            .map(|_| {
-                let m = m.clone();
-                std::thread::spawn(move || {
-                    for _ in 0..1000 {
-                        *m.lock() += 1;
-                    }
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().expect("worker thread panicked");
-        }
-        assert_eq!(*m.lock(), 10_000);
-    }
-
-    #[test]
-    fn terminal_raw_guard_double_enter_fails() {
-        // Allocate a pty pair and redirect stdin to the slave so
-        // TerminalRawGuard::enter()'s tcgetattr/tcsetattr calls see a
-        // real tty. Each nextest test runs in its own process, so
-        // dup2 on fd 0 is test-isolated.
-        let mut master: libc::c_int = 0;
-        let mut slave: libc::c_int = 0;
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
-        let saved_stdin = unsafe { libc::dup(0) };
-        assert!(saved_stdin >= 0);
-        assert_eq!(unsafe { libc::dup2(slave, 0) }, 0);
-
-        let first = TerminalRawGuard::enter().expect("first enter must succeed");
-        let second = TerminalRawGuard::enter();
-        let err_msg = match second {
-            Ok(_) => panic!("second concurrent enter must fail the INSTALLED CAS"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            err_msg.contains("already installed"),
-            "error message should name the double-install condition, got: {err_msg}"
-        );
-        drop(first);
-        let third = TerminalRawGuard::enter()
-            .expect("third enter must succeed after Drop clears INSTALLED");
-        drop(third);
-
-        unsafe {
-            libc::dup2(saved_stdin, 0);
-            libc::close(saved_stdin);
-            libc::close(slave);
-            libc::close(master);
-        }
-    }
-
-    #[test]
-    fn terminal_raw_guard_enter_drop_cycle() {
-        // Verify enter/drop can be repeated without getting stuck in
-        // the INSTALLED=true state. Each iteration allocates a fresh
-        // boxed termios (leaked by design — see the static doc on
-        // SAVED_TERMIOS) and transitions INSTALLED through
-        // false→true→false.
-        let mut master: libc::c_int = 0;
-        let mut slave: libc::c_int = 0;
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
-        let saved_stdin = unsafe { libc::dup(0) };
-        assert!(saved_stdin >= 0);
-        assert_eq!(unsafe { libc::dup2(slave, 0) }, 0);
-
-        for i in 0..3 {
-            let guard = TerminalRawGuard::enter()
-                .unwrap_or_else(|e| panic!("enter iteration {i} must succeed, got: {e}"));
-            drop(guard);
-        }
-
-        unsafe {
-            libc::dup2(saved_stdin, 0);
-            libc::close(saved_stdin);
-            libc::close(slave);
-            libc::close(master);
-        }
-    }
-
-    #[test]
-    fn pi_mutex_protocol_is_inherit() {
-        // Verify PTHREAD_PRIO_INHERIT is supported on this system.
-        unsafe {
-            let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
-            assert_eq!(libc::pthread_mutexattr_init(&mut attr), 0);
-            assert_eq!(
-                libc::pthread_mutexattr_setprotocol(&mut attr, libc::PTHREAD_PRIO_INHERIT),
-                0,
-            );
-            let mut protocol: libc::c_int = 0;
-            assert_eq!(libc::pthread_mutexattr_getprotocol(&attr, &mut protocol), 0);
-            assert_eq!(protocol, libc::PTHREAD_PRIO_INHERIT);
-            libc::pthread_mutexattr_destroy(&mut attr);
-        }
     }
 
     // -- RT scheduling tests --

@@ -188,7 +188,7 @@ Workers are `fork()`ed processes placed in cgroups:
 - `NiceSweep` — cycle nice level from -20 to 19
 - `AffinityChurn` — rapid self-directed sched_setaffinity
 - `PolicyChurn` — cycle through scheduling policies
-- `SchBench` — schbench-style messenger/worker with matrix multiply
+- `FanOutCompute` — messenger/worker fan-out with matrix-multiply compute
 - `PageFaultChurn` — rapid mmap/fault/MADV_DONTNEED cycling
 - `MutexContention` — N-way futex mutex contention
 - `Custom` — user-supplied work function

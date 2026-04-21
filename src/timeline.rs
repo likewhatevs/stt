@@ -1,9 +1,3 @@
-// Timeline is `pub(crate)` but its phase builders are called from
-// `cargo ktstr stats` and the VM dispatch path that renders
-// stimulus-aligned phase reports. Narrowing the allow here replaces
-// the blanket in lib.rs.
-#![allow(dead_code)]
-
 //! Stimulus/phase correlation for scenario execution.
 //!
 //! Correlates [`StimulusEvent`]s (cgroup operations, cpuset changes)
@@ -53,7 +47,6 @@ pub struct StimulusEvent {
     pub detail: Option<String>,
     /// Cumulative worker iterations at this event. Used to compute
     /// per-phase throughput (iterations/s).
-    #[serde(default)]
     pub total_iterations: Option<u64>,
 }
 
@@ -84,7 +77,6 @@ pub struct PhaseMetrics {
 pub enum ChangeDirection {
     Improved,
     Degraded,
-    Stable,
 }
 
 impl fmt::Display for ChangeDirection {
@@ -92,7 +84,6 @@ impl fmt::Display for ChangeDirection {
         match self {
             ChangeDirection::Improved => write!(f, "IMPROVEMENT"),
             ChangeDirection::Degraded => write!(f, "DEGRADATION"),
-            ChangeDirection::Stable => write!(f, "STABLE"),
         }
     }
 }
@@ -377,17 +368,6 @@ impl Timeline {
         out
     }
 
-    /// Format the timeline for human-readable output.
-    pub fn format(&self) -> String {
-        if self.phases.is_empty() {
-            return String::new();
-        }
-
-        let mut out = String::from("--- timeline ---\n");
-        self.format_phases(&mut out);
-        out
-    }
-
     /// Render phase details into the output buffer.
     fn format_phases(&self, out: &mut String) {
         for phase in &self.phases {
@@ -463,16 +443,11 @@ impl Timeline {
         }
     }
 
-    /// Check if any phase shows degradation.
-    pub fn has_degradation(&self) -> bool {
-        self.phases.iter().any(|p| {
-            p.changes
-                .iter()
-                .any(|c| c.direction == ChangeDirection::Degraded)
-        })
-    }
-
-    /// Collect all degradation changes across phases.
+    /// Collect all degradation changes across phases. Test-only after
+    /// the gauntlet analyzer was removed; the scenarios pipeline
+    /// consumes `Timeline` via `format_with_context` and does not read
+    /// degradations directly.
+    #[allow(dead_code)]
     pub fn degradations(&self) -> Vec<(&Phase, &PhaseChange)> {
         let mut out = Vec::new();
         for phase in &self.phases {
@@ -706,7 +681,7 @@ mod tests {
             ));
         }
         let t = Timeline::build(&events, &samples);
-        assert!(t.has_degradation());
+        assert!(!t.degradations().is_empty());
         let degradations = t.degradations();
         assert!(!degradations.is_empty());
         assert_eq!(degradations[0].1.direction, ChangeDirection::Degraded);
@@ -748,7 +723,7 @@ mod tests {
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
         let t = Timeline::build(&events, &samples);
-        assert!(!t.has_degradation());
+        assert!(t.degradations().is_empty());
         for phase in &t.phases {
             assert!(phase.changes.is_empty());
         }
@@ -761,16 +736,10 @@ mod tests {
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
         let t = Timeline::build(&events, &samples);
-        let formatted = t.format();
+        let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("BASELINE"));
         assert!(formatted.contains("Phase 1"));
         assert!(formatted.contains("imbalance"));
-    }
-
-    #[test]
-    fn format_empty_timeline() {
-        let t = Timeline { phases: Vec::new() };
-        assert!(t.format().is_empty());
     }
 
     #[test]
@@ -845,7 +814,7 @@ mod tests {
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
         let t = Timeline::build(&events, &samples);
-        let formatted = t.format();
+        let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("SetCpuset"));
         assert!(formatted.contains("4 cpus"));
     }
@@ -880,7 +849,6 @@ mod tests {
     fn change_direction_display() {
         assert_eq!(format!("{}", ChangeDirection::Improved), "IMPROVEMENT");
         assert_eq!(format!("{}", ChangeDirection::Degraded), "DEGRADATION");
-        assert_eq!(format!("{}", ChangeDirection::Stable), "STABLE");
     }
 
     // -- compute_metrics with event counters --
@@ -1016,7 +984,7 @@ mod tests {
             sample(700, vec![(1, 0, 5000), (1, 0, 7000)]), // cpu0 stalled
         ];
         let t = Timeline::build(&events, &samples);
-        let formatted = t.format();
+        let formatted = t.format_with_context(&TimelineContext::default());
         assert!(formatted.contains("stalls: 1"));
     }
 
@@ -1036,7 +1004,7 @@ mod tests {
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000)]))
             .collect();
         let t = Timeline::build(&events, &samples);
-        let formatted = t.format();
+        let formatted = t.format_with_context(&TimelineContext::default());
         // The last phase (50000+offset to end) should have no samples.
         assert!(formatted.contains("[no samples]"));
     }
@@ -1102,14 +1070,6 @@ mod tests {
             .filter(|(_, c)| c.metric == "fallback")
             .collect();
         assert!(!degs.is_empty());
-    }
-
-    // -- has_degradation on stable timeline --
-
-    #[test]
-    fn has_degradation_false_on_empty() {
-        let t = Timeline { phases: vec![] };
-        assert!(!t.has_degradation());
     }
 
     // -- format_with_context tests --
@@ -1252,7 +1212,7 @@ mod tests {
         }
         let t = Timeline::build(&events, &samples);
         assert_eq!(t.phases.len(), 2, "must have 2 phases");
-        assert!(t.has_degradation());
+        assert!(!t.degradations().is_empty());
 
         // Phase 0 (baseline) must have samples and reasonable metrics.
         assert!(
@@ -1304,7 +1264,7 @@ mod tests {
         );
 
         // Format output must be parseable.
-        let formatted = t.format();
+        let formatted = t.format_with_context(&TimelineContext::default());
         assert!(
             formatted.contains("BASELINE"),
             "format must include BASELINE phase"
@@ -1337,7 +1297,10 @@ mod tests {
             ));
         }
         let t = Timeline::build(&events, &samples);
-        assert!(t.has_degradation(), "DSQ depth jump must be detected");
+        assert!(
+            !t.degradations().is_empty(),
+            "DSQ depth jump must be detected"
+        );
         let degs = t.degradations();
         let dsq_deg = degs.iter().find(|(_, c)| c.metric == "dsq_depth");
         assert!(dsq_deg.is_some(), "must detect dsq_depth degradation");
@@ -1362,7 +1325,7 @@ mod tests {
             change.after
         );
 
-        let formatted = t.format();
+        let formatted = t.format_with_context(&TimelineContext::default());
         assert!(
             formatted.contains("dsq_depth"),
             "format must name dsq_depth"
@@ -1388,7 +1351,7 @@ mod tests {
         assert!(t.phases[0].metrics.sample_count > 0);
         assert!(t.phases[1].metrics.sample_count > 0);
         assert!(
-            !t.has_degradation(),
+            t.degradations().is_empty(),
             "stable phases must not show degradation"
         );
         assert!(t.degradations().is_empty());
@@ -1587,7 +1550,7 @@ mod tests {
             .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
             .collect();
         let t = Timeline::build(&events, &samples);
-        let formatted = t.format();
+        let formatted = t.format_with_context(&TimelineContext::default());
         assert!(
             formatted.contains("throughput:"),
             "format output must contain throughput when iteration_rate is set"

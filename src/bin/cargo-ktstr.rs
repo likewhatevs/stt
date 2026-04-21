@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -740,32 +743,28 @@ fn print_profile_summary(summary: &[(String, Vec<(String, u32)>)]) {
 
     println!("\n--- profile summary ---");
 
-    // Header: program name, then one column per profile.
     let profile_names: Vec<&str> = summary.iter().map(|(n, _)| n.as_str()).collect();
-    print!("  {:<40}", "program");
-    for pn in &profile_names {
-        print!(" {:>12}", pn);
-    }
-    println!();
-    print!("  {}", "-".repeat(40));
-    for _ in &profile_names {
-        print!(" {}", "-".repeat(12));
-    }
-    println!();
+    let mut table = ktstr::cli::new_table();
+    let mut header: Vec<&str> = Vec::with_capacity(1 + profile_names.len());
+    header.push("program");
+    header.extend(profile_names.iter().copied());
+    table.set_header(header);
 
-    // Rows: one per program.
     for prog in &prog_names {
-        print!("  {:<40}", prog);
+        let mut row: Vec<String> = Vec::with_capacity(1 + profile_names.len());
+        row.push(prog.clone());
         for (_, progs) in summary {
             let insns = progs
                 .iter()
                 .find(|(n, _)| n == prog)
                 .map(|(_, v)| *v)
                 .unwrap_or(0);
-            print!(" {:>12}", insns);
+            row.push(insns.to_string());
         }
-        println!();
+        table.add_row(row);
     }
+
+    println!("{table}");
 }
 
 fn run_completions(shell: clap_complete::Shell, binary: &str) {
@@ -808,7 +807,19 @@ fn run_model_status() -> Result<(), String> {
             status.spec.size_bytes / 1024 / 1024
         );
     } else if !status.sha_matches {
-        println!("(cached file failed SHA-256 verification; re-fetch to replace it)");
+        // Distinguish I/O failure during the SHA check from a
+        // successful hash that didn't match the pin. The two have
+        // different remediations: an I/O failure points at the
+        // filesystem entry (permissions, truncation); a mismatch
+        // points at the bytes themselves (re-fetch or re-pin).
+        if let Some(err) = status.sha_check_error.as_deref() {
+            println!(
+                "(cached file could not be checked: {err}; inspect the cache entry \
+                 or re-fetch to replace it)"
+            );
+        } else {
+            println!("(cached file failed SHA-256 check; re-fetch to replace it)");
+        }
     }
     Ok(())
 }
@@ -1542,13 +1553,13 @@ mod tests {
         let entry = store_test_entry(&cache, "match-key", &meta);
         let row = cli::format_entry_row(&entry, "same", &[]);
         assert!(
-            !row.contains("stale kconfig"),
-            "should not show stale marker when hashes match"
+            !row.contains("kconfig"),
+            "matching entry should carry no kconfig tag: {row}"
         );
     }
 
     #[test]
-    fn format_entry_row_no_kconfig_hash() {
+    fn format_entry_row_untracked_kconfig_tagged_distinctly_from_stale() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata();
@@ -1556,7 +1567,11 @@ mod tests {
         let row = cli::format_entry_row(&entry, "anything", &[]);
         assert!(
             !row.contains("stale kconfig"),
-            "should not show stale marker when entry has no hash"
+            "untracked entry must not be tagged as stale: {row}"
+        );
+        assert!(
+            row.contains("untracked kconfig"),
+            "untracked entry must be tagged as such so users can distinguish from matching: {row}"
         );
     }
 
@@ -1567,6 +1582,7 @@ mod tests {
         let meta = KernelMetadata::new(
             ktstr::cache::KernelSource::Local {
                 source_tree_path: None,
+                git_hash: None,
             },
             "x86_64".to_string(),
             "bzImage".to_string(),
@@ -1581,38 +1597,50 @@ mod tests {
     // in cli::kernel_list, so no test on format_entry_row covers it;
     // the helper itself now takes only the valid CacheEntry shape.
 
-    // -- has_stale_kconfig (via CacheEntry method) --
+    // -- kconfig_status (via CacheEntry method) --
 
     #[test]
-    fn has_stale_kconfig_different_hash() {
+    fn kconfig_status_reports_stale_on_hash_mismatch() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("old".to_string()));
         let entry = store_test_entry(&cache, "stale", &meta);
-        assert!(entry.has_stale_kconfig("new"));
+        assert_eq!(
+            entry.kconfig_status("new"),
+            ktstr::cache::KconfigStatus::Stale {
+                cached: "old".to_string(),
+                current: "new".to_string(),
+            }
+        );
     }
 
     #[test]
-    fn has_stale_kconfig_same_hash() {
+    fn kconfig_status_reports_matches_on_hash_equality() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
         let entry = store_test_entry(&cache, "fresh", &meta);
-        assert!(!entry.has_stale_kconfig("same"));
+        assert_eq!(
+            entry.kconfig_status("same"),
+            ktstr::cache::KconfigStatus::Matches
+        );
     }
 
     #[test]
-    fn has_stale_kconfig_no_hash_in_entry() {
+    fn kconfig_status_reports_untracked_when_entry_has_no_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "no-hash", &meta);
-        assert!(!entry.has_stale_kconfig("anything"));
+        assert_eq!(
+            entry.kconfig_status("anything"),
+            ktstr::cache::KconfigStatus::Untracked
+        );
     }
 
     // Corrupt entries no longer surface as CacheEntry — they are
     // ListedEntry::Corrupt with no metadata-bearing struct — so
-    // has_stale_kconfig isn't reachable from that state.
+    // kconfig_status isn't reachable from that state.
 
     // -- embedded_kconfig_hash --
 

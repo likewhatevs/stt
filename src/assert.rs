@@ -15,7 +15,7 @@
 //! Assertion uses a three-layer merge: [`Assert::default_checks()`] ->
 //! `Scheduler.assert` -> per-test `assert`.
 //!
-//! See the [Verification](https://likewhatevs.github.io/ktstr/guide/concepts/verification.html)
+//! See the [Checking](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html)
 //! chapter of the guide.
 
 use crate::workload::WorkerReport;
@@ -281,7 +281,6 @@ pub struct AssertResult {
     /// tagged with a [`DetailKind`] for structural filtering.
     pub details: Vec<AssertDetail>,
     /// Aggregated stats from all workers in this scenario.
-    #[serde(default)]
     pub stats: ScenarioStats,
 }
 
@@ -307,34 +306,25 @@ pub struct CgroupStats {
     /// Sum of CPU migration counts across all workers.
     pub total_migrations: u64,
     /// Migrations per iteration (total_migrations / total_iterations).
-    #[serde(default)]
     pub migration_ratio: f64,
     /// 99th percentile wake latency across all workers (microseconds).
-    #[serde(default)]
     pub p99_wake_latency_us: f64,
     /// Median wake latency across all workers (microseconds).
-    #[serde(default)]
     pub median_wake_latency_us: f64,
     /// Coefficient of variation (stddev / mean) of wake latencies.
-    #[serde(default)]
     pub wake_latency_cv: f64,
     /// Sum of iteration counts across all workers.
-    #[serde(default)]
     pub total_iterations: u64,
     /// Mean schedstat run delay across workers (microseconds).
-    #[serde(default)]
     pub mean_run_delay_us: f64,
     /// Worst schedstat run delay across workers (microseconds).
-    #[serde(default)]
     pub worst_run_delay_us: f64,
     /// Fraction of pages on the expected NUMA node(s) (0.0-1.0).
     /// Derived from `/proc/self/numa_maps` and the worker's
     /// [`MemPolicy`](crate::workload::MemPolicy).
-    #[serde(default)]
     pub page_locality: f64,
     /// Cross-node page migration ratio from `/proc/vmstat`
     /// `numa_pages_migrated` delta divided by total allocated pages.
-    #[serde(default)]
     pub cross_node_migration_ratio: f64,
     /// Extensible metrics for the generic comparison pipeline.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -359,31 +349,22 @@ pub struct ScenarioStats {
     /// CPU where the worst gap occurred across all cgroups.
     pub worst_gap_cpu: usize,
     /// Worst migration ratio across any cgroup.
-    #[serde(default)]
     pub worst_migration_ratio: f64,
     /// Worst p99 wake latency across all cgroups (microseconds).
-    #[serde(default)]
     pub p99_wake_latency_us: f64,
     /// Worst median wake latency across all cgroups (microseconds).
-    #[serde(default)]
     pub median_wake_latency_us: f64,
     /// Worst wake latency coefficient of variation across all cgroups.
-    #[serde(default)]
     pub wake_latency_cv: f64,
     /// Sum of iteration counts across all cgroups.
-    #[serde(default)]
     pub total_iterations: u64,
     /// Worst mean schedstat run delay across all cgroups (microseconds).
-    #[serde(default)]
     pub mean_run_delay_us: f64,
     /// Worst schedstat run delay across all cgroups (microseconds).
-    #[serde(default)]
     pub worst_run_delay_us: f64,
     /// Worst (lowest) page locality fraction across cgroups.
-    #[serde(default)]
     pub worst_page_locality: f64,
     /// Worst (highest) cross-node migration ratio across cgroups.
-    #[serde(default)]
     pub worst_cross_node_migration_ratio: f64,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).

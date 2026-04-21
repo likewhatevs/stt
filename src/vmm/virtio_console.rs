@@ -48,6 +48,7 @@ const TX_DESC_MAX: usize = 32 * 1024;
 const S_ACK: u32 = VIRTIO_CONFIG_S_ACKNOWLEDGE;
 const S_DRV: u32 = S_ACK | VIRTIO_CONFIG_S_DRIVER;
 const S_FEAT: u32 = S_DRV | VIRTIO_CONFIG_S_FEATURES_OK;
+#[allow(dead_code)]
 const S_OK: u32 = S_FEAT | VIRTIO_CONFIG_S_DRIVER_OK;
 
 /// Virtio-console MMIO device.
@@ -202,6 +203,7 @@ impl VirtioConsole {
     }
 
     /// Get all accumulated TX output as a string.
+    #[allow(dead_code)]
     pub fn output(&self) -> String {
         String::from_utf8_lossy(&self.tx_buf).to_string()
     }

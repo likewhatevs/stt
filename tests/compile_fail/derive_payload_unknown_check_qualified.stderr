@@ -1,8 +1,8 @@
-error[E0599]: no variant, associated function, or constant named `nonexistent_check` found for enum `Check` in the current scope
+error[E0599]: no variant or associated item named `nonexistent_check` found for enum `Check` in the current scope
   --> tests/compile_fail/derive_payload_unknown_check_qualified.rs:14:24
    |
 14 | #[default_check(Check::nonexistent_check("metric", 1.0))]
-   |                        ^^^^^^^^^^^^^^^^^ variant, associated function, or constant not found in `Check`
+   |                        ^^^^^^^^^^^^^^^^^ variant or associated item not found in `Check`
    |
 note: if you're trying to build a new `Check` consider using one of the following associated functions:
       Check::min

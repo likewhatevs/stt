@@ -154,14 +154,44 @@ pub(crate) const SENTINEL_SCHEDULER_DIED: &str = "SCHEDULER_DIED";
 /// on the surrounding lines.
 pub(crate) const SENTINEL_SCHEDULER_NOT_ATTACHED: &str = "SCHEDULER_NOT_ATTACHED";
 
+// ---------------------------------------------------------------------------
+// Init-stage classification labels
+// ---------------------------------------------------------------------------
+//
+// Returned by `classify_init_stage` and asserted by eval.rs tests via
+// substring match. Shared constants keep the production label and the
+// test pins from drifting silently.
+
+/// Stage label when no init sentinel appears in COM2 — indicates the
+/// guest kernel or initramfs never reached Rust init. Pinned by
+/// `classify_no_sentinels` (output.rs) and `eval_no_sentinels_shows_initramfs_failure`
+/// (eval.rs).
+pub(crate) const STAGE_INIT_NOT_STARTED: &str =
+    "init script never started (kernel or mount failure)";
+
+/// Stage label when `KTSTR_INIT_STARTED` was written but the payload
+/// sentinel never appeared — cgroup or scheduler setup failed after
+/// filesystem mounts. Pinned by `classify_init_started_only` (output.rs)
+/// and `eval_init_started_but_no_payload` (eval.rs).
+pub(crate) const STAGE_INIT_STARTED_NO_PAYLOAD: &str =
+    "init started but payload never ran (cgroup/scheduler setup failed)";
+
+/// Stage label when `KTSTR_PAYLOAD_STARTING` was written but no
+/// AssertResult JSON followed — the test function entered and then
+/// crashed, hung, or produced no output. Pinned by
+/// `classify_payload_starting` / `classify_payload_starting_without_init`
+/// (output.rs) and `eval_payload_started_no_result` (eval.rs).
+pub(crate) const STAGE_PAYLOAD_STARTED_NO_RESULT: &str =
+    "payload started but produced no test result";
+
 /// Classify the failure stage based on which sentinels appear in COM2 output.
 pub(crate) fn classify_init_stage(output: &str) -> &'static str {
     if output.contains(SENTINEL_PAYLOAD_STARTING) {
-        "payload started but produced no test result"
+        STAGE_PAYLOAD_STARTED_NO_RESULT
     } else if output.contains(SENTINEL_INIT_STARTED) {
-        "init started but payload never ran (cgroup/scheduler setup failed)"
+        STAGE_INIT_STARTED_NO_PAYLOAD
     } else {
-        "init script never started (kernel or mount failure)"
+        STAGE_INIT_NOT_STARTED
     }
 }
 
@@ -221,7 +251,7 @@ mod tests {
 
     #[test]
     fn parse_assert_result_valid() {
-        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("noise\n{RESULT_START}\n{json}\n{RESULT_END}\nmore");
         let r = parse_assert_result(&output).unwrap();
         assert!(r.passed);
@@ -241,7 +271,7 @@ mod tests {
 
     #[test]
     fn parse_assert_result_failed() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let r = parse_assert_result(&output).unwrap();
         assert!(!r.passed);
@@ -262,7 +292,7 @@ mod tests {
 
     #[test]
     fn parse_assert_result_with_details() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Other","message":"err1"},{"kind":"Other","message":"err2"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Other","message":"err1"},{"kind":"Other","message":"err2"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let r = parse_assert_result(&output).unwrap();
         assert!(!r.passed);
@@ -415,27 +445,21 @@ mod tests {
 
     #[test]
     fn classify_no_sentinels() {
-        assert_eq!(
-            classify_init_stage(""),
-            "init script never started (kernel or mount failure)",
-        );
+        assert_eq!(classify_init_stage(""), STAGE_INIT_NOT_STARTED);
     }
 
     #[test]
     fn classify_init_started_only() {
         assert_eq!(
             classify_init_stage("KTSTR_INIT_STARTED\nsome noise"),
-            "init started but payload never ran (cgroup/scheduler setup failed)",
+            STAGE_INIT_STARTED_NO_PAYLOAD,
         );
     }
 
     #[test]
     fn classify_payload_starting() {
         let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\nsome output";
-        assert_eq!(
-            classify_init_stage(output),
-            "payload started but produced no test result",
-        );
+        assert_eq!(classify_init_stage(output), STAGE_PAYLOAD_STARTED_NO_RESULT);
     }
 
     #[test]
@@ -445,7 +469,7 @@ mod tests {
         // payload started.
         assert_eq!(
             classify_init_stage("KTSTR_PAYLOAD_STARTING"),
-            "payload started but produced no test result",
+            STAGE_PAYLOAD_STARTED_NO_RESULT,
         );
     }
 

@@ -16,7 +16,7 @@ use super::btf_offsets::{
     SchedstatOffsets, ScxEventOffsets,
 };
 use super::{
-    CpuSnapshot, MonitorSample, RqSchedstat, SchedDomainSnapshot, SchedDomainStats,
+    CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot, SchedDomainStats,
     ScxEventCounters,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -295,6 +295,7 @@ impl GuestMem {
     }
 
     /// Write a u32 at DRAM offset `pa + offset`.
+    #[allow(dead_code)]
     pub fn write_u32(&self, pa: u64, offset: usize, val: u32) {
         self.write_scalar::<4>(pa, offset, val.to_ne_bytes());
     }
@@ -313,7 +314,7 @@ impl GuestMem {
     /// to detect the guest's mode at runtime.
     /// Returns `None` if any level is not present or the address is
     /// out of guest memory bounds.
-    pub fn translate_kva(&self, cr3_pa: u64, kva: u64, l5: bool) -> Option<u64> {
+    pub(crate) fn translate_kva(&self, cr3_pa: u64, kva: Kva, l5: bool) -> Option<u64> {
         #[cfg(target_arch = "x86_64")]
         {
             if l5 {
@@ -334,16 +335,17 @@ impl GuestMem {
     /// CR3 -> PGD -> PUD -> PMD -> PTE. Uses PS bit (bit 7) for
     /// huge pages, OA in bits \[51:12\].
     #[cfg(target_arch = "x86_64")]
-    fn walk_4level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
+    fn walk_4level(&self, cr3_pa: u64, kva: Kva) -> Option<u64> {
         const PRESENT: u64 = 1;
         const PS: u64 = 1 << 7;
         const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
-        let pgd_idx = (kva >> 39) & 0x1FF;
-        let pud_idx = (kva >> 30) & 0x1FF;
-        let pmd_idx = (kva >> 21) & 0x1FF;
-        let pte_idx = (kva >> 12) & 0x1FF;
-        let page_off = kva & 0xFFF;
+        let kva_bits = kva.0;
+        let pgd_idx = (kva_bits >> 39) & 0x1FF;
+        let pud_idx = (kva_bits >> 30) & 0x1FF;
+        let pmd_idx = (kva_bits >> 21) & 0x1FF;
+        let pte_idx = (kva_bits >> 12) & 0x1FF;
+        let page_off = kva_bits & 0xFFF;
 
         // PGD
         let pgd_pa = (cr3_pa & ADDR_MASK) + pgd_idx * 8;
@@ -360,7 +362,7 @@ impl GuestMem {
         }
         if pude & PS != 0 {
             let base = pude & 0x000F_FFFF_C000_0000;
-            return Some(base | (kva & 0x3FFF_FFFF));
+            return Some(base | (kva_bits & 0x3FFF_FFFF));
         }
 
         // PMD
@@ -371,7 +373,7 @@ impl GuestMem {
         }
         if pmde & PS != 0 {
             let base = pmde & 0x000F_FFFF_FFE0_0000;
-            return Some(base | (kva & 0x1F_FFFF));
+            return Some(base | (kva_bits & 0x1F_FFFF));
         }
 
         // PTE
@@ -403,7 +405,7 @@ impl GuestMem {
     /// GuestMem is mapped at DRAM_START, all GPAs are adjusted by
     /// subtracting DRAM_START to produce offsets into the memory region.
     #[cfg(target_arch = "aarch64")]
-    fn walk_3level_aarch64_64k(&self, ttbr_pa: u64, kva: u64) -> Option<u64> {
+    fn walk_3level_aarch64_64k(&self, ttbr_pa: u64, kva: Kva) -> Option<u64> {
         use crate::vmm::kvm::DRAM_START;
 
         const VALID: u64 = 1;
@@ -419,10 +421,11 @@ impl GuestMem {
         let to_offset = |gpa: u64| -> u64 { gpa.wrapping_sub(DRAM_START) };
 
         // 3-level walk for 64KB granule, 48-bit VA.
-        let pgd_idx = (kva >> 42) & 0x3F; // bits [47:42], 6 bits
-        let pmd_idx = (kva >> 29) & 0x1FFF; // bits [41:29], 13 bits
-        let pte_idx = (kva >> 16) & 0x1FFF; // bits [28:16], 13 bits
-        let page_off = kva & 0xFFFF; // bits [15:0], 16 bits
+        let kva_bits = kva.0;
+        let pgd_idx = (kva_bits >> 42) & 0x3F; // bits [47:42], 6 bits
+        let pmd_idx = (kva_bits >> 29) & 0x1FFF; // bits [41:29], 13 bits
+        let pte_idx = (kva_bits >> 16) & 0x1FFF; // bits [28:16], 13 bits
+        let page_off = kva_bits & 0xFFFF; // bits [15:0], 16 bits
 
         // PGD — ttbr_pa is already a GuestMem offset.
         let pgd_off = (ttbr_pa & ADDR_MASK) + pgd_idx * 8;
@@ -433,7 +436,7 @@ impl GuestMem {
         // PGD block: 4TB region (unlikely but spec-allowed)
         if pgde & DESC_MASK == BLOCK {
             let base = pgde & 0x0000_FC00_0000_0000;
-            return Some(to_offset(base) | (kva & 0x3FF_FFFF_FFFF));
+            return Some(to_offset(base) | (kva_bits & 0x3FF_FFFF_FFFF));
         }
 
         // PMD
@@ -445,7 +448,7 @@ impl GuestMem {
         // PMD block: 512MB region
         if pmde & DESC_MASK == BLOCK {
             let base = pmde & 0x0000_FFFF_E000_0000;
-            return Some(to_offset(base) | (kva & 0x1FFF_FFFF));
+            return Some(to_offset(base) | (kva_bits & 0x1FFF_FFFF));
         }
 
         // PTE — page descriptor (bits [1:0] = 0b11)
@@ -464,12 +467,12 @@ impl GuestMem {
     /// 5-level page table walk: CR3 -> PML5 -> P4D -> PUD -> PMD -> PTE.
     /// x86-64 only; aarch64 does not use 5-level paging.
     #[cfg(target_arch = "x86_64")]
-    fn walk_5level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
+    fn walk_5level(&self, cr3_pa: u64, kva: Kva) -> Option<u64> {
         const PRESENT: u64 = 1;
         const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
         // PML5 index: bits 56:48.
-        let pml5_idx = (kva >> 48) & 0x1FF;
+        let pml5_idx = (kva.0 >> 48) & 0x1FF;
 
         let pml5_pa = (cr3_pa & ADDR_MASK) + pml5_idx * 8;
         let pml5e = self.read_u64(pml5_pa, 0);
@@ -484,7 +487,7 @@ impl GuestMem {
 
     /// aarch64 stub: 5-level paging is not used.
     #[cfg(target_arch = "aarch64")]
-    fn walk_5level(&self, _cr3_pa: u64, _kva: u64) -> Option<u64> {
+    fn walk_5level(&self, _cr3_pa: u64, _kva: Kva) -> Option<u64> {
         None
     }
 
@@ -1064,7 +1067,6 @@ pub(crate) fn monitor_loop(
         vec![super::SustainedViolationTracker::default(); rq_pas.len()];
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(rq_pas.len());
-    let mut prev_vcpu_times: Option<Vec<Option<u64>>> = None;
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
         .unwrap_or_default();
@@ -1138,10 +1140,12 @@ pub(crate) fn monitor_loop(
             }
         }
 
-        // Read vCPU CPU times and store in snapshots for post-hoc analysis.
-        let curr_vcpu_times =
-            vcpu_timing.map(|vt| vt.read_cpu_times(&mut vcpu_timing_err_reported));
-        if let Some(ref times) = curr_vcpu_times {
+        // Stamp vCPU CPU times into the per-CPU snapshots. Reactive
+        // stall detection below reads these via `is_cpu_stalled`; the
+        // post-hoc `MonitorThresholds::evaluate` path reads them off
+        // the pushed samples.
+        if let Some(vt) = vcpu_timing {
+            let times = vt.read_cpu_times(&mut vcpu_timing_err_reported);
             for (i, cpu) in cpus.iter_mut().enumerate() {
                 if let Some(&t) = times.get(i) {
                     cpu.vcpu_cpu_time_ns = t;
@@ -1149,12 +1153,13 @@ pub(crate) fn monitor_loop(
             }
         }
 
-        // Inline threshold evaluation for reactive dump. The violation
-        // predicates mirror `MonitorThresholds::evaluate`: the same
-        // `SustainedViolationTracker`, the same `evaluate_preempted`
-        // helper, the same `imbalance_ratio`/`local_dsq_depth` reads.
-        // Any drift would let the reactive SysRq-D trigger fire on
-        // conditions the post-hoc verdict accepts (or vice versa).
+        // Inline threshold evaluation for reactive dump. Each check
+        // mirrors `MonitorThresholds::evaluate`: the same
+        // `SustainedViolationTracker`, the same `is_cpu_stalled`
+        // predicate, the same `imbalance_ratio`/`local_dsq_depth`
+        // reads. Any drift would let the reactive SysRq-D trigger
+        // fire on conditions the post-hoc verdict accepts (or vice
+        // versa).
         if let Some(trigger) = dump_trigger
             && !dump_requested
             && !cpus.is_empty()
@@ -1180,33 +1185,19 @@ pub(crate) fn monitor_loop(
                 sample_idx,
             );
 
-            // Stall check: per-CPU sustained window, exempt idle CPUs
-            // (nr_running==0 in both samples: NOHZ tick stopped) and
-            // preempted vCPUs (CPU time didn't advance: host stole the core).
+            // Stall check: per-CPU sustained window. Delegate to
+            // `is_cpu_stalled` so reactive and post-hoc stall paths
+            // cannot drift — the predicate owns the idle + preempted
+            // exemptions. `vcpu_cpu_time_ns` is already stamped into
+            // `cpus[i]` (and into the last pushed sample) above, so the
+            // helper sees the same vCPU timing the post-hoc path sees.
             if t.fail_on_stall
                 && let Some(prev) = samples.last()
             {
                 let n = prev.cpus.len().min(cpus.len()).min(stall_trackers.len());
                 for i in 0..n {
-                    let idle = cpus[i].nr_running == 0 && prev.cpus[i].nr_running == 0;
-                    // Delegate to the shared pure predicate so reactive
-                    // and post-hoc stall paths cannot drift. A missing
-                    // read (None on either side) returns false ("no
-                    // evidence of preemption"), which keeps the stall
-                    // path firing on clock-read failure rather than
-                    // silently suppressing it — the original bug.
-                    let preempted = match (&prev_vcpu_times, &curr_vcpu_times) {
-                        (Some(prev_t), Some(curr_t)) => evaluate_preempted(
-                            prev_t.get(i).copied().flatten(),
-                            curr_t.get(i).copied().flatten(),
-                            preemption_threshold_ns,
-                        ),
-                        _ => false,
-                    };
-                    let is_stall = cpus[i].rq_clock != 0
-                        && cpus[i].rq_clock == prev.cpus[i].rq_clock
-                        && !idle
-                        && !preempted;
+                    let is_stall =
+                        is_cpu_stalled(&prev.cpus[i], &cpus[i], preemption_threshold_ns);
                     stall_trackers[i].record(is_stall, cpus[i].rq_clock as f64, sample_idx);
                 }
             }
@@ -1225,8 +1216,6 @@ pub(crate) fn monitor_loop(
                 dump_requested = true;
             }
         }
-
-        prev_vcpu_times = curr_vcpu_times;
 
         let prog_stats = prog_stats_ctx.map(|ctx| {
             super::bpf_prog::read_prog_runtime_stats(

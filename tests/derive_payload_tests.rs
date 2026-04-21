@@ -10,7 +10,7 @@
 use ktstr::test_support::{Check, OutputFormat, PayloadKind, Polarity};
 
 /// Minimal derive: only `binary` is set, everything else defaults.
-/// Verifies the const-name strip + uppercase conversion,
+/// Checks the const-name strip + uppercase conversion,
 /// name-falls-back-to-binary, and the ExitCode output default.
 #[derive(ktstr::Payload)]
 #[payload(binary = "fio")]
@@ -27,7 +27,7 @@ fn derive_payload_minimal_const_name_and_defaults() {
     assert!(FIO_MINIMAL.metrics.is_empty());
 }
 
-/// Full grammar: every optional attribute at once. Verifies
+/// Full grammar: every optional attribute at once. Checks
 /// accumulation of `default_args` across multiple attrs, Check
 /// expressions, MetricHint with every polarity variant surface.
 #[derive(ktstr::Payload)]
@@ -182,7 +182,7 @@ fn derive_payload_metric_minimal_defaults_unknown_polarity() {
     assert_eq!(BARE_METRIC.metrics[0].unit, "");
 }
 
-/// Default check uses `range(...)` — verifies the macro's bare
+/// Default check uses `range(...)` — checks the macro's bare
 /// Check-constructor resolution against every const-fn constructor,
 /// not just the ones used above.
 #[derive(ktstr::Payload)]

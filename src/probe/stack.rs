@@ -142,6 +142,7 @@ pub struct StackFunction {
 }
 
 /// Extract function names as strings for auto-repro.
+#[allow(dead_code)]
 pub(crate) fn extract_stack_function_names(stack: &str) -> Vec<String> {
     extract_stack_functions_all(stack)
         .into_iter()

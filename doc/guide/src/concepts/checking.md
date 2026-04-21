@@ -1,6 +1,6 @@
-# Verification
+# Checking
 
-ktstr verifies scheduler behavior through two channels: worker-side
+ktstr checks scheduler behavior through two channels: worker-side
 telemetry and host-side monitoring.
 
 ## Worker checks
@@ -136,7 +136,7 @@ Every field is `Option`. `None` means "inherit from parent layer."
 
 ## Merge layers
 
-Verification uses a three-layer merge:
+Checking uses a three-layer merge:
 
 1. `Assert::default_checks()` -- baseline: `not_starved` enabled,
    monitor thresholds from `MonitorThresholds::DEFAULT`.
@@ -243,4 +243,4 @@ latency, and migration ratio. Counters (workers, cpus, migrations,
 iterations) are summed.
 
 For examples of overriding thresholds at the scheduler and per-test
-level, see [Customize Verification](../recipes/custom-verification.md).
+level, see [Customize Checking](../recipes/custom-checking.md).

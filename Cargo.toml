@@ -3,7 +3,7 @@ members = [".", "ktstr-macros", "scx-ktstr"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "GPL-2.0-only"
 repository = "https://github.com/likewhatevs/ktstr"
 
@@ -30,7 +30,7 @@ gix = { version = "0.81", default-features = false, features = ["sha1", "blockin
 reqwest = { version = "0.13", features = ["blocking"] }
 tar = "0.4"
 tempfile = "3"
-xz2 = "0.1"
+xz2 = { version = "0.1", features = ["static"] }
 opendal = { version = "0.55", default-features = false, features = ["services-ghac"] }
 tokio = { version = "1", features = ["rt"] }
 zstd = { version = "0.13", features = ["zstdmt"] }
@@ -66,9 +66,18 @@ linkme = "0.3"
 ktstr-macros = { version = "0.4.8", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 rayon = "1"
-object = { version = "0.36", default-features = false, features = ["build", "std", "elf"] }
+object = { version = "0.37", default-features = false, features = ["build"] }
 walkdir = "2"
 indicatif = "0.18"
+# Table rendering for stats and verifier CLI output. Replaces hand-rolled
+# `format!("{:<30}...")` layouts plus `"-".repeat()` separators with a
+# builder API that measures column widths from actual content, so labels
+# like `scenario/topology/work_type` stop spilling into adjacent columns
+# when topology names exceed the previously hardcoded 30-column width.
+# Default features pull in crossterm for `Cell::fg(Color::Red/Green)` in
+# the compare_runs VERDICT column; stdout TTY detection is handled by
+# comfy-table itself (see `crate::cli::new_table`).
+comfy-table = "7.2"
 # Stable hash for cache keys — std::hash::DefaultHasher is not
 # guaranteed stable across toolchain versions; siphasher::sip::SipHasher13
 # pins the algorithm so cached artifacts survive Rust updates.
@@ -88,13 +97,32 @@ rustix = { version = "1", features = ["fs", "shm", "system"] }
 # the list of variant names so `WorkType::ALL_NAMES` stays in lock-step
 # with the enum definition without a hand-maintained parallel table.
 strum = { version = "0.27", features = ["derive"] }
+# jemalloc as global allocator for the ktstr/cargo-ktstr binaries.
+# binary-only — the library stays allocator-agnostic so downstream
+# consumers pick their own allocator. enables per-thread allocation
+# introspection via mallctl for the host-state feature ().
+tikv-jemallocator = "0.6"
 # SHA-256 for verifying downloaded model-cache artifacts. `gix` pulls
 # in sha1 only; sha2 is a fresh dep and only the model-cache code
 # path needs it, so keep the feature surface minimal.
 sha2 = "0.10"
+# Lowercase hex encoding for SHA-256 digest comparisons in the
+# model-cache verify path.
+hex = "0.4"
+# Local inference backend for `OutputFormat::LlmExtract`. CPU-only —
+# no cuda/metal feature flags are forwarded. Pinned to exact patch
+# versions because candle + tokenizers are pre-1.0: a semver-
+# compatible patch bump can still break the quantized_qwen3 /
+# ConcatKvCache / Tokenizer::from_file API surface that `model.rs`
+# consumes. `cargo update -p` is how we opt into a new version.
+candle = { package = "candle-core", version = "=0.10.2", default-features = false }
+candle-nn = { version = "=0.10.2", default-features = false }
+candle-transformers = { version = "=0.10.2", default-features = false }
+tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy-regex"] }
 
 [profile.release]
 lto = "thin"
+panic = "abort"
 
 [features]
 integration = []

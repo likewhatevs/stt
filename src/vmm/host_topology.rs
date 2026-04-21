@@ -91,22 +91,6 @@ impl HostTopology {
             .unwrap_or(0)
     }
 
-    /// NUMA nodes used by the given set of host CPUs.
-    ///
-    /// Returns the sorted, deduplicated set of NUMA node IDs that own
-    /// the given CPUs. CPUs absent from `cpu_to_node` fall back to
-    /// node 0 — matches the single-node-system assumption used
-    /// elsewhere in this module (see [`llc_numa_node`](Self::llc_numa_node)).
-    pub fn numa_nodes_for_cpus(&self, cpus: &[usize]) -> Vec<usize> {
-        let mut nodes: Vec<usize> = cpus
-            .iter()
-            .map(|c| self.cpu_to_node.get(c).copied().unwrap_or(0))
-            .collect();
-        nodes.sort_unstable();
-        nodes.dedup();
-        nodes
-    }
-
     /// Total available host CPUs.
     pub fn total_cpus(&self) -> usize {
         self.online_cpus.len()
@@ -354,6 +338,7 @@ pub enum LlcLockMode {
     /// Shared access to the LLC (non-perf pinned tests).
     /// Multiple shared holders coexist; returns unavailable when
     /// exclusive holder exists.
+    #[allow(dead_code)]
     Shared,
 }
 
@@ -362,11 +347,15 @@ pub enum LlcLockMode {
 pub enum LockOutcome {
     /// All locks acquired successfully.
     Acquired {
+        /// LLC offset consumed; read only by the locking test fixtures.
+        #[allow(dead_code)]
         llc_offset: usize,
         locks: Vec<std::os::fd::OwnedFd>,
     },
-    /// Resources busy.
-    Unavailable(String),
+    /// Resources busy. The inner string carries the diagnostic reason
+    /// surfaced to test fixtures; production callers only match the
+    /// variant tag.
+    Unavailable(#[allow(dead_code)] String),
 }
 
 /// Requested sharing mode for [`try_flock`]. Translated to the
@@ -1119,22 +1108,6 @@ mod tests {
     }
 
     #[test]
-    fn numa_nodes_for_cpus_synthetic() {
-        let topo = synthetic_topo(vec![vec![0, 1], vec![2, 3]]);
-        assert_eq!(topo.numa_nodes_for_cpus(&[0, 1]), vec![0]);
-        assert_eq!(topo.numa_nodes_for_cpus(&[2, 3]), vec![1]);
-        let mut nodes = topo.numa_nodes_for_cpus(&[0, 2]);
-        nodes.sort();
-        assert_eq!(nodes, vec![0, 1]);
-    }
-
-    #[test]
-    fn numa_nodes_for_cpus_empty() {
-        let topo = synthetic_topo(vec![vec![0, 1]]);
-        assert!(topo.numa_nodes_for_cpus(&[]).is_empty());
-    }
-
-    #[test]
     fn max_cores_per_llc_synthetic() {
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5]]);
         assert_eq!(topo.max_cores_per_llc(), 4);
@@ -1217,7 +1190,10 @@ mod tests {
             .filter(|(vcpu, _)| *vcpu < 4) // vLLC 0,1 = vCPUs 0-3
             .map(|(_, cpu)| *cpu)
             .collect();
-        let node_0_host_nodes = topo.numa_nodes_for_cpus(&node_0_cpus);
+        let node_0_host_nodes: std::collections::BTreeSet<usize> = node_0_cpus
+            .iter()
+            .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
+            .collect();
         assert_eq!(
             node_0_host_nodes.len(),
             1,
@@ -1233,7 +1209,10 @@ mod tests {
             .filter(|(vcpu, _)| *vcpu >= 4) // vLLC 2,3 = vCPUs 4-7
             .map(|(_, cpu)| *cpu)
             .collect();
-        let node_1_host_nodes = topo.numa_nodes_for_cpus(&node_1_cpus);
+        let node_1_host_nodes: std::collections::BTreeSet<usize> = node_1_cpus
+            .iter()
+            .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
+            .collect();
         assert_eq!(
             node_1_host_nodes.len(),
             1,
@@ -1243,7 +1222,8 @@ mod tests {
 
         // The two guest NUMA nodes should map to different host NUMA nodes.
         assert_ne!(
-            node_0_host_nodes[0], node_1_host_nodes[0],
+            node_0_host_nodes.iter().next(),
+            node_1_host_nodes.iter().next(),
             "guest NUMA nodes should map to different host NUMA nodes",
         );
     }
@@ -1393,7 +1373,10 @@ mod tests {
                 .filter(|(vcpu, _)| *vcpu >= start && *vcpu < end)
                 .map(|(_, cpu)| *cpu)
                 .collect();
-            let nodes = topo.numa_nodes_for_cpus(&cpus);
+            let nodes: std::collections::BTreeSet<usize> = cpus
+                .iter()
+                .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
+                .collect();
             assert_eq!(
                 nodes.len(),
                 1,

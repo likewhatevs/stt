@@ -50,6 +50,7 @@ const TRACE_PIPE: &str = "/sys/kernel/tracing/trace_pipe";
 const SYSFS_SCHED_EXT_ROOT_OPS: &str = "/sys/kernel/sched_ext/root/ops";
 
 /// Returns true when this process is PID 1 (running as /init in a VM).
+#[allow(dead_code)]
 pub fn is_pid1() -> bool {
     unsafe { libc::getpid() == 1 }
 }
@@ -104,7 +105,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let t_mounts = t0.elapsed();
 
     // Verify initramfs extraction completed. The sentinel file is the
-    // last entry written by create_initramfs_base — its absence means
+    // last entry written by build_initramfs_base — its absence means
     // the kernel ran out of memory during cpio extraction. The memory
     // formula should prevent this; hitting it indicates an estimation bug.
     if !Path::new("/.ktstr_init_ok").exists() {
@@ -456,7 +457,7 @@ fn shell_mode_requested() -> bool {
 }
 
 /// Read /exec_cmd from the initramfs if present.
-/// The host writes this file via build_suffix_full when --exec is used.
+/// The host writes this file via build_suffix when --exec is used.
 fn shell_exec_cmd() -> Option<String> {
     fs::read_to_string("/exec_cmd")
         .ok()

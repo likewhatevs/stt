@@ -21,8 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
-        with:
-          rust-components: clippy,rustfmt
       - run: cargo fmt -- --check
       - run: cargo clippy --workspace --all-targets
 
@@ -36,9 +34,8 @@ jobs:
       KTSTR_GHA_CACHE: "1"
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Provision Rust toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -75,9 +72,8 @@ jobs:
       KTSTR_GHA_CACHE: "1"
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Provision Rust toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -110,9 +106,8 @@ jobs:
       KTSTR_GHA_CACHE: "1"
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt,llvm-tools-preview
+      - name: Provision Rust toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
@@ -141,9 +136,8 @@ jobs:
       KTSTR_GHA_CACHE: "1"
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt,llvm-tools-preview
+      - name: Provision Rust toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest

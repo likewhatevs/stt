@@ -23,7 +23,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::assert::AssertResult;
-use crate::vmm;
 
 use super::args::{
     extract_probe_stack_arg, extract_test_fn_arg, extract_work_type_arg, resolve_cgroup_root,
@@ -31,7 +30,7 @@ use super::args::{
 use super::entry::find_test;
 use super::output::{extract_sched_ext_dump, print_assert_result};
 use super::profraw::try_flush_profraw;
-use super::runtime::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
+use super::runtime::{config_file_parts, verbose};
 use super::{KtstrTestEntry, TopoOverride};
 use crate::verifier::{SCHED_OUTPUT_END, SCHED_OUTPUT_START, parse_sched_output};
 
@@ -95,6 +94,86 @@ fn format_tail(text: &str, n: usize, header: &str) -> Option<String> {
     }
     let start = lines.len().saturating_sub(n);
     Some(format!("--- {header} ---\n{}", lines[start..].join("\n")))
+}
+
+/// Classify the repro VM outcome into a single human-readable status
+/// line, used when the probe pipeline produced no events and the
+/// caller needs to tell the user *why* the repro VM did not yield
+/// probe data.
+///
+/// The ordering of branches matters. Each check eliminates a
+/// distinct failure mode so the most specific match wins:
+///
+/// 1. `timed_out` — VM wall clock exceeded. No further signals are
+///    meaningful; the run never reached a natural exit.
+/// 2. `SCHEDULER_NOT_ATTACHED` in `output` — the scheduler process
+///    stayed alive but never completed attachment (BPF verifier
+///    reject, ops mismatch, sysfs absent). `rust_init` emits this
+///    sentinel with a reason suffix then force-reboots, which is
+///    distinct from a scheduler crash. Checked *before* the crash
+///    branch because the emission path prevents a subsequent
+///    SCHEDULER_DIED write in the same run.
+/// 3. `crash_message.is_some()` or `SCHEDULER_DIED` in `output` —
+///    the scheduler process crashed or was reported dead by the
+///    guest's sched_exit monitor.
+/// 4. Nonzero exit code — something exited abnormally, but the
+///    guest did not emit a classification sentinel.
+/// 5. Clean exit — scheduler ran to completion; the first VM's
+///    crash did not reproduce.
+fn classify_repro_vm_status(
+    timed_out: bool,
+    has_crash_message: bool,
+    output: &str,
+    exit_code: i32,
+) -> String {
+    if timed_out {
+        return "repro VM: timed out".to_string();
+    }
+    if let Some(reason) = extract_not_attached_reason(output) {
+        return format!(
+            "repro VM: scheduler did not attach ({reason}) (exit code {exit_code})",
+        );
+    }
+    if has_crash_message || output.contains(super::SENTINEL_SCHEDULER_DIED) {
+        return format!("repro VM: scheduler crashed (exit code {exit_code})");
+    }
+    if exit_code != 0 {
+        return format!("repro VM: exited abnormally (exit code {exit_code})");
+    }
+    "repro VM: scheduler ran normally (crash did not reproduce)".to_string()
+}
+
+/// Extract the reason suffix after `SCHEDULER_NOT_ATTACHED:` on the
+/// first line of `output` that carries the sentinel. Returns
+/// `Some("timeout")` for the line `SCHEDULER_NOT_ATTACHED: timeout`,
+/// `Some("sched_ext sysfs absent")` for the sysfs-absent emission,
+/// or `None` when no line carries the sentinel.
+///
+/// The sentinel emission in `vmm::rust_init::start_scheduler` writes
+/// `"SCHEDULER_NOT_ATTACHED: <reason>"` as a single COM2 line. The
+/// parser splits at the first `:` after the sentinel and trims the
+/// remainder so trailing whitespace from `write_com2` does not leak
+/// into the reason string.
+///
+/// The FIRST line with the sentinel wins unconditionally. If that
+/// first occurrence is malformed — no colon, or an empty/
+/// whitespace-only suffix — the result is `None` and no subsequent
+/// line is consulted. A malformed first occurrence indicates an
+/// emitter bug; falling through to a later, "better" line would
+/// paper over that bug. The caller handles `None` by routing to the
+/// generic crashed / abnormal-exit branches, which already surface
+/// exit code and crash-message diagnostics.
+fn extract_not_attached_reason(output: &str) -> Option<&str> {
+    let line = output
+        .lines()
+        .find(|l| l.contains(super::SENTINEL_SCHEDULER_NOT_ATTACHED))?;
+    let idx = line.find(super::SENTINEL_SCHEDULER_NOT_ATTACHED)?;
+    let after = &line[idx + super::SENTINEL_SCHEDULER_NOT_ATTACHED.len()..];
+    let reason = after.strip_prefix(':')?.trim();
+    if reason.is_empty() {
+        return None;
+    }
+    Some(reason)
 }
 
 /// Attempt auto-repro: extract stack functions from COM2 scheduler output
@@ -170,20 +249,17 @@ pub(crate) fn attempt_auto_repro(
     let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
-    let mut builder = vmm::KtstrVm::builder()
-        .kernel(kernel)
-        .init_binary(ktstr_bin)
-        .with_topology(vm_topology)
-        .memory_deferred_min(memory_mb)
-        .cmdline(&cmdline_extra)
-        .shm_size(KTSTR_TEST_SHM_SIZE)
-        .run_args(&guest_args)
-        .timeout(Duration::from_secs(60))
-        .no_perf_mode(no_perf_mode);
-
-    if let Some(sched_path) = scheduler {
-        builder = builder.scheduler_binary(sched_path);
-    }
+    let mut builder = super::runtime::build_vm_builder_base(
+        entry,
+        kernel,
+        ktstr_bin,
+        scheduler,
+        vm_topology,
+        memory_mb,
+        &cmdline_extra,
+        &guest_args,
+        no_perf_mode,
+    );
 
     {
         let mut args: Vec<String> = Vec::new();
@@ -197,14 +273,6 @@ pub(crate) fn attempt_auto_repro(
             builder = builder.sched_args(&args);
         }
     }
-
-    // Forward bpf_map_write and watchdog_timeout so the repro VM
-    // reproduces the same exit as the first VM with probes attached.
-    for bpf_write in entry.bpf_map_write {
-        builder =
-            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
-    }
-    builder = builder.watchdog_timeout(entry.watchdog_timeout);
 
     let vm = match builder.build() {
         Ok(vm) => vm,
@@ -292,24 +360,12 @@ pub(crate) fn attempt_auto_repro(
 
     // Crash reproduction status when probe data is absent.
     if !has_probe {
-        let status = if repro_result.timed_out {
-            "repro VM: timed out".to_string()
-        } else if repro_result.crash_message.is_some()
-            || repro_result.output.contains(super::SENTINEL_SCHEDULER_DIED)
-        {
-            format!(
-                "repro VM: scheduler crashed (exit code {})",
-                repro_result.exit_code,
-            )
-        } else if repro_result.exit_code != 0 {
-            format!(
-                "repro VM: exited abnormally (exit code {})",
-                repro_result.exit_code,
-            )
-        } else {
-            "repro VM: scheduler ran normally (crash did not reproduce)".to_string()
-        };
-        out.push_str(&status);
+        out.push_str(&classify_repro_vm_status(
+            repro_result.timed_out,
+            repro_result.crash_message.is_some(),
+            &repro_result.output,
+            repro_result.exit_code,
+        ));
     }
 
     // Duration line before tails.
@@ -729,12 +785,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         // Wait for probes to attach before starting the test function.
         // Without this, the test may crash the scheduler before probes
         // are active, resulting in 0 captured events.
-        while !pipeline
-            .probes_ready
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        pipeline.probes_ready.wait();
 
         Some(ProbeHandle {
             thread: handle,
@@ -801,21 +852,26 @@ struct ProbeHandle {
     render_hints: std::collections::HashMap<String, crate::probe::btf::RenderHint>,
 }
 
-/// Cross-thread probe pipeline atomics.
+/// Cross-thread probe pipeline signals.
 ///
-/// Groups the three `Arc<AtomicBool>` signals the probe setup path
-/// has to hand to its worker thread: `stop` (main thread asks the
-/// probe thread to shut down), `output_done` (probe thread tells
-/// the main thread it has already emitted `PROBE_PAYLOAD_*`), and
-/// `probes_ready` (probe thread signals the main thread that
-/// kprobes/kfentries have attached). [`Clone`] is the expected way
-/// to produce the thread-side view before calling
-/// `std::thread::spawn` — each clone bumps refcounts only.
+/// Groups the three signals the probe setup path has to hand to its
+/// worker thread: `stop` (main thread asks the probe thread to shut
+/// down), `output_done` (probe thread tells the main thread it has
+/// already emitted `PROBE_PAYLOAD_*`), and `probes_ready` (probe
+/// thread signals the main thread that kprobes/kfentries have
+/// attached). `stop` and `output_done` remain `AtomicBool` because
+/// they are consulted inside the probe-thread's ring-buffer poll loop
+/// where a blocking wait would stall diagnostics collection;
+/// `probes_ready` uses [`crate::probe::process::Latch`] so the
+/// dispatch path blocks on a condvar instead of sleep-polling.
+/// [`Clone`] is the expected way to produce the thread-side view
+/// before calling `std::thread::spawn` — each clone bumps refcounts
+/// only.
 #[derive(Clone, Default)]
 pub(crate) struct ProbePipeline {
     pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub output_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub probes_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub probes_ready: std::sync::Arc<crate::probe::process::Latch>,
 }
 
 impl ProbePipeline {
@@ -946,12 +1002,7 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
     });
 
     // Wait for Phase A probes (kprobes + trigger + kernel fexit) to attach.
-    while !pipeline
-        .probes_ready
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    pipeline.probes_ready.wait();
 
     eprintln!(
         "ktstr_test: probe phase_a: {} kernel functions attached, waiting for Phase B",
@@ -1066,7 +1117,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
             ));
         }
 
-        let phase_b_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let phase_b_done = std::sync::Arc::new(crate::probe::process::Latch::new());
         let phase_b_done_clone = phase_b_done.clone();
 
         let phase_b_input = crate::probe::process::PhaseBInput {
@@ -1081,9 +1132,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
             eprintln!("ktstr_test: probe phase_b: failed to send: {e}");
         } else {
             // Wait for Phase B attachment to complete.
-            while !phase_b_done.load(std::sync::atomic::Ordering::Acquire) {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            phase_b_done.wait();
             eprintln!("ktstr_test: probe phase_b: BPF fentry attached");
         }
     } else {
@@ -1486,5 +1535,168 @@ mod tests {
         // Tokens that merely contain the key substring but do not
         // start with it are ignored (e.g. `xRUST_LOG=...`).
         assert!(parse_rust_env_from_cmdline("xRUST_LOG=x").is_empty());
+    }
+
+    // -- extract_not_attached_reason --
+
+    #[test]
+    fn extract_not_attached_reason_timeout() {
+        let output = "noise\nSCHEDULER_NOT_ATTACHED: timeout\nmore";
+        assert_eq!(extract_not_attached_reason(output), Some("timeout"));
+    }
+
+    #[test]
+    fn extract_not_attached_reason_sysfs_absent() {
+        // Multi-word reason must survive through to the caller so the
+        // user can distinguish "timeout" from "sched_ext sysfs absent".
+        let output = "SCHEDULER_NOT_ATTACHED: sched_ext sysfs absent";
+        assert_eq!(
+            extract_not_attached_reason(output),
+            Some("sched_ext sysfs absent"),
+        );
+    }
+
+    #[test]
+    fn extract_not_attached_reason_trims_trailing_whitespace() {
+        // `write_com2` may append whitespace; the reason comparison
+        // and display path should not expose that to the user.
+        let output = "SCHEDULER_NOT_ATTACHED:  timeout  \n";
+        assert_eq!(extract_not_attached_reason(output), Some("timeout"));
+    }
+
+    #[test]
+    fn extract_not_attached_reason_absent_returns_none() {
+        assert_eq!(extract_not_attached_reason(""), None);
+        assert_eq!(
+            extract_not_attached_reason("SCHEDULER_DIED\nKTSTR_EXIT=1"),
+            None,
+        );
+    }
+
+    #[test]
+    fn extract_not_attached_reason_without_colon_returns_none() {
+        // The sentinel token alone, with no `: reason` suffix, carries
+        // no diagnostic value. `None` lets the caller fall through to
+        // the generic abnormal-exit branch instead of surfacing an
+        // empty reason.
+        let output = "SCHEDULER_NOT_ATTACHED\nKTSTR_EXIT=1";
+        assert_eq!(extract_not_attached_reason(output), None);
+    }
+
+    #[test]
+    fn extract_not_attached_reason_empty_suffix_returns_none() {
+        // `SCHEDULER_NOT_ATTACHED:` with no reason text is functionally
+        // equivalent to no sentinel — no classification signal to
+        // surface.
+        let output = "SCHEDULER_NOT_ATTACHED:\n";
+        assert_eq!(extract_not_attached_reason(output), None);
+        let output_ws = "SCHEDULER_NOT_ATTACHED:   \n";
+        assert_eq!(extract_not_attached_reason(output_ws), None);
+    }
+
+    #[test]
+    fn extract_not_attached_reason_first_match_wins() {
+        // Two sentinel lines should not be possible in production
+        // (rust_init emits exactly one before force_reboot), but if
+        // the harness ever concatenates outputs, pinning "first match"
+        // keeps the classification stable.
+        let output =
+            "SCHEDULER_NOT_ATTACHED: timeout\nSCHEDULER_NOT_ATTACHED: sched_ext sysfs absent";
+        assert_eq!(extract_not_attached_reason(output), Some("timeout"));
+    }
+
+    // -- classify_repro_vm_status --
+
+    #[test]
+    fn classify_repro_vm_status_timeout_wins_over_other_signals() {
+        // Even with a crash message present, the VM-level timeout is
+        // the primary classification — a timed-out VM may have dumped
+        // any signal on the way out.
+        let status = classify_repro_vm_status(
+            /*timed_out*/ true,
+            /*has_crash_message*/ true,
+            "SCHEDULER_NOT_ATTACHED: timeout\nSCHEDULER_DIED",
+            137,
+        );
+        assert_eq!(status, "repro VM: timed out");
+    }
+
+    #[test]
+    fn classify_repro_vm_status_not_attached_with_reason() {
+        let status = classify_repro_vm_status(
+            false,
+            false,
+            "noise\nSCHEDULER_NOT_ATTACHED: sched_ext sysfs absent\nKTSTR_EXIT=1",
+            1,
+        );
+        assert_eq!(
+            status,
+            "repro VM: scheduler did not attach (sched_ext sysfs absent) (exit code 1)",
+        );
+    }
+
+    #[test]
+    fn classify_repro_vm_status_not_attached_takes_precedence_over_crashed() {
+        // The rust_init emission path writes SCHEDULER_NOT_ATTACHED and
+        // then force-reboots before any SCHEDULER_DIED write could
+        // happen. If both sentinels ever appear in the same output,
+        // NOT_ATTACHED is the more specific classification and should
+        // win.
+        let status = classify_repro_vm_status(
+            false,
+            true,
+            "SCHEDULER_DIED\nSCHEDULER_NOT_ATTACHED: timeout",
+            1,
+        );
+        assert_eq!(
+            status,
+            "repro VM: scheduler did not attach (timeout) (exit code 1)",
+        );
+    }
+
+    #[test]
+    fn classify_repro_vm_status_crashed_from_sentinel() {
+        let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", 139);
+        assert_eq!(status, "repro VM: scheduler crashed (exit code 139)");
+    }
+
+    #[test]
+    fn classify_repro_vm_status_crashed_from_crash_message() {
+        // crash_message set without a SCHEDULER_DIED sentinel (e.g.
+        // VM-level crash detection from COM1) still routes to the
+        // crashed branch.
+        let status = classify_repro_vm_status(false, true, "no sentinels here", 134);
+        assert_eq!(status, "repro VM: scheduler crashed (exit code 134)");
+    }
+
+    #[test]
+    fn classify_repro_vm_status_abnormal_exit() {
+        let status = classify_repro_vm_status(false, false, "clean output", 2);
+        assert_eq!(status, "repro VM: exited abnormally (exit code 2)");
+    }
+
+    #[test]
+    fn classify_repro_vm_status_clean_run() {
+        let status = classify_repro_vm_status(false, false, "clean output", 0);
+        assert_eq!(
+            status,
+            "repro VM: scheduler ran normally (crash did not reproduce)",
+        );
+    }
+
+    #[test]
+    fn classify_repro_vm_status_malformed_not_attached_falls_through() {
+        // A SCHEDULER_NOT_ATTACHED token with no colon-delimited
+        // reason does not count as a classification signal. With no
+        // crash signals and exit_code=1 the result should be the
+        // abnormal-exit branch, not a NOT_ATTACHED branch with an
+        // empty reason.
+        let status = classify_repro_vm_status(
+            false,
+            false,
+            "SCHEDULER_NOT_ATTACHED\nKTSTR_EXIT=1",
+            1,
+        );
+        assert_eq!(status, "repro VM: exited abnormally (exit code 1)");
     }
 }

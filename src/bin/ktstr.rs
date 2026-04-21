@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -101,7 +104,7 @@ enum Command {
         /// Valid: CpuSpin, YieldHeavy, Mixed, IoSync, Bursty, PipeIo,
         /// FutexPingPong, CachePressure, CacheYield, CachePipe,
         /// FutexFanOut, ForkExit, NiceSweep, AffinityChurn, PolicyChurn,
-        /// SchBench, PageFaultChurn, MutexContention.
+        /// FanOutCompute, PageFaultChurn, MutexContention.
         #[arg(long)]
         work_type: Option<String>,
 

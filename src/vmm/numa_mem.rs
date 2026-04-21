@@ -164,17 +164,20 @@ impl NumaMemoryLayout {
     }
 
     /// GPA immediately after the last node's memory.
+    #[allow(dead_code)]
     pub fn end_gpa(&self) -> u64 {
         let last = self.regions.last().unwrap();
         last.gpa_start + last.size
     }
 
     /// Whether this layout has exactly one region.
+    #[allow(dead_code)]
     pub fn is_single_region(&self) -> bool {
         self.regions.len() == 1
     }
 
     /// Next available KVM slot index (after all node regions).
+    #[allow(dead_code)]
     pub fn next_slot(&self) -> u32 {
         self.regions.last().map_or(0, |r| r.slot + 1)
     }
@@ -345,6 +348,7 @@ impl NumaMemoryLayout {
     /// Find the node region containing a GPA.
     ///
     /// Regions are sorted by `gpa_start`, so this uses binary search.
+    #[allow(dead_code)]
     pub fn region_for_gpa(&self, gpa: u64) -> Option<&NodeRegion> {
         let idx = self
             .regions
@@ -359,6 +363,7 @@ impl NumaMemoryLayout {
     }
 
     /// Node region by node_id.
+    #[allow(dead_code)]
     pub fn region_for_node(&self, node_id: u32) -> Option<&NodeRegion> {
         self.regions.iter().find(|r| r.node_id == node_id)
     }

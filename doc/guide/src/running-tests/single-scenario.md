@@ -18,7 +18,7 @@ Run one test with verbose output to see scheduler logs and kernel
 console:
 
 ```sh
-RUST_BACKTRACE=1 cargo nextest run -E 'test(cover_cgroup_cpuset_crossllc_race)'
+RUST_BACKTRACE=1 cargo nextest run -E 'test(cover_cgroup_cpuset_cross_llc_race)'
 ```
 
 ## VM topology

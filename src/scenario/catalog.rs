@@ -94,7 +94,7 @@ pub fn all_scenarios() -> Vec<Scenario> {
             dfl()
         ),
         s!(
-            "cgroup_cpuset_crossllc_steady",
+            "cgroup_cpuset_cross_llc_steady",
             "basic",
             "2 cgroups, cpusets spanning LLC boundary",
             2,
@@ -493,11 +493,11 @@ pub fn all_scenarios() -> Vec<Scenario> {
         ),
         // No controller + rapid cgroup moves
         custom!(
-            "cgroup_noctrl_task_migration",
+            "cgroup_no_ctrl_task_migration",
             "advanced",
             "Rapid per-task moves without controller",
             F_NO_CTRL,
-            custom_cgroup_noctrl_task_migration
+            custom_cgroup_no_ctrl_task_migration
         ),
         // Work conservation + cpuset change
         custom!(
@@ -517,11 +517,11 @@ pub fn all_scenarios() -> Vec<Scenario> {
         ),
         // No controller + nested cgroups
         custom!(
-            "nested_cgroup_noctrl",
+            "nested_cgroup_no_ctrl",
             "advanced",
             "Nested cgroups without controller",
             F_NO_CTRL,
-            custom_nested_cgroup_noctrl
+            custom_nested_cgroup_no_ctrl
         ),
         // Cpuset swap to disjoint range
         custom!(
@@ -669,27 +669,27 @@ pub fn all_scenarios() -> Vec<Scenario> {
         ),
         // No controller + work conservation
         custom!(
-            "cgroup_noctrl_imbalance",
+            "cgroup_no_ctrl_imbalance",
             "interaction",
             "Per-task moves during imbalanced load without controller",
             F_NO_CTRL_BORROW,
-            custom_cgroup_noctrl_imbalance
+            custom_cgroup_no_ctrl_imbalance
         ),
         // No controller + cpusets
         custom!(
-            "cgroup_noctrl_cpuset_change",
+            "cgroup_no_ctrl_cpuset_change",
             "interaction",
             "Cpuset add/clear without controller",
             F_NO_CTRL,
-            custom_cgroup_noctrl_cpuset_change
+            custom_cgroup_no_ctrl_cpuset_change
         ),
         // No controller + rebalancing
         custom!(
-            "cgroup_noctrl_load_imbalance",
+            "cgroup_no_ctrl_load_imbalance",
             "interaction",
             "Heavy + light cgroups without controller",
             F_NO_CTRL_REBAL,
-            custom_cgroup_noctrl_load_imbalance
+            custom_cgroup_no_ctrl_load_imbalance
         ),
         // Affinity rejection + cpusets
         custom!(
@@ -750,11 +750,11 @@ pub fn all_scenarios() -> Vec<Scenario> {
         ),
         // Cross-LLC cpuset race
         custom!(
-            "cgroup_cpuset_crossllc_race",
+            "cgroup_cpuset_cross_llc_race",
             "stress",
             "Rapid cpuset flips across LLC boundaries",
             F_LLC_REBAL,
-            custom_cgroup_cpuset_crossllc_race
+            custom_cgroup_cpuset_cross_llc_race
         ),
         // Performance: cache pressure vs compute imbalance
         custom!(
@@ -782,19 +782,19 @@ pub fn all_scenarios() -> Vec<Scenario> {
         ),
         // Performance: 1:N fan-out wake pattern
         custom!(
-            "fanout_wake",
+            "fan_out_wake",
             "performance",
             "1:N futex fan-out wake vs compute workers",
             F_BORROW,
-            custom_fanout_wake
+            custom_fan_out_wake
         ),
-        // Performance: schbench-style messenger/worker workload
+        // Performance: fan-out messenger/worker with compute workload
         custom!(
-            "schbench_style",
+            "fan_out_compute",
             "performance",
-            "Schbench-style wake latency vs compute workers",
+            "Fan-out wake latency vs compute workers",
             F_BORROW,
-            custom_schbench_style
+            custom_fan_out_compute
         ),
         // Stress: task creation/destruction churn
         s!(

@@ -274,9 +274,9 @@ semantics, profile generation, and using flags in
 not the global set. This prevents testing with flags the scheduler
 doesn't implement.
 
-## Verification overrides
+## Checking overrides
 
-`Scheduler.assert` provides scheduler-level verification defaults.
+`Scheduler.assert` provides scheduler-level checking defaults.
 These sit between `Assert::default_checks()` and per-test overrides in
 the merge chain.
 

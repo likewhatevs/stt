@@ -3,13 +3,13 @@
 //! ktstr boots lightweight KVM virtual machines with controlled CPU topologies,
 //! runs scheduler test scenarios inside them, and evaluates results from the
 //! host via guest memory introspection. Each test creates cgroups, spawns
-//! worker processes, and verifies that the scheduler handled the workload
+//! worker processes, and checks that the scheduler handled the workload
 //! correctly. Also tests under the kernel's default EEVDF scheduler.
 //!
 //! # Quick start
 //!
 //! Declare cgroups and workloads as data, let the framework handle
-//! lifecycle and verification:
+//! lifecycle and checking:
 //!
 //! ```rust
 //! use ktstr::prelude::*;
@@ -475,11 +475,16 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
             let cache::ListedEntry::Valid(entry) = listed else {
                 continue;
             };
-            // Skip entries built with a different kconfig.
-            if entry.has_stale_kconfig(&kc_hash) {
+            // Skip entries built with a different kconfig. Untracked
+            // (pre-kconfig-tracking) entries are reused — their image
+            // could still boot correctly, and skipping them would
+            // permanently orphan legacy cache entries.
+            if let cache::KconfigStatus::Stale { .. } = entry.kconfig_status(&kc_hash) {
                 continue;
             }
             let image = entry.image_path();
+            // TOCTOU guard: list() guarantees image existence at scan time,
+            // but a concurrent cache-clean could delete between scan and use.
             if !image.exists() {
                 continue;
             }

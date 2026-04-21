@@ -12,9 +12,8 @@
 //!
 //! [`OutputFormat::LlmExtract`] routes stdout through
 //! [`crate::test_support::model::extract_via_llm`]: the model owns
-//! prompt composition, retry-once-on-parse-failure, and the initial
-//! JSON-from-prose parse, then feeds the resulting
-//! `serde_json::Value` into this module's
+//! prompt composition and the initial JSON-from-prose parse, then
+//! feeds the resulting `serde_json::Value` into this module's
 //! [`walk_json_leaves`] with the source pre-tagged to
 //! [`MetricSource::LlmExtract`]. One extraction walker, two
 //! acquisition paths.
@@ -33,11 +32,11 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 ///
 /// [`OutputFormat::LlmExtract`] with an optional `hint` delegates to
 /// [`crate::test_support::model::extract_via_llm`], which composes a
-/// prompt (appending the hint when present), invokes the local
-/// inference backend, retries once on a JSON-parse failure, and walks
-/// the resulting JSON with [`MetricSource::LlmExtract`]. An
-/// unwired/unavailable inference backend yields an empty metric
-/// set, matching the non-fatal contract above.
+/// prompt (appending the hint when present), runs a single
+/// deterministic (ArgMax) inference pass, and walks the resulting
+/// JSON with [`MetricSource::LlmExtract`]. An unavailable inference
+/// backend (missing cache, forward-pass failure) yields an empty
+/// metric set, matching the non-fatal contract above.
 pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Vec<Metric> {
     match format {
         OutputFormat::ExitCode => Vec::new(),
@@ -50,8 +49,8 @@ pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Vec<Metric> {
 
 /// Locate a JSON document within mixed text output and parse it.
 ///
-/// Many benchmark tools emit a banner line (fio, stress-ng,
-/// schbench) before the structured JSON body. A strict
+/// Many benchmark tools emit a banner line (fio, stress-ng)
+/// before the structured JSON body. A strict
 /// `serde_json::from_str(stdout)` fails for those. This helper
 /// first tries the whole input; on failure, scans for the first
 /// balanced `{...}` (or `[...]`) region and parses that.
@@ -297,28 +296,42 @@ mod tests {
     }
 
     #[test]
-    fn llm_extract_returns_empty_when_backend_unwired() {
+    fn llm_extract_returns_empty_when_backend_unavailable() {
         // LlmExtract delegates to `model::extract_via_llm`, which
-        // calls `invoke_inference` — currently a stub returning
-        // `InferenceError::NotWired`. The pipeline treats that as
-        // a non-fatal extraction error and returns an empty metric
-        // set so downstream Check evaluation reports each referenced
-        // metric as missing rather than failing the whole run.
+        // calls `load_inference` followed by `invoke_with_model`.
+        // Forcing the offline gate makes `ensure()` bail on the
+        // uncached model, so `load_inference` surfaces
+        // an `anyhow::Error` and the pipeline returns an empty
+        // metric set — non-fatal extraction error so downstream
+        // Check evaluation reports each referenced metric as missing
+        // rather than failing the whole run.
         //
-        // Once the real backend lands (candle/llama-cpp-rs), this
-        // test flips to asserting a non-empty result against a
-        // canned prompt/response fixture. Deliberately not set up
-        // for that yet — stubbed backend + no fixture model file =
-        // empty output, which is the contracted behavior.
+        // Calls `model::reset_for_test()` under `lock_env()` so a
+        // previously memoized `Ok(_)` slot in `MODEL_CACHE` cannot
+        // bypass the offline gate. Without the reset, the test could
+        // pass for the wrong reason — cached inference yielding an
+        // empty Vec rather than `ensure()` tripping on the offline
+        // env var.
+        let _lock = super::super::test_helpers::lock_env();
+        super::super::model::reset_for_test();
+        let _cache = super::super::test_helpers::isolated_cache_dir();
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
         let m = extract_metrics("anything", &OutputFormat::LlmExtract(None));
         assert!(m.is_empty());
     }
 
     #[test]
-    fn llm_extract_with_hint_still_returns_empty_unwired() {
-        // Same as above but exercising the hint-carrying variant
-        // so the dispatch path that plumbs `hint` into
-        // `extract_via_llm` is covered.
+    fn llm_extract_with_hint_returns_empty_when_backend_unavailable() {
+        // Same contract as `llm_extract_returns_empty_when_backend_unavailable`
+        // but exercising the hint-carrying variant so the dispatch path
+        // that plumbs `hint` into `extract_via_llm` is covered.
+        //
+        // Same `model::reset_for_test()` rationale: the offline-gate
+        // assertion is meaningful only when MODEL_CACHE starts empty.
+        let _lock = super::super::test_helpers::lock_env();
+        super::super::model::reset_for_test();
+        let _cache = super::super::test_helpers::isolated_cache_dir();
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
         let m = extract_metrics(
             "anything",
             &OutputFormat::LlmExtract(Some("focus on latency")),

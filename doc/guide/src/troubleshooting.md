@@ -311,14 +311,14 @@ PipeIo requires num_workers divisible by 2, got 3
 ```
 
 Grouped work types (`PipeIo`, `FutexPingPong`, `CachePipe`,
-`FutexFanOut`, `SchBench`) require `num_workers` divisible by their
+`FutexFanOut`, `FanOutCompute`) require `num_workers` divisible by their
 group size. `WorkType::worker_group_size()` returns the divisor.
 
 **Fixes:**
 
 - Set `CgroupDef::workers(n)` to a value divisible by the work
   type's group size (2 for pipe/futex pairs, `fan_out + 1` for
-  FutexFanOut and SchBench).
+  FutexFanOut and FanOutCompute).
 - Use an ungrouped work type (`CpuSpin`, `Mixed`, `Bursty`,
   `IoSync`, `YieldHeavy`) if worker count flexibility is needed.
 
@@ -358,7 +358,7 @@ is set.
 ## Stale kconfig
 
 ```text
-warning: entries marked (stale kconfig) were built with a different ktstr.kconfig.
+warning: entries marked (stale kconfig) were built against a different ktstr.kconfig.
 Rebuild with: kernel build --force VERSION
 ```
 
@@ -549,4 +549,4 @@ Common causes:
 - **Debug thresholds**: CI often runs debug builds. Debug builds use
   relaxed thresholds (3000ms gap, 35% spread) but may still hit
   limits on slow runners. See
-  [default thresholds](concepts/verification.md#default-thresholds).
+  [default thresholds](concepts/checking.md#default-thresholds).

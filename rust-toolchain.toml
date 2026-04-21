@@ -1,0 +1,4 @@
+# pinned for trybuild stderr stability; bump with re-bless of tests/compile_fail/*.stderr
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

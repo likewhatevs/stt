@@ -31,7 +31,7 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 /// Every key=value attribute is optional. The accepted attributes and
 /// their defaults are the fields of
 /// [`ktstr::test_support::KtstrTestEntry`] (runtime metadata) and
-/// [`ktstr::assert::Assert`] (verification thresholds). A few are
+/// [`ktstr::assert::Assert`] (checking thresholds). A few are
 /// worth calling out because their names differ from the underlying
 /// field or because they have nontrivial defaults:
 ///

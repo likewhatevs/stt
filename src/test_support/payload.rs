@@ -740,7 +740,7 @@ mod tests {
     /// round-trip self-contained.
     #[test]
     fn higher_is_worse_polarity_round_trip() {
-        use crate::stats::{Aggregator, MetricDef};
+        use crate::stats::MetricDef;
 
         // true (higher-is-worse) → LowerBetter → true.
         let m = MetricDef {
@@ -749,7 +749,6 @@ mod tests {
             default_abs: 0.0,
             default_rel: 0.0,
             display_unit: "",
-            aggregate: Aggregator::Max,
             accessor: |_| None,
         };
         assert_eq!(m.polarity, Polarity::LowerBetter);
@@ -762,7 +761,6 @@ mod tests {
             default_abs: 0.0,
             default_rel: 0.0,
             display_unit: "",
-            aggregate: Aggregator::Max,
             accessor: |_| None,
         };
         assert_eq!(m.polarity, Polarity::HigherBetter);
@@ -780,7 +778,7 @@ mod tests {
     /// target metrics.
     #[test]
     fn higher_is_worse_covers_all_polarity_variants() {
-        use crate::stats::{Aggregator, MetricDef};
+        use crate::stats::MetricDef;
         fn make(p: Polarity) -> MetricDef {
             MetricDef {
                 name: "x",
@@ -788,7 +786,6 @@ mod tests {
                 default_abs: 0.0,
                 default_rel: 0.0,
                 display_unit: "",
-                aggregate: Aggregator::Max,
                 accessor: |_| None,
             }
         }

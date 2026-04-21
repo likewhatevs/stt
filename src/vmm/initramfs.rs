@@ -1,10 +1,10 @@
-/// Minimal initramfs (cpio newc format) creation via the `cpio` crate.
-/// Packs the test binary as `/init` along with scheduler binaries,
-/// shared libraries, optional busybox, and user-provided include files
-/// into a cpio archive for use as Linux initrd.
-/// Init setup is handled by Rust code in `vmm::rust_init`.
+//! Minimal initramfs (cpio newc format) creation via the `cpio` crate.
+//! Packs the test binary as `/init` along with scheduler binaries,
+//! shared libraries, optional busybox, and user-provided include files
+//! into a cpio archive for use as Linux initrd.
+//! Init setup is handled by Rust code in `vmm::rust_init`.
 use anyhow::{Context, Result};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -30,127 +30,8 @@ pub(crate) struct MissingLib {
     pub soname: String,
     /// True if this soname appears in the root binary's DT_NEEDED.
     /// False if it is a transitive dependency of one of the root's deps.
+    #[allow(dead_code)]
     pub direct: bool,
-}
-
-/// Parse `/etc/ld.so.conf` and any included files to produce additional
-/// library search paths. The format:
-/// - One directory path per line
-/// - Lines starting with `#` are comments
-/// - `include <glob>` directives match files. Globs are expanded via
-///   the `glob` crate, so any component of the path may contain a
-///   wildcard — e.g. `/etc/ld.so.conf.d/*.conf` (single-component,
-///   the glibc default) or `/etc/*/conf.d/*.conf` (multi-component).
-///   Relative globs are resolved against the including file's parent
-///   directory.
-/// - Empty lines are skipped
-///
-/// Parsed once and cached for the process lifetime.
-static LD_SO_CONF_PATHS: LazyLock<Vec<PathBuf>> =
-    LazyLock::new(|| parse_ld_so_conf(Path::new("/etc/ld.so.conf")));
-
-/// Maximum recursion depth for ld.so.conf `include` chains. Guards against
-/// cyclic or pathologically deep include graphs.
-const LD_SO_CONF_MAX_DEPTH: usize = 16;
-
-/// Parse a single ld.so.conf-format file, recursing into `include` directives.
-/// Cycles are broken via a visited-set keyed on the canonicalized path
-/// (falling back to the raw path when canonicalize fails, e.g. ENOENT);
-/// the recursion also stops at [`LD_SO_CONF_MAX_DEPTH`].
-fn parse_ld_so_conf_file(
-    path: &Path,
-    out: &mut Vec<PathBuf>,
-    visited: &mut HashSet<PathBuf>,
-    depth: usize,
-) {
-    if depth >= LD_SO_CONF_MAX_DEPTH {
-        tracing::warn!(
-            path = %path.display(),
-            max_depth = LD_SO_CONF_MAX_DEPTH,
-            "ld.so.conf include depth limit hit; truncating further includes"
-        );
-        return;
-    }
-    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(key) {
-        tracing::warn!(
-            path = %path.display(),
-            "ld.so.conf already-visited include file; skipping to avoid redundant or cyclic descent"
-        );
-        return;
-    }
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    // Resolve relative include paths against the including file's
-    // parent directory (matches glibc's behavior), not the process
-    // CWD which is arbitrary. Fall back to "." only when the file
-    // has no parent (pathological).
-    let base = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // Require a whitespace separator after "include" — bare
-        // "include" followed by a non-whitespace char (e.g.
-        // "includelocale") is a different keyword, not an include
-        // directive. Accepts any ASCII whitespace (space, tab, etc.)
-        // so tab-separated `include\tpath.conf` parses too.
-        if let Some(rest) = trimmed.strip_prefix("include")
-            && rest.chars().next().is_some_and(|c| c.is_ascii_whitespace())
-        {
-            let glob_pattern = rest.trim();
-            if glob_pattern.is_empty() {
-                continue;
-            }
-            // Resolve the glob pattern against `base` so that relative
-            // includes match glibc's semantics.
-            let pattern_pathbuf = if Path::new(glob_pattern).is_absolute() {
-                PathBuf::from(glob_pattern)
-            } else {
-                base.join(glob_pattern)
-            };
-            let pattern_str = pattern_pathbuf.to_string_lossy();
-            // `glob` crate handles multi-component patterns
-            // (e.g. `subdir/*/file.conf`) correctly; the previous
-            // `file_name()`-only match silently dropped any match
-            // whose directory part contained a wildcard.
-            match glob::glob(&pattern_str) {
-                Ok(paths) => {
-                    let mut matched: Vec<PathBuf> = paths.filter_map(Result::ok).collect();
-                    matched.sort();
-                    for p in matched {
-                        parse_ld_so_conf_file(&p, out, visited, depth + 1);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        pattern = %pattern_str,
-                        err = %e,
-                        "ld.so.conf include: malformed glob pattern; skipping"
-                    );
-                }
-            }
-        } else {
-            let dir = PathBuf::from(trimmed);
-            if dir.is_dir() {
-                out.push(dir);
-            }
-        }
-    }
-}
-
-/// Parse `/etc/ld.so.conf` and return all library search directories.
-fn parse_ld_so_conf(path: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let mut visited = HashSet::new();
-    parse_ld_so_conf_file(path, &mut paths, &mut visited, 0);
-    paths
 }
 
 /// Parsed soname-to-path mappings from `/etc/ld.so.cache`.
@@ -736,7 +617,7 @@ fn is_deleted_self(path: &Path) -> bool {
 
 /// Build the base cpio archive: /init binary, extra binaries, and shared
 /// libraries. Does NOT include /args, trailer, or 512-byte padding. The
-/// returned bytes are a valid cpio prefix that `build_suffix_full` can complete
+/// returned bytes are a valid cpio prefix that `build_suffix` can complete
 /// with per-invocation args.
 ///
 /// The test binary is packed as `/init` (the kernel's rdinit entry point).
@@ -769,7 +650,7 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
 /// individual file entries before calling this function (see
 /// `cli::resolve_include_files`).
 #[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
-pub fn create_initramfs_base(
+pub fn build_initramfs_base(
     payload: &Path,
     extra_binaries: &[(&str, &Path)],
     include_files: &[(&str, &Path)],
@@ -1020,28 +901,39 @@ pub fn create_initramfs_base(
     Ok(archive)
 }
 
-/// Build the suffix that completes a base archive: /args and
-/// /sched_args entries, optional /sched_enable and /sched_disable
-/// shell scripts for kernel-built schedulers, optional /exec_cmd,
+/// Per-invocation inputs that turn a cached base archive into a
+/// complete initramfs. Borrows all slices so callers can build a
+/// `SuffixParams` without copying `Vec<String>` fields.
+#[derive(Default)]
+pub struct SuffixParams<'a> {
+    /// `/args` contents — one entry per line.
+    pub args: &'a [String],
+    /// `/sched_args` contents, or empty to skip the entry.
+    pub sched_args: &'a [String],
+    /// `/sched_enable` shell-script lines for kernel-built
+    /// schedulers, or empty to skip the entry.
+    pub sched_enable: &'a [String],
+    /// `/sched_disable` shell-script lines, or empty to skip.
+    pub sched_disable: &'a [String],
+    /// `/exec_cmd` contents when `--exec` is used; `None` otherwise.
+    pub exec_cmd: Option<&'a str>,
+}
+
+/// Build the suffix that completes a base archive: `/args` and
+/// `/sched_args` entries, optional `/sched_enable` and `/sched_disable`
+/// shell scripts for kernel-built schedulers, optional `/exec_cmd`,
 /// trailer, and 512-byte padding. `base_len` is needed to compute the
 /// padding. The returned Vec is typically ~200 bytes.
-pub fn build_suffix_full(
-    base_len: usize,
-    args: &[String],
-    sched_args: &[String],
-    sched_enable: &[&str],
-    sched_disable: &[&str],
-    exec_cmd: Option<&str>,
-) -> Result<Vec<u8>> {
+pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8>> {
     let mut suffix = Vec::new();
 
     // Args file
-    let args_data = args.join("\n");
+    let args_data = params.args.join("\n");
     write_entry(&mut suffix, "args", args_data.as_bytes(), 0o100644)?;
 
     // Scheduler args file
-    if !sched_args.is_empty() {
-        let sched_args_data = sched_args.join("\n");
+    if !params.sched_args.is_empty() {
+        let sched_args_data = params.sched_args.join("\n");
         write_entry(
             &mut suffix,
             "sched_args",
@@ -1051,16 +943,16 @@ pub fn build_suffix_full(
     }
 
     // Kernel-built scheduler enable/disable scripts
-    if !sched_enable.is_empty() {
-        let data = sched_enable.join("\n");
+    if !params.sched_enable.is_empty() {
+        let data = params.sched_enable.join("\n");
         write_entry(&mut suffix, "sched_enable", data.as_bytes(), 0o100755)?;
     }
-    if !sched_disable.is_empty() {
-        let data = sched_disable.join("\n");
+    if !params.sched_disable.is_empty() {
+        let data = params.sched_disable.join("\n");
         write_entry(&mut suffix, "sched_disable", data.as_bytes(), 0o100755)?;
     }
 
-    if let Some(cmd) = exec_cmd {
+    if let Some(cmd) = params.exec_cmd {
         write_entry(&mut suffix, "exec_cmd", cmd.as_bytes(), 0o100644)?;
     }
 
@@ -1510,20 +1402,42 @@ pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Concatenate `base` and `suffix` into a single buffer and compress it
+/// with [`lz4_legacy_compress`]. Used by the aarch64 path, which loads
+/// initramfs as one compressed blob rather than streaming per-part.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn lz4_compress_combined(base: &[u8], suffix: &[u8]) -> Vec<u8> {
+    let mut full = Vec::with_capacity(base.len() + suffix.len());
+    full.extend_from_slice(base);
+    full.extend_from_slice(suffix);
+    lz4_legacy_compress(&full)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Thin test wrapper over [`build_suffix_full`] that skips the
-    /// kernel-builtin scheduler and exec-cmd knobs — the tests in this
-    /// module only exercise `args` and `sched_args`, so stripping the
-    /// unused parameters keeps assertions focused.
-    fn build_suffix(base_len: usize, args: &[String], sched_args: &[String]) -> Result<Vec<u8>> {
-        build_suffix_full(base_len, args, sched_args, &[], &[], None)
+    /// Thin test wrapper over [`build_suffix`] that takes only the
+    /// args tests commonly vary. The remaining [`SuffixParams`] fields
+    /// default to empty, so assertions stay focused on the args- and
+    /// sched-args-only suffix shape.
+    fn build_suffix_args(
+        base_len: usize,
+        args: &[String],
+        sched_args: &[String],
+    ) -> Result<Vec<u8>> {
+        build_suffix(
+            base_len,
+            &SuffixParams {
+                args,
+                sched_args,
+                ..Default::default()
+            },
+        )
     }
 
     /// Thin test wrapper that produces a complete cpio newc archive by
-    /// concatenating [`create_initramfs_base`] and [`build_suffix`]
+    /// concatenating [`build_initramfs_base`] and [`build_suffix`]
     /// output. Production callers build base and suffix separately so
     /// they can stream the parts into guest memory without an
     /// intermediate `Vec`; the monolithic form is only needed for
@@ -1533,8 +1447,8 @@ mod tests {
         extra_binaries: &[(&str, &Path)],
         args: &[String],
     ) -> Result<Vec<u8>> {
-        let base = create_initramfs_base(payload, extra_binaries, &[], false)?;
-        let suffix = build_suffix(base.len(), args, &[])?;
+        let base = build_initramfs_base(payload, extra_binaries, &[], false)?;
+        let suffix = build_suffix_args(base.len(), args, &[])?;
         let mut archive = Vec::with_capacity(base.len() + suffix.len());
         archive.extend_from_slice(&base);
         archive.extend_from_slice(&suffix);
@@ -1600,9 +1514,9 @@ mod tests {
     }
 
     #[test]
-    fn create_initramfs_base_is_valid_cpio() {
+    fn build_initramfs_base_is_valid_cpio() {
         let exe = crate::resolve_current_exe().unwrap();
-        let initrd = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let initrd = build_initramfs_base(&exe, &[], &[], false).unwrap();
         assert_eq!(&initrd[..6], b"070701");
         // Base is NOT 512-aligned on its own; only base+suffix is.
         let full = create_initramfs(&exe, &[], &[]).unwrap();
@@ -1650,9 +1564,9 @@ mod tests {
     #[test]
     fn suffix_adds_args_and_trailer() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let args = vec!["run".into(), "--json".into()];
-        let suffix = build_suffix(base.len(), &args, &[]).unwrap();
+        let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
         let s = String::from_utf8_lossy(&suffix);
         assert!(s.contains("args"), "suffix should contain args entry");
         assert!(s.contains("TRAILER!!!"), "suffix should contain trailer");
@@ -1668,8 +1582,8 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let args = vec!["run".into(), "--json".into(), "scenario".into()];
         let monolithic = create_initramfs(&exe, &[], &args).unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
-        let suffix = build_suffix(base.len(), &args, &[]).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+        let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
         let mut split = Vec::with_capacity(base.len() + suffix.len());
         split.extend_from_slice(&base);
         split.extend_from_slice(&suffix);
@@ -1682,17 +1596,17 @@ mod tests {
     #[test]
     fn suffix_different_args_differ() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
-        let a = build_suffix(base.len(), &["a".into()], &[]).unwrap();
-        let b = build_suffix(base.len(), &["b".into()], &[]).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+        let a = build_suffix_args(base.len(), &["a".into()], &[]).unwrap();
+        let b = build_suffix_args(base.len(), &["b".into()], &[]).unwrap();
         assert_ne!(a, b, "different args should produce different suffixes");
     }
 
     #[test]
     fn suffix_empty_args() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
-        let suffix = build_suffix(base.len(), &[], &[]).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+        let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
         assert_eq!((base.len() + suffix.len()) % 512, 0);
         let s = String::from_utf8_lossy(&suffix);
         assert!(s.contains("TRAILER!!!"));
@@ -1968,9 +1882,9 @@ mod tests {
     #[test]
     fn suffix_with_sched_args() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let sched_args = vec!["--enable-borrow".into(), "--llc".into()];
-        let suffix = build_suffix(base.len(), &[], &sched_args).unwrap();
+        let suffix = build_suffix_args(base.len(), &[], &sched_args).unwrap();
         let s = String::from_utf8_lossy(&suffix);
         assert!(
             s.contains("sched_args"),
@@ -1983,8 +1897,8 @@ mod tests {
     #[test]
     fn suffix_without_sched_args_omits_entry() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
-        let suffix = build_suffix(base.len(), &[], &[]).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+        let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
         let s = String::from_utf8_lossy(&suffix);
         assert!(
             !s.contains("sched_args"),
@@ -2136,19 +2050,19 @@ mod tests {
     }
 
     #[test]
-    fn create_initramfs_base_contains_init() {
+    fn build_initramfs_base_contains_init() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("init"), "base should contain init entry");
     }
 
     #[test]
-    fn create_initramfs_base_includes_extra_shared_libs() {
+    fn build_initramfs_base_includes_extra_shared_libs() {
         let exe = crate::resolve_current_exe().unwrap();
         let sched = crate::test_support::require_binary("scx-ktstr");
         let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
-        let base = create_initramfs_base(&exe, &extras, &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &extras, &[], false).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(
             s.contains("lib64/libelf"),
@@ -2184,7 +2098,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("ktstr-test-include-busybox");
         std::fs::write(&tmp, b"hello").unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/test.txt", tmp.as_path())];
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let names = cpio_entry_names(&base);
         assert!(
             names.iter().any(|n| n == "bin/busybox"),
@@ -2197,7 +2111,7 @@ mod tests {
     #[test]
     fn include_files_no_busybox_when_empty() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let names = cpio_entry_names(&base);
         assert!(
             !names.iter().any(|n| n == "bin/busybox"),
@@ -2215,7 +2129,7 @@ mod tests {
 
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/run.sh", tmp.as_path())];
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(
             s.contains("include-files/run.sh"),
@@ -2238,7 +2152,7 @@ mod tests {
         }
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         // Dynamic ELF should pull in libc shared libs.
         let shared = resolve_shared_libs(sh).unwrap();
@@ -2258,7 +2172,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/hello.sh", tmp.as_path())];
         // Should not fail (ELF parsing skipped for non-ELF).
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("include-files/hello.sh"));
         let _ = std::fs::remove_file(&tmp);
@@ -2271,7 +2185,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> =
             vec![("include-files/subdir/nested/file.txt", tmp.as_path())];
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("include-files"), "should have include-files dir");
         assert!(
@@ -2319,7 +2233,7 @@ mod tests {
         std::fs::write(&tmp, b"data").unwrap();
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/../etc/passwd", tmp.as_path())];
-        let result = create_initramfs_base(&exe, &[], &includes, true);
+        let result = build_initramfs_base(&exe, &[], &includes, true);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2344,7 +2258,7 @@ mod tests {
         );
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/pipe", fifo_path.as_path())];
-        let result = create_initramfs_base(&exe, &[], &includes, true);
+        let result = build_initramfs_base(&exe, &[], &includes, true);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2360,7 +2274,7 @@ mod tests {
         let _ = std::fs::create_dir(&dir_path);
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/mydir", dir_path.as_path())];
-        let result = create_initramfs_base(&exe, &[], &includes, true);
+        let result = build_initramfs_base(&exe, &[], &includes, true);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2374,265 +2288,12 @@ mod tests {
     fn busybox_independent_of_include_files() {
         let exe = crate::resolve_current_exe().unwrap();
         // busybox=true but no include_files.
-        let base = create_initramfs_base(&exe, &[], &[], true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], true).unwrap();
         let names = cpio_entry_names(&base);
         assert!(
             names.iter().any(|n| n == "bin/busybox"),
             "busybox=true should have bin/busybox entry even without includes: {:?}",
             names
-        );
-    }
-
-    // -- ld.so.conf parsing tests --
-
-    #[test]
-    fn parse_ld_so_conf_empty_file() {
-        let tmp = std::env::temp_dir().join("ktstr-test-ldso-empty");
-        std::fs::write(&tmp, "").unwrap();
-        let paths = parse_ld_so_conf(&tmp);
-        assert!(paths.is_empty());
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn parse_ld_so_conf_comments_and_blank_lines() {
-        let tmp = std::env::temp_dir().join("ktstr-test-ldso-comments");
-        std::fs::write(&tmp, "# comment\n\n# another\n").unwrap();
-        let paths = parse_ld_so_conf(&tmp);
-        assert!(paths.is_empty());
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn parse_ld_so_conf_directory_entries() {
-        let tmp = std::env::temp_dir().join("ktstr-test-ldso-dirs");
-        // /usr/lib exists on all Linux systems.
-        std::fs::write(&tmp, "/usr/lib\n/nonexistent-dir-xyz\n").unwrap();
-        let paths = parse_ld_so_conf(&tmp);
-        assert!(
-            paths.contains(&PathBuf::from("/usr/lib")),
-            "should include existing directory: {:?}",
-            paths
-        );
-        assert!(
-            !paths.contains(&PathBuf::from("/nonexistent-dir-xyz")),
-            "should skip nonexistent directories: {:?}",
-            paths
-        );
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn parse_ld_so_conf_include_directive() {
-        let tmp_dir = std::env::temp_dir().join("ktstr-test-ldso-include");
-        let conf_d = tmp_dir.join("conf.d");
-        let _ = std::fs::create_dir_all(&conf_d);
-        // Create a sub-config that points to /usr/lib.
-        std::fs::write(conf_d.join("test.conf"), "/usr/lib\n").unwrap();
-        // Create main config with include.
-        let main_conf = tmp_dir.join("ld.so.conf");
-        std::fs::write(
-            &main_conf,
-            format!("include {}/conf.d/*.conf\n", tmp_dir.display()),
-        )
-        .unwrap();
-        let paths = parse_ld_so_conf(&main_conf);
-        assert!(
-            paths.contains(&PathBuf::from("/usr/lib")),
-            "include directive should pull in /usr/lib: {:?}",
-            paths
-        );
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }
-
-    #[test]
-    fn parse_ld_so_conf_nonexistent_returns_empty() {
-        let paths = parse_ld_so_conf(Path::new("/nonexistent/ld.so.conf"));
-        assert!(paths.is_empty());
-    }
-
-    #[test]
-    fn parse_ld_so_conf_self_include_does_not_stack_overflow() {
-        // Regression: a config that includes itself previously recursed
-        // without bound and overflowed the stack. The visited-set (keyed on
-        // canonicalized path) must break the cycle on the second visit.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let self_conf = tmp.path().join("self.conf");
-        std::fs::write(
-            &self_conf,
-            format!("include {}/self.conf\n/usr/lib\n", tmp.path().display()),
-        )
-        .unwrap();
-        let paths = parse_ld_so_conf(&self_conf);
-        assert!(
-            paths.contains(&PathBuf::from("/usr/lib")),
-            "self-include must still parse the rest of the file: {:?}",
-            paths
-        );
-    }
-
-    #[test]
-    fn parse_ld_so_conf_mutual_include_does_not_stack_overflow() {
-        // Regression: a ↔ b include cycle previously recursed without bound.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let a = tmp.path().join("a.conf");
-        let b = tmp.path().join("b.conf");
-        std::fs::write(
-            &a,
-            format!("include {}/b.conf\n/usr/lib\n", tmp.path().display()),
-        )
-        .unwrap();
-        std::fs::write(&b, format!("include {}/a.conf\n", tmp.path().display())).unwrap();
-        let paths = parse_ld_so_conf(&a);
-        assert!(
-            paths.contains(&PathBuf::from("/usr/lib")),
-            "mutual include must still collect non-cycle directories: {:?}",
-            paths
-        );
-    }
-
-    #[test]
-    fn parse_ld_so_conf_long_chain_terminates() {
-        // Regression: a deep, acyclic include chain must terminate at
-        // LD_SO_CONF_MAX_DEPTH without stack exhaustion. The terminal file
-        // (only reachable past the depth limit) writes `/usr/lib`; its
-        // absence from the result proves the depth limit actually stopped
-        // descent rather than merely avoiding a crash.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let chain_len = LD_SO_CONF_MAX_DEPTH + 4;
-        for i in 0..chain_len {
-            let this = tmp.path().join(format!("link_{i}.conf"));
-            let next = tmp.path().join(format!("link_{}.conf", i + 1));
-            if i + 1 < chain_len {
-                std::fs::write(&this, format!("include {}\n", next.display())).unwrap();
-            } else {
-                std::fs::write(&this, "/usr/lib\n").unwrap();
-            }
-        }
-        let root = tmp.path().join("link_0.conf");
-        let paths = parse_ld_so_conf(&root);
-        assert!(
-            !paths.contains(&PathBuf::from("/usr/lib")),
-            "depth limit must prevent reading the terminal file at depth {} > {}: {:?}",
-            chain_len - 1,
-            LD_SO_CONF_MAX_DEPTH,
-            paths,
-        );
-    }
-
-    /// Regression: `strip_prefix("include")` also matched any word
-    /// starting with "include" (e.g. "includelocale") as an include
-    /// directive, silently attempting to glob whatever followed.
-    /// Requiring `"include "` with a trailing space fixes this.
-    #[test]
-    fn parse_ld_so_conf_rejects_include_without_space() {
-        // parse_ld_so_conf only records directories that actually
-        // exist, so point at real on-disk paths under the tempdir.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let real_dir = tmp.path().join("real-lib");
-        std::fs::create_dir(&real_dir).unwrap();
-        let locale_dir = tmp.path().join("locale");
-        std::fs::create_dir(&locale_dir).unwrap();
-        let extra = tmp.path().join("extra.conf");
-        std::fs::write(&extra, format!("{}\n", real_dir.display())).unwrap();
-        let conf = tmp.path().join("fake.conf");
-        // First line: "includelocale" — old code with
-        // `strip_prefix("include")` treats the remainder ("locale")
-        // as a glob pattern and would include whatever matches
-        // ./locale. New code requires `"include "` with a trailing
-        // space so this line is treated as a non-include, non-dir
-        // line and ignored.
-        // Second line: the real include.
-        std::fs::write(
-            &conf,
-            format!("includelocale\ninclude {}\n", extra.display()),
-        )
-        .unwrap();
-        let paths = parse_ld_so_conf(&conf);
-        assert!(
-            paths.contains(&real_dir),
-            "real include must be honored: paths={paths:?}, expected {}",
-            real_dir.display()
-        );
-        assert!(
-            !paths.contains(&locale_dir),
-            "'includelocale' (no trailing space) must not match as an \
-             include directive; ./locale dir must not appear: {paths:?}"
-        );
-    }
-
-    /// Regression: tab-separated `include\tpath.conf` must parse as an
-    /// include directive too. Prior `strip_prefix("include ")` required
-    /// a literal space and silently dropped tab-separated lines, which
-    /// some system ld.so.conf generators emit.
-    #[test]
-    fn parse_ld_so_conf_accepts_tab_separator() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let lib = tmp.path().join("tab-lib");
-        std::fs::create_dir(&lib).unwrap();
-        let extra = tmp.path().join("extra.conf");
-        std::fs::write(&extra, format!("{}\n", lib.display())).unwrap();
-        let conf = tmp.path().join("root.conf");
-        // Tab between "include" and the path.
-        std::fs::write(&conf, format!("include\t{}\n", extra.display())).unwrap();
-        let paths = parse_ld_so_conf(&conf);
-        assert!(
-            paths.contains(&lib),
-            "tab-separated include must be honored: {paths:?}"
-        );
-    }
-
-    /// Regression: relative include paths must resolve against the
-    /// including file's parent directory (glibc semantics), not the
-    /// process CWD. Previously a `include nested.conf` from
-    /// `/etc/ld.so.conf.d/*.conf` silently missed its sibling file
-    /// when CWD was unrelated.
-    #[test]
-    fn parse_ld_so_conf_resolves_relative_include_against_parent() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let sub = tmp.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let resolved = tmp.path().join("resolved-relative");
-        std::fs::create_dir(&resolved).unwrap();
-        let main = sub.join("main.conf");
-        let sibling = sub.join("sibling.conf");
-        std::fs::write(&main, "include sibling.conf\n").unwrap();
-        std::fs::write(&sibling, format!("{}\n", resolved.display())).unwrap();
-        let paths = parse_ld_so_conf(&main);
-        assert!(
-            paths.contains(&resolved),
-            "relative include must resolve against main.conf's parent dir: {paths:?}"
-        );
-    }
-
-    /// Regression: multi-component globs like `subdir/*/file.conf`
-    /// used to silently match nothing because the old file_name()-only
-    /// matcher ignored the wildcard directory segment.
-    #[test]
-    fn parse_ld_so_conf_multi_component_glob_matches() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let inner_a = tmp.path().join("a").join("inner");
-        let inner_b = tmp.path().join("b").join("inner");
-        std::fs::create_dir_all(&inner_a).unwrap();
-        std::fs::create_dir_all(&inner_b).unwrap();
-        // Real on-disk dirs that the include files point at —
-        // parse_ld_so_conf rejects non-existent directories.
-        let lib_a = tmp.path().join("lib-a");
-        let lib_b = tmp.path().join("lib-b");
-        std::fs::create_dir(&lib_a).unwrap();
-        std::fs::create_dir(&lib_b).unwrap();
-        std::fs::write(inner_a.join("lib.conf"), format!("{}\n", lib_a.display())).unwrap();
-        std::fs::write(inner_b.join("lib.conf"), format!("{}\n", lib_b.display())).unwrap();
-        let root = tmp.path().join("root.conf");
-        std::fs::write(
-            &root,
-            format!("include {}/*/inner/lib.conf\n", tmp.path().display()),
-        )
-        .unwrap();
-        let paths = parse_ld_so_conf(&root);
-        assert!(
-            paths.contains(&lib_a) && paths.contains(&lib_b),
-            "multi-component glob must expand both matching files: {paths:?}"
         );
     }
 
@@ -2696,7 +2357,7 @@ mod tests {
     #[test]
     fn no_duplicate_cpio_entries() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let entries = cpio_entries(&base);
         let mut seen = std::collections::HashSet::new();
         let mut duplicates = Vec::new();
@@ -2733,7 +2394,7 @@ mod tests {
             ("usr/local/custom/platform/lib/libcustom3.so", f3.as_path()),
         ];
 
-        let base = create_initramfs_base(&exe, &[], &includes, false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, false).unwrap();
         let entries = cpio_entries(&base);
         let entry_names: Vec<&str> = entries.iter().map(|(n, _, _, _)| n.as_str()).collect();
 
@@ -2824,7 +2485,7 @@ mod tests {
         }
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
-        let base = create_initramfs_base(&exe, &[], &includes, false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, false).unwrap();
         let entries = cpio_entries(&base);
         let entry_map: std::collections::HashMap<&str, (u32, u32, u32)> = entries
             .iter()
@@ -2862,7 +2523,7 @@ mod tests {
         // Verify that all entries use ino=0 and nlink=1, so the kernel
         // initramfs unpacker never enters the hardlink path.
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let mut remaining: &[u8] = base.as_slice();
         while let Ok(reader) = cpio::newc::Reader::new(remaining) {
             if reader.entry().is_trailer() {
