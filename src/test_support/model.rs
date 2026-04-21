@@ -63,13 +63,17 @@
 //!    This is the failure point for `KTSTR_MODEL_OFFLINE=1` with an
 //!    uncached artifact and for a placeholder/malformed SHA pin.
 //!    The result is memoized in the process-wide [`MODEL_CACHE`]
-//!    `OnceLock<Result<Mutex<LoadedInference>, String>>` via
-//!    [`OnceLock::get_or_init`]: concurrent first-call races
-//!    serialize on the cell (at most one load runs end-to-end), and
-//!    a failed load is cached as `Err` so subsequent calls fail-closed
-//!    without repeating the 2.44 GiB load. The outer `Mutex` then
-//!    serializes repeated generation passes against the shared
-//!    `ModelWeights`.
+//!    `Mutex<Option<Arc<Result<Mutex<LoadedInference>, String>>>>`
+//!    via [`memoized_inference`]: concurrent first-call races
+//!    serialize on the outer `Mutex` (at most one load runs
+//!    end-to-end), and a failed load is cached as `Err` so subsequent
+//!    calls fail-closed without repeating the 2.44 GiB load. The
+//!    inner `Mutex` then serializes repeated generation passes
+//!    against the shared `ModelWeights`. Tests that mutate
+//!    `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` call
+//!    [`reset_for_test`] (cfg(test)-only) before asserting offline-gate
+//!    trip behavior so a previously-memoized `Ok(_)` does not bypass
+//!    the gate.
 //! 3. `invoke_with_model` (module-private) runs one greedy
 //!    generation pass against the loaded state: clears the KV cache
 //!    up front (idempotence guarantee), feeds the ChatML-wrapped
@@ -90,15 +94,18 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use super::KTSTR_TESTS;
 use super::payload::OutputFormat;
 
 /// Set by [`prefetch_if_required`] when both [`ensure`] calls
 /// succeed; read by [`load_inference`] to skip the redundant second
-/// SHA hash. Never reset — [`MODEL_CACHE`] memoizes `load_inference`
-/// once per process (absent panics in the load closure).
+/// SHA hash. Cleared by [`reset_for_test`] alongside [`MODEL_CACHE`]
+/// so cfg(test) callers that re-flip `KTSTR_MODEL_OFFLINE` do not
+/// observe a stale "prefetch ran successfully" signal that would
+/// route the next `load_inference` through `locate()` and bypass the
+/// offline gate that [`ensure`] enforces.
 ///
 /// Set only on the all-success path of `prefetch_if_required` — after
 /// both `ensure(&DEFAULT_MODEL)` and `ensure(&DEFAULT_TOKENIZER)`
@@ -111,15 +118,22 @@ static PREFETCH_VERIFIED: AtomicBool = AtomicBool::new(false);
 
 /// Process-wide memoized inference state.
 ///
+/// The outer `Mutex` serializes initialization and gates access to the
+/// `Option`; the inner `Arc` lets concurrent callers each hold the
+/// shared inference state for the duration of their generation pass
+/// without keeping the outer mutex locked. The double layer of
+/// `Mutex`es (outer over the slot, inner over the model) is
+/// deliberate — see "Lock layering" below.
+///
 /// # Serialization guarantee
 ///
-/// [`OnceLock::get_or_init`] runs the initializer at most once per
-/// process even under concurrent first-call races: every caller
-/// observes the same stored value, and exactly one caller's closure
-/// executes end-to-end. Competing callers block on the cell until that
-/// initializer returns, so the 2.44 GiB GGUF load, tokenizer parse,
-/// and EOS-id resolution in `load_inference` happen at most once
-/// rather than once per racing thread.
+/// The outer `Mutex` makes [`memoized_inference`] atomic: a caller
+/// arriving with the slot still `None` runs `load_inference`
+/// end-to-end and stores the result; competing callers block on the
+/// `lock()` until the initializer returns, then read the now-`Some`
+/// slot and proceed. So the 2.44 GiB GGUF load, tokenizer parse, and
+/// EOS-id resolution in `load_inference` happen at most once per
+/// process rather than once per racing thread.
 ///
 /// # Fail-closed on load error
 ///
@@ -130,23 +144,49 @@ static PREFETCH_VERIFIED: AtomicBool = AtomicBool::new(false);
 /// re-attempting the load. Retrying would repeat the same failure —
 /// the offline gate does not flip, a placeholder pin does not become
 /// real, and a corrupt cache entry does not self-heal — so re-trying
-/// would only burn wall time. The error is stored pre-rendered as
-/// a `String` (the full `{e:#}` chain of the original
-/// `anyhow::Error`) because `OnceLock` hands out shared `&Err(_)`
-/// references and every cached-miss call wants the same human-
-/// readable message in its `tracing::warn` line — rendering once at
+/// would only burn wall time. The error is stored pre-rendered as a
+/// `String` (the full `{e:#}` chain of the original `anyhow::Error`)
+/// because every cached-miss call wants the same human-readable
+/// message in its `tracing::warn` line — rendering once at
 /// memoization time keeps the hot path a cheap `&str` borrow.
 ///
 /// # Panic vs. returned Err
 ///
 /// Only a returned `Err` is fail-closed — a panic inside the
-/// `load_inference` closure leaves the `OnceLock` cell uninitialized
-/// (per [`OnceLock::get_or_init`]'s contract) and the next caller
-/// re-runs the initializer. Fail-closed memoization therefore applies
-/// exclusively to errors returned through the normal `Result` channel;
-/// load paths that can panic (e.g. candle-side allocation failure) do
-/// not poison the cache.
-static MODEL_CACHE: OnceLock<Result<Mutex<LoadedInference>, String>> = OnceLock::new();
+/// `load_inference` closure leaves the slot still `None` (the
+/// assignment that stores the `Some(_)` runs after `load_inference`
+/// returns) and the next caller re-runs the initializer. The outer
+/// `Mutex` will be marked poisoned by the panic, but
+/// [`memoized_inference`] recovers via `unwrap_or_else(|e|
+/// e.into_inner())` so a poisoned lock does not wedge later callers.
+/// Fail-closed memoization therefore applies exclusively to errors
+/// returned through the normal `Result` channel; load paths that can
+/// panic (e.g. candle-side allocation failure) do not poison the
+/// cache.
+///
+/// # Lock layering
+///
+/// The outer `Mutex<Option<Arc<...>>>` is held only across the slot
+/// read/init/clone window — sub-microsecond once initialized. The
+/// inner `Mutex<LoadedInference>` is held for the full duration of a
+/// generation pass and serializes concurrent inference calls against
+/// the shared `ModelWeights`. Holding the inner mutex via the cloned
+/// `Arc` (rather than via the outer slot) means a caller running
+/// inference does not block other callers from observing the slot is
+/// already populated.
+///
+/// # Test-only reset
+///
+/// [`reset_for_test`] clears the slot and is the hook tests use to
+/// re-exercise `load_inference` (and through it, `ensure()`'s
+/// offline-gate trip) when they have just mutated `KTSTR_MODEL_OFFLINE`
+/// or `KTSTR_CACHE_DIR`. Without that reset, a successful load in any
+/// earlier test (real or future) would memoize an `Ok(_)` slot that
+/// silently bypassed the offline gate on every subsequent call. The
+/// reset is `#[cfg(test)]`-only — production code never clears the
+/// memoized state.
+type CachedInference = Result<Mutex<LoadedInference>, String>;
+static MODEL_CACHE: Mutex<Option<Arc<CachedInference>>> = Mutex::new(None);
 
 /// Pinned description of a model artifact the cache knows how to
 /// fetch and verify.
@@ -1190,6 +1230,63 @@ fn strip_think_block(s: &str) -> String {
     out
 }
 
+/// Return the memoized [`MODEL_CACHE`] entry, populating it under the
+/// outer mutex on the first call.
+///
+/// Returns `Arc<CachedInference>` so the caller releases the outer
+/// mutex before running inference: the inner `Mutex<LoadedInference>`
+/// is held for the full generation pass and another thread initiating
+/// `extract_via_llm` should be free to observe the populated slot
+/// without waiting on the inference in flight. Cloning the `Arc` is
+/// cheap (one atomic increment); the only synchronization on the
+/// outer mutex is the lock + (slot read or load + store) + unlock.
+fn memoized_inference() -> Arc<CachedInference> {
+    let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(arc) = guard.as_ref() {
+        return Arc::clone(arc);
+    }
+    let result = load_inference()
+        .map(Mutex::new)
+        .map_err(|e| format!("{e:#}"));
+    let arc = Arc::new(result);
+    *guard = Some(Arc::clone(&arc));
+    arc
+}
+
+/// Clear [`MODEL_CACHE`] and [`PREFETCH_VERIFIED`] so the next
+/// [`extract_via_llm`] / [`load_inference`] call re-runs the load
+/// path end-to-end (including [`ensure`]'s offline-gate check).
+///
+/// # When to call
+///
+/// Tests that mutate `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` and
+/// then assert offline-gate / load-failure behavior. Without this
+/// reset, an `Ok(_)` slot left by an earlier successful load — in any
+/// test or any prior call within the same process — would short-
+/// circuit `extract_via_llm` and return cached inference state
+/// without ever consulting `ensure()`, silently bypassing the gate.
+///
+/// # Locking order
+///
+/// Callers must hold
+/// [`crate::test_support::test_helpers::ENV_LOCK`] across both the
+/// reset and any subsequent env-var mutations + `extract_via_llm`
+/// calls that depend on the freshly cleared slot. The lock keeps the
+/// reset, the env mutation, and the next initialization atomic with
+/// respect to other env-touching tests in this process.
+///
+/// # cfg(test)-only
+///
+/// Production code never resets the cache: the memoized state is
+/// load-once-per-process by design. The reset hook is a test-only
+/// affordance for re-exercising the load path.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    PREFETCH_VERIFIED.store(false, Ordering::Release);
+    let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
 /// Run the full LlmExtract pipeline against `stdout` and return the
 /// resulting metrics, all pre-tagged with
 /// [`MetricSource::LlmExtract`](super::MetricSource::LlmExtract).
@@ -1208,17 +1305,13 @@ fn strip_think_block(s: &str) -> String {
 pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Metric> {
     let prompt = compose_prompt(stdout, hint);
 
-    // `get_or_init` serializes concurrent first-call races: every
-    // caller observes the same stored value, and exactly one caller's
-    // closure runs end-to-end while competing callers block on the
-    // cell. A failed load is memoized as `Err` so subsequent calls
-    // return an empty metric set without repeating the 2.44 GiB load.
-    let cache = MODEL_CACHE.get_or_init(|| {
-        load_inference()
-            .map(Mutex::new)
-            .map_err(|e| format!("{e:#}"))
-    });
-    let cache = match cache {
+    // `memoized_inference` serializes concurrent first-call races on
+    // the outer mutex: every caller observes the same stored value,
+    // and exactly one caller's closure runs end-to-end. A failed load
+    // is memoized as `Err` so subsequent calls return an empty metric
+    // set without repeating the 2.44 GiB load.
+    let cached = memoized_inference();
+    let cache = match cached.as_ref() {
         Ok(c) => c,
         Err(msg) => {
             tracing::warn!(%msg, "LlmExtract model load failed (cached)");
@@ -2417,11 +2510,16 @@ mod tests {
     /// distinguish a user-requested skip from a pipeline bug. Pins
     /// the offline-gate trip point so a regression that swallowed
     /// the env var context would fire here first.
+    ///
+    /// Calls [`reset_for_test`] under `ENV_LOCK` so a `PREFETCH_VERIFIED
+    /// = true` set by an earlier test does not route this call through
+    /// `locate()` (which skips the offline-gate `ensure()` it expects).
     #[test]
     fn load_inference_errs_with_offline_message_under_offline_gate() {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
         let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
         let _env_cache = super::super::test_helpers::EnvVarGuard::set(
@@ -2446,11 +2544,21 @@ mod tests {
     /// must not panic on any stdout shape. The offline gate trips
     /// `ensure()` before any model load, so the inference call
     /// fails cleanly and the pipeline reports no metrics.
+    ///
+    /// Calls [`reset_for_test`] under `ENV_LOCK` so a previously
+    /// memoized `Ok(_)` slot in [`MODEL_CACHE`] cannot bypass the
+    /// offline gate this test means to exercise. Without the reset,
+    /// any earlier successful load anywhere in the test binary would
+    /// short-circuit `extract_via_llm` and leave this test passing
+    /// for the wrong reason ("returned Vec::new() because cached
+    /// inference produced no JSON" rather than "returned Vec::new()
+    /// because the offline gate tripped").
     #[test]
     fn extract_via_llm_returns_empty_when_backend_unavailable() {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
         let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
         let _env_cache = super::super::test_helpers::EnvVarGuard::set(
@@ -2461,6 +2569,84 @@ mod tests {
         assert!(metrics.is_empty());
         let metrics = extract_via_llm("stdout with hint", Some("focus"));
         assert!(metrics.is_empty());
+    }
+
+    /// `reset_for_test()` clears both [`MODEL_CACHE`] and
+    /// [`PREFETCH_VERIFIED`] so the next `extract_via_llm` /
+    /// `load_inference` call re-runs the load path end-to-end.
+    ///
+    /// The contract this pins:
+    /// 1. After `reset_for_test()`, the outer `MODEL_CACHE` slot is
+    ///    `None` — the next `extract_via_llm` call re-runs
+    ///    `load_inference` (and through it, `ensure()`'s offline gate).
+    /// 2. After `reset_for_test()`, `PREFETCH_VERIFIED` is `false` so
+    ///    the next `load_inference` falls back to `ensure()` rather
+    ///    than `locate()` and the offline gate is consulted again.
+    ///
+    /// Drives the contract with `KTSTR_MODEL_OFFLINE=1`: a first
+    /// `extract_via_llm` call populates the slot with `Err`. We then
+    /// flip the slot to a synthetic `Ok(...)` payload (so the bug-
+    /// pollution the reset is preventing is visible — without the
+    /// reset, a downstream call would observe the synthetic Ok and
+    /// skip the offline gate). After `reset_for_test()`, the next
+    /// `extract_via_llm` call re-runs `ensure()`, the offline gate
+    /// trips, and the cache lands at `Err` again. `assert_eq!` on
+    /// the rendered error chains proves the same offline-gate code
+    /// path ran both times.
+    #[test]
+    fn reset_for_test_clears_model_cache_and_prefetch_verified() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Seed a populated slot so we can prove reset clears it. Use
+        // the offline-gate path so seeding doesn't try to load the
+        // 2.44 GiB GGUF.
+        reset_for_test();
+        let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
+        // First call — populates MODEL_CACHE with Err(<offline gate>).
+        let _ = extract_via_llm("seed call", None);
+        {
+            let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                guard.is_some(),
+                "first extract_via_llm should populate MODEL_CACHE"
+            );
+        }
+        // Stamp PREFETCH_VERIFIED so we can prove the reset clears it
+        // alongside the cache.
+        PREFETCH_VERIFIED.store(true, Ordering::Release);
+        // Reset: both must be cleared.
+        reset_for_test();
+        {
+            let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                guard.is_none(),
+                "reset_for_test must clear MODEL_CACHE to None"
+            );
+        }
+        assert!(
+            !PREFETCH_VERIFIED.load(Ordering::Acquire),
+            "reset_for_test must clear PREFETCH_VERIFIED to false"
+        );
+        // Subsequent extract_via_llm under the same offline gate must
+        // re-trip ensure() rather than reading a stale cached entry.
+        let _ = extract_via_llm("post-reset call", None);
+        let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let cached = guard
+            .as_ref()
+            .expect("post-reset call should populate MODEL_CACHE");
+        match cached.as_ref() {
+            Err(msg) => assert!(
+                msg.contains(OFFLINE_ENV),
+                "post-reset cached error should mention offline gate, got: {msg}"
+            ),
+            Ok(_) => panic!("post-reset cached entry should be Err under offline gate"),
+        }
     }
 
     /// `any_test_requires_model()` scans [`KTSTR_TESTS`] and returns
