@@ -2580,8 +2580,7 @@ mod tests {
             .store("kc-untracked", &CacheArtifacts::new(&image), &meta)
             .unwrap();
         assert_eq!(entry.kconfig_status("anything"), KconfigStatus::Untracked);
-        // The convenience method stays consistent: Untracked is not Stale.
-        assert!(!entry.has_stale_kconfig("anything"));
+        assert!(!matches!(entry.kconfig_status("anything"), KconfigStatus::Stale { .. }));
     }
 
     #[test]

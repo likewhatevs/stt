@@ -712,9 +712,8 @@ mod tests {
     /// `find_kernel`'s cache-scan step (step 2) must keep cache
     /// entries whose `ktstr_kconfig_hash` is `None` (pre-tracking
     /// format → [`cache::KconfigStatus::Untracked`]). The filter
-    /// uses [`cache::CacheEntry::has_stale_kconfig`], which only
-    /// returns `true` for the `Stale` variant; `Untracked` falls
-    /// through to the return.
+    /// checks for `KconfigStatus::Stale` specifically; `Untracked`
+    /// falls through to the return.
     ///
     /// A regression that tightened the filter to "anything not
     /// Matches" (e.g. `kconfig_status(&kc) != Matches`) would quietly

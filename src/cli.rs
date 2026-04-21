@@ -2587,14 +2587,13 @@ mod tests {
     /// `kernel_list` renders each cache entry twice — once into the
     /// JSON `stale_kconfig` boolean (inline at the JSON-branch call
     /// site) and once into the human `(stale kconfig)` tag emitted
-    /// by [`format_entry_row`]. Both paths share `has_stale_kconfig`
-    /// as their source of truth, so their reported stale-ness must
-    /// agree on every entry.
+    /// by [`format_entry_row`]. Both paths derive staleness from
+    /// `kconfig_status`, so their reported stale-ness must agree on
+    /// every entry.
     ///
-    /// A regression that changes one path to `kconfig_status !=
-    /// Matches` (pulling `Untracked` into the stale bucket) while
-    /// leaving the other on `has_stale_kconfig` would diverge the
-    /// human and JSON outputs without breaking either in isolation.
+    /// A regression that changes one path's variant matching without
+    /// updating the other would diverge the human and JSON outputs
+    /// without breaking either in isolation.
     /// This test exercises each KconfigStatus variant and asserts the
     /// two paths produce the same answer.
     #[test]
@@ -2632,12 +2631,10 @@ mod tests {
                 .store(label, &CacheArtifacts::new(&image), &meta)
                 .unwrap();
 
-            // Mirror the JSON branch's inline expression at the
-            // `stale_kconfig` field (cli::kernel_list, JSON arm).
-            let json_stale = entry.has_stale_kconfig(current_hash);
+            let json_stale = matches!(entry.kconfig_status(current_hash), KconfigStatus::Stale { .. });
 
             // Human branch: format_entry_row emits "(stale kconfig)"
-            // iff `entry.has_stale_kconfig(...)` is true.
+            // iff kconfig_status returns Stale.
             let human_row = format_entry_row(&entry, current_hash, &[]);
             let human_stale = human_row.contains("stale kconfig");
 
