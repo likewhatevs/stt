@@ -1553,13 +1553,13 @@ mod tests {
         let entry = store_test_entry(&cache, "match-key", &meta);
         let row = cli::format_entry_row(&entry, "same", &[]);
         assert!(
-            !row.contains("stale kconfig"),
-            "should not show stale marker when hashes match"
+            !row.contains("kconfig"),
+            "matching entry should carry no kconfig tag: {row}"
         );
     }
 
     #[test]
-    fn format_entry_row_no_kconfig_hash() {
+    fn format_entry_row_untracked_kconfig_tagged_distinctly_from_stale() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata();
@@ -1567,7 +1567,11 @@ mod tests {
         let row = cli::format_entry_row(&entry, "anything", &[]);
         assert!(
             !row.contains("stale kconfig"),
-            "should not show stale marker when entry has no hash"
+            "untracked entry must not be tagged as stale: {row}"
+        );
+        assert!(
+            row.contains("untracked kconfig"),
+            "untracked entry must be tagged as such so users can distinguish from matching: {row}"
         );
     }
 

@@ -169,8 +169,10 @@ pub fn format_entry_row(
     let version = meta.version.as_deref().unwrap_or("-");
     let source = meta.source.to_string();
     let mut tags = String::new();
-    if let KconfigStatus::Stale { .. } = entry.kconfig_status(kconfig_hash) {
-        tags.push_str(" (stale kconfig)");
+    match entry.kconfig_status(kconfig_hash) {
+        KconfigStatus::Stale { .. } => tags.push_str(" (stale kconfig)"),
+        KconfigStatus::Untracked => tags.push_str(" (untracked kconfig)"),
+        KconfigStatus::Matches => {}
     }
     if version != "-" && is_eol(version, active_prefixes) {
         tags.push_str(" (EOL)");
@@ -197,11 +199,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
                     let meta = &entry.metadata;
                     let v = meta.version.as_deref().unwrap_or("-");
                     let eol = v != "-" && is_eol(v, &active_prefixes);
-                    let kconfig_status = match entry.kconfig_status(&kconfig_hash) {
-                        KconfigStatus::Matches => "matches",
-                        KconfigStatus::Stale { .. } => "stale",
-                        KconfigStatus::Untracked => "untracked",
-                    };
+                    let kconfig_status = entry.kconfig_status(&kconfig_hash).to_string();
                     serde_json::json!({
                         "key": entry.key,
                         "path": entry.path.display().to_string(),
