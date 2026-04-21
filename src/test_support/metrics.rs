@@ -300,7 +300,7 @@ mod tests {
         // LlmExtract delegates to `model::extract_via_llm`, which
         // calls `load_inference` followed by `invoke_with_model`.
         // Forcing the offline gate makes `ensure()` bail on the
-        // uncached placeholder model, so `load_inference` surfaces
+        // uncached model, so `load_inference` surfaces
         // an `anyhow::Error` and the pipeline returns an empty
         // metric set — non-fatal extraction error so downstream
         // Check evaluation reports each referenced metric as missing
@@ -308,7 +308,12 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
         let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
         let m = extract_metrics("anything", &OutputFormat::LlmExtract(None));
         assert!(m.is_empty());
     }
@@ -321,7 +326,12 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
         let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
         let m = extract_metrics(
             "anything",
             &OutputFormat::LlmExtract(Some("focus on latency")),

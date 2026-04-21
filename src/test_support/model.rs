@@ -757,7 +757,7 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
         .tokenizer
         .decode(&generated, true)
         .map_err(anyhow::Error::msg)?;
-    Ok(strip_think_block(&decoded).to_string())
+    Ok(strip_think_block(&decoded))
 }
 
 /// Strip one or more `<think>…</think>` blocks from the model's raw
@@ -777,11 +777,11 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
 /// closes independently, yielding `"midend"`). `find`-first would
 /// bleed an orphan `</think>` through for nested input; `rfind`-last
 /// would merge siblings into a single phantom block.
-fn strip_think_block(s: &str) -> std::borrow::Cow<'_, str> {
+fn strip_think_block(s: &str) -> String {
     const OPEN: &str = "<think>";
     const CLOSE: &str = "</think>";
     if !s.contains(OPEN) {
-        return std::borrow::Cow::Borrowed(s);
+        return s.to_string();
     }
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -831,7 +831,7 @@ fn strip_think_block(s: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     out.push_str(rest);
-    std::borrow::Cow::Owned(out)
+    out
 }
 
 /// Run the full LlmExtract pipeline against `stdout` and return the
@@ -932,7 +932,7 @@ mod tests {
     fn verify_sha256_matches_empty_file() {
         // SHA-256 of the empty string — a stable external anchor
         // that proves the hasher is wired correctly, independent of
-        // the placeholder DEFAULT_MODEL digest.
+        // the DEFAULT_MODEL digest.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), []).unwrap();
         let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -1284,9 +1284,12 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Forcing offline ensures `ensure` bails on the uncached
-        // placeholder model rather than attempting a network fetch.
+        let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
         let r = load_inference();
         match r {
             Err(e) => {
@@ -1310,7 +1313,12 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
         let metrics = extract_via_llm("arbitrary stdout", None);
         assert!(metrics.is_empty());
         let metrics = extract_via_llm("stdout with hint", Some("focus"));
@@ -1322,11 +1330,7 @@ mod tests {
     #[test]
     fn strip_think_block_noop_on_absent_tag() {
         let s = "plain output with no think block";
-        let out = strip_think_block(s);
-        // Borrowed fast path: input without `<think>` must not
-        // allocate a new String.
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(out, s);
+        assert_eq!(strip_think_block(s), s);
     }
 
     #[test]
@@ -1356,6 +1360,18 @@ mod tests {
         // verbatim so the truncation is visible downstream instead
         // of silently masked by a partial strip.
         let s = "before <think>unclosed trace and then garbage";
+        assert_eq!(strip_think_block(s), s);
+    }
+
+    /// Orphan `</think>` with no matching opener: the scanner only
+    /// fires on `<think>` (the opener substring `<think` followed by
+    /// `>` is not present in `</think>`), so an isolated close tag
+    /// falls through the `contains(OPEN)` fast path and the input is
+    /// returned unchanged. Guards against a regression that would
+    /// treat `</think>` as load-bearing in isolation.
+    #[test]
+    fn strip_think_block_preserves_orphan_close_tag() {
+        let s = "</think>some text";
         assert_eq!(strip_think_block(s), s);
     }
 
