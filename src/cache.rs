@@ -2542,6 +2542,82 @@ mod tests {
         assert!(entry.vmlinux_path().is_none());
     }
 
+    // -- KconfigStatus variants --
+
+    #[test]
+    fn kconfig_status_matches_when_hash_equal() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta =
+            test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("deadbeef".to_string()));
+        let entry = cache
+            .store("kc-match", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert_eq!(entry.kconfig_status("deadbeef"), KconfigStatus::Matches);
+    }
+
+    #[test]
+    fn kconfig_status_untracked_when_no_hash_in_entry() {
+        // Pre-kconfig-tracking cache entries (ktstr_kconfig_hash == None)
+        // must surface as `Untracked`, not `Stale`. `find_kernel`'s
+        // stale-filter at lib.rs treats `Untracked` as "keep" so legacy
+        // entries remain usable — verified here so a regression that
+        // conflates "no recorded hash" with "different hash" surfaces
+        // at unit-test time.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        // test_metadata seeds ktstr_kconfig_hash = Some("def456"); strip
+        // it here to hit the None branch in kconfig_status.
+        let meta = KernelMetadata {
+            ktstr_kconfig_hash: None,
+            ..test_metadata("6.14.2")
+        };
+        let entry = cache
+            .store("kc-untracked", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        assert_eq!(entry.kconfig_status("anything"), KconfigStatus::Untracked);
+        // The convenience method stays consistent: Untracked is not Stale.
+        assert!(!entry.has_stale_kconfig("anything"));
+    }
+
+    #[test]
+    fn kconfig_status_stale_pins_cached_and_current_field_order() {
+        // `KconfigStatus::Stale { cached, current }` names the two
+        // hashes for diagnostics: `cached` is what the entry recorded
+        // at build time, `current` is what the caller is comparing
+        // against. A swap would invert the "was / is" story in every
+        // diagnostic message consuming these fields (e.g. `kernel list`
+        // tags, future error-formatting code). Pin the mapping so a
+        // refactor that swaps the two construction args breaks this
+        // test before it ships a misleading diagnostic.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta =
+            test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("old_cached".to_string()));
+        let entry = cache
+            .store("kc-stale", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        match entry.kconfig_status("new_current") {
+            KconfigStatus::Stale { cached, current } => {
+                assert_eq!(
+                    cached, "old_cached",
+                    "`cached` must hold the hash recorded in the entry"
+                );
+                assert_eq!(
+                    current, "new_current",
+                    "`current` must hold the hash the caller passed in"
+                );
+            }
+            other => panic!("expected KconfigStatus::Stale, got {other:?}"),
+        }
+    }
+
     // -- prefer_source_tree_for_dwarf --
 
     #[test]
