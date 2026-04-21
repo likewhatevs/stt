@@ -3035,9 +3035,10 @@ mod tests {
     /// `neutralize_alloc_relocs` rewrites the `sh_size` field to 0
     /// in every section header whose `sh_type` is `SHT_REL` or
     /// `SHT_RELA` AND whose `sh_flags` carries `SHF_ALLOC`. Pin the
-    /// three observable invariants against a focused fixture:
+    /// four observable invariants against a focused fixture:
     ///
-    /// 1. SHF_ALLOC + SHT_RELA section has sh_size zeroed post-call.
+    /// 1a. SHF_ALLOC + SHT_RELA section has sh_size zeroed post-call.
+    /// 1b. SHF_ALLOC + SHT_REL section has sh_size zeroed post-call.
     /// 2. Non-ALLOC SHT_RELA section has sh_size preserved (guards
     ///    against over-matching — real kernel ELFs carry
     ///    non-ALLOC RELA sections like `.rela.debug_info` that must
@@ -3288,6 +3289,186 @@ mod tests {
         assert_eq!(
             processed, data,
             "neutralize_alloc_relocs must be a byte-identity no-op when no SHF_ALLOC reloc sections are present"
+        );
+    }
+
+    /// `neutralize_alloc_relocs` must be byte-identity idempotent:
+    /// `f(f(x)) == f(x)`. The production filter at cache.rs:937-960
+    /// keys on `sh_type` and `sh_flags` — neither of which the
+    /// function ever writes, only `sh_size` is rewritten. On the
+    /// second pass every matching section header is re-matched (same
+    /// sh_type and sh_flags) and `out[size_offset..size_end].fill(0)`
+    /// rewrites already-zero bytes; every other byte is left untouched
+    /// by `out = data.to_vec()`.
+    ///
+    /// Guards against a future "skip already-zero" optimization that
+    /// drifts the filter predicate (e.g. stops matching headers whose
+    /// `sh_size` is already 0), and against a future mutation that
+    /// widens the rewrite to touch `sh_flags` or `sh_type` — which
+    /// would break idempotence by changing what the second pass
+    /// matches on.
+    ///
+    /// Uses the same 4-section fixture as
+    /// `neutralize_alloc_relocs_zeros_only_sh_size_of_alloc_reloc_sections`
+    /// so both positive (SHT_RELA+ALLOC, SHT_REL+ALLOC) and negative
+    /// (SHT_RELA no-ALLOC, non-RELA .text) paths are re-walked on the
+    /// second pass.
+    #[test]
+    fn neutralize_alloc_relocs_is_idempotent() {
+        use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
+        use object::write;
+
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        // .text — anchored with a symbol so the object writer emits
+        // .symtab/.strtab (matches the sibling test's fixture shape).
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 1);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_text_symbol".to_vec(),
+            value: 0x0,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        // .rela.kaslr — SHT_RELA + SHF_ALLOC. Primary positive case.
+        let kaslr_id = obj.add_section(
+            Vec::new(),
+            b".rela.kaslr".to_vec(),
+            object::SectionKind::Elf(SHT_RELA),
+        );
+        obj.append_section_data(kaslr_id, &[0xA5; 32], 1);
+        obj.section_mut(kaslr_id).flags = object::SectionFlags::Elf {
+            sh_flags: u64::from(SHF_ALLOC),
+        };
+        // .rel.foo — SHT_REL + SHF_ALLOC. Exercises the second arm of
+        // the `is_rela` predicate so a regression that special-cased
+        // only SHT_RELA on re-entry would surface here.
+        let rel_id = obj.add_section(
+            Vec::new(),
+            b".rel.foo".to_vec(),
+            object::SectionKind::Elf(SHT_REL),
+        );
+        obj.append_section_data(rel_id, &[0xC7; 24], 1);
+        obj.section_mut(rel_id).flags = object::SectionFlags::Elf {
+            sh_flags: u64::from(SHF_ALLOC),
+        };
+        // .rela.debug_info — SHT_RELA without SHF_ALLOC. Negative
+        // control on the second pass as well.
+        let rdbg_id = obj.add_section(
+            Vec::new(),
+            b".rela.debug_info".to_vec(),
+            object::SectionKind::Elf(SHT_RELA),
+        );
+        obj.append_section_data(rdbg_id, &[0xB6; 16], 1);
+        // flags left as SectionFlags::None — no SHF_ALLOC.
+
+        let data = obj.write().unwrap();
+
+        let first_pass = neutralize_alloc_relocs(&data).unwrap();
+        let second_pass = neutralize_alloc_relocs(&first_pass).unwrap();
+
+        // Non-vacuous guard: the first call must actually modify bytes
+        // on this fixture (which carries SHF_ALLOC reloc sections); a
+        // degenerate no-op implementation of `neutralize_alloc_relocs`
+        // would trivially satisfy idempotence and must not pass.
+        assert_ne!(
+            first_pass, data,
+            "first call must modify bytes on a fixture with SHF_ALLOC reloc sections; \
+             if this fails, neutralize_alloc_relocs is a no-op"
+        );
+
+        // Primary idempotence assertion: byte equality between passes.
+        assert_eq!(
+            second_pass, first_pass,
+            "neutralize_alloc_relocs must be idempotent: a second pass over its own output produces byte-identical bytes"
+        );
+
+        // Length preservation across both passes — the function only
+        // rewrites in-place `sh_size` fields, never resizes the buffer.
+        assert_eq!(
+            first_pass.len(),
+            data.len(),
+            "first pass must preserve ELF length"
+        );
+        assert_eq!(
+            second_pass.len(),
+            first_pass.len(),
+            "second pass must preserve ELF length"
+        );
+
+        // Re-parse post-second-pass: the ELF header and section
+        // header table must still be well-formed after two rewrites.
+        let post_elf = goblin::elf::Elf::parse(&second_pass)
+            .expect("second-pass output must remain parseable as ELF");
+
+        let mut post_kaslr = None;
+        let mut post_rel = None;
+        let mut post_rdbg = None;
+        for sh in post_elf.section_headers.iter() {
+            let name = post_elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
+            match name {
+                ".rela.kaslr" => post_kaslr = Some(sh.clone()),
+                ".rel.foo" => post_rel = Some(sh.clone()),
+                ".rela.debug_info" => post_rdbg = Some(sh.clone()),
+                _ => {}
+            }
+        }
+        let post_kaslr = post_kaslr.expect(".rela.kaslr must survive second pass");
+        let post_rel = post_rel.expect(".rel.foo must survive second pass");
+        let post_rdbg = post_rdbg.expect(".rela.debug_info must survive second pass");
+
+        // SHF_ALLOC+reloc sections stay zeroed on the second pass.
+        assert_eq!(
+            post_kaslr.sh_size, 0,
+            ".rela.kaslr sh_size must remain zero after the second pass"
+        );
+        assert_eq!(
+            post_rel.sh_size, 0,
+            ".rel.foo sh_size must remain zero after the second pass"
+        );
+
+        // SHF_ALLOC flag must still be set on the zeroed sections —
+        // the function touches sh_size ONLY, never sh_flags.
+        assert!(
+            post_kaslr.sh_flags & u64::from(SHF_ALLOC) != 0,
+            ".rela.kaslr SHF_ALLOC flag must survive both passes; got sh_flags={:#x}",
+            post_kaslr.sh_flags
+        );
+        assert!(
+            post_rel.sh_flags & u64::from(SHF_ALLOC) != 0,
+            ".rel.foo SHF_ALLOC flag must survive both passes; got sh_flags={:#x}",
+            post_rel.sh_flags
+        );
+
+        // Negative control survives both passes untouched: non-ALLOC
+        // SHT_RELA section keeps its original sh_size.
+        assert_eq!(
+            post_rdbg.sh_size, 16,
+            ".rela.debug_info sh_size must be preserved across both passes (no SHF_ALLOC)"
+        );
+    }
+
+    /// `neutralize_alloc_relocs` fails loudly when fed bytes that do
+    /// not parse as an ELF — the goblin parse returns Err and the
+    /// function wraps it in an `anyhow::anyhow!("parse vmlinux ELF
+    /// for preprocess: {e}")`. Pin only the stable "parse vmlinux ELF
+    /// for preprocess" wrapper in `neutralize_alloc_relocs`; the
+    /// goblin-side error text is version-dependent and not part of
+    /// the contract.
+    #[test]
+    fn neutralize_alloc_relocs_rejects_invalid_elf() {
+        let err = neutralize_alloc_relocs(b"not an ELF at all, just some bytes").unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("parse vmlinux ELF for preprocess"),
+            "expected error context to name the ELF parse step; got: {rendered}"
         );
     }
 
