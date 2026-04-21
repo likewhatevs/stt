@@ -101,15 +101,12 @@ pub struct ModelSpec {
 /// Default model served when a payload declares
 /// [`OutputFormat::LlmExtract`] without pointing at a custom pin.
 ///
-/// Qwen3-4B Q4_K_M GGUF (~2.44 GiB). URL points at the official
-/// `Qwen/Qwen3-4B-GGUF` repo on Hugging Face. SHA-256 is a
-/// placeholder until the artifact is hashed locally; the all-`?`
-/// marker trips the hex-decode step in [`verify_sha256`] with a
-/// clear error rather than silently validating the wrong bytes.
+/// Qwen3-4B Q4_K_M GGUF (~2.5 GiB). URL points at the official
+/// `Qwen/Qwen3-4B-GGUF` repo on Hugging Face.
 pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
     file_name: "Qwen3-4B-Q4_K_M.gguf",
     url: "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
-    sha256_hex: "????????????????????????????????????????????????????????????????",
+    sha256_hex: "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
     size_bytes: 2500 * 1024 * 1024,
 };
 
@@ -127,14 +124,10 @@ pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
 /// artifact from its authoritative repo keeps the two pins in sync
 /// with the same Qwen3-4B release.
 ///
-/// SHA-256 is a placeholder on the same footing as [`DEFAULT_MODEL`]
-/// — the all-`?` hex trips [`verify_sha256`] with a clear error
-/// until the artifact is hashed locally. Size is ~11 MiB, a typical
-/// BBPE tokenizer serialization for Qwen3-class models.
 pub const DEFAULT_TOKENIZER: ModelSpec = ModelSpec {
     file_name: "Qwen3-4B-tokenizer.json",
     url: "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/tokenizer.json",
-    sha256_hex: "????????????????????????????????????????????????????????????????",
+    sha256_hex: "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
     size_bytes: 11 * 1024 * 1024,
 };
 
