@@ -740,32 +740,28 @@ fn print_profile_summary(summary: &[(String, Vec<(String, u32)>)]) {
 
     println!("\n--- profile summary ---");
 
-    // Header: program name, then one column per profile.
     let profile_names: Vec<&str> = summary.iter().map(|(n, _)| n.as_str()).collect();
-    print!("  {:<40}", "program");
-    for pn in &profile_names {
-        print!(" {:>12}", pn);
-    }
-    println!();
-    print!("  {}", "-".repeat(40));
-    for _ in &profile_names {
-        print!(" {}", "-".repeat(12));
-    }
-    println!();
+    let mut table = ktstr::cli::new_table();
+    let mut header: Vec<&str> = Vec::with_capacity(1 + profile_names.len());
+    header.push("program");
+    header.extend(profile_names.iter().copied());
+    table.set_header(header);
 
-    // Rows: one per program.
     for prog in &prog_names {
-        print!("  {:<40}", prog);
+        let mut row: Vec<String> = Vec::with_capacity(1 + profile_names.len());
+        row.push(prog.clone());
         for (_, progs) in summary {
             let insns = progs
                 .iter()
                 .find(|(n, _)| n == prog)
                 .map(|(_, v)| *v)
                 .unwrap_or(0);
-            print!(" {:>12}", insns);
+            row.push(insns.to_string());
         }
-        println!();
+        table.add_row(row);
     }
+
+    println!("{table}");
 }
 
 fn run_completions(shell: clap_complete::Shell, binary: &str) {
@@ -1579,6 +1575,7 @@ mod tests {
         let meta = KernelMetadata::new(
             ktstr::cache::KernelSource::Local {
                 source_tree_path: None,
+                git_hash: None,
             },
             "x86_64".to_string(),
             "bzImage".to_string(),
@@ -1593,38 +1590,50 @@ mod tests {
     // in cli::kernel_list, so no test on format_entry_row covers it;
     // the helper itself now takes only the valid CacheEntry shape.
 
-    // -- has_stale_kconfig (via CacheEntry method) --
+    // -- kconfig_status (via CacheEntry method) --
 
     #[test]
-    fn has_stale_kconfig_different_hash() {
+    fn kconfig_status_reports_stale_on_hash_mismatch() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("old".to_string()));
         let entry = store_test_entry(&cache, "stale", &meta);
-        assert!(entry.has_stale_kconfig("new"));
+        assert_eq!(
+            entry.kconfig_status("new"),
+            ktstr::cache::KconfigStatus::Stale {
+                cached: "old".to_string(),
+                current: "new".to_string(),
+            }
+        );
     }
 
     #[test]
-    fn has_stale_kconfig_same_hash() {
+    fn kconfig_status_reports_matches_on_hash_equality() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
         let entry = store_test_entry(&cache, "fresh", &meta);
-        assert!(!entry.has_stale_kconfig("same"));
+        assert_eq!(
+            entry.kconfig_status("same"),
+            ktstr::cache::KconfigStatus::Matches
+        );
     }
 
     #[test]
-    fn has_stale_kconfig_no_hash_in_entry() {
+    fn kconfig_status_reports_untracked_when_entry_has_no_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let meta = test_metadata();
         let entry = store_test_entry(&cache, "no-hash", &meta);
-        assert!(!entry.has_stale_kconfig("anything"));
+        assert_eq!(
+            entry.kconfig_status("anything"),
+            ktstr::cache::KconfigStatus::Untracked
+        );
     }
 
     // Corrupt entries no longer surface as CacheEntry — they are
     // ListedEntry::Corrupt with no metadata-bearing struct — so
-    // has_stale_kconfig isn't reachable from that state.
+    // kconfig_status isn't reachable from that state.
 
     // -- embedded_kconfig_hash --
 

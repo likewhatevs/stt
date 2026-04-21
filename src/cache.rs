@@ -45,10 +45,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// How a cached kernel's source was acquired, with per-variant
-/// payload (git details for `Git`, source-tree path for `Local`).
+/// payload (git details for `Git`, source-tree path and git hash for
+/// `Local`).
 ///
 /// Serialized as `{"type": "tarball"}`, `{"type": "git", "hash": ..., "ref": ...}`,
-/// or `{"type": "local", "source_tree_path": ...}`.
+/// or `{"type": "local", "source_tree_path": ..., "git_hash": ...}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "type")]
 #[non_exhaustive]
@@ -71,6 +72,11 @@ pub enum KernelSource {
         /// been sanitized for remote cache transport or is otherwise
         /// unavailable.
         source_tree_path: Option<PathBuf>,
+        /// Git commit hash of the source tree at build time (short
+        /// form). `None` when the tree is not a git repository or
+        /// the hash could not be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_hash: Option<String>,
     },
 }
 
@@ -253,15 +259,6 @@ impl CacheEntry {
                 current: current_hash.to_string(),
             },
         }
-    }
-
-    /// Convenience: true when [`kconfig_status`](Self::kconfig_status)
-    /// is [`KconfigStatus::Stale`]. `Untracked` returns false.
-    pub fn has_stale_kconfig(&self, current_hash: &str) -> bool {
-        matches!(
-            self.kconfig_status(current_hash),
-            KconfigStatus::Stale { .. }
-        )
     }
 }
 
@@ -759,7 +756,10 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
 /// unrecoverable without re-downloading sources.
 pub fn prefer_source_tree_for_dwarf(dir: &Path) -> Option<PathBuf> {
     let metadata = read_metadata(dir)?;
-    let KernelSource::Local { source_tree_path } = metadata.source else {
+    let KernelSource::Local {
+        source_tree_path, ..
+    } = metadata.source
+    else {
         return None;
     };
     let src_path = source_tree_path?;
@@ -1243,6 +1243,7 @@ mod tests {
             version: Some("6.14.0".to_string()),
             source: KernelSource::Local {
                 source_tree_path: Some(PathBuf::from("/tmp/linux")),
+                git_hash: Some("deadbee".to_string()),
             },
             arch: "x86_64".to_string(),
             image_name: "bzImage".to_string(),
@@ -1257,10 +1258,31 @@ mod tests {
             parsed.source,
             KernelSource::Local {
                 source_tree_path: Some(ref p),
+                git_hash: Some(ref h),
             }
-            if p == &PathBuf::from("/tmp/linux")
+            if p == &PathBuf::from("/tmp/linux") && h == "deadbee"
         ));
         assert!(parsed.has_vmlinux);
+    }
+
+    /// git_hash on KernelSource::Local uses serde(default) and
+    /// skip_serializing_if = Option::is_none. When the field is absent
+    /// in the JSON input, deserialization must fill `None` rather than
+    /// erroring; when `None` on the value being serialized, the key
+    /// must not appear in the emitted JSON.
+    #[test]
+    fn kernel_source_local_git_hash_serde_round_trip_none() {
+        let src = KernelSource::Local {
+            source_tree_path: Some(PathBuf::from("/tmp/linux")),
+            git_hash: None,
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(
+            !json.contains("git_hash"),
+            "git_hash=None must be skipped during serialization, got {json}"
+        );
+        let parsed: KernelSource = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, KernelSource::Local { git_hash: None, .. }));
     }
 
     #[test]
@@ -1278,10 +1300,12 @@ mod tests {
         assert!(g.contains(r#""ref":"main""#));
         let l = serde_json::to_string(&KernelSource::Local {
             source_tree_path: Some(PathBuf::from("/tmp/linux")),
+            git_hash: Some("a1b2c3d".to_string()),
         })
         .unwrap();
         assert!(l.contains(r#""type":"local""#));
         assert!(l.contains(r#""source_tree_path":"/tmp/linux""#));
+        assert!(l.contains(r#""git_hash":"a1b2c3d""#));
     }
 
     // -- CacheDir --
@@ -2516,6 +2540,7 @@ mod tests {
             version: Some("6.14.2".to_string()),
             source: KernelSource::Local {
                 source_tree_path: Some(src_tree.clone()),
+                git_hash: None,
             },
             arch: "x86_64".to_string(),
             image_name: "bzImage".to_string(),
@@ -2548,6 +2573,7 @@ mod tests {
             version: None,
             source: KernelSource::Local {
                 source_tree_path: Some(src_tree),
+                git_hash: None,
             },
             arch: "x86_64".to_string(),
             image_name: "bzImage".to_string(),

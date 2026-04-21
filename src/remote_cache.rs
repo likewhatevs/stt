@@ -79,7 +79,10 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
     // local filesystem paths that must not leak to remote storage.
     // For non-Local source variants there's nothing to sanitize.
     let mut meta_sanitized = metadata.clone();
-    if let crate::cache::KernelSource::Local { source_tree_path } = &mut meta_sanitized.source {
+    if let crate::cache::KernelSource::Local {
+        source_tree_path, ..
+    } = &mut meta_sanitized.source
+    {
         *source_tree_path = None;
     }
 
@@ -610,6 +613,7 @@ mod tests {
         let meta = KernelMetadata::new(
             KernelSource::Local {
                 source_tree_path: Some(std::path::PathBuf::from("/tmp/linux-src")),
+                git_hash: Some("deadbee".to_string()),
             },
             "x86_64".to_string(),
             "bzImage".to_string(),
@@ -618,7 +622,8 @@ mod tests {
         assert!(matches!(
             meta.source,
             KernelSource::Local {
-                source_tree_path: Some(_)
+                source_tree_path: Some(_),
+                git_hash: Some(_),
             }
         ));
 
@@ -635,12 +640,13 @@ mod tests {
         let restored_meta = &restored.metadata;
         assert!(
             matches!(
-                restored_meta.source,
+                &restored_meta.source,
                 KernelSource::Local {
-                    source_tree_path: None
-                }
+                    source_tree_path: None,
+                    git_hash: Some(h),
+                } if h == "deadbee"
             ),
-            "source_tree_path must be stripped during pack"
+            "source_tree_path must be stripped during pack, git_hash must survive"
         );
     }
 

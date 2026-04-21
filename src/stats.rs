@@ -1154,8 +1154,8 @@ pub fn list_runs() -> anyhow::Result<()> {
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
-    println!("{:<40} {:>6}  DATE", "RUN", "TESTS");
-    println!("{}", "-".repeat(60));
+    let mut table = crate::cli::new_table();
+    table.set_header(vec!["RUN", "TESTS", "DATE"]);
     for entry in &entries {
         let key = entry.file_name();
         let key_str = key.to_string_lossy();
@@ -1168,8 +1168,9 @@ pub fn list_runs() -> anyhow::Result<()> {
             .min()
             .unwrap_or("-")
             .to_string();
-        println!("{:<40} {:>6}  {}", key_str, count, date);
+        table.add_row(vec![key_str.to_string(), count.to_string(), date]);
     }
+    println!("{table}");
     Ok(())
 }
 
@@ -1394,23 +1395,26 @@ pub fn compare_runs(
 
     let report = compare_rows(&rows_a, &rows_b, filter, threshold);
 
-    println!(
-        "{:<30} {:<34} {:>10} {:>10} {:>10}  VERDICT",
-        "TEST", "METRIC", a, b, "DELTA"
-    );
-    println!("{}", "-".repeat(112));
+    use comfy_table::{Cell, Color};
+    let mut table = crate::cli::new_table();
+    table.set_header(vec!["TEST", "METRIC", a, b, "DELTA", "VERDICT"]);
     for f in &report.findings {
-        let verdict = if f.is_regression {
-            "\x1b[31mREGRESSION\x1b[0m"
+        let (verdict_text, verdict_color) = if f.is_regression {
+            ("REGRESSION", Color::Red)
         } else {
-            "\x1b[32mimprovement\x1b[0m"
+            ("improvement", Color::Green)
         };
         let label = format!("{}/{}/{}", f.scenario, f.topology, f.work_type);
-        println!(
-            "{:<30} {:<34} {:>10.2} {:>10.2} {:>+10.2}{:<2} {}",
-            label, f.metric.name, f.val_a, f.val_b, f.delta, f.metric.display_unit, verdict,
-        );
+        table.add_row(vec![
+            Cell::new(label),
+            Cell::new(f.metric.name),
+            Cell::new(format!("{:.2}", f.val_a)),
+            Cell::new(format!("{:.2}", f.val_b)),
+            Cell::new(format!("{:+.2}{}", f.delta, f.metric.display_unit)),
+            Cell::new(verdict_text).fg(verdict_color),
+        ]);
     }
+    println!("{table}");
 
     println!();
     println!(

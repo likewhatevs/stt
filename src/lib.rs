@@ -475,8 +475,11 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
             let cache::ListedEntry::Valid(entry) = listed else {
                 continue;
             };
-            // Skip entries built with a different kconfig.
-            if entry.has_stale_kconfig(&kc_hash) {
+            // Skip entries built with a different kconfig. Untracked
+            // (pre-kconfig-tracking) entries are reused — their image
+            // could still boot correctly, and skipping them would
+            // permanently orphan legacy cache entries.
+            if let cache::KconfigStatus::Stale { .. } = entry.kconfig_status(&kc_hash) {
                 continue;
             }
             let image = entry.image_path();

@@ -18,7 +18,8 @@ pub struct AcquiredSource {
     /// Version string if known (e.g. "6.14.2", "6.15-rc3").
     pub version: Option<String>,
     /// How the source was acquired, with per-variant payload
-    /// (git hash/ref for `Git`, source tree path for `Local`).
+    /// (git hash/ref for `Git`, source tree path and git hash for
+    /// `Local`).
     pub kernel_source: crate::cache::KernelSource,
     /// Whether the source is a temporary directory that should be
     /// cleaned up after building.
@@ -628,6 +629,7 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
         version: None,
         kernel_source: crate::cache::KernelSource::Local {
             source_tree_path: Some(canonical),
+            git_hash: short_hash,
         },
         is_temp: false,
         is_dirty,

@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 
-use crate::cache::{CacheDir, CacheEntry};
+use crate::cache::{CacheDir, CacheEntry, KconfigStatus};
 use crate::runner::RunConfig;
 use crate::scenario::{Scenario, flags};
 use crate::workload::WorkType;
@@ -169,7 +169,7 @@ pub fn format_entry_row(
     let version = meta.version.as_deref().unwrap_or("-");
     let source = meta.source.to_string();
     let mut tags = String::new();
-    if entry.has_stale_kconfig(kconfig_hash) {
+    if let KconfigStatus::Stale { .. } = entry.kconfig_status(kconfig_hash) {
         tags.push_str(" (stale kconfig)");
     }
     if version != "-" && is_eol(version, active_prefixes) {
@@ -197,6 +197,11 @@ pub fn kernel_list(json: bool) -> Result<()> {
                     let meta = &entry.metadata;
                     let v = meta.version.as_deref().unwrap_or("-");
                     let eol = v != "-" && is_eol(v, &active_prefixes);
+                    let kconfig_status = match entry.kconfig_status(&kconfig_hash) {
+                        KconfigStatus::Matches => "matches",
+                        KconfigStatus::Stale { .. } => "stale",
+                        KconfigStatus::Untracked => "untracked",
+                    };
                     serde_json::json!({
                         "key": entry.key,
                         "path": entry.path.display().to_string(),
@@ -205,7 +210,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
                         "arch": meta.arch,
                         "built_at": meta.built_at,
                         "ktstr_kconfig_hash": meta.ktstr_kconfig_hash,
-                        "stale_kconfig": entry.has_stale_kconfig(&kconfig_hash),
+                        "kconfig_status": kconfig_status,
                         "eol": eol,
                         "config_hash": meta.config_hash,
                         "image_name": meta.image_name,
@@ -239,12 +244,12 @@ pub fn kernel_list(json: bool) -> Result<()> {
         "  {:<48} {:<12} {:<8} {:<7} BUILT",
         "KEY", "VERSION", "SOURCE", "ARCH"
     );
-    let mut has_stale_kconfig = false;
+    let mut any_stale = false;
     for listed in &entries {
         match listed {
             crate::cache::ListedEntry::Valid(entry) => {
-                if entry.has_stale_kconfig(&kconfig_hash) {
-                    has_stale_kconfig = true;
+                if let KconfigStatus::Stale { .. } = entry.kconfig_status(&kconfig_hash) {
+                    any_stale = true;
                 }
                 println!(
                     "{}",
@@ -256,7 +261,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
             }
         }
     }
-    if has_stale_kconfig {
+    if any_stale {
         eprintln!(
             "warning: entries marked (stale kconfig) were built with a different ktstr.kconfig. \
              Rebuild with: kernel build --force VERSION"
@@ -1363,6 +1368,36 @@ pub fn stderr_color() -> bool {
     use std::io::IsTerminal;
     static COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *COLOR.get_or_init(|| std::io::stderr().is_terminal())
+}
+
+/// Whether stdout supports color (cached per process). Distinct from
+/// [`stderr_color`] because `cargo ktstr stats compare > report.txt`
+/// pipes stdout to a file while leaving stderr on the TTY — gating
+/// stdout tables on the stderr TTY state would leave ANSI escapes
+/// in the file. Table-rendering code paths gate on this reading;
+/// diagnostic/status prints use [`stderr_color`].
+pub fn stdout_color() -> bool {
+    use std::io::IsTerminal;
+    static COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *COLOR.get_or_init(|| std::io::stdout().is_terminal())
+}
+
+/// Build a borderless comfy-table with styling gated on
+/// [`stdout_color`]. When stdout is not a TTY (CI, piped-to-file),
+/// `force_no_tty` suppresses cell color escapes so a log or grep
+/// capture does not land raw `\x1b[...` sequences. The NOTHING preset
+/// skips box-drawing characters and keeps whitespace-padded columns,
+/// matching the previous hand-rolled `format!("{:<30}…")` look while
+/// auto-measuring each column from actual cell contents.
+pub fn new_table() -> comfy_table::Table {
+    use comfy_table::{ContentArrangement, Table, presets::NOTHING};
+    let mut t = Table::new();
+    t.load_preset(NOTHING);
+    t.set_content_arrangement(ContentArrangement::Disabled);
+    if !stdout_color() {
+        t.force_no_tty();
+    }
+    t
 }
 
 /// Print a styled status message to stderr.

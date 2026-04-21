@@ -632,18 +632,18 @@ pub fn format_verifier_diff(
 
     let mut out = String::new();
     out.push_str(&format!("\ndelta A/B diff: {label_a} vs {label_b}\n"));
-    out.push_str(&format!(
-        "  {:<40} {:>10} {:>10} {:>10}\n",
-        "program", "A", "B", "delta"
-    ));
-    out.push_str(&format!("  {}\n", "-".repeat(72)));
-
+    let mut table = crate::cli::new_table();
+    table.set_header(vec!["program", "A", "B", "delta"]);
     for row in &diff_rows {
-        out.push_str(&format!(
-            "  {:<40} {:>10} {:>10} {:>+10}\n",
-            row.name, row.a, row.b, row.delta
-        ));
+        table.add_row(vec![
+            row.name.clone(),
+            row.a.to_string(),
+            row.b.to_string(),
+            format!("{:+}", row.delta),
+        ]);
     }
+    out.push_str(&table.to_string());
+    out.push('\n');
     out
 }
 

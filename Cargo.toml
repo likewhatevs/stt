@@ -69,6 +69,15 @@ rayon = "1"
 object = { version = "0.37", default-features = false, features = ["build", "std", "elf"] }
 walkdir = "2"
 indicatif = "0.18"
+# Table rendering for stats and verifier CLI output. Replaces hand-rolled
+# `format!("{:<30}...")` layouts plus `"-".repeat()` separators with a
+# builder API that measures column widths from actual content, so labels
+# like `scenario/topology/work_type` stop spilling into adjacent columns
+# when topology names exceed the previously hardcoded 30-column width.
+# Default features pull in crossterm for `Cell::fg(Color::Red/Green)` in
+# the compare_runs VERDICT column; stdout TTY detection is handled by
+# comfy-table itself (see `crate::cli::new_table`).
+comfy-table = "7.2"
 # Stable hash for cache keys — std::hash::DefaultHasher is not
 # guaranteed stable across toolchain versions; siphasher::sip::SipHasher13
 # pins the algorithm so cached artifacts survive Rust updates.
