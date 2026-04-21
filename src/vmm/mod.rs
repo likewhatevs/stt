@@ -1168,6 +1168,21 @@ impl KtstrVm {
         KtstrVmBuilder::default()
     }
 
+    /// Borrow this VM's per-invocation initramfs-suffix inputs into an
+    /// [`initramfs::SuffixParams`]. Centralizes the `run_args` /
+    /// `sched_args` / sched-enable / sched-disable / `exec_cmd`
+    /// bundling so both x86_64 and aarch64 paths construct the suffix
+    /// from the same source of truth.
+    fn suffix_params(&self) -> initramfs::SuffixParams<'_> {
+        initramfs::SuffixParams {
+            args: &self.run_args,
+            sched_args: &self.sched_args,
+            sched_enable: &self.sched_enable_cmds,
+            sched_disable: &self.sched_disable_cmds,
+            exec_cmd: self.exec_cmd.as_deref(),
+        }
+    }
+
     /// Boot the VM, run until shutdown/timeout, return captured output.
     pub fn run(&self) -> Result<VmResult> {
         let start = Instant::now();
@@ -1864,16 +1879,7 @@ impl KtstrVm {
         let base_bytes: &[u8] = base.as_ref();
 
         let t0 = Instant::now();
-        let enable_refs: Vec<&str> = self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
-        let disable_refs: Vec<&str> = self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
-        let suffix = initramfs::build_suffix_full(
-            base_bytes.len(),
-            &self.run_args,
-            &self.sched_args,
-            &enable_refs,
-            &disable_refs,
-            self.exec_cmd.as_deref(),
-        )?;
+        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
         let uncompressed_size = base_bytes.len() + suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
@@ -1936,16 +1942,7 @@ impl KtstrVm {
         let base_bytes: &[u8] = base.as_ref();
 
         let t0 = Instant::now();
-        let enable_refs: Vec<&str> = self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
-        let disable_refs: Vec<&str> = self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
-        let suffix = initramfs::build_suffix_full(
-            base_bytes.len(),
-            &self.run_args,
-            &self.sched_args,
-            &enable_refs,
-            &disable_refs,
-            self.exec_cmd.as_deref(),
-        )?;
+        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
         let uncompressed_size = base_bytes.len() + suffix.len();
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
@@ -3293,26 +3290,13 @@ impl KtstrVm {
                     .join()
                     .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
                 let base_bytes: &[u8] = base.as_ref();
-                let enable_refs: Vec<&str> =
-                    self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
-                let disable_refs: Vec<&str> =
-                    self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
-                let suffix = initramfs::build_suffix_full(
-                    base_bytes.len(),
-                    &self.run_args,
-                    &self.sched_args,
-                    &enable_refs,
-                    &disable_refs,
-                    self.exec_cmd.as_deref(),
-                )?;
+                let suffix =
+                    initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
                 let uncompressed_size = base_bytes.len() + suffix.len();
 
                 // Compress before computing memory so the formula uses
                 // actual compressed size.
-                let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
-                full.extend_from_slice(base_bytes);
-                full.extend_from_slice(&suffix);
-                let initrd_data = initramfs::lz4_legacy_compress(&full);
+                let initrd_data = initramfs::lz4_compress_combined(base_bytes, &suffix);
                 let total_size = initrd_data.len() as u64;
 
                 let kernel_init_size = read_kernel_init_size(&self.kernel).unwrap_or(0);
@@ -3357,22 +3341,9 @@ impl KtstrVm {
                     .join()
                     .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
                 let base_bytes: &[u8] = base.as_ref();
-                let enable_refs: Vec<&str> =
-                    self.sched_enable_cmds.iter().map(|s| s.as_str()).collect();
-                let disable_refs: Vec<&str> =
-                    self.sched_disable_cmds.iter().map(|s| s.as_str()).collect();
-                let suffix = initramfs::build_suffix_full(
-                    base_bytes.len(),
-                    &self.run_args,
-                    &self.sched_args,
-                    &enable_refs,
-                    &disable_refs,
-                    self.exec_cmd.as_deref(),
-                )?;
-                let mut full = Vec::with_capacity(base_bytes.len() + suffix.len());
-                full.extend_from_slice(base_bytes);
-                full.extend_from_slice(&suffix);
-                let initrd_data = initramfs::lz4_legacy_compress(&full);
+                let suffix =
+                    initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
+                let initrd_data = initramfs::lz4_compress_combined(base_bytes, &suffix);
                 let total_size = initrd_data.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
                 initramfs::load_initramfs_parts(&vm.guest_mem, &[&initrd_data], load_addr)?;

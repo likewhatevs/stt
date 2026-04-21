@@ -457,7 +457,7 @@ fn shell_mode_requested() -> bool {
 }
 
 /// Read /exec_cmd from the initramfs if present.
-/// The host writes this file via build_suffix_full when --exec is used.
+/// The host writes this file via build_suffix when --exec is used.
 fn shell_exec_cmd() -> Option<String> {
     fs::read_to_string("/exec_cmd")
         .ok()
