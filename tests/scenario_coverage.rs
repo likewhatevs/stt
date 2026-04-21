@@ -262,8 +262,8 @@ fn cover_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 #[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 2048)]
-fn cover_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
-    ktstr::scenario::performance::custom_fanout_wake(ctx)
+fn cover_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
+    ktstr::scenario::performance::custom_fan_out_wake(ctx)
 }
 
 // -- watchdog timeout overwrite --

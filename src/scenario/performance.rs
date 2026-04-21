@@ -96,7 +96,7 @@ pub fn custom_cache_pipe_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult>
 /// wake-to-run latency. A second cgroup runs CpuSpin workers to create
 /// CPU contention. Checks wake latency CV to catch inconsistent
 /// receiver placement.
-pub fn custom_fanout_wake(ctx: &Ctx) -> Result<AssertResult> {
+pub fn custom_fan_out_wake(ctx: &Ctx) -> Result<AssertResult> {
     let fan_out = 4usize;
     let group_size = fan_out + 1;
     // Round down to nearest multiple of group_size, at least one group.

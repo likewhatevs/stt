@@ -782,11 +782,11 @@ pub fn all_scenarios() -> Vec<Scenario> {
         ),
         // Performance: 1:N fan-out wake pattern
         custom!(
-            "fanout_wake",
+            "fan_out_wake",
             "performance",
             "1:N futex fan-out wake vs compute workers",
             F_BORROW,
-            custom_fanout_wake
+            custom_fan_out_wake
         ),
         // Performance: fan-out messenger/worker with compute workload
         custom!(
