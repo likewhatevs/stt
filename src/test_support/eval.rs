@@ -919,7 +919,10 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::output::{RESULT_END, RESULT_START};
+    use super::super::output::{
+        RESULT_END, RESULT_START, STAGE_INIT_NOT_STARTED, STAGE_INIT_STARTED_NO_PAYLOAD,
+        STAGE_PAYLOAD_STARTED_NO_RESULT,
+    };
     use super::super::test_helpers::{
         ENV_LOCK, EVAL_TOPO, EnvVarGuard, eevdf_entry, make_vm_result, no_repro, sched_entry,
     };
@@ -1668,7 +1671,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("init script never started"),
+            msg.contains(STAGE_INIT_NOT_STARTED),
             "no sentinels should indicate kernel/mount failure, got: {msg}",
         );
     }
@@ -1693,7 +1696,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("init started but payload never ran"),
+            msg.contains(STAGE_INIT_STARTED_NO_PAYLOAD),
             "init sentinel only should indicate cgroup/scheduler setup failure, got: {msg}",
         );
     }
@@ -1719,7 +1722,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("payload started but produced no test result"),
+            msg.contains(STAGE_PAYLOAD_STARTED_NO_RESULT),
             "both sentinels should indicate payload ran but failed, got: {msg}",
         );
     }
