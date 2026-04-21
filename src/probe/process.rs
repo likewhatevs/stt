@@ -78,7 +78,6 @@ pub struct ProbeDiagnostics {
     /// Whether the trigger fired.
     pub trigger_fired: bool,
     /// Which trigger mechanism attached ("tp_btf").
-    #[serde(default)]
     pub trigger_type: String,
     /// Error from tp_btf/sched_ext_exit attach failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]

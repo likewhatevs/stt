@@ -70,7 +70,6 @@ pub enum KernelSource {
         /// Path to the source tree on disk. `None` when the tree has
         /// been sanitized for remote cache transport or is otherwise
         /// unavailable.
-        #[serde(default)]
         source_tree_path: Option<PathBuf>,
     },
 }
@@ -91,7 +90,6 @@ impl fmt::Display for KernelSource {
 pub struct KernelMetadata {
     /// Kernel version string (e.g. "6.14.2", "6.15-rc3").
     /// `None` for local builds without a version tag.
-    #[serde(default)]
     pub version: Option<String>,
     /// How the kernel source was acquired, with per-source payload.
     pub source: KernelSource,
@@ -100,17 +98,14 @@ pub struct KernelMetadata {
     /// Boot image filename (e.g. "bzImage", "Image").
     pub image_name: String,
     /// CRC32 of the final .config used for the build.
-    #[serde(default)]
     pub config_hash: Option<String>,
     /// ISO 8601 timestamp of when the image was built.
     pub built_at: String,
     /// CRC32 of ktstr.kconfig at build time.
-    #[serde(default)]
     pub ktstr_kconfig_hash: Option<String>,
     /// Whether a stripped vmlinux ELF was cached alongside the image.
     /// When true, the entry directory contains a `vmlinux` file; see
     /// [`strip_vmlinux_debug`] for the strip policy.
-    #[serde(default)]
     pub has_vmlinux: bool,
 }
 
@@ -1198,45 +1193,6 @@ mod tests {
             if p == &PathBuf::from("/tmp/linux")
         ));
         assert!(parsed.has_vmlinux);
-    }
-
-    #[test]
-    fn cache_metadata_deserialize_tagged_tarball() {
-        // Minimal Tarball entry with optional fields absent.
-        let json = r#"{
-            "version": "6.14.2",
-            "source": {"type": "tarball"},
-            "arch": "x86_64",
-            "image_name": "bzImage",
-            "built_at": "2026-04-12T10:00:00Z"
-        }"#;
-        let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.version.as_deref(), Some("6.14.2"));
-        assert_eq!(parsed.source, KernelSource::Tarball);
-        assert!(parsed.config_hash.is_none());
-        assert!(parsed.ktstr_kconfig_hash.is_none());
-        assert!(!parsed.has_vmlinux);
-    }
-
-    #[test]
-    fn cache_metadata_deserialize_null_version() {
-        let json = r#"{
-            "version": null,
-            "source": {"type": "local", "source_tree_path": null},
-            "arch": "x86_64",
-            "image_name": "bzImage",
-            "config_hash": null,
-            "built_at": "2026-04-12T10:00:00Z",
-            "ktstr_kconfig_hash": null
-        }"#;
-        let parsed: KernelMetadata = serde_json::from_str(json).unwrap();
-        assert!(parsed.version.is_none());
-        assert!(matches!(
-            parsed.source,
-            KernelSource::Local {
-                source_tree_path: None
-            }
-        ));
     }
 
     #[test]

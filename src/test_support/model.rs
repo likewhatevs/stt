@@ -55,7 +55,13 @@
 //! payload's [`OutputFormat::LlmExtract`] fires:
 //!
 //! 1. [`compose_prompt`] assembles `{LLM_EXTRACT_PROMPT_TEMPLATE}\n\n{focus}STDOUT:\n{body}`.
-//! 2. [`invoke_with_model`] runs the backend.
+//! 2. `load_inference` (module-private) SHA-verifies the cached
+//!    model + tokenizer and constructs the Qwen3 in-memory state
+//!    (weights, tokenizer, EOS id, device). `invoke_with_model`
+//!    (module-private) then runs one greedy generation pass against
+//!    the loaded state; it calls `model.clear_kv_cache()` up front
+//!    so repeated invocations don't contaminate each other's
+//!    position offsets.
 //! 3. On `Ok`, [`super::metrics::find_and_parse_json`] extracts the
 //!    JSON region; parsed values flow through
 //!    [`super::metrics::walk_json_leaves`] pre-tagged with
@@ -67,9 +73,12 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use super::KTSTR_TESTS;
 use super::payload::OutputFormat;
+
+static MODEL_CACHE: OnceLock<Mutex<LoadedInference>> = OnceLock::new();
 
 /// Pinned description of a model artifact the cache knows how to
 /// fetch and verify.
@@ -263,21 +272,19 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     if st.cached && st.sha_matches {
         return Ok(st.path);
     }
-    if let Some(v) = read_offline_env() {
-        let v_safe = sanitize_env_value(&v);
-        anyhow::bail!(
-            "{OFFLINE_ENV}={v_safe} set but model '{}' is not cached at {}; \
-             pre-seed the cache or unset {OFFLINE_ENV} to fetch.",
-            spec.file_name,
-            st.path.display(),
-        );
-    }
-    // Pre-fetch SHA-pin shape check. `status()` swallowed a malformed
-    // pin via `unwrap_or(false)` on `verify_sha256`, so a placeholder
-    // (all-`?`) `sha256_hex` would silently skip the fast path and
-    // drop through to `fetch` — wasting a 2.5 GiB download before
-    // the post-download `verify_sha256` bails. Catch the placeholder
-    // here so the error surfaces before bytes hit the wire.
+    // SHA-pin shape check runs before the offline-gate check. A
+    // malformed or placeholder pin is a programmer error in the
+    // `ModelSpec` itself — it does not depend on runtime state. Pre-
+    // seeding a cache under the offline gate cannot rescue a broken
+    // pin, so surfacing the shape failure first gives the clearer
+    // diagnostic ("fix the ModelSpec") instead of the downstream
+    // "KTSTR_MODEL_OFFLINE set but not cached" red herring. `status()`
+    // swallowed a malformed pin via `unwrap_or(false)` on
+    // `verify_sha256`, so a placeholder (all-`?`) `sha256_hex` would
+    // silently skip the fast path and drop through to `fetch` —
+    // wasting a 2.5 GiB download before the post-download
+    // `verify_sha256` bails. Catch it here so the error surfaces
+    // before either the offline bail or the network request.
     if spec.sha256_hex.len() != 64 || !spec.sha256_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         anyhow::bail!(
             "model '{}' has a placeholder or malformed SHA-256 pin \
@@ -286,6 +293,15 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
             spec.file_name,
             spec.sha256_hex,
             spec.url,
+        );
+    }
+    if let Some(v) = read_offline_env() {
+        let v_safe = sanitize_env_value(&v);
+        anyhow::bail!(
+            "{OFFLINE_ENV}={v_safe} set but model '{}' is not cached at {}; \
+             pre-seed the cache or unset {OFFLINE_ENV} to fetch.",
+            spec.file_name,
+            st.path.display(),
         );
     }
     fetch(spec, &st.path)
@@ -551,9 +567,10 @@ const SAMPLE_LEN: usize = 512;
 const SEED: u64 = 299_792_458;
 
 /// Loaded inference state: the Qwen3 weights, its tokenizer, and the
-/// resolved EOS token id. Held on the stack of `extract_via_llm` for
-/// the duration of a single pipeline invocation.
-pub(crate) struct LoadedInference {
+/// resolved EOS token id. Threaded through `load_inference` and
+/// `invoke_with_model` — both module-private. Nothing outside
+/// `model.rs` constructs or observes this type.
+struct LoadedInference {
     model: candle_transformers::models::quantized_qwen3::ModelWeights,
     tokenizer: tokenizers::Tokenizer,
     eos_id: u32,
@@ -566,7 +583,7 @@ pub(crate) struct LoadedInference {
 /// Every failure point flows through `anyhow::Error` so
 /// `extract_via_llm` surfaces the full chain (path, cause) when
 /// logging.
-pub(crate) fn load_inference() -> anyhow::Result<LoadedInference> {
+fn load_inference() -> anyhow::Result<LoadedInference> {
     use candle::{Device, quantized::gguf_file};
     use candle_transformers::models::quantized_qwen3::ModelWeights;
     use tokenizers::Tokenizer;
@@ -604,19 +621,27 @@ pub(crate) fn load_inference() -> anyhow::Result<LoadedInference> {
 /// and return the decoded assistant text with any `<think>…</think>`
 /// block stripped.
 ///
-/// Caller contract: invoke `model.clear_kv_cache()` between repeated
-/// calls with the same `LoadedInference`. The KV cache otherwise
-/// carries context from the prior attempt and contaminates the
-/// prompt forward pass's position offsets.
+/// The KV cache is cleared up front on every call so repeated
+/// invocations with the same `LoadedInference` don't carry state
+/// across the prompt forward pass's position offsets — the callee
+/// owns that invariant rather than pushing it onto callers.
 ///
 /// Greedy: `Sampling::ArgMax` with a fixed seed. Output is a
 /// deterministic function of the prompt + weights.
-pub(crate) fn invoke_with_model(
-    state: &mut LoadedInference,
-    prompt: &str,
-) -> anyhow::Result<String> {
+fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Result<String> {
     use candle::Tensor;
     use candle_transformers::generation::{LogitsProcessor, Sampling};
+
+    // A prior invocation may have populated per-layer K/V tensors
+    // addressed by absolute positions `[0, prompt_len + generated)`
+    // of the previous prompt. This call re-starts at `index_pos=0`,
+    // so the stale entries would alias the new prompt's slots and
+    // poison the forward pass. Clearing unconditionally costs a
+    // layer-scoped vec walk per call (see
+    // `candle_transformers::models::quantized_qwen3::ModelWeights::clear_kv_cache`)
+    // and is the lone safety gate keeping `invoke_with_model`
+    // idempotent across repeated calls on the same state.
+    state.model.clear_kv_cache();
 
     // Qwen3 ChatML prompt. The `/no_think` directive at the end of
     // the user turn switches the model out of thinking mode per the
@@ -706,25 +731,61 @@ pub(crate) fn invoke_with_model(
 /// prose surrounding the JSON region, but a half-balanced think
 /// block (missing closing tag from a truncated generation) is left
 /// as-is to avoid hiding corruption.
+///
+/// Tags are matched by depth: each outer `<think>` opens a block and
+/// is closed by the `</think>` whose running depth hits zero. This
+/// handles both nested blocks (`<think><think>x</think></think>` →
+/// both tags belong to one outer block, fully removed) and sibling
+/// blocks (`<think>a</think>mid<think>b</think>end` → each block
+/// closes independently, yielding `"midend"`). `find`-first would
+/// bleed an orphan `</think>` through for nested input; `rfind`-last
+/// would merge siblings into a single phantom block.
 fn strip_think_block(s: &str) -> std::borrow::Cow<'_, str> {
-    if !s.contains("<think>") {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    if !s.contains(OPEN) {
         return std::borrow::Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    while let Some(open) = rest.find("<think>") {
-        out.push_str(&rest[..open]);
-        let after_open = &rest[open + "<think>".len()..];
-        match after_open.find("</think>") {
-            Some(close) => {
-                rest = &after_open[close + "</think>".len()..];
-            }
-            None => {
-                // Unterminated: keep the remaining tail verbatim so a
-                // truncation bug is visible rather than masked.
-                out.push_str(&rest[open..]);
-                rest = "";
-                break;
+    'outer: while let Some(open_idx) = rest.find(OPEN) {
+        out.push_str(&rest[..open_idx]);
+        // Depth scanner: start with depth 1 (the opening tag we just
+        // found) and consume tags until it returns to 0 or we run
+        // out of input. `cursor` indexes into `rest` — its absolute
+        // position within `rest` moves forward monotonically as each
+        // tag is consumed. Using byte positions in a &str is safe
+        // because OPEN and CLOSE are both ASCII, so find() only
+        // returns byte offsets that fall on char boundaries.
+        let mut cursor = open_idx + OPEN.len();
+        let mut depth: usize = 1;
+        while depth > 0 {
+            let tail = &rest[cursor..];
+            let next_open = tail.find(OPEN);
+            let next_close = tail.find(CLOSE);
+            match (next_open, next_close) {
+                (Some(o), Some(c)) if o < c => {
+                    depth += 1;
+                    cursor += o + OPEN.len();
+                }
+                (_, Some(c)) => {
+                    depth -= 1;
+                    cursor += c + CLOSE.len();
+                    if depth == 0 {
+                        rest = &rest[cursor..];
+                        continue 'outer;
+                    }
+                }
+                (Some(_), None) | (None, None) => {
+                    // Unterminated outer block: no `</think>` remains
+                    // to close depth. Keep the remainder verbatim
+                    // from the original opening tag so a truncation
+                    // bug is visible rather than masked by a partial
+                    // strip.
+                    out.push_str(&rest[open_idx..]);
+                    rest = "";
+                    break 'outer;
+                }
             }
         }
     }
@@ -750,13 +811,25 @@ fn strip_think_block(s: &str) -> std::borrow::Cow<'_, str> {
 pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Metric> {
     let prompt = compose_prompt(stdout, hint);
 
-    let mut state = match load_inference() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = ?e, "LlmExtract model load failed");
-            return Vec::new();
+    let cache = match MODEL_CACHE.get() {
+        Some(c) => c,
+        None => {
+            let loaded = match load_inference() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "LlmExtract model load failed");
+                    return Vec::new();
+                }
+            };
+            if MODEL_CACHE.set(Mutex::new(loaded)).is_err() {
+                tracing::debug!("MODEL_CACHE init race; discarding duplicate load");
+            }
+            MODEL_CACHE
+                .get()
+                .expect("MODEL_CACHE populated by this or a racing peer")
         }
     };
+    let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
 
     let response = match invoke_with_model(&mut state, &prompt) {
         Ok(s) => s,
@@ -1357,5 +1430,39 @@ mod tests {
         // of silently masked by a partial strip.
         let s = "before <think>unclosed trace and then garbage";
         assert_eq!(strip_think_block(s), s);
+    }
+
+    /// Nested `<think>` tags must match by depth: the outermost open
+    /// pairs with the outermost close, and everything in between —
+    /// including the inner `<think>inner</think>` — is stripped as
+    /// part of the outer block. A depth-blind `find`-first
+    /// implementation closes on the inner `</think>` and leaves the
+    /// outer `</think>` as an orphan, which is the bug this case
+    /// regression-guards.
+    #[test]
+    fn strip_think_block_handles_nested_tags() {
+        let s = "<think><think>inner</think></think>{\"k\": 1}";
+        assert_eq!(strip_think_block(s), "{\"k\": 1}");
+    }
+
+    /// Nested block embedded between plain text on both sides.
+    /// Verifies that the depth scanner emits pre/post context
+    /// unchanged while collapsing the full outer block (both inner
+    /// and outer `</think>` pair consumed).
+    #[test]
+    fn strip_think_block_handles_nested_tags_with_surrounding_text() {
+        let s = "pre <think>a<think>b</think>c</think> post";
+        assert_eq!(strip_think_block(s), "pre  post");
+    }
+
+    /// Mixed: a nested block followed by an independent sibling
+    /// block. The scanner must close the outer of the first nested
+    /// pair (depth 1→2→1→0) on its own `</think>`, then restart for
+    /// the sibling block — NOT merge the two into a single phantom
+    /// block spanning the intervening text.
+    #[test]
+    fn strip_think_block_handles_nested_then_sibling() {
+        let s = "<think><think>x</think></think>mid<think>y</think>end";
+        assert_eq!(strip_think_block(s), "midend");
     }
 }

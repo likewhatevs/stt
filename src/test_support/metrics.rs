@@ -299,12 +299,13 @@ mod tests {
     #[test]
     fn llm_extract_returns_empty_when_backend_unavailable() {
         // LlmExtract delegates to `model::extract_via_llm`, which
-        // calls `invoke_inference`. Forcing the offline gate makes
-        // `ensure()` bail on the uncached placeholder model, so the
-        // inference call surfaces an `anyhow::Error` and the pipeline
-        // returns an empty metric set — non-fatal extraction error so
-        // downstream Check evaluation reports each referenced metric
-        // as missing rather than failing the whole run.
+        // calls `load_inference` followed by `invoke_with_model`.
+        // Forcing the offline gate makes `ensure()` bail on the
+        // uncached placeholder model, so `load_inference` surfaces
+        // an `anyhow::Error` and the pipeline returns an empty
+        // metric set — non-fatal extraction error so downstream
+        // Check evaluation reports each referenced metric as missing
+        // rather than failing the whole run.
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

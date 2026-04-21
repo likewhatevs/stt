@@ -748,11 +748,14 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
     // genuinely missing at test time.
     match super::model::prefetch_if_required() {
         Ok(Some(path)) => {
-            eprintln!("ktstr: model cache ready at {}", path.display());
+            tracing::info!(path = %path.display(), "model cache ready");
         }
         Ok(None) => {}
         Err(e) => {
-            eprintln!("ktstr: model prefetch failed ({e:#}); LlmExtract tests may fail");
+            tracing::warn!(
+                error = ?e,
+                "model prefetch failed; LlmExtract tests may fail",
+            );
         }
     }
 
@@ -1325,7 +1328,7 @@ mod tests {
 
     #[test]
     fn eval_verify_result_passed_returns_ok() {
-        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_pass__");
         let result = make_vm_result(&output, "", 0, false);
@@ -1348,7 +1351,7 @@ mod tests {
 
     #[test]
     fn eval_verify_result_failed_includes_details() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"},{"kind":"Unfair","message":"spread 45%"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"},{"kind":"Unfair","message":"spread 45%"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_fail_details__");
         let result = make_vm_result(&output, "", 0, false);
@@ -1374,7 +1377,7 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_includes_sched_log() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"worker 0 stuck 5000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"worker 0 stuck 5000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
         );
@@ -1402,7 +1405,7 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_has_fingerprint() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let error_line = "Error: apply_cell_config BPF program returned error -2";
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",
@@ -1495,7 +1498,7 @@ mod tests {
 
     #[test]
     fn eval_no_sched_output_no_fingerprint() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_no_fp__");
         let result = make_vm_result(&output, "", 0, false);
@@ -1519,7 +1522,7 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_has_fingerprint() {
-        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let error_line = "Error: imbalance detected internally";
         let sched_log =
             format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
@@ -1806,7 +1809,7 @@ mod tests {
 
     #[test]
     fn eval_sched_died_includes_console() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_died_console__");
         let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
@@ -1831,7 +1834,7 @@ mod tests {
 
     #[test]
     fn eval_sched_died_includes_monitor() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_died_monitor__");
         let result = crate::vmm::VmResult {
@@ -1883,7 +1886,7 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_includes_sched_log() {
-        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
+        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let sched_log =
             format!("{SCHED_OUTPUT_START}\nscheduler debug output here\n{SCHED_OUTPUT_END}",);
         let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");

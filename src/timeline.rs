@@ -47,7 +47,6 @@ pub struct StimulusEvent {
     pub detail: Option<String>,
     /// Cumulative worker iterations at this event. Used to compute
     /// per-phase throughput (iterations/s).
-    #[serde(default)]
     pub total_iterations: Option<u64>,
 }
 

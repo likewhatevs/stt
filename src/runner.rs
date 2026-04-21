@@ -142,7 +142,6 @@ pub struct ScenarioResult {
     pub details: Vec<AssertDetail>,
     /// Aggregate statistics merged across all cgroups and workers for
     /// this scenario.
-    #[serde(default)]
     pub stats: ScenarioStats,
 }
 
@@ -431,16 +430,6 @@ mod tests {
     }
 
     #[test]
-    fn scenario_result_default_stats() {
-        let json =
-            r#"{"scenario_name":"t","passed":true,"skipped":false,"duration_s":1.0,"details":[]}"#;
-        let r: ScenarioResult = serde_json::from_str(json).unwrap();
-        assert!(r.passed);
-        assert_eq!(r.stats.total_workers, 0);
-        assert_eq!(r.stats.cgroups.len(), 0);
-    }
-
-    #[test]
     fn scenario_result_with_cgroups() {
         let r = ScenarioResult {
             scenario_name: "proportional/default".into(),
@@ -604,26 +593,6 @@ mod tests {
         // Verify stats default to zero, not garbage.
         assert_eq!(r2.stats.worst_spread, 0.0);
         assert_eq!(r2.stats.worst_gap_ms, 0);
-    }
-
-    #[test]
-    fn scenario_result_serde_missing_stats_uses_default_values() {
-        // JSON without "stats" field — serde #[serde(default)] should fill defaults.
-        let json = r#"{"scenario_name":"missing_stats","passed":true,"skipped":false,"duration_s":1.0,"details":[{"kind":"Other","message":"ok"}]}"#;
-        let r: ScenarioResult = serde_json::from_str(json).unwrap();
-        assert_eq!(r.scenario_name, "missing_stats");
-        assert!(r.passed);
-        assert_eq!(r.details.len(), 1);
-        assert_eq!(r.details[0].message, "ok");
-        assert_eq!(r.details[0].kind, crate::assert::DetailKind::Other);
-        // Verify every stats field gets its Default value, not just total_workers.
-        assert_eq!(r.stats.total_workers, 0);
-        assert_eq!(r.stats.total_cpus, 0);
-        assert_eq!(r.stats.total_migrations, 0);
-        assert_eq!(r.stats.worst_spread, 0.0);
-        assert_eq!(r.stats.worst_gap_ms, 0);
-        assert_eq!(r.stats.worst_gap_cpu, 0);
-        assert!(r.stats.cgroups.is_empty());
     }
 
     #[test]
