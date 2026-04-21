@@ -55,18 +55,28 @@
 //! payload's [`OutputFormat::LlmExtract`] fires:
 //!
 //! 1. [`compose_prompt`] assembles `{LLM_EXTRACT_PROMPT_TEMPLATE}\n\n{focus}STDOUT:\n{body}`.
-//! 2. `load_inference` (module-private) SHA-verifies the cached
-//!    model + tokenizer and constructs the Qwen3 in-memory state
-//!    (weights, tokenizer, EOS id, device). `invoke_with_model`
-//!    (module-private) then runs one greedy generation pass against
-//!    the loaded state; it calls `model.clear_kv_cache()` up front
-//!    so repeated invocations don't contaminate each other's
-//!    position offsets.
-//! 3. On `Ok`, [`super::metrics::find_and_parse_json`] extracts the
+//! 2. `load_inference` (module-private) routes both artifact paths
+//!    through [`ensure`] — SHA-verifying the cached GGUF model and
+//!    tokenizer or surfacing the offline-gate/missing-cache error —
+//!    then opens the GGUF, builds the Qwen3 `ModelWeights`, loads
+//!    the tokenizer, and resolves the `<|im_end|>` EOS token id.
+//!    This is the failure point for `KTSTR_MODEL_OFFLINE=1` with an
+//!    uncached artifact and for a placeholder/malformed SHA pin.
+//!    Result is memoized in the process-wide `MODEL_CACHE` static
+//!    on success so subsequent calls skip the 2.44 GiB load.
+//! 3. `invoke_with_model` (module-private) runs one greedy
+//!    generation pass against the loaded state: clears the KV cache
+//!    up front (idempotence guarantee), feeds the ChatML-wrapped
+//!    `/no_think`-directed prompt through the forward loop under
+//!    `Sampling::ArgMax` with a fixed seed (deterministic output
+//!    per prompt+weights), then passes the decoded text through
+//!    `strip_think_block` (module-private) to remove any leaked
+//!    `<think>…</think>` region before returning.
+//! 4. On `Ok`, [`super::metrics::find_and_parse_json`] extracts the
 //!    JSON region; parsed values flow through
 //!    [`super::metrics::walk_json_leaves`] pre-tagged with
 //!    [`MetricSource::LlmExtract`](crate::test_support::MetricSource::LlmExtract).
-//! 4. A JSON-parse failure or infra error (model missing, forward-
+//! 5. A JSON-parse failure or infra error (model missing, forward-
 //!    pass error) returns an empty metric set. No retry: under
 //!    deterministic ArgMax sampling a second call on the same
 //!    prompt produces byte-identical output.
@@ -140,7 +150,6 @@ pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
 /// its `tokenizer.json` is not published there. Pulling each
 /// artifact from its authoritative repo keeps the two pins in sync
 /// with the same Qwen3-4B release.
-///
 pub const DEFAULT_TOKENIZER: ModelSpec = ModelSpec {
     file_name: "Qwen3-4B-tokenizer.json",
     url: "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/tokenizer.json",
@@ -293,7 +302,7 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // wasting a 2.44 GiB download before the post-download
     // `verify_sha256` bails. Catch it here so the error surfaces
     // before either the offline bail or the network request.
-    if spec.sha256_hex.len() != 64 || !spec.sha256_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_sha256_hex(spec.sha256_hex) {
         anyhow::bail!(
             "model '{}' has a placeholder or malformed SHA-256 pin \
              ({:?}); refusing to download {} until a real digest is \
@@ -406,6 +415,18 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     Ok(final_path.to_path_buf())
 }
 
+/// Canonical predicate for a well-formed SHA-256 hex pin: exactly
+/// 64 ASCII characters, each a hex digit (`0-9a-fA-F`). Shared by
+/// [`ensure`] (pre-fetch shape check on [`ModelSpec::sha256_hex`])
+/// and [`verify_sha256`] (post-read validation of the expected pin);
+/// centralizing the rule prevents drift between the two call sites.
+/// Callers that need to distinguish "wrong length" from "non-hex"
+/// for diagnostics still need their own branching — this helper
+/// collapses the predicate, not the error messages.
+fn is_valid_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Return `Ok(true)` when the file's SHA-256 matches the expected
 /// hex pin (case-insensitive), `Ok(false)` otherwise. `Err` only on
 /// I/O error reading the file or a malformed expected hex string
@@ -416,14 +437,20 @@ fn verify_sha256(path: &std::path::Path, expected_hex: &str) -> Result<bool> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
-    if expected_hex.len() != 64 {
-        anyhow::bail!(
-            "expected SHA-256 hex must be 64 chars, got {} ({:?})",
-            expected_hex.len(),
-            expected_hex,
-        );
-    }
-    if !expected_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_sha256_hex(expected_hex) {
+        // The helper unified the predicate; pick the specific
+        // diagnostic wording from the same two branches the tests
+        // pin (`verify_sha256_rejects_malformed_hex_length` expects
+        // "64 chars", `verify_sha256_rejects_non_hex_chars` expects
+        // "non-hex"). Length is checked first so a non-64 string of
+        // all hex digits surfaces as a length error.
+        if expected_hex.len() != 64 {
+            anyhow::bail!(
+                "expected SHA-256 hex must be 64 chars, got {} ({:?})",
+                expected_hex.len(),
+                expected_hex,
+            );
+        }
         anyhow::bail!(
             "expected SHA-256 hex contains non-hex chars: {:?}",
             expected_hex,
