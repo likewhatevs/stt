@@ -917,6 +917,14 @@ pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Me
     match super::metrics::find_and_parse_json(&response) {
         Some(json) => super::metrics::walk_json_leaves(&json, super::MetricSource::LlmExtract),
         None => {
+            // Intentionally log only `response.len()` (byte count), not
+            // the body. The response can run up to SAMPLE_LEN tokens —
+            // multi-KB chat output with leaked `<think>` traces under
+            // pathological inputs — and dumping that into the tracing
+            // subscriber floods CI logs while leaking prompt-dependent
+            // content. The byte count plus the emitted event is enough
+            // to diagnose "empty response" vs "large response missing
+            // JSON region" without the payload itself.
             tracing::warn!(
                 response_bytes = response.len(),
                 "LlmExtract response was not parseable JSON; returning empty metric set",
@@ -2071,5 +2079,75 @@ mod tests {
             rendered.contains("non-HTTPS"),
             "expected reject_insecure_url error through ensure→fetch, got: {rendered}"
         );
+    }
+
+    /// Under OFFLINE=1 with a cached file whose bytes do NOT match the
+    /// declared SHA pin, status() returns `cached=true, sha_matches=false`
+    /// and ensure() must bail with the offline-gate error — NOT attempt
+    /// a re-download. Pins two invariants: (1) status() correctly
+    /// classifies a stale cache (bytes present, hash wrong), and (2)
+    /// ensure() prefers "offline, refuse network" over "stale cache,
+    /// re-download silently" when OFFLINE is set. A regression that
+    /// tried to re-fetch under offline would surface as reqwest-side
+    /// error rather than the clear OFFLINE_ENV message.
+    #[test]
+    fn ensure_under_offline_bails_on_stale_cache_sha_mismatch() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
+        let spec = ModelSpec {
+            file_name: "stale.gguf",
+            url: "https://placeholder.example/stale.gguf",
+            // Valid-shape pin; actual bytes written below will not
+            // hash to this.
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 16,
+        };
+        let on_disk = tmp.path().join(spec.file_name);
+        std::fs::write(&on_disk, b"wrong bytes for pin").unwrap();
+        // Verify status() classifies correctly before running ensure.
+        let st = status(&spec).expect("status should not error on valid-shape pin");
+        assert!(st.cached, "file exists, status must report cached=true");
+        assert!(
+            !st.sha_matches,
+            "bytes don't match zero-pin; sha_matches must be false"
+        );
+        // Now ensure() should bail with the offline-gate error, not
+        // attempt to re-fetch.
+        let err = ensure(&spec).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(OFFLINE_ENV),
+            "expected offline-gate bail on stale cache, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("non-HTTPS"),
+            "expected offline-path bail, not the URL-scheme path: {rendered}"
+        );
+    }
+
+    /// A `<think>` opener that appears INSIDE a think block
+    /// without a matching second `</think>` leaves the outer block
+    /// unterminated. Input `<think>the string <think> appears</think>`
+    /// has two openers (depth rises to 2) but only one closer (depth
+    /// drops to 1); the scanner exhausts input with depth still > 0
+    /// and takes the unterminated branch — emitting the entire
+    /// string verbatim so the truncation is visible downstream.
+    /// Distinct from `strip_think_block_handles_nested_tags`
+    /// (balanced nesting collapses cleanly) and
+    /// `strip_think_block_preserves_unterminated_open_tag` (depth-1
+    /// unterminated) — this exercises the depth-2-unterminated path
+    /// that arises when the model emits a literal `<think>` token
+    /// inside its reasoning body.
+    #[test]
+    fn strip_think_block_preserves_inner_opener_with_missing_outer_close() {
+        let s = "<think>the string <think> appears</think>";
+        assert_eq!(strip_think_block(s), s);
     }
 }
