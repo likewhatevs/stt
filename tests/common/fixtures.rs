@@ -52,6 +52,36 @@
 //! [...])]`. The binary names themselves (`"fio"`, `"stress-ng"`,
 //! `"schbench"`) are what ktstr's include-files infrastructure
 //! resolves inside the guest.
+//!
+//! # Polarity::Unknown downstream
+//!
+//! Metrics extracted from a hinted payload are matched against the
+//! payload's `metrics` table by name in
+//! [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun)'s post-exit pipeline;
+//! names with no matching hint land with
+//! [`Polarity::Unknown`](ktstr::test_support::Polarity::Unknown) and
+//! an empty unit. Unknown propagates as follows:
+//!
+//! - **`Check` assertion pass** — [`Check`](ktstr::test_support::Check)
+//!   variants (`Min`, `Max`, `Range`, `Exists`, `ExitCodeEq`) compare
+//!   values to thresholds without consulting polarity. An Unknown
+//!   metric fails checks the same way a hinted metric does; polarity
+//!   plays no role at assert time.
+//! - **`AssertResult::merge` per-key worst-case** — when multiple
+//!   cgroups contribute the same ext_metric, the merge consults the
+//!   crate-internal `MetricDef` from the `METRICS` registry. Names
+//!   absent from the registry (the case for any Unknown metric not
+//!   also registered at crate scope) default to `higher_is_worse=true`
+//!   and merge by taking the max — conservative for regressions, but
+//!   NOT a declared polarity for the metric.
+//! - **`cargo ktstr test-stats` cross-run comparison** — the
+//!   crate-internal `compare_runs` iterates the `METRICS` registry
+//!   only, so Unknown metrics extracted purely via `MetricHint`
+//!   absence are NOT classified as regression or improvement. They
+//!   are recorded to the sidecar for later manual inspection; to
+//!   surface them in a comparison verdict, register a `MetricDef` in
+//!   `src/stats.rs` or add a `MetricHint` on the payload with an
+//!   explicit polarity.
 
 use ktstr::Payload;
 
@@ -59,9 +89,11 @@ use ktstr::Payload;
 /// scheduler regressions.
 ///
 /// Output format: JSON. Supply `--output-format=json` at the call
-/// site (via `.arg(...)` on the runtime builder, or via a scheduler
-/// default_args entry) or use [`FIO_JSON`] which bakes it into
-/// `default_args` for the common "just give me metrics" path.
+/// site (via `.arg(...)` on the
+/// [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun) builder returned by
+/// `ctx.payload(&FIO)`, or via a scheduler default_args entry) or
+/// use [`FIO_JSON`] which bakes it into `default_args` for the
+/// common "just give me metrics" path.
 ///
 /// **Caveat:** `FIO` leaves `default_args` empty, so invoking it
 /// without `--output-format=json` causes `fio` to emit its
@@ -137,7 +169,8 @@ pub struct FioJsonPayload;
 /// without at least one stressor flag (e.g. `--cpu 1`, `--vm 1`)
 /// causes stress-ng to print usage and exit nonzero on some
 /// versions. Always append a stressor via `.arg(...)` on the
-/// runtime builder.
+/// [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun) builder returned
+/// by `ctx.payload(&STRESS_NG)`.
 ///
 /// Tests that want bogo_ops/sec metrics should declare their own
 /// custom `Payload` via [`#[derive(Payload)]`](ktstr::Payload) and

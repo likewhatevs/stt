@@ -50,6 +50,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// Serialized as `{"type": "tarball"}`, `{"type": "git", "git_hash": ..., "ref": ...}`,
 /// or `{"type": "local", "source_tree_path": ..., "git_hash": ...}`.
+/// Every per-variant payload field is emitted explicitly — `Option`
+/// fields serialize as `null` when `None` rather than being skipped.
+/// The `serde(default)` and `skip_serializing_if` compat shims were
+/// dropped pre-1.0, so a truncated `metadata.json` that omits any of
+/// these keys fails deserialization and surfaces the entry as
+/// [`ListedEntry::Corrupt`] via [`CacheDir::list`] instead of
+/// silently defaulting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "type")]
 #[non_exhaustive]
@@ -60,10 +67,9 @@ pub enum KernelSource {
     /// Shallow clone of a git URL at a caller-specified ref.
     Git {
         /// Git commit hash of the kernel source (short form).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         git_hash: Option<String>,
         /// Git ref used for checkout (branch, tag, or ref spec).
-        #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "ref")]
         git_ref: Option<String>,
     },
     /// Build of a local on-disk kernel source tree.
@@ -78,7 +84,6 @@ pub enum KernelSource {
         /// HEAD hash does not describe a tree with uncommitted
         /// changes, so identifying it by that hash would mislead a
         /// reproducer.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         git_hash: Option<String>,
     },
 }
@@ -1278,11 +1283,12 @@ mod tests {
         assert!(parsed.has_vmlinux);
     }
 
-    /// git_hash on KernelSource::Local uses serde(default) and
-    /// skip_serializing_if = Option::is_none. When the field is absent
-    /// in the JSON input, deserialization must fill `None` rather than
-    /// erroring; when `None` on the value being serialized, the key
-    /// must not appear in the emitted JSON.
+    /// git_hash on KernelSource::Local is a plain Option<String> with
+    /// no serde attributes — the compat shims (serde(default) +
+    /// skip_serializing_if) were removed for pre-1.0, so None
+    /// serializes as an explicit `null` key and deserialization
+    /// accepts `null` (or the key being absent is a deserialization
+    /// error, guarding against truncated cache metadata).
     #[test]
     fn kernel_source_local_git_hash_serde_round_trip_none() {
         let src = KernelSource::Local {
@@ -1291,8 +1297,8 @@ mod tests {
         };
         let json = serde_json::to_string(&src).unwrap();
         assert!(
-            !json.contains("git_hash"),
-            "git_hash=None must be skipped during serialization, got {json}"
+            json.contains(r#""git_hash":null"#),
+            "git_hash=None must round-trip as explicit null, got {json}"
         );
         let parsed: KernelSource = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, KernelSource::Local { git_hash: None, .. }));
