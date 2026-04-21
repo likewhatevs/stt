@@ -808,7 +808,19 @@ fn run_model_status() -> Result<(), String> {
             status.spec.size_bytes / 1024 / 1024
         );
     } else if !status.sha_matches {
-        println!("(cached file failed SHA-256 verification; re-fetch to replace it)");
+        // Distinguish I/O failure during verification from a
+        // successful hash that didn't match the pin. The two have
+        // different remediations: an I/O failure points at the
+        // filesystem entry (permissions, truncation); a mismatch
+        // points at the bytes themselves (re-fetch or re-pin).
+        if let Some(err) = status.sha_check_error.as_deref() {
+            println!(
+                "(cached file could not be verified: {err}; inspect the cache entry \
+                 or re-fetch to replace it)"
+            );
+        } else {
+            println!("(cached file failed SHA-256 verification; re-fetch to replace it)");
+        }
     }
     Ok(())
 }

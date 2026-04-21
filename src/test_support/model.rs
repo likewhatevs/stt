@@ -264,6 +264,22 @@ pub struct ModelStatus {
     pub path: PathBuf,
     pub cached: bool,
     pub sha_matches: bool,
+    /// Rendered error chain from [`verify_sha256`] when the SHA check
+    /// could not complete due to an I/O failure (e.g. permission
+    /// denied, short read, file disappeared between the `metadata()`
+    /// probe and the read). `None` when verification ran to
+    /// completion — regardless of whether the digest matched.
+    ///
+    /// Distinguishes "bytes don't hash to the pin" (`sha_matches =
+    /// false`, `sha_check_error = None`) from "we couldn't read the
+    /// bytes to compute a hash" (`sha_matches = false`,
+    /// `sha_check_error = Some(_)`). Both surface as
+    /// `sha_matches = false` so [`ensure`] treats either as "cache
+    /// entry unusable, replace it"; the distinction is captured here
+    /// so callers that want a precise diagnostic (the offline-gate
+    /// bail, the CLI `model status` readout) can name the underlying
+    /// failure rather than defaulting to "bytes don't match."
+    pub sha_check_error: Option<String>,
 }
 
 /// Resolve the cache root, creating it lazily when a writer needs it.
@@ -298,7 +314,7 @@ pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
 pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
     let root = resolve_cache_root()?;
     let path = root.join(spec.file_name);
-    let (cached, sha_matches) = match std::fs::metadata(&path) {
+    let (cached, sha_matches, sha_check_error) = match std::fs::metadata(&path) {
         Ok(meta) if meta.is_file() => {
             // A cached file is considered "matched" only when the
             // SHA agrees with the pin. Distinguish the two Err
@@ -308,28 +324,32 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
             // pointless re-download branch), while an I/O failure
             // on the cached file (open/read error) means the file
             // is unusable — surface that as `sha_matches = false`
-            // so ensure() replaces it rather than bailing the whole
-            // status() call.
-            let matches = match verify_sha256(&path, spec.sha256_hex) {
-                Ok(m) => m,
+            // with the underlying error captured in
+            // `sha_check_error`, so ensure() replaces the cache
+            // entry and the CLI / offline-gate bail can name the
+            // specific reason rather than the generic "doesn't
+            // match" default.
+            let (matches, check_err) = match verify_sha256(&path, spec.sha256_hex) {
+                Ok(m) => (m, None),
                 Err(e) => {
                     if !is_valid_sha256_hex(spec.sha256_hex) {
                         return Err(e).with_context(|| {
                             format!("verify SHA-256 pin for cached model '{}'", spec.file_name,)
                         });
                     }
-                    false
+                    (false, Some(format!("{e:#}")))
                 }
             };
-            (true, matches)
+            (true, matches, check_err)
         }
-        _ => (false, false),
+        _ => (false, false, None),
     };
     Ok(ModelStatus {
         spec: *spec,
         path,
         cached,
         sha_matches,
+        sha_check_error,
     })
 }
 
@@ -376,15 +396,29 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     }
     if let Some(v) = read_offline_env() {
         let v_safe = sanitize_env_value(&v);
-        // Distinguish the two paths that reach here: a missing cache
-        // entry vs. a present-but-stale one. Both trip the offline
-        // gate, but the remediation differs — a no-cache case needs
-        // pre-seeding, while a stale-cache case needs re-pinning or
-        // re-fetching the bytes. Collapsing them into a single "not
-        // cached" message misroutes the user into a pre-seed step
-        // that a file-present-but-mismatched cache would skip right
-        // past.
+        // Distinguish the three paths that reach here: a missing
+        // cache entry, a present-but-unreadable one (SHA check
+        // failed with an I/O error), and a present-but-stale one
+        // (SHA computed successfully but didn't match the pin).
+        // All three trip the offline gate, but the remediation
+        // differs — a no-cache case needs pre-seeding, a bytes-
+        // mismatch case needs re-pinning or re-fetching the bytes,
+        // and an I/O-unreadable case needs attention to the cache
+        // entry's filesystem state (permissions, truncation,
+        // missing extents). Collapsing these into a single generic
+        // message misroutes the user.
         if st.cached {
+            if let Some(err) = st.sha_check_error.as_deref() {
+                anyhow::bail!(
+                    "{OFFLINE_ENV}={v_safe} set but model '{}' is cached at {} \
+                     and the SHA-256 check could not complete ({}); \
+                     inspect the cache entry (permissions, truncation, \
+                     filesystem errors) or unset {OFFLINE_ENV} to re-fetch.",
+                    spec.file_name,
+                    st.path.display(),
+                    err,
+                );
+            }
             anyhow::bail!(
                 "{OFFLINE_ENV}={v_safe} set but model '{}' is cached at {} \
                  with bytes that do not match the declared SHA-256 pin; \
@@ -1267,6 +1301,19 @@ mod tests {
             "SHA is a fixed zero pin — garbage bytes must not match",
         );
         assert_eq!(st.path, on_disk);
+        // Pin the distinction between "SHA computed, did not match"
+        // and "SHA check failed with I/O error": garbage bytes hash
+        // cleanly to some non-zero digest, so verify_sha256 returns
+        // Ok(false) and `sha_check_error` stays None. The
+        // complementary I/O-error case populates this field; ensure()
+        // and the CLI `model status` readout branch on it to name
+        // the specific remediation.
+        assert!(
+            st.sha_check_error.is_none(),
+            "SHA check completed (mismatch, not I/O error); \
+             sha_check_error must be None, got: {:?}",
+            st.sha_check_error
+        );
     }
 
     /// status() on a file that exists but whose SHA pin is malformed
