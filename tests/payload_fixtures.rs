@@ -162,8 +162,8 @@ fn schbench_identity_fields_are_stable() {
 /// to [`OutputFormat`] that loses the `Option<&'static str>`
 /// payload surfaces here, not at runtime inside extract_via_llm.
 ///
-/// The hint string itself ("focus on wakeup latency percentiles")
-/// is the fixture's invariant: it is deliberately asserted by
+/// The hint string itself ("wakeup latency percentiles") is the
+/// fixture's invariant: it is deliberately asserted by
 /// value — not by `matches!(.., Some(_))` — so a future refactor
 /// that accidentally substitutes, truncates, or duplicates the
 /// hint breaks this assertion rather than landing a quietly
@@ -180,12 +180,22 @@ fn schbench_hinted_output_carries_hint_through_derive() {
     ));
     match SCHBENCH_HINTED.output {
         OutputFormat::LlmExtract(Some(hint)) => {
-            assert_eq!(hint, "focus on wakeup latency percentiles");
+            assert_eq!(hint, "wakeup latency percentiles");
         }
         other => panic!("expected OutputFormat::LlmExtract(Some(hint)), got {other:?}",),
     }
     assert_eq!(
         SCHBENCH_HINTED.default_args, SCHBENCH.default_args,
+        "hinted fixture must differ from SCHBENCH only in name and output",
+    );
+    assert_eq!(
+        SCHBENCH_HINTED.metrics.len(),
+        SCHBENCH.metrics.len(),
+        "hinted fixture must differ from SCHBENCH only in name and output",
+    );
+    assert_eq!(
+        SCHBENCH_HINTED.default_checks.len(),
+        SCHBENCH.default_checks.len(),
         "hinted fixture must differ from SCHBENCH only in name and output",
     );
     assert!(SCHBENCH_HINTED.metrics.is_empty());

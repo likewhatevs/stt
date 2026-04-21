@@ -38,10 +38,10 @@
 //!   routed through the local LLM pipeline rather than the JSON
 //!   walker.
 //! - [`SCHBENCH_HINTED`] declares
-//!   `OutputFormat::LlmExtract(Some("focus on wakeup latency
-//!   percentiles"))` — identical to [`SCHBENCH`] in every other
-//!   field, exercising the derive's `LlmExtract("hint")` call
-//!   form and the hint-threading path through
+//!   `OutputFormat::LlmExtract(Some("wakeup latency percentiles"))`
+//!   — identical to [`SCHBENCH`] in every other field, exercising
+//!   the derive's `LlmExtract("hint")` call form and the
+//!   hint-threading path through
 //!   [`extract_via_llm`](ktstr::test_support::model::extract_via_llm).
 //!
 //! All fixtures use short, stable `name` fields matching their
@@ -91,12 +91,11 @@ pub struct FioPayload;
 /// Compared to [`FIO`], this fixture differs in exactly two
 /// fields:
 ///
-/// 1. **`name`** — `"fio_json"` instead of `"fio"`. The distinct
-///    name lets both fixtures register as workloads in the same
-///    `#[ktstr_test(workloads = [FIO, FIO_JSON])]` attribute
-///    without hitting the pairwise-dedup rejection. The `binary`
-///    field (the name resolved by the include-files
-///    infrastructure) is still `"fio"` in both.
+/// 1. **`name`** — `"fio_json"` instead of `"fio"`. Uses a
+///    distinct name so sidecar files and log output can
+///    disambiguate the two fixtures. The `binary` field (the name
+///    resolved by the include-files infrastructure) is still
+///    `"fio"` in both.
 /// 2. **`default_args`** — `&["--output-format=json"]` instead of
 ///    `&[]`. Everything else — `kind`, `output`, `default_checks`,
 ///    `metrics` — is character-for-character identical to [`FIO`].
@@ -162,15 +161,14 @@ pub struct StressNgPayload;
 pub struct SchbenchPayload;
 
 /// Hint-carrying sibling of [`SCHBENCH`] — identical in every
-/// field except `name` (so the two can coexist as workloads in a
-/// single `#[ktstr_test(workloads = [...])]` attribute under the
-/// pairwise-dedup rule) and `output`.
+/// field except `name` (uses a distinct name so sidecar files and
+/// log output can disambiguate the two fixtures) and `output`.
 ///
-/// Declares `output = LlmExtract("focus on wakeup latency
-/// percentiles")`. The derive macro translates the call form into
+/// Declares `output = LlmExtract("wakeup latency percentiles")`.
+/// The derive macro translates the call form into
 /// [`OutputFormat::LlmExtract(Some(...))`](ktstr::test_support::OutputFormat::LlmExtract),
-/// and the stored `&'static str` is appended to the default LLM
-/// prompt by
+/// and the stored `&'static str` is inserted between the template
+/// and the stdout block as a `Focus:` directive by
 /// [`extract_via_llm`](ktstr::test_support::model::extract_via_llm)
 /// when the fixture runs — steering the model toward the stat the
 /// scheduler regression cares about instead of whatever numeric
@@ -182,7 +180,11 @@ pub struct SchbenchPayload;
 /// hint-carrying shape — the bare [`SCHBENCH`] covers the
 /// no-hint form, this fixture covers the with-hint form.
 #[derive(Payload)]
-#[payload(binary = "schbench", name = "schbench_hinted", output = LlmExtract("focus on wakeup latency percentiles"))]
+#[payload(
+    binary = "schbench",
+    name = "schbench_hinted",
+    output = LlmExtract("wakeup latency percentiles"),
+)]
 #[default_args("--runtime", "30", "--message-threads", "2")]
 #[default_check(exit_code_eq(0))]
 #[allow(dead_code)]
