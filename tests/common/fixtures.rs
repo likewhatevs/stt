@@ -186,6 +186,50 @@ pub struct StressNgPayload;
 /// Latency-focused scheduler benchmark. Uses `LlmExtract` to
 /// exercise the LLM extraction pipeline (schbench supports `--json`
 /// but this fixture intentionally uses the third acquisition path).
+///
+/// **No metric hints.** schbench emits canonical latency stats
+/// (`Wakeup Latencies`, `Request Latencies`, `RPS`) with standard
+/// percentiles that would otherwise be obvious
+/// [`Polarity::LowerBetter`](ktstr::test_support::Polarity::LowerBetter)
+/// candidates — yet `metrics` is deliberately empty. The reason is
+/// upstream: hints in [`Payload`](ktstr::Payload)'s `metrics`
+/// field bind a fixed dotted-path name to a polarity/unit pair,
+/// and the post-extraction resolver inside
+/// [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun) looks
+/// each extracted metric up by exact name. The
+/// [`OutputFormat::LlmExtract`](ktstr::test_support::OutputFormat::LlmExtract)
+/// path produces metric names from whatever JSON the local model
+/// emits — not from a stable schema. The model's dotted paths vary
+/// with weights, prompt, and the hinted-focus string (even under
+/// ArgMax, a different base model produces different keys). A hint
+/// declared against e.g. `"wakeup_latency_pct99"` would miss when
+/// the model emits `"wakeup.latency.p99"` or
+/// `"wakeup_latency.99th_percentile"`. Rather than ship hints that
+/// silently fail to apply and leave every metric at
+/// [`Polarity::Unknown`](ktstr::test_support::Polarity::Unknown)
+/// anyway, the fixture leaves `metrics` empty so the absence of
+/// polarity classification is visible by construction. Tests that
+/// need strict regression direction for schbench should pipe
+/// `--json -` instead and declare an `OutputFormat::Json` fixture
+/// with concrete hint paths that match the fixed schbench schema
+/// (e.g. `"normal.wakeup_latency_pct99.0"` from `write_json_stats`
+/// in schbench.c).
+///
+/// **stdout-only extraction.** schbench writes its percentile
+/// tables (`show_latencies` → `fprintf(stderr, ...)`) and summary
+/// lines (`avg worker transfer`, `average rps`, `sched delay`) to
+/// **stderr** by default; stdout only carries output when
+/// `--json -` is passed.
+/// [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun)
+/// extracts metrics from stdout alone (stderr is surfaced only on
+/// exit-code mismatch), so this fixture's default invocation hands
+/// [`extract_via_llm`](ktstr::test_support::model::extract_via_llm)
+/// an empty string. The happy-path assertion is the exit-code gate
+/// in `default_checks`; the metric set is intentionally empty. To
+/// drive the LLM extraction against real latency text, append
+/// `--json -` via `.arg("--json").arg("-")` on the runtime builder
+/// — the JSON block lands on stdout and the LlmExtract pipeline
+/// receives a non-empty body.
 #[derive(Payload)]
 #[payload(binary = "schbench", output = LlmExtract)]
 #[default_args("--runtime", "30", "--message-threads", "2")]

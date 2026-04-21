@@ -94,9 +94,68 @@ pub enum PayloadKind {
     /// own `binary: SchedulerSpec` carries the Eevdf/Discover/Path/
     /// KernelBuiltin taxonomy — no duplication at the Payload level.
     Scheduler(&'static Scheduler),
-    /// Bare userspace binary looked up by name in the guest (via the
-    /// include-files infrastructure). Not a scheduler — runs as a
-    /// workload under whatever scheduler the test declares.
+    /// Bare userspace binary looked up by name in the guest. Not a
+    /// scheduler — runs as a workload under whatever scheduler the
+    /// test declares.
+    ///
+    /// # How the binary reaches the guest
+    ///
+    /// The stored `&'static str` is the executable name passed to
+    /// `std::process::Command::new` inside the guest (see
+    /// [`PayloadRun::run`](crate::scenario::payload_run::PayloadRun::run)),
+    /// which resolves it against the guest's `PATH`. The framework
+    /// does NOT package the binary into the initramfs automatically —
+    /// the test author must supply it via the `-i` / `--include-files`
+    /// resolver on the launching CLI.
+    ///
+    /// Supply a binary via the [`resolve_include_files`](crate::cli::resolve_include_files)
+    /// resolver. The resolver is wired up to the `shell` subcommand
+    /// of both `ktstr` and `cargo ktstr` through the repeatable
+    /// `-i` / `--include-files` flag. Each `-i` argument accepts:
+    ///
+    /// - an explicit path (absolute, relative, or containing `/`) —
+    ///   must exist on the host;
+    /// - a bare name — searched in `PATH` on the host;
+    /// - a directory — walked recursively, preserving structure under
+    ///   `/include-files/<dirname>/...` in the guest.
+    ///
+    /// Every regular file ends up at `/include-files/<name>` (or
+    /// deeper for directory walks). Dynamically-linked ELFs pull in
+    /// their `DT_NEEDED` shared libraries automatically; the guest
+    /// init prepends every `/include-files/*` subdirectory containing
+    /// an executable to `PATH`, so a binary packaged with `-i` is
+    /// runnable by bare name from a test body.
+    ///
+    /// Example — launch a shell VM with `fio` available by bare name:
+    ///
+    /// ```sh
+    /// cargo ktstr shell -i fio --exec "fio --version"
+    /// ```
+    ///
+    /// The `fio` binary is resolved against the host's `PATH`, copied
+    /// to `/include-files/fio` in the guest, exposed on the guest
+    /// `PATH`, and spawnable as `fio` from any guest-side process.
+    ///
+    /// # `#[ktstr_test]` entries
+    ///
+    /// The `#[ktstr_test]` harness (invoked via `cargo nextest run`)
+    /// does NOT expose `-i` on its surface: the VM-boot path includes
+    /// only the scheduler's config file (see the
+    /// [`Scheduler`](crate::test_support::Scheduler) `config_file`
+    /// field). For a `#[ktstr_test]` that declares
+    /// `PayloadKind::Binary("fio")`, the `fio` binary must already be
+    /// present on the guest `PATH` — either pre-installed in the base
+    /// initramfs or made available via a bespoke test harness that
+    /// wires `resolve_include_files` through its own builder chain.
+    ///
+    /// # Scheduler config files
+    ///
+    /// Scheduler-kind payloads that set
+    /// [`Scheduler`](crate::test_support::Scheduler)'s `config_file`
+    /// field are the one case the framework packages automatically:
+    /// the config file is placed at `/include-files/{filename}`
+    /// without a `-i` flag. Binary-kind payloads have no equivalent
+    /// shortcut — `-i` is the sole entry point.
     Binary(&'static str),
 }
 
