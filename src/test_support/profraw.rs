@@ -196,7 +196,7 @@ pub(crate) fn target_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::{ENV_LOCK, EnvVarGuard};
+    use super::super::test_helpers::{EnvVarGuard, lock_env};
     use super::*;
     use crate::vmm::shm_ring::parse_shm_params_from_str;
 
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn target_dir_with_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env = EnvVarGuard::set("LLVM_COV_TARGET_DIR", "/tmp/my-cov-dir");
         let dir = target_dir();
         assert_eq!(dir, PathBuf::from("/tmp/my-cov-dir"));
@@ -286,19 +286,21 @@ mod tests {
 
     #[test]
     fn target_dir_from_llvm_profile_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_cov = EnvVarGuard::remove("LLVM_COV_TARGET_DIR");
-        let _env_prof =
-            EnvVarGuard::set("LLVM_PROFILE_FILE", "/tmp/cov-target/ktstr-%p-%m.profraw");
+        let _lock = lock_env();
+        let _cov = EnvVarGuard::remove("LLVM_COV_TARGET_DIR");
+        let _prof = EnvVarGuard::set(
+            "LLVM_PROFILE_FILE",
+            "/tmp/cov-target/ktstr-%p-%m.profraw",
+        );
         let dir = target_dir();
         assert_eq!(dir, PathBuf::from("/tmp/cov-target"));
     }
 
     #[test]
     fn target_dir_without_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_cov = EnvVarGuard::remove("LLVM_COV_TARGET_DIR");
-        let _env_prof = EnvVarGuard::remove("LLVM_PROFILE_FILE");
+        let _lock = lock_env();
+        let _cov = EnvVarGuard::remove("LLVM_COV_TARGET_DIR");
+        let _prof = EnvVarGuard::remove("LLVM_PROFILE_FILE");
         let dir = target_dir();
         // Falls back to current_exe parent + "llvm-cov-target".
         assert!(

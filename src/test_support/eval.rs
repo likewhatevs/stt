@@ -21,6 +21,7 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::assert::AssertResult;
 use crate::timeline::StimulusEvent;
@@ -38,42 +39,7 @@ use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
 use crate::verifier::{SCHED_OUTPUT_START, parse_sched_output};
 
-use super::runtime::{config_file_parts, verbose};
-
-// ---------------------------------------------------------------------------
-// Failure-message constants
-// ---------------------------------------------------------------------------
-//
-// Shared between the production error-formatting paths in this module
-// and the tests that pin those messages. Editing a production string
-// here without updating the test (or vice versa) is caught at compile
-// time instead of as a runtime test assertion drift.
-
-/// Header body for a timed-out run with no parseable AssertResult.
-/// Pinned by `eval_timeout_no_result` and `eval_timeout_with_sched_includes_diagnostics`.
-pub(crate) const ERR_TIMED_OUT_NO_RESULT: &str = "timed out (no result in SHM or COM2)";
-
-/// Header body for a run whose scenario passed but whose monitor
-/// verdict failed. Pinned by `eval_monitor_fail_has_fingerprint` and
-/// `eval_monitor_fail_includes_sched_log`.
-pub(crate) const ERR_MONITOR_FAILED_AFTER_SCENARIO: &str = "passed scenario but monitor failed";
-
-/// Reason body when a scheduler is running but no AssertResult was
-/// received from the guest. Pinned by `eval_sched_dies_no_com2_output`
-/// and `eval_sched_dies_with_sched_log`.
-pub(crate) const ERR_NO_TEST_RESULT_FROM_GUEST: &str = "no test result received from guest \
-     (scheduler may have crashed, or guest output was lost \
-     before reaching the host)";
-
-/// Reason body when EEVDF (no scheduler) produced no AssertResult.
-/// Pinned by `eval_eevdf_no_com2_output` and `eval_payload_exits_no_verify_result`.
-pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
-    "test function produced no output (no test result found)";
-
-/// Prefix for the `guest crashed: ...` reason body. Pinned by
-/// `eval_crash_in_output_says_guest_crashed`, `eval_crash_eevdf_says_guest_crashed`,
-/// and `eval_crash_message_from_shm`.
-pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
+use super::runtime::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
 
 /// Run a single ktstr_test and return the VM's AssertResult.
 pub(crate) fn run_ktstr_test_inner(
@@ -120,24 +86,26 @@ pub(crate) fn run_ktstr_test_inner(
     let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
-    let mut builder = super::runtime::build_vm_builder_base(
-        entry,
-        &kernel,
-        &ktstr_bin,
-        scheduler.as_deref(),
-        vm_topology,
-        memory_mb,
-        &cmdline_extra,
-        &guest_args,
-        no_perf_mode,
-    )
-    .performance_mode(entry.performance_mode);
+    let mut builder = vmm::KtstrVm::builder()
+        .kernel(&kernel)
+        .init_binary(&ktstr_bin)
+        .with_topology(vm_topology)
+        .memory_deferred_min(memory_mb)
+        .cmdline(&cmdline_extra)
+        .shm_size(KTSTR_TEST_SHM_SIZE)
+        .run_args(&guest_args)
+        .timeout(Duration::from_secs(60))
+        .performance_mode(entry.performance_mode)
+        .no_perf_mode(no_perf_mode);
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.
     let merged_assert = crate::assert::Assert::default_checks()
         .merge(entry.scheduler.assert())
         .merge(&entry.assert);
 
+    if let Some(ref sched_path) = scheduler {
+        builder = builder.scheduler_binary(sched_path);
+    }
     if let Some(SchedulerSpec::KernelBuiltin { enable, disable }) =
         entry.scheduler.scheduler_binary()
     {
@@ -162,6 +130,13 @@ pub(crate) fn run_ktstr_test_inner(
     }
     if !sched_args.is_empty() {
         builder = builder.sched_args(&sched_args);
+    }
+
+    builder = builder.watchdog_timeout(entry.watchdog_timeout);
+
+    for bpf_write in entry.bpf_map_write {
+        builder =
+            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
     }
 
     // Catch ResourceContention before .context() wraps it —
@@ -493,7 +468,7 @@ fn evaluate_vm_result(
                 let timeline_section = build_timeline_section();
                 let monitor_section = format_monitor_section(monitor, merged_assert);
                 let msg = format!(
-                    "{}ktstr_test '{}'{} [topo={}] {ERR_MONITOR_FAILED_AFTER_SCENARIO}:\n  {}{}{}{}{}",
+                    "{}ktstr_test '{}'{} [topo={}] passed scenario but monitor failed:\n  {}{}{}{}{}",
                     fingerprint_line,
                     entry.name,
                     sched_label,
@@ -548,7 +523,7 @@ fn evaluate_vm_result(
 
     if result.timed_out {
         let msg = format!(
-            "{}ktstr_test '{}'{} [topo={}] {ERR_TIMED_OUT_NO_RESULT}{}{}{}{}{}{}",
+            "{}ktstr_test '{}'{} [topo={}] timed out (no result in SHM or COM2){}{}{}{}{}{}",
             fingerprint_line,
             entry.name,
             sched_label,
@@ -564,13 +539,16 @@ fn evaluate_vm_result(
     }
 
     let reason = if let Some(ref shm_crash) = result.crash_message {
-        format!("{ERR_GUEST_CRASHED_PREFIX}\n{shm_crash}")
+        format!("guest crashed:\n{shm_crash}")
     } else if let Some(crash_msg) = extract_panic_message(output) {
-        format!("{ERR_GUEST_CRASHED_PREFIX} {crash_msg}")
+        format!("guest crashed: {crash_msg}")
     } else if entry.scheduler.has_active_scheduling() {
-        ERR_NO_TEST_RESULT_FROM_GUEST.to_string()
+        "no test result received from guest \
+         (scheduler may have crashed, or guest output was lost \
+         before reaching the host)"
+            .to_string()
     } else {
-        ERR_NO_TEST_FUNCTION_OUTPUT.to_string()
+        "test function produced no output (no test result found)".to_string()
     };
     let msg = format!(
         "{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}",
@@ -770,14 +748,11 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
     // genuinely missing at test time.
     match super::model::prefetch_if_required() {
         Ok(Some(path)) => {
-            tracing::info!(path = %path.display(), "model cache ready");
+            eprintln!("ktstr: model cache ready at {}", path.display());
         }
         Ok(None) => {}
         Err(e) => {
-            tracing::warn!(
-                error = ?e,
-                "model prefetch failed; LlmExtract tests may fail",
-            );
+            eprintln!("ktstr: model prefetch failed ({e:#}); LlmExtract tests may fail");
         }
     }
 
@@ -909,12 +884,9 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::output::{
-        RESULT_END, RESULT_START, STAGE_INIT_NOT_STARTED, STAGE_INIT_STARTED_NO_PAYLOAD,
-        STAGE_PAYLOAD_STARTED_NO_RESULT,
-    };
+    use super::super::output::{RESULT_END, RESULT_START};
     use super::super::test_helpers::{
-        ENV_LOCK, EVAL_TOPO, EnvVarGuard, eevdf_entry, make_vm_result, no_repro, sched_entry,
+        EVAL_TOPO, EnvVarGuard, eevdf_entry, lock_env, make_vm_result, no_repro, sched_entry,
     };
     use super::*;
     use crate::verifier::SCHED_OUTPUT_END;
@@ -923,13 +895,9 @@ mod tests {
 
     #[test]
     fn resolve_test_kernel_with_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
-        let _env = EnvVarGuard::set(
-            "KTSTR_TEST_KERNEL",
-            exe.to_str()
-                .expect("resolve_current_exe returns UTF-8 path"),
-        );
+        let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", exe.to_str().unwrap());
         let result = resolve_test_kernel();
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), exe);
@@ -937,7 +905,7 @@ mod tests {
 
     #[test]
     fn resolve_test_kernel_with_nonexistent_env_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", "/nonexistent/kernel/path");
         let result = resolve_test_kernel();
         assert!(result.is_err());
@@ -977,7 +945,7 @@ mod tests {
 
     #[test]
     fn resolve_scheduler_discover_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env = EnvVarGuard::remove("KTSTR_SCHEDULER");
         let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_xyz__"));
         assert!(result.is_err());
@@ -985,13 +953,9 @@ mod tests {
 
     #[test]
     fn resolve_scheduler_discover_via_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
-        let _env = EnvVarGuard::set(
-            "KTSTR_SCHEDULER",
-            exe.to_str()
-                .expect("resolve_current_exe returns UTF-8 path"),
-        );
+        let _env = EnvVarGuard::set("KTSTR_SCHEDULER", exe.to_str().unwrap());
         let result = resolve_scheduler(&SchedulerSpec::Discover("anything"));
         assert!(result.is_ok());
         assert_eq!(result.unwrap().unwrap(), exe);
@@ -1024,13 +988,9 @@ mod tests {
 
     #[test]
     fn nextest_setup_writes_kernel_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
-        let _env = EnvVarGuard::set(
-            "KTSTR_TEST_KERNEL",
-            exe.to_str()
-                .expect("resolve_current_exe returns UTF-8 path"),
-        );
+        let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", exe.to_str().unwrap());
 
         let mut buf = Vec::new();
         let result = nextest_setup(&[exe.as_path()], &mut buf);
@@ -1047,8 +1007,8 @@ mod tests {
 
     #[test]
     fn eval_eevdf_no_com2_output() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+        let _lock = lock_env();
+        let _bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_eevdf_no_out__");
         let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1065,8 +1025,8 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(ERR_NO_TEST_FUNCTION_OUTPUT),
-            "EEVDF with no COM2 output should say {ERR_NO_TEST_FUNCTION_OUTPUT:?}, got: {msg}",
+            msg.contains("test function produced no output"),
+            "EEVDF with no COM2 output should say 'test function produced no output', got: {msg}",
         );
         assert!(
             !msg.contains("no test result received from guest"),
@@ -1100,7 +1060,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(ERR_NO_TEST_RESULT_FROM_GUEST),
+            msg.contains("no test result received from guest"),
             "scheduler present with no output should take the scheduler-path fallback, got: {msg}",
         );
         assert!(
@@ -1111,8 +1071,8 @@ mod tests {
 
     #[test]
     fn eval_sched_dies_with_sched_log() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+        let _lock = lock_env();
+        let _bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let sched_log = format!(
             "noise\n{SCHED_OUTPUT_START}\ndo_enqueue_task+0x1a0\nbalance_one+0x50\n{SCHED_OUTPUT_END}\nmore",
         );
@@ -1132,7 +1092,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(ERR_NO_TEST_RESULT_FROM_GUEST),
+            msg.contains("no test result received from guest"),
             "should take the scheduler-path fallback, got: {msg}",
         );
         assert!(
@@ -1231,8 +1191,8 @@ mod tests {
 
     #[test]
     fn eval_timeout_no_result() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+        let _lock = lock_env();
+        let _bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_timeout__");
         let result = make_vm_result("", "booting...\nstill booting...", 0, true);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1249,8 +1209,12 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(ERR_TIMED_OUT_NO_RESULT),
-            "should contain full timed-out reason {ERR_TIMED_OUT_NO_RESULT:?}, got: {msg}",
+            msg.contains("timed out"),
+            "should say timed out, got: {msg}",
+        );
+        assert!(
+            msg.contains("no result in SHM or COM2"),
+            "should mention SHM or COM2, got: {msg}",
         );
         assert!(
             msg.contains("booting"),
@@ -1286,8 +1250,8 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(ERR_NO_TEST_FUNCTION_OUTPUT),
-            "non-parseable COM2 with EEVDF should say {ERR_NO_TEST_FUNCTION_OUTPUT:?}, got: {msg}",
+            msg.contains("test function produced no output"),
+            "non-parseable COM2 with EEVDF should say 'test function produced no output', got: {msg}",
         );
         assert!(
             !msg.contains("no test result received from guest"),
@@ -1325,7 +1289,7 @@ mod tests {
 
     #[test]
     fn eval_verify_result_passed_returns_ok() {
-        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_pass__");
         let result = make_vm_result(&output, "", 0, false);
@@ -1348,7 +1312,7 @@ mod tests {
 
     #[test]
     fn eval_verify_result_failed_includes_details() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"},{"kind":"Unfair","message":"spread 45%"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"},{"kind":"Unfair","message":"spread 45%"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_fail_details__");
         let result = make_vm_result(&output, "", 0, false);
@@ -1374,7 +1338,7 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_includes_sched_log() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"worker 0 stuck 5000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"worker 0 stuck 5000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
         );
@@ -1402,7 +1366,7 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_has_fingerprint() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let error_line = "Error: apply_cell_config BPF program returned error -2";
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",
@@ -1495,7 +1459,7 @@ mod tests {
 
     #[test]
     fn eval_no_sched_output_no_fingerprint() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_no_fp__");
         let result = make_vm_result(&output, "", 0, false);
@@ -1519,7 +1483,7 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_has_fingerprint() {
-        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let error_line = "Error: imbalance detected internally";
         let sched_log =
             format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
@@ -1593,7 +1557,7 @@ mod tests {
             .unwrap_err()
         );
         assert!(
-            msg.contains(ERR_MONITOR_FAILED_AFTER_SCENARIO),
+            msg.contains("passed scenario but monitor failed"),
             "got: {msg}"
         );
         assert!(msg.contains(error_line), "got: {msg}");
@@ -1604,8 +1568,8 @@ mod tests {
 
     #[test]
     fn eval_timeout_with_sched_includes_diagnostics() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+        let _lock = lock_env();
+        let _bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = sched_entry("__eval_timeout_sched__");
         let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1622,8 +1586,8 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(ERR_TIMED_OUT_NO_RESULT),
-            "should contain {ERR_TIMED_OUT_NO_RESULT:?}, got: {msg}"
+            msg.contains("timed out"),
+            "should say timed out, got: {msg}"
         );
         assert!(
             msg.contains("[sched=test_sched_bin]"),
@@ -1643,8 +1607,8 @@ mod tests {
 
     #[test]
     fn eval_no_sentinels_shows_initramfs_failure() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+        let _lock = lock_env();
+        let _bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_no_sentinel__");
         let result = make_vm_result("", "Kernel panic", 1, false);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1661,15 +1625,15 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(STAGE_INIT_NOT_STARTED),
+            msg.contains("init script never started"),
             "no sentinels should indicate kernel/mount failure, got: {msg}",
         );
     }
 
     #[test]
     fn eval_init_started_but_no_payload() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+        let _lock = lock_env();
+        let _bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_init_only__");
         let result = make_vm_result("KTSTR_INIT_STARTED\n", "boot log", 1, false);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1686,15 +1650,15 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(STAGE_INIT_STARTED_NO_PAYLOAD),
+            msg.contains("init started but payload never ran"),
             "init sentinel only should indicate cgroup/scheduler setup failure, got: {msg}",
         );
     }
 
     #[test]
     fn eval_payload_started_no_result() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+        let _lock = lock_env();
+        let _bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_payload_start__");
         let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\ngarbage";
         let result = make_vm_result(output, "", 1, false);
@@ -1712,7 +1676,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(STAGE_PAYLOAD_STARTED_NO_RESULT),
+            msg.contains("payload started but produced no test result"),
             "both sentinels should indicate payload ran but failed, got: {msg}",
         );
     }
@@ -1737,7 +1701,7 @@ mod tests {
         )
         .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains(ERR_GUEST_CRASHED_PREFIX), "got: {msg}");
+        assert!(msg.contains("guest crashed:"), "got: {msg}");
         assert!(msg.contains("assertion failed"), "got: {msg}");
     }
 
@@ -1759,7 +1723,7 @@ mod tests {
         )
         .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains(ERR_GUEST_CRASHED_PREFIX), "got: {msg}");
+        assert!(msg.contains("guest crashed:"), "got: {msg}");
         assert!(msg.contains("index out of bounds"), "got: {msg}");
     }
 
@@ -1786,8 +1750,8 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains(ERR_GUEST_CRASHED_PREFIX),
-            "should say {ERR_GUEST_CRASHED_PREFIX:?}, got: {msg}",
+            msg.contains("guest crashed:"),
+            "should say 'guest crashed:', got: {msg}",
         );
         assert!(
             msg.contains("ktstr_guest_init"),
@@ -1806,7 +1770,7 @@ mod tests {
 
     #[test]
     fn eval_sched_died_includes_console() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_died_console__");
         let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
@@ -1831,7 +1795,7 @@ mod tests {
 
     #[test]
     fn eval_sched_died_includes_monitor() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler crashed during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_died_monitor__");
         let result = crate::vmm::VmResult {
@@ -1883,7 +1847,7 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_includes_sched_log() {
-        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0}}"#;
         let sched_log =
             format!("{SCHED_OUTPUT_START}\nscheduler debug output here\n{SCHED_OUTPUT_END}",);
         let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");
@@ -1958,7 +1922,7 @@ mod tests {
             .unwrap_err()
         );
         assert!(
-            msg.contains(ERR_MONITOR_FAILED_AFTER_SCENARIO),
+            msg.contains("passed scenario but monitor failed"),
             "got: {msg}"
         );
         assert!(msg.contains("--- scheduler log ---"), "got: {msg}");

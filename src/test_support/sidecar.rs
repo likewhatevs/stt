@@ -626,7 +626,7 @@ pub(crate) fn write_sidecar(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::{ENV_LOCK, EnvVarGuard};
+    use super::super::test_helpers::lock_env;
     use super::*;
     use crate::assert::{AssertResult, CgroupStats};
     use crate::scenario::Ctx;
@@ -953,10 +953,19 @@ mod tests {
 
     #[test]
     fn write_sidecar_defaults_to_target_dir_without_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env_sidecar = EnvVarGuard::remove("KTSTR_SIDECAR_DIR");
-        let _env_kernel = EnvVarGuard::remove("KTSTR_KERNEL");
-        let _env_target = EnvVarGuard::remove("CARGO_TARGET_DIR");
+        let _lock = lock_env();
+        let key = "KTSTR_SIDECAR_DIR";
+        let kernel_key = "KTSTR_KERNEL";
+        let target_key = "CARGO_TARGET_DIR";
+        let prev = std::env::var(key).ok();
+        let prev_kernel = std::env::var(kernel_key).ok();
+        let prev_target = std::env::var(target_key).ok();
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(kernel_key);
+            std::env::remove_var(target_key);
+        };
 
         let dir = sidecar_dir();
         let expected = format!("target/ktstr/unknown-{}", crate::GIT_HASH);
@@ -992,16 +1001,31 @@ mod tests {
         let path = dir.join("__sidecar_default_dir__.ktstr.json");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            match prev_kernel {
+                Some(v) => std::env::set_var(kernel_key, v),
+                None => std::env::remove_var(kernel_key),
+            }
+            match prev_target {
+                Some(v) => std::env::set_var(target_key, v),
+                None => std::env::remove_var(target_key),
+            }
+        }
     }
 
     #[test]
     fn write_sidecar_writes_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-write-test");
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1049,6 +1073,10 @@ mod tests {
         assert!(!loaded.skipped, "pass result is not a skip");
 
         let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     #[test]
@@ -1057,13 +1085,12 @@ mod tests {
         // produce distinct sidecar filenames so neither clobbers the
         // other. A hash of work_type/sysctls/kargs alone would miss
         // this difference.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-flagvariant-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1107,6 +1134,10 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     #[test]
@@ -1114,13 +1145,12 @@ mod tests {
         // Two gauntlet variants differing only in work_type must
         // produce distinct sidecar filenames so neither clobbers the
         // other.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-variant-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1162,6 +1192,10 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     /// Freeze the `sidecar_variant_hash` wire format to the exact 64-bit
@@ -1496,13 +1530,13 @@ mod tests {
     /// sidecars entirely for non-VM early exits.
     #[test]
     fn write_skip_sidecar_records_passed_true_skipped_true() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-writes-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1543,6 +1577,10 @@ mod tests {
         assert_eq!(loaded.active_flags, active_flags);
 
         let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     /// When the sidecar directory cannot be created (path collision
@@ -1552,7 +1590,9 @@ mod tests {
     /// error would make skips invisible to post-run analysis.
     #[test]
     fn write_skip_sidecar_returns_err_when_dir_cannot_be_created() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
 
         // Create a regular file, then try to use it as the sidecar
         // directory. `create_dir_all` fails because the path exists
@@ -1561,10 +1601,8 @@ mod tests {
         let _ = std::fs::remove_file(&blocker);
         let _ = std::fs::remove_dir_all(&blocker);
         std::fs::write(&blocker, b"not a dir").unwrap();
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            blocker.to_str().expect("tempfile path is UTF-8"),
-        );
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, blocker.to_str().unwrap()) };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1582,6 +1620,10 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&blocker);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     // -- sidecar payload + metrics fields --
@@ -1698,13 +1740,13 @@ mod tests {
     fn write_sidecar_records_entry_payload_name() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-payload-name-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
 
         static FIO: Payload = Payload {
             name: "fio",
@@ -1760,6 +1802,10 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     /// `write_sidecar` must forward the `payload_metrics` slice
@@ -1770,13 +1816,13 @@ mod tests {
     fn write_sidecar_forwards_payload_metrics_slice() {
         use crate::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-metrics-slice-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1839,6 +1885,10 @@ mod tests {
         assert!(loaded.metrics[1].metrics.is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 
     /// `write_skip_sidecar` must also carry `entry.payload` through
@@ -1849,13 +1899,13 @@ mod tests {
     fn write_skip_sidecar_records_entry_payload_name() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
+        let key = "KTSTR_SIDECAR_DIR";
+        let prev = std::env::var(key).ok();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-payload-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        // SAFETY: test-only, single-threaded env mutation with save/restore.
+        unsafe { std::env::set_var(key, tmp.to_str().unwrap()) };
 
         static STRESS: Payload = Payload {
             name: "stress-ng",
@@ -1897,5 +1947,9 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 }
