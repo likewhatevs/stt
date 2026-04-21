@@ -8,9 +8,6 @@ use std::collections::BTreeMap;
 
 use polars::prelude::*;
 
-use crate::timeline::Timeline;
-use crate::vmm::shm_ring;
-
 /// Definition of a metric for the comparison pipeline.
 ///
 /// Each entry describes polarity (`higher_is_worse`), dual-gate
@@ -225,83 +222,36 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
     METRICS.iter().find(|m| m.name == name)
 }
 
-/// Monitor data preserved from a gauntlet VM run for timeline analysis.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct GauntletMonitorData {
-    pub summary: crate::monitor::MonitorSummary,
-    pub samples: Vec<crate::monitor::MonitorSample>,
-    pub stimulus_events: Vec<shm_ring::StimulusEvent>,
-}
-
-/// Result from a single gauntlet VM run.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct VmRunResult {
-    pub label: String,
-    pub passed: bool,
-    pub duration_s: f64,
-    pub detail: String,
-    pub scenario_results: Vec<crate::runner::ScenarioResult>,
-    pub monitor_data: Option<GauntletMonitorData>,
-}
-
 /// Per-scenario result row for gauntlet analysis and run-to-run comparison.
 ///
-/// Two constructors populate this struct from different data sources,
-/// and each one leaves a distinct subset of fields at their default
-/// ("unknown") values. Readers that compute derived metrics must
-/// tolerate both partial populations:
+/// Populated by [`sidecar_to_row`] from on-disk `SidecarResult`s. The
+/// comparison pipeline reads metric values through [`MetricDef::read`]
+/// / [`METRICS`] rather than dereferencing fields directly so new
+/// metrics can land through the registry without touching every
+/// reader.
 ///
-/// - [`sidecar_to_row`] (post-run analysis from on-disk
-///   `SidecarResult`): populates every stats, monitor, benchmark, and
-///   NUMA field. Leaves `flags = ""`, `replica = 1`, and every
-///   `worst_degradation_*` / `degradation_count` field at zero/empty
-///   because on-disk sidecars carry a `MonitorSummary` but not the
-///   per-sample [`Timeline`] used to compute degradation deltas.
-/// - [`extract_rows`] (in-process gauntlet from [`VmRunResult`]s):
-///   parses a `"topology/scenario/flags[/work_type][#replica]"` label
-///   for the identity fields and rebuilds the [`Timeline`] from live
-///   monitor samples, so the `worst_degradation_*` fields are
-///   populated. Leaves `scheduler = ""` (label format does not embed
-///   scheduler) and `skipped = false` (run-in-process path has no skip
-///   semantic — only sidecar rows carry real skip flags).
-///
-/// The comparison pipeline must read through [`MetricDef::read`] /
-/// [`METRICS`] rather than dereferencing fields directly when it
-/// cannot assume which constructor produced the row.
+/// The `worst_degradation_*` and `degradation_count` fields are read by
+/// [`build_dataframe`] but are always zero when populated via
+/// [`sidecar_to_row`]: sidecars carry the aggregate `MonitorSummary`
+/// but not the per-sample trace that would populate the degradation
+/// fields.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GauntletRow {
     pub scenario: String,
-    /// Scheduler flag set active for this row. Populated by
-    /// [`extract_rows`] from the gauntlet label's flags segment;
-    /// [`sidecar_to_row`] leaves this empty because the sidecar
-    /// carries `active_flags` separately, and `stats` consumers that
-    /// build rows from sidecars do not project it here.
     pub flags: String,
     pub topology: String,
     pub work_type: String,
     /// Scheduler binary name carried from the source sidecar
-    /// (`SidecarResult::scheduler`). Empty when the row was built
-    /// from a [`VmRunResult`] via [`extract_rows`], because the
-    /// inline gauntlet label format does not embed the scheduler.
-    /// Surfaced through the substring filter in [`compare_rows`] so
-    /// users can narrow A/B comparisons by scheduler name.
+    /// (`SidecarResult::scheduler`). Surfaced through the substring
+    /// filter in [`compare_rows`] so users can narrow A/B comparisons
+    /// by scheduler name.
     pub scheduler: String,
-    /// Replica index extracted from a `"#N"` suffix on the gauntlet
-    /// label (via [`extract_rows`]). [`sidecar_to_row`] defaults this
-    /// to `1` because on-disk sidecars are per-run and the replica
-    /// fan-out is already resolved into distinct sidecar files.
     pub replica: u32,
     pub passed: bool,
     /// True when the run was skipped (topology mismatch, missing
     /// resource). `passed` stays `true` for gate-compat; `skipped`
     /// lets stats tooling exclude these from pass counts so skipped
     /// runs don't inflate the apparent pass rate.
-    ///
-    /// Populated only by [`sidecar_to_row`]; [`extract_rows`] always
-    /// leaves this `false` because the in-process gauntlet only runs
-    /// the scenario when preflight has already accepted it.
     pub skipped: bool,
     pub spread: f64,
     pub gap_ms: u64,
@@ -323,11 +273,6 @@ pub struct GauntletRow {
     // NUMA fields.
     pub page_locality: f64,
     pub cross_node_migration_ratio: f64,
-    // Timeline degradation fields. Populated only by [`extract_rows`]
-    // (from [`Timeline::build`] over live monitor samples). The
-    // [`sidecar_to_row`] path leaves these zero/empty because
-    // [`SidecarResult`] persists the aggregate `MonitorSummary` but
-    // not the per-sample trace required to compute degradations.
     pub worst_degradation_op: String,
     pub worst_imbalance_delta: f64,
     pub worst_dsq_delta: f64,
@@ -399,216 +344,6 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         degradation_count: 0,
         ext_metrics: sc.stats.ext_metrics.clone(),
     }
-}
-
-/// Parse a gauntlet label "topology/scenario/flags[/work_type][#replica]" into
-/// (topology, scenario, flags, work_type, replica).
-#[allow(dead_code)]
-fn parse_label(label: &str) -> (&str, &str, &str, &str, u32) {
-    // Strip optional "#N" replica suffix. Replicas are 1-indexed (the
-    // generator never emits `#0`), so treat a parsed `0` the same way
-    // we treat a non-numeric suffix: keep the `#` as part of the base
-    // and default replica to 1. This keeps the invariant `replica >= 1`
-    // holding for every caller of `parse_label`, including the
-    // proptest that feeds arbitrary `#0` strings.
-    let (base, replica) = match label.rfind('#') {
-        Some(pos) => {
-            let tail = &label[pos + 1..];
-            match tail.parse::<u32>() {
-                Ok(r) if r >= 1 => (&label[..pos], r),
-                _ => (label, 1),
-            }
-        }
-        None => (label, 1),
-    };
-    let mut parts = base.splitn(4, '/');
-    let topo = parts.next().unwrap_or("");
-    let scenario = parts.next().unwrap_or("");
-    let flags = parts.next().unwrap_or("default");
-    let work_type = parts.next().unwrap_or("CpuSpin");
-    (topo, scenario, flags, work_type, replica)
-}
-
-/// Map op_kinds bitmask to the name of the dominant op variant.
-#[allow(dead_code)]
-fn op_kinds_to_name(op_kinds: u32) -> &'static str {
-    // Return the name of the highest-priority op present.
-    // Priority: the op most likely to cause observable scheduler changes.
-    const NAMES: &[&str] = &[
-        "AddCgroup",    // 0
-        "RemoveCgroup", // 1
-        "SetCpuset",    // 2
-        "ClearCpuset",  // 3
-        "SwapCpusets",  // 4
-        "Spawn",        // 5
-        "StopCgroup",   // 6
-        "SetAffinity",  // 7
-        "SpawnHost",    // 8
-        "MoveAllTasks", // 9
-    ];
-    // Pick the first set bit as the representative op.
-    for (i, name) in NAMES.iter().enumerate() {
-        if op_kinds & (1 << i) != 0 {
-            return name;
-        }
-    }
-    "unknown"
-}
-
-/// Convert shm_ring::StimulusEvent to timeline::StimulusEvent.
-#[allow(dead_code)]
-fn shm_stim_to_timeline(events: &[shm_ring::StimulusEvent]) -> Vec<crate::timeline::StimulusEvent> {
-    let mut out = vec![crate::timeline::StimulusEvent {
-        elapsed_ms: 0,
-        label: "ScenarioStart".to_string(),
-        op_kind: None,
-        detail: None,
-        total_iterations: None,
-    }];
-    for e in events {
-        out.push(crate::timeline::StimulusEvent {
-            elapsed_ms: e.elapsed_ms as u64,
-            label: format!("StepStart[{}]", e.step_index),
-            op_kind: Some(op_kinds_to_name(e.op_kinds).to_string()),
-            detail: Some(format!("{} ops", e.op_count)),
-            total_iterations: Some(e.total_iterations),
-        });
-    }
-    out
-}
-
-/// Extract worst degradation per metric from a timeline.
-/// Returns (worst_op, imbalance_delta, dsq_delta, fallback_delta, keep_last_delta, count).
-#[allow(dead_code)]
-fn extract_worst_degradation(timeline: Option<&Timeline>) -> (String, f64, f64, f64, f64, u32) {
-    let timeline = match timeline {
-        Some(t) => t,
-        None => return (String::new(), 0.0, 0.0, 0.0, 0.0, 0),
-    };
-
-    let mut worst_op = String::new();
-    let mut worst_imb = 0.0f64;
-    let mut worst_dsq = 0.0f64;
-    let mut worst_fb = 0.0f64;
-    let mut worst_kl = 0.0f64;
-    let mut worst_max_delta = 0.0f64;
-    let mut count = 0u32;
-
-    for (phase, change) in timeline.degradations() {
-        count += 1;
-        let delta = change.after - change.before;
-        let op = phase
-            .stimulus
-            .as_ref()
-            .and_then(|s| s.op_kind.clone())
-            .unwrap_or_default();
-
-        match change.metric.as_str() {
-            "imbalance" if delta > worst_imb => {
-                worst_imb = delta;
-            }
-            "dsq_depth" if delta > worst_dsq => {
-                worst_dsq = delta;
-            }
-            "fallback" if delta > worst_fb => {
-                worst_fb = delta;
-            }
-            "keep_last" if delta > worst_kl => {
-                worst_kl = delta;
-            }
-            _ => {}
-        }
-
-        if delta.abs() > worst_max_delta {
-            worst_max_delta = delta.abs();
-            worst_op = op;
-        }
-    }
-
-    (worst_op, worst_imb, worst_dsq, worst_fb, worst_kl, count)
-}
-
-/// Extract analysis rows from gauntlet results.
-#[allow(dead_code)]
-pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
-    let mut rows = Vec::new();
-    for r in results {
-        let (topo, scenario, flags, work_type, replica) = parse_label(&r.label);
-        let stats = r.scenario_results.first().map(|r| &r.stats);
-        let summary = r.monitor_data.as_ref().map(|m| &m.summary);
-
-        // Build timeline from monitor samples + stimulus events.
-        let timeline = r.monitor_data.as_ref().map(|m| {
-            let stim_events: Vec<crate::timeline::StimulusEvent> =
-                shm_stim_to_timeline(&m.stimulus_events);
-            Timeline::build(&stim_events, &m.samples)
-        });
-
-        // Extract worst degradation per metric from timeline.
-        let (
-            worst_deg_op,
-            worst_imb_delta,
-            worst_dsq_delta,
-            worst_fb_delta,
-            worst_kl_delta,
-            deg_count,
-        ) = extract_worst_degradation(timeline.as_ref());
-
-        rows.push(GauntletRow {
-            scenario: scenario.to_string(),
-            flags: flags.to_string(),
-            topology: topo.to_string(),
-            work_type: work_type.to_string(),
-            // Scheduler isn't encoded in the gauntlet label format
-            // ("topology/scenario/flags[/work_type][#replica]") and
-            // VmRunResult does not carry it separately. Sidecar-based
-            // rows populate this via sidecar_to_row.
-            scheduler: String::new(),
-            replica,
-            passed: r.passed,
-            // VmRunResult path has no skip semantic; rows here are
-            // always executed runs. Sidecar-based rows propagate the
-            // real skipped value via sidecar_to_row.
-            skipped: false,
-            spread: stats.map(|s| s.worst_spread).unwrap_or(0.0),
-            gap_ms: stats.map(|s| s.worst_gap_ms).unwrap_or(0),
-            migrations: stats.map(|s| s.total_migrations).unwrap_or(0),
-            migration_ratio: stats.map(|s| s.worst_migration_ratio).unwrap_or(0.0),
-            imbalance_ratio: summary.map(|m| m.max_imbalance_ratio).unwrap_or(0.0),
-            max_dsq_depth: summary.map(|m| m.max_local_dsq_depth).unwrap_or(0),
-            stall_count: if summary.map(|m| m.stall_detected).unwrap_or(false) {
-                1
-            } else {
-                0
-            },
-            fallback_count: summary
-                .and_then(|m| m.event_deltas.as_ref())
-                .map(|e| e.total_fallback)
-                .unwrap_or(0),
-            keep_last_count: summary
-                .and_then(|m| m.event_deltas.as_ref())
-                .map(|e| e.total_dispatch_keep_last)
-                .unwrap_or(0),
-            p99_wake_latency_us: stats.map(|s| s.p99_wake_latency_us).unwrap_or(0.0),
-            median_wake_latency_us: stats.map(|s| s.median_wake_latency_us).unwrap_or(0.0),
-            wake_latency_cv: stats.map(|s| s.wake_latency_cv).unwrap_or(0.0),
-            total_iterations: stats.map(|s| s.total_iterations).unwrap_or(0),
-            mean_run_delay_us: stats.map(|s| s.mean_run_delay_us).unwrap_or(0.0),
-            worst_run_delay_us: stats.map(|s| s.worst_run_delay_us).unwrap_or(0.0),
-            page_locality: stats.map(|s| s.worst_page_locality).unwrap_or(0.0),
-            cross_node_migration_ratio: stats
-                .map(|s| s.worst_cross_node_migration_ratio)
-                .unwrap_or(0.0),
-            worst_degradation_op: worst_deg_op,
-            worst_imbalance_delta: worst_imb_delta,
-            worst_dsq_delta,
-            worst_fallback_delta: worst_fb_delta,
-            worst_keep_last_delta: worst_kl_delta,
-            degradation_count: deg_count,
-            ext_metrics: stats.map(|s| s.ext_metrics.clone()).unwrap_or_default(),
-        });
-    }
-    rows
 }
 
 /// Build a polars DataFrame from gauntlet rows.
@@ -1396,16 +1131,6 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
     report
 }
 
-/// Analyze gauntlet results and return a formatted report.
-#[allow(dead_code)]
-pub fn analyze_gauntlet(results: &[VmRunResult]) -> String {
-    if results.is_empty() {
-        return String::new();
-    }
-    let rows = extract_rows(results);
-    analyze_rows(&rows)
-}
-
 // ---------------------------------------------------------------------------
 // Test-run enumeration and A/B comparison
 // ---------------------------------------------------------------------------
@@ -1719,125 +1444,6 @@ pub fn compare_runs(
 mod tests {
     use super::*;
     use crate::assert::ScenarioStats;
-    use crate::runner::ScenarioResult;
-
-    fn make_result(
-        label: &str,
-        passed: bool,
-        spread: f64,
-        gap_ms: u64,
-        migrations: u64,
-    ) -> VmRunResult {
-        let sr = ScenarioResult {
-            scenario_name: label.to_string(),
-            passed,
-            skipped: false,
-            duration_s: 20.0,
-            details: vec![],
-            stats: ScenarioStats {
-                cgroups: vec![],
-                total_workers: 4,
-                total_cpus: 4,
-                total_migrations: migrations,
-                worst_spread: spread,
-                worst_gap_ms: gap_ms,
-                worst_gap_cpu: 0,
-                ..Default::default()
-            },
-        };
-        VmRunResult {
-            label: label.to_string(),
-            passed,
-            duration_s: 20.0,
-            detail: String::new(),
-            scenario_results: vec![sr],
-            monitor_data: None,
-        }
-    }
-
-    #[test]
-    fn replicated_cgroup_pass_rate() {
-        // 3 replicas of a cgroup, 2 pass 1 fails.
-        let results = vec![
-            make_result("tiny/a/flags#1", true, 5.0, 50, 10),
-            make_result("tiny/a/flags#2", false, 25.0, 3000, 5),
-            make_result("tiny/a/flags#3", true, 8.0, 100, 12),
-        ];
-        let report = analyze_gauntlet(&results);
-        assert!(report.contains("Cgroups with <100% pass rate"));
-        assert!(report.contains("2/3"));
-    }
-
-    #[test]
-    fn replicated_all_pass() {
-        let results = vec![
-            make_result("tiny/a/flags#1", true, 5.0, 50, 10),
-            make_result("tiny/a/flags#2", true, 6.0, 60, 11),
-            make_result("tiny/a/flags#3", true, 7.0, 55, 9),
-        ];
-        let report = analyze_gauntlet(&results);
-        assert!(report.contains("All cgroups passed across all replicas"));
-    }
-
-    #[test]
-    fn build_dataframe_basic() {
-        let results = vec![
-            make_result("tiny/a/flags1", true, 5.0, 50, 10),
-            make_result("tiny/b/flags2", false, 20.0, 3000, 5),
-        ];
-        let rows = extract_rows(&results);
-        let df = build_dataframe(&rows).unwrap();
-        assert_eq!(df.height(), 2);
-        assert_eq!(df.width(), 30);
-    }
-
-    #[test]
-    fn analyze_empty() {
-        let report = analyze_gauntlet(&[]);
-        assert!(report.is_empty());
-    }
-
-    #[test]
-    fn analyze_no_outliers() {
-        // All results similar — no outliers expected.
-        let results: Vec<VmRunResult> = (0..5)
-            .map(|i| make_result(&format!("topo{i}/scenario/flags"), true, 5.0, 50, 10))
-            .collect();
-        let report = analyze_gauntlet(&results);
-        assert!(report.contains("GAUNTLET ANALYSIS"));
-        assert!(report.contains("No outliers detected"));
-    }
-
-    #[test]
-    fn analyze_with_outlier() {
-        // Many normal results to anchor the mean low; a few extreme outliers
-        // to exceed the 2-sigma threshold.
-        let mut results: Vec<VmRunResult> = (0..20)
-            .map(|i| make_result(&format!("topo{}/normal/flags", i % 5), true, 5.0, 50, 10))
-            .collect();
-        results.push(make_result("topo0/outlier/flags", true, 200.0, 50, 10));
-        results.push(make_result("topo1/outlier/flags", true, 195.0, 50, 10));
-        results.push(make_result("topo2/outlier/flags", true, 190.0, 50, 10));
-        let report = analyze_gauntlet(&results);
-        assert!(report.contains("GAUNTLET ANALYSIS"));
-        assert!(report.contains("Outliers detected"), "report: {report}");
-        assert!(report.contains("outlier"));
-        assert!(report.contains("spread"));
-    }
-
-    #[test]
-    fn analyze_dimension_summaries() {
-        let results = vec![
-            make_result("tiny/a/f1", true, 5.0, 50, 10),
-            make_result("large/a/f1", false, 25.0, 3000, 5),
-            make_result("tiny/b/f2", true, 3.0, 30, 8),
-            make_result("large/b/f2", true, 8.0, 100, 12),
-        ];
-        let report = analyze_gauntlet(&results);
-        assert!(report.contains("By scenario"));
-        assert!(report.contains("By flags"));
-        assert!(report.contains("By topology"));
-    }
 
     #[test]
     fn col_mean_std_basic() {
@@ -1976,90 +1582,6 @@ mod tests {
     #[test]
     fn decompose_flags_empty() {
         assert!(decompose_flags("").is_empty());
-    }
-
-    // -- op_kinds_to_name tests --
-
-    #[test]
-    fn op_kinds_to_name_single_bits() {
-        assert_eq!(op_kinds_to_name(1 << 0), "AddCgroup");
-        assert_eq!(op_kinds_to_name(1 << 1), "RemoveCgroup");
-        assert_eq!(op_kinds_to_name(1 << 2), "SetCpuset");
-        assert_eq!(op_kinds_to_name(1 << 3), "ClearCpuset");
-        assert_eq!(op_kinds_to_name(1 << 4), "SwapCpusets");
-        assert_eq!(op_kinds_to_name(1 << 5), "Spawn");
-        assert_eq!(op_kinds_to_name(1 << 6), "StopCgroup");
-        assert_eq!(op_kinds_to_name(1 << 7), "SetAffinity");
-        assert_eq!(op_kinds_to_name(1 << 8), "SpawnHost");
-    }
-
-    #[test]
-    fn op_kinds_to_name_multiple_returns_lowest_set() {
-        // With bits 2 and 5 set, returns the first (lowest) set bit match.
-        assert_eq!(op_kinds_to_name((1 << 2) | (1 << 5)), "SetCpuset");
-    }
-
-    #[test]
-    fn op_kinds_to_name_zero() {
-        assert_eq!(op_kinds_to_name(0), "unknown");
-    }
-
-    #[test]
-    fn op_kinds_to_name_high_bit() {
-        // Bit 9+ is beyond the NAMES array.
-        assert_eq!(op_kinds_to_name(1 << 15), "unknown");
-    }
-
-    // -- extract_worst_degradation tests --
-
-    #[test]
-    fn extract_worst_degradation_none() {
-        let (op, imb, dsq, fb, kl, count) = extract_worst_degradation(None);
-        assert!(op.is_empty());
-        assert_eq!(imb, 0.0);
-        assert_eq!(dsq, 0.0);
-        assert_eq!(fb, 0.0);
-        assert_eq!(kl, 0.0);
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn extract_worst_degradation_no_degradations() {
-        use crate::timeline::Timeline;
-        let t = Timeline { phases: vec![] };
-        let (op, imb, dsq, fb, kl, count) = extract_worst_degradation(Some(&t));
-        assert!(op.is_empty());
-        assert_eq!(imb, 0.0);
-        assert_eq!(dsq, 0.0);
-        assert_eq!(fb, 0.0);
-        assert_eq!(kl, 0.0);
-        assert_eq!(count, 0);
-    }
-
-    // -- shm_stim_to_timeline tests --
-
-    #[test]
-    fn shm_stim_to_timeline_empty() {
-        let result = shm_stim_to_timeline(&[]);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].label, "ScenarioStart");
-    }
-
-    #[test]
-    fn shm_stim_to_timeline_with_events() {
-        let events = vec![crate::vmm::shm_ring::StimulusEvent {
-            elapsed_ms: 1000,
-            step_index: 0,
-            op_count: 3,
-            op_kinds: 1 << 2,
-            cgroup_count: 2,
-            worker_count: 4,
-            total_iterations: 50000,
-        }];
-        let result = shm_stim_to_timeline(&events);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[1].label, "StepStart[0]");
-        assert_eq!(result[1].op_kind.as_deref(), Some("SetCpuset"));
     }
 
     // -- format_stimulus_crosstab tests --
@@ -2480,78 +2002,6 @@ mod tests {
         assert_eq!(row.fallback_count, 0);
         assert_eq!(row.keep_last_count, 0);
     }
-
-    // -- parse_label --
-
-    #[test]
-    fn parse_label_full() {
-        let (topo, scenario, flags, wt, replica) =
-            parse_label("tiny-2llc/cgroup_steady/llc+borrow/CpuSpin#3");
-        assert_eq!(topo, "tiny-2llc");
-        assert_eq!(scenario, "cgroup_steady");
-        assert_eq!(flags, "llc+borrow");
-        assert_eq!(wt, "CpuSpin");
-        assert_eq!(replica, 3);
-    }
-
-    #[test]
-    fn parse_label_no_replica() {
-        let (topo, scenario, flags, wt, replica) =
-            parse_label("tiny-2llc/cgroup_steady/default/Mixed");
-        assert_eq!(topo, "tiny-2llc");
-        assert_eq!(scenario, "cgroup_steady");
-        assert_eq!(flags, "default");
-        assert_eq!(wt, "Mixed");
-        assert_eq!(replica, 1);
-    }
-
-    #[test]
-    fn parse_label_no_work_type() {
-        let (topo, scenario, flags, wt, replica) = parse_label("tiny-2llc/cgroup_steady/default");
-        assert_eq!(topo, "tiny-2llc");
-        assert_eq!(scenario, "cgroup_steady");
-        assert_eq!(flags, "default");
-        assert_eq!(wt, "CpuSpin");
-        assert_eq!(replica, 1);
-    }
-
-    #[test]
-    fn parse_label_no_flags() {
-        let (topo, scenario, flags, wt, replica) = parse_label("tiny-2llc/cgroup_steady");
-        assert_eq!(topo, "tiny-2llc");
-        assert_eq!(scenario, "cgroup_steady");
-        assert_eq!(flags, "default");
-        assert_eq!(wt, "CpuSpin");
-        assert_eq!(replica, 1);
-    }
-
-    #[test]
-    fn parse_label_replica_non_numeric() {
-        let (_, _, _, _, replica) = parse_label("t/s/f/w#notanumber");
-        assert_eq!(replica, 1);
-    }
-
-    #[test]
-    fn parse_label_empty() {
-        let (topo, scenario, flags, wt, replica) = parse_label("");
-        assert_eq!(topo, "");
-        assert_eq!(scenario, "");
-        assert_eq!(flags, "default");
-        assert_eq!(wt, "CpuSpin");
-        assert_eq!(replica, 1);
-    }
-
-    #[test]
-    fn parse_label_only_topo() {
-        let (topo, scenario, flags, wt, replica) = parse_label("tiny-2llc");
-        assert_eq!(topo, "tiny-2llc");
-        assert_eq!(scenario, "");
-        assert_eq!(flags, "default");
-        assert_eq!(wt, "CpuSpin");
-        assert_eq!(replica, 1);
-    }
-
-    // -- proptest --
 
     // -- metric_def tests --
 
@@ -3075,44 +2525,5 @@ mod tests {
         assert_eq!(res.regressions, 1);
         assert_eq!(res.new_in_b, 0, "beta is filtered out, not new");
         assert_eq!(res.removed_from_a, 0, "gamma is filtered out, not removed");
-    }
-
-    // -- parse_label proptests --
-
-    use proptest::prop_assert;
-
-    proptest::proptest! {
-        /// Arbitrary input must produce a well-formed tuple: replica
-        /// is always >= 1 (1 is the default when no `#N` suffix is
-        /// present; 0 would mean "no replicas" which is nonsensical).
-        /// Broadened the input range from 50 to 200 characters to
-        /// exercise long labels and pathological `/`/`#` mixes.
-        #[test]
-        fn prop_parse_label_never_panics(s in "\\PC{0,200}") {
-            let (_topo, _scenario, _flags, _work_type, replica) = parse_label(&s);
-            prop_assert!(replica >= 1, "replica < 1 from {s:?}: {replica}");
-        }
-
-        #[test]
-        fn prop_parse_label_replica_default_1(
-            topo in "[a-z0-9_-]{1,10}",
-            scenario in "[a-z0-9_]{1,10}",
-            flags in "[a-z+]{1,10}",
-        ) {
-            let label = format!("{topo}/{scenario}/{flags}");
-            let (_, _, _, _, replica) = parse_label(&label);
-            assert_eq!(replica, 1);
-        }
-
-        #[test]
-        fn prop_parse_label_replica_roundtrip(
-            topo in "[a-z]{1,5}",
-            scenario in "[a-z]{1,5}",
-            r in 1u32..1000,
-        ) {
-            let label = format!("{topo}/{scenario}/default/CpuSpin#{r}");
-            let (_, _, _, _, replica) = parse_label(&label);
-            assert_eq!(replica, r);
-        }
     }
 }

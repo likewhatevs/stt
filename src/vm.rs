@@ -1,149 +1,22 @@
-//! VM launch configuration and gauntlet topology presets.
+//! Gauntlet topology presets.
 //!
-//! See the [Running Tests](https://likewhatevs.github.io/ktstr/guide/running-tests.html)
-//! and [Gauntlet](https://likewhatevs.github.io/ktstr/guide/running-tests/gauntlet.html)
-//! chapters of the guide.
+//! See the [Gauntlet](https://likewhatevs.github.io/ktstr/guide/running-tests/gauntlet.html)
+//! chapter of the guide.
 
-use anyhow::{Context, Result};
-use std::path::PathBuf;
-use std::time::Duration;
-
-use crate::vmm::{self, Topology, VmResult};
-
-/// Configuration for launching a test VM.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct VmConfig {
-    pub kernel: Option<String>,
-    pub topology: Topology,
-    pub memory_mb: usize,
-    pub timeout: Option<Duration>,
-    /// Linux source tree with built kernel. Resolves to
-    /// `{kernel_dir}/arch/x86/boot/bzImage` on x86_64 or
-    /// `{kernel_dir}/arch/arm64/boot/Image` on aarch64.
-    pub kernel_dir: Option<String>,
-}
-
-impl Default for VmConfig {
-    fn default() -> Self {
-        Self {
-            kernel: None,
-            topology: Topology {
-                llcs: 2,
-                cores_per_llc: 2,
-                threads_per_core: 1,
-                numa_nodes: 1,
-                nodes: None,
-                distances: None,
-            },
-            memory_mb: 4096,
-            timeout: None,
-            kernel_dir: None,
-        }
-    }
-}
-
-impl VmConfig {
-    /// Reject values that would leave the VM unbootable. Mirrors the
-    /// `RunConfig::validate` / `TopoOverride::validate` /
-    /// `KtstrTestEntry::validate` pattern so every directly-constructed
-    /// config has one consistent entry point for up-front checks.
-    ///
-    /// Rules:
-    /// - `memory_mb` must be `> 0` (a VM with zero memory cannot boot).
-    #[allow(dead_code)]
-    pub fn validate(&self) -> Result<()> {
-        if self.memory_mb == 0 {
-            anyhow::bail!("VmConfig.memory_mb must be > 0 (a VM with zero memory cannot boot)");
-        }
-        Ok(())
-    }
-}
-
-/// Boot a KVM VM with the given config and run ktstr inside it.
-///
-/// Resolves the kernel image, builds the initramfs (ktstr binary +
-/// optional scheduler), and boots the VM. Returns the VM's exit
-/// result including serial output.
-#[allow(dead_code)]
-pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
-    cfg.validate()?;
-    // Resolve kernel
-    let kernel = if let Some(ref kd) = cfg.kernel_dir {
-        #[cfg(target_arch = "x86_64")]
-        let image = PathBuf::from(kd).join("arch/x86/boot/bzImage");
-        #[cfg(target_arch = "aarch64")]
-        let image = PathBuf::from(kd).join("arch/arm64/boot/Image");
-        image
-    } else if let Some(ref k) = cfg.kernel {
-        PathBuf::from(k)
-    } else {
-        crate::find_kernel()?.unwrap_or_else(|| PathBuf::from("/boot/vmlinuz"))
-    };
-
-    // Find ktstr binary (ourselves)
-    let ktstr_bin = crate::resolve_current_exe()?;
-
-    // Build guest args: strip --scheduler-bin (host path) and append
-    // the guest-side path (/scheduler) so the inner ktstr finds the binary.
-    let mut sched_bin: Option<PathBuf> = None;
-    let mut guest_args = Vec::with_capacity(ktstr_args.len() + 2);
-    let mut iter = ktstr_args.iter();
-    while let Some(a) = iter.next() {
-        if a == "--scheduler-bin" {
-            if let Some(val) = iter.next() {
-                sched_bin = Some(PathBuf::from(val));
-            }
-        } else if let Some(val) = a.strip_prefix("--scheduler-bin=") {
-            sched_bin = Some(PathBuf::from(val));
-        } else {
-            guest_args.push(a.clone());
-        }
-    }
-    if sched_bin.is_some() {
-        guest_args.push("--scheduler-bin".into());
-        guest_args.push("/scheduler".into());
-    }
-
-    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
-    let t = &cfg.topology;
-    let mut builder = vmm::KtstrVm::builder()
-        .kernel(&kernel)
-        .init_binary(&ktstr_bin)
-        .topology(t.numa_nodes, t.llcs, t.cores_per_llc, t.threads_per_core)
-        .memory_mb(u32::try_from(cfg.memory_mb).context("memory_mb exceeds u32::MAX")?)
-        .run_args(&guest_args)
-        .no_perf_mode(no_perf_mode);
-
-    if let Some(ref sb) = sched_bin {
-        builder = builder.scheduler_binary(sb);
-    }
-    if let Some(t) = cfg.timeout {
-        builder = builder.timeout(t);
-    }
-
-    builder.build()?.run()
-}
-
-/// Compute a VM timeout based on scenario count, duration, and CPU count.
-///
-/// Accounts for boot overhead that scales with large CPU counts.
-#[allow(dead_code)]
-pub fn compute_timeout(num_runs: usize, duration_s: u64, num_cpus: usize) -> Duration {
-    // Large VMs boot slower: add 1s per 10 CPUs beyond 16
-    let boot_overhead = 10 + (num_cpus.saturating_sub(16) / 10) as u64;
-    Duration::from_secs(boot_overhead + num_runs as u64 * (duration_s + 2) * 2)
-}
+use crate::vmm::Topology;
 
 /// A gauntlet topology preset.
 ///
 /// Each preset defines a specific CPU topology for matrix testing.
 /// See [`gauntlet_presets()`] for the full set.
-#[allow(dead_code)]
 pub struct TopoPreset {
     pub name: &'static str,
+    /// Human-readable description; read by preset-audit tests only.
+    #[allow(dead_code)]
     pub description: &'static str,
     pub topology: Topology,
+    /// Memory budget for this preset's VM; read by preset-audit tests only.
+    #[allow(dead_code)]
     pub memory_mb: usize,
 }
 
@@ -327,32 +200,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compute_timeout_basic() {
-        // 8 CPUs: no extra boot overhead (below 16 threshold)
-        assert_eq!(
-            compute_timeout(1, 20, 8),
-            Duration::from_secs(10 + (20 + 2) * 2)
-        );
-    }
-
-    #[test]
-    fn compute_timeout_multiple_runs() {
-        assert_eq!(
-            compute_timeout(5, 15, 8),
-            Duration::from_secs(10 + 5 * (15 + 2) * 2)
-        );
-    }
-
-    #[test]
-    fn compute_timeout_large_vm() {
-        // 240 CPUs: (240-16)/10 = 22 extra seconds
-        assert_eq!(
-            compute_timeout(1, 20, 240),
-            Duration::from_secs(32 + (20 + 2) * 2)
-        );
-    }
-
-    #[test]
     fn gauntlet_presets_unique_names() {
         let p = gauntlet_presets();
         let names: Vec<&str> = p.iter().map(|p| p.name).collect();
@@ -375,38 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn vm_config_default() {
-        let c = VmConfig::default();
-        assert_eq!(c.topology.total_cpus(), 4);
-        assert_eq!(c.memory_mb, 4096);
-        assert!(c.kernel.is_none());
-        assert!(c.timeout.is_none());
-    }
-
-    #[test]
-    fn compute_timeout_zero_runs() {
-        // num_runs=0: only boot overhead, no per-run time
-        assert_eq!(compute_timeout(0, 30, 8), Duration::from_secs(10));
-    }
-
-    #[test]
-    fn compute_timeout_zero_cpus() {
-        // num_cpus=0: saturating_sub(16) clamps to 0, no extra overhead
-        assert_eq!(
-            compute_timeout(1, 10, 0),
-            Duration::from_secs(10 + (10 + 2) * 2)
-        );
-    }
-
-    #[test]
-    fn compute_timeout_large_cpu_count() {
-        // num_cpus=1000: (1000-16)/10 = 98 extra seconds
-        let t = compute_timeout(1, 10, 1000);
-        assert_eq!(t, Duration::from_secs(10 + 98 + (10 + 2) * 2));
-        assert!(t.as_secs() < 10_000, "should be finite and reasonable");
-    }
-
-    #[test]
     fn gauntlet_presets_memory_sane() {
         for p in &gauntlet_presets() {
             assert!(
@@ -424,33 +239,6 @@ mod tests {
                 cpus
             );
         }
-    }
-
-    #[test]
-    fn compute_timeout_16_cpus_boundary() {
-        // Exactly 16 CPUs: saturating_sub(16) = 0, no extra overhead
-        assert_eq!(
-            compute_timeout(1, 10, 16),
-            Duration::from_secs(10 + (10 + 2) * 2)
-        );
-    }
-
-    #[test]
-    fn compute_timeout_17_cpus() {
-        // 17 CPUs: (17-16)/10 = 0 (integer division), no extra
-        assert_eq!(
-            compute_timeout(1, 10, 17),
-            Duration::from_secs(10 + (10 + 2) * 2)
-        );
-    }
-
-    #[test]
-    fn compute_timeout_26_cpus() {
-        // 26 CPUs: (26-16)/10 = 1 extra second
-        assert_eq!(
-            compute_timeout(1, 10, 26),
-            Duration::from_secs(11 + (10 + 2) * 2)
-        );
     }
 
     #[test]
@@ -554,65 +342,6 @@ mod tests {
                 cpus
             );
         }
-    }
-
-    #[test]
-    fn run_in_vm_rejects_zero_memory() {
-        let cfg = VmConfig {
-            memory_mb: 0,
-            ..VmConfig::default()
-        };
-        let err = run_in_vm(&cfg, &[]).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("memory_mb") && msg.contains("> 0"),
-            "error must name the field: {msg}"
-        );
-    }
-
-    /// `VmConfig::validate` is the directly-callable entry point for
-    /// the same check that `run_in_vm` gates on. Explicit coverage
-    /// ensures the method itself returns Err rather than relying
-    /// solely on the `run_in_vm` wrapper.
-    #[test]
-    fn vm_config_validate_rejects_zero_memory() {
-        let cfg = VmConfig {
-            memory_mb: 0,
-            ..VmConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("memory_mb") && msg.contains("> 0"),
-            "VmConfig::validate error must name the field: {msg}"
-        );
-    }
-
-    #[test]
-    fn vm_config_validate_accepts_default() {
-        VmConfig::default().validate().unwrap();
-    }
-
-    #[test]
-    fn vm_config_custom() {
-        let c = VmConfig {
-            kernel: Some("/boot/custom".into()),
-            topology: Topology {
-                llcs: 4,
-                cores_per_llc: 8,
-                threads_per_core: 1,
-                numa_nodes: 1,
-                nodes: None,
-                distances: None,
-            },
-            memory_mb: 8192,
-            timeout: Some(Duration::from_secs(300)),
-            kernel_dir: Some("/src/linux".into()),
-        };
-        assert_eq!(c.topology.total_cpus(), 32);
-        assert_eq!(c.memory_mb, 8192);
-        assert!(c.timeout.is_some());
-        assert_eq!(c.timeout.unwrap(), Duration::from_secs(300));
     }
 
     #[test]

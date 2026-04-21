@@ -198,7 +198,8 @@ pub(crate) fn extract_features(
 ///
 /// VM tests: `10 + max(0, (total_cpus - 16) / 10) + duration + 2`.
 /// Adds 3s for `performance_mode` (hugepage setup, vCPU pinning).
-/// Derived from the boot overhead in `vm::compute_timeout`.
+/// The 10s baseline covers kernel boot; the per-16-CPU term accounts
+/// for vCPU + memory setup overhead that scales with VM size.
 ///
 /// Host-only tests run without a VM: `duration + 2`.
 pub(crate) fn estimate_duration(entry: &KtstrTestEntry, topo: &Topology) -> f64 {
