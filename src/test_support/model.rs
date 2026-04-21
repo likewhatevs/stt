@@ -1944,4 +1944,132 @@ mod tests {
         let s = "<think>x</Think>";
         assert_eq!(strip_think_block(s), s);
     }
+
+    /// `anyhow::Error::new` preserves the underlying error's
+    /// source chain — exercising the migration from
+    /// `Error::msg` (which drops the chain) to `Error::new`. Wrap
+    /// a known `std::io::Error`, then walk the anyhow error's
+    /// chain iterator and assert the underlying io::Error is
+    /// reachable as the root cause. A regression that reverted any
+    /// of the candle/tokenizer conversions to `Error::msg` would
+    /// silently hide the original error, but this test documents the
+    /// mechanism rather than dynamically scanning production code.
+    #[test]
+    fn anyhow_error_new_preserves_source_chain() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "fixture io error");
+        let wrapped = anyhow::Error::new(io_err).context("wrapped layer");
+        // chain() yields context->root in order; the last element is
+        // the original io::Error.
+        let chain: Vec<&(dyn std::error::Error + 'static)> = wrapped.chain().collect();
+        assert!(
+            chain.len() >= 2,
+            "expected at least 2 layers (context + io), got {}",
+            chain.len()
+        );
+        let root = wrapped.root_cause();
+        let io: &std::io::Error = root
+            .downcast_ref()
+            .expect("root cause should downcast to io::Error");
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(io.to_string(), "fixture io error");
+    }
+
+    /// `anyhow::Error::from_boxed` preserves the underlying error's
+    /// Display output through the chain — exercising the
+    /// migration for tokenizer errors (which arrive as
+    /// `Box<dyn std::error::Error + Send + Sync>` per
+    /// tokenizers-0.21.4/src/tokenizer/mod.rs:51). Verify both the
+    /// context layer and the inner message are visible in the chain.
+    /// Unlike `anyhow_error_new_preserves_source_chain`, the concrete
+    /// type stored under `from_boxed` is the trait object itself, so
+    /// `downcast_ref::<io::Error>()` on root_cause returns None —
+    /// that's an artifact of trait-object storage, not a chain loss.
+    /// The Display path is what `.context()` users consume, so pin
+    /// the Display round-trip.
+    #[test]
+    fn anyhow_error_from_boxed_preserves_display_chain() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::InvalidData, "fixture boxed error");
+        let boxed: Box<dyn std::error::Error + Send + Sync + 'static> = Box::new(io_err);
+        let wrapped = anyhow::Error::from_boxed(boxed).context("tokenizer layer");
+        let rendered = format!("{wrapped:#}");
+        assert!(
+            rendered.contains("tokenizer layer"),
+            "context layer missing from chain Display: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("fixture boxed error"),
+            "inner boxed error Display missing from chain: {rendered:?}"
+        );
+        // `.chain()` should yield both layers; count proves the chain
+        // is non-trivial (not flattened to a single message).
+        assert!(
+            wrapped.chain().count() >= 2,
+            "expected >= 2 chain layers after from_boxed + context"
+        );
+    }
+
+    /// `reject_insecure_url` rejects every non-HTTPS scheme — pair
+    /// with `reject_insecure_url_rejects_http` which only covers
+    /// `http://`. Each input here is a distinct non-HTTPS shape the
+    /// `starts_with("https://")` gate must reject: ftp, file, a
+    /// scheme-less path, the empty string, and the HTTPS prefix
+    /// missing its slashes. A regression that replaced the
+    /// `starts_with` gate with a substring search or a laxer URL
+    /// parse would admit one of these.
+    #[test]
+    fn reject_insecure_url_rejects_non_https_schemes() {
+        let cases: &[&str] = &[
+            "ftp://example.com/model.gguf",
+            "file:///tmp/model.gguf",
+            "example.com/model.gguf",
+            "",
+            "https:/example.com/model.gguf",
+            "HTTPS://example.com/model.gguf",
+        ];
+        for url in cases {
+            let err = reject_insecure_url(url).unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("non-HTTPS"),
+                "URL {url:?} must be rejected, got: {rendered}"
+            );
+        }
+    }
+
+    /// Full `ensure()` flow with an `http://` URL must bail at the
+    /// `reject_insecure_url` gate inside `fetch()`. Cache is empty,
+    /// offline is unset, and SHA pin is validly shaped — so the
+    /// status fast path, the explicit shape check, and the offline
+    /// gate all pass, driving execution through to fetch(). The
+    /// resulting Err surfaces the "non-HTTPS" message, proving
+    /// fetch() gates URL scheme before any network or filesystem
+    /// action. Does not require network: fetch bails before reqwest
+    /// is constructed.
+    #[test]
+    fn ensure_bails_with_non_https_error_on_http_url() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // Explicitly clear the offline env so prior tests cannot
+        // poison this one through ENV_LOCK acquisition ordering.
+        let _env_offline = super::super::test_helpers::EnvVarGuard::remove(OFFLINE_ENV);
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
+        let spec = ModelSpec {
+            file_name: "http-url.gguf",
+            url: "http://placeholder.example/http-url.gguf",
+            // 64-char zero pin is valid shape; shape check passes.
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let err = ensure(&spec).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("non-HTTPS"),
+            "expected reject_insecure_url error through ensure→fetch, got: {rendered}"
+        );
+    }
 }
