@@ -106,6 +106,11 @@ pub struct KernelMetadata {
     /// Whether a stripped vmlinux ELF was cached alongside the image.
     /// When true, the entry directory contains a `vmlinux` file; see
     /// [`strip_vmlinux_debug`] for the strip policy.
+    ///
+    /// Required in metadata.json — plain `bool` without
+    /// `#[serde(default)]` must be present during deserialization, so
+    /// entries that predate this field surface as Corrupt rather than
+    /// defaulting to `false`.
     pub has_vmlinux: bool,
 }
 
@@ -1092,6 +1097,34 @@ mod tests {
         let image = dir.join("bzImage");
         fs::write(&image, b"fake kernel image").unwrap();
         image
+    }
+
+    /// Build a minimal ELF object with a single `.text` section (64
+    /// bytes of 0xCC) anchored by one symbol. The anchor symbol is
+    /// what drives `object::write` to emit `.symtab`/`.strtab`, and
+    /// every `neutralize_alloc_relocs` test shares this base shape.
+    /// Callers that need SHF_ALLOC relocation sections add them on
+    /// top of the returned object before calling `.write()`.
+    fn build_base_elf_with_text_symbol() -> object::write::Object<'static> {
+        use object::write;
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 1);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_text_symbol".to_vec(),
+            value: 0x0,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        obj
     }
 
     // -- keep-list source disjointness --
@@ -3062,27 +3095,10 @@ mod tests {
     #[test]
     fn neutralize_alloc_relocs_zeros_only_sh_size_of_alloc_reloc_sections() {
         use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
-        use object::write;
 
-        let mut obj = write::Object::new(
-            object::BinaryFormat::Elf,
-            object::Architecture::X86_64,
-            object::Endianness::Little,
-        );
-        // .text — a normal section. Anchor a symbol so the object
-        // writer emits .symtab/.strtab.
-        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
-        obj.append_section_data(text_id, &[0xCC; 64], 1);
-        let _ = obj.add_symbol(write::Symbol {
-            name: b"test_text_symbol".to_vec(),
-            value: 0x0,
-            size: 8,
-            kind: object::SymbolKind::Data,
-            scope: object::SymbolScope::Compilation,
-            weak: false,
-            section: write::SymbolSection::Section(text_id),
-            flags: object::SymbolFlags::None,
-        });
+        // Base ELF with .text + anchor symbol (so object::write
+        // emits .symtab/.strtab). Reloc sections are added below.
+        let mut obj = build_base_elf_with_text_symbol();
         // .rela.kaslr — SHT_RELA + SHF_ALLOC. Shape matches what
         // CONFIG_RELOCATABLE + CONFIG_RANDOMIZE_BASE kernels emit
         // and motivates this pass per the fn docstring. sh_size
@@ -3273,26 +3289,9 @@ mod tests {
     /// documented as the "no-op" branch in the fn docstring.
     #[test]
     fn neutralize_alloc_relocs_noop_when_no_alloc_reloc_sections() {
-        use object::write;
-
-        let mut obj = write::Object::new(
-            object::BinaryFormat::Elf,
-            object::Architecture::X86_64,
-            object::Endianness::Little,
-        );
-        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
-        obj.append_section_data(text_id, &[0xCC; 64], 1);
-        let _ = obj.add_symbol(write::Symbol {
-            name: b"test_text_symbol".to_vec(),
-            value: 0x0,
-            size: 8,
-            kind: object::SymbolKind::Data,
-            scope: object::SymbolScope::Compilation,
-            weak: false,
-            section: write::SymbolSection::Section(text_id),
-            flags: object::SymbolFlags::None,
-        });
-        let data = obj.write().unwrap();
+        // Base ELF carries only .text + anchor symbol — no reloc
+        // sections at all, so the filter matches nothing.
+        let data = build_base_elf_with_text_symbol().write().unwrap();
 
         let processed = neutralize_alloc_relocs(&data).unwrap();
         assert_eq!(
@@ -3325,27 +3324,12 @@ mod tests {
     #[test]
     fn neutralize_alloc_relocs_is_idempotent() {
         use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
-        use object::write;
 
-        let mut obj = write::Object::new(
-            object::BinaryFormat::Elf,
-            object::Architecture::X86_64,
-            object::Endianness::Little,
-        );
-        // .text — anchored with a symbol so the object writer emits
-        // .symtab/.strtab (matches the sibling test's fixture shape).
-        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
-        obj.append_section_data(text_id, &[0xCC; 64], 1);
-        let _ = obj.add_symbol(write::Symbol {
-            name: b"test_text_symbol".to_vec(),
-            value: 0x0,
-            size: 8,
-            kind: object::SymbolKind::Data,
-            scope: object::SymbolScope::Compilation,
-            weak: false,
-            section: write::SymbolSection::Section(text_id),
-            flags: object::SymbolFlags::None,
-        });
+        // Base .text + anchor symbol; the reloc sections added below
+        // intentionally mirror the sibling zeros_only test's fixture
+        // so both positive and negative filter paths re-walk on the
+        // second pass.
+        let mut obj = build_base_elf_with_text_symbol();
         // .rela.kaslr — SHT_RELA + SHF_ALLOC. Primary positive case.
         let kaslr_id = obj.add_section(
             Vec::new(),
@@ -3485,6 +3469,10 @@ mod tests {
     ///    and magic gates, and fails on the subsequent class-dispatch
     ///    match with `Error::Malformed("invalid ELF class 0")`. This is
     ///    the "passes magic, fails deeper" path.
+    ///
+    /// Either failure mode flows through the same `anyhow::anyhow!`
+    /// wrapper, so the test pins the wrapper string for each input
+    /// without pinning the goblin-side sub-error wording.
     #[test]
     fn neutralize_alloc_relocs_rejects_invalid_elf() {
         // Table-driven so a future goblin upgrade that changes either
@@ -3507,6 +3495,177 @@ mod tests {
                 "[{label}] expected error context to name the ELF parse step; got: {rendered}"
             );
         }
+    }
+
+    /// ELF32 counterpart of
+    /// [`neutralize_alloc_relocs_zeros_only_sh_size_of_alloc_reloc_sections`].
+    ///
+    /// `neutralize_alloc_relocs` dispatches on `elf.is_64` at the
+    /// `sh_size` offset/width pair — 32-byte offset + 8-byte field for
+    /// ELF64, 20-byte offset + 4-byte field for ELF32 (per the
+    /// ELF32/ELF64 section header layouts documented at the call site).
+    /// The existing fixture-driven coverage is all ELF64 (Architecture::
+    /// X86_64), so a regression that swapped the `if elf.is_64` branches
+    /// or hardcoded the 64-bit offsets would silently corrupt 32-bit
+    /// inputs without tripping any assertion.
+    ///
+    /// Uses `Architecture::I386` which `object` maps to
+    /// `address_size == U32` and therefore emits ELFCLASS32 via the
+    /// writer's is_64=false path. goblin then parses the output with
+    /// `is_64 == false`, driving `neutralize_alloc_relocs` through the
+    /// else `(20, 4)` branch.
+    ///
+    /// Exercises BOTH arms of the
+    /// `sh.sh_type == SHT_RELA || sh.sh_type == SHT_REL` filter
+    /// predicate on the ELF32 code path. A regression that special-
+    /// cased SHT_REL only on ELF64 (e.g. wired it to a 64-bit offset
+    /// table), or dropped SHT_REL from the ELF32 filter altogether,
+    /// would leave one section un-zeroed here.
+    ///
+    /// Invariants pinned: SHF_ALLOC + SHT_RELA AND SHF_ALLOC + SHT_REL
+    /// both have their sh_size zeroed, the output remains parseable
+    /// as ELF32 (is_64 stays false), and the buffer length is
+    /// preserved (the fn only rewrites an in-place header field,
+    /// never resizes).
+    #[test]
+    fn neutralize_alloc_relocs_zeros_sh_size_in_elf32_fixture() {
+        use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
+        use object::write;
+
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::I386,
+            object::Endianness::Little,
+        );
+        // .text anchored by a symbol so object::write emits
+        // .symtab/.strtab — mirrors the ELF64 fixture pattern.
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 1);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_text_symbol".to_vec(),
+            value: 0x0,
+            size: 4,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        // .rela.kaslr — SHT_RELA + SHF_ALLOC. A 16-byte payload is
+        // large enough that a mis-targeted 4-byte write at offset 20
+        // (the correct ELF32 sh_size location) is observable via
+        // goblin's post-parse sh_size read.
+        let kaslr_id = obj.add_section(
+            Vec::new(),
+            b".rela.kaslr".to_vec(),
+            object::SectionKind::Elf(SHT_RELA),
+        );
+        obj.append_section_data(kaslr_id, &[0xA5; 16], 1);
+        obj.section_mut(kaslr_id).flags = object::SectionFlags::Elf {
+            sh_flags: u64::from(SHF_ALLOC),
+        };
+        // .rel.foo — SHT_REL + SHF_ALLOC. Exercises the second arm
+        // of the `is_rela` predicate (`|| sh.sh_type == SHT_REL`) on
+        // the ELF32 code path. A regression that dropped SHT_REL
+        // from the filter on the 32-bit path would leave this
+        // section's sh_size unchanged and trip the post-call
+        // assertion below.
+        let rel_id = obj.add_section(
+            Vec::new(),
+            b".rel.foo".to_vec(),
+            object::SectionKind::Elf(SHT_REL),
+        );
+        obj.append_section_data(rel_id, &[0xC7; 12], 1);
+        obj.section_mut(rel_id).flags = object::SectionFlags::Elf {
+            sh_flags: u64::from(SHF_ALLOC),
+        };
+
+        let data = obj.write().unwrap();
+
+        // Positive-control the fixture: the output must actually be
+        // ELF32 (is_64 == false) — otherwise this test would false-pass
+        // through the ELF64 code path the sibling test already covers.
+        // A future object-crate change that remapped I386 to ELF64
+        // would surface here rather than silently duplicating existing
+        // coverage.
+        let pre_elf = goblin::elf::Elf::parse(&data).unwrap();
+        assert!(
+            !pre_elf.is_64,
+            "fixture must produce ELF32 (is_64 == false) to exercise the (20, 4) branch"
+        );
+        let pre_kaslr = pre_elf
+            .section_headers
+            .iter()
+            .find(|sh| pre_elf.shdr_strtab.get_at(sh.sh_name) == Some(".rela.kaslr"))
+            .expect("fixture must carry .rela.kaslr")
+            .clone();
+        let pre_rel = pre_elf
+            .section_headers
+            .iter()
+            .find(|sh| pre_elf.shdr_strtab.get_at(sh.sh_name) == Some(".rel.foo"))
+            .expect("fixture must carry .rel.foo")
+            .clone();
+        assert_eq!(
+            pre_kaslr.sh_type, SHT_RELA,
+            ".rela.kaslr sh_type must be SHT_RELA"
+        );
+        assert!(
+            pre_kaslr.sh_flags & u64::from(SHF_ALLOC) != 0,
+            ".rela.kaslr must carry SHF_ALLOC; got sh_flags={:#x}",
+            pre_kaslr.sh_flags
+        );
+        assert_eq!(
+            pre_kaslr.sh_size, 16,
+            ".rela.kaslr sh_size must match 16-byte payload pre-call"
+        );
+        assert_eq!(pre_rel.sh_type, SHT_REL, ".rel.foo sh_type must be SHT_REL");
+        assert!(
+            pre_rel.sh_flags & u64::from(SHF_ALLOC) != 0,
+            ".rel.foo must carry SHF_ALLOC; got sh_flags={:#x}",
+            pre_rel.sh_flags
+        );
+        assert_eq!(
+            pre_rel.sh_size, 12,
+            ".rel.foo sh_size must match 12-byte payload pre-call"
+        );
+
+        let processed = neutralize_alloc_relocs(&data).unwrap();
+        assert_eq!(
+            processed.len(),
+            data.len(),
+            "neutralize_alloc_relocs must not resize the ELF32 buffer"
+        );
+
+        let post_elf = goblin::elf::Elf::parse(&processed).unwrap();
+        assert!(
+            !post_elf.is_64,
+            "post-call parse must still be ELF32; the fn must not alter the e_ident class byte"
+        );
+        let post_kaslr = post_elf
+            .section_headers
+            .iter()
+            .find(|sh| post_elf.shdr_strtab.get_at(sh.sh_name) == Some(".rela.kaslr"))
+            .expect(".rela.kaslr must survive the neutralize pass")
+            .clone();
+        let post_rel = post_elf
+            .section_headers
+            .iter()
+            .find(|sh| post_elf.shdr_strtab.get_at(sh.sh_name) == Some(".rel.foo"))
+            .expect(".rel.foo must survive the neutralize pass")
+            .clone();
+        // Primary invariants: sh_size is zeroed in the ELF32 4-byte
+        // slot at offset 20 within both section header entries — one
+        // per arm of the SHT_RELA || SHT_REL filter predicate.
+        assert_eq!(
+            post_kaslr.sh_size, 0,
+            "ELF32 .rela.kaslr sh_size must be zeroed (SHT_RELA arm); got {}",
+            post_kaslr.sh_size
+        );
+        assert_eq!(
+            post_rel.sh_size, 0,
+            "ELF32 .rel.foo sh_size must be zeroed (SHT_REL arm); got {}",
+            post_rel.sh_size
+        );
     }
 
     #[test]
