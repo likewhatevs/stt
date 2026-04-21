@@ -3485,10 +3485,6 @@ mod tests {
     ///    and magic gates, and fails on the subsequent class-dispatch
     ///    match with `Error::Malformed("invalid ELF class 0")`. This is
     ///    the "passes magic, fails deeper" path.
-    ///
-    /// Either failure mode flows through the same `anyhow::anyhow!`
-    /// wrapper, so the test pins the wrapper string for each input
-    /// without pinning the goblin-side sub-error wording.
     #[test]
     fn neutralize_alloc_relocs_rejects_invalid_elf() {
         // Table-driven so a future goblin upgrade that changes either

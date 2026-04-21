@@ -1746,6 +1746,306 @@ mod tests {
         assert_eq!(lens.into_inner(), vec![0, 1, 2]);
     }
 
+    // -- run_make_with_output --
+
+    /// `Command::current_dir` on a non-existent path causes
+    /// `Command::spawn` to fail before exec, with an underlying
+    /// `io::Error` of kind `NotFound`. `run_make_with_output` wraps
+    /// that error via `.with_context(|| format!("spawn make {}", ...))`,
+    /// so the rendered anyhow chain must surface BOTH the
+    /// `"spawn make <args>"` annotation (proving the wrapping landed
+    /// on the failing operation) AND the underlying
+    /// `"No such file or directory"` message (proving the io::Error
+    /// chain was preserved through context). A regression that
+    /// dropped either layer — bare `?` losing the context, or
+    /// `Error::msg` losing the source — would surface here. Pipe2 +
+    /// try_clone run before spawn, so reaching this error proves
+    /// they succeeded too.
+    #[test]
+    fn run_make_with_output_surfaces_actionable_error_when_kernel_dir_missing() {
+        let missing = std::path::Path::new("/this/path/should/not/exist/ktstr_test");
+        let err = run_make_with_output(missing, &["foo"], None)
+            .expect_err("nonexistent kernel_dir must surface a spawn failure");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("spawn make foo"),
+            "expected `spawn make foo` context layer, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("No such file or directory"),
+            "expected underlying io::Error chain, got: {rendered}"
+        );
+    }
+
+    /// End-to-end exercise of the merged-pipe path against a real
+    /// `make` invocation that emits to BOTH stdout and stderr in
+    /// large enough volume to fill a 64 KiB pipe buffer (Linux
+    /// default), then exits non-zero. Two invariants:
+    ///
+    /// 1. **No-deadlock.** The production code creates ONE pipe
+    ///    shared between stdout and stderr and reads it with a
+    ///    single BufReader (no threads, no select). If the merge
+    ///    were broken — e.g. if stderr were left attached to the
+    ///    inherited fd 2 instead of `try_clone`'d onto the pipe
+    ///    write end — high-volume stderr writes would still complete
+    ///    via the inherited fd, but a regression that wired stderr
+    ///    to a SECOND independent pipe with no reader would hang
+    ///    the child after the first ~64 KiB of stderr writes. The
+    ///    pipe-buffer-overflow lines below force that scenario; if
+    ///    the test completes, no-deadlock holds.
+    ///
+    /// 2. **Failure-path Err.** A non-zero exit must surface as
+    ///    `Err` with the `"make ... failed"` wording from the
+    ///    `bail!` at the end of `run_make_with_output`. A regression
+    ///    that swallowed the exit status or routed it through `Ok`
+    ///    would hide compiler errors in CI logs.
+    ///
+    /// Skipped (passes silently) when `make` is not on PATH so the
+    /// test suite stays runnable on minimal CI containers without
+    /// build tools. The companion
+    /// [`run_make_with_output_surfaces_actionable_error_when_kernel_dir_missing`]
+    /// test exercises the spawn-failure path without needing make.
+    #[test]
+    fn run_make_with_output_drains_high_volume_failing_make_without_deadlock() {
+        if resolve_in_path(std::path::Path::new("make")).is_none() {
+            skip!("make not in PATH");
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        // Default target prints 1 KiB to stdout and 1 KiB to stderr
+        // for 100 iterations (~200 KiB total — well past the Linux
+        // 64 KiB pipe buffer), then `false` exits 1. Recipe lines
+        // MUST start with a TAB, not spaces — make rejects spaces.
+        // `printf` with a 1 KiB byte string per call avoids relying
+        // on a specific shell loop construct; the Makefile uses
+        // make's own iteration via repetition.
+        let stdout_chunk: String = "S".repeat(1024);
+        let stderr_chunk: String = "E".repeat(1024);
+        let mut recipe = String::new();
+        for _ in 0..100 {
+            recipe.push_str(&format!("\t@printf '%s\\n' '{stdout_chunk}'\n"));
+            recipe.push_str(&format!("\t@printf '%s\\n' '{stderr_chunk}' >&2\n"));
+        }
+        let makefile = format!("default:\n{recipe}\t@false\n");
+        std::fs::write(dir.path().join("Makefile"), makefile).unwrap();
+        // Passing `default` explicitly anchors the error message
+        // wording to `"make default failed"` rather than the
+        // double-space `"make  failed"` form that `&[]` produces.
+        let err = run_make_with_output(dir.path(), &["default"], None)
+            .expect_err("non-zero exit must surface as Err");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("make default failed"),
+            "expected `make default failed` wording from bail!, got: {rendered}"
+        );
+    }
+
+    /// Redirect the test process's `stderr` (fd 2) to a tempfile for
+    /// the duration of `f`, then restore. Returns the bytes written
+    /// to fd 2 during the call. Used by tests that need to observe
+    /// what the production code emitted via `eprintln!` — there is
+    /// no in-band way to capture that without process-level fd
+    /// manipulation because `eprintln!` writes straight through to
+    /// fd 2.
+    ///
+    /// Implementation walks libc directly because nix 0.31's `dup2`
+    /// requires `&mut OwnedFd` for the destination, and fd 2 is not
+    /// an OwnedFd we can lawfully construct (we don't own it; std's
+    /// `Stderr` handle is the borrower). Saving via `libc::dup`,
+    /// swapping via `libc::dup2`, and restoring via a second `dup2`
+    /// keeps ownership semantics clean: we never claim to own fd 2,
+    /// we just temporarily point it elsewhere.
+    ///
+    /// Test-only utility — no production caller. Lives in this test
+    /// module so its scope is bounded.
+    fn capture_test_stderr<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut sink = tempfile::tempfile().expect("create stderr-capture tempfile");
+        let sink_fd = std::os::unix::io::AsRawFd::as_raw_fd(&sink);
+        // Flush any pending stderr buffering before redirect. eprintln!
+        // is line-buffered to a Stderr lock; flush ensures pre-call
+        // output reaches the original fd 2 instead of leaking into
+        // the captured tempfile.
+        std::io::stderr().flush().ok();
+        // SAFETY: libc::dup, libc::dup2, libc::close on integer fds
+        // are POSIX-defined and have no Rust-level safety obligations
+        // beyond the integers being valid open fds. fd 2 is open in
+        // every Unix process.
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved >= 0, "dup(STDERR_FILENO) failed");
+        let dup2_rc = unsafe { libc::dup2(sink_fd, libc::STDERR_FILENO) };
+        assert!(dup2_rc >= 0, "dup2(sink, STDERR_FILENO) failed");
+        let result = f();
+        // Flush before restore so all of f's writes land in the sink.
+        std::io::stderr().flush().ok();
+        let restore_rc = unsafe { libc::dup2(saved, libc::STDERR_FILENO) };
+        assert!(restore_rc >= 0, "dup2(saved, STDERR_FILENO) failed");
+        unsafe { libc::close(saved) };
+        sink.seek(SeekFrom::Start(0)).expect("rewind sink");
+        let mut bytes = Vec::new();
+        sink.read_to_end(&mut bytes).expect("read sink");
+        (result, bytes)
+    }
+
+    /// Direct proof of the merge: emit a unique marker on stdout and
+    /// a different unique marker on stderr from a child process,
+    /// then exit non-zero so `run_make_with_output` enters the
+    /// failure branch and `eprintln!`s every captured line. The
+    /// captured Vec is internal to the function, but the production
+    /// code's failure-path `eprintln!` loop (lines 521-525) dumps
+    /// every captured line to fd 2 before the `bail!` fires. Capture
+    /// fd 2 around the call via [`capture_test_stderr`] and assert
+    /// BOTH markers appear in the output.
+    ///
+    /// If the merge were broken (e.g. stderr installed on a
+    /// separate pipe with no reader, or left attached to the
+    /// parent's fd 2), the stderr marker would either deadlock the
+    /// child or end up on the test process's original stderr — NOT
+    /// in the captured Vec, NOT re-emitted by the failure-branch
+    /// eprintln loop, NOT in the bytes this test reads from the
+    /// sink. Asserting both markers appear is the empirical merge
+    /// proof that complements the no-deadlock invariant pinned by
+    /// `run_make_with_output_drains_high_volume_failing_make_without_deadlock`.
+    ///
+    /// Skipped when `make` is not on PATH for the same reason the
+    /// high-volume test is.
+    #[test]
+    fn run_make_with_output_merges_stderr_into_captured_output() {
+        if resolve_in_path(std::path::Path::new("make")).is_none() {
+            skip!("make not in PATH");
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        // Two distinguishable markers so the assertion can detect a
+        // half-merge regression where only one stream made it through.
+        let stdout_marker = "KTSTR_STDOUT_MARKER_e7f9";
+        let stderr_marker = "KTSTR_STDERR_MARKER_a1b2";
+        let makefile = format!(
+            "default:\n\
+             \t@printf '%s\\n' '{stdout_marker}'\n\
+             \t@printf '%s\\n' '{stderr_marker}' >&2\n\
+             \t@false\n"
+        );
+        std::fs::write(dir.path().join("Makefile"), makefile).unwrap();
+
+        let (result, captured_bytes) =
+            capture_test_stderr(|| run_make_with_output(dir.path(), &["default"], None));
+        let err = result.expect_err("non-zero exit must surface as Err");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("make default failed"),
+            "expected `make default failed` wording, got: {rendered}"
+        );
+        let captured = String::from_utf8_lossy(&captured_bytes);
+        assert!(
+            captured.contains(stdout_marker),
+            "stdout marker missing from captured output (eprintln'd via failure path) — \
+             expected `{stdout_marker}` in: {captured:?}"
+        );
+        assert!(
+            captured.contains(stderr_marker),
+            "stderr marker missing from captured output — proves the merge is BROKEN: \
+             stderr did not reach the captured Vec. expected `{stderr_marker}` in: {captured:?}"
+        );
+    }
+
+    /// Stderr-only high-volume burst: emit ~128 KiB to stderr alone
+    /// (no interleaved stdout writes), then exit non-zero. This
+    /// isolates the stderr-merge invariant from the stdout path.
+    /// A regression that wired stderr to a separate unread pipe
+    /// would deadlock the child after the first ~64 KiB (Linux
+    /// default pipe buffer) since no reader exists on the broken
+    /// stderr pipe. 128 KiB is double the buffer — definitely
+    /// triggers the deadlock condition. Distinct from the
+    /// interleaved high-volume test in
+    /// [`run_make_with_output_drains_high_volume_failing_make_without_deadlock`]:
+    /// that test interleaves so partial-merge regressions could
+    /// "look" like they work because alternating stdout drains the
+    /// pipe between stderr writes; this test forces stderr to drain
+    /// alone. Test completion = no-deadlock pass.
+    ///
+    /// Skipped when `make` is not on PATH.
+    #[test]
+    fn run_make_with_output_drains_stderr_only_high_volume_without_deadlock() {
+        if resolve_in_path(std::path::Path::new("make")).is_none() {
+            skip!("make not in PATH");
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        // 128 iterations * 1 KiB = 128 KiB of stderr — 2x the default
+        // 64 KiB pipe buffer. No stdout writes at all so the buffer
+        // can only drain via the merged-pipe reader.
+        let chunk: String = "X".repeat(1024);
+        let mut recipe = String::new();
+        for _ in 0..128 {
+            recipe.push_str(&format!("\t@printf '%s\\n' '{chunk}' >&2\n"));
+        }
+        let makefile = format!("default:\n{recipe}\t@false\n");
+        std::fs::write(dir.path().join("Makefile"), makefile).unwrap();
+        let err = run_make_with_output(dir.path(), &["default"], None)
+            .expect_err("non-zero exit must surface as Err");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("make default failed"),
+            "expected `make default failed` wording, got: {rendered}"
+        );
+    }
+
+    /// Spawn-failure path must not leak the pipe2 OwnedFds. Three
+    /// fds are allocated before spawn: `read_fd` (pipe2 read end),
+    /// `write_fd` (pipe2 write end, consumed by `Stdio::from`), and
+    /// `write_fd_err` (`try_clone` of write_fd). When spawn fails:
+    /// - `write_fd` is owned by the Command builder, which is
+    ///   dropped on the early-return path.
+    /// - `write_fd_err` is still in scope as an `OwnedFd` and drops
+    ///   when the function returns.
+    /// - `read_fd` is still in scope and drops on return.
+    ///
+    /// All three should release via OwnedFd's Drop (which calls
+    /// `close()` on the inner fd). Count `/proc/self/fd` entries
+    /// before and after a guaranteed-spawn-failure call; the count
+    /// must not increase. A regression that switched to raw fd
+    /// integers (no Drop) or that consumed the write_fd via a path
+    /// other than Stdio::from (leaving it dangling on early return)
+    /// would surface here as a leak of 1-3 fds per call.
+    ///
+    /// Linux-only: relies on `/proc/self/fd` enumeration. Skipped
+    /// silently when /proc isn't a procfs mount.
+    #[test]
+    fn run_make_with_output_releases_fds_on_spawn_failure() {
+        let proc_fd = std::path::Path::new("/proc/self/fd");
+        if !proc_fd.is_dir() {
+            eprintln!(
+                "skipping run_make_with_output_releases_fds_on_spawn_failure: \
+                 /proc/self/fd not available"
+            );
+            return;
+        }
+        let count_fds = || -> usize {
+            std::fs::read_dir(proc_fd)
+                .expect("read /proc/self/fd")
+                .filter_map(|e| e.ok())
+                .count()
+        };
+        // Warm-up pass: the first call may allocate process-wide
+        // resources (thread-local buffers, lazy_static-like state in
+        // the std/anyhow paths) that look like fd growth on a single
+        // before/after measurement. Run once outside the measurement
+        // window so steady-state fd usage is what we sample.
+        let missing = std::path::Path::new("/this/path/should/not/exist/ktstr_test_fdcheck");
+        let _ = run_make_with_output(missing, &["foo"], None);
+        let before = count_fds();
+        // Run the failing path several times — a per-call leak of
+        // even one fd would compound here and surface as a clear
+        // delta. A single-call measurement could miss small leaks
+        // masked by transient fd churn from the test runtime.
+        for _ in 0..16 {
+            let _ = run_make_with_output(missing, &["foo"], None);
+        }
+        let after = count_fds();
+        assert!(
+            after <= before,
+            "fd leak on spawn failure: {before} -> {after} (16 calls, expected no growth)"
+        );
+    }
+
     // -- resolve_flags --
 
     #[test]
