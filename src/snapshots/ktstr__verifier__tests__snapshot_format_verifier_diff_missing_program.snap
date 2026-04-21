@@ -4,7 +4,6 @@ expression: "format_verifier_diff(\"A\", &stats_a, \"B\", &stats_b)"
 ---
 
 delta A/B diff: A vs B
-  program                                           A          B      delta
-  ------------------------------------------------------------------------
-  enqueue                                         500        500         +0
-  new_prog                                        100          0       +100
+ program   A    B    delta 
+ enqueue   500  500  +0    
+ new_prog  100  0    +100

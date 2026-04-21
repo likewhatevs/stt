@@ -100,7 +100,7 @@ strum = { version = "0.27", features = ["derive"] }
 # jemalloc as global allocator for the ktstr/cargo-ktstr binaries.
 # binary-only — the library stays allocator-agnostic so downstream
 # consumers pick their own allocator. enables per-thread allocation
-# introspection via mallctl for the host-state feature ().
+# introspection via mallctl for the host-state feature.
 tikv-jemallocator = "0.6"
 # SHA-256 for verifying downloaded model-cache artifacts. `gix` pulls
 # in sha1 only; sha2 is a fresh dep and only the model-cache code

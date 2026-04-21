@@ -159,11 +159,12 @@ pub struct FioJsonPayload;
 /// under configurable contention.
 ///
 /// Output format: `ExitCode`. stress-ng emits human-readable
-/// progress lines to stderr; metrics require `--metrics-brief
-/// --yaml`, which produces YAML on stderr (not stdout). Since the
-/// extraction pipeline only consumes stdout, even `--yaml` does
-/// not currently feed `extract_metrics`; the fixture stays in
-/// exit-code mode and the happy path is a zero exit.
+/// progress lines to stderr; its machine-readable-metrics flags
+/// write structured output to a caller-named file, not to stdout
+/// or stderr. Since the extraction pipeline only consumes stdout,
+/// no default stress-ng invocation feeds `extract_metrics`; the
+/// fixture stays in exit-code mode and the happy path is a zero
+/// exit.
 ///
 /// **Caveat:** `default_args` is empty, so invoking `STRESS_NG`
 /// without at least one stressor flag (e.g. `--cpu 1`, `--vm 1`)
@@ -174,9 +175,12 @@ pub struct FioJsonPayload;
 ///
 /// Tests that want bogo_ops/sec metrics should declare their own
 /// custom `Payload` via [`#[derive(Payload)]`](ktstr::Payload) and
-/// pair it with a post-hoc stderr-to-stdout bridge, or wait for
-/// the LlmExtract backend to land and declare
-/// `output = LlmExtract("bogo ops")`.
+/// pair it with a post-hoc stderr-to-stdout bridge, or declare
+/// `output = LlmExtract("bogo ops")`. stress-ng emits bogo_ops on
+/// stderr by default and its machine-readable-metrics flags write
+/// to a caller-named file, not stdout, so a wrapper that captures
+/// or redirects structured output onto stdout is still required
+/// to give the LLM a non-empty body.
 #[derive(Payload)]
 #[payload(binary = "stress-ng")]
 #[default_check(exit_code_eq(0))]
@@ -212,7 +216,7 @@ pub struct StressNgPayload;
 /// need strict regression direction for schbench should pipe
 /// `--json -` instead and declare an `OutputFormat::Json` fixture
 /// with concrete hint paths that match the fixed schbench schema
-/// (e.g. `"normal.wakeup_latency_pct99.0"` from `write_json_stats`
+/// (e.g. `"int.wakeup_latency_pct99.0"` from `write_json_stats`
 /// in schbench.c).
 ///
 /// **stdout-only extraction.** schbench writes its percentile

@@ -725,12 +725,12 @@ mod tests {
     #[test]
     fn find_kernel_preserves_untracked_cache_entries() {
         use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
-        use crate::test_support::test_helpers::{ENV_LOCK, EnvVarGuard};
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
         // `find_kernel` reads KTSTR_KERNEL and KTSTR_CACHE_DIR. Both
         // are process-wide, so other tests in this binary must not be
         // mutating them in parallel while this test owns them.
-        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env_lock = lock_env();
         // KTSTR_KERNEL: unset so find_kernel skips step 1 and falls
         // straight into the cache scan (step 2), which is the branch
         // this test targets.

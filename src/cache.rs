@@ -51,12 +51,19 @@ use serde::{Deserialize, Serialize};
 /// Serialized as `{"type": "tarball"}`, `{"type": "git", "git_hash": ..., "ref": ...}`,
 /// or `{"type": "local", "source_tree_path": ..., "git_hash": ...}`.
 /// Every per-variant payload field is emitted explicitly — `Option`
-/// fields serialize as `null` when `None` rather than being skipped.
-/// The `serde(default)` and `skip_serializing_if` compat shims were
-/// dropped pre-1.0, so a truncated `metadata.json` that omits any of
-/// these keys fails deserialization and surfaces the entry as
-/// [`ListedEntry::Corrupt`] via [`CacheDir::list`] instead of
-/// silently defaulting.
+/// fields serialize as `null` when `None` rather than being skipped,
+/// so JSON consumers see stable keys across every variant regardless
+/// of which optional payload values are set.
+///
+/// Only the serialization side is pinned here. On deserialize,
+/// serde_json treats absent `Option` keys as `None`, so an old
+/// `metadata.json` that drops `git_hash`, `ref`, or
+/// `source_tree_path` still round-trips — see
+/// [`tests::kernel_source_absent_option_keys_deserialize_as_none`].
+/// Cache-integrity enforcement (truncated `metadata.json` surfacing
+/// as [`ListedEntry::Corrupt`] via [`CacheDir::list`]) rides on the
+/// required non-`Option` fields of [`KernelMetadata`], not on the
+/// optional payloads here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "type")]
 #[non_exhaustive]
@@ -99,6 +106,16 @@ impl fmt::Display for KernelSource {
 }
 
 /// Metadata stored alongside a cached kernel image.
+///
+/// Required fields (`source`, `arch`, `image_name`, `built_at`,
+/// `has_vmlinux`) must be present in `metadata.json` during
+/// deserialization; a truncated file that drops any of them surfaces
+/// the entry as [`ListedEntry::Corrupt`] via [`CacheDir::list`]
+/// rather than silently defaulting. Optional fields (`version`,
+/// `config_hash`, `ktstr_kconfig_hash`) and the `Option`-typed
+/// payloads inside [`KernelSource`] variants tolerate absent keys
+/// as `None` — they participate in the on-disk shape but do not
+/// gate cache integrity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct KernelMetadata {
@@ -411,11 +428,15 @@ impl CacheDir {
     /// List all cached kernel entries, sorted by build time (newest
     /// first). Entries with missing metadata, unparseable metadata,
     /// or a missing image file surface as [`ListedEntry::Corrupt`] at
-    /// the end of the Vec. Valid entries are guaranteed to have an
-    /// image file present — callers can call
-    /// [`CacheEntry::image_path`] without re-stat'ing.
-    /// (Concurrent cache mutation can invalidate this — callers in
-    /// multi-process contexts should handle ENOENT gracefully.)
+    /// the end of the Vec. Valid entries are observed to have an
+    /// image file present at scan time — the presence check runs
+    /// inside this function before classification, so callers do not
+    /// need to re-stat for steady-state reads. The guarantee is
+    /// best-effort against TOCTOU: concurrent cache mutation
+    /// (another process calling `store`/`clean`, or manual rmdir)
+    /// can invalidate the invariant between `list()` return and a
+    /// subsequent [`CacheEntry::image_path`] open, so callers in
+    /// multi-process contexts must still handle ENOENT gracefully.
     pub fn list(&self) -> anyhow::Result<Vec<ListedEntry>> {
         let mut entries: Vec<ListedEntry> = Vec::new();
         let read_dir = match fs::read_dir(&self.root) {
@@ -1285,10 +1306,12 @@ mod tests {
 
     /// git_hash on KernelSource::Local is a plain Option<String> with
     /// no serde attributes — the compat shims (serde(default) +
-    /// skip_serializing_if) were removed for pre-1.0, so None
+    /// skip_serializing_if) were removed for pre-1.0, so `None`
     /// serializes as an explicit `null` key and deserialization
-    /// accepts `null` (or the key being absent is a deserialization
-    /// error, guarding against truncated cache metadata).
+    /// accepts `null` back as `None`. This test pins only the
+    /// None → null → None round trip; the absent-key branch is
+    /// exercised separately by
+    /// [`kernel_source_absent_option_keys_deserialize_as_none`].
     #[test]
     fn kernel_source_local_git_hash_serde_round_trip_none() {
         let src = KernelSource::Local {
@@ -1302,6 +1325,62 @@ mod tests {
         );
         let parsed: KernelSource = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, KernelSource::Local { git_hash: None, .. }));
+    }
+
+    /// Older `metadata.json` files written before `Option` fields
+    /// were emitted as explicit `null` simply omit the keys. The
+    /// [`KernelSource`] doc states absent `Option` keys must
+    /// deserialize as `None` — cache-integrity enforcement rides on
+    /// the required non-`Option` fields of [`KernelMetadata`], not
+    /// on the optional payloads inside variants. Feed each variant
+    /// a minimal JSON with every `Option` key omitted, deserialize,
+    /// and assert the result carries `None` in every payload slot.
+    #[test]
+    fn kernel_source_absent_option_keys_deserialize_as_none() {
+        // Git with both git_hash and ref omitted.
+        let git_bare: KernelSource = serde_json::from_str(r#"{"type":"git"}"#)
+            .expect("Git with absent Option keys must deserialize");
+        assert!(matches!(
+            git_bare,
+            KernelSource::Git {
+                git_hash: None,
+                git_ref: None,
+            }
+        ));
+
+        // Git with only git_hash present.
+        let git_hash_only: KernelSource =
+            serde_json::from_str(r#"{"type":"git","git_hash":"abc"}"#)
+                .expect("Git with only git_hash must deserialize");
+        assert!(matches!(
+            git_hash_only,
+            KernelSource::Git {
+                git_hash: Some(ref h),
+                git_ref: None,
+            } if h == "abc"
+        ));
+
+        // Git with only ref present.
+        let git_ref_only: KernelSource = serde_json::from_str(r#"{"type":"git","ref":"main"}"#)
+            .expect("Git with only ref must deserialize");
+        assert!(matches!(
+            git_ref_only,
+            KernelSource::Git {
+                git_hash: None,
+                git_ref: Some(ref r),
+            } if r == "main"
+        ));
+
+        // Local with both source_tree_path and git_hash omitted.
+        let local_bare: KernelSource = serde_json::from_str(r#"{"type":"local"}"#)
+            .expect("Local with absent Option keys must deserialize");
+        assert!(matches!(
+            local_bare,
+            KernelSource::Local {
+                source_tree_path: None,
+                git_hash: None,
+            }
+        ));
     }
 
     #[test]
@@ -2580,7 +2659,6 @@ mod tests {
             .store("kc-untracked", &CacheArtifacts::new(&image), &meta)
             .unwrap();
         assert_eq!(entry.kconfig_status("anything"), KconfigStatus::Untracked);
-        assert!(!matches!(entry.kconfig_status("anything"), KconfigStatus::Stale { .. }));
     }
 
     #[test]

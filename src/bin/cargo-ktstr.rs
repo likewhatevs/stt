@@ -1563,9 +1563,19 @@ mod tests {
         let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
         let entry = store_test_entry(&cache, "match-key", &meta);
         let row = cli::format_entry_row(&entry, "same", &[]);
+        // Assert absence of the two variant tags (`(stale kconfig)`,
+        // `(untracked kconfig)`) rather than the bare word `kconfig`.
+        // A future column-header that includes "kconfig" (e.g. a
+        // KCONFIG column) would otherwise fail this test spuriously —
+        // the contract being pinned is "Matches carries neither the
+        // stale nor the untracked tag," not "the word never appears."
         assert!(
-            !row.contains("kconfig"),
-            "matching entry should carry no kconfig tag: {row}"
+            !row.contains("stale kconfig"),
+            "matching entry must not carry (stale kconfig) tag: {row}"
+        );
+        assert!(
+            !row.contains("untracked kconfig"),
+            "matching entry must not carry (untracked kconfig) tag: {row}"
         );
     }
 

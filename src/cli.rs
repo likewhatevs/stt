@@ -130,8 +130,26 @@ fn version_prefix(version: &str) -> Option<String> {
     }
 }
 
-/// Check if a version's series is in the active releases list.
+/// Return `true` when `version`'s major.minor series is absent
+/// from a non-empty `active_prefixes` list — i.e. the version is
+/// end-of-life relative to the kernel.org releases snapshot the
+/// caller supplied.
+///
+/// Returns `false` in three cases:
+/// - `active_prefixes` is empty. Callers pass an empty slice to
+///   signal "active list unknown" (fetch failure, or skipped
+///   lookup), per the `kernel list --json` doc contract that
+///   fetch failure must not flag any entry EOL. Without the
+///   explicit empty-slice guard, `!any(..)` on an empty iterator
+///   is `true` and every entry would be tagged EOL — the exact
+///   opposite of the contract.
+/// - `version` has no parseable major.minor prefix (e.g. a cache
+///   key or freeform string).
+/// - `version`'s major.minor prefix appears in `active_prefixes`.
 fn is_eol(version: &str, active_prefixes: &[String]) -> bool {
+    if active_prefixes.is_empty() {
+        return false;
+    }
     let Some(prefix) = version_prefix(version) else {
         return false;
     };
@@ -2584,18 +2602,26 @@ mod tests {
 
     // -- kernel_list JSON/human parity --
 
-    /// `kernel_list` renders each cache entry twice — once into the
-    /// JSON `stale_kconfig` boolean (inline at the JSON-branch call
-    /// site) and once into the human `(stale kconfig)` tag emitted
-    /// by [`format_entry_row`]. Both paths derive staleness from
-    /// `kconfig_status`, so their reported stale-ness must agree on
-    /// every entry.
+    /// Pin the [`format_entry_row`] staleness mapping: the human
+    /// `(stale kconfig)` tag appears iff `CacheEntry::kconfig_status`
+    /// returns `KconfigStatus::Stale`. The test exercises every
+    /// `KconfigStatus` variant (Matches, Stale, Untracked), so a
+    /// regression that tightened the variant-to-tag mapping — e.g.
+    /// surfacing Untracked as stale or dropping the Stale branch —
+    /// surfaces as a tag/status disagreement.
     ///
-    /// A regression that changes one path's variant matching without
-    /// updating the other would diverge the human and JSON outputs
-    /// without breaking either in isolation.
-    /// This test exercises each KconfigStatus variant and asserts the
-    /// two paths produce the same answer.
+    /// `kernel list --json` emits `kconfig_status` as a 3-value
+    /// string (`"matches"` / `"stale"` / `"untracked"`) via
+    /// `CacheEntry::kconfig_status(...).to_string()` at the
+    /// JSON-branch call site — NOT a `stale_kconfig` boolean. The
+    /// "JSON/human parity" phrasing in the test name refers to the
+    /// shared `kconfig_status` gate both branches key off.
+    ///
+    /// The current body only evaluates the human branch against the
+    /// `kconfig_status` method return; it does not exercise the
+    /// JSON emission path, so a regression that broke the
+    /// JSON-branch string serialization would slip through this
+    /// test.
     #[test]
     fn kernel_list_stale_kconfig_json_human_parity() {
         use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
@@ -2645,5 +2671,57 @@ mod tests {
                  json_stale={json_stale}, human_row={human_row:?}"
             );
         }
+    }
+
+    // -- is_eol predicate --
+    //
+    // Pure function, no env / fixtures. Pins every return branch
+    // documented on `is_eol`: the empty-slice guard, the
+    // prefix-in-list branch, the prefix-absent branch, and the
+    // unparseable-prefix branch.
+
+    /// Empty `active_prefixes` is the "active list unknown" signal
+    /// (fetch failure, skipped lookup). The empty-slice guard must
+    /// return false so the `kernel list --json` contract holds:
+    /// releases.json failure means no entry is tagged EOL. Without
+    /// the guard, `!any(..)` on an empty iterator is `true` and the
+    /// predicate would flip to tagging every entry EOL — the exact
+    /// opposite of the contract.
+    #[test]
+    fn is_eol_empty_active_prefixes_returns_false() {
+        assert!(!is_eol("6.14.2", &[]));
+    }
+
+    /// Happy path for an active series: the major.minor prefix
+    /// (`6.14`) appears in the supplied `active_prefixes` list, so
+    /// the any-match arm fires and the overall predicate returns
+    /// false (not EOL).
+    #[test]
+    fn is_eol_prefix_in_active_list_returns_false() {
+        assert!(!is_eol("6.14.2", &["6.14".to_string()]));
+    }
+
+    /// The failure path the predicate exists to detect: the
+    /// version's `5.10` prefix is absent from a non-empty active
+    /// list, so `!any(..)` fires and the predicate returns true.
+    /// Sanity-checks the only code path that produces `true` in the
+    /// current implementation.
+    #[test]
+    fn is_eol_prefix_absent_from_active_list_returns_true() {
+        assert!(is_eol(
+            "5.10.200",
+            &["6.14".to_string(), "6.12".to_string()],
+        ));
+    }
+
+    /// A version string with no parseable major.minor prefix (e.g.
+    /// a cache key or freeform identifier) short-circuits via
+    /// `version_prefix` and returns false. Distinct from the
+    /// empty-slice branch above: the active list is non-empty here,
+    /// so reaching false requires the prefix-absent short-circuit to
+    /// fire.
+    #[test]
+    fn is_eol_unparseable_version_returns_false() {
+        assert!(!is_eol("abc", &["6.14".to_string()]));
     }
 }
