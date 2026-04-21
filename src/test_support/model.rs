@@ -1354,20 +1354,21 @@ pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Me
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::test_helpers::{EnvVarGuard, isolated_cache_dir, lock_env};
 
     #[test]
     fn resolve_cache_root_honors_ktstr_cache_dir() {
         // Nextest runs tests in parallel within a binary and
-        // `std::env::set_var` is process-wide. ENV_LOCK serializes
-        // the save/mutate/restore window against every other
-        // env-touching test in this crate so concurrent runners in
-        // sidecar.rs / eval.rs don't race on KTSTR_CACHE_DIR.
-        // Poisoned-lock recovery: env tests don't establish shared
-        // invariants beyond the save/restore pair, so a panic inside
-        // the critical section is safe to unwrap through.
-        let _lock = super::super::test_helpers::lock_env();
+        // `std::env::set_var` is process-wide. `lock_env()`
+        // serializes the save/mutate/restore window against every
+        // other env-touching test in this crate so concurrent
+        // runners in sidecar.rs / eval.rs don't race on
+        // KTSTR_CACHE_DIR. Poisoned-lock recovery is handled
+        // inside `lock_env()` itself, so a panic inside the
+        // critical section is safe to recover through.
+        let _lock = lock_env();
         let _env =
-            super::super::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", "/explicit/override");
+            EnvVarGuard::set("KTSTR_CACHE_DIR", "/explicit/override");
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, PathBuf::from("/explicit/override"));
     }
@@ -1518,9 +1519,9 @@ mod tests {
     fn ensure_in_offline_mode_fails_loudly_when_uncached() {
         // See `resolve_cache_root_honors_ktstr_cache_dir` for the
         // lock_env() rationale.
-        let _lock = super::super::test_helpers::lock_env();
-        let _cache = super::super::test_helpers::isolated_cache_dir();
-        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _lock = lock_env();
+        let _cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         let fake = ModelSpec {
             file_name: "does-not-exist.gguf",
             url: "https://placeholder.example/none.gguf",
@@ -1551,9 +1552,9 @@ mod tests {
     /// out the placeholder pin, NOT the offline gate.
     #[test]
     fn ensure_surfaces_sha_shape_error_before_offline_gate() {
-        let _lock = super::super::test_helpers::lock_env();
-        let _cache = super::super::test_helpers::isolated_cache_dir();
-        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _lock = lock_env();
+        let _cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         // Placeholder-shape SHA (all-`?`, 64 chars) is 64 bytes long
         // but contains no ASCII hex digits, so is_valid_sha256_hex
         // rejects it at the shape-check step inside ensure() BEFORE
@@ -1584,8 +1585,8 @@ mod tests {
     /// at the expected path.
     #[test]
     fn status_reports_cached_but_sha_mismatch_for_garbage_bytes() {
-        let _lock = super::super::test_helpers::lock_env();
-        let cache = super::super::test_helpers::isolated_cache_dir();
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
         let spec = ModelSpec {
             file_name: "bogus.gguf",
             url: "https://placeholder.example/bogus.gguf",
@@ -1652,8 +1653,8 @@ mod tests {
             );
             return;
         }
-        let _lock = super::super::test_helpers::lock_env();
-        let cache = super::super::test_helpers::isolated_cache_dir();
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
         let spec = ModelSpec {
             file_name: "unreadable.gguf",
             url: "https://placeholder.example/unreadable.gguf",
@@ -1720,8 +1721,8 @@ mod tests {
     /// logic into a pointless re-download branch.
     #[test]
     fn status_surfaces_malformed_pin_error_for_cached_file() {
-        let _lock = super::super::test_helpers::lock_env();
-        let cache = super::super::test_helpers::isolated_cache_dir();
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
         let spec = ModelSpec {
             file_name: "malformed-pin.gguf",
             url: "https://placeholder.example/malformed-pin.gguf",
@@ -1760,8 +1761,8 @@ mod tests {
     /// surface here.
     #[test]
     fn status_surfaces_length_fail_pin_error_for_cached_file() {
-        let _lock = super::super::test_helpers::lock_env();
-        let cache = super::super::test_helpers::isolated_cache_dir();
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
         let spec = ModelSpec {
             file_name: "short-pin.gguf",
             url: "https://placeholder.example/short-pin.gguf",
@@ -1787,10 +1788,10 @@ mod tests {
     /// through to `XDG_CACHE_HOME` and appends `ktstr/models`.
     #[test]
     fn resolve_cache_root_honors_xdg_cache_home() {
-        let _lock = super::super::test_helpers::lock_env();
-        let _env_ktstr = super::super::test_helpers::EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _lock = lock_env();
+        let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
         let _env_xdg =
-            super::super::test_helpers::EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
+            EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
         let root = resolve_cache_root().unwrap();
         assert_eq!(
             root,
@@ -1804,10 +1805,10 @@ mod tests {
     /// documented default on a fresh system.
     #[test]
     fn resolve_cache_root_falls_back_to_home_cache() {
-        let _lock = super::super::test_helpers::lock_env();
-        let _env_ktstr = super::super::test_helpers::EnvVarGuard::remove("KTSTR_CACHE_DIR");
-        let _env_xdg = super::super::test_helpers::EnvVarGuard::remove("XDG_CACHE_HOME");
-        let _env_home = super::super::test_helpers::EnvVarGuard::set("HOME", "/home/fake");
+        let _lock = lock_env();
+        let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _env_home = EnvVarGuard::set("HOME", "/home/fake");
         let root = resolve_cache_root().unwrap();
         assert_eq!(
             root,
@@ -1825,10 +1826,10 @@ mod tests {
     /// silently write cache entries into the current working dir.
     #[test]
     fn resolve_cache_root_treats_empty_ktstr_cache_dir_as_unset() {
-        let _lock = super::super::test_helpers::lock_env();
-        let _env_ktstr = super::super::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", "");
+        let _lock = lock_env();
+        let _env_ktstr = EnvVarGuard::set("KTSTR_CACHE_DIR", "");
         let _env_xdg =
-            super::super::test_helpers::EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
+            EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
         let root = resolve_cache_root().unwrap();
         assert_eq!(
             root,
@@ -1916,11 +1917,11 @@ mod tests {
     /// the full 200-char payload.
     #[test]
     fn ensure_offline_error_sanitizes_env_value_in_message() {
-        let _lock = super::super::test_helpers::lock_env();
-        let _cache = super::super::test_helpers::isolated_cache_dir();
+        let _lock = lock_env();
+        let _cache = isolated_cache_dir();
         // Embed a newline + a very long tail; both get rewritten.
         let hostile = format!("inject\nbreak{}", "z".repeat(200));
-        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, &hostile);
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, &hostile);
         let fake = ModelSpec {
             file_name: "not-here.gguf",
             url: "https://placeholder.example/not-here.gguf",
@@ -2465,15 +2466,15 @@ mod tests {
     /// the offline-gate trip point so a regression that swallowed
     /// the env var context would fire here first.
     ///
-    /// Calls [`reset_for_test`] under `ENV_LOCK` so a `PREFETCH_VERIFIED
+    /// Calls [`reset_for_test`] under [`lock_env`] so a `PREFETCH_VERIFIED
     /// = true` set by an earlier test does not route this call through
     /// `locate()` (which skips the offline-gate `ensure()` it expects).
     #[test]
     fn load_inference_errs_with_offline_message_under_offline_gate() {
-        let _lock = super::super::test_helpers::lock_env();
+        let _lock = lock_env();
         reset_for_test();
-        let _cache = super::super::test_helpers::isolated_cache_dir();
-        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         let r = load_inference();
         match r {
             Err(e) => {
@@ -2493,7 +2494,7 @@ mod tests {
     /// `ensure()` before any model load, so the inference call
     /// fails cleanly and the pipeline reports no metrics.
     ///
-    /// Calls [`reset_for_test`] under `ENV_LOCK` so a previously
+    /// Calls [`reset_for_test`] under [`lock_env`] so a previously
     /// memoized `Ok(_)` slot in [`MODEL_CACHE`] cannot bypass the
     /// offline gate this test means to exercise. Without the reset,
     /// any earlier successful load anywhere in the test binary would
@@ -2503,10 +2504,10 @@ mod tests {
     /// because the offline gate tripped").
     #[test]
     fn extract_via_llm_returns_empty_when_backend_unavailable() {
-        let _lock = super::super::test_helpers::lock_env();
+        let _lock = lock_env();
         reset_for_test();
-        let _cache = super::super::test_helpers::isolated_cache_dir();
-        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         let metrics = extract_via_llm("arbitrary stdout", None);
         assert!(metrics.is_empty());
         let metrics = extract_via_llm("stdout with hint", Some("focus"));
@@ -2537,13 +2538,13 @@ mod tests {
     /// path ran both times.
     #[test]
     fn reset_for_test_clears_model_cache_and_prefetch_verified() {
-        let _lock = super::super::test_helpers::lock_env();
+        let _lock = lock_env();
         // Seed a populated slot so we can prove reset clears it. Use
         // the offline-gate path so seeding doesn't try to load the
         // 2.44 GiB GGUF.
         reset_for_test();
-        let _cache = super::super::test_helpers::isolated_cache_dir();
-        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         // First call — populates MODEL_CACHE with Err(<offline gate>).
         let _ = extract_via_llm("seed call", None);
         {
@@ -2935,11 +2936,11 @@ mod tests {
     /// is constructed.
     #[test]
     fn ensure_bails_with_non_https_error_on_http_url() {
-        let _lock = super::super::test_helpers::lock_env();
-        let _cache = super::super::test_helpers::isolated_cache_dir();
+        let _lock = lock_env();
+        let _cache = isolated_cache_dir();
         // Explicitly clear the offline env so prior tests cannot
         // poison this one through lock_env acquisition ordering.
-        let _env_offline = super::super::test_helpers::EnvVarGuard::remove(OFFLINE_ENV);
+        let _env_offline = EnvVarGuard::remove(OFFLINE_ENV);
         let spec = ModelSpec {
             file_name: "http-url.gguf",
             url: "http://placeholder.example/http-url.gguf",
@@ -2966,9 +2967,9 @@ mod tests {
     /// error rather than the clear OFFLINE_ENV message.
     #[test]
     fn ensure_under_offline_bails_on_stale_cache_sha_mismatch() {
-        let _lock = super::super::test_helpers::lock_env();
-        let cache = super::super::test_helpers::isolated_cache_dir();
-        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         let spec = ModelSpec {
             file_name: "stale.gguf",
             url: "https://placeholder.example/stale.gguf",
@@ -3042,8 +3043,8 @@ mod tests {
     /// the `!path.is_file()` branch; no SHA check or download fires.
     #[test]
     fn locate_errors_when_cached_file_missing() {
-        let _lock = super::super::test_helpers::lock_env();
-        let cache = super::super::test_helpers::isolated_cache_dir();
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
         let err = locate(&DEFAULT_MODEL).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
@@ -3071,8 +3072,8 @@ mod tests {
     /// expected `root.join(file_name)` path.
     #[test]
     fn locate_returns_path_when_cached_file_present() {
-        let _lock = super::super::test_helpers::lock_env();
-        let cache = super::super::test_helpers::isolated_cache_dir();
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
         let expected_path = cache.path().join(DEFAULT_MODEL.file_name);
         std::fs::write(&expected_path, []).unwrap();
         let got = locate(&DEFAULT_MODEL).unwrap();

@@ -1437,12 +1437,12 @@ mod tests {
     }
 
     /// Thin test wrapper that produces a complete cpio newc archive by
-    /// concatenating [`build_initramfs_base`] and [`build_suffix`]
+    /// concatenating [`build_initramfs_base`] and [`build_suffix_args`]
     /// output. Production callers build base and suffix separately so
     /// they can stream the parts into guest memory without an
     /// intermediate `Vec`; the monolithic form is only needed for
     /// round-trip archive-shape assertions in tests.
-    fn create_initramfs(
+    fn build_initramfs(
         payload: &Path,
         extra_binaries: &[(&str, &Path)],
         args: &[String],
@@ -1505,9 +1505,9 @@ mod tests {
     }
 
     #[test]
-    fn create_initramfs_has_init() {
+    fn build_initramfs_has_init() {
         let exe = crate::resolve_current_exe().unwrap();
-        let initrd = create_initramfs(&exe, &[], &[]).unwrap();
+        let initrd = build_initramfs(&exe, &[], &[]).unwrap();
         let s = String::from_utf8_lossy(&initrd);
         assert!(s.contains("init"), "should contain init entry");
         assert!(s.contains("TRAILER!!!"));
@@ -1519,27 +1519,27 @@ mod tests {
         let initrd = build_initramfs_base(&exe, &[], &[], false).unwrap();
         assert_eq!(&initrd[..6], b"070701");
         // Base is NOT 512-aligned on its own; only base+suffix is.
-        let full = create_initramfs(&exe, &[], &[]).unwrap();
+        let full = build_initramfs(&exe, &[], &[]).unwrap();
         assert!(initrd.len() <= full.len());
     }
 
     #[test]
-    fn create_initramfs_padded() {
+    fn build_initramfs_padded() {
         let exe = crate::resolve_current_exe().unwrap();
-        let initrd = create_initramfs(&exe, &[], &[]).unwrap();
+        let initrd = build_initramfs(&exe, &[], &[]).unwrap();
         assert_eq!(initrd.len() % 512, 0);
     }
 
     #[test]
     fn initramfs_nonexistent_file() {
-        let result = create_initramfs(Path::new("/nonexistent"), &[], &[]);
+        let result = build_initramfs(Path::new("/nonexistent"), &[], &[]);
         assert!(result.is_err());
     }
 
     #[test]
     fn initramfs_nonexistent_extra_binary() {
         let exe = crate::resolve_current_exe().unwrap();
-        let result = create_initramfs(&exe, &[("bad", Path::new("/nonexistent"))], &[]);
+        let result = build_initramfs(&exe, &[("bad", Path::new("/nonexistent"))], &[]);
         assert!(result.is_err());
     }
 
@@ -1547,7 +1547,7 @@ mod tests {
     fn initramfs_with_args() {
         let exe = crate::resolve_current_exe().unwrap();
         let args = vec!["run".into(), "--json".into(), "scenario".into()];
-        let initrd = create_initramfs(&exe, &[], &args).unwrap();
+        let initrd = build_initramfs(&exe, &[], &args).unwrap();
         let s = String::from_utf8_lossy(&initrd);
         assert!(s.contains("args"));
     }
@@ -1555,7 +1555,7 @@ mod tests {
     #[test]
     fn initramfs_empty_args() {
         let exe = crate::resolve_current_exe().unwrap();
-        let initrd = create_initramfs(&exe, &[], &[]).unwrap();
+        let initrd = build_initramfs(&exe, &[], &[]).unwrap();
         assert_eq!(initrd.len() % 512, 0);
     }
 
@@ -1581,7 +1581,7 @@ mod tests {
     fn split_matches_monolithic() {
         let exe = crate::resolve_current_exe().unwrap();
         let args = vec!["run".into(), "--json".into(), "scenario".into()];
-        let monolithic = create_initramfs(&exe, &[], &args).unwrap();
+        let monolithic = build_initramfs(&exe, &[], &args).unwrap();
         let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
         let mut split = Vec::with_capacity(base.len() + suffix.len());

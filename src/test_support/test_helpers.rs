@@ -47,17 +47,25 @@ pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
 ///   * on drop, the env var's previous value is restored and the
 ///     directory is removed.
 ///
+/// Field order is load-bearing: Rust drops fields in declaration
+/// order, so `_guard` drops first (restoring `KTSTR_CACHE_DIR` to
+/// whatever the test process saw before construction) and `tmp`
+/// drops second (removing the directory). Reversing the order
+/// would leave `KTSTR_CACHE_DIR` pointing at a deleted tempdir
+/// during the window between `tmp`'s and `_guard`'s drop calls —
+/// a dangling-env-ref hazard in any code that races with the
+/// tail of the drop sequence.
+///
 /// Callers that also mutate other env vars must hold [`lock_env`]
 /// for the guard's full lifetime so the save/restore pair does not
 /// race with another test in the same binary.
 pub(crate) struct IsolatedCacheDir {
-    pub(crate) tmp: TempDir,
     _guard: EnvVarGuard,
+    tmp: TempDir,
 }
 
 impl IsolatedCacheDir {
-    /// The temp directory's root path. Shorthand for
-    /// `self.tmp.path()`.
+    /// The temp directory's root path.
     pub(crate) fn path(&self) -> &std::path::Path {
         self.tmp.path()
     }
@@ -73,7 +81,7 @@ pub(crate) fn isolated_cache_dir() -> IsolatedCacheDir {
             .to_str()
             .expect("tempdir path is UTF-8 on every supported target"),
     );
-    IsolatedCacheDir { tmp, _guard: guard }
+    IsolatedCacheDir { _guard: guard, tmp }
 }
 
 /// Shared `Topology` used by `evaluate_vm_result` tests: the
@@ -304,3 +312,82 @@ pub(crate) static FLAGS_STEAL_LLC: &[&FlagDecl] = &[&TEST_STEAL, &TEST_LLC];
 pub(crate) static FLAGS_BORROW_LONG: &[&FlagDecl] = &[&BORROW_LONG];
 pub(crate) static FLAGS_AB: &[&FlagDecl] = &[&TEST_A, &TEST_B];
 pub(crate) static FLAGS_LLC_STEAL: &[&FlagDecl] = &[&TEST_LLC, &TEST_STEAL];
+
+// ---------------------------------------------------------------------------
+// EnvVarGuard drop-time restoration tests
+// ---------------------------------------------------------------------------
+//
+// Each test uses a distinct env var name so even when `lock_env()` is
+// not held across the full set, the tests don't clobber each other's
+// pre-existing values. `lock_env()` still serializes against any other
+// env-touching test in the crate so the save/mutate/restore window
+// does not race with `HOME` / `XDG_CACHE_HOME` / `KTSTR_CACHE_DIR`
+// rewrites in cache / model / sidecar tests.
+
+/// `EnvVarGuard::set` restores the PRE-EXISTING value of the key
+/// when the guard drops. Pre-seed the key to a known sentinel,
+/// construct a guard that overwrites it, confirm the overwrite is
+/// visible, drop the guard, and re-read: the sentinel must be back.
+#[test]
+fn env_var_guard_set_restores_original_value_on_drop() {
+    const KEY: &str = "KTSTR_TEST_ENV_VAR_GUARD_SET_RESTORES_ORIGINAL";
+    let _lock = lock_env();
+    // SAFETY: process-wide env mutation; we hold `lock_env()` so no
+    // other test in this binary is racing a key mutation.
+    unsafe { std::env::set_var(KEY, "pre-existing") };
+    {
+        let _g = EnvVarGuard::set(KEY, "overwritten");
+        assert_eq!(std::env::var(KEY).ok().as_deref(), Some("overwritten"));
+    }
+    assert_eq!(
+        std::env::var(KEY).ok().as_deref(),
+        Some("pre-existing"),
+        "EnvVarGuard::set must restore the pre-existing value on drop"
+    );
+    // Cleanup so a subsequent test run doesn't inherit our sentinel.
+    unsafe { std::env::remove_var(KEY) };
+}
+
+/// `EnvVarGuard::set` on a key that is currently absent restores it
+/// to absent on drop — the guard remembered `None`, so dropping must
+/// `remove_var` rather than re-`set_var` the string `"None"` or a
+/// stale previous value.
+#[test]
+fn env_var_guard_set_restores_absent_key_on_drop() {
+    const KEY: &str = "KTSTR_TEST_ENV_VAR_GUARD_SET_RESTORES_ABSENT";
+    let _lock = lock_env();
+    // Guarantee the key is absent before the guard fires.
+    unsafe { std::env::remove_var(KEY) };
+    assert!(std::env::var(KEY).is_err(), "setup: key must start absent");
+    {
+        let _g = EnvVarGuard::set(KEY, "transient");
+        assert_eq!(std::env::var(KEY).ok().as_deref(), Some("transient"));
+    }
+    assert!(
+        std::env::var(KEY).is_err(),
+        "EnvVarGuard::set on an absent key must restore absence, not leave the value behind"
+    );
+}
+
+/// `EnvVarGuard::remove` preserves the PRE-EXISTING value across its
+/// lifetime: the guard takes the key out of the environment while
+/// alive, then puts the original back on drop.
+#[test]
+fn env_var_guard_remove_restores_original_value_on_drop() {
+    const KEY: &str = "KTSTR_TEST_ENV_VAR_GUARD_REMOVE_RESTORES_ORIGINAL";
+    let _lock = lock_env();
+    unsafe { std::env::set_var(KEY, "pre-existing") };
+    {
+        let _g = EnvVarGuard::remove(KEY);
+        assert!(
+            std::env::var(KEY).is_err(),
+            "EnvVarGuard::remove must remove the key for the guard's lifetime"
+        );
+    }
+    assert_eq!(
+        std::env::var(KEY).ok().as_deref(),
+        Some("pre-existing"),
+        "EnvVarGuard::remove must restore the pre-existing value on drop"
+    );
+    unsafe { std::env::remove_var(KEY) };
+}
