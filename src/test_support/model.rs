@@ -402,20 +402,8 @@ fn verify_sha256(path: &std::path::Path, expected_hex: &str) -> Result<bool> {
         }
         hasher.update(&buf[..n]);
     }
-    let got = hex_encode(&hasher.finalize());
+    let got = hex::encode(hasher.finalize());
     Ok(got.eq_ignore_ascii_case(expected_hex))
-}
-
-/// Lowercase hex encoder — avoids pulling in the `hex` crate for a
-/// 64-byte-output helper used exactly twice (verify + debug).
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(*b >> 4) as usize] as char);
-        out.push(HEX[(*b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 /// Reject `http://` URLs so a placeholder typo can't leak the SHA-
@@ -466,7 +454,11 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     }
     if let Some(v) = read_offline_env() {
         let v_safe = sanitize_env_value(&v);
-        eprintln!("ktstr: {OFFLINE_ENV}={v_safe} set; skipping eager model prefetch");
+        tracing::warn!(
+            env_var = OFFLINE_ENV,
+            value = %v_safe,
+            "offline gate set; skipping eager model prefetch",
+        );
         return Ok(None);
     }
     let model_path = ensure(&DEFAULT_MODEL)?;
@@ -733,7 +725,7 @@ pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Me
     let mut state = match load_inference() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ktstr: LlmExtract model load failed: {e:#}");
+            tracing::warn!(error = ?e, "LlmExtract model load failed");
             return Vec::new();
         }
     };
@@ -741,17 +733,16 @@ pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Me
     let response = match invoke_with_model(&mut state, &prompt) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ktstr: LlmExtract inference failed: {e:#}");
+            tracing::warn!(error = ?e, "LlmExtract inference failed");
             return Vec::new();
         }
     };
     match super::metrics::find_and_parse_json(&response) {
         Some(json) => super::metrics::walk_json_leaves(&json, super::MetricSource::LlmExtract),
         None => {
-            eprintln!(
-                "ktstr: LlmExtract response was not parseable JSON \
-                 ({} bytes); returning empty metric set",
-                response.len(),
+            tracing::warn!(
+                response_bytes = response.len(),
+                "LlmExtract response was not parseable JSON; returning empty metric set",
             );
             Vec::new()
         }
@@ -816,14 +807,6 @@ mod tests {
     #[test]
     fn reject_insecure_url_accepts_https() {
         reject_insecure_url("https://example.com/model.gguf").unwrap();
-    }
-
-    #[test]
-    fn hex_encode_matches_known_vectors() {
-        assert_eq!(hex_encode(&[]), "");
-        assert_eq!(hex_encode(&[0x00]), "00");
-        assert_eq!(hex_encode(&[0xff]), "ff");
-        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
     }
 
     #[test]
@@ -905,7 +888,7 @@ mod tests {
         let mut h = Sha256::new();
         h.update(&data);
         let expected_bytes = h.finalize();
-        let expected_hex = hex_encode(&expected_bytes);
+        let expected_hex = hex::encode(expected_bytes);
         assert!(verify_sha256(tmp.path(), &expected_hex).unwrap());
 
         // Negative: flip one byte at the far end and verify the

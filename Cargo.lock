@@ -3162,6 +3162,7 @@ dependencies = [
  "gix",
  "glob",
  "goblin",
+ "hex",
  "indicatif",
  "insta",
  "ktstr-macros",
