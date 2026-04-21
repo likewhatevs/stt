@@ -953,31 +953,21 @@ mod tests {
     #[test]
     fn resolve_scheduler_discover_missing() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let key = "KTSTR_SCHEDULER";
-        let prev = std::env::var(key).ok();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe { std::env::remove_var(key) };
+        let _env = EnvVarGuard::remove("KTSTR_SCHEDULER");
         let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_xyz__"));
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
         assert!(result.is_err());
     }
 
     #[test]
     fn resolve_scheduler_discover_via_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let key = "KTSTR_SCHEDULER";
-        let prev = std::env::var(key).ok();
         let exe = crate::resolve_current_exe().unwrap();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
+        let _env = EnvVarGuard::set(
+            "KTSTR_SCHEDULER",
+            exe.to_str()
+                .expect("resolve_current_exe returns UTF-8 path"),
+        );
         let result = resolve_scheduler(&SchedulerSpec::Discover("anything"));
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
         assert!(result.is_ok());
         assert_eq!(result.unwrap().unwrap(), exe);
     }
@@ -1010,19 +1000,15 @@ mod tests {
     #[test]
     fn nextest_setup_writes_kernel_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let key = "KTSTR_TEST_KERNEL";
-        let prev = std::env::var(key).ok();
         let exe = crate::resolve_current_exe().unwrap();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
+        let _env = EnvVarGuard::set(
+            "KTSTR_TEST_KERNEL",
+            exe.to_str()
+                .expect("resolve_current_exe returns UTF-8 path"),
+        );
 
         let mut buf = Vec::new();
         let result = nextest_setup(&[exe.as_path()], &mut buf);
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
 
         assert!(result.is_ok(), "nextest_setup failed: {result:?}");
         let output = String::from_utf8(buf).unwrap();
