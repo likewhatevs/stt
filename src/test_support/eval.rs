@@ -41,6 +41,41 @@ use crate::verifier::{SCHED_OUTPUT_START, parse_sched_output};
 
 use super::runtime::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
 
+// ---------------------------------------------------------------------------
+// Failure-message constants
+// ---------------------------------------------------------------------------
+//
+// Shared between the production error-formatting paths in this module
+// and the tests that pin those messages. Editing a production string
+// here without updating the test (or vice versa) is caught at compile
+// time instead of as a runtime test assertion drift.
+
+/// Header body for a timed-out run with no parseable AssertResult.
+/// Pinned by `eval_timeout_no_result` and `eval_timeout_with_sched_includes_diagnostics`.
+pub(crate) const ERR_TIMED_OUT_NO_RESULT: &str = "timed out (no result in SHM or COM2)";
+
+/// Header body for a run whose scenario passed but whose monitor
+/// verdict failed. Pinned by `eval_monitor_fail_has_fingerprint` and
+/// `eval_monitor_fail_includes_sched_log`.
+pub(crate) const ERR_MONITOR_FAILED_AFTER_SCENARIO: &str = "passed scenario but monitor failed";
+
+/// Reason body when a scheduler is running but no AssertResult was
+/// received from the guest. Pinned by `eval_sched_dies_no_com2_output`
+/// and `eval_sched_dies_with_sched_log`.
+pub(crate) const ERR_NO_TEST_RESULT_FROM_GUEST: &str = "no test result received from guest \
+     (scheduler may have crashed, or guest output was lost \
+     before reaching the host)";
+
+/// Reason body when EEVDF (no scheduler) produced no AssertResult.
+/// Pinned by `eval_eevdf_no_com2_output` and `eval_payload_exits_no_verify_result`.
+pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
+    "test function produced no output (no test result found)";
+
+/// Prefix for the `guest crashed: ...` reason body. Pinned by
+/// `eval_crash_in_output_says_guest_crashed`, `eval_crash_eevdf_says_guest_crashed`,
+/// and `eval_crash_message_from_shm`.
+pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
+
 /// Run a single ktstr_test and return the VM's AssertResult.
 pub(crate) fn run_ktstr_test_inner(
     entry: &KtstrTestEntry,
@@ -468,7 +503,7 @@ fn evaluate_vm_result(
                 let timeline_section = build_timeline_section();
                 let monitor_section = format_monitor_section(monitor, merged_assert);
                 let msg = format!(
-                    "{}ktstr_test '{}'{} [topo={}] passed scenario but monitor failed:\n  {}{}{}{}{}",
+                    "{}ktstr_test '{}'{} [topo={}] {ERR_MONITOR_FAILED_AFTER_SCENARIO}:\n  {}{}{}{}{}",
                     fingerprint_line,
                     entry.name,
                     sched_label,
@@ -523,7 +558,7 @@ fn evaluate_vm_result(
 
     if result.timed_out {
         let msg = format!(
-            "{}ktstr_test '{}'{} [topo={}] timed out (no result in SHM or COM2){}{}{}{}{}{}",
+            "{}ktstr_test '{}'{} [topo={}] {ERR_TIMED_OUT_NO_RESULT}{}{}{}{}{}{}",
             fingerprint_line,
             entry.name,
             sched_label,
@@ -539,16 +574,13 @@ fn evaluate_vm_result(
     }
 
     let reason = if let Some(ref shm_crash) = result.crash_message {
-        format!("guest crashed:\n{shm_crash}")
+        format!("{ERR_GUEST_CRASHED_PREFIX}\n{shm_crash}")
     } else if let Some(crash_msg) = extract_panic_message(output) {
-        format!("guest crashed: {crash_msg}")
+        format!("{ERR_GUEST_CRASHED_PREFIX} {crash_msg}")
     } else if entry.scheduler.has_active_scheduling() {
-        "no test result received from guest \
-         (scheduler may have crashed, or guest output was lost \
-         before reaching the host)"
-            .to_string()
+        ERR_NO_TEST_RESULT_FROM_GUEST.to_string()
     } else {
-        "test function produced no output (no test result found)".to_string()
+        ERR_NO_TEST_FUNCTION_OUTPUT.to_string()
     };
     let msg = format!(
         "{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}",
@@ -1040,8 +1072,8 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("test function produced no output"),
-            "EEVDF with no COM2 output should say 'test function produced no output', got: {msg}",
+            msg.contains(ERR_NO_TEST_FUNCTION_OUTPUT),
+            "EEVDF with no COM2 output should say {ERR_NO_TEST_FUNCTION_OUTPUT:?}, got: {msg}",
         );
         assert!(
             !msg.contains("no test result received from guest"),
@@ -1075,7 +1107,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("no test result received from guest"),
+            msg.contains(ERR_NO_TEST_RESULT_FROM_GUEST),
             "scheduler present with no output should take the scheduler-path fallback, got: {msg}",
         );
         assert!(
@@ -1107,7 +1139,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("no test result received from guest"),
+            msg.contains(ERR_NO_TEST_RESULT_FROM_GUEST),
             "should take the scheduler-path fallback, got: {msg}",
         );
         assert!(
@@ -1224,12 +1256,8 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("timed out"),
-            "should say timed out, got: {msg}",
-        );
-        assert!(
-            msg.contains("no result in SHM or COM2"),
-            "should mention SHM or COM2, got: {msg}",
+            msg.contains(ERR_TIMED_OUT_NO_RESULT),
+            "should contain full timed-out reason {ERR_TIMED_OUT_NO_RESULT:?}, got: {msg}",
         );
         assert!(
             msg.contains("booting"),
@@ -1265,8 +1293,8 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("test function produced no output"),
-            "non-parseable COM2 with EEVDF should say 'test function produced no output', got: {msg}",
+            msg.contains(ERR_NO_TEST_FUNCTION_OUTPUT),
+            "non-parseable COM2 with EEVDF should say {ERR_NO_TEST_FUNCTION_OUTPUT:?}, got: {msg}",
         );
         assert!(
             !msg.contains("no test result received from guest"),
@@ -1572,7 +1600,7 @@ mod tests {
             .unwrap_err()
         );
         assert!(
-            msg.contains("passed scenario but monitor failed"),
+            msg.contains(ERR_MONITOR_FAILED_AFTER_SCENARIO),
             "got: {msg}"
         );
         assert!(msg.contains(error_line), "got: {msg}");
@@ -1601,8 +1629,8 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("timed out"),
-            "should say timed out, got: {msg}"
+            msg.contains(ERR_TIMED_OUT_NO_RESULT),
+            "should contain {ERR_TIMED_OUT_NO_RESULT:?}, got: {msg}"
         );
         assert!(
             msg.contains("[sched=test_sched_bin]"),
@@ -1716,7 +1744,7 @@ mod tests {
         )
         .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("guest crashed:"), "got: {msg}");
+        assert!(msg.contains(ERR_GUEST_CRASHED_PREFIX), "got: {msg}");
         assert!(msg.contains("assertion failed"), "got: {msg}");
     }
 
@@ -1738,7 +1766,7 @@ mod tests {
         )
         .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("guest crashed:"), "got: {msg}");
+        assert!(msg.contains(ERR_GUEST_CRASHED_PREFIX), "got: {msg}");
         assert!(msg.contains("index out of bounds"), "got: {msg}");
     }
 
@@ -1765,8 +1793,8 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("guest crashed:"),
-            "should say 'guest crashed:', got: {msg}",
+            msg.contains(ERR_GUEST_CRASHED_PREFIX),
+            "should say {ERR_GUEST_CRASHED_PREFIX:?}, got: {msg}",
         );
         assert!(
             msg.contains("ktstr_guest_init"),
@@ -1937,7 +1965,7 @@ mod tests {
             .unwrap_err()
         );
         assert!(
-            msg.contains("passed scenario but monitor failed"),
+            msg.contains(ERR_MONITOR_FAILED_AFTER_SCENARIO),
             "got: {msg}"
         );
         assert!(msg.contains("--- scheduler log ---"), "got: {msg}");
