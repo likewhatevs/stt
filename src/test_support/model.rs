@@ -279,6 +279,22 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
             st.path.display(),
         );
     }
+    // Pre-fetch SHA-pin shape check. `status()` swallowed a malformed
+    // pin via `unwrap_or(false)` on `verify_sha256`, so a placeholder
+    // (all-`?`) `sha256_hex` would silently skip the fast path and
+    // drop through to `fetch` — wasting a 2.5 GiB download before
+    // the post-download `verify_sha256` bails. Catch the placeholder
+    // here so the error surfaces before bytes hit the wire.
+    if spec.sha256_hex.len() != 64 || !spec.sha256_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "model '{}' has a placeholder or malformed SHA-256 pin \
+             ({:?}); refusing to download {} until a real digest is \
+             recorded. Replace the pin in the ModelSpec before retrying.",
+            spec.file_name,
+            spec.sha256_hex,
+            spec.url,
+        );
+    }
     fetch(spec, &st.path)
 }
 
@@ -306,14 +322,21 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
 
     // Use an explicit Client with connect + overall timeouts rather
     // than `reqwest::blocking::get`, which has no timeout and will
-    // hang forever on a slow or unreachable mirror. 5m overall is
-    // enough for a few-hundred-MB model download on a typical
-    // connection; 30s connect catches DNS/TLS wedges early. Tests
-    // that don't actually hit the network (offline gate, cached
-    // path) never enter this branch.
+    // hang forever on a slow or unreachable mirror. 30s connect
+    // catches DNS/TLS wedges early. Tests that don't actually hit
+    // the network (offline gate, cached path) never enter this
+    // branch.
+    //
+    // 15-minute overall timeout sizing: the pinned Qwen3-4B GGUF is
+    // ~2.44 GiB (see DEFAULT_MODEL.size_bytes). 900s tolerates ~2.7
+    // MiB/s sustained throughput, a margin the previous 300s cap
+    // (which required ~8.5 MiB/s) did not hold on CDN-throttled or
+    // bandwidth-limited CI runners. The fetch is idempotent —
+    // subsequent test runs hit the cached-and-verified fast path,
+    // so the slow-path cost is paid once per cache warmup.
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(900))
         .build()
         .context("build reqwest::blocking::Client for model fetch")?;
     let mut response = client
