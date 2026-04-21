@@ -248,7 +248,9 @@ pub fn find_image_in_dir(dir: &std::path::Path) -> Option<std::path::PathBuf> {
 /// build trees or host paths.
 ///
 /// `release`: kernel release string (e.g. from `uname -r`). When
-/// `None`, falls back to running `uname -r` via `Command`.
+/// `None`, falls back to reading `/proc/sys/kernel/osrelease` — the
+/// same value the kernel exposes via the `uname(2)` syscall, without
+/// the shell-out cost.
 ///
 /// Without `kernel_dir`, searches local build trees (`./linux`,
 /// `../linux`), `/lib/modules/{release}/build`, then host paths

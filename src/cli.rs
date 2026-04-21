@@ -399,12 +399,17 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
 
 /// Run make with merged stdout+stderr piped through a spinner.
 ///
-/// Creates a single pipe via `nix::unistd::pipe`, hands the write end
-/// to the child's stdout AND stderr (a clone), and reads from the
-/// read end. One pipe, one reader — no threads, no channel, no
-/// chance of a deadlock where reading stdout blocks while stderr
-/// fills its buffer. Same merged-stream semantics that `sh -c
-/// "make … 2>&1"` gives, without the shell-out.
+/// Creates a single pipe via `nix::unistd::pipe2(O_CLOEXEC)`, hands
+/// the write end to the child's stdout AND stderr (a clone), and
+/// reads from the read end. `O_CLOEXEC` prevents the raw pipe fds
+/// from leaking into any concurrently-spawned children on other
+/// threads — without the flag, a race between `pipe()` and the
+/// `Stdio::from()` consumption could let an unrelated `fork+exec`
+/// inherit the write end and hold the reader open indefinitely.
+/// One pipe, one reader — no threads, no channel, no chance of a
+/// deadlock where reading stdout blocks while stderr fills its
+/// buffer. Same merged-stream semantics that `sh -c "make … 2>&1"`
+/// gives, without the shell-out.
 ///
 /// When a spinner is active, each line is printed via `println()`
 /// so the spinner redraws below the output. When no spinner,

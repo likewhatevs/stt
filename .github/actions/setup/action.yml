@@ -1,5 +1,5 @@
 name: Setup ktstr build environment
-description: Install clang-20, bpftool, sccache, and optionally KVM + debug symbols. Rust toolchain is provisioned from rust-toolchain.toml on first cargo invocation.
+description: Install clang-20, bpftool, sccache, and optionally KVM + debug symbols. Rust toolchain is eagerly provisioned from rust-toolchain.toml via `rustup show active-toolchain || rustup toolchain install` so the install cost is paid in this action rather than on the first cargo invocation.
 
 inputs:
   tools:

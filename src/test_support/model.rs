@@ -110,8 +110,16 @@ pub struct ModelSpec {
 /// Default model served when a payload declares
 /// [`OutputFormat::LlmExtract`] without pointing at a custom pin.
 ///
-/// Qwen3-4B Q4_K_M GGUF (~2.5 GiB). URL points at the official
-/// `Qwen/Qwen3-4B-GGUF` repo on Hugging Face.
+/// Qwen3-4B Q4_K_M GGUF (~2.44 GiB — 2500 MiB per [`ModelSpec::size_bytes`]).
+/// The 4B-parameter tier gives usable structured-JSON extraction
+/// quality (better than 1-2B tiers for the "emit ONLY a JSON object"
+/// constraint the `LLM_EXTRACT_PROMPT_TEMPLATE` enforces) at an
+/// artifact size small enough that host-side post-test extraction
+/// loads and runs in reasonable wall time on CPU. Larger 7B-14B tiers
+/// would multiply both disk footprint and inference latency without
+/// a commensurate gain on a narrow "parse benchmark stdout" task.
+///
+/// URL points at the official `Qwen/Qwen3-4B-GGUF` repo on Hugging Face.
 pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
     file_name: "Qwen3-4B-Q4_K_M.gguf",
     url: "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
@@ -282,14 +290,14 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // swallowed a malformed pin via `unwrap_or(false)` on
     // `verify_sha256`, so a placeholder (all-`?`) `sha256_hex` would
     // silently skip the fast path and drop through to `fetch` —
-    // wasting a 2.5 GiB download before the post-download
+    // wasting a 2.44 GiB download before the post-download
     // `verify_sha256` bails. Catch it here so the error surfaces
     // before either the offline bail or the network request.
     if spec.sha256_hex.len() != 64 || !spec.sha256_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         anyhow::bail!(
             "model '{}' has a placeholder or malformed SHA-256 pin \
              ({:?}); refusing to download {} until a real digest is \
-             recorded. Replace the pin in the ModelSpec before retrying.",
+             recorded. Replace the pin in the ModelSpec before re-running.",
             spec.file_name,
             spec.sha256_hex,
             spec.url,
