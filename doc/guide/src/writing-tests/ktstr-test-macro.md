@@ -72,7 +72,7 @@ so most tests do not need to set `numa_nodes`. See
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
 | `watchdog_timeout_s` | 4 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 
-### Verification
+### Checking
 
 | Attribute | Default | Description |
 |---|---|---|
@@ -100,8 +100,8 @@ so most tests do not need to set `numa_nodes`. See
 worker with zero work units), fairness spread (max-min off-CPU% below
 `max_spread_pct`), and scheduling gaps (longest gap below `max_gap_ms`).
 Each threshold can be overridden independently. See
-[Customize Verification](../recipes/custom-verification.md) for
-override examples and [Verification](../concepts/verification.md) for
+[Customize Checking](../recipes/custom-checking.md) for
+override examples and [Checking](../concepts/checking.md) for
 the merge chain.
 
 ### Flag constraints

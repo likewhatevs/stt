@@ -1,4 +1,4 @@
-//! External-context verification for the `KTSTR_TESTS` distributed
+//! External-context check for the `KTSTR_TESTS` distributed
 //! slice.
 //!
 //! The `#[ktstr_test]` macro has been covered by every integration

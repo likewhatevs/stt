@@ -70,7 +70,7 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
 }
 
 /// Two cgroups with disjoint cpusets, workers pinned to 2 CPUs within
-/// each partition. Verifies pinning interacts correctly with cpuset
+/// each partition. Checks pinning interacts correctly with cpuset
 /// constraints. Uses a relaxed 75% spread threshold.
 pub fn custom_cgroup_cpuset_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     let usable = ctx.topo.usable_cpus();

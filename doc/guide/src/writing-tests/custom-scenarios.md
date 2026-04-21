@@ -81,12 +81,12 @@ native type) for liveness checks. Pass it to `process_alive` or
 **`settle`** -- time to wait after cgroup creation for the scheduler
 to stabilize.
 
-## Verification in custom scenarios
+## Checking in custom scenarios
 
 Use `Assert` for both direct report checking and ops-based scenarios.
 Call `assert.assert_cgroup(reports, cpuset)` for manual report
 collection, or use `execute_steps_with()` for ops-based scenarios. See
-[Verification](../concepts/verification.md#worker-checks-via-assert).
+[Checking](../concepts/checking.md#worker-checks-via-assert).
 
 ## Registering a custom scenario (ktstr contributors only)
 

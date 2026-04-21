@@ -171,7 +171,7 @@ pub struct ModelSpec {
     pub sha256_hex: &'static str,
     /// Approximate on-disk size in bytes; surfaced in status output
     /// so users can tell at a glance whether the cache entry is the
-    /// right artifact. Not used for verification (SHA is the gate).
+    /// right artifact. Not used for the integrity check (SHA is the gate).
     pub size_bytes: u64,
 }
 
@@ -279,10 +279,10 @@ pub struct ModelStatus {
     pub path: PathBuf,
     pub cached: bool,
     pub sha_matches: bool,
-    /// Rendered error chain from [`verify_sha256`] when the SHA check
+    /// Rendered error chain from [`check_sha256`] when the SHA check
     /// could not complete due to an I/O failure (e.g. permission
     /// denied, short read, file disappeared between the `metadata()`
-    /// probe and the read). `None` when verification ran to
+    /// probe and the read). `None` when the SHA check ran to
     /// completion — regardless of whether the digest matched.
     ///
     /// Distinguishes "bytes don't hash to the pin" (`sha_matches =
@@ -333,7 +333,7 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
         Ok(meta) if meta.is_file() => {
             // A cached file is considered "matched" only when the
             // SHA agrees with the pin. Distinguish the two Err
-            // sources from verify_sha256: a malformed pin is a
+            // sources from check_sha256: a malformed pin is a
             // ModelSpec programmer error that MUST surface (hiding
             // it as "doesn't match" misroutes callers into a
             // pointless re-download branch), while an I/O failure
@@ -344,7 +344,7 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
             // entry and the CLI / offline-gate bail can name the
             // specific reason rather than the generic "doesn't
             // match" default.
-            let (matches, check_err) = match verify_sha256(&path, spec.sha256_hex) {
+            let (matches, check_err) = match check_sha256(&path, spec.sha256_hex) {
                 Ok(m) => (m, None),
                 Err(e) => {
                     if !is_valid_sha256_hex(spec.sha256_hex) {
@@ -395,9 +395,9 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // cached-file branch (so ensure() never reaches this check with
     // a cached file + malformed pin). This explicit check covers the
     // no-cache case: status() returned `cached = false` without
-    // calling `verify_sha256`, so without this gate a placeholder
+    // calling `check_sha256`, so without this gate a placeholder
     // (all-`?`) pin would drop through to `fetch` and waste a
-    // 2.44 GiB download before the post-download `verify_sha256`
+    // 2.44 GiB download before the post-download `check_sha256`
     // bails.
     if !is_valid_sha256_hex(spec.sha256_hex) {
         anyhow::bail!(
@@ -629,7 +629,7 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
             .with_context(|| format!("flush {} after body stream", tmp_path.display()))?;
     }
 
-    if !verify_sha256(&tmp_path, spec.sha256_hex)? {
+    if !check_sha256(&tmp_path, spec.sha256_hex)? {
         anyhow::bail!(
             "SHA-256 mismatch for model '{}' downloaded from {}: expected {}, \
              got something else. Pin or source is wrong; refusing to cache \
@@ -654,7 +654,7 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
 /// Canonical predicate for a well-formed SHA-256 hex pin: exactly
 /// 64 ASCII characters, each a hex digit (`0-9a-fA-F`). Shared by
 /// [`ensure`] (pre-fetch shape check on [`ModelSpec::sha256_hex`])
-/// and [`verify_sha256`] (post-read validation of the expected pin);
+/// and [`check_sha256`] (post-read validation of the expected pin);
 /// centralizing the rule prevents drift between the two call sites.
 /// Callers that need to distinguish "wrong length" from "non-hex"
 /// for diagnostics still need their own branching — this helper
@@ -669,15 +669,15 @@ fn is_valid_sha256_hex(s: &str) -> bool {
 /// (non-64 chars / non-hex chars), which would render the check
 /// itself useless and must surface instead of silently pretending
 /// the file is good.
-fn verify_sha256(path: &std::path::Path, expected_hex: &str) -> Result<bool> {
+fn check_sha256(path: &std::path::Path, expected_hex: &str) -> Result<bool> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
     if !is_valid_sha256_hex(expected_hex) {
         // The helper unified the predicate; pick the specific
         // diagnostic wording from the same two branches the tests
-        // pin (`verify_sha256_rejects_malformed_hex_length` expects
-        // "64 chars", `verify_sha256_rejects_non_hex_chars` expects
+        // pin (`check_sha256_rejects_malformed_hex_length` expects
+        // "64 chars", `check_sha256_rejects_non_hex_chars` expects
         // "non-hex"). Length is checked first so a non-64 string of
         // all hex digits surfaces as a length error.
         if expected_hex.len() != 64 {
@@ -1292,47 +1292,47 @@ mod tests {
     }
 
     #[test]
-    fn verify_sha256_matches_empty_file() {
+    fn check_sha256_matches_empty_file() {
         // SHA-256 of the empty string — a stable external anchor
         // that proves the hasher is wired correctly, independent of
         // the DEFAULT_MODEL digest.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), []).unwrap();
         let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert!(verify_sha256(tmp.path(), expected).unwrap());
+        assert!(check_sha256(tmp.path(), expected).unwrap());
     }
 
     #[test]
-    fn verify_sha256_mismatch_returns_false() {
+    fn check_sha256_mismatch_returns_false() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"not empty").unwrap();
         let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        assert!(!verify_sha256(tmp.path(), empty_sha).unwrap());
+        assert!(!check_sha256(tmp.path(), empty_sha).unwrap());
     }
 
     #[test]
-    fn verify_sha256_is_case_insensitive() {
+    fn check_sha256_is_case_insensitive() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), []).unwrap();
         let upper = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
-        assert!(verify_sha256(tmp.path(), upper).unwrap());
+        assert!(check_sha256(tmp.path(), upper).unwrap());
     }
 
     #[test]
-    fn verify_sha256_rejects_malformed_hex_length() {
+    fn check_sha256_rejects_malformed_hex_length() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), []).unwrap();
-        let err = verify_sha256(tmp.path(), "tooshort").unwrap_err();
+        let err = check_sha256(tmp.path(), "tooshort").unwrap_err();
         assert!(format!("{err:#}").contains("64 chars"), "err: {err:#}");
     }
 
     #[test]
-    fn verify_sha256_rejects_non_hex_chars() {
+    fn check_sha256_rejects_non_hex_chars() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), []).unwrap();
         // 64 chars but includes `?`.
         let bad = "????????????????????????????????????????????????????????????????";
-        let err = verify_sha256(tmp.path(), bad).unwrap_err();
+        let err = check_sha256(tmp.path(), bad).unwrap_err();
         assert!(format!("{err:#}").contains("non-hex"), "err: {err:#}");
     }
 
@@ -1342,23 +1342,23 @@ mod tests {
     /// and the multi-chunk test below; a regression that broke
     /// single-chunk non-empty hashing would surface here.
     #[test]
-    fn verify_sha256_matches_abc() {
+    fn check_sha256_matches_abc() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"abc").unwrap();
         // Known SHA-256("abc") — NIST FIPS 180-2 / RFC 6234 test vector.
         let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        assert!(verify_sha256(tmp.path(), expected).unwrap());
+        assert!(check_sha256(tmp.path(), expected).unwrap());
     }
 
     /// Multi-chunk file (larger than a single read buffer)
-    /// exercises the streaming `Read`-loop branch of `verify_sha256`
+    /// exercises the streaming `Read`-loop branch of `check_sha256`
     /// (vs the single-buffer fast path for small files). 192 KiB of
     /// repeated "a" bytes is large enough to cross any reasonable
     /// BufReader default (8 KiB) multiple times; the expected SHA
     /// is computed once here from a known constant so the test
     /// remains deterministic.
     #[test]
-    fn verify_sha256_matches_multi_chunk_file() {
+    fn check_sha256_matches_multi_chunk_file() {
         use sha2::{Digest, Sha256};
         let tmp = tempfile::NamedTempFile::new().unwrap();
         // 192 KiB of 'a' bytes. 192 * 1024 = 196_608; several
@@ -1371,7 +1371,7 @@ mod tests {
         h.update(&data);
         let expected_bytes = h.finalize();
         let expected_hex = hex::encode(expected_bytes);
-        assert!(verify_sha256(tmp.path(), &expected_hex).unwrap());
+        assert!(check_sha256(tmp.path(), &expected_hex).unwrap());
 
         // Negative: flip one byte at the far end and verify the
         // digest rejects, proving the hasher walked past the first
@@ -1379,22 +1379,22 @@ mod tests {
         let mut tampered = data;
         *tampered.last_mut().unwrap() = b'b';
         std::fs::write(tmp.path(), &tampered).unwrap();
-        assert!(!verify_sha256(tmp.path(), &expected_hex).unwrap());
+        assert!(!check_sha256(tmp.path(), &expected_hex).unwrap());
     }
 
     /// A non-existent path is an I/O-layer failure, not a pin-shape
-    /// failure, so `verify_sha256` must surface the `std::fs::File::open`
+    /// failure, so `check_sha256` must surface the `std::fs::File::open`
     /// error with the `open <path>` anyhow context attached. Pins the
     /// error wording so callers that pattern-match on "open" still
     /// find it if the underlying `io::Error` string changes.
     #[test]
-    fn verify_sha256_errors_on_missing_file() {
+    fn check_sha256_errors_on_missing_file() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist.bin");
         // Valid 64-char hex so the function passes the shape check
         // and reaches the file-open step.
         let valid_hex = "0".repeat(64);
-        let err = verify_sha256(&missing, &valid_hex).unwrap_err();
+        let err = check_sha256(&missing, &valid_hex).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("open "),
@@ -1527,7 +1527,7 @@ mod tests {
         assert_eq!(st.path, on_disk);
         // Pin the distinction between "SHA computed, did not match"
         // and "SHA check failed with I/O error": garbage bytes hash
-        // cleanly to some non-zero digest, so verify_sha256 returns
+        // cleanly to some non-zero digest, so check_sha256 returns
         // Ok(false) and `sha_check_error` stays None. The
         // complementary I/O-error case populates this field; ensure()
         // and the CLI `model status` readout branch on it to name
@@ -1546,7 +1546,7 @@ mod tests {
     /// must report `sha_matches = false` AND populate
     /// `sha_check_error` with the rendered I/O-error chain — NOT
     /// silently collapse into the bytes-mismatch branch. Exercises
-    /// the I/O-error arm of the `verify_sha256` match in status()
+    /// the I/O-error arm of the `check_sha256` match in status()
     /// that the structural change capturing I/O failures into
     /// `sha_check_error` wired up.
     ///
@@ -1583,7 +1583,7 @@ mod tests {
             file_name: "unreadable.gguf",
             url: "https://placeholder.example/unreadable.gguf",
             // Valid-shape pin so the shape-check branch of
-            // verify_sha256 doesn't fire; the only way to reach the
+            // check_sha256 doesn't fire; the only way to reach the
             // I/O-error capture path is a valid pin + open/read
             // failure on the cached file.
             sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
@@ -1592,7 +1592,7 @@ mod tests {
         let on_disk = tmp.path().join(spec.file_name);
         std::fs::write(&on_disk, b"any content").unwrap();
         // Mode 0o000 strips owner/group/other read bits so the
-        // subsequent File::open inside verify_sha256 hits EACCES.
+        // subsequent File::open inside check_sha256 hits EACCES.
         // The file itself remains in the directory (metadata.is_file
         // still returns true), so status() enters the is_file arm
         // rather than the `_ => (false, false, None)` fallback.
@@ -1620,7 +1620,7 @@ mod tests {
         );
         assert!(
             !st.sha_matches,
-            "verify_sha256 hit an I/O error, could not compute a hash; \
+            "check_sha256 hit an I/O error, could not compute a hash; \
              sha_matches must be false"
         );
         let err = st
@@ -1642,7 +1642,7 @@ mod tests {
     }
 
     /// status() on a file that exists but whose SHA pin is malformed
-    /// (non-hex chars) must surface the verify_sha256 error instead
+    /// (non-hex chars) must surface the check_sha256 error instead
     /// of coercing it into `sha_matches = false`. A malformed pin is
     /// a programmer error in the ModelSpec — silently reporting
     /// "SHA doesn't match" hides the defect and misroutes downstream
@@ -1670,7 +1670,7 @@ mod tests {
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("non-hex"),
-            "expected malformed-pin error from verify_sha256, got: {rendered}"
+            "expected malformed-pin error from check_sha256, got: {rendered}"
         );
         // Pin the context wrapper that names the offending
         // ModelSpec's file_name. Without this assertion, a regression
@@ -1686,11 +1686,11 @@ mod tests {
     /// Sibling of [`status_surfaces_malformed_pin_error_for_cached_file`]
     /// for the other malformed-pin branch: the pin is all ASCII hex
     /// digits but has the wrong length. Exercises the
-    /// `expected_hex.len() != 64` branch of `verify_sha256`, which
+    /// `expected_hex.len() != 64` branch of `check_sha256`, which
     /// status() routes through the malformed-pin surface path (per
     /// the is_valid_sha256_hex predicate, wrong length is as much a
     /// ModelSpec defect as wrong chars). Pins the "64 chars" diagnostic
-    /// from `verify_sha256`'s length branch so a regression that
+    /// from `check_sha256`'s length branch so a regression that
     /// collapsed the two wordings into a single generic message would
     /// surface here.
     #[test]
@@ -1716,7 +1716,7 @@ mod tests {
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("64 chars"),
-            "expected length-fail error from verify_sha256, got: {rendered}"
+            "expected length-fail error from check_sha256, got: {rendered}"
         );
         assert!(
             rendered.contains(spec.file_name),
@@ -2236,7 +2236,7 @@ mod tests {
     }
 
     /// `DEFAULT_TOKENIZER.sha256_hex` must pass the same shape gate
-    /// that `verify_sha256` and `ensure()` enforce: 64 ASCII hex
+    /// that `check_sha256` and `ensure()` enforce: 64 ASCII hex
     /// digits, no more, no less. A placeholder or malformed pin
     /// would fail this check at build time (via
     /// `default_tokenizer_sha_is_valid_shape`) instead of surfacing
@@ -2292,7 +2292,7 @@ mod tests {
 
     /// Mirror [`default_tokenizer_sha_is_valid_shape`] for
     /// `DEFAULT_MODEL`. Paired so a pin swap on either artifact
-    /// surfaces through shape verification before the artifact is
+    /// surfaces through the shape check before the artifact is
     /// fetched.
     #[test]
     fn default_model_sha_is_valid_shape() {
@@ -2387,9 +2387,9 @@ mod tests {
     /// 64 ASCII hex digits. Covers the three rejection classes the
     /// helper guards against: too-short (63 bytes), too-long (65),
     /// and an input that IS 64 bytes long but contains a non-ASCII
-    /// Unicode digit. Paired with `verify_sha256_rejects_malformed_hex_length`
-    /// and `verify_sha256_rejects_non_hex_chars` which exercise the
-    /// same predicate via `verify_sha256`'s error-surface wrapper.
+    /// Unicode digit. Paired with `check_sha256_rejects_malformed_hex_length`
+    /// and `check_sha256_rejects_non_hex_chars` which exercise the
+    /// same predicate via `check_sha256`'s error-surface wrapper.
     #[test]
     fn is_valid_sha256_hex_rejects_non_canonical_inputs() {
         // 63 bytes (short by one).
@@ -2558,7 +2558,7 @@ mod tests {
     }
 
     /// Nested block embedded between plain text on both sides.
-    /// Verifies that the depth scanner emits pre/post context
+    /// Checks that the depth scanner emits pre/post context
     /// unchanged while collapsing the full outer block (both inner
     /// and outer `</think>` pair consumed).
     #[test]

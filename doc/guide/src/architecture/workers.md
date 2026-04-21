@@ -111,8 +111,8 @@ Empty when numa_maps is unavailable.
 counter from `/proc/vmstat` between pre- and post-workload snapshots.
 Measures cross-node page migrations during the test.
 
-These fields feed the NUMA [verification
-checks](../concepts/verification.md#numa-checks).
+These fields feed the NUMA [checking
+thresholds](../concepts/checking.md#numa-checks).
 
 Custom workers produce their own `WorkerReport`. The framework does
 not populate any telemetry fields for Custom -- migration tracking,

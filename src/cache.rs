@@ -989,7 +989,7 @@ fn neutralize_alloc_relocs(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// Everything else is deleted outright (DWARF `.debug_*`, relocation
 /// sections, etc.).
 ///
-/// After stripping, verifies the result has a non-empty symbol table.
+/// After stripping, checks the result has a non-empty symbol table.
 /// Returns an error to trigger the fallback to `strip_debug_prefix`
 /// if the symbol table is empty.
 fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -1019,7 +1019,7 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     // entries here lets us fail fast without the post-write
     // `goblin::elf::Elf::parse(&out)` we used to run. The null symbol
     // (index 0) is filtered via the empty-name check, matching the
-    // semantics of the old verification pass.
+    // semantics of the old check pass.
     let named_syms = builder
         .symbols
         .iter()

@@ -3,13 +3,13 @@
 //! ktstr boots lightweight KVM virtual machines with controlled CPU topologies,
 //! runs scheduler test scenarios inside them, and evaluates results from the
 //! host via guest memory introspection. Each test creates cgroups, spawns
-//! worker processes, and verifies that the scheduler handled the workload
+//! worker processes, and checks that the scheduler handled the workload
 //! correctly. Also tests under the kernel's default EEVDF scheduler.
 //!
 //! # Quick start
 //!
 //! Declare cgroups and workloads as data, let the framework handle
-//! lifecycle and verification:
+//! lifecycle and checking:
 //!
 //! ```rust
 //! use ktstr::prelude::*;
