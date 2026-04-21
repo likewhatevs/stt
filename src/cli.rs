@@ -187,10 +187,14 @@ pub fn format_entry_row(
     let version = meta.version.as_deref().unwrap_or("-");
     let source = meta.source.to_string();
     let mut tags = String::new();
-    match entry.kconfig_status(kconfig_hash) {
-        KconfigStatus::Stale { .. } => tags.push_str(" (stale kconfig)"),
-        KconfigStatus::Untracked => tags.push_str(" (untracked kconfig)"),
-        KconfigStatus::Matches => {}
+    // Compose the kconfig tag from `KconfigStatus`'s `Display` impl
+    // so the tag word ("stale" / "untracked") and the JSON
+    // `kconfig_status` field both flow through one source of truth.
+    // `Matches` emits no tag — `kernel list` only annotates entries
+    // that deviate from the current kconfig.
+    let status = entry.kconfig_status(kconfig_hash);
+    if !matches!(status, KconfigStatus::Matches) {
+        tags.push_str(&format!(" ({status} kconfig)"));
     }
     if version != "-" && is_eol(version, active_prefixes) {
         tags.push_str(" (EOL)");

@@ -785,4 +785,89 @@ mod tests {
              filter at lib.rs must treat `Untracked` as keep, not stale"
         );
     }
+
+    /// [`find_kernel`]'s cache scan (step 2) must skip entries where
+    /// `matches!(entry.kconfig_status(&hash), KconfigStatus::Stale { .. })`
+    /// and fall through to the next viable candidate.
+    ///
+    /// Two valid entries are seeded:
+    ///
+    /// * a current-hash entry built at `2026-04-01T00:00:00Z`, and
+    /// * a stale-hash entry built at `2026-04-20T00:00:00Z`.
+    ///
+    /// [`cache::CacheDir::list`] sorts by `built_at` descending, so
+    /// the stale entry is yielded first. If the `KconfigStatus::Stale`
+    /// skip branch at the top of [`find_kernel`]'s cache-scan loop
+    /// regressed to a no-op, `find_kernel` would return the stale
+    /// entry's image. Asserting it returns the current entry's image
+    /// proves the filter actually engages — strictly stronger than a
+    /// single-entry `assert_ne!` on the stale path.
+    #[test]
+    fn find_kernel_skips_stale_cache_entry() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+        let _env_lock = lock_env();
+        let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.to_str().unwrap());
+
+        let current_hash = crate::kconfig_hash();
+        let stale_hash = format!("{current_hash}-stale");
+
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = tempfile::TempDir::new().unwrap();
+
+        // Current-hash entry: older built_at. cache.list() sorts
+        // newest-first, so this entry lands AFTER the stale entry — if
+        // find_kernel failed to skip stale, it would return the stale
+        // image instead of this one.
+        let current_image = src_dir.path().join("current.bzImage");
+        std::fs::write(&current_image, b"current kernel image").unwrap();
+        let current_meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "current.bzImage".to_string(),
+            "2026-04-01T00:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()))
+        .with_ktstr_kconfig_hash(Some(current_hash.clone()));
+        let current_entry = cache
+            .store(
+                "current-entry",
+                &CacheArtifacts::new(&current_image),
+                &current_meta,
+            )
+            .unwrap();
+
+        // Stale entry: newer built_at, so list() yields it first.
+        let stale_image = src_dir.path().join("stale.bzImage");
+        std::fs::write(&stale_image, b"stale kernel image").unwrap();
+        let stale_meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "stale.bzImage".to_string(),
+            "2026-04-20T00:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.3".to_string()))
+        .with_ktstr_kconfig_hash(Some(stale_hash));
+        cache
+            .store(
+                "stale-entry",
+                &CacheArtifacts::new(&stale_image),
+                &stale_meta,
+            )
+            .unwrap();
+
+        let resolved = find_kernel().unwrap();
+        assert_eq!(
+            resolved,
+            Some(current_entry.image_path()),
+            "find_kernel must skip the newer stale entry and return the \
+             current-hash entry — regression of the KconfigStatus::Stale \
+             skip branch in find_kernel's cache-scan loop",
+        );
+    }
 }

@@ -413,7 +413,7 @@ impl CacheDir {
         if !entry_dir.is_dir() {
             return None;
         }
-        let metadata = read_metadata(&entry_dir)?;
+        let metadata = read_metadata(&entry_dir).ok()?;
         // Entry must have a kernel image file.
         if !entry_dir.join(&metadata.image_name).exists() {
             return None;
@@ -459,7 +459,7 @@ impl CacheDir {
                 continue;
             }
             match read_metadata(&path) {
-                Some(metadata) => {
+                Ok(metadata) => {
                     let image_path = path.join(&metadata.image_name);
                     if image_path.exists() {
                         entries.push(ListedEntry::Valid(CacheEntry {
@@ -482,10 +482,10 @@ impl CacheDir {
                         });
                     }
                 }
-                None => entries.push(ListedEntry::Corrupt {
+                Err(reason) => entries.push(ListedEntry::Corrupt {
                     key: name,
                     path,
-                    reason: "metadata.json missing or unparseable".to_string(),
+                    reason,
                 }),
             }
         }
@@ -764,10 +764,30 @@ fn atomic_swap_dirs(src: &Path, dst: &Path) -> anyhow::Result<()> {
 }
 
 /// Read and deserialize metadata.json from a cache entry directory.
-fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
+///
+/// On failure returns a human-readable reason suitable for surfacing
+/// through [`ListedEntry::Corrupt::reason`]. The reason carries a
+/// distinct prefix per failure mode so `kernel list` output and CI
+/// logs can point the user at the specific cause:
+/// - `"metadata.json missing"` — the file is absent (ENOENT), which
+///   typically means the directory is not a cache entry at all
+///   (scanner stumbled onto an unrelated dir).
+/// - `"metadata.json unreadable: {e}"` — other I/O error from
+///   `fs::read_to_string` (permissions, dangling symlink, etc.).
+/// - `"metadata.json parse error: {e}"` — serde_json rejected the
+///   file. The underlying `serde_json::Error` display is appended,
+///   which names the malformed or missing required field plus its
+///   line/column in the JSON.
+fn read_metadata(dir: &Path) -> Result<KernelMetadata, String> {
     let meta_path = dir.join("metadata.json");
-    let contents = fs::read_to_string(meta_path).ok()?;
-    serde_json::from_str(&contents).ok()
+    let contents = match fs::read_to_string(&meta_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("metadata.json missing".to_string());
+        }
+        Err(e) => return Err(format!("metadata.json unreadable: {e}")),
+    };
+    serde_json::from_str(&contents).map_err(|e| format!("metadata.json parse error: {e}"))
 }
 
 /// Re-route a cache-entry directory to its original source tree when
@@ -794,7 +814,7 @@ fn read_metadata(dir: &Path) -> Option<KernelMetadata> {
 /// directory for symbol/BTF lookup — file:line is genuinely
 /// unrecoverable without re-downloading sources.
 pub fn prefer_source_tree_for_dwarf(dir: &Path) -> Option<PathBuf> {
-    let metadata = read_metadata(dir)?;
+    let metadata = read_metadata(dir).ok()?;
     let KernelSource::Local {
         source_tree_path, ..
     } = metadata.source
@@ -1630,9 +1650,9 @@ mod tests {
         let ListedEntry::Corrupt { reason, .. } = corrupt else {
             panic!("expected Corrupt variant");
         };
-        assert!(
-            reason.contains("metadata.json missing or unparseable"),
-            "missing-metadata reason should cite metadata.json, got: {reason}",
+        assert_eq!(
+            reason, "metadata.json missing",
+            "missing-metadata reason should be the exact missing-file label, got: {reason}",
         );
     }
 
@@ -1679,9 +1699,10 @@ mod tests {
     #[test]
     fn cache_dir_list_classifies_malformed_json_as_corrupt() {
         // metadata.json exists but is not valid JSON. `read_metadata`
-        // returns None on `serde_json::from_str` failure, so list()
-        // must surface the entry as Corrupt with the
-        // unparseable-metadata reason.
+        // maps the serde_json::Error into
+        // `"metadata.json parse error: {e}"`, so list() must surface
+        // the entry as Corrupt with that prefix and the underlying
+        // parse-error message preserved for actionable diagnostics.
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().to_path_buf());
         let entry_dir = tmp.path().join("malformed-json");
@@ -1697,8 +1718,8 @@ mod tests {
             panic!("expected Corrupt variant for malformed-json entry");
         };
         assert!(
-            reason.contains("metadata.json missing or unparseable"),
-            "malformed-JSON reason should match the unparseable-metadata label, got: {reason}",
+            reason.starts_with("metadata.json parse error: "),
+            "malformed-JSON reason should carry the parse-error prefix, got: {reason}",
         );
     }
 
@@ -1713,14 +1734,10 @@ mod tests {
         // wrapped in `Option` — a plain `bool` with no
         // `#[serde(default)]` attribute must still be present in the
         // JSON payload. serde_json reports the first missing required
-        // field in declaration order (`source`) but the test asserts
-        // only the Corrupt classification and the generic
-        // unparseable-metadata label, not the specific field name.
-        // list() must surface the entry as Corrupt with the
-        // unparseable-metadata reason — both incomplete metadata and
-        // malformed JSON surface as Corrupt with the same reason
-        // string because read_metadata returns None for either
-        // failure mode.
+        // field in declaration order (`source`), and `read_metadata`
+        // propagates that message as the Corrupt reason so the user
+        // sees which specific field is absent rather than a generic
+        // "unparseable metadata" blob.
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().to_path_buf());
         let entry_dir = tmp.path().join("incomplete-metadata");
@@ -1739,8 +1756,12 @@ mod tests {
             panic!("expected Corrupt variant for entry with incomplete metadata");
         };
         assert!(
-            reason.contains("metadata.json missing or unparseable"),
-            "incomplete-metadata reason should match the unparseable-metadata label, got: {reason}",
+            reason.starts_with("metadata.json parse error: "),
+            "incomplete-metadata reason should carry the parse-error prefix, got: {reason}",
+        );
+        assert!(
+            reason.contains("missing field `source`"),
+            "incomplete-metadata reason should name the first missing required field, got: {reason}",
         );
     }
 
