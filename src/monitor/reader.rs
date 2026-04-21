@@ -1067,7 +1067,6 @@ pub(crate) fn monitor_loop(
         vec![super::SustainedViolationTracker::default(); rq_pas.len()];
     let mut dump_requested = false;
     let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(rq_pas.len());
-    let mut prev_vcpu_times: Option<Vec<Option<u64>>> = None;
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
         .unwrap_or_default();
@@ -1141,10 +1140,12 @@ pub(crate) fn monitor_loop(
             }
         }
 
-        // Read vCPU CPU times and store in snapshots for post-hoc analysis.
-        let curr_vcpu_times =
-            vcpu_timing.map(|vt| vt.read_cpu_times(&mut vcpu_timing_err_reported));
-        if let Some(ref times) = curr_vcpu_times {
+        // Stamp vCPU CPU times into the per-CPU snapshots. Reactive
+        // stall detection below reads these via `is_cpu_stalled`; the
+        // post-hoc `MonitorThresholds::evaluate` path reads them off
+        // the pushed samples.
+        if let Some(vt) = vcpu_timing {
+            let times = vt.read_cpu_times(&mut vcpu_timing_err_reported);
             for (i, cpu) in cpus.iter_mut().enumerate() {
                 if let Some(&t) = times.get(i) {
                     cpu.vcpu_cpu_time_ns = t;
@@ -1152,12 +1153,13 @@ pub(crate) fn monitor_loop(
             }
         }
 
-        // Inline threshold evaluation for reactive dump. The violation
-        // predicates mirror `MonitorThresholds::evaluate`: the same
-        // `SustainedViolationTracker`, the same `evaluate_preempted`
-        // helper, the same `imbalance_ratio`/`local_dsq_depth` reads.
-        // Any drift would let the reactive SysRq-D trigger fire on
-        // conditions the post-hoc verdict accepts (or vice versa).
+        // Inline threshold evaluation for reactive dump. Each check
+        // mirrors `MonitorThresholds::evaluate`: the same
+        // `SustainedViolationTracker`, the same `is_cpu_stalled`
+        // predicate, the same `imbalance_ratio`/`local_dsq_depth`
+        // reads. Any drift would let the reactive SysRq-D trigger
+        // fire on conditions the post-hoc verdict accepts (or vice
+        // versa).
         if let Some(trigger) = dump_trigger
             && !dump_requested
             && !cpus.is_empty()
@@ -1183,33 +1185,19 @@ pub(crate) fn monitor_loop(
                 sample_idx,
             );
 
-            // Stall check: per-CPU sustained window, exempt idle CPUs
-            // (nr_running==0 in both samples: NOHZ tick stopped) and
-            // preempted vCPUs (CPU time didn't advance: host stole the core).
+            // Stall check: per-CPU sustained window. Delegate to
+            // `is_cpu_stalled` so reactive and post-hoc stall paths
+            // cannot drift — the predicate owns the idle + preempted
+            // exemptions. `vcpu_cpu_time_ns` is already stamped into
+            // `cpus[i]` (and into the last pushed sample) above, so the
+            // helper sees the same vCPU timing the post-hoc path sees.
             if t.fail_on_stall
                 && let Some(prev) = samples.last()
             {
                 let n = prev.cpus.len().min(cpus.len()).min(stall_trackers.len());
                 for i in 0..n {
-                    let idle = cpus[i].nr_running == 0 && prev.cpus[i].nr_running == 0;
-                    // Delegate to the shared pure predicate so reactive
-                    // and post-hoc stall paths cannot drift. A missing
-                    // read (None on either side) returns false ("no
-                    // evidence of preemption"), which keeps the stall
-                    // path firing on clock-read failure rather than
-                    // silently suppressing it — the original bug.
-                    let preempted = match (&prev_vcpu_times, &curr_vcpu_times) {
-                        (Some(prev_t), Some(curr_t)) => evaluate_preempted(
-                            prev_t.get(i).copied().flatten(),
-                            curr_t.get(i).copied().flatten(),
-                            preemption_threshold_ns,
-                        ),
-                        _ => false,
-                    };
-                    let is_stall = cpus[i].rq_clock != 0
-                        && cpus[i].rq_clock == prev.cpus[i].rq_clock
-                        && !idle
-                        && !preempted;
+                    let is_stall =
+                        is_cpu_stalled(&prev.cpus[i], &cpus[i], preemption_threshold_ns);
                     stall_trackers[i].record(is_stall, cpus[i].rq_clock as f64, sample_idx);
                 }
             }
@@ -1228,8 +1216,6 @@ pub(crate) fn monitor_loop(
                 dump_requested = true;
             }
         }
-
-        prev_vcpu_times = curr_vcpu_times;
 
         let prog_stats = prog_stats_ctx.map(|ctx| {
             super::bpf_prog::read_prog_runtime_stats(
