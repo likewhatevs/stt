@@ -11,11 +11,10 @@
 
 #![cfg(test)]
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
-use tempfile::TempDir;
 
 use crate::assert::AssertResult;
 use crate::scenario::Ctx;
@@ -30,51 +29,6 @@ use crate::vmm::topology::Topology;
 /// so any test that mutates an env var must hold this mutex for its
 /// full save/mutate/restore window.
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Lock [`ENV_LOCK`] for the lifetime of a test, recovering from
-/// poisoning. If a previous test panicked while holding the lock we
-/// still want the current test to run: env-touching tests establish
-/// no shared invariant beyond their own save/restore pair, so the
-/// poisoned inner guard is safe to take.
-pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Tempdir bound as the process-wide `KTSTR_CACHE_DIR`. While the
-/// returned value is live:
-///   * the temp directory exists on disk and is pointed at by
-///     `KTSTR_CACHE_DIR`;
-///   * on drop, the env var's previous value is restored and the
-///     directory is removed.
-///
-/// Callers that also mutate other env vars must hold [`lock_env`]
-/// for the guard's full lifetime so the save/restore pair does not
-/// race with another test in the same binary.
-pub(crate) struct IsolatedCacheDir {
-    pub(crate) tmp: TempDir,
-    _guard: EnvVarGuard,
-}
-
-impl IsolatedCacheDir {
-    /// The temp directory's root path. Shorthand for
-    /// `self.tmp.path()`.
-    pub(crate) fn path(&self) -> &std::path::Path {
-        self.tmp.path()
-    }
-}
-
-/// Create a fresh tempdir and point `KTSTR_CACHE_DIR` at it. See
-/// [`IsolatedCacheDir`] for drop semantics.
-pub(crate) fn isolated_cache_dir() -> IsolatedCacheDir {
-    let tmp = TempDir::new().expect("tempdir for isolated cache root");
-    let guard = EnvVarGuard::set(
-        "KTSTR_CACHE_DIR",
-        tmp.path()
-            .to_str()
-            .expect("tempdir path is UTF-8 on every supported target"),
-    );
-    IsolatedCacheDir { tmp, _guard: guard }
-}
 
 /// Shared `Topology` used by `evaluate_vm_result` tests: the
 /// 1-numa-1-llc-2-core-1-thread topology is unremarkable on every
