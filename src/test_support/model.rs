@@ -89,10 +89,21 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use super::KTSTR_TESTS;
 use super::payload::OutputFormat;
+
+/// Set by [`prefetch_if_required`] when both [`ensure`] calls
+/// succeed; read by [`load_inference`] to skip the redundant second
+/// SHA hash. Never reset — [`MODEL_CACHE`] memoizes `load_inference`
+/// once per process (absent panics in the load closure).
+///
+/// Stays `false` on every prefetch short-circuit (no-test-needs-it,
+/// offline gate, ensure error) so `load_inference` falls back to
+/// [`ensure`] and first-use SHA checking still happens.
+static PREFETCH_VERIFIED: AtomicBool = AtomicBool::new(false);
 
 /// Process-wide memoized inference state.
 ///
@@ -617,18 +628,18 @@ pub fn any_test_requires_model() -> bool {
 
 /// Prefetch [`DEFAULT_MODEL`] and [`DEFAULT_TOKENIZER`] when at least
 /// one registered test needs the LlmExtract backend. No-op when
-/// `KTSTR_MODEL_OFFLINE` is set (skips fetch, leaves per-test failures
-/// to surface downstream) or when no test declares
+/// `KTSTR_MODEL_OFFLINE` is set or no test declares
 /// [`OutputFormat::LlmExtract`].
 ///
 /// Both artifacts are ensured together because inference needs both —
 /// deferring the tokenizer to first-call would only move a failure
 /// that setup already has the authority to surface.
 ///
+/// On full success sets [`PREFETCH_VERIFIED`] so [`load_inference`]
+/// can skip re-hashing.
+///
 /// Returns `Ok(None)` when no fetch was attempted; `Ok(Some(path))`
-/// when both artifacts are now cached (the model path is returned so
-/// callers can log the inference entry point); `Err` on fetch/verify
-/// failure.
+/// with the model path on success; `Err` on fetch/verify failure.
 pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     if !any_test_requires_model() {
         return Ok(None);
@@ -644,7 +655,32 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     }
     let model_path = ensure(&DEFAULT_MODEL)?;
     ensure(&DEFAULT_TOKENIZER)?;
+    // Release pairs with Acquire in load_inference to establish
+    // happens-before between the ensure-side filesystem writes
+    // (tempfile persist) and the fast-path reader.
+    PREFETCH_VERIFIED.store(true, Ordering::Release);
     Ok(Some(model_path))
+}
+
+/// Resolve the cache path for `spec` without re-hashing. Fails if
+/// the file is missing.
+///
+/// Callers must have already SHA-verified the artifact in this
+/// process (via [`prefetch_if_required`]); otherwise use [`ensure`]
+/// so the first use triggers a SHA check.
+fn locate(spec: &ModelSpec) -> Result<PathBuf> {
+    let root = resolve_cache_root()?;
+    let path = root.join(spec.file_name);
+    if !path.is_file() {
+        anyhow::bail!(
+            "model '{}' not present at {} — was SHA-verified earlier in this process \
+             but has since been removed; re-run to re-fetch, or check whether another \
+             process cleared the cache",
+            spec.file_name,
+            path.display(),
+        );
+    }
+    Ok(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -726,19 +762,22 @@ struct LoadedInference {
     device: candle::Device,
 }
 
-/// Ensure both artifacts are cached, open the GGUF, build the Qwen3
-/// `ModelWeights`, and load the tokenizer. Returns the bundled state.
+/// Build the bundled Qwen3 weights + tokenizer + EOS id.
 ///
-/// Every failure point flows through `anyhow::Error` so
-/// `extract_via_llm` surfaces the full chain (path, cause) when
-/// logging.
+/// When [`PREFETCH_VERIFIED`] is set, uses [`locate`] and skips
+/// re-hashing the model's ~2.5 GiB. Otherwise falls back to
+/// [`ensure`] so first use triggers a SHA check.
 fn load_inference() -> anyhow::Result<LoadedInference> {
     use candle::{Device, quantized::gguf_file};
     use candle_transformers::models::quantized_qwen3::ModelWeights;
     use tokenizers::Tokenizer;
 
-    let model_path = ensure(&DEFAULT_MODEL)?;
-    let tokenizer_path = ensure(&DEFAULT_TOKENIZER)?;
+    // Acquire pairs with the Release store in prefetch_if_required.
+    let (model_path, tokenizer_path) = if PREFETCH_VERIFIED.load(Ordering::Acquire) {
+        (locate(&DEFAULT_MODEL)?, locate(&DEFAULT_TOKENIZER)?)
+    } else {
+        (ensure(&DEFAULT_MODEL)?, ensure(&DEFAULT_TOKENIZER)?)
+    };
 
     let device = Device::Cpu;
 
