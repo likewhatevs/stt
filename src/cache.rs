@@ -3020,7 +3020,7 @@ mod tests {
             flags: object::SymbolFlags::None,
         });
         // `.comment` is ELF's standard toolchain-producer string table
-        // (`SectionKind::OtherString` per object-0.36 common.rs:209).
+        // (`object::SectionKind::OtherString`).
         // Real kernel builds carry one stamped by GCC/Clang.
         let comment_id = obj.add_section(
             Vec::new(),
