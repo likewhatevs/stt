@@ -534,7 +534,7 @@ pub fn git_clone(
         cache_key,
         version: None,
         kernel_source: crate::cache::KernelSource::Git {
-            hash: Some(short_hash),
+            git_hash: Some(short_hash),
             git_ref: Some(git_ref.to_string()),
         },
         is_temp: true,

@@ -659,7 +659,7 @@ mod tests {
         let image = create_fake_image(src.path());
         let meta = KernelMetadata::new(
             KernelSource::Git {
-                hash: Some("a1b2c3d".to_string()),
+                git_hash: Some("a1b2c3d".to_string()),
                 git_ref: Some("v6.15-rc3".to_string()),
             },
             "x86_64".to_string(),
@@ -680,7 +680,7 @@ mod tests {
         assert!(matches!(
             rmeta.source,
             KernelSource::Git {
-                hash: Some(ref h),
+                git_hash: Some(ref h),
                 git_ref: Some(ref r),
             }
             if h == "a1b2c3d" && r == "v6.15-rc3"

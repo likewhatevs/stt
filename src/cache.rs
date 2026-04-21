@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 /// payload (git details for `Git`, source-tree path and git hash for
 /// `Local`).
 ///
-/// Serialized as `{"type": "tarball"}`, `{"type": "git", "hash": ..., "ref": ...}`,
+/// Serialized as `{"type": "tarball"}`, `{"type": "git", "git_hash": ..., "ref": ...}`,
 /// or `{"type": "local", "source_tree_path": ..., "git_hash": ...}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "type")]
@@ -61,7 +61,7 @@ pub enum KernelSource {
     Git {
         /// Git commit hash of the kernel source (short form).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        hash: Option<String>,
+        git_hash: Option<String>,
         /// Git ref used for checkout (branch, tag, or ref spec).
         #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
         git_ref: Option<String>,
@@ -1215,7 +1215,7 @@ mod tests {
         let meta = KernelMetadata {
             version: Some("6.15-rc3".to_string()),
             source: KernelSource::Git {
-                hash: Some("a1b2c3d".to_string()),
+                git_hash: Some("a1b2c3d".to_string()),
                 git_ref: Some("v6.15-rc3".to_string()),
             },
             arch: "aarch64".to_string(),
@@ -1230,7 +1230,7 @@ mod tests {
         assert!(matches!(
             parsed.source,
             KernelSource::Git {
-                hash: Some(ref h),
+                git_hash: Some(ref h),
                 git_ref: Some(ref r),
             }
             if h == "a1b2c3d" && r == "v6.15-rc3"
@@ -1291,12 +1291,12 @@ mod tests {
         let t = serde_json::to_string(&KernelSource::Tarball).unwrap();
         assert_eq!(t, r#"{"type":"tarball"}"#);
         let g = serde_json::to_string(&KernelSource::Git {
-            hash: Some("abc".to_string()),
+            git_hash: Some("abc".to_string()),
             git_ref: Some("main".to_string()),
         })
         .unwrap();
         assert!(g.contains(r#""type":"git""#));
-        assert!(g.contains(r#""hash":"abc""#));
+        assert!(g.contains(r#""git_hash":"abc""#));
         assert!(g.contains(r#""ref":"main""#));
         let l = serde_json::to_string(&KernelSource::Local {
             source_tree_path: Some(PathBuf::from("/tmp/linux")),
