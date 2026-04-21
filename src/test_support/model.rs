@@ -1300,7 +1300,7 @@ mod tests {
             rendered.contains("non-hex"),
             "expected malformed-pin error from verify_sha256, got: {rendered}"
         );
-        // Pin the  context wrapper that names the offending
+        // Pin the context wrapper that names the offending
         // ModelSpec's file_name. Without this assertion, a regression
         // that dropped the .with_context layer would strip the
         // file-name annotation and leave CLI users to guess which
@@ -2294,7 +2294,7 @@ mod tests {
             !rendered.contains("non-HTTPS"),
             "expected offline-path bail, not the URL-scheme path: {rendered}"
         );
-        // Pin the stale-cache branch wording introduced by . The
+        // Pin the stale-cache branch wording. The
         // file exists on disk but its bytes do not hash to the pin, so
         // ensure() must take the `st.cached` path of the offline bail
         // and produce a "do not match" message — distinct from the
