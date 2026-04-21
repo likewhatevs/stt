@@ -1,8 +1,8 @@
-/// Minimal initramfs (cpio newc format) creation via the `cpio` crate.
-/// Packs the test binary as `/init` along with scheduler binaries,
-/// shared libraries, optional busybox, and user-provided include files
-/// into a cpio archive for use as Linux initrd.
-/// Init setup is handled by Rust code in `vmm::rust_init`.
+//! Minimal initramfs (cpio newc format) creation via the `cpio` crate.
+//! Packs the test binary as `/init` along with scheduler binaries,
+//! shared libraries, optional busybox, and user-provided include files
+//! into a cpio archive for use as Linux initrd.
+//! Init setup is handled by Rust code in `vmm::rust_init`.
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -650,7 +650,7 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
 /// individual file entries before calling this function (see
 /// `cli::resolve_include_files`).
 #[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
-pub fn create_initramfs_base(
+pub fn build_initramfs_base(
     payload: &Path,
     extra_binaries: &[(&str, &Path)],
     include_files: &[(&str, &Path)],
@@ -1437,7 +1437,7 @@ mod tests {
     }
 
     /// Thin test wrapper that produces a complete cpio newc archive by
-    /// concatenating [`create_initramfs_base`] and [`build_suffix`]
+    /// concatenating [`build_initramfs_base`] and [`build_suffix`]
     /// output. Production callers build base and suffix separately so
     /// they can stream the parts into guest memory without an
     /// intermediate `Vec`; the monolithic form is only needed for
@@ -1447,7 +1447,7 @@ mod tests {
         extra_binaries: &[(&str, &Path)],
         args: &[String],
     ) -> Result<Vec<u8>> {
-        let base = create_initramfs_base(payload, extra_binaries, &[], false)?;
+        let base = build_initramfs_base(payload, extra_binaries, &[], false)?;
         let suffix = build_suffix_args(base.len(), args, &[])?;
         let mut archive = Vec::with_capacity(base.len() + suffix.len());
         archive.extend_from_slice(&base);
@@ -1514,9 +1514,9 @@ mod tests {
     }
 
     #[test]
-    fn create_initramfs_base_is_valid_cpio() {
+    fn build_initramfs_base_is_valid_cpio() {
         let exe = crate::resolve_current_exe().unwrap();
-        let initrd = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let initrd = build_initramfs_base(&exe, &[], &[], false).unwrap();
         assert_eq!(&initrd[..6], b"070701");
         // Base is NOT 512-aligned on its own; only base+suffix is.
         let full = create_initramfs(&exe, &[], &[]).unwrap();
@@ -1564,7 +1564,7 @@ mod tests {
     #[test]
     fn suffix_adds_args_and_trailer() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let args = vec!["run".into(), "--json".into()];
         let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
         let s = String::from_utf8_lossy(&suffix);
@@ -1582,7 +1582,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let args = vec!["run".into(), "--json".into(), "scenario".into()];
         let monolithic = create_initramfs(&exe, &[], &args).unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
         let mut split = Vec::with_capacity(base.len() + suffix.len());
         split.extend_from_slice(&base);
@@ -1596,7 +1596,7 @@ mod tests {
     #[test]
     fn suffix_different_args_differ() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let a = build_suffix_args(base.len(), &["a".into()], &[]).unwrap();
         let b = build_suffix_args(base.len(), &["b".into()], &[]).unwrap();
         assert_ne!(a, b, "different args should produce different suffixes");
@@ -1605,7 +1605,7 @@ mod tests {
     #[test]
     fn suffix_empty_args() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
         assert_eq!((base.len() + suffix.len()) % 512, 0);
         let s = String::from_utf8_lossy(&suffix);
@@ -1882,7 +1882,7 @@ mod tests {
     #[test]
     fn suffix_with_sched_args() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let sched_args = vec!["--enable-borrow".into(), "--llc".into()];
         let suffix = build_suffix_args(base.len(), &[], &sched_args).unwrap();
         let s = String::from_utf8_lossy(&suffix);
@@ -1897,7 +1897,7 @@ mod tests {
     #[test]
     fn suffix_without_sched_args_omits_entry() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
         let s = String::from_utf8_lossy(&suffix);
         assert!(
@@ -2050,19 +2050,19 @@ mod tests {
     }
 
     #[test]
-    fn create_initramfs_base_contains_init() {
+    fn build_initramfs_base_contains_init() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("init"), "base should contain init entry");
     }
 
     #[test]
-    fn create_initramfs_base_includes_extra_shared_libs() {
+    fn build_initramfs_base_includes_extra_shared_libs() {
         let exe = crate::resolve_current_exe().unwrap();
         let sched = crate::test_support::require_binary("scx-ktstr");
         let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
-        let base = create_initramfs_base(&exe, &extras, &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &extras, &[], false).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(
             s.contains("lib64/libelf"),
@@ -2098,7 +2098,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("ktstr-test-include-busybox");
         std::fs::write(&tmp, b"hello").unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/test.txt", tmp.as_path())];
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let names = cpio_entry_names(&base);
         assert!(
             names.iter().any(|n| n == "bin/busybox"),
@@ -2111,7 +2111,7 @@ mod tests {
     #[test]
     fn include_files_no_busybox_when_empty() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let names = cpio_entry_names(&base);
         assert!(
             !names.iter().any(|n| n == "bin/busybox"),
@@ -2129,7 +2129,7 @@ mod tests {
 
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/run.sh", tmp.as_path())];
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(
             s.contains("include-files/run.sh"),
@@ -2152,7 +2152,7 @@ mod tests {
         }
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         // Dynamic ELF should pull in libc shared libs.
         let shared = resolve_shared_libs(sh).unwrap();
@@ -2172,7 +2172,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/hello.sh", tmp.as_path())];
         // Should not fail (ELF parsing skipped for non-ELF).
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("include-files/hello.sh"));
         let _ = std::fs::remove_file(&tmp);
@@ -2185,7 +2185,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> =
             vec![("include-files/subdir/nested/file.txt", tmp.as_path())];
-        let base = create_initramfs_base(&exe, &[], &includes, true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("include-files"), "should have include-files dir");
         assert!(
@@ -2233,7 +2233,7 @@ mod tests {
         std::fs::write(&tmp, b"data").unwrap();
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/../etc/passwd", tmp.as_path())];
-        let result = create_initramfs_base(&exe, &[], &includes, true);
+        let result = build_initramfs_base(&exe, &[], &includes, true);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2258,7 +2258,7 @@ mod tests {
         );
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/pipe", fifo_path.as_path())];
-        let result = create_initramfs_base(&exe, &[], &includes, true);
+        let result = build_initramfs_base(&exe, &[], &includes, true);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2274,7 +2274,7 @@ mod tests {
         let _ = std::fs::create_dir(&dir_path);
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/mydir", dir_path.as_path())];
-        let result = create_initramfs_base(&exe, &[], &includes, true);
+        let result = build_initramfs_base(&exe, &[], &includes, true);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -2288,7 +2288,7 @@ mod tests {
     fn busybox_independent_of_include_files() {
         let exe = crate::resolve_current_exe().unwrap();
         // busybox=true but no include_files.
-        let base = create_initramfs_base(&exe, &[], &[], true).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], true).unwrap();
         let names = cpio_entry_names(&base);
         assert!(
             names.iter().any(|n| n == "bin/busybox"),
@@ -2357,7 +2357,7 @@ mod tests {
     #[test]
     fn no_duplicate_cpio_entries() {
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let entries = cpio_entries(&base);
         let mut seen = std::collections::HashSet::new();
         let mut duplicates = Vec::new();
@@ -2394,7 +2394,7 @@ mod tests {
             ("usr/local/custom/platform/lib/libcustom3.so", f3.as_path()),
         ];
 
-        let base = create_initramfs_base(&exe, &[], &includes, false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, false).unwrap();
         let entries = cpio_entries(&base);
         let entry_names: Vec<&str> = entries.iter().map(|(n, _, _, _)| n.as_str()).collect();
 
@@ -2485,7 +2485,7 @@ mod tests {
         }
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
-        let base = create_initramfs_base(&exe, &[], &includes, false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &includes, false).unwrap();
         let entries = cpio_entries(&base);
         let entry_map: std::collections::HashMap<&str, (u32, u32, u32)> = entries
             .iter()
@@ -2523,7 +2523,7 @@ mod tests {
         // Verify that all entries use ino=0 and nlink=1, so the kernel
         // initramfs unpacker never enters the hardlink path.
         let exe = crate::resolve_current_exe().unwrap();
-        let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
         let mut remaining: &[u8] = base.as_slice();
         while let Ok(reader) = cpio::newc::Reader::new(remaining) {
             if reader.entry().is_trailer() {
