@@ -617,7 +617,7 @@ fn is_deleted_self(path: &Path) -> bool {
 
 /// Build the base cpio archive: /init binary, extra binaries, and shared
 /// libraries. Does NOT include /args, trailer, or 512-byte padding. The
-/// returned bytes are a valid cpio prefix that `build_suffix_full` can complete
+/// returned bytes are a valid cpio prefix that `build_suffix` can complete
 /// with per-invocation args.
 ///
 /// The test binary is packed as `/init` (the kernel's rdinit entry point).
@@ -901,28 +901,39 @@ pub fn create_initramfs_base(
     Ok(archive)
 }
 
-/// Build the suffix that completes a base archive: /args and
-/// /sched_args entries, optional /sched_enable and /sched_disable
-/// shell scripts for kernel-built schedulers, optional /exec_cmd,
+/// Per-invocation inputs that turn a cached base archive into a
+/// complete initramfs. Borrows all slices so callers can build a
+/// `SuffixParams` without copying `Vec<String>` fields.
+#[derive(Default)]
+pub struct SuffixParams<'a> {
+    /// `/args` contents — one entry per line.
+    pub args: &'a [String],
+    /// `/sched_args` contents, or empty to skip the entry.
+    pub sched_args: &'a [String],
+    /// `/sched_enable` shell-script lines for kernel-built
+    /// schedulers, or empty to skip the entry.
+    pub sched_enable: &'a [String],
+    /// `/sched_disable` shell-script lines, or empty to skip.
+    pub sched_disable: &'a [String],
+    /// `/exec_cmd` contents when `--exec` is used; `None` otherwise.
+    pub exec_cmd: Option<&'a str>,
+}
+
+/// Build the suffix that completes a base archive: `/args` and
+/// `/sched_args` entries, optional `/sched_enable` and `/sched_disable`
+/// shell scripts for kernel-built schedulers, optional `/exec_cmd`,
 /// trailer, and 512-byte padding. `base_len` is needed to compute the
 /// padding. The returned Vec is typically ~200 bytes.
-pub fn build_suffix_full(
-    base_len: usize,
-    args: &[String],
-    sched_args: &[String],
-    sched_enable: &[&str],
-    sched_disable: &[&str],
-    exec_cmd: Option<&str>,
-) -> Result<Vec<u8>> {
+pub fn build_suffix(base_len: usize, params: &SuffixParams<'_>) -> Result<Vec<u8>> {
     let mut suffix = Vec::new();
 
     // Args file
-    let args_data = args.join("\n");
+    let args_data = params.args.join("\n");
     write_entry(&mut suffix, "args", args_data.as_bytes(), 0o100644)?;
 
     // Scheduler args file
-    if !sched_args.is_empty() {
-        let sched_args_data = sched_args.join("\n");
+    if !params.sched_args.is_empty() {
+        let sched_args_data = params.sched_args.join("\n");
         write_entry(
             &mut suffix,
             "sched_args",
@@ -932,16 +943,16 @@ pub fn build_suffix_full(
     }
 
     // Kernel-built scheduler enable/disable scripts
-    if !sched_enable.is_empty() {
-        let data = sched_enable.join("\n");
+    if !params.sched_enable.is_empty() {
+        let data = params.sched_enable.join("\n");
         write_entry(&mut suffix, "sched_enable", data.as_bytes(), 0o100755)?;
     }
-    if !sched_disable.is_empty() {
-        let data = sched_disable.join("\n");
+    if !params.sched_disable.is_empty() {
+        let data = params.sched_disable.join("\n");
         write_entry(&mut suffix, "sched_disable", data.as_bytes(), 0o100755)?;
     }
 
-    if let Some(cmd) = exec_cmd {
+    if let Some(cmd) = params.exec_cmd {
         write_entry(&mut suffix, "exec_cmd", cmd.as_bytes(), 0o100644)?;
     }
 
@@ -1391,16 +1402,38 @@ pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Concatenate `base` and `suffix` into a single buffer and compress it
+/// with [`lz4_legacy_compress`]. Used by the aarch64 path, which loads
+/// initramfs as one compressed blob rather than streaming per-part.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn lz4_compress_combined(base: &[u8], suffix: &[u8]) -> Vec<u8> {
+    let mut full = Vec::with_capacity(base.len() + suffix.len());
+    full.extend_from_slice(base);
+    full.extend_from_slice(suffix);
+    lz4_legacy_compress(&full)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Thin test wrapper over [`build_suffix_full`] that skips the
-    /// kernel-builtin scheduler and exec-cmd knobs — the tests in this
-    /// module only exercise `args` and `sched_args`, so stripping the
-    /// unused parameters keeps assertions focused.
-    fn build_suffix(base_len: usize, args: &[String], sched_args: &[String]) -> Result<Vec<u8>> {
-        build_suffix_full(base_len, args, sched_args, &[], &[], None)
+    /// Thin test wrapper over [`build_suffix`] that takes only the
+    /// args tests commonly vary. The remaining [`SuffixParams`] fields
+    /// default to empty, so assertions stay focused on the args- and
+    /// sched-args-only suffix shape.
+    fn build_suffix_args(
+        base_len: usize,
+        args: &[String],
+        sched_args: &[String],
+    ) -> Result<Vec<u8>> {
+        build_suffix(
+            base_len,
+            &SuffixParams {
+                args,
+                sched_args,
+                ..Default::default()
+            },
+        )
     }
 
     /// Thin test wrapper that produces a complete cpio newc archive by
@@ -1415,7 +1448,7 @@ mod tests {
         args: &[String],
     ) -> Result<Vec<u8>> {
         let base = create_initramfs_base(payload, extra_binaries, &[], false)?;
-        let suffix = build_suffix(base.len(), args, &[])?;
+        let suffix = build_suffix_args(base.len(), args, &[])?;
         let mut archive = Vec::with_capacity(base.len() + suffix.len());
         archive.extend_from_slice(&base);
         archive.extend_from_slice(&suffix);
@@ -1533,7 +1566,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
         let args = vec!["run".into(), "--json".into()];
-        let suffix = build_suffix(base.len(), &args, &[]).unwrap();
+        let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
         let s = String::from_utf8_lossy(&suffix);
         assert!(s.contains("args"), "suffix should contain args entry");
         assert!(s.contains("TRAILER!!!"), "suffix should contain trailer");
@@ -1550,7 +1583,7 @@ mod tests {
         let args = vec!["run".into(), "--json".into(), "scenario".into()];
         let monolithic = create_initramfs(&exe, &[], &args).unwrap();
         let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
-        let suffix = build_suffix(base.len(), &args, &[]).unwrap();
+        let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
         let mut split = Vec::with_capacity(base.len() + suffix.len());
         split.extend_from_slice(&base);
         split.extend_from_slice(&suffix);
@@ -1564,8 +1597,8 @@ mod tests {
     fn suffix_different_args_differ() {
         let exe = crate::resolve_current_exe().unwrap();
         let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
-        let a = build_suffix(base.len(), &["a".into()], &[]).unwrap();
-        let b = build_suffix(base.len(), &["b".into()], &[]).unwrap();
+        let a = build_suffix_args(base.len(), &["a".into()], &[]).unwrap();
+        let b = build_suffix_args(base.len(), &["b".into()], &[]).unwrap();
         assert_ne!(a, b, "different args should produce different suffixes");
     }
 
@@ -1573,7 +1606,7 @@ mod tests {
     fn suffix_empty_args() {
         let exe = crate::resolve_current_exe().unwrap();
         let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
-        let suffix = build_suffix(base.len(), &[], &[]).unwrap();
+        let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
         assert_eq!((base.len() + suffix.len()) % 512, 0);
         let s = String::from_utf8_lossy(&suffix);
         assert!(s.contains("TRAILER!!!"));
@@ -1851,7 +1884,7 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
         let sched_args = vec!["--enable-borrow".into(), "--llc".into()];
-        let suffix = build_suffix(base.len(), &[], &sched_args).unwrap();
+        let suffix = build_suffix_args(base.len(), &[], &sched_args).unwrap();
         let s = String::from_utf8_lossy(&suffix);
         assert!(
             s.contains("sched_args"),
@@ -1865,7 +1898,7 @@ mod tests {
     fn suffix_without_sched_args_omits_entry() {
         let exe = crate::resolve_current_exe().unwrap();
         let base = create_initramfs_base(&exe, &[], &[], false).unwrap();
-        let suffix = build_suffix(base.len(), &[], &[]).unwrap();
+        let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
         let s = String::from_utf8_lossy(&suffix);
         assert!(
             !s.contains("sched_args"),
