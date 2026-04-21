@@ -216,6 +216,16 @@ pub enum KconfigStatus {
     Untracked,
 }
 
+impl fmt::Display for KconfigStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KconfigStatus::Matches => f.write_str("matches"),
+            KconfigStatus::Stale { .. } => f.write_str("stale"),
+            KconfigStatus::Untracked => f.write_str("untracked"),
+        }
+    }
+}
+
 // Re-export KernelId from kernel_path (canonical definition, std-only).
 pub use crate::kernel_path::KernelId;
 
@@ -3896,6 +3906,36 @@ mod tests {
             has_symbol(&elf, "schedule"),
             "schedule function symbol dropped by strip"
         );
+    }
+
+    // -- KconfigStatus Display impl --
+    //
+    // Pins the three Display strings that flow through `kernel list
+    // --json` as the `kconfig_status` field. CI scripts consume these
+    // exact strings, so any rewording is a downstream-visible
+    // contract change.
+
+    #[test]
+    fn kconfig_status_display_matches_renders_lowercase_word() {
+        assert_eq!(KconfigStatus::Matches.to_string(), "matches");
+    }
+
+    #[test]
+    fn kconfig_status_display_stale_renders_lowercase_word_without_hashes() {
+        let s = KconfigStatus::Stale {
+            cached: "deadbeef".to_string(),
+            current: "cafebabe".to_string(),
+        }
+        .to_string();
+        assert_eq!(
+            s, "stale",
+            "Display elides the cached/current hashes; callers that need them must match on the variant directly"
+        );
+    }
+
+    #[test]
+    fn kconfig_status_display_untracked_renders_lowercase_word() {
+        assert_eq!(KconfigStatus::Untracked.to_string(), "untracked");
     }
 
     use crate::test_support::test_helpers::EnvVarGuard;
