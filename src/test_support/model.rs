@@ -1316,6 +1316,107 @@ mod tests {
         );
     }
 
+    /// Complement of [`status_reports_cached_but_sha_mismatch_for_garbage_bytes`]:
+    /// when the cached file exists (so `metadata().is_file()` passes)
+    /// but `File::open()` fails with a permission error, status()
+    /// must report `sha_matches = false` AND populate
+    /// `sha_check_error` with the rendered I/O-error chain — NOT
+    /// silently collapse into the bytes-mismatch branch. Exercises
+    /// the I/O-error arm of the `verify_sha256` match in status()
+    /// that the structural change capturing I/O failures into
+    /// `sha_check_error` wired up.
+    ///
+    /// Unix-only: relies on POSIX permission semantics (mode 0o000
+    /// blocks reads). Skipped under root because DAC check is bypassed
+    /// for the superuser — the open would succeed and the test would
+    /// no longer exercise the I/O-error arm. CI runners running as
+    /// non-root fire the assertion; root-owned CI runners skip it
+    /// (logged via `eprintln!` so a user invoking the test suite
+    /// manually sees that this specific case was bypassed rather
+    /// than silently passed).
+    #[cfg(unix)]
+    #[test]
+    fn status_captures_io_error_for_unreadable_cached_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: libc::geteuid is documented (POSIX) to always succeed
+        // with no errno side effect — there's nothing to synchronize
+        // and the call is thread-safe by POSIX contract. nix's own
+        // wrapper would be preferable but ktstr's nix feature set
+        // omits "user", so reaching for libc directly avoids a
+        // Cargo.toml change for a test-only root check.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping status_captures_io_error_for_unreadable_cached_file: \
+                 running as root, mode 0o000 does not block reads under DAC"
+            );
+            return;
+        }
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = ModelSpec {
+            file_name: "unreadable.gguf",
+            url: "https://placeholder.example/unreadable.gguf",
+            // Valid-shape pin so the shape-check branch of
+            // verify_sha256 doesn't fire; the only way to reach the
+            // I/O-error capture path is a valid pin + open/read
+            // failure on the cached file.
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let on_disk = tmp.path().join(spec.file_name);
+        std::fs::write(&on_disk, b"any content").unwrap();
+        // Mode 0o000 strips owner/group/other read bits so the
+        // subsequent File::open inside verify_sha256 hits EACCES.
+        // The file itself remains in the directory (metadata.is_file
+        // still returns true), so status() enters the is_file arm
+        // rather than the `_ => (false, false, None)` fallback.
+        std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
+
+        let st = status(&spec).unwrap();
+
+        // Restore readable permissions before the tempdir Drop runs
+        // its remove_dir_all. Unlink on the file needs write+execute
+        // on the PARENT directory (not the file), so 0o000 on the
+        // file itself wouldn't block cleanup on Linux — but some
+        // filesystems and some tempfile paths are less tolerant,
+        // and leaving a world-unreadable file in the tempdir after
+        // assertion failures would make debug output harder. Reset
+        // defensively.
+        std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            st.cached,
+            "metadata().is_file() passed despite 0o000 — status must report cached=true"
+        );
+        assert!(
+            !st.sha_matches,
+            "verify_sha256 hit an I/O error, could not compute a hash; \
+             sha_matches must be false"
+        );
+        let err = st
+            .sha_check_error
+            .as_deref()
+            .expect("I/O error path must populate sha_check_error with Some(_)");
+        // `{e:#}` on a File::open failure at permission-denied yields
+        // something like "open /tmp/.../unreadable.gguf: Permission
+        // denied (os error 13)". The exact phrasing of std's
+        // io::Error Display for EACCES is "Permission denied" on
+        // Linux — pin against "ermission" (case-ambiguity safe
+        // relative to "Permission") OR "denied" to survive small
+        // libc-side wording drift across platforms while still
+        // requiring a substantively permission-related diagnostic.
+        assert!(
+            err.contains("ermission") || err.contains("denied"),
+            "expected permission-denied error in rendered chain, got: {err}"
+        );
+    }
+
     /// status() on a file that exists but whose SHA pin is malformed
     /// (non-hex chars) must surface the verify_sha256 error instead
     /// of coercing it into `sha_matches = false`. A malformed pin is
