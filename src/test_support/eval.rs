@@ -889,7 +889,7 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
 mod tests {
     use super::super::output::{RESULT_END, RESULT_START};
     use super::super::test_helpers::{
-        ENV_LOCK, EVAL_TOPO, eevdf_entry, make_vm_result, no_repro, sched_entry,
+        ENV_LOCK, EVAL_TOPO, EnvVarGuard, eevdf_entry, make_vm_result, no_repro, sched_entry,
     };
     use super::*;
     use crate::verifier::SCHED_OUTPUT_END;
@@ -899,16 +899,13 @@ mod tests {
     #[test]
     fn resolve_test_kernel_with_env_var() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let key = "KTSTR_TEST_KERNEL";
-        let prev = std::env::var(key).ok();
         let exe = crate::resolve_current_exe().unwrap();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe { std::env::set_var(key, exe.to_str().unwrap()) };
+        let _env = EnvVarGuard::set(
+            "KTSTR_TEST_KERNEL",
+            exe.to_str()
+                .expect("resolve_current_exe returns UTF-8 path"),
+        );
         let result = resolve_test_kernel();
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), exe);
     }
@@ -916,15 +913,8 @@ mod tests {
     #[test]
     fn resolve_test_kernel_with_nonexistent_env_path() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let key = "KTSTR_TEST_KERNEL";
-        let prev = std::env::var(key).ok();
-        // SAFETY: test-only, single-threaded env mutation with save/restore.
-        unsafe { std::env::set_var(key, "/nonexistent/kernel/path") };
+        let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", "/nonexistent/kernel/path");
         let result = resolve_test_kernel();
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
         assert!(result.is_err());
     }
 
