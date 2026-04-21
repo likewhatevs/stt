@@ -649,11 +649,12 @@ fn load_inference() -> anyhow::Result<LoadedInference> {
         anyhow::Error::new(e).context(format!("open GGUF model at {}", model_path.display()))
     })?;
     let content = gguf_file::Content::read(&mut file)
-        .map_err(|e| anyhow::Error::msg(e.with_path(&model_path)))?;
-    let model = ModelWeights::from_gguf(content, &mut file, &device).map_err(anyhow::Error::msg)?;
+        .map_err(|e| anyhow::Error::new(e.with_path(&model_path)))?;
+    let model = ModelWeights::from_gguf(content, &mut file, &device).map_err(anyhow::Error::new)?;
 
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-        anyhow::Error::msg(e).context(format!("load tokenizer at {}", tokenizer_path.display()))
+        anyhow::Error::from_boxed(e)
+            .context(format!("load tokenizer at {}", tokenizer_path.display()))
     })?;
 
     let eos_id = *tokenizer
@@ -724,7 +725,7 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
     let encoding = state
         .tokenizer
         .encode(chat_prompt, true)
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::from_boxed)?;
     let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
 
     let mut logits_processor = LogitsProcessor::from_sampling(SEED, Sampling::ArgMax);
@@ -734,15 +735,15 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
     // `(b, vocab)`; the caller's `squeeze(0)` strips the batch dim.
     let input = Tensor::new(prompt_tokens.as_slice(), &state.device)
         .and_then(|t| t.unsqueeze(0))
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::new)?;
     let logits = state
         .model
         .forward(&input, 0)
         .and_then(|l| l.squeeze(0))
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::new)?;
     let mut next_token = logits_processor
         .sample(&logits)
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::new)?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(SAMPLE_LEN);
     if next_token != state.eos_id {
@@ -760,15 +761,15 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
         }
         let input = Tensor::new(&[next_token], &state.device)
             .and_then(|t| t.unsqueeze(0))
-            .map_err(anyhow::Error::msg)?;
+            .map_err(anyhow::Error::new)?;
         let logits = state
             .model
             .forward(&input, prompt_tokens.len() + step)
             .and_then(|l| l.squeeze(0))
-            .map_err(anyhow::Error::msg)?;
+            .map_err(anyhow::Error::new)?;
         next_token = logits_processor
             .sample(&logits)
-            .map_err(anyhow::Error::msg)?;
+            .map_err(anyhow::Error::new)?;
         if next_token == state.eos_id {
             break;
         }
@@ -785,7 +786,7 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
     let decoded = state
         .tokenizer
         .decode(&generated, true)
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::from_boxed)?;
     Ok(strip_think_block(&decoded))
 }
 
@@ -1586,6 +1587,33 @@ mod tests {
             "DEFAULT_MODEL.url must be HTTPS: {:?}",
             DEFAULT_MODEL.url
         );
+    }
+
+    /// Mirror [`default_tokenizer_file_name_ends_with_json`] for
+    /// `DEFAULT_MODEL` — the cache fetcher and GGUF loader both
+    /// expect the artifact to be a GGUF file, so a pin swap to a
+    /// different format surfaces before inference tries to parse it.
+    #[test]
+    fn default_model_file_name_ends_with_gguf() {
+        assert!(
+            DEFAULT_MODEL.file_name.ends_with(".gguf"),
+            "DEFAULT_MODEL.file_name should end with .gguf: {:?}",
+            DEFAULT_MODEL.file_name
+        );
+    }
+
+    /// `LLM_EXTRACT_PROMPT_TEMPLATE` is load-bearing: the prompt
+    /// wording, `emit ONLY a single JSON object` instruction, and
+    /// `emit \`{}\`` fallback all shape what the tiny local model
+    /// produces. A drive-by rewrite that changes the template without
+    /// reviewing the downstream `walk_json_leaves` pipeline would
+    /// silently regress extraction quality. The exact-length pin
+    /// forces any such rewrite to touch this test, flagging it for
+    /// manual review. Value matches `LLM_EXTRACT_PROMPT_TEMPLATE.len()`
+    /// after Rust's line-continuation processing.
+    #[test]
+    fn llm_extract_prompt_template_exact_length() {
+        const { assert!(LLM_EXTRACT_PROMPT_TEMPLATE.len() == 290) };
     }
 
     /// `wrap_chatml_no_think` produces the exact ChatML string
