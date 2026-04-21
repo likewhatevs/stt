@@ -397,6 +397,44 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
     Ok(())
 }
 
+/// Drain a reader into a `Vec<String>`, one entry per newline-delimited
+/// chunk, with a final partial chunk (no trailing newline) emitted
+/// with the same lossy-UTF-8 conversion. Byte-oriented so non-UTF-8
+/// input survives via `from_utf8_lossy` (U+FFFD replacement) instead
+/// of being dropped at the line boundary. Strips the trailing `\n`
+/// and an optional preceding `\r` so CRLF input matches LF semantics.
+/// Calls `on_line` for each line before appending to the returned
+/// `Vec`.
+///
+/// Extracted from [`run_make_with_output`] so the read logic is
+/// testable with in-memory readers (the caller still owns child
+/// kill+wait).
+fn drain_lines_lossy(
+    mut reader: impl BufRead,
+    mut on_line: impl FnMut(&str),
+) -> std::io::Result<Vec<String>> {
+    let mut captured = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let mut slice: &[u8] = &buf;
+        if let Some(rest) = slice.strip_suffix(b"\n") {
+            slice = rest;
+            if let Some(rest) = slice.strip_suffix(b"\r") {
+                slice = rest;
+            }
+        }
+        let line = String::from_utf8_lossy(slice).into_owned();
+        on_line(&line);
+        captured.push(line);
+    }
+    Ok(captured)
+}
+
 /// Run make with merged stdout+stderr piped through a spinner.
 ///
 /// Creates a single pipe via `nix::unistd::pipe2(O_CLOEXEC)`, hands
@@ -420,9 +458,9 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
 /// (`.lines()` + `Result::ok`) dropped every error-tagged item —
 /// a mid-stream read failure just looked like EOF and the child's
 /// tail output disappeared without a diagnostic. The byte-oriented
-/// `read_until` now surfaces such failures with `anyhow` context
-/// naming the merged-stream read, so a broken-pipe or EIO during
-/// make's output is caught at the call site.
+/// [`drain_lines_lossy`] now surfaces such failures with `anyhow`
+/// context naming the merged-stream read, so a broken-pipe or EIO
+/// during make's output is caught at the call site.
 pub fn run_make_with_output(
     kernel_dir: &Path,
     args: &[&str],
@@ -458,53 +496,25 @@ pub fn run_make_with_output(
     // hiding real compiler errors in CI logs. Lossy conversion keeps
     // every line visible with U+FFFD where the bytes were not valid
     // UTF-8.
-    let mut reader = std::io::BufReader::new(std::fs::File::from(read_fd));
-    let mut captured = Vec::new();
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        // On pipe-read I/O failure, kill and reap the child before
-        // propagating so `make` doesn't linger as a zombie. `?` would
-        // return with the Child's `Drop` impl also not reaping it
-        // (stdlib documents that Child does not auto-wait on drop).
-        // `kill` is a no-op against a process already waited on —
-        // stdlib's send_signal early-returns when `self.status` is
-        // set. Against a still-running or zombie child the SIGKILL
-        // either terminates or is delivered to the already-dead task
-        // entry; the actual outcome doesn't matter to this path.
-        // `wait` then reaps the process-table entry and yields the
-        // exit status (or the signal we just sent). Both operations
-        // use `.ok()` because the read-side error is the actionable
-        // diagnostic; a secondary wait/kill failure should not mask it.
-        let n = match reader.read_until(b'\n', &mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                child.kill().ok();
-                child.wait().ok();
-                return Err(e).context("read merged make stdout+stderr");
-            }
-        };
-        if n == 0 {
-            break;
-        }
-        // Strip the trailing newline (and an optional preceding CR
-        // for CRLF sources) before lossy conversion so the printed
-        // line matches what a line-oriented reader would have
-        // produced. The final chunk before EOF may carry no
-        // trailing newline; in that case no suffix is stripped.
-        let mut slice: &[u8] = &buf;
-        if let Some(rest) = slice.strip_suffix(b"\n") {
-            slice = rest;
-            if let Some(rest) = slice.strip_suffix(b"\r") {
-                slice = rest;
-            }
-        }
-        let line = String::from_utf8_lossy(slice).into_owned();
+    let reader = std::io::BufReader::new(std::fs::File::from(read_fd));
+    let captured = match drain_lines_lossy(reader, |line| {
         if let Some(sp) = spinner {
-            sp.println(&line);
+            sp.println(line);
         }
-        captured.push(line);
-    }
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            // On pipe-read I/O failure, kill and reap the child
+            // before propagating so `make` doesn't linger as a
+            // zombie — stdlib's Child does not auto-wait on drop.
+            // Both ops use `.ok()` because the read-side error is
+            // the actionable diagnostic; a secondary wait/kill
+            // failure should not mask it.
+            child.kill().ok();
+            child.wait().ok();
+            return Err(e).context("read merged make stdout+stderr");
+        }
+    };
 
     let status = child.wait()?;
     if !status.success() {
@@ -1584,6 +1594,106 @@ mod tests {
         // exercises that lifecycle end-to-end.
         let sp = Spinner::start("test");
         sp.finish("done");
+    }
+
+    // -- drain_lines_lossy --
+
+    #[test]
+    fn drain_lines_lossy_eof_terminated_happy_path() {
+        let input: &[u8] = b"alpha\nbeta\ngamma\n";
+        let mut seen = Vec::new();
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |line| {
+            seen.push(line.to_string())
+        })
+        .unwrap();
+        assert_eq!(captured, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(seen, captured);
+    }
+
+    #[test]
+    fn drain_lines_lossy_strips_crlf() {
+        let input: &[u8] = b"one\r\ntwo\r\nthree\r\n";
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_| {}).unwrap();
+        assert_eq!(captured, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn drain_lines_lossy_non_utf8_bytes_survive_via_replacement() {
+        // 0xFF is not valid UTF-8 in any position. `from_utf8_lossy`
+        // replaces it with U+FFFD instead of dropping the line.
+        let input: &[u8] = b"valid\n\xffbroken\ntail\n";
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_| {}).unwrap();
+        assert_eq!(captured, vec!["valid", "\u{FFFD}broken", "tail"]);
+    }
+
+    #[test]
+    fn drain_lines_lossy_empty_stream_yields_empty_vec() {
+        let input: &[u8] = b"";
+        let mut calls = 0usize;
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_| calls += 1).unwrap();
+        assert!(captured.is_empty());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn drain_lines_lossy_single_line_without_trailing_newline() {
+        // Final chunk without a trailing newline should still be
+        // emitted; BufRead::read_until returns the partial buffer
+        // on EOF.
+        let input: &[u8] = b"no-newline";
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_| {}).unwrap();
+        assert_eq!(captured, vec!["no-newline"]);
+    }
+
+    #[test]
+    fn drain_lines_lossy_lone_cr_at_eof_is_preserved() {
+        // Bare CR without a following LF is NOT stripped — the CR
+        // strip is nested inside the LF strip, so only `\r\n` is
+        // normalized. A final chunk ending in `\r` keeps it.
+        let input: &[u8] = b"foo\r";
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_| {}).unwrap();
+        assert_eq!(captured, vec!["foo\r"]);
+    }
+
+    #[test]
+    fn drain_lines_lossy_interior_cr_is_preserved() {
+        // Only the trailing `\r` before `\n` is stripped; an
+        // interior CR in the line body passes through verbatim.
+        let input: &[u8] = b"ab\rcd\n";
+        let captured = drain_lines_lossy(std::io::Cursor::new(input), |_| {}).unwrap();
+        assert_eq!(captured, vec!["ab\rcd"]);
+    }
+
+    #[test]
+    fn drain_lines_lossy_propagates_io_error_after_first_read() {
+        use std::io::{BufReader, ErrorKind, Read};
+
+        // Reader returns "line1\n" on the first read, then BrokenPipe
+        // on the second. `drain_lines_lossy` must surface the Err —
+        // the pre-refactor `.lines()` + `Result::ok` formulation
+        // silently dropped errors and this test guards against that
+        // regression.
+        struct FlakyReader {
+            calls: usize,
+        }
+        impl Read for FlakyReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        let data = b"line1\n";
+                        let n = data.len().min(buf.len());
+                        buf[..n].copy_from_slice(&data[..n]);
+                        Ok(n)
+                    }
+                    _ => Err(std::io::Error::new(ErrorKind::BrokenPipe, "pipe closed")),
+                }
+            }
+        }
+
+        let err = drain_lines_lossy(BufReader::new(FlakyReader { calls: 0 }), |_| {})
+            .expect_err("flaky reader must surface Err");
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
     }
 
     // -- resolve_flags --
