@@ -37,6 +37,19 @@ pub(crate) struct Cr3Pa(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PageOffset(pub u64);
 
+/// Kernel virtual address. Newtype around `u64` so a KVA can't be
+/// mistaken for a guest DRAM offset (`PA`) or for the base values
+/// [`Cr3Pa`]/[`PageOffset`] at any page-walk call site. `Display`
+/// renders as `0x<hex>` for tracing output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct Kva(pub u64);
+
+impl std::fmt::Display for Kva {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#x}", self.0)
+    }
+}
+
 /// DSQ depth above this value indicates uninitialized guest memory.
 /// Real kernels never queue this many tasks on a single CPU's local DSQ.
 pub const DSQ_PLAUSIBILITY_CEILING: u32 = 10_000;

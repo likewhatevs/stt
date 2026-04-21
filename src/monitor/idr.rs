@@ -4,6 +4,7 @@
 //! the xarray tree structure in guest physical memory to enumerate
 //! entries by index. Used by both BPF map and BPF program discovery.
 
+use super::Kva;
 use super::reader::GuestMem;
 use super::symbols::kva_to_pa;
 
@@ -26,7 +27,7 @@ pub(crate) fn translate_any_kva(
     if direct_pa < mem.size() {
         return Some(direct_pa);
     }
-    mem.translate_kva(cr3_pa, kva, l5)
+    mem.translate_kva(cr3_pa, Kva(kva), l5)
 }
 
 /// Load an entry from an xarray by index.

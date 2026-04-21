@@ -17,7 +17,7 @@ use super::btf_offsets::BpfMapOffsets;
 use super::idr::{translate_any_kva, xa_load};
 use super::reader::GuestMem;
 use super::symbols::text_kva_to_pa;
-use super::{Cr3Pa, PageOffset};
+use super::{Cr3Pa, Kva, PageOffset};
 
 /// Bundle of borrow-held state every map-access routine threads
 /// through the page-table walk, bounds check, and byte read/write path.
@@ -222,7 +222,7 @@ where
     let total = len as u64;
     while consumed < total {
         let kva = target_kva + consumed;
-        let Some(pa) = ctx.mem.translate_kva(ctx.cr3_pa.0, kva, ctx.l5) else {
+        let Some(pa) = ctx.mem.translate_kva(ctx.cr3_pa.0, Kva(kva), ctx.l5) else {
             return false;
         };
         // Advance at most to the next page boundary so the next
@@ -1138,7 +1138,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(cr3_pa, kva, false);
+        let pa = mem.translate_kva(cr3_pa, Kva(kva), false);
         assert_eq!(pa, Some(data_pa));
         // Read through the translated PA to verify correctness.
         assert_eq!(mem.read_u64(pa.unwrap(), 0), 0xDEAD_BEEF_CAFE_1234);
@@ -1152,7 +1152,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // KVA + 0x100 should map to data_pa + 0x100
-        let pa = mem.translate_kva(cr3_pa, kva + 0x100, false);
+        let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false);
         assert_eq!(pa, Some(data_pa + 0x100));
     }
 
@@ -1164,7 +1164,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // A completely different address that has no PGD entry.
-        let pa = mem.translate_kva(cr3_pa, 0xFFFF_FFFF_8000_0000, false);
+        let pa = mem.translate_kva(cr3_pa, Kva(0xFFFF_FFFF_8000_0000), false);
         assert_eq!(pa, None);
     }
 
@@ -1177,7 +1177,7 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // Same PGD/PUD/PMD but next PTE index — not mapped.
         let unmapped_kva = kva + 0x1000;
-        let pa = mem.translate_kva(cr3_pa, unmapped_kva, false);
+        let pa = mem.translate_kva(cr3_pa, Kva(unmapped_kva), false);
         assert_eq!(pa, None);
     }
 
@@ -1224,12 +1224,12 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(pgd_pa, kva, false);
+        let pa = mem.translate_kva(pgd_pa, Kva(kva), false);
         assert_eq!(pa, Some(huge_page_pa));
         assert_eq!(mem.read_u64(pa.unwrap(), 0), 0xCAFE_BABE_1234_5678);
 
         // Offset within the 2MB page.
-        let pa_off = mem.translate_kva(pgd_pa, kva + 0x1000, false);
+        let pa_off = mem.translate_kva(pgd_pa, Kva(kva + 0x1000), false);
         assert_eq!(pa_off, Some(huge_page_pa + 0x1000));
     }
 
@@ -1270,11 +1270,11 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(pgd_pa, kva, false);
+        let pa = mem.translate_kva(pgd_pa, Kva(kva), false);
         assert_eq!(pa, Some(huge_page_pa));
 
         // Offset within the 1GB page.
-        let pa_off = mem.translate_kva(pgd_pa, kva + 0x1234_5678, false);
+        let pa_off = mem.translate_kva(pgd_pa, Kva(kva + 0x1234_5678), false);
         assert_eq!(pa_off, Some(huge_page_pa + 0x1234_5678));
     }
 
@@ -1297,7 +1297,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        assert_eq!(mem.translate_kva(pgd_pa, kva, false), None);
+        assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false), None);
     }
 
     #[test]
@@ -1324,7 +1324,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        assert_eq!(mem.translate_kva(pgd_pa, kva, false), None);
+        assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false), None);
     }
 
     #[test]
@@ -1353,7 +1353,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        assert_eq!(mem.translate_kva(pgd_pa, kva, false), None);
+        assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false), None);
     }
 
     #[test]
@@ -1385,7 +1385,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        assert_eq!(mem.translate_kva(pgd_pa, kva, false), None);
+        assert_eq!(mem.translate_kva(pgd_pa, Kva(kva), false), None);
     }
 
     // -- write_bpf_map_value tests --
@@ -1854,7 +1854,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(cr3_pa, kva, true);
+        let pa = mem.translate_kva(cr3_pa, Kva(kva), true);
         assert_eq!(pa, Some(data_pa));
         assert_eq!(mem.read_u64(pa.unwrap(), 0), 0x5555_AAAA_1234_5678);
     }
@@ -1866,7 +1866,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(cr3_pa, kva + 0x100, true);
+        let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), true);
         assert_eq!(pa, Some(data_pa + 0x100));
     }
 
@@ -1879,7 +1879,7 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // Different PML5 index — no entry mapped.
         let unmapped_kva: u64 = 0xFF22_8880_0000_5000;
-        assert_eq!(mem.translate_kva(cr3_pa, unmapped_kva, true), None);
+        assert_eq!(mem.translate_kva(cr3_pa, Kva(unmapped_kva), true), None);
     }
 
     #[test]
@@ -1894,9 +1894,9 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // 4-level walk uses bits 47:39 for PGD, not bits 56:48 for PML5.
         // The PGD index into our PML5 table won't find the right entry.
-        let pa_4level = mem.translate_kva(cr3_pa, kva, false);
+        let pa_4level = mem.translate_kva(cr3_pa, Kva(kva), false);
         // Should either be None (unmapped) or a different PA than 5-level.
-        let pa_5level = mem.translate_kva(cr3_pa, kva, true);
+        let pa_5level = mem.translate_kva(cr3_pa, Kva(kva), true);
         assert_ne!(pa_4level, pa_5level);
     }
 
@@ -2424,7 +2424,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        assert_eq!(mem.translate_kva(pml5_pa, kva, true), None);
+        assert_eq!(mem.translate_kva(pml5_pa, Kva(kva), true), None);
     }
 
     // -- 5-level: 2MB huge page --
@@ -2465,10 +2465,10 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(pml5_pa, kva, true);
+        let pa = mem.translate_kva(pml5_pa, Kva(kva), true);
         assert_eq!(pa, Some(huge_page_pa));
 
-        let pa_off = mem.translate_kva(pml5_pa, kva + 0x1234, true);
+        let pa_off = mem.translate_kva(pml5_pa, Kva(kva + 0x1234), true);
         assert_eq!(pa_off, Some(huge_page_pa + 0x1234));
     }
 
@@ -2507,10 +2507,10 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(pml5_pa, kva, true);
+        let pa = mem.translate_kva(pml5_pa, Kva(kva), true);
         assert_eq!(pa, Some(huge_page_pa));
 
-        let pa_off = mem.translate_kva(pml5_pa, kva + 0x1234_5678, true);
+        let pa_off = mem.translate_kva(pml5_pa, Kva(kva + 0x1234_5678), true);
         assert_eq!(pa_off, Some(huge_page_pa + 0x1234_5678));
     }
 
@@ -4159,7 +4159,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(cr3_pa, kva, false);
+        let pa = mem.translate_kva(cr3_pa, Kva(kva), false);
         assert_eq!(
             pa,
             Some(data_pa),
@@ -4175,7 +4175,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(cr3_pa, kva + 0x100, false);
+        let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false);
         assert_eq!(pa, Some(data_pa + 0x100));
     }
 
@@ -4187,7 +4187,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kva_257 = kva + (1u64 << 39);
-        assert_eq!(mem.translate_kva(cr3_pa, kva_257, false), None);
+        assert_eq!(mem.translate_kva(cr3_pa, Kva(kva_257), false), None);
     }
 
     // -- aarch64 64KB granule vmalloc region tests --
@@ -4231,7 +4231,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(cr3_pa, kva, false);
+        let pa = mem.translate_kva(cr3_pa, Kva(kva), false);
         assert_eq!(pa, Some(data_pa), "64KB vmalloc walk should resolve");
         assert_eq!(mem.read_u64(pa.unwrap(), 0), 0x1234_5678_ABCD_EF00);
     }
@@ -4243,7 +4243,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let pa = mem.translate_kva(cr3_pa, kva + 0x100, false);
+        let pa = mem.translate_kva(cr3_pa, Kva(kva + 0x100), false);
         assert_eq!(pa, Some(data_pa + 0x100));
     }
 
@@ -4255,7 +4255,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let unmapped = kva + (1u64 << 42);
-        assert_eq!(mem.translate_kva(cr3_pa, unmapped, false), None);
+        assert_eq!(mem.translate_kva(cr3_pa, Kva(unmapped), false), None);
     }
 
     // -- iter_htab_entries tests --

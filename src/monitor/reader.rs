@@ -16,7 +16,7 @@ use super::btf_offsets::{
     SchedstatOffsets, ScxEventOffsets,
 };
 use super::{
-    CpuSnapshot, MonitorSample, RqSchedstat, SchedDomainSnapshot, SchedDomainStats,
+    CpuSnapshot, Kva, MonitorSample, RqSchedstat, SchedDomainSnapshot, SchedDomainStats,
     ScxEventCounters,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -314,7 +314,7 @@ impl GuestMem {
     /// to detect the guest's mode at runtime.
     /// Returns `None` if any level is not present or the address is
     /// out of guest memory bounds.
-    pub fn translate_kva(&self, cr3_pa: u64, kva: u64, l5: bool) -> Option<u64> {
+    pub(crate) fn translate_kva(&self, cr3_pa: u64, kva: Kva, l5: bool) -> Option<u64> {
         #[cfg(target_arch = "x86_64")]
         {
             if l5 {
@@ -335,16 +335,17 @@ impl GuestMem {
     /// CR3 -> PGD -> PUD -> PMD -> PTE. Uses PS bit (bit 7) for
     /// huge pages, OA in bits \[51:12\].
     #[cfg(target_arch = "x86_64")]
-    fn walk_4level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
+    fn walk_4level(&self, cr3_pa: u64, kva: Kva) -> Option<u64> {
         const PRESENT: u64 = 1;
         const PS: u64 = 1 << 7;
         const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
-        let pgd_idx = (kva >> 39) & 0x1FF;
-        let pud_idx = (kva >> 30) & 0x1FF;
-        let pmd_idx = (kva >> 21) & 0x1FF;
-        let pte_idx = (kva >> 12) & 0x1FF;
-        let page_off = kva & 0xFFF;
+        let kva_bits = kva.0;
+        let pgd_idx = (kva_bits >> 39) & 0x1FF;
+        let pud_idx = (kva_bits >> 30) & 0x1FF;
+        let pmd_idx = (kva_bits >> 21) & 0x1FF;
+        let pte_idx = (kva_bits >> 12) & 0x1FF;
+        let page_off = kva_bits & 0xFFF;
 
         // PGD
         let pgd_pa = (cr3_pa & ADDR_MASK) + pgd_idx * 8;
@@ -361,7 +362,7 @@ impl GuestMem {
         }
         if pude & PS != 0 {
             let base = pude & 0x000F_FFFF_C000_0000;
-            return Some(base | (kva & 0x3FFF_FFFF));
+            return Some(base | (kva_bits & 0x3FFF_FFFF));
         }
 
         // PMD
@@ -372,7 +373,7 @@ impl GuestMem {
         }
         if pmde & PS != 0 {
             let base = pmde & 0x000F_FFFF_FFE0_0000;
-            return Some(base | (kva & 0x1F_FFFF));
+            return Some(base | (kva_bits & 0x1F_FFFF));
         }
 
         // PTE
@@ -404,7 +405,7 @@ impl GuestMem {
     /// GuestMem is mapped at DRAM_START, all GPAs are adjusted by
     /// subtracting DRAM_START to produce offsets into the memory region.
     #[cfg(target_arch = "aarch64")]
-    fn walk_3level_aarch64_64k(&self, ttbr_pa: u64, kva: u64) -> Option<u64> {
+    fn walk_3level_aarch64_64k(&self, ttbr_pa: u64, kva: Kva) -> Option<u64> {
         use crate::vmm::kvm::DRAM_START;
 
         const VALID: u64 = 1;
@@ -420,10 +421,11 @@ impl GuestMem {
         let to_offset = |gpa: u64| -> u64 { gpa.wrapping_sub(DRAM_START) };
 
         // 3-level walk for 64KB granule, 48-bit VA.
-        let pgd_idx = (kva >> 42) & 0x3F; // bits [47:42], 6 bits
-        let pmd_idx = (kva >> 29) & 0x1FFF; // bits [41:29], 13 bits
-        let pte_idx = (kva >> 16) & 0x1FFF; // bits [28:16], 13 bits
-        let page_off = kva & 0xFFFF; // bits [15:0], 16 bits
+        let kva_bits = kva.0;
+        let pgd_idx = (kva_bits >> 42) & 0x3F; // bits [47:42], 6 bits
+        let pmd_idx = (kva_bits >> 29) & 0x1FFF; // bits [41:29], 13 bits
+        let pte_idx = (kva_bits >> 16) & 0x1FFF; // bits [28:16], 13 bits
+        let page_off = kva_bits & 0xFFFF; // bits [15:0], 16 bits
 
         // PGD — ttbr_pa is already a GuestMem offset.
         let pgd_off = (ttbr_pa & ADDR_MASK) + pgd_idx * 8;
@@ -434,7 +436,7 @@ impl GuestMem {
         // PGD block: 4TB region (unlikely but spec-allowed)
         if pgde & DESC_MASK == BLOCK {
             let base = pgde & 0x0000_FC00_0000_0000;
-            return Some(to_offset(base) | (kva & 0x3FF_FFFF_FFFF));
+            return Some(to_offset(base) | (kva_bits & 0x3FF_FFFF_FFFF));
         }
 
         // PMD
@@ -446,7 +448,7 @@ impl GuestMem {
         // PMD block: 512MB region
         if pmde & DESC_MASK == BLOCK {
             let base = pmde & 0x0000_FFFF_E000_0000;
-            return Some(to_offset(base) | (kva & 0x1FFF_FFFF));
+            return Some(to_offset(base) | (kva_bits & 0x1FFF_FFFF));
         }
 
         // PTE — page descriptor (bits [1:0] = 0b11)
@@ -465,12 +467,12 @@ impl GuestMem {
     /// 5-level page table walk: CR3 -> PML5 -> P4D -> PUD -> PMD -> PTE.
     /// x86-64 only; aarch64 does not use 5-level paging.
     #[cfg(target_arch = "x86_64")]
-    fn walk_5level(&self, cr3_pa: u64, kva: u64) -> Option<u64> {
+    fn walk_5level(&self, cr3_pa: u64, kva: Kva) -> Option<u64> {
         const PRESENT: u64 = 1;
         const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
         // PML5 index: bits 56:48.
-        let pml5_idx = (kva >> 48) & 0x1FF;
+        let pml5_idx = (kva.0 >> 48) & 0x1FF;
 
         let pml5_pa = (cr3_pa & ADDR_MASK) + pml5_idx * 8;
         let pml5e = self.read_u64(pml5_pa, 0);
@@ -485,7 +487,7 @@ impl GuestMem {
 
     /// aarch64 stub: 5-level paging is not used.
     #[cfg(target_arch = "aarch64")]
-    fn walk_5level(&self, _cr3_pa: u64, _kva: u64) -> Option<u64> {
+    fn walk_5level(&self, _cr3_pa: u64, _kva: Kva) -> Option<u64> {
         None
     }
 

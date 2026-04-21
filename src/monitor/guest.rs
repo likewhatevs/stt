@@ -17,6 +17,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use super::Kva;
 use super::reader::GuestMem;
 use super::symbols::{kva_to_pa, resolve_page_offset, resolve_pgtable_l5, text_kva_to_pa};
 
@@ -177,13 +178,13 @@ impl<'a> GuestKernel<'a> {
     ///
     /// Translates via page table walk. Returns `None` if unmapped.
     pub fn read_kva_u32(&self, kva: u64) -> Option<u32> {
-        let pa = self.mem.translate_kva(self.cr3_pa, kva, self.l5)?;
+        let pa = self.mem.translate_kva(self.cr3_pa, Kva(kva), self.l5)?;
         Some(self.mem.read_u32(pa, 0))
     }
 
     /// Read a u64 from a vmalloc'd kernel virtual address.
     pub fn read_kva_u64(&self, kva: u64) -> Option<u64> {
-        let pa = self.mem.translate_kva(self.cr3_pa, kva, self.l5)?;
+        let pa = self.mem.translate_kva(self.cr3_pa, Kva(kva), self.l5)?;
         Some(self.mem.read_u64(pa, 0))
     }
 
@@ -196,7 +197,7 @@ impl<'a> GuestKernel<'a> {
         for (i, byte) in buf.iter_mut().enumerate() {
             let pa = self
                 .mem
-                .translate_kva(self.cr3_pa, kva + i as u64, self.l5)?;
+                .translate_kva(self.cr3_pa, Kva(kva + i as u64), self.l5)?;
             *byte = self.mem.read_u8(pa, 0);
         }
         Some(buf)
@@ -205,7 +206,7 @@ impl<'a> GuestKernel<'a> {
     /// Write a u8 to a vmalloc'd kernel virtual address.
     /// Returns false if the address is unmapped.
     pub fn write_kva_u8(&self, kva: u64, val: u8) -> bool {
-        let Some(pa) = self.mem.translate_kva(self.cr3_pa, kva, self.l5) else {
+        let Some(pa) = self.mem.translate_kva(self.cr3_pa, Kva(kva), self.l5) else {
             return false;
         };
         self.mem.write_u8(pa, 0, val);
@@ -217,7 +218,10 @@ impl<'a> GuestKernel<'a> {
     /// if any page is unmapped.
     pub fn write_kva_bytes(&self, kva: u64, data: &[u8]) -> bool {
         for (i, &byte) in data.iter().enumerate() {
-            let Some(pa) = self.mem.translate_kva(self.cr3_pa, kva + i as u64, self.l5) else {
+            let Some(pa) = self
+                .mem
+                .translate_kva(self.cr3_pa, Kva(kva + i as u64), self.l5)
+            else {
                 return false;
             };
             self.mem.write_u8(pa, 0, byte);
