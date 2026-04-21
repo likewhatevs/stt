@@ -1,5 +1,0 @@
----
-source: src/verifier.rs
-expression: "format_brief_line(\"bpf_prog_enqueue\", 1234)"
----
-  bpf_prog_enqueue                         verified_insns=1234

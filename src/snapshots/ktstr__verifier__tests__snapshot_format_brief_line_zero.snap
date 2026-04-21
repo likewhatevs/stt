@@ -1,5 +1,0 @@
----
-source: src/verifier.rs
-expression: "format_brief_line(\"bpf_prog_init\", 0)"
----
-  bpf_prog_init                            verified_insns=0

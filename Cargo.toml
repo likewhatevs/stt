@@ -66,7 +66,7 @@ linkme = "0.3"
 ktstr-macros = { version = "0.4.8", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 rayon = "1"
-object = { version = "0.37", default-features = false, features = ["build", "std", "elf"] }
+object = { version = "0.37", default-features = false, features = ["build"] }
 walkdir = "2"
 indicatif = "0.18"
 # Table rendering for stats and verifier CLI output. Replaces hand-rolled

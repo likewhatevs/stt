@@ -8,7 +8,6 @@
 //! - [`parse_verifier_stats`] — extract insn/state counts from verifier log
 //! - [`normalize_verifier_line`] — strip variable register state annotations
 //! - [`detect_cycle`] / [`collapse_cycles`] — loop iteration compression
-//! - [`format_brief_line`] — single-line program summary
 //! - [`build_b_map`] / [`build_diff_rows`] — A/B comparison helpers
 //! - [`SCHED_OUTPUT_START`] / [`SCHED_OUTPUT_END`] — COM2 delimiters
 //!   written by the guest's rust_init around the scheduler log region;
@@ -449,11 +448,6 @@ pub fn collapse_cycles(log: &str) -> String {
     text
 }
 
-/// Format a single program's brief output line (without ANSI color).
-pub fn format_brief_line(name: &str, verified_insns: u32) -> String {
-    format!("  {:<40} verified_insns={}", name, verified_insns)
-}
-
 /// Build diff rows from A stats and B lookup map.
 pub fn build_diff_rows(stats_a: &[ProgStats], b_map: &HashMap<String, u64>) -> Vec<DiffRow> {
     let mut rows = Vec::new();
@@ -891,34 +885,6 @@ verification time 100 usec
         assert_eq!(vs.processed_insns, 42);
         assert_eq!(vs.time_usec, Some(10));
         assert!(vs.stack_depth.is_some());
-    }
-
-    // -----------------------------------------------------------------------
-    // format_brief_line
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn format_brief_line_basic() {
-        let line = format_brief_line("dispatch", 100);
-        assert!(line.contains("dispatch"), "name: {line}");
-        assert!(
-            line.contains("verified_insns=100"),
-            "verified_insns: {line}"
-        );
-    }
-
-    #[test]
-    fn format_brief_line_zero_verified() {
-        let line = format_brief_line("broken", 0);
-        assert!(line.contains("verified_insns=0"), "verified_insns: {line}");
-    }
-
-    #[test]
-    fn format_brief_line_long_name() {
-        let short = format_brief_line("x", 1);
-        let long = format_brief_line("a_very_long_program_name_here", 1);
-        assert!(short.contains("verified_insns=1"));
-        assert!(long.contains("verified_insns=1"));
     }
 
     // -----------------------------------------------------------------------
@@ -1414,24 +1380,6 @@ libbpf: failed to load BPF skeleton 'ktstr_ops': -22
     }
 
     // -- insta snapshot tests --
-
-    #[test]
-    fn snapshot_format_brief_line() {
-        insta::assert_snapshot!(format_brief_line("bpf_prog_enqueue", 1234));
-    }
-
-    #[test]
-    fn snapshot_format_brief_line_long_name() {
-        insta::assert_snapshot!(format_brief_line(
-            "bpf_struct_ops_sched_ext_ops_dispatch_very_long_name",
-            99999
-        ));
-    }
-
-    #[test]
-    fn snapshot_format_brief_line_zero() {
-        insta::assert_snapshot!(format_brief_line("bpf_prog_init", 0));
-    }
 
     #[test]
     fn snapshot_format_verifier_output_no_log() {
