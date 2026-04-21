@@ -629,10 +629,12 @@ fn load_inference() -> anyhow::Result<LoadedInference> {
 /// and return the decoded assistant text with any `<think>…</think>`
 /// block stripped.
 ///
-/// The KV cache is cleared up front on every call so repeated
-/// invocations with the same `LoadedInference` don't carry state
-/// across the prompt forward pass's position offsets — the callee
-/// owns that invariant rather than pushing it onto callers.
+/// Idempotent: repeated calls with the same `LoadedInference` are
+/// safe; each invocation starts with a clean KV cache. The cache is
+/// cleared up front on every call so repeated invocations don't
+/// carry state across the prompt forward pass's position offsets —
+/// the callee owns that invariant rather than pushing it onto
+/// callers.
 ///
 /// Greedy: `Sampling::ArgMax` with a fixed seed. Output is a
 /// deterministic function of the prompt + weights.
@@ -786,10 +788,14 @@ fn strip_think_block(s: &str) -> std::borrow::Cow<'_, str> {
                 }
                 (Some(_), None) | (None, None) => {
                     // Unterminated outer block: no `</think>` remains
-                    // to close depth. Keep the remainder verbatim
-                    // from the original opening tag so a truncation
-                    // bug is visible rather than masked by a partial
-                    // strip.
+                    // to close depth. Emit everything from the
+                    // opening `<think>` (`&rest[open_idx..]`) through
+                    // end-of-input verbatim — including any inner
+                    // `<think>` openers we already counted into
+                    // `depth`. Preserving the full tail unstripped
+                    // keeps a truncation bug visible rather than
+                    // masking it behind a partial strip that would
+                    // look like a complete response.
                     out.push_str(&rest[open_idx..]);
                     rest = "";
                     break 'outer;
@@ -1011,12 +1017,15 @@ mod tests {
 
     #[test]
     fn default_model_size_is_in_expected_ballpark() {
-        // The pinned Qwen3-4B Q4_K_M GGUF is ~2.44 GiB; the frozen
-        // design targets an artifact in the low-GiB range. A wildly
-        // different size signals someone swapped the pin for a
-        // mistaken artifact.
+        // The pinned Qwen3-4B Q4_K_M GGUF is ~2.44 GiB. The upper
+        // bound is tight at 3 GiB so a silent swap to a higher-bit
+        // quantization (Q5/Q6/Q8) of the same 4B-parameter base —
+        // which would balloon the artifact to 3-4+ GiB and multiply
+        // inference latency — fails this check instead of slipping
+        // through. A wildly different size signals someone swapped
+        // the pin for a mistaken artifact.
         const { assert!(DEFAULT_MODEL.size_bytes > 100 * 1024 * 1024) };
-        const { assert!(DEFAULT_MODEL.size_bytes < 4 * 1024 * 1024 * 1024) };
+        const { assert!(DEFAULT_MODEL.size_bytes < 3 * 1024 * 1024 * 1024) };
     }
 
     #[test]

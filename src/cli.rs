@@ -433,9 +433,13 @@ pub fn run_make_with_output(
         .spawn()
         .with_context(|| format!("spawn make {}", args.join(" ")))?;
 
-    // Parent has no remaining writer handles — both clones were
-    // moved into the child's Stdio above. Child's writes end when
-    // it exits, so the reader sees EOF naturally.
+    // Parent has no remaining writer handles. `Stdio::from(OwnedFd)`
+    // consumed `write_fd` and `write_fd_err` into the Command
+    // builder; during `.spawn()` the builder installs them as the
+    // child's stdout/stderr via `dup2`, then drops its own OwnedFd
+    // copies. The child therefore holds the only live write ends
+    // (its dup2'd stdout/stderr, fd 1/2). When `make` exits, those
+    // fds are closed and the reader here sees EOF naturally.
     let reader = std::fs::File::from(read_fd);
     let mut captured = Vec::new();
     for line in std::io::BufReader::new(reader)
