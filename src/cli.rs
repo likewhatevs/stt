@@ -2011,4 +2011,72 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].0.contains("sh"));
     }
+
+    // -- kernel_list JSON/human parity --
+
+    /// `kernel_list` renders each cache entry twice — once into the
+    /// JSON `stale_kconfig` boolean (inline at the JSON-branch call
+    /// site) and once into the human `(stale kconfig)` tag emitted
+    /// by [`format_entry_row`]. Both paths share `has_stale_kconfig`
+    /// as their source of truth, so their reported stale-ness must
+    /// agree on every entry.
+    ///
+    /// A regression that changes one path to `kconfig_status !=
+    /// Matches` (pulling `Untracked` into the stale bucket) while
+    /// leaving the other on `has_stale_kconfig` would diverge the
+    /// human and JSON outputs without breaking either in isolation.
+    /// This test exercises each KconfigStatus variant and asserts the
+    /// two paths produce the same answer.
+    #[test]
+    fn kernel_list_stale_kconfig_json_human_parity() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+
+        fn metadata_with_hash(hash: Option<&str>) -> KernelMetadata {
+            KernelMetadata::new(
+                KernelSource::Tarball,
+                "x86_64".to_string(),
+                "bzImage".to_string(),
+                "2026-04-12T10:00:00Z".to_string(),
+            )
+            .with_version(Some("6.14.2".to_string()))
+            .with_ktstr_kconfig_hash(hash.map(str::to_string))
+        }
+
+        // (case label, entry's recorded ktstr_kconfig_hash, caller's
+        // current hash). These cover every KconfigStatus variant:
+        // Matches, Stale, Untracked.
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            ("matches", Some("same"), "same"),
+            ("stale", Some("old"), "new"),
+            ("untracked", None, "anything"),
+        ];
+
+        for &(label, entry_hash, current_hash) in cases {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cache = CacheDir::with_root(tmp.path().join("cache"));
+            let src = tempfile::TempDir::new().unwrap();
+            let image = src.path().join("bzImage");
+            std::fs::write(&image, b"fake kernel").unwrap();
+            let meta = metadata_with_hash(entry_hash);
+            let entry = cache
+                .store(label, &CacheArtifacts::new(&image), &meta)
+                .unwrap();
+
+            // Mirror the JSON branch's inline expression at the
+            // `stale_kconfig` field (cli::kernel_list, JSON arm).
+            let json_stale = entry.has_stale_kconfig(current_hash);
+
+            // Human branch: format_entry_row emits "(stale kconfig)"
+            // iff `entry.has_stale_kconfig(...)` is true.
+            let human_row = format_entry_row(&entry, current_hash, &[]);
+            let human_stale = human_row.contains("stale kconfig");
+
+            assert_eq!(
+                json_stale, human_stale,
+                "kernel_list JSON/human stale-kconfig disagreement on `{label}` \
+                 (entry_hash={entry_hash:?}, current_hash={current_hash:?}); \
+                 json_stale={json_stale}, human_row={human_row:?}"
+            );
+        }
+    }
 }

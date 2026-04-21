@@ -701,4 +701,84 @@ mod tests {
         assert_eq!(errno_name(0), None);
         assert_eq!(errno_name(-1), None);
     }
+
+    // -- find_kernel cache filter --
+
+    /// `find_kernel`'s cache-scan step (step 2) must keep cache
+    /// entries whose `ktstr_kconfig_hash` is `None` (pre-tracking
+    /// format → [`cache::KconfigStatus::Untracked`]). The filter
+    /// uses [`cache::CacheEntry::has_stale_kconfig`], which only
+    /// returns `true` for the `Stale` variant; `Untracked` falls
+    /// through to the return.
+    ///
+    /// A regression that tightened the filter to "anything not
+    /// Matches" (e.g. `kconfig_status(&kc) != Matches`) would quietly
+    /// drop every legacy cache entry built before ktstr tracked the
+    /// kconfig fingerprint, forcing users to rebuild kernels whose
+    /// only defect is the absence of a recorded hash. This test
+    /// materializes exactly that shape — one valid image, no
+    /// recorded hash — and asserts `find_kernel` returns it.
+    #[test]
+    fn find_kernel_preserves_untracked_cache_entries() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+        use crate::test_support::test_helpers::{ENV_LOCK, EnvVarGuard};
+
+        // `find_kernel` reads KTSTR_KERNEL and KTSTR_CACHE_DIR. Both
+        // are process-wide, so other tests in this binary must not be
+        // mutating them in parallel while this test owns them.
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        // KTSTR_KERNEL: unset so find_kernel skips step 1 and falls
+        // straight into the cache scan (step 2), which is the branch
+        // this test targets.
+        let _kernel_guard = EnvVarGuard::remove("KTSTR_KERNEL");
+
+        // KTSTR_CACHE_DIR: point at an isolated temp dir so the
+        // test sees only the Untracked entry we stage below — and
+        // the host's real cache (if any) does not influence the
+        // result.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.to_str().unwrap());
+
+        // Stage one valid image with `ktstr_kconfig_hash = None`
+        // (Untracked). `has_vmlinux` stays false so find_kernel's
+        // vmlinux-symbol guard at lib.rs (only reached when
+        // vmlinux_path() is Some) does not fire.
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let image = src_dir.path().join("bzImage");
+        std::fs::write(&image, b"fake kernel image").unwrap();
+        let meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()));
+        // `ktstr_kconfig_hash` defaults to None in `KernelMetadata::new`,
+        // which is exactly the Untracked shape this test needs.
+        assert!(
+            meta.ktstr_kconfig_hash.is_none(),
+            "test fixture must have no recorded kconfig hash to exercise the \
+             Untracked branch of kconfig_status"
+        );
+        let entry = cache
+            .store("untracked-entry", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        let expected_image = entry.image_path();
+        assert!(
+            expected_image.exists(),
+            "fixture image must exist on disk so find_kernel's image.exists() \
+             check passes — got {expected_image:?}"
+        );
+
+        // find_kernel must return the Untracked entry's image.
+        let resolved = find_kernel().unwrap();
+        assert_eq!(
+            resolved,
+            Some(expected_image),
+            "find_kernel dropped an Untracked cache entry — the kconfig-hash \
+             filter at lib.rs must treat `Untracked` as keep, not stale"
+        );
+    }
 }
