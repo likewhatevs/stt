@@ -133,3 +133,13 @@ pub struct FioJsonPayload;
 #[default_check(exit_code_eq(0))]
 #[allow(dead_code)]
 pub struct StressNgPayload;
+
+/// Latency-focused scheduler benchmark. Uses `LlmExtract` to
+/// exercise the LLM extraction pipeline (schbench supports `--json`
+/// but this fixture intentionally uses the third acquisition path).
+#[derive(Payload)]
+#[payload(binary = "schbench", output = LlmExtract)]
+#[default_args("--runtime", "30", "--message-threads", "2")]
+#[default_check(exit_code_eq(0))]
+#[allow(dead_code)]
+pub struct SchbenchPayload;

@@ -1,5 +1,5 @@
-//! Integration smoke tests for the FIO / FIO_JSON / STRESS_NG
-//! payload fixtures.
+//! Integration smoke tests for the FIO / FIO_JSON / STRESS_NG /
+//! SCHBENCH payload fixtures.
 //!
 //! The fixtures themselves live under `tests/common/fixtures.rs`
 //! because they are test scaffolding, not shipped API. This test
@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::fixtures::{FIO, FIO_JSON, STRESS_NG};
+use common::fixtures::{FIO, FIO_JSON, SCHBENCH, STRESS_NG};
 use ktstr::test_support::{
     Check, MetricHint, MetricSource, OutputFormat, PayloadKind, Polarity, extract_metrics,
 };
@@ -136,7 +136,23 @@ fn stress_ng_extract_metrics_smoke_returns_empty() {
     );
 }
 
-/// Neither fixture is a scheduler-kind payload — they must not
+/// SCHBENCH identity fields are pinned so tests relying on the
+/// fixture can detect silent drift.
+#[test]
+fn schbench_identity_fields_are_stable() {
+    assert_eq!(SCHBENCH.name, "schbench");
+    assert!(matches!(SCHBENCH.kind, PayloadKind::Binary("schbench")));
+    assert!(matches!(SCHBENCH.output, OutputFormat::LlmExtract(None)));
+    assert_eq!(
+        SCHBENCH.default_args,
+        &["--runtime", "30", "--message-threads", "2"]
+    );
+    assert!(SCHBENCH.metrics.is_empty());
+    assert_eq!(SCHBENCH.default_checks.len(), 1);
+    assert!(matches!(SCHBENCH.default_checks[0], Check::ExitCodeEq(0)));
+}
+
+/// No fixture is a scheduler-kind payload — they must not
 /// be accepted by CgroupDef::workload's scheduler-kind rejection
 /// gate (which panics at builder time).
 #[test]
@@ -144,6 +160,7 @@ fn fixtures_are_not_scheduler_kind() {
     assert!(!FIO.is_scheduler());
     assert!(!FIO_JSON.is_scheduler());
     assert!(!STRESS_NG.is_scheduler());
+    assert!(!SCHBENCH.is_scheduler());
 }
 
 /// Polarity hints flow through `extract_metrics` via the
@@ -164,8 +181,8 @@ fn extract_metrics_does_not_apply_polarity_hints() {
     assert_eq!(metrics[0].unit, "");
 }
 
-/// Compile-time invariant: both fixtures carry the exit-code gate
-/// as their first default check. Declared as a `const` block so
+/// Compile-time invariant: every fixture carries the exit-code gate
+/// as its first default check. Declared as a `const` block so
 /// the assertion runs at compile time — a silent drift of
 /// `default_checks[0]` breaks the build, not a test.
 #[test]
@@ -174,18 +191,22 @@ fn fixtures_default_checks_pin_exit_code_gate() {
         assert!(matches!(FIO.default_checks[0], Check::ExitCodeEq(0)));
         assert!(matches!(FIO_JSON.default_checks[0], Check::ExitCodeEq(0)));
         assert!(matches!(STRESS_NG.default_checks[0], Check::ExitCodeEq(0)));
+        assert!(matches!(SCHBENCH.default_checks[0], Check::ExitCodeEq(0)));
     };
     assert!(!FIO.default_checks.is_empty());
     assert!(!FIO_JSON.default_checks.is_empty());
     assert!(!STRESS_NG.default_checks.is_empty());
+    assert!(!SCHBENCH.default_checks.is_empty());
 }
 
-/// Identity-tag all three fixtures' output formats so a consumer
-/// reading this file sees the cases side-by-side — Json vs
-/// ExitCode — the canonical two-ends-of-the-spectrum demonstration.
+/// Identity-tag every fixture's output format so a consumer
+/// reading this file sees the cases side-by-side — Json,
+/// ExitCode, and LlmExtract — the three canonical
+/// acquisition paths the extraction pipeline supports.
 #[test]
-fn fixture_output_formats_span_json_and_exit_code() {
+fn fixture_output_formats_span_json_exit_code_and_llm_extract() {
     assert!(matches!(FIO.output, OutputFormat::Json));
     assert!(matches!(FIO_JSON.output, OutputFormat::Json));
     assert!(matches!(STRESS_NG.output, OutputFormat::ExitCode));
+    assert!(matches!(SCHBENCH.output, OutputFormat::LlmExtract(None)));
 }
