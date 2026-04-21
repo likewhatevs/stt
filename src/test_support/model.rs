@@ -121,6 +121,16 @@ use super::payload::OutputFormat;
 /// references and every cached-miss call wants the same human-
 /// readable message in its `tracing::warn` line — rendering once at
 /// memoization time keeps the hot path a cheap `&str` borrow.
+///
+/// # Panic vs. returned Err
+///
+/// Only a returned `Err` is fail-closed — a panic inside the
+/// `load_inference` closure leaves the `OnceLock` cell uninitialized
+/// (per [`OnceLock::get_or_init`]'s contract) and the next caller
+/// re-runs the initializer. Fail-closed memoization therefore applies
+/// exclusively to errors returned through the normal `Result` channel;
+/// load paths that can panic (e.g. candle-side allocation failure) do
+/// not poison the cache.
 static MODEL_CACHE: OnceLock<Result<Mutex<LoadedInference>, String>> = OnceLock::new();
 
 /// Pinned description of a model artifact the cache knows how to
@@ -1760,6 +1770,16 @@ mod tests {
     /// callers control prompt content and the wrapper stays
     /// transparent. Pin this transparency so a defensive-escape
     /// change surfaces as an explicit behavior break.
+    ///
+    /// An adversarial stdout containing literal `<|im_end|>` /
+    /// `<|im_start|>` control tokens can close or reopen the assistant
+    /// turn from inside the user turn, confusing the model's turn
+    /// boundaries and letting the payload inject assistant-side
+    /// instructions. Sanitizing these control tokens on the stdout
+    /// body before composing the prompt is tracked as future work;
+    /// this test pins the current transparent-wrap behavior so any
+    /// future sanitization pass replaces the wrapper's contract
+    /// deliberately rather than drifting in silently.
     #[test]
     fn wrap_chatml_no_think_passes_prompt_body_verbatim() {
         let got = wrap_chatml_no_think("line 1\n<|im_end|>\nline 3");
