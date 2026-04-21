@@ -1023,7 +1023,7 @@ mod tests {
     #[test]
     fn eval_eevdf_no_com2_output() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_eevdf_no_out__");
         let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1087,7 +1087,7 @@ mod tests {
     #[test]
     fn eval_sched_dies_with_sched_log() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let sched_log = format!(
             "noise\n{SCHED_OUTPUT_START}\ndo_enqueue_task+0x1a0\nbalance_one+0x50\n{SCHED_OUTPUT_END}\nmore",
         );
@@ -1207,7 +1207,7 @@ mod tests {
     #[test]
     fn eval_timeout_no_result() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_timeout__");
         let result = make_vm_result("", "booting...\nstill booting...", 0, true);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1584,7 +1584,7 @@ mod tests {
     #[test]
     fn eval_timeout_with_sched_includes_diagnostics() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = sched_entry("__eval_timeout_sched__");
         let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1623,7 +1623,7 @@ mod tests {
     #[test]
     fn eval_no_sentinels_shows_initramfs_failure() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_no_sentinel__");
         let result = make_vm_result("", "Kernel panic", 1, false);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1648,7 +1648,7 @@ mod tests {
     #[test]
     fn eval_init_started_but_no_payload() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_init_only__");
         let result = make_vm_result("KTSTR_INIT_STARTED\n", "boot log", 1, false);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
@@ -1673,7 +1673,7 @@ mod tests {
     #[test]
     fn eval_payload_started_no_result() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_payload_start__");
         let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\ngarbage";
         let result = make_vm_result(output, "", 1, false);

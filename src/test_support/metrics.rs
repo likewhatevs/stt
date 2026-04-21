@@ -308,17 +308,9 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_offline = std::env::var("KTSTR_MODEL_OFFLINE").ok();
-        // SAFETY: ENV_LOCK serializes process-wide env mutations.
-        unsafe { std::env::set_var("KTSTR_MODEL_OFFLINE", "1") };
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
         let m = extract_metrics("anything", &OutputFormat::LlmExtract(None));
         assert!(m.is_empty());
-        unsafe {
-            match prev_offline {
-                Some(v) => std::env::set_var("KTSTR_MODEL_OFFLINE", v),
-                None => std::env::remove_var("KTSTR_MODEL_OFFLINE"),
-            }
-        }
     }
 
     #[test]
@@ -329,20 +321,12 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_offline = std::env::var("KTSTR_MODEL_OFFLINE").ok();
-        // SAFETY: ENV_LOCK serializes process-wide env mutations.
-        unsafe { std::env::set_var("KTSTR_MODEL_OFFLINE", "1") };
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
         let m = extract_metrics(
             "anything",
             &OutputFormat::LlmExtract(Some("focus on latency")),
         );
         assert!(m.is_empty());
-        unsafe {
-            match prev_offline {
-                Some(v) => std::env::set_var("KTSTR_MODEL_OFFLINE", v),
-                None => std::env::remove_var("KTSTR_MODEL_OFFLINE"),
-            }
-        }
     }
 
     #[test]
