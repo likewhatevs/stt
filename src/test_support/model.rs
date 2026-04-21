@@ -517,6 +517,15 @@ pub(crate) fn compose_prompt(stdout: &str, hint: Option<&str>) -> String {
 /// single JSON object; 512 tokens is enough for a dense metric bag
 /// (hundreds of keys) without letting a runaway generation burn
 /// wall time.
+///
+/// 512 is sufficient even with `<think>…</think>` leakage: the
+/// `/no_think` directive (see [`invoke_with_model`]) suppresses
+/// Qwen3's reasoning trace to at most an empty `<think></think>`
+/// shell (~8 tokens), which the post-decode [`strip_think_block`]
+/// removes before the JSON walker sees the response. The cap-hit
+/// warning in the generation loop fires if the shell grows or a
+/// full trace leaks despite `/no_think`, surfacing the regression
+/// rather than silently truncating.
 const SAMPLE_LEN: usize = 512;
 
 /// Deterministic seed. ArgMax sampling ignores the RNG but
@@ -596,12 +605,13 @@ pub(crate) fn invoke_with_model(
     // Qwen3 ChatML prompt. The `/no_think` directive at the end of
     // the user turn switches the model out of thinking mode per the
     // Qwen3 model card: the assistant skips the `<think>…</think>`
-    // block and emits the final answer directly. Deterministic JSON
-    // extraction doesn't need the extra tokens a thinking trace
-    // would burn. The post-decode `strip_think_block` below remains
-    // as a belt-and-suspenders defense because the `/no_think`
-    // directive is a soft switch and the model can still emit an
-    // empty `<think></think>` shell.
+    // block and emits the final answer directly, keeping the SAMPLE_LEN
+    // token budget available for the JSON response rather than burning
+    // it on a reasoning trace the downstream walker would discard.
+    // The post-decode `strip_think_block` below remains as a belt-
+    // and-suspenders defense because the `/no_think` directive is a
+    // soft switch and the model can still emit an empty
+    // `<think></think>` shell.
     let chat_prompt =
         format!("<|im_start|>user\n{prompt} /no_think<|im_end|>\n<|im_start|>assistant\n");
     let encoding = state
@@ -632,9 +642,11 @@ pub(crate) fn invoke_with_model(
         generated.push(next_token);
     }
 
-    // Generation loop. index_pos advances as the sum of prompt
-    // length + positions already generated — the KV cache uses this
-    // to place each new token's Q/K/V in the right slot.
+    // Generation loop. index_pos advances to the absolute position
+    // of the token being processed — the KV cache uses it to place
+    // each new token's Q/K/V in the right slot. On step 0 the position
+    // is `prompt_tokens.len()`, i.e. the slot immediately after the
+    // prompt pass's last token.
     for step in 0..SAMPLE_LEN.saturating_sub(1) {
         if next_token == state.eos_id {
             break;
