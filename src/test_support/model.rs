@@ -908,33 +908,10 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // SAFETY: `std::env::set_var` / `remove_var` are `unsafe` in
-        // Rust 2024 because a concurrent thread calling
-        // `std::env::var_os` may UB-observe a half-updated environ
-        // table. The guards here are:
-        //   (a) `ENV_LOCK` above serializes every env-mutating test
-        //       in this crate — no parallel writer exists within
-        //       the ktstr test binary's threads.
-        //   (b) No reader thread is spawned inside this test — the
-        //       only consumers of the env var (`resolve_cache_root`)
-        //       run on the test thread after the mutation returns.
-        //   (c) The save-before / restore-after pair keeps other
-        //       tests' environment state intact across the critical
-        //       section, so a subsequent test that reads the same
-        //       key sees its prior value.
-        // Remaining residual risk: a signal handler or child process
-        // spawned during the critical section would observe mid-
-        // mutation env state. No tests in this module spawn such.
-        let prev = std::env::var("KTSTR_CACHE_DIR").ok();
-        unsafe { std::env::set_var("KTSTR_CACHE_DIR", "/explicit/override") };
+        let _env =
+            super::super::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", "/explicit/override");
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, PathBuf::from("/explicit/override"));
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
-                None => std::env::remove_var("KTSTR_CACHE_DIR"),
-            }
-        }
     }
 
     #[test]
@@ -1062,15 +1039,12 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_offline = std::env::var(OFFLINE_ENV).ok();
-        let prev_cache = std::env::var("KTSTR_CACHE_DIR").ok();
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: ENV_LOCK guards process-wide env mutations; the
-        // save/restore pair preserves other tests' state.
-        unsafe {
-            std::env::set_var(OFFLINE_ENV, "1");
-            std::env::set_var("KTSTR_CACHE_DIR", tmp.path());
-        }
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
         let fake = ModelSpec {
             file_name: "does-not-exist.gguf",
             url: "https://placeholder.example/none.gguf",
@@ -1079,16 +1053,6 @@ mod tests {
         };
         let err = ensure(&fake).unwrap_err();
         assert!(format!("{err:#}").contains(OFFLINE_ENV), "err: {err:#}");
-        unsafe {
-            match prev_offline {
-                Some(v) => std::env::set_var(OFFLINE_ENV, v),
-                None => std::env::remove_var(OFFLINE_ENV),
-            }
-            match prev_cache {
-                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
-                None => std::env::remove_var("KTSTR_CACHE_DIR"),
-            }
-        }
     }
 
     /// status() on a file that exists but whose SHA does not
@@ -1102,7 +1066,6 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_cache = std::env::var("KTSTR_CACHE_DIR").ok();
         let tmp = tempfile::tempdir().unwrap();
         let spec = ModelSpec {
             file_name: "bogus.gguf",
@@ -1113,8 +1076,10 @@ mod tests {
         };
         let on_disk = tmp.path().join(spec.file_name);
         std::fs::write(&on_disk, b"definitely-not-zero-sha").unwrap();
-        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
-        unsafe { std::env::set_var("KTSTR_CACHE_DIR", tmp.path()) };
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
         let st = status(&spec).unwrap();
         assert!(st.cached, "file exists, status must report cached=true");
         assert!(
@@ -1122,12 +1087,6 @@ mod tests {
             "SHA is a fixed zero pin — garbage bytes must not match",
         );
         assert_eq!(st.path, on_disk);
-        unsafe {
-            match prev_cache {
-                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
-                None => std::env::remove_var("KTSTR_CACHE_DIR"),
-            }
-        }
     }
 
     /// With `KTSTR_CACHE_DIR` unset, `resolve_cache_root` falls
@@ -1137,28 +1096,14 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_ktstr = std::env::var("KTSTR_CACHE_DIR").ok();
-        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
-        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
-        unsafe {
-            std::env::remove_var("KTSTR_CACHE_DIR");
-            std::env::set_var("XDG_CACHE_HOME", "/xdg/caches");
-        }
+        let _env_ktstr = super::super::test_helpers::EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _env_xdg =
+            super::super::test_helpers::EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
         let root = resolve_cache_root().unwrap();
         assert_eq!(
             root,
             PathBuf::from("/xdg/caches").join("ktstr").join("models"),
         );
-        unsafe {
-            match prev_ktstr {
-                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
-                None => std::env::remove_var("KTSTR_CACHE_DIR"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
-            }
-        }
     }
 
     /// With both `KTSTR_CACHE_DIR` and `XDG_CACHE_HOME` unset,
@@ -1170,15 +1115,9 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_ktstr = std::env::var("KTSTR_CACHE_DIR").ok();
-        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
-        unsafe {
-            std::env::remove_var("KTSTR_CACHE_DIR");
-            std::env::remove_var("XDG_CACHE_HOME");
-            std::env::set_var("HOME", "/home/fake");
-        }
+        let _env_ktstr = super::super::test_helpers::EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _env_xdg = super::super::test_helpers::EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _env_home = super::super::test_helpers::EnvVarGuard::set("HOME", "/home/fake");
         let root = resolve_cache_root().unwrap();
         assert_eq!(
             root,
@@ -1187,20 +1126,6 @@ mod tests {
                 .join("ktstr")
                 .join("models"),
         );
-        unsafe {
-            match prev_ktstr {
-                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
-                None => std::env::remove_var("KTSTR_CACHE_DIR"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
-            }
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
     }
 
     /// Empty `KTSTR_CACHE_DIR` must fall through to XDG
@@ -1213,29 +1138,15 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_ktstr = std::env::var("KTSTR_CACHE_DIR").ok();
-        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
-        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
-        unsafe {
-            std::env::set_var("KTSTR_CACHE_DIR", "");
-            std::env::set_var("XDG_CACHE_HOME", "/xdg/caches");
-        }
+        let _env_ktstr = super::super::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", "");
+        let _env_xdg =
+            super::super::test_helpers::EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
         let root = resolve_cache_root().unwrap();
         assert_eq!(
             root,
             PathBuf::from("/xdg/caches").join("ktstr").join("models"),
             "empty KTSTR_CACHE_DIR must be treated as unset so XDG wins",
         );
-        unsafe {
-            match prev_ktstr {
-                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
-                None => std::env::remove_var("KTSTR_CACHE_DIR"),
-            }
-            match prev_xdg {
-                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
-            }
-        }
     }
 
     /// `sanitize_env_value` replaces control characters (newline,
