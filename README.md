@@ -82,7 +82,7 @@ it does not build or run on other platforms.
 **Required:**
 
 - Linux host with `/dev/kvm`
-- Rust >= 1.88 (stable)
+- Rust >= 1.95 (stable, pinned via `rust-toolchain.toml`)
 - clang (BPF skeleton compilation)
 - pkg-config, make, gcc
 - autotools (autoconf, autopoint, flex, bison, gawk) -- vendored

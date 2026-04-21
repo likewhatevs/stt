@@ -3,7 +3,7 @@ members = [".", "ktstr-macros", "scx-ktstr"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "GPL-2.0-only"
 repository = "https://github.com/likewhatevs/ktstr"
 

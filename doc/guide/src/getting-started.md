@@ -6,7 +6,7 @@
 it does not build or run on other platforms.
 
 - Linux host with KVM access (`/dev/kvm`)
-- Rust toolchain (stable, >= 1.88)
+- Rust toolchain (stable, >= 1.95; pinned via `rust-toolchain.toml`)
 - clang (BPF skeleton compilation)
 - pkg-config, make, gcc
 - autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
