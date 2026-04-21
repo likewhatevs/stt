@@ -314,7 +314,7 @@ impl BaseKey {
 
         // Hash include files: archive paths (sorted for determinism),
         // content hashes, and shared lib hashes for ELF includes (their
-        // shared libs are packed by create_initramfs_base).
+        // shared libs are packed by build_initramfs_base).
         let mut sorted: Vec<(&str, &Path)> = include_files
             .iter()
             .map(|(a, p)| (a.as_str(), p.as_path()))
@@ -399,11 +399,11 @@ pub(crate) fn get_or_build_base(
             // We won the race — build, write, release.
             tracing::debug!("initramfs shm: builder (O_EXCL won)");
             let t0 = std::time::Instant::now();
-            let data = initramfs::create_initramfs_base(payload, extras, include_files, busybox)?;
+            let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
                 bytes = data.len(),
-                "create_initramfs_base",
+                "build_initramfs_base",
             );
 
             // Write data to the segment and release the exclusive lock.
@@ -448,12 +448,12 @@ pub(crate) fn get_or_build_base(
 
     // 3. Fallback: build without SHM coordination.
     let t0 = std::time::Instant::now();
-    let data = initramfs::create_initramfs_base(payload, extras, include_files, busybox)?;
+    let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
     let arc = Arc::new(data);
     tracing::debug!(
         elapsed_us = t0.elapsed().as_micros(),
         bytes = arc.len(),
-        "create_initramfs_base (fallback)",
+        "build_initramfs_base (fallback)",
     );
 
     base_cache()

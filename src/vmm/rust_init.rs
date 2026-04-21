@@ -104,7 +104,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let t_mounts = t0.elapsed();
 
     // Verify initramfs extraction completed. The sentinel file is the
-    // last entry written by create_initramfs_base — its absence means
+    // last entry written by build_initramfs_base — its absence means
     // the kernel ran out of memory during cpio extraction. The memory
     // formula should prevent this; hitting it indicates an estimation bug.
     if !Path::new("/.ktstr_init_ok").exists() {

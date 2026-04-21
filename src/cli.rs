@@ -258,7 +258,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
     }
     if has_stale_kconfig {
         eprintln!(
-            "warning: entries marked (stale kconfig) were built with a different ktstr.kconfig. \
+            "warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. \
              Rebuild with: kernel build --force VERSION"
         );
     }
