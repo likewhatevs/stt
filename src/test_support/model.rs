@@ -777,6 +777,11 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
 /// closes independently, yielding `"midend"`). `find`-first would
 /// bleed an orphan `</think>` through for nested input; `rfind`-last
 /// would merge siblings into a single phantom block.
+///
+/// Matching is byte-exact: only literal `<think>` and `</think>`
+/// are recognized. Case variants, self-closing tags, attribute-
+/// carrying tags, and whitespace-injected tags pass through
+/// verbatim.
 fn strip_think_block(s: &str) -> String {
     const OPEN: &str = "<think>";
     const CLOSE: &str = "</think>";
@@ -1019,6 +1024,30 @@ mod tests {
         assert!(!verify_sha256(tmp.path(), &expected_hex).unwrap());
     }
 
+    /// A non-existent path is an I/O-layer failure, not a pin-shape
+    /// failure, so `verify_sha256` must surface the `std::fs::File::open`
+    /// error with the `open <path>` anyhow context attached. Pins the
+    /// error wording so callers that pattern-match on "open" still
+    /// find it if the underlying `io::Error` string changes.
+    #[test]
+    fn verify_sha256_errors_on_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist.bin");
+        // Valid 64-char hex so the function passes the shape check
+        // and reaches the file-open step.
+        let valid_hex = "0".repeat(64);
+        let err = verify_sha256(&missing, &valid_hex).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("open "),
+            "error must carry 'open <path>' context: {rendered}"
+        );
+        assert!(
+            rendered.contains("does-not-exist.bin"),
+            "error must include the missing path: {rendered}"
+        );
+    }
+
     #[test]
     fn default_model_size_is_in_expected_ballpark() {
         // The pinned Qwen3-4B Q4_K_M GGUF is ~2.44 GiB. The upper
@@ -1053,6 +1082,46 @@ mod tests {
         };
         let err = ensure(&fake).unwrap_err();
         assert!(format!("{err:#}").contains(OFFLINE_ENV), "err: {err:#}");
+    }
+
+    /// `ensure()` must check the SHA pin shape BEFORE the offline
+    /// gate. A malformed pin is a programmer error that no runtime
+    /// state can fix — surfacing it first gives the actionable
+    /// "fix the ModelSpec" error instead of the downstream "OFFLINE
+    /// set but not cached" red herring. This test sets OFFLINE=1 AND
+    /// supplies a placeholder (all-`?`) SHA pin; the error must call
+    /// out the placeholder pin, NOT the offline gate.
+    #[test]
+    fn ensure_surfaces_sha_shape_error_before_offline_gate() {
+        let _guard = super::super::test_helpers::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
+        // Placeholder-shape SHA (all-`?`, 64 chars) is 64 bytes long
+        // but contains no ASCII hex digits, so is_valid_sha256_hex
+        // rejects it at the shape-check step inside ensure() BEFORE
+        // reaching the offline bail.
+        let bad_pin = ModelSpec {
+            file_name: "placeholder-pin.gguf",
+            url: "https://placeholder.example/placeholder-pin.gguf",
+            sha256_hex: "????????????????????????????????????????????????????????????????",
+            size_bytes: 1,
+        };
+        let err = ensure(&bad_pin).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("placeholder or malformed"),
+            "expected SHA-shape error, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{OFFLINE_ENV}=")),
+            "shape error must NOT mention the offline gate: {rendered}"
+        );
     }
 
     /// status() on a file that exists but whose SHA does not
@@ -1185,6 +1254,42 @@ mod tests {
         assert_eq!(out.len(), 67);
     }
 
+    /// Exactly `MAX_ENV_ECHO_LEN` bytes (64) must NOT trip the
+    /// truncation branch — the gate is `> 64`, not `>= 64`. Pins the
+    /// off-by-one so a future refactor that tightens to `>=` surfaces
+    /// here.
+    #[test]
+    fn sanitize_env_value_at_exact_cap_does_not_truncate() {
+        let raw: String = "x".repeat(64);
+        let out = sanitize_env_value(&raw);
+        assert_eq!(out, raw, "64-byte input must pass through unchanged");
+        assert!(
+            !out.ends_with("..."),
+            "64-byte input must not gain a truncation marker: {out:?}"
+        );
+    }
+
+    /// A multi-byte UTF-8 codepoint straddling the byte cap must be
+    /// dropped whole, not split mid-sequence. 63 ASCII bytes plus
+    /// one `β` (2 UTF-8 bytes) totals 65 bytes, which trips the
+    /// truncation branch. The char_indices walk stops at the last
+    /// whole char whose end ≤ 64: 'x' #63 ends at byte 63, while
+    /// placing 'β' next would reach byte 65. So the prefix truncates
+    /// at byte 63, yielding 63 x's plus the `...` marker (66 bytes).
+    #[test]
+    fn sanitize_env_value_truncates_on_char_boundary_for_utf8_straddle() {
+        let raw: String = format!("{}β", "x".repeat(63));
+        assert_eq!(raw.len(), 65, "setup: input must be 65 bytes");
+        let out = sanitize_env_value(&raw);
+        assert_eq!(out.len(), 66, "63 truncated + 3 marker = 66 bytes");
+        assert!(out.ends_with("..."), "marker missing: {out:?}");
+        assert_eq!(&out[..63], &"x".repeat(63), "prefix must be 63 x's");
+        assert!(
+            !out.contains('β'),
+            "straddling codepoint must be dropped whole: {out:?}"
+        );
+    }
+
     /// ensure()'s offline-bail error echoes the env value
     /// through `sanitize_env_value`. Set `OFFLINE_ENV` to a value
     /// containing both control chars and overlong content, and
@@ -1271,6 +1376,48 @@ mod tests {
             !p.contains("Focus:"),
             "whitespace-only hint should not emit Focus header: {p}"
         );
+    }
+
+    /// `Some("")` — the distinct "hint is provided but empty" case —
+    /// must degrade identically to whitespace-only: no `Focus:`
+    /// header. Pairs with `compose_prompt_empty_hint_degrades_to_no_focus`
+    /// (whitespace-only) so both `h.trim().is_empty()` branches are
+    /// exercised.
+    #[test]
+    fn compose_prompt_explicitly_empty_string_hint_omits_focus() {
+        let p = compose_prompt("x", Some(""));
+        assert!(
+            !p.contains("Focus:"),
+            "empty-string hint must not emit Focus header: {p}"
+        );
+    }
+
+    /// `is_valid_sha256_hex` rejects any input that is not exactly
+    /// 64 ASCII hex digits. Covers the three rejection classes the
+    /// helper guards against: too-short (63 bytes), too-long (65),
+    /// and an input that IS 64 bytes long but contains a non-ASCII
+    /// Unicode digit. Paired with `verify_sha256_rejects_malformed_hex_length`
+    /// and `verify_sha256_rejects_non_hex_chars` which exercise the
+    /// same predicate via `verify_sha256`'s error-surface wrapper.
+    #[test]
+    fn is_valid_sha256_hex_rejects_non_canonical_inputs() {
+        // 63 bytes (short by one).
+        assert!(!is_valid_sha256_hex(&"a".repeat(63)));
+        // 65 bytes (long by one).
+        assert!(!is_valid_sha256_hex(&"a".repeat(65)));
+        // 64 BYTES with a non-ASCII Unicode digit: 62 ASCII hex chars
+        // plus one Arabic-Indic `٠` (U+0660, 2 UTF-8 bytes) totals
+        // 64 bytes, so the length check passes. The `is_ascii_hexdigit`
+        // predicate then rejects `٠` because it's outside the ASCII
+        // range, proving both halves of the predicate are load-bearing.
+        let unicode_digit = format!("{}٠", "0".repeat(62));
+        assert_eq!(unicode_digit.len(), 64, "setup: must be exactly 64 bytes");
+        assert!(
+            !is_valid_sha256_hex(&unicode_digit),
+            "non-ASCII Unicode digit must fail is_ascii_hexdigit even at correct byte length"
+        );
+        // Sanity: exactly 64 ASCII hex digits IS accepted.
+        assert!(is_valid_sha256_hex(&"0".repeat(64)));
     }
 
     /// Under the offline gate with no cached artifacts,
@@ -1407,5 +1554,138 @@ mod tests {
     fn strip_think_block_handles_nested_then_sibling() {
         let s = "<think><think>x</think></think>mid<think>y</think>end";
         assert_eq!(strip_think_block(s), "midend");
+    }
+
+    /// Three independent sibling blocks surrounded by non-block text
+    /// on every side. Each block closes on its own `</think>`, and the
+    /// scanner restarts cleanly between them; the three non-block
+    /// letters `x`, `y`, `z` survive verbatim while `a`, `b`, `c` (all
+    /// inside think blocks) are stripped.
+    #[test]
+    fn strip_think_block_removes_three_sibling_blocks() {
+        let s = "<think>a</think>x<think>b</think>y<think>c</think>z";
+        assert_eq!(strip_think_block(s), "xyz");
+    }
+
+    /// A complete block followed by trailing orphan `</think>` tags:
+    /// the scanner consumes the paired `<think>a</think>`, leaving
+    /// `rest` positioned on `</think></think>`. The outer loop then
+    /// runs `rest.find(OPEN)` — no `<think>` opener remains, so the
+    /// trailing closers fall through unstripped. Pins that post-block
+    /// orphan closers survive the scanner (distinct from the fast
+    /// path, which the leading-orphan case in
+    /// `strip_think_block_preserves_orphan_close_tag` already covers).
+    #[test]
+    fn strip_think_block_preserves_multiple_orphan_close_tags() {
+        let s = "<think>a</think></think></think>";
+        assert_eq!(strip_think_block(s), "</think></think>");
+    }
+
+    /// EOF immediately after an opening `<think>` with no body and no
+    /// close tag. Same semantics as `preserves_unterminated_open_tag`:
+    /// the unterminated block is emitted verbatim from the opener to
+    /// end-of-input so the truncation is visible downstream.
+    #[test]
+    fn strip_think_block_preserves_eof_immediately_after_open() {
+        let s = "prefix <think>";
+        assert_eq!(strip_think_block(s), s);
+    }
+
+    /// A complete sibling block followed by an unterminated sibling:
+    /// the first block closes cleanly on its own `</think>` and emits
+    /// only the inter-block text `mid`, then the second opener has no
+    /// matching close so everything from the second `<think>` onward
+    /// is preserved verbatim.
+    #[test]
+    fn strip_think_block_handles_complete_then_unterminated_sibling() {
+        let s = "<think>a</think>mid<think>unclosed";
+        assert_eq!(strip_think_block(s), "mid<think>unclosed");
+    }
+
+    /// Unicode body inside a think block. The scanner uses byte
+    /// offsets from `str::find`, which returns positions on UTF-8
+    /// char boundaries because both `<think>` and `</think>` are
+    /// ASCII. A multi-byte codepoint inside the block therefore
+    /// cannot be bisected; the whole block is stripped and any
+    /// trailing text survives intact.
+    #[test]
+    fn strip_think_block_handles_unicode_body() {
+        let s = "<think>αβγ</think>result";
+        assert_eq!(strip_think_block(s), "result");
+    }
+
+    /// Two sibling blocks with zero gap between them. The first
+    /// closer resets `rest` to start exactly at the second opener,
+    /// and the outer loop immediately finds and strips the second
+    /// block, yielding an empty string.
+    #[test]
+    fn strip_think_block_removes_adjacent_sibling_blocks() {
+        let s = "<think>a</think><think>b</think>";
+        assert_eq!(strip_think_block(s), "");
+    }
+
+    /// Depth-3 nested opener chain closed by three back-to-back
+    /// closers. The depth scanner climbs to 3 on successive openers,
+    /// then decrements back to 0 on the three closers; the whole
+    /// construct is consumed as one outer block, leaving the empty
+    /// string.
+    #[test]
+    fn strip_think_block_handles_depth_three_nesting() {
+        let s = "<think><think><think>deep</think></think></think>";
+        assert_eq!(strip_think_block(s), "");
+    }
+
+    /// Uppercase `<THINK>` shares no `<think>` substring, so the
+    /// fast-path `contains(OPEN)` rejects this shape before the
+    /// scanner runs. Pins the intentional case-sensitivity against
+    /// a future refactor to `eq_ignore_ascii_case`-style matching.
+    #[test]
+    fn strip_think_block_preserves_uppercase_tags() {
+        let s = "<THINK>x</THINK>";
+        assert_eq!(strip_think_block(s), s);
+    }
+
+    /// Self-closing `<think/>` has `/` where `<think>` has `>`, so
+    /// the fast-path `contains(OPEN)` rejects this shape before the
+    /// scanner runs. Qwen3 never emits this shape; pinning the
+    /// current policy so a future "be lenient" refactor has to
+    /// justify the change.
+    #[test]
+    fn strip_think_block_preserves_self_closing_tag() {
+        let s = "before <think/> after";
+        assert_eq!(strip_think_block(s), s);
+    }
+
+    /// Whitespace inside tag punctuation (`< think>` or `</ think>`)
+    /// breaks the byte-exact substring, so the fast-path
+    /// `contains(OPEN)` rejects this shape before the scanner runs.
+    /// The input survives verbatim.
+    #[test]
+    fn strip_think_block_preserves_whitespace_in_tag() {
+        let s = "< think>x</ think>";
+        assert_eq!(strip_think_block(s), s);
+    }
+
+    /// Attribute-carrying tag (`<think id="1">`) is not the byte-
+    /// exact `<think>` opener, so the fast-path `contains(OPEN)`
+    /// rejects this shape before the scanner runs. Pins the
+    /// minimal-matcher policy against a future refactor that
+    /// tolerates attributes.
+    #[test]
+    fn strip_think_block_preserves_tag_with_attributes() {
+        let s = r#"<think id="1">x</think>"#;
+        assert_eq!(strip_think_block(s), s);
+    }
+
+    /// Lowercase opener matches, but mixed-case closer does NOT.
+    /// The scanner enters on the `<think>` opener, finds no matching
+    /// `</think>` in the tail (closer is `</Think>`), and the
+    /// unterminated branch emits the full block verbatim — distinct
+    /// from the fast-path preserves_uppercase_tags case because the
+    /// scanner actually runs here.
+    #[test]
+    fn strip_think_block_preserves_half_matched_case() {
+        let s = "<think>x</Think>";
+        assert_eq!(strip_think_block(s), s);
     }
 }
