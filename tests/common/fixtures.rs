@@ -1,7 +1,8 @@
-//! Ready-made [`Payload`](ktstr::Payload) fixtures for the two
+//! Ready-made [`Payload`](ktstr::Payload) fixtures for the
 //! benchmark binaries that dominate scheduler-regression testing:
-//! `fio` (disk IO throughput, emits JSON) and `stress-ng`
-//! (synthetic CPU/memory stressors, exit-code only).
+//! `fio` (disk IO throughput, emits JSON), `stress-ng`
+//! (synthetic CPU/memory stressors, exit-code only), and
+//! `schbench` (latency percentiles, routed through LlmExtract).
 //!
 //! Each fixture is declared via
 //! [`#[derive(Payload)]`](ktstr::Payload), the same path downstream
@@ -13,15 +14,15 @@
 //! These fixtures live under `tests/common/` rather than inside the
 //! library's `src/` tree because they are TEST SCAFFOLDING, not
 //! shipped API. A downstream scheduler author who wants the same
-//! `fio` / `stress-ng` shapes should either copy the declarations
-//! below into their own crate or write their own via
-//! `#[derive(Payload)]`. The library does not ship fio or stress-ng
-//! binaries — the `kind = PayloadKind::Binary(name)` just declares
-//! the name; host-side include-files resolution picks the path up
-//! at test time.
+//! `fio` / `stress-ng` / `schbench` shapes should either copy the
+//! declarations below into their own crate or write their own via
+//! `#[derive(Payload)]`. The library does not ship fio, stress-ng,
+//! or schbench binaries — the `kind = PayloadKind::Binary(name)`
+//! just declares the name; host-side include-files resolution picks
+//! the path up at test time.
 //!
-//! The two fixtures illustrate the two ends of the
-//! [`OutputFormat`](ktstr::test_support::OutputFormat) spectrum:
+//! The fixtures cover all three
+//! [`OutputFormat`](ktstr::test_support::OutputFormat) variants:
 //!
 //! - [`FIO`] and [`FIO_JSON`] declare `OutputFormat::Json` with a
 //!   set of [`MetricHint`](ktstr::test_support::MetricHint)s
@@ -31,10 +32,16 @@
 //!   `exit_code_eq(0)` default — stress-ng reports via exit code
 //!   (bogo_ops land in stderr and are not machine-extractable
 //!   without `--metrics-brief --yaml`).
+//! - [`SCHBENCH`] uses `OutputFormat::LlmExtract(None)` — schbench
+//!   emits human-readable percentile tables, so extraction is
+//!   routed through the local LLM pipeline rather than the JSON
+//!   walker.
 //!
-//! Both fixtures use short, stable `name` fields (`"fio"`,
-//! `"stress-ng"`) matching the binary names that ktstr's
-//! include-files infrastructure resolves inside the guest.
+//! All fixtures use short, stable `name` fields matching their
+//! binary names — except FIO_JSON, which uses `"fio_json"` to
+//! coexist with FIO in the same workloads list. The binary names
+//! themselves (`"fio"`, `"stress-ng"`, `"schbench"`) are what
+//! ktstr's include-files infrastructure resolves inside the guest.
 
 use ktstr::Payload;
 
