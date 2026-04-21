@@ -5301,7 +5301,7 @@ mod tests {
         step_state.handles.clear();
     }
 
-    /// Ruling (pass 1 / F1): a step-local `Op::MoveAllTasks` that
+    /// A step-local `Op::MoveAllTasks` that
     /// pulls from a Backdrop-owned cgroup into a step-local cgroup
     /// must bail before touching cgroupfs. The persistent worker
     /// would otherwise be stranded in a cgroup that gets rmdir'd at
@@ -5754,7 +5754,7 @@ mod tests {
         );
     }
 
-    /// T2: step-local `Op::AddCgroup` with a name that already lives
+    /// Step-local `Op::AddCgroup` with a name that already lives
     /// in the Backdrop must route through the same
     /// `cgroup_name_is_tracked` collision guard as `apply_setup`,
     /// rather than letting the CgroupGroup push a shadow entry that
@@ -5796,7 +5796,7 @@ mod tests {
         );
     }
 
-    /// T2 companion: `Op::AddCgroup` applied twice in one step pushes
+    /// `Op::AddCgroup` applied twice in one step pushes
     /// two entries into the same CgroupGroup's `names` vec. Drop then
     /// calls `remove_cgroup` for each — the second hits an
     /// already-removed cgroup (safe via `let _ = `).
@@ -5821,7 +5821,7 @@ mod tests {
         );
     }
 
-    /// T9: `MoveAllTasks` must re-key EVERY workload handle whose
+    /// `MoveAllTasks` must re-key EVERY workload handle whose
     /// current name matches `from`, not just the first. Multiple
     /// handles on the same cgroup arise when a scenario issues two
     /// `Op::Spawn` ops on the same cgroup name.
