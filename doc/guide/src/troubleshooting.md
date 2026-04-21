@@ -311,14 +311,14 @@ PipeIo requires num_workers divisible by 2, got 3
 ```
 
 Grouped work types (`PipeIo`, `FutexPingPong`, `CachePipe`,
-`FutexFanOut`, `SchBench`) require `num_workers` divisible by their
+`FutexFanOut`, `FanOutCompute`) require `num_workers` divisible by their
 group size. `WorkType::worker_group_size()` returns the divisor.
 
 **Fixes:**
 
 - Set `CgroupDef::workers(n)` to a value divisible by the work
   type's group size (2 for pipe/futex pairs, `fan_out + 1` for
-  FutexFanOut and SchBench).
+  FutexFanOut and FanOutCompute).
 - Use an ungrouped work type (`CpuSpin`, `Mixed`, `Bursty`,
   `IoSync`, `YieldHeavy`) if worker count flexibility is needed.
 

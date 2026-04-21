@@ -50,8 +50,8 @@ pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Vec<Metric> {
 
 /// Locate a JSON document within mixed text output and parse it.
 ///
-/// Many benchmark tools emit a banner line (fio, stress-ng,
-/// schbench) before the structured JSON body. A strict
+/// Many benchmark tools emit a banner line (fio, stress-ng)
+/// before the structured JSON body. A strict
 /// `serde_json::from_str(stdout)` fails for those. This helper
 /// first tries the whole input; on failure, scans for the first
 /// balanced `{...}` (or `[...]`) region and parses that.

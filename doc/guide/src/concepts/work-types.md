@@ -15,7 +15,7 @@ pub enum WorkType {
     CacheYield { size_kb: usize, stride: usize },
     CachePipe { size_kb: usize, burst_iters: u64 },
     FutexFanOut { fan_out: usize, spin_iters: u64 },
-    SchBench { fan_out: usize, cache_footprint_kb: usize, operations: usize, sleep_usec: u64 },
+    FanOutCompute { fan_out: usize, cache_footprint_kb: usize, operations: usize, sleep_usec: u64 },
     Sequence { first: Phase, rest: Vec<Phase> },
     ForkExit,
     NiceSweep,
@@ -32,7 +32,7 @@ Parameterized variants have convenience constructors:
 `WorkType::futex_ping_pong(1024)`, `WorkType::cache_pressure(32, 64)`,
 `WorkType::cache_yield(32, 64)`, `WorkType::cache_pipe(32, 1024)`,
 `WorkType::futex_fan_out(4, 1024)`,
-`WorkType::schbench(4, 256, 5, 100)`,
+`WorkType::fan_out_compute(4, 256, 5, 100)`,
 `WorkType::affinity_churn(1024)`, `WorkType::policy_churn(1024)`,
 `WorkType::page_fault_churn(4096, 256, 64)`,
 `WorkType::mutex_contention(4, 256, 1024)`,
@@ -47,7 +47,7 @@ Parameterized variants have convenience constructors:
 | CPU borrowing / idle balance | `Bursty` |
 | Cross-CPU wake latency | `PipeIo`, `CachePipe` |
 | Cache-aware scheduling | `CachePressure`, `CacheYield` |
-| Cache-aware fan-out wake latency | `SchBench` |
+| Cache-aware fan-out wake latency | `FanOutCompute` |
 | Fan-out wake storms | `FutexFanOut` |
 | Mixed real-world patterns | `Sequence` |
 | Task creation/destruction pressure | `ForkExit` |
@@ -104,9 +104,9 @@ placement. Requires even `num_workers`.
 One messenger per group does `spin_iters` of CPU spin work then wakes
 `fan_out` receivers via `FUTEX_WAKE`. Receivers measure wake-to-run
 latency. For cache-aware fan-out with matrix multiply work, see
-`SchBench`. Requires `num_workers` divisible by `fan_out + 1`.
+`FanOutCompute`. Requires `num_workers` divisible by `fan_out + 1`.
 
-**`SchBench`** -- schbench-style messenger/worker workload. One
+**`FanOutCompute`** -- messenger/worker fan-out with compute work. One
 messenger per group stamps a `CLOCK_MONOTONIC` timestamp then wakes
 `fan_out` workers via `FUTEX_WAKE`. Workers measure wake-to-run latency
 (time from messenger's timestamp to worker getting the CPU), sleep for
@@ -236,12 +236,12 @@ let wt = WorkType::custom("my_workload", my_workload);
 ## Grouped work types
 
 `PipeIo`, `FutexPingPong`, and `CachePipe` require `num_workers`
-divisible by 2 (paired). `FutexFanOut` and `SchBench` require
+divisible by 2 (paired). `FutexFanOut` and `FanOutCompute` require
 `num_workers` divisible by `fan_out + 1` (1 messenger + N receivers per
 group). `MutexContention` requires `num_workers` divisible by
 `contenders`. `WorkType::worker_group_size()` returns the group size
 for these variants, or `None` for ungrouped types. `PipeIo` and
-`CachePipe` use pipes; `FutexPingPong`, `FutexFanOut`, `SchBench`,
+`CachePipe` use pipes; `FutexPingPong`, `FutexFanOut`, `FanOutCompute`,
 and `MutexContention` use shared mmap pages with futex wait/wake.
 
 ## Default values
@@ -254,7 +254,7 @@ and `MutexContention` use shared mmap pages with futex wait/wake.
 - `CacheYield`: `size_kb=32`, `stride=64`
 - `CachePipe`: `size_kb=32`, `burst_iters=1024`
 - `FutexFanOut`: `fan_out=4`, `spin_iters=1024`
-- `SchBench`: `fan_out=4`, `cache_footprint_kb=256`, `operations=5`, `sleep_usec=100`
+- `FanOutCompute`: `fan_out=4`, `cache_footprint_kb=256`, `operations=5`, `sleep_usec=100`
 - `AffinityChurn`: `spin_iters=1024`
 - `PolicyChurn`: `spin_iters=1024`
 - `PageFaultChurn`: `region_kb=4096`, `touches_per_cycle=256`, `spin_iters=64`
@@ -316,7 +316,7 @@ for all scenarios that use it. Scenarios with non-`CpuSpin` work types
 are not overridden.
 
 Overrides to grouped work types (`PipeIo`, `FutexPingPong`,
-`CachePipe`, `FutexFanOut`, `SchBench`, `MutexContention`) are skipped
+`CachePipe`, `FutexFanOut`, `FanOutCompute`, `MutexContention`) are skipped
 when `num_workers` is not divisible by the work type's group size.
 
 Ops-based scenarios have a separate override mechanism via

@@ -158,10 +158,10 @@ pub enum WorkType {
     /// Receivers measure wake-to-run latency as the interval from
     /// stamping `before_block = Instant::now()` just before the wait
     /// loop to observing the futex generation advance. Unlike
-    /// [`SchBench`](Self::SchBench), there is no shared messenger
+    /// [`FanOutCompute`](Self::FanOutCompute), there is no shared messenger
     /// timestamp — the measurement is receiver-local and excludes the
     /// messenger's pre-wake delay. For cache-aware fan-out with matrix
-    /// multiply work, see `SchBench`. Requires num_workers divisible
+    /// multiply work, see `FanOutCompute`. Requires num_workers divisible
     /// by (fan_out + 1).
     FutexFanOut { fan_out: usize, spin_iters: u64 },
     /// Compound work pattern: loop through phases in order, repeat.
@@ -187,7 +187,7 @@ pub enum WorkType {
     /// when CAP_SYS_NICE is available). Exercises __sched_setscheduler
     /// and scheduling class transitions.
     PolicyChurn { spin_iters: u64 },
-    /// Schbench-style messenger/worker workload. One messenger per group
+    /// Messenger/worker fan-out with compute work. One messenger per group
     /// wakes `fan_out` workers via shared futex. After recording the
     /// wake-to-run latency, each worker sleeps for `sleep_usec`
     /// microseconds (simulating think time), then does `operations`
@@ -195,7 +195,7 @@ pub enum WorkType {
     /// set. Wake-to-run latency is the interval from the messenger's
     /// timestamp to the worker observing the generation advance.
     /// Requires num_workers divisible by (fan_out + 1).
-    SchBench {
+    FanOutCompute {
         fan_out: usize,
         cache_footprint_kb: usize,
         operations: usize,
@@ -279,7 +279,7 @@ impl WorkType {
             WorkType::NiceSweep => "NiceSweep",
             WorkType::AffinityChurn { .. } => "AffinityChurn",
             WorkType::PolicyChurn { .. } => "PolicyChurn",
-            WorkType::SchBench { .. } => "SchBench",
+            WorkType::FanOutCompute { .. } => "FanOutCompute",
             WorkType::PageFaultChurn { .. } => "PageFaultChurn",
             WorkType::MutexContention { .. } => "MutexContention",
             WorkType::Custom { name, .. } => name,
@@ -322,7 +322,7 @@ impl WorkType {
             "NiceSweep" => Some(WorkType::NiceSweep),
             "AffinityChurn" => Some(WorkType::AffinityChurn { spin_iters: 1024 }),
             "PolicyChurn" => Some(WorkType::PolicyChurn { spin_iters: 1024 }),
-            "SchBench" => Some(WorkType::SchBench {
+            "FanOutCompute" => Some(WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
                 operations: 5,
@@ -354,7 +354,7 @@ impl WorkType {
             | WorkType::FutexPingPong { .. }
             | WorkType::CachePipe { .. } => Some(2),
             WorkType::FutexFanOut { fan_out, .. } => Some(fan_out + 1),
-            WorkType::SchBench { fan_out, .. } => Some(fan_out + 1),
+            WorkType::FanOutCompute { fan_out, .. } => Some(fan_out + 1),
             WorkType::MutexContention { contenders, .. } => Some(*contenders),
             _ => None,
         }
@@ -366,7 +366,7 @@ impl WorkType {
             self,
             WorkType::FutexPingPong { .. }
                 | WorkType::FutexFanOut { .. }
-                | WorkType::SchBench { .. }
+                | WorkType::FanOutCompute { .. }
                 | WorkType::MutexContention { .. }
         )
     }
@@ -378,7 +378,7 @@ impl WorkType {
             WorkType::CachePressure { .. }
                 | WorkType::CacheYield { .. }
                 | WorkType::CachePipe { .. }
-                | WorkType::SchBench { .. }
+                | WorkType::FanOutCompute { .. }
         )
     }
 
@@ -433,14 +433,14 @@ impl WorkType {
         WorkType::PolicyChurn { spin_iters }
     }
 
-    /// Schbench-style messenger/worker workload with the given parameters.
-    pub fn schbench(
+    /// Messenger/worker fan-out with compute work using the given parameters.
+    pub fn fan_out_compute(
         fan_out: usize,
         cache_footprint_kb: usize,
         operations: usize,
         sleep_usec: u64,
     ) -> Self {
-        WorkType::SchBench {
+        WorkType::FanOutCompute {
             fan_out,
             cache_footprint_kb,
             operations,
@@ -954,7 +954,7 @@ pub struct WorkerReport {
     /// futex wait, `poll`, `sched_yield`, `nanosleep`, etc.) and the
     /// wakeup that resumes execution; not a yield-specific measure.
     /// Populated for blocking work types: Bursty, PipeIo, FutexPingPong,
-    /// FutexFanOut, SchBench, CacheYield, CachePipe, IoSync, NiceSweep,
+    /// FutexFanOut, FanOutCompute, CacheYield, CachePipe, IoSync, NiceSweep,
     /// AffinityChurn, PolicyChurn, MutexContention, Sequence with
     /// Sleep/Yield/Io phases.
     pub resume_latencies_ns: Vec<u64>,
@@ -1015,7 +1015,7 @@ pub struct WorkloadHandle {
     started: bool,
     /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
-    /// Size of each futex mmap region (4 for FutexPingPong/FutexFanOut/MutexContention, 16 for SchBench).
+    /// Size of each futex mmap region (4 for FutexPingPong/FutexFanOut/MutexContention, 16 for FanOutCompute).
     futex_region_size: usize,
     /// MAP_SHARED region of per-worker u64 iteration counters. Workers
     /// atomically store their iteration count; parent reads via
@@ -1175,7 +1175,7 @@ impl WorkloadHandle {
         // SIGKILLs+reaps forked children, closes open pipe fds, and
         // munmaps the shared regions — so no leak on a mid-spawn
         // error path.
-        let futex_region_size = if matches!(config.work_type, WorkType::SchBench { .. }) {
+        let futex_region_size = if matches!(config.work_type, WorkType::FanOutCompute { .. }) {
             16
         } else {
             std::mem::size_of::<u32>()
@@ -1206,9 +1206,9 @@ impl WorkloadHandle {
             }
         }
 
-        // For FutexPingPong/FutexFanOut/SchBench/MutexContention, allocate
+        // For FutexPingPong/FutexFanOut/FanOutCompute/MutexContention, allocate
         // one shared region per worker group via MAP_SHARED|MAP_ANONYMOUS
-        // so all members of the fork see the same physical page. SchBench
+        // so all members of the fork see the same physical page. FanOutCompute
         // needs 16 bytes (futex u32 at offset 0, wake timestamp u64 at
         // offset 8); others need 4 bytes.
         let futex_group_size = config.work_type.worker_group_size().unwrap_or(2);
@@ -1778,15 +1778,15 @@ fn worker_main(
     let mut max_gap_ns: u64 = 0;
     let mut max_gap_cpu: usize = last_cpu;
     let mut max_gap_at_ns: u64 = 0;
-    // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe, SchBench).
+    // Lazily allocated per-worker cache buffer (CachePressure, CacheYield, CachePipe, FanOutCompute).
     let mut cache_pressure_buf: Option<Vec<u8>> = None;
-    // Separate Vec<u64> for schbench_matrix_multiply: the matrix
+    // Separate Vec<u64> for the matrix_multiply helper: the matrix
     // workload interprets its storage as a sequence of u64 operands,
     // and a `Vec<u8>` has only 1-byte alignment. Reinterpreting a
     // u8-backed buffer as `*mut u64` is UB regardless of buffer
     // contents. Vec<u64> gives natural 8-byte alignment from the
     // allocator.
-    let mut schbench_matrix_buf: Option<Vec<u64>> = None;
+    let mut matrix_buf: Option<Vec<u64>> = None;
     // Persistent temp file for IoSync / Phase::Io (opened on first use, removed on exit).
     let mut io_sync_file: Option<(std::fs::File, String)> = None;
     let mut io_seq_file: Option<(std::fs::File, String)> = None;
@@ -1839,8 +1839,8 @@ fn worker_main(
         } else {
             Vec::new()
         };
-    // SchBench: pre-compute matrix dimension from cache_footprint_kb.
-    let schbench_matrix_size: usize = if let WorkType::SchBench {
+    // FanOutCompute: pre-compute matrix dimension from cache_footprint_kb.
+    let matrix_size: usize = if let WorkType::FanOutCompute {
         cache_footprint_kb,
         operations,
         ..
@@ -2269,7 +2269,7 @@ fn worker_main(
                 );
                 iterations += 1;
             }
-            WorkType::SchBench {
+            WorkType::FanOutCompute {
                 fan_out,
                 operations,
                 sleep_usec,
@@ -2331,12 +2331,11 @@ fn worker_main(
                     if sleep_usec > 0 && !STOP.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_micros(sleep_usec));
                     }
-                    if schbench_matrix_size > 0 && !STOP.load(Ordering::Relaxed) {
-                        let buf = schbench_matrix_buf.get_or_insert_with(|| {
-                            vec![0u64; 3 * schbench_matrix_size * schbench_matrix_size]
-                        });
+                    if matrix_size > 0 && !STOP.load(Ordering::Relaxed) {
+                        let buf = matrix_buf
+                            .get_or_insert_with(|| vec![0u64; 3 * matrix_size * matrix_size]);
                         for _ in 0..operations {
-                            schbench_matrix_multiply(buf, schbench_matrix_size);
+                            matrix_multiply(buf, matrix_size);
                             work_units = work_units.wrapping_add(1);
                         }
                     }
@@ -2574,7 +2573,7 @@ fn cache_rmw_loop(buf: &mut [u8], stride: usize, iters: u64, work_units: &mut u6
 /// storage is naturally 8-byte aligned. An earlier version took a
 /// `&mut [u8]` and cast to `*mut u64`, which was UB because a
 /// `Vec<u8>` is only 1-byte aligned.
-fn schbench_matrix_multiply(data: &mut [u64], size: usize) {
+fn matrix_multiply(data: &mut [u64], size: usize) {
     debug_assert_eq!(data.len(), 3 * size * size);
     let stride = size * size;
     for i in 0..size {
@@ -2819,10 +2818,10 @@ mod tests {
         assert_eq!(WorkType::ALL_NAMES.len(), 20);
     }
 
-    // -- schbench_matrix_multiply --
+    // -- matrix_multiply --
 
     #[test]
-    fn schbench_matrix_multiply_1x1_produces_product() {
+    fn matrix_multiply_1x1_produces_product() {
         // Size=1: A=[a], B=[b], expected C=[a*b]. The `black_box` calls
         // prevent constant folding, so the test directly exercises the
         // wrapping_mul path without any compiler optimization eating
@@ -2830,12 +2829,12 @@ mod tests {
         let mut data = vec![0u64; 3];
         data[0] = 3; // A
         data[1] = 5; // B
-        schbench_matrix_multiply(&mut data, 1);
+        matrix_multiply(&mut data, 1);
         assert_eq!(data[2], 15, "C = A * B for 1x1 matrix");
     }
 
     #[test]
-    fn schbench_matrix_multiply_2x2_against_reference() {
+    fn matrix_multiply_2x2_against_reference() {
         // A = [[1, 2], [3, 4]], B = [[5, 6], [7, 8]]
         // C = A * B = [[19, 22], [43, 50]]
         let size = 2;
@@ -2849,7 +2848,7 @@ mod tests {
         data[stride + 1] = 6;
         data[stride + 2] = 7;
         data[stride + 3] = 8;
-        schbench_matrix_multiply(&mut data, size);
+        matrix_multiply(&mut data, size);
         assert_eq!(data[2 * stride], 19);
         assert_eq!(data[2 * stride + 1], 22);
         assert_eq!(data[2 * stride + 2], 43);
@@ -2857,7 +2856,7 @@ mod tests {
     }
 
     #[test]
-    fn schbench_matrix_multiply_3x3_diagonal() {
+    fn matrix_multiply_3x3_diagonal() {
         // Identity-like: A = diag(2, 3, 5), B = diag(1, 1, 1) = I.
         // Expected C = A = diag(2, 3, 5).
         let size = 3;
@@ -2869,7 +2868,7 @@ mod tests {
         data[stride] = 1;
         data[stride + 4] = 1;
         data[stride + 8] = 1;
-        schbench_matrix_multiply(&mut data, size);
+        matrix_multiply(&mut data, size);
         let c = &data[2 * stride..3 * stride];
         // Diagonal entries carry A's diagonal because B = I.
         assert_eq!(c[0], 2);
@@ -2891,7 +2890,7 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "assertion")]
-    fn schbench_matrix_multiply_mismatched_len_panics_in_debug() {
+    fn matrix_multiply_mismatched_len_panics_in_debug() {
         // debug_assert_eq!(data.len(), 3 * size * size) guards the
         // bounds contract. Under cfg(debug_assertions) this panics.
         // Release builds skip the assert (no panic), so the test
@@ -2899,7 +2898,7 @@ mod tests {
         // `cargo nextest run --release` would run the test expecting
         // a panic the release binary can't raise.
         let mut data = vec![0u64; 5]; // 3 * 2 * 2 = 12, so 5 is wrong.
-        schbench_matrix_multiply(&mut data, 2);
+        matrix_multiply(&mut data, 2);
     }
 
     #[test]
@@ -4831,24 +4830,24 @@ mod tests {
         assert!(reports[0].wall_time_ns > 0);
     }
 
-    // -- SchBench tests --
+    // -- FanOutCompute tests --
 
     #[test]
-    fn schbench_name() {
-        let wt = WorkType::SchBench {
+    fn fan_out_compute_name() {
+        let wt = WorkType::FanOutCompute {
             fan_out: 4,
             cache_footprint_kb: 256,
             operations: 5,
             sleep_usec: 100,
         };
-        assert_eq!(wt.name(), "SchBench");
+        assert_eq!(wt.name(), "FanOutCompute");
     }
 
     #[test]
-    fn schbench_from_name() {
-        let wt = WorkType::from_name("SchBench").unwrap();
+    fn fan_out_compute_from_name() {
+        let wt = WorkType::from_name("FanOutCompute").unwrap();
         match wt {
-            WorkType::SchBench {
+            WorkType::FanOutCompute {
                 fan_out,
                 cache_footprint_kb,
                 operations,
@@ -4859,34 +4858,34 @@ mod tests {
                 assert_eq!(operations, 5);
                 assert_eq!(sleep_usec, 100);
             }
-            _ => panic!("expected SchBench"),
+            _ => panic!("expected FanOutCompute"),
         }
     }
 
     #[test]
-    fn schbench_group_size() {
-        let wt = WorkType::schbench(4, 256, 5, 100);
+    fn fan_out_compute_group_size() {
+        let wt = WorkType::fan_out_compute(4, 256, 5, 100);
         assert_eq!(wt.worker_group_size(), Some(5));
-        let wt2 = WorkType::schbench(1, 256, 5, 100);
+        let wt2 = WorkType::fan_out_compute(1, 256, 5, 100);
         assert_eq!(wt2.worker_group_size(), Some(2));
     }
 
     #[test]
-    fn schbench_needs_shared_mem() {
-        assert!(WorkType::schbench(4, 256, 5, 100).needs_shared_mem());
+    fn fan_out_compute_needs_shared_mem() {
+        assert!(WorkType::fan_out_compute(4, 256, 5, 100).needs_shared_mem());
     }
 
     #[test]
-    fn schbench_needs_cache_buf() {
-        assert!(WorkType::schbench(4, 256, 5, 100).needs_cache_buf());
+    fn fan_out_compute_needs_cache_buf() {
+        assert!(WorkType::fan_out_compute(4, 256, 5, 100).needs_cache_buf());
     }
 
     #[test]
-    fn spawn_schbench_produces_work() {
+    fn spawn_fan_out_compute_produces_work() {
         let config = WorkloadConfig {
             num_workers: 5, // 1 messenger + 4 workers
             affinity: AffinityMode::None,
-            work_type: WorkType::SchBench {
+            work_type: WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
                 operations: 5,
@@ -4901,18 +4900,22 @@ mod tests {
         let reports = h.stop_and_collect();
         assert_eq!(reports.len(), 5);
         for r in &reports {
-            assert!(r.work_units > 0, "SchBench worker {} did no work", r.tid);
+            assert!(
+                r.work_units > 0,
+                "FanOutCompute worker {} did no work",
+                r.tid
+            );
         }
         let has_latencies = reports.iter().any(|r| !r.resume_latencies_ns.is_empty());
         assert!(has_latencies, "workers should record wake latencies");
     }
 
     #[test]
-    fn spawn_schbench_bad_worker_count_fails() {
+    fn spawn_fan_out_compute_bad_worker_count_fails() {
         let config = WorkloadConfig {
             num_workers: 3,
             affinity: AffinityMode::None,
-            work_type: WorkType::SchBench {
+            work_type: WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
                 operations: 5,
@@ -4931,11 +4934,11 @@ mod tests {
     }
 
     #[test]
-    fn spawn_schbench_two_groups() {
+    fn spawn_fan_out_compute_two_groups() {
         let config = WorkloadConfig {
             num_workers: 10, // 2 groups of (1 messenger + 4 workers)
             affinity: AffinityMode::None,
-            work_type: WorkType::SchBench {
+            work_type: WorkType::FanOutCompute {
                 fan_out: 4,
                 cache_footprint_kb: 256,
                 operations: 5,
@@ -4951,7 +4954,11 @@ mod tests {
         let reports = h.stop_and_collect();
         assert_eq!(reports.len(), 10);
         for r in &reports {
-            assert!(r.work_units > 0, "SchBench worker {} did no work", r.tid);
+            assert!(
+                r.work_units > 0,
+                "FanOutCompute worker {} did no work",
+                r.tid
+            );
         }
     }
 

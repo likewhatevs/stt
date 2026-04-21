@@ -788,13 +788,13 @@ pub fn all_scenarios() -> Vec<Scenario> {
             F_BORROW,
             custom_fanout_wake
         ),
-        // Performance: schbench-style messenger/worker workload
+        // Performance: fan-out messenger/worker with compute workload
         custom!(
-            "schbench_style",
+            "fan_out_compute",
             "performance",
-            "Schbench-style wake latency vs compute workers",
+            "Fan-out wake latency vs compute workers",
             F_BORROW,
-            custom_schbench_style
+            custom_fan_out_compute
         ),
         // Stress: task creation/destruction churn
         s!(
