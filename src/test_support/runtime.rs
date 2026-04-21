@@ -211,11 +211,11 @@ mod tests {
     // -- build_cmdline_extra --
 
     use super::super::entry::{KtstrTestEntry, Sysctl};
-    use super::super::test_helpers::{ENV_LOCK, EnvVarGuard};
+    use super::super::test_helpers::{EnvVarGuard, lock_env};
 
     #[test]
     fn build_cmdline_extra_includes_iomem_relaxed_by_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         // Make sure the env does not inject spurious RUST_BACKTRACE /
         // RUST_LOG entries that would break the default assertion.
         let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn build_cmdline_extra_appends_sysctls_kargs() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
         let _env_log = EnvVarGuard::remove("RUST_LOG");
 
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn build_cmdline_extra_propagates_rust_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let _env_log = EnvVarGuard::set("RUST_LOG", "debug");
 

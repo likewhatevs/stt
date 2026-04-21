@@ -914,7 +914,7 @@ mod tests {
         STAGE_PAYLOAD_STARTED_NO_RESULT,
     };
     use super::super::test_helpers::{
-        ENV_LOCK, EVAL_TOPO, EnvVarGuard, eevdf_entry, make_vm_result, no_repro, sched_entry,
+        EVAL_TOPO, EnvVarGuard, eevdf_entry, lock_env, make_vm_result, no_repro, sched_entry,
     };
     use super::*;
     use crate::verifier::SCHED_OUTPUT_END;
@@ -923,7 +923,7 @@ mod tests {
 
     #[test]
     fn resolve_test_kernel_with_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
         let _env = EnvVarGuard::set(
             "KTSTR_TEST_KERNEL",
@@ -937,7 +937,7 @@ mod tests {
 
     #[test]
     fn resolve_test_kernel_with_nonexistent_env_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", "/nonexistent/kernel/path");
         let result = resolve_test_kernel();
         assert!(result.is_err());
@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn resolve_scheduler_discover_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env = EnvVarGuard::remove("KTSTR_SCHEDULER");
         let result = resolve_scheduler(&SchedulerSpec::Discover("__nonexistent_scheduler_xyz__"));
         assert!(result.is_err());
@@ -985,7 +985,7 @@ mod tests {
 
     #[test]
     fn resolve_scheduler_discover_via_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
         let _env = EnvVarGuard::set(
             "KTSTR_SCHEDULER",
@@ -1024,7 +1024,7 @@ mod tests {
 
     #[test]
     fn nextest_setup_writes_kernel_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
         let _env = EnvVarGuard::set(
             "KTSTR_TEST_KERNEL",
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn eval_eevdf_no_com2_output() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_eevdf_no_out__");
         let result = make_vm_result("", "boot log line\nKernel panic", 1, false);
@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     fn eval_sched_dies_with_sched_log() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let sched_log = format!(
             "noise\n{SCHED_OUTPUT_START}\ndo_enqueue_task+0x1a0\nbalance_one+0x50\n{SCHED_OUTPUT_END}\nmore",
@@ -1231,7 +1231,7 @@ mod tests {
 
     #[test]
     fn eval_timeout_no_result() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_timeout__");
         let result = make_vm_result("", "booting...\nstill booting...", 0, true);
@@ -1604,7 +1604,7 @@ mod tests {
 
     #[test]
     fn eval_timeout_with_sched_includes_diagnostics() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = sched_entry("__eval_timeout_sched__");
         let result = make_vm_result("", "Linux version 6.14.0\nkernel panic here", -1, true);
@@ -1643,7 +1643,7 @@ mod tests {
 
     #[test]
     fn eval_no_sentinels_shows_initramfs_failure() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_no_sentinel__");
         let result = make_vm_result("", "Kernel panic", 1, false);
@@ -1668,7 +1668,7 @@ mod tests {
 
     #[test]
     fn eval_init_started_but_no_payload() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_init_only__");
         let result = make_vm_result("KTSTR_INIT_STARTED\n", "boot log", 1, false);
@@ -1693,7 +1693,7 @@ mod tests {
 
     #[test]
     fn eval_payload_started_no_result() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_payload_start__");
         let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\ngarbage";

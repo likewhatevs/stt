@@ -1269,7 +1269,7 @@ fn memoized_inference() -> Arc<CachedInference> {
 /// # Locking order
 ///
 /// Callers must hold
-/// [`crate::test_support::test_helpers::ENV_LOCK`] across both the
+/// [`crate::test_support::test_helpers::lock_env`] across both the
 /// reset and any subsequent env-var mutations + `extract_via_llm`
 /// calls that depend on the freshly cleared slot. The lock keeps the
 /// reset, the env mutation, and the next initialization atomic with
@@ -1361,9 +1361,7 @@ mod tests {
         // Poisoned-lock recovery: env tests don't establish shared
         // invariants beyond the save/restore pair, so a panic inside
         // the critical section is safe to unwrap through.
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = super::super::test_helpers::lock_env();
         let _env =
             super::super::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", "/explicit/override");
         let root = resolve_cache_root().unwrap();
@@ -1515,16 +1513,10 @@ mod tests {
     #[test]
     fn ensure_in_offline_mode_fails_loudly_when_uncached() {
         // See `resolve_cache_root_honors_ktstr_cache_dir` for the
-        // ENV_LOCK rationale.
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        // lock_env() rationale.
+        let _lock = super::super::test_helpers::lock_env();
+        let _cache = super::super::test_helpers::isolated_cache_dir();
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         let fake = ModelSpec {
             file_name: "does-not-exist.gguf",
             url: "https://placeholder.example/none.gguf",
@@ -1555,15 +1547,9 @@ mod tests {
     /// out the placeholder pin, NOT the offline gate.
     #[test]
     fn ensure_surfaces_sha_shape_error_before_offline_gate() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        let _lock = super::super::test_helpers::lock_env();
+        let _cache = super::super::test_helpers::isolated_cache_dir();
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         // Placeholder-shape SHA (all-`?`, 64 chars) is 64 bytes long
         // but contains no ASCII hex digits, so is_valid_sha256_hex
         // rejects it at the shape-check step inside ensure() BEFORE
@@ -1594,10 +1580,8 @@ mod tests {
     /// at the expected path.
     #[test]
     fn status_reports_cached_but_sha_mismatch_for_garbage_bytes() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        let _lock = super::super::test_helpers::lock_env();
+        let cache = super::super::test_helpers::isolated_cache_dir();
         let spec = ModelSpec {
             file_name: "bogus.gguf",
             url: "https://placeholder.example/bogus.gguf",
@@ -1605,12 +1589,8 @@ mod tests {
             sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
             size_bytes: 16,
         };
-        let on_disk = tmp.path().join(spec.file_name);
+        let on_disk = cache.path().join(spec.file_name);
         std::fs::write(&on_disk, b"definitely-not-zero-sha").unwrap();
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         let st = status(&spec).unwrap();
         assert!(st.cached, "file exists, status must report cached=true");
         assert!(
@@ -1668,10 +1648,8 @@ mod tests {
             );
             return;
         }
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        let _lock = super::super::test_helpers::lock_env();
+        let cache = super::super::test_helpers::isolated_cache_dir();
         let spec = ModelSpec {
             file_name: "unreadable.gguf",
             url: "https://placeholder.example/unreadable.gguf",
@@ -1682,7 +1660,7 @@ mod tests {
             sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
             size_bytes: 1,
         };
-        let on_disk = tmp.path().join(spec.file_name);
+        let on_disk = cache.path().join(spec.file_name);
         std::fs::write(&on_disk, b"any content").unwrap();
         // Mode 0o000 strips owner/group/other read bits so the
         // subsequent File::open inside check_sha256 hits EACCES.
@@ -1690,10 +1668,6 @@ mod tests {
         // still returns true), so status() enters the is_file arm
         // rather than the `_ => (false, false, None)` fallback.
         std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
 
         let st = status(&spec).unwrap();
 
@@ -1742,10 +1716,8 @@ mod tests {
     /// logic into a pointless re-download branch.
     #[test]
     fn status_surfaces_malformed_pin_error_for_cached_file() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        let _lock = super::super::test_helpers::lock_env();
+        let cache = super::super::test_helpers::isolated_cache_dir();
         let spec = ModelSpec {
             file_name: "malformed-pin.gguf",
             url: "https://placeholder.example/malformed-pin.gguf",
@@ -1753,12 +1725,8 @@ mod tests {
             sha256_hex: "????????????????????????????????????????????????????????????????",
             size_bytes: 1,
         };
-        let on_disk = tmp.path().join(spec.file_name);
+        let on_disk = cache.path().join(spec.file_name);
         std::fs::write(&on_disk, b"any bytes will do").unwrap();
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         let err = status(&spec).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
@@ -1788,10 +1756,8 @@ mod tests {
     /// surface here.
     #[test]
     fn status_surfaces_length_fail_pin_error_for_cached_file() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        let _lock = super::super::test_helpers::lock_env();
+        let cache = super::super::test_helpers::isolated_cache_dir();
         let spec = ModelSpec {
             file_name: "short-pin.gguf",
             url: "https://placeholder.example/short-pin.gguf",
@@ -1799,12 +1765,8 @@ mod tests {
             sha256_hex: "000000000000000000000000000000000000000000000000000000000000000",
             size_bytes: 1,
         };
-        let on_disk = tmp.path().join(spec.file_name);
+        let on_disk = cache.path().join(spec.file_name);
         std::fs::write(&on_disk, b"any bytes will do").unwrap();
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         let err = status(&spec).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
@@ -1821,9 +1783,7 @@ mod tests {
     /// through to `XDG_CACHE_HOME` and appends `ktstr/models`.
     #[test]
     fn resolve_cache_root_honors_xdg_cache_home() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = super::super::test_helpers::lock_env();
         let _env_ktstr = super::super::test_helpers::EnvVarGuard::remove("KTSTR_CACHE_DIR");
         let _env_xdg =
             super::super::test_helpers::EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
@@ -1840,9 +1800,7 @@ mod tests {
     /// documented default on a fresh system.
     #[test]
     fn resolve_cache_root_falls_back_to_home_cache() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = super::super::test_helpers::lock_env();
         let _env_ktstr = super::super::test_helpers::EnvVarGuard::remove("KTSTR_CACHE_DIR");
         let _env_xdg = super::super::test_helpers::EnvVarGuard::remove("XDG_CACHE_HOME");
         let _env_home = super::super::test_helpers::EnvVarGuard::set("HOME", "/home/fake");
@@ -1863,9 +1821,7 @@ mod tests {
     /// silently write cache entries into the current working dir.
     #[test]
     fn resolve_cache_root_treats_empty_ktstr_cache_dir_as_unset() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = super::super::test_helpers::lock_env();
         let _env_ktstr = super::super::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", "");
         let _env_xdg =
             super::super::test_helpers::EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
@@ -1956,17 +1912,11 @@ mod tests {
     /// the full 200-char payload.
     #[test]
     fn ensure_offline_error_sanitizes_env_value_in_message() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        let _lock = super::super::test_helpers::lock_env();
+        let _cache = super::super::test_helpers::isolated_cache_dir();
         // Embed a newline + a very long tail; both get rewritten.
         let hostile = format!("inject\nbreak{}", "z".repeat(200));
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, &hostile);
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         let fake = ModelSpec {
             file_name: "not-here.gguf",
             url: "https://placeholder.example/not-here.gguf",
@@ -2516,16 +2466,10 @@ mod tests {
     /// `locate()` (which skips the offline-gate `ensure()` it expects).
     #[test]
     fn load_inference_errs_with_offline_message_under_offline_gate() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = super::super::test_helpers::lock_env();
         reset_for_test();
-        let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
+        let _cache = super::super::test_helpers::isolated_cache_dir();
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         let r = load_inference();
         match r {
             Err(e) => {
@@ -2555,16 +2499,10 @@ mod tests {
     /// because the offline gate tripped").
     #[test]
     fn extract_via_llm_returns_empty_when_backend_unavailable() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = super::super::test_helpers::lock_env();
         reset_for_test();
-        let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
+        let _cache = super::super::test_helpers::isolated_cache_dir();
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         let metrics = extract_via_llm("arbitrary stdout", None);
         assert!(metrics.is_empty());
         let metrics = extract_via_llm("stdout with hint", Some("focus"));
@@ -2595,19 +2533,13 @@ mod tests {
     /// path ran both times.
     #[test]
     fn reset_for_test_clears_model_cache_and_prefetch_verified() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = super::super::test_helpers::lock_env();
         // Seed a populated slot so we can prove reset clears it. Use
         // the offline-gate path so seeding doesn't try to load the
         // 2.44 GiB GGUF.
         reset_for_test();
-        let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
+        let _cache = super::super::test_helpers::isolated_cache_dir();
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         // First call — populates MODEL_CACHE with Err(<offline gate>).
         let _ = extract_via_llm("seed call", None);
         {
@@ -2999,17 +2931,11 @@ mod tests {
     /// is constructed.
     #[test]
     fn ensure_bails_with_non_https_error_on_http_url() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        let _lock = super::super::test_helpers::lock_env();
+        let _cache = super::super::test_helpers::isolated_cache_dir();
         // Explicitly clear the offline env so prior tests cannot
-        // poison this one through ENV_LOCK acquisition ordering.
+        // poison this one through lock_env acquisition ordering.
         let _env_offline = super::super::test_helpers::EnvVarGuard::remove(OFFLINE_ENV);
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         let spec = ModelSpec {
             file_name: "http-url.gguf",
             url: "http://placeholder.example/http-url.gguf",
@@ -3036,15 +2962,9 @@ mod tests {
     /// error rather than the clear OFFLINE_ENV message.
     #[test]
     fn ensure_under_offline_bails_on_stale_cache_sha_mismatch() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        let _lock = super::super::test_helpers::lock_env();
+        let cache = super::super::test_helpers::isolated_cache_dir();
         let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
         let spec = ModelSpec {
             file_name: "stale.gguf",
             url: "https://placeholder.example/stale.gguf",
@@ -3053,7 +2973,7 @@ mod tests {
             sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
             size_bytes: 16,
         };
-        let on_disk = tmp.path().join(spec.file_name);
+        let on_disk = cache.path().join(spec.file_name);
         std::fs::write(&on_disk, b"wrong bytes for pin").unwrap();
         // Verify status() classifies correctly before running ensure.
         let st = status(&spec).expect("status should not error on valid-shape pin");
@@ -3118,14 +3038,8 @@ mod tests {
     /// the `!path.is_file()` branch; no SHA check or download fires.
     #[test]
     fn locate_errors_when_cached_file_missing() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
+        let _lock = super::super::test_helpers::lock_env();
+        let cache = super::super::test_helpers::isolated_cache_dir();
         let err = locate(&DEFAULT_MODEL).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
@@ -3136,7 +3050,7 @@ mod tests {
             rendered.contains(DEFAULT_MODEL.file_name),
             "error must name the missing artifact: {rendered}"
         );
-        let expected_path = tmp.path().join(DEFAULT_MODEL.file_name);
+        let expected_path = cache.path().join(DEFAULT_MODEL.file_name);
         assert!(
             rendered.contains(&expected_path.display().to_string()),
             "error must include the resolved cache path: {rendered}"
@@ -3153,15 +3067,9 @@ mod tests {
     /// expected `root.join(file_name)` path.
     #[test]
     fn locate_returns_path_when_cached_file_present() {
-        let _guard = super::super::test_helpers::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
-            "KTSTR_CACHE_DIR",
-            tmp.path().to_str().expect("tempdir path is UTF-8"),
-        );
-        let expected_path = tmp.path().join(DEFAULT_MODEL.file_name);
+        let _lock = super::super::test_helpers::lock_env();
+        let cache = super::super::test_helpers::isolated_cache_dir();
+        let expected_path = cache.path().join(DEFAULT_MODEL.file_name);
         std::fs::write(&expected_path, []).unwrap();
         let got = locate(&DEFAULT_MODEL).unwrap();
         assert_eq!(got, expected_path);

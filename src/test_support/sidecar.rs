@@ -626,7 +626,7 @@ pub(crate) fn write_sidecar(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::{ENV_LOCK, EnvVarGuard};
+    use super::super::test_helpers::{EnvVarGuard, lock_env};
     use super::*;
     use crate::assert::{AssertResult, CgroupStats};
     use crate::scenario::Ctx;
@@ -953,7 +953,7 @@ mod tests {
 
     #[test]
     fn write_sidecar_defaults_to_target_dir_without_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let _env_sidecar = EnvVarGuard::remove("KTSTR_SIDECAR_DIR");
         let _env_kernel = EnvVarGuard::remove("KTSTR_KERNEL");
         let _env_target = EnvVarGuard::remove("CARGO_TARGET_DIR");
@@ -996,7 +996,7 @@ mod tests {
 
     #[test]
     fn write_sidecar_writes_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-write-test");
         let _env_sidecar = EnvVarGuard::set(
             "KTSTR_SIDECAR_DIR",
@@ -1057,7 +1057,7 @@ mod tests {
         // produce distinct sidecar filenames so neither clobbers the
         // other. A hash of work_type/sysctls/kargs alone would miss
         // this difference.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-flagvariant-test");
         let _ = std::fs::remove_dir_all(&tmp);
         let _env_sidecar = EnvVarGuard::set(
@@ -1114,7 +1114,7 @@ mod tests {
         // Two gauntlet variants differing only in work_type must
         // produce distinct sidecar filenames so neither clobbers the
         // other.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-variant-test");
         let _ = std::fs::remove_dir_all(&tmp);
         let _env_sidecar = EnvVarGuard::set(
@@ -1496,7 +1496,7 @@ mod tests {
     /// sidecars entirely for non-VM early exits.
     #[test]
     fn write_skip_sidecar_records_passed_true_skipped_true() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-writes-test");
         let _ = std::fs::remove_dir_all(&tmp);
         let _env_sidecar = EnvVarGuard::set(
@@ -1552,7 +1552,7 @@ mod tests {
     /// error would make skips invisible to post-run analysis.
     #[test]
     fn write_skip_sidecar_returns_err_when_dir_cannot_be_created() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
 
         // Create a regular file, then try to use it as the sidecar
         // directory. `create_dir_all` fails because the path exists
@@ -1698,7 +1698,7 @@ mod tests {
     fn write_sidecar_records_entry_payload_name() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-payload-name-test");
         let _ = std::fs::remove_dir_all(&tmp);
         let _env_sidecar = EnvVarGuard::set(
@@ -1770,7 +1770,7 @@ mod tests {
     fn write_sidecar_forwards_payload_metrics_slice() {
         use crate::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-metrics-slice-test");
         let _ = std::fs::remove_dir_all(&tmp);
         let _env_sidecar = EnvVarGuard::set(
@@ -1849,7 +1849,7 @@ mod tests {
     fn write_skip_sidecar_records_entry_payload_name() {
         use crate::test_support::{OutputFormat, Payload, PayloadKind};
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-payload-test");
         let _ = std::fs::remove_dir_all(&tmp);
         let _env_sidecar = EnvVarGuard::set(
