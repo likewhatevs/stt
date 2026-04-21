@@ -305,9 +305,17 @@ mod tests {
         // metric set — non-fatal extraction error so downstream
         // Check evaluation reports each referenced metric as missing
         // rather than failing the whole run.
+        //
+        // Calls `model::reset_for_test()` under `ENV_LOCK` so a
+        // previously memoized `Ok(_)` slot in `MODEL_CACHE` cannot
+        // bypass the offline gate. Without the reset, the test could
+        // pass for the wrong reason — cached inference yielding an
+        // empty Vec rather than `ensure()` tripping on the offline
+        // env var.
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        super::super::model::reset_for_test();
         let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
         let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
         let _env_cache = super::super::test_helpers::EnvVarGuard::set(
@@ -323,9 +331,13 @@ mod tests {
         // Same contract as `llm_extract_returns_empty_when_backend_unavailable`
         // but exercising the hint-carrying variant so the dispatch path
         // that plumbs `hint` into `extract_via_llm` is covered.
+        //
+        // Same `model::reset_for_test()` rationale: the offline-gate
+        // assertion is meaningful only when MODEL_CACHE starts empty.
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        super::super::model::reset_for_test();
         let tmp = tempfile::tempdir().expect("create tempdir for KTSTR_CACHE_DIR");
         let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
         let _env_cache = super::super::test_helpers::EnvVarGuard::set(
