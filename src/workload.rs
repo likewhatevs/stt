@@ -3099,7 +3099,7 @@ mod tests {
     /// config that passes the `worker_group_size` check and then
     /// provokes the per-worker pipe path (num_workers=2 with
     /// PipeIo) so the function allocates inter-worker pipes and
-    /// spawns successfully, then verifies Drop cleans up when the
+    /// spawns successfully, then checks Drop cleans up when the
     /// handle is dropped without `stop_and_collect`.
     ///
     /// The direct spawn-failure path is hard to trigger
@@ -3206,7 +3206,7 @@ mod tests {
     // helper subprocess so `setrlimit` scope is confined to that
     // child and the parent test binary's limits stay intact.
     //
-    // Cleanup verification strategy:
+    // Cleanup check strategy:
     //   - Count open fds via `/proc/self/fd/` before and after the
     //     failed `spawn`. After SpawnGuard::Drop, the fd count must
     //     return to baseline (all pipe pairs, report pipes, and start

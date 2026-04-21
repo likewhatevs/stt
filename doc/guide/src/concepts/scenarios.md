@@ -59,7 +59,7 @@ For `Steady` scenarios, `run_scenario()`:
 6. Polls scheduler liveness during the workload phase.
 7. Stops workers, collects `WorkerReport` telemetry.
 8. Runs starvation, fairness, gap, and cpuset isolation checks (see
-   [Worker checks](verification.md#worker-checks)).
+   [Worker checks](checking.md#worker-checks)).
 
 `Custom` scenarios get a `Ctx` reference and implement their own logic
 using the same building blocks. See

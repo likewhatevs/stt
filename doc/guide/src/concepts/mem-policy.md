@@ -112,17 +112,17 @@ policy. Returns the node set for `Bind`, `Interleave`,
 `PreferredMany`, and `WeightedInterleave`; a single-element set for
 `Preferred`; and an empty set for `Default`/`Local`.
 
-## NUMA verification
+## NUMA checking
 
 Page locality and migration results from workers using `MemPolicy` are
-checked by the [NUMA verification
-assertions](verification.md#numa-checks). The expected node set for
+checked by the [NUMA checking
+assertions](checking.md#numa-checks). The expected node set for
 locality checks is derived from the worker's `MemPolicy` at evaluation
 time.
 
 ## Example: NUMA-aware test
 
-A complete test that verifies page locality across two NUMA nodes:
+A complete test that checks page locality across two NUMA nodes:
 
 ```rust,ignore
 use ktstr::prelude::*;

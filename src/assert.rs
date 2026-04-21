@@ -15,7 +15,7 @@
 //! Assertion uses a three-layer merge: [`Assert::default_checks()`] ->
 //! `Scheduler.assert` -> per-test `assert`.
 //!
-//! See the [Verification](https://likewhatevs.github.io/ktstr/guide/concepts/verification.html)
+//! See the [Checking](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html)
 //! chapter of the guide.
 
 use crate::workload::WorkerReport;

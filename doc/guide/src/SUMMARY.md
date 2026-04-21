@@ -18,7 +18,7 @@
   - [Scenarios](concepts/scenarios.md)
   - [Flags](concepts/flags.md)
   - [Work Types](concepts/work-types.md)
-  - [Verification](concepts/verification.md)
+  - [Checking](concepts/checking.md)
   - [Ops and Steps](concepts/ops.md)
   - [TestTopology](concepts/topology.md)
   - [MemPolicy](concepts/mem-policy.md)
@@ -36,7 +36,7 @@
   - [Investigate a Crash](recipes/investigate-crash.md)
   - [A/B Compare Branches](recipes/ab-compare.md)
   - [Write a Dynamic Scenario](recipes/dynamic-scenario.md)
-  - [Customize Verification](recipes/custom-verification.md)
+  - [Customize Checking](recipes/custom-checking.md)
   - [Benchmarking and Negative Tests](recipes/benchmarking-tests.md)
 
 # Architecture

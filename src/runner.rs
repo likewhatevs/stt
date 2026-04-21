@@ -4,7 +4,7 @@
 //! and returns `Result<Vec<ScenarioResult>>` — one per (scenario, flag
 //! profile) pair, carrying pass/fail verdict, per-check details, and
 //! run metadata. [`RunConfig`] controls flag selection, duration, and
-//! verification behavior.
+//! checking behavior.
 //!
 //! See the [Running Tests](https://likewhatevs.github.io/ktstr/guide/running-tests.html)
 //! chapter of the guide.
@@ -21,7 +21,7 @@ use crate::topology::TestTopology;
 
 /// Full configuration for a scenario run session.
 ///
-/// Controls flag selection, durations, and verification behavior.
+/// Controls flag selection, durations, and checking behavior.
 /// The scheduler is managed externally -- `ktstr run` does not
 /// start or stop schedulers.
 #[derive(Debug, Clone)]

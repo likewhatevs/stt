@@ -549,4 +549,4 @@ Common causes:
 - **Debug thresholds**: CI often runs debug builds. Debug builds use
   relaxed thresholds (3000ms gap, 35% spread) but may still hit
   limits on slow runners. See
-  [default thresholds](concepts/verification.md#default-thresholds).
+  [default thresholds](concepts/checking.md#default-thresholds).

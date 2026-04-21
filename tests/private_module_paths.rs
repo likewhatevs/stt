@@ -1,4 +1,4 @@
-//! External-context verification for `ktstr::__private::{ctor, serde_json}`.
+//! External-context check for `ktstr::__private::{ctor, serde_json}`.
 //!
 //! The `#[ktstr_test]` proc macro emits two items that reference
 //! crates through the `__private` re-export module:

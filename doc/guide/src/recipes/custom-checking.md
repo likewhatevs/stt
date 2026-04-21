@@ -1,12 +1,12 @@
-# Customize Verification
+# Customize Checking
 
-Override default [verification](../concepts/verification.md) thresholds
+Override default [checking](../concepts/checking.md) thresholds
 for schedulers that tolerate higher imbalance, different gap thresholds,
 or relaxed event rates.
 
 ## Scheduler-level overrides
 
-Define a `Scheduler` with custom verification:
+Define a `Scheduler` with custom checks:
 
 ```rust,ignore
 use ktstr::prelude::*;
@@ -57,13 +57,13 @@ fn high_imbalance_test(ctx: &Ctx) -> Result<AssertResult> {
 
 `not_starved = true` enables starvation, fairness spread, and
 scheduling gap checks. Each threshold can be overridden independently.
-See [Verification: Worker checks](../concepts/verification.md#worker-checks)
+See [Checking: Worker checks](../concepts/checking.md#worker-checks)
 for details and default thresholds.
 
 ## Merge order
 
 Three-layer merge with last-`Some`-wins semantics. See
-[Verification: Merge layers](../concepts/verification.md#merge-layers).
+[Checking: Merge layers](../concepts/checking.md#merge-layers).
 
 ## Using Assert directly in ops scenarios
 
