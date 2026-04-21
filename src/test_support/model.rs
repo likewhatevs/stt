@@ -1195,16 +1195,14 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_offline = std::env::var(OFFLINE_ENV).ok();
-        let prev_cache = std::env::var("KTSTR_CACHE_DIR").ok();
         let tmp = tempfile::tempdir().unwrap();
         // Embed a newline + a very long tail; both get rewritten.
         let hostile = format!("inject\nbreak{}", "z".repeat(200));
-        // SAFETY: ENV_LOCK serializes, save/restore preserves state.
-        unsafe {
-            std::env::set_var(OFFLINE_ENV, &hostile);
-            std::env::set_var("KTSTR_CACHE_DIR", tmp.path());
-        }
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, &hostile);
+        let _env_cache = super::super::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            tmp.path().to_str().expect("tempdir path is UTF-8"),
+        );
         let fake = ModelSpec {
             file_name: "not-here.gguf",
             url: "https://placeholder.example/not-here.gguf",
@@ -1221,16 +1219,6 @@ mod tests {
             msg.contains("inject?break"),
             "sanitized stem missing: {msg:?}"
         );
-        unsafe {
-            match prev_offline {
-                Some(v) => std::env::set_var(OFFLINE_ENV, v),
-                None => std::env::remove_var(OFFLINE_ENV),
-            }
-            match prev_cache {
-                Some(v) => std::env::set_var("KTSTR_CACHE_DIR", v),
-                None => std::env::remove_var("KTSTR_CACHE_DIR"),
-            }
-        }
     }
 
     // -- LlmExtract pipeline --
@@ -1296,11 +1284,9 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_offline = std::env::var(OFFLINE_ENV).ok();
         // Forcing offline ensures `ensure` bails on the uncached
         // placeholder model rather than attempting a network fetch.
-        // SAFETY: ENV_LOCK serializes process-wide env mutations.
-        unsafe { std::env::set_var(OFFLINE_ENV, "1") };
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
         let r = load_inference();
         match r {
             Err(e) => {
@@ -1310,12 +1296,6 @@ mod tests {
                 );
             }
             Ok(_) => panic!("expected Err under offline gate, got Ok"),
-        }
-        unsafe {
-            match prev_offline {
-                Some(v) => std::env::set_var(OFFLINE_ENV, v),
-                None => std::env::remove_var(OFFLINE_ENV),
-            }
         }
     }
 
@@ -1330,19 +1310,11 @@ mod tests {
         let _guard = super::super::test_helpers::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let prev_offline = std::env::var(OFFLINE_ENV).ok();
-        // SAFETY: ENV_LOCK serializes process-wide env mutations.
-        unsafe { std::env::set_var(OFFLINE_ENV, "1") };
+        let _env_offline = super::super::test_helpers::EnvVarGuard::set(OFFLINE_ENV, "1");
         let metrics = extract_via_llm("arbitrary stdout", None);
         assert!(metrics.is_empty());
         let metrics = extract_via_llm("stdout with hint", Some("focus"));
         assert!(metrics.is_empty());
-        unsafe {
-            match prev_offline {
-                Some(v) => std::env::set_var(OFFLINE_ENV, v),
-                None => std::env::remove_var(OFFLINE_ENV),
-            }
-        }
     }
 
     // -- strip_think_block --

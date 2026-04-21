@@ -154,20 +154,15 @@ mod tests {
     // -- build_cmdline_extra --
 
     use super::super::entry::{KtstrTestEntry, Sysctl};
-    use super::super::test_helpers::ENV_LOCK;
+    use super::super::test_helpers::{ENV_LOCK, EnvVarGuard};
 
     #[test]
     fn build_cmdline_extra_includes_iomem_relaxed_by_default() {
         let _guard = ENV_LOCK.lock().unwrap();
         // Make sure the env does not inject spurious RUST_BACKTRACE /
         // RUST_LOG entries that would break the default assertion.
-        let prev_bt = std::env::var("RUST_BACKTRACE").ok();
-        let prev_log = std::env::var("RUST_LOG").ok();
-        // SAFETY: test holds ENV_LOCK — no other thread may mutate env concurrently.
-        unsafe {
-            std::env::remove_var("RUST_BACKTRACE");
-            std::env::remove_var("RUST_LOG");
-        }
+        let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
+        let _env_log = EnvVarGuard::remove("RUST_LOG");
 
         let entry = KtstrTestEntry {
             name: "cmdline_test",
@@ -175,30 +170,13 @@ mod tests {
         };
         let out = build_cmdline_extra(&entry);
         assert_eq!(out, "iomem=relaxed");
-
-        // SAFETY: single-threaded test restoration under ENV_LOCK.
-        unsafe {
-            match prev_bt {
-                Some(v) => std::env::set_var("RUST_BACKTRACE", v),
-                None => std::env::remove_var("RUST_BACKTRACE"),
-            }
-            match prev_log {
-                Some(v) => std::env::set_var("RUST_LOG", v),
-                None => std::env::remove_var("RUST_LOG"),
-            }
-        }
     }
 
     #[test]
     fn build_cmdline_extra_appends_sysctls_kargs() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let prev_bt = std::env::var("RUST_BACKTRACE").ok();
-        let prev_log = std::env::var("RUST_LOG").ok();
-        // SAFETY: test holds ENV_LOCK.
-        unsafe {
-            std::env::remove_var("RUST_BACKTRACE");
-            std::env::remove_var("RUST_LOG");
-        }
+        let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
+        let _env_log = EnvVarGuard::remove("RUST_LOG");
 
         static SYSCTLS: &[Sysctl] = &[Sysctl::new("kernel.foo", "1")];
         static SCHED: Scheduler = Scheduler::new("s").sysctls(SYSCTLS).kargs(&["quiet"]);
@@ -210,30 +188,13 @@ mod tests {
         };
         let out = build_cmdline_extra(&entry);
         assert_eq!(out, "iomem=relaxed sysctl.kernel.foo=1 quiet");
-
-        // SAFETY: single-threaded test restoration under ENV_LOCK.
-        unsafe {
-            match prev_bt {
-                Some(v) => std::env::set_var("RUST_BACKTRACE", v),
-                None => std::env::remove_var("RUST_BACKTRACE"),
-            }
-            match prev_log {
-                Some(v) => std::env::set_var("RUST_LOG", v),
-                None => std::env::remove_var("RUST_LOG"),
-            }
-        }
     }
 
     #[test]
     fn build_cmdline_extra_propagates_rust_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let prev_bt = std::env::var("RUST_BACKTRACE").ok();
-        let prev_log = std::env::var("RUST_LOG").ok();
-        // SAFETY: test holds ENV_LOCK.
-        unsafe {
-            std::env::set_var("RUST_BACKTRACE", "1");
-            std::env::set_var("RUST_LOG", "debug");
-        }
+        let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
+        let _env_log = EnvVarGuard::set("RUST_LOG", "debug");
 
         let entry = KtstrTestEntry {
             name: "cmd",
@@ -248,18 +209,6 @@ mod tests {
             out.contains("RUST_LOG=debug"),
             "expected RUST_LOG propagation: {out}"
         );
-
-        // SAFETY: single-threaded test restoration under ENV_LOCK.
-        unsafe {
-            match prev_bt {
-                Some(v) => std::env::set_var("RUST_BACKTRACE", v),
-                None => std::env::remove_var("RUST_BACKTRACE"),
-            }
-            match prev_log {
-                Some(v) => std::env::set_var("RUST_LOG", v),
-                None => std::env::remove_var("RUST_LOG"),
-            }
-        }
     }
 
     // -- resolve_vm_topology --
