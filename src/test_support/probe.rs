@@ -23,7 +23,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::assert::AssertResult;
-use crate::vmm;
 
 use super::args::{
     extract_probe_stack_arg, extract_test_fn_arg, extract_work_type_arg, resolve_cgroup_root,
@@ -31,7 +30,7 @@ use super::args::{
 use super::entry::find_test;
 use super::output::{extract_sched_ext_dump, print_assert_result};
 use super::profraw::try_flush_profraw;
-use super::runtime::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
+use super::runtime::{config_file_parts, verbose};
 use super::{KtstrTestEntry, TopoOverride};
 use crate::verifier::{SCHED_OUTPUT_END, SCHED_OUTPUT_START, parse_sched_output};
 
@@ -170,20 +169,17 @@ pub(crate) fn attempt_auto_repro(
     let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
-    let mut builder = vmm::KtstrVm::builder()
-        .kernel(kernel)
-        .init_binary(ktstr_bin)
-        .with_topology(vm_topology)
-        .memory_deferred_min(memory_mb)
-        .cmdline(&cmdline_extra)
-        .shm_size(KTSTR_TEST_SHM_SIZE)
-        .run_args(&guest_args)
-        .timeout(Duration::from_secs(60))
-        .no_perf_mode(no_perf_mode);
-
-    if let Some(sched_path) = scheduler {
-        builder = builder.scheduler_binary(sched_path);
-    }
+    let mut builder = super::runtime::build_vm_builder_base(
+        entry,
+        kernel,
+        ktstr_bin,
+        scheduler,
+        vm_topology,
+        memory_mb,
+        &cmdline_extra,
+        &guest_args,
+        no_perf_mode,
+    );
 
     {
         let mut args: Vec<String> = Vec::new();
@@ -197,14 +193,6 @@ pub(crate) fn attempt_auto_repro(
             builder = builder.sched_args(&args);
         }
     }
-
-    // Forward bpf_map_write and watchdog_timeout so the repro VM
-    // reproduces the same exit as the first VM with probes attached.
-    for bpf_write in entry.bpf_map_write {
-        builder =
-            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
-    }
-    builder = builder.watchdog_timeout(entry.watchdog_timeout);
 
     let vm = match builder.build() {
         Ok(vm) => vm,

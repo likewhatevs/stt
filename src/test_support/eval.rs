@@ -21,7 +21,6 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use crate::assert::AssertResult;
 use crate::timeline::StimulusEvent;
@@ -39,7 +38,7 @@ use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
 use crate::verifier::{SCHED_OUTPUT_START, parse_sched_output};
 
-use super::runtime::{KTSTR_TEST_SHM_SIZE, config_file_parts, verbose};
+use super::runtime::{config_file_parts, verbose};
 
 /// Run a single ktstr_test and return the VM's AssertResult.
 pub(crate) fn run_ktstr_test_inner(
@@ -86,26 +85,24 @@ pub(crate) fn run_ktstr_test_inner(
     let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
-    let mut builder = vmm::KtstrVm::builder()
-        .kernel(&kernel)
-        .init_binary(&ktstr_bin)
-        .with_topology(vm_topology)
-        .memory_deferred_min(memory_mb)
-        .cmdline(&cmdline_extra)
-        .shm_size(KTSTR_TEST_SHM_SIZE)
-        .run_args(&guest_args)
-        .timeout(Duration::from_secs(60))
-        .performance_mode(entry.performance_mode)
-        .no_perf_mode(no_perf_mode);
+    let mut builder = super::runtime::build_vm_builder_base(
+        entry,
+        &kernel,
+        &ktstr_bin,
+        scheduler.as_deref(),
+        vm_topology,
+        memory_mb,
+        &cmdline_extra,
+        &guest_args,
+        no_perf_mode,
+    )
+    .performance_mode(entry.performance_mode);
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.
     let merged_assert = crate::assert::Assert::default_checks()
         .merge(entry.scheduler.assert())
         .merge(&entry.assert);
 
-    if let Some(ref sched_path) = scheduler {
-        builder = builder.scheduler_binary(sched_path);
-    }
     if let Some(SchedulerSpec::KernelBuiltin { enable, disable }) =
         entry.scheduler.scheduler_binary()
     {
@@ -130,13 +127,6 @@ pub(crate) fn run_ktstr_test_inner(
     }
     if !sched_args.is_empty() {
         builder = builder.sched_args(&sched_args);
-    }
-
-    builder = builder.watchdog_timeout(entry.watchdog_timeout);
-
-    for bpf_write in entry.bpf_map_write {
-        builder =
-            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
     }
 
     // Catch ResourceContention before .context() wraps it —

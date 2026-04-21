@@ -6,6 +6,7 @@
 //! internal to `test_support`.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::entry::KtstrTestEntry;
 
@@ -104,6 +105,62 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
     }
     args.extend(entry.scheduler.sched_args().iter().map(|s| s.to_string()));
     args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
+}
+
+/// Host-side watchdog applied to every ktstr_test VM. Kept as a
+/// single const so a bump in one path cannot drift against the
+/// auto-repro path.
+pub(crate) const KTSTR_VM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Configure the ktstr_test VM builder prefix shared by the main
+/// test path ([`super::eval::run_ktstr_test_inner`]) and the
+/// auto-repro path ([`super::probe::attempt_auto_repro`]).
+///
+/// Applies, in order: kernel, init binary, topology, memory floor,
+/// guest cmdline, SHM size, guest argv, host-side timeout, perf-mode
+/// disable flag, optional scheduler binary, every queued BPF map
+/// write, and the scheduler watchdog timeout.
+///
+/// The caller owns the divergent tail. `run_ktstr_test_inner`
+/// additionally wires `performance_mode`,
+/// `sched_enable_cmds`/`sched_disable_cmds` for kernel-built
+/// schedulers, `monitor_thresholds`, and `sched_args` extended with
+/// active-flag mappings from `entry.scheduler.flag_args`.
+/// `attempt_auto_repro` additionally wires `include_files` plus
+/// base `sched_args` (no active-flag extension).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_vm_builder_base(
+    entry: &KtstrTestEntry,
+    kernel: &Path,
+    ktstr_bin: &Path,
+    scheduler: Option<&Path>,
+    vm_topology: crate::vmm::topology::Topology,
+    memory_mb: u32,
+    cmdline_extra: &str,
+    guest_args: &[String],
+    no_perf_mode: bool,
+) -> crate::vmm::KtstrVmBuilder {
+    let mut builder = crate::vmm::KtstrVm::builder()
+        .kernel(kernel)
+        .init_binary(ktstr_bin)
+        .with_topology(vm_topology)
+        .memory_deferred_min(memory_mb)
+        .cmdline(cmdline_extra)
+        .shm_size(KTSTR_TEST_SHM_SIZE)
+        .run_args(guest_args)
+        .timeout(KTSTR_VM_TIMEOUT)
+        .no_perf_mode(no_perf_mode);
+
+    if let Some(sched_path) = scheduler {
+        builder = builder.scheduler_binary(sched_path);
+    }
+
+    for bpf_write in entry.bpf_map_write {
+        builder =
+            builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);
+    }
+
+    builder.watchdog_timeout(entry.watchdog_timeout)
 }
 
 #[cfg(test)]
@@ -357,6 +414,127 @@ mod tests {
                 "--flag".to_string(),
                 "--extra".to_string(),
             ],
+        );
+    }
+
+    // -- build_vm_builder_base --
+
+    /// Kernel-path surfaces in the builder's "kernel not found" error.
+    /// Proves the `kernel()` setter is wired through the helper.
+    #[test]
+    fn build_vm_builder_base_propagates_kernel_path() {
+        let entry = KtstrTestEntry {
+            name: "vmb_kernel_path",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let exe = crate::resolve_current_exe().unwrap();
+        let missing_kernel =
+            PathBuf::from("/nonexistent/build_vm_builder_base_test_kernel.bzImage");
+        let result = build_vm_builder_base(
+            &entry,
+            &missing_kernel,
+            &exe,
+            None,
+            crate::vmm::topology::Topology::new(1, 1, 1, 1),
+            256,
+            "",
+            &["run".to_string()],
+            true,
+        )
+        .build();
+        // `KtstrVm` does not implement Debug, so `.unwrap_err()` is not
+        // available — collapse Ok into a panic to extract the error by hand.
+        let err = match result {
+            Ok(_) => panic!("builder.build() unexpectedly succeeded for missing kernel"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("kernel not found"),
+            "expected kernel not found error, got: {msg}",
+        );
+        assert!(
+            msg.contains("build_vm_builder_base_test_kernel"),
+            "expected the fake kernel path to appear in the error, got: {msg}",
+        );
+    }
+
+    /// A zero-`llcs` topology is forwarded to the builder and surfaces
+    /// as a validation error. Proves `with_topology()` is wired through.
+    #[test]
+    fn build_vm_builder_base_propagates_topology_validation() {
+        let entry = KtstrTestEntry {
+            name: "vmb_topology",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let exe = crate::resolve_current_exe().unwrap();
+        let bad_topology = crate::vmm::topology::Topology {
+            llcs: 0,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let result = build_vm_builder_base(
+            &entry,
+            &exe,
+            &exe,
+            None,
+            bad_topology,
+            256,
+            "",
+            &["run".to_string()],
+            true,
+        )
+        .build();
+        let err = match result {
+            Ok(_) => panic!("builder.build() unexpectedly succeeded for zero-llcs topology"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("llcs must be > 0"),
+            "expected topology validation error, got: {msg}",
+        );
+    }
+
+    /// An optional scheduler binary is attached when `Some(path)`
+    /// is supplied, surfacing as a "scheduler binary not found"
+    /// error when the path is missing.
+    #[test]
+    fn build_vm_builder_base_propagates_scheduler_binary() {
+        let entry = KtstrTestEntry {
+            name: "vmb_scheduler",
+            ..KtstrTestEntry::DEFAULT
+        };
+        let exe = crate::resolve_current_exe().unwrap();
+        let missing_scheduler =
+            PathBuf::from("/nonexistent/build_vm_builder_base_test_scheduler");
+        let result = build_vm_builder_base(
+            &entry,
+            &exe,
+            &exe,
+            Some(&missing_scheduler),
+            crate::vmm::topology::Topology::new(1, 1, 1, 1),
+            256,
+            "",
+            &["run".to_string()],
+            true,
+        )
+        .build();
+        let err = match result {
+            Ok(_) => panic!("builder.build() unexpectedly succeeded for missing scheduler"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scheduler binary not found"),
+            "expected scheduler binary error, got: {msg}",
+        );
+        assert!(
+            msg.contains("build_vm_builder_base_test_scheduler"),
+            "expected the fake scheduler path to appear, got: {msg}",
         );
     }
 }
