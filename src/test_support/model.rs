@@ -953,7 +953,7 @@ pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Me
     let cache = match cache {
         Ok(c) => c,
         Err(msg) => {
-            tracing::warn!(%msg, "LlmExtract model load previously failed");
+            tracing::warn!(%msg, "LlmExtract model load failed (cached)");
             return Vec::new();
         }
     };
@@ -1171,7 +1171,18 @@ mod tests {
             size_bytes: 1,
         };
         let err = ensure(&fake).unwrap_err();
-        assert!(format!("{err:#}").contains(OFFLINE_ENV), "err: {err:#}");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(OFFLINE_ENV), "err: {rendered}");
+        // Pin the not-cached branch wording: the file does not exist
+        // on disk, so ensure() must take the `!st.cached` path of the
+        // offline bail and produce "is not cached at {path}". A
+        // regression that routed this case through the stale-cache
+        // branch (or collapsed the two messages into one generic
+        // wording) would mask the distinction from the user.
+        assert!(
+            rendered.contains("is not cached"),
+            "expected not-cached branch wording, got: {rendered}"
+        );
     }
 
     /// `ensure()` must check the SHA pin shape BEFORE the offline
@@ -1278,6 +1289,15 @@ mod tests {
         assert!(
             rendered.contains("non-hex"),
             "expected malformed-pin error from verify_sha256, got: {rendered}"
+        );
+        // Pin the  context wrapper that names the offending
+        // ModelSpec's file_name. Without this assertion, a regression
+        // that dropped the .with_context layer would strip the
+        // file-name annotation and leave CLI users to guess which
+        // pin was malformed when multiple ModelSpec entries exist.
+        assert!(
+            rendered.contains(spec.file_name),
+            "expected status() context to name the file, got: {rendered}"
         );
     }
 
@@ -2253,6 +2273,18 @@ mod tests {
         assert!(
             !rendered.contains("non-HTTPS"),
             "expected offline-path bail, not the URL-scheme path: {rendered}"
+        );
+        // Pin the stale-cache branch wording introduced by . The
+        // file exists on disk but its bytes do not hash to the pin, so
+        // ensure() must take the `st.cached` path of the offline bail
+        // and produce a "do not match" message — distinct from the
+        // not-cached branch's "is not cached" wording. A regression
+        // that collapsed the two branches into a single "not cached"
+        // message would misroute the user toward a pre-seed step when
+        // they actually need to replace the stale cache entry.
+        assert!(
+            rendered.contains("do not match"),
+            "expected stale-cache branch wording, got: {rendered}"
         );
     }
 
