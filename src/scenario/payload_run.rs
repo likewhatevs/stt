@@ -19,6 +19,22 @@
 //! 2. Plus any runtime `.arg(...)` / `.args(...)` appends.
 //!
 //! Checks composition is identical in shape.
+//!
+//! # Stdout-only metric extraction
+//!
+//! The extraction pipeline consumes **stdout only**. Stderr is
+//! captured and forwarded verbatim into the exit-code-mismatch
+//! detail produced by [`Check::ExitCodeEq`] (see the
+//! `format_exit_mismatch` path) but is NEVER fed to
+//! [`crate::test_support::extract_metrics`] — neither the
+//! `OutputFormat::Json` walker nor the `OutputFormat::LlmExtract`
+//! prompt sees a stderr byte. Payloads that emit their structured
+//! output on stderr (e.g. schbench's default percentile tables via
+//! `show_latencies` → `fprintf(stderr, ...)`) therefore hand the
+//! extractor an empty string and produce zero metrics. Redirect the
+//! payload's output to stdout at the invocation site (schbench:
+//! `--json -`) or declare an `OutputFormat::ExitCode` fixture for
+//! stderr-only binaries.
 
 use std::borrow::Cow;
 use std::ffi::CString;
