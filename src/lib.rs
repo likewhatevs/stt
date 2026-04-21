@@ -480,6 +480,8 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 continue;
             }
             let image = entry.image_path();
+            // TOCTOU guard: list() guarantees image existence at scan time,
+            // but a concurrent cache-clean could delete between scan and use.
             if !image.exists() {
                 continue;
             }

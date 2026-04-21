@@ -213,10 +213,10 @@ pub fn kernel_list(json: bool) -> Result<()> {
                         "has_vmlinux": meta.has_vmlinux,
                     })
                 }
-                crate::cache::ListedEntry::Corrupt { key, path } => serde_json::json!({
+                crate::cache::ListedEntry::Corrupt { key, path, reason } => serde_json::json!({
                     "key": key,
                     "path": path.display().to_string(),
-                    "error": "corrupt metadata",
+                    "error": reason,
                 }),
             })
             .collect();
@@ -251,8 +251,8 @@ pub fn kernel_list(json: bool) -> Result<()> {
                     format_entry_row(entry, &kconfig_hash, &active_prefixes)
                 );
             }
-            crate::cache::ListedEntry::Corrupt { key, .. } => {
-                println!("  {key:<48} (corrupt metadata)");
+            crate::cache::ListedEntry::Corrupt { key, reason, .. } => {
+                println!("  {key:<48} (corrupt: {reason})");
             }
         }
     }
@@ -295,8 +295,8 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
                 crate::cache::ListedEntry::Valid(entry) => {
                     println!("{}", format_entry_row(entry, &kconfig_hash, &[]));
                 }
-                crate::cache::ListedEntry::Corrupt { key, .. } => {
-                    println!("  {key:<48} (corrupt metadata)");
+                crate::cache::ListedEntry::Corrupt { key, reason, .. } => {
+                    println!("  {key:<48} (corrupt: {reason})");
                 }
             }
         }

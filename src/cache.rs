@@ -261,20 +261,28 @@ impl CacheEntry {
 }
 
 /// Entry yielded by [`CacheDir::list`]. Distinguishes valid entries
-/// (with parsed metadata) from corrupt ones (unreadable or
-/// unparseable metadata) so callers don't have to re-check `Option`.
+/// (with parsed metadata AND a present image file) from corrupt ones
+/// (unreadable metadata, unparseable metadata, or metadata that
+/// references an image file that no longer exists) so callers don't
+/// have to re-check `Option` or re-stat the image path.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ListedEntry {
-    /// Valid cache entry with parsed metadata.
+    /// Valid cache entry with parsed metadata and an image file
+    /// present on disk at the metadata-declared path.
     Valid(CacheEntry),
-    /// Entry directory exists but metadata.json is missing or
-    /// fails to parse.
+    /// Entry directory exists but is unusable. Common reasons:
+    /// metadata.json missing, metadata.json unparseable, or metadata
+    /// parsed cleanly but the declared image file is absent (partial
+    /// download, manual deletion, failed strip+rename).
     Corrupt {
         /// Cache key (directory name).
         key: String,
         /// Path to the (corrupt) entry directory.
         path: PathBuf,
+        /// Human-readable explanation of why the entry is classified
+        /// as corrupt. Rendered by CLI consumers for the user.
+        reason: String,
     },
 }
 
@@ -381,8 +389,13 @@ impl CacheDir {
     }
 
     /// List all cached kernel entries, sorted by build time (newest
-    /// first). Entries with missing or corrupt metadata surface as
-    /// [`ListedEntry::Corrupt`] at the end of the Vec.
+    /// first). Entries with missing metadata, unparseable metadata,
+    /// or a missing image file surface as [`ListedEntry::Corrupt`] at
+    /// the end of the Vec. Valid entries are guaranteed to have an
+    /// image file present — callers can call
+    /// [`CacheEntry::image_path`] without re-stat'ing.
+    /// (Concurrent cache mutation can invalidate this — callers in
+    /// multi-process contexts should handle ENOENT gracefully.)
     pub fn list(&self) -> anyhow::Result<Vec<ListedEntry>> {
         let mut entries: Vec<ListedEntry> = Vec::new();
         let read_dir = match fs::read_dir(&self.root) {
@@ -405,12 +418,34 @@ impl CacheDir {
                 continue;
             }
             match read_metadata(&path) {
-                Some(metadata) => entries.push(ListedEntry::Valid(CacheEntry {
+                Some(metadata) => {
+                    let image_path = path.join(&metadata.image_name);
+                    if image_path.exists() {
+                        entries.push(ListedEntry::Valid(CacheEntry {
+                            key: name,
+                            path,
+                            metadata,
+                        }));
+                    } else {
+                        // Metadata parsed but the image file declared
+                        // inside it is gone — treat as corrupt so
+                        // callers don't dispatch to image_path() and
+                        // get a path that 404s downstream.
+                        entries.push(ListedEntry::Corrupt {
+                            key: name,
+                            path,
+                            reason: format!(
+                                "image file {} missing from entry directory",
+                                metadata.image_name
+                            ),
+                        });
+                    }
+                }
+                None => entries.push(ListedEntry::Corrupt {
                     key: name,
                     path,
-                    metadata,
-                })),
-                None => entries.push(ListedEntry::Corrupt { key: name, path }),
+                    reason: "metadata.json missing or unparseable".to_string(),
+                }),
             }
         }
         // Sort by built_at descending (newest first). Corrupt entries
@@ -1437,6 +1472,53 @@ mod tests {
         // Corrupt entry surfaces as ListedEntry::Corrupt.
         let corrupt = entries.iter().find(|e| e.key() == "corrupt").unwrap();
         assert!(corrupt.as_valid().is_none());
+        let ListedEntry::Corrupt { reason, .. } = corrupt else {
+            panic!("expected Corrupt variant");
+        };
+        assert!(
+            reason.contains("metadata.json missing or unparseable"),
+            "missing-metadata reason should cite metadata.json, got: {reason}",
+        );
+    }
+
+    #[test]
+    fn cache_dir_list_classifies_missing_image_as_corrupt() {
+        // Metadata parses cleanly but the image file it references
+        // has been deleted (partial download / manual cleanup).
+        // list() must surface the entry as ListedEntry::Corrupt with
+        // an image-missing reason, so callers don't dispatch to
+        // image_path() and get a stale path.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        let entry = cache
+            .store("missing-image", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+
+        // Delete only the image file; leave metadata.json in place.
+        fs::remove_file(entry.image_path()).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "missing-image");
+        assert!(
+            listed.as_valid().is_none(),
+            "entry with missing image must not surface as Valid",
+        );
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for missing-image entry");
+        };
+        assert!(
+            reason.contains("image file") && reason.contains("missing"),
+            "reason should cite missing image file, got: {reason}",
+        );
+        assert!(
+            reason.contains(&meta.image_name),
+            "reason should name the specific image file, got: {reason}",
+        );
     }
 
     #[test]
