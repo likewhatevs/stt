@@ -41,6 +41,7 @@ pub struct GuestKernel<'a> {
     l5: bool,
 }
 
+#[allow(dead_code)]
 impl<'a> GuestKernel<'a> {
     /// Create from GuestMem and vmlinux path.
     ///

@@ -50,6 +50,7 @@ const TRACE_PIPE: &str = "/sys/kernel/tracing/trace_pipe";
 const SYSFS_SCHED_EXT_ROOT_OPS: &str = "/sys/kernel/sched_ext/root/ops";
 
 /// Returns true when this process is PID 1 (running as /init in a VM).
+#[allow(dead_code)]
 pub fn is_pid1() -> bool {
     unsafe { libc::getpid() == 1 }
 }

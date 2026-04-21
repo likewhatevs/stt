@@ -1,11 +1,3 @@
-// VMM contains the KVM boot path, console/SHM ring helpers, and
-// gauntlet entry points used by `ktstr run`, `cargo ktstr verifier`,
-// `cargo ktstr shell`, and the `#[ktstr_test]` dispatch harness. It
-// stays `pub(crate)` to avoid freezing the public surface while the
-// auto-repro and monitor pipelines continue to evolve; the allow is
-// narrowed here to replace the blanket in lib.rs.
-#![allow(dead_code)]
-
 //! Virtual machine monitor for booting Linux kernels in KVM to host
 //! scheduler test scenarios.
 //!
@@ -945,6 +937,7 @@ pub struct VmResult {
     /// Data drained from the SHM ring buffer after VM exit.
     pub shm_data: Option<shm_ring::ShmDrainResult>,
     /// Stimulus events extracted from SHM ring entries.
+    #[allow(dead_code)]
     pub stimulus_events: Vec<shm_ring::StimulusEvent>,
     /// BPF verifier stats collected from host-side memory reads.
     pub verifier_stats: Vec<monitor::bpf_prog::ProgVerifierStats>,
@@ -968,6 +961,7 @@ pub struct KvmStatsTotals {
 /// Covers VM exit rate, halt-polling behavior, preemption notifications,
 /// signal-driven exits, and hypercall counts; all fields scheduler
 /// authors typically correlate with scx decisions.
+#[allow(dead_code)]
 pub const KVM_INTERESTING_STATS: &[&str] = &[
     "exits",
     "halt_exits",

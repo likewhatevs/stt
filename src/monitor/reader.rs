@@ -295,6 +295,7 @@ impl GuestMem {
     }
 
     /// Write a u32 at DRAM offset `pa + offset`.
+    #[allow(dead_code)]
     pub fn write_u32(&self, pa: u64, offset: usize, val: u32) {
         self.write_scalar::<4>(pa, offset, val.to_ne_bytes());
     }

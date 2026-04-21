@@ -1,9 +1,3 @@
-// Timeline is `pub(crate)` but its phase builders are called from
-// `cargo ktstr stats` and the VM dispatch path that renders
-// stimulus-aligned phase reports. Narrowing the allow here replaces
-// the blanket in lib.rs.
-#![allow(dead_code)]
-
 //! Stimulus/phase correlation for scenario execution.
 //!
 //! Correlates [`StimulusEvent`]s (cgroup operations, cpuset changes)
@@ -81,6 +75,7 @@ pub struct PhaseMetrics {
 
 /// Direction of change at a phase boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ChangeDirection {
     Improved,
     Degraded,
@@ -378,6 +373,7 @@ impl Timeline {
     }
 
     /// Format the timeline for human-readable output.
+    #[allow(dead_code)]
     pub fn format(&self) -> String {
         if self.phases.is_empty() {
             return String::new();
@@ -464,6 +460,7 @@ impl Timeline {
     }
 
     /// Check if any phase shows degradation.
+    #[allow(dead_code)]
     pub fn has_degradation(&self) -> bool {
         self.phases.iter().any(|p| {
             p.changes
@@ -473,6 +470,7 @@ impl Timeline {
     }
 
     /// Collect all degradation changes across phases.
+    #[allow(dead_code)]
     pub fn degradations(&self) -> Vec<(&Phase, &PhaseChange)> {
         let mut out = Vec::new();
         for phase in &self.phases {

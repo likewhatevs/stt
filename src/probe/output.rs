@@ -165,6 +165,7 @@ pub(crate) fn make_relative(path: &str) -> String {
 /// When `kernel_dir` is set and contains a vmlinux, resolves source
 /// locations from DWARF via ELF symbol table addresses (not host
 /// kallsyms).
+#[allow(dead_code)]
 pub fn format_probe_events(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)], // (func_idx, display_name)

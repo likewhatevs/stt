@@ -40,12 +40,14 @@ pub(crate) struct AccessorCtx<'a> {
 }
 
 /// BPF_MAP_TYPE_HASH from include/uapi/linux/bpf.h.
+#[allow(dead_code)]
 pub const BPF_MAP_TYPE_HASH: u32 = 1;
 
 /// BPF_MAP_TYPE_ARRAY from include/uapi/linux/bpf.h.
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 
 /// BPF_MAP_TYPE_PERCPU_ARRAY from include/uapi/linux/bpf.h.
+#[allow(dead_code)]
 pub const BPF_MAP_TYPE_PERCPU_ARRAY: u32 = 6;
 
 /// BPF_OBJ_NAME_LEN from include/linux/bpf.h.
@@ -53,6 +55,7 @@ const BPF_OBJ_NAME_LEN: usize = 16;
 
 /// Discovered BPF map metadata and value location.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BpfMapInfo {
     /// Guest physical address of the `struct bpf_map`.
     pub map_pa: u64,
@@ -334,6 +337,7 @@ pub(crate) fn read_bpf_map_value_u32(
 
 /// Maximum number of entries to iterate when walking a hash map.
 /// Prevents unbounded iteration on corrupted or very large maps.
+#[allow(dead_code)]
 const HTAB_ITER_MAX: usize = 1_000_000;
 
 /// Iterate all entries in a BPF_MAP_TYPE_HASH map, yielding (key, value)
@@ -353,6 +357,7 @@ const HTAB_ITER_MAX: usize = 1_000_000;
 /// offsets are unavailable, or the htab struct itself is untranslatable.
 /// Untranslatable buckets are skipped; an untranslatable element breaks
 /// the current bucket's chain and advances to the next bucket.
+#[allow(dead_code)]
 fn iter_htab_entries(ctx: &AccessorCtx<'_>, map: &BpfMapInfo) -> Vec<(Vec<u8>, Vec<u8>)> {
     if map.map_type != BPF_MAP_TYPE_HASH {
         return Vec::new();
@@ -453,6 +458,7 @@ fn iter_htab_entries(ctx: &AccessorCtx<'_>, map: &BpfMapInfo) -> Vec<(Vec<u8>, V
 /// does not. Returns an empty vec if the map is not
 /// `BPF_MAP_TYPE_PERCPU_ARRAY`, `key >= max_entries`, or the percpu
 /// pointer is zero.
+#[allow(dead_code)]
 fn read_percpu_array_value(
     ctx: &AccessorCtx<'_>,
     map: &BpfMapInfo,
@@ -505,6 +511,7 @@ fn read_percpu_array_value(
 /// The variant must match the [`BpfFieldKind`] of the target field.
 /// `write_field` returns `false` on mismatch.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum BpfValue {
     /// 1-byte boolean.
     Bool(bool),
@@ -526,6 +533,7 @@ pub enum BpfValue {
 /// Const, Typedef, TypeTag, Restrict) to the underlying Int or Enum.
 /// Falls back to [`Bytes`](Self::Bytes) for non-standard sizes.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum BpfFieldKind {
     /// 1-byte boolean.
     Bool,
@@ -546,6 +554,7 @@ pub enum BpfFieldKind {
 /// Resolved from BTF by [`BpfValueLayout::from_btf`]. Bitfields and
 /// unnamed fields are skipped.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BpfFieldInfo {
     /// Field name from BTF.
     pub name: String,
@@ -562,6 +571,7 @@ pub struct BpfFieldInfo {
 /// Built by [`from_btf`](Self::from_btf) which chases modifier chains
 /// to reach the underlying Struct and extracts field metadata.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BpfValueLayout {
     /// Fields in declaration order. Bitfields and unnamed fields are excluded.
     pub fields: Vec<BpfFieldInfo>,
@@ -569,6 +579,7 @@ pub struct BpfValueLayout {
     pub total_size: usize,
 }
 
+#[allow(dead_code)]
 impl BpfValueLayout {
     /// Build a layout from a btf_rs Btf and a type ID.
     ///
@@ -639,6 +650,7 @@ pub(crate) fn resolve_to_struct(btf: &btf_rs::Btf, type_id: u32) -> Option<btf_r
 /// chasing its type chain to the underlying Int or Enum (both map to
 /// signed/unsigned integer kinds by size, with Bytes as fallback for
 /// non-standard sizes).
+#[allow(dead_code)]
 fn resolve_field_kind(btf: &btf_rs::Btf, member: &btf_rs::Member) -> Option<(BpfFieldKind, usize)> {
     let mut t = btf.resolve_chained_type(member).ok()?;
     for _ in 0..20 {
@@ -701,6 +713,7 @@ fn resolve_field_kind(btf: &btf_rs::Btf, member: &btf_rs::Member) -> Option<(Bpf
 }
 
 /// Read a typed field from a BPF map's value region.
+#[allow(dead_code)]
 fn read_typed_field(
     ctx: &AccessorCtx<'_>,
     map: &BpfMapInfo,
@@ -722,6 +735,7 @@ fn read_typed_field(
 }
 
 /// Write a typed field to a BPF map's value region.
+#[allow(dead_code)]
 fn write_typed_field(
     ctx: &AccessorCtx<'_>,
     map: &BpfMapInfo,
@@ -762,6 +776,7 @@ pub struct BpfMapAccessor<'a> {
     offsets: &'a BpfMapOffsets,
 }
 
+#[allow(dead_code)]
 impl<'a> BpfMapAccessor<'a> {
     /// Create from an existing [`GuestKernel`] and a caller-owned
     /// [`BpfMapOffsets`].
@@ -963,6 +978,7 @@ pub struct BpfMapAccessorOwned<'a> {
     offsets: BpfMapOffsets,
 }
 
+#[allow(dead_code)]
 impl<'a> BpfMapAccessorOwned<'a> {
     /// Create from GuestMem and vmlinux path.
     ///

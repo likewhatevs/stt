@@ -1,9 +1,3 @@
-// Shared helper crosses the cache / initramfs boundary. `cache::strip_*`
-// wants a keep-list for vmlinux, `initramfs::strip_debug_sections` wants
-// a deny-list for user binaries; both re-parse the same object-crate
-// Builder and re-run the same write pass. Narrow `pub(crate)` visibility.
-#![allow(dead_code)]
-
 //! ELF section-stripping primitives shared between cache vmlinux
 //! handling and initramfs payload packaging.
 //!

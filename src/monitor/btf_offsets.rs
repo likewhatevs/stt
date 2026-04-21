@@ -686,15 +686,6 @@ pub struct IdrOffsets {
 }
 
 impl IdrOffsets {
-    /// All-zero IDR offsets for tests that never actually walk an idr.
-    #[cfg(test)]
-    pub(crate) const EMPTY: Self = Self {
-        xa_node_slots: 0,
-        xa_node_shift: 0,
-        idr_xa_head: 0,
-        idr_next: 0,
-    };
-
     /// Resolve IDR + xa_node offsets from a pre-loaded BTF object.
     pub fn from_btf(btf: &Btf) -> Result<Self> {
         let (xa_node, _) = find_struct(btf, "xa_node")?;
@@ -725,6 +716,7 @@ impl IdrOffsets {
 /// Byte offsets within kernel BPF structures needed for host-side
 /// BPF map discovery and value access.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BpfMapOffsets {
     /// Offset of `name` (char\[BPF_OBJ_NAME_LEN\]) within `struct bpf_map`.
     pub map_name: usize,
@@ -851,6 +843,7 @@ impl BpfMapOffsets {
 /// Resolution is optional — `resolve_htab_offsets()` returns `Err`
 /// when the required types are missing from BTF.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HtabOffsets {
     /// Offset of `buckets` pointer within `struct bpf_htab`.
     pub htab_buckets: usize,

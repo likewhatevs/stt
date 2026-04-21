@@ -1,9 +1,3 @@
-// VM exposes gauntlet presets and launch-config helpers that the
-// `ktstr run` and `cargo ktstr test` binaries consume. The module
-// stays `pub(crate)` to avoid fixing every public doc example; the
-// allow is narrowed here to replace the blanket in lib.rs.
-#![allow(dead_code)]
-
 //! VM launch configuration and gauntlet topology presets.
 //!
 //! See the [Running Tests](https://likewhatevs.github.io/ktstr/guide/running-tests.html)
@@ -57,6 +51,7 @@ impl VmConfig {
     ///
     /// Rules:
     /// - `memory_mb` must be `> 0` (a VM with zero memory cannot boot).
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<()> {
         if self.memory_mb == 0 {
             anyhow::bail!("VmConfig.memory_mb must be > 0 (a VM with zero memory cannot boot)");
@@ -70,6 +65,7 @@ impl VmConfig {
 /// Resolves the kernel image, builds the initramfs (ktstr binary +
 /// optional scheduler), and boots the VM. Returns the VM's exit
 /// result including serial output.
+#[allow(dead_code)]
 pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
     cfg.validate()?;
     // Resolve kernel
@@ -132,6 +128,7 @@ pub fn run_in_vm(cfg: &VmConfig, ktstr_args: &[String]) -> Result<VmResult> {
 /// Compute a VM timeout based on scenario count, duration, and CPU count.
 ///
 /// Accounts for boot overhead that scales with large CPU counts.
+#[allow(dead_code)]
 pub fn compute_timeout(num_runs: usize, duration_s: u64, num_cpus: usize) -> Duration {
     // Large VMs boot slower: add 1s per 10 CPUs beyond 16
     let boot_overhead = 10 + (num_cpus.saturating_sub(16) / 10) as u64;

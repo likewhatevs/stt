@@ -97,6 +97,7 @@ impl HostTopology {
     /// the given CPUs. CPUs absent from `cpu_to_node` fall back to
     /// node 0 — matches the single-node-system assumption used
     /// elsewhere in this module (see [`llc_numa_node`](Self::llc_numa_node)).
+    #[allow(dead_code)]
     pub fn numa_nodes_for_cpus(&self, cpus: &[usize]) -> Vec<usize> {
         let mut nodes: Vec<usize> = cpus
             .iter()
@@ -347,6 +348,7 @@ impl HostTopology {
 
 /// Lock mode for LLC reservation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LlcLockMode {
     /// Exclusive access to the entire LLC (performance_mode tests).
     /// Returns unavailable when any shared or exclusive holder exists.
@@ -359,6 +361,7 @@ pub enum LlcLockMode {
 
 /// Resource lock acquisition outcome.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum LockOutcome {
     /// All locks acquired successfully.
     Acquired {

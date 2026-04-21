@@ -1,11 +1,3 @@
-// Monitor exposes BPF map discovery, introspection, and value readers
-// that scheduler-level tests and the `cargo ktstr verifier` path reach
-// for from outside the crate. The module is `pub(crate)` for now, so
-// rustc sees every public helper as unused; lifting the allow to the
-// module root keeps the dead-code check at a narrower scope than the
-// old blanket in lib.rs.
-#![allow(dead_code)]
-
 //! Host-side guest memory monitor and BPF map introspection.
 //!
 //! Reads per-CPU runqueue structures from guest VM memory via BTF-resolved

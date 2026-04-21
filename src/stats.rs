@@ -1,9 +1,3 @@
-// Stats is `pub(crate)` but its extractors and comparators are called
-// from `cargo ktstr stats` CLI handlers that build outside the lib
-// crate's own dependency graph (separate [[bin]] target). Narrowing
-// the allow to this file replaces the blanket in lib.rs.
-#![allow(dead_code)]
-
 //! Gauntlet analysis and run-to-run comparison.
 //!
 //! Collects per-scenario results into a [`polars`] DataFrame for
@@ -17,34 +11,13 @@ use polars::prelude::*;
 use crate::timeline::Timeline;
 use crate::vmm::shm_ring;
 
-/// How multiple rows sharing a pairing key collapse into one
-/// value during comparison. The rule per metric is set on
-/// [`MetricDef::aggregate`]: `Mean` for rate/latency metrics,
-/// `Sum` for counter totals, `Max` for worst-case peaks, `Min`
-/// for higher-is-better metrics (so the pairing key reports the
-/// worst observed value).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Aggregator {
-    /// Arithmetic mean of per-row values.
-    Mean,
-    /// Sum of per-row values.
-    Sum,
-    /// Largest per-row value.
-    Max,
-    /// Smallest per-row value.
-    Min,
-}
-
 /// Definition of a metric for the comparison pipeline.
 ///
 /// Each entry describes polarity (`higher_is_worse`), dual-gate
 /// significance thresholds (`default_abs`, `default_rel`), a
-/// display unit string for formatted output, a row accessor
+/// display unit string for formatted output, and a row accessor
 /// (`accessor`) that returns the metric's value from a
-/// [`GauntletRow`] without a hand-maintained name→field match,
-/// and an [`Aggregator`] that describes how to reduce multiple
-/// matching rows to one value when the comparison pairing key
-/// collapses them.
+/// [`GauntletRow`] without a hand-maintained name→field match.
 ///
 /// The `accessor` field is skipped in serde output because `fn`
 /// pointers are not serializable. If a `Deserialize` impl is
@@ -67,7 +40,6 @@ pub struct MetricDef {
     pub default_abs: f64,
     pub default_rel: f64,
     pub display_unit: &'static str,
-    pub aggregate: Aggregator,
     #[serde(skip)]
     pub accessor: fn(&GauntletRow) -> Option<f64>,
 }
@@ -116,7 +88,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 5.0,
         default_rel: 0.25,
         display_unit: "%",
-        aggregate: Aggregator::Max,
         accessor: |r| Some(r.spread),
     },
     MetricDef {
@@ -125,7 +96,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 500.0,
         default_rel: 0.50,
         display_unit: "ms",
-        aggregate: Aggregator::Max,
         accessor: |r| Some(r.gap_ms as f64),
     },
     MetricDef {
@@ -134,7 +104,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 10.0,
         default_rel: 0.30,
         display_unit: "",
-        aggregate: Aggregator::Sum,
         accessor: |r| Some(r.migrations as f64),
     },
     MetricDef {
@@ -143,7 +112,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
-        aggregate: Aggregator::Max,
         accessor: |r| Some(r.migration_ratio),
     },
     MetricDef {
@@ -152,7 +120,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 1.0,
         default_rel: 0.25,
         display_unit: "x",
-        aggregate: Aggregator::Max,
         accessor: |r| Some(r.imbalance_ratio),
     },
     MetricDef {
@@ -161,7 +128,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 10.0,
         default_rel: 0.50,
         display_unit: "",
-        aggregate: Aggregator::Max,
         accessor: |r| Some(r.max_dsq_depth as f64),
     },
     MetricDef {
@@ -170,7 +136,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "",
-        aggregate: Aggregator::Sum,
         accessor: |r| Some(r.stall_count as f64),
     },
     MetricDef {
@@ -179,7 +144,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 5.0,
         default_rel: 0.30,
         display_unit: "/s",
-        aggregate: Aggregator::Sum,
         accessor: |r| Some(r.fallback_count as f64),
     },
     MetricDef {
@@ -188,7 +152,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 5.0,
         default_rel: 0.30,
         display_unit: "/s",
-        aggregate: Aggregator::Sum,
         accessor: |r| Some(r.keep_last_count as f64),
     },
     MetricDef {
@@ -197,7 +160,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
-        aggregate: Aggregator::Mean,
         accessor: |r| Some(r.p99_wake_latency_us),
     },
     MetricDef {
@@ -206,7 +168,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 20.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
-        aggregate: Aggregator::Mean,
         accessor: |r| Some(r.median_wake_latency_us),
     },
     MetricDef {
@@ -215,7 +176,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.10,
         default_rel: 0.25,
         display_unit: "",
-        aggregate: Aggregator::Mean,
         accessor: |r| Some(r.wake_latency_cv),
     },
     MetricDef {
@@ -224,7 +184,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 100.0,
         default_rel: 0.10,
         display_unit: "",
-        aggregate: Aggregator::Sum,
         accessor: |r| Some(r.total_iterations as f64),
     },
     MetricDef {
@@ -233,7 +192,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
-        aggregate: Aggregator::Mean,
         accessor: |r| Some(r.mean_run_delay_us),
     },
     MetricDef {
@@ -242,7 +200,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 100.0,
         default_rel: 0.50,
         display_unit: "\u{00b5}s",
-        aggregate: Aggregator::Max,
         accessor: |r| Some(r.worst_run_delay_us),
     },
     MetricDef {
@@ -251,7 +208,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.05,
         default_rel: 0.10,
         display_unit: "",
-        aggregate: Aggregator::Min,
         accessor: |r| Some(r.page_locality),
     },
     MetricDef {
@@ -260,7 +216,6 @@ pub static METRICS: &[MetricDef] = &[
         default_abs: 0.05,
         default_rel: 0.20,
         display_unit: "",
-        aggregate: Aggregator::Max,
         accessor: |r| Some(r.cross_node_migration_ratio),
     },
 ];
@@ -272,6 +227,7 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
 
 /// Monitor data preserved from a gauntlet VM run for timeline analysis.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct GauntletMonitorData {
     pub summary: crate::monitor::MonitorSummary,
     pub samples: Vec<crate::monitor::MonitorSample>,
@@ -280,6 +236,7 @@ pub struct GauntletMonitorData {
 
 /// Result from a single gauntlet VM run.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct VmRunResult {
     pub label: String,
     pub passed: bool,
@@ -446,6 +403,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
 
 /// Parse a gauntlet label "topology/scenario/flags[/work_type][#replica]" into
 /// (topology, scenario, flags, work_type, replica).
+#[allow(dead_code)]
 fn parse_label(label: &str) -> (&str, &str, &str, &str, u32) {
     // Strip optional "#N" replica suffix. Replicas are 1-indexed (the
     // generator never emits `#0`), so treat a parsed `0` the same way
@@ -472,6 +430,7 @@ fn parse_label(label: &str) -> (&str, &str, &str, &str, u32) {
 }
 
 /// Map op_kinds bitmask to the name of the dominant op variant.
+#[allow(dead_code)]
 fn op_kinds_to_name(op_kinds: u32) -> &'static str {
     // Return the name of the highest-priority op present.
     // Priority: the op most likely to cause observable scheduler changes.
@@ -497,6 +456,7 @@ fn op_kinds_to_name(op_kinds: u32) -> &'static str {
 }
 
 /// Convert shm_ring::StimulusEvent to timeline::StimulusEvent.
+#[allow(dead_code)]
 fn shm_stim_to_timeline(events: &[shm_ring::StimulusEvent]) -> Vec<crate::timeline::StimulusEvent> {
     let mut out = vec![crate::timeline::StimulusEvent {
         elapsed_ms: 0,
@@ -519,6 +479,7 @@ fn shm_stim_to_timeline(events: &[shm_ring::StimulusEvent]) -> Vec<crate::timeli
 
 /// Extract worst degradation per metric from a timeline.
 /// Returns (worst_op, imbalance_delta, dsq_delta, fallback_delta, keep_last_delta, count).
+#[allow(dead_code)]
 fn extract_worst_degradation(timeline: Option<&Timeline>) -> (String, f64, f64, f64, f64, u32) {
     let timeline = match timeline {
         Some(t) => t,
@@ -568,6 +529,7 @@ fn extract_worst_degradation(timeline: Option<&Timeline>) -> (String, f64, f64, 
 }
 
 /// Extract analysis rows from gauntlet results.
+#[allow(dead_code)]
 pub fn extract_rows(results: &[VmRunResult]) -> Vec<GauntletRow> {
     let mut rows = Vec::new();
     for r in results {
@@ -1435,6 +1397,7 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
 }
 
 /// Analyze gauntlet results and return a formatted report.
+#[allow(dead_code)]
 pub fn analyze_gauntlet(results: &[VmRunResult]) -> String {
     if results.is_empty() {
         return String::new();
