@@ -177,9 +177,12 @@ impl<'a> PayloadRun<'a> {
     }
 
     /// Blocking foreground run. Spawns the payload binary, waits
-    /// for it to exit, extracts metrics from stdout per the
-    /// payload's [`OutputFormat`], and evaluates declared [`Check`]s
-    /// into an [`AssertResult`].
+    /// for it to exit, extracts metrics from its output per the
+    /// payload's [`OutputFormat`] (stdout-primary with stderr
+    /// fallback for `Json` / `LlmExtract`; no extraction for
+    /// `ExitCode`), and evaluates declared [`Check`]s into an
+    /// [`AssertResult`]. See the module-level `# Stdout-primary,
+    /// stderr-fallback` section for the full contract.
     ///
     /// Runtime is bounded by the value set via
     /// [`timeout`](Self::timeout). When the deadline expires,

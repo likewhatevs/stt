@@ -3157,7 +3157,7 @@ mod tests {
         assert!(!is_eol("abc", &["6.14".to_string()]));
     }
 
-    /// The #212 regression: a cache entry on `6.15-rc1` compared
+    /// Regression guard: a cache entry on `6.15-rc1` compared
     /// against an active list that advanced to `6.15-rc4` must NOT
     /// be tagged EOL. Both prefixes normalize to `6.15`, so the
     /// comparison succeeds regardless of which RC the two sides
@@ -3189,7 +3189,7 @@ mod tests {
 
     /// A linux-next-derived cache entry targets the NEXT merge
     /// window, so its `major.minor` can precede any entry in the
-    /// current stable/longterm active list. After the #212 prefix
+    /// current stable/longterm active list. After the prefix
     /// normalization, `"6.16-rc1"` → `"6.16"`; when the active list
     /// (`fetch_active_prefixes` skips `linux-next` monikers by
     /// construction — see src/cli.rs) only carries older stable
@@ -3642,6 +3642,35 @@ mod tests {
         let out = partition_clean_candidates(&entries, Some(3), false);
         let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
         assert_eq!(keys, vec!["c1"]);
+    }
+
+    /// Defensive cell: (keep=Some, corrupt_only=true). Clap's
+    /// `#[arg(long, conflicts_with = "keep")]` on `--corrupt-only`
+    /// rejects this combination at parse time (pinned by
+    /// `kernel_clean_rejects_corrupt_only_with_keep` below), so the
+    /// partitioner never sees it in practice. But `partition_clean_candidates`
+    /// is a pure function reachable from any internal caller that
+    /// bypasses clap — a future direct caller, a unit test, or a
+    /// programmatic entry point. Pin the fallback behavior: when
+    /// `corrupt_only=true`, `keep` is inert (valid entries skipped
+    /// regardless, corrupt entries removed regardless of keep slot).
+    /// This removes the "wait, what would it do?" answer from the
+    /// code review for any future call-site that passes both.
+    #[test]
+    fn partition_clean_candidates_corrupt_only_ignores_keep() {
+        let entries = vec![
+            mk_valid("v_new1"),
+            mk_corrupt("c_mid"),
+            mk_valid("v_new2"),
+            mk_valid("v_old"),
+        ];
+        let out = partition_clean_candidates(&entries, Some(2), true);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(
+            keys,
+            vec!["c_mid"],
+            "corrupt_only=true must make keep inert: valid entries preserved, only corrupt removed",
+        );
     }
 
     // -- clap argument-parse pin: --corrupt-only conflicts_with --keep

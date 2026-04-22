@@ -77,7 +77,32 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use serde::Serialize;
 
+/// Wire schema version emitted in every [`ProbeOutput`] JSON body.
+///
+/// **Additive-safe policy**: adding a new always-emitted field or a
+/// new optional field (`#[serde(skip_serializing_if = ...)]`) does
+/// not require a bump — consumers parsing with serde's default
+/// ignore-unknown-fields behavior absorb the new field without
+/// semantic change. Only **field removals**, **field renames**, or
+/// **semantic changes to existing fields** (value shape, unit,
+/// range) trigger a version increment. This keeps the rolling
+/// enrichment cadence (per-thread comm, timestamp, error_kind, etc.)
+/// from generating spurious version churn.
 const SCHEMA_VERSION: u32 = 1;
+
+/// Capture the current wall-clock as Unix epoch seconds. `unwrap_or(0)`
+/// handles the impossible pre-epoch-clock case defensively — KVM
+/// guests under kvm-clock or NTP always resolve post-1970, so the
+/// zero is a never-fires safety net rather than a real fallback.
+/// Factored so `run()`, `run_self_test()`, and any future probe-
+/// output site reach for the same helper instead of re-typing the
+/// `SystemTime::now().duration_since(UNIX_EPOCH)...` chain.
+fn now_unix_sec() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Candidate symbol names for jemalloc's per-thread state.
 ///
@@ -174,6 +199,24 @@ struct ProbeOutput {
     schema_version: u32,
     pid: i32,
     tool_version: &'static str,
+    /// Unix-epoch seconds at the start of the probe run. Intended for
+    /// downstream diff tooling that correlates multiple probe
+    /// snapshots against a workload timeline — an absolute timestamp
+    /// lets callers align probe captures with other sidecar-emitted
+    /// events. Unix seconds rather than ISO-8601 because this bin
+    /// lives in its own compilation unit with no dependency on the
+    /// lib crate's `test_support::timefmt` helper, and a `u64` is
+    /// unambiguous and format-free for JSON consumers.
+    ///
+    /// **Clock source**: guest `CLOCK_REALTIME` (via
+    /// `std::time::SystemTime`). Host-guest correlation requires
+    /// aligned clocks — kvm-clock on the guest (default for KVM
+    /// under ktstr's VMM) or NTP on both sides. Without alignment,
+    /// the guest's monotonic drift produces a fixed offset against
+    /// the host's timeline; downstream tools diffing probe captures
+    /// across host + guest events must account for the offset or
+    /// the correlation silently skews.
+    timestamp_unix_sec: u64,
     threads: Vec<ThreadResult>,
 }
 
@@ -182,13 +225,72 @@ struct ProbeOutput {
 enum ThreadResult {
     Ok {
         tid: i32,
+        /// Per-thread name from `/proc/{pid}/task/{tid}/comm`, trimmed
+        /// of the trailing newline. `None` when the file read fails
+        /// — typically the tid exited between enumeration and the
+        /// comm read (race) — or when the comm string is empty
+        /// after trimming (defense-in-depth; unexpected for live
+        /// threads, since the kernel guarantees at least the first
+        /// 16 bytes of the task name are populated). Best-effort: a
+        /// `None` here never fails the probe.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        comm: Option<String>,
         allocated_bytes: u64,
         deallocated_bytes: u64,
     },
     Err {
         tid: i32,
+        /// Per-thread name from `/proc/{pid}/task/{tid}/comm`, read
+        /// with the same semantics as the `Ok` arm. Particularly
+        /// useful on failure: knowing WHICH thread exited or refused
+        /// attach is harder from the tid alone.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        comm: Option<String>,
+        /// Human-readable error rendering for log / stderr paths.
         error: String,
+        /// Structural classification so machine consumers can bucket
+        /// failures (race vs. permission vs. arithmetic) without
+        /// substring-matching the `error` field. See
+        /// [`ThreadErrorKind`] for variant semantics.
+        error_kind: ThreadErrorKind,
     },
+}
+
+/// Structural classifier for per-thread probe failures. The `error`
+/// string is retained for human diagnostics; this enum exists so
+/// machine consumers can aggregate (e.g. "n tids exited during
+/// probe" vs. "n tids denied ptrace attach") without substring-
+/// matching free-form text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ThreadErrorKind {
+    /// `ptrace(PTRACE_SEIZE)` or `ptrace(PTRACE_INTERRUPT)` failed.
+    /// Typical causes: ESRCH (tid exited between enumeration and
+    /// attach — the race is the common case, not exceptional) or
+    /// EPERM (yama/uid policy). Transient under workload churn.
+    PtraceAttach,
+    /// `waitpid` after interrupt returned an error or an unexpected
+    /// status. The tid may have exited between seize and wait; the
+    /// kernel reports either `Err(ECHILD)` or a non-Stopped wait
+    /// status.
+    Waitpid,
+    /// `ptrace(PTRACE_GETREGSET, NT_PRSTATUS)` failed — the target
+    /// tid exited between attach and register fetch, or the target
+    /// is not an x86_64 thread (the probe refuses non-x86_64
+    /// upstream of this path, but this variant is held as
+    /// belt-and-braces).
+    GetRegset,
+    /// `process_vm_readv` against the computed TLS address failed or
+    /// returned a short read. The address may be unmapped or the tid
+    /// may have exited mid-read. Different root cause from
+    /// `PtraceAttach` — we already have the register set when this
+    /// fires.
+    ProcessVmReadv,
+    /// TLS-offset arithmetic overflowed (e.g. `fs_base -
+    /// aligned_size + st_value` underflowed in the symbol-pin math).
+    /// Should not occur for well-formed jemalloc ELFs; a hit means
+    /// the symbol resolution produced a violated invariant.
+    TlsArithmetic,
 }
 
 // ---------------------------------------------------------------------
@@ -699,16 +801,30 @@ fn install_cleanup_handler() {
 }
 
 /// Perform the full seize → interrupt → wait → read-regs →
+/// Per-thread probe error carrying both a human rendering and a
+/// structural classifier. Produced by [`probe_single_thread`];
+/// consumed at the caller to populate [`ThreadResult::Err`].
+struct ThreadProbeError {
+    kind: ThreadErrorKind,
+    source: anyhow::Error,
+}
+
+impl ThreadProbeError {
+    fn new(kind: ThreadErrorKind, source: anyhow::Error) -> Self {
+        Self { kind, source }
+    }
+}
+
 /// read-counters → detach sequence for a single target tid.
 fn probe_single_thread(
     tid: i32,
     symbol: &TsdTlsSymbol,
     offsets: &CounterOffsets,
-) -> Result<ThreadCounters> {
+) -> std::result::Result<ThreadCounters, ThreadProbeError> {
     let pid = Pid::from_raw(tid);
 
     ptrace::seize(pid, Options::empty()).map_err(|e| {
-        if e == nix::errno::Errno::EPERM {
+        let rendered = if e == nix::errno::Errno::EPERM {
             anyhow!(
                 "ptrace(PTRACE_SEIZE) on tid {tid}: permission denied (EPERM). \
                  Grant access with one of: (1) run as root, (2) setcap \
@@ -718,7 +834,8 @@ fn probe_single_thread(
             )
         } else {
             anyhow!("ptrace(PTRACE_SEIZE) on tid {tid}: {e}")
-        }
+        };
+        ThreadProbeError::new(ThreadErrorKind::PtraceAttach, rendered)
     })?;
     // Record the attach BEFORE we try to interrupt, so a failure in
     // interrupt still lets cleanup detach us.
@@ -726,16 +843,34 @@ fn probe_single_thread(
 
     let _attached_guard = ScopeDetach(tid);
 
-    ptrace::interrupt(pid)
-        .with_context(|| format!("ptrace(PTRACE_INTERRUPT) on tid {tid}"))?;
+    ptrace::interrupt(pid).map_err(|e| {
+        ThreadProbeError::new(
+            ThreadErrorKind::PtraceAttach,
+            anyhow!("ptrace(PTRACE_INTERRUPT) on tid {tid}: {e}"),
+        )
+    })?;
     match waitpid(pid, None) {
         Ok(WaitStatus::Stopped(_, _) | WaitStatus::PtraceEvent(_, _, _)) => {}
-        Ok(other) => bail!("waitpid on tid {tid} returned unexpected status: {other:?}"),
-        Err(e) => bail!("waitpid on tid {tid}: {e}"),
+        Ok(other) => {
+            return Err(ThreadProbeError::new(
+                ThreadErrorKind::Waitpid,
+                anyhow!("waitpid on tid {tid} returned unexpected status: {other:?}"),
+            ));
+        }
+        Err(e) => {
+            return Err(ThreadProbeError::new(
+                ThreadErrorKind::Waitpid,
+                anyhow!("waitpid on tid {tid}: {e}"),
+            ));
+        }
     }
 
-    let regs = ptrace::getregset::<NT_PRSTATUS>(pid)
-        .with_context(|| format!("ptrace(PTRACE_GETREGSET, NT_PRSTATUS) on tid {tid}"))?;
+    let regs = ptrace::getregset::<NT_PRSTATUS>(pid).map_err(|e| {
+        ThreadProbeError::new(
+            ThreadErrorKind::GetRegset,
+            anyhow!("ptrace(PTRACE_GETREGSET, NT_PRSTATUS) on tid {tid}: {e}"),
+        )
+    })?;
     let fs_base = regs.fs_base;
 
     let addr = compute_tls_address(
@@ -743,7 +878,8 @@ fn probe_single_thread(
         symbol.tls_image_aligned_size,
         symbol.st_value,
         offsets.thread_allocated,
-    )?;
+    )
+    .map_err(|e| ThreadProbeError::new(ThreadErrorKind::TlsArithmetic, e))?;
 
     let (_base, span) = offsets.combined_read_span();
     let mut buf = vec![0u8; span as usize];
@@ -752,12 +888,19 @@ fn probe_single_thread(
         len: span as usize,
     };
     let mut local = [IoSliceMut::new(&mut buf)];
-    let n = process_vm_readv(pid, &mut local, &[remote])
-        .with_context(|| format!("process_vm_readv on tid {tid} at {addr:#x}"))?;
+    let n = process_vm_readv(pid, &mut local, &[remote]).map_err(|e| {
+        ThreadProbeError::new(
+            ThreadErrorKind::ProcessVmReadv,
+            anyhow!("process_vm_readv on tid {tid} at {addr:#x}: {e}"),
+        )
+    })?;
     if n != span as usize {
-        bail!(
-            "short process_vm_readv on tid {tid}: got {n} bytes, expected {span}"
-        );
+        return Err(ThreadProbeError::new(
+            ThreadErrorKind::ProcessVmReadv,
+            anyhow!(
+                "short process_vm_readv on tid {tid}: got {n} bytes, expected {span}"
+            ),
+        ));
     }
 
     let allocated = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -770,6 +913,29 @@ fn probe_single_thread(
         allocated_bytes: allocated,
         deallocated_bytes: deallocated,
     })
+}
+
+/// Best-effort read of `/proc/{pid}/task/{tid}/comm`. Trims
+/// surrounding whitespace, handling the kernel's trailing newline.
+/// Returns `None` on any read failure — tid may have exited between
+/// enumeration and this read, or the file may be unreadable for
+/// permission reasons. The comm string is a diagnostic enrichment;
+/// its absence is not a probe failure.
+///
+/// Captured BEFORE ptrace attach — a thread that renames itself via
+/// `prctl(PR_SET_NAME)` mid-probe will appear with its pre-rename
+/// name. The race is narrow (single read-modify-write inside the
+/// probe loop) and attributing a rename to a specific probe cycle
+/// is not a supported diagnostic.
+fn read_thread_comm(pid: i32, tid: i32) -> Option<String> {
+    let path = format!("/proc/{pid}/task/{tid}/comm");
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Drop guard that detaches the tid on scope exit so a mid-read
@@ -820,6 +986,19 @@ fn run(cli: &Cli) -> RunOutcome {
             ));
         }
     };
+    // Self-probe reject: PTRACE_SEIZE refuses a tracer's own tgid —
+    // ptrace semantics say a process cannot attach to itself. Catching
+    // this at the CLI boundary produces an actionable error instead of
+    // a per-thread EPERM cascade mid-run that looks like a permissions
+    // problem.
+    let self_pid = std::process::id() as i32;
+    if pid == self_pid {
+        return RunOutcome::Fatal(anyhow!(
+            "refusing to probe self (pid {pid} == ktstr-jemalloc-probe's own pid). \
+             ptrace(PTRACE_SEIZE) rejects self-attach — a process cannot trace \
+             itself. Run the probe from a separate process against the target's pid."
+        ));
+    }
     if !Path::new(&format!("/proc/{pid}")).exists() {
         return RunOutcome::Fatal(anyhow!("pid {pid} does not exist"));
     }
@@ -834,6 +1013,12 @@ fn run(cli: &Cli) -> RunOutcome {
         Err(e) => return RunOutcome::Fatal(e),
     };
 
+    // Capture timestamp BEFORE iterating threads so the field
+    // represents "start of probe run" as its doc claims — a
+    // post-loop capture would tail the variable-length per-thread
+    // ptrace work and drift into meaninglessness for long traces.
+    let timestamp_unix_sec = now_unix_sec();
+
     let mut threads: Vec<ThreadResult> = Vec::with_capacity(tids.len());
     let mut interrupted = false;
     for tid in tids {
@@ -842,15 +1027,23 @@ fn run(cli: &Cli) -> RunOutcome {
             interrupted = true;
             break;
         }
+        // Read comm BEFORE probe: on failure paths the tid may
+        // exit mid-probe, and the pre-probe read has the best chance
+        // of catching a populated comm. Best-effort either way — a
+        // `None` comm never upgrades a per-thread result to Err.
+        let comm = read_thread_comm(pid, tid);
         match probe_single_thread(tid, &symbol, &offsets) {
             Ok(c) => threads.push(ThreadResult::Ok {
                 tid,
+                comm,
                 allocated_bytes: c.allocated_bytes,
                 deallocated_bytes: c.deallocated_bytes,
             }),
             Err(e) => threads.push(ThreadResult::Err {
                 tid,
-                error: format!("{e:#}"),
+                comm,
+                error: format!("{:#}", e.source),
+                error_kind: e.kind,
             }),
         }
     }
@@ -859,6 +1052,7 @@ fn run(cli: &Cli) -> RunOutcome {
         schema_version: SCHEMA_VERSION,
         pid,
         tool_version: env!("CARGO_PKG_VERSION"),
+        timestamp_unix_sec,
         threads,
     };
 
@@ -886,13 +1080,29 @@ fn print_output(cli: &Cli, out: &ProbeOutput) -> Result<()> {
             match t {
                 ThreadResult::Ok {
                     tid,
+                    comm,
                     allocated_bytes,
                     deallocated_bytes,
-                } => println!(
-                    "tid={tid} allocated_bytes={allocated_bytes} deallocated_bytes={deallocated_bytes}",
-                ),
-                ThreadResult::Err { tid, error } => {
-                    eprintln!("warning: tid {tid}: {error}");
+                } => {
+                    let comm_suffix = comm
+                        .as_deref()
+                        .map(|c| format!(" comm={c}"))
+                        .unwrap_or_default();
+                    println!(
+                        "tid={tid}{comm_suffix} allocated_bytes={allocated_bytes} deallocated_bytes={deallocated_bytes}",
+                    );
+                }
+                ThreadResult::Err {
+                    tid,
+                    comm,
+                    error,
+                    error_kind,
+                } => {
+                    let comm_suffix = comm
+                        .as_deref()
+                        .map(|c| format!(" comm={c}"))
+                        .unwrap_or_default();
+                    eprintln!("warning: tid {tid}{comm_suffix} [{error_kind:?}]: {error}");
                 }
             }
         }
@@ -956,6 +1166,11 @@ fn run_self_test(bytes: u64) -> RunOutcome {
     }
 
     let self_pid: i32 = std::process::id() as i32;
+    // Capture timestamp BEFORE spawning the self-test worker so the
+    // field represents "start of probe run" per its doc, not the
+    // post-join point that would slide with `bytes` or worker
+    // scheduling latency.
+    let timestamp_unix_sec = now_unix_sec();
     let worker_tid = Arc::new(AtomicI32::new(0));
     let worker_fs_base = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let tid_clone = worker_tid.clone();
@@ -1067,6 +1282,7 @@ fn run_self_test(bytes: u64) -> RunOutcome {
             schema_version: SCHEMA_VERSION,
             pid: self_pid,
             tool_version: env!("CARGO_PKG_VERSION"),
+            timestamp_unix_sec,
             threads: Vec::new(),
         })
     } else {
@@ -1074,6 +1290,7 @@ fn run_self_test(bytes: u64) -> RunOutcome {
             schema_version: SCHEMA_VERSION,
             pid: self_pid,
             tool_version: env!("CARGO_PKG_VERSION"),
+            timestamp_unix_sec,
             threads: Vec::new(),
         })
     }
@@ -1266,32 +1483,77 @@ mod tests {
         assert!(find_symbol_by_name(&tab, &strs, "tsd_tls").is_none());
     }
 
-    /// JSON schema v1: success + error arms round-trip via serde.
+    /// JSON schema v1: success + error arms round-trip via serde,
+    /// with the batch-47 enrichment fields (`comm`, `error_kind`,
+    /// `timestamp_unix_sec`) present where expected. Includes a
+    /// third entry — an `Ok` with `comm: None` — to pin the
+    /// `skip_serializing_if` behavior on the Ok arm as well.
     #[test]
     fn thread_result_json_shape() {
         let ok = ThreadResult::Ok {
             tid: 42,
+            comm: Some("worker-0".to_string()),
             allocated_bytes: 1024,
             deallocated_bytes: 512,
         };
+        let ok_no_comm = ThreadResult::Ok {
+            tid: 44,
+            comm: None,
+            allocated_bytes: 2048,
+            deallocated_bytes: 1024,
+        };
         let err = ThreadResult::Err {
             tid: 43,
+            comm: None,
             error: "thread exited before probe".to_string(),
+            error_kind: ThreadErrorKind::Waitpid,
         };
         let out = ProbeOutput {
             schema_version: SCHEMA_VERSION,
             pid: 100,
             tool_version: "0.0.0",
-            threads: vec![ok, err],
+            timestamp_unix_sec: 1_700_000_000,
+            threads: vec![ok, ok_no_comm, err],
         };
         let s = serde_json::to_string(&out).unwrap();
         assert!(s.contains("\"schema_version\":1"));
         assert!(s.contains("\"pid\":100"));
+        assert!(s.contains("\"tool_version\":\"0.0.0\""));
+        assert!(s.contains("\"timestamp_unix_sec\":1700000000"));
         assert!(s.contains("\"allocated_bytes\":1024"));
         assert!(s.contains("\"deallocated_bytes\":512"));
+        assert!(s.contains("\"allocated_bytes\":2048"));
+        assert!(s.contains("\"deallocated_bytes\":1024"));
+        assert!(s.contains("\"comm\":\"worker-0\""));
         assert!(s.contains("\"error\":\"thread exited before probe\""));
+        assert!(s.contains("\"error_kind\":\"waitpid\""));
         assert!(s.contains("\"tid\":42"));
         assert!(s.contains("\"tid\":43"));
+        assert!(s.contains("\"tid\":44"));
+        // `comm: None` on EITHER arm must be omitted (skip_serializing_if).
+        // The ok_no_comm and Err entries both have comm: None, so the
+        // serialized blob must carry zero `"comm":null` occurrences.
+        assert!(!s.contains("\"comm\":null"));
+    }
+
+    /// `ThreadErrorKind` serializes every variant to its documented
+    /// snake_case token. Pins the `#[serde(rename_all = "snake_case")]`
+    /// attribute against accidental removal or rename — the error
+    /// classification is a wire contract consumed by downstream
+    /// tooling, and a silent rename ("get_regset" → "getregset")
+    /// would break every consumer that matches on the token.
+    #[test]
+    fn thread_error_kind_snake_case_serialization() {
+        for (k, expected) in [
+            (ThreadErrorKind::PtraceAttach, "ptrace_attach"),
+            (ThreadErrorKind::Waitpid, "waitpid"),
+            (ThreadErrorKind::GetRegset, "get_regset"),
+            (ThreadErrorKind::ProcessVmReadv, "process_vm_readv"),
+            (ThreadErrorKind::TlsArithmetic, "tls_arithmetic"),
+        ] {
+            let s = serde_json::to_string(&k).unwrap();
+            assert_eq!(s, format!("\"{expected}\""), "variant {k:?}");
+        }
     }
 
     /// `iter_task_ids` of /proc/self/task must return at least the

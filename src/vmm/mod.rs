@@ -4659,10 +4659,10 @@ mod tests {
         );
         // SCHEDULER_DIED / SCHEDULER_NOT_ATTACHED sentinels are
         // written by start_scheduler in rust_init on attach failure
-        // or scheduler death. "sched_ext: disabled" is the kernel's
+        // or scheduler exit. "sched_ext: disabled" is the kernel's
         // own disable message when scx tears down a scheduler (e.g.
         // on watchdog stall). Any of these appearing proves the
-        // watchdog either fired or the scheduler failed for another
+        // watchdog either fired or the scheduler exited for another
         // reason — either way the test's "no stall exit" invariant
         // is broken.
         let output = &result.output;

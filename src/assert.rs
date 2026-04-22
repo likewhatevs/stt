@@ -240,6 +240,18 @@ impl AssertDetail {
     /// form matched emitters that mentioned either phrase anywhere
     /// in a longer detail, which allowed unrelated diagnostics to
     /// accidentally trip the scheduler-death console-dump path.
+    ///
+    /// **Defense-in-depth note on `SCHED_NO_LONGER_RUNNING_PREFIX`:**
+    /// every current emitter of this prefix (see `scenario::mod.rs`
+    /// at the `anyhow::bail!` sites around the `process_alive(ctx.sched_pid)`
+    /// checks) routes through `bail!`, producing an `anyhow::Error`
+    /// that never populates an `AssertDetail::message`. In practice
+    /// the second arm of this match is unreachable via normal flow.
+    /// It stays as a defense-in-depth catch for any future migration
+    /// that converts one of those bail sites to an AssertDetail push
+    /// — if that happens the detector will pick the message up
+    /// without requiring a simultaneous edit here. Removing the arm
+    /// would silently regress that future coverage.
     pub(crate) fn is_scheduler_death(&self) -> bool {
         self.message.starts_with(SCHED_EXITED_PREFIX)
             || self.message.starts_with(SCHED_NO_LONGER_RUNNING_PREFIX)
@@ -4025,5 +4037,61 @@ numa_miss 5";
         b.stats.worst_cross_node_migration_ratio = 0.15;
         a.merge(b);
         assert!((a.stats.worst_cross_node_migration_ratio - 0.15).abs() < f64::EPSILON);
+    }
+
+    /// `is_scheduler_death` must fire on a message that starts with
+    /// `SCHED_EXITED_PREFIX`. Primary detection path: `ops::apply_op_phase`
+    /// pushes an `AssertDetail` with this prefix when the scheduler pid
+    /// goes away mid-scenario. A regression that dropped this arm (or
+    /// loosened `starts_with` back to `contains`) would silently break
+    /// the console-dump gate in `evaluate_vm_result`.
+    #[test]
+    fn is_scheduler_death_matches_sched_exited_prefix() {
+        let detail = AssertDetail::new(
+            DetailKind::Monitor,
+            format!("{SCHED_EXITED_PREFIX} unexpectedly after completing step 3 of 10 (4.2s into test)"),
+        );
+        assert!(
+            detail.is_scheduler_death(),
+            "message starting with SCHED_EXITED_PREFIX must be detected as scheduler death",
+        );
+    }
+
+    /// Defense-in-depth arm: a message starting with
+    /// `SCHED_NO_LONGER_RUNNING_PREFIX` must also be detected even
+    /// though no current emitter routes this prefix through
+    /// `AssertDetail` (all uses `anyhow::bail!`). Pin the detection so
+    /// a future migration that converts one of the bail sites to an
+    /// AssertDetail push gets picked up without a simultaneous edit
+    /// to `is_scheduler_death`.
+    #[test]
+    fn is_scheduler_death_matches_sched_no_longer_running_prefix() {
+        let detail = AssertDetail::new(
+            DetailKind::Monitor,
+            format!("{SCHED_NO_LONGER_RUNNING_PREFIX} after cgroup creation (pid=12345)"),
+        );
+        assert!(
+            detail.is_scheduler_death(),
+            "message starting with SCHED_NO_LONGER_RUNNING_PREFIX must be detected as scheduler death (defense-in-depth)",
+        );
+    }
+
+    /// Negative control: an unrelated diagnostic that merely *mentions*
+    /// the prefix mid-string must NOT trip the detector. Pin the
+    /// `starts_with` semantic — the earlier `contains` form matched
+    /// emitters that incidentally referenced "scheduler process exited"
+    /// in a later sentence, causing the console-dump gate to fire on
+    /// unrelated failures. A regression that reverts to `contains`
+    /// would fail this test.
+    #[test]
+    fn is_scheduler_death_rejects_prefix_mid_string() {
+        let detail = AssertDetail::new(
+            DetailKind::Monitor,
+            format!("unexpected: {SCHED_EXITED_PREFIX} (mentioned only as context)"),
+        );
+        assert!(
+            !detail.is_scheduler_death(),
+            "message with prefix mid-string must NOT be detected — only starts_with counts",
+        );
     }
 }

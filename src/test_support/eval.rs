@@ -1157,14 +1157,14 @@ mod tests {
     }
 
     #[test]
-    fn eval_sched_mid_test_death_triggers_repro() {
-        // Scheduler dies mid-test: sched_exit_monitor dumps log to COM2
+    fn eval_sched_mid_test_exit_triggers_repro() {
+        // Scheduler exits mid-test: sched_exit_monitor dumps log to COM2
         // but does NOT write "SCHEDULER_DIED". Auto-repro should still
         // trigger because has_active_scheduling() is true and no
         // AssertResult was produced.
         let sched_log =
             format!("{SCHED_OUTPUT_START}\nError: BPF program error\n{SCHED_OUTPUT_END}",);
-        let entry = sched_entry("__eval_mid_death_repro__");
+        let entry = sched_entry("__eval_mid_exit_repro__");
         let result = make_vm_result(&sched_log, "", 1, false);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let repro_called = std::sync::atomic::AtomicBool::new(false);
@@ -1186,7 +1186,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             repro_called.load(std::sync::atomic::Ordering::Relaxed),
-            "repro_fn should be called for mid-test scheduler death without SCHEDULER_DIED marker",
+            "repro_fn should be called for mid-test scheduler exit without SCHEDULER_DIED marker",
         );
         assert!(
             msg.contains("--- auto-repro ---"),
@@ -1816,10 +1816,10 @@ mod tests {
     // -- diagnostic section tests --
 
     #[test]
-    fn eval_sched_died_includes_console() {
+    fn eval_sched_exit_includes_console() {
         let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler process exited unexpectedly after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
-        let entry = sched_entry("__eval_sched_died_console__");
+        let entry = sched_entry("__eval_sched_exit_console__");
         let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
@@ -1841,10 +1841,10 @@ mod tests {
     }
 
     #[test]
-    fn eval_sched_died_includes_monitor() {
+    fn eval_sched_exit_includes_monitor() {
         let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler process exited unexpectedly during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
-        let entry = sched_entry("__eval_sched_died_monitor__");
+        let entry = sched_entry("__eval_sched_exit_monitor__");
         let result = crate::vmm::VmResult {
             success: false,
             exit_code: 1,

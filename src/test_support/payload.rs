@@ -490,8 +490,10 @@ impl Payload {
 /// non-empty does it retry against stderr. Well-behaved binaries
 /// keep stdout canonical; payloads that emit structured output only
 /// on stderr (schbench's `show_latencies` → `fprintf(stderr, ...)`)
-/// still parse. The streams are never merged. `ExitCode` skips both
-/// passes.
+/// still parse. The streams are never merged. `ExitCode` does
+/// neither the stdout pass nor the stderr fallback — it records the
+/// exit code and nothing else, so there is no extraction step and
+/// no fallback is needed.
 #[derive(Debug, Clone, Copy)]
 pub enum OutputFormat {
     /// Pass/fail from exit code alone. Stdout is archived for
