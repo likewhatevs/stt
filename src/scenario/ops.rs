@@ -1855,7 +1855,8 @@ fn run_scenario(
             r.details.push(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Monitor,
                 format!(
-                    "scheduler process exited unexpectedly after completing step {} of {} ({:.1}s into test)",
+                    "{} unexpectedly after completing step {} of {} ({:.1}s into test)",
+                    crate::assert::SCHED_EXITED_PREFIX,
                     step_idx,
                     steps.len(),
                     scenario_start.elapsed().as_secs_f64(),
@@ -1929,7 +1930,8 @@ fn run_scenario(
         result.details.push(crate::assert::AssertDetail::new(
             crate::assert::DetailKind::Monitor,
             format!(
-                "scheduler process exited unexpectedly (detected after all {} steps completed, {:.1}s elapsed)",
+                "{} unexpectedly (detected after all {} steps completed, {:.1}s elapsed)",
+                crate::assert::SCHED_EXITED_PREFIX,
                 steps.len(),
                 scenario_start.elapsed().as_secs_f64(),
             ),

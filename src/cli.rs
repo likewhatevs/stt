@@ -21,7 +21,7 @@ use crate::workload::WorkType;
 /// dispatch identically; defining the variants once means a new
 /// `kernel` subcommand (or a flag change) lands in both surfaces by
 /// construction.
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum KernelCommand {
     /// List cached kernel images.
     #[command(long_about = EOL_EXPLANATION)]
@@ -520,40 +520,35 @@ pub fn kernel_list(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Remove cached kernels with optional keep-N and confirmation prompt.
+/// Pure partitioner for [`kernel_clean`]: given an ordered
+/// (newest-first per `cache::list()`) slice of entries, return the
+/// subset that should be removed.
 ///
-/// `corrupt_only = true` narrows removal to `ListedEntry::Corrupt`
-/// (metadata missing or unparseable, image file absent); valid
-/// entries are left untouched regardless of `keep` / `force`.
+/// Split from [`kernel_clean`] so the policy is covered by
+/// fixture tests without touching the filesystem: selection
+/// semantics are a four-axis matrix (`Valid` vs `Corrupt`, `keep`
+/// vs no keep, `corrupt_only` true vs false) and the previous
+/// inline loop made every edge regress-only-at-runtime.
 ///
-/// `keep = Some(N)` retains the N newest **valid** entries.
-/// Corrupt entries never consume a keep slot — they are always
-/// removal candidates when `corrupt_only = false`, since they
-/// occupy disk without being usable. This avoids the pathological
-/// case where `cache.list()` sorts a corrupt entry into the top N
-/// and `--keep N` ends up preserving junk while removing real
-/// kernels.
-pub fn kernel_clean(keep: Option<usize>, force: bool, corrupt_only: bool) -> Result<()> {
-    let cache = CacheDir::new()?;
-    let entries = cache.list()?;
-
-    if entries.is_empty() {
-        println!("nothing to clean");
-        return Ok(());
-    }
-
-    let kconfig_hash = embedded_kconfig_hash();
+/// Rules:
+/// - `Corrupt` entries are always removal candidates (they occupy
+///   disk without being usable, and never consume a `keep` slot).
+/// - `Valid` entries are removal candidates only when
+///   `corrupt_only = false`; the first `keep.unwrap_or(0)` valid
+///   entries in input order are retained, every subsequent valid
+///   entry is a candidate.
+/// - Input order is preserved in the output — `cache.list()` sorts
+///   `built_at`-descending, so the retained `keep` prefix is the
+///   most recent entries.
+fn partition_clean_candidates<'a>(
+    entries: &'a [crate::cache::ListedEntry],
+    keep: Option<usize>,
+    corrupt_only: bool,
+) -> Vec<&'a crate::cache::ListedEntry> {
     let skip = keep.unwrap_or(0);
-
-    // Partition into removal candidates:
-    // - Corrupt: always a candidate (unless `corrupt_only` is the
-    //   no-op case of zero corrupt entries found below).
-    // - Valid: candidate only when `corrupt_only = false`, and the
-    //   N newest valid entries (by `cache.list()`'s built_at-desc
-    //   ordering) are retained when `keep = Some(N)`.
     let mut valid_kept = 0usize;
     let mut to_remove: Vec<&crate::cache::ListedEntry> = Vec::new();
-    for listed in &entries {
+    for listed in entries {
         match listed {
             crate::cache::ListedEntry::Valid(_) => {
                 if corrupt_only {
@@ -570,6 +565,28 @@ pub fn kernel_clean(keep: Option<usize>, force: bool, corrupt_only: bool) -> Res
             }
         }
     }
+    to_remove
+}
+
+/// Remove cached kernels with optional keep-N and confirmation prompt.
+///
+/// `corrupt_only = true` narrows removal to `ListedEntry::Corrupt`
+/// (metadata missing or unparseable, image file absent); valid
+/// entries are left untouched regardless of `keep` / `force`.
+///
+/// `keep = Some(N)` retains the N newest **valid** entries.
+pub fn kernel_clean(keep: Option<usize>, force: bool, corrupt_only: bool) -> Result<()> {
+    let cache = CacheDir::new()?;
+    let entries = cache.list()?;
+
+    if entries.is_empty() {
+        println!("nothing to clean");
+        return Ok(());
+    }
+
+    let kconfig_hash = embedded_kconfig_hash();
+
+    let to_remove = partition_clean_candidates(&entries, keep, corrupt_only);
 
     if to_remove.is_empty() {
         println!("nothing to clean");
@@ -3541,5 +3558,146 @@ mod tests {
             "non-empty active_prefixes excluding entry's prefix must tag EOL, \
              got row: {row_with_active:?}",
         );
+    }
+
+    // -- partition_clean_candidates fixture coverage -----------------
+    //
+    // Four-axis matrix: Valid vs Corrupt, keep present vs absent,
+    // corrupt_only true vs false, empty vs populated. Builds the
+    // `ListedEntry` values directly in the test to avoid touching
+    // `$HOME/.cache/ktstr`; the partitioner is a pure function of its
+    // inputs.
+
+    fn mk_valid(key: &str) -> crate::cache::ListedEntry {
+        use crate::cache::{CacheEntry, KernelMetadata, KernelSource};
+        let path = std::path::PathBuf::from(format!("/tmp/fixture/{key}"));
+        let metadata = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-22T00:00:00Z".to_string(),
+        );
+        crate::cache::ListedEntry::Valid(CacheEntry {
+            key: key.to_string(),
+            path,
+            metadata,
+        })
+    }
+
+    fn mk_corrupt(key: &str) -> crate::cache::ListedEntry {
+        crate::cache::ListedEntry::Corrupt {
+            key: key.to_string(),
+            path: std::path::PathBuf::from(format!("/tmp/fixture/{key}")),
+            reason: "test fixture corrupt".to_string(),
+        }
+    }
+
+    #[test]
+    fn partition_clean_candidates_empty_input_yields_empty_output() {
+        let out = partition_clean_candidates(&[], None, false);
+        assert!(out.is_empty());
+        let out = partition_clean_candidates(&[], Some(5), true);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn partition_clean_candidates_corrupt_only_skips_valid_entries() {
+        let entries = vec![mk_valid("v1"), mk_corrupt("c1"), mk_valid("v2")];
+        let out = partition_clean_candidates(&entries, None, true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key(), "c1");
+    }
+
+    #[test]
+    fn partition_clean_candidates_no_keep_removes_every_entry() {
+        let entries = vec![mk_valid("v1"), mk_corrupt("c1"), mk_valid("v2")];
+        let out = partition_clean_candidates(&entries, None, false);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(keys, vec!["v1", "c1", "v2"]);
+    }
+
+    #[test]
+    fn partition_clean_candidates_keep_retains_n_newest_valid_preserves_corrupt() {
+        // Input order is `cache.list()`'s built_at-desc, so index 0 is
+        // newest. keep=2 retains v_new1 + v_new2 (the first two valid
+        // entries), removes v_old, and ALWAYS removes the corrupt
+        // entry regardless of position.
+        let entries = vec![
+            mk_valid("v_new1"),
+            mk_corrupt("c_mid"),
+            mk_valid("v_new2"),
+            mk_valid("v_old"),
+        ];
+        let out = partition_clean_candidates(&entries, Some(2), false);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(keys, vec!["c_mid", "v_old"]);
+    }
+
+    #[test]
+    fn partition_clean_candidates_keep_never_preserves_corrupt() {
+        // Even when keep=3 would "cover" every entry, corrupt ones
+        // still surface as removal candidates — they don't consume a
+        // keep slot by design.
+        let entries = vec![mk_corrupt("c1"), mk_valid("v1"), mk_valid("v2")];
+        let out = partition_clean_candidates(&entries, Some(3), false);
+        let keys: Vec<&str> = out.iter().map(|e| e.key()).collect();
+        assert_eq!(keys, vec!["c1"]);
+    }
+
+    // -- clap argument-parse pin: --corrupt-only conflicts_with --keep
+    //
+    // `#[arg(long, conflicts_with = "keep")]` on the `corrupt_only`
+    // field enforces the exclusion at parse time. This fixture pins
+    // the invariant so a future refactor that drops or renames the
+    // `conflicts_with` attr (or renames the `keep` target) trips a
+    // unit-test regression immediately rather than surfacing as a
+    // quiet "keep budget silently ignored" at runtime.
+
+    #[test]
+    fn kernel_clean_rejects_corrupt_only_with_keep() {
+        use clap::Parser as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let err = TestCli::try_parse_from([
+            "prog",
+            "clean",
+            "--keep",
+            "2",
+            "--corrupt-only",
+        ])
+        .expect_err("--keep together with --corrupt-only must fail parsing");
+        let msg = err.to_string();
+        assert!(
+            msg.to_ascii_lowercase().contains("cannot be used with")
+                || msg.to_ascii_lowercase().contains("conflict"),
+            "clap error must surface the conflict between --keep and --corrupt-only, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn kernel_clean_accepts_corrupt_only_alone() {
+        use clap::Parser as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let parsed = TestCli::try_parse_from(["prog", "clean", "--corrupt-only"])
+            .expect("--corrupt-only without --keep must parse cleanly");
+        match parsed.cmd {
+            KernelCommand::Clean {
+                keep,
+                force,
+                corrupt_only,
+            } => {
+                assert_eq!(keep, None);
+                assert!(!force);
+                assert!(corrupt_only);
+            }
+            other => panic!("expected KernelCommand::Clean, got {other:?}"),
+        }
     }
 }

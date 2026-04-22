@@ -1014,7 +1014,8 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     // applicable and there is nothing to bail on.
     if ctx.sched_pid != 0 && !process_alive(ctx.sched_pid) {
         anyhow::bail!(
-            "scheduler process no longer running after cgroup creation (pid={})",
+            "{} after cgroup creation (pid={})",
+            crate::assert::SCHED_NO_LONGER_RUNNING_PREFIX,
             ctx.sched_pid,
         );
     }
@@ -1116,7 +1117,8 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         result.details.push(crate::assert::AssertDetail::new(
             crate::assert::DetailKind::Monitor,
             format!(
-                "scheduler process exited unexpectedly during workload ({:.1}s into test)",
+                "{} unexpectedly during workload ({:.1}s into test)",
+                crate::assert::SCHED_EXITED_PREFIX,
                 scenario_start.elapsed().as_secs_f64(),
             ),
         ));
@@ -1305,7 +1307,8 @@ pub fn setup_cgroups<'a>(
     // (kernel-default path); skip the liveness-based bail.
     if ctx.sched_pid != 0 && !process_alive(ctx.sched_pid) {
         anyhow::bail!(
-            "scheduler process no longer running after cgroup creation (pid={})",
+            "{} after cgroup creation (pid={})",
+            crate::assert::SCHED_NO_LONGER_RUNNING_PREFIX,
             ctx.sched_pid,
         );
     }

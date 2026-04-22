@@ -457,10 +457,7 @@ fn evaluate_vm_result(
             let console_section = if check_result
                 .details
                 .iter()
-                .any(|d| {
-                    d.contains("scheduler process exited")
-                        || d.contains("scheduler process no longer running")
-                })
+                .any(crate::assert::AssertDetail::is_scheduler_death)
                 || verbose()
             {
                 let init_stage = classify_init_stage(output);

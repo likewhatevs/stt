@@ -158,6 +158,25 @@ pub enum DetailKind {
     Other,
 }
 
+/// Message prefix emitted by scenario runners when the scheduler
+/// process has been observed to have exited (via sched_pid probe
+/// returning ESRCH or wait on the leader). Consumed by
+/// [`AssertDetail::is_scheduler_death`]; exposed as `pub(crate)`
+/// so emitters and detectors reference the same literal — renaming
+/// the prefix is a one-site edit instead of a grep-and-hope across
+/// `scenario::*` + `test_support::eval`.
+pub(crate) const SCHED_EXITED_PREFIX: &str = "scheduler process exited";
+
+/// Message prefix emitted when a scheduler liveness probe found the
+/// process no longer running. Distinct wording from
+/// [`SCHED_EXITED_PREFIX`] because the check site differs — this
+/// form fires on post-ops liveness probes, the other on in-workload
+/// detection — but both are scheduler-death signals from the
+/// detector's perspective. Consumed by
+/// [`AssertDetail::is_scheduler_death`].
+pub(crate) const SCHED_NO_LONGER_RUNNING_PREFIX: &str =
+    "scheduler process no longer running";
+
 /// A single diagnostic message from an assertion, paired with a
 /// structural [`DetailKind`] so filtering is robust to wording changes.
 ///
@@ -201,6 +220,29 @@ impl AssertDetail {
             kind,
             message: message.into(),
         }
+    }
+
+    /// True iff `message` was emitted by one of the scheduler-death
+    /// signal paths (leader exited, post-ops liveness probe returned
+    /// ESRCH, workload-phase liveness watchdog). Centralizes the
+    /// prefix-match so `test_support::eval` and any future consumer
+    /// filter against a single pair of constants rather than
+    /// open-coded `.contains(...)` chains. Prefix match (not equality)
+    /// because emitters append per-event context (elapsed time,
+    /// step number, pid) after the base phrase.
+    ///
+    /// **Emit-site contract**: every emitter MUST start the message
+    /// with [`SCHED_EXITED_PREFIX`] or [`SCHED_NO_LONGER_RUNNING_PREFIX`]
+    /// verbatim (via `format!("{PREFIX} ...")` against the const) —
+    /// burying the phrase mid-string will NOT be picked up by this
+    /// detector. The `starts_with` semantic is a deliberate
+    /// tightening over the previous `contains(...)` check: the old
+    /// form matched emitters that mentioned either phrase anywhere
+    /// in a longer detail, which allowed unrelated diagnostics to
+    /// accidentally trip the scheduler-death console-dump path.
+    pub(crate) fn is_scheduler_death(&self) -> bool {
+        self.message.starts_with(SCHED_EXITED_PREFIX)
+            || self.message.starts_with(SCHED_NO_LONGER_RUNNING_PREFIX)
     }
 }
 
