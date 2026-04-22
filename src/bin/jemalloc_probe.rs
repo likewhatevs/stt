@@ -7,22 +7,39 @@
 //! thread_event.h:117-119), so attaching late does not miss prior
 //! allocations — the reading is cumulative from thread creation.
 //!
+//! Two entry points:
+//! - `--pid <PID>`: external-pid mode. Attaches to every thread in
+//!   the target process via ptrace, reads each thread's TSD counters
+//!   through `process_vm_readv`, detaches. DWARF is resolved against
+//!   the target's `/proc/<pid>/exe`, so the target ELF must ship
+//!   with debuginfo.
+//! - `--self-test <BYTES>`: same-process closed-loop mode. Spawns an
+//!   allocator thread inside the probe itself, reads its TSD counter
+//!   via `process_vm_readv` on the probe's own pid (no ptrace needed
+//!   for same-process reads under the same-uid kernel check), and
+//!   exits 0 iff the observed counter is at least `BYTES`. DWARF is
+//!   resolved against the probe's own ELF (which is never stripped),
+//!   so external targets' debuginfo state is irrelevant in this mode.
+//!
 //! Scope for v1:
 //! - Linux x86_64 only.
 //! - Static-linked jemalloc only (symbol lives in the main executable's
 //!   static TLS image).
-//! - Requires DWARF debuginfo on the jemalloc-carrying ELF so
-//!   `offsetof(tsd_s, thread_allocated)` can be resolved without
-//!   hardcoding per-version offsets.
-//! - Requires CAP_SYS_PTRACE, root, or same-uid-as-target.
+//! - External-pid mode requires DWARF debuginfo on the target ELF and
+//!   CAP_SYS_PTRACE / root / same-uid-as-target; self-test mode
+//!   requires neither (DWARF is on the probe; the target is self).
 //!
-//! Mechanism (per target thread):
+//! Mechanism (external-pid, per target thread):
 //! 1. `ptrace(PTRACE_SEIZE)` + `ptrace(PTRACE_INTERRUPT)` to stop.
 //! 2. `ptrace(PTRACE_GETREGSET, NT_PRSTATUS)` to read `fs_base`.
 //! 3. `process_vm_readv` 24 bytes at the computed TLS address to read
 //!    `thread_allocated` + `thread_allocated_next_event_fast` +
 //!    `thread_deallocated` in one syscall while the thread is stopped.
 //! 4. `ptrace(PTRACE_DETACH)`.
+//!
+//! Mechanism (self-test): arch_prctl(ARCH_GET_FS) in the allocator
+//! thread instead of PTRACE_GETREGSET; `process_vm_readv` against
+//! self_pid; no ptrace attach/detach.
 //!
 //! Address math (Variant II TLS, x86_64):
 //!   addr(tsd_tls) = fs_base - round_up(PT_TLS.p_memsz, PT_TLS.p_align) + st_value
@@ -75,11 +92,39 @@ const TSD_TLS_SYMBOL_NAMES: &[&str] = &["tsd_tls", "je_tsd_tls", "_rjem_je_tsd_t
 
 /// DWARF struct name for jemalloc's per-thread state.
 const TSD_STRUCT_NAME: &str = "tsd_s";
+/// jemalloc mangles `tsd_s` field names with this fixed prefix via
+/// the `TSD_MANGLE` macro (`include/jemalloc/internal/tsd.h`) so
+/// that direct field access in C code triggers a compile-time
+/// symbol-lookup failure, forcing callers to go through the
+/// `tsd_*_get` / `tsd_*_set` accessor macros. The DWARF emitted by
+/// the compiler carries the mangled names verbatim — we match on
+/// the full prefixed name to avoid accidental false positives on
+/// substring overlaps like `thread_allocated_last_event_key` and
+/// `thread_allocated_next_event_fast` in the TSD_DATA_SLOW pad.
+///
+/// Defined as a macro so [`ALLOCATED_FIELD`] / [`DEALLOCATED_FIELD`]
+/// can assemble their full constant strings with `concat!` — a
+/// `const &str` does not work as an argument to `concat!`. The
+/// companion [`TSD_MANGLE_PREFIX`] const re-exposes the same string
+/// for runtime use in error messages.
+macro_rules! tsd_mangle_prefix {
+    () => {
+        "cant_access_tsd_items_directly_use_a_getter_or_setter_"
+    };
+}
+/// Runtime-accessible form of [`tsd_mangle_prefix!`]. Used by the
+/// `resolve_field_offsets` error message so a future jemalloc that
+/// renames the prefix surfaces the drift directly in the diagnostic.
+const TSD_MANGLE_PREFIX: &str = tsd_mangle_prefix!();
 /// DWARF field name for the cumulative-bytes-allocated counter
-/// inside [`TSD_STRUCT_NAME`].
-const ALLOCATED_FIELD: &str = "thread_allocated";
+/// inside [`TSD_STRUCT_NAME`]. Must be compared as an exact byte
+/// match — [`TSD_MANGLE_PREFIX`] is present on every sibling field,
+/// so a `contains`/`starts_with` check would collide with other
+/// `thread_allocated_*` names.
+const ALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_allocated");
 /// DWARF field name for the cumulative-bytes-deallocated counter.
-const DEALLOCATED_FIELD: &str = "thread_deallocated";
+/// Same exact-match rule as [`ALLOCATED_FIELD`].
+const DEALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_deallocated");
 
 /// Probe a running jemalloc-linked process and report per-thread
 /// allocated / deallocated byte counters.
@@ -333,10 +378,12 @@ pub(crate) fn resolve_field_offsets(elf_path: &Path) -> Result<CounterOffsets> {
     let allocated = allocated.ok_or_else(|| {
         anyhow!(
             "DWARF walk of {} did not find field '{}' in struct '{}' — \
-             target was built without -g or the jemalloc version renamed the field",
+             target was built without -g, the jemalloc version renamed the field, \
+             or the TSD_MANGLE prefix ('{}') drifted",
             elf_path.display(),
             ALLOCATED_FIELD,
             TSD_STRUCT_NAME,
+            TSD_MANGLE_PREFIX,
         )
     })?;
     let deallocated = deallocated.ok_or_else(|| {

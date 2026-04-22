@@ -157,21 +157,31 @@ pub(crate) fn build_vm_builder_base(
 
     // Opt-in jemalloc-probe wiring. An integration test that needs
     // the probe (see `tests/jemalloc_probe_tests.rs`) sets
-    // `KTSTR_PROBE_BINARY` to the absolute host path of
+    // `KTSTR_JEMALLOC_PROBE_BINARY` to the absolute host path of
     // `ktstr-jemalloc-probe` via `#[ctor]` before the test harness
     // dispatches. When set, the probe is packed into every VM's
-    // base initramfs and the init binary is shipped with DWARF
-    // preserved so the probe can resolve struct offsets. Absent env
-    // var = existing behavior (no probe, init stripped).
-    if let Ok(probe_path) = std::env::var("KTSTR_PROBE_BINARY")
+    // base initramfs; the init binary stays stripped because the
+    // probe carries its own DWARF. Absent env var = existing
+    // behavior (no probe).
+    if let Ok(probe_path) = std::env::var("KTSTR_JEMALLOC_PROBE_BINARY")
         && !probe_path.is_empty()
     {
-        // Pack the probe binary into the guest initramfs as an
-        // extra. No DWARF on the init — closed-loop probe tests
-        // use the probe's `--self-test` mode which inspects the
-        // probe's own `/proc/self/mem` (the probe ships with its
-        // own DWARF), so the init can stay stripped.
-        builder = builder.probe_binary(std::path::PathBuf::from(probe_path));
+        // Pack the probe binary into the guest initramfs at
+        // `/bin/ktstr-jemalloc-probe`. Closed-loop probe tests use
+        // either the probe's `--self-test` mode (same-process read)
+        // or the paired `ktstr-jemalloc-alloc-worker` target
+        // (external-pid read); both rely on DWARF in the probe's
+        // own ELF, not the init's.
+        builder = builder.jemalloc_probe_binary(std::path::PathBuf::from(probe_path));
+    }
+    if let Ok(worker_path) = std::env::var("KTSTR_JEMALLOC_ALLOC_WORKER_BINARY")
+        && !worker_path.is_empty()
+    {
+        // Pack the jemalloc-alloc-worker binary alongside the
+        // probe. Only the cross-process closed-loop test sets
+        // this; scheduler-only tests leave the env var unset and
+        // skip the wiring.
+        builder = builder.jemalloc_alloc_worker_binary(std::path::PathBuf::from(worker_path));
     }
 
     for bpf_write in entry.bpf_map_write {

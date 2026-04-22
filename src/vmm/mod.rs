@@ -132,17 +132,21 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
 
 impl BaseKey {
     /// Hashes the payload binary content, payload shared libs,
-    /// optional scheduler binary content and shared libs, optional
-    /// probe binary content and shared libs, and the
-    /// `preserve_payload_dwarf` flag. Probe and preserve-dwarf
-    /// participate because both change the bytes written into the
-    /// initramfs: a preserved-DWARF init is a different blob from a
-    /// stripped one, and a probe extra adds another binary to the
-    /// archive.
+    /// optional scheduler / probe / alloc-worker binary content and
+    /// shared libs, and the `preserve_payload_dwarf` flag. Each
+    /// optional input participates symmetrically because each
+    /// changes the bytes written into the initramfs. Even though
+    /// probe + alloc-worker are currently routed through
+    /// `include_files` (so their content also appears in the
+    /// `new_shell` include-hash loop), an explicit parameter keeps
+    /// the cache key sensitive to those inputs regardless of the
+    /// routing choice — if a future change moves them back to
+    /// extras, the key stays correct without a separate update.
     pub(crate) fn new(
         payload: &Path,
         scheduler: Option<&Path>,
         probe: Option<&Path>,
+        worker: Option<&Path>,
         preserve_payload_dwarf: bool,
     ) -> Result<Self> {
         use siphasher::sip::SipHasher13;
@@ -169,6 +173,15 @@ impl BaseKey {
             None => 0u8.hash(&mut hasher),
         }
 
+        match worker {
+            Some(w) => {
+                1u8.hash(&mut hasher);
+                hash_file(w)?.hash(&mut hasher);
+                Self::hash_shared_libs(w, &mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+
         preserve_payload_dwarf.hash(&mut hasher);
 
         Ok(BaseKey(hasher.finish()))
@@ -178,13 +191,14 @@ impl BaseKey {
     /// busybox flag so different shell configurations get distinct
     /// cache keys. Include file archive paths and content are hashed
     /// so the same payload + same includes = cache hit, while
-    /// different includes = cache miss. `probe` and
+    /// different includes = cache miss. `probe`, `worker`, and
     /// `preserve_payload_dwarf` are hashed for the same reasons as
     /// [`BaseKey::new`].
     pub(crate) fn new_shell(
         payload: &Path,
         scheduler: Option<&Path>,
         probe: Option<&Path>,
+        worker: Option<&Path>,
         include_files: &[(String, PathBuf)],
         busybox: bool,
         preserve_payload_dwarf: bool,
@@ -211,6 +225,15 @@ impl BaseKey {
                 1u8.hash(&mut hasher);
                 hash_file(p)?.hash(&mut hasher);
                 Self::hash_shared_libs(p, &mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+
+        match worker {
+            Some(w) => {
+                1u8.hash(&mut hasher);
+                hash_file(w)?.hash(&mut hasher);
+                Self::hash_shared_libs(w, &mut hasher);
             }
             None => 0u8.hash(&mut hasher),
         }
@@ -874,9 +897,15 @@ pub struct KtstrVm {
     /// Passed to the guest via /exec_cmd in the initramfs.
     exec_cmd: Option<String>,
     /// Optional host path to `ktstr-jemalloc-probe`. When `Some`, the
-    /// probe is packed into the guest initramfs as an extra binary
-    /// alongside `scheduler_binary`. Consumed by `spawn_initramfs_resolve`.
-    probe_binary: Option<PathBuf>,
+    /// probe is packed into the guest initramfs as an extra binary at
+    /// `bin/ktstr-jemalloc-probe`. Consumed by `spawn_initramfs_resolve`.
+    jemalloc_probe_binary: Option<PathBuf>,
+    /// Optional host path to `ktstr-jemalloc-alloc-worker`. When
+    /// `Some`, the worker is packed alongside the probe as an
+    /// extra. The cross-process closed-loop test in
+    /// `tests/jemalloc_probe_tests.rs` spawns it as a background
+    /// payload and probes its pid.
+    jemalloc_alloc_worker_binary: Option<PathBuf>,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -1440,46 +1469,69 @@ impl KtstrVm {
         let bin = self.init_binary.as_ref()?;
         let payload = bin.clone();
         let scheduler = self.scheduler_binary.clone();
-        let probe = self.probe_binary.clone();
+        let probe = self.jemalloc_probe_binary.clone();
+        let worker = self.jemalloc_alloc_worker_binary.clone();
         // `preserve_payload_dwarf` remains on the internal build
         // + cache APIs for future use (GNU-debuglink follow-up can
         // reintroduce a builder knob), but no current code path
         // invokes it — the closed-loop probe tests rely on the
-        // probe binary's own DWARF via `--self-test`.
+        // probe binary's own DWARF via `--self-test` or on the
+        // `jemalloc-alloc-worker` binary's own DWARF.
         let preserve_payload_dwarf = false;
         let include_files = self.include_files.clone();
         let busybox = self.busybox;
         std::thread::Builder::new()
             .name("initramfs-resolve".into())
             .spawn(move || -> Result<(BaseRef, BaseKey)> {
-                // Extras are content-addressed binaries packed next to the
-                // init under `/init` siblings. Order is stable (scheduler
-                // first, probe second) so the cache key computed by
-                // `BaseKey::new` / `BaseKey::new_shell` matches the
-                // initramfs we actually build.
+                // Extras are stripped by `build_initramfs_base`
+                // before write. The scheduler can lose its DWARF
+                // without functional impact, but the probe and
+                // worker MUST retain DWARF — the probe resolves
+                // `tsd_s.thread_allocated` field offsets against
+                // the running target's `/proc/<pid>/exe`, and a
+                // stripped target has no DWARF to walk. Route
+                // probe + worker through `include_files` instead,
+                // which copies files verbatim (no `strip_debug`).
                 let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
                 if let Some(s) = scheduler.as_deref() {
                     extras.push(("scheduler", s));
                 }
+                // Shell-mode cache keying treats ANY include_files
+                // as shell-mode. `jemalloc_probe_binary` and `jemalloc_alloc_worker_binary`
+                // are real include_files at the cache-key layer —
+                // hash them accordingly so a binary-change
+                // invalidates the cache. The scheduler stays in
+                // the non-shell path.
+                let has_jemalloc_extras =
+                    probe.as_deref().is_some() || worker.as_deref().is_some();
+                let shell_mode =
+                    busybox || !include_files.is_empty() || has_jemalloc_extras;
+
+                // Merge include_files with probe + worker so both
+                // the cache key and the actual archive build see
+                // the same input set.
+                let mut merged_includes: Vec<(String, PathBuf)> =
+                    include_files.clone();
                 if let Some(p) = probe.as_deref() {
-                    // Prefix with `bin/` so the probe lands at
-                    // `/bin/ktstr-jemalloc-probe` in the guest
-                    // archive — `/bin` is on the guest `PATH` (see
-                    // `rust_init::build_include_path`), so the
-                    // probe resolves by bare name via
-                    // `Command::new("ktstr-jemalloc-probe")`. The
-                    // `bin/busybox` entry at
-                    // `src/vmm/initramfs.rs:848` follows the same
-                    // convention.
-                    extras.push(("bin/ktstr-jemalloc-probe", p));
+                    merged_includes.push((
+                        "bin/ktstr-jemalloc-probe".to_string(),
+                        p.to_path_buf(),
+                    ));
                 }
-                let shell_mode = busybox || !include_files.is_empty();
+                if let Some(w) = worker.as_deref() {
+                    merged_includes.push((
+                        "bin/ktstr-jemalloc-alloc-worker".to_string(),
+                        w.to_path_buf(),
+                    ));
+                }
+
                 let key = if shell_mode {
                     BaseKey::new_shell(
                         &payload,
                         scheduler.as_deref(),
                         probe.as_deref(),
-                        &include_files,
+                        worker.as_deref(),
+                        &merged_includes,
                         busybox,
                         preserve_payload_dwarf,
                     )?
@@ -1488,11 +1540,12 @@ impl KtstrVm {
                         &payload,
                         scheduler.as_deref(),
                         probe.as_deref(),
+                        worker.as_deref(),
                         preserve_payload_dwarf,
                     )?
                 };
 
-                let include_refs: Vec<(&str, &std::path::Path)> = include_files
+                let include_refs: Vec<(&str, &std::path::Path)> = merged_includes
                     .iter()
                     .map(|(a, p)| (a.as_str(), p.as_path()))
                     .collect();
@@ -3276,11 +3329,16 @@ pub struct KtstrVmBuilder {
     dmesg: bool,
     exec_cmd: Option<String>,
     /// Optional host path to the `ktstr-jemalloc-probe` binary.
-    /// When `Some`, the probe is packed into the guest initramfs as
-    /// an extra binary (alongside `scheduler_binary`) and becomes
-    /// spawnable by bare name inside the guest — used by the
-    /// closed-loop probe tests in `tests/jemalloc_probe_tests.rs`.
-    probe_binary: Option<PathBuf>,
+    /// When `Some`, the probe is packed into the guest initramfs at
+    /// `bin/ktstr-jemalloc-probe` and becomes spawnable by bare name
+    /// inside the guest — used by the closed-loop probe tests in
+    /// `tests/jemalloc_probe_tests.rs`.
+    jemalloc_probe_binary: Option<PathBuf>,
+    /// Optional host path to `ktstr-jemalloc-alloc-worker`. When
+    /// `Some`, packed into the initramfs at `bin/ktstr-jemalloc-
+    /// alloc-worker`. Used together with `jemalloc_probe_binary` for the
+    /// cross-process closed-loop test.
+    jemalloc_alloc_worker_binary: Option<PathBuf>,
 }
 
 impl Default for KtstrVmBuilder {
@@ -3315,8 +3373,8 @@ impl Default for KtstrVmBuilder {
             busybox: false,
             dmesg: false,
             exec_cmd: None,
-            probe_binary: None,
-            preserve_init_dwarf: false,
+            jemalloc_probe_binary: None,
+            jemalloc_alloc_worker_binary: None,
         }
     }
 }
@@ -3537,28 +3595,40 @@ impl KtstrVmBuilder {
     }
 
     /// Host path to `ktstr-jemalloc-probe`. When set, the probe is
-    /// packed into the guest initramfs as an extra binary and
-    /// resolves by bare name on the guest `PATH`. Tests that target
-    /// the jemalloc TLS probe from a guest-side `ctx.payload(&PROBE)`
-    /// invocation must set this to the host path obtained via
-    /// `env!("CARGO_BIN_EXE_ktstr-jemalloc-probe")`. Typically paired
-    /// with `.preserve_init_dwarf(true)` so the init binary inside
-    /// the guest retains DWARF for the probe to resolve against.
-    pub fn probe_binary(mut self, path: impl Into<PathBuf>) -> Self {
-        self.probe_binary = Some(path.into());
+    /// packed into the guest initramfs as an extra binary under
+    /// `bin/` and resolves by bare name on the guest `PATH`. Tests
+    /// that target the jemalloc TLS probe from a guest-side
+    /// `ctx.payload(&PROBE)` invocation must set this to the host
+    /// path obtained via `env!("CARGO_BIN_EXE_ktstr-jemalloc-probe")`.
+    ///
+    /// The probe binary carries its own DWARF (never stripped) and
+    /// runs in `--self-test` mode against its own `/proc/self/mem`,
+    /// so the init binary does NOT need to retain DWARF. An earlier
+    /// design attempted to preserve DWARF on the init binary so the
+    /// probe could resolve offsets against the running init; that
+    /// inflated the initramfs past practical VM memory budgets (the
+    /// unstripped test binary is ~1 GB) and was abandoned in favor
+    /// of routing DWARF through the probe and worker binaries.
+    pub fn jemalloc_probe_binary(mut self, path: impl Into<PathBuf>) -> Self {
+        self.jemalloc_probe_binary = Some(path.into());
         self
     }
 
-    /// Preserve DWARF debuginfo on the init binary copied into the
-    /// initramfs. Default off — the normal path runs
-    /// `strip_debug(payload)` to shrink the initramfs. When
-    /// `true`, the init binary is copied verbatim so a probe (see
-    /// [`probe_binary`](Self::probe_binary)) can resolve struct /
-    /// variable offsets inside the running init process. The
-    /// initramfs cache key also hashes this flag so stripped and
-    /// unstripped base images do not share a cache entry.
-    pub fn preserve_init_dwarf(mut self, enabled: bool) -> Self {
-        self.preserve_init_dwarf = enabled;
+    /// Host path to `ktstr-jemalloc-alloc-worker`. When set, the
+    /// worker is packed alongside the probe in the guest initramfs
+    /// as `/bin/ktstr-jemalloc-alloc-worker`. Used by the
+    /// cross-process closed-loop test — spawned as a background
+    /// payload that allocates a known number of bytes on the
+    /// huge-size path (the jemalloc code path that unconditionally
+    /// updates `thread_allocated` regardless of tcache state), then
+    /// probed externally. The worker is much smaller than the full
+    /// ktstr test binary (a single `fn main` linked against
+    /// tikv-jemallocator) so shipping it keeps the initramfs well
+    /// inside VM memory budgets — the init-DWARF approach that
+    /// inflated the archive past those budgets was abandoned in
+    /// favor of per-binary DWARF on the probe and worker.
+    pub fn jemalloc_alloc_worker_binary(mut self, path: impl Into<PathBuf>) -> Self {
+        self.jemalloc_alloc_worker_binary = Some(path.into());
         self
     }
 
@@ -3672,8 +3742,8 @@ impl KtstrVmBuilder {
             busybox: self.busybox,
             dmesg: self.dmesg,
             exec_cmd: self.exec_cmd,
-            probe_binary: self.probe_binary,
-            preserve_init_dwarf: self.preserve_init_dwarf,
+            jemalloc_probe_binary: self.jemalloc_probe_binary,
+            jemalloc_alloc_worker_binary: self.jemalloc_alloc_worker_binary,
         })
     }
 
@@ -4909,14 +4979,14 @@ mod tests {
     #[test]
     fn base_key_same_inputs_match() {
         let exe = crate::resolve_current_exe().unwrap();
-        let k1 = BaseKey::new(&exe, None, None, false).unwrap();
-        let k2 = BaseKey::new(&exe, None, None, false).unwrap();
+        let k1 = BaseKey::new(&exe, None, None, None, false).unwrap();
+        let k2 = BaseKey::new(&exe, None, None, None, false).unwrap();
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn base_key_nonexistent_payload_fails() {
-        let result = BaseKey::new(Path::new("/nonexistent/binary"), None, None, false);
+        let result = BaseKey::new(Path::new("/nonexistent/binary"), None, None, None, false);
         assert!(result.is_err());
     }
 
@@ -4928,10 +4998,10 @@ mod tests {
         let bin = tmp.join("payload");
 
         std::fs::write(&bin, b"content_v1").unwrap();
-        let k1 = BaseKey::new(&bin, None, None, false).unwrap();
+        let k1 = BaseKey::new(&bin, None, None, None, false).unwrap();
 
         std::fs::write(&bin, b"content_v2").unwrap();
-        let k2 = BaseKey::new(&bin, None, None, false).unwrap();
+        let k2 = BaseKey::new(&bin, None, None, None, false).unwrap();
 
         assert_ne!(
             k1, k2,
@@ -4943,8 +5013,8 @@ mod tests {
     #[test]
     fn base_key_with_scheduler() {
         let exe = crate::resolve_current_exe().unwrap();
-        let k1 = BaseKey::new(&exe, None, None, false).unwrap();
-        let k2 = BaseKey::new(&exe, Some(&exe), None, false).unwrap();
+        let k1 = BaseKey::new(&exe, None, None, None, false).unwrap();
+        let k2 = BaseKey::new(&exe, Some(&exe), None, None, false).unwrap();
         assert_ne!(k1, k2, "with vs without scheduler should differ");
     }
 
@@ -4994,7 +5064,7 @@ mod tests {
     #[test]
     fn base_cache_hit() {
         let exe = crate::resolve_current_exe().unwrap();
-        let key = BaseKey::new(&exe, None, None, false).unwrap();
+        let key = BaseKey::new(&exe, None, None, None, false).unwrap();
 
         // Insert a sentinel value.
         let sentinel = Arc::new(vec![0xDE, 0xAD]);

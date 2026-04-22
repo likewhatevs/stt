@@ -161,6 +161,10 @@ path = "src/bin/cargo-ktstr.rs"
 name = "ktstr-jemalloc-probe"
 path = "src/bin/jemalloc_probe.rs"
 
+[[bin]]
+name = "ktstr-jemalloc-alloc-worker"
+path = "src/bin/jemalloc_alloc_worker.rs"
+
 [[test]]
 name = "ktstr_sched_tests"
 
