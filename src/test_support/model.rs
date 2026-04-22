@@ -526,6 +526,18 @@ fn fetch_timeout_for_size(size_bytes: u64) -> std::time::Duration {
     std::time::Duration::from_secs(body_secs.max(FETCH_MIN_TIMEOUT_SECS))
 }
 
+/// Combine `blocks_available` and `fragment_size` from statvfs into
+/// an available-byte count. Saturates at `u64::MAX` for pathological
+/// FUSE mounts reporting enormous synthetic block/fragment counts;
+/// `u64::MAX` is treated as unbounded space by [`ensure_free_space`]
+/// so the gate passes — deliberate, since a false bail on spurious
+/// overflow is worse than trusting the filesystem. Extracted so the
+/// saturation predicate is addressable in tests that don't want to
+/// mock a real filesystem.
+fn bytes_from_statvfs_parts(blocks: u64, frag: u64) -> u64 {
+    blocks.saturating_mul(frag)
+}
+
 /// Return the free space (in bytes, available to unprivileged users)
 /// on the filesystem that holds `dir`. Wraps
 /// [`nix::sys::statvfs::statvfs`]: `blocks_available` (`f_bavail`) is
@@ -537,16 +549,17 @@ fn fetch_timeout_for_size(size_bytes: u64) -> std::time::Duration {
 /// unprivileged process cannot actually consume the reserved slack,
 /// and the fetcher runs unprivileged in the normal case.
 ///
-/// Saturating multiplication guards against a pathological statvfs
-/// return (e.g. a FUSE filesystem reporting enormous synthetic
-/// counts) overflowing `u64`. `u64::MAX` is effectively "unbounded
-/// space" for the subsequent comparison; the gate will always pass.
+/// Product is computed via [`bytes_from_statvfs_parts`], which
+/// saturates at `u64::MAX` for pathological statvfs returns (FUSE
+/// filesystems reporting enormous synthetic counts). A saturated
+/// `u64::MAX` is effectively "unbounded space" for the subsequent
+/// comparison; the gate will always pass.
 fn filesystem_available_bytes(dir: &std::path::Path) -> Result<u64> {
     let vfs =
         nix::sys::statvfs::statvfs(dir).with_context(|| format!("statvfs {}", dir.display()))?;
     let blocks = vfs.blocks_available() as u64;
     let frag = vfs.fragment_size() as u64;
-    Ok(blocks.saturating_mul(frag))
+    Ok(bytes_from_statvfs_parts(blocks, frag))
 }
 
 /// Pre-flight gate in [`fetch`]: refuse to start a download when the
@@ -558,10 +571,12 @@ fn filesystem_available_bytes(dir: &std::path::Path) -> Result<u64> {
 /// diagnostic —
 /// `"Need 2.69 GiB free at /path/to/cache; have 512 MiB"` — otherwise.
 ///
-/// The 10% margin (`size_bytes + size_bytes / 10`) is computed with
-/// saturating arithmetic so a future `ModelSpec` pin near `u64::MAX`
-/// cannot wrap the margin calculation into a small positive number
-/// that would let an impossible fetch bypass the gate.
+/// Needed bytes = `size_bytes + size_bytes / 10` (size plus 10%
+/// margin). The division itself cannot overflow. The SUM is what a
+/// `ModelSpec` pin near `u64::MAX` could wrap, so it uses
+/// `saturating_add`: a pathological `size_bytes` saturates at
+/// `u64::MAX` rather than wrapping into a small positive number that
+/// would let an impossible fetch bypass the gate.
 ///
 /// Sizes are rendered through [`indicatif::HumanBytes`] so the error
 /// message speaks in human-scale IEC prefixes (`GiB` / `MiB` / `KiB`)
@@ -1515,6 +1530,56 @@ mod tests {
         // the pin for a mistaken artifact.
         const { assert!(DEFAULT_MODEL.size_bytes > 100 * 1024 * 1024) };
         const { assert!(DEFAULT_MODEL.size_bytes < 3 * 1024 * 1024 * 1024) };
+    }
+
+    /// `bytes_from_statvfs_parts` uses `saturating_mul` so a
+    /// pathological FUSE filesystem reporting enormous synthetic
+    /// block + fragment counts lands at `u64::MAX` (treated as
+    /// unbounded space) instead of wrapping into a small positive
+    /// number. A wrapping regression would report too FEW available
+    /// bytes and flip `ensure_free_space` into spurious bails; the
+    /// saturation is what keeps the gate trusting the filesystem.
+    /// Pin the saturation and the zero-operand short-circuits so a
+    /// regression to raw `*` or `wrapping_mul` surfaces here.
+    #[test]
+    fn bytes_from_statvfs_parts_saturates_on_overflow() {
+        // u64::MAX × 2 would wrap; saturating_mul clamps to u64::MAX.
+        assert_eq!(bytes_from_statvfs_parts(u64::MAX, 2), u64::MAX);
+        assert_eq!(bytes_from_statvfs_parts(2, u64::MAX), u64::MAX);
+        assert_eq!(bytes_from_statvfs_parts(u64::MAX, u64::MAX), u64::MAX);
+        // Zero on either side produces zero — no overflow path.
+        assert_eq!(bytes_from_statvfs_parts(u64::MAX, 0), 0);
+        assert_eq!(bytes_from_statvfs_parts(0, u64::MAX), 0);
+        // Typical real-world inputs compute exactly (no saturation).
+        assert_eq!(bytes_from_statvfs_parts(1_000, 4_096), 4_096_000);
+        assert_eq!(bytes_from_statvfs_parts(0, 4_096), 0);
+    }
+
+    /// `ensure_free_space` composes the required byte count as
+    /// `size_bytes + size_bytes / 10` via `saturating_add`. A
+    /// `ModelSpec` pin at `u64::MAX` must therefore land at
+    /// `u64::MAX` (not wrap to a tiny positive number that would let
+    /// the gate pass on a near-empty disk). Pin that an impossible
+    /// `size_bytes = u64::MAX` always bails — statvfs on a real
+    /// filesystem cannot report `u64::MAX` available bytes (18.4
+    /// exabytes), so the `available < needed` branch fires
+    /// unconditionally.
+    #[test]
+    fn ensure_free_space_saturates_on_u64_max_spec() {
+        let dir = std::env::temp_dir();
+        let spec = ModelSpec {
+            file_name: "saturate-u64-max",
+            url: "https://placeholder.example/saturate-u64-max",
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: u64::MAX,
+        };
+        let err = ensure_free_space(&dir, &spec)
+            .expect_err("u64::MAX size must saturate and trip the bail, not wrap past the gate");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.starts_with("Need "),
+            "bail must report Need/have gap, got: {rendered}"
+        );
     }
 
     #[test]

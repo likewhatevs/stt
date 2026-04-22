@@ -2,8 +2,14 @@
 //!
 //! Used by [`KtstrVm::run_interactive`](super::KtstrVm::run_interactive)
 //! to put stdin into raw mode for the lifetime of the shell session,
-//! restoring the original termios on every exit path — including
-//! panics and process-killing signals (SIGINT/SIGTERM/SIGQUIT).
+//! restoring the original termios on every catchable signal we
+//! subscribe to (SIGINT/SIGTERM/SIGQUIT/SIGABRT) plus the normal
+//! Drop path. SIGKILL and SIGSEGV are intentionally out of scope:
+//! the first cannot be caught; the second fires from corrupted
+//! state where tcsetattr is unsafe. SIGABRT is included so a
+//! `panic = "abort"` release build (see `[profile.release]` in
+//! Cargo.toml) still restores the terminal before process death:
+//! an unwind-less panic calls `abort(3)`, which raises SIGABRT.
 
 use anyhow::{Context, Result};
 
@@ -84,8 +90,11 @@ extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
 
 /// Sets stdin to raw mode on creation, restores original termios on drop.
 /// Handles panic paths via Drop. Installs signal handlers for SIGINT,
-/// SIGTERM, SIGQUIT with SA_RESETHAND that restore termios via raw
-/// libc::tcsetattr (async-signal-safe) before the default handler runs.
+/// SIGTERM, SIGQUIT, and SIGABRT with SA_RESETHAND that restore
+/// termios via raw libc::tcsetattr (async-signal-safe) before the
+/// default handler runs. SIGABRT catches the `panic = "abort"`
+/// release-build path where an unwind-less panic calls `abort(3)`
+/// instead of unwinding Drop.
 pub(crate) struct TerminalRawGuard {
     original: nix::sys::termios::Termios,
     fd: std::os::unix::io::RawFd,
@@ -93,6 +102,7 @@ pub(crate) struct TerminalRawGuard {
     prev_sigint: libc::sigaction,
     prev_sigterm: libc::sigaction,
     prev_sigquit: libc::sigaction,
+    prev_sigabrt: libc::sigaction,
 }
 
 impl TerminalRawGuard {
@@ -156,6 +166,7 @@ impl TerminalRawGuard {
         let mut prev_sigint: libc::sigaction = unsafe { std::mem::zeroed() };
         let mut prev_sigterm: libc::sigaction = unsafe { std::mem::zeroed() };
         let mut prev_sigquit: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut prev_sigabrt: libc::sigaction = unsafe { std::mem::zeroed() };
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = terminal_restore_signal_handler as *const () as usize;
@@ -164,6 +175,13 @@ impl TerminalRawGuard {
             libc::sigaction(libc::SIGINT, &sa, &mut prev_sigint);
             libc::sigaction(libc::SIGTERM, &sa, &mut prev_sigterm);
             libc::sigaction(libc::SIGQUIT, &sa, &mut prev_sigquit);
+            // SIGABRT covers the `panic = "abort"` release path:
+            // `abort(3)` raises SIGABRT on the panicking thread, which
+            // terminates the process after the default handler runs.
+            // Installing our restore handler with SA_RESETHAND means
+            // the termios is restored before the default SIGABRT
+            // handler generates the core dump / exits the process.
+            libc::sigaction(libc::SIGABRT, &sa, &mut prev_sigabrt);
         }
 
         Ok(Self {
@@ -172,6 +190,7 @@ impl TerminalRawGuard {
             prev_sigint,
             prev_sigterm,
             prev_sigquit,
+            prev_sigabrt,
         })
     }
 }
@@ -208,6 +227,7 @@ impl Drop for TerminalRawGuard {
             libc::sigaction(libc::SIGINT, &self.prev_sigint, std::ptr::null_mut());
             libc::sigaction(libc::SIGTERM, &self.prev_sigterm, std::ptr::null_mut());
             libc::sigaction(libc::SIGQUIT, &self.prev_sigquit, std::ptr::null_mut());
+            libc::sigaction(libc::SIGABRT, &self.prev_sigabrt, std::ptr::null_mut());
         }
     }
 }
@@ -291,6 +311,107 @@ mod tests {
         }
 
         unsafe {
+            libc::dup2(saved_stdin, 0);
+            libc::close(saved_stdin);
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
+    /// Regression pin for the SIGABRT arm of the signal-handler set.
+    /// Before `enter()`, install `SIG_IGN` as a sentinel disposition
+    /// for SIGABRT. After `enter()`, the live disposition must NO
+    /// LONGER be `SIG_IGN` — proof `enter()` replaced it with
+    /// [`terminal_restore_signal_handler`]. After `drop(guard)`, the
+    /// disposition must return to the `SIG_IGN` sentinel — proof
+    /// Drop stored and restored the previous sigaction rather than
+    /// clobbering it to `SIG_DFL` (which would re-enable SIGABRT's
+    /// default core-dump on a later abort the caller did not raise
+    /// themselves).
+    #[test]
+    fn terminal_raw_guard_installs_and_restores_sigabrt_handler() {
+        // Same openpty + dup2 stdin dance the other tests use so
+        // enter()'s tcgetattr / tcsetattr see a real tty.
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+        let saved_stdin = unsafe { libc::dup(0) };
+        assert!(saved_stdin >= 0);
+        assert_eq!(unsafe { libc::dup2(slave, 0) }, 0);
+
+        // Install SIG_IGN as the pre-enter sentinel and save the
+        // ORIGINAL disposition so the test can hand the process back
+        // to the test runner with whatever was in place before.
+        let mut pre_test: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut ign: libc::sigaction = unsafe { std::mem::zeroed() };
+        ign.sa_sigaction = libc::SIG_IGN;
+        unsafe {
+            libc::sigemptyset(&mut ign.sa_mask);
+            libc::sigaction(libc::SIGABRT, &ign, &mut pre_test);
+        }
+
+        // Sanity-check the sentinel is in place.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigaction(libc::SIGABRT, std::ptr::null(), &mut current);
+        }
+        assert_eq!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "test setup: SIG_IGN sentinel must be installed before enter()",
+        );
+
+        let guard = TerminalRawGuard::enter().expect("enter must succeed");
+
+        // After enter() the disposition MUST NOT be SIG_IGN (or
+        // SIG_DFL) — it must be a real handler function pointer,
+        // i.e. [`terminal_restore_signal_handler`].
+        unsafe {
+            libc::sigaction(libc::SIGABRT, std::ptr::null(), &mut current);
+        }
+        assert_ne!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "enter() must replace the SIGABRT SIG_IGN sentinel with its own handler",
+        );
+        assert_ne!(
+            current.sa_sigaction,
+            libc::SIG_DFL,
+            "enter() must not leave SIGABRT at SIG_DFL",
+        );
+        let expected = terminal_restore_signal_handler as *const () as usize;
+        assert_eq!(
+            current.sa_sigaction, expected,
+            "enter() must point SIGABRT at terminal_restore_signal_handler",
+        );
+
+        drop(guard);
+
+        // Drop must restore the SIG_IGN sentinel verbatim.
+        unsafe {
+            libc::sigaction(libc::SIGABRT, std::ptr::null(), &mut current);
+        }
+        assert_eq!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "Drop must restore the previous SIGABRT SIG_IGN sentinel",
+        );
+
+        // Hand the process back to whatever disposition was in
+        // place before the test ran. Close the pty pair + restore
+        // stdin last so any assertion failure above still surfaces
+        // the original tty.
+        unsafe {
+            libc::sigaction(libc::SIGABRT, &pre_test, std::ptr::null_mut());
             libc::dup2(saved_stdin, 0);
             libc::close(saved_stdin);
             libc::close(slave);

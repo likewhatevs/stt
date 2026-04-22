@@ -1399,17 +1399,28 @@ impl WorkloadHandle {
                     //    during worker_main / serde_json.
                     //
                     //    Caveat: catch_unwind is a no-op under
-                    //    `panic = "abort"`. ktstr's Cargo.toml does
-                    //    not set abort in any profile, so default
-                    //    unwind semantics apply. If a downstream
-                    //    consumer switches the panic strategy,
-                    //    defense (2) still severs guard Drop via
-                    //    mem::forget but the abort would also skip
-                    //    the `f.write_all(&json)` call, so the
-                    //    parent's `stop_and_collect` would see a
-                    //    missing WorkerReport — acceptable, the
-                    //    parent's sentinel fallback covers that
-                    //    case.
+                    //    `panic = "abort"`, which ktstr's Cargo.toml
+                    //    DOES set in `[profile.release]`. In release
+                    //    builds a panic inside this closure aborts
+                    //    the child immediately (SIGABRT); the
+                    //    `catch_unwind` call compiles but never
+                    //    returns `Err`, and neither the
+                    //    `f.write_all(&json)` nor the `_exit(1)`
+                    //    below runs on the panic path. The parent's
+                    //    `stop_and_collect` therefore observes a
+                    //    missing WorkerReport and fills in a
+                    //    sentinel — that sentinel fallback IS the
+                    //    release-build correctness mechanism.
+                    //    Defenses (1) and (2) still apply unchanged
+                    //    under abort: the silent panic hook
+                    //    suppresses the panic message and the
+                    //    `mem::forget(guard)` severs Drop (the abort
+                    //    itself also skips Drops, but the forget
+                    //    makes the intent explicit regardless of
+                    //    strategy). Dev/test builds (cargo test,
+                    //    cargo nextest run — dev profile inherits
+                    //    default unwind semantics) still get a real
+                    //    `catch_unwind` Err → `_exit(1)` fast-path.
                     //
                     // 4. `_exit(1)` on catch_unwind Err, `_exit(0)`
                     //    on Ok — bypasses Rust's global static
@@ -3286,6 +3297,16 @@ mod tests {
             // returns an exit code. `_exit` skips Rust destructors
             // so the parent's resources copied via fork are not
             // double-closed.
+            //
+            // `catch_unwind` + `unwrap_or(99)` is effective here
+            // because this helper is gated under `#[cfg(test)]` and
+            // the dev/test profile inherits default unwind
+            // semantics. Under `[profile.release]`'s `panic =
+            // "abort"` the catch_unwind would be a no-op and a panic
+            // in `body` would SIGABRT the child — which the parent's
+            // signal-code path (`100 + WTERMSIG`) still surfaces
+            // distinctly from the 99 fallback, so the exit-code
+            // convention above remains self-consistent either way.
             let _ = std::panic::take_hook();
             std::panic::set_hook(Box::new(|_| {}));
             let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(99);
@@ -4276,10 +4297,15 @@ mod tests {
     // -- read_schedstat tests --
 
     #[test]
-    fn read_schedstat_returns_triple() {
-        // Checks that the function parses without panicking.
-        let (cpu_time, run_delay, timeslices) = read_schedstat();
-        let _ = (cpu_time, run_delay, timeslices);
+    fn read_schedstat_returns_finite_triple() {
+        // The calling thread has been scheduled at least once by the
+        // time this test runs (it's executing right now), so cpu_time
+        // and timeslices must be strictly positive. run_delay can
+        // legitimately be zero on an idle host where the test thread
+        // never waited for a runqueue slot, so it is left unchecked.
+        let (cpu_time, _run_delay, timeslices) = read_schedstat();
+        assert!(cpu_time > 0);
+        assert!(timeslices > 0);
     }
 
     // -- FutexFanOut tests --
