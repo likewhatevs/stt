@@ -270,3 +270,60 @@ pub struct SchbenchPayload;
 #[default_check(exit_code_eq(0))]
 #[allow(dead_code)]
 pub struct SchbenchHintedPayload;
+
+/// `schbench` with `--json -` pre-baked into `default_args`.
+///
+/// Schbench writes a JSON summary block to stdout when invoked with
+/// `--json -` (the third argument hyphen selects stdout over a file
+/// path). That block is parseable by the
+/// [`OutputFormat::Json`](ktstr::test_support::OutputFormat::Json)
+/// extraction pipeline — stable dotted-path metric names pinned at
+/// schbench's source-level JSON schema (`write_json_stats` in
+/// `schbench.c`), no LLM in the loop.
+///
+/// Compared to [`SCHBENCH`] and [`SCHBENCH_HINTED`], this fixture
+/// differs in:
+///
+/// 1. **`name`** — `"schbench_json"` instead of `"schbench"`. Uses
+///    a distinct name so sidecar files and log output can
+///    disambiguate the three fixtures. The `binary` field stays
+///    `"schbench"` in all three.
+/// 2. **`output`** — `OutputFormat::Json` rather than `LlmExtract`,
+///    so extraction goes through `find_and_parse_json` +
+///    `walk_json_leaves` and bypasses the 2.44 GiB model load
+///    altogether. Tests that only want schbench metrics (no
+///    scheduler-regression narrative) save minutes of CPU time by
+///    picking this over [`SCHBENCH`].
+/// 3. **`default_args`** — includes `--json -` so a bare
+///    `ctx.payload(&SCHBENCH_JSON)` call immediately produces the
+///    JSON body.
+/// 4. **`metrics`** — concrete hints on the schbench JSON schema.
+///    Polarity annotations follow schbench convention: latency
+///    percentiles are `LowerBetter`, request-per-second is
+///    `HigherBetter`.
+///
+/// **Caveat: simultaneous SCHBENCH + SCHBENCH_JSON.** All three
+/// fixtures share `kind = PayloadKind::Binary("schbench")`. A
+/// scenario that lists multiple of them as workloads spawns
+/// schbench once per fixture — each with its own argv set. The
+/// pairwise-dedup on the `workloads` attribute only rejects
+/// identical Payload paths; distinct constants that share a binary
+/// are NOT deduped. Pick one fixture per scenario.
+///
+/// Hint paths match the JSON keys emitted by schbench's
+/// `write_json_stats` in `schbench.c`. Unhinted paths still land in
+/// the extracted metric set with
+/// [`Polarity::Unknown`](ktstr::test_support::Polarity::Unknown),
+/// so the JSON blob is surfaced in sidecar output for regression
+/// tracking even when a specific percentile is not pinned here.
+#[derive(Payload)]
+#[payload(binary = "schbench", name = "schbench_json", output = Json)]
+#[default_args("--runtime", "30", "--message-threads", "2", "--json", "-")]
+#[default_check(exit_code_eq(0))]
+#[metric(name = "rps", polarity = HigherBetter, unit = "rps")]
+#[metric(name = "wakeup_latencies_usec.p99", polarity = LowerBetter, unit = "us")]
+#[metric(name = "wakeup_latencies_usec.p50", polarity = LowerBetter, unit = "us")]
+#[metric(name = "request_latencies_usec.p99", polarity = LowerBetter, unit = "us")]
+#[metric(name = "request_latencies_usec.p50", polarity = LowerBetter, unit = "us")]
+#[allow(dead_code)]
+pub struct SchbenchJsonPayload;

@@ -480,6 +480,13 @@ pub enum OutputFormat {
     /// [`OutputFormat::Json`] but tag each metric with
     /// [`MetricSource::LlmExtract`]. The optional `&'static str` is
     /// a user-provided focus hint appended to the default prompt.
+    ///
+    /// When present, the hint is emitted on its own line as
+    /// `Focus: <hint>\n\n` between the default prompt template and
+    /// the `STDOUT:` section (see `compose_prompt` in `test_support::model`).
+    /// An empty or whitespace-only hint is dropped — the line is not
+    /// emitted — so a caller passing `Some("")` or `Some("   ")` sees
+    /// the same prompt as `None`.
     LlmExtract(Option<&'static str>),
 }
 

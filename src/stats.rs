@@ -239,6 +239,18 @@ pub struct GauntletRow {
     /// filter in [`compare_rows`] so users can narrow A/B comparisons
     /// by scheduler name.
     pub scheduler: String,
+    /// Active scheduler flags carried from
+    /// `SidecarResult::active_flags`. Previously this field did not
+    /// exist on the row; every A/B comparison therefore ignored
+    /// flag-profile identity and treated two rows whose only
+    /// difference was the flag set as the same row (causing
+    /// same-key collisions in `compare_rows` and pointer-latching
+    /// on whichever sidecar happened to be scanned first).
+    /// Carrying the full flag list here keeps the (scenario,
+    /// topology, work_type, flags) identity tuple unambiguous and
+    /// lets the substring filter match on flag names too.
+    #[serde(default)]
+    pub flags: Vec<String>,
     pub passed: bool,
     /// True when the run was skipped (topology mismatch, missing
     /// resource). `passed` stays `true` for gate-compat; `skipped`
@@ -279,6 +291,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         topology: sc.topology.clone(),
         work_type: sc.work_type.clone(),
         scheduler: sc.scheduler.clone(),
+        flags: sc.active_flags.clone(),
         passed: sc.passed,
         skipped: sc.skipped,
         spread: sc.stats.worst_spread,
@@ -804,19 +817,38 @@ pub(crate) fn compare_rows(
     let mut report = CompareReport::default();
 
     for row_b in rows_b {
-        let key_b = (&row_b.scenario, &row_b.topology, &row_b.work_type);
+        // Identity key includes `flags` so two rows that share
+        // (scenario, topology, work_type) but run under different
+        // flag sets do not collide into the same A/B pair. Earlier
+        // the key was a 3-tuple, so a scheduler with N flag profiles
+        // produced N rows per (scenario, topology, work_type) and
+        // compare_rows would pick arbitrarily whichever rows_a entry
+        // happened to be first — making regression math match a
+        // baseline against an unrelated flag profile.
+        let key_b = (
+            &row_b.scenario,
+            &row_b.topology,
+            &row_b.work_type,
+            &row_b.flags,
+        );
         if let Some(f) = filter {
+            // Include `flags` in the filterable join so the substring
+            // filter can narrow by flag name (e.g. `-E llc`).
             let joined = format!(
-                "{} {} {} {}",
-                row_b.scenario, row_b.topology, row_b.scheduler, row_b.work_type,
+                "{} {} {} {} {}",
+                row_b.scenario,
+                row_b.topology,
+                row_b.scheduler,
+                row_b.work_type,
+                row_b.flags.join(","),
             );
             if !joined.contains(f) {
                 continue;
             }
         }
-        let row_a = rows_a
-            .iter()
-            .find(|r| (&r.scenario, &r.topology, &r.work_type) == key_b);
+        let row_a = rows_a.iter().find(|r| {
+            (&r.scenario, &r.topology, &r.work_type, &r.flags) == key_b
+        });
         let Some(row_a) = row_a else {
             report.new_in_b += 1;
             continue;
@@ -884,19 +916,30 @@ pub(crate) fn compare_rows(
     // Filter applies here too, so rows excluded by the filter never
     // count as removed.
     for row_a in rows_a {
-        let key_a = (&row_a.scenario, &row_a.topology, &row_a.work_type);
+        // Same 4-tuple identity key as the first pass — see that
+        // loop's comment for the flag-profile collision rationale.
+        let key_a = (
+            &row_a.scenario,
+            &row_a.topology,
+            &row_a.work_type,
+            &row_a.flags,
+        );
         if let Some(f) = filter {
             let joined = format!(
-                "{} {} {} {}",
-                row_a.scenario, row_a.topology, row_a.scheduler, row_a.work_type,
+                "{} {} {} {} {}",
+                row_a.scenario,
+                row_a.topology,
+                row_a.scheduler,
+                row_a.work_type,
+                row_a.flags.join(","),
             );
             if !joined.contains(f) {
                 continue;
             }
         }
-        let exists_in_b = rows_b
-            .iter()
-            .any(|r| (&r.scenario, &r.topology, &r.work_type) == key_a);
+        let exists_in_b = rows_b.iter().any(|r| {
+            (&r.scenario, &r.topology, &r.work_type, &r.flags) == key_a
+        });
         if !exists_in_b {
             report.removed_from_a += 1;
         }
@@ -919,8 +962,20 @@ pub fn compare_runs(
     b: &str,
     filter: Option<&str>,
     threshold: Option<f64>,
+    dir: Option<&std::path::Path>,
 ) -> anyhow::Result<i32> {
-    let root = crate::test_support::runs_root();
+    // `--dir` overrides the default runs root. Earlier versions of
+    // this function accepted the flag through the CLI but never
+    // threaded it through to the sidecar lookup, so the value was
+    // silently ignored and every comparison ran against
+    // `runs_root()` regardless — the user could see their runs via
+    // `cargo ktstr stats list --dir X` but `compare` quietly looked
+    // in the default location. Accepting `Option<&Path>` here keeps
+    // `--dir` load-bearing.
+    let root: std::path::PathBuf = match dir {
+        Some(d) => d.to_path_buf(),
+        None => crate::test_support::runs_root(),
+    };
     let dir_a = root.join(a);
     let dir_b = root.join(b);
     if !dir_a.exists() {
@@ -1078,6 +1133,7 @@ mod tests {
             topology: topo.into(),
             work_type: "CpuSpin".into(),
             scheduler: String::new(),
+            flags: Vec::new(),
             skipped: false,
             passed,
             spread,
@@ -1700,6 +1756,53 @@ mod tests {
             "val_a must come from the first matching row"
         );
         assert_eq!(spread.delta, 20.0);
+    }
+
+    /// Flag-profile collision regression pin. Two rows that share
+    /// `(scenario, topology, work_type)` but run under different
+    /// flag sets must NOT collide in the A/B join. Before `flags`
+    /// was part of the identity key, `compare_rows` would match
+    /// rows_b's `llc` variant against whichever rows_a variant came
+    /// first — typically `borrow` — and silently produce a diff
+    /// across two unrelated flag profiles.
+    ///
+    /// Construction: rows_a carries `llc` at spread=10 and `borrow`
+    /// at spread=100; rows_b mirrors the 3-tuple but swaps the flag
+    /// order (`borrow` at 10, `llc` at 100). A 3-tuple join would
+    /// pair `(llc, 10)` vs `(borrow, 10)` → zero spread delta, zero
+    /// regressions. The 4-tuple join pairs same-flag-set rows:
+    /// `(llc, 10)` vs `(llc, 100)` and `(borrow, 100)` vs
+    /// `(borrow, 10)` — one regression, one improvement on
+    /// worst_spread.
+    #[test]
+    fn compare_rows_same_key_different_flags_do_not_collide() {
+        let mut a_llc = cmp_row("t", "tiny-1llc", true, 10.0, 0);
+        a_llc.flags = vec!["llc".to_string()];
+        let mut a_borrow = cmp_row("t", "tiny-1llc", true, 100.0, 0);
+        a_borrow.flags = vec!["borrow".to_string()];
+        let mut b_borrow = cmp_row("t", "tiny-1llc", true, 10.0, 0);
+        b_borrow.flags = vec!["borrow".to_string()];
+        let mut b_llc = cmp_row("t", "tiny-1llc", true, 100.0, 0);
+        b_llc.flags = vec!["llc".to_string()];
+
+        let rows_a = vec![a_llc, a_borrow];
+        let rows_b = vec![b_borrow, b_llc];
+        let res = compare_rows(&rows_a, &rows_b, None, None);
+
+        // Each flag profile's spread moved by 90 → one regression
+        // (llc 10→100) and one improvement (borrow 100→10).
+        assert_eq!(
+            res.regressions, 1,
+            "llc regression should fire (10 → 100)",
+        );
+        assert_eq!(
+            res.improvements, 1,
+            "borrow improvement should fire (100 → 10)",
+        );
+        // Neither side should be treated as new / removed — both
+        // keys match across A and B when flags are part of the key.
+        assert_eq!(res.new_in_b, 0);
+        assert_eq!(res.removed_from_a, 0);
     }
 
     /// Filtering is applied before the failed-row gate. A failed row

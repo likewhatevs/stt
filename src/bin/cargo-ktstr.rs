@@ -212,10 +212,20 @@ enum StatsCommand {
         /// scheduler, work_type.
         #[arg(short = 'E', long)]
         filter: Option<String>,
-        /// Relative significance threshold in percent (e.g. 10 for 10%).
-        /// Omit to use each metric's built-in default.
+        /// Relative significance threshold in percent (e.g. 10 for
+        /// 10%). When set, overrides the per-metric default
+        /// threshold for ALL metrics — intentionally, so callers
+        /// can loosen a tight default or tighten a loose one from
+        /// the CLI without per-metric knobs. Omit to use each
+        /// metric's built-in default.
         #[arg(long)]
         threshold: Option<f64>,
+        /// Alternate run root to resolve `a` / `b` against. Defaults
+        /// to `test_support::runs_root()` (typically `target/ktstr/`).
+        /// Useful when comparing archived sidecar trees copied off a
+        /// CI host.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
     },
 }
 
@@ -343,8 +353,9 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             b,
             filter,
             threshold,
+            dir,
         }) => {
-            let exit = cli::compare_runs(a, b, filter.as_deref(), *threshold)
+            let exit = cli::compare_runs(a, b, filter.as_deref(), *threshold, dir.as_deref())
                 .map_err(|e| format!("{e:#}"))?;
             if exit != 0 {
                 std::process::exit(exit);
@@ -1129,6 +1140,7 @@ mod tests {
                         b,
                         filter,
                         threshold,
+                        dir,
                     }),
                 ..
             } => {
@@ -1136,6 +1148,7 @@ mod tests {
                 assert_eq!(b, "b");
                 assert_eq!(filter.as_deref(), Some("cgroup_steady"));
                 assert!(threshold.is_none());
+                assert!(dir.is_none());
             }
             _ => panic!("expected Stats Compare"),
         }
