@@ -942,18 +942,19 @@ impl<'a> Ctx<'a> {
 ///
 /// Shared scaffolding for [`run_scenario`] and [`setup_cgroups`] —
 /// both defer `.start()` until every handle has been spawned and
-/// every tid moved, so workers see a stable cgroup membership at
-/// first run. [`spawn_diverse`] does NOT use this helper because
-/// it starts each handle inline (eager-start semantics required
-/// for its IoSync/CpuSpin mix — workload ordering matters when
-/// the mix includes I/O-bound and CPU-bound cgroups).
+/// every worker pid moved, so workers see a stable cgroup
+/// membership at first run. [`spawn_diverse`] does NOT use this
+/// helper because it starts each handle inline (eager-start
+/// semantics required for its IoSync/CpuSpin mix — workload
+/// ordering matters when the mix includes I/O-bound and CPU-bound
+/// cgroups).
 ///
 /// `cfg_fn` builds the per-cgroup [`WorkloadConfig`] from its
 /// index + name; callers own the per-cgroup customization logic.
 ///
 /// `move_tasks` is ESRCH-tolerant — a worker that exits between
 /// fork and cgroup placement is warned and skipped, unlike the
-/// original per-tid `move_task` which propagated ESRCH.
+/// original per-pid `move_task` which propagated ESRCH.
 fn spawn_and_move<F>(
     ctx: &Ctx,
     names: &[String],

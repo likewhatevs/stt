@@ -5306,7 +5306,6 @@ mod tests {
             ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
         // Readiness handshake — poll for the ready file the worker
         // writes after its `libc::signal(SIGUSR1, SIG_IGN)` call
         // completes. Replaces a fixed 200ms sleep with progress-
@@ -5322,8 +5321,12 @@ mod tests {
         // and the parent would send SIGUSR1 before SIG_IGN was
         // actually installed. PID reuse across test runs in the same
         // session is plausible because fork() picks from the kernel's
-        // recycled PID pool.
+        // recycled PID pool. This MUST run before `h.start()` — after
+        // start() the worker is unblocked and can write a fresh ready
+        // file before we reach this line, which would cause us to
+        // unlink a live handshake and wedge the poll loop.
         let _ = std::fs::remove_file(&ready_path);
+        h.start();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !ready_path.exists() {
             if Instant::now() >= deadline {

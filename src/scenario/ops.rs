@@ -4587,7 +4587,7 @@ mod tests {
 
     /// A call captured by MockCgroupOps during apply_setup execution.
     /// Equality-comparable so tests can assert on the exact sequence.
-    /// `MoveTasks` stores the tid count rather than the full `tids` Vec
+    /// `MoveTasks` stores the pid count rather than the full `pids` Vec
     /// because PIDs are unpredictable between runs.
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum CgroupCall {
@@ -4597,7 +4597,7 @@ mod tests {
         SetCpuset(String, BTreeSet<usize>),
         ClearCpuset(String),
         MoveTask(String, libc::pid_t),
-        MoveTasks(String, usize), // (cgroup name, number of tids)
+        MoveTasks(String, usize), // (cgroup name, number of pids)
         ClearSubtreeControl(String),
         DrainTasks(String),
         CleanupAll,
