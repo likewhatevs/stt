@@ -5329,6 +5329,19 @@ mod tests {
         h.start();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !ready_path.exists() {
+            // Liveness probe: if the worker died before it could write
+            // the ready file, no amount of further polling will produce
+            // it. `kill(pid, 0)` is the POSIX "does this process
+            // exist?" probe — Err(ESRCH) is the definitive
+            // negative. Break immediately instead of burning the full
+            // 2s deadline on a child that is already reaped.
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(worker_pid), None).is_err() {
+                panic!(
+                    "worker at pid {worker_pid} exited before writing ready file \
+                     {ready_path:?} — the child crashed or was reaped before it \
+                     could reach `ignores_sigusr1_fn`'s ready-file write",
+                );
+            }
             if Instant::now() >= deadline {
                 panic!(
                     "worker at pid {worker_pid} never wrote ready file {ready_path:?} \

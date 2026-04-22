@@ -2042,13 +2042,41 @@ fn build_stimulus(
     let cgroup_count = state.step.cgroups.names().len() + state.backdrop.cgroups.names().len();
     let worker_count = state.step.handles.len() + state.backdrop.handles.len();
 
+    // Saturate narrowing conversions for the wire schema: the
+    // StimulusPayload fields are sized for realistic scenarios
+    // (u32 ms, u16 counts) but `as u32` / `as u16` silently
+    // wrap on overflow, poisoning downstream consumers. Log the
+    // overflow so the operator sees which field exceeded its
+    // bound and substitute MAX — clipped-high is a safer wire
+    // value than silently wrapping to a small number.
+    let to_u32 = |field: &str, v: u128| -> u32 {
+        u32::try_from(v).unwrap_or_else(|_| {
+            tracing::warn!(
+                field,
+                value = %v,
+                "StimulusPayload field overflowed u32; saturating to u32::MAX",
+            );
+            u32::MAX
+        })
+    };
+    let to_u16 = |field: &str, v: usize| -> u16 {
+        u16::try_from(v).unwrap_or_else(|_| {
+            tracing::warn!(
+                field,
+                value = v,
+                "StimulusPayload field overflowed u16; saturating to u16::MAX",
+            );
+            u16::MAX
+        })
+    };
+
     StimulusPayload {
-        elapsed_ms: scenario_start.elapsed().as_millis() as u32,
+        elapsed_ms: to_u32("elapsed_ms", scenario_start.elapsed().as_millis()),
         step_index: step_idx as u16,
-        op_count: ops.len() as u16,
+        op_count: to_u16("op_count", ops.len()),
         op_kinds,
-        cgroup_count: cgroup_count as u16,
-        worker_count: worker_count as u16,
+        cgroup_count: to_u16("cgroup_count", cgroup_count),
+        worker_count: to_u16("worker_count", worker_count),
         total_iterations,
     }
 }

@@ -1752,7 +1752,12 @@ pub fn assert_benchmarks(
 ) -> AssertResult {
     let mut r = AssertResult::pass();
     if reports.is_empty() {
-        return r;
+        // No worker reports means nothing to measure — any benchmark
+        // threshold the caller supplied cannot be evaluated. A silent
+        // pass would let thresholds look "green" on a broken run that
+        // never produced signal; surface it as skip so the operator
+        // knows the benchmark was not actually exercised.
+        return AssertResult::skip("no worker reports — benchmark skipped");
     }
 
     // Collect all wake latencies across workers.
@@ -3540,8 +3545,20 @@ mod tests {
 
     #[test]
     fn assert_benchmarks_empty_reports() {
+        // Empty reports → skip (passed stays true for gate-compat, but
+        // `skipped` is set and a detail with DetailKind::Skip carries
+        // the reason). The thresholds supplied here cannot be evaluated
+        // against zero signal, so a silent pass would mask a broken run.
         let r = assert_benchmarks(&[], Some(1000), Some(0.5), Some(100.0));
-        assert!(r.passed);
+        assert!(r.passed, "skip keeps passed=true for gate-compat");
+        assert!(r.skipped, "no reports must surface as skipped");
+        assert!(
+            r.details
+                .iter()
+                .any(|d| matches!(d.kind, DetailKind::Skip) && d.message.contains("no worker reports")),
+            "skip detail must carry the 'no worker reports' reason: {:?}",
+            r.details,
+        );
     }
 
     #[test]
