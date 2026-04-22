@@ -522,14 +522,16 @@ fn evaluate_vm_result(
     }
 
     // No parseable result — no AssertResult found in SHM or COM2.
-    // When a scheduler is running this typically means the scheduler died;
-    // without a scheduler (EEVDF) it means the payload itself failed.
-    // Attempt auto-repro if enabled and a scheduler was running.
-    // Any scheduler failure that prevents producing a test result warrants
-    // repro — BPF verifier failures, scx_bpf_error() exits, crashes, and
-    // stalls all land here. Previous code required specific string patterns
-    // ("SCHEDULER_DIED", "sched_ext:" + "disabled") which missed mid-test
-    // deaths where the sched_exit_monitor writes to SHM but not COM2.
+    // With an scx scheduler under test this typically means the
+    // scheduler is no longer running; without a scheduler (EEVDF)
+    // it means the payload itself failed. Attempt auto-repro if
+    // enabled and a scheduler was running.
+    // Any scheduler failure that prevents producing a test result
+    // warrants repro — BPF verifier failures, scx_bpf_error() exits,
+    // crashes, and stalls all land here. Previous code required
+    // specific string patterns (`SENTINEL_SCHEDULER_DIED`,
+    // "sched_ext:" + "disabled") which missed mid-test exits where
+    // the sched_exit_monitor writes to SHM but not COM2.
     let repro_section = if entry.scheduler.has_active_scheduling() {
         repro_fn(output)
             .map(|r| format!("\n\n--- auto-repro ---\n{r}"))

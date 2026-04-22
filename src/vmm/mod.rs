@@ -4670,8 +4670,8 @@ mod tests {
         assert!(
             !output.contains(crate::test_support::SENTINEL_SCHEDULER_DIED)
                 && !stderr.contains(crate::test_support::SENTINEL_SCHEDULER_DIED),
-            "scheduler died during 15s run — either the watchdog fired or the \
-             scheduler failed for another reason. output: {output:?}, stderr: {stderr:?}",
+            "scheduler no longer running after 15s — either the watchdog fired or the \
+             scheduler exited for another reason. output: {output:?}, stderr: {stderr:?}",
         );
         assert!(
             !output.contains(crate::test_support::SENTINEL_SCHEDULER_NOT_ATTACHED)
