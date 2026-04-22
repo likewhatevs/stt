@@ -495,6 +495,33 @@ mod tests {
         assert_eq!(decode_named_value("", "enforce", "1"), "true");
     }
 
+    /// Malformed hex input must flow through the `as_u64` fallback
+    /// (warn + 0) rather than panicking. Uses `dsq_id` so `as_u64()`
+    /// is invoked and its result reaches `decode_dsq_id(0)`, which
+    /// formats 0 as `DSQ(0x0)` (the `_ =>` arm of decode_dsq_id with
+    /// the type bits cleared).
+    #[test]
+    fn decode_named_value_malformed_hex_falls_back_to_zero() {
+        assert_eq!(decode_named_value("", "dsq_id", "0xGHIJ"), "DSQ(0x0)");
+    }
+
+    /// Same contract as the hex case but for a malformed decimal —
+    /// `val.parse::<u64>()` fails, `as_u64` warns and returns 0, and
+    /// the enclosing decode proceeds without panicking.
+    #[test]
+    fn decode_named_value_malformed_decimal_falls_back_to_zero() {
+        assert_eq!(decode_named_value("", "dsq_id", "abc"), "DSQ(0x0)");
+    }
+
+    /// Empty value is also malformed on both branches (strip_prefix
+    /// fails → decimal parse → empty-string parse fails). Pins that
+    /// the empty-input path does not special-case away from the
+    /// warn-and-zero contract.
+    #[test]
+    fn decode_named_value_empty_value_falls_back_to_zero() {
+        assert_eq!(decode_named_value("", "dsq_id", ""), "DSQ(0x0)");
+    }
+
     #[test]
     fn decode_named_value_scx_flags() {
         let v = TASK_QUEUED | (TASK_STATE_ENABLED << TASK_STATE_SHIFT);

@@ -285,7 +285,30 @@ pub struct GauntletRow {
 }
 
 /// Convert a SidecarResult to a GauntletRow for run-to-run comparison.
+///
+/// Non-finite f64 values (NaN, ±Infinity) are sanitized to 0.0 with a
+/// warn before they reach the row. `serde_json::to_string` rejects
+/// non-finite, so a single poisoned metric would otherwise halt every
+/// downstream JSON write. Sanitizing at the ingress boundary keeps the
+/// serializer happy without silencing the upstream data quality issue.
 pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
+    // Local closure so the warn can carry the scenario name as
+    // context — keyed by field so the operator can pinpoint which
+    // metric produced the bad value.
+    let finite_or_zero = |field: &str, v: f64| -> f64 {
+        if v.is_finite() {
+            v
+        } else {
+            tracing::warn!(
+                test = %sc.test_name,
+                field,
+                value = v,
+                "non-finite f64 in GauntletRow field; substituting 0.0",
+            );
+            0.0
+        }
+    };
+
     GauntletRow {
         scenario: sc.test_name.clone(),
         topology: sc.topology.clone(),
@@ -294,15 +317,17 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         flags: sc.active_flags.clone(),
         passed: sc.passed,
         skipped: sc.skipped,
-        spread: sc.stats.worst_spread,
+        spread: finite_or_zero("spread", sc.stats.worst_spread),
         gap_ms: sc.stats.worst_gap_ms,
         migrations: sc.stats.total_migrations,
-        migration_ratio: sc.stats.worst_migration_ratio,
-        imbalance_ratio: sc
-            .monitor
-            .as_ref()
-            .map(|m| m.max_imbalance_ratio)
-            .unwrap_or(0.0),
+        migration_ratio: finite_or_zero("migration_ratio", sc.stats.worst_migration_ratio),
+        imbalance_ratio: finite_or_zero(
+            "imbalance_ratio",
+            sc.monitor
+                .as_ref()
+                .map(|m| m.max_imbalance_ratio)
+                .unwrap_or(0.0),
+        ),
         max_dsq_depth: sc
             .monitor
             .as_ref()
@@ -325,19 +350,34 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .and_then(|m| m.event_deltas.as_ref())
             .map(|e| e.total_dispatch_keep_last)
             .unwrap_or(0),
-        worst_p99_wake_latency_us: sc.stats.worst_p99_wake_latency_us,
-        worst_median_wake_latency_us: sc.stats.worst_median_wake_latency_us,
-        worst_wake_latency_cv: sc.stats.worst_wake_latency_cv,
+        worst_p99_wake_latency_us: finite_or_zero(
+            "worst_p99_wake_latency_us",
+            sc.stats.worst_p99_wake_latency_us,
+        ),
+        worst_median_wake_latency_us: finite_or_zero(
+            "worst_median_wake_latency_us",
+            sc.stats.worst_median_wake_latency_us,
+        ),
+        worst_wake_latency_cv: finite_or_zero(
+            "worst_wake_latency_cv",
+            sc.stats.worst_wake_latency_cv,
+        ),
         total_iterations: sc.stats.total_iterations,
-        worst_mean_run_delay_us: sc.stats.worst_mean_run_delay_us,
-        worst_run_delay_us: sc.stats.worst_run_delay_us,
-        page_locality: sc.stats.worst_page_locality,
-        cross_node_migration_ratio: sc.stats.worst_cross_node_migration_ratio,
-        // Non-finite values (NaN, +/-Infinity) cause `serde_json::to_string`
-        // on the enclosing GauntletRow to fail, halting any downstream
-        // serializer or comparison tool that needs the row as JSON.
-        // Drop non-finite entries with a warn so the row still serializes
-        // and the operator can see which metric produced the bad value.
+        worst_mean_run_delay_us: finite_or_zero(
+            "worst_mean_run_delay_us",
+            sc.stats.worst_mean_run_delay_us,
+        ),
+        worst_run_delay_us: finite_or_zero("worst_run_delay_us", sc.stats.worst_run_delay_us),
+        page_locality: finite_or_zero("page_locality", sc.stats.worst_page_locality),
+        cross_node_migration_ratio: finite_or_zero(
+            "cross_node_migration_ratio",
+            sc.stats.worst_cross_node_migration_ratio,
+        ),
+        // Non-finite entries would also break `serde_json::to_string`,
+        // but the map shape makes "substitute 0.0" ambiguous (the entry
+        // might legitimately be 0.0 for a different scenario). Drop the
+        // entry entirely so the non-finite value can't be confused with
+        // a real zero datapoint.
         ext_metrics: sc
             .stats
             .ext_metrics
@@ -1356,6 +1396,43 @@ mod tests {
         assert_eq!(row.stall_count, 0);
         assert_eq!(row.fallback_count, 0);
         assert_eq!(row.keep_last_count, 0);
+    }
+
+    /// `sidecar_to_row` must sanitize non-finite f64 in the row's
+    /// direct fields (not just `ext_metrics`) — same `serde_json`
+    /// rejects-NaN motivation. Unlike `ext_metrics`, direct fields
+    /// can't be dropped (the row schema is fixed), so non-finite
+    /// collapses to 0.0 with a warn. Pins all 10 direct f64 field
+    /// assignments behind the `finite_or_zero` helper via spread =
+    /// NaN (one representative); if the helper ever gets removed
+    /// from one of its call sites, extending this test to cover the
+    /// other 9 is a single-line edit.
+    #[test]
+    fn sidecar_to_row_zeros_non_finite_direct_f64_fields() {
+        use crate::assert::ScenarioStats;
+        use crate::test_support;
+        let sc = test_support::SidecarResult {
+            stats: ScenarioStats {
+                worst_spread: f64::NAN,
+                worst_migration_ratio: f64::INFINITY,
+                worst_p99_wake_latency_us: f64::NEG_INFINITY,
+                worst_page_locality: f64::NAN,
+                ..Default::default()
+            },
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row = sidecar_to_row(&sc);
+        assert_eq!(row.spread, 0.0, "NaN must collapse to 0.0");
+        assert_eq!(row.migration_ratio, 0.0, "+Infinity must collapse to 0.0");
+        assert_eq!(
+            row.worst_p99_wake_latency_us, 0.0,
+            "-Infinity must collapse to 0.0"
+        );
+        assert_eq!(row.page_locality, 0.0, "NaN must collapse to 0.0");
+        // Motivation check: the sanitized row serializes. Without the
+        // `finite_or_zero` wraps, serde_json::to_string would return
+        // Err because NaN / Infinity have no JSON representation.
+        serde_json::to_string(&row).expect("sanitized row must serialize cleanly");
     }
 
     /// `sidecar_to_row` must drop NaN / +Infinity / -Infinity from

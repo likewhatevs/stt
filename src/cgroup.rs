@@ -430,16 +430,46 @@ impl CgroupOps for CgroupManager {
 /// so writes to `/sys/fs/cgroup/cgroup.procs` succeed even when
 /// intermediate cgroups have `subtree_control` set.
 /// ESRCH (task exited) is silently tolerated; other errors are logged.
+/// A `read_to_string` failure or a malformed pid line is surfaced via
+/// `tracing::warn!` — silently dropping either would hide a cgroup
+/// that still contains tasks and send it into cleanup, which then
+/// fails with EBUSY and compounds the confusion.
 fn drain_pids_to_root(procs_path: &Path, context: &str) {
     let dst = Path::new("/sys/fs/cgroup/cgroup.procs");
-    if let Ok(content) = fs::read_to_string(procs_path) {
-        for line in content.lines() {
-            if let Ok(pid) = line.trim().parse::<u32>()
-                && let Err(e) = write_with_timeout(dst, &pid.to_string(), CGROUP_WRITE_TIMEOUT)
-                && !is_esrch(&e)
-            {
-                tracing::warn!(pid, cgroup = context, err = %e, "failed to drain task");
+    let content = match fs::read_to_string(procs_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                path = %procs_path.display(),
+                cgroup = context,
+                err = %e,
+                "drain_pids_to_root: read_to_string failed; tasks may remain in cgroup",
+            );
+            return;
+        }
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let pid: u32 = match trimmed.parse() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    path = %procs_path.display(),
+                    cgroup = context,
+                    line = trimmed,
+                    err = %e,
+                    "drain_pids_to_root: malformed pid line; skipping",
+                );
+                continue;
             }
+        };
+        if let Err(e) = write_with_timeout(dst, &pid.to_string(), CGROUP_WRITE_TIMEOUT)
+            && !is_esrch(&e)
+        {
+            tracing::warn!(pid, cgroup = context, err = %e, "failed to drain task");
         }
     }
 }
