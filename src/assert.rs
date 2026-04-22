@@ -2131,28 +2131,95 @@ mod tests {
     #[test]
     fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
         // Symmetric case: when `other` reports smaller values, `self`
-        // retains its larger worst. Covers the branch of each
-        // `.max()` call where `self` wins, which the "b larger"
-        // test above never exercises.
+        // retains its larger worst. Covers the "self wins" branch of
+        // every scalar worst-comparison in merge (9 fields total:
+        // 8 `.max()` calls + the coupled `worst_gap_ms` guard).
         let mut a = AssertResult::pass();
         a.stats.worst_spread = 30.0;
+        a.stats.worst_gap_ms = 500;
+        a.stats.worst_gap_cpu = 7;
+        a.stats.worst_migration_ratio = 0.9;
         a.stats.worst_p99_wake_latency_us = 100.0;
+        a.stats.worst_median_wake_latency_us = 60.0;
+        a.stats.worst_wake_latency_cv = 0.7;
+        a.stats.worst_run_delay_us = 300.0;
         a.stats.worst_mean_run_delay_us = 200.0;
+        a.stats.worst_cross_node_migration_ratio = 0.35;
         a.stats.total_iterations = 500;
 
         let mut b = AssertResult::pass();
         b.stats.worst_spread = 5.0;
+        b.stats.worst_gap_ms = 100;
+        b.stats.worst_gap_cpu = 3;
+        b.stats.worst_migration_ratio = 0.1;
         b.stats.worst_p99_wake_latency_us = 10.0;
+        b.stats.worst_median_wake_latency_us = 5.0;
+        b.stats.worst_wake_latency_cv = 0.1;
+        b.stats.worst_run_delay_us = 40.0;
         b.stats.worst_mean_run_delay_us = 20.0;
+        b.stats.worst_cross_node_migration_ratio = 0.05;
         b.stats.total_iterations = 50;
 
         a.merge(b);
 
         assert_eq!(a.stats.worst_spread, 30.0);
+        assert_eq!(a.stats.worst_gap_ms, 500);
+        // `worst_gap_cpu` stays 7: coupling means it retains `self`'s
+        // index when `self` wins on `worst_gap_ms`.
+        assert_eq!(a.stats.worst_gap_cpu, 7);
+        assert_eq!(a.stats.worst_migration_ratio, 0.9);
         assert_eq!(a.stats.worst_p99_wake_latency_us, 100.0);
+        assert_eq!(a.stats.worst_median_wake_latency_us, 60.0);
+        assert_eq!(a.stats.worst_wake_latency_cv, 0.7);
+        assert_eq!(a.stats.worst_run_delay_us, 300.0);
         assert_eq!(a.stats.worst_mean_run_delay_us, 200.0);
+        assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.35);
         // Totals always sum, independent of worst-wins direction.
         assert_eq!(a.stats.total_iterations, 550);
+    }
+
+    #[test]
+    fn merge_worst_page_locality_lowest_non_zero() {
+        // `worst_page_locality` can't use plain `.min()` because 0.0
+        // is the "unreported" sentinel — a fresh cgroup with no NUMA
+        // readings would otherwise clobber a real reading from a
+        // reporting cgroup. The merge instead takes the lowest
+        // non-zero value.
+
+        // (a) self=0.0 (unreported) + other=0.8 (reported) → 0.8.
+        let mut a = AssertResult::pass();
+        a.stats.worst_page_locality = 0.0;
+        let mut b = AssertResult::pass();
+        b.stats.worst_page_locality = 0.8;
+        a.merge(b);
+        assert_eq!(
+            a.stats.worst_page_locality, 0.8,
+            "unreported self must adopt other's reading"
+        );
+
+        // (b) self=0.6 + other=0.8 → 0.6 (self's lower reading wins).
+        let mut a = AssertResult::pass();
+        a.stats.worst_page_locality = 0.6;
+        let mut b = AssertResult::pass();
+        b.stats.worst_page_locality = 0.8;
+        a.merge(b);
+        assert_eq!(
+            a.stats.worst_page_locality, 0.6,
+            "lower non-zero reading wins across cgroups"
+        );
+
+        // (c) self=0.8 (reported) + other=0.0 (unreported) → 0.8.
+        // Plain `.min()` would select 0.0 here — the guard rejects
+        // other's sentinel instead of overwriting self.
+        let mut a = AssertResult::pass();
+        a.stats.worst_page_locality = 0.8;
+        let mut b = AssertResult::pass();
+        b.stats.worst_page_locality = 0.0;
+        a.merge(b);
+        assert_eq!(
+            a.stats.worst_page_locality, 0.8,
+            "unreported other must not clobber self's reading"
+        );
     }
 
     #[test]
@@ -4253,6 +4320,26 @@ numa_miss 5";
         assert!(
             !detail.is_scheduler_death(),
             "predicate must filter on message prefix only; a mis-set kind does not imply scheduler death",
+        );
+    }
+
+    /// Common-root false positive: "scheduler process started
+    /// successfully" shares the "scheduler process " prefix with
+    /// [`SCHED_EXITED_PREFIX`] but carries the opposite meaning —
+    /// a healthy startup, not a death event. Pins the predicate's
+    /// `starts_with(SCHED_EXITED_PREFIX)` specificity so a regression
+    /// that loosens the match to `starts_with("scheduler process ")`
+    /// (or a fuzzy `contains` fallback) can't silently route startup
+    /// diagnostics through the scheduler-death console-dump gate.
+    #[test]
+    fn is_scheduler_death_rejects_common_root_non_death_message() {
+        let detail = AssertDetail::new(
+            DetailKind::Monitor,
+            "scheduler process started successfully",
+        );
+        assert!(
+            !detail.is_scheduler_death(),
+            "shared 'scheduler process' root must not match — prefix specificity is the guard",
         );
     }
 }

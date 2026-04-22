@@ -191,19 +191,25 @@ pub struct StressNgPayload;
 /// exercise the LLM extraction pipeline (schbench supports `--json`
 /// but this fixture intentionally uses the third acquisition path).
 ///
-/// **Contract — empty metric set by design.** A bare
-/// `ctx.payload(&SCHBENCH)` run produces **zero extracted metrics**.
-/// Not a bug, not a pipeline failure: the fixture's default argv
-/// deliberately leaves stdout empty so the LlmExtract path receives
-/// an empty body, and `metrics = []` so no hint is ever applied. The
-/// happy-path assertion is the exit-code gate; anything else is the
-/// caller's responsibility. Two orthogonal reasons drive this, each
-/// expanded below:
+/// **Contract — no polarity-classified metrics by design.** A bare
+/// `ctx.payload(&SCHBENCH)` run is expected to reach the
+/// `default_check(exit_code_eq(0))` gate cleanly and produce **no
+/// polarity-tagged metrics**. Not a bug, not a pipeline failure:
+/// the fixture declares `metrics = []`, so no hint ever binds an
+/// extracted metric name to a polarity / unit pair, and whatever
+/// the LLM pulls out of schbench's output stays at
+/// [`Polarity::Unknown`](ktstr::test_support::Polarity::Unknown).
+/// The happy-path assertion is the exit-code gate; anything else
+/// is the caller's responsibility. Two orthogonal reasons drive
+/// this, each expanded below:
 ///
 /// 1. schbench writes latency tables and summary lines to **stderr**
 ///    by default — stdout is empty unless `--json -` is passed.
-///    [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun)
-///    extracts from stdout only.
+///    [`OutputFormat::LlmExtract`](ktstr::test_support::OutputFormat::LlmExtract)
+///    runs stdout-primary with a stderr fallback: the LLM extracts
+///    first against (empty) stdout, observes zero metrics, then
+///    retries against stderr's latency text. See the stderr-fallback
+///    section below for the details.
 /// 2. LLM-extracted metric names are non-deterministic, so any hint
 ///    declared on this fixture would silently fail to match. The
 ///    fixture ships with `metrics = []` so the absence of polarity
@@ -242,21 +248,27 @@ pub struct StressNgPayload;
 /// (e.g. `"int.wakeup_latency_pct99.0"` from `write_json_stats`
 /// in schbench.c).
 ///
-/// **stdout-only extraction.** schbench writes its percentile
+/// **Stderr-fallback extraction.** schbench writes its percentile
 /// tables (`show_latencies` → `fprintf(stderr, ...)`) and summary
 /// lines (`avg worker transfer`, `average rps`, `sched delay`) to
 /// **stderr** by default; stdout only carries output when
-/// `--json -` is passed.
-/// [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun)
-/// extracts metrics from stdout alone (stderr is surfaced only on
-/// exit-code mismatch), so this fixture's default invocation hands
+/// `--json -` is passed. Under the stdout-primary / stderr-fallback
+/// contract on
+/// [`OutputFormat`](ktstr::test_support::OutputFormat) (documented
+/// on [`PayloadRun::run`](ktstr::scenario::payload_run::PayloadRun::run)),
 /// [`extract_via_llm`](ktstr::test_support::model::extract_via_llm)
-/// an empty string. The happy-path assertion is the exit-code gate
-/// in `default_checks`; the metric set is intentionally empty. To
-/// drive the LLM extraction against real latency text, append
-/// `--json -` via `.arg("--json").arg("-")` on the runtime builder
-/// — the JSON block lands on stdout and the LlmExtract pipeline
-/// receives a non-empty body.
+/// is invoked against stdout first — for this fixture that yields
+/// zero metrics because stdout is empty — and then re-invoked
+/// against stderr since the stdout pass produced nothing and
+/// stderr is non-empty. The LLM therefore receives schbench's
+/// latency text on the fallback leg. The extracted metric names
+/// are model-dependent (see "No metric hints." above), so with
+/// `metrics = []` none of them pick up a polarity / unit, and the
+/// happy-path assertion remains the exit-code gate in
+/// `default_checks`. For a stable regression-direction schema,
+/// append `--json -` via `.arg("--json").arg("-")` on the runtime
+/// builder — the JSON block lands on stdout, the stdout-primary
+/// pass consumes it, and the stderr fallback never fires.
 #[derive(Payload)]
 #[payload(binary = "schbench", output = LlmExtract)]
 #[default_args("--runtime", "30", "--message-threads", "2")]

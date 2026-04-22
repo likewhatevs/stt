@@ -624,6 +624,18 @@ impl MpolFlags {
     /// optimization for this policy.
     pub const NUMA_BALANCING: Self = Self(1 << 13);
 
+    /// Test-only raw-bit constructor. Lets unknown-bit guards
+    /// (e.g. `validate_mempolicy_cpuset` in src/scenario/ops.rs)
+    /// be tested against bit patterns that are not reachable via
+    /// the documented `STATIC_NODES | RELATIVE_NODES |
+    /// NUMA_BALANCING` constants. Production callers must use the
+    /// named constants + `union` / `BitOr` so the model stays in
+    /// sync with the validator's known-bits mask.
+    #[cfg(test)]
+    pub(crate) const fn from_bits_for_test(bits: u32) -> Self {
+        Self(bits)
+    }
+
     /// Combine two flag sets.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)

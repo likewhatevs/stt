@@ -2061,6 +2061,15 @@ fn build_stimulus(
 /// cgroup's scenario intent — the cpuset the cgroup runs in and
 /// the host topology.
 ///
+/// # Empty-nodemask early return
+///
+/// Policies with no nodemask — [`MemPolicy::Default`] and
+/// [`MemPolicy::Local`] — carry no node IDs to validate against,
+/// so this function returns `Ok(())` unconditionally for them
+/// (after the unknown-bit and mutual-exclusion flag guards run).
+/// Every other variant (Bind, Preferred, Interleave) reaches the
+/// cpuset / host-topology coverage logic below.
+///
 /// # Why this is a scenario-intent check, not a kernel guard
 ///
 /// ktstr only writes `cpuset.cpus` on each cgroup; it never writes
@@ -2088,16 +2097,21 @@ fn build_stimulus(
 /// that the test author almost certainly did not intend. Surface
 /// the mismatch here before `run_steps` commits to the policy.
 ///
-/// `MpolFlags::STATIC_NODES` is the rebind-behavior flag (see
-/// `mm/mempolicy.c: mpol_relative_nodemask` + the `MPOL_F_*`
-/// handling in `mpol_rebind_policy`): with it set, the nodemask
-/// survives cpuset rebind operations unchanged; without it, the
-/// nodemask is remapped when the cpuset's `mems_allowed` changes
-/// after the policy was installed. Since ktstr never rebinds
-/// `cpuset.mems` mid-run, the flag is effectively a
-/// cross-node-intent declaration for the validator's purposes — a
-/// sign the author knows the intent is "allocations on a node
-/// outside the CPU-affinity cpuset" and has opted in to that shape.
+/// `MpolFlags::STATIC_NODES` is the rebind-behavior flag. Two
+/// kernel sites encode the semantics: `mpol_set_nodemask` in
+/// `mm/mempolicy.c` consumes the flag during policy creation (it
+/// determines whether the supplied nodemask is stored absolute or
+/// remapped against the caller's cpuset at install time), and
+/// `mpol_rebind_policy` (same file) branches on the flag when the
+/// cpuset's `mems_allowed` changes after the policy was installed
+/// — with `STATIC_NODES` set, the stored nodemask is unchanged;
+/// without it, the kernel remaps the nodemask against the new
+/// `mems_allowed`. Since ktstr never rebinds `cpuset.mems` mid-run,
+/// only the install-time semantics applies, and the flag is
+/// effectively a cross-node-intent declaration for the validator's
+/// purposes — a sign the author knows the intent is "allocations on
+/// a node outside the CPU-affinity cpuset" and has opted in to
+/// that shape.
 ///
 /// # Flag-specific handling (in order of evaluation)
 ///
@@ -2124,6 +2138,33 @@ fn validate_mempolicy_cpuset(
     cgroup_name: &str,
 ) -> Result<()> {
     use crate::workload::MpolFlags;
+
+    // Reject unknown bits before any other check. The `MpolFlags`
+    // type is a `u32` bitfield covering three documented bits
+    // (STATIC_NODES, RELATIVE_NODES, NUMA_BALANCING); any other bit
+    // set in `flags` is either a user typo (raw-constructing the
+    // struct with an arbitrary integer) or forward-compat from a
+    // future kernel flag that this validator hasn't learned yet.
+    // Either way, surfacing unknown bits here prevents a silent
+    // semantic mismatch — the kernel would either reject with
+    // EINVAL or (worse) treat the bit as a flag we don't model.
+    let known_bits = MpolFlags::STATIC_NODES.bits()
+        | MpolFlags::RELATIVE_NODES.bits()
+        | MpolFlags::NUMA_BALANCING.bits();
+    let unknown_bits = flags.bits() & !known_bits;
+    if unknown_bits != 0 {
+        anyhow::bail!(
+            "cgroup '{}': MpolFlags contains unknown bit(s) {:#x} (known bits: \
+             STATIC_NODES={:#x}, RELATIVE_NODES={:#x}, NUMA_BALANCING={:#x}); \
+             refusing to forward to the kernel — update MpolFlags to model the \
+             new bit before using it, or clear the bit at the call site",
+            cgroup_name,
+            unknown_bits,
+            MpolFlags::STATIC_NODES.bits(),
+            MpolFlags::RELATIVE_NODES.bits(),
+            MpolFlags::NUMA_BALANCING.bits(),
+        );
+    }
 
     // `STATIC_NODES | RELATIVE_NODES` is a kernel-rejected combination —
     // `MPOL_F_STATIC_NODES` and `MPOL_F_RELATIVE_NODES` are mutually
@@ -4410,6 +4451,38 @@ mod tests {
         assert!(
             rendered.contains("mutually exclusive"),
             "error must name the mutual-exclusion contract; got: {rendered}"
+        );
+    }
+
+    /// The unknown-bit guard must reject any `MpolFlags` bit that
+    /// isn't one of the three documented constants. Without this
+    /// test, a regression that accidentally widened `known_bits` or
+    /// skipped the guard would land silently — the kernel would
+    /// either EINVAL or (worse) interpret the bit as a flag the
+    /// validator doesn't model. Uses the `#[cfg(test)]`
+    /// `from_bits_for_test` constructor to synthesize a bit pattern
+    /// (1 << 10) that no production `MpolFlags` call path can
+    /// produce via the named constants.
+    #[test]
+    fn validate_mempolicy_rejects_unknown_bits() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..8).collect();
+        let unknown = crate::workload::MpolFlags::from_bits_for_test(1 << 10);
+        let err = validate_mempolicy_cpuset(
+            &MemPolicy::Default,
+            unknown,
+            &cpuset,
+            &ctx,
+            "cg_unknown_bit",
+        )
+        .expect_err("unknown bit must bail");
+        let s = err.to_string();
+        assert!(s.contains("cg_unknown_bit"), "bail must name cgroup: {s}");
+        assert!(s.contains("unknown bit"), "bail must name the unknown-bit contract: {s}");
+        assert!(
+            s.contains("STATIC_NODES"),
+            "bail must enumerate the known bits so the user sees what IS supported: {s}",
         );
     }
 

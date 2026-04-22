@@ -265,7 +265,7 @@ enum ThreadResult {
 /// machine consumers can aggregate (e.g. "n tids exited during
 /// probe" vs. "n tids denied ptrace attach") without substring-
 /// matching free-form text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 enum ThreadErrorKind {
     /// `ptrace(PTRACE_SEIZE)` or `ptrace(PTRACE_INTERRUPT)` failed.
@@ -1560,23 +1560,41 @@ mod tests {
         assert!(!s.contains("\"comm\":null"));
     }
 
+    /// Canonical snake_case token for each `ThreadErrorKind` variant.
+    /// Single source of truth consumed by both the serde-serialization
+    /// test and the `Display`↔serde parity test. Adding a new variant
+    /// triggers a compile error here (missing match arm); combined
+    /// with the `strum::EnumIter` derive on the enum and the
+    /// `ThreadErrorKind::iter()` loop in each test, no variant can
+    /// slip through untested.
+    fn expected_error_kind_token(k: ThreadErrorKind) -> &'static str {
+        match k {
+            ThreadErrorKind::PtraceAttach => "ptrace_attach",
+            ThreadErrorKind::Waitpid => "waitpid",
+            ThreadErrorKind::GetRegset => "get_regset",
+            ThreadErrorKind::ProcessVmReadv => "process_vm_readv",
+            ThreadErrorKind::TlsArithmetic => "tls_arithmetic",
+        }
+    }
+
     /// `ThreadErrorKind` serializes every variant to its documented
     /// snake_case token. Pins the `#[serde(rename_all = "snake_case")]`
     /// attribute against accidental removal or rename — the error
     /// classification is a wire contract consumed by downstream
     /// tooling, and a silent rename ("get_regset" → "getregset")
     /// would break every consumer that matches on the token.
+    /// Iterates via `strum::EnumIter` so a newly-added variant is
+    /// covered exhaustively without a parallel array edit.
     #[test]
     fn thread_error_kind_snake_case_serialization() {
-        for (k, expected) in [
-            (ThreadErrorKind::PtraceAttach, "ptrace_attach"),
-            (ThreadErrorKind::Waitpid, "waitpid"),
-            (ThreadErrorKind::GetRegset, "get_regset"),
-            (ThreadErrorKind::ProcessVmReadv, "process_vm_readv"),
-            (ThreadErrorKind::TlsArithmetic, "tls_arithmetic"),
-        ] {
+        use strum::IntoEnumIterator;
+        for k in ThreadErrorKind::iter() {
             let s = serde_json::to_string(&k).unwrap();
-            assert_eq!(s, format!("\"{expected}\""), "variant {k:?}");
+            assert_eq!(
+                s,
+                format!("\"{}\"", expected_error_kind_token(k)),
+                "variant {k:?}",
+            );
         }
     }
 
@@ -1607,28 +1625,25 @@ mod tests {
     }
 
     /// `Display` for `ThreadErrorKind` must render the same snake_case
-    /// token as the serde JSON serialization. The stderr render path
-    /// (`print_output`) uses `{error_kind}` so operators grepping
-    /// `warning: tid ... [ptrace_attach]: ...` can share a pattern
-    /// with the JSON `"error_kind": "ptrace_attach"` consumers. A
-    /// drift (e.g. Display rendering `PtraceAttach` while serde still
-    /// emits `ptrace_attach`) would silently fork the two vocabularies.
+    /// token as the serde JSON serialization AND the canonical
+    /// expected-token mapping. The stderr render path (`print_output`)
+    /// uses `{error_kind}` so operators matching on
+    /// `warning: tid ... [ptrace_attach]: ...` share a pattern with
+    /// the JSON `"error_kind": "ptrace_attach"` consumers. A drift
+    /// (e.g. Display rendering `PtraceAttach` while serde still emits
+    /// `ptrace_attach`) would silently fork the two vocabularies.
+    /// Iterates via `strum::EnumIter` so a newly-added variant is
+    /// covered without a parallel array edit.
     #[test]
     fn thread_error_kind_display_matches_serde_token() {
-        for k in [
-            ThreadErrorKind::PtraceAttach,
-            ThreadErrorKind::Waitpid,
-            ThreadErrorKind::GetRegset,
-            ThreadErrorKind::ProcessVmReadv,
-            ThreadErrorKind::TlsArithmetic,
-        ] {
+        use strum::IntoEnumIterator;
+        for k in ThreadErrorKind::iter() {
+            let expected = expected_error_kind_token(k);
             let json = serde_json::to_string(&k).unwrap();
             let serde_token = json.trim_matches('"');
             let display_token = format!("{k}");
-            assert_eq!(
-                display_token, serde_token,
-                "Display and serde token diverged for {k:?}",
-            );
+            assert_eq!(serde_token, expected, "serde token for {k:?}");
+            assert_eq!(display_token, expected, "Display token for {k:?}");
         }
     }
 
@@ -1663,6 +1678,52 @@ mod tests {
                     RunOutcome::Fatal(_) => unreachable!(),
                 },
             ),
+        }
+    }
+
+    /// Acceptance direction for the self-probe gate: a non-self pid
+    /// must NOT trigger the `refusing to probe self` short-circuit.
+    /// Pairs with `run_rejects_self_probe` to pin the gate's
+    /// exactness — a regression that broadened the check (e.g. to
+    /// "any pid in the probe's own process group", or a mis-typed
+    /// comparison that tripped on unrelated pids) would fire the
+    /// self-probe path and be caught here.
+    ///
+    /// Spawns `sleep 30` as a disposable non-self target; after the
+    /// probe call, the child is killed + reaped so nothing leaks.
+    /// The spawned process is not jemalloc-linked, so `run()` is
+    /// expected to fail later in the pipeline (at
+    /// `find_jemalloc_via_maps` or a ptrace step) with a DIFFERENT
+    /// error. The assertion is narrow: whatever error surfaces, it
+    /// must not be the self-probe message. `Ok` / `AllFailed` are
+    /// equally acceptable — all three outcomes prove the self-probe
+    /// gate was cleared.
+    #[test]
+    fn run_accepts_non_self_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep for non-self pid acceptance test");
+        let child_pid = child.id() as i32;
+        let self_pid = std::process::id() as i32;
+        assert_ne!(
+            child_pid, self_pid,
+            "spawned child pid must differ from parent for this test to be meaningful",
+        );
+        let cli = Cli {
+            pid: Some(child_pid),
+            json: false,
+            self_test: None,
+        };
+        let outcome = run(&cli);
+        let _ = child.kill();
+        let _ = child.wait();
+        if let RunOutcome::Fatal(err) = outcome {
+            let msg = format!("{err:#}");
+            assert!(
+                !msg.contains("refusing to probe self"),
+                "self-probe gate must NOT fire for non-self pid {child_pid} (self={self_pid}), got: {msg}",
+            );
         }
     }
 }

@@ -1703,6 +1703,25 @@ Hugepagesize:       2048 kB
     ///
     /// Deltas (`load() - before-snapshot`) absorb pre-population
     /// from sibling tests: the test is robust to execution order.
+    ///
+    /// # Nextest subprocess-isolation assumption
+    ///
+    /// The before-snapshot / after-delta arithmetic assumes no
+    /// **other** concurrent test inside the same process mutates
+    /// the counters mid-run. ktstr's test suite is driven by
+    /// `cargo nextest run`, which spawns a fresh subprocess per
+    /// test by default — so each test sees a freshly-initialized
+    /// process with its own counters, and the only writers to
+    /// `STATIC_INIT_CALLS` / `MEMINFO_READ_CALLS` during this
+    /// test's window are its own five `collect_host_context()`
+    /// calls. Under `cargo test` (shared-process, thread-parallel)
+    /// a sibling test calling `collect_host_context()` in parallel
+    /// would skew the deltas. The CLAUDE.md rule "always use
+    /// `cargo nextest run`, never `cargo test`" is what keeps this
+    /// assumption load-bearing; a future migration away from
+    /// nextest would need to re-assess this test's atomic-delta
+    /// scheme (likely via per-test-thread counters or a mutex
+    /// around the whole call window).
     #[cfg(target_os = "linux")]
     #[test]
     fn collect_host_context_call_counts_match_caching_invariants() {
@@ -1742,26 +1761,40 @@ Hugepagesize:       2048 kB
         );
     }
 
-    /// Memory-only NUMA nodes (CXL / Intel Optane / persistent
-    /// memory tiers) have no CPUs assigned. They do not appear in
-    /// `cpu_to_node`, so the counter — which iterates
-    /// `cpu_to_node.values()` — MUST exclude them. The counter is
-    /// the "CPU-bearing nodes" count, not the "all nodes" count.
+    /// `count_numa_nodes_in_topology` counts the cardinality of
+    /// distinct values in [`HostTopology::cpu_to_node`] — the
+    /// "CPU-bearing nodes" count, and nothing else. Memory-only
+    /// NUMA nodes (CXL / Intel Optane / persistent memory tiers)
+    /// have no CPUs by definition and are structurally
+    /// unrepresentable in the current [`HostTopology`]: the struct
+    /// has no "all nodes" field populated from
+    /// `/sys/devices/system/node/*` independently of the CPU
+    /// mapping. From the counter's perspective a memory-only node
+    /// and a non-existent node are indistinguishable — both are
+    /// simply missing from `cpu_to_node`.
     ///
-    /// This invariant is deliberate: cgroup cpuset assignments,
-    /// scheduler placement, and the NUMA memory-policy paths ktstr
-    /// tests care about are all CPU-keyed. A memory-only node is
-    /// irrelevant to those flows. Surfacing it in the count would
-    /// inflate the denominator for "CPUs per node" and similar
-    /// derivations downstream.
+    /// **What this test pins is narrow**: the counter's only
+    /// source is `cpu_to_node`. A regression that added a parallel
+    /// source (e.g. an `all_nodes: Vec<u32>` field fed from
+    /// `/sys/...`) and summed it into the count would inflate the
+    /// "CPUs per node" denominator for every downstream consumer —
+    /// cgroup cpuset assignments, scheduler placement, and the
+    /// NUMA memory-policy validator in
+    /// [`ops::validate_mempolicy_cpuset`] — all of which are
+    /// CPU-keyed and would quietly break under an inflated count.
+    /// The exclusion is therefore by construction (the parallel
+    /// field doesn't exist), not by active filtering.
     ///
-    /// Pin the behavior with a topology where 4 CPUs map across
-    /// nodes 0 and 1 and an extra node id (2) has ZERO cpu_to_node
-    /// entries — representing a memory-only tier. The count must
-    /// come back as 2 (the CPU-bearing nodes), not 3. A regression
-    /// that added `+1` for every memory-only node — or switched
-    /// the implementation to read a separate `all_nodes` field —
-    /// would trip this assertion.
+    /// Fixture: 4 CPUs mapped across nodes 0 and 1, so
+    /// `cpu_to_node.values()` has 2 distinct entries. The assertion
+    /// demands `count == 2`. A future impl that introduced a second
+    /// source must either (a) audit all CPU-keyed consumers at the
+    /// same time and update this doc to match, or (b) leave this
+    /// counter cpu_to_node-driven and add a separate
+    /// `count_all_nodes_including_memory_only` helper with its own
+    /// coverage. The inline comment at the "absent node id" line
+    /// carries the same contract for readers browsing the test
+    /// body.
     #[test]
     fn count_numa_nodes_in_topology_excludes_memory_only_nodes() {
         let mut cpu_to_node = std::collections::HashMap::new();
