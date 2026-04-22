@@ -1872,10 +1872,6 @@ mod tests {
             test_name: "my_test".to_string(),
             topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
-            payload: None,
-            metrics: vec![],
-            passed: true,
-            skipped: false,
             stats: ScenarioStats {
                 cgroups: vec![],
                 total_workers: 4,
@@ -1906,17 +1902,7 @@ mod tests {
                 prog_stats_deltas: None,
                 ..Default::default()
             }),
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..test_support::SidecarResult::test_fixture()
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "my_test");
@@ -1940,24 +1926,8 @@ mod tests {
         let sc = test_support::SidecarResult {
             test_name: "eevdf_test".to_string(),
             topology: "1n1l2c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            payload: None,
-            metrics: vec![],
-            skipped: false,
             passed: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..test_support::SidecarResult::test_fixture()
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "eevdf_test");
@@ -1974,14 +1944,6 @@ mod tests {
         use crate::monitor;
         use crate::test_support;
         let sc = test_support::SidecarResult {
-            test_name: "t".to_string(),
-            topology: "1n1l1c1t".to_string(),
-            skipped: false,
-            scheduler: "test".to_string(),
-            payload: None,
-            metrics: vec![],
-            passed: true,
-            stats: Default::default(),
             monitor: Some(monitor::MonitorSummary {
                 prog_stats_deltas: None,
                 total_samples: 5,
@@ -1992,17 +1954,7 @@ mod tests {
                 schedstat_deltas: None,
                 ..Default::default()
             }),
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..test_support::SidecarResult::test_fixture()
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.stall_count, 0);

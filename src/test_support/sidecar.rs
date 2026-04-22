@@ -130,13 +130,72 @@ pub struct SidecarResult {
     /// Host context — static-ish runtime state (CPU model,
     /// memory size, THP policy, kernel release, host cmdline,
     /// scheduler tunables). Populated at sidecar-write time from
-    /// `host_state::collect_host_context`. `None` only on the
-    /// test-fixture path where the sidecar is constructed by hand;
-    /// deliberately excluded from [`sidecar_variant_hash`] so
-    /// gauntlet variants on different hosts collapse into the same
-    /// hash bucket.
+    /// `host_state::collect_host_context`. `None` on the
+    /// test-fixture path where the sidecar is synthesized via
+    /// [`SidecarResult::test_fixture`]; deliberately excluded from
+    /// [`sidecar_variant_hash`] so gauntlet variants on different
+    /// hosts collapse into the same hash bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<crate::host_state::HostContext>,
+}
+
+#[cfg(test)]
+impl SidecarResult {
+    /// Populated [`SidecarResult`] for unit tests. Every field has a
+    /// reasonable default so call sites only spell out what they want
+    /// to vary via struct-update syntax:
+    ///
+    /// ```ignore
+    /// let sc = SidecarResult {
+    ///     test_name: "my_test".to_string(),
+    ///     passed: false,
+    ///     ..SidecarResult::test_fixture()
+    /// };
+    /// ```
+    ///
+    /// Defaults model a passing EEVDF run on a minimal `1n1l1c1t`
+    /// topology with no payload and no VM telemetry: `test_name="t"`,
+    /// `topology="1n1l1c1t"`, `scheduler="eevdf"`, `work_type="CpuSpin"`,
+    /// `passed=true`, `skipped=false`, every [`Option`] `None`, every
+    /// [`Vec`] empty, `stats` is `ScenarioStats::default()`, and both
+    /// `timestamp`/`run_id` are empty strings.
+    ///
+    /// **Prefer this over local `base = || SidecarResult { ... }`
+    /// closures.** A local closure duplicates the default set and
+    /// drifts the moment [`SidecarResult`] grows a field; this fixture
+    /// is the single place those defaults live.
+    ///
+    /// **Hash-stability tests must not rely on these defaults for
+    /// hash-participating fields** (`topology`, `scheduler`, `payload`,
+    /// `work_type`, `active_flags`, `sysctls`, `kargs`). Tests that pin
+    /// a [`sidecar_variant_hash`] output against a literal constant
+    /// must spell every hash-participating field out explicitly so a
+    /// future change to these defaults cannot silently shift the
+    /// pinned value.
+    pub(crate) fn test_fixture() -> SidecarResult {
+        SidecarResult {
+            test_name: "t".to_string(),
+            topology: "1n1l1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: Vec::new(),
+            passed: true,
+            skipped: false,
+            stats: crate::assert::ScenarioStats::default(),
+            monitor: None,
+            stimulus_events: Vec::new(),
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            sysctls: Vec::new(),
+            kargs: Vec::new(),
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+            host: None,
+        }
+    }
 }
 
 /// Scan a directory for ktstr sidecar JSON files. Recurses one level
@@ -646,6 +705,80 @@ mod tests {
     use crate::scenario::Ctx;
     use anyhow::Result;
 
+    // -- test_fixture self-tests --
+    //
+    // Guard the fixture's observable shape so call-site tests can rely
+    // on these defaults without re-asserting them.
+
+    /// Serializing the fixture and parsing the result back must
+    /// succeed — proves every field is serde-compatible and no default
+    /// produces a value that fails to round-trip (e.g. a NaN float or
+    /// an invalid Option combination).
+    #[test]
+    fn test_fixture_round_trips_clean() {
+        let sc = SidecarResult::test_fixture();
+        let json = serde_json::to_string(&sc).expect("fixture must serialize");
+        let _loaded: SidecarResult =
+            serde_json::from_str(&json).expect("fixture JSON must parse back");
+    }
+
+    /// `passed=true, skipped=false` is the fixture's verdict default
+    /// so tests that only care about the success path don't need to
+    /// spell either field out. A silent flip of either bit would
+    /// invert the meaning of every unmodified call-site test.
+    #[test]
+    fn test_fixture_is_pass_not_skip() {
+        let sc = SidecarResult::test_fixture();
+        assert!(sc.passed, "fixture must default to passed=true");
+        assert!(!sc.skipped, "fixture must default to skipped=false");
+    }
+
+    /// `host=None` is the fixture's host default so
+    /// [`sidecar_variant_hash_excludes_host_context`] and every test
+    /// that asserts the JSON does not carry a host key can rely on
+    /// the default rather than spelling it out. Production writers
+    /// populate host explicitly (see `write_sidecar` /
+    /// `write_skip_sidecar`).
+    #[test]
+    fn test_fixture_host_is_none() {
+        let sc = SidecarResult::test_fixture();
+        assert!(sc.host.is_none(), "fixture must default to host=None");
+    }
+
+    /// `payload=None, metrics=empty` is the fixture's default so
+    /// tests that verify the serde `skip_serializing_if` contract
+    /// (e.g. [`sidecar_payload_and_metrics_omitted_when_empty`]) can
+    /// rely on these defaults rather than re-spelling them.
+    #[test]
+    fn test_fixture_payload_and_metrics_empty() {
+        let sc = SidecarResult::test_fixture();
+        assert!(sc.payload.is_none(), "fixture must default to payload=None");
+        assert!(sc.metrics.is_empty(), "fixture must default to metrics=empty");
+    }
+
+    /// Two fresh fixtures must hash to the same value and that value
+    /// must match the pinned constant. Protects against a change to
+    /// fixture defaults that would silently shift every call-site
+    /// test that passes the fixture straight into
+    /// [`sidecar_variant_hash`] (e.g. `sidecar_variant_hash_distinguishes_payload`'s
+    /// `none` handle). If this constant needs to move, every such
+    /// call site must be re-read to confirm the shift is intentional.
+    #[test]
+    fn test_fixture_variant_hash_is_stable() {
+        let a = sidecar_variant_hash(&SidecarResult::test_fixture());
+        let b = sidecar_variant_hash(&SidecarResult::test_fixture());
+        assert_eq!(a, b, "two fresh fixtures must hash identically");
+        assert_eq!(
+            a, 0x55f6b9881e152f8c,
+            "fixture hash drifted — update only if the fixture default \
+             change is intentional; verify every call site that passes \
+             the fixture straight into sidecar_variant_hash still expresses \
+             the intent it had before",
+        );
+    }
+
+    /// Full literal intentional: exercises every field through serde so
+    /// a future addition is caught by a compile error here.
     #[test]
     fn sidecar_result_roundtrip() {
         let sc = SidecarResult {
@@ -742,24 +875,8 @@ mod tests {
         let sc = SidecarResult {
             test_name: "eevdf_test".to_string(),
             topology: "1n1l2c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            payload: None,
-            metrics: vec![],
             passed: false,
-            skipped: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..SidecarResult::test_fixture()
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -795,24 +912,7 @@ mod tests {
         let sc = SidecarResult {
             test_name: "test_x".to_string(),
             topology: "1n1l2c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            payload: None,
-            metrics: vec![],
-            passed: true,
-            skipped: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..SidecarResult::test_fixture()
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(tmp.join("test_x.ktstr.json"), &json).unwrap();
@@ -833,23 +933,8 @@ mod tests {
             test_name: "nested_test".to_string(),
             topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
-            payload: None,
-            metrics: vec![],
             passed: false,
-            skipped: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..SidecarResult::test_fixture()
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(sub.join("nested_test.ktstr.json"), &json).unwrap();
@@ -877,25 +962,7 @@ mod tests {
 
         let sc = |name: &str| SidecarResult {
             test_name: name.to_string(),
-            topology: "1n1l1c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            payload: None,
-            metrics: vec![],
-            passed: true,
-            skipped: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..SidecarResult::test_fixture()
         };
         // One level: should be collected.
         std::fs::write(
@@ -945,26 +1012,8 @@ mod tests {
     #[test]
     fn sidecar_result_work_type_field() {
         let sc = SidecarResult {
-            test_name: "t".to_string(),
-            topology: "1n1l1c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            payload: None,
-            metrics: vec![],
-            passed: true,
-            skipped: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
             work_type: "Bursty".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..SidecarResult::test_fixture()
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -1185,34 +1234,30 @@ mod tests {
     /// sidecars and vice versa. Pinning the output against a
     /// pre-computed constant catches that drift before it ships.
     ///
-    /// Only fields that feed the hash (topology, scheduler, payload,
-    /// work_type, active_flags, sysctls, kargs) are set to significant
-    /// values; irrelevant fields are zero-ish defaults so this test
-    /// stays robust against unrelated `SidecarResult` schema growth.
+    /// Every currently hash-participating field (topology, scheduler,
+    /// payload, work_type, active_flags, sysctls, kargs) is set
+    /// explicitly; non-participating fields come from
+    /// [`SidecarResult::test_fixture`] so unrelated schema growth does
+    /// not disturb the constant. If a future change adds a new
+    /// hash-participating field to [`sidecar_variant_hash`], add it
+    /// here too — otherwise this test silently degrades into a
+    /// same-defaults check.
     #[test]
     fn sidecar_variant_hash_stability_populated() {
-        use crate::assert::ScenarioStats;
+        // Every currently hash-participating field is spelled out
+        // explicitly so a change to `test_fixture` defaults cannot
+        // silently shift the pinned constant. If you add a new
+        // hash-participating field to `sidecar_variant_hash`, add
+        // it here and recompute the expected constant.
         let sc = SidecarResult {
-            test_name: String::new(),
             topology: "1n2l4c1t".to_string(),
             scheduler: "scx-ktstr".to_string(),
             payload: None,
-            metrics: vec![],
-            passed: false,
-            skipped: false,
-            stats: ScenarioStats::default(),
-            monitor: None,
-            stimulus_events: Vec::new(),
             work_type: "CpuSpin".to_string(),
             active_flags: vec!["llc".to_string(), "steal".to_string()],
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
             sysctls: vec!["sysctl.kernel.sched_cfs_bandwidth_slice_us=1000".to_string()],
             kargs: vec!["nosmt".to_string()],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..SidecarResult::test_fixture()
         };
         // If this assertion trips, the wire format changed. Bumping
         // the expected value is the wrong fix unless you also plan
@@ -1236,28 +1281,20 @@ mod tests {
     /// regressions.
     #[test]
     fn sidecar_variant_hash_stability_empty_collections() {
-        use crate::assert::ScenarioStats;
+        // Every currently hash-participating field is spelled out
+        // explicitly so a change to `test_fixture` defaults cannot
+        // silently shift the pinned constant. If you add a new
+        // hash-participating field to `sidecar_variant_hash`, add
+        // it here and recompute the expected constant.
         let sc = SidecarResult {
-            test_name: String::new(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             payload: None,
-            metrics: vec![],
-            passed: false,
-            skipped: false,
-            stats: ScenarioStats::default(),
-            monitor: None,
-            stimulus_events: Vec::new(),
             work_type: String::new(),
             active_flags: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
             sysctls: Vec::new(),
             kargs: Vec::new(),
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..SidecarResult::test_fixture()
         };
         assert_eq!(sidecar_variant_hash(&sc), 0x1b61394511b42e01);
     }
@@ -1268,30 +1305,13 @@ mod tests {
     /// don't clobber each other's files.
     #[test]
     fn sidecar_variant_hash_distinguishes_payload() {
-        use crate::assert::ScenarioStats;
-        let base = || SidecarResult {
-            test_name: String::new(),
-            topology: "1n1l1c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            payload: None,
-            metrics: Vec::new(),
-            passed: false,
-            skipped: false,
-            stats: ScenarioStats::default(),
-            monitor: None,
-            stimulus_events: Vec::new(),
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            sysctls: Vec::new(),
-            kargs: Vec::new(),
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
-        };
+        // `none` relies on [`SidecarResult::test_fixture`] defaulting
+        // `payload` to `None`. If that default changes, the absent-vs-
+        // present comparison below collapses — the assertion below
+        // and this comment are intentionally load-bearing.
+        let base = SidecarResult::test_fixture;
         let none = base();
+        assert!(none.payload.is_none(), "fixture default for payload must remain None");
         let fio = SidecarResult {
             payload: Some("fio".to_string()),
             ..base()
@@ -1315,33 +1335,6 @@ mod tests {
 
     // -- format_verifier_stats tests --
 
-    fn make_sidecar_with_vstats(
-        vstats: Vec<crate::monitor::bpf_prog::ProgVerifierStats>,
-    ) -> SidecarResult {
-        SidecarResult {
-            test_name: "t".to_string(),
-            topology: "1n1l1c1t".to_string(),
-            scheduler: "test".to_string(),
-            payload: None,
-            metrics: vec![],
-            passed: true,
-            skipped: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vstats,
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
-        }
-    }
-
     #[test]
     fn format_verifier_stats_empty() {
         assert!(format_verifier_stats(&[]).is_empty());
@@ -1349,22 +1342,25 @@ mod tests {
 
     #[test]
     fn format_verifier_stats_no_data() {
-        let sc = make_sidecar_with_vstats(vec![]);
+        let sc = SidecarResult::test_fixture();
         assert!(format_verifier_stats(&[sc]).is_empty());
     }
 
     #[test]
     fn format_verifier_stats_table() {
-        let sc = make_sidecar_with_vstats(vec![
-            crate::monitor::bpf_prog::ProgVerifierStats {
-                name: "dispatch".to_string(),
-                verified_insns: 50000,
-            },
-            crate::monitor::bpf_prog::ProgVerifierStats {
-                name: "enqueue".to_string(),
-                verified_insns: 30000,
-            },
-        ]);
+        let sc = SidecarResult {
+            verifier_stats: vec![
+                crate::monitor::bpf_prog::ProgVerifierStats {
+                    name: "dispatch".to_string(),
+                    verified_insns: 50000,
+                },
+                crate::monitor::bpf_prog::ProgVerifierStats {
+                    name: "enqueue".to_string(),
+                    verified_insns: 30000,
+                },
+            ],
+            ..SidecarResult::test_fixture()
+        };
         let result = format_verifier_stats(&[sc]);
         assert!(result.contains("BPF VERIFIER STATS"));
         assert!(result.contains("dispatch"));
@@ -1377,10 +1373,13 @@ mod tests {
 
     #[test]
     fn format_verifier_stats_warning() {
-        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
-            name: "heavy".to_string(),
-            verified_insns: 800000,
-        }]);
+        let sc = SidecarResult {
+            verifier_stats: vec![crate::monitor::bpf_prog::ProgVerifierStats {
+                name: "heavy".to_string(),
+                verified_insns: 800000,
+            }],
+            ..SidecarResult::test_fixture()
+        };
         let result = format_verifier_stats(&[sc]);
         assert!(result.contains("WARNING"));
         assert!(result.contains("heavy"));
@@ -1389,10 +1388,13 @@ mod tests {
 
     #[test]
     fn sidecar_verifier_stats_serde_roundtrip() {
-        let sc = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
-            name: "init".to_string(),
-            verified_insns: 5000,
-        }]);
+        let sc = SidecarResult {
+            verifier_stats: vec![crate::monitor::bpf_prog::ProgVerifierStats {
+                name: "init".to_string(),
+                verified_insns: 5000,
+            }],
+            ..SidecarResult::test_fixture()
+        };
         let json = serde_json::to_string(&sc).unwrap();
         assert!(json.contains("verifier_stats"));
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -1403,21 +1405,25 @@ mod tests {
 
     #[test]
     fn sidecar_verifier_stats_empty_omitted() {
-        let sc = make_sidecar_with_vstats(vec![]);
+        let sc = SidecarResult::test_fixture();
         let json = serde_json::to_string(&sc).unwrap();
         assert!(!json.contains("verifier_stats"));
     }
 
     #[test]
     fn format_verifier_stats_deduplicates() {
-        let sc1 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
+        let vstats = vec![crate::monitor::bpf_prog::ProgVerifierStats {
             name: "dispatch".to_string(),
             verified_insns: 50000,
-        }]);
-        let sc2 = make_sidecar_with_vstats(vec![crate::monitor::bpf_prog::ProgVerifierStats {
-            name: "dispatch".to_string(),
-            verified_insns: 50000,
-        }]);
+        }];
+        let sc1 = SidecarResult {
+            verifier_stats: vstats.clone(),
+            ..SidecarResult::test_fixture()
+        };
+        let sc2 = SidecarResult {
+            verifier_stats: vstats,
+            ..SidecarResult::test_fixture()
+        };
         let result = format_verifier_stats(&[sc1, sc2]);
         // Deduplicated: total should be 50000, not 100000.
         assert!(result.contains("total verified insns: 50000"));
@@ -1607,28 +1613,7 @@ mod tests {
     /// before it ships.
     #[test]
     fn sidecar_payload_and_metrics_omitted_when_empty() {
-        let sc = SidecarResult {
-            test_name: "t".to_string(),
-            topology: "1n1l1c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            payload: None,
-            metrics: vec![],
-            passed: true,
-            skipped: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
-        };
+        let sc = SidecarResult::test_fixture();
         let json = serde_json::to_string(&sc).unwrap();
         assert!(
             !json.contains("\"payload\""),
@@ -1666,24 +1651,9 @@ mod tests {
         let sc = SidecarResult {
             test_name: "fio_run".to_string(),
             topology: "1n1l2c1t".to_string(),
-            scheduler: "eevdf".to_string(),
             payload: Some("fio".to_string()),
             metrics: vec![pm],
-            passed: true,
-            skipped: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
+            ..SidecarResult::test_fixture()
         };
         let json = serde_json::to_string(&sc).unwrap();
         assert!(json.contains("\"payload\":\"fio\""));
@@ -1909,31 +1879,7 @@ mod tests {
     /// the run-key split reaches on-disk sidecars.
     #[test]
     fn sidecar_variant_hash_excludes_host_context() {
-        use crate::assert::ScenarioStats;
         use crate::host_state::HostContext;
-        let base = || SidecarResult {
-            test_name: String::new(),
-            topology: "1n1l2c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            payload: None,
-            metrics: Vec::new(),
-            passed: false,
-            skipped: false,
-            stats: ScenarioStats::default(),
-            monitor: None,
-            stimulus_events: Vec::new(),
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            sysctls: Vec::new(),
-            kargs: Vec::new(),
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
-            host: None,
-        };
-        let without_host = base();
         let populated = HostContext {
             cpu_model: Some("Example CPU".to_string()),
             cpu_vendor: Some("GenuineExample".to_string()),
@@ -1950,9 +1896,14 @@ mod tests {
             uname_machine: Some("x86_64".to_string()),
             host_cmdline: Some("preempt=lazy".to_string()),
         };
+        let without_host = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            ..SidecarResult::test_fixture()
+        };
         let with_host = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
             host: Some(populated),
-            ..base()
+            ..SidecarResult::test_fixture()
         };
         assert_eq!(
             sidecar_variant_hash(&without_host),
@@ -1991,26 +1942,9 @@ mod tests {
             host_cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
         };
         let sc = SidecarResult {
-            test_name: "t".to_string(),
             topology: "1n1l2c1t".to_string(),
-            scheduler: "eevdf".to_string(),
-            payload: None,
-            metrics: vec![],
-            passed: true,
-            skipped: false,
-            stats: Default::default(),
-            monitor: None,
-            stimulus_events: vec![],
-            work_type: "CpuSpin".to_string(),
-            active_flags: Vec::new(),
-            verifier_stats: vec![],
-            kvm_stats: None,
-            sysctls: vec![],
-            kargs: vec![],
-            kernel_version: None,
-            timestamp: String::new(),
-            run_id: String::new(),
             host: Some(ctx),
+            ..SidecarResult::test_fixture()
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
