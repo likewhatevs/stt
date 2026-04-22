@@ -1902,39 +1902,32 @@ mod tests {
     /// manipulation because `eprintln!` writes straight through to
     /// fd 2.
     ///
-    /// Implementation walks libc directly because nix 0.31's `dup2`
-    /// requires `&mut OwnedFd` for the destination, and fd 2 is not
-    /// an OwnedFd we can lawfully construct (we don't own it; std's
-    /// `Stderr` handle is the borrower). Saving via `libc::dup`,
-    /// swapping via `libc::dup2`, and restoring via a second `dup2`
-    /// keeps ownership semantics clean: we never claim to own fd 2,
-    /// we just temporarily point it elsewhere.
+    /// Uses [`nix::unistd::dup`] (returns an `OwnedFd` for the
+    /// saved-stderr handle) and [`nix::unistd::dup2_stderr`] (the
+    /// nix 0.31 purpose-built wrapper for redirecting fd 2); the
+    /// latter sidesteps the generic `dup2`'s `&mut OwnedFd` newfd
+    /// requirement — which would be awkward here, because fd 2 is
+    /// not an `OwnedFd` we can lawfully construct. Dropping `saved`
+    /// at scope exit closes it; fd 2 retains its own kernel-level
+    /// reference to the original stderr open file description.
     ///
     /// Test-only utility — no production caller. Lives in this test
     /// module so its scope is bounded.
     fn capture_test_stderr<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
+        use nix::unistd::{dup, dup2_stderr};
         use std::io::{Read, Seek, SeekFrom, Write};
         let mut sink = tempfile::tempfile().expect("create stderr-capture tempfile");
-        let sink_fd = std::os::unix::io::AsRawFd::as_raw_fd(&sink);
         // Flush any pending stderr buffering before redirect. eprintln!
         // is line-buffered to a Stderr lock; flush ensures pre-call
         // output reaches the original fd 2 instead of leaking into
         // the captured tempfile.
         std::io::stderr().flush().ok();
-        // SAFETY: libc::dup, libc::dup2, libc::close on integer fds
-        // are POSIX-defined and have no Rust-level safety obligations
-        // beyond the integers being valid open fds. fd 2 is open in
-        // every Unix process.
-        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
-        assert!(saved >= 0, "dup(STDERR_FILENO) failed");
-        let dup2_rc = unsafe { libc::dup2(sink_fd, libc::STDERR_FILENO) };
-        assert!(dup2_rc >= 0, "dup2(sink, STDERR_FILENO) failed");
+        let saved = dup(std::io::stderr()).expect("dup(stderr) failed");
+        dup2_stderr(&sink).expect("dup2_stderr(sink) failed");
         let result = f();
         // Flush before restore so all of f's writes land in the sink.
         std::io::stderr().flush().ok();
-        let restore_rc = unsafe { libc::dup2(saved, libc::STDERR_FILENO) };
-        assert!(restore_rc >= 0, "dup2(saved, STDERR_FILENO) failed");
-        unsafe { libc::close(saved) };
+        dup2_stderr(&saved).expect("dup2_stderr(saved) failed");
         sink.seek(SeekFrom::Start(0)).expect("rewind sink");
         let mut bytes = Vec::new();
         sink.read_to_end(&mut bytes).expect("read sink");

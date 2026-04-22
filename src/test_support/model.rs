@@ -71,7 +71,7 @@
 //!    inner `Mutex` then serializes repeated generation passes
 //!    against the shared `ModelWeights`. Tests that mutate
 //!    `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` call
-//!    [`reset_for_test`] (cfg(test)-only) before asserting offline-gate
+//!    [`reset`] (cfg(test)-only) before asserting offline-gate
 //!    trip behavior so a previously-memoized `Ok(_)` does not bypass
 //!    the gate.
 //! 3. `invoke_with_model` (module-private) runs one greedy
@@ -101,7 +101,7 @@ use super::payload::OutputFormat;
 
 /// Set by [`prefetch_if_required`] when both [`ensure`] calls
 /// succeed; read by [`load_inference`] to skip the redundant second
-/// SHA hash. Cleared by [`reset_for_test`] alongside [`MODEL_CACHE`]
+/// SHA hash. Cleared by [`reset`] alongside [`MODEL_CACHE`]
 /// so cfg(test) callers that re-flip `KTSTR_MODEL_OFFLINE` do not
 /// observe a stale "prefetch ran successfully" signal that would
 /// route the next `load_inference` through `locate()` and bypass the
@@ -177,7 +177,7 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 ///
 /// # Test-only reset
 ///
-/// [`reset_for_test`] clears the slot and is the hook tests use to
+/// [`reset`] clears the slot and is the hook tests use to
 /// re-exercise `load_inference` (and through it, `ensure()`'s
 /// offline-gate trip) when they have just mutated `KTSTR_MODEL_OFFLINE`
 /// or `KTSTR_CACHE_DIR`. Without that reset, a successful load in any
@@ -1285,7 +1285,7 @@ fn memoized_inference() -> Arc<CachedInference> {
 /// load-once-per-process by design. The reset hook is a test-only
 /// affordance for re-exercising the load path.
 #[cfg(test)]
-pub(crate) fn reset_for_test() {
+pub(crate) fn reset() {
     PREFETCH_CHECKED.store(false, Ordering::Release);
     let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
@@ -2466,13 +2466,13 @@ mod tests {
     /// the offline-gate trip point so a regression that swallowed
     /// the env var context would fire here first.
     ///
-    /// Calls [`reset_for_test`] under [`lock_env`] so a `PREFETCH_CHECKED
+    /// Calls [`reset`] under [`lock_env`] so a `PREFETCH_CHECKED
     /// = true` set by an earlier test does not route this call through
     /// `locate()` (which skips the offline-gate `ensure()` it expects).
     #[test]
     fn load_inference_errs_with_offline_message_under_offline_gate() {
         let _lock = lock_env();
-        reset_for_test();
+        reset();
         let _cache = isolated_cache_dir();
         let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         let r = load_inference();
@@ -2494,7 +2494,7 @@ mod tests {
     /// `ensure()` before any model load, so the inference call
     /// fails cleanly and the pipeline reports no metrics.
     ///
-    /// Calls [`reset_for_test`] under [`lock_env`] so a previously
+    /// Calls [`reset`] under [`lock_env`] so a previously
     /// memoized `Ok(_)` slot in [`MODEL_CACHE`] cannot bypass the
     /// offline gate this test means to exercise. Without the reset,
     /// any earlier successful load anywhere in the test binary would
@@ -2505,7 +2505,7 @@ mod tests {
     #[test]
     fn extract_via_llm_returns_empty_when_backend_unavailable() {
         let _lock = lock_env();
-        reset_for_test();
+        reset();
         let _cache = isolated_cache_dir();
         let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         let metrics = extract_via_llm("arbitrary stdout", None);
@@ -2514,15 +2514,15 @@ mod tests {
         assert!(metrics.is_empty());
     }
 
-    /// `reset_for_test()` clears both [`MODEL_CACHE`] and
+    /// `reset()` clears both [`MODEL_CACHE`] and
     /// [`PREFETCH_CHECKED`] so the next `extract_via_llm` /
     /// `load_inference` call re-runs the load path end-to-end.
     ///
     /// The contract this pins:
-    /// 1. After `reset_for_test()`, the outer `MODEL_CACHE` slot is
+    /// 1. After `reset()`, the outer `MODEL_CACHE` slot is
     ///    `None` — the next `extract_via_llm` call re-runs
     ///    `load_inference` (and through it, `ensure()`'s offline gate).
-    /// 2. After `reset_for_test()`, `PREFETCH_CHECKED` is `false` so
+    /// 2. After `reset()`, `PREFETCH_CHECKED` is `false` so
     ///    the next `load_inference` falls back to `ensure()` rather
     ///    than `locate()` and the offline gate is consulted again.
     ///
@@ -2531,18 +2531,18 @@ mod tests {
     /// flip the slot to a synthetic `Ok(...)` payload (so the bug-
     /// pollution the reset is preventing is visible — without the
     /// reset, a downstream call would observe the synthetic Ok and
-    /// skip the offline gate). After `reset_for_test()`, the next
+    /// skip the offline gate). After `reset()`, the next
     /// `extract_via_llm` call re-runs `ensure()`, the offline gate
     /// trips, and the cache lands at `Err` again. `assert_eq!` on
     /// the rendered error chains proves the same offline-gate code
     /// path ran both times.
     #[test]
-    fn reset_for_test_clears_model_cache_and_prefetch_checked() {
+    fn reset_clears_model_cache_and_prefetch_checked() {
         let _lock = lock_env();
         // Seed a populated slot so we can prove reset clears it. Use
         // the offline-gate path so seeding doesn't try to load the
         // 2.44 GiB GGUF.
-        reset_for_test();
+        reset();
         let _cache = isolated_cache_dir();
         let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         // First call — populates MODEL_CACHE with Err(<offline gate>).
@@ -2558,17 +2558,17 @@ mod tests {
         // alongside the cache.
         PREFETCH_CHECKED.store(true, Ordering::Release);
         // Reset: both must be cleared.
-        reset_for_test();
+        reset();
         {
             let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             assert!(
                 guard.is_none(),
-                "reset_for_test must clear MODEL_CACHE to None"
+                "reset must clear MODEL_CACHE to None"
             );
         }
         assert!(
             !PREFETCH_CHECKED.load(Ordering::Acquire),
-            "reset_for_test must clear PREFETCH_CHECKED to false"
+            "reset must clear PREFETCH_CHECKED to false"
         );
         // Subsequent extract_via_llm under the same offline gate must
         // re-trip ensure() rather than reading a stale cached entry.
@@ -2867,7 +2867,7 @@ mod tests {
     /// Display output through the chain — exercising the
     /// migration for tokenizer errors (which arrive as
     /// `Box<dyn std::error::Error + Send + Sync>` per
-    /// tokenizers-0.21.4/src/tokenizer/mod.rs:51). Verify both the
+    /// tokenizers-0.21.4/src/tokenizer/mod.rs:51). Check both the
     /// context layer and the inner message are visible in the chain.
     /// Unlike `anyhow_error_new_preserves_source_chain`, the concrete
     /// type stored under `from_boxed` is the trait object itself, so
@@ -2980,7 +2980,7 @@ mod tests {
         };
         let on_disk = cache.path().join(spec.file_name);
         std::fs::write(&on_disk, b"wrong bytes for pin").unwrap();
-        // Verify status() classifies correctly before running ensure.
+        // Check status() classifies correctly before running ensure.
         let st = status(&spec).expect("status should not error on valid-shape pin");
         assert!(st.cached, "file exists, status must report cached=true");
         assert!(

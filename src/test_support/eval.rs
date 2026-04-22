@@ -1265,7 +1265,7 @@ mod tests {
     #[test]
     fn eval_payload_exits_no_check_result() {
         // Payload wrote something to COM2 but not a valid AssertResult.
-        let entry = eevdf_entry("__eval_no_verify__");
+        let entry = eevdf_entry("__eval_no_check__");
         let result = make_vm_result(
             "some output but no delimiters",
             "Linux version 6.14.0\nboot complete",

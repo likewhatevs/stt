@@ -1741,6 +1741,41 @@ mod tests {
     }
 
     #[test]
+    fn cache_dir_list_classifies_unreadable_metadata_as_corrupt() {
+        // The `missing` and `parse error` branches of `read_metadata`
+        // are covered elsewhere; the third branch — any I/O error on
+        // `fs::read_to_string` that is NOT `ErrorKind::NotFound` — is
+        // exercised here. Forcing a non-ENOENT error without relying
+        // on filesystem permissions (which vary across rootless
+        // containers and CI sandboxes) is awkward, so we make
+        // `metadata.json` a DIRECTORY: `read_to_string` then fails
+        // with `EISDIR`, which read_metadata must map to the
+        // `"metadata.json unreadable: "` prefix rather than the
+        // missing or parse-error labels. This pins the three-way
+        // distinction so a future refactor that collapses the arms
+        // back into a single generic "corrupt" reason breaks this
+        // test before it ships a less-actionable diagnostic.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entry_dir = tmp.path().join("unreadable-metadata");
+        fs::create_dir_all(entry_dir.join("metadata.json")).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "unreadable-metadata");
+        assert!(listed.as_valid().is_none());
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for entry with unreadable metadata");
+        };
+        assert!(
+            reason.starts_with("metadata.json unreadable: "),
+            "unreadable-metadata reason should carry the unreadable prefix distinct from the \
+             missing / parse-error prefixes, got: {reason}",
+        );
+    }
+
+    #[test]
     fn cache_dir_list_classifies_malformed_json_as_corrupt() {
         // metadata.json exists but is not valid JSON. `read_metadata`
         // maps the serde_json::Error into
