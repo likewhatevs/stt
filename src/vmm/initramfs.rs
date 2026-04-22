@@ -1621,6 +1621,140 @@ mod tests {
     }
 
     #[test]
+    fn suffix_with_sched_enable() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+        let sched_enable = vec!["echo 1 > /sys/kernel/sched_ext/enable".to_string()];
+        let suffix = build_suffix(
+            base.len(),
+            &SuffixParams {
+                sched_enable: &sched_enable,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut archive = Vec::with_capacity(base.len() + suffix.len());
+        archive.extend_from_slice(&base);
+        archive.extend_from_slice(&suffix);
+        let entries = cpio_entries(&archive);
+        let entry = entries
+            .iter()
+            .find(|(name, ..)| name == "sched_enable")
+            .expect("sched_enable entry missing");
+        assert_eq!(
+            entry.1 as usize,
+            sched_enable[0].len(),
+            "sched_enable size should match joined content length",
+        );
+        // 0o100755 = S_IFREG | 0o755 (executable — it's a shell script).
+        assert_eq!(entry.2, 0o100755, "sched_enable must be executable");
+    }
+
+    #[test]
+    fn suffix_with_sched_disable() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+        let sched_disable = vec!["echo 0 > /sys/kernel/sched_ext/enable".to_string()];
+        let suffix = build_suffix(
+            base.len(),
+            &SuffixParams {
+                sched_disable: &sched_disable,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut archive = Vec::with_capacity(base.len() + suffix.len());
+        archive.extend_from_slice(&base);
+        archive.extend_from_slice(&suffix);
+        let entries = cpio_entries(&archive);
+        let entry = entries
+            .iter()
+            .find(|(name, ..)| name == "sched_disable")
+            .expect("sched_disable entry missing");
+        assert_eq!(entry.1 as usize, sched_disable[0].len());
+        assert_eq!(entry.2, 0o100755, "sched_disable must be executable");
+    }
+
+    #[test]
+    fn suffix_with_exec_cmd() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+        let cmd = "/usr/bin/stress-ng --cpu 1 --timeout 5s";
+        let suffix = build_suffix(
+            base.len(),
+            &SuffixParams {
+                exec_cmd: Some(cmd),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut archive = Vec::with_capacity(base.len() + suffix.len());
+        archive.extend_from_slice(&base);
+        archive.extend_from_slice(&suffix);
+        let entries = cpio_entries(&archive);
+        let entry = entries
+            .iter()
+            .find(|(name, ..)| name == "exec_cmd")
+            .expect("exec_cmd entry missing");
+        assert_eq!(entry.1 as usize, cmd.len());
+        // 0o100644 = S_IFREG | 0o644 (non-executable data file — read by init, not exec'd).
+        assert_eq!(entry.2, 0o100644, "exec_cmd must be a plain data file");
+    }
+
+    #[test]
+    fn suffix_omits_empty_optional_entries() {
+        // Confirms the is_empty() / Option::None guards in build_suffix —
+        // empty sched_enable, empty sched_disable, and None exec_cmd must
+        // not leave zero-length cpio entries in the archive.
+        let exe = crate::resolve_current_exe().unwrap();
+        let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
+        let suffix = build_suffix(base.len(), &SuffixParams::default()).unwrap();
+        let mut archive = Vec::with_capacity(base.len() + suffix.len());
+        archive.extend_from_slice(&base);
+        archive.extend_from_slice(&suffix);
+        let names = cpio_entry_names(&archive);
+        assert!(!names.iter().any(|n| n == "sched_enable"));
+        assert!(!names.iter().any(|n| n == "sched_disable"));
+        assert!(!names.iter().any(|n| n == "exec_cmd"));
+    }
+
+    #[test]
+    fn lz4_compress_combined_roundtrips() {
+        // The aarch64 loader ships base+suffix as a single compressed
+        // blob rather than streaming per-part (unlike x86_64, which
+        // concatenates pre-compressed parts). Pin the concat+compress
+        // semantic: decompression must yield exactly base ++ suffix,
+        // and the output must start with the LZ4 legacy magic so the
+        // kernel's initramfs decompressor accepts it.
+        let base = b"this is the base initramfs bytes".repeat(64);
+        let suffix = b"and here is the suffix with cpio trailer".repeat(32);
+
+        let compressed = lz4_compress_combined(&base, &suffix);
+        assert_eq!(
+            &compressed[..4],
+            &LZ4_LEGACY_MAGIC,
+            "output must start with LZ4 legacy magic for the kernel decompressor",
+        );
+
+        // Legacy frame: [magic 4B] [chunk_size LE u32] [chunk bytes]...
+        // Input fits in one LZ4_CHUNK_SIZE chunk, so a single chunk suffices.
+        let chunk_size =
+            u32::from_le_bytes(compressed[4..8].try_into().unwrap()) as usize;
+        let expected_uncompressed = base.len() + suffix.len();
+        let decompressed =
+            lz4_flex::block::decompress(&compressed[8..8 + chunk_size], expected_uncompressed)
+                .expect("lz4 block decompress failed");
+
+        let mut concatenated = Vec::with_capacity(expected_uncompressed);
+        concatenated.extend_from_slice(&base);
+        concatenated.extend_from_slice(&suffix);
+        assert_eq!(
+            decompressed, concatenated,
+            "decompressed blob must equal base ++ suffix",
+        );
+    }
+
+    #[test]
     fn try_cow_overlay_rejects_cross_region_span() {
         // The bounds check in try_cow_overlay relies on
         // GuestMemoryMmap::get_slice failing when a range would cross

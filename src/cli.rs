@@ -287,6 +287,72 @@ pub fn format_entry_row(
 }
 
 /// List cached kernel images.
+///
+/// # JSON output schema (`--json`)
+///
+/// ```json
+/// {
+///   "current_ktstr_kconfig_hash": "abc123...",
+///   "active_prefixes_fetch_error": null,
+///   "entries": [
+///     {
+///       "key": "7.1.0-rc2",
+///       "path": "/path/to/cache/entry",
+///       "version": "7.1.0-rc2",
+///       "source": { "type": "tarball" },
+///       "arch": "x86_64",
+///       "built_at": "2026-04-15T12:34:56Z",
+///       "ktstr_kconfig_hash": "abc123...",
+///       "kconfig_status": "matches",
+///       "eol": false,
+///       "config_hash": "def456...",
+///       "image_name": "bzImage",
+///       "image_path": "/path/to/cache/entry/bzImage",
+///       "has_vmlinux": true
+///     },
+///     {
+///       "key": "6.12.0-broken",
+///       "path": "/path/to/cache/broken-entry",
+///       "error": "metadata.json missing required field `version`"
+///     }
+///   ]
+/// }
+/// ```
+///
+/// **Wrapper fields:**
+/// - `current_ktstr_kconfig_hash`: hex digest of the kconfig fragment
+///   the running binary was built against, so consumers can detect
+///   entries that were built with a different fragment.
+/// - `active_prefixes_fetch_error`: `null` on success, human-readable
+///   error string on failure to fetch the active kernel-series list
+///   from kernel.org. When non-null, `eol` annotation is disabled for
+///   the run (no series data to compare against) and every entry's
+///   `eol` is `false` regardless of actual support status — so
+///   consumers must check this field before trusting `eol`.
+/// - `entries`: heterogeneous array; each element is either a valid
+///   entry (object with the full field set) or a corrupt entry
+///   (object with only `key`, `path`, and `error`). Corrupt entries
+///   have a structurally different shape — consumers should detect the
+///   `"error"` key and branch.
+///
+/// **Entry fields (valid entries):**
+/// - `kconfig_status`: one of `"matches"`, `"stale"`, or `"untracked"`
+///   (the Display forms of `cache::KconfigStatus`). `matches` means
+///   the entry's `ktstr_kconfig_hash` equals
+///   `current_ktstr_kconfig_hash`; `stale` means they differ;
+///   `untracked` means the entry has no recorded kconfig hash (pre-dates
+///   kconfig hash tracking).
+/// - `eol`: `true` iff the entry's version series does not appear in
+///   the active-prefix list. Only meaningful when
+///   `active_prefixes_fetch_error` is `null`.
+/// - `has_vmlinux`: whether the cache entry includes the uncompressed
+///   `vmlinux` (needed for DWARF-driven probes); when `false`, only
+///   the compressed `image_path` is available.
+/// - `source`: tagged object (serde internally tagged on `"type"`).
+///   Variants: `{"type": "tarball"}`, `{"type": "git", "git_hash": ?,
+///   "ref": ?}`, `{"type": "local", "source_tree_path": ?, "git_hash":
+///   ?}`. Variant-specific fields are nullable — consumers must
+///   dispatch on `"type"` before reading them. See `cache::KernelSource`.
 pub fn kernel_list(json: bool) -> Result<()> {
     let cache = CacheDir::new()?;
     let entries = cache.list()?;
