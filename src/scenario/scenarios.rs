@@ -54,7 +54,7 @@ pub fn steady(ctx: &Ctx) -> Result<AssertResult> {
 /// Skips on single-LLC topologies.
 pub fn steady_llc(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.num_llcs() < 2 {
-        return Ok(AssertResult::skip("skipped: need >=2 LLCs"));
+        return Ok(AssertResult::skip("need >=2 LLCs"));
     }
     execute_defs(
         ctx,

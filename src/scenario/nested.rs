@@ -104,7 +104,7 @@ pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
 pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     let all = ctx.topo.all_cpus();
     if all.len() < 4 {
-        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
+        return Ok(AssertResult::skip("need >=4 CPUs"));
     }
     let mid = all.len() / 2;
     let set_a: BTreeSet<usize> = all[..mid].iter().copied().collect();

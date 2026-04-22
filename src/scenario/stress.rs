@@ -100,7 +100,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     // consume path, CPUs go idle and never retry.
     let all = ctx.topo.all_cpus();
     if all.len() < 4 {
-        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
+        return Ok(AssertResult::skip("need >=4 CPUs"));
     }
     let last = all.len() - 1;
 
@@ -163,7 +163,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
 pub fn custom_cgroup_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     // All workload types across 5 cgroups, no flags. Exercises base dispatch with every work pattern.
     if ctx.topo.all_cpus().len() < 6 {
-        return Ok(AssertResult::skip("skipped: need >=6 CPUs for 5 cgroups"));
+        return Ok(AssertResult::skip("need >=6 CPUs for 5 cgroups"));
     }
     let names: Vec<String> = (0..5).map(|i| format!("cg_{i}")).collect();
     let mut _guard = CgroupGroup::new(ctx.cgroups);
@@ -182,7 +182,7 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> 
     // All workload types with cpusets.
     let all = ctx.topo.all_cpus();
     if all.len() < 6 {
-        return Ok(AssertResult::skip("skipped: need >=6 CPUs"));
+        return Ok(AssertResult::skip("need >=6 CPUs"));
     }
     let last = all.len() - 1;
     let chunk = last / 3;
@@ -204,7 +204,7 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
     // Dynamic cgroup ops with diverse workloads.
     if ctx.topo.all_cpus().len() < 5 {
         return Ok(AssertResult::skip(
-            "skipped: need >=5 CPUs for dynamic cgroup add",
+            "need >=5 CPUs for dynamic cgroup add",
         ));
     }
     let names: Vec<String> = (0..3).map(|i| format!("cg_{i}")).collect();
@@ -242,12 +242,12 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
 pub fn custom_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
     // Need at least 2 LLCs to flip cpusets across LLC boundaries.
     if ctx.topo.num_llcs() < 2 {
-        return Ok(AssertResult::skip("skipped: need >=2 LLCs"));
+        return Ok(AssertResult::skip("need >=2 LLCs"));
     }
     let llc0_full: BTreeSet<usize> = ctx.topo.llc_aligned_cpuset(0);
     let llc1_full: BTreeSet<usize> = ctx.topo.llc_aligned_cpuset(1);
     if llc0_full.is_empty() {
-        return Ok(AssertResult::skip("skipped: LLC0 has no CPUs"));
+        return Ok(AssertResult::skip("LLC0 has no CPUs"));
     }
 
     // Reserve one CPU from LLC0 for cg_0 to avoid cg_0-starvation.
@@ -260,7 +260,7 @@ pub fn custom_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
     let llc1: BTreeSet<usize> = llc1_full.clone();
     if llc0.is_empty() {
         return Ok(AssertResult::skip(
-            "skipped: LLC0 too small after reserving for cg_0",
+            "LLC0 too small after reserving for cg_0",
         ));
     }
 

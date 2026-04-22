@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
     let max_new = ctx.topo.total_cpus().saturating_sub(3).min(2);
     if max_new == 0 {
-        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
+        return Ok(AssertResult::skip("need >=4 CPUs"));
     }
 
     let extra_names: &[&str] = &["cg_2", "cg_3"];
@@ -52,7 +52,7 @@ pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
 pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
     let n = 4.min(ctx.topo.total_cpus().saturating_sub(1));
     if n < 2 {
-        return Ok(AssertResult::skip("skipped: need >=3 CPUs"));
+        return Ok(AssertResult::skip("need >=3 CPUs"));
     }
     let half = n / 2;
 
@@ -100,7 +100,7 @@ pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
 /// replacing the pre-refactor explicit stop + remove ops.
 pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 4 {
-        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
+        return Ok(AssertResult::skip("need >=4 CPUs"));
     }
 
     let backdrop = Backdrop::new().with_cgroups([

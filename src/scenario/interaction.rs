@@ -95,7 +95,7 @@ pub fn custom_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
 /// Four cgroups with 16/1/8/4 workers testing multi-cell rebalancing.
 pub fn custom_cgroup_4way_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 5 {
-        return Ok(AssertResult::skip("skipped: need >=5 CPUs for 4 cgroups"));
+        return Ok(AssertResult::skip("need >=5 CPUs for 4 cgroups"));
     }
 
     let steps = vec![Step::with_defs(
@@ -137,7 +137,7 @@ pub fn custom_cgroup_cpuset_imbalance_combined(ctx: &Ctx) -> Result<AssertResult
 pub fn custom_cgroup_cpuset_overlap_imbalance_combined(ctx: &Ctx) -> Result<AssertResult> {
     let sets = ctx.topo.overlapping_cpusets(3, 0.5);
     if sets.iter().any(|s| s.is_empty()) {
-        return Ok(AssertResult::skip("skipped: not enough CPUs"));
+        return Ok(AssertResult::skip("not enough CPUs"));
     }
 
     let steps = vec![Step::with_defs(

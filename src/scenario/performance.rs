@@ -35,7 +35,7 @@ pub fn custom_cache_pressure_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 /// latency CV (consistent placement) and throughput fairness.
 pub fn custom_cache_yield_wake_affine(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.num_llcs() < 2 {
-        return Ok(AssertResult::skip("skipped: need >=2 LLCs"));
+        return Ok(AssertResult::skip("need >=2 LLCs"));
     }
 
     let checks = Assert::default_checks()

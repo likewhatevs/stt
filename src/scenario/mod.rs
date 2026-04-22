@@ -684,6 +684,9 @@ pub struct Ctx<'a> {
     /// PID of the running scheduler (for liveness checks). Stored as
     /// `pid_t` to match the kernel's native type — avoids u32→i32
     /// sign-cast wraparound at the `kill`/`process_alive` boundary.
+    ///
+    /// A value of `0` means no scheduler is attached; `run_scenario`
+    /// and step-level liveness probes skip the check in that case.
     pub sched_pid: libc::pid_t,
     /// Time to wait after cgroup creation for scheduler stabilization.
     pub settle: Duration,
@@ -880,11 +883,12 @@ impl<'a> Ctx<'a> {
 /// cgroup under the current topology. Polls scheduler liveness at
 /// 500ms intervals. If the scheduler exits after cgroup creation but
 /// before the workload starts, returns an `Err` so callers can treat
-/// the run as a setup failure. A scheduler death mid-workload is
+/// the run as a setup failure. A scheduler exit mid-workload is
 /// reported as a completed-but-failed `AssertResult` with
-/// "scheduler crashed during workload" in `details`, not an error.
-/// On workload failure, captures the guest kernel console via
-/// `read_kmsg` so diagnostics include the stall or crash context.
+/// "scheduler process exited unexpectedly during workload" in
+/// `details`, not an error. On workload failure, captures the guest
+/// kernel console via `read_kmsg` so diagnostics include the stall
+/// or crash context.
 pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     tracing::info!(scenario = scenario.name, "running");
     if let Action::Custom(f) = &scenario.action {
@@ -897,7 +901,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     if let Some(ref cs) = cpusets
         && cs.iter().any(|s| s.is_empty())
     {
-        return Ok(AssertResult::skip("skipped: not enough CPUs/LLCs"));
+        return Ok(AssertResult::skip("not enough CPUs/LLCs"));
     }
 
     let scenario_start = std::time::Instant::now();
@@ -915,9 +919,15 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     tracing::debug!(cgroups = scenario.num_cgroups, "cgroups created, settling");
     thread::sleep(ctx.settle);
 
-    // Bail early if the scheduler died after cgroup creation
-    if !process_alive(ctx.sched_pid) {
-        anyhow::bail!("scheduler died after cgroup creation");
+    // Bail early if the scheduler process is no longer running after
+    // cgroup creation. sched_pid == 0 means no scheduler was
+    // configured (kernel-default path), so liveness is not
+    // applicable and there is nothing to bail on.
+    if ctx.sched_pid != 0 && !process_alive(ctx.sched_pid) {
+        anyhow::bail!(
+            "scheduler process no longer running after cgroup creation (pid={})",
+            ctx.sched_pid,
+        );
     }
 
     let mut handles = Vec::new();
@@ -980,22 +990,30 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     tracing::debug!(duration_s = ctx.duration.as_secs(), "running workload");
 
     // Poll scheduler liveness during the workload phase instead of a
-    // single sleep. Detects scheduler death within 500ms rather than
+    // single sleep. Detects scheduler exit within 500ms rather than
     // waiting the full duration and collecting misleading results.
+    // sched_pid == 0 means no scheduler was configured (kernel-default
+    // path); skip liveness polling entirely and sleep the full
+    // duration.
     let deadline = std::time::Instant::now() + ctx.duration;
     let mut sched_dead = false;
-    while std::time::Instant::now() < deadline {
-        if !process_alive(ctx.sched_pid) {
-            sched_dead = true;
-            tracing::warn!("scheduler died during workload phase");
-            break;
+    if ctx.sched_pid != 0 {
+        while std::time::Instant::now() < deadline {
+            if !process_alive(ctx.sched_pid) {
+                sched_dead = true;
+                tracing::warn!("scheduler process exited during workload phase");
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            thread::sleep(remaining.min(Duration::from_millis(500)));
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        thread::sleep(remaining.min(Duration::from_millis(500)));
-    }
 
-    if !sched_dead {
-        sched_dead = !process_alive(ctx.sched_pid);
+        if !sched_dead {
+            sched_dead = !process_alive(ctx.sched_pid);
+        }
+    } else {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        thread::sleep(remaining);
     }
 
     let mut result = AssertResult::pass();
@@ -1021,7 +1039,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         result.details.push(crate::assert::AssertDetail::new(
             crate::assert::DetailKind::Monitor,
             format!(
-                "scheduler crashed during workload ({:.1}s into test)",
+                "scheduler process exited unexpectedly during workload ({:.1}s into test)",
                 scenario_start.elapsed().as_secs_f64(),
             ),
         ));
@@ -1206,8 +1224,13 @@ pub fn setup_cgroups<'a>(
         guard.add_cgroup_no_cpuset(&format!("cg_{i}"))?;
     }
     thread::sleep(ctx.settle);
-    if !process_alive(ctx.sched_pid) {
-        anyhow::bail!("scheduler died after cgroup creation");
+    // sched_pid == 0 means no scheduler was configured
+    // (kernel-default path); skip the liveness-based bail.
+    if ctx.sched_pid != 0 && !process_alive(ctx.sched_pid) {
+        anyhow::bail!(
+            "scheduler process no longer running after cgroup creation (pid={})",
+            ctx.sched_pid,
+        );
     }
     let handles: Result<Vec<_>> = (0..n)
         .map(|i| {

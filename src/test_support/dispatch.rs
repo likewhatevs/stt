@@ -480,7 +480,7 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
 
     if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
         eprintln!(
-            "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+            "ktstr: SKIP: {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             bare_name,
         );
         // See run_ktstr_test_inner for the sidecar-emission rationale.
@@ -581,7 +581,7 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
 
     if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
         eprintln!(
-            "ktstr: SKIP: skipping {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+            "ktstr: SKIP: {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             test_name,
         );
         if let Err(e) = write_skip_sidecar(entry, &flags) {

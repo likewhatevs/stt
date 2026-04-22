@@ -820,7 +820,10 @@ pub fn kernel_build_pipeline(
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
         eprintln!("{cli_label}: kernel built at {}", image_path.display());
-        eprintln!("{cli_label}: skipping cache (dirty tree)");
+        eprintln!(
+            "{cli_label}: skipping cache — working tree has uncommitted changes; \
+             commit or stash to enable caching"
+        );
         return Ok(KernelBuildResult {
             entry: None,
             image_path,

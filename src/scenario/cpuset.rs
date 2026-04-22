@@ -81,7 +81,7 @@ fn cgroup_cpuset_resize_steps(ctx: &Ctx) -> Vec<Step> {
 /// Three-phase cpuset resize: 50/50, 25/75, 75/25.
 pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 4 {
-        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
+        return Ok(AssertResult::skip("need >=4 CPUs"));
     }
     execute_scenario(
         ctx,
@@ -93,7 +93,7 @@ pub fn custom_cgroup_cpuset_resize(ctx: &Ctx) -> Result<AssertResult> {
 /// Swap disjoint cpuset assignments between two cgroups twice.
 pub fn custom_cgroup_cpuset_swap_disjoint(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 8 {
-        return Ok(AssertResult::skip("skipped: need >=8 CPUs"));
+        return Ok(AssertResult::skip("need >=8 CPUs"));
     }
 
     let backdrop = Backdrop::new()
@@ -143,7 +143,7 @@ pub fn custom_cgroup_cpuset_workload_imbalance(ctx: &Ctx) -> Result<AssertResult
 /// Oversubscribed and bursty cgroups with cpuset narrowing and widening.
 pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.all_cpus().len() < 4 {
-        return Ok(AssertResult::skip("skipped: need >=4 CPUs"));
+        return Ok(AssertResult::skip("need >=4 CPUs"));
     }
 
     let all = ctx.topo.all_cpus();
@@ -187,7 +187,7 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> 
 /// migration.
 pub fn custom_cgroup_cpuset_numa_swap(ctx: &Ctx) -> Result<AssertResult> {
     if ctx.topo.num_numa_nodes() < 2 {
-        return Ok(AssertResult::skip("skipped: need >=2 NUMA nodes"));
+        return Ok(AssertResult::skip("need >=2 NUMA nodes"));
     }
 
     let backdrop = Backdrop::new()

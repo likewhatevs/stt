@@ -1842,7 +1842,10 @@ fn run_scenario(
     // --- Step loop with per-Step teardown ---
     for (step_idx, step) in steps.iter().enumerate() {
         // Check scheduler liveness between steps (skip before first).
-        if step_idx > 0 && !process_alive(ctx.sched_pid) {
+        // sched_pid == 0 means no scheduler was configured
+        // (kernel-default path); the liveness probe cannot
+        // meaningfully report on a pid that was never set.
+        if step_idx > 0 && ctx.sched_pid != 0 && !process_alive(ctx.sched_pid) {
             // Collect backdrop-owned workload handles into the
             // result before reporting the crash so whatever the
             // persistent workers produced is still assertable.
@@ -1852,7 +1855,7 @@ fn run_scenario(
             r.details.push(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Monitor,
                 format!(
-                    "scheduler crashed after completing step {} of {} ({:.1}s into test)",
+                    "scheduler process exited unexpectedly after completing step {} of {} ({:.1}s into test)",
                     step_idx,
                     steps.len(),
                     scenario_start.elapsed().as_secs_f64(),
@@ -1913,8 +1916,9 @@ fn run_scenario(
         w.write(shm_ring::MSG_TYPE_SCENARIO_END, &elapsed.to_ne_bytes());
     }
 
-    // Final liveness check.
-    let sched_dead = !process_alive(ctx.sched_pid);
+    // Final liveness check. sched_pid == 0 ⇒ no scheduler configured
+    // (kernel-default path); no liveness to report on.
+    let sched_dead = ctx.sched_pid != 0 && !process_alive(ctx.sched_pid);
 
     // --- Backdrop teardown ---
     let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
@@ -1925,7 +1929,7 @@ fn run_scenario(
         result.details.push(crate::assert::AssertDetail::new(
             crate::assert::DetailKind::Monitor,
             format!(
-                "scheduler crashed during test (detected after all {} steps completed, {:.1}s elapsed)",
+                "scheduler process exited unexpectedly (detected after all {} steps completed, {:.1}s elapsed)",
                 steps.len(),
                 scenario_start.elapsed().as_secs_f64(),
             ),
