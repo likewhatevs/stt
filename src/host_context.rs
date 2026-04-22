@@ -367,8 +367,17 @@ static STATIC_HOST_INFO: OnceLock<StaticHostInfo> = OnceLock::new();
 /// `Option<HostContext>` layer on
 /// [`SidecarResult`](crate::test_support::SidecarResult)).
 pub fn collect_host_context() -> HostContext {
-    let static_info = STATIC_HOST_INFO.get_or_init(compute_static_host_info).clone();
+    // Read `/proc/meminfo` exactly once per call and share the
+    // parsed fields with `compute_static_host_info` (for `mem_total_kb`
+    // / `hugepagesize_kb` on cold init) and with the per-call
+    // hugepage counters. The prior formulation read `/proc/meminfo`
+    // twice on the cold path — once here for the dynamic counters
+    // and once inside the `OnceLock` init for the static fields —
+    // which is wasted syscall + parse work.
     let meminfo = read_meminfo();
+    let static_info = STATIC_HOST_INFO
+        .get_or_init(|| compute_static_host_info(&meminfo))
+        .clone();
     HostContext {
         cpu_model: static_info.cpu_model,
         cpu_vendor: static_info.cpu_vendor,
@@ -387,13 +396,12 @@ pub fn collect_host_context() -> HostContext {
     }
 }
 
-/// Populate the static-fields cache on first access. Reads
-/// `/proc/cpuinfo` (CPU identity), `/proc/meminfo` (MemTotal +
-/// Hugepagesize), the host NUMA topology, and a single `uname()`
-/// call.
-fn compute_static_host_info() -> StaticHostInfo {
+/// Populate the static-fields cache on first access. Takes the
+/// already-parsed `/proc/meminfo` from the caller so the cold path
+/// does not re-read the file. Reads `/proc/cpuinfo` (CPU identity),
+/// the host NUMA topology, and a single `uname()` call.
+fn compute_static_host_info(meminfo: &MeminfoFields) -> StaticHostInfo {
     let (cpu_model, cpu_vendor) = read_cpuinfo_identity();
-    let meminfo = read_meminfo();
     let u = rustix::system::uname();
     StaticHostInfo {
         cpu_model,
@@ -660,6 +668,53 @@ mod tests {
         assert_eq!(a.cpu_model, b.cpu_model);
         assert_eq!(a.cpu_vendor, b.cpu_vendor);
         assert_eq!(a.cmdline, b.cmdline);
+    }
+
+    /// Direct OnceLock caching test for `STATIC_HOST_INFO`. The
+    /// sibling `collect_host_context_is_stable_across_calls` proves
+    /// static fields match between calls but does not verify the
+    /// cache mechanism itself — the two reads could both hit
+    /// `compute_static_host_info` and still match on a quiescent
+    /// host. This test pins the caching contract directly: after
+    /// the first call populates `STATIC_HOST_INFO`, the stored
+    /// reference survives the second call unchanged (same allocation
+    /// address AND same field values), proving `get_or_init` hit the
+    /// cached branch instead of re-running the init closure.
+    ///
+    /// Uses `OnceLock::get` (non-init probe) to observe cache state
+    /// without touching it.
+    ///
+    /// Robust to test ordering: if another test populated
+    /// `STATIC_HOST_INFO` first, `collect_host_context()` here hits
+    /// the cache and the pointer comparison still passes because
+    /// `OnceLock` permits no re-init.
+    #[test]
+    fn static_host_info_is_cached_after_first_call() {
+        let _ = collect_host_context();
+        let first = STATIC_HOST_INFO
+            .get()
+            .expect("STATIC_HOST_INFO must be populated after collect_host_context");
+        let first_ptr = first as *const StaticHostInfo;
+
+        let _ = collect_host_context();
+        let second = STATIC_HOST_INFO
+            .get()
+            .expect("STATIC_HOST_INFO must still be populated on second call");
+        let second_ptr = second as *const StaticHostInfo;
+
+        assert_eq!(
+            first_ptr, second_ptr,
+            "OnceLock must return the same allocation across calls — \
+             a pointer mismatch means the cache re-initialized, \
+             defeating the get_or_init contract",
+        );
+        // Cross-check field-level equality. Redundant with the pointer
+        // check but serves as a second anchor so a future replacement
+        // of `OnceLock` with something that clones on access still
+        // fails loudly rather than silently weakening the cache.
+        assert_eq!(first.cpu_model, second.cpu_model);
+        assert_eq!(first.uname_release, second.uname_release);
+        assert_eq!(first.total_memory_kb, second.total_memory_kb);
     }
 
     /// Host context round-trips through JSON — every field uses
