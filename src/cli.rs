@@ -241,8 +241,9 @@ pub(crate) fn entry_is_eol(entry: &CacheEntry, active_prefixes: &[String]) -> bo
 /// (transient outage where EOL annotation must degrade, not flip).
 ///
 /// See [`is_eol`]'s empty-slice guard for the recommended fallback pattern.
-pub(crate) fn fetch_active_prefixes() -> Result<Vec<String>, String> {
-    let releases = crate::fetch::fetch_releases()?;
+pub(crate) fn fetch_active_prefixes() -> anyhow::Result<Vec<String>> {
+    let client = reqwest::blocking::Client::new();
+    let releases = crate::fetch::fetch_releases(&client)?;
     let mut prefixes = Vec::new();
     for (moniker, version) in &releases {
         if moniker == "linux-next" {
@@ -1305,8 +1306,8 @@ pub fn resolve_cached_kernel(
         KernelId::Version(ver) => {
             // Major.minor prefix (e.g. "6.14") → resolve to latest patch.
             let resolved = if crate::fetch::is_major_minor_prefix(ver) {
-                crate::fetch::fetch_version_for_prefix(ver, cli_label)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                let client = reqwest::blocking::Client::new();
+                crate::fetch::fetch_version_for_prefix(&client, ver, cli_label)?
             } else {
                 ver.clone()
             };
@@ -1412,8 +1413,8 @@ pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
     ));
 
     let sp = Spinner::start("Fetching latest kernel version...");
-    let ver =
-        crate::fetch::fetch_latest_stable_version(cli_label).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let client = reqwest::blocking::Client::new();
+    let ver = crate::fetch::fetch_latest_stable_version(&client, cli_label)?;
     sp.finish(format!("Latest stable: {ver}"));
 
     let cache_dir = download_and_cache_version(&ver, cli_label)?;
@@ -1441,8 +1442,8 @@ fn download_and_cache_version(version: &str, cli_label: &str) -> Result<std::pat
     let tmp_dir = tempfile::TempDir::new()?;
 
     let sp = Spinner::start("Downloading kernel...");
-    let acquired = crate::fetch::download_tarball(version, tmp_dir.path(), cli_label)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let client = reqwest::blocking::Client::new();
+    let acquired = crate::fetch::download_tarball(&client, version, tmp_dir.path(), cli_label)?;
     sp.finish("Downloaded");
 
     let cache = crate::cache::CacheDir::new()?;

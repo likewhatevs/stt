@@ -8,6 +8,9 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result, anyhow};
+use reqwest::blocking::Client;
+
 /// Downloaded/cloned kernel source ready for building.
 #[non_exhaustive]
 pub struct AcquiredSource {
@@ -44,14 +47,14 @@ pub fn arch_info() -> (&'static str, &'static str) {
 /// Parse a version string into its major version for URL construction.
 ///
 /// "6.14.2" -> 6, "6.15-rc3" -> 6.
-fn major_version(version: &str) -> Result<u32, String> {
+fn major_version(version: &str) -> Result<u32> {
     let major_str = version
         .split('.')
         .next()
-        .ok_or_else(|| format!("invalid version: {version}"))?;
+        .ok_or_else(|| anyhow!("invalid version: {version}"))?;
     major_str
         .parse::<u32>()
-        .map_err(|e| format!("invalid major version in {version}: {e}"))
+        .with_context(|| format!("invalid major version in {version}"))
 }
 
 /// Determine if a version string represents an RC release.
@@ -66,7 +69,7 @@ fn is_rc(version: &str) -> bool {
 ///
 /// Returns `Some("6.14.10")` for prefix `"6.14"` if that series exists in
 /// releases.json. Returns `None` if the series is not found (EOL or invalid).
-fn latest_in_series(version: &str) -> Option<String> {
+fn latest_in_series(client: &Client, version: &str) -> Option<String> {
     let prefix = {
         let parts: Vec<&str> = version.split('.').collect();
         if parts.len() >= 2 {
@@ -76,7 +79,7 @@ fn latest_in_series(version: &str) -> Option<String> {
         }
     };
 
-    let releases = fetch_releases().ok()?;
+    let releases = fetch_releases(client).ok()?;
     let mut best: Option<(String, (u32, u32, u32))> = None;
     for (moniker, ver) in &releases {
         if moniker == "linux-next" {
@@ -101,14 +104,14 @@ fn latest_in_series(version: &str) -> Option<String> {
 ///
 /// Suggests the latest version in the same major.minor series when
 /// releases.json contains one.
-fn version_not_found_msg(version: &str) -> String {
+fn version_not_found_msg(client: &Client, version: &str) -> String {
     let parts: Vec<&str> = version.split('.').collect();
     let prefix = if parts.len() >= 2 {
         format!("{}.{}", parts[0], parts[1])
     } else {
         version.to_string()
     };
-    match latest_in_series(version) {
+    match latest_in_series(client, version) {
         Some(latest) if latest != version => {
             format!("version {version} not found. latest {prefix}.x: {latest}")
         }
@@ -118,14 +121,14 @@ fn version_not_found_msg(version: &str) -> String {
 
 /// Reject responses where the server returned HTML instead of a binary
 /// archive. Some CDN error pages return 200 with text/html.
-fn reject_html_response(response: &reqwest::blocking::Response, url: &str) -> Result<(), String> {
+fn reject_html_response(response: &reqwest::blocking::Response, url: &str) -> Result<()> {
     if let Some(ct) = response.headers().get(reqwest::header::CONTENT_TYPE)
         && let Ok(ct_str) = ct.to_str()
         && ct_str.contains("text/html")
     {
-        return Err(format!(
+        anyhow::bail!(
             "download {url}: server returned HTML instead of tarball (URL may be invalid)"
-        ));
+        );
     }
     Ok(())
 }
@@ -145,19 +148,23 @@ fn print_download_size(response: &reqwest::blocking::Response, url: &str, cli_la
 
 /// Download a stable kernel tarball (.tar.xz) from cdn.kernel.org.
 fn download_stable_tarball(
+    client: &Client,
     version: &str,
     dest_dir: &Path,
     cli_label: &str,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf> {
     let major = major_version(version)?;
     let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz");
 
-    let response = reqwest::blocking::get(&url).map_err(|e| format!("download {url}: {e}"))?;
+    let response = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("download {url}"))?;
     if !response.status().is_success() {
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(version_not_found_msg(version));
+            anyhow::bail!("{}", version_not_found_msg(client, version));
         }
-        return Err(format!("download {url}: HTTP {}", response.status()));
+        anyhow::bail!("download {url}: HTTP {}", response.status());
     }
     reject_html_response(&response, &url)?;
     print_download_size(&response, &url, cli_label);
@@ -167,30 +174,36 @@ fn download_stable_tarball(
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(dest_dir)
-        .map_err(|e| format!("extract tarball: {e}"))?;
+        .with_context(|| "extract tarball")?;
 
     let source_dir = dest_dir.join(format!("linux-{version}"));
     if !source_dir.is_dir() {
-        return Err(format!(
-            "expected directory linux-{version} after extraction"
-        ));
+        anyhow::bail!("expected directory linux-{version} after extraction");
     }
     Ok(source_dir)
 }
 
 /// Download an RC kernel tarball (.tar.gz) from git.kernel.org.
-fn download_rc_tarball(version: &str, dest_dir: &Path, cli_label: &str) -> Result<PathBuf, String> {
+fn download_rc_tarball(
+    client: &Client,
+    version: &str,
+    dest_dir: &Path,
+    cli_label: &str,
+) -> Result<PathBuf> {
     let url = format!("https://git.kernel.org/torvalds/t/linux-{version}.tar.gz");
 
-    let response = reqwest::blocking::get(&url).map_err(|e| format!("download {url}: {e}"))?;
+    let response = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("download {url}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(format!(
+        anyhow::bail!(
             "RC tarball not found: {url}\n  \
              RC releases are removed from git.kernel.org after the stable version ships."
-        ));
+        );
     }
     if !response.status().is_success() {
-        return Err(format!("download {url}: HTTP {}", response.status()));
+        anyhow::bail!("download {url}: HTTP {}", response.status());
     }
     reject_html_response(&response, &url)?;
     print_download_size(&response, &url, cli_label);
@@ -200,13 +213,11 @@ fn download_rc_tarball(version: &str, dest_dir: &Path, cli_label: &str) -> Resul
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(dest_dir)
-        .map_err(|e| format!("extract tarball: {e}"))?;
+        .with_context(|| "extract tarball")?;
 
     let source_dir = dest_dir.join(format!("linux-{version}"));
     if !source_dir.is_dir() {
-        return Err(format!(
-            "expected directory linux-{version} after extraction"
-        ));
+        anyhow::bail!("expected directory linux-{version} after extraction");
     }
     Ok(source_dir)
 }
@@ -216,15 +227,16 @@ fn download_rc_tarball(version: &str, dest_dir: &Path, cli_label: &str) -> Resul
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 pub fn download_tarball(
+    client: &Client,
     version: &str,
     dest_dir: &Path,
     cli_label: &str,
-) -> Result<AcquiredSource, String> {
+) -> Result<AcquiredSource> {
     let (arch, _) = arch_info();
     let source_dir = if is_rc(version) {
-        download_rc_tarball(version, dest_dir, cli_label)?
+        download_rc_tarball(client, version, dest_dir, cli_label)?
     } else {
-        download_stable_tarball(version, dest_dir, cli_label)?
+        download_stable_tarball(client, version, dest_dir, cli_label)?
     };
 
     Ok(AcquiredSource {
@@ -249,21 +261,30 @@ fn patch_level(version: &str) -> Option<u32> {
 }
 
 /// Fetch releases.json from kernel.org and return (moniker, version) pairs.
-pub(crate) fn fetch_releases() -> Result<Vec<(String, String)>, String> {
+///
+/// `client` is the HTTP client to use. Callers share a single
+/// [`reqwest::blocking::Client`] across the fetch-family so connection
+/// pooling and tls handshake cost is amortized; the parameter also
+/// gives tests a fault-injection seam (point the client at an
+/// httpmock-style local mock server).
+pub(crate) fn fetch_releases(client: &Client) -> Result<Vec<(String, String)>> {
     let url = "https://www.kernel.org/releases.json";
-    let response = reqwest::blocking::get(url).map_err(|e| format!("fetch {url}: {e}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("fetch {url}"))?;
     if !response.status().is_success() {
-        return Err(format!("fetch {url}: HTTP {}", response.status()));
+        anyhow::bail!("fetch {url}: HTTP {}", response.status());
     }
     let body = response
         .text()
-        .map_err(|e| format!("read response body: {e}"))?;
+        .with_context(|| "read response body")?;
     let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("parse releases.json: {e}"))?;
+        serde_json::from_str(&body).with_context(|| "parse releases.json")?;
     let releases = json
         .get("releases")
         .and_then(|r| r.as_array())
-        .ok_or_else(|| "releases.json: missing releases array".to_string())?;
+        .ok_or_else(|| anyhow!("releases.json: missing releases array"))?;
     Ok(releases
         .iter()
         .filter_map(|r| {
@@ -282,9 +303,9 @@ pub(crate) fn fetch_releases() -> Result<Vec<(String, String)>, String> {
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
-pub fn fetch_latest_stable_version(cli_label: &str) -> Result<String, String> {
+pub fn fetch_latest_stable_version(client: &Client, cli_label: &str) -> Result<String> {
     eprintln!("{cli_label}: fetching latest kernel version");
-    let releases = fetch_releases()?;
+    let releases = fetch_releases(client)?;
 
     let mut best: Option<&str> = None;
     for (moniker, version) in &releases {
@@ -300,8 +321,8 @@ pub fn fetch_latest_stable_version(cli_label: &str) -> Result<String, String> {
         break;
     }
 
-    let version =
-        best.ok_or_else(|| "no stable kernel with patch >= 8 found in releases.json".to_string())?;
+    let version = best
+        .ok_or_else(|| anyhow!("no stable kernel with patch >= 8 found in releases.json"))?;
     eprintln!("{cli_label}: latest stable kernel: {version}");
     Ok(version.to_string())
 }
@@ -349,9 +370,9 @@ pub fn is_major_minor_prefix(s: &str) -> bool {
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
-pub fn fetch_version_for_prefix(prefix: &str, cli_label: &str) -> Result<String, String> {
+pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) -> Result<String> {
     eprintln!("{cli_label}: fetching latest {prefix}.x kernel version");
-    let releases = fetch_releases()?;
+    let releases = fetch_releases(client)?;
 
     let mut best: Option<(&str, (u32, u32, u32))> = None;
     for (moniker, version) in &releases {
@@ -378,7 +399,7 @@ pub fn fetch_version_for_prefix(prefix: &str, cli_label: &str) -> Result<String,
     }
 
     eprintln!("{cli_label}: {prefix}.x not in releases.json (EOL series), probing cdn.kernel.org");
-    probe_latest_patch(prefix, cli_label)
+    probe_latest_patch(client, prefix, cli_label)
 }
 
 /// Upper bound for the search range in [`probe_latest_patch`].
@@ -393,17 +414,17 @@ const PROBE_PATCH_MAX: u32 = 500;
 /// response body is not HTML (some CDN error pages return 200 with
 /// text/html). Network / transport failures propagate as `Err`.
 fn probe_patch_exists(
-    client: &reqwest::blocking::Client,
+    client: &Client,
     major: u32,
     prefix: &str,
     patch: u32,
-) -> Result<bool, String> {
+) -> Result<bool> {
     let url =
         format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{prefix}.{patch}.tar.xz");
     let response = client
         .head(&url)
         .send()
-        .map_err(|e| format!("HEAD {url}: {e}"))?;
+        .with_context(|| format!("HEAD {url}"))?;
     if !response.status().is_success() {
         return Ok(false);
     }
@@ -430,11 +451,10 @@ fn probe_patch_exists(
 /// Complexity: the largest patch N is pinpointed in `O(log N)` batches
 /// rather than `O(N)` serial requests, and every batch completes in
 /// roughly one RTT.
-fn probe_latest_patch(prefix: &str, cli_label: &str) -> Result<String, String> {
+fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<String> {
     use rayon::prelude::*;
 
     let major = major_version(prefix)?;
-    let client = reqwest::blocking::Client::new();
 
     /// Initial batch size. Each subsequent round doubles the window so
     /// minors with many patches still finish in log-time rounds.
@@ -458,8 +478,8 @@ fn probe_latest_patch(prefix: &str, cli_label: &str) -> Result<String, String> {
         // short-circuits via `collect::<Result<_, _>>()`.
         let results: Vec<(u32, bool)> = (lo..=hi)
             .into_par_iter()
-            .map(|patch| probe_patch_exists(&client, major, prefix, patch).map(|ok| (patch, ok)))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|patch| probe_patch_exists(client, major, prefix, patch).map(|ok| (patch, ok)))
+            .collect::<Result<Vec<_>>>()?;
         // rayon preserves input order, so iterating advances `last_good`
         // through increasing patch numbers and stops at the first 404.
         for (patch, ok) in results {
@@ -476,7 +496,7 @@ fn probe_latest_patch(prefix: &str, cli_label: &str) -> Result<String, String> {
     }
 
     if last_good == 0 {
-        return Err(format!("no tarball found for {prefix}.x on cdn.kernel.org"));
+        anyhow::bail!("no tarball found for {prefix}.x on cdn.kernel.org");
     }
     let version = format!("{prefix}.{last_good}");
     eprintln!("{cli_label}: latest {prefix}.x kernel (from cdn probe): {version}");
@@ -492,36 +512,36 @@ pub fn git_clone(
     git_ref: &str,
     dest_dir: &Path,
     cli_label: &str,
-) -> Result<AcquiredSource, String> {
+) -> Result<AcquiredSource> {
     let (arch, _) = arch_info();
     eprintln!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
 
     let clone_dir = dest_dir.join("linux");
 
     let mut prep = gix::prepare_clone(url, &clone_dir)
-        .map_err(|e| format!("prepare clone: {e}"))?
+        .with_context(|| "prepare clone")?
         .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
             NonZeroU32::new(1).expect("1 is nonzero"),
         ))
         .with_ref_name(Some(git_ref))
-        .map_err(|e| format!("set ref name: {e}"))?;
+        .with_context(|| "set ref name")?;
 
     let (mut checkout, _outcome) = prep
         .fetch_then_checkout(
             gix::progress::Discard,
             &std::sync::atomic::AtomicBool::new(false),
         )
-        .map_err(|e| format!("clone fetch: {e}"))?;
+        .with_context(|| "clone fetch")?;
 
     let (_repo, _outcome) = checkout
         .main_worktree(
             gix::progress::Discard,
             &std::sync::atomic::AtomicBool::new(false),
         )
-        .map_err(|e| format!("checkout: {e}"))?;
+        .with_context(|| "checkout")?;
 
-    let repo = gix::open(&clone_dir).map_err(|e| format!("open cloned repo: {e}"))?;
-    let head = repo.head_id().map_err(|e| format!("read HEAD: {e}"))?;
+    let repo = gix::open(&clone_dir).with_context(|| "open cloned repo")?;
+    let head = repo.head_id().with_context(|| "read HEAD")?;
     let short_hash = format!("{}", head).chars().take(7).collect::<String>();
 
     let cache_key = format!(
@@ -557,23 +577,23 @@ pub fn git_clone(
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
-pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSource, String> {
+pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSource> {
     let (arch, _) = arch_info();
 
     if !source_path.is_dir() {
-        return Err(format!("{}: not a directory", source_path.display()));
+        anyhow::bail!("{}: not a directory", source_path.display());
     }
 
     let canonical = source_path
         .canonicalize()
-        .map_err(|e| format!("canonicalize {}: {e}", source_path.display()))?;
+        .with_context(|| format!("canonicalize {}", source_path.display()))?;
 
     // Git hash extraction and dirty detection via gix.
     // Submodule checks are skipped (false positives on kernel
     // trees with uninitialized submodules).
     let (short_hash, is_dirty) = match gix::discover(&canonical) {
         Ok(repo) => {
-            let head = repo.head_id().map_err(|e| format!("read HEAD: {e}"))?;
+            let head = repo.head_id().with_context(|| "read HEAD")?;
             let short_hash = format!("{}", head).chars().take(7).collect::<String>();
 
             // tree_index_status compares a TREE id against the index;
@@ -582,14 +602,14 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
             // returns an error and index dirt goes undetected.
             let head_tree = repo
                 .head_tree()
-                .map_err(|e| format!("read HEAD tree: {e}"))?;
+                .with_context(|| "read HEAD tree")?;
             let head_tree_id = head_tree.id;
 
             // Check HEAD-vs-index for tracked file changes.
             let mut index_dirty = false;
             let index = repo
                 .index_or_empty()
-                .map_err(|e| format!("open index: {e}"))?;
+                .with_context(|| "open index")?;
             let _ = repo.tree_index_status(
                 &head_tree_id,
                 &index,
@@ -605,7 +625,7 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
             // skipping submodules entirely (Ignore::All).
             let worktree_dirty = if !index_dirty {
                 repo.status(gix::progress::Discard)
-                    .map_err(|e| format!("status: {e}"))?
+                    .with_context(|| "status")?
                     .index_worktree_rewrites(None)
                     .index_worktree_submodules(gix::status::Submodule::Given {
                         ignore: gix::submodule::config::Ignore::All,
@@ -739,7 +759,7 @@ mod tests {
     // -- URL construction --
 
     /// Stable tarball URL pattern (same logic as download_stable_tarball).
-    fn stable_tarball_url(version: &str) -> Result<String, String> {
+    fn stable_tarball_url(version: &str) -> Result<String> {
         let major = major_version(version)?;
         Ok(format!(
             "https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{version}.tar.xz"
