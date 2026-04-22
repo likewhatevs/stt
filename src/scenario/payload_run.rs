@@ -1709,6 +1709,63 @@ mod tests {
         }
     }
 
+    /// Production-scale counterpart to the boundary tests above. The
+    /// existing small-string cases use ~20 bytes, well below the
+    /// production [`STDERR_TAIL_BYTES`] threshold of 1024. This test
+    /// lands a multi-byte character's interior byte on the truncation
+    /// offset of a >1 KiB string, matching the actual shape of an
+    /// overflowing stderr from a real payload. The snap-forward must
+    /// advance past the interior byte so `stderr_tail` does not panic
+    /// on mid-codepoint slicing.
+    #[test]
+    fn stderr_tail_snaps_forward_at_production_threshold() {
+        // Layout: "A"*100 + "é" (2B) + "B"*1023 = 1125 bytes.
+        // start = 1125 - 1024 = 101 — the interior byte of "é"
+        // (whose boundary bytes are at 100 and 102). The snap-forward
+        // advances start to 102, so the tail begins with the "B"
+        // suffix rather than a corrupt split "é".
+        let mut s = "A".repeat(100);
+        s.push('é');
+        s.push_str(&"B".repeat(1023));
+        assert!(
+            s.len() > STDERR_TAIL_BYTES,
+            "fixture must exceed STDERR_TAIL_BYTES to exercise the truncation path",
+        );
+        let tail = stderr_tail(&s, STDERR_TAIL_BYTES);
+        assert!(tail.starts_with("..."));
+        assert!(
+            tail[3..].starts_with('B'),
+            "expected snap-forward past 'é' interior byte at >1 KiB, got prefix: {:?}",
+            &tail[..20.min(tail.len())],
+        );
+    }
+
+    /// Production-scale complement: when the truncation offset lands
+    /// exactly on a multi-byte character's first byte (a boundary),
+    /// the character survives — no off-by-one that would drop it.
+    /// Covers the is_char_boundary-true branch of the snap-forward
+    /// loop at the real [`STDERR_TAIL_BYTES`] size.
+    #[test]
+    fn stderr_tail_preserves_multibyte_at_production_boundary() {
+        // Layout: "A"*100 + "é" (2B) + "B"*1022 = 1124 bytes.
+        // start = 1124 - 1024 = 100 — the first byte of "é" (which
+        // IS a char boundary). No snap runs; "é" is included whole.
+        let mut s = "A".repeat(100);
+        s.push('é');
+        s.push_str(&"B".repeat(1022));
+        assert!(
+            s.len() > STDERR_TAIL_BYTES,
+            "fixture must exceed STDERR_TAIL_BYTES to exercise the truncation path",
+        );
+        let tail = stderr_tail(&s, STDERR_TAIL_BYTES);
+        assert!(tail.starts_with("..."));
+        assert!(
+            tail.contains('é'),
+            "boundary-aligned 'é' at the >1 KiB truncation offset must survive, got prefix: {:?}",
+            &tail[..40.min(tail.len())],
+        );
+    }
+
     #[test]
     fn evaluate_checks_missing_metric_fails_loudly() {
         let pm = PayloadMetrics {
