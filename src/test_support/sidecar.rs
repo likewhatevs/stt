@@ -705,6 +705,30 @@ mod tests {
     use crate::scenario::Ctx;
     use anyhow::Result;
 
+    /// Collect every sidecar file in `dir` whose name starts with
+    /// `prefix` and ends with `.ktstr.json`. Returns paths in
+    /// filesystem iteration order; non-UTF-8 filenames are skipped.
+    ///
+    /// Call sites that write a single sidecar take the first match
+    /// via `.into_iter().next().expect(..)` (the variant-hash suffix
+    /// is opaque to the test so prefix match is how the file is
+    /// recovered); tests that assert on the number of gauntlet
+    /// variants use `.len()`.
+    fn find_sidecars_by_prefix(
+        dir: &std::path::Path,
+        prefix: &str,
+    ) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("sidecar dir must exist for lookup")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with(prefix) && n.ends_with(".ktstr.json")
+                })
+            })
+            .collect()
+    }
+
     // -- test_fixture self-tests --
     //
     // Guard the fixture's observable shape so call-site tests can rely
@@ -1098,15 +1122,9 @@ mod tests {
         // Sidecar filename now includes a variant hash suffix so
         // gauntlet variants don't clobber each other. Find the file
         // by prefix match rather than exact path.
-        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
-            .expect("sidecar dir was created")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("__sidecar_write_test__-") && n.ends_with(".ktstr.json"))
-                    .unwrap_or(false)
-            })
+        let path = find_sidecars_by_prefix(&tmp, "__sidecar_write_test__-")
+            .into_iter()
+            .next()
             .expect("sidecar file with variant suffix should be written");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
@@ -1157,16 +1175,11 @@ mod tests {
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_a, &[]).unwrap();
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_b, &[]).unwrap();
 
-        let names: Vec<String> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("__flagvariant_test__-"))
-            .collect();
+        let paths = find_sidecars_by_prefix(&tmp, "__flagvariant_test__-");
         assert_eq!(
-            names.len(),
+            paths.len(),
             2,
-            "two active_flags variants must produce two distinct files, got {names:?}"
+            "two active_flags variants must produce two distinct files, got {paths:?}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1209,16 +1222,11 @@ mod tests {
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
         write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[], &[]).unwrap();
 
-        let names: Vec<String> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("__variant_test__-"))
-            .collect();
+        let paths = find_sidecars_by_prefix(&tmp, "__variant_test__-");
         assert_eq!(
-            names.len(),
+            paths.len(),
             2,
-            "two work_type variants must produce two distinct files, got {names:?}"
+            "two work_type variants must produce two distinct files, got {paths:?}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1534,14 +1542,9 @@ mod tests {
         let active_flags: Vec<String> = vec!["llc".to_string()];
         write_skip_sidecar(&entry, &active_flags).expect("skip sidecar must write");
 
-        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
-            .expect("skip sidecar dir was created")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| {
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.starts_with("__skip_sidecar_test__-") && n.ends_with(".ktstr.json")
-                })
-            })
+        let path = find_sidecars_by_prefix(&tmp, "__skip_sidecar_test__-")
+            .into_iter()
+            .next()
             .expect("skip sidecar file with variant suffix should be written");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
@@ -1720,14 +1723,9 @@ mod tests {
         let ok = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
 
-        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
-            .expect("sidecar dir was created")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| {
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.starts_with("__payload_name_test__-") && n.ends_with(".ktstr.json")
-                })
-            })
+        let path = find_sidecars_by_prefix(&tmp, "__payload_name_test__-")
+            .into_iter()
+            .next()
             .expect("sidecar file with variant suffix should be written");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
@@ -1795,14 +1793,9 @@ mod tests {
         ];
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &metrics).unwrap();
 
-        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
-            .expect("sidecar dir was created")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| {
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.starts_with("__metrics_slice_test__-") && n.ends_with(".ktstr.json")
-                })
-            })
+        let path = find_sidecars_by_prefix(&tmp, "__metrics_slice_test__-")
+            .into_iter()
+            .next()
             .expect("sidecar file should be written");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
@@ -1850,14 +1843,9 @@ mod tests {
         };
         write_skip_sidecar(&entry, &[]).unwrap();
 
-        let path: std::path::PathBuf = std::fs::read_dir(&tmp)
-            .expect("sidecar dir was created")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .find(|p| {
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.starts_with("__skip_payload_name_test__-") && n.ends_with(".ktstr.json")
-                })
-            })
+        let path = find_sidecars_by_prefix(&tmp, "__skip_payload_name_test__-")
+            .into_iter()
+            .next()
             .expect("sidecar file should be written");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
@@ -1894,7 +1882,7 @@ mod tests {
             uname_sysname: Some("Linux".to_string()),
             uname_release: Some("6.11.0".to_string()),
             uname_machine: Some("x86_64".to_string()),
-            host_cmdline: Some("preempt=lazy".to_string()),
+            cmdline: Some("preempt=lazy".to_string()),
         };
         let without_host = SidecarResult {
             topology: "1n1l2c1t".to_string(),
@@ -1913,10 +1901,12 @@ mod tests {
     }
 
     /// A `SidecarResult` carrying a fully populated `HostContext`
-    /// round-trips through serde_json without losing fields. Pins
-    /// the combined schema so a future change that breaks
-    /// composition between the outer `SidecarResult` and the
-    /// `HostContext` it embeds is caught at the seam.
+    /// round-trips through serde_json without losing fields.
+    /// Struct-level `PartialEq` on `HostContext` makes one
+    /// `assert_eq!(host, ctx)` cover every field, so a future
+    /// change that breaks composition between the outer
+    /// `SidecarResult` and the embedded `HostContext` is caught at
+    /// the seam without needing a per-field assertion.
     #[test]
     fn sidecar_result_roundtrip_with_populated_host_context() {
         use crate::host_state::HostContext;
@@ -1934,40 +1924,21 @@ mod tests {
             hugepagesize_kb: Some(2048),
             thp_enabled: Some("always [madvise] never".to_string()),
             thp_defrag: Some("[always] defer madvise never".to_string()),
-            sched_tunables: Some(tunables.clone()),
+            sched_tunables: Some(tunables),
             numa_nodes: Some(2),
             uname_sysname: Some("Linux".to_string()),
             uname_release: Some("6.11.0".to_string()),
             uname_machine: Some("x86_64".to_string()),
-            host_cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
+            cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
         };
         let sc = SidecarResult {
             topology: "1n1l2c1t".to_string(),
-            host: Some(ctx),
+            host: Some(ctx.clone()),
             ..SidecarResult::test_fixture()
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
         let host = loaded.host.expect("host must round-trip");
-        assert_eq!(host.cpu_model.as_deref(), Some("Example CPU"));
-        assert_eq!(host.cpu_vendor.as_deref(), Some("GenuineExample"));
-        assert_eq!(host.total_memory_kb, Some(16_384_000));
-        assert_eq!(host.hugepages_total, Some(4));
-        assert_eq!(host.hugepages_free, Some(2));
-        assert_eq!(host.hugepagesize_kb, Some(2048));
-        assert_eq!(host.thp_enabled.as_deref(), Some("always [madvise] never"));
-        assert_eq!(
-            host.thp_defrag.as_deref(),
-            Some("[always] defer madvise never"),
-        );
-        assert_eq!(host.sched_tunables.as_ref().unwrap(), &tunables);
-        assert_eq!(host.numa_nodes, Some(2));
-        assert_eq!(host.uname_sysname.as_deref(), Some("Linux"));
-        assert_eq!(host.uname_release.as_deref(), Some("6.11.0"));
-        assert_eq!(host.uname_machine.as_deref(), Some("x86_64"));
-        assert_eq!(
-            host.host_cmdline.as_deref(),
-            Some("preempt=lazy isolcpus=1-3"),
-        );
+        assert_eq!(host, ctx);
     }
 }

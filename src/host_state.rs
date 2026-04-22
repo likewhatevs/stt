@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 /// field is optional so a partial read (missing /proc entry,
 /// permission denied, parse failure) still records the fields that
 /// did succeed instead of dropping the whole snapshot.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HostContext {
     /// CPU model string — the `model name` line of `/proc/cpuinfo`.
     /// Single value (first processor entry) since heterogeneous
@@ -49,22 +49,28 @@ pub struct HostContext {
     /// Active THP policy — content of
     /// `/sys/kernel/mm/transparent_hugepage/enabled` with the
     /// bracketed selection preserved verbatim (e.g.
-    /// `"always [madvise] never"`). Stored as-read rather than
-    /// parsed because the bracket is the meaningful part and downstream
-    /// tooling may want the full menu too.
+    /// `"always [madvise] never"`). Trimmed of leading and
+    /// trailing whitespace by `read_trimmed_sysfs`, so the trailing
+    /// newline that sysfs appends does not appear in the captured
+    /// value. Stored as-read rather than parsed because the bracket
+    /// is the meaningful part and downstream tooling may want the
+    /// full menu too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thp_enabled: Option<String>,
     /// Active THP defrag policy — content of
     /// `/sys/kernel/mm/transparent_hugepage/defrag`, bracket
-    /// preserved.
+    /// preserved. Trimmed of leading and trailing whitespace by
+    /// `read_trimmed_sysfs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thp_defrag: Option<String>,
     /// `/proc/sys/kernel/sched_*` tunables. Keys are the leaf
     /// basename (e.g. `sched_migration_cost_ns`); values are the
     /// single-line content trimmed of leading and trailing
-    /// whitespace. Empty map when the directory is unreadable; the
-    /// containing Option is `None` only when the listing itself
-    /// fails.
+    /// whitespace. `None` when the `read_dir` of
+    /// `/proc/sys/kernel` fails; empty map when the directory is
+    /// readable but contains no entries starting with `sched_`
+    /// (or all such entries fail the per-file read or trim to
+    /// empty).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sched_tunables: Option<BTreeMap<String, String>>,
     /// Count of NUMA nodes — derived from
@@ -99,7 +105,7 @@ pub struct HostContext {
     /// string because any split-into-pairs parser loses the
     /// quoted-value and flag-only variants the kernel accepts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_cmdline: Option<String>,
+    pub cmdline: Option<String>,
 }
 
 /// Static-fields cache. These values do not change for the lifetime
@@ -108,7 +114,7 @@ pub struct HostContext {
 /// `/proc` and `/sys` for them once and reusing the result avoids
 /// repeated syscalls on every sidecar write. Dynamic fields
 /// (sched_tunables, hugepages_total, hugepages_free, thp_enabled,
-/// thp_defrag, host_cmdline) are NOT cached — they can shift
+/// thp_defrag, cmdline) are NOT cached — they can shift
 /// between tests via sysctl, hugepage reservation, THP policy flip,
 /// or live kexec, and a cached snapshot would hide that change.
 #[derive(Clone)]
@@ -131,12 +137,14 @@ static STATIC_HOST_INFO: OnceLock<StaticHostInfo> = OnceLock::new();
 ///
 /// Every sub-read is fallible; individual failures leave the
 /// corresponding field `None` and the rest of the context
-/// proceeds. A host with `/proc` entirely unmounted (extreme test
-/// fixture) returns a `HostContext` with every field `None` —
-/// which serializes to an empty JSON object and distinguishes
-/// "collection attempted, nothing known" from "collection not
-/// attempted" (represented at the enclosing `Option<HostContext>`
-/// layer on [`SidecarResult`](crate::test_support::SidecarResult)).
+/// proceeds. Even on a host where every `/proc` and `/sys` read
+/// fails, the three `uname_*` fields still populate because they
+/// come from the `uname()` syscall — filesystem-independent. An
+/// otherwise-empty `HostContext` serializes to a near-empty JSON
+/// object and distinguishes "collection attempted, nothing known"
+/// from "collection not attempted" (represented at the enclosing
+/// `Option<HostContext>` layer on
+/// [`SidecarResult`](crate::test_support::SidecarResult)).
 pub(crate) fn collect_host_context() -> HostContext {
     let static_info = STATIC_HOST_INFO.get_or_init(compute_static_host_info).clone();
     let meminfo = read_meminfo();
@@ -154,7 +162,7 @@ pub(crate) fn collect_host_context() -> HostContext {
         uname_sysname: static_info.uname_sysname,
         uname_release: static_info.uname_release,
         uname_machine: static_info.uname_machine,
-        host_cmdline: read_trimmed_sysfs("/proc/cmdline"),
+        cmdline: read_trimmed_sysfs("/proc/cmdline"),
     }
 }
 
@@ -299,15 +307,19 @@ fn parse_trimmed(text: &str) -> Option<String> {
 }
 
 /// Walk `/proc/sys/kernel` for entries whose name starts with
-/// `sched_` and record each as `basename → content`. Skips
-/// directories (the kernel exposes no sched_* directories today but
-/// guarding keeps behavior defined if that changes) and entries
-/// whose content is not readable as UTF-8.
+/// `sched_` and record each as `basename → content`. Skips any
+/// entry that is not a regular file — directories, symlinks,
+/// sockets, fifos, and block/char devices all fall through the
+/// `file_type.is_file()` guard. The kernel exposes no non-file
+/// `sched_*` entries today but guarding keeps behavior defined if
+/// that changes. Also skips entries whose name is not valid UTF-8
+/// and entries whose contents cannot be read or trim to empty.
 ///
 /// Returns `None` only when the directory listing itself fails
-/// (unreadable /proc); an empty map is a valid result (kernel
-/// without any sched_* tunables — e.g. a very old or unusual
-/// build).
+/// (unreadable `/proc/sys/kernel`); an empty map is a valid result
+/// — it means the directory was readable but had no entries
+/// starting with `sched_`, or every such entry failed the
+/// per-file read or trim to empty.
 fn read_sched_tunables() -> Option<BTreeMap<String, String>> {
     let entries = std::fs::read_dir("/proc/sys/kernel").ok()?;
     let mut out = BTreeMap::new();
@@ -343,9 +355,8 @@ fn count_numa_nodes_via_topology() -> Option<usize> {
     if topo.cpu_to_node.is_empty() {
         return Some(1);
     }
-    let mut nodes: Vec<usize> = topo.cpu_to_node.values().copied().collect();
-    nodes.sort_unstable();
-    nodes.dedup();
+    let nodes: std::collections::BTreeSet<usize> =
+        topo.cpu_to_node.values().copied().collect();
     Some(nodes.len())
 }
 
@@ -371,15 +382,19 @@ mod tests {
     /// verbatim — `read_trimmed_sysfs` trims leading/trailing
     /// whitespace and returns `None` only when the read fails or
     /// the file is empty after trim. No token filtering is applied.
-    /// The assertion only requires that, when populated, the
-    /// captured value is trimmed (no stray whitespace).
+    /// Because the cmdline is always present on Linux, this test
+    /// asserts the field populates unconditionally; an if-let
+    /// version of this check would pass vacuously on a kernel that
+    /// accidentally dropped the capture.
     #[test]
-    fn collect_host_context_captures_host_cmdline_on_linux() {
+    fn collect_host_context_captures_cmdline_on_linux() {
         let ctx = collect_host_context();
-        if let Some(cmdline) = ctx.host_cmdline.as_ref() {
-            assert!(!cmdline.is_empty(), "populated cmdline must not be empty");
-            assert_eq!(cmdline.as_str(), cmdline.trim());
-        }
+        let cmdline = ctx
+            .cmdline
+            .as_deref()
+            .expect("/proc/cmdline is always readable on a running Linux system");
+        assert!(!cmdline.is_empty(), "populated cmdline must not be empty");
+        assert_eq!(cmdline, cmdline.trim());
     }
 
     /// Stability regression — repeated calls return equal
@@ -395,7 +410,7 @@ mod tests {
         assert_eq!(a.uname_machine, b.uname_machine);
         assert_eq!(a.cpu_model, b.cpu_model);
         assert_eq!(a.cpu_vendor, b.cpu_vendor);
-        assert_eq!(a.host_cmdline, b.host_cmdline);
+        assert_eq!(a.cmdline, b.cmdline);
     }
 
     /// Host context round-trips through JSON — every field uses
@@ -411,13 +426,14 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize empty");
         assert!(decoded.cpu_model.is_none());
         assert!(decoded.uname_sysname.is_none());
-        assert!(decoded.host_cmdline.is_none());
+        assert!(decoded.cmdline.is_none());
     }
 
-    /// Populated host context round-trips — every field's
-    /// serde_json shape is stable. Asserts ALL fields, not just a
-    /// handful, so a future field addition or serde-attr change
-    /// that breaks a subset of the shape is caught by this test.
+    /// Populated host context round-trips — struct-level
+    /// `PartialEq` makes one `assert_eq!(decoded, ctx)` cover every
+    /// field. Any future field addition or serde-attr change that
+    /// breaks the round-trip for any single field is caught without
+    /// needing a per-field assertion.
     #[test]
     fn host_context_populated_round_trips_via_json() {
         let mut tunables = BTreeMap::new();
@@ -431,35 +447,16 @@ mod tests {
             hugepagesize_kb: Some(2048),
             thp_enabled: Some("always [madvise] never".to_string()),
             thp_defrag: Some("[always] defer defer+madvise madvise never".to_string()),
-            sched_tunables: Some(tunables.clone()),
+            sched_tunables: Some(tunables),
             numa_nodes: Some(2),
             uname_sysname: Some("Linux".to_string()),
             uname_release: Some("6.11.0".to_string()),
             uname_machine: Some("x86_64".to_string()),
-            host_cmdline: Some("preempt=lazy transparent_hugepage=madvise".to_string()),
+            cmdline: Some("preempt=lazy transparent_hugepage=madvise".to_string()),
         };
         let json = serde_json::to_string(&ctx).expect("serialize");
         let decoded: HostContext = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(decoded.cpu_model.as_deref(), Some("Example CPU"));
-        assert_eq!(decoded.cpu_vendor.as_deref(), Some("GenuineExample"));
-        assert_eq!(decoded.total_memory_kb, Some(16_384_000));
-        assert_eq!(decoded.hugepages_total, Some(0));
-        assert_eq!(decoded.hugepages_free, Some(0));
-        assert_eq!(decoded.hugepagesize_kb, Some(2048));
-        assert_eq!(decoded.thp_enabled.as_deref(), Some("always [madvise] never"));
-        assert_eq!(
-            decoded.thp_defrag.as_deref(),
-            Some("[always] defer defer+madvise madvise never"),
-        );
-        assert_eq!(decoded.sched_tunables.as_ref().unwrap(), &tunables);
-        assert_eq!(decoded.numa_nodes, Some(2));
-        assert_eq!(decoded.uname_sysname.as_deref(), Some("Linux"));
-        assert_eq!(decoded.uname_release.as_deref(), Some("6.11.0"));
-        assert_eq!(decoded.uname_machine.as_deref(), Some("x86_64"));
-        assert_eq!(
-            decoded.host_cmdline.as_deref(),
-            Some("preempt=lazy transparent_hugepage=madvise"),
-        );
+        assert_eq!(decoded, ctx);
     }
 
     #[test]
