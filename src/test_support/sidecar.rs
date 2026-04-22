@@ -865,6 +865,45 @@ mod tests {
         assert!(sc.metrics.is_empty(), "fixture must default to metrics=empty");
     }
 
+    /// Summary guard on every empty-collection / None-Option /
+    /// empty-String default. A silent flip of any of these defaults
+    /// breaks every test that depends on "unset → omitted from JSON"
+    /// via the `skip_serializing_if` attrs — and there are many such
+    /// tests across this file. One tripwire here catches the flip in
+    /// one place rather than fanning out to per-default pins.
+    ///
+    /// Hash-participating string defaults (`test_name`,
+    /// `topology`, `scheduler`, `work_type`) are intentionally NOT
+    /// re-asserted here — their drift is caught by
+    /// `test_fixture_variant_hash_is_stable` which pins the hash.
+    #[test]
+    fn test_fixture_all_collections_empty_by_default() {
+        let sc = SidecarResult::test_fixture();
+        assert!(sc.metrics.is_empty(), "metrics must default empty");
+        assert!(sc.active_flags.is_empty(), "active_flags must default empty");
+        assert!(sc.stimulus_events.is_empty(), "stimulus_events must default empty");
+        assert!(sc.verifier_stats.is_empty(), "verifier_stats must default empty");
+        assert!(sc.sysctls.is_empty(), "sysctls must default empty");
+        assert!(sc.kargs.is_empty(), "kargs must default empty");
+        assert!(sc.payload.is_none(), "payload must default None");
+        assert!(sc.monitor.is_none(), "monitor must default None");
+        assert!(sc.kvm_stats.is_none(), "kvm_stats must default None");
+        assert!(sc.kernel_version.is_none(), "kernel_version must default None");
+        assert!(sc.host.is_none(), "host must default None");
+        assert!(sc.timestamp.is_empty(), "timestamp must default empty String");
+        assert!(sc.run_id.is_empty(), "run_id must default empty String");
+        assert!(
+            sc.stats.cgroups.is_empty(),
+            "stats.cgroups must default empty (ScenarioStats::default)",
+        );
+        // Overlaps deliberately with `test_fixture_is_pass_not_skip`
+        // so this single summary test is sufficient to catch a
+        // verdict-default flip even if callers forget the other
+        // self-test exists. Cheap belt + suspenders.
+        assert!(sc.passed, "passed must default true");
+        assert!(!sc.skipped, "skipped must default false");
+    }
+
     /// Two fresh fixtures must hash to the same value and that value
     /// must match the pinned constant. Protects against a change to
     /// fixture defaults that would silently shift every call-site
@@ -977,6 +1016,147 @@ mod tests {
         assert_eq!(deltas.total_dispatch_keep_last, 3);
         assert_eq!(loaded.stimulus_events.len(), 1);
         assert_eq!(loaded.stimulus_events[0].label, "StepStart[0]");
+    }
+
+    /// Exhaustive schema-audit gate for `SidecarResult`'s serde
+    /// round-trip. Every field is populated with a value that is
+    /// distinct from the `test_fixture` default AND every field is
+    /// asserted individually after serialization + deserialization.
+    /// A new field added to `SidecarResult` triggers failure at two
+    /// independent sites for `SidecarResult` top-level fields; nested
+    /// structs use `..Default::default()` and rely on their own
+    /// per-type tests:
+    /// 1. The construction literal below fails to compile (Rust
+    ///    requires every field in a struct literal without
+    ///    `..Default::default()`).
+    /// 2. The per-field assertion block below misses the new field,
+    ///    so the audit surfaces as a reviewer note.
+    ///
+    /// Nested struct literals inside the construction (e.g.
+    /// `MonitorSummary`, `ScenarioStats`, `HostContext`,
+    /// `PayloadMetrics`) use `..Default::default()` to remain
+    /// resilient to unrelated nested-type growth — adding a field
+    /// to one of those nested types does NOT trip this test. Fields
+    /// of those nested types that should trigger a similar audit
+    /// must grow their own all-fields round-trip test in their
+    /// owning module (e.g.
+    /// `host_context_populated_round_trips_via_json` for
+    /// `HostContext`).
+    ///
+    /// Complements the structurally-populated
+    /// [`sidecar_result_roundtrip`] which exercises nested-struct
+    /// shapes but only asserts on a subset of fields. Leaving both
+    /// is intentional: the structural test proves deep trees survive
+    /// serde; this test proves every scalar and Option round-trips.
+    ///
+    /// Distinct non-default values used:
+    /// - `test_name="audit"` (vs fixture `"t"`).
+    /// - `topology="8n8l16c2t"` (vs fixture `"1n1l1c1t"`).
+    /// - `scheduler="scx_audit"` (vs fixture `"eevdf"`).
+    /// - `work_type="AuditWork"` (vs fixture `"CpuSpin"`).
+    /// - `passed=false, skipped=true` (vs fixture `true`, `false`).
+    /// - Non-empty collections for every `Vec<_>` field.
+    /// - `Some(…)` for every `Option<_>` field.
+    /// - Non-empty Strings for `timestamp`, `run_id`.
+    #[test]
+    fn sidecar_result_roundtrip_all_fields_round_trip() {
+        use crate::assert::{CgroupStats, ScenarioStats};
+        use crate::host_context::HostContext;
+        use crate::monitor::MonitorSummary;
+        use crate::monitor::bpf_prog::ProgVerifierStats;
+        use crate::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
+        use crate::timeline::StimulusEvent;
+
+        let sc = SidecarResult {
+            test_name: "audit".to_string(),
+            topology: "8n8l16c2t".to_string(),
+            scheduler: "scx_audit".to_string(),
+            payload: Some("audit_payload".to_string()),
+            metrics: vec![PayloadMetrics {
+                metrics: vec![Metric {
+                    name: "audit_metric".to_string(),
+                    value: 42.0,
+                    polarity: Polarity::HigherBetter,
+                    unit: "audits".to_string(),
+                    source: MetricSource::Json,
+                }],
+                exit_code: 7,
+            }],
+            passed: false,
+            skipped: true,
+            stats: ScenarioStats {
+                cgroups: vec![CgroupStats {
+                    num_workers: 3,
+                    ..Default::default()
+                }],
+                total_workers: 3,
+                ..Default::default()
+            },
+            monitor: Some(MonitorSummary {
+                total_samples: 17,
+                ..Default::default()
+            }),
+            stimulus_events: vec![StimulusEvent {
+                elapsed_ms: 123,
+                label: "audit_event".to_string(),
+                op_kind: None,
+                detail: None,
+                total_iterations: None,
+            }],
+            work_type: "AuditWork".to_string(),
+            active_flags: vec!["flag_a".to_string(), "flag_b".to_string()],
+            verifier_stats: vec![ProgVerifierStats {
+                name: "audit_prog".to_string(),
+                verified_insns: 999,
+            }],
+            kvm_stats: Some(crate::vmm::KvmStatsTotals::default()),
+            sysctls: vec!["sysctl.kernel.audit_sysctl=1".to_string()],
+            kargs: vec!["audit_karg".to_string()],
+            kernel_version: Some("6.99.0".to_string()),
+            timestamp: "audit-timestamp".to_string(),
+            run_id: "audit-run-id".to_string(),
+            host: Some(HostContext {
+                uname_sysname: Some("AuditLinux".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let json = serde_json::to_string(&sc).expect("serialize");
+        let loaded: SidecarResult = serde_json::from_str(&json).expect("deserialize");
+
+        // Every field asserted, in struct-declaration order.
+        assert_eq!(loaded.test_name, "audit");
+        assert_eq!(loaded.topology, "8n8l16c2t");
+        assert_eq!(loaded.scheduler, "scx_audit");
+        assert_eq!(loaded.payload.as_deref(), Some("audit_payload"));
+        assert_eq!(loaded.metrics.len(), 1);
+        assert_eq!(loaded.metrics[0].exit_code, 7);
+        assert_eq!(loaded.metrics[0].metrics.len(), 1);
+        assert_eq!(loaded.metrics[0].metrics[0].name, "audit_metric");
+        assert_eq!(loaded.metrics[0].metrics[0].value, 42.0);
+        assert!(!loaded.passed, "passed must survive as false");
+        assert!(loaded.skipped, "skipped must survive as true");
+        assert_eq!(loaded.stats.total_workers, 3);
+        assert_eq!(loaded.stats.cgroups.len(), 1);
+        assert_eq!(loaded.stats.cgroups[0].num_workers, 3);
+        let mon = loaded.monitor.expect("monitor round-trips");
+        assert_eq!(mon.total_samples, 17);
+        assert_eq!(loaded.stimulus_events.len(), 1);
+        assert_eq!(loaded.stimulus_events[0].label, "audit_event");
+        assert_eq!(loaded.stimulus_events[0].elapsed_ms, 123);
+        assert_eq!(loaded.work_type, "AuditWork");
+        assert_eq!(loaded.active_flags, vec!["flag_a", "flag_b"]);
+        assert_eq!(loaded.verifier_stats.len(), 1);
+        assert_eq!(loaded.verifier_stats[0].name, "audit_prog");
+        assert_eq!(loaded.verifier_stats[0].verified_insns, 999);
+        assert!(loaded.kvm_stats.is_some(), "kvm_stats must round-trip as Some");
+        assert_eq!(loaded.sysctls, vec!["sysctl.kernel.audit_sysctl=1"]);
+        assert_eq!(loaded.kargs, vec!["audit_karg"]);
+        assert_eq!(loaded.kernel_version.as_deref(), Some("6.99.0"));
+        assert_eq!(loaded.timestamp, "audit-timestamp");
+        assert_eq!(loaded.run_id, "audit-run-id");
+        let host = loaded.host.expect("host round-trips");
+        assert_eq!(host.uname_sysname.as_deref(), Some("AuditLinux"));
     }
 
     #[test]
