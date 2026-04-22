@@ -1531,90 +1531,14 @@ mod tests {
     }
 
     // -- format_entry_row --
-
-    #[test]
-    fn format_entry_row_with_metadata() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache"));
-        let meta = test_metadata();
-        let entry = store_test_entry(&cache, "6.14.2-tarball-x86_64", &meta);
-        let row = cli::format_entry_row(&entry, "abc123", &[]);
-        assert!(row.contains("6.14.2-tarball-x86_64"));
-        assert!(row.contains("6.14.2"));
-        assert!(row.contains("tarball"));
-        assert!(row.contains("x86_64"));
-        assert!(row.contains("2026-04-12T10:00:00Z"));
-    }
-
-    /// Sibling of `kconfig_status_reports_stale_on_hash_mismatch`:
-    /// that test pins the `KconfigStatus::Stale` variant returned by
-    /// `CacheEntry::kconfig_status` when the cached hash differs from
-    /// the current hash; this test pins the human-readable tag
-    /// (`(stale kconfig)`) emitted by `cli::format_entry_row` for the
-    /// same state.
-    #[test]
-    fn format_entry_row_stale_kconfig() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache"));
-        let meta = test_metadata().with_ktstr_kconfig_hash(Some("old_hash".to_string()));
-        let entry = store_test_entry(&cache, "stale-key", &meta);
-        let row = cli::format_entry_row(&entry, "new_hash", &[]);
-        assert!(
-            row.contains("stale kconfig"),
-            "should show stale kconfig marker"
-        );
-    }
-
-    /// Sibling of `kconfig_status_reports_matches_on_hash_equality`:
-    /// that test pins the `KconfigStatus::Matches` variant returned by
-    /// `CacheEntry::kconfig_status` when cached and current hashes
-    /// agree; this test pins the format-row contract that matching
-    /// entries carry no kconfig tag.
-    #[test]
-    fn format_entry_row_matching_kconfig() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache"));
-        let meta = test_metadata().with_ktstr_kconfig_hash(Some("same".to_string()));
-        let entry = store_test_entry(&cache, "match-key", &meta);
-        let row = cli::format_entry_row(&entry, "same", &[]);
-        // Assert absence of the two variant tags (`(stale kconfig)`,
-        // `(untracked kconfig)`) rather than the bare word `kconfig`.
-        // A future column-header that includes "kconfig" (e.g. a
-        // KCONFIG column) would otherwise fail this test spuriously —
-        // the contract being pinned is "Matches carries neither the
-        // stale nor the untracked tag," not "the word never appears."
-        assert!(
-            !row.contains("stale kconfig"),
-            "matching entry must not carry (stale kconfig) tag: {row}"
-        );
-        assert!(
-            !row.contains("untracked kconfig"),
-            "matching entry must not carry (untracked kconfig) tag: {row}"
-        );
-    }
-
-    /// Sibling of `kconfig_status_reports_untracked_when_entry_has_no_hash`:
-    /// that test pins the `KconfigStatus::Untracked` variant returned
-    /// by `CacheEntry::kconfig_status` when the entry has no recorded
-    /// hash; this test pins the format-row tag (`(untracked kconfig)`)
-    /// that distinguishes that state from `(stale kconfig)` in human
-    /// output.
-    #[test]
-    fn format_entry_row_untracked_kconfig_tagged_distinctly_from_stale() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cache = CacheDir::with_root(tmp.path().join("cache"));
-        let meta = test_metadata();
-        let entry = store_test_entry(&cache, "no-hash-key", &meta);
-        let row = cli::format_entry_row(&entry, "anything", &[]);
-        assert!(
-            !row.contains("stale kconfig"),
-            "untracked entry must not be tagged as stale: {row}"
-        );
-        assert!(
-            row.contains("untracked kconfig"),
-            "untracked entry must be tagged as such so users can distinguish from matching: {row}"
-        );
-    }
+    //
+    // The (Matches / Stale / Untracked) × (not-EOL / EOL) outcome
+    // matrix plus the `version == None` → "-" dash-render branch are
+    // pinned by `format_entry_row_renders_eol_kconfig_matrix` in
+    // `src/cli.rs` tests (cases c1-c7). The test below covers a
+    // distinct corner the matrix does not: `KernelSource::Local`
+    // rendering through format_entry_row, since the matrix uses
+    // `Tarball` exclusively for determinism.
 
     #[test]
     fn format_entry_row_no_version() {

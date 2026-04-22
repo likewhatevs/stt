@@ -2737,6 +2737,80 @@ mod tests {
         assert!(!is_eol("abc", &["6.14".to_string()]));
     }
 
+    /// Snapshot pin for `format_entry_row` across the 6-case outcome
+    /// matrix over (EOL, not-EOL) × (Matches, Stale, Untracked);
+    /// empty and unparseable `active_prefixes` branches are pinned by
+    /// sibling `is_eol_` tests. A 7th case fixes the `version == "-"`
+    /// short-circuit at cli.rs where a missing version skips the EOL
+    /// tag even under a non-empty active list.
+    ///
+    /// Inline snapshot captures exact padding and tag ordering so any
+    /// drift — column width change, tag reorder, `(EOL)` string
+    /// rename, Display-impl tweak on `KconfigStatus` — fails this one
+    /// test. Uses `KernelSource::Tarball` because it is the simplest
+    /// variant to construct; `Display` on `KernelSource` strips
+    /// payload fields for every variant, so source choice only
+    /// affects the rendered column when the Display impl changes.
+    /// Fixed `built_at` timestamp keeps the snapshot date-stable.
+    /// Key lengths vary (12-20 chars) but all fit within the 48-char
+    /// column, so padding drift surfaces at multiple pad counts
+    /// across c1-c7.
+    #[test]
+    fn format_entry_row_renders_eol_kconfig_matrix() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let image = src_dir.join("bzImage");
+        std::fs::write(&image, b"fake kernel").unwrap();
+
+        let current_hash = "a1b2c3d4";
+        let active_prefixes = ["6.14".to_string()];
+
+        // version "6.14.2" is in active list → not EOL; version
+        // "2.6.32" is long-EOL; version None → rendered as "-" and
+        // short-circuits the EOL guard regardless of active list.
+        // entry_hash == current → Matches; entry_hash != current →
+        // Stale; None → Untracked.
+        let build_row =
+            |key: &str, version: Option<&str>, entry_hash: Option<&str>| -> String {
+                let meta = KernelMetadata::new(
+                    KernelSource::Tarball,
+                    "x86_64".to_string(),
+                    "bzImage".to_string(),
+                    "2026-04-12T10:00:00Z".to_string(),
+                )
+                .with_version(version.map(str::to_string))
+                .with_ktstr_kconfig_hash(entry_hash.map(str::to_string));
+                let entry = cache
+                    .store(key, &CacheArtifacts::new(&image), &meta)
+                    .unwrap();
+                format_entry_row(&entry, current_hash, &active_prefixes)
+            };
+
+        let rows = [
+            build_row("c1-active-matches", Some("6.14.2"), Some(current_hash)),
+            build_row("c2-active-stale", Some("6.14.2"), Some("deadbeef")),
+            build_row("c3-active-untracked", Some("6.14.2"), None),
+            build_row("c4-eol-matches", Some("2.6.32"), Some(current_hash)),
+            build_row("c5-eol-stale", Some("2.6.32"), Some("deadbeef")),
+            build_row("c6-eol-untracked", Some("2.6.32"), None),
+            build_row("c7-active-no-version", None, Some(current_hash)),
+        ];
+        let joined = rows.join("\n");
+        insta::assert_snapshot!(joined, @r"
+          c1-active-matches                                6.14.2       tarball  x86_64  2026-04-12T10:00:00Z
+          c2-active-stale                                  6.14.2       tarball  x86_64  2026-04-12T10:00:00Z (stale kconfig)
+          c3-active-untracked                              6.14.2       tarball  x86_64  2026-04-12T10:00:00Z (untracked kconfig)
+          c4-eol-matches                                   2.6.32       tarball  x86_64  2026-04-12T10:00:00Z (EOL)
+          c5-eol-stale                                     2.6.32       tarball  x86_64  2026-04-12T10:00:00Z (stale kconfig) (EOL)
+          c6-eol-untracked                                 2.6.32       tarball  x86_64  2026-04-12T10:00:00Z (untracked kconfig) (EOL)
+          c7-active-no-version                             -            tarball  x86_64  2026-04-12T10:00:00Z
+        ");
+    }
+
     /// Regression pin for `format_entry_row` with empty
     /// `active_prefixes` — the fallback path `kernel_list` enters
     /// when [`fetch_active_prefixes`] returns `Err`. The `(EOL)` tag
