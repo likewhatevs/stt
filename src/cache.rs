@@ -1339,11 +1339,26 @@ mod tests {
     /// every `neutralize_alloc_relocs` test shares this base shape.
     /// Callers that need SHF_ALLOC relocation sections add them on
     /// top of the returned object before calling `.write()`.
-    fn build_base_elf_with_text_symbol() -> object::write::Object<'static> {
+    ///
+    /// `arch` selects the ELF class: `Architecture::X86_64` yields
+    /// ELF64 (8-byte anchor symbol), `Architecture::I386` yields
+    /// ELF32 (4-byte anchor symbol). The anchor-symbol size is the
+    /// only shape difference between the two classes at this
+    /// fixture level; everything downstream (section headers, the
+    /// `is_rela` predicate under test) is driven by the
+    /// ELF32/ELF64 split `object::write` performs based on `arch`.
+    fn build_base_elf_with_text_symbol(
+        arch: object::Architecture,
+    ) -> object::write::Object<'static> {
         use object::write;
+        let sym_size = match arch {
+            object::Architecture::X86_64 => 8,
+            object::Architecture::I386 => 4,
+            _ => 8,
+        };
         let mut obj = write::Object::new(
             object::BinaryFormat::Elf,
-            object::Architecture::X86_64,
+            arch,
             object::Endianness::Little,
         );
         let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
@@ -1351,7 +1366,7 @@ mod tests {
         let _ = obj.add_symbol(write::Symbol {
             name: b"test_text_symbol".to_vec(),
             value: 0x0,
-            size: 8,
+            size: sym_size,
             kind: object::SymbolKind::Data,
             scope: object::SymbolScope::Compilation,
             weak: false,
@@ -3600,7 +3615,7 @@ mod tests {
 
         // Base ELF with .text + anchor symbol (so object::write
         // emits .symtab/.strtab). Reloc sections are added below.
-        let mut obj = build_base_elf_with_text_symbol();
+        let mut obj = build_base_elf_with_text_symbol(object::Architecture::X86_64);
         // .rela.kaslr — SHT_RELA + SHF_ALLOC. Shape matches what
         // CONFIG_RELOCATABLE + CONFIG_RANDOMIZE_BASE kernels emit
         // and motivates this pass per the fn docstring. sh_size
@@ -3810,7 +3825,7 @@ mod tests {
     fn neutralize_alloc_relocs_noop_when_no_alloc_reloc_sections() {
         // Base ELF carries only .text + anchor symbol — no reloc
         // sections at all, so the filter matches nothing.
-        let data = build_base_elf_with_text_symbol().write().unwrap();
+        let data = build_base_elf_with_text_symbol(object::Architecture::X86_64).write().unwrap();
 
         let processed = neutralize_alloc_relocs(&data).unwrap();
         assert_eq!(
@@ -3849,7 +3864,7 @@ mod tests {
         // intentionally mirror the sibling zeros_only test's fixture
         // so both positive and negative filter paths re-walk on the
         // second pass.
-        let mut obj = build_base_elf_with_text_symbol();
+        let mut obj = build_base_elf_with_text_symbol(object::Architecture::X86_64);
         // .rela.kaslr — SHT_RELA + SHF_ALLOC. Primary positive case.
         let kaslr_id = obj.add_section(
             Vec::new(),
@@ -4050,27 +4065,12 @@ mod tests {
     #[test]
     fn neutralize_alloc_relocs_zeros_sh_size_in_elf32_fixture() {
         use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
-        use object::write;
 
-        let mut obj = write::Object::new(
-            object::BinaryFormat::Elf,
-            object::Architecture::I386,
-            object::Endianness::Little,
-        );
-        // .text anchored by a symbol so object::write emits
-        // .symtab/.strtab — mirrors the ELF64 fixture pattern.
-        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
-        obj.append_section_data(text_id, &[0xCC; 64], 1);
-        let _ = obj.add_symbol(write::Symbol {
-            name: b"test_text_symbol".to_vec(),
-            value: 0x0,
-            size: 4,
-            kind: object::SymbolKind::Data,
-            scope: object::SymbolScope::Compilation,
-            weak: false,
-            section: write::SymbolSection::Section(text_id),
-            flags: object::SymbolFlags::None,
-        });
+        // Base shape — .text + test_text_symbol with ELF32-sized
+        // anchor — is shared with the ELF64 fixtures via the
+        // helper. Passing `Architecture::I386` flips the ELF class
+        // (is_64 false) and downgrades the symbol size to 4 bytes.
+        let mut obj = build_base_elf_with_text_symbol(object::Architecture::I386);
         // .rela.kaslr — SHT_RELA + SHF_ALLOC. A 16-byte payload is
         // large enough that a mis-targeted 4-byte write at offset 20
         // (the correct ELF32 sh_size location) is observable via
