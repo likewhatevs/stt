@@ -27,8 +27,8 @@ use super::{
     KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_flags_arg,
     extract_test_fn_arg, extract_topo_arg, find_test, format_callback_profile, format_kvm_stats,
     format_verifier_stats, maybe_dispatch_vm_test, parse_topo_string,
-    propagate_rust_env_from_cmdline, resolve_test_kernel, run_ktstr_test_inner, sidecar_dir,
-    try_flush_profraw, validate_entry_flags, write_skip_sidecar,
+    propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
+    run_ktstr_test_inner, sidecar_dir, try_flush_profraw, validate_entry_flags,
 };
 
 /// Early dispatch for `#[ktstr_test]` test execution.
@@ -210,7 +210,7 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                 .unwrap()
                 .reason
                 .clone();
-            eprintln!("ktstr: SKIP: resource contention: {reason}");
+            crate::report::test_skip(format_args!("resource contention: {reason}"));
             0
         }
         Err(_) if expect_err => 0,
@@ -479,14 +479,12 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     let active_flags: Vec<String> = entry.required_flags.iter().map(|s| s.to_string()).collect();
 
     if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
-        eprintln!(
-            "ktstr: SKIP: {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+        crate::report::test_skip(format_args!(
+            "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             bare_name,
-        );
+        ));
         // See run_ktstr_test_inner for the sidecar-emission rationale.
-        if let Err(e) = write_skip_sidecar(entry, &active_flags) {
-            eprintln!("ktstr_test: {e:#}");
-        }
+        record_skip_sidecar(entry, &active_flags);
         return 0;
     }
 
@@ -580,13 +578,11 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
     };
 
     if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
-        eprintln!(
-            "ktstr: SKIP: {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+        crate::report::test_skip(format_args!(
+            "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             test_name,
-        );
-        if let Err(e) = write_skip_sidecar(entry, &flags) {
-            eprintln!("ktstr_test: {e:#}");
-        }
+        ));
+        record_skip_sidecar(entry, &flags);
         return 0;
     }
 

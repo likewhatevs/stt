@@ -5,17 +5,20 @@
 //! any `#[cfg(test)]` code without an explicit `use`.
 
 /// Emit a canonical `ktstr: SKIP: ...` message and return from the
-/// caller. Centralizes the prefix so every test reports skips in a
-/// single grep-able format.
+/// caller. Routes through [`crate::report::test_skip`] so the
+/// prefix lives in one place — the alternative (15+ open-coded
+/// `eprintln!` sites) drifts into inconsistent casings that break
+/// every grep-based test-summary tool.
 ///
 /// Only callable from functions returning `()` — the macro expands to
 /// an early `return;` with no value. Production code that returns a
 /// non-unit type (dispatcher fns returning `i32`, helpers returning
-/// `Option<T>`) must emit the `ktstr: SKIP:` line manually and return
-/// its own sentinel.
+/// `Option<T>`, loop bodies that `continue`) calls
+/// [`crate::report::test_skip`] directly and drives its own control
+/// flow.
 macro_rules! skip {
     ($($arg:tt)*) => {{
-        eprintln!("ktstr: SKIP: {}", format_args!($($arg)*));
+        $crate::report::test_skip(format_args!($($arg)*));
         return;
     }};
 }

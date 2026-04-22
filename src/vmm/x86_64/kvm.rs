@@ -584,8 +584,7 @@ mod tests {
                 // interact with host KVM limitations). The APIC ID
                 // assertion above validates the split irqchip logic;
                 // skip the VM creation test on those hosts.
-                eprintln!("skipping large_topology VM creation: {e:#}");
-                return;
+                skip!("large_topology VM creation: {e:#}");
             }
         };
         assert!(vm.split_irqchip, "large topology should use split IRQ chip");

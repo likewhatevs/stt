@@ -237,7 +237,7 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
     let kernel_dir = std::env::var("KTSTR_KERNEL").ok();
     let result = crate::kernel_path::resolve_btf(kernel_dir.as_deref());
     if result.is_none() {
-        eprintln!("ktstr: SKIP: no vmlinux found (set KTSTR_KERNEL or place vmlinux in ./linux)");
+        crate::report::test_skip("no vmlinux found (set KTSTR_KERNEL or place vmlinux in ./linux)");
     }
     result
 }

@@ -878,8 +878,7 @@ mod tests {
     #[test]
     fn local_source_clean_repo_populates_hash() {
         if std::process::Command::new("git").arg("--version").output().is_err() {
-            eprintln!("skipping: git CLI unavailable");
-            return;
+            skip!("git CLI unavailable");
         }
         let tmp = tempfile::TempDir::new().unwrap();
         init_repo_with_commit(tmp.path());
@@ -912,8 +911,7 @@ mod tests {
     #[test]
     fn local_source_dirty_tracked_file_clears_hash() {
         if std::process::Command::new("git").arg("--version").output().is_err() {
-            eprintln!("skipping: git CLI unavailable");
-            return;
+            skip!("git CLI unavailable");
         }
         let tmp = tempfile::TempDir::new().unwrap();
         init_repo_with_commit(tmp.path());
@@ -947,8 +945,7 @@ mod tests {
     #[test]
     fn local_source_dirty_staged_only_clears_hash() {
         if std::process::Command::new("git").arg("--version").output().is_err() {
-            eprintln!("skipping: git CLI unavailable");
-            return;
+            skip!("git CLI unavailable");
         }
         let tmp = tempfile::TempDir::new().unwrap();
         init_repo_with_commit(tmp.path());

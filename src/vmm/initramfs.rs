@@ -1813,8 +1813,7 @@ mod tests {
     fn elf_dynamic_needed_extracts_sonames() {
         let sh = Path::new("/bin/sh");
         if !sh.exists() || !is_elf(sh) {
-            eprintln!("skipping: /bin/sh not ELF");
-            return;
+            skip!("/bin/sh not ELF");
         }
         let data = std::fs::read(sh).unwrap();
         let elf = goblin::elf::Elf::parse(&data).unwrap();
@@ -2190,12 +2189,10 @@ mod tests {
         // /bin/sh is a dynamic ELF on most systems.
         let sh = Path::new("/bin/sh");
         if !sh.exists() {
-            eprintln!("skipping: /bin/sh not found");
-            return;
+            skip!("/bin/sh not found");
         }
         if !is_elf(sh) {
-            eprintln!("skipping: /bin/sh is not ELF");
-            return;
+            skip!("/bin/sh is not ELF");
         }
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
@@ -2527,8 +2524,7 @@ mod tests {
         // appear in the archive with non-zero sizes.
         let sh = Path::new("/bin/sh");
         if !sh.exists() || !is_elf(sh) {
-            eprintln!("skipping: /bin/sh not available or not ELF");
-            return;
+            skip!("/bin/sh not available or not ELF");
         }
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
@@ -2821,8 +2817,7 @@ mod tests {
     fn lz4_legacy_compress_c_compat() {
         let lz4_check = std::process::Command::new("lz4").arg("--version").output();
         if lz4_check.is_err() {
-            eprintln!("skipping: lz4 CLI not found");
-            return;
+            skip!("lz4 CLI not found");
         }
 
         let data = build_synthetic_cpio(2 << 20); // ~2MB
@@ -2859,8 +2854,7 @@ mod tests {
     fn lz4_legacy_reference_cross_compat() {
         let lz4_check = std::process::Command::new("lz4").arg("--version").output();
         if lz4_check.is_err() {
-            eprintln!("skipping: lz4 CLI not found");
-            return;
+            skip!("lz4 CLI not found");
         }
 
         let data = build_synthetic_cpio(2 << 20);

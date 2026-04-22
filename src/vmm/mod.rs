@@ -3994,7 +3994,7 @@ mod tests {
             }
             ShmCreateResult::Error => {
                 // Environment without /dev/shm — skip rather than fail.
-                eprintln!("skip: shm_open unavailable in this environment");
+                skip!("shm_open unavailable in this environment");
             }
         }
     }
@@ -4014,8 +4014,7 @@ mod tests {
         let fd = match shm_try_create_excl(&name) {
             ShmCreateResult::Winner(fd) => fd,
             _ => {
-                eprintln!("skip: shm_open unavailable");
-                return;
+                skip!("shm_open unavailable");
             }
         };
         let payload = b"shm-unit-test-payload";
@@ -4273,7 +4272,7 @@ mod tests {
                     if e.downcast_ref::<host_topology::ResourceContention>()
                         .is_some() =>
                 {
-                    eprintln!("ktstr: SKIP: {label}: resource contention: {e}");
+                    crate::report::test_skip(format_args!("{label}: resource contention: {e}"));
                     continue;
                 }
                 Err(e) => panic!("{e:#}"),

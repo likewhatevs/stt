@@ -253,6 +253,7 @@ pub mod host_context;
 pub mod kernel_path;
 pub(crate) mod monitor;
 pub(crate) mod probe;
+pub(crate) mod report;
 pub mod runner;
 pub mod scenario;
 pub(crate) mod stats;

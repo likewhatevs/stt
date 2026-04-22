@@ -75,6 +75,22 @@ pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
 /// and `eval_crash_message_from_shm`.
 pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 
+/// Write a skip sidecar for `entry` + `active_flags`, logging to
+/// stderr on failure without propagating the error. Used at five
+/// sites — the three in [`run_ktstr_test_inner`] (performance_mode
+/// gate plus the two `ResourceContention` arms at VM build + VM
+/// run) and the two in `super::dispatch` (performance_mode gates
+/// at the plain-run and flag-profile entry points) — all of which
+/// must record the skip for stats tooling but cannot meaningfully
+/// handle a sidecar-write failure beyond logging it. The skip
+/// itself is still valid; only post-run stats tooling loses
+/// visibility.
+pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String]) {
+    if let Err(e) = write_skip_sidecar(entry, active_flags) {
+        eprintln!("ktstr_test: {e:#}");
+    }
+}
+
 /// Run a single ktstr_test and return the VM's AssertResult.
 pub(crate) fn run_ktstr_test_inner(
     entry: &KtstrTestEntry,
@@ -86,17 +102,15 @@ pub(crate) fn run_ktstr_test_inner(
         t.validate().context("TopoOverride validation")?;
     }
     if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
-        eprintln!(
-            "ktstr: SKIP: {}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
+        crate::report::test_skip(format_args!(
+            "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             entry.name,
-        );
+        ));
         // Record the skip so stats tooling sees every skipped run,
         // not just the ones that made it to the VM-run site. A sidecar
         // write failure is logged but not propagated: the skip itself
         // is still valid — only post-run stats tooling loses visibility.
-        if let Err(e) = write_skip_sidecar(entry, active_flags) {
-            eprintln!("ktstr_test: {e:#}");
-        }
+        record_skip_sidecar(entry, active_flags);
         return Ok(AssertResult::skip(
             "test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
         ));
@@ -177,9 +191,7 @@ pub(crate) fn run_ktstr_test_inner(
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
                 .is_some() =>
         {
-            if let Err(se) = write_skip_sidecar(entry, active_flags) {
-                eprintln!("ktstr_test: {se:#}");
-            }
+            record_skip_sidecar(entry, active_flags);
             return Err(e);
         }
         Err(e) => return Err(e.context("build ktstr_test VM")),
@@ -191,9 +203,7 @@ pub(crate) fn run_ktstr_test_inner(
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
                 .is_some() =>
         {
-            if let Err(se) = write_skip_sidecar(entry, active_flags) {
-                eprintln!("ktstr_test: {se:#}");
-            }
+            record_skip_sidecar(entry, active_flags);
             return Err(e);
         }
         Err(e) => return Err(e.context("run ktstr_test VM")),
