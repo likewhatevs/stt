@@ -3173,11 +3173,14 @@ mod tests {
     /// A minor component with no leading digits (e.g. `"6.x"`) fails
     /// the `minor_digits.is_empty()` guard. Distinct from the no-dot
     /// path: we got past `split_once` but could not extract a
-    /// numeric series.
+    /// numeric series. `"6."` is the degenerate case of the same
+    /// guard — `split_once('.')` yields `("6", "")`, and the empty
+    /// rest produces an empty digit collection.
     #[test]
     fn version_prefix_rejects_non_numeric_minor() {
         assert!(version_prefix("6.x").is_none());
         assert!(version_prefix("6.-rc1").is_none());
+        assert!(version_prefix("6.").is_none());
     }
 
     // -- is_eol predicate --

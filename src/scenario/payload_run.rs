@@ -687,14 +687,26 @@ fn kill_payload_process_group(child: &std::process::Child, payload_name: &str) {
     let pid = nix::unistd::Pid::from_raw(pgid);
     match nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) => {}
-        Err(nix::errno::Errno::ESRCH) => {}
+        Err(nix::errno::Errno::ESRCH) => {
+            tracing::debug!(
+                payload = payload_name,
+                pgid,
+                "ESRCH — payload process group already reaped",
+            );
+        }
         Err(e) => {
             tracing::warn!(payload = payload_name, pgid, %e, "killpg failed for payload process group");
         }
     }
     match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) => {}
-        Err(nix::errno::Errno::ESRCH) => {}
+        Err(nix::errno::Errno::ESRCH) => {
+            tracing::debug!(
+                payload = payload_name,
+                pid = pgid,
+                "ESRCH — payload leader already reaped",
+            );
+        }
         Err(e) => {
             tracing::warn!(payload = payload_name, pid = pgid, %e, "direct kill failed for payload leader");
         }

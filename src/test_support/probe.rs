@@ -135,7 +135,21 @@ fn classify_repro_vm_status(
         );
     }
     if has_crash_message || output.contains(super::SENTINEL_SCHEDULER_DIED) {
-        return format!("repro VM: scheduler crashed (exit code {exit_code})");
+        // Describe qemu's exit disposition precisely: a crash sentinel
+        // in `output` can coincide with qemu itself exiting 0 (guest
+        // panic handler + orderly reboot), >0 (propagated non-zero),
+        // or <0 (signal-kill per the caller's sign convention).
+        // Labeling all three as "crashed (exit N)" conflates the
+        // guest-scheduler failure with qemu's own exit, making the
+        // qemu-clean case especially misleading.
+        let exit_clause = if exit_code < 0 {
+            format!("killed by signal ({exit_code})")
+        } else if exit_code == 0 {
+            "exited cleanly".to_string()
+        } else {
+            format!("exited with non-zero status ({exit_code})")
+        };
+        return format!("repro VM: scheduler crashed — {exit_clause}");
     }
     if exit_code != 0 {
         return format!("repro VM: exited abnormally (exit code {exit_code})");
@@ -1686,17 +1700,49 @@ mod tests {
 
     #[test]
     fn classify_repro_vm_status_crashed_from_sentinel() {
+        // Positive exit code on the crash-sentinel branch → qemu
+        // propagated a non-zero exit alongside the guest crash
+        // sentinel. Clause format: "exited with non-zero status (N)".
         let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", 139);
-        assert_eq!(status, "repro VM: scheduler crashed (exit code 139)");
+        assert_eq!(
+            status,
+            "repro VM: scheduler crashed — exited with non-zero status (139)",
+        );
     }
 
     #[test]
     fn classify_repro_vm_status_crashed_from_crash_message() {
         // crash_message set without a SCHEDULER_DIED sentinel (e.g.
         // VM-level crash detection from COM1) still routes to the
-        // crashed branch.
+        // crashed branch. Positive exit code → non-zero-status clause.
         let status = classify_repro_vm_status(false, true, "no sentinels here", 134);
-        assert_eq!(status, "repro VM: scheduler crashed (exit code 134)");
+        assert_eq!(
+            status,
+            "repro VM: scheduler crashed — exited with non-zero status (134)",
+        );
+    }
+
+    /// exit_code == 0 with a crash sentinel is the "guest panic
+    /// handler + orderly reboot" case — qemu shut down cleanly but
+    /// the guest emitted SCHEDULER_DIED. The old format conflated
+    /// this with a true qemu-level crash; the branched format makes
+    /// it unambiguous.
+    #[test]
+    fn classify_repro_vm_status_crashed_from_sentinel_qemu_clean_exit() {
+        let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", 0);
+        assert_eq!(status, "repro VM: scheduler crashed — exited cleanly");
+    }
+
+    /// Negative exit_code on the crash branch = qemu killed by
+    /// signal (std::process::ExitStatus maps signal-kill to a
+    /// negative i32 here). Clause format: "killed by signal (N)".
+    #[test]
+    fn classify_repro_vm_status_crashed_from_sentinel_killed_by_signal() {
+        let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", -9);
+        assert_eq!(
+            status,
+            "repro VM: scheduler crashed — killed by signal (-9)",
+        );
     }
 
     #[test]
