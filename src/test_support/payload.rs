@@ -165,6 +165,34 @@ pub enum PayloadKind {
     /// the config file is placed at `/include-files/{filename}`
     /// without a `-i` flag. Binary-kind payloads have no equivalent
     /// shortcut — `-i` is the sole entry point.
+    ///
+    /// # Fork / kill semantics
+    ///
+    /// A binary-kind payload is spawned in its own process group via
+    /// `CommandExt::process_group(0)` in
+    /// [`build_command`](crate::scenario::payload_run) so the
+    /// framework can reach every descendant the binary forks. Direct consequences for test
+    /// authors:
+    ///
+    /// - `std::process::Child::kill()` only targets the direct child
+    ///   — a `fork()`ed descendant (stress-ng worker, fio `--numjobs`,
+    ///   schbench worker mode, pipeline subshells under `sh -c`)
+    ///   survives. Never call `child.kill()` directly on a payload
+    ///   `Child`; the handle's `kill()` wrapper fans out SIGKILL to
+    ///   the whole process group via `killpg`.
+    /// - [`PayloadHandle::kill`](crate::scenario::payload_run::PayloadHandle::kill),
+    ///   [`PayloadHandle::wait`](crate::scenario::payload_run::PayloadHandle::wait)
+    ///   cleanup, and the panic-safety Drop arm all route through
+    ///   `kill_payload_process_group`, which issues `killpg(pgid,
+    ///   SIGKILL)` followed by a single-pid SIGKILL fallback so
+    ///   descendants and the leader both exit. This is the only kill
+    ///   path test authors need.
+    /// - Pipe drainers (stdout / stderr reader threads) block on EOF,
+    ///   which only arrives after every descendant holding the
+    ///   write ends closes them. A bare `child.kill()` leaves the
+    ///   descendants holding the pipes open and
+    ///   `wait_and_capture` hangs
+    ///   forever — motivating the `killpg` requirement.
     Binary(&'static str),
 }
 

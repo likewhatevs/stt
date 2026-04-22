@@ -66,6 +66,30 @@ use crate::workload::*;
 /// group and `kill(-1, ...)` signals every process the caller is
 /// permitted to signal. Neither matches "is this specific process
 /// alive?", so we refuse rather than probe.
+///
+/// # EPERM: foreign-UID processes report as dead
+///
+/// `kill(pid, 0)` returns one of three things for `pid > 0`:
+///
+/// 1. `Ok(())` — pid exists and the caller is permitted to signal it
+///    (same UID, or the caller has `CAP_KILL`). This maps to `true`.
+/// 2. `Err(ESRCH)` — no process with that pid. Maps to `false`.
+/// 3. `Err(EPERM)` — the pid exists but belongs to a different UID
+///    (or is otherwise unsignalable by the caller). Per `kill(2)`,
+///    "EPERM implies the process exists" — a live process. This
+///    implementation treats EPERM as `false` (via `.is_ok()`) because
+///    ktstr's callers use `process_alive` to ask "is the scheduler /
+///    payload *I launched* still running?", not "does any process
+///    with this pid exist?". A foreign-UID process sharing the pid is
+///    not the one the caller is tracking and is correctly classified
+///    as "no, not *my* process."
+///
+/// If a future caller needs to distinguish "dead" from "alive but
+/// unsignalable," switch to `Errno::ESRCH` discrimination on the
+/// `kill` result instead of `.is_ok()` — do NOT change this function
+/// silently, because existing callers rely on the EPERM-as-false
+/// behavior when walking /proc on heavily-forking hosts where pid
+/// reuse can land a foreign-UID process on the old slot.
 fn process_alive(pid: libc::pid_t) -> bool {
     if pid <= 0 {
         return false;
@@ -1880,25 +1904,19 @@ mod tests {
 
     #[test]
     fn process_alive_nonexistent_pid() {
-        // Fork a child that exits immediately, then waitpid to reap it.
-        // After reap the PID is returned to the kernel and process_alive
-        // must report false. Picking an arbitrary PID leaves a race
-        // where that PID could be in use by another process on the host;
-        // using a PID we just freed ourselves is deterministic.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
-        if pid == 0 {
-            unsafe { libc::_exit(0) };
-        }
-        let mut status: libc::c_int = 0;
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        assert_eq!(
-            waited,
-            pid,
-            "waitpid failed: {}",
-            std::io::Error::last_os_error()
-        );
-        assert!(!process_alive(pid));
+        // Use `pid_t::MAX` (2^31 - 1) as a guaranteed-non-existent pid.
+        // Linux's `pid_max` is capped at 2^22 (4,194,304) per
+        // `include/linux/threads.h` (PID_MAX_LIMIT), so any pid above
+        // that threshold cannot be allocated — kill(2) returns ESRCH
+        // unconditionally. The previous formulation (fork + waitpid +
+        // probe-the-freed-pid) had a PID-reuse race: between waitpid
+        // returning and process_alive probing, the kernel could
+        // allocate the freed pid to a concurrent fork() on the host
+        // (heavily-forking CI runners, container hosts, etc.) and
+        // turn this test into a flake. Using a pid above PID_MAX_LIMIT
+        // removes the race entirely — no syscall ordering can place a
+        // live process on a pid the kernel refuses to allocate.
+        assert!(!process_alive(libc::pid_t::MAX));
     }
 
     #[test]
