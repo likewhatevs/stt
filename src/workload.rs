@@ -1028,8 +1028,12 @@ pub struct WorkerReport {
     pub iterations: u64,
     /// Delta of /proc/self/schedstat field 2 (run_delay) over the work loop.
     pub schedstat_run_delay_ns: u64,
-    /// Delta of /proc/self/schedstat field 3 (timeslices/context switches).
-    pub schedstat_ctx_switches: u64,
+    /// Delta of /proc/self/schedstat field 3 (pcount — number of
+    /// times the task was scheduled in over the work loop). This is
+    /// NOT a context-switch count; /proc/<pid>/status's
+    /// `voluntary_ctxt_switches` / `nonvoluntary_ctxt_switches` are
+    /// the true context-switch counters and are not read here.
+    pub schedstat_run_count: u64,
     /// Delta of /proc/self/schedstat field 1 (cpu_time) over the work loop.
     pub schedstat_cpu_time_ns: u64,
     /// Per-NUMA-node page counts from `/proc/self/numa_maps` after workload.
@@ -2835,7 +2839,7 @@ fn worker_main(
         resume_latencies_ns,
         iterations,
         schedstat_run_delay_ns: ss_delay_delta,
-        schedstat_ctx_switches: ss_ts_delta,
+        schedstat_run_count: ss_ts_delta,
         schedstat_cpu_time_ns: ss_cpu_delta,
         numa_pages,
         vmstat_numa_pages_migrated: vmstat_migrated_delta,
@@ -3488,7 +3492,7 @@ mod tests {
             resume_latencies_ns: vec![1000, 2000],
             iterations: 10,
             schedstat_run_delay_ns: 500_000,
-            schedstat_ctx_switches: 20,
+            schedstat_run_count: 20,
             schedstat_cpu_time_ns: 4_000_000_000,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
@@ -4138,7 +4142,7 @@ mod tests {
             resume_latencies_ns: vec![],
             iterations: 0,
             schedstat_run_delay_ns: 0,
-            schedstat_ctx_switches: 0,
+            schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
@@ -4166,7 +4170,7 @@ mod tests {
             resume_latencies_ns: vec![],
             iterations: u64::MAX,
             schedstat_run_delay_ns: u64::MAX,
-            schedstat_ctx_switches: u64::MAX,
+            schedstat_run_count: u64::MAX,
             schedstat_cpu_time_ns: u64::MAX,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
@@ -4533,7 +4537,7 @@ mod tests {
             resume_latencies_ns: vec![],
             iterations: 0,
             schedstat_run_delay_ns: 0,
-            schedstat_ctx_switches: 0,
+            schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
@@ -4586,7 +4590,7 @@ mod tests {
             resume_latencies_ns: vec![],
             iterations: 0,
             schedstat_run_delay_ns: 0,
-            schedstat_ctx_switches: 0,
+            schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
@@ -5231,7 +5235,7 @@ mod tests {
             resume_latencies_ns: vec![],
             iterations: 0,
             schedstat_run_delay_ns: 0,
-            schedstat_ctx_switches: 0,
+            schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
@@ -5275,7 +5279,7 @@ mod tests {
             resume_latencies_ns: vec![],
             iterations: work_units,
             schedstat_run_delay_ns: 0,
-            schedstat_ctx_switches: 0,
+            schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
