@@ -1085,7 +1085,8 @@ fn run(cli: &Cli) -> RunOutcome {
     // this at the CLI boundary produces an actionable error instead of
     // a per-thread EPERM cascade mid-run that looks like a permissions
     // problem.
-    let self_pid = std::process::id() as i32;
+    let self_pid = libc::pid_t::try_from(std::process::id())
+        .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
     if pid == self_pid {
         return RunOutcome::Fatal(anyhow!(
             "refusing to probe self (pid {pid} == ktstr-jemalloc-probe's own pid). \
@@ -1259,7 +1260,8 @@ fn run_self_test(bytes: u64) -> RunOutcome {
         Ok(fs_base)
     }
 
-    let self_pid: i32 = std::process::id() as i32;
+    let self_pid: i32 = libc::pid_t::try_from(std::process::id())
+        .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
     // Capture timestamp BEFORE spawning the self-test worker so the
     // field represents "start of probe run" per its doc, not the
     // post-join point that would slide with `bytes` or worker
@@ -1274,7 +1276,8 @@ fn run_self_test(bytes: u64) -> RunOutcome {
     let bytes_usize = bytes as usize;
 
     let worker = std::thread::spawn(move || {
-        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let tid = libc::pid_t::try_from(unsafe { libc::syscall(libc::SYS_gettid) })
+            .expect("Linux pid_max <= 2^22 so tid fits in pid_t");
         let fs_base = match arch_get_fs() {
             Ok(v) => v,
             Err(e) => {
@@ -1673,7 +1676,8 @@ mod tests {
     /// current thread. Sorted ascending.
     #[test]
     fn iter_task_ids_self() {
-        let pid = std::process::id() as i32;
+        let pid = libc::pid_t::try_from(std::process::id())
+            .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
         let tids = iter_task_ids(pid).expect("self/task must be readable");
         assert!(!tids.is_empty());
         assert!(tids.windows(2).all(|w| w[0] <= w[1]), "tids must be sorted");
@@ -1729,7 +1733,10 @@ mod tests {
     #[test]
     fn run_rejects_self_probe() {
         let cli = Cli {
-            pid: Some(std::process::id() as i32),
+            pid: Some(
+                libc::pid_t::try_from(std::process::id())
+                    .expect("Linux pid_max <= 2^22 so pid fits in pid_t"),
+            ),
             json: false,
             self_test: None,
         };
@@ -1775,8 +1782,10 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("spawn sleep for non-self pid acceptance test");
-        let child_pid = child.id() as i32;
-        let self_pid = std::process::id() as i32;
+        let child_pid = libc::pid_t::try_from(child.id())
+            .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
+        let self_pid = libc::pid_t::try_from(std::process::id())
+            .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
         assert_ne!(
             child_pid, self_pid,
             "spawned child pid must differ from parent for this test to be meaningful",
