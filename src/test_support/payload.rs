@@ -71,6 +71,20 @@ pub struct Payload {
     /// Declared metric hints — polarity, unit. Unhinted metrics
     /// extracted from output land as [`Polarity::Unknown`].
     pub metrics: &'static [MetricHint],
+    /// Host-side file specs resolved at runtime. Each entry is
+    /// passed through the same resolver as CLI `-i` /
+    /// `--include-files` arguments (see
+    /// [`crate::cli::resolve_include_files`]): bare names are
+    /// searched in the host's `PATH`, explicit paths (absolute,
+    /// relative, or containing `/`) must exist on the host, and
+    /// directories are walked recursively. Resolved entries
+    /// union-merge with whatever the CLI passed via `-i` —
+    /// declarative dependencies NEVER replace CLI input; the two
+    /// sources concatenate and dedupe on identical host_path.
+    /// Populate via the `#[include_files("helper", ...)]`
+    /// attribute on `#[derive(Payload)]` or by spelling the array
+    /// in the struct literal.
+    pub include_files: &'static [&'static str],
 }
 
 impl std::fmt::Debug for Payload {
@@ -226,6 +240,7 @@ impl Payload {
         default_args: &[],
         default_checks: &[],
         metrics: &[],
+        include_files: &[],
     };
 
     /// Short, human-readable name for logging and sidecar output.
@@ -262,6 +277,7 @@ impl Payload {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         }
     }
 
@@ -288,6 +304,7 @@ impl Payload {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         }
     }
 
@@ -845,6 +862,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         match FIO.kind {
             PayloadKind::Binary(name) => assert_eq!(name, "fio"),
@@ -878,6 +896,7 @@ mod tests {
             polarity: Polarity::HigherBetter,
             unit: "iops",
         }],
+        include_files: &[],
     };
 
     #[test]

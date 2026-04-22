@@ -9,6 +9,7 @@ const FIO: Payload = Payload {
     default_args: &[],
     default_checks: &[],
     metrics: &[],
+    include_files: &[],
 };
 
 // `workloads` must be an array literal `[FIO]`, not a bare path.

@@ -303,6 +303,7 @@ impl CpusetSpec {
 /// #     default_args: &[],
 /// #     default_checks: &[],
 /// #     metrics: &[],
+/// #     include_files: &[],
 /// # };
 /// let def = CgroupDef::named("io_and_spin")
 ///     .with_cpuset(CpusetSpec::disjoint(0, 2))
@@ -3109,6 +3110,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let ops: Vec<Op> = vec![
             Op::AddCgroup { name: "a".into() },
@@ -3168,6 +3170,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         assert_eq!(Op::AddCgroup { name: "a".into() }.discriminant(), 0);
         assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 1);
@@ -5066,6 +5069,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let def = CgroupDef::named("cg_0").workload(&FIO);
         let p = def.payload.expect("workload was attached");
@@ -5101,6 +5105,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
 
         let cgroups = CgroupManager::new("/nonexistent");
@@ -5150,6 +5155,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let step = Step::with_payload(&FIO, HoldSpec::Fixed(Duration::from_millis(50)));
         assert_eq!(step.ops.len(), 1);
@@ -5182,6 +5188,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
 
         let op = Op::run_payload(&FIO, vec!["--warmup".into()]);
@@ -5331,6 +5338,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
 
         let mock = MockCgroupOps::new();
@@ -5368,6 +5376,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
 
         let mock = MockCgroupOps::new();
@@ -5437,6 +5446,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
 
         let mock = MockCgroupOps::new();
@@ -5542,6 +5552,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -5862,6 +5873,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -5918,6 +5930,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -5966,6 +5979,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6013,6 +6027,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6052,6 +6067,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();

@@ -68,6 +68,7 @@ static JEMALLOC_PROBE_SELFTEST: Payload = Payload {
     default_args: &[],
     default_checks: &[Check::ExitCodeEq(0)],
     metrics: &[],
+    include_files: &[],
 };
 
 /// External-pid probe invocation. Used by the cross-process
@@ -80,6 +81,7 @@ static JEMALLOC_PROBE_EXTERNAL: Payload = Payload {
     default_args: &[],
     default_checks: &[Check::ExitCodeEq(0)],
     metrics: &[],
+    include_files: &[],
 };
 
 /// External-pid probe invocation without exit-code gating. Used by
@@ -92,6 +94,7 @@ static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload {
     default_args: &[],
     default_checks: &[],
     metrics: &[],
+    include_files: &[],
 };
 
 /// Allocator worker target. Spawned as a background payload; the
@@ -107,6 +110,7 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload {
     default_args: &[],
     default_checks: &[],
     metrics: &[],
+    include_files: &[],
 };
 
 // ---------------------------------------------------------------------------

@@ -108,6 +108,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut extra_sched_args: Vec<String> = Vec::new();
     let mut required_flags: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut excluded_flags: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut extra_include_files: Vec<String> = Vec::new();
     let mut min_numa_nodes: u32 = 1;
     let mut min_numa_nodes_set = false;
     let mut min_llcs: u32 = 1;
@@ -487,6 +488,35 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     return syn::Error::new_spanned(
                                         elem,
                                         "expected string literal in extra_sched_args",
+                                    )
+                                    .to_compile_error()
+                                    .into();
+                                }
+                            }
+                        }
+                    }
+                    "extra_include_files" => {
+                        let arr = match value {
+                            syn::Expr::Array(ea) => ea,
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    "expected array of string literals for extra_include_files",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        for elem in &arr.elems {
+                            match elem {
+                                syn::Expr::Lit(syn::ExprLit {
+                                    lit: syn::Lit::Str(ls),
+                                    ..
+                                }) => extra_include_files.push(ls.value()),
+                                _ => {
+                                    return syn::Error::new_spanned(
+                                        elem,
+                                        "expected string literal in extra_include_files",
                                     )
                                     .to_compile_error()
                                     .into();
@@ -1000,6 +1030,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             workers_per_cgroup: #workers_per_cgroup,
             expect_err: #expect_err,
             host_only: #host_only,
+            extra_include_files: &[#(#extra_include_files),*],
         };
 
         #[test]
@@ -1627,6 +1658,7 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
                 default_args: &[],
                 default_checks: &[],
                 metrics: &[],
+                include_files: &[],
             };
 
         impl #enum_name {
@@ -1794,12 +1826,13 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
     let payload_name = name_override.unwrap_or_else(|| binary.clone());
 
     // Walk outer `#[default_args(...)]` / `#[default_check(...)]` /
-    // `#[metric(...)]` attrs in source order so the emitted slices
-    // match the declaration.
+    // `#[metric(...)]` / `#[include_files(...)]` attrs in source
+    // order so the emitted slices match the declaration.
     let mut default_args: Vec<String> = Vec::new();
     let mut default_checks: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut metrics: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut seen_metric_names: Vec<String> = Vec::new();
+    let mut include_files: Vec<String> = Vec::new();
 
     for attr in &input.attrs {
         if attr.path().is_ident("default_args") {
@@ -1856,6 +1889,28 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
             }
             seen_metric_names.push(metric_name);
             metrics.push(tokens);
+        } else if attr.path().is_ident("include_files") {
+            // Variadic string literals: `#[include_files("helper",
+            // "config.json")]`. Each entry is passed through to
+            // `Payload::include_files` verbatim; the runtime
+            // resolver (`resolve_include_files`) interprets bare
+            // names vs explicit paths vs directories the same way
+            // the CLI `-i` flag does. Order is preserved so the
+            // user's declaration order is visible in the emitted
+            // slice — useful when the resolver's dedup policy
+            // reports a conflict, as the first-declared entry
+            // wins.
+            let parser =
+                syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated;
+            let parsed = attr.parse_args_with(parser).map_err(|e| {
+                syn::Error::new(
+                    e.span(),
+                    "include_files must be one or more string literals separated by `,`",
+                )
+            })?;
+            for lit in parsed {
+                include_files.push(lit.value());
+            }
         }
     }
 
@@ -1881,6 +1936,7 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
             default_args: &[#(#default_args),*],
             default_checks: &[#(#default_checks),*],
             metrics: &[#(#metrics),*],
+            include_files: &[#(#include_files),*],
         };
     };
 

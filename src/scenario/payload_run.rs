@@ -1473,6 +1473,7 @@ mod tests {
         default_args: &["--output-format=json"],
         default_checks: &[],
         metrics: &[],
+        include_files: &[],
     };
 
     const EEVDF_SCHED_PAYLOAD: Payload = Payload {
@@ -1482,6 +1483,7 @@ mod tests {
         default_args: &[],
         default_checks: &[],
         metrics: &[],
+        include_files: &[],
     };
 
     #[test]
@@ -2194,6 +2196,7 @@ mod tests {
                 polarity: Polarity::HigherBetter,
                 unit: "iops",
             }],
+            include_files: &[],
         };
         resolve_polarities(&mut metrics, &HINTED);
         assert_eq!(metrics[0].polarity, Polarity::HigherBetter);
@@ -2244,6 +2247,7 @@ mod tests {
             default_args: &["60"],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let handle = PayloadRun::new(&ctx, &SLEEPER)
             .spawn()
@@ -2266,6 +2270,7 @@ mod tests {
             default_args: &["60"],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let mut handle = PayloadRun::new(&ctx, &SLEEPER)
             .spawn()
@@ -2408,6 +2413,7 @@ mod tests {
             default_args: &[],
             default_checks: &[Check::exit_code_eq(0), Check::min("iops", 500.0)],
             metrics: &[],
+            include_files: &[],
         };
         let cgroups = CgroupManager::new("/nonexistent");
         let topo = TestTopology::synthetic(4, 1);
@@ -2562,6 +2568,7 @@ mod tests {
                     unit: "iops",
                 },
             ],
+            include_files: &[],
         };
         let mut ms = vec![
             Metric {
@@ -2629,6 +2636,7 @@ mod tests {
                     unit: "overridden",
                 },
             ],
+            include_files: &[],
         };
         let mut ms = vec![Metric {
             name: "iops".into(),
@@ -2662,6 +2670,7 @@ mod tests {
                 polarity: Polarity::HigherBetter,
                 unit: "iops",
             }],
+            include_files: &[],
         };
         let mut ms = vec![
             Metric {
@@ -2696,6 +2705,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let mut ms = vec![Metric {
             name: "anything".into(),
@@ -2823,6 +2833,7 @@ mod tests {
         default_args: &[],
         default_checks: &[],
         metrics: &[],
+        include_files: &[],
     };
 
     /// Well-behaved case: stdout carries the JSON document; stderr
@@ -2922,6 +2933,7 @@ mod tests {
             default_args: &["-c", "sleep 60 & exec sleep 60"],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let handle = PayloadRun::new(&ctx, &MULTI_SLEEPER)
             .spawn()

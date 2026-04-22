@@ -1,5 +1,5 @@
 error: duplicate `payload = ...` — each test declares at most one primary payload; extras belong in `workloads = [..]`
-  --> tests/compile_fail/ktstr_test_payload_duplicate.rs:24:29
+  --> tests/compile_fail/ktstr_test_payload_duplicate.rs:26:29
    |
-24 | #[ktstr_test(payload = FIO, payload = STRESS)]
+26 | #[ktstr_test(payload = FIO, payload = STRESS)]
    |                             ^^^^^^^

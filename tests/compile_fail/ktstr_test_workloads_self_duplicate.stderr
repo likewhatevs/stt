@@ -1,5 +1,5 @@
 error: `FIO` appears twice in `workloads = [..]` — each workload entry must be distinct. Remove the duplicate or compose the payload once and rely on runtime scheduling to spread it across cgroups.
-  --> tests/compile_fail/ktstr_test_workloads_self_duplicate.rs:14:32
+  --> tests/compile_fail/ktstr_test_workloads_self_duplicate.rs:15:32
    |
-14 | #[ktstr_test(workloads = [FIO, FIO])]
+15 | #[ktstr_test(workloads = [FIO, FIO])]
    |                                ^^^

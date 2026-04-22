@@ -1,5 +1,5 @@
 error: expected array of Payload paths for workloads (e.g. [FIO, STRESS_NG])
-  --> tests/compile_fail/ktstr_test_workloads_not_array.rs:15:26
+  --> tests/compile_fail/ktstr_test_workloads_not_array.rs:16:26
    |
-15 | #[ktstr_test(workloads = FIO)]
+16 | #[ktstr_test(workloads = FIO)]
    |                          ^^^

@@ -163,10 +163,56 @@ pub(crate) fn run_ktstr_test_inner(
     }
 
     let mut sched_args: Vec<String> = Vec::new();
+    // Declarative include-files: union every Payload's
+    // `include_files` specs (scheduler + test payload + workloads +
+    // entry.extra) through the same resolver the CLI `-i` flag uses,
+    // then merge with the scheduler config file (if any). Dedupe
+    // policy: identical `(archive_path, host_path)` pairs collapse
+    // silently; a conflict on the same `archive_path` with
+    // differing `host_path` aborts the test with a diagnostic
+    // naming both sources — two unrelated declarations resolving
+    // to the same archive slot is a real ambiguity the user must
+    // resolve manually.
+    let declarative_specs: Vec<std::path::PathBuf> = entry
+        .all_include_files()
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    let mut resolved_includes: Vec<(String, std::path::PathBuf)> = if declarative_specs.is_empty()
+    {
+        Vec::new()
+    } else {
+        crate::cli::resolve_include_files(&declarative_specs)
+            .context("resolving declarative include_files from Payload definitions")?
+    };
     if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
-        builder = builder.include_files(vec![(archive_path, host_path)]);
+        resolved_includes.push((archive_path, host_path));
         sched_args.push("--config".to_string());
         sched_args.push(guest_path);
+    }
+    // Dedupe + conflict detection.
+    let mut seen: std::collections::BTreeMap<String, std::path::PathBuf> =
+        std::collections::BTreeMap::new();
+    for (archive, host) in &resolved_includes {
+        if let Some(existing) = seen.get(archive) {
+            if existing != host {
+                anyhow::bail!(
+                    "include_files conflict for archive path '{archive}': two declarative \
+                     sources resolved to different host paths ({} vs {}). Remove the \
+                     duplicate declaration or rename one of the archive entries.",
+                    existing.display(),
+                    host.display(),
+                );
+            }
+            // Identical pair: silent dedupe.
+        } else {
+            seen.insert(archive.clone(), host.clone());
+        }
+    }
+    let unioned: Vec<(String, std::path::PathBuf)> =
+        seen.into_iter().collect();
+    if !unioned.is_empty() {
+        builder = builder.include_files(unioned);
     }
     super::runtime::append_base_sched_args(entry, &mut sched_args);
     for flag_name in active_flags {

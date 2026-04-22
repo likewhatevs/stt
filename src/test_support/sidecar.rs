@@ -2157,6 +2157,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -2286,6 +2287,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {

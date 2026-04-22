@@ -600,6 +600,15 @@ pub struct KtstrTestEntry {
     /// booting a VM. Used for tests that need host tools (cargo,
     /// nested VMs) unavailable in the guest initramfs.
     pub host_only: bool,
+    /// Extra host-side file specs beyond what the entry's
+    /// [`scheduler`](Self::scheduler) / [`payload`](Self::payload) /
+    /// [`workloads`](Self::workloads) declare. Unions with those
+    /// per-payload specs at `run_ktstr_test` time; see
+    /// [`all_include_files`](Self::all_include_files) for the
+    /// aggregation contract. Use this slot for test-level
+    /// dependencies that don't belong on a specific Payload —
+    /// auxiliary data files, per-test helper scripts, fixtures.
+    pub extra_include_files: &'static [&'static str],
 }
 
 /// Placeholder function for [`KtstrTestEntry::DEFAULT`].
@@ -668,6 +677,7 @@ impl KtstrTestEntry {
         workers_per_cgroup: 2,
         expect_err: false,
         host_only: false,
+        extra_include_files: &[],
     };
 
     /// Reject values that would boot a broken VM or leave assertions
@@ -745,6 +755,33 @@ impl KtstrTestEntry {
             }
         }
         Ok(())
+    }
+
+    /// Aggregate every declared include-file spec: the entry's
+    /// [`scheduler`](Self::scheduler) and (if present) its primary
+    /// [`payload`](Self::payload) contribute their
+    /// [`Payload::include_files`](crate::test_support::Payload::include_files),
+    /// each entry in [`workloads`](Self::workloads) contributes its
+    /// own, and [`extra_include_files`](Self::extra_include_files)
+    /// contributes test-level extras. Order: scheduler → payload →
+    /// workloads (in declaration order) → extras. Duplicate spec
+    /// strings at this layer are NOT deduped — the downstream
+    /// [`crate::cli::resolve_include_files`] + union pass at
+    /// `run_ktstr_test` resolves each entry to a `(archive_path,
+    /// host_path)` pair and dedupes on identical pairs while
+    /// erroring on archive_path collisions with conflicting
+    /// host_paths.
+    pub fn all_include_files(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Vec::new();
+        out.extend(self.scheduler.include_files.iter().copied());
+        if let Some(p) = self.payload {
+            out.extend(p.include_files.iter().copied());
+        }
+        for w in self.workloads {
+            out.extend(w.include_files.iter().copied());
+        }
+        out.extend(self.extra_include_files.iter().copied());
+        out
     }
 }
 
@@ -892,6 +929,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let entry = KtstrTestEntry {
             name: "payload_entry",
@@ -913,6 +951,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         // stress-ng emits progress / metrics / summaries to stderr; stdout
         // is blank. `OutputFormat::Json` yields zero metrics — stdout has
@@ -930,6 +969,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let entry = KtstrTestEntry {
             name: "multi_workload",
@@ -956,6 +996,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -993,6 +1034,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         // stress-ng emits progress / metrics / summaries to stderr; stdout
         // is blank. `OutputFormat::Json` yields zero metrics — stdout has
@@ -1010,6 +1052,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1468,6 +1511,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let entry = KtstrTestEntry {
             name: "bad_required",
@@ -1489,6 +1533,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let entry = KtstrTestEntry {
             name: "bad_both",

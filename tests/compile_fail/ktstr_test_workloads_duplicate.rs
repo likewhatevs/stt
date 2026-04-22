@@ -9,6 +9,7 @@ const FIO: Payload = Payload {
     default_args: &[],
     default_checks: &[],
     metrics: &[],
+    include_files: &[],
 };
 
 #[allow(dead_code)]
@@ -19,6 +20,7 @@ const STRESS: Payload = Payload {
     default_args: &[],
     default_checks: &[],
     metrics: &[],
+    include_files: &[],
 };
 
 #[ktstr_test(workloads = [FIO], workloads = [STRESS])]

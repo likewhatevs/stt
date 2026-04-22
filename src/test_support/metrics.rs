@@ -978,6 +978,7 @@ mod tests {
             default_args: &[],
             default_checks: &[],
             metrics: &[],
+            include_files: &[],
         };
         let stdout = r#"{"throughput": 42.5}"#;
         let m = extract_metrics(stdout, &EXAMPLE_PAYLOAD.output).unwrap();
