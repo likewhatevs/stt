@@ -889,6 +889,50 @@ impl<'a> Ctx<'a> {
 /// `details`, not an error. On workload failure, captures the guest
 /// kernel console via `read_kmsg` so diagnostics include the stall
 /// or crash context.
+/// Spawn workers per cgroup, move each handle's tids into its
+/// cgroup, then start all handles in a second pass.
+///
+/// Shared scaffolding for [`run_scenario`] and [`setup_cgroups`] —
+/// both defer `.start()` until every handle has been spawned and
+/// every tid moved, so workers see a stable cgroup membership at
+/// first run. [`spawn_diverse`] does NOT use this helper because
+/// it starts each handle inline (eager-start semantics required
+/// for its IoSync/CpuSpin mix — workload ordering matters when
+/// the mix includes I/O-bound and CPU-bound cgroups).
+///
+/// `cfg_fn` builds the per-cgroup [`WorkloadConfig`] from its
+/// index + name; callers own the per-cgroup customization logic.
+///
+/// `move_tasks` is ESRCH-tolerant — a worker that exits between
+/// fork and cgroup placement is warned and skipped, unlike the
+/// original per-tid `move_task` which propagated ESRCH.
+fn spawn_and_move<F>(
+    ctx: &Ctx,
+    names: &[String],
+    mut cfg_fn: F,
+) -> Result<Vec<WorkloadHandle>>
+where
+    F: FnMut(usize, &str) -> Result<WorkloadConfig>,
+{
+    let mut handles = Vec::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let wl = cfg_fn(i, name.as_str())?;
+        let h = WorkloadHandle::spawn(&wl)?;
+        tracing::debug!(
+            cgroup = %name,
+            workers = wl.num_workers,
+            tids = h.tids().len(),
+            "spawned workers",
+        );
+        ctx.cgroups.move_tasks(name.as_str(), &h.tids())?;
+        handles.push(h);
+    }
+    for h in &mut handles {
+        h.start();
+    }
+    Ok(handles)
+}
+
 pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     tracing::info!(scenario = scenario.name, "running");
     if let Action::Custom(f) = &scenario.action {
@@ -930,8 +974,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         );
     }
 
-    let mut handles = Vec::new();
-    for (i, name) in names.iter().enumerate() {
+    let handles = spawn_and_move(ctx, &names, |i, name| {
         let cw = scenario
             .cgroup_works
             .get(i)
@@ -966,26 +1009,15 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
             matches!(cw.work_type, WorkType::CpuSpin),
             n,
         );
-        let wl = WorkloadConfig {
+        Ok(WorkloadConfig {
             num_workers: n,
             affinity,
             work_type: effective_work_type,
             sched_policy: cw.sched_policy,
             mem_policy: cw.mem_policy.clone(),
             mpol_flags: cw.mpol_flags,
-        };
-        let h = WorkloadHandle::spawn(&wl)?;
-        tracing::debug!(cgroup = %name, workers = n, tids = h.tids().len(), "spawned workers");
-        for tid in h.tids() {
-            ctx.cgroups.move_task(name, tid)?;
-        }
-        handles.push(h);
-    }
-
-    // Start all workers now that they're in their cgroups
-    for h in &mut handles {
-        h.start();
-    }
+        })
+    })?;
 
     tracing::debug!(duration_s = ctx.duration.as_secs(), "running workload");
 
@@ -1232,17 +1264,8 @@ pub fn setup_cgroups<'a>(
             ctx.sched_pid,
         );
     }
-    let handles: Result<Vec<_>> = (0..n)
-        .map(|i| {
-            let h = WorkloadHandle::spawn(wl)?;
-            ctx.cgroups.move_tasks(&format!("cg_{i}"), &h.tids())?;
-            Ok(h)
-        })
-        .collect();
-    let mut handles = handles?;
-    for h in &mut handles {
-        h.start();
-    }
+    let names: Vec<String> = (0..n).map(|i| format!("cg_{i}")).collect();
+    let handles = spawn_and_move(ctx, &names, |_, _| Ok(wl.clone()))?;
     Ok((handles, guard))
 }
 

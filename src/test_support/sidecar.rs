@@ -129,13 +129,19 @@ pub struct SidecarResult {
     pub run_id: String,
     /// Host context — static-ish runtime state (CPU model,
     /// memory size, THP policy, kernel release, host cmdline,
-    /// scheduler tunables). Populated at sidecar-write time from
-    /// `host_context::collect_host_context`. `None` on the
-    /// test-fixture path where the sidecar is synthesized via
-    /// [`SidecarResult::test_fixture`]; deliberately excluded from
-    /// [`sidecar_variant_hash`] so gauntlet variants on different
-    /// hosts collapse into the same hash bucket.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// scheduler tunables). Populated by production sidecar
+    /// writers; `None` on the test-fixture path.
+    /// Deliberately excluded from the variant hash so
+    /// gauntlet variants on different hosts collapse into the same
+    /// hash bucket.
+    ///
+    /// No serde attributes: the field is always emitted
+    /// (`"host": null` when `None`) and always required on
+    /// deserialize. Making both directions symmetric avoids the
+    /// `serialize-omits / deserialize-requires` asymmetry that a
+    /// `skip_serializing_if` without `default` would otherwise
+    /// create. The other `Option` fields on this struct still
+    /// carry `serde(default)` — unifying them is a follow-up.
     pub host: Option<crate::host_context::HostContext>,
 }
 
@@ -756,20 +762,18 @@ mod tests {
     /// inflate the match count.
     #[test]
     fn find_sidecars_by_prefix_filters_suffix() {
-        let tmp = std::env::temp_dir().join("ktstr-helper-suffix-test");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
         std::fs::write(tmp.join("foo-0001.ktstr.json"), b"{}").unwrap();
         std::fs::write(tmp.join("foo-0002.ktstr.json.tmp"), b"{}").unwrap();
         std::fs::write(tmp.join("foo-0003.json"), b"{}").unwrap();
         std::fs::write(tmp.join("foo-0004.ktstr.txt"), b"{}").unwrap();
-        let paths = find_sidecars_by_prefix(&tmp, "foo-");
+        let paths = find_sidecars_by_prefix(tmp, "foo-");
         assert_eq!(
             paths.len(),
             1,
             "only the .ktstr.json file must match, got {paths:?}",
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// The prefix filter must reject filenames whose prefix does
@@ -779,19 +783,17 @@ mod tests {
     /// share a parent directory.
     #[test]
     fn find_sidecars_by_prefix_filters_prefix() {
-        let tmp = std::env::temp_dir().join("ktstr-helper-prefix-test");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
         std::fs::write(tmp.join("foo-0001.ktstr.json"), b"{}").unwrap();
         std::fs::write(tmp.join("bar-0002.ktstr.json"), b"{}").unwrap();
         std::fs::write(tmp.join("foobar-0003.ktstr.json"), b"{}").unwrap();
-        let paths = find_sidecars_by_prefix(&tmp, "foo-");
+        let paths = find_sidecars_by_prefix(tmp, "foo-");
         assert_eq!(
             paths.len(),
             1,
             "only files starting with 'foo-' must match (not 'foobar-'), got {paths:?}",
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A directory that contains nothing matching the `prefix` +
@@ -802,16 +804,14 @@ mod tests {
     /// helper-internal panic.
     #[test]
     fn find_sidecars_by_prefix_empty_when_no_match() {
-        let tmp = std::env::temp_dir().join("ktstr-helper-empty-test");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
         std::fs::write(tmp.join("bar-0001.ktstr.json"), b"{}").unwrap();
-        let paths = find_sidecars_by_prefix(&tmp, "foo-");
+        let paths = find_sidecars_by_prefix(tmp, "foo-");
         assert!(
             paths.is_empty(),
             "no prefix match must yield empty Vec, got {paths:?}",
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // -- test_fixture self-tests --
@@ -1181,11 +1181,9 @@ mod tests {
 
     #[test]
     fn collect_sidecars_empty_dir() {
-        let tmp = std::env::temp_dir().join("ktstr-sidecars-empty-test");
-        std::fs::create_dir_all(&tmp).unwrap();
-        let results = collect_sidecars(&tmp);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let results = collect_sidecars(tmp_dir.path());
         assert!(results.is_empty());
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
@@ -1196,8 +1194,8 @@ mod tests {
 
     #[test]
     fn collect_sidecars_reads_json() {
-        let tmp = std::env::temp_dir().join("ktstr-sidecars-json-test");
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
         let sc = SidecarResult {
             test_name: "test_x".to_string(),
             topology: "1n1l2c1t".to_string(),
@@ -1207,15 +1205,15 @@ mod tests {
         std::fs::write(tmp.join("test_x.ktstr.json"), &json).unwrap();
         // Non-ktstr JSON should be ignored.
         std::fs::write(tmp.join("other.json"), r#"{"key":"val"}"#).unwrap();
-        let results = collect_sidecars(&tmp);
+        let results = collect_sidecars(tmp);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].test_name, "test_x");
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
     fn collect_sidecars_recurses_one_level() {
-        let tmp = std::env::temp_dir().join("ktstr-sidecars-recurse-test");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
         let sub = tmp.join("job-0");
         std::fs::create_dir_all(&sub).unwrap();
         let sc = SidecarResult {
@@ -1227,11 +1225,10 @@ mod tests {
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(sub.join("nested_test.ktstr.json"), &json).unwrap();
-        let results = collect_sidecars(&tmp);
+        let results = collect_sidecars(tmp);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].test_name, "nested_test");
         assert!(!results[0].passed);
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
@@ -1243,8 +1240,8 @@ mod tests {
         // test catches the schema-scope regression before stats
         // tooling starts double-counting results from unrelated
         // sub-runs under the same `runs_root`.
-        let tmp = std::env::temp_dir().join("ktstr-sidecars-depth-test");
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
         let top_sub = tmp.join("job-0");
         let deep_sub = top_sub.join("replay-0");
         std::fs::create_dir_all(&deep_sub).unwrap();
@@ -1266,36 +1263,32 @@ mod tests {
         )
         .unwrap();
 
-        let results = collect_sidecars(&tmp);
+        let results = collect_sidecars(tmp);
         let names: Vec<&str> = results.iter().map(|r| r.test_name.as_str()).collect();
         assert_eq!(
             names,
             vec!["top_level"],
             "collect_sidecars must see only the one-level-deep sidecar, not the two-level one"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn collect_sidecars_skips_invalid_json() {
-        let tmp = std::env::temp_dir().join("ktstr-sidecars-invalid-test");
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
         std::fs::write(tmp.join("bad.ktstr.json"), "not json").unwrap();
-        let results = collect_sidecars(&tmp);
+        let results = collect_sidecars(tmp);
         assert!(results.is_empty());
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
     fn collect_sidecars_skips_non_ktstr_json() {
-        let tmp = std::env::temp_dir().join("ktstr-sidecars-notktstr-test");
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
         // File ends in .json but does NOT contain ".ktstr." in the name
         std::fs::write(tmp.join("other.json"), r#"{"test":"val"}"#).unwrap();
-        let results = collect_sidecars(&tmp);
+        let results = collect_sidecars(tmp);
         assert!(results.is_empty());
-        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
@@ -1350,18 +1343,21 @@ mod tests {
         // embeds a variant-hash suffix (see
         // `serialize_and_write_sidecar`), so a fixed `test_name +
         // ".ktstr.json"` path never matches — use the
-        // prefix-scan helper the sibling tests use.
+        // prefix-scan helper the sibling tests use. The parent
+        // `dir` itself is shared with any other test that runs
+        // without `KTSTR_SIDECAR_DIR` set, so leave it in place;
+        // only this test's own files are removed.
         for p in find_sidecars_by_prefix(&dir, "__sidecar_default_dir__-") {
             let _ = std::fs::remove_file(&p);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn write_sidecar_writes_file() {
         let _lock = lock_env();
-        let tmp = std::env::temp_dir().join("ktstr-sidecar-write-test");
-        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1392,7 +1388,7 @@ mod tests {
         // Sidecar filename now includes a variant hash suffix so
         // gauntlet variants don't clobber each other. Find the file
         // by prefix match rather than exact path.
-        let path = find_sidecars_by_prefix(&tmp, "__sidecar_write_test__-")
+        let path = find_sidecars_by_prefix(tmp, "__sidecar_write_test__-")
             .into_iter()
             .next()
             .expect("sidecar file with variant suffix should be written");
@@ -1413,8 +1409,6 @@ mod tests {
             "write_sidecar must populate host field from collect_host_context",
         );
         assert_eq!(host.uname_sysname.as_deref(), Some("Linux"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1424,9 +1418,9 @@ mod tests {
         // other. A hash of work_type/sysctls/kargs alone would miss
         // this difference.
         let _lock = lock_env();
-        let tmp = std::env::temp_dir().join("ktstr-sidecar-flagvariant-test");
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1457,14 +1451,12 @@ mod tests {
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_a, &[]).unwrap();
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &flags_b, &[]).unwrap();
 
-        let paths = find_sidecars_by_prefix(&tmp, "__flagvariant_test__-");
+        let paths = find_sidecars_by_prefix(tmp, "__flagvariant_test__-");
         assert_eq!(
             paths.len(),
             2,
             "two active_flags variants must produce two distinct files, got {paths:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1473,9 +1465,9 @@ mod tests {
         // produce distinct sidecar filenames so neither clobbers the
         // other.
         let _lock = lock_env();
-        let tmp = std::env::temp_dir().join("ktstr-sidecar-variant-test");
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1504,14 +1496,12 @@ mod tests {
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
         write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[], &[]).unwrap();
 
-        let paths = find_sidecars_by_prefix(&tmp, "__variant_test__-");
+        let paths = find_sidecars_by_prefix(tmp, "__variant_test__-");
         assert_eq!(
             paths.len(),
             2,
             "two work_type variants must produce two distinct files, got {paths:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Freeze the `sidecar_variant_hash` wire format to the exact 64-bit
