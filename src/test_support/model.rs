@@ -1261,6 +1261,20 @@ struct LoadedInference {
 /// When [`PREFETCH_CHECKED`] is set, uses [`locate`] and skips
 /// re-hashing the model's ~2.5 GiB. Otherwise falls back to
 /// [`ensure`] so first use triggers a SHA check.
+///
+/// Production callers reach this function only through
+/// [`memoized_inference`], which populates [`MODEL_CACHE`] on the
+/// first miss and serves every subsequent call from the cached
+/// `Arc`. The ~2.44 GiB GGUF mmap + parse therefore runs at most
+/// once per process (tens of seconds on a cold page cache, a few
+/// seconds when warm); concurrent first callers serialize on the
+/// outer `MODEL_CACHE` mutex and every later call short-circuits
+/// before reaching this body. Both the `Ok` and the `Err` returned
+/// here are cached — a load failure does not retry. The
+/// `cfg(test)`-only `reset` hook is the only way to clear the slot
+/// and re-enter this function (tests that exercise the load path
+/// repeatedly call `reset` + `load_inference` directly under the
+/// `test_helpers::lock_env` guard).
 fn load_inference() -> anyhow::Result<LoadedInference> {
     use candle::{Device, quantized::gguf_file};
     use candle_transformers::models::quantized_qwen3::ModelWeights;
