@@ -855,6 +855,15 @@ pub fn build_initramfs_base_with_opts(
     for (archive_path, _, _) in &validated_includes {
         register_parent_dirs(&mut dirs, archive_path);
     }
+    // Extras with a path component (e.g. "bin/ktstr-jemalloc-probe")
+    // need their parent directory registered too, otherwise the
+    // kernel's cpio extractor sees the file before the directory
+    // entry exists and silently drops it. The `("scheduler",
+    // path)` case writes to archive root and has no parent to
+    // register, so `register_parent_dirs` no-ops on it.
+    for (name, _) in extra_binaries {
+        register_parent_dirs(&mut dirs, name);
+    }
 
     drop(_s_resolve);
 

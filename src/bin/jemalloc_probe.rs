@@ -28,6 +28,16 @@
 //!   addr(tsd_tls) = fs_base - round_up(PT_TLS.p_memsz, PT_TLS.p_align) + st_value
 //!   addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
 
+// Link jemalloc as the global allocator so the probe binary itself
+// carries the `tsd_tls` symbol. Required by the `--self-test` mode
+// which resolves tsd_s field offsets against `/proc/self/maps` /
+// `/proc/self/exe` — without this, the probe uses glibc malloc and
+// has no jemalloc TLS to probe (self-test fails with "ELF has no
+// PT_TLS segment"). Matches the global-allocator declaration in
+// src/bin/ktstr.rs and src/bin/cargo-ktstr.rs.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fs;
@@ -89,12 +99,25 @@ const DEALLOCATED_FIELD: &str = "thread_deallocated";
                   path writes are unconditional."
 )]
 struct Cli {
-    /// Target process id.
-    #[arg(long)]
-    pid: i32,
+    /// Target process id. Required unless `--self-test` is set.
+    #[arg(long, required_unless_present = "self_test")]
+    pid: Option<i32>,
     /// Emit JSON on stdout instead of a human-readable table.
     #[arg(long)]
     json: bool,
+    /// Self-test mode: spawn a worker thread that allocates the
+    /// given number of bytes, read the worker's jemalloc TSD
+    /// counters via `/proc/self/mem`, and exit 0 iff the probe
+    /// observes at least that many `thread_allocated` bytes on
+    /// the worker's thread.
+    ///
+    /// The probe binary ships with its own DWARF debuginfo so the
+    /// TSD offset resolution succeeds even when used against a
+    /// stripped external target would fail. Used by
+    /// `tests/jemalloc_probe_tests.rs` for the closed-loop VM
+    /// validation.
+    #[arg(long, conflicts_with = "pid", value_name = "BYTES")]
+    self_test: Option<u64>,
 }
 
 // ---------------------------------------------------------------------
@@ -740,16 +763,26 @@ enum RunOutcome {
 }
 
 fn run(cli: &Cli) -> RunOutcome {
-    if !Path::new(&format!("/proc/{}", cli.pid)).exists() {
-        return RunOutcome::Fatal(anyhow!("pid {} does not exist", cli.pid));
+    // `required_unless_present = "self_test"` in the Cli derive
+    // guarantees `pid` is Some whenever we reach this path.
+    let pid = match cli.pid {
+        Some(p) => p,
+        None => {
+            return RunOutcome::Fatal(anyhow!(
+                "BUG: run() called without --pid set and without --self-test"
+            ));
+        }
+    };
+    if !Path::new(&format!("/proc/{pid}")).exists() {
+        return RunOutcome::Fatal(anyhow!("pid {pid} does not exist"));
     }
 
-    let (symbol, offsets) = match find_jemalloc_via_maps(cli.pid) {
+    let (symbol, offsets) = match find_jemalloc_via_maps(pid) {
         Ok(v) => v,
         Err(e) => return RunOutcome::Fatal(e),
     };
 
-    let tids = match iter_task_ids(cli.pid) {
+    let tids = match iter_task_ids(pid) {
         Ok(v) => v,
         Err(e) => return RunOutcome::Fatal(e),
     };
@@ -777,7 +810,7 @@ fn run(cli: &Cli) -> RunOutcome {
 
     let out = ProbeOutput {
         schema_version: SCHEMA_VERSION,
-        pid: cli.pid,
+        pid,
         tool_version: env!("CARGO_PKG_VERSION"),
         threads,
     };
@@ -820,9 +853,205 @@ fn print_output(cli: &Cli, out: &ProbeOutput) -> Result<()> {
     Ok(())
 }
 
+/// Result emitted by `--self-test` mode. Probe JSON for external
+/// pids goes through [`ProbeOutput`]; self-test surfaces a simpler
+/// pass/fail shape because the caller (the VM integration test)
+/// only needs the one observation + verdict.
+#[derive(Debug, Serialize)]
+struct SelfTestOutput {
+    schema_version: u32,
+    tid: i32,
+    known_bytes: u64,
+    observed_bytes: u64,
+    passed: bool,
+}
+
+/// `--self-test <BYTES>`: spawn an allocator worker in this
+/// process, wait for it to finish allocating, read its
+/// `thread_allocated` TSD counter via `process_vm_readv` on our
+/// own pid, compare against `bytes`, and exit accordingly.
+///
+/// No ptrace: the target thread is in the same process, so
+/// `process_vm_readv(self_pid, ...)` succeeds under the same-uid
+/// kernel check without CAP_SYS_PTRACE. The worker self-reports
+/// its FS base via `arch_prctl(ARCH_GET_FS)` instead of the
+/// ptrace GETREGSET path used for external probes, again because
+/// we can't ptrace our own threads.
+///
+/// The probe binary ships with DWARF (not stripped), so
+/// `find_jemalloc_via_maps(self_pid)` resolves `tsd_s`'s field
+/// layout against the probe's own executable — the external-pid
+/// DWARF-requirement does not apply here.
+fn run_self_test(bytes: u64) -> RunOutcome {
+    use std::sync::atomic::AtomicI32;
+    use std::sync::{Arc, mpsc};
+
+    // Load CURRENT thread's arch_prctl(ARCH_GET_FS) to learn its
+    // FS base. x86_64-only — aarch64 uses a different TLS model
+    // and the probe already bails on non-x86_64 elsewhere.
+    fn arch_get_fs() -> Result<u64> {
+        const ARCH_GET_FS: libc::c_int = 0x1003;
+        let mut fs_base: u64 = 0;
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_arch_prctl,
+                ARCH_GET_FS as libc::c_ulong,
+                &mut fs_base as *mut u64,
+            )
+        };
+        if r != 0 {
+            return Err(anyhow!(
+                "arch_prctl(ARCH_GET_FS) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(fs_base)
+    }
+
+    let self_pid: i32 = std::process::id() as i32;
+    let worker_tid = Arc::new(AtomicI32::new(0));
+    let worker_fs_base = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let tid_clone = worker_tid.clone();
+    let fs_clone = worker_fs_base.clone();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let bytes_usize = bytes as usize;
+
+    let worker = std::thread::spawn(move || {
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let fs_base = match arch_get_fs() {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("arch_get_fs: {e:#}")));
+                return;
+            }
+        };
+        tid_clone.store(tid, Ordering::Release);
+        fs_clone.store(fs_base, Ordering::Release);
+        // Alloc AFTER registering tid/fs so a main-thread read
+        // before the alloc completes only misses the counter
+        // update, not identity metadata.
+        let known: Vec<u8> = vec![0u8; bytes_usize];
+        std::hint::black_box(&known);
+        let _ = ready_tx.send(Ok(()));
+        let _ = stop_rx.recv();
+        drop(known);
+    });
+
+    let ready = match ready_rx.recv() {
+        Ok(r) => r,
+        Err(e) => return RunOutcome::Fatal(anyhow!("self-test ready recv: {e}")),
+    };
+    if let Err(msg) = ready {
+        let _ = stop_tx.send(());
+        let _ = worker.join();
+        return RunOutcome::Fatal(anyhow!("self-test worker: {msg}"));
+    }
+
+    let tid = worker_tid.load(Ordering::Acquire);
+    let fs_base = worker_fs_base.load(Ordering::Acquire);
+
+    // Resolve jemalloc symbols + offsets against the probe's own
+    // ELF (via `/proc/self/maps`). DWARF comes from the probe
+    // binary, not the target of an external probe.
+    let (symbol, offsets) = match find_jemalloc_via_maps(self_pid) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = stop_tx.send(());
+            let _ = worker.join();
+            return RunOutcome::Fatal(e);
+        }
+    };
+
+    let addr = match compute_tls_address(
+        fs_base,
+        symbol.tls_image_aligned_size,
+        symbol.st_value,
+        offsets.thread_allocated,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = stop_tx.send(());
+            let _ = worker.join();
+            return RunOutcome::Fatal(e);
+        }
+    };
+
+    let mut buf = [0u8; 8];
+    let remote = RemoteIoVec {
+        base: addr as usize,
+        len: 8,
+    };
+    let mut local = [IoSliceMut::new(&mut buf)];
+    let n = match process_vm_readv(Pid::from_raw(self_pid), &mut local, &[remote]) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = stop_tx.send(());
+            let _ = worker.join();
+            return RunOutcome::Fatal(anyhow!(
+                "process_vm_readv(self_pid={self_pid}, addr={addr:#x}): {e}"
+            ));
+        }
+    };
+    let _ = stop_tx.send(());
+    let _ = worker.join();
+    if n != 8 {
+        return RunOutcome::Fatal(anyhow!(
+            "short process_vm_readv: got {n} bytes, expected 8"
+        ));
+    }
+    let observed = u64::from_le_bytes(buf);
+
+    let out = SelfTestOutput {
+        schema_version: SCHEMA_VERSION,
+        tid,
+        known_bytes: bytes,
+        observed_bytes: observed,
+        passed: observed >= bytes,
+    };
+    match serde_json::to_string_pretty(&out) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            return RunOutcome::Fatal(anyhow!("serialize self-test output: {e}"));
+        }
+    }
+    if out.passed {
+        RunOutcome::Ok(ProbeOutput {
+            schema_version: SCHEMA_VERSION,
+            pid: self_pid,
+            tool_version: env!("CARGO_PKG_VERSION"),
+            threads: Vec::new(),
+        })
+    } else {
+        RunOutcome::AllFailed(ProbeOutput {
+            schema_version: SCHEMA_VERSION,
+            pid: self_pid,
+            tool_version: env!("CARGO_PKG_VERSION"),
+            threads: Vec::new(),
+        })
+    }
+}
+
 fn main() {
     install_cleanup_handler();
     let cli = Cli::parse();
+    // `--self-test` is an alternative entry point; its JSON shape
+    // is `SelfTestOutput`, not `ProbeOutput`. Emission happens
+    // inside `run_self_test`, so main only needs to translate
+    // the `RunOutcome` to an exit code.
+    if let Some(bytes) = cli.self_test {
+        match run_self_test(bytes) {
+            RunOutcome::Ok(_) => return,
+            RunOutcome::AllFailed(_) => {
+                eprintln!("error: self-test failed (observed < known)");
+                std::process::exit(1);
+            }
+            RunOutcome::Fatal(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     match run(&cli) {
         RunOutcome::Ok(out) => {
             if let Err(e) = print_output(&cli, &out) {

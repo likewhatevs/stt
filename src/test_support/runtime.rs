@@ -166,9 +166,12 @@ pub(crate) fn build_vm_builder_base(
     if let Ok(probe_path) = std::env::var("KTSTR_PROBE_BINARY")
         && !probe_path.is_empty()
     {
-        builder = builder
-            .probe_binary(std::path::PathBuf::from(probe_path))
-            .preserve_init_dwarf(true);
+        // Pack the probe binary into the guest initramfs as an
+        // extra. No DWARF on the init — closed-loop probe tests
+        // use the probe's `--self-test` mode which inspects the
+        // probe's own `/proc/self/mem` (the probe ships with its
+        // own DWARF), so the init can stay stripped.
+        builder = builder.probe_binary(std::path::PathBuf::from(probe_path));
     }
 
     for bpf_write in entry.bpf_map_write {

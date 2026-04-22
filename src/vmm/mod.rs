@@ -877,10 +877,6 @@ pub struct KtstrVm {
     /// probe is packed into the guest initramfs as an extra binary
     /// alongside `scheduler_binary`. Consumed by `spawn_initramfs_resolve`.
     probe_binary: Option<PathBuf>,
-    /// When `true`, the init binary is copied verbatim (DWARF
-    /// preserved) into the initramfs, skipping `strip_debug`. Required
-    /// by probes that resolve struct offsets inside the running init.
-    preserve_init_dwarf: bool,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -1445,7 +1441,12 @@ impl KtstrVm {
         let payload = bin.clone();
         let scheduler = self.scheduler_binary.clone();
         let probe = self.probe_binary.clone();
-        let preserve_payload_dwarf = self.preserve_init_dwarf;
+        // `preserve_payload_dwarf` remains on the internal build
+        // + cache APIs for future use (GNU-debuglink follow-up can
+        // reintroduce a builder knob), but no current code path
+        // invokes it — the closed-loop probe tests rely on the
+        // probe binary's own DWARF via `--self-test`.
+        let preserve_payload_dwarf = false;
         let include_files = self.include_files.clone();
         let busybox = self.busybox;
         std::thread::Builder::new()
@@ -3280,13 +3281,6 @@ pub struct KtstrVmBuilder {
     /// spawnable by bare name inside the guest — used by the
     /// closed-loop probe tests in `tests/jemalloc_probe_tests.rs`.
     probe_binary: Option<PathBuf>,
-    /// When `true`, the init binary is copied into the initramfs
-    /// WITHOUT `strip_debug`, preserving DWARF debuginfo so the
-    /// jemalloc TLS probe can resolve `thread_allocated` /
-    /// `thread_deallocated` field offsets inside the running init
-    /// process. Off by default; tests that need the probe pair this
-    /// with [`probe_binary`](Self::probe_binary).
-    preserve_init_dwarf: bool,
 }
 
 impl Default for KtstrVmBuilder {
