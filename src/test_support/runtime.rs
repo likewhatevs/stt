@@ -155,6 +155,22 @@ pub(crate) fn build_vm_builder_base(
         builder = builder.scheduler_binary(sched_path);
     }
 
+    // Opt-in jemalloc-probe wiring. An integration test that needs
+    // the probe (see `tests/jemalloc_probe_tests.rs`) sets
+    // `KTSTR_PROBE_BINARY` to the absolute host path of
+    // `ktstr-jemalloc-probe` via `#[ctor]` before the test harness
+    // dispatches. When set, the probe is packed into every VM's
+    // base initramfs and the init binary is shipped with DWARF
+    // preserved so the probe can resolve struct offsets. Absent env
+    // var = existing behavior (no probe, init stripped).
+    if let Ok(probe_path) = std::env::var("KTSTR_PROBE_BINARY")
+        && !probe_path.is_empty()
+    {
+        builder = builder
+            .probe_binary(std::path::PathBuf::from(probe_path))
+            .preserve_init_dwarf(true);
+    }
+
     for bpf_write in entry.bpf_map_write {
         builder =
             builder.bpf_map_write(bpf_write.map_name_suffix, bpf_write.offset, bpf_write.value);

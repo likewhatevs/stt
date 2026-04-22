@@ -178,3 +178,6 @@ name = "verifier_pipeline"
 
 [[test]]
 name = "compile_fail"
+
+[[test]]
+name = "jemalloc_probe_tests"

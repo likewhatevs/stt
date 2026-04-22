@@ -649,12 +649,41 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
 /// must not contain `..` components. Callers expand directories into
 /// individual file entries before calling this function (see
 /// `cli::resolve_include_files`).
-#[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
+///
+/// The init binary itself is `strip_debug`'d by default. To keep DWARF
+/// on the init binary (required by probes that resolve struct offsets
+/// inside the running init), use [`build_initramfs_base_with_opts`]
+/// with `preserve_payload_dwarf: true`.
+///
+/// Kept as a thin wrapper so the tests in this file (which use the
+/// default-strip behavior) do not need to thread
+/// `preserve_payload_dwarf: false` through every call site.
+#[allow(dead_code)]
 pub fn build_initramfs_base(
     payload: &Path,
     extra_binaries: &[(&str, &Path)],
     include_files: &[(&str, &Path)],
     busybox: bool,
+) -> Result<Vec<u8>> {
+    build_initramfs_base_with_opts(payload, extra_binaries, include_files, busybox, false)
+}
+
+/// Extended form of [`build_initramfs_base`] that accepts
+/// `preserve_payload_dwarf`. When `true`, the init binary is read
+/// verbatim (no `strip_debug`) so DWARF debuginfo survives into the
+/// guest ELF on disk and in-process memory. Extras remain stripped
+/// regardless of this flag — only the init binary is affected.
+///
+/// The initramfs cache key hashes this flag (see
+/// [`BaseKey::new`](crate::vmm::BaseKey::new)), so stripped and
+/// unstripped init variants do not share a cache entry.
+#[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len(), preserve_dwarf = preserve_payload_dwarf))]
+pub fn build_initramfs_base_with_opts(
+    payload: &Path,
+    extra_binaries: &[(&str, &Path)],
+    include_files: &[(&str, &Path)],
+    busybox: bool,
+    preserve_payload_dwarf: bool,
 ) -> Result<Vec<u8>> {
     // Validate include_files and collect metadata (reused in the write
     // loop to avoid a second stat syscall per file).
@@ -693,7 +722,11 @@ pub fn build_initramfs_base(
         validated_includes.push((archive_path, host_path, meta.permissions().mode()));
     }
 
-    let binary = {
+    let binary = if preserve_payload_dwarf {
+        let _s = tracing::debug_span!("read_binary_preserve_dwarf").entered();
+        std::fs::read(payload)
+            .with_context(|| format!("read init binary (preserve DWARF): {}", payload.display()))?
+    } else {
         let _s = tracing::debug_span!("strip_debug").entered();
         strip_debug(payload).with_context(|| format!("strip/read binary: {}", payload.display()))?
     };

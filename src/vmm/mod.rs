@@ -131,9 +131,20 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
 }
 
 impl BaseKey {
-    /// Hashes the payload binary content, payload shared libs, and
-    /// optional scheduler binary content and shared libs.
-    pub(crate) fn new(payload: &Path, scheduler: Option<&Path>) -> Result<Self> {
+    /// Hashes the payload binary content, payload shared libs,
+    /// optional scheduler binary content and shared libs, optional
+    /// probe binary content and shared libs, and the
+    /// `preserve_payload_dwarf` flag. Probe and preserve-dwarf
+    /// participate because both change the bytes written into the
+    /// initramfs: a preserved-DWARF init is a different blob from a
+    /// stripped one, and a probe extra adds another binary to the
+    /// archive.
+    pub(crate) fn new(
+        payload: &Path,
+        scheduler: Option<&Path>,
+        probe: Option<&Path>,
+        preserve_payload_dwarf: bool,
+    ) -> Result<Self> {
         use siphasher::sip::SipHasher13;
         let mut hasher = SipHasher13::new_with_keys(0, 0);
 
@@ -149,6 +160,17 @@ impl BaseKey {
             None => 0u8.hash(&mut hasher),
         }
 
+        match probe {
+            Some(p) => {
+                1u8.hash(&mut hasher);
+                hash_file(p)?.hash(&mut hasher);
+                Self::hash_shared_libs(p, &mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+
+        preserve_payload_dwarf.hash(&mut hasher);
+
         Ok(BaseKey(hasher.finish()))
     }
 
@@ -156,12 +178,16 @@ impl BaseKey {
     /// busybox flag so different shell configurations get distinct
     /// cache keys. Include file archive paths and content are hashed
     /// so the same payload + same includes = cache hit, while
-    /// different includes = cache miss.
+    /// different includes = cache miss. `probe` and
+    /// `preserve_payload_dwarf` are hashed for the same reasons as
+    /// [`BaseKey::new`].
     pub(crate) fn new_shell(
         payload: &Path,
         scheduler: Option<&Path>,
+        probe: Option<&Path>,
         include_files: &[(String, PathBuf)],
         busybox: bool,
+        preserve_payload_dwarf: bool,
     ) -> Result<Self> {
         use siphasher::sip::SipHasher13;
         let mut hasher = SipHasher13::new_with_keys(0, 0);
@@ -179,6 +205,17 @@ impl BaseKey {
             }
             None => 0u8.hash(&mut hasher),
         }
+
+        match probe {
+            Some(p) => {
+                1u8.hash(&mut hasher);
+                hash_file(p)?.hash(&mut hasher);
+                Self::hash_shared_libs(p, &mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+
+        preserve_payload_dwarf.hash(&mut hasher);
 
         // Hash include files: archive paths (sorted for determinism),
         // content hashes, and shared lib hashes for ELF includes (their
@@ -250,6 +287,7 @@ pub(crate) fn get_or_build_base(
     include_files: &[(&str, &Path)],
     busybox: bool,
     key: &BaseKey,
+    preserve_payload_dwarf: bool,
 ) -> Result<BaseRef> {
     // Clean stale SHM segments from previous runs.
     cleanup_stale_shm(key);
@@ -267,7 +305,13 @@ pub(crate) fn get_or_build_base(
             // We won the race — build, write, release.
             tracing::debug!("initramfs shm: builder (O_EXCL won)");
             let t0 = std::time::Instant::now();
-            let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
+            let data = initramfs::build_initramfs_base_with_opts(
+                payload,
+                extras,
+                include_files,
+                busybox,
+                preserve_payload_dwarf,
+            )?;
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
                 bytes = data.len(),
@@ -316,7 +360,13 @@ pub(crate) fn get_or_build_base(
 
     // 3. Fallback: build without SHM coordination.
     let t0 = std::time::Instant::now();
-    let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
+    let data = initramfs::build_initramfs_base_with_opts(
+        payload,
+        extras,
+        include_files,
+        busybox,
+        preserve_payload_dwarf,
+    )?;
     let arc = Arc::new(data);
     tracing::debug!(
         elapsed_us = t0.elapsed().as_micros(),
@@ -823,6 +873,14 @@ pub struct KtstrVm {
     /// Command to execute non-interactively in shell mode (--exec).
     /// Passed to the guest via /exec_cmd in the initramfs.
     exec_cmd: Option<String>,
+    /// Optional host path to `ktstr-jemalloc-probe`. When `Some`, the
+    /// probe is packed into the guest initramfs as an extra binary
+    /// alongside `scheduler_binary`. Consumed by `spawn_initramfs_resolve`.
+    probe_binary: Option<PathBuf>,
+    /// When `true`, the init binary is copied verbatim (DWARF
+    /// preserved) into the initramfs, skipping `strip_debug`. Required
+    /// by probes that resolve struct offsets inside the running init.
+    preserve_init_dwarf: bool,
 }
 
 /// Parameters for a host-side BPF map write during VM execution.
@@ -1386,27 +1444,56 @@ impl KtstrVm {
         let bin = self.init_binary.as_ref()?;
         let payload = bin.clone();
         let scheduler = self.scheduler_binary.clone();
+        let probe = self.probe_binary.clone();
+        let preserve_payload_dwarf = self.preserve_init_dwarf;
         let include_files = self.include_files.clone();
         let busybox = self.busybox;
         std::thread::Builder::new()
             .name("initramfs-resolve".into())
             .spawn(move || -> Result<(BaseRef, BaseKey)> {
-                let extras: Vec<(&str, &std::path::Path)> = scheduler
-                    .as_deref()
-                    .map(|p| vec![("scheduler", p)])
-                    .unwrap_or_default();
+                // Extras are content-addressed binaries packed next to the
+                // init under `/init` siblings. Order is stable (scheduler
+                // first, probe second) so the cache key computed by
+                // `BaseKey::new` / `BaseKey::new_shell` matches the
+                // initramfs we actually build.
+                let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
+                if let Some(s) = scheduler.as_deref() {
+                    extras.push(("scheduler", s));
+                }
+                if let Some(p) = probe.as_deref() {
+                    extras.push(("ktstr-jemalloc-probe", p));
+                }
                 let shell_mode = busybox || !include_files.is_empty();
                 let key = if shell_mode {
-                    BaseKey::new_shell(&payload, scheduler.as_deref(), &include_files, busybox)?
+                    BaseKey::new_shell(
+                        &payload,
+                        scheduler.as_deref(),
+                        probe.as_deref(),
+                        &include_files,
+                        busybox,
+                        preserve_payload_dwarf,
+                    )?
                 } else {
-                    BaseKey::new(&payload, scheduler.as_deref())?
+                    BaseKey::new(
+                        &payload,
+                        scheduler.as_deref(),
+                        probe.as_deref(),
+                        preserve_payload_dwarf,
+                    )?
                 };
 
                 let include_refs: Vec<(&str, &std::path::Path)> = include_files
                     .iter()
                     .map(|(a, p)| (a.as_str(), p.as_path()))
                     .collect();
-                let base = get_or_build_base(&payload, &extras, &include_refs, busybox, &key)?;
+                let base = get_or_build_base(
+                    &payload,
+                    &extras,
+                    &include_refs,
+                    busybox,
+                    &key,
+                    preserve_payload_dwarf,
+                )?;
                 Ok((base, key))
             })
             .ok()
@@ -3178,6 +3265,19 @@ pub struct KtstrVmBuilder {
     busybox: bool,
     dmesg: bool,
     exec_cmd: Option<String>,
+    /// Optional host path to the `ktstr-jemalloc-probe` binary.
+    /// When `Some`, the probe is packed into the guest initramfs as
+    /// an extra binary (alongside `scheduler_binary`) and becomes
+    /// spawnable by bare name inside the guest — used by the
+    /// closed-loop probe tests in `tests/jemalloc_probe_tests.rs`.
+    probe_binary: Option<PathBuf>,
+    /// When `true`, the init binary is copied into the initramfs
+    /// WITHOUT `strip_debug`, preserving DWARF debuginfo so the
+    /// jemalloc TLS probe can resolve `thread_allocated` /
+    /// `thread_deallocated` field offsets inside the running init
+    /// process. Off by default; tests that need the probe pair this
+    /// with [`probe_binary`](Self::probe_binary).
+    preserve_init_dwarf: bool,
 }
 
 impl Default for KtstrVmBuilder {
@@ -3212,6 +3312,8 @@ impl Default for KtstrVmBuilder {
             busybox: false,
             dmesg: false,
             exec_cmd: None,
+            probe_binary: None,
+            preserve_init_dwarf: false,
         }
     }
 }
@@ -3431,6 +3533,32 @@ impl KtstrVmBuilder {
         self
     }
 
+    /// Host path to `ktstr-jemalloc-probe`. When set, the probe is
+    /// packed into the guest initramfs as an extra binary and
+    /// resolves by bare name on the guest `PATH`. Tests that target
+    /// the jemalloc TLS probe from a guest-side `ctx.payload(&PROBE)`
+    /// invocation must set this to the host path obtained via
+    /// `env!("CARGO_BIN_EXE_ktstr-jemalloc-probe")`. Typically paired
+    /// with `.preserve_init_dwarf(true)` so the init binary inside
+    /// the guest retains DWARF for the probe to resolve against.
+    pub fn probe_binary(mut self, path: impl Into<PathBuf>) -> Self {
+        self.probe_binary = Some(path.into());
+        self
+    }
+
+    /// Preserve DWARF debuginfo on the init binary copied into the
+    /// initramfs. Default off — the normal path runs
+    /// `strip_debug(payload)` to shrink the initramfs. When
+    /// `true`, the init binary is copied verbatim so a probe (see
+    /// [`probe_binary`](Self::probe_binary)) can resolve struct /
+    /// variable offsets inside the running init process. The
+    /// initramfs cache key also hashes this flag so stripped and
+    /// unstripped base images do not share a cache entry.
+    pub fn preserve_init_dwarf(mut self, enabled: bool) -> Self {
+        self.preserve_init_dwarf = enabled;
+        self
+    }
+
     /// Embed busybox in the initramfs for shell mode.
     #[allow(dead_code)]
     pub fn busybox(mut self, enabled: bool) -> Self {
@@ -3541,6 +3669,8 @@ impl KtstrVmBuilder {
             busybox: self.busybox,
             dmesg: self.dmesg,
             exec_cmd: self.exec_cmd,
+            probe_binary: self.probe_binary,
+            preserve_init_dwarf: self.preserve_init_dwarf,
         })
     }
 
@@ -4776,14 +4906,14 @@ mod tests {
     #[test]
     fn base_key_same_inputs_match() {
         let exe = crate::resolve_current_exe().unwrap();
-        let k1 = BaseKey::new(&exe, None).unwrap();
-        let k2 = BaseKey::new(&exe, None).unwrap();
+        let k1 = BaseKey::new(&exe, None, None, false).unwrap();
+        let k2 = BaseKey::new(&exe, None, None, false).unwrap();
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn base_key_nonexistent_payload_fails() {
-        let result = BaseKey::new(Path::new("/nonexistent/binary"), None);
+        let result = BaseKey::new(Path::new("/nonexistent/binary"), None, None, false);
         assert!(result.is_err());
     }
 
@@ -4795,10 +4925,10 @@ mod tests {
         let bin = tmp.join("payload");
 
         std::fs::write(&bin, b"content_v1").unwrap();
-        let k1 = BaseKey::new(&bin, None).unwrap();
+        let k1 = BaseKey::new(&bin, None, None, false).unwrap();
 
         std::fs::write(&bin, b"content_v2").unwrap();
-        let k2 = BaseKey::new(&bin, None).unwrap();
+        let k2 = BaseKey::new(&bin, None, None, false).unwrap();
 
         assert_ne!(
             k1, k2,
@@ -4810,8 +4940,8 @@ mod tests {
     #[test]
     fn base_key_with_scheduler() {
         let exe = crate::resolve_current_exe().unwrap();
-        let k1 = BaseKey::new(&exe, None).unwrap();
-        let k2 = BaseKey::new(&exe, Some(&exe)).unwrap();
+        let k1 = BaseKey::new(&exe, None, None, false).unwrap();
+        let k2 = BaseKey::new(&exe, Some(&exe), None, false).unwrap();
         assert_ne!(k1, k2, "with vs without scheduler should differ");
     }
 
@@ -4861,7 +4991,7 @@ mod tests {
     #[test]
     fn base_cache_hit() {
         let exe = crate::resolve_current_exe().unwrap();
-        let key = BaseKey::new(&exe, None).unwrap();
+        let key = BaseKey::new(&exe, None, None, false).unwrap();
 
         // Insert a sentinel value.
         let sentinel = Arc::new(vec![0xDE, 0xAD]);
