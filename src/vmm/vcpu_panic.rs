@@ -139,6 +139,18 @@ thread_local! {
 /// with the main VM thread and the monitor/watchdog. Fields are
 /// `pub(crate)` to match the container's `pub(crate)` visibility;
 /// nothing outside the `vmm` module observes this struct directly.
+///
+/// INVARIANT: Every field's `Drop` must be panic-free. `VcpuPanicCtx`
+/// is owned by the `VCPU_PANIC_CTX` thread-local slot and dropped
+/// when that slot is cleared — potentially during unwinding of a
+/// `body()` panic in `with_vcpu_panic_ctx`. A panicking `Drop` in
+/// that window produces a double-panic: the unwind-in-progress plus
+/// the Drop panic → `std` aborts the process (even under the
+/// test-profile `panic = "unwind"` setting), and the classified
+/// shutdown signal this type exists to produce never reaches the
+/// watchdog. `Arc<AtomicBool>` satisfies the invariant — its Drop is
+/// an atomic decrement + optional `Box` deallocation, neither of
+/// which panics. Any new field must uphold the same guarantee.
 #[derive(Clone)]
 pub(crate) struct VcpuPanicCtx {
     /// VM-wide kill signal. Flipping this unblocks the monitor loop
@@ -187,30 +199,54 @@ fn install_hook_with_prev_for_test(prev: Box<PanicHook>) {
 
 /// Register `ctx` for the current thread, run `body`, then clear the
 /// registration. Any panic inside `body` is observed by the hook
-/// installed by [`install_once`]; on normal return the thread-local
-/// is reset so a future reuse of this OS thread (unusual but
-/// possible if a runtime recycles threads) does not carry stale
-/// context into an unrelated panic.
+/// installed by [`install_once`]; regardless of whether `body`
+/// returns normally or unwinds, a Drop guard clears the thread-local
+/// before this function's stack frame exits so a future reuse of
+/// this OS thread (unusual but possible if a runtime recycles
+/// threads) does not carry stale context into an unrelated panic.
 ///
 /// INVARIANT: `body()` must not hold a `borrow` or `borrow_mut` on
 /// `VCPU_PANIC_CTX` across a potential panic — the hook needs a
 /// `borrow()` to read the context, and an outstanding borrow would
 /// make that `borrow()` panic (turning the hook into a nested
 /// panic, which under panic=abort aborts without signaling). The
-/// two `borrow_mut` windows in this function scope strictly to the
-/// `set` / `clear` statements and release before/after `body()`, so
-/// the panic window inside `body()` never overlaps a mutable borrow.
-/// Callers inside `body` must not re-enter this module's thread
-/// local.
+/// set- and clear-site `borrow_mut` windows scope strictly to one
+/// statement each: the `set` releases before `body()` runs, and the
+/// guard's `clear` runs after the hook has already fired and
+/// released its shared borrow. The panic window inside `body()`
+/// never overlaps a mutable borrow. Callers inside `body` must not
+/// re-enter this module's thread local.
+///
+/// RAII via `CtxGuard`: the previous formulation cleared the slot
+/// with an unconditional statement after `body()`, which was skipped
+/// when `body()` unwound under the test profile (`panic = "unwind"`).
+/// That left stale context in the thread-local for the next reuse
+/// of this OS thread; if the runtime recycled the thread onto an
+/// unrelated panic, the hook would fire flags that weren't meant for
+/// it. Clearing via a Drop guard closes that window — Drop runs on
+/// both the normal-return path and the unwinding path.
 pub(crate) fn with_vcpu_panic_ctx<R>(ctx: VcpuPanicCtx, body: impl FnOnce() -> R) -> R {
+    /// Clear-on-drop helper so the `VCPU_PANIC_CTX` slot is always
+    /// reset, whether `body()` returns normally or unwinds. Drop is
+    /// panic-free: the `borrow_mut()` is safe because the panic hook
+    /// (which takes `borrow()`) has already fired and released by
+    /// the time any unwinding Drop runs; writing `None` into the
+    /// slot drops the stored `VcpuPanicCtx`, whose `Arc<AtomicBool>`
+    /// fields are themselves panic-free per the type's INVARIANT.
+    struct CtxGuard;
+    impl Drop for CtxGuard {
+        fn drop(&mut self) {
+            VCPU_PANIC_CTX.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+
     VCPU_PANIC_CTX.with(|slot| {
         *slot.borrow_mut() = Some(ctx);
     });
-    let result = body();
-    VCPU_PANIC_CTX.with(|slot| {
-        *slot.borrow_mut() = None;
-    });
-    result
+    let _guard = CtxGuard;
+    body()
 }
 
 #[cfg(test)]
@@ -255,6 +291,36 @@ mod tests {
                 assert!(
                     slot.borrow().is_none(),
                     "thread-local must be None after normal return",
+                );
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// RAII guard in `with_vcpu_panic_ctx` must clear the thread-
+    /// local on the unwind path too, not just normal return. Before
+    /// the guard landed, the clear statement ran AFTER `body()`, so
+    /// a panicking `body()` skipped it entirely — leaving stale ctx
+    /// in the slot for the next reuse of this OS thread. Under the
+    /// test profile (`panic = "unwind"`), `catch_unwind` here
+    /// observes the panic; the slot-is-None assertion that follows
+    /// proves the guard's Drop ran during unwind.
+    #[test]
+    fn with_vcpu_panic_ctx_clears_thread_local_on_unwind() {
+        install_once();
+        let ctx = VcpuPanicCtx {
+            kill: Arc::new(AtomicBool::new(false)),
+            exited: Arc::new(AtomicBool::new(false)),
+        };
+        std::thread::spawn(move || {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                with_vcpu_panic_ctx(ctx, || panic!("test: intended panic"));
+            }));
+            VCPU_PANIC_CTX.with(|slot| {
+                assert!(
+                    slot.borrow().is_none(),
+                    "thread-local must be None after unwind — RAII guard must clear on drop, not just after body()",
                 );
             });
         })

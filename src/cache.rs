@@ -698,8 +698,6 @@ impl CacheDir {
     }
 }
 
-/// Validate a cache key.
-///
 /// Scan `cache_root` for `.tmp-{key}-{pid}` directories whose `{pid}`
 /// is no longer a live process and remove them.
 ///

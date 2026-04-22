@@ -620,6 +620,29 @@ impl Drop for PayloadHandle {
 /// — it means either "group/process already reaped" or "group not
 /// yet set up"; the follow-up direct `kill` plus the leader's
 /// eventual `waitpid` consumer handle both.
+///
+/// # Caller contract
+///
+/// Every caller MUST hold a live [`SigchldScope`] for the duration of
+/// the `wait` / `waitpid` that reaps the leader after this call
+/// returns. Without `SIG_DFL` for `SIGCHLD`, the guest init's
+/// `SIG_IGN` default causes `wait` to block until the child is
+/// re-reaped by init or to return `ECHILD` on an already-ignored
+/// SIGCHLD. The current caller set is:
+///
+/// - `PayloadHandle::wait` / `::kill` / `::try_wait` / `::drop` — all
+///   hold `self._sigchld` (field declaration order places it last,
+///   so the scope is live for every method body's duration).
+/// - `wait_with_deadline` — runs under its caller `spawn_and_wait`'s
+///   `SigchldScope` (opened at the top of `spawn_and_wait`). The
+///   scope is alive for the full `wait_with_deadline` call because
+///   `spawn_and_wait` holds it as a local `_sigchld` across the
+///   callee.
+///
+/// A future caller that skips either pattern will see
+/// `waitpid` hang on some guest runtimes — add a `SigchldScope` at
+/// the call site, or extend an enclosing type with a
+/// `_sigchld: SigchldScope` field, before landing.
 fn kill_payload_process_group(child: &std::process::Child) {
     let pgid = libc::pid_t::try_from(child.id())
         .expect("child pid fits in pid_t (Linux pid_max <= 2^22)");
@@ -1116,60 +1139,108 @@ fn spawn_and_wait(
     }
 }
 
-/// Poll `try_wait` until the child exits or `timeout` elapses.
+/// Block in the kernel until the child exits or `timeout` elapses.
 /// On expiry, kill the whole process group (killpg + single-pid
 /// SIGKILL) and drain captured output.
 ///
-/// Poll granularity is 10ms — coarse enough that the overhead is
-/// negligible on any realistic payload duration (schbench / fio
-/// runs are seconds to minutes), fine enough that deadlines are
-/// honored within one tick.
+/// Implementation uses `pidfd_open(2)` + `epoll_wait` so the waiter
+/// is kernel-blocked instead of spinning on a 10ms `try_wait` loop.
+/// The earlier poll burned one wake per 10ms for the entire payload
+/// runtime (typically multi-second schbench / fio runs), producing a
+/// small but measurable CPU spike on every timed payload; pidfd
+/// parks the thread until the kernel signals child exit, so idle
+/// waiters contribute zero CPU. Minimum kernel: Linux 5.3.
+///
+/// Deadline honoring: the `epoll_wait` timeout is re-derived from
+/// `saturating_duration_since` each iteration so `EINTR` restarts
+/// narrow the remaining window rather than extending it.
 fn wait_with_deadline(
     child: &mut std::process::Child,
     timeout: Duration,
 ) -> Result<SpawnOutput> {
+    use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+
     let deadline = std::time::Instant::now() + timeout;
-    let poll_interval = Duration::from_millis(10);
+
+    let pid = libc::pid_t::try_from(child.id())
+        .expect("child pid fits in pid_t (Linux pid_max <= 2^22)");
+    // `pidfd_open(pid, 0)`: returns an fd that becomes readable when
+    // the pid exits. No `PIDFD_NONBLOCK` flag — epoll is the gate.
+    let pidfd_raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0i32) };
+    if pidfd_raw < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("pidfd_open({pid})"));
+    }
+    // SAFETY: the syscall succeeded and returned a fresh fd.
+    let pidfd: OwnedFd = unsafe { OwnedFd::from_raw_fd(pidfd_raw as i32) };
+
+    let epoll = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC)
+        .with_context(|| "epoll_create1 for pidfd wait")?;
+    // `data` field is unused — we only ever watch one fd. The add()
+    // syscall still needs an `EpollEvent` with populated events.
+    let event = EpollEvent::new(EpollFlags::EPOLLIN, 0);
+    epoll
+        .add(pidfd.as_fd(), event)
+        .with_context(|| "epoll_ctl ADD pidfd")?;
+
+    let mut events = [EpollEvent::empty()];
     loop {
-        match child.try_wait().with_context(|| "try_wait child")? {
-            Some(_status) => {
-                // `try_wait` reaps the child on `Some`; the status
-                // is available via the subsequent `wait_and_capture`
-                // drain path, which runs `child.wait()` on an
-                // already-reaped child and receives the cached
-                // `ExitStatus` from stdlib. Drain captured output
-                // normally. An error here is still a cleanup point:
-                // surviving descendants (if any) must be killed so
-                // the pid slot frees.
-                return match wait_and_capture(child) {
-                    Ok(out) => Ok(out),
-                    Err(e) => {
-                        kill_payload_process_group(child);
-                        let _ = child.wait();
-                        Err(e)
-                    }
-                };
-            }
-            None => {
-                if std::time::Instant::now() >= deadline {
+        // Race-safe reap attempt first: if the child exited between
+        // spawn and pidfd_open, or between iterations while we were
+        // outside epoll_wait, `try_wait` catches it without a needless
+        // syscall.
+        if child
+            .try_wait()
+            .with_context(|| "try_wait child")?
+            .is_some()
+        {
+            return match wait_and_capture(child) {
+                Ok(out) => Ok(out),
+                Err(e) => {
                     kill_payload_process_group(child);
-                    // `wait_and_capture` now blocks only until the
-                    // killpg-delivered SIGKILL closes the
-                    // descendants' pipes, which is bounded by
-                    // kernel signal-delivery latency (microseconds
-                    // in practice). An unexpected error still has
-                    // the same cleanup obligation as the no-timeout
-                    // path.
-                    return match wait_and_capture(child) {
-                        Ok(out) => Ok(out),
-                        Err(e) => {
-                            let _ = child.wait();
-                            Err(e)
-                                .with_context(|| format!("drain after timeout of {timeout:?}"))
-                        }
-                    };
+                    let _ = child.wait();
+                    Err(e)
                 }
-                std::thread::sleep(poll_interval);
+            };
+        }
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            kill_payload_process_group(child);
+            return match wait_and_capture(child) {
+                Ok(out) => Ok(out),
+                Err(e) => {
+                    let _ = child.wait();
+                    Err(e).with_context(|| format!("drain after timeout of {timeout:?}"))
+                }
+            };
+        }
+
+        // `PollTimeout` (aliased as `EpollTimeout`) stores the value
+        // as `i32`, so `TryFrom<u32>` rejects any input larger than
+        // `i32::MAX` (~24.8 days of milliseconds). Clamp both casts —
+        // `u128 → u32` and then `u32 → i32`-range — so a
+        // `Duration::MAX`-shaped remainder saturates to the max
+        // accepted value instead of bubbling up a conversion error.
+        let ms_u32 = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+        let ms_u32 = std::cmp::min(ms_u32, i32::MAX as u32);
+        let timeout_param = EpollTimeout::try_from(ms_u32)
+            .with_context(|| "epoll timeout conversion")?;
+
+        match epoll.wait(&mut events, timeout_param) {
+            Ok(_) => {
+                // Either the pidfd went readable (child exit) OR the
+                // timeout fired (ready_count == 0). Loop back: the
+                // `try_wait` at top handles the exit path, the
+                // `remaining.is_zero()` branch handles the deadline.
+            }
+            Err(nix::errno::Errno::EINTR) => {
+                // Signal interrupted the wait; loop and re-compute
+                // the remaining window.
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("epoll_wait: {e}"));
             }
         }
     }
@@ -1241,9 +1312,19 @@ fn wait_and_capture(child: &mut std::process::Child) -> Result<SpawnOutput> {
     // `.join().unwrap()` below is NOT a bug: the workspace builds
     // with `panic = "abort"` in release (see Cargo.toml
     // `[profile.release]`), so a panicked reader thread aborts the
-    // whole process and `join()` never returns a `JoinError`. The
+    // whole process and `join()` never returns an
+    // `Err(Box<dyn Any + Send>)` (`std::thread::Result::Err`). The
     // historic `.map_err(|_| anyhow!("...panicked"))` arm could not
     // fire and misled readers into expecting a recoverable error.
+    //
+    // Under cargo's default `panic = "unwind"` (dev + test profiles
+    // — only `[profile.release]` overrides to abort in this crate),
+    // a reader-thread panic DOES unwind into `thread::Result::Err`;
+    // `.unwrap()` re-panics on the main thread so the test harness
+    // sees the failure instead of hanging on a half-drained stream.
+    // The panic=abort caller contract holds in release; debug/test
+    // callers get a loud re-panic rather than a silent wrong answer.
+    // Either way no `Err` reaches the `?`.
     let (stdout, _stdout_truncated) = match stdout_handle {
         Some(h) => h.join().unwrap().with_context(|| "read child stdout")?,
         None => (String::new(), false),
