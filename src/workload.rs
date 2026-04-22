@@ -363,6 +363,16 @@ impl WorkType {
     /// `"Sequence"` and `"Custom"` in the match space even though
     /// `from_name` refuses to construct them — the point of
     /// [`suggest`](Self::suggest) is naming, not construction.
+    ///
+    /// Whitespace handling: the match uses `eq_ignore_ascii_case`
+    /// without trimming, so surrounding whitespace in `s`
+    /// (`" CpuSpin"`, `"CpuSpin\n"`) suppresses a match. Callers
+    /// that accept user input with possible surrounding whitespace
+    /// must `s.trim()` before calling — the same convention
+    /// [`from_name`] follows. Keeping the predicate strict here
+    /// avoids confusing "suggested canonical spelling" reports for
+    /// inputs that were already nearly correct save for stray
+    /// whitespace the caller should have already normalized.
     pub fn suggest(s: &str) -> Option<&'static str> {
         Self::ALL_NAMES
             .iter()
