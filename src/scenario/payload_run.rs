@@ -43,6 +43,8 @@ use std::borrow::Cow;
 use std::ffi::CString;
 use std::path::PathBuf;
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
 
 use crate::assert::{AssertDetail, AssertResult, DetailKind};
@@ -70,6 +72,13 @@ pub struct PayloadRun<'a> {
     /// [`Cow`] keeps static-name callers zero-alloc while still
     /// accepting owned Strings from dynamic call sites.
     cgroup: Option<Cow<'static, str>>,
+    /// Optional runtime bound for the foreground `.run()` path. `None`
+    /// means wait indefinitely; `Some(duration)` arms a deadline
+    /// watchdog that SIGKILLs the payload's process group if it has
+    /// not exited by the deadline. Set via [`timeout`](Self::timeout).
+    /// Ignored by `.spawn()` — background handles manage their own
+    /// lifetime via [`PayloadHandle::wait`] / `.kill()` / `.try_wait()`.
+    timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for PayloadRun<'_> {
@@ -79,6 +88,7 @@ impl std::fmt::Debug for PayloadRun<'_> {
             .field("args_len", &self.args.len())
             .field("checks_len", &self.checks.len())
             .field("cgroup", &self.cgroup)
+            .field("timeout", &self.timeout)
             .finish()
     }
 }
@@ -93,6 +103,7 @@ impl<'a> PayloadRun<'a> {
             args,
             checks,
             cgroup: None,
+            timeout: None,
         }
     }
 
@@ -147,10 +158,43 @@ impl<'a> PayloadRun<'a> {
         self
     }
 
+    /// Bound `.run()`'s wait for the payload to exit. `None` (the
+    /// default when `.timeout` is not called) waits indefinitely —
+    /// suitable for payloads whose runtime is bounded internally
+    /// (schbench `-r 10`, fio `--runtime`, ...). `Some(duration)`
+    /// arms a deadline watchdog inside `.run()` that SIGKILLs the
+    /// payload's whole process group if it has not exited by the
+    /// deadline. Ignored by `.spawn()` — background handles manage
+    /// their own timing.
+    ///
+    /// The builder shape keeps `.run()` zero-arg so non-timeout
+    /// call sites read naturally, and leaves room for future
+    /// knobs (per-test environment, stdin, …) without another
+    /// signature break.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout = Some(duration);
+        self
+    }
+
     /// Blocking foreground run. Spawns the payload binary, waits
     /// for it to exit, extracts metrics from stdout per the
     /// payload's [`OutputFormat`], and evaluates declared [`Check`]s
     /// into an [`AssertResult`].
+    ///
+    /// Runtime is bounded by the value set via
+    /// [`timeout`](Self::timeout). When the deadline expires,
+    /// [`kill_payload_process_group`] fires and the returned
+    /// `(AssertResult, PayloadMetrics)` reflects the captured
+    /// output plus the killed-child exit code; `status.code()`
+    /// returns `None` for a SIGKILL'd child, which
+    /// [`spawn_and_wait`] surfaces as `exit_code = -1` in
+    /// [`SpawnOutput`]. The timeout case is not an error — the
+    /// caller can still inspect metrics collected before the kill.
+    /// A post-kill drain failure is reported as `Err` (wraps the
+    /// original I/O error with "drain after timeout of N"); the
+    /// caller loses no output that was already captured because
+    /// the partial reader-thread buffers have been consumed in
+    /// the error path too.
     ///
     /// Metrics are also recorded to the per-test sidecar via the
     /// SHM ring; the returned tuple is a convenience view of the
@@ -159,11 +203,12 @@ impl<'a> PayloadRun<'a> {
     /// Returns `Err` when the payload is not
     /// [`PayloadKind::Binary`] (schedulers are framework-launched,
     /// not test-body-launched), when the cgroup name fails
-    /// validation, or when the spawn itself fails.
+    /// validation, when the spawn itself fails, or when post-kill
+    /// drain fails (see the timeout paragraph).
     pub fn run(self) -> Result<(AssertResult, PayloadMetrics)> {
         let binary = payload_binary(self.payload)?;
         let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref())?;
-        let output = spawn_and_wait(binary, &self.args, cgroup_path.as_deref())
+        let output = spawn_and_wait(binary, &self.args, cgroup_path.as_deref(), self.timeout)
             .with_context(|| format!("spawn payload '{}'", self.payload.name))?;
         Ok(evaluate(self.payload, &self.checks, output))
     }
@@ -363,13 +408,24 @@ impl PayloadHandle {
     /// SHM ring; the returned tuple is a convenience view of the
     /// same values.
     pub fn wait(mut self) -> Result<(AssertResult, PayloadMetrics)> {
-        let child = self
+        let mut child = self
             .child
             .take()
             .ok_or_else(|| already_consumed(self.payload))?;
-        let output = wait_and_capture(child)
-            .with_context(|| format!("wait payload '{}'", self.payload.name))?;
-        Ok(evaluate(self.payload, &self.checks, output))
+        match wait_and_capture(&mut child) {
+            Ok(output) => Ok(evaluate(self.payload, &self.checks, output)),
+            Err(e) => {
+                // Reader-thread panic or wait-syscall failure left
+                // the child (and any fork descendants holding the
+                // pipes open) alive. `kill_payload_process_group`
+                // sends killpg + single-pid SIGKILL to close the
+                // pipes and guarantee the leader exits; the
+                // trailing `wait` reaps it so the pid slot is freed.
+                kill_payload_process_group(&child);
+                let _ = child.wait();
+                Err(e).with_context(|| format!("wait payload '{}'", self.payload.name))
+            }
+        }
     }
 
     /// SIGKILL the child **and every process it forked**, reap it,
@@ -388,14 +444,22 @@ impl PayloadHandle {
     /// SHM ring; the returned tuple is a convenience view of the
     /// same values.
     pub fn kill(mut self) -> Result<(AssertResult, PayloadMetrics)> {
-        let child = self
+        let mut child = self
             .child
             .take()
             .ok_or_else(|| already_consumed(self.payload))?;
         kill_payload_process_group(&child);
-        let output = wait_and_capture(child)
-            .with_context(|| format!("reap killed payload '{}'", self.payload.name))?;
-        Ok(evaluate(self.payload, &self.checks, output))
+        match wait_and_capture(&mut child) {
+            Ok(output) => Ok(evaluate(self.payload, &self.checks, output)),
+            Err(e) => {
+                // killpg + single-pid SIGKILL already ran at the
+                // start; the reap or pipe-drain failed afterwards.
+                // One more `wait` clears the zombie so the pid slot
+                // is freed regardless of the capture error.
+                let _ = child.wait();
+                Err(e).with_context(|| format!("reap killed payload '{}'", self.payload.name))
+            }
+        }
     }
 
     /// Non-blocking check for exit without consuming the handle.
@@ -415,13 +479,22 @@ impl PayloadHandle {
             Some(_status) => {
                 // `child` was Some above; the earlier branch didn't
                 // `take()` it, so this unwrap is guaranteed to hold.
-                let child = self
+                let mut child = self
                     .child
                     .take()
                     .expect("child still present on terminal branch");
-                let output = wait_and_capture(child)
-                    .with_context(|| format!("reap payload '{}'", self.payload.name))?;
-                Ok(Some(evaluate(self.payload, &self.checks, output)))
+                match wait_and_capture(&mut child) {
+                    Ok(output) => Ok(Some(evaluate(self.payload, &self.checks, output))),
+                    Err(e) => {
+                        // Leader exited (try_wait returned Some) but
+                        // pipe drain failed — descendants may still
+                        // hold the pipes. Kill the group to release
+                        // them, then reap the leader zombie.
+                        kill_payload_process_group(&child);
+                        let _ = child.wait();
+                        Err(e).with_context(|| format!("reap payload '{}'", self.payload.name))
+                    }
+                }
             }
             None => Ok(None),
         }
@@ -455,14 +528,32 @@ impl Drop for PayloadHandle {
     }
 }
 
-/// Send `SIGKILL` to the process group headed by `child`.
+/// Send `SIGKILL` to the process group headed by `child` AND to the
+/// leader pid directly.
 ///
-/// `build_command` installs a `setpgid(0, 0)` pre_exec hook that
-/// makes the child's pid its own process-group leader, so signalling
-/// that pgid reaches every fork descendant. The pid → pgid identity
-/// depends on `setpgid` succeeding; if the pre_exec hook failed,
-/// `spawn()` returns `Err` before a `PayloadHandle` is built, so a
-/// live handle here always has a valid pgid.
+/// `build_command` requests `CommandExt::process_group(0)` so the
+/// child's pid becomes its own process-group leader, coordinated
+/// with exec setup by the standard library. `killpg(pgid, SIGKILL)`
+/// on the child's pid therefore reaches every fork descendant in
+/// one shot — a single `child.kill()` would otherwise miss
+/// grandchildren of multi-process payloads (stress-ng, schbench
+/// worker mode, fio --numjobs) and those orphans would keep the
+/// stdout/stderr pipes open, hanging `wait_and_capture` forever.
+///
+/// The follow-up `kill(pid, SIGKILL)` on the leader pid is
+/// belt-and-suspenders coverage for the edge case where `killpg`
+/// alone is insufficient: the kernel-side pgid transition during
+/// exec may not have completed yet when `killpg` fires, so
+/// `killpg` returns `ESRCH` (no such group) and the leader
+/// survives. A direct `kill(pid, SIGKILL)` always reaches the
+/// leader, and the SIGKILL survives `execve(2)` to take effect
+/// once exec completes (signal disposition is preserved across
+/// exec; the pending signal is delivered once the new image
+/// starts). SIGKILL is idempotent against zombies and
+/// already-dead processes, so the extra signal is safe after a
+/// successful `killpg` — a killpg that reached the leader has
+/// already queued it for SIGKILL, and the follow-up `kill(pid)`
+/// is a no-op on the terminated process.
 ///
 /// `child.id()` returns `u32` for API ergonomics; on Linux the
 /// kernel's `pid_max ≤ 2²²` guarantees the value fits in
@@ -470,24 +561,27 @@ impl Drop for PayloadHandle {
 /// every live child. `debug_assert!(pgid > 0)` catches the
 /// theoretically-impossible non-positive case before
 /// [`nix::sys::signal::killpg`] would otherwise interpret it as a
-/// broadcast target. `ESRCH` (no such group) is treated as success:
-/// the payload and every fork descendant have already exited, which
-/// is the terminal state `kill()` is trying to reach anyway.
+/// broadcast target. `ESRCH` is logged as-a-no-op for both calls
+/// — it means either "group/process already reaped" or "group not
+/// yet set up"; the follow-up direct `kill` plus the leader's
+/// eventual `waitpid` consumer handle both.
 fn kill_payload_process_group(child: &std::process::Child) {
     let pgid = libc::pid_t::try_from(child.id())
         .expect("child pid fits in pid_t (Linux pid_max <= 2^22)");
     debug_assert!(pgid > 0, "child pid must be positive, got {pgid}");
-    match nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pgid),
-        nix::sys::signal::Signal::SIGKILL,
-    ) {
+    let pid = nix::unistd::Pid::from_raw(pgid);
+    match nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) => {}
-        Err(nix::errno::Errno::ESRCH) => {
-            // "No such process group" — every member already exited
-            // and was reaped, so the kill goal is already satisfied.
-        }
+        Err(nix::errno::Errno::ESRCH) => {}
         Err(e) => {
             tracing::warn!(pgid, %e, "killpg failed for payload process group");
+        }
+    }
+    match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => {}
+        Err(e) => {
+            tracing::warn!(pid = pgid, %e, "direct kill failed for payload leader");
         }
     }
 }
@@ -709,25 +803,34 @@ fn build_command(
     use std::process::{Command, Stdio};
 
     let mut cmd = Command::new(binary);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    // SAFETY: `setpgid(0, 0)` is async-signal-safe (POSIX.1-2017,
-    // 2.4.3) and only adjusts the calling process's own
-    // process-group membership. Placing the payload at the head of a
-    // fresh process group means `killpg` on the child's pid reaches
-    // every fork descendant — a single `child.kill()` would otherwise
-    // miss grandchildren of multi-process payloads (stress-ng,
-    // schbench with worker processes, fio with multiple jobs), and
-    // those orphans keep the stdout/stderr pipes open, hanging
-    // `wait_and_capture` and discarding the metrics.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // `process_group(0)` requests a fresh process group with the
+        // child as leader (pgid == child's pid). `killpg` on the
+        // child's pid then reaches every fork descendant in one
+        // signal — a single `child.kill()` would otherwise miss
+        // grandchildren of multi-process payloads (stress-ng,
+        // schbench worker mode, fio with multiple jobs), and those
+        // orphans keep the stdout/stderr pipes open, hanging
+        // `wait_and_capture` and discarding the metrics.
+        //
+        // Previously a hand-rolled `pre_exec(setpgid(0, 0))` hook
+        // did the same job, but a `killpg` issued between `fork(2)`
+        // and the child's `setpgid` completion could return `ESRCH`
+        // (no such group) while the child and its descendants
+        // survived. `CommandExt::process_group` NARROWS that
+        // window: on `posix_spawn`-capable platforms (and futures
+        // where `process_group` dispatches to it) the pgid
+        // transition is kernel-sequenced with exec and the race is
+        // eliminated. When the standard library has to fall through
+        // to the fork+exec path — which it does whenever a cgroup
+        // placement `pre_exec` hook is also registered below, as
+        // `process_group(0)` and any `pre_exec` together force the
+        // legacy path — the remaining window is covered by the
+        // direct `kill(pid, SIGKILL)` follow-up in
+        // `kill_payload_process_group`.
+        .process_group(0);
 
     if let Some(cg) = cgroup_path {
         // Precompute the full `.../cgroup.procs` CString on the
@@ -922,24 +1025,99 @@ impl Drop for SigchldScope {
 }
 
 /// Foreground path: spawn + wait + capture. Used by `.run()`.
-/// Wraps the `.output()` call in a [`SigchldScope`] so `waitpid`
-/// inside `Command::output` sees `SIG_DFL` and returns the child's
-/// real exit status instead of `ECHILD` under the guest init's
-/// `SIGCHLD = SIG_IGN`.
+///
+/// Wraps the child's lifetime in a [`SigchldScope`] so `waitpid`
+/// sees `SIG_DFL` and returns the child's real exit status instead
+/// of `ECHILD` under the guest init's `SIGCHLD = SIG_IGN`.
+///
+/// When `timeout` is `Some`, a poll loop bounds the payload's
+/// runtime. Exceeding the deadline fires
+/// [`kill_payload_process_group`] (killpg + single-pid SIGKILL)
+/// so fork descendants die and release the pipes, then
+/// [`wait_and_capture`] drains whatever output accumulated before
+/// the kill. The `SpawnOutput` returned on timeout carries the
+/// partial output and the post-kill exit code; the caller decides
+/// whether that counts as a test failure.
 fn spawn_and_wait(
     binary: &str,
     args: &[String],
     cgroup_path: Option<&std::path::Path>,
+    timeout: Option<Duration>,
 ) -> Result<SpawnOutput> {
     let _sigchld = SigchldScope::new();
-    let output = build_command(binary, args, cgroup_path)?
-        .output()
+    let mut child = build_command(binary, args, cgroup_path)?
+        .spawn()
         .map_err(|e| spawn_error_context(e, binary))?;
-    Ok(SpawnOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(-1),
-    })
+    match timeout {
+        Some(deadline) => wait_with_deadline(&mut child, deadline),
+        None => match wait_and_capture(&mut child) {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                kill_payload_process_group(&child);
+                let _ = child.wait();
+                Err(e)
+            }
+        },
+    }
+}
+
+/// Poll `try_wait` until the child exits or `timeout` elapses.
+/// On expiry, kill the whole process group (killpg + single-pid
+/// SIGKILL) and drain captured output.
+///
+/// Poll granularity is 10ms — coarse enough that the overhead is
+/// negligible on any realistic payload duration (schbench / fio
+/// runs are seconds to minutes), fine enough that deadlines are
+/// honored within one tick.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<SpawnOutput> {
+    let deadline = std::time::Instant::now() + timeout;
+    let poll_interval = Duration::from_millis(10);
+    loop {
+        match child.try_wait().with_context(|| "try_wait child")? {
+            Some(_status) => {
+                // `try_wait` reaps the child on `Some`; the status
+                // is available via the subsequent `wait_and_capture`
+                // drain path, which runs `child.wait()` on an
+                // already-reaped child and receives the cached
+                // `ExitStatus` from stdlib. Drain captured output
+                // normally. An error here is still a cleanup point:
+                // surviving descendants (if any) must be killed so
+                // the pid slot frees.
+                return match wait_and_capture(child) {
+                    Ok(out) => Ok(out),
+                    Err(e) => {
+                        kill_payload_process_group(child);
+                        let _ = child.wait();
+                        Err(e)
+                    }
+                };
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    kill_payload_process_group(child);
+                    // `wait_and_capture` now blocks only until the
+                    // killpg-delivered SIGKILL closes the
+                    // descendants' pipes, which is bounded by
+                    // kernel signal-delivery latency (microseconds
+                    // in practice). An unexpected error still has
+                    // the same cleanup obligation as the no-timeout
+                    // path.
+                    return match wait_and_capture(child) {
+                        Ok(out) => Ok(out),
+                        Err(e) => {
+                            let _ = child.wait();
+                            Err(e)
+                                .with_context(|| format!("drain after timeout of {timeout:?}"))
+                        }
+                    };
+                }
+                std::thread::sleep(poll_interval);
+            }
+        }
+    }
 }
 
 /// Background path: spawn without waiting. Returns the live
@@ -962,13 +1140,20 @@ fn spawn_child(
 /// Reap a (possibly already-killed) [`Child`]: wait for it to
 /// exit, drain stdout + stderr, return the captured output.
 ///
+/// Takes `&mut Child` so callers retain ownership and can
+/// `kill_payload_process_group` + `wait` to clean up descendants
+/// when this function returns `Err` (e.g. a reader thread panicked
+/// or the wait syscall itself failed). An owned-child signature
+/// would lose the handle inside this function and leave descendants
+/// running because [`std::process::Child::drop`] is a no-op.
+///
 /// Sequential stdout-then-stderr reads deadlock when the child
 /// fills one pipe buffer (typically 64KiB) while the other is
 /// unread — the child blocks on write, the parent blocks on read
 /// of the empty pipe. Drain both pipes concurrently via helper
 /// threads, mirroring what `std::process::Command::output` does
 /// for the foreground path.
-fn wait_and_capture(mut child: std::process::Child) -> Result<SpawnOutput> {
+fn wait_and_capture(child: &mut std::process::Child) -> Result<SpawnOutput> {
     use std::io::Read;
     let stdout_handle = child.stdout.take().map(|mut out| {
         std::thread::spawn(move || -> std::io::Result<String> {
