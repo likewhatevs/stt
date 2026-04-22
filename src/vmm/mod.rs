@@ -1507,22 +1507,22 @@ impl KtstrVm {
             );
         }
 
-        // Read back first 8 bytes from guest memory to verify write.
-        let mut verify_buf = [0u8; 8];
+        // Read back first 8 bytes from guest memory to check write.
+        let mut check_buf = [0u8; 8];
         vm.guest_mem
-            .read_slice(&mut verify_buf, GuestAddress(load_addr))
-            .context("read-back initrd verify")?;
+            .read_slice(&mut check_buf, GuestAddress(load_addr))
+            .context("read-back initrd check")?;
         tracing::debug!(
             first_8 = format!(
                 "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                verify_buf[0],
-                verify_buf[1],
-                verify_buf[2],
-                verify_buf[3],
-                verify_buf[4],
-                verify_buf[5],
-                verify_buf[6],
-                verify_buf[7]
+                check_buf[0],
+                check_buf[1],
+                check_buf[2],
+                check_buf[3],
+                check_buf[4],
+                check_buf[5],
+                check_buf[6],
+                check_buf[7]
             ),
             expected_magic = "02214c18",
             "initrd_verify",

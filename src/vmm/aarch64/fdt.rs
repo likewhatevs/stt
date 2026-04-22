@@ -901,7 +901,7 @@ mod tests {
         }
     }
 
-    fn verify_cpu_numa_node_ids(topo: &Topology, props: &[(String, String, Vec<u8>)]) {
+    fn check_cpu_numa_node_ids(topo: &Topology, props: &[(String, String, Vec<u8>)]) {
         for cpu_id in 0..topo.total_cpus() {
             let node_path = format!("cpus/cpu@{cpu_id}");
             let numa_id = prop_u32(props, &node_path, "numa-node-id")
@@ -939,7 +939,7 @@ mod tests {
             false,
         )
         .unwrap();
-        verify_cpu_numa_node_ids(&topo, &parse_dtb_props(&dtb));
+        check_cpu_numa_node_ids(&topo, &parse_dtb_props(&dtb));
 
         // SMT variant: sibling threads share the same LLC and must get
         // the same numa-node-id.
@@ -964,7 +964,7 @@ mod tests {
             false,
         )
         .unwrap();
-        verify_cpu_numa_node_ids(&topo_smt, &parse_dtb_props(&dtb_smt));
+        check_cpu_numa_node_ids(&topo_smt, &parse_dtb_props(&dtb_smt));
     }
 
     #[test]
@@ -1011,8 +1011,8 @@ mod tests {
         );
     }
 
-    /// Verify multi-NUMA memory nodes: numa-node-id, reg, contiguity, total size.
-    fn verify_memory_nodes(
+    /// Check multi-NUMA memory nodes: numa-node-id, reg, contiguity, total size.
+    fn check_memory_nodes(
         topo: &Topology,
         props: &[(String, String, Vec<u8>)],
         memory_mb: u32,
@@ -1089,7 +1089,7 @@ mod tests {
             false,
         )
         .unwrap();
-        verify_memory_nodes(&topo, &parse_dtb_props(&dtb), memory_mb, 0);
+        check_memory_nodes(&topo, &parse_dtb_props(&dtb), memory_mb, 0);
 
         // F3: with-SHM case — last node absorbs SHM region.
         let shm_size: u64 = 0x10_0000;
@@ -1105,7 +1105,7 @@ mod tests {
             false,
         )
         .unwrap();
-        verify_memory_nodes(&topo, &parse_dtb_props(&dtb_shm), memory_mb, shm_size);
+        check_memory_nodes(&topo, &parse_dtb_props(&dtb_shm), memory_mb, shm_size);
     }
 
     #[test]

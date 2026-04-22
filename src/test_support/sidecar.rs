@@ -998,10 +998,7 @@ mod tests {
     fn write_sidecar_writes_file() {
         let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-write-test");
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1060,10 +1057,7 @@ mod tests {
         let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-flagvariant-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1117,10 +1111,7 @@ mod tests {
         let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-variant-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1499,10 +1490,7 @@ mod tests {
         let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-writes-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1561,10 +1549,7 @@ mod tests {
         let _ = std::fs::remove_file(&blocker);
         let _ = std::fs::remove_dir_all(&blocker);
         std::fs::write(&blocker, b"not a dir").unwrap();
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            blocker.to_str().expect("tempfile path is UTF-8"),
-        );
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &blocker);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1701,10 +1686,7 @@ mod tests {
         let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-payload-name-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
 
         static FIO: Payload = Payload {
             name: "fio",
@@ -1773,10 +1755,7 @@ mod tests {
         let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-metrics-slice-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1852,10 +1831,7 @@ mod tests {
         let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-payload-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        let _env_sidecar = EnvVarGuard::set(
-            "KTSTR_SIDECAR_DIR",
-            tmp.to_str().expect("tempdir path is UTF-8"),
-        );
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
 
         static STRESS: Payload = Payload {
             name: "stress-ng",

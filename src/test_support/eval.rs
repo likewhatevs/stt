@@ -925,11 +925,7 @@ mod tests {
     fn resolve_test_kernel_with_env_var() {
         let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
-        let _env = EnvVarGuard::set(
-            "KTSTR_TEST_KERNEL",
-            exe.to_str()
-                .expect("resolve_current_exe returns UTF-8 path"),
-        );
+        let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", &exe);
         let result = resolve_test_kernel();
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), exe);
@@ -987,11 +983,7 @@ mod tests {
     fn resolve_scheduler_discover_via_env() {
         let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
-        let _env = EnvVarGuard::set(
-            "KTSTR_SCHEDULER",
-            exe.to_str()
-                .expect("resolve_current_exe returns UTF-8 path"),
-        );
+        let _env = EnvVarGuard::set("KTSTR_SCHEDULER", &exe);
         let result = resolve_scheduler(&SchedulerSpec::Discover("anything"));
         assert!(result.is_ok());
         assert_eq!(result.unwrap().unwrap(), exe);
@@ -1026,11 +1018,7 @@ mod tests {
     fn nextest_setup_writes_kernel_env() {
         let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
-        let _env = EnvVarGuard::set(
-            "KTSTR_TEST_KERNEL",
-            exe.to_str()
-                .expect("resolve_current_exe returns UTF-8 path"),
-        );
+        let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", &exe);
 
         let mut buf = Vec::new();
         let result = nextest_setup(&[exe.as_path()], &mut buf);
