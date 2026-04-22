@@ -92,6 +92,49 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 }
 
 /// Run a single ktstr_test and return the VM's AssertResult.
+/// Dedupe a resolved include-file list produced by unioning the
+/// per-payload `include_files` specs through
+/// [`crate::cli::resolve_include_files`] and appending the scheduler
+/// config file entry. Policy:
+///
+/// - Identical `(archive_path, host_path)` pairs collapse silently
+///   (the same host file declared twice is harmless).
+/// - Two entries sharing an `archive_path` but resolving to
+///   different `host_path`s are a genuine ambiguity — a scheduler's
+///   and a payload's `include_files` both claiming
+///   `include-files/config.json` but pointing at different host
+///   paths means one of the two would silently overwrite the other
+///   in the initramfs. Bail with a diagnostic naming both host
+///   paths so the author can rename one archive slot.
+///
+/// Order is stabilized via `BTreeMap`'s sorted iteration so the
+/// emitted slice is deterministic regardless of which caller
+/// appended first. Extracted from `run_ktstr_test_inner` so the
+/// policy can be unit-tested without constructing a whole
+/// KtstrTestEntry + VmBuilder.
+fn dedupe_include_files(
+    resolved: &[(String, std::path::PathBuf)],
+) -> Result<Vec<(String, std::path::PathBuf)>> {
+    let mut seen: std::collections::BTreeMap<String, std::path::PathBuf> =
+        std::collections::BTreeMap::new();
+    for (archive, host) in resolved {
+        if let Some(existing) = seen.get(archive) {
+            if existing != host {
+                anyhow::bail!(
+                    "include_files conflict for archive path '{archive}': two declarative \
+                     sources resolved to different host paths ({} vs {}). Remove the \
+                     duplicate declaration or rename one of the archive entries.",
+                    existing.display(),
+                    host.display(),
+                );
+            }
+        } else {
+            seen.insert(archive.clone(), host.clone());
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
 pub(crate) fn run_ktstr_test_inner(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
@@ -190,27 +233,7 @@ pub(crate) fn run_ktstr_test_inner(
         sched_args.push("--config".to_string());
         sched_args.push(guest_path);
     }
-    // Dedupe + conflict detection.
-    let mut seen: std::collections::BTreeMap<String, std::path::PathBuf> =
-        std::collections::BTreeMap::new();
-    for (archive, host) in &resolved_includes {
-        if let Some(existing) = seen.get(archive) {
-            if existing != host {
-                anyhow::bail!(
-                    "include_files conflict for archive path '{archive}': two declarative \
-                     sources resolved to different host paths ({} vs {}). Remove the \
-                     duplicate declaration or rename one of the archive entries.",
-                    existing.display(),
-                    host.display(),
-                );
-            }
-            // Identical pair: silent dedupe.
-        } else {
-            seen.insert(archive.clone(), host.clone());
-        }
-    }
-    let unioned: Vec<(String, std::path::PathBuf)> =
-        seen.into_iter().collect();
+    let unioned = dedupe_include_files(&resolved_includes)?;
     if !unioned.is_empty() {
         builder = builder.include_files(unioned);
     }
@@ -1012,6 +1035,100 @@ mod tests {
     use super::*;
     use crate::assert::{AssertDetail, DetailKind};
     use crate::verifier::SCHED_OUTPUT_END;
+
+    // -- dedupe_include_files tests --
+    //
+    // Policy pins for the aggregator downstream of
+    // `KtstrTestEntry::all_include_files` + `resolve_include_files`:
+    // identical `(archive, host)` pairs collapse silently, same
+    // archive with conflicting hosts aborts. Deterministic
+    // ordering (BTreeMap keys).
+
+    /// Empty input → empty result. Pins the identity case so a
+    /// regression that introduces an invariant init-element
+    /// (e.g. implicit config file) would break this.
+    #[test]
+    fn dedupe_include_files_empty_input() {
+        let out = dedupe_include_files(&[]).unwrap();
+        assert!(out.is_empty(), "empty in → empty out, got {out:?}");
+    }
+
+    /// Identical pair appearing twice deduplicates silently. The
+    /// output contains a single entry; no error, no warning. Models
+    /// the scheduler-and-payload-both-declare-config case.
+    #[test]
+    fn dedupe_include_files_identical_pair_collapses() {
+        let input = vec![
+            (
+                "include-files/helper".to_string(),
+                std::path::PathBuf::from("/usr/bin/helper"),
+            ),
+            (
+                "include-files/helper".to_string(),
+                std::path::PathBuf::from("/usr/bin/helper"),
+            ),
+        ];
+        let out = dedupe_include_files(&input).unwrap();
+        assert_eq!(out.len(), 1, "identical pair must dedupe, got {out:?}");
+        assert_eq!(out[0].0, "include-files/helper");
+        assert_eq!(out[0].1, std::path::PathBuf::from("/usr/bin/helper"));
+    }
+
+    /// Same archive_path with conflicting host_paths is a genuine
+    /// ambiguity — one declaration would silently overwrite the
+    /// other's file in the initramfs. Policy: hard error with a
+    /// diagnostic naming both host paths so the operator knows
+    /// which declarations need disambiguation.
+    #[test]
+    fn dedupe_include_files_archive_collision_errors() {
+        let input = vec![
+            (
+                "include-files/config.json".to_string(),
+                std::path::PathBuf::from("/tmp/sched/config.json"),
+            ),
+            (
+                "include-files/config.json".to_string(),
+                std::path::PathBuf::from("/tmp/payload/config.json"),
+            ),
+        ];
+        let err = dedupe_include_files(&input).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("include_files conflict"),
+            "diagnostic must mention 'include_files conflict': {msg}",
+        );
+        assert!(
+            msg.contains("/tmp/sched/config.json") && msg.contains("/tmp/payload/config.json"),
+            "diagnostic must name both host paths: {msg}",
+        );
+    }
+
+    /// Multiple distinct archive_paths pass through unchanged. Verifies
+    /// the aggregator doesn't accidentally collapse orthogonal entries
+    /// (e.g. dropping by coincidental prefix or path-component equality).
+    #[test]
+    fn dedupe_include_files_preserves_distinct_entries() {
+        let input = vec![
+            (
+                "include-files/a".to_string(),
+                std::path::PathBuf::from("/usr/bin/a"),
+            ),
+            (
+                "include-files/b".to_string(),
+                std::path::PathBuf::from("/usr/bin/b"),
+            ),
+            (
+                "include-files/c".to_string(),
+                std::path::PathBuf::from("/usr/bin/c"),
+            ),
+        ];
+        let out = dedupe_include_files(&input).unwrap();
+        assert_eq!(out.len(), 3, "three distinct entries must survive");
+        let archives: Vec<&str> = out.iter().map(|(a, _)| a.as_str()).collect();
+        assert!(archives.contains(&"include-files/a"));
+        assert!(archives.contains(&"include-files/b"));
+        assert!(archives.contains(&"include-files/c"));
+    }
 
     // -- resolve_test_kernel tests --
 

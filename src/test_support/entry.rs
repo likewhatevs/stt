@@ -1579,4 +1579,118 @@ mod tests {
             "kernel"
         );
     }
+
+    // -- all_include_files aggregation tests --
+    //
+    // Pins the scheduler → payload → workloads → extras order. The
+    // dedupe + archive-collision policy lives downstream in
+    // `eval::dedupe_include_files`; this aggregator just gathers
+    // raw spec strings.
+
+    /// No Payload and no extras declare include_files → empty result.
+    /// Regression guard for `all_include_files` returning an implicit
+    /// non-empty list (e.g. leaking a default).
+    #[test]
+    fn all_include_files_empty_when_nothing_declared() {
+        let entry = KtstrTestEntry {
+            name: "t",
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert!(entry.all_include_files().is_empty());
+    }
+
+    /// Scheduler + payload + workloads + extras merge in declaration
+    /// order. Pins:
+    /// - order is scheduler → payload → workloads (preserving the
+    ///   slice order) → extra_include_files
+    /// - duplicates are NOT deduped at this layer (that's eval's job)
+    #[test]
+    fn all_include_files_merges_sources_in_order() {
+        static SCHED_PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
+            name: "sched",
+            kind: crate::test_support::PayloadKind::Scheduler(
+                &crate::test_support::Scheduler::EEVDF,
+            ),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &["sched-helper"],
+        };
+        static PRIMARY: crate::test_support::Payload = crate::test_support::Payload {
+            name: "primary",
+            kind: crate::test_support::PayloadKind::Binary("fio"),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &["fio"],
+        };
+        static WL_A: crate::test_support::Payload = crate::test_support::Payload {
+            name: "wl_a",
+            kind: crate::test_support::PayloadKind::Binary("stress-ng"),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &["stress-ng"],
+        };
+        static WL_B: crate::test_support::Payload = crate::test_support::Payload {
+            name: "wl_b",
+            kind: crate::test_support::PayloadKind::Binary("schbench"),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &["schbench"],
+        };
+        static WORKLOADS: &[&crate::test_support::Payload] = &[&WL_A, &WL_B];
+        let entry = KtstrTestEntry {
+            name: "t",
+            scheduler: &SCHED_PAYLOAD,
+            payload: Some(&PRIMARY),
+            workloads: WORKLOADS,
+            extra_include_files: &["test-fixture.json"],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let got = entry.all_include_files();
+        assert_eq!(
+            got,
+            vec![
+                "sched-helper",
+                "fio",
+                "stress-ng",
+                "schbench",
+                "test-fixture.json",
+            ],
+            "aggregation order must be scheduler → payload → workloads → extras",
+        );
+    }
+
+    /// Absent optional `payload` slot contributes nothing — the
+    /// aggregator skips it without the `None → empty-push` misbehavior
+    /// a future refactor might introduce.
+    #[test]
+    fn all_include_files_skips_absent_payload() {
+        static SCHED_PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
+            name: "sched",
+            kind: crate::test_support::PayloadKind::Scheduler(
+                &crate::test_support::Scheduler::EEVDF,
+            ),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &["sched-helper"],
+        };
+        let entry = KtstrTestEntry {
+            name: "t",
+            scheduler: &SCHED_PAYLOAD,
+            payload: None,
+            workloads: &[],
+            extra_include_files: &[],
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(entry.all_include_files(), vec!["sched-helper"]);
+    }
 }

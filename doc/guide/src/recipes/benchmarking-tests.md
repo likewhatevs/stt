@@ -132,3 +132,56 @@ not JSON); `OutputFormat::LlmExtract` may extract numbers from the
 fallback but results depend on the local model's tolerance for
 that prose format. Keep `OutputFormat::ExitCode` for stress-ng
 unless you are prepared for that tradeoff.
+
+## Declarative include_files on Payload
+
+Payloads that need host binaries or fixtures in the guest initramfs
+can declare them on the `Payload` itself instead of relying on the
+CLI `-i` / `--include-files` flag at every invocation. The specs
+are resolved at `run_ktstr_test` time through the same
+`resolve_include_files` pipeline the CLI uses — bare names are
+searched in the host's `PATH`, explicit paths must exist, and
+directories are walked recursively.
+
+Declare per-Payload via the `#[include_files(...)]` attribute on
+`#[derive(Payload)]`:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+#[derive(Payload)]
+#[payload(binary = "fio")]
+#[include_files("fio", "bench-helper")]
+#[metric(name = "iops", polarity = "higher_is_better", unit = "ops/s")]
+struct FioPayload;
+```
+
+The generated `FIO` const carries `include_files: &["fio",
+"bench-helper"]`. When any `#[ktstr_test]` uses `FIO` as a payload
+or workload, those files get resolved and packed into the initramfs
+automatically — no `-i` flag needed on the CLI.
+
+Test-level extras that don't belong on any specific payload go on
+the `#[ktstr_test]` attribute directly:
+
+```rust,ignore
+#[ktstr_test(
+    scheduler = MY_SCHED,
+    payload = FIO,
+    extra_include_files = ["test-fixtures/workload.json"],
+)]
+fn fio_with_fixture(ctx: &Ctx) -> Result<AssertResult> {
+    // test body
+    # Ok(AssertResult::pass())
+}
+```
+
+The declarative set (scheduler's `include_files` + payload's +
+workloads' + `extra_include_files`) is additive with the CLI
+`-i` flag — it does NOT replace CLI input. Running
+`ktstr exec --test fio_with_fixture -i extra-binary` packs
+`extra-binary` alongside the declaratively-declared files; the
+union is deduped on identical `(archive_path, host_path)` pairs.
+Two declarations that resolve to the same archive slot with
+different host paths surface as a hard error with both host paths
+in the diagnostic, rather than one silently overwriting the other.
