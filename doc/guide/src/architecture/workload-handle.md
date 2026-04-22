@@ -16,12 +16,18 @@ pub struct WorkloadHandle { /* ... */ }
 ```rust,ignore
 let config = WorkloadConfig {
     num_workers: 4,
-    affinity: AffinityMode::None,
-    work_type: WorkType::CpuSpin,
-    sched_policy: SchedPolicy::Normal,
+    work_type: WorkType::Mixed,
+    ..Default::default()
 };
 let mut handle = WorkloadHandle::spawn(&config)?;
 ```
+
+Set only the fields that matter for the test and let
+`..Default::default()` fill in the rest. The spread-default form is the
+canonical style in the ktstr codebase — it keeps examples pinned to
+intent (`num_workers`, `work_type`) and survives additions to
+`WorkloadConfig` (e.g. NUMA memory-policy fields) without rotting.
+Consult the `WorkloadConfig` rustdoc for the current field list.
 
 `spawn()` forks `num_workers` child processes. Each child installs a
 SIGUSR1 handler, then blocks on a pipe waiting for the start signal.

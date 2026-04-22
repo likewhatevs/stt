@@ -1993,4 +1993,87 @@ mod tests {
     fn format_host_delta_both_absent_emits_nothing() {
         assert_eq!(format_host_delta(None, None, "a", "b"), "");
     }
+
+    // -- GauntletRow serde round-trip tests --
+    //
+    // Both `flags: Vec<String>` and `ext_metrics: BTreeMap<String, f64>`
+    // carry `#[serde(default, skip_serializing_if = "…::is_empty")]`.
+    // These tests pin that symmetric contract: the keys disappear from
+    // JSON when the collection is empty, round-trip through from_str
+    // reconstructs an equivalent row, and a non-empty payload emits
+    // its contents verbatim.
+
+    /// Empty collections are elided on serialize. Regression guard for
+    /// the `skip_serializing_if` pair — dropping either arm would make
+    /// sidecar files carry `"flags":[]` / `"ext_metrics":{}` noise and
+    /// silently change the on-disk schema for existing runs.
+    #[test]
+    fn gauntlet_row_empty_collections_omit_keys() {
+        let row = make_row("scn", "topo", true, 0.0);
+        assert!(row.flags.is_empty());
+        assert!(row.ext_metrics.is_empty());
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(
+            !json.contains("\"flags\""),
+            "empty flags must be omitted from JSON: {json}"
+        );
+        assert!(
+            !json.contains("\"ext_metrics\""),
+            "empty ext_metrics must be omitted from JSON: {json}"
+        );
+    }
+
+    /// Non-empty collections appear with their full payload. Locks in
+    /// that `skip_serializing_if` only fires on empty, not on "has
+    /// content". A false positive here would silently drop flags and
+    /// extensible metrics from sidecar files.
+    #[test]
+    fn gauntlet_row_non_empty_collections_emit_payload() {
+        let mut row = make_row("scn", "topo", true, 0.0);
+        row.flags = vec!["flag_a".into(), "flag_b".into()];
+        row.ext_metrics.insert("custom_metric".into(), 42.5);
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(
+            json.contains("\"flags\":[\"flag_a\",\"flag_b\"]"),
+            "flags payload missing: {json}"
+        );
+        assert!(
+            json.contains("\"custom_metric\":42.5"),
+            "ext_metrics payload missing: {json}"
+        );
+    }
+
+    /// Round-trip with empty collections: `serde(default)` must
+    /// repopulate the absent keys with empty values so the reconstructed
+    /// row compares equal on those fields. Regression guard for the
+    /// `default` half of the symmetric pair — removing it would make
+    /// deserialize fail on any row written before the fields existed.
+    #[test]
+    fn gauntlet_row_round_trip_empty_collections() {
+        let row = make_row("scn", "topo", true, 1.5);
+        let json = serde_json::to_string(&row).unwrap();
+        let back: GauntletRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.flags, row.flags);
+        assert_eq!(back.ext_metrics, row.ext_metrics);
+        assert_eq!(back.scenario, row.scenario);
+        assert_eq!(back.spread, row.spread);
+        assert!(back.flags.is_empty());
+        assert!(back.ext_metrics.is_empty());
+    }
+
+    /// Round-trip with populated collections: every entry survives the
+    /// to_string → from_str cycle. Guards against any future field-level
+    /// serde attribute (e.g. a rename or custom serializer) accidentally
+    /// shearing content on one side of the cycle.
+    #[test]
+    fn gauntlet_row_round_trip_non_empty_collections() {
+        let mut row = make_row("scn", "topo", false, 3.14);
+        row.flags = vec!["a".into(), "b".into(), "c".into()];
+        row.ext_metrics.insert("m1".into(), 1.0);
+        row.ext_metrics.insert("m2".into(), 2.5);
+        let json = serde_json::to_string(&row).unwrap();
+        let back: GauntletRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.flags, row.flags);
+        assert_eq!(back.ext_metrics, row.ext_metrics);
+    }
 }
