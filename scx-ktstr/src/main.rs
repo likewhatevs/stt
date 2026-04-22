@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use anyhow::Result;
@@ -89,42 +89,63 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         eprintln!("scx-ktstr: slow mode enabled");
     }
 
-    if let Some(delay_s) = stall_after {
-        let skel_ptr = &mut skel as *mut _ as usize;
-        let shutdown_clone = shutdown.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(delay_s));
-            if !shutdown_clone.load(Ordering::Relaxed) {
-                // SAFETY: skel outlives this thread (main thread joins via uei_exited loop).
-                // The BPF .bss map is mmap'd; writing to it is a single atomic store
-                // visible to the BPF program on the next dispatch call.
-                let skel = unsafe { &mut *(skel_ptr as *mut BpfSkel<'_>) };
-                if let Some(bss) = skel.maps.bss_data.as_mut() {
-                    bss.stall = 1;
-                }
-                eprintln!("scx-ktstr: stall enabled after {delay_s}s");
-            }
-        });
+    // `--stall-after` / `--degrade-after` triggers are checked inline
+    // in the main poll loop below. Previously they were driven by two
+    // fire-and-forget (JoinHandle dropped unused) `thread::spawn`
+    // closures that captured `&mut skel` as `usize` and re-cast it
+    // under `unsafe` after the sleep; that is UAF-prone — the threads
+    // are never joined, and the `BpfSkel<'_>` stack local (plus its
+    // owned libbpf `Object`, `BpfLink`, and mmap'd `bss`/`rodata`
+    // regions) drops when `run` returns on shutdown or `uei_exited`.
+    // Folding the triggers into the existing 1-second poll cadence
+    // eliminates the aliasing, removes the `unsafe` cast, and bounds
+    // the wake latency to the same granularity the file-triggered
+    // path already has. Delay precision is `Duration::from_secs(delay_s)`
+    // with 1 s poll granularity — adequate for the test durations
+    // these flags are used with (tens of seconds and up).
+    //
+    // Gating change vs the old timer-thread design: triggers become
+    // inert once `uei_exited!(&skel, uei)` fires. A dead scheduler
+    // no longer receives stall/degrade signals, because the poll
+    // loop exits before the next tick. The previous design would
+    // still flip the bss bytes on a dead skel (also visible to no
+    // one — the scheduler was already unloaded). No observable
+    // regression in practice.
+    //
+    // Zero-delay handling: `stall_after=0` / `degrade_after=0` would
+    // otherwise wait for the first `thread::sleep(1s)` before the
+    // elapsed check fired. Fire those immediately before entering
+    // the loop so the semantics match the old "spawn + sleep(0)"
+    // path (which fired essentially instantly).
+    if let Some(bss) = skel.maps.bss_data.as_mut() {
+        if stall_after == Some(0) && bss.stall == 0 {
+            bss.stall = 1;
+            eprintln!("scx-ktstr: stall enabled after 0s");
+        }
+        if degrade_after == Some(0) && bss.degrade_rt == 0 {
+            bss.degrade_rt = 1;
+            eprintln!("scx-ktstr: degrade enabled after 0s");
+        }
     }
-
-    if let Some(delay_s) = degrade_after {
-        let skel_ptr = &mut skel as *mut _ as usize;
-        let shutdown_clone = shutdown.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(delay_s));
-            if !shutdown_clone.load(Ordering::Relaxed) {
-                let skel = unsafe { &mut *(skel_ptr as *mut BpfSkel<'_>) };
-                if let Some(bss) = skel.maps.bss_data.as_mut() {
-                    bss.degrade_rt = 1;
-                }
-                eprintln!("scx-ktstr: degrade enabled after {delay_s}s");
-            }
-        });
-    }
-
+    let start = Instant::now();
     while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&skel, uei) {
         thread::sleep(Duration::from_secs(1));
+        let elapsed = start.elapsed();
         if let Some(bss) = skel.maps.bss_data.as_mut() {
+            if let Some(delay_s) = stall_after
+                && bss.stall == 0
+                && elapsed >= Duration::from_secs(delay_s)
+            {
+                bss.stall = 1;
+                eprintln!("scx-ktstr: stall enabled after {delay_s}s");
+            }
+            if let Some(delay_s) = degrade_after
+                && bss.degrade_rt == 0
+                && elapsed >= Duration::from_secs(delay_s)
+            {
+                bss.degrade_rt = 1;
+                eprintln!("scx-ktstr: degrade enabled after {delay_s}s");
+            }
             if std::path::Path::new("/tmp/ktstr_stall").exists() && bss.stall == 0 {
                 bss.stall = 1;
                 eprintln!("scx-ktstr: stall enabled via /tmp/ktstr_stall");
