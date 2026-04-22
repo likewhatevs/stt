@@ -69,6 +69,38 @@ type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static;
 /// this thread registered a [`VcpuPanicCtx`]) and then delegate to
 /// `prev`. Factored out of [`install_once`] so tests can install a
 /// custom `prev` and observe that the chain is not silently dropped.
+///
+/// # RefCell borrow invariant
+///
+/// The hook takes a shared `slot.borrow()` on `VCPU_PANIC_CTX`, the
+/// per-thread `RefCell<Option<VcpuPanicCtx>>`. That borrow is safe
+/// only because the hook is never re-entered while another borrow is
+/// active on the same thread's RefCell:
+///
+/// - `with_vcpu_panic_ctx` scopes its two `borrow_mut()` windows
+///   strictly to the set / clear statements and drops them before
+///   running `body()`, per that function's documented INVARIANT. Any
+///   panic raised inside `body()` therefore finds the RefCell
+///   unborrowed, and the hook's `borrow()` cannot conflict.
+/// - A panic is delivered to `std`'s hook machinery synchronously on
+///   the panicking thread. `std::panic::set_hook` serializes hook
+///   registration, and `catch_unwind` / runtime unwinding calls the
+///   hook exactly once per `panic!` site before unwinding continues.
+///   There is no concurrent second entry into this closure on the
+///   same thread to hold a conflicting borrow.
+/// - `prev(info)` is the previously-installed process-wide hook
+///   captured at `install_once` time. By construction it does not
+///   re-enter this module's thread-local (no ktstr code path inside a
+///   `prev` hook touches `VCPU_PANIC_CTX`), so the delegation tail
+///   cannot recursively panic into our hook.
+///
+/// If any of those preconditions breaks — a caller holds a `borrow`
+/// across a panic site, a runtime gains re-entrant hook dispatch, or
+/// a downstream `prev` hook calls back into this module — the
+/// `borrow()` here panics, the panic hook double-panics, and under
+/// `panic = "abort"` the process aborts without emitting the classified
+/// shutdown signal `VcpuPanicCtx` exists to produce. Preserve the
+/// invariant.
 fn make_hook(prev: Box<PanicHook>) -> Box<PanicHook> {
     Box::new(move |info| {
         VCPU_PANIC_CTX.with(|slot| {

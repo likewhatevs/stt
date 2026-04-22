@@ -7,10 +7,12 @@
 //! KVM stats across gauntlet variants.
 //!
 //! Responsibilities owned by this module:
-//! - [`SidecarResult`]: the on-disk schema. Fields are `serde`-tagged
-//!   with `skip_serializing_if` / `default` so optional VM telemetry
-//!   (monitor, KVM stats, BPF verifier stats) doesn't bloat sidecars
-//!   that didn't run a VM.
+//! - [`SidecarResult`]: the on-disk schema. Fields serialize as
+//!   `null` / `[]` when empty — no `skip_serializing_if` or
+//!   `serde(default)` — so serialize and deserialize are symmetric.
+//!   A missing field in a parsed sidecar is a hard error (pre-1.0:
+//!   old sidecar JSON is disposable; regenerate by re-running the
+//!   test).
 //! - [`collect_sidecars`]: load every `*.ktstr.json` under a directory
 //!   (one level of subdirectories for per-job gauntlet layouts).
 //! - [`write_sidecar`] / [`write_skip_sidecar`]: serialize one run to
@@ -52,9 +54,8 @@ pub struct SidecarResult {
     pub scheduler: String,
     /// Binary payload name (matches `Payload::name` when
     /// `entry.payload` is set). `None` when the test declared no
-    /// binary payload — serialized out so sidecars for
-    /// scheduler-only tests don't carry a null field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// binary payload. Serialized as `"payload": null` in that case;
+    /// required on deserialize — matches `host`'s symmetric pattern.
     pub payload: Option<String>,
     /// Per-payload extracted metrics collected from `ctx.payload(X).run()`
     /// / `.spawn().wait()` call sites during the test body.
@@ -62,9 +63,8 @@ pub struct SidecarResult {
     /// One [`PayloadMetrics`] per invocation, in the order the calls
     /// ran. Empty when no payload calls were made (scheduler-only
     /// tests, or a binary-only test where the body bailed before
-    /// running the payload). Empty vec → omitted from JSON via
-    /// `skip_serializing_if`; this is NOT a backward-compat shim.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// running the payload). Always emitted as `"metrics": []` in
+    /// that case; required on deserialize.
     pub metrics: Vec<PayloadMetrics>,
     /// Overall pass/fail verdict for this run.
     pub passed: bool,
@@ -78,8 +78,8 @@ pub struct SidecarResult {
     pub stats: ScenarioStats,
     /// Monitor summary. `None` means the monitor loop did not run
     /// (host-only tests, early VM failure) or sample collection
-    /// produced no valid data.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// produced no valid data. Always emitted (`"monitor": null` on
+    /// absence); required on deserialize.
     pub monitor: Option<MonitorSummary>,
     /// Ordered stimulus events published by the guest step executor
     /// while the scenario ran.
@@ -92,34 +92,30 @@ pub struct SidecarResult {
     /// sidecar variant-hash so flag-only variants don't clobber.
     pub active_flags: Vec<String>,
     /// Per-BPF-program verifier statistics captured from the VM's
-    /// scheduler (when one was loaded). Absent when no scheduler
-    /// programs were inspected; empty vec distinguishes "inspected,
-    /// none matched" from absence.
-    ///
-    /// `default` pairs with `skip_serializing_if` so a sidecar that
-    /// never collected verifier stats (empty vec → omitted from
-    /// JSON) round-trips cleanly. This is NOT a backward-compat shim
-    /// for missing fields in older sidecars.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// scheduler (when one was loaded). Empty when no scheduler
+    /// programs were inspected. Always emitted as `"verifier_stats":
+    /// []` in that case; required on deserialize.
     pub verifier_stats: Vec<crate::monitor::bpf_prog::ProgVerifierStats>,
     /// Aggregate per-vCPU KVM stats read after VM exit. `None` when
     /// the VM did not run (host-only tests) or KVM stats were
-    /// unavailable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// unavailable. Always emitted as `"kvm_stats": null` on absence;
+    /// required on deserialize.
     pub kvm_stats: Option<crate::vmm::KvmStatsTotals>,
     /// Effective sysctls active during this test run, recorded as raw
-    /// `sysctl.key=value` cmdline strings.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// `sysctl.key=value` cmdline strings. Always emitted as
+    /// `"sysctls": []` when none; required on deserialize.
     pub sysctls: Vec<String>,
     /// Effective kernel command-line args active during this test run.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always emitted as `"kargs": []` when none; required on
+    /// deserialize.
     pub kargs: Vec<String>,
     /// Kernel version of the VM under test (from cache metadata,
     /// e.g. `"6.14.2"`). Populated from the VM's `/proc/version` or
     /// the cache entry metadata; `None` for host-only tests or when
     /// the version could not be determined. The host's running
     /// kernel release is carried separately in `host.uname_release`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Always emitted (`"kernel_version": null` on absence); required
+    /// on deserialize.
     pub kernel_version: Option<String>,
     /// ISO 8601 timestamp of when this test run started.
     pub timestamp: String,
@@ -137,11 +133,14 @@ pub struct SidecarResult {
     ///
     /// No serde attributes: the field is always emitted
     /// (`"host": null` when `None`) and always required on
-    /// deserialize. Making both directions symmetric avoids the
-    /// `serialize-omits / deserialize-requires` asymmetry that a
-    /// `skip_serializing_if` without `default` would otherwise
-    /// create. The other `Option` fields on this struct still
-    /// carry `serde(default)` — unifying them is a follow-up.
+    /// deserialize. Every other `Option` and `Vec` field on this
+    /// struct follows the same pattern — `serde(default)` and
+    /// `skip_serializing_if` have been removed crate-wide so
+    /// serialize and deserialize are symmetric for all sidecar
+    /// fields. A missing field in a parsed sidecar is a hard error;
+    /// pre-1.0, sidecar data is disposable, so regenerate by
+    /// re-running the test rather than carrying a compat shim for
+    /// older JSON.
     pub host: Option<crate::host_context::HostContext>,
 }
 
@@ -855,9 +854,9 @@ mod tests {
     }
 
     /// `payload=None, metrics=empty` is the fixture's default so
-    /// tests that verify the serde `skip_serializing_if` contract
-    /// (e.g. [`sidecar_payload_and_metrics_omitted_when_empty`]) can
-    /// rely on these defaults rather than re-spelling them.
+    /// tests that verify the serde always-emit contract
+    /// (e.g. [`sidecar_payload_and_metrics_always_emit_when_empty`])
+    /// can rely on these defaults rather than re-spelling them.
     #[test]
     fn test_fixture_payload_and_metrics_empty() {
         let sc = SidecarResult::test_fixture();
@@ -867,10 +866,11 @@ mod tests {
 
     /// Summary guard on every empty-collection / None-Option /
     /// empty-String default. A silent flip of any of these defaults
-    /// breaks every test that depends on "unset → omitted from JSON"
-    /// via the `skip_serializing_if` attrs — and there are many such
-    /// tests across this file. One tripwire here catches the flip in
-    /// one place rather than fanning out to per-default pins.
+    /// breaks every test that depends on "unset → serialized as
+    /// null / []" via the symmetric always-emit contract — and
+    /// there are many such tests across this file. One tripwire
+    /// here catches the flip in one place rather than fanning out
+    /// to per-default pins.
     ///
     /// Hash-participating string defaults (`test_name`,
     /// `topology`, `scheduler`, `work_type`) are intentionally NOT
@@ -1173,8 +1173,16 @@ mod tests {
         assert!(!loaded.passed);
         assert!(loaded.monitor.is_none());
         assert!(loaded.stimulus_events.is_empty());
-        // monitor field should be absent from JSON when None
-        assert!(!json.contains("\"monitor\""));
+        // `monitor` is emitted as `"monitor":null` when absent — the
+        // sidecar schema is symmetric, with every `Option` field always
+        // present on the wire and required on deserialize. Pinning the
+        // emission pattern prevents a drift back to the old asymmetric
+        // `skip_serializing_if` form that failed deserialize on a None-
+        // produced sidecar.
+        assert!(
+            json.contains("\"monitor\":null"),
+            "monitor=None must serialize as `\"monitor\":null`, not be omitted: {json}",
+        );
     }
 
     // -- collect_sidecars tests --
@@ -1683,11 +1691,18 @@ mod tests {
         assert_eq!(loaded.verifier_stats[0].verified_insns, 5000);
     }
 
+    /// Every `Vec` field emits as `"x":[]` when empty rather than
+    /// being omitted. Pin the always-emit contract so a regression
+    /// that re-adds `skip_serializing_if` on `verifier_stats` is
+    /// caught before it ships.
     #[test]
-    fn sidecar_verifier_stats_empty_omitted() {
+    fn sidecar_verifier_stats_empty_emits_as_empty_array() {
         let sc = SidecarResult::test_fixture();
         let json = serde_json::to_string(&sc).unwrap();
-        assert!(!json.contains("verifier_stats"));
+        assert!(
+            json.contains("\"verifier_stats\":[]"),
+            "empty verifier_stats must emit as `\"verifier_stats\":[]`: {json}",
+        );
     }
 
     #[test]
@@ -1886,29 +1901,24 @@ mod tests {
 
     // -- sidecar payload + metrics fields --
 
-    /// Empty `payload` + `metrics` must round-trip omitted from
-    /// JSON: stats tooling for scheduler-only tests (the vast
-    /// majority) already parses sidecars without either field, and
-    /// emitting `"payload": null, "metrics": []` on every write
-    /// would bloat every sidecar in a large run.
-    ///
-    /// The `serde(default, skip_serializing_if = ...)` attrs are
-    /// the mechanism; this test pins the observable output so a
-    /// future change that drops `skip_serializing_if` is caught
-    /// before it ships.
+    /// Empty `payload` / `metrics` serialize as `"payload":null` /
+    /// `"metrics":[]` (always-emit symmetric with `host`) rather than
+    /// being omitted. Pin the wire shape so a regression that re-adds
+    /// `skip_serializing_if` on either field is caught before it
+    /// ships, and verify the None/empty round-trip remains correct
+    /// under the deserialize-requires contract.
     #[test]
-    fn sidecar_payload_and_metrics_omitted_when_empty() {
+    fn sidecar_payload_and_metrics_always_emit_when_empty() {
         let sc = SidecarResult::test_fixture();
         let json = serde_json::to_string(&sc).unwrap();
         assert!(
-            !json.contains("\"payload\""),
-            "empty payload must be skipped from JSON: {json}",
+            json.contains("\"payload\":null"),
+            "empty payload must emit as `\"payload\":null`: {json}",
         );
         assert!(
-            !json.contains("\"metrics\""),
-            "empty metrics must be skipped from JSON: {json}",
+            json.contains("\"metrics\":[]"),
+            "empty metrics must emit as `\"metrics\":[]`: {json}",
         );
-        // Round-trip still works: the default impls fill both fields.
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
         assert!(loaded.payload.is_none());
         assert!(loaded.metrics.is_empty());

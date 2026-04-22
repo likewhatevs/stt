@@ -310,15 +310,19 @@ pub struct ModelSpec {
 ///    [`DEFAULT_TOKENIZER`] URL continues to resolve.
 /// 2. **`sha256_hex`** — re-compute via
 ///    ```text
-///    curl -L <new_url> | sha256sum
+///    curl -fL <new_url> | sha256sum
 ///    ```
-///    and paste the 64-hex token. The module-level `const { assert!(...) }`
-///    compile-fails any pin that is not exactly 64 ASCII hex chars.
+///    and paste the 64-hex token. `-f` makes curl exit non-zero on
+///    HTTP 4xx/5xx so a 404/500 error-page body does not get hashed
+///    in place of the real artifact. The module-level
+///    `const { assert!(...) }` compile-fails any pin that is not
+///    exactly 64 ASCII hex chars.
 /// 3. **`size_bytes`** — set to the new artifact's on-disk byte count.
 ///    The value is surfaced in status output (so users can eyeball
 ///    cache entries) and is ballpark-gated by two compile-time
-///    assertions (`>100 MiB` and `<3 GiB`, see
-///    `default_model_size_is_in_expected_ballpark`); tighten those bounds if the new
+///    assertions (`>100 MiB` and `<3 GiB`, see the module-scope
+///    `const _: () = assert!(...)` ballpark checks on
+///    `DEFAULT_MODEL.size_bytes`); tighten those bounds if the new
 ///    pin falls outside that envelope.
 ///
 /// The **ballpark size** serves two orthogonal purposes: (a) catches
@@ -375,6 +379,35 @@ const _: () = assert!(
 const _: () = assert!(
     is_valid_sha256_hex(DEFAULT_TOKENIZER.sha256_hex),
     "DEFAULT_TOKENIZER.sha256_hex must be 64 ASCII hex characters",
+);
+
+// Ballpark size bounds on the pinned artifacts. The pinned Qwen3-4B
+// Q4_K_M GGUF is ~2.44 GiB; bound tight at 3 GiB so a silent swap to a
+// higher-bit quantization (Q5/Q6/Q8) of the same 4B-parameter base —
+// which would balloon the artifact past 3 GiB and multiply inference
+// latency — fails this check instead of slipping through. The lower
+// bound of 100 MiB rejects a wildly truncated or placeholder pin.
+// Tokenizer is ~11 MiB; 3-50 MiB brackets the realistic range for a
+// sentencepiece/BPE tokenizer JSON.
+//
+// Module scope (not inside `#[test]`) so a pin rotation that slips
+// past the ballpark fails `cargo check` without `--tests`, mirroring
+// the SHA-hex pin guards above.
+const _: () = assert!(
+    DEFAULT_MODEL.size_bytes > 100 * 1024 * 1024,
+    "DEFAULT_MODEL.size_bytes must exceed 100 MiB — pin truncation suspected",
+);
+const _: () = assert!(
+    DEFAULT_MODEL.size_bytes < 3 * 1024 * 1024 * 1024,
+    "DEFAULT_MODEL.size_bytes must stay under 3 GiB — higher-bit quant swap suspected",
+);
+const _: () = assert!(
+    DEFAULT_TOKENIZER.size_bytes > 3 * 1024 * 1024,
+    "DEFAULT_TOKENIZER.size_bytes must exceed 3 MiB — pin truncation suspected",
+);
+const _: () = assert!(
+    DEFAULT_TOKENIZER.size_bytes < 50 * 1024 * 1024,
+    "DEFAULT_TOKENIZER.size_bytes must stay under 50 MiB — unexpected artifact shape",
 );
 
 /// Environment variable that opts out of the eager prefetch.
@@ -1784,19 +1817,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn default_model_size_is_in_expected_ballpark() {
-        // The pinned Qwen3-4B Q4_K_M GGUF is ~2.44 GiB. The upper
-        // bound is tight at 3 GiB so a silent swap to a higher-bit
-        // quantization (Q5/Q6/Q8) of the same 4B-parameter base —
-        // which would balloon the artifact to 3-4+ GiB and multiply
-        // inference latency — fails this check instead of slipping
-        // through. A wildly different size signals someone swapped
-        // the pin for a mistaken artifact.
-        const { assert!(DEFAULT_MODEL.size_bytes > 100 * 1024 * 1024) };
-        const { assert!(DEFAULT_MODEL.size_bytes < 3 * 1024 * 1024 * 1024) };
-    }
-
     /// `bytes_from_statvfs_parts` uses `saturating_mul` so a
     /// pathological FUSE filesystem reporting enormous synthetic
     /// block + fragment counts lands at `u64::MAX` (treated as
@@ -2760,19 +2780,6 @@ mod tests {
             "DEFAULT_TOKENIZER.file_name must end with .json: {:?}",
             DEFAULT_TOKENIZER.file_name
         );
-    }
-
-    /// `DEFAULT_TOKENIZER.size_bytes` is ~11 MiB (the Qwen3-4B
-    /// tokenizer.json on HuggingFace). A silent swap to a completely
-    /// different artifact — a stale truncated file or the wrong
-    /// tokenizer family — would land well outside the 3-50 MiB
-    /// window. Keeps the sanity bounds loose enough to tolerate
-    /// legitimate variation between minor Qwen3 revisions while
-    /// catching obviously-wrong pins.
-    #[test]
-    fn default_tokenizer_size_is_in_expected_ballpark() {
-        const { assert!(DEFAULT_TOKENIZER.size_bytes > 3 * 1024 * 1024) };
-        const { assert!(DEFAULT_TOKENIZER.size_bytes < 50 * 1024 * 1024) };
     }
 
     /// Mirror [`default_tokenizer_sha_is_valid_shape`] for

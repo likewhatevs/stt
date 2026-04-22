@@ -571,7 +571,7 @@ impl CacheDir {
         // which accumulates across crashes and takes disk space.
         // `clean_orphaned_tmp_dirs` reads the cache root, inspects
         // each `.tmp-{key}-{pid}` name, and removes entries whose
-        // `{pid}` is no longer a live Linux pid. Errors are logged
+        // `{pid}` is no longer a live pid. Errors are logged
         // and swallowed — a failure to clean orphans must not block
         // a successful store.
         if let Err(e) = clean_orphaned_tmp_dirs(&self.root) {
