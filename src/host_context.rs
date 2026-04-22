@@ -573,12 +573,30 @@ fn read_sched_tunables() -> Option<BTreeMap<String, String>> {
 /// — returning zero would misrepresent the topology.
 fn count_numa_nodes_via_topology() -> Option<usize> {
     let topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok()?;
+    Some(count_numa_nodes_in_topology(&topo))
+}
+
+/// Pure-function seam split from [`count_numa_nodes_via_topology`]:
+/// given a [`HostTopology`](crate::vmm::host_topology::HostTopology),
+/// return the number of distinct NUMA nodes it claims. An empty
+/// `cpu_to_node` map maps to `1` because every Linux system has at
+/// least one NUMA node — returning zero would misrepresent the
+/// topology. Sparse / non-contiguous node IDs are counted correctly
+/// because `BTreeSet::from_iter` deduplicates on insert.
+///
+/// Keeping the I/O (sysfs probe) separate from the pure counting
+/// logic lets unit tests exercise the UMA-fallback branch and the
+/// dedup path without standing up a real /sys layout. Also acts as
+/// a partial injection seam for #22.
+pub(crate) fn count_numa_nodes_in_topology(
+    topo: &crate::vmm::host_topology::HostTopology,
+) -> usize {
     if topo.cpu_to_node.is_empty() {
-        return Some(1);
+        return 1;
     }
     let nodes: std::collections::BTreeSet<usize> =
         topo.cpu_to_node.values().copied().collect();
-    Some(nodes.len())
+    nodes.len()
 }
 
 #[cfg(test)]
@@ -1252,6 +1270,150 @@ Hugepagesize:       2048 kB
         assert!(
             out.contains("sched_tunables.sched_b: 2 → (absent)"),
             "removed sched_b must surface as <value> → (absent): {out}",
+        );
+    }
+
+    // ------------------------------------------------------------
+    // read_trimmed_sysfs — IO-wrapper edge cases. `parse_trimmed`
+    // is tested separately; these tests exercise the `read_to_string
+    // + parse_trimmed` chain end-to-end against real files via
+    // `tempfile::NamedTempFile`.
+    // ------------------------------------------------------------
+
+    /// Nonexistent path → `None`. `read_to_string` returns `ENOENT`;
+    /// `.ok()` converts to `None`; the `and_then` short-circuits.
+    /// Guards against a regression that re-introduces `unwrap()`
+    /// on the read result.
+    ///
+    /// The "nonexistent" path is constructed under a fresh
+    /// `TempDir` (unique per invocation, auto-cleaned on drop)
+    /// rather than a fixed name under `std::env::temp_dir()` —
+    /// the latter would race with a concurrent run of the same
+    /// test from a parallel test runner or cargo-watch session.
+    #[test]
+    fn read_trimmed_sysfs_missing_file_returns_none() {
+        let scratch = tempfile::TempDir::new().expect("create scratch temp dir");
+        let missing = scratch.path().join("nonexistent-target");
+        assert!(read_trimmed_sysfs(&missing).is_none());
+    }
+
+    /// Whitespace-only file → `None`. `str::trim` leaves the empty
+    /// string; `parse_trimmed` catches that and returns `None`.
+    /// A kernel sysfs file that transiently reads as just `"\n"`
+    /// must map to `None` rather than `Some("")`.
+    #[test]
+    fn read_trimmed_sysfs_whitespace_only_returns_none() {
+        let mut f = tempfile::NamedTempFile::new().expect("create tempfile");
+        std::io::Write::write_all(&mut f, b"  \n\t \r\n  ").expect("write whitespace");
+        assert!(read_trimmed_sysfs(f.path()).is_none());
+    }
+
+    /// Populated file → `Some(trimmed)`. Exercises the full IO +
+    /// trim chain against a realistic sysfs shape (`value\n`).
+    #[test]
+    fn read_trimmed_sysfs_populated_file_returns_trimmed_content() {
+        let mut f = tempfile::NamedTempFile::new().expect("create tempfile");
+        std::io::Write::write_all(&mut f, b"madvise\n").expect("write content");
+        assert_eq!(read_trimmed_sysfs(f.path()).as_deref(), Some("madvise"));
+    }
+
+    /// Bracketed-selection THP shape round-trips through the IO
+    /// wrapper. `parse_trimmed_preserves_bracketed_thp` already pins
+    /// the pure trim-preservation; this test walks the whole IO +
+    /// trim chain so a regression that double-trims or parses the
+    /// brackets is caught at the wrapper boundary.
+    #[test]
+    fn read_trimmed_sysfs_preserves_thp_bracket_selection() {
+        let mut f = tempfile::NamedTempFile::new().expect("create tempfile");
+        std::io::Write::write_all(&mut f, b"always [madvise] never\n").expect("write");
+        assert_eq!(
+            read_trimmed_sysfs(f.path()).as_deref(),
+            Some("always [madvise] never"),
+        );
+    }
+
+    // ------------------------------------------------------------
+    // count_numa_nodes_in_topology — UMA fallback + sparse / dense
+    // dedup paths. Pure logic; the IO-reading wrapper
+    // `count_numa_nodes_via_topology` is left untested here (that
+    // was the tradeoff in the seam extraction — the IO path just
+    // delegates to this helper after a sysfs probe).
+    // ------------------------------------------------------------
+
+    /// Empty `cpu_to_node` map → `1`. This is the UMA fallback
+    /// branch: every Linux system has at least one NUMA node, so
+    /// returning zero would misrepresent the topology. Guarded
+    /// against a refactor that removes the `is_empty` check and
+    /// lets `BTreeSet::len()` return 0.
+    #[test]
+    fn count_numa_nodes_in_topology_empty_returns_one() {
+        let topo = crate::vmm::host_topology::HostTopology {
+            llc_groups: Vec::new(),
+            online_cpus: Vec::new(),
+            cpu_to_node: std::collections::HashMap::new(),
+        };
+        assert_eq!(count_numa_nodes_in_topology(&topo), 1);
+    }
+
+    /// Single-node: every CPU maps to node 0. Dedup produces a
+    /// set with one entry. Pinned separately from the empty-map
+    /// case because the code path is different — `is_empty` is
+    /// false here, so the `BTreeSet` branch runs and must still
+    /// return 1.
+    #[test]
+    fn count_numa_nodes_in_topology_single_node() {
+        let mut cpu_to_node = std::collections::HashMap::new();
+        for cpu in 0..8 {
+            cpu_to_node.insert(cpu, 0);
+        }
+        let topo = crate::vmm::host_topology::HostTopology {
+            llc_groups: Vec::new(),
+            online_cpus: (0..8).collect(),
+            cpu_to_node,
+        };
+        assert_eq!(count_numa_nodes_in_topology(&topo), 1);
+    }
+
+    /// Two-node split (CPUs 0-3 → node 0, CPUs 4-7 → node 1).
+    /// The common post-fix case a sidecar host-context snapshot
+    /// needs to report correctly.
+    #[test]
+    fn count_numa_nodes_in_topology_two_nodes() {
+        let mut cpu_to_node = std::collections::HashMap::new();
+        for cpu in 0..4 {
+            cpu_to_node.insert(cpu, 0);
+        }
+        for cpu in 4..8 {
+            cpu_to_node.insert(cpu, 1);
+        }
+        let topo = crate::vmm::host_topology::HostTopology {
+            llc_groups: Vec::new(),
+            online_cpus: (0..8).collect(),
+            cpu_to_node,
+        };
+        assert_eq!(count_numa_nodes_in_topology(&topo), 2);
+    }
+
+    /// Sparse node IDs — `{0, 2, 5}` with non-contiguous numbering
+    /// (e.g. a CXL-host topology where some nodes are memory-only).
+    /// `BTreeSet::from_iter` dedups on insert, so the count is the
+    /// number of distinct IDs, NOT `max_id + 1`.
+    #[test]
+    fn count_numa_nodes_in_topology_sparse_ids() {
+        let mut cpu_to_node = std::collections::HashMap::new();
+        cpu_to_node.insert(0, 0);
+        cpu_to_node.insert(1, 2);
+        cpu_to_node.insert(2, 5);
+        cpu_to_node.insert(3, 0); // duplicate of cpu 0's node
+        let topo = crate::vmm::host_topology::HostTopology {
+            llc_groups: Vec::new(),
+            online_cpus: vec![0, 1, 2, 3],
+            cpu_to_node,
+        };
+        assert_eq!(
+            count_numa_nodes_in_topology(&topo),
+            3,
+            "sparse IDs {{0, 2, 5}} must count as 3, not max_id+1",
         );
     }
 
