@@ -85,6 +85,26 @@ pub struct DiffRow {
     pub delta: i64,
 }
 
+/// Parse `raw` as `u64`, warning with `field` context on failure.
+/// Returns 0 on parse error. Centralizes the
+/// warn-and-default-to-zero path for the three count words
+/// (`processed_insns`, `total_states`, `peak_states`) so their
+/// error handling stays in lock-step.
+fn parse_or_warn(raw: &str, field: &str) -> u64 {
+    match raw.parse() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                field,
+                word = raw,
+                err = %e,
+                "malformed BPF verifier count; leaving 0",
+            );
+            0
+        }
+    }
+}
+
 /// Parse verifier stats from the log output.
 ///
 /// The kernel always emits a "processed N insns ..." line. When
@@ -108,39 +128,18 @@ pub fn parse_verifier_stats(log: &str) -> VerifierStats {
             found_insns = true;
             let words: Vec<&str> = line.split_whitespace().collect();
             if words.len() >= 2 {
-                match words[1].parse() {
-                    Ok(n) => stats.processed_insns = n,
-                    Err(e) => tracing::warn!(
-                        word = words[1],
-                        err = %e,
-                        "malformed BPF verifier 'processed insns' count; leaving 0",
-                    ),
-                }
+                stats.processed_insns = parse_or_warn(words[1], "processed_insns");
             }
             for (i, &w) in words.iter().enumerate() {
                 if w == "total_states"
                     && let Some(v) = words.get(i + 1)
                 {
-                    match v.parse() {
-                        Ok(n) => stats.total_states = n,
-                        Err(e) => tracing::warn!(
-                            word = %v,
-                            err = %e,
-                            "malformed BPF verifier 'total_states' count; leaving 0",
-                        ),
-                    }
+                    stats.total_states = parse_or_warn(v, "total_states");
                 }
                 if w == "peak_states"
                     && let Some(v) = words.get(i + 1)
                 {
-                    match v.parse() {
-                        Ok(n) => stats.peak_states = n,
-                        Err(e) => tracing::warn!(
-                            word = %v,
-                            err = %e,
-                            "malformed BPF verifier 'peak_states' count; leaving 0",
-                        ),
-                    }
+                    stats.peak_states = parse_or_warn(v, "peak_states");
                 }
             }
         }

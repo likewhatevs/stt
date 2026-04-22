@@ -333,7 +333,29 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         worst_run_delay_us: sc.stats.worst_run_delay_us,
         page_locality: sc.stats.worst_page_locality,
         cross_node_migration_ratio: sc.stats.worst_cross_node_migration_ratio,
-        ext_metrics: sc.stats.ext_metrics.clone(),
+        // Non-finite values (NaN, +/-Infinity) cause `serde_json::to_string`
+        // on the enclosing GauntletRow to fail, halting any downstream
+        // serializer or comparison tool that needs the row as JSON.
+        // Drop non-finite entries with a warn so the row still serializes
+        // and the operator can see which metric produced the bad value.
+        ext_metrics: sc
+            .stats
+            .ext_metrics
+            .iter()
+            .filter_map(|(k, &v)| {
+                if v.is_finite() {
+                    Some((k.clone(), v))
+                } else {
+                    tracing::warn!(
+                        test = %sc.test_name,
+                        metric = %k,
+                        value = v,
+                        "dropping non-finite ext_metric; serde_json rejects NaN/Infinity",
+                    );
+                    None
+                }
+            })
+            .collect(),
     }
 }
 
@@ -1336,6 +1358,46 @@ mod tests {
         assert_eq!(row.keep_last_count, 0);
     }
 
+    /// `sidecar_to_row` must drop NaN / +Infinity / -Infinity from
+    /// `ext_metrics` because `serde_json::to_string` rejects non-finite
+    /// f64 values — without this guard a single malformed scenario
+    /// metric would poison every sidecar write on its batch. Finite
+    /// entries must pass through unchanged. Also checks that the
+    /// post-filter row serializes cleanly (the motivation for the
+    /// filter).
+    #[test]
+    fn sidecar_to_row_drops_non_finite_ext_metrics() {
+        use crate::assert::ScenarioStats;
+        use crate::test_support;
+        let mut ext = BTreeMap::new();
+        ext.insert("good".to_string(), 1.0);
+        ext.insert("nan".to_string(), f64::NAN);
+        ext.insert("inf".to_string(), f64::INFINITY);
+        ext.insert("neg_inf".to_string(), f64::NEG_INFINITY);
+        let sc = test_support::SidecarResult {
+            stats: ScenarioStats {
+                ext_metrics: ext,
+                ..Default::default()
+            },
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row = sidecar_to_row(&sc);
+        assert_eq!(
+            row.ext_metrics.len(),
+            1,
+            "only the finite entry should survive: {:?}",
+            row.ext_metrics
+        );
+        assert_eq!(row.ext_metrics.get("good"), Some(&1.0));
+        assert!(!row.ext_metrics.contains_key("nan"));
+        assert!(!row.ext_metrics.contains_key("inf"));
+        assert!(!row.ext_metrics.contains_key("neg_inf"));
+        // Motivation check: the post-filter row serializes. Without the
+        // filter, serde_json::to_string would return Err because NaN /
+        // Infinity have no JSON representation.
+        serde_json::to_string(&row).expect("filtered row must serialize cleanly");
+    }
+
     // -- metric_def tests --
 
     #[test]
@@ -2004,10 +2066,10 @@ mod tests {
     // its contents verbatim.
 
     /// Empty collections are elided on serialize. Regression guard for
-    /// the `skip_serializing_if` pair — dropping either arm would make
-    /// the writer emit `"flags":[]` / `"ext_metrics":{}` and break the
-    /// symmetric contract the `default` half relies on (writer omits,
-    /// reader defaults).
+    /// the `skip_serializing_if` half — dropping it would make the
+    /// writer emit `"flags":[]` / `"ext_metrics":{}` noise on every
+    /// row (the `default` half is guarded by the sibling round-trip
+    /// test).
     #[test]
     fn gauntlet_row_empty_collections_omit_keys() {
         let row = make_row("scn", "topo", true, 0.0);

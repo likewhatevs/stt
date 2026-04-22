@@ -290,16 +290,48 @@ impl CgroupManager {
     }
 
     /// Remove all child cgroups under the parent (keeps the parent itself).
+    ///
+    /// Returns `Ok` even when individual filesystem probes fail; callers
+    /// treat cleanup as best-effort teardown (see the runner's warn-
+    /// and-continue in `src/runner.rs`). Per-entry `read_dir` /
+    /// `DirEntry` / `file_type` errors are surfaced via
+    /// `tracing::warn!` — mirrors `CgroupGroup::drop` so a failure
+    /// shows up in logs instead of silently leaving children behind.
     pub fn cleanup_all(&self) -> Result<()> {
         if !self.parent.exists() {
             return Ok(());
         }
-        // Remove all child cgroups but keep the parent
-        if let Ok(entries) = fs::read_dir(&self.parent) {
-            for e in entries.flatten() {
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    cleanup_recursive(&e.path());
+        let entries = match fs::read_dir(&self.parent) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!(
+                    parent = %self.parent.display(),
+                    err = %err,
+                    "cleanup_all: read_dir failed; child cgroups may remain under parent",
+                );
+                return Ok(());
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::warn!(
+                        parent = %self.parent.display(),
+                        err = %err,
+                        "cleanup_all: dir entry read failed; skipping",
+                    );
+                    continue;
                 }
+            };
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => cleanup_recursive(&entry.path()),
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    path = %entry.path().display(),
+                    err = %err,
+                    "cleanup_all: file_type read failed; skipping entry",
+                ),
             }
         }
         Ok(())
@@ -414,16 +446,46 @@ fn drain_pids_to_root(procs_path: &Path, context: &str) {
 
 fn cleanup_recursive(path: &std::path::Path) {
     // Depth-first: clean children before parent
-    if let Ok(entries) = fs::read_dir(path) {
-        for e in entries.flatten() {
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                cleanup_recursive(&e.path());
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            err = %err,
+                            "cleanup_recursive: dir entry read failed; skipping",
+                        );
+                        continue;
+                    }
+                };
+                match entry.file_type() {
+                    Ok(t) if t.is_dir() => cleanup_recursive(&entry.path()),
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(
+                        path = %entry.path().display(),
+                        err = %err,
+                        "cleanup_recursive: file_type read failed; skipping entry",
+                    ),
+                }
             }
         }
+        Err(err) => tracing::warn!(
+            path = %path.display(),
+            err = %err,
+            "cleanup_recursive: read_dir failed; child cgroups may remain",
+        ),
     }
     drain_pids_to_root(&path.join("cgroup.procs"), &path.display().to_string());
     std::thread::sleep(std::time::Duration::from_millis(10));
-    let _ = fs::remove_dir(path);
+    if let Err(err) = fs::remove_dir(path) {
+        tracing::warn!(
+            path = %path.display(),
+            err = %err,
+            "cleanup_recursive: remove_dir failed; cgroup directory may remain",
+        );
+    }
 }
 
 #[cfg(test)]
