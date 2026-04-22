@@ -914,6 +914,15 @@ mod tests {
             default_checks: &[],
             metrics: &[],
         };
+        // stress-ng emits progress / metrics / summaries to stderr; stdout
+        // is blank. `OutputFormat::Json` yields zero metrics — stdout has
+        // nothing JSON-shaped to parse, and the stderr fallback sees prose
+        // rather than JSON so the extraction pipeline returns empty.
+        // `OutputFormat::LlmExtract` MAY extract numbers from the stderr
+        // fallback, but results depend on the local model's tolerance for
+        // stress-ng's prose format — unstable without a stderr→stdout
+        // redirect wired into `default_args`. Keep `ExitCode` unless you
+        // are prepared for that tradeoff.
         const STRESS_NG: Payload = Payload {
             name: "stress-ng",
             kind: PayloadKind::Binary("stress-ng"),
@@ -985,6 +994,15 @@ mod tests {
             default_checks: &[],
             metrics: &[],
         };
+        // stress-ng emits progress / metrics / summaries to stderr; stdout
+        // is blank. `OutputFormat::Json` yields zero metrics — stdout has
+        // nothing JSON-shaped to parse, and the stderr fallback sees prose
+        // rather than JSON so the extraction pipeline returns empty.
+        // `OutputFormat::LlmExtract` MAY extract numbers from the stderr
+        // fallback, but results depend on the local model's tolerance for
+        // stress-ng's prose format — unstable without a stderr→stdout
+        // redirect wired into `default_args`. Keep `ExitCode` unless you
+        // are prepared for that tradeoff.
         const STRESS_NG: Payload = Payload {
             name: "stress-ng",
             kind: PayloadKind::Binary("stress-ng"),

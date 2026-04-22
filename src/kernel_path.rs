@@ -130,7 +130,7 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
     // 2-3. Local build trees.
     for rel in &["./linux", "../linux"] {
         let p = std::path::PathBuf::from(rel);
-        if p.is_dir() && _has_kernel_artifacts(&p) {
+        if p.is_dir() && has_kernel_artifacts(&p) {
             return Some(p);
         }
     }
@@ -333,8 +333,7 @@ pub fn resolve_btf(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
 ///
 /// Checks both build tree layout (arch subdirectories) and cache
 /// entry layout (boot image at directory root).
-#[allow(dead_code)]
-fn _has_kernel_artifacts(dir: &std::path::Path) -> bool {
+fn has_kernel_artifacts(dir: &std::path::Path) -> bool {
     if dir.join("vmlinux").exists() {
         return true;
     }
@@ -438,13 +437,13 @@ mod tests {
         assert_ne!(result, Some(PathBuf::from("")));
     }
 
-    // -- _has_kernel_artifacts --
+    // -- has_kernel_artifacts --
 
     #[test]
     fn kernel_path_has_artifacts_vmlinux() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("vmlinux"), b"fake").unwrap();
-        assert!(_has_kernel_artifacts(tmp.path()));
+        assert!(has_kernel_artifacts(tmp.path()));
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -454,13 +453,13 @@ mod tests {
         let boot = tmp.path().join("arch/x86/boot");
         std::fs::create_dir_all(&boot).unwrap();
         std::fs::write(boot.join("bzImage"), b"fake").unwrap();
-        assert!(_has_kernel_artifacts(tmp.path()));
+        assert!(has_kernel_artifacts(tmp.path()));
     }
 
     #[test]
     fn kernel_path_has_artifacts_empty_dir() {
         let tmp = TempDir::new().unwrap();
-        assert!(!_has_kernel_artifacts(tmp.path()));
+        assert!(!has_kernel_artifacts(tmp.path()));
     }
 
     // -- find_image_in_dir --
@@ -511,7 +510,7 @@ mod tests {
         // Cache entry layout: bzImage at directory root.
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("bzImage"), b"fake").unwrap();
-        assert!(_has_kernel_artifacts(tmp.path()));
+        assert!(has_kernel_artifacts(tmp.path()));
     }
 
     // -- derive_kernel_dir --
