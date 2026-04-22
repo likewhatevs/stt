@@ -103,6 +103,22 @@ pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
 /// Current header version.
 pub const SHM_RING_VERSION: u32 = 1;
 
+/// Upper bound on a valid ring capacity, in bytes.
+///
+/// `ShmRingHeader.capacity` is `u32` so a torn init or a guest writing
+/// a wild value (e.g. `0xFFFF_FFFF`) can produce a capacity that
+/// vastly exceeds the actual mapped SHM region. Using such a value
+/// would make the drain path read beyond the mapped window (live: via
+/// `mem.read_volatile` past the end of the region; snapshot: via
+/// slice indexing into `buf` past `HEADER_SIZE + actual_capacity`),
+/// aborting the host under `panic = "abort"`.
+///
+/// Chosen at 1 GiB — orders of magnitude above any realistic
+/// `KTSTR_SHM_SIZE` (tens of KiB to a few MiB for metric / TLV
+/// traffic) while leaving `u32::MAX` / the corrupt-pattern region
+/// strictly rejected.
+pub const MAX_SHM_CAPACITY: u32 = 1 << 30;
+
 /// Byte offset within the SHM region for the host-to-guest dump request flag.
 /// Occupies the first byte of the `control_bytes` field in ShmRingHeader (offset 12).
 /// Host writes `DUMP_REQ_SYSRQ_D` to request a SysRq-D dump; guest polls
@@ -556,6 +572,16 @@ pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
         return ShmDrainResult::default();
     }
 
+    // Guest-supplied `capacity` must be a plausible ring size. Zero
+    // would divide-by-zero inside `read_ring_into`'s `ptr % capacity`;
+    // values above `MAX_SHM_CAPACITY` indicate torn init or
+    // corruption and would indexing-panic on `buf` once the walk
+    // advances past the real region. Either case: treat as
+    // uninitialized and bail out cleanly.
+    if header.capacity == 0 || header.capacity > MAX_SHM_CAPACITY {
+        return ShmDrainResult::default();
+    }
+
     let capacity = header.capacity as usize;
     let data_start = shm_offset + HEADER_SIZE;
     let mut read_pos = header.read_ptr;
@@ -614,18 +640,20 @@ pub fn shm_drain_live(mem: &crate::monitor::reader::GuestMem, shm_base_pa: u64) 
         return ShmDrainResult::default();
     }
 
-    let capacity = mem.read_u32(shm_base_pa, 8) as usize;
+    let capacity_raw = mem.read_u32(shm_base_pa, 8);
     // `capacity` is guest-supplied and not covered by the magic gate
     // above — a torn init (guest writes magic before capacity) or
     // corruption can leave capacity at zero while magic reads valid.
     // `read_ring_volatile` would then compute `ptr % capacity as u64`
     // and divide by zero, panicking the monitor thread and — under
-    // `panic = "abort"` — aborting the entire host. Treat as
-    // uninitialized: return an empty drain and let the next tick
-    // re-read the header.
-    if capacity == 0 {
+    // `panic = "abort"` — aborting the entire host. A wild value like
+    // `0xFFFF_FFFF` is just as damaging: `read_ring_volatile` would
+    // then read_volatile past the end of the mapped SHM region. Reject
+    // both ends: treat as uninitialized and let the next tick re-read.
+    if capacity_raw == 0 || capacity_raw > MAX_SHM_CAPACITY {
         return ShmDrainResult::default();
     }
+    let capacity = capacity_raw as usize;
     let write_ptr = mem.read_u64(shm_base_pa, 16);
     let read_ptr = mem.read_u64(shm_base_pa, 24);
     let drops = mem.read_u64(shm_base_pa, 32);
@@ -908,6 +936,60 @@ mod tests {
             result > 0,
             "post-wraparound write should succeed, got {result}"
         );
+    }
+
+    /// A torn-init or corrupt guest can leave `capacity = 0` with a
+    /// valid magic. Drain must not divide-by-zero under `ptr %
+    /// capacity` inside the ring walk; return an empty drain instead.
+    #[test]
+    fn drain_rejects_zero_capacity() {
+        let mut buf = make_ring(1024);
+        // Overwrite capacity (u32 at offset 8) with 0.
+        buf[8..12].copy_from_slice(&0u32.to_ne_bytes());
+        // Set a non-zero write_ptr so the walk would otherwise start.
+        buf[16..24].copy_from_slice(&64u64.to_ne_bytes());
+
+        let result = shm_drain(&buf, 0);
+        assert!(
+            result.entries.is_empty(),
+            "capacity=0 must bail out, got {} entries",
+            result.entries.len(),
+        );
+    }
+
+    /// A wild `capacity` (e.g. `0xFFFF_FFFF` from torn init) must be
+    /// rejected, not trusted. Trusting it would index past the end of
+    /// `buf` in `read_ring_into` once the walk advances, panicking the
+    /// host.
+    #[test]
+    fn drain_rejects_oversized_capacity() {
+        let mut buf = make_ring(1024);
+        buf[8..12].copy_from_slice(&u32::MAX.to_ne_bytes());
+        buf[16..24].copy_from_slice(&64u64.to_ne_bytes());
+
+        let result = shm_drain(&buf, 0);
+        assert!(
+            result.entries.is_empty(),
+            "capacity>MAX_SHM_CAPACITY must bail out, got {} entries",
+            result.entries.len(),
+        );
+    }
+
+    /// Boundary: a capacity exactly equal to `MAX_SHM_CAPACITY + 1`
+    /// must be rejected, while the allocation-realistic small cases
+    /// already covered by the other tests continue to work.
+    #[test]
+    fn drain_rejects_capacity_one_past_max() {
+        let mut buf = make_ring(1024);
+        let over = (MAX_SHM_CAPACITY as u64) + 1;
+        // `as u32` truncates but MAX_SHM_CAPACITY+1 < u32::MAX so it
+        // is representable directly.
+        let over_u32 = over as u32;
+        buf[8..12].copy_from_slice(&over_u32.to_ne_bytes());
+        buf[16..24].copy_from_slice(&64u64.to_ne_bytes());
+
+        let result = shm_drain(&buf, 0);
+        assert!(result.entries.is_empty());
     }
 
     #[test]

@@ -58,6 +58,44 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
+/// Panic-hook callable type. Matches the signature accepted by
+/// [`std::panic::set_hook`] and returned by [`std::panic::take_hook`].
+type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static;
+
+/// Build the chained panic hook: flip per-thread kill/exited flags (if
+/// this thread registered a [`VcpuPanicCtx`]) and then delegate to
+/// `prev`. Factored out of [`install_once`] so tests can install a
+/// custom `prev` and observe that the chain is not silently dropped.
+fn make_hook(prev: Box<PanicHook>) -> Box<PanicHook> {
+    Box::new(move |info| {
+        VCPU_PANIC_CTX.with(|slot| {
+            if let Some(ctx) = slot.borrow().as_ref() {
+                ctx.kill.store(true, Ordering::Release);
+                ctx.exited.store(true, Ordering::Release);
+            }
+        });
+        prev(info);
+    })
+}
+
+/// Count of times the `HOOK_ONCE` body executed. The `Once` contract
+/// guarantees this reaches 1 and stays there regardless of how many
+/// callers invoke [`install_once`], giving tests a stronger assertion
+/// than "no panic / no deadlock" for install idempotency.
+#[cfg(test)]
+static INSTALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Serialize tests that install a custom panic hook via
+/// [`install_hook_with_prev_for_test`]. The hook is process-wide, so
+/// concurrent manipulation would race. Tests that only rely on the
+/// standard `install_once` hook do NOT need this lock — they observe
+/// a stable hook via `Once`.
+#[cfg(test)]
+static HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 thread_local! {
     /// Per-thread context consulted by the panic hook. `Some` only
     /// for threads that passed through [`with_vcpu_panic_ctx`].
@@ -87,19 +125,32 @@ static HOOK_ONCE: Once = Once::new();
 /// Install the vCPU panic hook if it has not already been installed.
 /// Idempotent — safe to call from every `spawn_ap_threads`
 /// invocation; `Once` gates the actual registration.
+///
+/// Install convention: callers MUST ensure no other panic hook is
+/// installed process-wide AFTER this call. Any later
+/// [`std::panic::set_hook`] replaces ours as the active hook; the
+/// replacement sees ours as its `prev`, but for vCPU-thread panics our
+/// hook is no longer invoked first, so the classified-shutdown
+/// signaling documented on [`VcpuPanicCtx`] is bypassed. Embedders
+/// with their own panic hook must install it BEFORE `install_once` so
+/// our hook sits on top of theirs in the chain.
 pub(crate) fn install_once() {
     HOOK_ONCE.call_once(|| {
+        #[cfg(test)]
+        INSTALL_COUNT.fetch_add(1, Ordering::Relaxed);
         let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            VCPU_PANIC_CTX.with(|slot| {
-                if let Some(ctx) = slot.borrow().as_ref() {
-                    ctx.kill.store(true, Ordering::Release);
-                    ctx.exited.store(true, Ordering::Release);
-                }
-            });
-            prev(info);
-        }));
+        std::panic::set_hook(make_hook(prev));
     });
+}
+
+/// Install a custom `prev` hook wrapped by [`make_hook`] directly,
+/// bypassing [`HOOK_ONCE`]. Test-only helper for verifying the
+/// prev-hook chain fires on a panic that enters the vCPU hook.
+/// Callers must hold [`HOOK_TEST_LOCK`] and restore the previous hook
+/// via [`std::panic::set_hook`] before releasing the lock.
+#[cfg(test)]
+fn install_hook_with_prev_for_test(prev: Box<PanicHook>) {
+    std::panic::set_hook(make_hook(prev));
 }
 
 /// Register `ctx` for the current thread, run `body`, then clear the
@@ -207,6 +258,78 @@ mod tests {
         .unwrap();
         assert!(kill_r, "kill must be flipped by the panic hook");
         assert!(exited_r, "exited must be flipped by the panic hook");
+    }
+
+    /// Stronger idempotency check: [`HOOK_ONCE`]'s body must run at
+    /// most once regardless of how many [`install_once`] calls land,
+    /// including across concurrent tests. Asserts the underlying
+    /// [`INSTALL_COUNT`] counter is 1 after repeated calls — the
+    /// original `install_once_is_idempotent` only proved absence of
+    /// panic/deadlock, which does not distinguish "body ran once"
+    /// from "body ran every call".
+    #[test]
+    fn install_once_body_runs_exactly_once() {
+        install_once();
+        let after_first = INSTALL_COUNT.load(Ordering::Relaxed);
+        for _ in 0..20 {
+            install_once();
+        }
+        let after_many = INSTALL_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after_many, after_first,
+            "HOOK_ONCE body ran more than once under repeated install_once calls",
+        );
+        assert!(
+            after_many >= 1,
+            "INSTALL_COUNT must reach 1 after install_once",
+        );
+    }
+
+    /// A panic inside a registered context must still chain to the
+    /// previously-installed panic hook. Guards against a regression
+    /// where the tail `prev(info)` call is removed or skipped — the
+    /// classified-shutdown signaling is harmless on its own, but the
+    /// user-facing panic message / backtrace only reach stderr via
+    /// the preserved prev chain.
+    #[test]
+    fn panic_inside_ctx_still_runs_prev_hook() {
+        let _guard = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::panic::take_hook();
+
+        let prev_ran = Arc::new(AtomicBool::new(false));
+        let prev_ran_c = prev_ran.clone();
+        install_hook_with_prev_for_test(Box::new(move |_info| {
+            prev_ran_c.store(true, Ordering::Release);
+        }));
+
+        let kill = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let ctx = VcpuPanicCtx {
+            kill: kill.clone(),
+            exited: exited.clone(),
+        };
+        std::thread::spawn(move || {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                with_vcpu_panic_ctx(ctx, || panic!("test: prev-hook chain"));
+            }));
+        })
+        .join()
+        .unwrap();
+
+        std::panic::set_hook(saved);
+
+        assert!(
+            prev_ran.load(Ordering::Acquire),
+            "prev hook must run after our hook in the chain",
+        );
+        assert!(
+            kill.load(Ordering::Acquire),
+            "our hook must flip kill before delegating to prev",
+        );
+        assert!(
+            exited.load(Ordering::Acquire),
+            "our hook must flip exited before delegating to prev",
+        );
     }
 
     /// A panic on a thread that never registered a context must NOT
