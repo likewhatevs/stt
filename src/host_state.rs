@@ -178,14 +178,24 @@ fn compute_static_host_info() -> StaticHostInfo {
     }
 }
 
-/// Parse the first processor's `vendor_id` and `model name` lines
-/// from `/proc/cpuinfo`. Returning after the first blank line
-/// (processor boundary) keeps the scan O(one processor) on big
-/// machines where `/proc/cpuinfo` can span many MiB.
+/// Read `/proc/cpuinfo` and extract the first processor's
+/// `vendor_id` and `model name` lines. Thin I/O wrapper; the
+/// parsing logic lives in [`parse_cpuinfo_identity`] so it can
+/// be unit-tested with synthetic fixtures.
 fn read_cpuinfo_identity() -> (Option<String>, Option<String>) {
     let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") else {
         return (None, None);
     };
+    parse_cpuinfo_identity(&text)
+}
+
+/// Pure parser split from `read_cpuinfo_identity` for unit
+/// testability. Parses the first processor's `vendor_id` and
+/// `model name` lines from `/proc/cpuinfo` content. Returning
+/// after the first blank line (processor boundary) keeps the
+/// scan O(one processor) on big machines where `/proc/cpuinfo`
+/// can span many MiB.
+fn parse_cpuinfo_identity(text: &str) -> (Option<String>, Option<String>) {
     let mut model: Option<String> = None;
     let mut vendor: Option<String> = None;
     for line in text.lines() {
@@ -222,15 +232,25 @@ struct MeminfoFields {
     hugepagesize_kb: Option<u64>,
 }
 
-/// Return the four `/proc/meminfo` fields the host context needs.
-/// Lines without a numeric first token are silently skipped so a
-/// kernel that introduces a new non-numeric line (e.g. a future
-/// flags field) does not poison the struct.
+/// Read `/proc/meminfo` and extract the four fields the host
+/// context needs. Thin I/O wrapper; parsing lives in
+/// [`parse_meminfo`] so it can be unit-tested with synthetic
+/// fixtures.
 fn read_meminfo() -> MeminfoFields {
-    let mut out = MeminfoFields::default();
     let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
-        return out;
+        return MeminfoFields::default();
     };
+    parse_meminfo(&text)
+}
+
+/// Pure parser split from `read_meminfo` for unit testability.
+/// Parses the four `/proc/meminfo` fields the host context needs
+/// from already-read content. Lines without a numeric first token
+/// are silently skipped so a kernel that introduces a new
+/// non-numeric line (e.g. a future flags field) does not poison
+/// the struct.
+fn parse_meminfo(text: &str) -> MeminfoFields {
+    let mut out = MeminfoFields::default();
     for line in text.lines() {
         let Some((key, rest)) = line.split_once(':') else {
             continue;
@@ -251,17 +271,31 @@ fn read_meminfo() -> MeminfoFields {
     out
 }
 
-/// Read a sysfs leaf (or `/proc` pseudofile), trimming leading and
-/// trailing whitespace. Returns `None` on any read error (ENOENT,
-/// EACCES, EIO) so the caller records the field as absent without
-/// treating it as a fatal context-collection failure. Empty files after
-/// trim map to `None` too — an empty cmdline or thp file is not
-/// useful to record.
+/// Read a sysfs leaf (or `/proc` pseudofile) and return its
+/// trimmed content. Thin I/O wrapper; parsing lives in
+/// [`parse_trimmed`] so it can be unit-tested with synthetic
+/// fixtures. Returns `None` on any read error (ENOENT, EACCES,
+/// EIO) so the caller records the field as absent without
+/// treating it as a fatal context-collection failure.
 fn read_trimmed_sysfs(path: impl AsRef<std::path::Path>) -> Option<String> {
     std::fs::read_to_string(path.as_ref())
         .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .and_then(|s| parse_trimmed(&s))
+}
+
+/// Pure parser split from `read_trimmed_sysfs` for unit
+/// testability. Trims leading and trailing whitespace; returns
+/// `None` when the result is empty — an empty cmdline or thp
+/// file is not useful to record. Bracketed content inside the
+/// value (e.g. `"always [madvise] never"` from THP) is preserved
+/// verbatim because `str::trim` only affects the edges.
+fn parse_trimmed(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Walk `/proc/sys/kernel` for entries whose name starts with
@@ -425,6 +459,329 @@ mod tests {
         assert_eq!(
             decoded.host_cmdline.as_deref(),
             Some("preempt=lazy transparent_hugepage=madvise"),
+        );
+    }
+
+    #[test]
+    fn parse_cpuinfo_identity_happy_path() {
+        let text = "\
+processor\t: 0
+vendor_id\t: GenuineIntel
+cpu family\t: 6
+model\t\t: 85
+model name\t: Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz
+stepping\t: 4
+";
+        let (model, vendor) = parse_cpuinfo_identity(text);
+        assert_eq!(
+            model.as_deref(),
+            Some("Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz"),
+        );
+        assert_eq!(vendor.as_deref(), Some("GenuineIntel"));
+    }
+
+    #[test]
+    fn parse_cpuinfo_identity_empty_input() {
+        let (model, vendor) = parse_cpuinfo_identity("");
+        assert!(model.is_none());
+        assert!(vendor.is_none());
+    }
+
+    #[test]
+    fn parse_cpuinfo_identity_arm64_no_model_or_vendor() {
+        // ARM64 /proc/cpuinfo has neither `model name` nor
+        // `vendor_id` — it uses `CPU implementer`, `CPU part`, etc.
+        let text = "\
+processor\t: 0
+BogoMIPS\t: 50.00
+Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32
+CPU implementer\t: 0x41
+CPU architecture: 8
+CPU variant\t: 0x3
+CPU part\t: 0xd0c
+CPU revision\t: 1
+";
+        let (model, vendor) = parse_cpuinfo_identity(text);
+        assert!(model.is_none(), "no 'model name' line on ARM64");
+        assert!(vendor.is_none(), "no 'vendor_id' line on ARM64");
+    }
+
+    #[test]
+    fn parse_cpuinfo_identity_malformed_lines_are_skipped() {
+        // Lines without ':' are skipped; lines with empty value
+        // after trim are skipped.
+        let text = "\
+nonsense line with no colon
+vendor_id\t:
+model name\t:    Actual Model Name
+vendor_id\t: ActualVendor
+";
+        let (model, vendor) = parse_cpuinfo_identity(text);
+        assert_eq!(model.as_deref(), Some("Actual Model Name"));
+        assert_eq!(
+            vendor.as_deref(),
+            Some("ActualVendor"),
+            "empty vendor line must not poison — next real value wins",
+        );
+    }
+
+    #[test]
+    fn parse_cpuinfo_identity_crlf_line_endings() {
+        // `str::lines()` accepts both \n and \r\n — the \r in \r\n
+        // is stripped by str::lines() itself; the trim handles any
+        // residual whitespace.
+        let text = "vendor_id\t: GenuineIntel\r\nmodel name\t: Some CPU\r\n";
+        let (model, vendor) = parse_cpuinfo_identity(text);
+        assert_eq!(model.as_deref(), Some("Some CPU"));
+        assert_eq!(vendor.as_deref(), Some("GenuineIntel"));
+    }
+
+    #[test]
+    fn parse_cpuinfo_identity_first_processor_only() {
+        // Multi-processor /proc/cpuinfo — blank line separates
+        // processor blocks. Only the first block's values must
+        // surface; later blocks with different values are ignored.
+        let text = "\
+processor\t: 0
+vendor_id\t: GenuineIntel
+model name\t: First CPU
+
+processor\t: 1
+vendor_id\t: DifferentVendor
+model name\t: Second CPU
+";
+        let (model, vendor) = parse_cpuinfo_identity(text);
+        assert_eq!(model.as_deref(), Some("First CPU"));
+        assert_eq!(vendor.as_deref(), Some("GenuineIntel"));
+    }
+
+    #[test]
+    fn parse_meminfo_happy_path() {
+        let text = "\
+MemTotal:       16384000 kB
+MemFree:         8000000 kB
+HugePages_Total:      42
+HugePages_Free:       40
+Hugepagesize:       2048 kB
+";
+        let out = parse_meminfo(text);
+        assert_eq!(out.mem_total_kb, Some(16_384_000));
+        assert_eq!(out.hugepages_total, Some(42));
+        assert_eq!(out.hugepages_free, Some(40));
+        assert_eq!(out.hugepagesize_kb, Some(2048));
+    }
+
+    #[test]
+    fn parse_meminfo_empty_input() {
+        let out = parse_meminfo("");
+        assert!(out.mem_total_kb.is_none());
+        assert!(out.hugepages_total.is_none());
+        assert!(out.hugepages_free.is_none());
+        assert!(out.hugepagesize_kb.is_none());
+    }
+
+    #[test]
+    fn parse_meminfo_missing_fields_stay_none() {
+        // Only MemTotal is present — the other three fields must
+        // remain None so callers can distinguish "zero" from
+        // "absent."
+        let text = "MemTotal:       1024 kB\nMemFree:         512 kB\n";
+        let out = parse_meminfo(text);
+        assert_eq!(out.mem_total_kb, Some(1024));
+        assert!(out.hugepages_total.is_none());
+        assert!(out.hugepages_free.is_none());
+        assert!(out.hugepagesize_kb.is_none());
+    }
+
+    #[test]
+    fn parse_meminfo_non_numeric_value_skipped() {
+        // A future kernel flags-style line ("SomeFlags: abc def")
+        // must not poison the struct — its non-numeric first token
+        // causes the line to be skipped silently.
+        let text = "\
+MemTotal:       2048 kB
+SomeFlags:      abc def ghi
+Hugepagesize:      2048 kB
+";
+        let out = parse_meminfo(text);
+        assert_eq!(out.mem_total_kb, Some(2048));
+        assert_eq!(out.hugepagesize_kb, Some(2048));
+    }
+
+    #[test]
+    fn parse_meminfo_unknown_fields_tolerated() {
+        // Unknown keys must be ignored without affecting known
+        // fields — adding new /proc/meminfo lines upstream is a
+        // no-op here.
+        let text = "\
+MemTotal:       100 kB
+Unknown_Field:  999
+HugePages_Total:   3
+Another_Unknown: 77 kB
+";
+        let out = parse_meminfo(text);
+        assert_eq!(out.mem_total_kb, Some(100));
+        assert_eq!(out.hugepages_total, Some(3));
+        assert!(out.hugepages_free.is_none());
+    }
+
+    #[test]
+    fn parse_meminfo_crlf_line_endings() {
+        let text =
+            "MemTotal:       512 kB\r\nHugePages_Total:    2\r\nHugepagesize:   2048 kB\r\n";
+        let out = parse_meminfo(text);
+        assert_eq!(out.mem_total_kb, Some(512));
+        assert_eq!(out.hugepages_total, Some(2));
+        assert_eq!(out.hugepagesize_kb, Some(2048));
+    }
+
+    #[test]
+    fn parse_cpuinfo_identity_duplicate_key_first_wins() {
+        // Two `model name` / `vendor_id` lines in the first
+        // processor block. The match guard is `if model.is_none()`,
+        // so the first occurrence must win; the second is ignored.
+        let text = "\
+vendor_id\t: FirstVendor
+model name\t: First Model
+vendor_id\t: SecondVendor
+model name\t: Second Model
+";
+        let (model, vendor) = parse_cpuinfo_identity(text);
+        assert_eq!(model.as_deref(), Some("First Model"));
+        assert_eq!(vendor.as_deref(), Some("FirstVendor"));
+    }
+
+    #[test]
+    fn parse_cpuinfo_identity_value_with_internal_colon() {
+        // `str::split_once(':')` splits on the first colon only,
+        // so any ':' inside the value survives verbatim. Real
+        // /proc/cpuinfo model names rarely contain ':' but the
+        // parser must preserve them.
+        let text = "model name\t: Intel(R): Xeon(R) CPU @ 2.00GHz\n";
+        let (model, _vendor) = parse_cpuinfo_identity(text);
+        assert_eq!(
+            model.as_deref(),
+            Some("Intel(R): Xeon(R) CPU @ 2.00GHz"),
+            "internal ':' must be preserved in the value",
+        );
+    }
+
+    #[test]
+    fn parse_cpuinfo_identity_leading_blank_line() {
+        // The loop breaks on the first empty line (processor-block
+        // boundary). A leading blank line therefore terminates
+        // before any field is read — result is (None, None).
+        let text = "\nvendor_id\t: GenuineIntel\nmodel name\t: Some CPU\n";
+        let (model, vendor) = parse_cpuinfo_identity(text);
+        assert!(model.is_none(), "leading blank line must short-circuit");
+        assert!(vendor.is_none(), "leading blank line must short-circuit");
+    }
+
+    #[test]
+    fn parse_meminfo_duplicate_key_last_wins() {
+        // Unlike parse_cpuinfo_identity, parse_meminfo's match
+        // arms assign unconditionally — the last occurrence of a
+        // key overrides earlier ones. Documented here so a future
+        // change to this behavior (e.g. adding a first-wins guard)
+        // is caught by this test.
+        let text = "MemTotal:       100 kB\nMemTotal:       200 kB\n";
+        let out = parse_meminfo(text);
+        assert_eq!(out.mem_total_kb, Some(200));
+    }
+
+    #[test]
+    fn parse_meminfo_line_without_colon() {
+        // Lines without ':' are skipped via `split_once(':')`
+        // returning None. Real /proc/meminfo never emits such
+        // lines but the parser must tolerate them without
+        // dropping the surrounding valid content.
+        let text = "\
+garbage line without any colon
+MemTotal:       100 kB
+another garbage line
+HugePages_Total:   3
+";
+        let out = parse_meminfo(text);
+        assert_eq!(out.mem_total_kb, Some(100));
+        assert_eq!(out.hugepages_total, Some(3));
+    }
+
+    #[test]
+    fn parse_meminfo_empty_value_after_colon() {
+        // A key with an empty value after the colon: rest is "",
+        // split_whitespace().next() returns None, token becomes
+        // the empty string, parse::<u64>() fails, the line is
+        // skipped. The target field stays None so the absence is
+        // visible to callers.
+        let text = "MemTotal:\nHugePages_Total:  5\n";
+        let out = parse_meminfo(text);
+        assert!(
+            out.mem_total_kb.is_none(),
+            "empty value after ':' must leave the field None",
+        );
+        assert_eq!(
+            out.hugepages_total,
+            Some(5),
+            "subsequent valid lines must still parse",
+        );
+    }
+
+    #[test]
+    fn parse_meminfo_negative_and_overflow_value_skipped() {
+        // u64 parsing rejects both negative values and values
+        // exceeding u64::MAX. Both failure modes must skip the
+        // line silently; later valid lines still parse.
+        let text = "\
+MemTotal:       -1 kB
+HugePages_Total:   99999999999999999999999
+Hugepagesize:       2048 kB
+";
+        let out = parse_meminfo(text);
+        assert!(
+            out.mem_total_kb.is_none(),
+            "negative value must fail u64 parse and skip",
+        );
+        assert!(
+            out.hugepages_total.is_none(),
+            "overflow value must fail u64 parse and skip",
+        );
+        assert_eq!(
+            out.hugepagesize_kb,
+            Some(2048),
+            "later valid line must still parse",
+        );
+    }
+
+    #[test]
+    fn parse_trimmed_empty_is_none() {
+        assert!(parse_trimmed("").is_none());
+    }
+
+    #[test]
+    fn parse_trimmed_whitespace_only_is_none() {
+        // Spaces, tabs, and newlines all count as whitespace for
+        // `str::trim`; a file containing only those characters
+        // carries no signal and must map to None.
+        assert!(parse_trimmed("   \n\t  \r\n").is_none());
+    }
+
+    #[test]
+    fn parse_trimmed_strips_trailing_newline() {
+        // sysfs leaves typically end with a single trailing '\n';
+        // the parser must strip it so downstream comparisons do
+        // not carry stray whitespace.
+        assert_eq!(parse_trimmed("content\n").as_deref(), Some("content"));
+    }
+
+    #[test]
+    fn parse_trimmed_preserves_bracketed_thp() {
+        // THP policy files read like `"always [madvise] never\n"`;
+        // the bracket indicating the active selection must survive
+        // the trim verbatim because `str::trim` only touches the
+        // edges.
+        assert_eq!(
+            parse_trimmed("always [madvise] never\n").as_deref(),
+            Some("always [madvise] never"),
         );
     }
 
