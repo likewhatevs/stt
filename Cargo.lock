@@ -3203,6 +3203,7 @@ dependencies = [
  "crc32fast",
  "ctor",
  "flate2",
+ "gimli",
  "gix",
  "glob",
  "goblin",
