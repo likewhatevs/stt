@@ -770,8 +770,8 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
         .context("write KTSTR_TEST_KERNEL to env")?;
 
     for bin in binaries {
-        let key = vmm::BaseKey::new(bin, None, None, None, false)?;
-        let _ = vmm::get_or_build_base(bin, &[], &[], false, &key, false)?;
+        let key = vmm::BaseKey::new(bin, None, None, None)?;
+        let _ = vmm::get_or_build_base(bin, &[], &[], false, &key)?;
     }
 
     // Eager-conditional prefetch: if any registered test declares

@@ -49,13 +49,6 @@ const TRACE_PIPE: &str = "/sys/kernel/tracing/trace_pipe";
 /// `sch->ops.name` is set.
 const SYSFS_SCHED_EXT_ROOT_OPS: &str = "/sys/kernel/sched_ext/root/ops";
 
-/// Test helper — returns true when this process is PID 1 (running
-/// as /init in a VM).
-#[cfg(test)]
-pub fn is_pid1() -> bool {
-    unsafe { libc::getpid() == 1 }
-}
-
 /// Reboot immediately. Used for fatal init errors and normal shutdown.
 fn force_reboot() -> ! {
     let _ = reboot(RebootMode::RB_AUTOBOOT);
@@ -1520,11 +1513,6 @@ mod tests {
     #[test]
     fn exec_shell_line_unsupported_input_no_panic() {
         exec_shell_line("# this is a comment");
-    }
-
-    #[test]
-    fn is_pid1_false_in_test() {
-        assert!(!is_pid1());
     }
 
     #[test]

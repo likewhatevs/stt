@@ -1238,18 +1238,18 @@ fn wait_and_capture(child: &mut std::process::Child) -> Result<SpawnOutput> {
         })
     });
     let status = child.wait().with_context(|| "wait child")?;
+    // `.join().unwrap()` below is NOT a bug: the workspace builds
+    // with `panic = "abort"` in release (see Cargo.toml
+    // `[profile.release]`), so a panicked reader thread aborts the
+    // whole process and `join()` never returns a `JoinError`. The
+    // historic `.map_err(|_| anyhow!("...panicked"))` arm could not
+    // fire and misled readers into expecting a recoverable error.
     let (stdout, _stdout_truncated) = match stdout_handle {
-        Some(h) => h
-            .join()
-            .map_err(|_| anyhow!("stdout reader thread panicked"))?
-            .with_context(|| "read child stdout")?,
+        Some(h) => h.join().unwrap().with_context(|| "read child stdout")?,
         None => (String::new(), false),
     };
     let (stderr, _stderr_truncated) = match stderr_handle {
-        Some(h) => h
-            .join()
-            .map_err(|_| anyhow!("stderr reader thread panicked"))?
-            .with_context(|| "read child stderr")?,
+        Some(h) => h.join().unwrap().with_context(|| "read child stderr")?,
         None => (String::new(), false),
     };
     Ok(SpawnOutput {
@@ -1699,11 +1699,13 @@ mod tests {
         // Chinese "好" = 3 bytes (E5 A5 BD); pin it mid-string.
         let s = "xxxxxxxxxx好yyyyyyyyyy"; // 10 + 3 + 10 = 23 bytes
         for max in 1..=s.len() {
-            let tail = stderr_tail(s, max);
-            // Assertion: `tail` is already a `String`, so it is
-            // by construction valid UTF-8; re-rendering it proves
-            // no byte-level corruption leaked into the String.
-            let _ = tail.as_str();
+            // `stderr_tail` returns a `String`, which Rust guarantees
+            // is valid UTF-8 by construction. Calling it across every
+            // byte offset proves the helper never panics on
+            // multi-byte codepoint boundaries — the failure mode
+            // that motivated this test is a panic from slicing at
+            // mid-codepoint, not a corrupt string.
+            let _ = stderr_tail(s, max);
         }
     }
 

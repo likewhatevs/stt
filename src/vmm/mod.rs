@@ -132,23 +132,22 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
 }
 
 impl BaseKey {
-    /// Hashes the payload binary content, payload shared libs,
-    /// optional scheduler / probe / alloc-worker binary content and
-    /// shared libs, and the `preserve_payload_dwarf` flag. Each
-    /// optional input participates symmetrically because each
-    /// changes the bytes written into the initramfs. Even though
-    /// probe + alloc-worker are currently routed through
-    /// `include_files` (so their content also appears in the
-    /// `new_shell` include-hash loop), an explicit parameter keeps
-    /// the cache key sensitive to those inputs regardless of the
-    /// routing choice — if a future change moves them back to
-    /// extras, the key stays correct without a separate update.
+    /// Hashes the payload binary content, payload shared libs, and
+    /// the optional scheduler / probe / alloc-worker binary content
+    /// and shared libs. Each optional input participates
+    /// symmetrically because each changes the bytes written into
+    /// the initramfs. Even though probe + alloc-worker are
+    /// currently routed through `include_files` (so their content
+    /// also appears in the `new_shell` include-hash loop), an
+    /// explicit parameter keeps the cache key sensitive to those
+    /// inputs regardless of the routing choice — if a future change
+    /// moves them back to extras, the key stays correct without a
+    /// separate update.
     pub(crate) fn new(
         payload: &Path,
         scheduler: Option<&Path>,
         probe: Option<&Path>,
         worker: Option<&Path>,
-        preserve_payload_dwarf: bool,
     ) -> Result<Self> {
         use siphasher::sip::SipHasher13;
         let mut hasher = SipHasher13::new_with_keys(0, 0);
@@ -183,8 +182,6 @@ impl BaseKey {
             None => 0u8.hash(&mut hasher),
         }
 
-        preserve_payload_dwarf.hash(&mut hasher);
-
         Ok(BaseKey(hasher.finish()))
     }
 
@@ -192,9 +189,8 @@ impl BaseKey {
     /// busybox flag so different shell configurations get distinct
     /// cache keys. Include file archive paths and content are hashed
     /// so the same payload + same includes = cache hit, while
-    /// different includes = cache miss. `probe`, `worker`, and
-    /// `preserve_payload_dwarf` are hashed for the same reasons as
-    /// [`BaseKey::new`].
+    /// different includes = cache miss. `probe` and `worker` are
+    /// hashed for the same reasons as [`BaseKey::new`].
     pub(crate) fn new_shell(
         payload: &Path,
         scheduler: Option<&Path>,
@@ -202,7 +198,6 @@ impl BaseKey {
         worker: Option<&Path>,
         include_files: &[(String, PathBuf)],
         busybox: bool,
-        preserve_payload_dwarf: bool,
     ) -> Result<Self> {
         use siphasher::sip::SipHasher13;
         let mut hasher = SipHasher13::new_with_keys(0, 0);
@@ -238,8 +233,6 @@ impl BaseKey {
             }
             None => 0u8.hash(&mut hasher),
         }
-
-        preserve_payload_dwarf.hash(&mut hasher);
 
         // Hash include files: archive paths (sorted for determinism),
         // content hashes, and shared lib hashes for ELF includes (their
@@ -311,7 +304,6 @@ pub(crate) fn get_or_build_base(
     include_files: &[(&str, &Path)],
     busybox: bool,
     key: &BaseKey,
-    preserve_payload_dwarf: bool,
 ) -> Result<BaseRef> {
     // Clean stale SHM segments from previous runs.
     cleanup_stale_shm(key);
@@ -329,12 +321,11 @@ pub(crate) fn get_or_build_base(
             // We won the race — build, write, release.
             tracing::debug!("initramfs shm: builder (O_EXCL won)");
             let t0 = std::time::Instant::now();
-            let data = initramfs::build_initramfs_base_with_opts(
+            let data = initramfs::build_initramfs_base(
                 payload,
                 extras,
                 include_files,
                 busybox,
-                preserve_payload_dwarf,
             )?;
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
@@ -384,12 +375,11 @@ pub(crate) fn get_or_build_base(
 
     // 3. Fallback: build without SHM coordination.
     let t0 = std::time::Instant::now();
-    let data = initramfs::build_initramfs_base_with_opts(
+    let data = initramfs::build_initramfs_base(
         payload,
         extras,
         include_files,
         busybox,
-        preserve_payload_dwarf,
     )?;
     let arc = Arc::new(data);
     tracing::debug!(
@@ -1472,13 +1462,6 @@ impl KtstrVm {
         let scheduler = self.scheduler_binary.clone();
         let probe = self.jemalloc_probe_binary.clone();
         let worker = self.jemalloc_alloc_worker_binary.clone();
-        // `preserve_payload_dwarf` remains on the internal build
-        // + cache APIs for future use (GNU-debuglink follow-up can
-        // reintroduce a builder knob), but no current code path
-        // invokes it — the closed-loop probe tests rely on the
-        // probe binary's own DWARF via `--self-test` or on the
-        // `jemalloc-alloc-worker` binary's own DWARF.
-        let preserve_payload_dwarf = false;
         let include_files = self.include_files.clone();
         let busybox = self.busybox;
         std::thread::Builder::new()
@@ -1534,7 +1517,6 @@ impl KtstrVm {
                         worker.as_deref(),
                         &merged_includes,
                         busybox,
-                        preserve_payload_dwarf,
                     )?
                 } else {
                     BaseKey::new(
@@ -1542,7 +1524,6 @@ impl KtstrVm {
                         scheduler.as_deref(),
                         probe.as_deref(),
                         worker.as_deref(),
-                        preserve_payload_dwarf,
                     )?
                 };
 
@@ -1556,7 +1537,6 @@ impl KtstrVm {
                     &include_refs,
                     busybox,
                     &key,
-                    preserve_payload_dwarf,
                 )?;
                 Ok((base, key))
             })
@@ -5005,14 +4985,14 @@ mod tests {
     #[test]
     fn base_key_same_inputs_match() {
         let exe = crate::resolve_current_exe().unwrap();
-        let k1 = BaseKey::new(&exe, None, None, None, false).unwrap();
-        let k2 = BaseKey::new(&exe, None, None, None, false).unwrap();
+        let k1 = BaseKey::new(&exe, None, None, None).unwrap();
+        let k2 = BaseKey::new(&exe, None, None, None).unwrap();
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn base_key_nonexistent_payload_fails() {
-        let result = BaseKey::new(Path::new("/nonexistent/binary"), None, None, None, false);
+        let result = BaseKey::new(Path::new("/nonexistent/binary"), None, None, None);
         assert!(result.is_err());
     }
 
@@ -5024,10 +5004,10 @@ mod tests {
         let bin = tmp.join("payload");
 
         std::fs::write(&bin, b"content_v1").unwrap();
-        let k1 = BaseKey::new(&bin, None, None, None, false).unwrap();
+        let k1 = BaseKey::new(&bin, None, None, None).unwrap();
 
         std::fs::write(&bin, b"content_v2").unwrap();
-        let k2 = BaseKey::new(&bin, None, None, None, false).unwrap();
+        let k2 = BaseKey::new(&bin, None, None, None).unwrap();
 
         assert_ne!(
             k1, k2,
@@ -5039,8 +5019,8 @@ mod tests {
     #[test]
     fn base_key_with_scheduler() {
         let exe = crate::resolve_current_exe().unwrap();
-        let k1 = BaseKey::new(&exe, None, None, None, false).unwrap();
-        let k2 = BaseKey::new(&exe, Some(&exe), None, None, false).unwrap();
+        let k1 = BaseKey::new(&exe, None, None, None).unwrap();
+        let k2 = BaseKey::new(&exe, Some(&exe), None, None).unwrap();
         assert_ne!(k1, k2, "with vs without scheduler should differ");
     }
 
@@ -5090,7 +5070,7 @@ mod tests {
     #[test]
     fn base_cache_hit() {
         let exe = crate::resolve_current_exe().unwrap();
-        let key = BaseKey::new(&exe, None, None, None, false).unwrap();
+        let key = BaseKey::new(&exe, None, None, None).unwrap();
 
         // Insert a sentinel value.
         let sentinel = Arc::new(vec![0xDE, 0xAD]);

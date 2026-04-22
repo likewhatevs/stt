@@ -16,8 +16,6 @@ pub(crate) struct SharedLibs {
     /// Resolved `(guest_path, host_path)` pairs.
     pub found: Vec<(String, PathBuf)>,
     /// Library sonames that could not be resolved to a host path.
-    /// Each entry includes whether it is a direct (DT_NEEDED) dependency
-    /// of the root binary or a transitive dependency.
     pub missing: Vec<MissingLib>,
     /// The binary's PT_INTERP path, if present (e.g. `/lib64/ld-linux-x86-64.so.2`).
     pub interpreter: Option<String>,
@@ -28,10 +26,6 @@ pub(crate) struct SharedLibs {
 pub(crate) struct MissingLib {
     /// The soname (e.g. `libssl.so.1.1`).
     pub soname: String,
-    /// True if this soname appears in the root binary's DT_NEEDED.
-    /// False if it is a transitive dependency of one of the root's deps.
-    #[allow(dead_code)]
-    pub direct: bool,
 }
 
 /// Parsed soname-to-path mappings from `/etc/ld.so.cache`.
@@ -209,16 +203,16 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     let mut missing: Vec<MissingLib> = Vec::new();
     let mut visited = std::collections::HashSet::new();
 
-    // Current level: (soname, is_direct_dep_of_root, search_paths_from_parent)
-    let mut level: Vec<(String, bool, ElfSearchPaths)> = root_needed
+    // Current level: (soname, search_paths_from_parent)
+    let mut level: Vec<(String, ElfSearchPaths)> = root_needed
         .iter()
-        .map(|s| (s.clone(), true, root_search.clone()))
+        .map(|s| (s.clone(), root_search.clone()))
         .collect();
 
     while !level.is_empty() {
         // Phase 1: resolve sonames to host paths (sequential, cheap).
         let mut resolved: Vec<(String, PathBuf, PathBuf)> = Vec::new();
-        for (soname, is_direct, search_paths) in &level {
+        for (soname, search_paths) in &level {
             if !visited.insert(soname.clone()) {
                 continue;
             }
@@ -244,7 +238,6 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
             } else {
                 missing.push(MissingLib {
                     soname: soname.clone(),
-                    direct: *is_direct,
                 });
             }
         }
@@ -276,7 +269,6 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
         level = next_deps
             .into_iter()
             .filter(|(soname, _)| !visited.contains(soname))
-            .map(|(soname, search)| (soname, false, search))
             .collect();
     }
 
@@ -650,40 +642,14 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
 /// individual file entries before calling this function (see
 /// `cli::resolve_include_files`).
 ///
-/// The init binary itself is `strip_debug`'d by default. To keep DWARF
-/// on the init binary (required by probes that resolve struct offsets
-/// inside the running init), use [`build_initramfs_base_with_opts`]
-/// with `preserve_payload_dwarf: true`.
-///
-/// Kept as a thin wrapper so the tests in this file (which use the
-/// default-strip behavior) do not need to thread
-/// `preserve_payload_dwarf: false` through every call site.
-#[allow(dead_code)]
+/// The init binary is `strip_debug`'d before being written into the
+/// archive. Extras are stripped the same way.
+#[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
 pub fn build_initramfs_base(
     payload: &Path,
     extra_binaries: &[(&str, &Path)],
     include_files: &[(&str, &Path)],
     busybox: bool,
-) -> Result<Vec<u8>> {
-    build_initramfs_base_with_opts(payload, extra_binaries, include_files, busybox, false)
-}
-
-/// Extended form of [`build_initramfs_base`] that accepts
-/// `preserve_payload_dwarf`. When `true`, the init binary is read
-/// verbatim (no `strip_debug`) so DWARF debuginfo survives into the
-/// guest ELF on disk and in-process memory. Extras remain stripped
-/// regardless of this flag — only the init binary is affected.
-///
-/// The initramfs cache key hashes this flag (see
-/// [`BaseKey::new`](crate::vmm::BaseKey::new)), so stripped and
-/// unstripped init variants do not share a cache entry.
-#[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len(), preserve_dwarf = preserve_payload_dwarf))]
-pub fn build_initramfs_base_with_opts(
-    payload: &Path,
-    extra_binaries: &[(&str, &Path)],
-    include_files: &[(&str, &Path)],
-    busybox: bool,
-    preserve_payload_dwarf: bool,
 ) -> Result<Vec<u8>> {
     // Validate include_files and collect metadata (reused in the write
     // loop to avoid a second stat syscall per file).
@@ -722,11 +688,7 @@ pub fn build_initramfs_base_with_opts(
         validated_includes.push((archive_path, host_path, meta.permissions().mode()));
     }
 
-    let binary = if preserve_payload_dwarf {
-        let _s = tracing::debug_span!("read_binary_preserve_dwarf").entered();
-        std::fs::read(payload)
-            .with_context(|| format!("read init binary (preserve DWARF): {}", payload.display()))?
-    } else {
+    let binary = {
         let _s = tracing::debug_span!("strip_debug").entered();
         strip_debug(payload).with_context(|| format!("strip/read binary: {}", payload.display()))?
     };
@@ -1448,11 +1410,10 @@ pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
 /// Concatenate `base` and `suffix` into a single buffer and compress it
 /// with [`lz4_legacy_compress`]. Used by the aarch64 path, which loads
 /// initramfs as one compressed blob rather than streaming per-part.
-/// The body is arch-neutral (concat + compress); the `dead_code` allow
-/// is a no-op on aarch64 where the aarch64 loader is the sole caller,
-/// and keeps the helper callable from cross-arch tests or a future
-/// x86_64 caller without re-deriving it.
-#[allow(dead_code)]
+/// The body is arch-neutral (concat + compress). The sole current
+/// caller is the aarch64 loader; the helper stays available for
+/// cross-arch tests or a future x86_64 caller.
+#[allow(dead_code)] // called only from aarch64 loader paths; no cfg-arch gate so x86_64 tests keep it buildable.
 pub(crate) fn lz4_compress_combined(base: &[u8], suffix: &[u8]) -> Vec<u8> {
     let mut full = Vec::with_capacity(base.len() + suffix.len());
     full.extend_from_slice(base);
