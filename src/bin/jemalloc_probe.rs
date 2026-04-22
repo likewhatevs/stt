@@ -212,10 +212,14 @@ struct ProbeOutput {
     /// `std::time::SystemTime`). Host-guest correlation requires
     /// aligned clocks — kvm-clock on the guest (default for KVM
     /// under ktstr's VMM) or NTP on both sides. Without alignment,
-    /// the guest's monotonic drift produces a fixed offset against
-    /// the host's timeline; downstream tools diffing probe captures
-    /// across host + guest events must account for the offset or
-    /// the correlation silently skews.
+    /// the guest's `CLOCK_REALTIME` drifts against the host's
+    /// wall clock over time (NTP slew, stepped corrections, a
+    /// VMM-imposed offset at boot) — the skew between the two
+    /// timelines is ongoing, not a single fixed offset, so
+    /// downstream tools diffing probe captures across host +
+    /// guest events must re-anchor against each run's timestamps
+    /// rather than applying a constant offset, or the correlation
+    /// silently drifts.
     timestamp_unix_sec: u64,
     threads: Vec<ThreadResult>,
 }

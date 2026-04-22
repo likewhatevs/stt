@@ -152,28 +152,28 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.keep_last_count as f64),
     },
     MetricDef {
-        name: "p99_wake_latency_us",
+        name: "worst_p99_wake_latency_us",
         polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
-        accessor: |r| Some(r.p99_wake_latency_us),
+        accessor: |r| Some(r.worst_p99_wake_latency_us),
     },
     MetricDef {
-        name: "median_wake_latency_us",
+        name: "worst_median_wake_latency_us",
         polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 20.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
-        accessor: |r| Some(r.median_wake_latency_us),
+        accessor: |r| Some(r.worst_median_wake_latency_us),
     },
     MetricDef {
-        name: "wake_latency_cv",
+        name: "worst_wake_latency_cv",
         polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 0.10,
         default_rel: 0.25,
         display_unit: "",
-        accessor: |r| Some(r.wake_latency_cv),
+        accessor: |r| Some(r.worst_wake_latency_cv),
     },
     MetricDef {
         name: "total_iterations",
@@ -184,12 +184,12 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.total_iterations as f64),
     },
     MetricDef {
-        name: "mean_run_delay_us",
+        name: "worst_mean_run_delay_us",
         polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 50.0,
         default_rel: 0.25,
         display_unit: "\u{00b5}s",
-        accessor: |r| Some(r.mean_run_delay_us),
+        accessor: |r| Some(r.worst_mean_run_delay_us),
     },
     MetricDef {
         name: "worst_run_delay_us",
@@ -268,11 +268,11 @@ pub struct GauntletRow {
     pub fallback_count: i64,
     pub keep_last_count: i64,
     // Benchmarking fields.
-    pub p99_wake_latency_us: f64,
-    pub median_wake_latency_us: f64,
-    pub wake_latency_cv: f64,
+    pub worst_p99_wake_latency_us: f64,
+    pub worst_median_wake_latency_us: f64,
+    pub worst_wake_latency_cv: f64,
     pub total_iterations: u64,
-    pub mean_run_delay_us: f64,
+    pub worst_mean_run_delay_us: f64,
     pub worst_run_delay_us: f64,
     // NUMA fields.
     pub page_locality: f64,
@@ -325,11 +325,11 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .and_then(|m| m.event_deltas.as_ref())
             .map(|e| e.total_dispatch_keep_last)
             .unwrap_or(0),
-        p99_wake_latency_us: sc.stats.p99_wake_latency_us,
-        median_wake_latency_us: sc.stats.median_wake_latency_us,
-        wake_latency_cv: sc.stats.wake_latency_cv,
+        worst_p99_wake_latency_us: sc.stats.worst_p99_wake_latency_us,
+        worst_median_wake_latency_us: sc.stats.worst_median_wake_latency_us,
+        worst_wake_latency_cv: sc.stats.worst_wake_latency_cv,
         total_iterations: sc.stats.total_iterations,
-        mean_run_delay_us: sc.stats.mean_run_delay_us,
+        worst_mean_run_delay_us: sc.stats.worst_mean_run_delay_us,
         worst_run_delay_us: sc.stats.worst_run_delay_us,
         page_locality: sc.stats.worst_page_locality,
         cross_node_migration_ratio: sc.stats.worst_cross_node_migration_ratio,
@@ -353,11 +353,11 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let stalls: Vec<f64> = rows.iter().map(|r| r.stall_count as f64).collect();
     let fallback: Vec<f64> = rows.iter().map(|r| r.fallback_count as f64).collect();
     let keep_last: Vec<f64> = rows.iter().map(|r| r.keep_last_count as f64).collect();
-    let p99_wake_lat: Vec<f64> = rows.iter().map(|r| r.p99_wake_latency_us).collect();
-    let median_wake_lat: Vec<f64> = rows.iter().map(|r| r.median_wake_latency_us).collect();
-    let wake_cv: Vec<f64> = rows.iter().map(|r| r.wake_latency_cv).collect();
+    let p99_wake_lat: Vec<f64> = rows.iter().map(|r| r.worst_p99_wake_latency_us).collect();
+    let median_wake_lat: Vec<f64> = rows.iter().map(|r| r.worst_median_wake_latency_us).collect();
+    let wake_cv: Vec<f64> = rows.iter().map(|r| r.worst_wake_latency_cv).collect();
     let total_iters: Vec<f64> = rows.iter().map(|r| r.total_iterations as f64).collect();
-    let mean_run_delay: Vec<f64> = rows.iter().map(|r| r.mean_run_delay_us).collect();
+    let mean_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_mean_run_delay_us).collect();
     let worst_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_run_delay_us).collect();
     let page_locality: Vec<f64> = rows.iter().map(|r| r.page_locality).collect();
     let cross_node_mig: Vec<f64> = rows.iter().map(|r| r.cross_node_migration_ratio).collect();
@@ -377,11 +377,11 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
         "stalls" => &stalls,
         "fallback" => &fallback,
         "keep_last" => &keep_last,
-        "p99_wake_lat_us" => &p99_wake_lat,
-        "median_wake_lat_us" => &median_wake_lat,
-        "wake_latency_cv" => &wake_cv,
+        "worst_p99_wake_latency_us" => &p99_wake_lat,
+        "worst_median_wake_latency_us" => &median_wake_lat,
+        "worst_wake_latency_cv" => &wake_cv,
         "total_iterations" => &total_iters,
-        "mean_run_delay_us" => &mean_run_delay,
+        "worst_mean_run_delay_us" => &mean_run_delay,
         "worst_run_delay_us" => &worst_run_delay,
         "page_locality" => &page_locality,
         "cross_node_migration_ratio" => &cross_node_mig,
@@ -457,9 +457,9 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
         "stalls",
         "fallback",
         "keep_last",
-        "p99_wake_lat_us",
-        "wake_latency_cv",
-        "mean_run_delay_us",
+        "worst_p99_wake_latency_us",
+        "worst_wake_latency_cv",
+        "worst_mean_run_delay_us",
         "worst_run_delay_us",
     ];
     let mut outliers = Vec::new();
@@ -1145,11 +1145,11 @@ mod tests {
             stall_count: 0,
             fallback_count: 0,
             keep_last_count: 0,
-            p99_wake_latency_us: 0.0,
-            median_wake_latency_us: 0.0,
-            wake_latency_cv: 0.0,
+            worst_p99_wake_latency_us: 0.0,
+            worst_median_wake_latency_us: 0.0,
+            worst_wake_latency_cv: 0.0,
             total_iterations: 0,
-            mean_run_delay_us: 0.0,
+            worst_mean_run_delay_us: 0.0,
             worst_run_delay_us: 0.0,
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
@@ -1415,11 +1415,11 @@ mod tests {
         row.stall_count = 3;
         row.fallback_count = 11;
         row.keep_last_count = 4;
-        row.p99_wake_latency_us = 99.0;
-        row.median_wake_latency_us = 50.0;
-        row.wake_latency_cv = 0.5;
+        row.worst_p99_wake_latency_us = 99.0;
+        row.worst_median_wake_latency_us = 50.0;
+        row.worst_wake_latency_cv = 0.5;
         row.total_iterations = 1000;
-        row.mean_run_delay_us = 25.0;
+        row.worst_mean_run_delay_us = 25.0;
         row.worst_run_delay_us = 200.0;
         row.page_locality = 0.8;
         row.cross_node_migration_ratio = 0.1;
@@ -1432,11 +1432,11 @@ mod tests {
         assert_eq!(read_metric(&row, "stall_count"), Some(3.0));
         assert_eq!(read_metric(&row, "total_fallback"), Some(11.0));
         assert_eq!(read_metric(&row, "total_keep_last"), Some(4.0));
-        assert_eq!(read_metric(&row, "p99_wake_latency_us"), Some(99.0));
-        assert_eq!(read_metric(&row, "median_wake_latency_us"), Some(50.0));
-        assert_eq!(read_metric(&row, "wake_latency_cv"), Some(0.5));
+        assert_eq!(read_metric(&row, "worst_p99_wake_latency_us"), Some(99.0));
+        assert_eq!(read_metric(&row, "worst_median_wake_latency_us"), Some(50.0));
+        assert_eq!(read_metric(&row, "worst_wake_latency_cv"), Some(0.5));
         assert_eq!(read_metric(&row, "total_iterations"), Some(1000.0));
-        assert_eq!(read_metric(&row, "mean_run_delay_us"), Some(25.0));
+        assert_eq!(read_metric(&row, "worst_mean_run_delay_us"), Some(25.0));
         assert_eq!(read_metric(&row, "worst_run_delay_us"), Some(200.0));
         assert_eq!(read_metric(&row, "worst_page_locality"), Some(0.8));
         assert_eq!(
@@ -1949,6 +1949,19 @@ mod tests {
         // the `else` arm and not the `identical` arm.
         let body = &out["\nhost delta ('a' → 'b'):\n".len()..];
         assert!(!body.is_empty(), "differing contexts must produce a diff body");
+        // Pin the trailing-newline contract: the other three arms
+        // (`identical`, left-only, right-only) all end with '\n'; the
+        // differ arm delegates to `HostContext::diff()` whose output
+        // must also terminate with a newline so caller-side
+        // concatenation with subsequent sections doesn't butt headers
+        // against the last diff line. A regression that trimmed the
+        // trailing newline in `HostContext::diff` would produce
+        // run-on output only in the differ case — this assertion
+        // catches that asymmetry.
+        assert!(
+            out.ends_with('\n'),
+            "differ arm must end with a newline for contiguous-section output: {out:?}",
+        );
     }
 
     /// `(Some, None)` left-only: one run captured host data, the

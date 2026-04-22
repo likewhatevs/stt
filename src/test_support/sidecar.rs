@@ -1396,7 +1396,18 @@ mod tests {
         // Sidecar filename now includes a variant hash suffix so
         // gauntlet variants don't clobber each other. Find the file
         // by prefix match rather than exact path.
-        let path = find_sidecars_by_prefix(tmp, "__sidecar_write_test__-")
+        let paths = find_sidecars_by_prefix(tmp, "__sidecar_write_test__-");
+        // Single-variant test: if a future variant-hash collision
+        // produced two files sharing the prefix, `.next()` would
+        // silently pick one and the test would pass unpredictably.
+        // Pin `paths.len() == 1` to surface the collision as a
+        // test failure instead.
+        assert_eq!(
+            paths.len(),
+            1,
+            "single-variant test must produce exactly one sidecar, got {paths:?}",
+        );
+        let path = paths
             .into_iter()
             .next()
             .expect("sidecar file with variant suffix should be written");
@@ -1417,6 +1428,20 @@ mod tests {
             "write_sidecar must populate host field from collect_host_context",
         );
         assert_eq!(host.uname_sysname.as_deref(), Some("Linux"));
+        // Pair the uname check with a field that `HostContext::default()`
+        // leaves None. A regression that swapped the full
+        // `collect_host_context()` call for `HostContext { uname_sysname:
+        // Some("Linux".into()), ..Default::default() }` would pass the
+        // uname assertion but drop every other captured field —
+        // `cmdline` is present on every live Linux process (/proc/cmdline
+        // is always readable; see host_context::tests:
+        // collect_host_context_captures_cmdline_on_linux) so
+        // `cmdline.is_some()` catches the default-substitution regression.
+        assert!(
+            host.cmdline.is_some(),
+            "write_sidecar must capture full HostContext, not Default::default() — \
+             /proc/cmdline is always readable on Linux (see host_context tests)",
+        );
     }
 
     #[test]
@@ -1829,7 +1854,13 @@ mod tests {
         let active_flags: Vec<String> = vec!["llc".to_string()];
         write_skip_sidecar(&entry, &active_flags).expect("skip sidecar must write");
 
-        let path = find_sidecars_by_prefix(&tmp, "__skip_sidecar_test__-")
+        let paths = find_sidecars_by_prefix(&tmp, "__skip_sidecar_test__-");
+        assert_eq!(
+            paths.len(),
+            1,
+            "single-variant skip test must produce exactly one sidecar, got {paths:?}",
+        );
+        let path = paths
             .into_iter()
             .next()
             .expect("skip sidecar file with variant suffix should be written");
@@ -1859,6 +1890,14 @@ mod tests {
             "write_skip_sidecar must populate host field from collect_host_context",
         );
         assert_eq!(host.uname_sysname.as_deref(), Some("Linux"));
+        // Pair the uname check with a Default-distinguishing field —
+        // see `write_sidecar_writes_file` for the rationale. Keeps
+        // both the happy-path writer and the skip-path writer guarded
+        // against the same default-substitution regression.
+        assert!(
+            host.cmdline.is_some(),
+            "write_skip_sidecar must capture full HostContext, not Default::default()",
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2015,7 +2054,13 @@ mod tests {
         let ok = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
 
-        let path = find_sidecars_by_prefix(&tmp, "__payload_name_test__-")
+        let paths = find_sidecars_by_prefix(&tmp, "__payload_name_test__-");
+        assert_eq!(
+            paths.len(),
+            1,
+            "single-variant payload-name test must produce exactly one sidecar, got {paths:?}",
+        );
+        let path = paths
             .into_iter()
             .next()
             .expect("sidecar file with variant suffix should be written");
@@ -2085,7 +2130,13 @@ mod tests {
         ];
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &metrics).unwrap();
 
-        let path = find_sidecars_by_prefix(&tmp, "__metrics_slice_test__-")
+        let paths = find_sidecars_by_prefix(&tmp, "__metrics_slice_test__-");
+        assert_eq!(
+            paths.len(),
+            1,
+            "single-variant metrics-slice test must produce exactly one sidecar, got {paths:?}",
+        );
+        let path = paths
             .into_iter()
             .next()
             .expect("sidecar file should be written");
@@ -2135,7 +2186,13 @@ mod tests {
         };
         write_skip_sidecar(&entry, &[]).unwrap();
 
-        let path = find_sidecars_by_prefix(&tmp, "__skip_payload_name_test__-")
+        let paths = find_sidecars_by_prefix(&tmp, "__skip_payload_name_test__-");
+        assert_eq!(
+            paths.len(),
+            1,
+            "single-variant skip-payload-name test must produce exactly one sidecar, got {paths:?}",
+        );
+        let path = paths
             .into_iter()
             .next()
             .expect("sidecar file should be written");

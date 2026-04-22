@@ -4392,6 +4392,85 @@ mod tests {
         );
     }
 
+    /// `STATIC_NODES | RELATIVE_NODES` is a kernel-rejected
+    /// combination — `sanitize_mpol_flags` in `mm/mempolicy.c`
+    /// returns `EINVAL` if both bits are set. The validator must
+    /// surface this with a named diagnostic before the syscall,
+    /// not let it collapse into a generic EINVAL at runtime.
+    #[test]
+    fn validate_mempolicy_rejects_static_and_relative_conflict() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect();
+        let policy = MemPolicy::Bind([0].into_iter().collect());
+        let flags = crate::workload::MpolFlags::STATIC_NODES
+            | crate::workload::MpolFlags::RELATIVE_NODES;
+        let err = validate_mempolicy_cpuset(&policy, flags, &cpuset, &ctx, "cg_0")
+            .expect_err("STATIC_NODES | RELATIVE_NODES must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("mutually exclusive"),
+            "error must name the mutual-exclusion contract; got: {rendered}"
+        );
+    }
+
+    /// `RELATIVE_NODES` treats the policy nodemask as an ordinal
+    /// into the cpuset's allowed-nodes set — the kernel performs
+    /// the relative→absolute remap internally, so cpuset coverage
+    /// in absolute-id terms does not apply. The validator must
+    /// bypass the uncovered-node bail path that the default
+    /// (no-flag) case enforces; otherwise every RELATIVE_NODES
+    /// policy referencing an ordinal beyond the cpuset's first
+    /// node would false-positive.
+    #[test]
+    fn validate_mempolicy_relative_nodes_bypasses_cpuset_check() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        // cpuset covers NUMA node 0 only; policy references
+        // "node 1" which would fail the absolute-id coverage
+        // check in the default path. RELATIVE_NODES must bypass.
+        let cpuset: BTreeSet<usize> = (0..4).collect();
+        let policy = MemPolicy::Bind([1].into_iter().collect());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::RELATIVE_NODES,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok(),
+            "RELATIVE_NODES must bypass the absolute-id cpuset coverage check"
+        );
+    }
+
+    /// Under `STATIC_NODES` the nodemask is absolute, so the
+    /// validator must verify every referenced node actually exists
+    /// on the host topology. A policy pinning node 7 on a 2-node
+    /// host would fail at syscall time; surfacing it here names
+    /// the offender before the failure.
+    #[test]
+    fn validate_mempolicy_static_nodes_rejects_missing_host_node() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1); // host has nodes {0, 1}
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..8).collect();
+        // Reference a node that does not exist on this synthetic host.
+        let policy = MemPolicy::Bind([7].into_iter().collect());
+        let err = validate_mempolicy_cpuset(
+            &policy,
+            crate::workload::MpolFlags::STATIC_NODES,
+            &cpuset,
+            &ctx,
+            "cg_0",
+        )
+        .expect_err("STATIC_NODES policy referencing missing host node must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("do not exist on this host"),
+            "error must name the missing-host-node condition; got: {rendered}"
+        );
+    }
+
     #[test]
     fn cgroupdef_mem_policy_builder() {
         let def = CgroupDef::named("test").mem_policy(MemPolicy::Bind([0].into_iter().collect()));

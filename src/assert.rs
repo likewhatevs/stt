@@ -412,15 +412,15 @@ pub struct ScenarioStats {
     /// Worst migration ratio across any cgroup.
     pub worst_migration_ratio: f64,
     /// Worst p99 wake latency across all cgroups (microseconds).
-    pub p99_wake_latency_us: f64,
+    pub worst_p99_wake_latency_us: f64,
     /// Worst median wake latency across all cgroups (microseconds).
-    pub median_wake_latency_us: f64,
+    pub worst_median_wake_latency_us: f64,
     /// Worst wake latency coefficient of variation across all cgroups.
-    pub wake_latency_cv: f64,
+    pub worst_wake_latency_cv: f64,
     /// Sum of iteration counts across all cgroups.
     pub total_iterations: u64,
     /// Worst mean schedstat run delay across all cgroups (microseconds).
-    pub mean_run_delay_us: f64,
+    pub worst_mean_run_delay_us: f64,
     /// Worst schedstat run delay across all cgroups (microseconds).
     pub worst_run_delay_us: f64,
     /// Worst (lowest) page locality fraction across cgroups.
@@ -474,49 +474,39 @@ impl AssertResult {
         // the two `skipped` flags.
         self.skipped = self.skipped && other.skipped;
         self.details.extend(other.details);
-        self.stats.cgroups.extend(other.stats.cgroups);
-        self.stats.total_workers += other.stats.total_workers;
-        self.stats.total_cpus += other.stats.total_cpus;
-        self.stats.total_migrations += other.stats.total_migrations;
-        if other.stats.worst_spread > self.stats.worst_spread {
-            self.stats.worst_spread = other.stats.worst_spread;
+        let s = &mut self.stats;
+        let o = &other.stats;
+        s.total_workers += o.total_workers;
+        s.total_cpus += o.total_cpus;
+        s.total_migrations += o.total_migrations;
+        s.total_iterations += o.total_iterations;
+        s.worst_spread = s.worst_spread.max(o.worst_spread);
+        s.worst_migration_ratio = s.worst_migration_ratio.max(o.worst_migration_ratio);
+        s.worst_p99_wake_latency_us =
+            s.worst_p99_wake_latency_us.max(o.worst_p99_wake_latency_us);
+        s.worst_median_wake_latency_us = s
+            .worst_median_wake_latency_us
+            .max(o.worst_median_wake_latency_us);
+        s.worst_wake_latency_cv = s.worst_wake_latency_cv.max(o.worst_wake_latency_cv);
+        s.worst_run_delay_us = s.worst_run_delay_us.max(o.worst_run_delay_us);
+        s.worst_mean_run_delay_us = s.worst_mean_run_delay_us.max(o.worst_mean_run_delay_us);
+        s.worst_cross_node_migration_ratio = s
+            .worst_cross_node_migration_ratio
+            .max(o.worst_cross_node_migration_ratio);
+        // Coupled fields: `worst_gap_cpu` must come from the same
+        // cgroup that posted the new worst `worst_gap_ms`.
+        if o.worst_gap_ms > s.worst_gap_ms {
+            s.worst_gap_ms = o.worst_gap_ms;
+            s.worst_gap_cpu = o.worst_gap_cpu;
         }
-        if other.stats.worst_gap_ms > self.stats.worst_gap_ms {
-            self.stats.worst_gap_ms = other.stats.worst_gap_ms;
-            self.stats.worst_gap_cpu = other.stats.worst_gap_cpu;
-        }
-        if other.stats.worst_migration_ratio > self.stats.worst_migration_ratio {
-            self.stats.worst_migration_ratio = other.stats.worst_migration_ratio;
-        }
-        if other.stats.p99_wake_latency_us > self.stats.p99_wake_latency_us {
-            self.stats.p99_wake_latency_us = other.stats.p99_wake_latency_us;
-        }
-        if other.stats.median_wake_latency_us > self.stats.median_wake_latency_us {
-            self.stats.median_wake_latency_us = other.stats.median_wake_latency_us;
-        }
-        if other.stats.wake_latency_cv > self.stats.wake_latency_cv {
-            self.stats.wake_latency_cv = other.stats.wake_latency_cv;
-        }
-        self.stats.total_iterations += other.stats.total_iterations;
-        if other.stats.worst_run_delay_us > self.stats.worst_run_delay_us {
-            self.stats.worst_run_delay_us = other.stats.worst_run_delay_us;
-        }
-        // mean_run_delay: take worst across cgroups for scenario-level stat.
-        if other.stats.mean_run_delay_us > self.stats.mean_run_delay_us {
-            self.stats.mean_run_delay_us = other.stats.mean_run_delay_us;
-        }
-        // NUMA: worst page locality is the lowest non-zero value.
-        if other.stats.worst_page_locality > 0.0
-            && (self.stats.worst_page_locality == 0.0
-                || other.stats.worst_page_locality < self.stats.worst_page_locality)
+        // NUMA page locality: lowest non-zero value wins. Plain `min`
+        // would let an unreported cgroup (0.0 sentinel) clobber a
+        // real reading from another cgroup.
+        if o.worst_page_locality > 0.0
+            && (s.worst_page_locality == 0.0
+                || o.worst_page_locality < s.worst_page_locality)
         {
-            self.stats.worst_page_locality = other.stats.worst_page_locality;
-        }
-        if other.stats.worst_cross_node_migration_ratio
-            > self.stats.worst_cross_node_migration_ratio
-        {
-            self.stats.worst_cross_node_migration_ratio =
-                other.stats.worst_cross_node_migration_ratio;
+            s.worst_page_locality = o.worst_page_locality;
         }
         // Merge extensible metrics: take worst per key according to
         // each metric's polarity in the MetricDef registry. For
@@ -539,6 +529,10 @@ impl AssertResult {
                 entry.min(*v)
             };
         }
+        // Append per-cgroup stats last: moving `other.stats.cgroups`
+        // here consumes `other.stats`, so every scalar/map access
+        // above goes through the `&other.stats` reference first.
+        self.stats.cgroups.extend(other.stats.cgroups);
     }
 }
 
@@ -1572,11 +1566,11 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         worst_gap_ms: gap_ms,
         worst_gap_cpu: gap_cpu,
         worst_migration_ratio: cg.migration_ratio,
-        p99_wake_latency_us: cg.p99_wake_latency_us,
-        median_wake_latency_us: cg.median_wake_latency_us,
-        wake_latency_cv: cg.wake_latency_cv,
+        worst_p99_wake_latency_us: cg.p99_wake_latency_us,
+        worst_median_wake_latency_us: cg.median_wake_latency_us,
+        worst_wake_latency_cv: cg.wake_latency_cv,
         total_iterations: cg.total_iterations,
-        mean_run_delay_us: cg.mean_run_delay_us,
+        worst_mean_run_delay_us: cg.mean_run_delay_us,
         worst_run_delay_us: cg.worst_run_delay_us,
         worst_page_locality: 0.0,
         worst_cross_node_migration_ratio: 0.0,
@@ -2053,6 +2047,76 @@ mod tests {
         m.merge(r2);
         assert_eq!(m.stats.total_workers, 2);
         assert_eq!(m.stats.total_cpus, 2);
+    }
+
+    #[test]
+    fn merge_scenario_stats_worst_wins_and_iterations_sum() {
+        // Aggregates-across-cgroups contract: every `worst_*` field on
+        // ScenarioStats takes the larger value between the two cgroups,
+        // and `total_iterations` sums. Exercises fields that are not
+        // covered by the narrower merge_takes_worst_* tests: the wake-
+        // latency trio, the run-delay pair, the migration ratio, and
+        // the cross-node migration ratio.
+        let mut a = AssertResult::pass();
+        a.stats.total_iterations = 100;
+        a.stats.worst_spread = 5.0;
+        a.stats.worst_migration_ratio = 0.1;
+        a.stats.worst_p99_wake_latency_us = 20.0;
+        a.stats.worst_median_wake_latency_us = 10.0;
+        a.stats.worst_wake_latency_cv = 0.2;
+        a.stats.worst_run_delay_us = 50.0;
+        a.stats.worst_mean_run_delay_us = 30.0;
+        a.stats.worst_cross_node_migration_ratio = 0.05;
+
+        let mut b = AssertResult::pass();
+        b.stats.total_iterations = 400;
+        b.stats.worst_spread = 15.0;
+        b.stats.worst_migration_ratio = 0.4;
+        b.stats.worst_p99_wake_latency_us = 80.0;
+        b.stats.worst_median_wake_latency_us = 40.0;
+        b.stats.worst_wake_latency_cv = 0.5;
+        b.stats.worst_run_delay_us = 120.0;
+        b.stats.worst_mean_run_delay_us = 90.0;
+        b.stats.worst_cross_node_migration_ratio = 0.25;
+
+        a.merge(b);
+
+        assert_eq!(a.stats.total_iterations, 500);
+        assert_eq!(a.stats.worst_spread, 15.0);
+        assert_eq!(a.stats.worst_migration_ratio, 0.4);
+        assert_eq!(a.stats.worst_p99_wake_latency_us, 80.0);
+        assert_eq!(a.stats.worst_median_wake_latency_us, 40.0);
+        assert_eq!(a.stats.worst_wake_latency_cv, 0.5);
+        assert_eq!(a.stats.worst_run_delay_us, 120.0);
+        assert_eq!(a.stats.worst_mean_run_delay_us, 90.0);
+        assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.25);
+    }
+
+    #[test]
+    fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
+        // Symmetric case: when `other` reports smaller values, `self`
+        // retains its larger worst. Covers the branch of each
+        // `.max()` call where `self` wins, which the "b larger"
+        // test above never exercises.
+        let mut a = AssertResult::pass();
+        a.stats.worst_spread = 30.0;
+        a.stats.worst_p99_wake_latency_us = 100.0;
+        a.stats.worst_mean_run_delay_us = 200.0;
+        a.stats.total_iterations = 500;
+
+        let mut b = AssertResult::pass();
+        b.stats.worst_spread = 5.0;
+        b.stats.worst_p99_wake_latency_us = 10.0;
+        b.stats.worst_mean_run_delay_us = 20.0;
+        b.stats.total_iterations = 50;
+
+        a.merge(b);
+
+        assert_eq!(a.stats.worst_spread, 30.0);
+        assert_eq!(a.stats.worst_p99_wake_latency_us, 100.0);
+        assert_eq!(a.stats.worst_mean_run_delay_us, 200.0);
+        // Totals always sum, independent of worst-wins direction.
+        assert_eq!(a.stats.total_iterations, 550);
     }
 
     #[test]
@@ -3246,9 +3310,9 @@ mod tests {
         let reports = [rpt_with_latencies(1, latencies, 100, 5_000_000_000)];
         let r = assert_not_starved(&reports);
         assert_eq!(
-            r.stats.p99_wake_latency_us, 99.0,
+            r.stats.worst_p99_wake_latency_us, 99.0,
             "p99 must equal 99.0us (sorted[98] = 99_000ns), got {}us",
-            r.stats.p99_wake_latency_us
+            r.stats.worst_p99_wake_latency_us
         );
     }
 
@@ -3345,17 +3409,17 @@ mod tests {
         // p99 of [1000,2000,3000,4000,5000,6000,7000,8000,9000,10000] in us:
         // sorted, percentile index = ceil(10*0.99) - 1 = 9 -> sorted[9] = 10000ns = 10.0us
         assert!(
-            s.p99_wake_latency_us > 9.0,
+            s.worst_p99_wake_latency_us > 9.0,
             "p99: {}",
-            s.p99_wake_latency_us
+            s.worst_p99_wake_latency_us
         );
         // median of 10 samples: index 5 -> 6000ns = 6.0us
         assert!(
-            (s.median_wake_latency_us - 6.0).abs() < 0.1,
+            (s.worst_median_wake_latency_us - 6.0).abs() < 0.1,
             "median: {}",
-            s.median_wake_latency_us
+            s.worst_median_wake_latency_us
         );
-        assert!(s.wake_latency_cv > 0.0, "cv: {}", s.wake_latency_cv);
+        assert!(s.worst_wake_latency_cv > 0.0, "cv: {}", s.worst_wake_latency_cv);
         assert_eq!(s.total_iterations, 300);
     }
 
@@ -3364,9 +3428,9 @@ mod tests {
         let reports = [rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)];
         let r = assert_not_starved(&reports);
         assert!(r.passed);
-        assert_eq!(r.stats.p99_wake_latency_us, 0.0);
-        assert_eq!(r.stats.median_wake_latency_us, 0.0);
-        assert_eq!(r.stats.wake_latency_cv, 0.0);
+        assert_eq!(r.stats.worst_p99_wake_latency_us, 0.0);
+        assert_eq!(r.stats.worst_median_wake_latency_us, 0.0);
+        assert_eq!(r.stats.worst_wake_latency_cv, 0.0);
     }
 
     #[test]
@@ -3379,9 +3443,9 @@ mod tests {
         assert!(r.passed, "{:?}", r.details);
         // mean_run_delay = (100 + 300) / 2 = 200us
         assert!(
-            (r.stats.mean_run_delay_us - 200.0).abs() < 0.1,
+            (r.stats.worst_mean_run_delay_us - 200.0).abs() < 0.1,
             "mean: {}",
-            r.stats.mean_run_delay_us
+            r.stats.worst_mean_run_delay_us
         );
         // worst_run_delay = 300us
         assert!(
