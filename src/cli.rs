@@ -1949,15 +1949,25 @@ mod tests {
     /// `Command::spawn` to fail before exec, with an underlying
     /// `io::Error` of kind `NotFound`. `run_make_with_output` wraps
     /// that error via `.with_context(|| format!("spawn make {}", ...))`,
-    /// so the rendered anyhow chain must surface BOTH the
-    /// `"spawn make <args>"` annotation (proving the wrapping landed
-    /// on the failing operation) AND the underlying
-    /// `"No such file or directory"` message (proving the io::Error
-    /// chain was preserved through context). A regression that
-    /// dropped either layer — bare `?` losing the context, or
-    /// `Error::msg` losing the source — would surface here. Pipe2 +
-    /// try_clone run before spawn, so reaching this error proves
-    /// they succeeded too.
+    /// so the anyhow chain must surface BOTH the `"spawn make <args>"`
+    /// annotation (proving the wrapping landed on the failing
+    /// operation) AND the underlying `io::Error` with
+    /// `ErrorKind::NotFound` (proving the io::Error chain was
+    /// preserved through context). A regression that dropped either
+    /// layer — bare `?` losing the context, or `Error::msg` losing
+    /// the source — would surface here.
+    ///
+    /// The io::Error check uses `downcast_ref::<io::Error>()` on the
+    /// anyhow chain rather than matching on the rendered
+    /// `"No such file or directory"` string: the latter is the
+    /// English-locale output of glibc's `strerror(ENOENT)`, but
+    /// glibc translates per `LC_MESSAGES` — a CI runner with
+    /// `LANG=fr_FR.UTF-8` would see "Aucun fichier ou dossier de ce
+    /// type" and fail the test spuriously. `ErrorKind::NotFound` is
+    /// structural and locale-free.
+    ///
+    /// Pipe2 + try_clone run before spawn, so reaching this error
+    /// proves they succeeded too.
     #[test]
     fn run_make_with_output_surfaces_actionable_error_when_kernel_dir_missing() {
         let missing = std::path::Path::new("/this/path/should/not/exist/ktstr_test");
@@ -1968,9 +1978,14 @@ mod tests {
             rendered.contains("spawn make foo"),
             "expected `spawn make foo` context layer, got: {rendered}"
         );
+        let has_not_found = err.chain().any(|e| {
+            e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        });
         assert!(
-            rendered.contains("No such file or directory"),
-            "expected underlying io::Error chain, got: {rendered}"
+            has_not_found,
+            "expected underlying io::Error with ErrorKind::NotFound in anyhow chain, \
+             got: {rendered}"
         );
     }
 

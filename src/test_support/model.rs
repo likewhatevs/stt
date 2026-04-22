@@ -255,6 +255,23 @@ pub const DEFAULT_TOKENIZER: ModelSpec = ModelSpec {
     size_bytes: 11 * 1024 * 1024,
 };
 
+// Module-scope compile-time shape check on the DEFAULT_MODEL and
+// DEFAULT_TOKENIZER SHA pins: 64 ASCII hex chars, anything else is a
+// typo. Placed at module scope (not inside a `#[cfg(test)] fn`) so
+// the assertion fires on every `cargo check` / `cargo build`, not
+// only under `cargo check --tests`. A pin swap with a malformed hex
+// string now fails the default build before any runtime test hits
+// it. The `is_valid_sha256_hex` helper is const-evaluated, so the
+// entire check folds at compile time with no runtime cost.
+const _: () = assert!(
+    is_valid_sha256_hex(DEFAULT_MODEL.sha256_hex),
+    "DEFAULT_MODEL.sha256_hex must be 64 ASCII hex characters",
+);
+const _: () = assert!(
+    is_valid_sha256_hex(DEFAULT_TOKENIZER.sha256_hex),
+    "DEFAULT_TOKENIZER.sha256_hex must be 64 ASCII hex characters",
+);
+
 /// Environment variable that opts out of the eager prefetch.
 /// `KTSTR_MODEL_OFFLINE=1` (or any non-empty value) leaves the cache
 /// untouched; `LlmExtract` tests then surface missing-model errors
@@ -718,8 +735,23 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
 /// Callers that need to distinguish "wrong length" from "non-hex"
 /// for diagnostics still need their own branching — this helper
 /// collapses the predicate, not the error messages.
-fn is_valid_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+const fn is_valid_sha256_hex(s: &str) -> bool {
+    // `const fn` requires byte-level iteration — `.chars().all(...)`
+    // depends on non-const iterator adapters. `u8::is_ascii_hexdigit`
+    // has been `const fn` since Rust 1.47, so the per-byte predicate
+    // is a direct one-liner with identical semantics.
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_hexdigit() {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Return `Ok(true)` when the file's SHA-256 matches the expected
@@ -2407,7 +2439,7 @@ mod tests {
         );
     }
 
-    /// `DEFAULT_TOKENIZER.file_name` should end with `.json` — the
+    /// `DEFAULT_TOKENIZER.file_name` must end with `.json` — the
     /// tokenizers crate loads by JSON path and a non-JSON extension
     /// would fail at load time. Pin the convention so a pin swap to
     /// a different tokenizer format surfaces early.
@@ -2415,7 +2447,7 @@ mod tests {
     fn default_tokenizer_file_name_ends_with_json() {
         assert!(
             DEFAULT_TOKENIZER.file_name.ends_with(".json"),
-            "DEFAULT_TOKENIZER.file_name should end with .json: {:?}",
+            "DEFAULT_TOKENIZER.file_name must end with .json: {:?}",
             DEFAULT_TOKENIZER.file_name
         );
     }
@@ -2464,7 +2496,7 @@ mod tests {
     fn default_model_file_name_ends_with_gguf() {
         assert!(
             DEFAULT_MODEL.file_name.ends_with(".gguf"),
-            "DEFAULT_MODEL.file_name should end with .gguf: {:?}",
+            "DEFAULT_MODEL.file_name must end with .gguf: {:?}",
             DEFAULT_MODEL.file_name
         );
     }
