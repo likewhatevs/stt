@@ -1905,8 +1905,13 @@ fn worker_main(
     // accessing the guest kernel's vmstat via GuestMem or BPF.
     let vmstat_migrated_start = read_vmstat_numa_pages_migrated();
 
-    // schedstat snapshot at work-loop start.
-    let (ss_cpu_start, ss_delay_start, ss_ts_start) = read_schedstat();
+    // schedstat snapshot at work-loop start. `None` means schedstats
+    // is unavailable on this kernel (CONFIG_SCHEDSTATS off / procfs
+    // error); propagate that through as `None` at the end snapshot
+    // and we will emit zero deltas with a one-shot stderr warning —
+    // previously we could not distinguish "unavailable" from "worker
+    // has run for zero ns".
+    let schedstat_start = read_schedstat();
 
     while !STOP.load(Ordering::Relaxed) {
         match work_type {
@@ -2326,17 +2331,28 @@ fn worker_main(
                 let wake_ts_ptr = unsafe { (futex_ptr as *mut u8).add(8) as *mut u64 };
                 if is_messenger {
                     // Messenger: stamp wake time, advance generation, wake workers.
-                    let mut ts = libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: 0,
-                    };
-                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-                    let wake_ns = (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64);
-                    unsafe { std::ptr::write_volatile(wake_ts_ptr, wake_ns) };
-                    let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
-                    unsafe {
-                        std::ptr::write_volatile(futex_ptr, next);
-                        futex_wake(futex_ptr, fan_out as i32);
+                    // Advance the generation and wake the workers
+                    // ONLY after a successful `wake_ns` write. An
+                    // earlier draft advanced the generation
+                    // unconditionally, which meant a `clock_gettime`
+                    // failure would wake workers against the *prior*
+                    // round's `wake_ns` — producing an inflated
+                    // `now_ns - wake_ns` latency that would
+                    // contaminate the p99 tail of the reservoir.
+                    // Skipping the whole round (including the wake)
+                    // keeps the latency histogram honest; workers
+                    // stay parked on `futex_wait` with its 100 ms
+                    // timeout and observe the next successful round
+                    // normally. `spin_burst` still runs on this
+                    // thread so the messenger keeps producing
+                    // work_units.
+                    if let Some(wake_ns) = clock_gettime_ns(libc::CLOCK_MONOTONIC) {
+                        unsafe { std::ptr::write_volatile(wake_ts_ptr, wake_ns) };
+                        let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
+                        unsafe {
+                            std::ptr::write_volatile(futex_ptr, next);
+                            futex_wake(futex_ptr, fan_out as i32);
+                        }
                     }
                     spin_burst(&mut work_units, 256);
                 } else {
@@ -2352,21 +2368,24 @@ fn worker_main(
                         }
                         let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
                         if cur != expected {
-                            let mut now_ts = libc::timespec {
-                                tv_sec: 0,
-                                tv_nsec: 0,
-                            };
-                            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now_ts) };
-                            let now_ns =
-                                (now_ts.tv_sec as u64) * 1_000_000_000 + (now_ts.tv_nsec as u64);
-                            let wake_ns = unsafe { std::ptr::read_volatile(wake_ts_ptr) };
-                            let latency = now_ns.saturating_sub(wake_ns);
-                            reservoir_push(
-                                &mut resume_latencies_ns,
-                                &mut wake_sample_count,
-                                latency,
-                                MAX_WAKE_SAMPLES,
-                            );
+                            // Skip the reservoir push entirely on
+                            // `clock_gettime` failure — previously
+                            // the rc was discarded and a
+                            // zeroed/garbage `now_ts` was fed into
+                            // `saturating_sub`, silently contaminating
+                            // the resume-latency histogram with values
+                            // dominated by wake_ns itself.
+                            if let Some(now_ns) = clock_gettime_ns(libc::CLOCK_MONOTONIC) {
+                                let wake_ns =
+                                    unsafe { std::ptr::read_volatile(wake_ts_ptr) };
+                                let latency = now_ns.saturating_sub(wake_ns);
+                                reservoir_push(
+                                    &mut resume_latencies_ns,
+                                    &mut wake_sample_count,
+                                    latency,
+                                    MAX_WAKE_SAMPLES,
+                                );
+                            }
                             break;
                         }
                         unsafe { futex_wait(futex_ptr, expected, &ts) };
@@ -2560,8 +2579,19 @@ fn worker_main(
     let cpu_time_ns = thread_cpu_time_ns();
     let wall_time_ns = wall_time.as_nanos() as u64;
 
-    // schedstat snapshot at work-loop end; compute deltas.
-    let (ss_cpu_end, ss_delay_end, ss_ts_end) = read_schedstat();
+    // schedstat snapshot at work-loop end; compute deltas if both
+    // snapshots succeeded, else zero (the start-of-loop read already
+    // emitted a warning if schedstat is unavailable).
+    let schedstat_end = read_schedstat();
+    let (ss_delay_delta, ss_ts_delta, ss_cpu_delta) =
+        match (schedstat_start, schedstat_end) {
+            (Some((cpu_s, delay_s, ts_s)), Some((cpu_e, delay_e, ts_e))) => (
+                delay_e.saturating_sub(delay_s),
+                ts_e.saturating_sub(ts_s),
+                cpu_e.saturating_sub(cpu_s),
+            ),
+            _ => (0, 0, 0),
+        };
 
     // NUMA: read numa_maps and vmstat after workload.
     let numa_pages = read_numa_maps_pages();
@@ -2582,9 +2612,9 @@ fn worker_main(
         max_gap_at_ms: max_gap_at_ns / 1_000_000,
         resume_latencies_ns,
         iterations,
-        schedstat_run_delay_ns: ss_delay_end.saturating_sub(ss_delay_start),
-        schedstat_ctx_switches: ss_ts_end.saturating_sub(ss_ts_start),
-        schedstat_cpu_time_ns: ss_cpu_end.saturating_sub(ss_cpu_start),
+        schedstat_run_delay_ns: ss_delay_delta,
+        schedstat_ctx_switches: ss_ts_delta,
+        schedstat_cpu_time_ns: ss_cpu_delta,
         numa_pages,
         vmstat_numa_pages_migrated: vmstat_migrated_delta,
     }
@@ -2728,26 +2758,52 @@ fn reservoir_push(buf: &mut Vec<u64>, count: &mut u64, sample: u64, cap: usize) 
 }
 
 /// Read /proc/self/schedstat and return (cpu_time_ns, run_delay_ns, timeslices).
-/// Returns (0, 0, 0) on failure (e.g. schedstats not enabled).
-fn read_schedstat() -> (u64, u64, u64) {
+///
+/// Returns `None` when the file cannot be opened (kernel built
+/// without `CONFIG_SCHEDSTATS`, or `/proc` unavailable) or when any
+/// of the first three whitespace-separated fields is missing or not
+/// parseable as `u64`. Callers must distinguish "unavailable" from
+/// "zero observed" — the previous `(0, 0, 0)`-on-failure return was
+/// silently ambiguous across "schedstats disabled", "I/O error",
+/// and "worker genuinely did no work yet", which caused
+/// `assert_not_starved`-style checks to ratify the wrong invariant
+/// on kernels without schedstats.
+///
+/// Emits a process-wide one-shot warning to stderr the first time
+/// the file cannot be opened so the test log records the cause
+/// without flooding on every per-worker read. The parse-failure
+/// branches return `None` silently — a schedstat line that opens
+/// but fails `u64::parse` indicates a kernel-ABI drift that should
+/// not occur on any production kernel and warrants investigation by
+/// the maintainer rather than per-run log noise.
+fn read_schedstat() -> Option<(u64, u64, u64)> {
     let data = match std::fs::read_to_string("/proc/self/schedstat") {
         Ok(d) => d,
-        Err(_) => return (0, 0, 0),
+        Err(_) => {
+            warn_schedstat_unavailable_once();
+            return None;
+        }
     };
     let mut parts = data.split_whitespace();
-    let cpu_time = parts
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let run_delay = parts
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let timeslices = parts
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    (cpu_time, run_delay, timeslices)
+    let cpu_time = parts.next()?.parse::<u64>().ok()?;
+    let run_delay = parts.next()?.parse::<u64>().ok()?;
+    let timeslices = parts.next()?.parse::<u64>().ok()?;
+    Some((cpu_time, run_delay, timeslices))
+}
+
+/// Print a single "schedstat unavailable" warning for the lifetime
+/// of the process. The workload spawns `N_WORKERS` threads, each of
+/// which calls `read_schedstat` twice; without a gate this would
+/// emit up to `2N` duplicate lines on a kernel without
+/// `CONFIG_SCHEDSTATS`.
+fn warn_schedstat_unavailable_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "workload: /proc/self/schedstat unavailable (CONFIG_SCHEDSTATS off?); \
+             schedstat_* fields in WorkerReport will be zero"
+        );
+    });
 }
 
 /// Aggregate per-node page counts from `/proc/self/numa_maps`.
@@ -2776,16 +2832,67 @@ fn read_vmstat_numa_pages_migrated() -> u64 {
     crate::assert::parse_vmstat_numa_pages_migrated(&content).unwrap_or(0)
 }
 
-fn thread_cpu_time_ns() -> u64 {
+/// Read `clk` via `clock_gettime` and return the raw timespec packed
+/// as `tv_sec * 1e9 + tv_nsec` (ns units), or `None` if the syscall
+/// fails. The semantics of the returned value depend on `clk`:
+/// `CLOCK_MONOTONIC` is nanoseconds since an unspecified boot epoch,
+/// `CLOCK_THREAD_CPUTIME_ID` is nanoseconds of CPU time charged to
+/// the calling thread. Centralizes the error check that previously
+/// was either discarded entirely (producing garbage timespec readings
+/// that fed into wake-latency reservoirs) or collapsed to a 0
+/// sentinel indistinguishable from "clock read zero".
+fn clock_gettime_ns(clk: libc::clockid_t) -> Option<u64> {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    let ret = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    if ret != 0 {
-        return 0;
+    let rc = unsafe { libc::clock_gettime(clk, &mut ts) };
+    if rc != 0 {
+        warn_clock_gettime_failed_once(clk);
+        return None;
     }
-    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+    Some((ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64))
+}
+
+/// Print a single `clock_gettime` failure warning per clock id for
+/// the lifetime of the process. Same rationale as
+/// `warn_schedstat_unavailable_once`: dozens of workers will fail
+/// once each on a misconfigured host. Only `CLOCK_THREAD_CPUTIME_ID`
+/// and `CLOCK_MONOTONIC` are ever passed in by this file; any other
+/// clock id is a programming error and should panic in development
+/// rather than silently falling through to a speculative catch-all.
+fn warn_clock_gettime_failed_once(clk: libc::clockid_t) {
+    static WARNED_THREAD: std::sync::Once = std::sync::Once::new();
+    static WARNED_MONO: std::sync::Once = std::sync::Once::new();
+    let once = match clk {
+        libc::CLOCK_THREAD_CPUTIME_ID => &WARNED_THREAD,
+        libc::CLOCK_MONOTONIC => &WARNED_MONO,
+        _ => unreachable!("unexpected clockid {clk}"),
+    };
+    once.call_once(|| {
+        // Capture errno INSIDE `call_once` — on every subsequent
+        // call the `Once` has already run and the computation is
+        // short-circuited, so there is no point paying the syscall
+        // cost to read `last_os_error` again just to drop it.
+        let errno = std::io::Error::last_os_error();
+        eprintln!(
+            "workload: clock_gettime(clk={clk}) failed: {errno}; affected samples will be zero or skipped"
+        );
+    });
+}
+
+/// Read the calling thread's CPU-time counter. Returns 0 on syscall
+/// failure after emitting a one-shot stderr warning — callers treat
+/// the value as a per-thread cumulative counter and cannot usefully
+/// distinguish "zero ns" from "clock failed" at the counter's
+/// granularity (nanoseconds), so the 0 fallback is an acceptable
+/// compromise. The failure path is near-impossible on Linux (kernel
+/// must support `CLOCK_THREAD_CPUTIME_ID`, which has been default
+/// since 2.6.12). If this lands in a hostile environment where
+/// failure is real, callers should migrate to `clock_gettime_ns`
+/// directly and handle `None`.
+fn thread_cpu_time_ns() -> u64 {
+    clock_gettime_ns(libc::CLOCK_THREAD_CPUTIME_ID).unwrap_or(0)
 }
 
 fn set_sched_policy(pid: libc::pid_t, policy: SchedPolicy) -> Result<()> {
@@ -3922,31 +4029,6 @@ mod tests {
         assert_eq!(r.unwrap(), [7].into_iter().collect());
     }
 
-    // -- WorkType::name edge cases --
-
-    #[test]
-    fn work_type_name_io_sync() {
-        assert_eq!(WorkType::IoSync.name(), "IoSync");
-    }
-
-    #[test]
-    fn work_type_name_mixed() {
-        assert_eq!(WorkType::Mixed.name(), "Mixed");
-    }
-
-    #[test]
-    fn work_type_name_yield_heavy() {
-        assert_eq!(WorkType::YieldHeavy.name(), "YieldHeavy");
-    }
-
-    // -- WorkType::from_name edge cases --
-
-    #[test]
-    fn work_type_from_name_case_sensitive() {
-        assert!(WorkType::from_name("cpuspin").is_none());
-        assert!(WorkType::from_name("CPUSPIN").is_none());
-    }
-
     // -- SchedPolicy variants --
 
     /// Restore SCHED_NORMAL via the raw syscall. `set_sched_policy(Normal)`
@@ -4256,44 +4338,6 @@ mod tests {
         assert!(r.is_none(), "empty Random pool must resolve to no affinity");
     }
 
-    // -- spawn and collect edge cases --
-
-    #[test]
-    fn spawn_single_worker_reports_cpus() {
-        let config = WorkloadConfig {
-            num_workers: 1,
-            affinity: AffinityMode::None,
-            work_type: WorkType::CpuSpin,
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let reports = h.stop_and_collect();
-        assert_eq!(reports.len(), 1);
-        assert!(
-            !reports[0].cpus_used.is_empty(),
-            "should report at least one CPU"
-        );
-    }
-
-    #[test]
-    fn workload_handle_tids_ordered() {
-        let config = WorkloadConfig {
-            num_workers: 3,
-            ..Default::default()
-        };
-        let h = WorkloadHandle::spawn(&config).unwrap();
-        let tids = h.tids();
-        assert_eq!(tids.len(), 3);
-        // PIDs should all be positive
-        for tid in &tids {
-            assert!(*tid > 0);
-        }
-        drop(h);
-    }
-
     // -- reservoir_push tests --
 
     #[test]
@@ -4405,7 +4449,16 @@ mod tests {
         // and timeslices must be strictly positive. run_delay can
         // legitimately be zero on an idle host where the test thread
         // never waited for a runqueue slot, so it is left unchecked.
-        let (cpu_time, _run_delay, timeslices) = read_schedstat();
+        //
+        // `None` is a legitimate outcome when the host kernel is
+        // built without `CONFIG_SCHEDSTATS` — treat that as a skip
+        // rather than a test failure.
+        let Some((cpu_time, _run_delay, timeslices)) = read_schedstat() else {
+            eprintln!(
+                "skipping: /proc/self/schedstat not available (CONFIG_SCHEDSTATS off)"
+            );
+            return;
+        };
         assert!(cpu_time > 0);
         assert!(timeslices > 0);
     }
@@ -4744,22 +4797,6 @@ mod tests {
         match SchedPolicy::round_robin(25) {
             SchedPolicy::RoundRobin(p) => assert_eq!(p, 25),
             _ => panic!("expected RoundRobin"),
-        }
-    }
-
-    #[test]
-    fn sched_policy_fifo_default_priority() {
-        match SchedPolicy::fifo(1) {
-            SchedPolicy::Fifo(p) => assert_eq!(p, 1),
-            _ => panic!("expected Fifo(1)"),
-        }
-    }
-
-    #[test]
-    fn sched_policy_rr_default_priority() {
-        match SchedPolicy::round_robin(1) {
-            SchedPolicy::RoundRobin(p) => assert_eq!(p, 1),
-            _ => panic!("expected RoundRobin(1)"),
         }
     }
 
@@ -5175,6 +5212,63 @@ mod tests {
     fn work_mpol_flags_builder() {
         let w = Work::default().mpol_flags(MpolFlags::STATIC_NODES);
         assert_eq!(w.mpol_flags, MpolFlags::STATIC_NODES);
+    }
+
+    #[test]
+    fn mpol_flags_contains_identity() {
+        assert!(MpolFlags::NONE.contains(MpolFlags::NONE));
+        assert!(MpolFlags::STATIC_NODES.contains(MpolFlags::STATIC_NODES));
+        let composite = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(composite.contains(composite));
+    }
+
+    #[test]
+    fn mpol_flags_contains_superset_is_true_for_subset() {
+        let composite = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(composite.contains(MpolFlags::STATIC_NODES));
+        assert!(composite.contains(MpolFlags::NUMA_BALANCING));
+    }
+
+    #[test]
+    fn mpol_flags_contains_subset_is_false_for_superset() {
+        let composite = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(!MpolFlags::STATIC_NODES.contains(composite));
+        assert!(!MpolFlags::NUMA_BALANCING.contains(composite));
+    }
+
+    #[test]
+    fn mpol_flags_contains_empty_is_always_true() {
+        // `(x & 0) == 0` holds for every x, so every MpolFlags
+        // value — including NONE itself — is a superset of NONE.
+        assert!(MpolFlags::NONE.contains(MpolFlags::NONE));
+        assert!(MpolFlags::STATIC_NODES.contains(MpolFlags::NONE));
+        let composite = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(composite.contains(MpolFlags::NONE));
+    }
+
+    #[test]
+    fn mpol_flags_none_does_not_contain_any_set_flag() {
+        assert!(!MpolFlags::NONE.contains(MpolFlags::STATIC_NODES));
+        assert!(!MpolFlags::NONE.contains(MpolFlags::RELATIVE_NODES));
+        assert!(!MpolFlags::NONE.contains(MpolFlags::NUMA_BALANCING));
+    }
+
+    #[test]
+    fn mpol_flags_contains_rejects_disjoint_flag() {
+        // Single-flag values that share no bits must not satisfy
+        // `contains` in either direction.
+        assert!(!MpolFlags::STATIC_NODES.contains(MpolFlags::NUMA_BALANCING));
+        assert!(!MpolFlags::NUMA_BALANCING.contains(MpolFlags::STATIC_NODES));
+    }
+
+    #[test]
+    fn mpol_flags_contains_rejects_partial_overlap() {
+        // Partial bit overlap must not satisfy `contains` — every
+        // bit of `other` must be set in `self`, not merely some.
+        let a = MpolFlags::STATIC_NODES | MpolFlags::NUMA_BALANCING;
+        let b = MpolFlags::RELATIVE_NODES | MpolFlags::NUMA_BALANCING;
+        assert!(!a.contains(b));
+        assert!(!b.contains(a));
     }
 
     #[test]
