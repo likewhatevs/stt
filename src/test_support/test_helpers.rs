@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tempfile::TempDir;
 
-use crate::assert::AssertResult;
+use crate::assert::{AssertDetail, AssertResult, ScenarioStats};
 use crate::scenario::Ctx;
 use crate::scenario::flags::FlagDecl;
 
@@ -234,6 +234,30 @@ pub(crate) fn make_vm_result(
         kvm_stats: None,
         crash_message: None,
     }
+}
+
+/// Build a JSON-encoded [`AssertResult`] with a default (all-zero)
+/// [`ScenarioStats`] payload. Centralizes the 16-field zero-stats
+/// skeleton that previously had to be hand-typed at every
+/// `evaluate_vm_result` / `parse_assert_result` call site, and keeps
+/// the produced JSON automatically in step with any future
+/// `AssertResult` / `ScenarioStats` field addition — the helper goes
+/// through `serde_json::to_string`, so adding or removing a field
+/// flows through without parallel edits at each test.
+///
+/// Byte layout of the emitted JSON is irrelevant to the consumers
+/// (which round-trip through `serde_json::from_str` back into an
+/// `AssertResult`); what matters is that the helper produces a
+/// JSON body identical in semantic content to what the old
+/// hand-written literal encoded.
+pub(crate) fn build_assert_result_json(passed: bool, details: Vec<AssertDetail>) -> String {
+    let result = AssertResult {
+        passed,
+        skipped: false,
+        details,
+        stats: ScenarioStats::default(),
+    };
+    serde_json::to_string(&result).expect("AssertResult must always serialize")
 }
 
 /// Build a `KtstrTestEntry` with overridden memory/duration/workers

@@ -837,18 +837,13 @@ impl ThreadProbeError {
     fn new(kind: ThreadErrorKind, source: anyhow::Error) -> Self {
         Self { kind, source }
     }
-}
 
-/// read-counters → detach sequence for a single target tid.
-fn probe_single_thread(
-    tid: i32,
-    symbol: &TsdTlsSymbol,
-    offsets: &CounterOffsets,
-) -> std::result::Result<ThreadCounters, ThreadProbeError> {
-    let pid = Pid::from_raw(tid);
-
-    ptrace::seize(pid, Options::empty()).map_err(|e| {
-        let rendered = if e == nix::errno::Errno::EPERM {
+    /// `ptrace(PTRACE_SEIZE)` failure. The `EPERM` branch expands into
+    /// a multi-line operator hint enumerating the four common fixes
+    /// (root, file capability, uid match, yama scope). Kept out of the
+    /// caller so the hint text has a single source of truth.
+    fn ptrace_seize(tid: i32, e: nix::errno::Errno) -> Self {
+        let source = if e == nix::errno::Errno::EPERM {
             anyhow!(
                 "ptrace(PTRACE_SEIZE) on tid {tid}: permission denied (EPERM). \
                  Grant access with one of: (1) run as root, (2) setcap \
@@ -859,42 +854,81 @@ fn probe_single_thread(
         } else {
             anyhow!("ptrace(PTRACE_SEIZE) on tid {tid}: {e}")
         };
-        ThreadProbeError::new(ThreadErrorKind::PtraceAttach, rendered)
-    })?;
+        Self::new(ThreadErrorKind::PtraceAttach, source)
+    }
+
+    fn ptrace_interrupt(tid: i32, e: nix::errno::Errno) -> Self {
+        Self::new(
+            ThreadErrorKind::PtraceAttach,
+            anyhow!("ptrace(PTRACE_INTERRUPT) on tid {tid}: {e}"),
+        )
+    }
+
+    fn waitpid_unexpected(tid: i32, status: WaitStatus) -> Self {
+        Self::new(
+            ThreadErrorKind::Waitpid,
+            anyhow!("waitpid on tid {tid} returned unexpected status: {status:?}"),
+        )
+    }
+
+    fn waitpid_err(tid: i32, e: nix::errno::Errno) -> Self {
+        Self::new(
+            ThreadErrorKind::Waitpid,
+            anyhow!("waitpid on tid {tid}: {e}"),
+        )
+    }
+
+    fn getregset(tid: i32, e: nix::errno::Errno) -> Self {
+        Self::new(
+            ThreadErrorKind::GetRegset,
+            anyhow!("ptrace(PTRACE_GETREGSET, NT_PRSTATUS) on tid {tid}: {e}"),
+        )
+    }
+
+    fn tls_arithmetic(source: anyhow::Error) -> Self {
+        Self::new(ThreadErrorKind::TlsArithmetic, source)
+    }
+
+    fn process_vm_readv_err(tid: i32, addr: u64, e: nix::errno::Errno) -> Self {
+        Self::new(
+            ThreadErrorKind::ProcessVmReadv,
+            anyhow!("process_vm_readv on tid {tid} at {addr:#x}: {e}"),
+        )
+    }
+
+    fn process_vm_readv_short(tid: i32, n: usize, expected: u64) -> Self {
+        Self::new(
+            ThreadErrorKind::ProcessVmReadv,
+            anyhow!("short process_vm_readv on tid {tid}: got {n} bytes, expected {expected}"),
+        )
+    }
+}
+
+/// read-counters → detach sequence for a single target tid.
+fn probe_single_thread(
+    tid: i32,
+    symbol: &TsdTlsSymbol,
+    offsets: &CounterOffsets,
+) -> std::result::Result<ThreadCounters, ThreadProbeError> {
+    let pid = Pid::from_raw(tid);
+
+    ptrace::seize(pid, Options::empty())
+        .map_err(|e| ThreadProbeError::ptrace_seize(tid, e))?;
     // Record the attach BEFORE we try to interrupt, so a failure in
     // interrupt still lets cleanup detach us.
     attached().lock().unwrap().insert(tid);
 
     let _attached_guard = ScopeDetach(tid);
 
-    ptrace::interrupt(pid).map_err(|e| {
-        ThreadProbeError::new(
-            ThreadErrorKind::PtraceAttach,
-            anyhow!("ptrace(PTRACE_INTERRUPT) on tid {tid}: {e}"),
-        )
-    })?;
+    ptrace::interrupt(pid).map_err(|e| ThreadProbeError::ptrace_interrupt(tid, e))?;
     match waitpid(pid, None) {
         Ok(WaitStatus::Stopped(_, _) | WaitStatus::PtraceEvent(_, _, _)) => {}
-        Ok(other) => {
-            return Err(ThreadProbeError::new(
-                ThreadErrorKind::Waitpid,
-                anyhow!("waitpid on tid {tid} returned unexpected status: {other:?}"),
-            ));
-        }
-        Err(e) => {
-            return Err(ThreadProbeError::new(
-                ThreadErrorKind::Waitpid,
-                anyhow!("waitpid on tid {tid}: {e}"),
-            ));
-        }
+        Ok(other) => return Err(ThreadProbeError::waitpid_unexpected(tid, other)),
+        Err(e) => return Err(ThreadProbeError::waitpid_err(tid, e)),
     }
 
-    let regs = ptrace::getregset::<NT_PRSTATUS>(pid).map_err(|e| {
-        ThreadProbeError::new(
-            ThreadErrorKind::GetRegset,
-            anyhow!("ptrace(PTRACE_GETREGSET, NT_PRSTATUS) on tid {tid}: {e}"),
-        )
-    })?;
+    let regs = ptrace::getregset::<NT_PRSTATUS>(pid)
+        .map_err(|e| ThreadProbeError::getregset(tid, e))?;
     let fs_base = regs.fs_base;
 
     let addr = compute_tls_address(
@@ -903,7 +937,7 @@ fn probe_single_thread(
         symbol.st_value,
         offsets.thread_allocated,
     )
-    .map_err(|e| ThreadProbeError::new(ThreadErrorKind::TlsArithmetic, e))?;
+    .map_err(ThreadProbeError::tls_arithmetic)?;
 
     let (_base, span) = offsets.combined_read_span();
     let mut buf = vec![0u8; span as usize];
@@ -912,19 +946,10 @@ fn probe_single_thread(
         len: span as usize,
     };
     let mut local = [IoSliceMut::new(&mut buf)];
-    let n = process_vm_readv(pid, &mut local, &[remote]).map_err(|e| {
-        ThreadProbeError::new(
-            ThreadErrorKind::ProcessVmReadv,
-            anyhow!("process_vm_readv on tid {tid} at {addr:#x}: {e}"),
-        )
-    })?;
+    let n = process_vm_readv(pid, &mut local, &[remote])
+        .map_err(|e| ThreadProbeError::process_vm_readv_err(tid, addr, e))?;
     if n != span as usize {
-        return Err(ThreadProbeError::new(
-            ThreadErrorKind::ProcessVmReadv,
-            anyhow!(
-                "short process_vm_readv on tid {tid}: got {n} bytes, expected {span}"
-            ),
-        ));
+        return Err(ThreadProbeError::process_vm_readv_short(tid, n, span));
     }
 
     let allocated = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -1725,5 +1750,115 @@ mod tests {
                 "self-probe gate must NOT fire for non-self pid {child_pid} (self={self_pid}), got: {msg}",
             );
         }
+    }
+
+    // -- ThreadProbeError construction helpers --
+    //
+    // Each per-syscall helper was extracted from open-coded
+    // `ThreadProbeError::new(Kind, anyhow!(...))` sites in
+    // `probe_single_thread`; these tests pin (1) the `kind` tag each
+    // helper emits, (2) the exact message format so operators grepping
+    // stderr can keep stable anchors, and (3) the EPERM-branching
+    // logic inside `ptrace_seize`.
+
+    #[test]
+    fn ptrace_seize_eperm_renders_operator_hint() {
+        let err = ThreadProbeError::ptrace_seize(42, nix::errno::Errno::EPERM);
+        assert_eq!(err.kind, ThreadErrorKind::PtraceAttach);
+        let msg = format!("{}", err.source);
+        assert!(msg.contains("tid 42"), "got: {msg}");
+        assert!(msg.contains("permission denied"), "got: {msg}");
+        // The 4 operator-fix hints must all be enumerated.
+        assert!(msg.contains("(1) run as root"), "got: {msg}");
+        assert!(msg.contains("(2) setcap"), "got: {msg}");
+        assert!(msg.contains("(3) run under the"), "got: {msg}");
+        assert!(msg.contains("(4) set /proc/sys/kernel/yama/ptrace_scope=0"), "got: {msg}");
+    }
+
+    #[test]
+    fn ptrace_seize_non_eperm_uses_generic_rendering() {
+        // ESRCH is the common "tid exited before seize" race — must
+        // NOT render the EPERM operator hint (that would mislead the
+        // operator into chasing a permission issue for a transient
+        // exit).
+        let err = ThreadProbeError::ptrace_seize(42, nix::errno::Errno::ESRCH);
+        assert_eq!(err.kind, ThreadErrorKind::PtraceAttach);
+        let msg = format!("{}", err.source);
+        assert!(msg.contains("ptrace(PTRACE_SEIZE) on tid 42"), "got: {msg}");
+        assert!(!msg.contains("permission denied"), "got: {msg}");
+        assert!(!msg.contains("yama"), "got: {msg}");
+    }
+
+    #[test]
+    fn ptrace_interrupt_formats_tid_and_errno() {
+        let err = ThreadProbeError::ptrace_interrupt(17, nix::errno::Errno::ESRCH);
+        assert_eq!(err.kind, ThreadErrorKind::PtraceAttach);
+        let msg = format!("{}", err.source);
+        assert!(msg.contains("ptrace(PTRACE_INTERRUPT) on tid 17"), "got: {msg}");
+    }
+
+    #[test]
+    fn waitpid_unexpected_records_status_debug() {
+        let status = WaitStatus::Exited(Pid::from_raw(99), 7);
+        let err = ThreadProbeError::waitpid_unexpected(99, status);
+        assert_eq!(err.kind, ThreadErrorKind::Waitpid);
+        let msg = format!("{}", err.source);
+        assert!(msg.contains("waitpid on tid 99"), "got: {msg}");
+        assert!(msg.contains("unexpected status"), "got: {msg}");
+        // `{status:?}` renders the variant name — pin that the
+        // debug-formatted status is carried through.
+        assert!(msg.contains("Exited"), "got: {msg}");
+    }
+
+    #[test]
+    fn waitpid_err_formats_tid_and_errno() {
+        let err = ThreadProbeError::waitpid_err(55, nix::errno::Errno::ECHILD);
+        assert_eq!(err.kind, ThreadErrorKind::Waitpid);
+        let msg = format!("{}", err.source);
+        assert!(msg.contains("waitpid on tid 55"), "got: {msg}");
+    }
+
+    #[test]
+    fn getregset_formats_tid_and_errno() {
+        let err = ThreadProbeError::getregset(88, nix::errno::Errno::ESRCH);
+        assert_eq!(err.kind, ThreadErrorKind::GetRegset);
+        let msg = format!("{}", err.source);
+        assert!(msg.contains("PTRACE_GETREGSET"), "got: {msg}");
+        assert!(msg.contains("NT_PRSTATUS"), "got: {msg}");
+        assert!(msg.contains("tid 88"), "got: {msg}");
+    }
+
+    #[test]
+    fn tls_arithmetic_passes_through_source() {
+        let source = anyhow!("computed TLS address underflowed for fs_base=0x1000");
+        let err = ThreadProbeError::tls_arithmetic(source);
+        assert_eq!(err.kind, ThreadErrorKind::TlsArithmetic);
+        let msg = format!("{}", err.source);
+        assert!(msg.contains("underflowed"), "got: {msg}");
+    }
+
+    #[test]
+    fn process_vm_readv_err_renders_address_hex() {
+        let err = ThreadProbeError::process_vm_readv_err(
+            123,
+            0xdeadbeef,
+            nix::errno::Errno::EFAULT,
+        );
+        assert_eq!(err.kind, ThreadErrorKind::ProcessVmReadv);
+        let msg = format!("{}", err.source);
+        assert!(msg.contains("tid 123"), "got: {msg}");
+        // Address MUST render as hex (format spec `{:#x}`) so the
+        // operator can correlate with /proc/<pid>/maps.
+        assert!(msg.contains("0xdeadbeef"), "got: {msg}");
+    }
+
+    #[test]
+    fn process_vm_readv_short_records_got_and_expected() {
+        let err = ThreadProbeError::process_vm_readv_short(200, 12, 24);
+        assert_eq!(err.kind, ThreadErrorKind::ProcessVmReadv);
+        let msg = format!("{}", err.source);
+        assert!(msg.contains("short process_vm_readv on tid 200"), "got: {msg}");
+        assert!(msg.contains("got 12 bytes"), "got: {msg}");
+        assert!(msg.contains("expected 24"), "got: {msg}");
     }
 }

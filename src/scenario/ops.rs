@@ -1857,9 +1857,7 @@ fn run_scenario(
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::SchedulerExited,
-                format!(
-                    "{} unexpectedly after completing step {} of {} ({:.1}s into test)",
-                    crate::assert::SCHED_EXITED_PREFIX,
+                crate::assert::format_sched_exited_after_step(
                     step_idx,
                     steps.len(),
                     scenario_start.elapsed().as_secs_f64(),
@@ -1934,9 +1932,7 @@ fn run_scenario(
         result.passed = false;
         result.details.push(crate::assert::AssertDetail::new(
             crate::assert::DetailKind::SchedulerExited,
-            format!(
-                "{} unexpectedly (detected after all {} steps completed, {:.1}s elapsed)",
-                crate::assert::SCHED_EXITED_PREFIX,
+            crate::assert::format_sched_exited_after_all_steps(
                 steps.len(),
                 scenario_start.elapsed().as_secs_f64(),
             ),
@@ -2067,8 +2063,11 @@ fn build_stimulus(
 /// [`MemPolicy::Local`] — carry no node IDs to validate against,
 /// so this function returns `Ok(())` unconditionally for them
 /// (after the unknown-bit and mutual-exclusion flag guards run).
-/// Every other variant (Bind, Preferred, Interleave) reaches the
-/// cpuset / host-topology coverage logic below.
+/// Every other variant — any variant carrying a nodemask,
+/// currently [`MemPolicy::Bind`], [`MemPolicy::Preferred`],
+/// [`MemPolicy::PreferredMany`], [`MemPolicy::Interleave`], and
+/// [`MemPolicy::WeightedInterleave`] — reaches the cpuset /
+/// host-topology coverage logic below.
 ///
 /// # Why this is a scenario-intent check, not a kernel guard
 ///
@@ -2206,8 +2205,9 @@ fn validate_mempolicy_cpuset(
             anyhow::bail!(
                 "cgroup '{}': MemPolicy with MpolFlags::STATIC_NODES references \
                  NUMA node(s) {:?} that do not exist on this host (host nodes: {:?}); \
-                 the kernel will reject the policy — fix the MemPolicy or pick a \
-                 host with the required nodes",
+                 the kernel will reject or silently drop the policy (Preferred can \
+                 silently fall back to local allocation; Bind/Interleave reject with \
+                 EINVAL) — fix the MemPolicy or pick a host with the required nodes",
                 cgroup_name,
                 missing,
                 host_nodes,

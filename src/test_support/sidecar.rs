@@ -1216,6 +1216,43 @@ mod tests {
         );
     }
 
+    /// Strict-schema rejection: a sidecar JSON that omits a required
+    /// top-level field (here: `test_name`) must fail deserialization,
+    /// not silently default to the empty string. The SidecarResult
+    /// policy — serde(default) removed crate-wide so serialize and
+    /// deserialize are symmetric — is stated in the module doc and
+    /// on the `host` field; this test pins the policy by
+    /// construction. A regression that reintroduces `#[serde(default)]`
+    /// on any top-level SidecarResult field would cause the
+    /// `from_str` below to succeed instead of error.
+    ///
+    /// `test_name` is the chosen field because it is a plain String
+    /// and its absence produces a clean "missing field" error from
+    /// serde without sibling-field interference. Other top-level
+    /// fields (Vec, Option, nested struct) follow the same contract;
+    /// picking one is sufficient to guard the policy.
+    #[test]
+    fn sidecar_result_missing_required_field_rejected_by_deserialize() {
+        let fixture = SidecarResult::test_fixture();
+        let full = serde_json::to_value(&fixture).unwrap();
+        let mut obj = match full {
+            serde_json::Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert!(
+            obj.remove("test_name").is_some(),
+            "test fixture must emit `test_name` for this rejection test to be meaningful",
+        );
+        let without_test_name = serde_json::Value::Object(obj).to_string();
+        let err = serde_json::from_str::<SidecarResult>(&without_test_name)
+            .expect_err("deserialize must reject SidecarResult with `test_name` removed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("test_name"),
+            "missing-field error must name the missing field, got: {msg}",
+        );
+    }
+
     // -- collect_sidecars tests --
 
     #[test]

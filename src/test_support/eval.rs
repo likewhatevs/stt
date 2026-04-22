@@ -788,22 +788,36 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
     // runs remain decoupled from the model cache's availability;
     // the LlmExtract invocation path fails loudly when the model is
     // genuinely missing at test time.
+    //
+    // Channel policy for setup messages:
+    //
+    // * **Failure paths** dual-emit on stderr AND tracing —
+    //   `eprintln!` reaches nextest-direct users (no tracing
+    //   subscriber installed in the default test dispatch path), and
+    //   `tracing::{warn,error}!` reaches cargo-ktstr-wrapped runs
+    //   plus any external structured-log consumer. Both fire from
+    //   this module so the emit site is the single source of truth
+    //   for the message text.
+    // * **Success paths** are tracing-only HERE. The stderr line for
+    //   the cache-ready notice is owned by
+    //   [`super::model::prefetch_if_required`] and fires on cache
+    //   miss only (model.rs:`ktstr: model cache ready`) — emitting
+    //   `eprintln!` again at this call site would double-log on
+    //   every cold boot. The structured tracing line stays local so
+    //   observability consumers see an event whether the cache was
+    //   hit or missed.
+    //
+    // Do NOT "fix" this asymmetry by adding `eprintln!` to the Ok
+    // arm without deleting the one at model.rs — the duplication
+    // would be visible noise on every cold-start test run. If a
+    // future refactor consolidates the stderr emit to this site, it
+    // MUST remove the callee's eprintln in the same change.
     match super::model::prefetch_if_required() {
         Ok(Some(path)) => {
-            // `prefetch_if_required` owns the stderr "model cache
-            // ready" notice (only emitted on a cache miss, to avoid
-            // noise on every warm-cache run). Keep the tracing
-            // line here for structured-log consumers — it always
-            // fires, miss or hit.
             tracing::info!(path = %path.display(), "model cache ready");
         }
         Ok(None) => {}
         Err(e) => {
-            // Dual-emit: stderr for nextest-direct first-time-user
-            // visibility (no tracing subscriber installed in the
-            // default test dispatch path), tracing for
-            // cargo-ktstr-wrapped runs and structured-log
-            // consumers.
             eprintln!("ktstr: model prefetch failed; LlmExtract tests may fail: {e:#}");
             tracing::warn!(
                 error = ?e,
@@ -945,9 +959,11 @@ mod tests {
         STAGE_PAYLOAD_STARTED_NO_RESULT,
     };
     use super::super::test_helpers::{
-        EVAL_TOPO, EnvVarGuard, eevdf_entry, lock_env, make_vm_result, no_repro, sched_entry,
+        EVAL_TOPO, EnvVarGuard, build_assert_result_json, eevdf_entry, lock_env, make_vm_result,
+        no_repro, sched_entry,
     };
     use super::*;
+    use crate::assert::{AssertDetail, DetailKind};
     use crate::verifier::SCHED_OUTPUT_END;
 
     // -- resolve_test_kernel tests --
@@ -1344,7 +1360,7 @@ mod tests {
 
     #[test]
     fn eval_check_result_passed_returns_ok() {
-        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(true, vec![]);
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_pass__");
         let result = make_vm_result(&output, "", 0, false);
@@ -1367,7 +1383,13 @@ mod tests {
 
     #[test]
     fn eval_check_result_failed_includes_details() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"},{"kind":"Unfair","message":"spread 45%"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(
+            false,
+            vec![
+                AssertDetail::new(DetailKind::Stuck, "stuck 3000ms"),
+                AssertDetail::new(DetailKind::Unfair, "spread 45%"),
+            ],
+        );
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_fail_details__");
         let result = make_vm_result(&output, "", 0, false);
@@ -1393,7 +1415,10 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_includes_sched_log() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"worker 0 stuck 5000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(
+            false,
+            vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck 5000ms")],
+        );
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
         );
@@ -1421,7 +1446,10 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_has_fingerprint() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(
+            false,
+            vec![AssertDetail::new(DetailKind::Stuck, "stuck 3000ms")],
+        );
         let error_line = "Error: apply_cell_config BPF program returned error -2";
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",
@@ -1514,7 +1542,10 @@ mod tests {
 
     #[test]
     fn eval_no_sched_output_no_fingerprint() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(
+            false,
+            vec![AssertDetail::new(DetailKind::Stuck, "stuck")],
+        );
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_no_fp__");
         let result = make_vm_result(&output, "", 0, false);
@@ -1538,7 +1569,7 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_has_fingerprint() {
-        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let pass_json = build_assert_result_json(true, vec![]);
         let error_line = "Error: imbalance detected internally";
         let sched_log =
             format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
@@ -1825,7 +1856,13 @@ mod tests {
 
     #[test]
     fn eval_sched_exit_includes_console() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"SchedulerExited","message":"scheduler process exited unexpectedly after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(
+            false,
+            vec![AssertDetail::new(
+                DetailKind::SchedulerExited,
+                "scheduler process exited unexpectedly after completing step 1 of 2 (0.5s into test)",
+            )],
+        );
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_exit_console__");
         let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
@@ -1850,7 +1887,13 @@ mod tests {
 
     #[test]
     fn eval_sched_exit_includes_monitor() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"SchedulerExited","message":"scheduler process exited unexpectedly during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(
+            false,
+            vec![AssertDetail::new(
+                DetailKind::SchedulerExited,
+                "scheduler process exited unexpectedly during workload (2.0s into test)",
+            )],
+        );
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_exit_monitor__");
         let result = crate::vmm::VmResult {
@@ -1902,7 +1945,7 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_includes_sched_log() {
-        let pass_json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let pass_json = build_assert_result_json(true, vec![]);
         let sched_log =
             format!("{SCHED_OUTPUT_START}\nscheduler debug output here\n{SCHED_OUTPUT_END}",);
         let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");

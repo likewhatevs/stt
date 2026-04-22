@@ -244,14 +244,16 @@ pub(crate) fn format_console_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::build_assert_result_json;
     use super::*;
+    use crate::assert::{AssertDetail, DetailKind};
     use crate::verifier::{SCHED_OUTPUT_END, SCHED_OUTPUT_START};
 
     // -- parse_assert_result --
 
     #[test]
     fn parse_assert_result_valid() {
-        let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(true, vec![]);
         let output = format!("noise\n{RESULT_START}\n{json}\n{RESULT_END}\nmore");
         let r = parse_assert_result(&output).unwrap();
         assert!(r.passed);
@@ -271,7 +273,10 @@ mod tests {
 
     #[test]
     fn parse_assert_result_failed() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(
+            false,
+            vec![AssertDetail::new(DetailKind::Stuck, "stuck 3000ms")],
+        );
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let r = parse_assert_result(&output).unwrap();
         assert!(!r.passed);
@@ -292,7 +297,13 @@ mod tests {
 
     #[test]
     fn parse_assert_result_with_details() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Other","message":"err1"},{"kind":"Other","message":"err2"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"worst_p99_wake_latency_us":0.0,"worst_median_wake_latency_us":0.0,"worst_wake_latency_cv":0.0,"total_iterations":0,"worst_mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = build_assert_result_json(
+            false,
+            vec![
+                AssertDetail::new(DetailKind::Other, "err1"),
+                AssertDetail::new(DetailKind::Other, "err2"),
+            ],
+        );
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let r = parse_assert_result(&output).unwrap();
         assert!(!r.passed);

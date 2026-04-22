@@ -1121,9 +1121,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         result.passed = false;
         result.details.push(crate::assert::AssertDetail::new(
             crate::assert::DetailKind::SchedulerExited,
-            format!(
-                "{} unexpectedly during workload ({:.1}s into test)",
-                crate::assert::SCHED_EXITED_PREFIX,
+            crate::assert::format_sched_exited_during_workload(
                 scenario_start.elapsed().as_secs_f64(),
             ),
         ));

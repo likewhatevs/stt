@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# pre-push hook: require `cargo build --tests` to succeed for every
+# commit being pushed. Catches SHAs that compile the library but break
+# the test build (e.g. a field rename that missed a cfg(test) call
+# site) — without this, the main CI gate is the first signal, and the
+# broken SHA has already entered shared history.
+#
+# Runs once against the current worktree, which covers the tip SHA.
+# A full per-commit sweep would require checking out each range-to-push
+# SHA and rebuilding, which multiplies wall time by the push depth;
+# the tip-only check is the 95% catch at 1/N the cost.
+#
+# To enable locally:
+#   git config core.hooksPath .githooks
+#
+# Skip with --no-verify if you have a deliberate WIP-push need; prefer
+# fixing the breakage instead.
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: cargo not found, skipping test-build gate"
+    exit 0
+fi
+
+echo "pre-push: running cargo build --tests..."
+if ! cargo build --tests --quiet; then
+    echo
+    echo "pre-push: cargo build --tests FAILED. Fix the test build"
+    echo "          before pushing, or pass --no-verify to override."
+    exit 1
+fi
+
+exit 0

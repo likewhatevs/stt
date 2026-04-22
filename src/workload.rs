@@ -5223,6 +5223,99 @@ mod tests {
         assert!(reports[0].wall_time_ns > 0);
     }
 
+    /// Worker function that installs `SIG_IGN` for SIGUSR1 — overriding
+    /// the `sigusr1_handler` the child set up post-fork — and spins
+    /// for long enough to outlive the parent's 5s collection deadline.
+    /// Used by the sigusr1-ignored path test below.
+    ///
+    /// `libc::signal(SIGUSR1, SIG_IGN)` replaces the handler on the
+    /// child's process-wide disposition table, so the parent's
+    /// `kill(pid, SIGUSR1)` arrives as a no-op — STOP never flips to
+    /// true via the handler, and even code that checks STOP spins
+    /// past the deadline.
+    fn ignores_sigusr1_fn(stop: &AtomicBool) -> WorkerReport {
+        unsafe {
+            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+        }
+        let tid: libc::pid_t = unsafe { libc::getpid() };
+        // Spin for 7s — well past stop_and_collect's 5s shared
+        // deadline. The `!stop.load` check is kept honest (no infinite
+        // loop) but is only observed via the fallback timeout: with
+        // SIG_IGN in place, the parent's SIGUSR1 doesn't flip STOP.
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+        // Report body is never observed — the parent SIGKILLs the
+        // worker before any `f.write_all(&json)` could run. Per the
+        // `WorkerReport` doc, sentinel-shape constructions use
+        // `..Default::default()` so a future field addition doesn't
+        // silently drift the test.
+        WorkerReport {
+            tid,
+            ..WorkerReport::default()
+        }
+    }
+
+    /// Pins the `stop_and_collect` sentinel path where SIGUSR1 is
+    /// ignored and the WNOHANG-returns-`StillAlive` branch fires:
+    /// the parent escalates to SIGKILL, collects zero JSON from the
+    /// worker, and the synthesized [`WorkerReport`] carries
+    /// `exit_info: Some(TimedOut)` (or `Some(Signaled(SIGKILL))`
+    /// if the race between WNOHANG and the kill put the reap at
+    /// the blocking waitpid). Without this test, the escalation
+    /// branch of `classify_wait_outcome` is only covered by the
+    /// pure unit test `classify_wait_outcome_still_alive_maps_to_timed_out`;
+    /// pairing that with this end-to-end exercise proves the
+    /// integration (parent loop + `ignores_sigusr1_fn` + sentinel
+    /// fill) doesn't drop the diagnostic along the way.
+    ///
+    /// Expected runtime: ~5s (the shared deadline), plus a few ms
+    /// for spawn + kill + reap. Marked with a shorter spin window
+    /// in `ignores_sigusr1_fn` (7s ceiling) so even if the parent
+    /// deadline extends accidentally, the test still terminates.
+    #[test]
+    fn stop_and_collect_sentinel_exits_for_sigusr1_ignoring_worker() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            affinity: AffinityMode::None,
+            work_type: WorkType::custom("sigusr1_ignore", ignores_sigusr1_fn),
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1);
+        let r = &reports[0];
+        // Sentinel path: the worker never wrote JSON to the pipe
+        // (because it ignored SIGUSR1 + ran past the deadline), so
+        // the report is the zeroed sentinel shape. work_units = 0
+        // confirms the sentinel construction at stop_and_collect's
+        // `serde_json::from_slice` Err branch, not a worker-authored
+        // report leaking through.
+        assert_eq!(
+            r.work_units, 0,
+            "sentinel sidecar must be zeroed; non-zero work_units means \
+             we parsed the worker's real report instead of hitting the \
+             Err branch",
+        );
+        // `exit_info` must describe either the TimedOut (WNOHANG fast
+        // path caught StillAlive) or Signaled(SIGKILL=9) (the kill
+        // landed before the WNOHANG check) outcome. Any other variant
+        // — Exited (worker wrote JSON), WaitFailed (reap error) —
+        // would indicate a different failure shape than the one this
+        // test pins.
+        match &r.exit_info {
+            Some(WorkerExitInfo::TimedOut) => {}
+            Some(WorkerExitInfo::Signaled(sig)) if *sig == libc::SIGKILL => {}
+            other => panic!(
+                "expected TimedOut or Signaled(SIGKILL), got {other:?}",
+            ),
+        }
+    }
+
     // -- FanOutCompute tests --
 
     #[test]

@@ -145,12 +145,20 @@ pub(crate) fn ktstr_guest_init() -> ! {
 
     // Install tracing subscriber so tracing calls in guest code produce
     // output on stderr (COM2). Without this, they are silently dropped.
-    // EnvFilter respects RUST_LOG when set.
+    // EnvFilter respects RUST_LOG when set; default is `warn` so
+    // teardown diagnostics (`tracing::warn!`, `tracing::error!`)
+    // surface without requiring RUST_LOG to be plumbed through the
+    // guest cmdline. `from_default_env()` alone would collapse to
+    // the implicit `error` level and swallow warn-level output —
+    // exactly the diagnostics needed to debug teardown failures.
     let t_pre_subscriber = t0.elapsed();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .init();
     let t_subscriber = t0.elapsed();
 

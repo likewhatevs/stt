@@ -179,6 +179,45 @@ pub(crate) const SCHED_EXITED_PREFIX: &str = "scheduler process exited";
 pub(crate) const SCHED_NO_LONGER_RUNNING_PREFIX: &str =
     "scheduler process no longer running";
 
+/// Format the scheduler-exited detail message for an inter-step
+/// liveness-probe failure (the scheduler was alive after step
+/// `step_idx - 1` but ESRCH'd before step `step_idx` ran).
+///
+/// Begins with [`SCHED_EXITED_PREFIX`] verbatim — the emit-site
+/// contract consumed by [`AssertDetail::is_scheduler_death`] —
+/// followed by "unexpectedly after completing step N of M (X.Xs
+/// into test)". Centralized so ops.rs and any future emitter share
+/// a single format; the predicate-match tests guard the prefix
+/// compatibility.
+pub(crate) fn format_sched_exited_after_step(
+    step_idx: usize,
+    total_steps: usize,
+    elapsed_s: f64,
+) -> String {
+    format!(
+        "{SCHED_EXITED_PREFIX} unexpectedly after completing step {step_idx} of {total_steps} ({elapsed_s:.1}s into test)",
+    )
+}
+
+/// Format the scheduler-exited detail message for the post-loop
+/// liveness probe (the scheduler was alive throughout the step loop
+/// but ESRCH'd after the last step completed).
+pub(crate) fn format_sched_exited_after_all_steps(
+    total_steps: usize,
+    elapsed_s: f64,
+) -> String {
+    format!(
+        "{SCHED_EXITED_PREFIX} unexpectedly (detected after all {total_steps} steps completed, {elapsed_s:.1}s elapsed)",
+    )
+}
+
+/// Format the scheduler-exited detail message for in-workload
+/// detection (the mid-workload watchdog observed the scheduler exit
+/// during the running phase of a single-scenario run).
+pub(crate) fn format_sched_exited_during_workload(elapsed_s: f64) -> String {
+    format!("{SCHED_EXITED_PREFIX} unexpectedly during workload ({elapsed_s:.1}s into test)")
+}
+
 /// A single diagnostic message from an assertion, paired with a
 /// structural [`DetailKind`] so filtering is robust to wording changes.
 ///
@@ -2383,6 +2422,104 @@ mod tests {
         assert_eq!(r.details, r2.details);
     }
 
+    /// Strict-schema rejection: a `ScenarioStats` JSON with a
+    /// required scalar field omitted (here: `total_workers`) must
+    /// fail deserialization. `ScenarioStats` carries `Default` for
+    /// struct construction ergonomics, but that does NOT imply
+    /// `#[serde(default)]` on each field — and the sidecar schema
+    /// policy requires serialize/deserialize symmetry. A regression
+    /// that added `#[serde(default)]` to a scalar field (e.g. to
+    /// soften a schema migration) would make the `from_str` call
+    /// below succeed silently, defaulting to 0 without notifying the
+    /// consumer that the producer omitted data.
+    ///
+    /// The exception is `ext_metrics`, which intentionally carries
+    /// `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
+    /// to keep the wire minimal when unused — a complementary test
+    /// below pins THAT tolerance so dropping it by accident also
+    /// trips.
+    #[test]
+    fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
+        let s = ScenarioStats::default();
+        let mut obj = match serde_json::to_value(&s).unwrap() {
+            serde_json::Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert!(
+            obj.remove("total_workers").is_some(),
+            "ScenarioStats must emit `total_workers` for this rejection test to be meaningful",
+        );
+        let without_total_workers = serde_json::Value::Object(obj).to_string();
+        let err = serde_json::from_str::<ScenarioStats>(&without_total_workers).expect_err(
+            "deserialize must reject ScenarioStats with `total_workers` removed",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("total_workers"),
+            "missing-field error must name the missing field, got: {msg}",
+        );
+    }
+
+    /// Positive control for the `ext_metrics` exemption: omitting
+    /// `ext_metrics` from the wire is accepted (serde defaults it to
+    /// an empty `BTreeMap`). This is the ONE deliberate softness in
+    /// `ScenarioStats`'s schema — pinned here so a future sweep that
+    /// removes the `#[serde(default)]` attribute alongside other
+    /// hardening trips this test and forces a conscious decision.
+    #[test]
+    fn scenario_stats_missing_ext_metrics_tolerated_by_deserialize() {
+        let s = ScenarioStats::default();
+        let mut obj = match serde_json::to_value(&s).unwrap() {
+            serde_json::Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+        // `skip_serializing_if = "BTreeMap::is_empty"` keeps ext_metrics
+        // off the wire when empty — remove it if present, then assert
+        // the absence round-trips without error.
+        obj.remove("ext_metrics");
+        let without_ext_metrics = serde_json::Value::Object(obj).to_string();
+        let parsed: ScenarioStats = serde_json::from_str(&without_ext_metrics).expect(
+            "deserialize must tolerate missing ext_metrics (the sole exempt field)",
+        );
+        assert!(
+            parsed.ext_metrics.is_empty(),
+            "missing ext_metrics must default to empty, got {:?}",
+            parsed.ext_metrics,
+        );
+    }
+
+    /// Strict-schema rejection: an `AssertResult` JSON with a
+    /// required field omitted (here: `passed`) must fail
+    /// deserialization. `AssertResult` has NO `Default` derive and no
+    /// `#[serde(default)]` — every field is required on the wire.
+    /// Pinned so a regression that softens any of passed / skipped /
+    /// details / stats trips this test.
+    #[test]
+    fn assert_result_missing_required_field_rejected_by_deserialize() {
+        let r = AssertResult {
+            passed: false,
+            skipped: false,
+            details: vec!["detail".into()],
+            stats: ScenarioStats::default(),
+        };
+        let mut obj = match serde_json::to_value(&r).unwrap() {
+            serde_json::Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert!(
+            obj.remove("passed").is_some(),
+            "AssertResult must emit `passed` for this rejection test to be meaningful",
+        );
+        let without_passed = serde_json::Value::Object(obj).to_string();
+        let err = serde_json::from_str::<AssertResult>(&without_passed)
+            .expect_err("deserialize must reject AssertResult with `passed` removed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("passed"),
+            "missing-field error must name the missing field, got: {msg}",
+        );
+    }
+
     #[test]
     fn multiple_stuck_workers() {
         let threshold = gap_threshold_ms();
@@ -4341,5 +4478,67 @@ numa_miss 5";
             !detail.is_scheduler_death(),
             "shared 'scheduler process' root must not match — prefix specificity is the guard",
         );
+    }
+
+    // -- sched-exited format helpers --
+    //
+    // The three `format_sched_exited_*` helpers in this module are
+    // the single source of truth for emitter-side message formatting;
+    // every production site goes through them. These tests pin (1)
+    // the exact message templates so operators grepping stderr can
+    // keep stable anchors, (2) the numeric formatting (step N of M,
+    // `{:.1}s`), and (3) predicate compatibility — every formatted
+    // message MUST satisfy `is_scheduler_death()` so a regression in
+    // the template that drops the prefix is caught before it silently
+    // diverts the console-dump gate.
+
+    #[test]
+    fn format_sched_exited_after_step_has_expected_template() {
+        // 4.23 → "4.2" under `{:.1}`; avoid half-boundary inputs like
+        // x.x5 whose rounding depends on round-half-to-even.
+        let msg = format_sched_exited_after_step(3, 10, 4.23);
+        assert_eq!(
+            msg,
+            "scheduler process exited unexpectedly after completing step 3 of 10 (4.2s into test)",
+        );
+    }
+
+    #[test]
+    fn format_sched_exited_after_all_steps_has_expected_template() {
+        let msg = format_sched_exited_after_all_steps(7, 12.08);
+        assert_eq!(
+            msg,
+            "scheduler process exited unexpectedly (detected after all 7 steps completed, 12.1s elapsed)",
+        );
+    }
+
+    #[test]
+    fn format_sched_exited_during_workload_has_expected_template() {
+        let msg = format_sched_exited_during_workload(2.12);
+        assert_eq!(
+            msg,
+            "scheduler process exited unexpectedly during workload (2.1s into test)",
+        );
+    }
+
+    #[test]
+    fn format_sched_exited_helpers_satisfy_is_scheduler_death() {
+        // Every production emitter routes through one of the three
+        // helpers — so each helper's output must still trip the
+        // predicate that guards the console-dump gate. A regression
+        // in either the helper template or the prefix constant that
+        // silently breaks `is_scheduler_death` will fail this test
+        // before it reaches an eval.rs call site.
+        for msg in [
+            format_sched_exited_after_step(1, 1, 0.0),
+            format_sched_exited_after_all_steps(1, 0.0),
+            format_sched_exited_during_workload(0.0),
+        ] {
+            let detail = AssertDetail::new(DetailKind::SchedulerExited, msg.clone());
+            assert!(
+                detail.is_scheduler_death(),
+                "every sched-exited helper output must satisfy is_scheduler_death: {msg}",
+            );
+        }
     }
 }
