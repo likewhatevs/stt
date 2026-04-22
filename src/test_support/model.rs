@@ -1638,6 +1638,28 @@ pub(crate) fn reset() {
 ///   sees "LlmExtract model load failed: <reason>" instead of an
 ///   opaque "metric 'foo' not found" when the real failure was
 ///   that the model never loaded.
+///
+/// # MODEL_CACHE memoization + panic=abort (external harness authors)
+///
+/// Each caller routes through [`memoized_inference`]: the first call
+/// runs `load_inference` once under the global [`MODEL_CACHE`] mutex
+/// and stores the `Result` (success OR error); every subsequent call
+/// observes the cached value with no re-load. That means a load
+/// failure is cached — `Err(reason)` is identical across every call
+/// within the process lifetime once the first call sees it. This is
+/// the "fail-closed-forever" contract documented on [`MODEL_CACHE`].
+///
+/// Panics inside the load are NOT cached. Under the test/debug
+/// profile (`panic = "unwind"`) the slot remains `None` and the next
+/// caller retries. Under the release profile
+/// (`panic = "abort"`, see `Cargo.toml [profile.release]`) the
+/// process aborts before control returns, so retry is
+/// process-terminal rather than next-call-observable.
+/// External harnesses that embed ktstr must plan for this:
+/// (a) treat a first `Err(reason)` as terminal for the lifetime of
+/// the process — there is no public `clear_model_cache()` hook, and
+/// (b) expect a hard abort rather than an unwind on a load-side
+/// panic under release builds.
 pub(crate) fn extract_via_llm(
     output: &str,
     hint: Option<&str>,
