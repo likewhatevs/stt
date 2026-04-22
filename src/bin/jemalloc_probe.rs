@@ -1,0 +1,1046 @@
+//! Standalone jemalloc per-thread counter probe.
+//!
+//! Reads the `thread_allocated` / `thread_deallocated` TLS counters
+//! out of a running jemalloc-linked process. The counters are
+//! maintained unconditionally on jemalloc's alloc/dalloc fast + slow
+//! paths (see jemalloc_internal_inlines_c.h:277, 574 and
+//! thread_event.h:117-119), so attaching late does not miss prior
+//! allocations — the reading is cumulative from thread creation.
+//!
+//! Scope for v1:
+//! - Linux x86_64 only.
+//! - Static-linked jemalloc only (symbol lives in the main executable's
+//!   static TLS image).
+//! - Requires DWARF debuginfo on the jemalloc-carrying ELF so
+//!   `offsetof(tsd_s, thread_allocated)` can be resolved without
+//!   hardcoding per-version offsets.
+//! - Requires CAP_SYS_PTRACE, root, or same-uid-as-target.
+//!
+//! Mechanism (per target thread):
+//! 1. `ptrace(PTRACE_SEIZE)` + `ptrace(PTRACE_INTERRUPT)` to stop.
+//! 2. `ptrace(PTRACE_GETREGSET, NT_PRSTATUS)` to read `fs_base`.
+//! 3. `process_vm_readv` 24 bytes at the computed TLS address to read
+//!    `thread_allocated` + `thread_allocated_next_event_fast` +
+//!    `thread_deallocated` in one syscall while the thread is stopped.
+//! 4. `ptrace(PTRACE_DETACH)`.
+//!
+//! Address math (Variant II TLS, x86_64):
+//!   addr(tsd_tls) = fs_base - round_up(PT_TLS.p_memsz, PT_TLS.p_align) + st_value
+//!   addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
+
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+use std::fs;
+use std::io::IoSliceMut;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use anyhow::{Context, Result, anyhow, bail};
+use clap::Parser;
+use gimli::{AttributeValue, EndianSlice, LittleEndian, Reader, Unit};
+use goblin::elf::Elf;
+use nix::sys::ptrace;
+use nix::sys::ptrace::Options;
+use nix::sys::ptrace::regset::NT_PRSTATUS;
+use nix::sys::signal::{SigHandler, Signal, signal};
+use nix::sys::uio::{RemoteIoVec, process_vm_readv};
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::Pid;
+use serde::Serialize;
+
+const SCHEMA_VERSION: u32 = 1;
+
+/// Candidate symbol names for jemalloc's per-thread state.
+///
+/// jemalloc's build may apply a prefix via `--with-jemalloc-prefix`.
+/// Observed prefixes:
+/// - bare `tsd_tls` (unprefixed builds, older jemalloc versions).
+/// - `je_tsd_tls` (default `--with-jemalloc-prefix=je_`).
+/// - `_rjem_je_tsd_tls` (what tikv-jemallocator-sys bakes in so the
+///   Rust global-allocator's jemalloc cannot collide with system
+///   libc malloc symbols at link time).
+const TSD_TLS_SYMBOL_NAMES: &[&str] = &["tsd_tls", "je_tsd_tls", "_rjem_je_tsd_tls"];
+
+/// DWARF struct name for jemalloc's per-thread state.
+const TSD_STRUCT_NAME: &str = "tsd_s";
+/// DWARF field name for the cumulative-bytes-allocated counter
+/// inside [`TSD_STRUCT_NAME`].
+const ALLOCATED_FIELD: &str = "thread_allocated";
+/// DWARF field name for the cumulative-bytes-deallocated counter.
+const DEALLOCATED_FIELD: &str = "thread_deallocated";
+
+/// Probe a running jemalloc-linked process and report per-thread
+/// allocated / deallocated byte counters.
+#[derive(Parser, Debug)]
+#[command(
+    name = "ktstr-jemalloc-probe",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Read per-thread jemalloc allocated/deallocated byte counters from a running process",
+    long_about = "Reads jemalloc's per-thread `thread_allocated` / `thread_deallocated` TLS \
+                  counters out of a running process via ptrace + process_vm_readv. Counters are \
+                  cumulative from thread creation — attaching late does not miss prior \
+                  allocations. Requires CAP_SYS_PTRACE, root, or same-uid-as-target. V1 supports \
+                  x86_64 targets with a statically-linked jemalloc and DWARF debuginfo on the \
+                  binary carrying the jemalloc TLS symbol.\n\n\
+                  The `--enable-stats` jemalloc build flag is NOT required: `thread.allocated` / \
+                  `thread.deallocated` use jemalloc's `CTL_RO_NL_GEN` (ungated) and the fast/slow \
+                  path writes are unconditional."
+)]
+struct Cli {
+    /// Target process id.
+    #[arg(long)]
+    pid: i32,
+    /// Emit JSON on stdout instead of a human-readable table.
+    #[arg(long)]
+    json: bool,
+}
+
+// ---------------------------------------------------------------------
+// Output schema
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct ProbeOutput {
+    schema_version: u32,
+    pid: i32,
+    tool_version: &'static str,
+    threads: Vec<ThreadResult>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ThreadResult {
+    Ok {
+        tid: i32,
+        allocated_bytes: u64,
+        deallocated_bytes: u64,
+    },
+    Err {
+        tid: i32,
+        error: String,
+    },
+}
+
+// ---------------------------------------------------------------------
+// ELF + DWARF resolution (pure, testable seams)
+// ---------------------------------------------------------------------
+
+/// Thread-local symbol lookup result — enough to compute the
+/// per-thread address of the TLS image containing jemalloc's
+/// `tsd_tls`.
+#[derive(Debug, Clone)]
+pub(crate) struct TsdTlsSymbol {
+    /// Absolute path of the ELF containing the symbol.
+    pub elf_path: PathBuf,
+    /// `st_value` of the symbol. For a symbol in the main executable's
+    /// PT_TLS, this is the offset WITHIN the TLS image (small, positive).
+    pub st_value: u64,
+    /// Aligned size of the PT_TLS program header:
+    /// `round_up(p_memsz, p_align)`. Added as a negative offset to TP
+    /// to reach the start of the TLS image (Variant II).
+    pub tls_image_aligned_size: u64,
+    /// ELF architecture e_machine value — used to refuse non-x86_64
+    /// targets with a clear error.
+    pub e_machine: u16,
+}
+
+/// Locate jemalloc's `tsd_tls` (or `je_tsd_tls`) symbol inside the
+/// given ELF. Returns the symbol's `st_value` plus the PT_TLS-aligned
+/// image size needed for TP-relative addressing.
+///
+/// Lookup order (§10 of the accepted design):
+/// 1. `.symtab` — `tsd_tls`, then `je_tsd_tls`.
+/// 2. `.dynsym` — same two names.
+/// 3. TLS-section walk fallback (section flagged `SHF_TLS`,
+///    symbol's `st_size` matches the expected `tsd_t` byte size).
+///    Implemented as a follow-up path; v1 relies on 1-2 since
+///    ktstr's own binaries keep `.symtab`.
+pub(crate) fn find_tsd_tls(elf: &Elf<'_>, elf_path: &Path) -> Result<TsdTlsSymbol> {
+    let e_machine = elf.header.e_machine;
+    let tls_image_aligned_size = extract_pt_tls_size(elf)?;
+
+    // Order-preserving name search across symbol tables.
+    let finders: [(&str, &dyn Fn(&str) -> Option<u64>); 2] = [
+        (
+            ".symtab",
+            &|name| find_symbol_by_name(&elf.syms, &elf.strtab, name),
+        ),
+        (
+            ".dynsym",
+            &|name| find_symbol_by_name(&elf.dynsyms, &elf.dynstrtab, name),
+        ),
+    ];
+    for (_table_name, finder) in finders {
+        for name in TSD_TLS_SYMBOL_NAMES {
+            if let Some(st_value) = finder(name) {
+                return Ok(TsdTlsSymbol {
+                    elf_path: elf_path.to_path_buf(),
+                    st_value,
+                    tls_image_aligned_size,
+                    e_machine,
+                });
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "jemalloc TLS symbol ({}) not found in .symtab or .dynsym of {}",
+        TSD_TLS_SYMBOL_NAMES.join(" / "),
+        elf_path.display(),
+    ))
+}
+
+fn find_symbol_by_name(
+    syms: &goblin::elf::Symtab<'_>,
+    strs: &goblin::strtab::Strtab<'_>,
+    needle: &str,
+) -> Option<u64> {
+    for sym in syms.iter() {
+        if let Some(name) = strs.get_at(sym.st_name)
+            && name == needle
+        {
+            return Some(sym.st_value);
+        }
+    }
+    None
+}
+
+fn extract_pt_tls_size(elf: &Elf<'_>) -> Result<u64> {
+    let tls_hdr = elf
+        .program_headers
+        .iter()
+        .find(|ph| ph.p_type == goblin::elf::program_header::PT_TLS)
+        .ok_or_else(|| anyhow!("ELF has no PT_TLS segment — target does not use static TLS"))?;
+    let align = tls_hdr.p_align.max(1);
+    let rounded = tls_hdr
+        .p_memsz
+        .checked_add(align - 1)
+        .and_then(|v| Some(v & !(align - 1)))
+        .ok_or_else(|| anyhow!("PT_TLS size arithmetic overflow"))?;
+    Ok(rounded)
+}
+
+/// Offsets of the two counters inside `struct tsd_s`, resolved from
+/// DWARF. Computed once per ELF load; shared across every thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CounterOffsets {
+    thread_allocated: u64,
+    thread_deallocated: u64,
+}
+
+impl CounterOffsets {
+    /// Construct, enforcing `thread_allocated < thread_deallocated`.
+    /// jemalloc's TSD_DATA_FAST block lays them out in that order with
+    /// `thread_allocated_next_event_fast` between them
+    /// (tsd_internals.h L110-115). A reversed pair means the DWARF walk
+    /// picked up a different struct or the layout has drifted; either
+    /// way the combined-read math below would underflow and read
+    /// garbage, so we fail fast with an actionable error.
+    pub fn new(thread_allocated: u64, thread_deallocated: u64) -> Result<Self> {
+        if thread_allocated >= thread_deallocated {
+            bail!(
+                "unexpected tsd_s layout: thread_allocated ({thread_allocated}) \
+                 must precede thread_deallocated ({thread_deallocated}) per \
+                 jemalloc TSD_DATA_FAST ordering",
+            );
+        }
+        Ok(Self {
+            thread_allocated,
+            thread_deallocated,
+        })
+    }
+
+    /// Byte range covering both counters plus the
+    /// `thread_allocated_next_event_fast` u64 between them. Used as the
+    /// remote iov for a single `process_vm_readv` while the target
+    /// thread is stopped.
+    pub fn combined_read_span(&self) -> (u64, u64) {
+        let start = self.thread_allocated;
+        let end = self.thread_deallocated + 8;
+        (start, end - start)
+    }
+}
+
+/// Resolve the byte offsets of `thread_allocated` and
+/// `thread_deallocated` inside `struct tsd_s` by walking DWARF on the
+/// ELF. Returns `Err` with actionable text when the ELF has no
+/// `.debug_info` or the struct/fields are not found.
+pub(crate) fn resolve_field_offsets(elf_path: &Path) -> Result<CounterOffsets> {
+    let data = fs::read(elf_path)
+        .with_context(|| format!("re-read {} for DWARF inspection", elf_path.display()))?;
+    let elf = Elf::parse(&data).with_context(|| format!("parse ELF {}", elf_path.display()))?;
+
+    let load_section = |id: gimli::SectionId| -> Result<Cow<'_, [u8]>> {
+        let name = id.name();
+        for sh in &elf.section_headers {
+            if let Some(section_name) = elf.shdr_strtab.get_at(sh.sh_name)
+                && section_name == name
+            {
+                let range = sh.file_range().unwrap_or(0..0);
+                return Ok(Cow::Borrowed(&data[range]));
+            }
+        }
+        Ok(Cow::Borrowed(&[]))
+    };
+
+    let dwarf_sections = gimli::DwarfSections::load(load_section)?;
+    let dwarf = dwarf_sections.borrow(|bytes| EndianSlice::new(bytes, LittleEndian));
+
+    let mut allocated: Option<u64> = None;
+    let mut deallocated: Option<u64> = None;
+
+    let mut units = dwarf.units();
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        if let Some((a, d)) = struct_member_offsets_in_unit(&dwarf, &unit)? {
+            if let Some(v) = a {
+                allocated.get_or_insert(v);
+            }
+            if let Some(v) = d {
+                deallocated.get_or_insert(v);
+            }
+            if allocated.is_some() && deallocated.is_some() {
+                break;
+            }
+        }
+    }
+
+    let allocated = allocated.ok_or_else(|| {
+        anyhow!(
+            "DWARF walk of {} did not find field '{}' in struct '{}' — \
+             target was built without -g or the jemalloc version renamed the field",
+            elf_path.display(),
+            ALLOCATED_FIELD,
+            TSD_STRUCT_NAME,
+        )
+    })?;
+    let deallocated = deallocated.ok_or_else(|| {
+        anyhow!(
+            "DWARF walk of {} did not find field '{}' in struct '{}'",
+            elf_path.display(),
+            DEALLOCATED_FIELD,
+            TSD_STRUCT_NAME,
+        )
+    })?;
+    CounterOffsets::new(allocated, deallocated)
+}
+
+#[allow(clippy::type_complexity)]
+fn struct_member_offsets_in_unit<R: Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &Unit<R>,
+) -> Result<Option<(Option<u64>, Option<u64>)>> {
+    let mut entries = unit.entries();
+    while let Some((_, entry)) = entries.next_dfs()? {
+        if entry.tag() != gimli::DW_TAG_structure_type {
+            continue;
+        }
+        let name = match entry.attr_value(gimli::DW_AT_name)? {
+            Some(v) => v,
+            None => continue,
+        };
+        let name_str = dwarf.attr_string(unit, name)?;
+        if name_str.to_slice()?.as_ref() != TSD_STRUCT_NAME.as_bytes() {
+            continue;
+        }
+
+        let mut allocated: Option<u64> = None;
+        let mut deallocated: Option<u64> = None;
+        // depth == 1 is the tsd_s DIE itself; depth == 2 is a DIRECT
+        // member; depth > 2 is a nested type's member (e.g. a bitfield
+        // of `te_data_t`) — we must not accept those or we'll latch
+        // onto a same-named field in a nested DIE.
+        let mut depth = 1;
+        while let Some((delta, child)) = entries.next_dfs()? {
+            depth += delta;
+            if depth <= 0 {
+                break;
+            }
+            if depth != 2 {
+                continue;
+            }
+            if child.tag() != gimli::DW_TAG_member {
+                continue;
+            }
+            let child_name = match child.attr_value(gimli::DW_AT_name)? {
+                Some(v) => v,
+                None => continue,
+            };
+            let child_name_str = dwarf.attr_string(unit, child_name)?;
+            let bytes = child_name_str.to_slice()?;
+            let as_str = bytes.as_ref();
+            let is_allocated = as_str == ALLOCATED_FIELD.as_bytes();
+            let is_deallocated = as_str == DEALLOCATED_FIELD.as_bytes();
+            if !is_allocated && !is_deallocated {
+                continue;
+            }
+            let offset = member_offset(child.attr_value(gimli::DW_AT_data_member_location)?)?;
+            if is_allocated && allocated.is_none() {
+                allocated = offset;
+            }
+            if is_deallocated && deallocated.is_none() {
+                deallocated = offset;
+            }
+            if allocated.is_some() && deallocated.is_some() {
+                return Ok(Some((allocated, deallocated)));
+            }
+        }
+        return Ok(Some((allocated, deallocated)));
+    }
+    Ok(None)
+}
+
+fn member_offset<R: Reader>(attr: Option<AttributeValue<R>>) -> Result<Option<u64>> {
+    let Some(attr) = attr else { return Ok(None) };
+    match attr {
+        AttributeValue::Udata(v) => Ok(Some(v)),
+        AttributeValue::Data1(v) => Ok(Some(v as u64)),
+        AttributeValue::Data2(v) => Ok(Some(v as u64)),
+        AttributeValue::Data4(v) => Ok(Some(v as u64)),
+        AttributeValue::Data8(v) => Ok(Some(v)),
+        AttributeValue::Sdata(v) if v >= 0 => Ok(Some(v as u64)),
+        other => Err(anyhow!(
+            "unexpected DW_AT_data_member_location form: {:?} — \
+             DWARF expression forms are not supported for field-offset resolution in v1",
+            other
+        )),
+    }
+}
+
+/// Compute the absolute address of a TLS variable's field in the target.
+///
+/// Variant II (x86_64): the thread pointer (`fs_base`) points to the
+/// end of the static TLS block; the executable's TLS image sits at
+/// `fs_base - tls_image_aligned_size`. The symbol lives at
+/// `st_value` bytes within that image; the field lives `field_offset`
+/// bytes inside the symbol.
+///
+/// Returns `Err` on `fs_base < tls_image_aligned_size` — that would
+/// indicate the target has not initialized TLS or the ELF layout is
+/// malformed; silently wrapping into the top of the address space
+/// would produce a read from kernel-space and confuse the error path.
+pub(crate) fn compute_tls_address(
+    fs_base: u64,
+    tls_image_aligned_size: u64,
+    st_value: u64,
+    field_offset: u64,
+) -> Result<u64> {
+    let image_base = fs_base.checked_sub(tls_image_aligned_size).ok_or_else(|| {
+        anyhow!(
+            "fs_base ({fs_base:#x}) is below the aligned TLS image size \
+             ({tls_image_aligned_size:#x}); target likely has no static \
+             TLS initialized yet"
+        )
+    })?;
+    image_base
+        .checked_add(st_value)
+        .and_then(|v| v.checked_add(field_offset))
+        .ok_or_else(|| anyhow!("TLS address arithmetic overflow"))
+}
+
+// ---------------------------------------------------------------------
+// /proc/<pid>/{maps,task}
+// ---------------------------------------------------------------------
+
+/// Enumerate thread ids for a target pid from `/proc/<pid>/task/`.
+///
+/// Returns them sorted so output ordering is deterministic across
+/// runs and the enumeration is stable to `diff`.
+pub(crate) fn iter_task_ids(pid: i32) -> Result<Vec<i32>> {
+    let path = format!("/proc/{pid}/task");
+    let entries = fs::read_dir(&path).with_context(|| format!("read_dir {path}"))?;
+    let mut tids: Vec<i32> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
+        .collect();
+    tids.sort_unstable();
+    Ok(tids)
+}
+
+/// Scan `/proc/<pid>/maps` for a mapping whose on-disk ELF contains a
+/// jemalloc TLS symbol. Returns the (symbol info, DWARF-derived field
+/// offsets) pair for the main executable match.
+///
+/// v1 is constrained to static-linked jemalloc, so the symbol MUST
+/// live in the binary that `/proc/<pid>/exe` points at. If a match
+/// turns up in some other ELF (a shared library loaded separately),
+/// we bail — the TP math in this tool is only correct for the static
+/// TLS image in the main executable; dynamic-TLS DSOs need DTV walks
+/// (follow-up #558).
+pub(crate) fn find_jemalloc_via_maps(
+    pid: i32,
+) -> Result<(TsdTlsSymbol, CounterOffsets)> {
+    let exe_link = format!("/proc/{pid}/exe");
+    let exe_path = fs::read_link(&exe_link)
+        .with_context(|| format!("readlink {exe_link} (need it to gate static-TLS match)"))?;
+
+    let maps_path = format!("/proc/{pid}/maps");
+    let contents =
+        fs::read_to_string(&maps_path).with_context(|| format!("read {maps_path}"))?;
+
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut last_symbol_err: Option<anyhow::Error> = None;
+    for line in contents.lines() {
+        let Some(path) = parse_maps_elf_path(line) else {
+            continue;
+        };
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            // Mapping may reference a path we cannot read (permissions,
+            // deleted file). Skip and keep searching.
+            Err(_) => continue,
+        };
+        let elf = match Elf::parse(&data) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let symbol = match find_tsd_tls(&elf, &path) {
+            Ok(s) => s,
+            Err(e) => {
+                last_symbol_err = Some(e);
+                continue;
+            }
+        };
+        // Static-TLS guard: the match must be in the main executable.
+        // A hit in a DSO is not something v1 can address correctly
+        // (no DTV walk).
+        if path != exe_path {
+            bail!(
+                "jemalloc TLS symbol found in {} but static-TLS probe requires \
+                 the match be in the main executable ({}); dynamic-TLS lookups \
+                 in shared objects are not supported in v1",
+                path.display(),
+                exe_path.display(),
+            );
+        }
+        // Arch check runs before the (slow) DWARF walk so an aarch64
+        // target fails fast with the right message instead of running
+        // gimli over unsupported debug info.
+        if symbol.e_machine != goblin::elf::header::EM_X86_64 {
+            bail!(
+                "probe is x86_64-only; target ELF {} is {} (e_machine={:#x})",
+                symbol.elf_path.display(),
+                e_machine_name(symbol.e_machine),
+                symbol.e_machine,
+            );
+        }
+        let offsets = resolve_field_offsets(&path)?;
+        return Ok((symbol, offsets));
+    }
+
+    let context = last_symbol_err
+        .map(|e| format!(" — last per-ELF error: {e}"))
+        .unwrap_or_default();
+    bail!(
+        "jemalloc TLS symbol ({}) not found in any r-x mapping under {}{}",
+        TSD_TLS_SYMBOL_NAMES.join(" / "),
+        maps_path,
+        context
+    )
+}
+
+/// Human-readable name for an ELF e_machine value. Used in error
+/// messages so a user who probed the wrong target gets "aarch64" back
+/// instead of the raw hex number. Non-exhaustive; extends as new
+/// arches are added to v1's support list.
+pub(crate) fn e_machine_name(e_machine: u16) -> &'static str {
+    use goblin::elf::header::{EM_386, EM_AARCH64, EM_PPC64, EM_RISCV, EM_S390, EM_X86_64};
+    match e_machine {
+        EM_X86_64 => "x86_64",
+        EM_AARCH64 => "aarch64",
+        EM_386 => "i386",
+        EM_RISCV => "riscv",
+        EM_PPC64 => "ppc64",
+        EM_S390 => "s390",
+        _ => "unknown",
+    }
+}
+
+/// Extract the on-disk ELF path from a `/proc/<pid>/maps` line, or
+/// `None` if the line is a non-file mapping (anon, [stack], …) or
+/// not executable. Returning only `r-x` mappings avoids re-opening
+/// the same ELF for each of its segments.
+fn parse_maps_elf_path(line: &str) -> Option<PathBuf> {
+    let mut iter = line.split_whitespace();
+    let _range = iter.next()?;
+    let perms = iter.next()?;
+    // Skip non-executable mappings (rw-p, r--p, …); we only need the
+    // code-bearing mapping once per ELF.
+    if !perms.contains('x') {
+        return None;
+    }
+    let _offset = iter.next()?;
+    let _dev = iter.next()?;
+    let _inode = iter.next()?;
+    let path = iter.next()?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+// ---------------------------------------------------------------------
+// Per-thread attach / read / detach
+// ---------------------------------------------------------------------
+
+/// Single-snapshot counters read from one target thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThreadCounters {
+    pub allocated_bytes: u64,
+    pub deallocated_bytes: u64,
+}
+
+/// Tracks which tids we've seized so SIGINT cleanup can detach them.
+/// A Mutex<BTreeSet> is fine: contention is only between the probe
+/// thread and the signal handler, and the handler runs on SIGINT
+/// only.
+static ATTACHED: OnceLock<Mutex<BTreeSet<i32>>> = OnceLock::new();
+static CLEANUP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn attached() -> &'static Mutex<BTreeSet<i32>> {
+    ATTACHED.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+extern "C" fn on_sigint(_sig: i32) {
+    // Async-signal-safe subset: just flip the flag and let the main
+    // loop drain. We cannot touch the Mutex from signal context, but
+    // the iteration check in probe_single_thread catches it between
+    // tids.
+    CLEANUP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Install a SIGINT/SIGTERM handler that asks the main loop to detach
+/// every still-attached tid and exit. Returns `()` rather than
+/// failing — if signal install fails, the probe still works; only the
+/// Ctrl-C cleanup guarantee is weakened.
+fn install_cleanup_handler() {
+    for sig in [Signal::SIGINT, Signal::SIGTERM] {
+        // SAFETY: `on_sigint` only touches an `AtomicBool`, which is
+        // async-signal-safe.
+        unsafe {
+            let _ = signal(sig, SigHandler::Handler(on_sigint));
+        }
+    }
+}
+
+/// Perform the full seize → interrupt → wait → read-regs →
+/// read-counters → detach sequence for a single target tid.
+fn probe_single_thread(
+    tid: i32,
+    symbol: &TsdTlsSymbol,
+    offsets: &CounterOffsets,
+) -> Result<ThreadCounters> {
+    let pid = Pid::from_raw(tid);
+
+    ptrace::seize(pid, Options::empty()).map_err(|e| {
+        if e == nix::errno::Errno::EPERM {
+            anyhow!(
+                "ptrace(PTRACE_SEIZE) on tid {tid}: permission denied (EPERM). \
+                 Grant access with one of: (1) run as root, (2) setcap \
+                 cap_sys_ptrace+ep ktstr-jemalloc-probe, (3) run under the \
+                 same uid as target, (4) set /proc/sys/kernel/yama/ptrace_scope=0 \
+                 (requires root; affects system-wide ptrace policy)."
+            )
+        } else {
+            anyhow!("ptrace(PTRACE_SEIZE) on tid {tid}: {e}")
+        }
+    })?;
+    // Record the attach BEFORE we try to interrupt, so a failure in
+    // interrupt still lets cleanup detach us.
+    attached().lock().unwrap().insert(tid);
+
+    let _attached_guard = ScopeDetach(tid);
+
+    ptrace::interrupt(pid)
+        .with_context(|| format!("ptrace(PTRACE_INTERRUPT) on tid {tid}"))?;
+    match waitpid(pid, None) {
+        Ok(WaitStatus::Stopped(_, _) | WaitStatus::PtraceEvent(_, _, _)) => {}
+        Ok(other) => bail!("waitpid on tid {tid} returned unexpected status: {other:?}"),
+        Err(e) => bail!("waitpid on tid {tid}: {e}"),
+    }
+
+    let regs = ptrace::getregset::<NT_PRSTATUS>(pid)
+        .with_context(|| format!("ptrace(PTRACE_GETREGSET, NT_PRSTATUS) on tid {tid}"))?;
+    let fs_base = regs.fs_base;
+
+    let addr = compute_tls_address(
+        fs_base,
+        symbol.tls_image_aligned_size,
+        symbol.st_value,
+        offsets.thread_allocated,
+    )?;
+
+    let (_base, span) = offsets.combined_read_span();
+    let mut buf = vec![0u8; span as usize];
+    let remote = RemoteIoVec {
+        base: addr as usize,
+        len: span as usize,
+    };
+    let mut local = [IoSliceMut::new(&mut buf)];
+    let n = process_vm_readv(pid, &mut local, &[remote])
+        .with_context(|| format!("process_vm_readv on tid {tid} at {addr:#x}"))?;
+    if n != span as usize {
+        bail!(
+            "short process_vm_readv on tid {tid}: got {n} bytes, expected {span}"
+        );
+    }
+
+    let allocated = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    // bytes 8..16 are thread_allocated_next_event_fast (discarded).
+    let dealloc_offset = (offsets.thread_deallocated - offsets.thread_allocated) as usize;
+    let deallocated =
+        u64::from_le_bytes(buf[dealloc_offset..dealloc_offset + 8].try_into().unwrap());
+
+    Ok(ThreadCounters {
+        allocated_bytes: allocated,
+        deallocated_bytes: deallocated,
+    })
+}
+
+/// Drop guard that detaches the tid on scope exit so a mid-read
+/// failure doesn't leave the target thread stopped.
+struct ScopeDetach(i32);
+
+impl Drop for ScopeDetach {
+    fn drop(&mut self) {
+        let pid = Pid::from_raw(self.0);
+        let _ = ptrace::detach(pid, None);
+        attached().lock().unwrap().remove(&self.0);
+    }
+}
+
+/// Detach everything still in `ATTACHED`. Called from the main loop
+/// when SIGINT arrived between tids.
+fn detach_all_attached() {
+    let tids: Vec<i32> = attached().lock().unwrap().iter().copied().collect();
+    for tid in tids {
+        let _ = ptrace::detach(Pid::from_raw(tid), None);
+        attached().lock().unwrap().remove(&tid);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Orchestration + output
+// ---------------------------------------------------------------------
+
+/// Outcome classification so `main` can decide the exit code without
+/// re-inspecting the `threads` vec. `AllFailed` still emits JSON so
+/// callers have a machine-parseable explanation; `Fatal` is for
+/// pre-probe errors (pid missing, no jemalloc, arch mismatch) where
+/// there's no per-thread error to surface.
+enum RunOutcome {
+    Ok(ProbeOutput),
+    AllFailed(ProbeOutput),
+    Fatal(anyhow::Error),
+}
+
+fn run(cli: &Cli) -> RunOutcome {
+    if !Path::new(&format!("/proc/{}", cli.pid)).exists() {
+        return RunOutcome::Fatal(anyhow!("pid {} does not exist", cli.pid));
+    }
+
+    let (symbol, offsets) = match find_jemalloc_via_maps(cli.pid) {
+        Ok(v) => v,
+        Err(e) => return RunOutcome::Fatal(e),
+    };
+
+    let tids = match iter_task_ids(cli.pid) {
+        Ok(v) => v,
+        Err(e) => return RunOutcome::Fatal(e),
+    };
+
+    let mut threads: Vec<ThreadResult> = Vec::with_capacity(tids.len());
+    let mut interrupted = false;
+    for tid in tids {
+        if CLEANUP_REQUESTED.load(Ordering::SeqCst) {
+            detach_all_attached();
+            interrupted = true;
+            break;
+        }
+        match probe_single_thread(tid, &symbol, &offsets) {
+            Ok(c) => threads.push(ThreadResult::Ok {
+                tid,
+                allocated_bytes: c.allocated_bytes,
+                deallocated_bytes: c.deallocated_bytes,
+            }),
+            Err(e) => threads.push(ThreadResult::Err {
+                tid,
+                error: format!("{e:#}"),
+            }),
+        }
+    }
+
+    let out = ProbeOutput {
+        schema_version: SCHEMA_VERSION,
+        pid: cli.pid,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        threads,
+    };
+
+    if interrupted {
+        return RunOutcome::Fatal(anyhow!(
+            "probe interrupted by signal — attached threads detached"
+        ));
+    }
+
+    if out.threads.is_empty() || out.threads.iter().all(|t| matches!(t, ThreadResult::Err { .. }))
+    {
+        RunOutcome::AllFailed(out)
+    } else {
+        RunOutcome::Ok(out)
+    }
+}
+
+fn print_output(cli: &Cli, out: &ProbeOutput) -> Result<()> {
+    if cli.json {
+        let s = serde_json::to_string_pretty(out)?;
+        println!("{s}");
+    } else {
+        println!("pid={} tool_version={}", out.pid, out.tool_version);
+        for t in &out.threads {
+            match t {
+                ThreadResult::Ok {
+                    tid,
+                    allocated_bytes,
+                    deallocated_bytes,
+                } => println!(
+                    "tid={tid} allocated_bytes={allocated_bytes} deallocated_bytes={deallocated_bytes}",
+                ),
+                ThreadResult::Err { tid, error } => {
+                    eprintln!("warning: tid {tid}: {error}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    install_cleanup_handler();
+    let cli = Cli::parse();
+    match run(&cli) {
+        RunOutcome::Ok(out) => {
+            if let Err(e) = print_output(&cli, &out) {
+                eprintln!("error writing output: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        RunOutcome::AllFailed(out) => {
+            // Emit the structured output anyway so callers have the
+            // per-thread error reasons; exit non-zero to signal that
+            // nothing succeeded.
+            if let Err(e) = print_output(&cli, &out) {
+                eprintln!("error writing output: {e:#}");
+            }
+            eprintln!("error: all threads failed probe");
+            detach_all_attached();
+            std::process::exit(1);
+        }
+        RunOutcome::Fatal(e) => {
+            eprintln!("error: {e:#}");
+            detach_all_attached();
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Tests (pure-function seams)
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Variant II TLS TP math: fs_base - aligned_tls_size + st_value +
+    /// field_offset. Worked example pins the arithmetic against a
+    /// hand-checked case.
+    #[test]
+    fn compute_tls_address_variant_ii_example() {
+        let fs_base = 0x7f12_3456_7000;
+        let aligned = 512; // round_up(memsz=500, align=16)
+        let st_value = 0x100; // symbol is at byte 256 of the TLS image
+        let field = 264; // offsetof(tsd_s, thread_allocated) example
+        let addr = compute_tls_address(fs_base, aligned, st_value, field).unwrap();
+        // 0x7f1234567000 - 0x200 + 0x100 + 264
+        // = 0x7f1234566f00 + 264
+        // = 0x7f1234567008
+        assert_eq!(addr, 0x7f12_3456_7008);
+    }
+
+    /// Thread pointer equal to aligned image size is the minimum
+    /// valid configuration — subtraction lands at zero rather than
+    /// underflowing. A lower fs_base is an error surface (see next
+    /// test).
+    #[test]
+    fn compute_tls_address_boundary_tp_equals_image_size() {
+        let addr = compute_tls_address(/*fs_base*/ 4096, /*aligned*/ 4096, 0, 0).unwrap();
+        assert_eq!(addr, 0);
+    }
+
+    /// fs_base below the TLS image size is a malformed-state error —
+    /// the math must NOT wrap into the top of the u64 address space.
+    #[test]
+    fn compute_tls_address_underflow_errors() {
+        let err = compute_tls_address(4096, 8192, 0, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("below the aligned TLS image size"),
+            "got: {err}",
+        );
+    }
+
+    /// `combined_read_span` must cover both counters and the interleaving
+    /// `thread_allocated_next_event_fast` — else the single
+    /// process_vm_readv would need a second iov.
+    #[test]
+    fn counter_offsets_combined_span_covers_both() {
+        let o = CounterOffsets::new(264, 280).unwrap();
+        let (start, span) = o.combined_read_span();
+        assert_eq!(start, 264);
+        assert_eq!(span, 24, "8 (allocated) + 8 (fast_event) + 8 (deallocated)");
+    }
+
+    /// Exact-adjacency: if a future jemalloc drops the fast_event
+    /// field and places deallocated immediately after allocated, the
+    /// span collapses to 16. Guards against regression that would
+    /// truncate the read.
+    #[test]
+    fn counter_offsets_combined_span_adjacent() {
+        let o = CounterOffsets::new(100, 108).unwrap();
+        let (_start, span) = o.combined_read_span();
+        assert_eq!(span, 16);
+    }
+
+    /// Field-order invariant: `thread_allocated` must precede
+    /// `thread_deallocated` in the TSD layout. A reversed pair means
+    /// DWARF found the wrong struct or the upstream layout drifted;
+    /// either way the read math would underflow.
+    #[test]
+    fn counter_offsets_reject_reversed_order() {
+        let err = CounterOffsets::new(280, 264).unwrap_err();
+        assert!(
+            format!("{err}").contains("unexpected tsd_s layout"),
+            "got: {err}",
+        );
+    }
+
+    /// Equal offsets are also invalid — jemalloc's layout separates
+    /// the two counters by `thread_allocated_next_event_fast`.
+    #[test]
+    fn counter_offsets_reject_equal_offsets() {
+        assert!(CounterOffsets::new(100, 100).is_err());
+    }
+
+    /// e_machine error-message pretty-printer maps the handful of
+    /// common Linux architectures. Guards against regressions like
+    /// "probe is x86_64-only; target is 0xb7" — that hex means
+    /// aarch64, which is actionable once named.
+    #[test]
+    fn e_machine_name_common_arches() {
+        use goblin::elf::header::{EM_386, EM_AARCH64, EM_X86_64};
+        assert_eq!(e_machine_name(EM_X86_64), "x86_64");
+        assert_eq!(e_machine_name(EM_AARCH64), "aarch64");
+        assert_eq!(e_machine_name(EM_386), "i386");
+        assert_eq!(e_machine_name(0xbeef), "unknown");
+    }
+
+    /// /proc/<pid>/maps parser: only r-x mappings with on-disk paths
+    /// produce a candidate ELF path. Anon / [stack] / non-executable
+    /// mappings must be skipped.
+    #[test]
+    fn parse_maps_elf_path_accepts_rx_only() {
+        let line = "5580e0001000-5580e0002000 r-xp 00000000 fd:01 12345 /usr/bin/ktstr";
+        assert_eq!(
+            parse_maps_elf_path(line),
+            Some(PathBuf::from("/usr/bin/ktstr"))
+        );
+    }
+
+    #[test]
+    fn parse_maps_elf_path_rejects_non_executable() {
+        let line = "5580e0002000-5580e0003000 rw-p 00001000 fd:01 12345 /usr/bin/ktstr";
+        assert!(parse_maps_elf_path(line).is_none());
+    }
+
+    #[test]
+    fn parse_maps_elf_path_rejects_anon_mapping() {
+        let line = "7f1234567000-7f1234568000 rw-p 00000000 00:00 0 ";
+        assert!(parse_maps_elf_path(line).is_none());
+    }
+
+    #[test]
+    fn parse_maps_elf_path_rejects_pseudo_paths() {
+        // `[stack]` and friends start with `[` not `/` — not a real
+        // file so we skip them.
+        let line = "7ffc12345000-7ffc12367000 rw-p 00000000 00:00 0 [stack]";
+        assert!(parse_maps_elf_path(line).is_none());
+    }
+
+    /// `find_symbol_by_name` negative path: empty strtab must not
+    /// panic and returns None.
+    #[test]
+    fn find_symbol_by_name_nothing_found() {
+        let tab: goblin::elf::Symtab<'_> = Default::default();
+        let strs = goblin::strtab::Strtab::default();
+        assert!(find_symbol_by_name(&tab, &strs, "tsd_tls").is_none());
+    }
+
+    /// JSON schema v1: success + error arms round-trip via serde.
+    #[test]
+    fn thread_result_json_shape() {
+        let ok = ThreadResult::Ok {
+            tid: 42,
+            allocated_bytes: 1024,
+            deallocated_bytes: 512,
+        };
+        let err = ThreadResult::Err {
+            tid: 43,
+            error: "thread exited before probe".to_string(),
+        };
+        let out = ProbeOutput {
+            schema_version: SCHEMA_VERSION,
+            pid: 100,
+            tool_version: "0.0.0",
+            threads: vec![ok, err],
+        };
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(s.contains("\"schema_version\":1"));
+        assert!(s.contains("\"pid\":100"));
+        assert!(s.contains("\"allocated_bytes\":1024"));
+        assert!(s.contains("\"deallocated_bytes\":512"));
+        assert!(s.contains("\"error\":\"thread exited before probe\""));
+        assert!(s.contains("\"tid\":42"));
+        assert!(s.contains("\"tid\":43"));
+    }
+
+    /// `iter_task_ids` of /proc/self/task must return at least the
+    /// current thread. Sorted ascending.
+    #[test]
+    fn iter_task_ids_self() {
+        let pid = std::process::id() as i32;
+        let tids = iter_task_ids(pid).expect("self/task must be readable");
+        assert!(!tids.is_empty());
+        assert!(tids.windows(2).all(|w| w[0] <= w[1]), "tids must be sorted");
+    }
+
+    /// `extract_pt_tls_size` rounds PT_TLS.p_memsz up to p_align.
+    /// Since we can't easily construct a full goblin::elf::Elf
+    /// fixture, test the arithmetic via a small helper that mirrors
+    /// the inner logic.
+    #[test]
+    fn pt_tls_round_up_arithmetic() {
+        fn round_up(memsz: u64, align: u64) -> u64 {
+            let align = align.max(1);
+            (memsz + (align - 1)) & !(align - 1)
+        }
+        assert_eq!(round_up(500, 16), 512);
+        assert_eq!(round_up(512, 16), 512);
+        assert_eq!(round_up(513, 16), 528);
+        assert_eq!(round_up(0, 1), 0);
+    }
+}

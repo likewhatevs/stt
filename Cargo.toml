@@ -39,7 +39,7 @@ flate2 = "1"
 glob = "0.3"
 ctor = "0.8"
 libc = "0.2"
-nix = { version = "0.31", features = ["feature", "fs", "mount", "poll", "process", "reboot", "sched", "signal", "term"] }
+nix = { version = "0.31", features = ["feature", "fs", "mount", "poll", "process", "ptrace", "reboot", "sched", "signal", "term", "uio"] }
 blazesym = { version = "0.2", features = ["dwarf"] }
 rand = "0.10"
 rmesg = { version = "1", default-features = false, features = ["sync"] }
@@ -65,6 +65,11 @@ polars = { version = "0.53.0", default-features = false, features = ["lazy", "de
 linkme = "0.3"
 ktstr-macros = { version = "0.4.8", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
+# DWARF parser for resolving struct-member offsets in jemalloc's tsd_t
+# at probe time (jemalloc-probe binary). Already present transitively
+# via blazesym; pinned as a direct dep so the probe's offset-recovery
+# path doesn't depend on blazesym's re-export surface.
+gimli = "0.32"
 rayon = "1"
 object = { version = "0.37", default-features = false, features = ["build"] }
 walkdir = "2"
@@ -151,6 +156,10 @@ path = "src/bin/ktstr.rs"
 [[bin]]
 name = "cargo-ktstr"
 path = "src/bin/cargo-ktstr.rs"
+
+[[bin]]
+name = "ktstr-jemalloc-probe"
+path = "src/bin/jemalloc_probe.rs"
 
 [[test]]
 name = "ktstr_sched_tests"
