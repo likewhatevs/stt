@@ -1441,6 +1441,46 @@ pub fn compare_runs(
         );
     }
 
+    // Host-context delta. Static fields (uname triple, CPU
+    // identity, total memory, hugepage size, NUMA count) are
+    // memoized once per process in [`host_context`]'s
+    // `STATIC_HOST_INFO`, so every sidecar in a run carries
+    // identical values for them. Dynamic fields (sched_tunables,
+    // hugepages_{total,free}, thp_enabled, thp_defrag, cmdline)
+    // are re-read on every `collect_host_context` call, so an
+    // operator who flips a sysctl or reserves hugepages
+    // mid-run will see drift across sidecars within the same
+    // run. Picking the first `Some(host)` we encounter is a
+    // representative baseline, not a replay of every sample.
+    // For full timeseries, inspect individual sidecar JSON files.
+    // Surface the delta when both runs carry host data; when only
+    // one side has it (mixed tooling version, partial migration)
+    // say so explicitly rather than silently suppressing the
+    // section.
+    let host_a = sidecars_a.iter().find_map(|s| s.host.as_ref());
+    let host_b = sidecars_b.iter().find_map(|s| s.host.as_ref());
+    match (host_a, host_b) {
+        (Some(ha), Some(hb)) => {
+            let delta = crate::host_context::HostContext::diff(ha, hb);
+            println!();
+            if delta.is_empty() {
+                println!("host: identical between '{a}' and '{b}'");
+            } else {
+                println!("host delta ('{a}' → '{b}'):");
+                print!("{delta}");
+            }
+        }
+        (Some(_), None) => {
+            println!();
+            println!("host: captured in '{a}' only, delta unavailable");
+        }
+        (None, Some(_)) => {
+            println!();
+            println!("host: captured in '{b}' only, delta unavailable");
+        }
+        (None, None) => {}
+    }
+
     Ok(if report.regressions > 0 { 1 } else { 0 })
 }
 

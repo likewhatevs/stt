@@ -130,13 +130,13 @@ pub struct SidecarResult {
     /// Host context — static-ish runtime state (CPU model,
     /// memory size, THP policy, kernel release, host cmdline,
     /// scheduler tunables). Populated at sidecar-write time from
-    /// `host_state::collect_host_context`. `None` on the
+    /// `host_context::collect_host_context`. `None` on the
     /// test-fixture path where the sidecar is synthesized via
     /// [`SidecarResult::test_fixture`]; deliberately excluded from
     /// [`sidecar_variant_hash`] so gauntlet variants on different
     /// hosts collapse into the same hash bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<crate::host_state::HostContext>,
+    pub host: Option<crate::host_context::HostContext>,
 }
 
 #[cfg(test)]
@@ -642,7 +642,7 @@ pub(crate) fn write_skip_sidecar(
         kernel_version: detect_kernel_version(),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
-        host: Some(crate::host_state::collect_host_context()),
+        host: Some(crate::host_context::collect_host_context()),
     };
     serialize_and_write_sidecar(&sidecar, "skip sidecar")
 }
@@ -692,7 +692,7 @@ pub(crate) fn write_sidecar(
         kernel_version: detect_kernel_version(),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
-        host: Some(crate::host_state::collect_host_context()),
+        host: Some(crate::host_context::collect_host_context()),
     };
     serialize_and_write_sidecar(&sidecar, "sidecar")
 }
@@ -1952,7 +1952,7 @@ mod tests {
     /// the run-key split reaches on-disk sidecars.
     #[test]
     fn sidecar_variant_hash_excludes_host_context() {
-        use crate::host_state::HostContext;
+        use crate::host_context::HostContext;
         let populated = HostContext {
             cpu_model: Some("Example CPU".to_string()),
             cpu_vendor: Some("GenuineExample".to_string()),
@@ -1994,7 +1994,7 @@ mod tests {
     /// the seam without needing a per-field assertion.
     #[test]
     fn sidecar_result_roundtrip_with_populated_host_context() {
-        use crate::host_state::HostContext;
+        use crate::host_context::HostContext;
         let mut tunables = std::collections::BTreeMap::new();
         tunables.insert(
             "sched_migration_cost_ns".to_string(),

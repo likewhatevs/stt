@@ -126,6 +126,19 @@ enum KtstrCommand {
         #[arg(long, default_value = "cargo")]
         binary: String,
     },
+    /// Print the current host context used by sidecar collection:
+    /// CPU identity, memory/hugepage config, transparent-hugepage
+    /// policy, NUMA node count, kernel uname triple
+    /// (sysname/release/machine), kernel cmdline, and every
+    /// `/proc/sys/kernel/sched_*` tunable. Useful for diagnosing
+    /// cross-run regressions that trace back to host-context drift
+    /// (sysctl change, THP policy flip, hugepage reservation).
+    ///
+    /// For historical drift between archived runs, use
+    /// `cargo ktstr stats compare` — its host-delta section
+    /// reports which host-context fields changed between run A
+    /// and run B using the same [`HostContext::diff`] logic.
+    ShowHost,
     /// Clean up leftover ktstr cgroups.
     ///
     /// Without `--parent-cgroup`, scans `/sys/fs/cgroup` for the default
@@ -902,6 +915,10 @@ fn main() {
         },
         KtstrCommand::Cleanup { parent_cgroup } => {
             cli::cleanup(parent_cgroup).map_err(|e| format!("{e:#}"))
+        }
+        KtstrCommand::ShowHost => {
+            print!("{}", cli::show_host());
+            Ok(())
         }
     };
 
@@ -1690,5 +1707,26 @@ mod tests {
     fn embedded_kconfig_hash_matches_manual_crc32() {
         let expected = format!("{:08x}", crc32fast::hash(cli::EMBEDDED_KCONFIG.as_bytes()));
         assert_eq!(cli::embedded_kconfig_hash(), expected);
+    }
+
+    // -- show-host --
+
+    /// `cargo ktstr show-host` parses with no arguments and maps to
+    /// the `ShowHost` variant. A stray positional argument must be
+    /// rejected (clap default) so a typo like
+    /// `cargo ktstr show-host host_context` is caught at parse time.
+    #[test]
+    fn parse_show_host_minimal() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "show-host"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(k.command, KtstrCommand::ShowHost));
+
+        let rejected = Cargo::try_parse_from(["cargo", "ktstr", "show-host", "stray"]);
+        assert!(
+            rejected.is_err(),
+            "show-host must reject positional arguments",
+        );
     }
 }

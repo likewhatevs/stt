@@ -108,6 +108,223 @@ pub struct HostContext {
     pub cmdline: Option<String>,
 }
 
+impl HostContext {
+    /// Render as a human-readable multi-line report. Each field
+    /// occupies one line as `key: value`. Absent fields render as
+    /// `(unknown)` rather than being dropped, so operators see
+    /// which fields failed to populate. The `sched_tunables` map
+    /// is expanded one entry per line under the parent key; an
+    /// empty map renders as `(empty)` and a `None` map as
+    /// `(unknown)`. The output ends with a newline.
+    ///
+    /// This output is for human inspection only. For programmatic
+    /// access, parse the sidecar JSON directly or drive `serde_json`
+    /// against the [`HostContext`] struct — the text format here is
+    /// not a stable serialization contract and may be retuned for
+    /// readability without notice.
+    pub fn format_human(&self) -> String {
+        use std::fmt::Write;
+        // Destructuring bind forces every field of HostContext to
+        // appear by name here. Adding a new field to the struct
+        // will fail compilation until this function handles it —
+        // that is the intent, it prevents `show-host` from
+        // silently dropping a freshly-captured dimension.
+        let HostContext {
+            cpu_model,
+            cpu_vendor,
+            total_memory_kb,
+            hugepages_total,
+            hugepages_free,
+            hugepagesize_kb,
+            thp_enabled,
+            thp_defrag,
+            sched_tunables,
+            numa_nodes,
+            uname_sysname,
+            uname_release,
+            uname_machine,
+            cmdline,
+        } = self;
+        fn row<T: std::fmt::Display>(out: &mut String, key: &str, value: Option<&T>) {
+            match value {
+                Some(v) => {
+                    let _ = writeln!(out, "{key}: {v}");
+                }
+                None => {
+                    let _ = writeln!(out, "{key}: (unknown)");
+                }
+            }
+        }
+        let mut out = String::new();
+        row(&mut out, "uname_sysname", uname_sysname.as_ref());
+        row(&mut out, "uname_release", uname_release.as_ref());
+        row(&mut out, "uname_machine", uname_machine.as_ref());
+        row(&mut out, "cpu_model", cpu_model.as_ref());
+        row(&mut out, "cpu_vendor", cpu_vendor.as_ref());
+        row(&mut out, "total_memory_kb", total_memory_kb.as_ref());
+        row(&mut out, "hugepages_total", hugepages_total.as_ref());
+        row(&mut out, "hugepages_free", hugepages_free.as_ref());
+        row(&mut out, "hugepagesize_kb", hugepagesize_kb.as_ref());
+        row(&mut out, "numa_nodes", numa_nodes.as_ref());
+        row(&mut out, "thp_enabled", thp_enabled.as_ref());
+        row(&mut out, "thp_defrag", thp_defrag.as_ref());
+        row(&mut out, "cmdline", cmdline.as_ref());
+        match sched_tunables {
+            Some(map) if !map.is_empty() => {
+                out.push_str("sched_tunables:\n");
+                for (k, v) in map {
+                    let _ = writeln!(&mut out, "  {k} = {v}");
+                }
+            }
+            Some(_) => out.push_str("sched_tunables: (empty)\n"),
+            None => out.push_str("sched_tunables: (unknown)\n"),
+        }
+        out
+    }
+
+    /// Render the differences between two host contexts as
+    /// indented `key: before → after` lines. Fields that compare
+    /// equal are omitted; an empty return value means the two
+    /// contexts are field-for-field identical (including
+    /// `sched_tunables`). `None` values render as `(unknown)` and
+    /// map entries present in one side only render as `(absent)`
+    /// so a `None → Some(..)` transition does not silently look
+    /// the same as an unchanged absent field. When only one side
+    /// has a `sched_tunables` map, the other side renders
+    /// `(unknown)`; the Some side renders as `(empty)` for an
+    /// empty map or `(N entries)` for a populated one so the
+    /// cardinality of the new data is visible at a glance.
+    pub fn diff(a: &HostContext, b: &HostContext) -> String {
+        use std::collections::BTreeMap;
+        use std::fmt::Write;
+        // Symmetric destructuring bind of both sides: forces every
+        // field to appear by name here, same reason as
+        // `format_human` — a new HostContext field must be
+        // explicitly classified as hash-participating, scalar, or
+        // structured before diff will compile.
+        let HostContext {
+            cpu_model: a_cpu_model,
+            cpu_vendor: a_cpu_vendor,
+            total_memory_kb: a_total_memory_kb,
+            hugepages_total: a_hugepages_total,
+            hugepages_free: a_hugepages_free,
+            hugepagesize_kb: a_hugepagesize_kb,
+            thp_enabled: a_thp_enabled,
+            thp_defrag: a_thp_defrag,
+            sched_tunables: a_sched_tunables,
+            numa_nodes: a_numa_nodes,
+            uname_sysname: a_uname_sysname,
+            uname_release: a_uname_release,
+            uname_machine: a_uname_machine,
+            cmdline: a_cmdline,
+        } = a;
+        let HostContext {
+            cpu_model: b_cpu_model,
+            cpu_vendor: b_cpu_vendor,
+            total_memory_kb: b_total_memory_kb,
+            hugepages_total: b_hugepages_total,
+            hugepages_free: b_hugepages_free,
+            hugepagesize_kb: b_hugepagesize_kb,
+            thp_enabled: b_thp_enabled,
+            thp_defrag: b_thp_defrag,
+            sched_tunables: b_sched_tunables,
+            numa_nodes: b_numa_nodes,
+            uname_sysname: b_uname_sysname,
+            uname_release: b_uname_release,
+            uname_machine: b_uname_machine,
+            cmdline: b_cmdline,
+        } = b;
+        fn fmt_opt<T: std::fmt::Display>(v: Option<&T>) -> String {
+            match v {
+                Some(v) => v.to_string(),
+                None => "(unknown)".to_string(),
+            }
+        }
+        fn row<T: std::fmt::Display + PartialEq>(
+            out: &mut String,
+            key: &str,
+            a: Option<&T>,
+            b: Option<&T>,
+        ) {
+            if a == b {
+                return;
+            }
+            let _ = writeln!(out, "  {key}: {} → {}", fmt_opt(a), fmt_opt(b));
+        }
+        fn summarize_tunables(m: Option<&BTreeMap<String, String>>) -> String {
+            match m {
+                None => "(unknown)".to_string(),
+                Some(map) if map.is_empty() => "(empty)".to_string(),
+                Some(map) if map.len() == 1 => "(1 entry)".to_string(),
+                Some(map) => format!("({} entries)", map.len()),
+            }
+        }
+        let mut out = String::new();
+        row(&mut out, "uname_sysname", a_uname_sysname.as_ref(), b_uname_sysname.as_ref());
+        row(&mut out, "uname_release", a_uname_release.as_ref(), b_uname_release.as_ref());
+        row(&mut out, "uname_machine", a_uname_machine.as_ref(), b_uname_machine.as_ref());
+        row(&mut out, "cpu_model", a_cpu_model.as_ref(), b_cpu_model.as_ref());
+        row(&mut out, "cpu_vendor", a_cpu_vendor.as_ref(), b_cpu_vendor.as_ref());
+        row(
+            &mut out,
+            "total_memory_kb",
+            a_total_memory_kb.as_ref(),
+            b_total_memory_kb.as_ref(),
+        );
+        row(
+            &mut out,
+            "hugepages_total",
+            a_hugepages_total.as_ref(),
+            b_hugepages_total.as_ref(),
+        );
+        row(
+            &mut out,
+            "hugepages_free",
+            a_hugepages_free.as_ref(),
+            b_hugepages_free.as_ref(),
+        );
+        row(
+            &mut out,
+            "hugepagesize_kb",
+            a_hugepagesize_kb.as_ref(),
+            b_hugepagesize_kb.as_ref(),
+        );
+        row(&mut out, "numa_nodes", a_numa_nodes.as_ref(), b_numa_nodes.as_ref());
+        row(&mut out, "thp_enabled", a_thp_enabled.as_ref(), b_thp_enabled.as_ref());
+        row(&mut out, "thp_defrag", a_thp_defrag.as_ref(), b_thp_defrag.as_ref());
+        row(&mut out, "cmdline", a_cmdline.as_ref(), b_cmdline.as_ref());
+        match (a_sched_tunables.as_ref(), b_sched_tunables.as_ref()) {
+            (Some(am), Some(bm)) => {
+                let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+                keys.extend(am.keys().map(String::as_str));
+                keys.extend(bm.keys().map(String::as_str));
+                for k in keys {
+                    let av = am.get(k);
+                    let bv = bm.get(k);
+                    if av != bv {
+                        let _ = writeln!(
+                            &mut out,
+                            "  sched_tunables.{k}: {} → {}",
+                            av.map(String::as_str).unwrap_or("(absent)"),
+                            bv.map(String::as_str).unwrap_or("(absent)"),
+                        );
+                    }
+                }
+            }
+            (am, bm) if am != bm => {
+                let _ = writeln!(
+                    &mut out,
+                    "  sched_tunables: {} → {}",
+                    summarize_tunables(am),
+                    summarize_tunables(bm),
+                );
+            }
+            _ => {}
+        }
+        out
+    }
+}
+
 /// Static-fields cache. These values do not change for the lifetime
 /// of the process (CPU identity, total installed memory, hugepage
 /// size chosen at boot, NUMA count, uname triple), so walking
@@ -145,7 +362,7 @@ static STATIC_HOST_INFO: OnceLock<StaticHostInfo> = OnceLock::new();
 /// from "collection not attempted" (represented at the enclosing
 /// `Option<HostContext>` layer on
 /// [`SidecarResult`](crate::test_support::SidecarResult)).
-pub(crate) fn collect_host_context() -> HostContext {
+pub fn collect_host_context() -> HostContext {
     let static_info = STATIC_HOST_INFO.get_or_init(compute_static_host_info).clone();
     let meminfo = read_meminfo();
     HostContext {
@@ -779,6 +996,258 @@ Hugepagesize:       2048 kB
         assert_eq!(
             parse_trimmed("always [madvise] never\n").as_deref(),
             Some("always [madvise] never"),
+        );
+    }
+
+    // -- format_human / diff --
+
+    /// `format_human` on a default (all-`None`) context must
+    /// render every field explicitly as `(unknown)` rather than
+    /// dropping the field. Silently suppressing absent fields
+    /// would hide collection failures from the operator running
+    /// `cargo ktstr show-host` on a degraded host.
+    #[test]
+    fn format_human_default_renders_unknown_everywhere() {
+        let out = HostContext::default().format_human();
+        for key in [
+            "uname_sysname",
+            "uname_release",
+            "uname_machine",
+            "cpu_model",
+            "cpu_vendor",
+            "total_memory_kb",
+            "hugepages_total",
+            "hugepages_free",
+            "hugepagesize_kb",
+            "numa_nodes",
+            "thp_enabled",
+            "thp_defrag",
+            "cmdline",
+            "sched_tunables",
+        ] {
+            assert!(
+                out.contains(&format!("{key}: (unknown)")),
+                "key '{key}' must render as (unknown) on a default context, got:\n{out}",
+            );
+        }
+        assert!(
+            out.ends_with('\n'),
+            "format_human must end with a newline for direct print!() use",
+        );
+    }
+
+    /// Populated fields render verbatim and `sched_tunables`
+    /// expands per-entry under the parent key.
+    #[test]
+    fn format_human_populated_shows_values_and_tunables() {
+        let mut tunables = BTreeMap::new();
+        tunables.insert("sched_migration_cost_ns".to_string(), "500000".to_string());
+        tunables.insert("sched_min_granularity_ns".to_string(), "750000".to_string());
+        let ctx = HostContext {
+            uname_sysname: Some("Linux".to_string()),
+            uname_release: Some("6.11.0".to_string()),
+            uname_machine: Some("x86_64".to_string()),
+            cpu_model: Some("Example CPU".to_string()),
+            total_memory_kb: Some(16_384_000),
+            sched_tunables: Some(tunables),
+            cmdline: Some("preempt=lazy".to_string()),
+            ..HostContext::default()
+        };
+        let out = ctx.format_human();
+        assert!(out.contains("uname_sysname: Linux"), "{out}");
+        assert!(out.contains("uname_release: 6.11.0"), "{out}");
+        assert!(out.contains("cpu_model: Example CPU"), "{out}");
+        assert!(out.contains("total_memory_kb: 16384000"), "{out}");
+        assert!(out.contains("cmdline: preempt=lazy"), "{out}");
+        assert!(out.contains("sched_tunables:\n"), "{out}");
+        assert!(out.contains("  sched_migration_cost_ns = 500000"), "{out}");
+        assert!(out.contains("  sched_min_granularity_ns = 750000"), "{out}");
+        // Non-populated fields still render as (unknown) — show-host
+        // never silently hides a field.
+        assert!(out.contains("cpu_vendor: (unknown)"), "{out}");
+    }
+
+    /// `sched_tunables: Some(empty)` must not render as the generic
+    /// `(unknown)` — an empty map is a valid result (kernel with
+    /// no `sched_*` entries readable) and is distinguishable from
+    /// `None` (read_dir failure).
+    #[test]
+    fn format_human_sched_tunables_empty_vs_none() {
+        let mut ctx = HostContext::default();
+        ctx.sched_tunables = Some(BTreeMap::new());
+        let out_empty = ctx.format_human();
+        assert!(
+            out_empty.contains("sched_tunables: (empty)"),
+            "empty map must render distinctly from None: {out_empty}",
+        );
+        ctx.sched_tunables = None;
+        let out_none = ctx.format_human();
+        assert!(
+            out_none.contains("sched_tunables: (unknown)"),
+            "None map must render as (unknown): {out_none}",
+        );
+    }
+
+    /// Two identical contexts diff to an empty string. This is the
+    /// signal `compare_runs` uses to print `host: identical
+    /// between a and b` instead of an empty delta section.
+    #[test]
+    fn diff_identical_is_empty() {
+        let ctx = HostContext {
+            uname_sysname: Some("Linux".to_string()),
+            cpu_model: Some("Example CPU".to_string()),
+            ..HostContext::default()
+        };
+        assert_eq!(HostContext::diff(&ctx, &ctx), "");
+    }
+
+    /// A single changed field produces a single `key: before →
+    /// after` line; unchanged fields are omitted so the operator
+    /// sees only what shifted.
+    #[test]
+    fn diff_single_field_surfaces_only_that_field() {
+        let a = HostContext {
+            cmdline: Some("preempt=lazy".to_string()),
+            uname_release: Some("6.11.0".to_string()),
+            ..HostContext::default()
+        };
+        let b = HostContext {
+            cmdline: Some("preempt=full".to_string()),
+            uname_release: Some("6.11.0".to_string()),
+            ..HostContext::default()
+        };
+        let out = HostContext::diff(&a, &b);
+        assert!(
+            out.contains("cmdline: preempt=lazy → preempt=full"),
+            "cmdline change must appear: {out}",
+        );
+        assert!(
+            !out.contains("uname_release"),
+            "unchanged uname_release must not appear: {out}",
+        );
+    }
+
+    /// `None → Some(..)` renders as `(unknown) → <value>` so a
+    /// field that starts appearing in a newer run is not confused
+    /// with a field that was already present.
+    #[test]
+    fn diff_none_to_some_shows_unknown_arrow() {
+        let a = HostContext::default();
+        let b = HostContext {
+            uname_sysname: Some("Linux".to_string()),
+            ..HostContext::default()
+        };
+        let out = HostContext::diff(&a, &b);
+        assert!(
+            out.contains("uname_sysname: (unknown) → Linux"),
+            "(unknown) → Linux must appear: {out}",
+        );
+    }
+
+    /// Per-key `sched_tunables` diff: identical keys are omitted,
+    /// changed keys show old → new, and keys present on only one
+    /// side render as `(absent)`.
+    #[test]
+    fn diff_sched_tunables_per_key() {
+        let mut am = BTreeMap::new();
+        am.insert("sched_a".to_string(), "1".to_string());
+        am.insert("sched_b".to_string(), "old".to_string());
+        let mut bm = BTreeMap::new();
+        bm.insert("sched_a".to_string(), "1".to_string());
+        bm.insert("sched_b".to_string(), "new".to_string());
+        bm.insert("sched_c".to_string(), "3".to_string());
+        let a = HostContext {
+            sched_tunables: Some(am),
+            ..HostContext::default()
+        };
+        let b = HostContext {
+            sched_tunables: Some(bm),
+            ..HostContext::default()
+        };
+        let out = HostContext::diff(&a, &b);
+        assert!(
+            !out.contains("sched_tunables.sched_a"),
+            "unchanged sched_a must not appear: {out}",
+        );
+        assert!(
+            out.contains("sched_tunables.sched_b: old → new"),
+            "changed sched_b must appear: {out}",
+        );
+        assert!(
+            out.contains("sched_tunables.sched_c: (absent) → 3"),
+            "new key sched_c must appear as (absent) → 3: {out}",
+        );
+    }
+
+    /// `None vs Some(map)` at the outer `sched_tunables` level
+    /// still surfaces a line — otherwise a read_dir regression
+    /// would silently suppress the tunables section in compare
+    /// output. The Some side carries a cardinality sentinel so
+    /// the reader knows how much new data appeared.
+    #[test]
+    fn diff_sched_tunables_none_vs_some() {
+        let mut m = BTreeMap::new();
+        m.insert("sched_x".to_string(), "1".to_string());
+        let a = HostContext::default();
+        let b = HostContext {
+            sched_tunables: Some(m),
+            ..HostContext::default()
+        };
+        let out = HostContext::diff(&a, &b);
+        assert!(
+            out.contains("sched_tunables: (unknown) → (1 entry)"),
+            "None → Some(1 entry) must surface cardinality: {out}",
+        );
+    }
+
+    /// A field that transitions from `Some(value)` → `None`
+    /// (for example the kernel `cmdline` becoming unreadable in a
+    /// later run) must surface as `<old> → (unknown)` so an
+    /// operator running `stats compare` sees the disappearance
+    /// explicitly.
+    #[test]
+    fn diff_some_to_none_shows_arrow_unknown() {
+        let a = HostContext {
+            uname_release: Some("6.11.0".to_string()),
+            ..HostContext::default()
+        };
+        let b = HostContext::default();
+        let out = HostContext::diff(&a, &b);
+        assert!(
+            out.contains("uname_release: 6.11.0 → (unknown)"),
+            "Some → None must surface as <value> → (unknown): {out}",
+        );
+    }
+
+    /// A per-key `sched_tunables` entry that exists in `a` but
+    /// not in `b` renders as `<value> → (absent)`, the mirror of
+    /// the `(absent) → <value>` case. Without this, a tunable
+    /// that was being overridden in the older run and reverted to
+    /// default in the newer run would silently disappear from the
+    /// diff.
+    #[test]
+    fn diff_sched_tunables_key_removed() {
+        let mut am = BTreeMap::new();
+        am.insert("sched_a".to_string(), "1".to_string());
+        am.insert("sched_b".to_string(), "2".to_string());
+        let mut bm = BTreeMap::new();
+        bm.insert("sched_a".to_string(), "1".to_string());
+        let a = HostContext {
+            sched_tunables: Some(am),
+            ..HostContext::default()
+        };
+        let b = HostContext {
+            sched_tunables: Some(bm),
+            ..HostContext::default()
+        };
+        let out = HostContext::diff(&a, &b);
+        assert!(
+            !out.contains("sched_tunables.sched_a"),
+            "unchanged sched_a must not appear: {out}",
+        );
+        assert!(
+            out.contains("sched_tunables.sched_b: 2 → (absent)"),
+            "removed sched_b must surface as <value> → (absent): {out}",
         );
     }
 

@@ -919,6 +919,15 @@ pub fn compare_runs(a: &str, b: &str, filter: Option<&str>, threshold: Option<f6
     crate::stats::compare_runs(a, b, filter, threshold)
 }
 
+/// Collect the current host context via
+/// [`crate::host_context::collect_host_context`] and render it as
+/// a human-readable multi-line report via
+/// [`crate::host_context::HostContext::format_human`]. The output
+/// ends with a newline; callers print it verbatim.
+pub fn show_host() -> String {
+    crate::host_context::collect_host_context().format_human()
+}
+
 /// Pre-flight check for /dev/kvm availability and permissions.
 pub fn check_kvm() -> Result<()> {
     use std::path::Path;
@@ -1645,6 +1654,31 @@ impl Drop for Spinner {
 mod tests {
     use super::*;
     use crate::scenario;
+
+    // -- show_host smoke --
+
+    /// `show_host` must return a non-empty, newline-terminated
+    /// human-readable report. On Linux, `uname_sysname` is
+    /// populated from the `uname()` syscall regardless of `/proc`
+    /// or `/sys` availability, so the output is guaranteed to
+    /// contain that key. This also guards the
+    /// [`print!("{}", cli::show_host())`] dispatch in
+    /// `cargo-ktstr` — a future change that returns a
+    /// trailing-newline-less string would drop the final line
+    /// on the terminal.
+    #[test]
+    fn show_host_returns_populated_report() {
+        let out = show_host();
+        assert!(!out.is_empty(), "show_host must return non-empty output");
+        assert!(
+            out.ends_with('\n'),
+            "show_host output must end with a newline for print! use: {out:?}",
+        );
+        assert!(
+            out.contains("uname_sysname"),
+            "show_host must surface the uname_sysname field: {out}",
+        );
+    }
 
     // -- Spinner Drop --
 
