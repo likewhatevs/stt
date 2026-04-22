@@ -209,6 +209,24 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// silently bypassed the offline gate on every subsequent call. The
 /// reset is `#[cfg(test)]`-only — production code never clears the
 /// memoized state.
+///
+/// # Fail-closed-forever policy (production)
+///
+/// An `Err(_)` slot is memoized exactly like an `Ok(_)` slot.
+/// If the first call fails — missing weights, SHA mismatch, a
+/// corrupt GGUF mmap, offline-gate trip — every subsequent call in
+/// the same process returns that cached error without retrying the
+/// load. Production has no escape hatch: there is no public
+/// `clear_model_cache()` and `reset` is `#[cfg(test)]`-only.
+/// Downstream consumers that embed ktstr must treat a first-call
+/// failure as terminal for the lifetime of the process and surface
+/// the error through their own orchestration rather than expecting
+/// a retry to succeed. The rationale: a retry under a load pipeline
+/// that already failed (bad SHA, truncated download, OOM) almost
+/// always hits the same failure; a stable cached error keeps the
+/// `LlmExtract` surface deterministic across the process lifetime
+/// and lets callers log the error exactly once on the first
+/// extraction attempt rather than on every subsequent one.
 type CachedInference = Result<Mutex<LoadedInference>, String>;
 static MODEL_CACHE: Mutex<Option<Arc<CachedInference>>> = Mutex::new(None);
 
@@ -242,6 +260,22 @@ pub struct ModelSpec {
     pub url: &'static str,
     /// Hex-encoded SHA-256 digest of the expected file. Case-
     /// insensitive; the comparator normalizes both sides to lower.
+    ///
+    /// Computing the digest for a new pin (see the "model pin
+    /// rotation" section on [`DEFAULT_MODEL`]): fetch the artifact,
+    /// then run
+    ///
+    /// ```text
+    /// sha256sum <file>      # GNU coreutils (Linux)
+    /// shasum -a 256 <file>  # BSD / macOS
+    /// ```
+    ///
+    /// The leading 64-hex token of the output is this field. The
+    /// [`is_valid_sha256_hex`] gate at module scope compile-fails
+    /// any pin that is not exactly 64 ASCII hex chars, so
+    /// pasting the trailing filename or a truncated prefix trips a
+    /// `const { assert!(...) }` at crate build time rather than at
+    /// first fetch.
     pub sha256_hex: &'static str,
     /// Approximate on-disk size in bytes; surfaced in status output
     /// so users can tell at a glance whether the cache entry is the
@@ -262,6 +296,43 @@ pub struct ModelSpec {
 /// a commensurate gain on a narrow "parse benchmark stdout" task.
 ///
 /// URL points at the official `Qwen/Qwen3-4B-GGUF` repo on Hugging Face.
+///
+/// # Model pin rotation
+///
+/// When upgrading to a newer Qwen release (or swapping quantization),
+/// update all three fields in lockstep — a partial edit produces a
+/// `sha256 mismatch` on the next fetch at best, or a silently-wrong
+/// artifact pulled over a stale digest at worst:
+///
+/// 1. **`url`** — point at the new artifact on Hugging Face. Must be
+///    `https://` (the fetcher rejects `http://` unconditionally).
+///    Keep the same repo owner (`Qwen/`) when possible so the paired
+///    [`DEFAULT_TOKENIZER`] URL continues to resolve.
+/// 2. **`sha256_hex`** — re-compute via
+///    ```text
+///    curl -L <new_url> | sha256sum
+///    ```
+///    and paste the 64-hex token. The module-level `const { assert!(...) }`
+///    compile-fails any pin that is not exactly 64 ASCII hex chars.
+/// 3. **`size_bytes`** — set to the new artifact's on-disk byte count.
+///    The value is surfaced in status output (so users can eyeball
+///    cache entries) and is ballpark-gated by two compile-time
+///    assertions (`>100 MiB` and `<3 GiB`, see
+///    `default_model_size_is_in_expected_ballpark`); tighten those bounds if the new
+///    pin falls outside that envelope.
+///
+/// The **ballpark size** serves two orthogonal purposes: (a) catches
+/// pins that accidentally reference a non-weight file
+/// (`README.md`-sized entries fail the lower bound), and (b) keeps
+/// the quantization tier in the 4B-Q4_K_M neighborhood (a 14B full-
+/// precision pin would trip the upper bound and force an explicit
+/// rethink of inference latency).
+///
+/// Rotating the pin is a two-step commit: the SHA change alone
+/// invalidates every cached artifact in the repo — users re-fetch
+/// 2.44 GiB on next run — so batch it with a narrative commit message
+/// explaining why (tokenizer drift, quantization upgrade, model
+/// family change) so downstream users can anticipate the re-fetch.
 pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
     file_name: "Qwen3-4B-Q4_K_M.gguf",
     url: "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
@@ -311,6 +382,39 @@ const _: () = assert!(
 /// untouched; `LlmExtract` tests then surface missing-model errors
 /// at invocation time instead of at nextest setup.
 pub const OFFLINE_ENV: &str = "KTSTR_MODEL_OFFLINE";
+
+/// Environment variable that opts into raw-response tracing for
+/// LlmExtract. When set to any non-empty value,
+/// [`extract_via_llm`] emits the full model output on every call as
+/// a `tracing::debug!` event (field `response`) alongside the
+/// existing parse-outcome warn. Off by default: a single debug
+/// emission can run to multiple KiB of chat-formatted text with
+/// leaked `<think>` traces under pathological prompts, which floods
+/// CI logs and leaks prompt-dependent content when enabled blindly.
+///
+/// # When to enable
+///
+/// Debugging an LlmExtract test that lands in the "response was not
+/// parseable JSON; returning empty metric set" branch. The warn-level
+/// event only carries `response_bytes` (a byte count) by policy — a
+/// short count suggests "empty response", a long count suggests
+/// "large response missing JSON region" — but neither diagnoses the
+/// actual content. Flipping this env routes the body through
+/// `tracing::debug!` so a follow-up run with
+/// `RUST_LOG=ktstr::test_support::model=debug` surfaces exactly what
+/// the model emitted, letting the tester adjust the prompt, the hint,
+/// or the JSON extraction window.
+///
+/// # Why opt-in, not always-on
+///
+/// The warn at byte-count granularity is the designed steady-state
+/// signal: it is always safe to log, bounded in size, and answers
+/// the first triage question (did the model produce anything?).
+/// Routing the full body is reserved for explicit debugging because
+/// (a) it multiplies log volume by orders of magnitude, and (b) it
+/// can carry prompt-dependent content that would be noise in shared
+/// CI transcripts.
+pub const LLM_DEBUG_RESPONSES_ENV: &str = "KTSTR_LLM_DEBUG_RESPONSES";
 
 /// Read [`OFFLINE_ENV`] and return the trimmed value IFF it is set
 /// to a non-empty string. Centralizes the "non-empty env-var means
@@ -1490,6 +1594,22 @@ pub(crate) fn extract_via_llm(
             return Ok(Vec::new());
         }
     };
+    // Opt-in raw-response tracing: off by default (see
+    // `LLM_DEBUG_RESPONSES_ENV` doc). A non-empty env value routes
+    // the full model output through `tracing::debug!` so users
+    // debugging a "response was not parseable JSON" warn can see
+    // exactly what the model emitted without patching the source.
+    if std::env::var(LLM_DEBUG_RESPONSES_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        tracing::debug!(
+            response_bytes = response.len(),
+            response = %response,
+            "LlmExtract raw response (debug env enabled)",
+        );
+    }
     match super::metrics::find_and_parse_json(&response) {
         Some(json) => Ok(super::metrics::walk_json_leaves(
             &json,

@@ -106,6 +106,21 @@ fn _is_version_string(s: &str) -> bool {
     parts.next().is_none()
 }
 
+/// Read the running kernel release from `/proc/sys/kernel/osrelease`.
+///
+/// Returns `None` if the procfs entry is unreadable, empty, or missing.
+/// Callers that need the release string for `/lib/modules/{release}/…`
+/// fallbacks use this rather than shelling out to `uname -r`: the
+/// procfs entry exposes the same value the kernel returns from the
+/// uname(2) syscall (see linux/kernel/sys.c: `override_release`) and
+/// only costs a small read.
+fn kernel_release_from_procfs() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Resolve a kernel source/build directory.
 ///
 /// `kernel_dir`: value of `KTSTR_KERNEL` env var (if set).
@@ -135,16 +150,9 @@ pub fn resolve_kernel(kernel_dir: Option<&str>) -> Option<std::path::PathBuf> {
         }
     }
 
-    // 4. Installed kernel build dir. Read `/proc/sys/kernel/osrelease`
-    // directly instead of shelling out to `uname -r`; the procfs entry
-    // is the same value the kernel exposes via the uname(2) syscall
-    // (see linux/kernel/sys.c: override_release()) and costs only a
-    // read of a small text file.
-    if let Some(rel) = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
+    // 4. Installed kernel build dir — use the running release from
+    // procfs to locate `/lib/modules/{release}/build`.
+    if let Some(rel) = kernel_release_from_procfs() {
         let p = std::path::PathBuf::from(format!("/lib/modules/{rel}/build"));
         if p.is_dir() {
             return Some(p);
@@ -274,18 +282,14 @@ pub fn find_image(kernel_dir: Option<&str>, release: Option<&str>) -> Option<std
         return Some(img);
     }
 
-    // Host fallback paths. When `release` is not supplied, read the
-    // running kernel release from `/proc/sys/kernel/osrelease` rather
-    // than shelling out to `uname -r` — it's the same value the
-    // kernel exposes via uname(2) and needs only a small file read.
+    // Host fallback paths. When `release` is not supplied, pull the
+    // running kernel release from procfs via
+    // [`kernel_release_from_procfs`].
     let owned_release;
     let rel = match release {
         Some(r) => Some(r),
         None => {
-            owned_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
+            owned_release = kernel_release_from_procfs();
             owned_release.as_deref()
         }
     };

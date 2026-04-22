@@ -303,6 +303,29 @@ cargo run --bin ktstr -- list
 cargo run --bin ktstr -- run
 ```
 
+## Release profile — `panic = "abort"`
+
+ktstr's release profile sets `panic = "abort"`. Any panic on any
+thread tears down the entire process without unwinding: `Drop`
+impls do not run, `std::panic::catch_unwind` cannot observe the
+failure, and `libc::abort` delivers SIGABRT before the kernel
+returns control.
+
+Contributors writing library or binary code should write
+panic-free code on every thread that runs in the release profile
+— especially the monitor loop, KVM vCPU threads, and anything
+spawned from `WorkloadHandle`. Relying on `catch_unwind` as a
+soft failure boundary is a bug; introduce explicit `Result`
+plumbing instead. The only escape hatch is `panic_hook` (see
+`src/vmm/vcpu_panic.rs`), which runs synchronously on the
+panicking thread before `libc::abort` to flip kill/exited
+signalling atomics; it does not recover, only classifies.
+
+Tests run under the default `panic = "unwind"` profile, so
+`catch_unwind` works as expected inside `#[test]` bodies — but
+code paths that only execute under the release profile cannot be
+tested for unwind-safety directly.
+
 ## Documentation
 
 **[Guide](https://likewhatevs.github.io/ktstr/guide/)** -- getting started, concepts,

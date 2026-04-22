@@ -85,8 +85,8 @@ pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
 pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
 pub use metrics::extract_metrics;
 pub use model::{
-    DEFAULT_MODEL, ModelSpec, ModelStatus, OFFLINE_ENV, any_test_requires_model, ensure,
-    prefetch_if_required, status,
+    DEFAULT_MODEL, LLM_DEBUG_RESPONSES_ENV, ModelSpec, ModelStatus, OFFLINE_ENV,
+    any_test_requires_model, ensure, prefetch_if_required, status,
 };
 pub(crate) use output::{
     SENTINEL_EXEC_EXIT_PREFIX, SENTINEL_EXIT_PREFIX, SENTINEL_INIT_STARTED,
