@@ -336,11 +336,15 @@ impl PayloadHandle {
     /// Live child's OS-level pid, or `None` once `wait`/`kill`/
     /// `try_wait` has consumed the child.
     ///
-    /// Test-only: used by the fork-descendant reap test to probe the
-    /// process group via `killpg(_, 0)` after calling `kill()`
-    /// without reaching into the private `child` field.
-    #[cfg(test)]
-    fn child_pid(&self) -> Option<u32> {
+    /// Integration tests that spawn a workload and then need to
+    /// target it with a second tool (for example the jemalloc-TLS
+    /// probe in `tests/jemalloc_probe_tests.rs`, which passes the
+    /// workload's pid to `ktstr-jemalloc-probe --pid`) read this
+    /// value between `spawn` and `wait`/`kill`/`try_wait`. The
+    /// internal fork-descendant reap test also uses it to probe
+    /// the process group via `killpg(_, 0)` after `kill()` without
+    /// reaching into the private `child` field.
+    pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(|c| c.id())
     }
 
@@ -2347,7 +2351,7 @@ mod tests {
         // The pgid equals the head child's pid. Capture it via the
         // #[cfg(test)] accessor so the test does not reach into the
         // private `child` field.
-        let pgid = libc::pid_t::try_from(handle.child_pid().expect("child still present"))
+        let pgid = libc::pid_t::try_from(handle.pid().expect("child still present"))
             .expect("child pid fits in pid_t");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let (_, _) = handle.kill().expect("kill+reap");
