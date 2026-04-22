@@ -348,6 +348,7 @@ pub mod prelude {
     // name to its emitted type reads naturally at the call site.
     pub use crate::assert::{Assert, AssertResult};
     pub use crate::cgroup::CgroupManager;
+    pub use crate::host_context::HostContext;
     pub use crate::ktstr_test;
     pub use crate::scenario::backdrop::Backdrop;
     pub use crate::scenario::flags::FlagDecl;

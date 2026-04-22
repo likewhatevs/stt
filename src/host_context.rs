@@ -18,7 +18,29 @@ use std::sync::OnceLock;
 /// field is optional so a partial read (missing /proc entry,
 /// permission denied, parse failure) still records the fields that
 /// did succeed instead of dropping the whole snapshot.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// # Constructing instances in tests
+///
+/// `HostContext` is `#[non_exhaustive]`: downstream consumers
+/// cannot build one with a bare struct literal (`HostContext { ... }`)
+/// and must combine [`Default`] with Rust's struct-update syntax so
+/// a future field addition doesn't break the call site. The standard
+/// idiom is:
+///
+/// ```
+/// use ktstr::prelude::HostContext;
+/// let ctx = HostContext {
+///     cpu_model: Some("Test CPU".to_string()),
+///     numa_nodes: Some(2),
+///     ..HostContext::default()
+/// };
+/// ```
+///
+/// For tests that want a populated baseline (non-trivial defaults
+/// for every field) instead of `Default`'s all-`None` minimum, use
+/// [`HostContext::test_fixture`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct HostContext {
     /// CPU model string — the `model name` line of `/proc/cpuinfo`.
     /// Single value (first processor entry) since heterogeneous
@@ -113,6 +135,66 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    /// Populated [`HostContext`] for unit tests. Every field carries
+    /// a reasonable non-trivial value so call sites only spell out
+    /// what they want to vary via struct-update syntax:
+    ///
+    /// ```
+    /// use ktstr::prelude::HostContext;
+    /// let ctx = HostContext {
+    ///     numa_nodes: Some(4),
+    ///     ..HostContext::test_fixture()
+    /// };
+    /// ```
+    ///
+    /// Defaults model a plausible 2-node x86_64 Linux host: Intel
+    /// CPU identity, 64 GiB memory, 2 NUMA nodes, default THP
+    /// policies, a minimal `sched_*` tunable map, and a populated
+    /// uname triple. Parity with
+    /// [`SidecarResult::test_fixture`](crate::test_support::SidecarResult::test_fixture) —
+    /// both fixtures exist so tests don't re-derive an "everything
+    /// populated" baseline in every call site.
+    ///
+    /// **Prefer this over local "populated default" helpers.** A
+    /// local closure duplicates the default set and drifts the
+    /// moment [`HostContext`] grows a field; this fixture is the
+    /// single place those defaults live.
+    ///
+    /// **Hash-stability or serialization-pin tests must not rely on
+    /// these defaults.** Tests that fix a specific JSON/byte output
+    /// should spell every participating field out explicitly so a
+    /// future change to the fixture cannot silently shift the
+    /// pinned value.
+    pub fn test_fixture() -> HostContext {
+        let mut sched_tunables = BTreeMap::new();
+        sched_tunables.insert(
+            "sched_migration_cost_ns".to_string(),
+            "500000".to_string(),
+        );
+        sched_tunables.insert(
+            "sched_latency_ns".to_string(),
+            "24000000".to_string(),
+        );
+        HostContext {
+            cpu_model: Some("Intel(R) Xeon(R) Test CPU".to_string()),
+            cpu_vendor: Some("GenuineIntel".to_string()),
+            total_memory_kb: Some(64 * 1024 * 1024),
+            hugepages_total: Some(0),
+            hugepages_free: Some(0),
+            hugepages_size_kb: Some(2048),
+            thp_enabled: Some("always [madvise] never".to_string()),
+            thp_defrag: Some("always defer defer+madvise [madvise] never".to_string()),
+            sched_tunables: Some(sched_tunables),
+            numa_nodes: Some(2),
+            uname_sysname: Some("Linux".to_string()),
+            uname_release: Some("6.16.0-test".to_string()),
+            uname_machine: Some("x86_64".to_string()),
+            cmdline: Some(
+                "BOOT_IMAGE=/boot/vmlinuz-test root=/dev/sda1".to_string(),
+            ),
+        }
+    }
+
     /// Render as a human-readable multi-line report. Each field
     /// occupies one line as `key: value`. Absent fields render as
     /// `(unknown)` rather than being dropped, so operators see
@@ -651,6 +733,12 @@ pub(crate) fn count_numa_nodes_in_topology(
     nodes.len()
 }
 
+// Most tests in this module are pure parsers / formatters / diff
+// helpers that compile and pass on any target. The handful that
+// actually read `/proc`, `/sys`, or assert `uname_sysname == "Linux"`
+// are individually gated with `#[cfg(target_os = "linux")]` at the
+// test-fn level so non-Linux contributors still get coverage of the
+// portable surface.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +746,7 @@ mod tests {
     /// Host-context reads are host-dependent: we assert the
     /// collector returns SOMETHING, not specific values. On Linux
     /// CI the uname fields at least should populate.
+    #[cfg(target_os = "linux")]
     #[test]
     fn collect_host_context_returns_populated_struct_on_linux() {
         let ctx = collect_host_context();
@@ -677,6 +766,7 @@ mod tests {
     /// asserts the field populates unconditionally; an if-let
     /// version of this check would pass vacuously on a kernel that
     /// accidentally dropped the capture.
+    #[cfg(target_os = "linux")]
     #[test]
     fn collect_host_context_captures_cmdline_on_linux() {
         let ctx = collect_host_context();
@@ -692,6 +782,7 @@ mod tests {
     /// `HostContext` values. Proves stability across calls:
     /// static fields come from the cache, dynamic fields match
     /// between back-to-back reads on a quiescent host.
+    #[cfg(target_os = "linux")]
     #[test]
     fn collect_host_context_is_stable_across_calls() {
         let a = collect_host_context();
@@ -722,6 +813,7 @@ mod tests {
     /// `STATIC_HOST_INFO` first, `collect_host_context()` here hits
     /// the cache and the pointer comparison still passes because
     /// `OnceLock` permits no re-init.
+    #[cfg(target_os = "linux")]
     #[test]
     fn static_host_info_is_cached_after_first_call() {
         let _ = collect_host_context();
@@ -1569,6 +1661,7 @@ Hugepagesize:       2048 kB
     ///
     /// Deltas (`load() - before-snapshot`) absorb pre-population
     /// from sibling tests: the test is robust to execution order.
+    #[cfg(target_os = "linux")]
     #[test]
     fn collect_host_context_call_counts_match_caching_invariants() {
         use std::sync::atomic::Ordering;
