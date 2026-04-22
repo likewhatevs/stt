@@ -93,6 +93,33 @@ pub fn ktstr_test_early_dispatch() {
                 ktstr_main();
             }
         }
+    } else {
+        // cargo-test-direct path: the standard rustc test harness
+        // runs only the bare `#[test]` wrappers `#[ktstr_test]`
+        // generates. Gauntlet expansion (flag-profile × topology-
+        // preset combinations) lives inside `ktstr_main`'s `--list`
+        // + `--exact` handlers and is reachable ONLY under nextest.
+        // Every real ktstr entry produces topology-preset variants
+        // under nextest (`for_each_gauntlet_variant` iterates
+        // `crate::vm::gauntlet_presets()` regardless of whether the
+        // scheduler declares flags — the flag set only determines
+        // the profile half of the `presets × profiles` product).
+        // Without nextest those variants silently do not run —
+        // coverage loss with no error, no warning. Emit a one-shot
+        // stderr diagnostic when the binary carries any real entry
+        // so the user sees the gap instead of trusting a false
+        // green. Print once per process (cargo test invokes one
+        // test binary per crate; the ctor runs exactly once per
+        // test binary) so there is no need to gate with a
+        // std::sync::Once.
+        let has_real_tests = KTSTR_TESTS.iter().any(|e| e.name != "__unit_test_dummy__");
+        if has_real_tests {
+            eprintln!(
+                "warning: ktstr test entries detected but NEXTEST env var is not set; \
+                 flag-profile / topology-preset variants will not run under `cargo test`. \
+                 Use `cargo nextest run` (or `cargo ktstr test`) to exercise the full gauntlet.",
+            );
+        }
     }
 }
 

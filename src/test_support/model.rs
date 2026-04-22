@@ -167,13 +167,35 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// # Lock layering
 ///
 /// The outer `Mutex<Option<Arc<...>>>` is held only across the slot
-/// read/init/clone window — sub-microsecond once initialized. The
-/// inner `Mutex<LoadedInference>` is held for the full duration of a
-/// generation pass and serializes concurrent inference calls against
-/// the shared `ModelWeights`. Holding the inner mutex via the cloned
-/// `Arc` (rather than via the outer slot) means a caller running
-/// inference does not block other callers from observing the slot is
-/// already populated.
+/// read/init/clone window. After initialization, a subsequent caller
+/// sees `Some(arc)` and the critical section collapses to a mutex
+/// lock + clone + unlock (sub-microsecond).
+///
+/// **First-call blocking.** The first caller to reach
+/// [`memoized_inference`] with an empty slot runs `load_inference`
+/// inside the outer lock. That load mmap's the pinned Qwen3-4B
+/// Q4_K_M GGUF (~2.44 GiB) and parses it into `ModelWeights` — a
+/// few seconds of wall time on a warm disk cache, tens of seconds
+/// on a cold cache (block-backed read + quantization layer
+/// initialization). Every concurrent caller queued behind the
+/// outer mutex blocks for that entire window. Under nextest's
+/// default parallel execution, every `LlmExtract` test racing
+/// into the first call serializes here until the loader returns.
+/// This is deliberate — the single-loader contract is what gives
+/// the cached `Arc<CachedInference>` its "load exactly once per
+/// process" invariant and avoids paying 2+ GiB of wasted load
+/// work per additional concurrent first-caller. `nextest_setup`
+/// (the top-level-script hook) kicks the load before any test
+/// thread starts so nextest-direct runs never hit this path;
+/// cargo-test-direct runs or test harnesses that skip the hook
+/// pay the serialization cost once.
+///
+/// The inner `Mutex<LoadedInference>` is held for the full duration
+/// of a generation pass and serializes concurrent inference calls
+/// against the shared `ModelWeights`. Holding the inner mutex via
+/// the cloned `Arc` (rather than via the outer slot) means a caller
+/// running inference does not block other callers from observing
+/// the slot is already populated.
 ///
 /// # Test-only reset
 ///
@@ -1161,15 +1183,26 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
     use candle::Tensor;
     use candle_transformers::generation::{LogitsProcessor, Sampling};
 
-    // A prior invocation may have populated per-layer K/V tensors
-    // addressed by absolute positions `[0, prompt_len + generated)`
-    // of the previous prompt. This call re-starts at `index_pos=0`,
-    // so the stale entries would alias the new prompt's slots and
-    // poison the forward pass. Clearing unconditionally costs a
+    // Reset the per-layer K/V tensors so the prompt pass below can
+    // use `forward(input, 0)` — candle's
+    // `quantized_qwen3::ModelWeights::forward(input, index_pos)`
+    // interprets `index_pos` as the absolute slot into which each
+    // incoming token's attention K/V is written. At `index_pos=0`
+    // the forward overwrites slots `[0, prompt_len)` and relies on
+    // "no earlier cached state at those positions" for the
+    // attention math — a stale K/V from a prior invocation at
+    // position N < prompt_len would alias the new prompt and
+    // silently poison the output logits.
+    //
+    // Caller contract inverted at this layer: the callee
+    // (`invoke_with_model`) owns the "start from a clean KV" invariant
+    // unconditionally instead of pushing it onto `extract_via_llm` /
+    // downstream wrappers that would otherwise need to remember
+    // whether the last caller left the cache dirty. Clearing costs a
     // layer-scoped vec walk per call (see
-    // `candle_transformers::models::quantized_qwen3::ModelWeights::clear_kv_cache`)
-    // and is the lone safety gate keeping `invoke_with_model`
-    // idempotent across repeated calls on the same state.
+    // `candle_transformers::models::quantized_qwen3::ModelWeights::clear_kv_cache`),
+    // which is trivial next to the ~SAMPLE_LEN-token generation that
+    // follows.
     state.model.clear_kv_cache();
 
     let chat_prompt = wrap_chatml_no_think(prompt);
@@ -1788,30 +1821,22 @@ mod tests {
     /// `sha_check_error` wired up.
     ///
     /// Unix-only: relies on POSIX permission semantics (mode 0o000
-    /// blocks reads). Skipped under root because DAC check is bypassed
-    /// for the superuser — the open would succeed and the test would
-    /// no longer exercise the I/O-error arm. CI runners running as
-    /// non-root fire the assertion; root-owned CI runners skip it
-    /// (logged via `eprintln!` so a user invoking the test suite
-    /// manually sees that this specific case was bypassed rather
-    /// than silently passed).
+    /// blocks reads). Skipped under any environment that bypasses
+    /// DAC on open(2) — root, a process granted CAP_DAC_OVERRIDE or
+    /// CAP_DAC_READ_SEARCH (e.g. via `setcap`), or certain rootless
+    /// container harnesses. Detection is a direct open probe on the
+    /// freshly chmod'd file: if `File::open` succeeds under mode
+    /// 0o000 this environment cannot trigger EACCES, so the
+    /// I/O-error arm is unreachable and the test self-skips. The
+    /// probe is strictly stronger than a euid check (which caught
+    /// root but missed every capability-bypass path) and needs no
+    /// `libc::capget` plumbing. Skips are logged via `eprintln!` so
+    /// a user invoking the suite manually sees which specific case
+    /// was bypassed rather than silently passed.
     #[cfg(unix)]
     #[test]
     fn status_captures_io_error_for_unreadable_cached_file() {
         use std::os::unix::fs::PermissionsExt;
-        // `nix::unistd::geteuid()` is a safe wrapper over the POSIX
-        // `geteuid(2)` syscall — infallible by spec, no errno side
-        // effect. The `user` feature on the nix dep (Cargo.toml)
-        // gates this wrapper; with the feature enabled we avoid the
-        // `unsafe` block and the manual integer compare the earlier
-        // code needed.
-        if nix::unistd::geteuid().is_root() {
-            eprintln!(
-                "skipping status_captures_io_error_for_unreadable_cached_file: \
-                 running as root, mode 0o000 does not block reads under DAC"
-            );
-            return;
-        }
         let _lock = lock_env();
         let cache = isolated_cache_dir();
         let spec = ModelSpec {
@@ -1832,6 +1857,21 @@ mod tests {
         // still returns true), so status() enters the is_file arm
         // rather than the `_ => (false, false, None)` fallback.
         std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // DAC-bypass probe: if an open against the just-chmod'd file
+        // succeeds, the process has a read bypass (euid 0,
+        // CAP_DAC_OVERRIDE/CAP_DAC_READ_SEARCH, or equivalent
+        // sandbox behavior). Restore readable permissions first
+        // (skip! early-returns, so the restore must precede it) and
+        // emit through the centralized skip reporter.
+        if std::fs::File::open(&on_disk).is_ok() {
+            std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            skip!(
+                "open(0o000) succeeded — process has a DAC bypass (root, \
+                 CAP_DAC_OVERRIDE, or equivalent)"
+            );
+        }
 
         let st = status(&spec).unwrap();
 
