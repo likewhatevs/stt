@@ -1256,6 +1256,47 @@ Hugepagesize:       2048 kB
 
     // -- format_human / diff --
 
+    /// Snapshot-style pin of the label sequence `format_human`
+    /// emits. The order is load-bearing — downstream diff tools and
+    /// operator-eye scanning depend on a stable top-to-bottom field
+    /// ordering (uname → CPU → memory → hugepages → NUMA → THP →
+    /// cmdline → sched_tunables). A silent reorder from a future
+    /// edit that shuffles the `row(...)` calls would slip past the
+    /// existing `.contains(...)` checks, which are order-blind.
+    /// This test fails the moment the sequence drifts; updating it
+    /// forces the author to acknowledge the reorder and double-check
+    /// that downstream consumers can absorb it.
+    #[test]
+    fn format_human_field_order_is_stable() {
+        let out = HostContext::default().format_human();
+        let labels: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.split(':').next())
+            .filter(|s| !s.starts_with(' '))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "uname_sysname",
+                "uname_release",
+                "uname_machine",
+                "cpu_model",
+                "cpu_vendor",
+                "total_memory_kb",
+                "hugepages_total",
+                "hugepages_free",
+                "hugepages_size_kb",
+                "numa_nodes",
+                "thp_enabled",
+                "thp_defrag",
+                "cmdline",
+                "sched_tunables",
+            ],
+            "format_human field order drifted — if intentional, update \
+             the expected vector and audit downstream diff/scan consumers",
+        );
+    }
+
     /// `format_human` on a default (all-`None`) context must
     /// render every field explicitly as `(unknown)` rather than
     /// dropping the field. Silently suppressing absent fields

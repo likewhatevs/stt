@@ -531,7 +531,8 @@ fn evaluate_vm_result(
 
     // No parseable result — no AssertResult found in SHM or COM2.
     // With an scx scheduler under test this typically means the
-    // scheduler is no longer running; without a scheduler (EEVDF)
+    // scheduler exited (crash, BPF verifier reject, scx_bpf_error()
+    // exit, sched_ext disablement); on the kernel-default scheduler
     // it means the payload itself failed. Attempt auto-repro if
     // enabled and a scheduler was running.
     // Any scheduler failure that prevents producing a test result

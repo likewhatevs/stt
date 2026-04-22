@@ -797,6 +797,17 @@ fn drain_lines_lossy(
 /// [`drain_lines_lossy`] now surfaces such failures with `anyhow`
 /// context naming the merged-stream read, so a broken-pipe or EIO
 /// during make's output is caught at the call site.
+///
+/// Lines observed by `spinner.println()` and retained in the
+/// on-failure replay buffer are LF-normalized: `drain_lines_lossy`
+/// strips the trailing `\n`, and a preceding `\r` (the CRLF form
+/// Make emits on some toolchain + terminal combinations) is
+/// stripped too, so every line the caller sees is LF-only and
+/// terminator-less. Interior lone `\r` bytes — e.g. a progress
+/// bar using carriage-return redraw — pass through verbatim (see
+/// `drain_lines_lossy_interior_cr_is_preserved`), which keeps
+/// the on-failure replay readable without mangling tools that
+/// legitimately use `\r` mid-line.
 pub fn run_make_with_output(
     kernel_dir: &Path,
     args: &[&str],

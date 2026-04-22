@@ -770,11 +770,13 @@ fn filesystem_available_bytes(dir: &std::path::Path) -> Result<u64> {
 /// `"Need 2.69 GiB free at /path/to/cache; have 512 MiB"` — otherwise.
 ///
 /// Needed bytes = `size_bytes + size_bytes / 10` (size plus 10%
-/// margin). The division itself cannot overflow. The SUM is what a
-/// `ModelSpec` pin near `u64::MAX` could wrap, so it uses
-/// `saturating_add`: a pathological `size_bytes` saturates at
-/// `u64::MAX` rather than wrapping into a small positive number that
-/// would let an impossible fetch bypass the gate.
+/// margin). The division itself cannot overflow. The sum can
+/// overflow only when `size_bytes` is greater than about
+/// `u64::MAX * 10 / 11` (≈ 1.68e19), i.e. within the topmost ~9% of
+/// the u64 range — a range no real `ModelSpec` pin reaches, but the
+/// gate uses `saturating_add` anyway so a pathological or typo'd
+/// value saturates at `u64::MAX` instead of wrapping to a smaller
+/// `needed` that the `available < needed` check would let past.
 ///
 /// Sizes are rendered through [`indicatif::HumanBytes`] so the error
 /// message speaks in human-scale IEC prefixes (`GiB` / `MiB` / `KiB`)
