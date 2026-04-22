@@ -725,12 +725,12 @@ fn count_numa_nodes_via_topology() -> Option<usize> {
 pub(crate) fn count_numa_nodes_in_topology(
     topo: &crate::vmm::host_topology::HostTopology,
 ) -> usize {
-    if topo.cpu_to_node.is_empty() {
-        return 1;
-    }
-    let nodes: std::collections::BTreeSet<usize> =
-        topo.cpu_to_node.values().copied().collect();
-    nodes.len()
+    topo.cpu_to_node
+        .values()
+        .copied()
+        .collect::<std::collections::BTreeSet<usize>>()
+        .len()
+        .max(1)
 }
 
 // Most tests in this module are pure parsers / formatters / diff

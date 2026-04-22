@@ -378,11 +378,20 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         // might legitimately be 0.0 for a different scenario). Drop the
         // entry entirely so the non-finite value can't be confused with
         // a real zero datapoint.
+        //
+        // Also drop the walk-depth truncation sentinel
+        // [`crate::test_support::WALK_TRUNCATION_SENTINEL_NAME`]:
+        // it is diagnostic metadata from the JSON-walker depth cap,
+        // not a scenario metric, and must not participate in A/B
+        // comparison output.
         ext_metrics: sc
             .stats
             .ext_metrics
             .iter()
             .filter_map(|(k, &v)| {
+                if k == crate::test_support::WALK_TRUNCATION_SENTINEL_NAME {
+                    return None;
+                }
                 if v.is_finite() {
                     Some((k.clone(), v))
                 } else {

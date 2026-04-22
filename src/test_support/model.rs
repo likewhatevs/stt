@@ -1631,7 +1631,7 @@ pub(crate) fn extract_via_llm(
     let response = match invoke_with_model(&mut state, &prompt) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(error = ?e, "LlmExtract inference failed");
+            tracing::warn!(err = %format!("{e:#}"), "LlmExtract inference failed");
             return Ok(Vec::new());
         }
     };

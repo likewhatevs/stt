@@ -575,7 +575,7 @@ impl CacheDir {
         // and swallowed — a failure to clean orphans must not block
         // a successful store.
         if let Err(e) = clean_orphaned_tmp_dirs(&self.root) {
-            tracing::warn!(error = ?e, "clean_orphaned_tmp_dirs failed; continuing store");
+            tracing::warn!(err = %format!("{e:#}"), "clean_orphaned_tmp_dirs failed; continuing store");
         }
         fs::create_dir_all(&tmp_dir)?;
 
@@ -733,7 +733,7 @@ fn clean_orphaned_tmp_dirs(cache_root: &Path) -> anyhow::Result<()> {
         let dir_entry = match dir_entry {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(error = ?e, "skip unreadable cache root entry");
+                tracing::warn!(err = %format!("{e:#}"), "skip unreadable cache root entry");
                 continue;
             }
         };
@@ -780,7 +780,7 @@ fn clean_orphaned_tmp_dirs(cache_root: &Path) -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::warn!(
-                    error = ?e,
+                    err = %format!("{e:#}"),
                     path = %path.display(),
                     "failed to remove orphaned .tmp- dir; leaving in place",
                 );

@@ -820,7 +820,7 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
         Err(e) => {
             eprintln!("ktstr: model prefetch failed; LlmExtract tests may fail: {e:#}");
             tracing::warn!(
-                error = ?e,
+                err = %format!("{e:#}"),
                 "model prefetch failed; LlmExtract tests may fail",
             );
         }

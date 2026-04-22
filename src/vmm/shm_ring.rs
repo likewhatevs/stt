@@ -554,7 +554,7 @@ pub fn shm_init(buf: &mut [u8], shm_offset: usize, shm_size: usize) {
 /// construction, so `.unwrap()` is justified.
 fn read_header(buf: &[u8], shm_offset: usize) -> ShmRingHeader {
     let s = &buf[shm_offset..shm_offset + HEADER_SIZE];
-    ShmRingHeader::read_from_bytes(s).unwrap()
+    ShmRingHeader::read_from_bytes(s).expect("HEADER_SIZE matches ShmRingHeader layout")
 }
 
 /// Read `len` bytes from the ring's data area starting at monotonic offset
@@ -616,7 +616,8 @@ pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
     while read_pos + MSG_HEADER_SIZE as u64 <= write_pos {
         let mut hdr_buf = [0u8; MSG_HEADER_SIZE];
         read_ring_into(buf, data_start, capacity, read_pos, &mut hdr_buf);
-        let msg = ShmMessage::read_from_bytes(&hdr_buf).unwrap();
+        let msg = ShmMessage::read_from_bytes(&hdr_buf)
+            .expect("MSG_HEADER_SIZE matches ShmMessage layout");
 
         let total_msg_size = MSG_HEADER_SIZE as u64 + msg.length as u64;
         if read_pos + total_msg_size > write_pos {
@@ -691,7 +692,8 @@ pub fn shm_drain_live(mem: &crate::monitor::reader::GuestMem, shm_base_pa: u64) 
         // Read message header via volatile.
         let mut hdr_buf = [0u8; MSG_HEADER_SIZE];
         read_ring_volatile(mem, data_start_pa, capacity, read_pos, &mut hdr_buf);
-        let msg = ShmMessage::read_from_bytes(&hdr_buf).unwrap();
+        let msg = ShmMessage::read_from_bytes(&hdr_buf)
+            .expect("MSG_HEADER_SIZE matches ShmMessage layout");
 
         let total_msg_size = MSG_HEADER_SIZE as u64 + msg.length as u64;
         if read_pos + total_msg_size > write_ptr {

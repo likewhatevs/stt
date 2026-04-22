@@ -432,8 +432,11 @@ fn emit_payload_metrics_to_shm(pm: &PayloadMetrics) {
 /// stdout/stderr open, block [`wait_and_capture`], and lose metrics.
 ///
 /// When multiple handles are active, sidecar entries appear in
-/// finalization order (the order `.wait()`/`.kill()` are called),
-/// not spawn order.
+/// finalization order (the order `.wait()`, `.kill()`, or
+/// `.try_wait()` returning `Ok(Some(..))` are called), not spawn
+/// order. `.try_wait()` only records on its terminal branch; an
+/// `Ok(None)` return keeps the handle live and defers the sidecar
+/// write to the next terminal call.
 #[must_use = "dropping a PayloadHandle SIGKILLs the child's process group; call .wait() or .kill() explicitly"]
 pub struct PayloadHandle {
     /// Live child process. Wrapped in `Option` so consumers can
@@ -510,7 +513,7 @@ impl PayloadHandle {
                 // sends killpg + single-pid SIGKILL to close the
                 // pipes and guarantee the leader exits; the
                 // trailing `wait` reaps it so the pid slot is freed.
-                kill_payload_process_group(&child);
+                kill_payload_process_group(&child, self.payload.name);
                 let _ = child.wait();
                 Err(e).with_context(|| format!("wait payload '{}'", self.payload.name))
             }
@@ -537,7 +540,7 @@ impl PayloadHandle {
             .child
             .take()
             .ok_or_else(|| already_consumed(self.payload))?;
-        kill_payload_process_group(&child);
+        kill_payload_process_group(&child, self.payload.name);
         match wait_and_capture(&mut child) {
             Ok(output) => Ok(evaluate(self.payload, &self.checks, output)),
             Err(e) => {
@@ -579,7 +582,7 @@ impl PayloadHandle {
                         // pipe drain failed — descendants may still
                         // hold the pipes. Kill the group to release
                         // them, then reap the leader zombie.
-                        kill_payload_process_group(&child);
+                        kill_payload_process_group(&child, self.payload.name);
                         let _ = child.wait();
                         Err(e).with_context(|| format!("reap payload '{}'", self.payload.name))
                     }
@@ -606,7 +609,7 @@ fn already_consumed(payload: &'static Payload) -> anyhow::Error {
 impl Drop for PayloadHandle {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            kill_payload_process_group(&child);
+            kill_payload_process_group(&child, self.payload.name);
             let _ = child.wait();
             eprintln!(
                 "ktstr: PayloadHandle for '{}' dropped without wait/kill — \
@@ -677,7 +680,7 @@ impl Drop for PayloadHandle {
 /// `waitpid` hang on some guest runtimes — add a `SigchldScope` at
 /// the call site, or extend an enclosing type with a
 /// `_sigchld: SigchldScope` field, before landing.
-fn kill_payload_process_group(child: &std::process::Child) {
+fn kill_payload_process_group(child: &std::process::Child, payload_name: &str) {
     let pgid = libc::pid_t::try_from(child.id())
         .expect("child pid fits in pid_t (Linux pid_max <= 2^22)");
     debug_assert!(pgid > 0, "child pid must be positive, got {pgid}");
@@ -686,14 +689,14 @@ fn kill_payload_process_group(child: &std::process::Child) {
         Ok(()) => {}
         Err(nix::errno::Errno::ESRCH) => {}
         Err(e) => {
-            tracing::warn!(pgid, %e, "killpg failed for payload process group");
+            tracing::warn!(payload = payload_name, pgid, %e, "killpg failed for payload process group");
         }
     }
     match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) => {}
         Err(nix::errno::Errno::ESRCH) => {}
         Err(e) => {
-            tracing::warn!(pid = pgid, %e, "direct kill failed for payload leader");
+            tracing::warn!(payload = payload_name, pid = pgid, %e, "direct kill failed for payload leader");
         }
     }
 }
@@ -1161,11 +1164,11 @@ fn spawn_and_wait(
         .spawn()
         .map_err(|e| spawn_error_context(e, binary))?;
     match timeout {
-        Some(deadline) => wait_with_deadline(&mut child, deadline),
+        Some(deadline) => wait_with_deadline(&mut child, deadline, binary),
         None => match wait_and_capture(&mut child) {
             Ok(out) => Ok(out),
             Err(e) => {
-                kill_payload_process_group(&child);
+                kill_payload_process_group(&child, binary);
                 let _ = child.wait();
                 Err(e)
             }
@@ -1191,6 +1194,7 @@ fn spawn_and_wait(
 fn wait_with_deadline(
     child: &mut std::process::Child,
     timeout: Duration,
+    payload_name: &str,
 ) -> Result<SpawnOutput> {
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
@@ -1232,7 +1236,7 @@ fn wait_with_deadline(
             return match wait_and_capture(child) {
                 Ok(out) => Ok(out),
                 Err(e) => {
-                    kill_payload_process_group(child);
+                    kill_payload_process_group(child, payload_name);
                     let _ = child.wait();
                     Err(e)
                 }
@@ -1241,7 +1245,7 @@ fn wait_with_deadline(
 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            kill_payload_process_group(child);
+            kill_payload_process_group(child, payload_name);
             return match wait_and_capture(child) {
                 Ok(out) => Ok(out),
                 Err(e) => {
