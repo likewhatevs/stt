@@ -1461,7 +1461,16 @@ impl KtstrVm {
                     extras.push(("scheduler", s));
                 }
                 if let Some(p) = probe.as_deref() {
-                    extras.push(("ktstr-jemalloc-probe", p));
+                    // Prefix with `bin/` so the probe lands at
+                    // `/bin/ktstr-jemalloc-probe` in the guest
+                    // archive — `/bin` is on the guest `PATH` (see
+                    // `rust_init::build_include_path`), so the
+                    // probe resolves by bare name via
+                    // `Command::new("ktstr-jemalloc-probe")`. The
+                    // `bin/busybox` entry at
+                    // `src/vmm/initramfs.rs:848` follows the same
+                    // convention.
+                    extras.push(("bin/ktstr-jemalloc-probe", p));
                 }
                 let shell_mode = busybox || !include_files.is_empty();
                 let key = if shell_mode {

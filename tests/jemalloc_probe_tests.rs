@@ -87,13 +87,19 @@ static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload {
 };
 
 /// Background workload for the error-path test — busybox `sleep`
-/// with no jemalloc. The `60` arg is longer than any realistic
-/// probe run; the test kills it explicitly after probing.
+/// with no jemalloc. Invoked via the absolute path `/bin/busybox`
+/// rather than a bare `sleep` because the test-dispatch init
+/// (src/vmm/rust_init.rs:183-188) installs busybox applet
+/// symlinks ONLY in shell mode, not for `#[ktstr_test]` VMs — so
+/// `/bin/sleep` does not exist in this VM. `busybox` dispatches
+/// to its `sleep` applet when invoked with `sleep` as argv[1].
+/// The `60` arg is longer than any realistic probe run; the test
+/// kills it explicitly after probing.
 static BUSYBOX_SLEEP: Payload = Payload {
     name: "busybox_sleep",
-    kind: PayloadKind::Binary("sleep"),
+    kind: PayloadKind::Binary("/bin/busybox"),
     output: OutputFormat::ExitCode,
-    default_args: &["60"],
+    default_args: &["sleep", "60"],
     default_checks: &[],
     metrics: &[],
 };
@@ -131,9 +137,15 @@ fn spawn_allocator_worker(
         let known: Vec<u8> = vec![0u8; bytes];
         std::hint::black_box(&known);
         // Ready is signaled AFTER the allocation completes so the
-        // probe always reads stable state.
-        ready_tx.send(()).expect("ready send");
-        stop_rx.recv().expect("stop recv");
+        // probe always reads stable state. If the main thread
+        // drops `ready_rx` or `stop_tx` without completing the
+        // handshake (e.g. it returned Err from `.run()?` or
+        // panicked), both `send` and `recv` become `Err` cases —
+        // swallow them silently so the worker exits cleanly and
+        // its drop does not cascade a second panic into the
+        // ktstr panic hook (which reboots the VM on first panic).
+        let _ = ready_tx.send(());
+        let _ = stop_rx.recv();
         drop(known);
     });
     (ready_rx, stop_tx, handle, tid)
@@ -206,33 +218,50 @@ fn jemalloc_probe_single_worker_observes_known_allocation(ctx: &Ctx) -> Result<A
     const KNOWN_BYTES: usize = 16 * 1024 * 1024;
 
     let (ready_rx, stop_tx, worker, tid) = spawn_allocator_worker(KNOWN_BYTES);
-    ready_rx.recv().map_err(|e| anyhow!("worker ready: {e}"))?;
-    let worker_tid = tid.load(Ordering::Acquire);
-    assert!(worker_tid != 0, "worker tid must be populated");
-    let pid = std::process::id();
-
-    let (assert_result, metrics) = ctx
-        .payload(&JEMALLOC_PROBE)
-        .arg("--pid")
-        .arg(pid.to_string())
-        .arg("--json")
-        .run()?;
+    // Inner closure: on any early return (Err), the outer body
+    // still reaches the `stop_tx.send` + `worker.join` cleanup.
+    // Without this pattern, a `.run()?` error would drop `stop_tx`
+    // via the early return and the worker thread would panic on
+    // `stop_rx.recv`; ktstr's panic hook reboots on first panic,
+    // swallowing the real error before it reaches the test
+    // harness as a structured AssertResult.
+    let run_result: Result<AssertResult> = (|| {
+        ready_rx.recv().map_err(|e| anyhow!("worker ready: {e}"))?;
+        let worker_tid = tid.load(Ordering::Acquire);
+        if worker_tid == 0 {
+            return Err(anyhow!("worker tid not populated after ready signal"));
+        }
+        let pid = std::process::id();
+        let (assert_result, metrics) = ctx
+            .payload(&JEMALLOC_PROBE)
+            .arg("--pid")
+            .arg(pid.to_string())
+            .arg("--json")
+            .run()?;
+        let observed = observed_allocated(&metrics, worker_tid).ok_or_else(|| {
+            anyhow!(
+                "probe JSON missing threads entry for worker tid {worker_tid}; \
+                 flat metrics list: {:?}",
+                metrics
+                    .metrics
+                    .iter()
+                    .map(|m| (m.name.as_str(), m.value))
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+        let expected = KNOWN_BYTES as u64;
+        if observed < expected {
+            return Ok(fail_result(format!(
+                "probe allocated_bytes={observed} for tid={worker_tid}, \
+                 expected >= {expected}"
+            )));
+        }
+        Ok(assert_result)
+    })();
 
     let _ = stop_tx.send(());
     let _ = worker.join();
-
-    let observed = observed_allocated(&metrics, worker_tid).ok_or_else(|| {
-        anyhow!("probe JSON missing threads entry for worker tid {worker_tid}")
-    })?;
-
-    let expected = KNOWN_BYTES as u64;
-    if observed < expected {
-        return Ok(fail_result(format!(
-            "probe allocated_bytes={observed} for tid={worker_tid}, \
-             expected >= {expected}"
-        )));
-    }
-    Ok(assert_result)
+    run_result
 }
 
 /// Two workers on distinct threads with distinct known
@@ -253,52 +282,55 @@ fn jemalloc_probe_multi_worker_per_thread_attribution(ctx: &Ctx) -> Result<Asser
 
     let (ready_a, stop_a, handle_a, tid_a_atom) = spawn_allocator_worker(SMALL_BYTES);
     let (ready_b, stop_b, handle_b, tid_b_atom) = spawn_allocator_worker(LARGE_BYTES);
-    ready_a.recv().map_err(|e| anyhow!("worker A ready: {e}"))?;
-    ready_b.recv().map_err(|e| anyhow!("worker B ready: {e}"))?;
-    let tid_a = tid_a_atom.load(Ordering::Acquire);
-    let tid_b = tid_b_atom.load(Ordering::Acquire);
-    assert!(tid_a != 0 && tid_b != 0 && tid_a != tid_b);
-
-    let pid = std::process::id();
-    let (_assert, metrics) = ctx
-        .payload(&JEMALLOC_PROBE)
-        .arg("--pid")
-        .arg(pid.to_string())
-        .arg("--json")
-        .run()?;
+    // Same cleanup-after-early-return pattern as the single-worker
+    // test: see that test's comment block for the panic-hook
+    // rationale.
+    let run_result: Result<AssertResult> = (|| {
+        ready_a.recv().map_err(|e| anyhow!("worker A ready: {e}"))?;
+        ready_b.recv().map_err(|e| anyhow!("worker B ready: {e}"))?;
+        let tid_a = tid_a_atom.load(Ordering::Acquire);
+        let tid_b = tid_b_atom.load(Ordering::Acquire);
+        if tid_a == 0 || tid_b == 0 || tid_a == tid_b {
+            return Err(anyhow!(
+                "worker tids not distinct + populated: a={tid_a} b={tid_b}"
+            ));
+        }
+        let pid = std::process::id();
+        let (_assert, metrics) = ctx
+            .payload(&JEMALLOC_PROBE)
+            .arg("--pid")
+            .arg(pid.to_string())
+            .arg("--json")
+            .run()?;
+        let obs_a = observed_allocated(&metrics, tid_a)
+            .ok_or_else(|| anyhow!("probe output missing worker A tid {tid_a}"))?;
+        let obs_b = observed_allocated(&metrics, tid_b)
+            .ok_or_else(|| anyhow!("probe output missing worker B tid {tid_b}"))?;
+        if obs_a < SMALL_BYTES as u64 {
+            return Ok(fail_result(format!(
+                "worker A (tid={tid_a}) observed {obs_a} < expected {SMALL_BYTES}"
+            )));
+        }
+        if obs_b < LARGE_BYTES as u64 {
+            return Ok(fail_result(format!(
+                "worker B (tid={tid_b}) observed {obs_b} < expected {LARGE_BYTES}"
+            )));
+        }
+        let delta_required = (LARGE_BYTES - SMALL_BYTES) as u64;
+        if obs_b < obs_a + delta_required {
+            return Ok(fail_result(format!(
+                "per-thread attribution failed: obs_a={obs_a}, obs_b={obs_b}; \
+                 expected obs_b - obs_a >= {delta_required}"
+            )));
+        }
+        Ok(AssertResult::pass())
+    })();
 
     let _ = stop_a.send(());
     let _ = stop_b.send(());
     let _ = handle_a.join();
     let _ = handle_b.join();
-
-    let obs_a = observed_allocated(&metrics, tid_a)
-        .ok_or_else(|| anyhow!("probe output missing worker A tid {tid_a}"))?;
-    let obs_b = observed_allocated(&metrics, tid_b)
-        .ok_or_else(|| anyhow!("probe output missing worker B tid {tid_b}"))?;
-
-    if obs_a < SMALL_BYTES as u64 {
-        return Ok(fail_result(format!(
-            "worker A (tid={tid_a}) observed {obs_a} < expected {SMALL_BYTES}"
-        )));
-    }
-    if obs_b < LARGE_BYTES as u64 {
-        return Ok(fail_result(format!(
-            "worker B (tid={tid_b}) observed {obs_b} < expected {LARGE_BYTES}"
-        )));
-    }
-    // Cross-check: obs_b should exceed obs_a by at least the
-    // difference between the known allocations. Without this,
-    // both lower bounds could hold under a probe that reports
-    // per-process total for every thread.
-    let delta_required = (LARGE_BYTES - SMALL_BYTES) as u64;
-    if obs_b < obs_a + delta_required {
-        return Ok(fail_result(format!(
-            "per-thread attribution failed: obs_a={obs_a}, obs_b={obs_b}; \
-             expected obs_b - obs_a >= {delta_required}"
-        )));
-    }
-    Ok(AssertResult::pass())
+    run_result
 }
 
 /// Error path — probe a process that has no jemalloc (busybox

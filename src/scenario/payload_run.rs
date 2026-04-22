@@ -185,12 +185,13 @@ impl<'a> PayloadRun<'a> {
     pub fn spawn(self) -> Result<PayloadHandle> {
         let binary = payload_binary(self.payload)?;
         let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref())?;
-        let child = spawn_child(binary, &self.args, cgroup_path.as_deref())
+        let (child, sigchld) = spawn_child(binary, &self.args, cgroup_path.as_deref())
             .with_context(|| format!("spawn payload '{}'", self.payload.name))?;
         Ok(PayloadHandle {
             child: Some(child),
             payload: self.payload,
             checks: self.checks,
+            _sigchld: sigchld,
         })
     }
 }
@@ -307,6 +308,12 @@ pub struct PayloadHandle {
     child: Option<std::process::Child>,
     payload: &'static Payload,
     checks: Vec<Check>,
+    /// `SIGCHLD` guard installed at spawn time. Kept alive until
+    /// the handle is consumed (via `wait`/`kill`/Drop) so the
+    /// child's eventual `waitpid` sees `SIG_DFL` instead of the
+    /// guest init's `SIG_IGN`. See [`SigchldScope`] for the full
+    /// rationale.
+    _sigchld: SigchldScope,
 }
 
 impl std::fmt::Debug for PayloadHandle {
@@ -857,12 +864,74 @@ fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
     }
 }
 
+/// RAII guard that saves the process's `SIGCHLD` disposition, sets
+/// it to `SIG_DFL` on construction, and restores the saved value on
+/// `Drop`. Required for [`spawn_and_wait`] and the background
+/// [`spawn_child`] path because the guest ktstr-init sets
+/// `SIGCHLD = SIG_IGN` at startup
+/// (src/vmm/rust_init.rs:100, "Ignore SIGCHLD so child processes
+/// don't become zombies"). Under `SIG_IGN` the kernel auto-reaps
+/// children, so `waitpid(child_pid)` returns `ECHILD` and Rust
+/// std's `Command::spawn()` / `.output()` / `Child::wait()`
+/// internals panic with "wait() should either return Ok or panic".
+///
+/// The shell-exec mode at rust_init.rs:212-225 already documents
+/// this exact gotcha and uses the same save/set-`SIG_DFL` /
+/// restore-on-completion pattern. `PayloadRun::run` /
+/// `PayloadRun::spawn` are the second dispatch site that needs it.
+///
+/// For background spawns, the guard lives on [`PayloadHandle`]
+/// until `.wait()` / `.kill()` / `Drop` consumes the handle, so
+/// the child is reap-able via `waitpid` for the entire window
+/// between spawn and final disposition. Foreground spawns
+/// (`spawn_and_wait`) scope the guard to the `.output()` call —
+/// the child is reaped inline, no lingering state.
+struct SigchldScope {
+    prev: libc::sighandler_t,
+}
+
+impl SigchldScope {
+    /// Save current `SIGCHLD` handler and install `SIG_DFL`.
+    /// On host builds the init never flips SIGCHLD to SIG_IGN, so
+    /// `prev` equals `SIG_DFL` and Drop is a no-op mathematically
+    /// — the extra syscall is cheap and keeps behavior uniform
+    /// between host and guest.
+    fn new() -> Self {
+        // SAFETY: `libc::signal` is thread-unsafe in the sense that
+        // concurrent installs race. Payload spawn runs on the test
+        // body's main thread, which is the only spawner; worker
+        // threads a test body creates do not install signal
+        // handlers. The guard is scoped to a single spawn +
+        // optional wait pairing, not nested within itself.
+        let prev = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+        SigchldScope { prev }
+    }
+}
+
+impl Drop for SigchldScope {
+    fn drop(&mut self) {
+        // SAFETY: same rationale as `new` — single-threaded signal
+        // install, no concurrent racers. Restore whatever was
+        // installed before we entered the scope so we leave the
+        // process back in its original disposition (SIG_IGN under
+        // the guest init, typically SIG_DFL elsewhere).
+        unsafe {
+            libc::signal(libc::SIGCHLD, self.prev);
+        }
+    }
+}
+
 /// Foreground path: spawn + wait + capture. Used by `.run()`.
+/// Wraps the `.output()` call in a [`SigchldScope`] so `waitpid`
+/// inside `Command::output` sees `SIG_DFL` and returns the child's
+/// real exit status instead of `ECHILD` under the guest init's
+/// `SIGCHLD = SIG_IGN`.
 fn spawn_and_wait(
     binary: &str,
     args: &[String],
     cgroup_path: Option<&std::path::Path>,
 ) -> Result<SpawnOutput> {
+    let _sigchld = SigchldScope::new();
     let output = build_command(binary, args, cgroup_path)?
         .output()
         .map_err(|e| spawn_error_context(e, binary))?;
@@ -874,15 +943,20 @@ fn spawn_and_wait(
 }
 
 /// Background path: spawn without waiting. Returns the live
-/// [`Child`] for [`PayloadHandle`] to manage.
+/// [`Child`] plus a [`SigchldScope`] that must be held for the
+/// child's lifetime — [`PayloadHandle`] keeps it alive until
+/// `.wait()` / `.kill()` / `Drop` so `waitpid` during reap sees
+/// `SIG_DFL` and observes the child's real exit.
 fn spawn_child(
     binary: &str,
     args: &[String],
     cgroup_path: Option<&std::path::Path>,
-) -> Result<std::process::Child> {
-    build_command(binary, args, cgroup_path)?
+) -> Result<(std::process::Child, SigchldScope)> {
+    let sigchld = SigchldScope::new();
+    let child = build_command(binary, args, cgroup_path)?
         .spawn()
-        .map_err(|e| spawn_error_context(e, binary))
+        .map_err(|e| spawn_error_context(e, binary))?;
+    Ok((child, sigchld))
 }
 
 /// Reap a (possibly already-killed) [`Child`]: wait for it to
