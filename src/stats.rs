@@ -1916,6 +1916,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "my_test");
@@ -1956,6 +1957,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.scenario, "eevdf_test");
@@ -2000,6 +2002,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let row = sidecar_to_row(&sc);
         assert_eq!(row.stall_count, 0);

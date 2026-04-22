@@ -114,9 +114,11 @@ pub struct SidecarResult {
     /// Effective kernel command-line args active during this test run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kargs: Vec<String>,
-    /// Kernel version string (e.g. `"6.14.2"`). Populated from the VM's
-    /// `/proc/version` or the cache entry metadata; `None` for host-only
-    /// tests or when the version could not be determined.
+    /// Kernel version of the VM under test (from cache metadata,
+    /// e.g. `"6.14.2"`). Populated from the VM's `/proc/version` or
+    /// the cache entry metadata; `None` for host-only tests or when
+    /// the version could not be determined. The host's running
+    /// kernel release is carried separately in `host.uname_release`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_version: Option<String>,
     /// ISO 8601 timestamp of when this test run started.
@@ -125,6 +127,16 @@ pub struct SidecarResult {
     /// hash and a monotonic counter to distinguish runs within the same
     /// build.
     pub run_id: String,
+    /// Host fingerprint — static-ish runtime context (CPU model,
+    /// memory size, THP policy, kernel release, host cmdline,
+    /// scheduler tunables). Populated at sidecar-write time from
+    /// `host_state::collect_host_fingerprint`. `None` only on the
+    /// test-fixture path where the sidecar is constructed by hand;
+    /// deliberately excluded from [`sidecar_variant_hash`] so
+    /// gauntlet variants on different hosts collapse into the same
+    /// hash bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<crate::host_state::HostFingerprint>,
 }
 
 /// Scan a directory for ktstr sidecar JSON files. Recurses one level
@@ -571,6 +583,7 @@ pub(crate) fn write_skip_sidecar(
         kernel_version: detect_kernel_version(),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
+        host: Some(crate::host_state::collect_host_fingerprint()),
     };
     serialize_and_write_sidecar(&sidecar, "skip sidecar")
 }
@@ -620,6 +633,7 @@ pub(crate) fn write_sidecar(
         kernel_version: detect_kernel_version(),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
+        host: Some(crate::host_state::collect_host_fingerprint()),
     };
     serialize_and_write_sidecar(&sidecar, "sidecar")
 }
@@ -699,6 +713,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let json = serde_json::to_string_pretty(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -744,6 +759,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -796,6 +812,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(tmp.join("test_x.ktstr.json"), &json).unwrap();
@@ -832,6 +849,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         std::fs::write(sub.join("nested_test.ktstr.json"), &json).unwrap();
@@ -877,6 +895,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         // One level: should be collected.
         std::fs::write(
@@ -945,6 +964,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -1165,10 +1185,10 @@ mod tests {
     /// sidecars and vice versa. Pinning the output against a
     /// pre-computed constant catches that drift before it ships.
     ///
-    /// Only fields that feed the hash (topology, scheduler, work_type,
-    /// active_flags, sysctls, kargs) are set to significant values;
-    /// irrelevant fields are zero-ish defaults so this test stays
-    /// robust against unrelated `SidecarResult` schema growth.
+    /// Only fields that feed the hash (topology, scheduler, payload,
+    /// work_type, active_flags, sysctls, kargs) are set to significant
+    /// values; irrelevant fields are zero-ish defaults so this test
+    /// stays robust against unrelated `SidecarResult` schema growth.
     #[test]
     fn sidecar_variant_hash_stability_populated() {
         use crate::assert::ScenarioStats;
@@ -1192,6 +1212,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         // If this assertion trips, the wire format changed. Bumping
         // the expected value is the wrong fix unless you also plan
@@ -1236,6 +1257,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         assert_eq!(sidecar_variant_hash(&sc), 0x1b61394511b42e01);
     }
@@ -1267,6 +1289,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let none = base();
         let fio = SidecarResult {
@@ -1315,6 +1338,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         }
     }
 
@@ -1603,6 +1627,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         assert!(
@@ -1658,6 +1683,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
+            host: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         assert!(json.contains("\"payload\":\"fio\""));
@@ -1873,5 +1899,141 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `host` is deliberately excluded from `sidecar_variant_hash`:
+    /// two gauntlet variants run on different hosts must collapse
+    /// into the same hash bucket so downstream stats tooling groups
+    /// them together. If a future change accidentally folds
+    /// `HostFingerprint` into the hash, this test catches it before
+    /// the run-key split reaches on-disk sidecars.
+    #[test]
+    fn sidecar_variant_hash_excludes_host_fingerprint() {
+        use crate::assert::ScenarioStats;
+        use crate::host_state::HostFingerprint;
+        let base = || SidecarResult {
+            test_name: String::new(),
+            topology: "1n1l2c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: Vec::new(),
+            passed: false,
+            skipped: false,
+            stats: ScenarioStats::default(),
+            monitor: None,
+            stimulus_events: Vec::new(),
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            sysctls: Vec::new(),
+            kargs: Vec::new(),
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+            host: None,
+        };
+        let without_host = base();
+        let populated = HostFingerprint {
+            cpu_model: Some("Example CPU".to_string()),
+            cpu_vendor: Some("GenuineExample".to_string()),
+            total_memory_kb: Some(16_384_000),
+            hugepages_total: Some(0),
+            hugepages_free: Some(0),
+            hugepagesize_kb: Some(2048),
+            thp_enabled: Some("always [madvise] never".to_string()),
+            thp_defrag: Some("[always] defer madvise never".to_string()),
+            sched_tunables: None,
+            numa_nodes: Some(2),
+            uname_sysname: Some("Linux".to_string()),
+            uname_release: Some("6.11.0".to_string()),
+            uname_machine: Some("x86_64".to_string()),
+            host_cmdline: Some("preempt=lazy".to_string()),
+        };
+        let with_host = SidecarResult {
+            host: Some(populated),
+            ..base()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&without_host),
+            sidecar_variant_hash(&with_host),
+            "host fingerprint must not influence variant hash",
+        );
+    }
+
+    /// A `SidecarResult` carrying a fully populated `HostFingerprint`
+    /// round-trips through serde_json without losing fields. Pins
+    /// the combined schema so a future change that breaks
+    /// composition between the outer `SidecarResult` and the
+    /// `HostFingerprint` it embeds is caught at the seam.
+    #[test]
+    fn sidecar_result_roundtrip_with_populated_host_fingerprint() {
+        use crate::host_state::HostFingerprint;
+        let mut tunables = std::collections::BTreeMap::new();
+        tunables.insert(
+            "sched_migration_cost_ns".to_string(),
+            "500000".to_string(),
+        );
+        let fp = HostFingerprint {
+            cpu_model: Some("Example CPU".to_string()),
+            cpu_vendor: Some("GenuineExample".to_string()),
+            total_memory_kb: Some(16_384_000),
+            hugepages_total: Some(4),
+            hugepages_free: Some(2),
+            hugepagesize_kb: Some(2048),
+            thp_enabled: Some("always [madvise] never".to_string()),
+            thp_defrag: Some("[always] defer madvise never".to_string()),
+            sched_tunables: Some(tunables.clone()),
+            numa_nodes: Some(2),
+            uname_sysname: Some("Linux".to_string()),
+            uname_release: Some("6.11.0".to_string()),
+            uname_machine: Some("x86_64".to_string()),
+            host_cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
+        };
+        let sc = SidecarResult {
+            test_name: "t".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: vec![],
+            passed: true,
+            skipped: false,
+            stats: Default::default(),
+            monitor: None,
+            stimulus_events: vec![],
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: vec![],
+            kvm_stats: None,
+            sysctls: vec![],
+            kargs: vec![],
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+            host: Some(fp),
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
+        let host = loaded.host.expect("host must round-trip");
+        assert_eq!(host.cpu_model.as_deref(), Some("Example CPU"));
+        assert_eq!(host.cpu_vendor.as_deref(), Some("GenuineExample"));
+        assert_eq!(host.total_memory_kb, Some(16_384_000));
+        assert_eq!(host.hugepages_total, Some(4));
+        assert_eq!(host.hugepages_free, Some(2));
+        assert_eq!(host.hugepagesize_kb, Some(2048));
+        assert_eq!(host.thp_enabled.as_deref(), Some("always [madvise] never"));
+        assert_eq!(
+            host.thp_defrag.as_deref(),
+            Some("[always] defer madvise never"),
+        );
+        assert_eq!(host.sched_tunables.as_ref().unwrap(), &tunables);
+        assert_eq!(host.numa_nodes, Some(2));
+        assert_eq!(host.uname_sysname.as_deref(), Some("Linux"));
+        assert_eq!(host.uname_release.as_deref(), Some("6.11.0"));
+        assert_eq!(host.uname_machine.as_deref(), Some("x86_64"));
+        assert_eq!(
+            host.host_cmdline.as_deref(),
+            Some("preempt=lazy isolcpus=1-3"),
+        );
     }
 }

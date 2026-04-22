@@ -99,11 +99,8 @@ rustix = { version = "1", features = ["fs", "shm", "system"] }
 strum = { version = "0.27", features = ["derive"] }
 # jemalloc as global allocator for the ktstr/cargo-ktstr binaries.
 # binary-only — the library stays allocator-agnostic so downstream
-# consumers pick their own allocator. The "stats" feature compiles
-# jemalloc with statistics tracking so the host-state feature can
-# query per-thread allocation counters via mallctl; without it, the
-# mallctl stats namespace is unavailable at runtime.
-tikv-jemallocator = { version = "0.6", features = ["stats"] }
+# consumers pick their own allocator.
+tikv-jemallocator = { version = "0.6" }
 # SHA-256 for verifying downloaded model-cache artifacts. `gix` pulls
 # in sha1 only; sha2 is a fresh dep and only the model-cache code
 # path needs it, so keep the feature surface minimal.
