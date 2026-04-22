@@ -7,9 +7,39 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
+
+/// Process-wide [`reqwest::blocking::Client`] lazily initialized on first
+/// access via [`shared_client`]. Keeping a single Client instance across
+/// the fetch-family reuses its TCP connection pool and TLS session cache
+/// across repeated calls to the same host within a CLI run — the design
+/// intent the doc on [`fetch_releases`] describes. Cross-host fetches
+/// in the same run still re-handshake because reqwest's connection pool
+/// keys on host.
+static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
+
+/// Return the process-wide shared [`reqwest::blocking::Client`]. First
+/// call constructs it with `reqwest::blocking::Client::new()`; every
+/// subsequent call returns a reference to the same instance. Call sites
+/// that need fault-injection seams (httpmock-style tests) should
+/// construct a local `Client` directly and pass it to `fetch_*`; this
+/// helper is for top-level CLI entries that want the default client.
+///
+/// # Panics
+///
+/// Panics on the first call if `reqwest::blocking::Client::new()` fails
+/// to build a default client — inherited behavior from reqwest, which
+/// uses it as the infallible constructor. The documented failure modes
+/// are TLS backend initialization (e.g. rustls/native-tls subsystem
+/// unreachable) and are treated as setup bugs rather than runtime
+/// errors; a failing first call would have failed just as hard under
+/// the pre-singleton `Client::new()` per-callsite pattern.
+pub fn shared_client() -> &'static Client {
+    SHARED_CLIENT.get_or_init(Client::new)
+}
 
 /// Downloaded/cloned kernel source ready for building.
 #[non_exhaustive]
@@ -262,11 +292,14 @@ fn patch_level(version: &str) -> Option<u32> {
 
 /// Fetch releases.json from kernel.org and return (moniker, version) pairs.
 ///
-/// `client` is the HTTP client to use. Callers share a single
-/// [`reqwest::blocking::Client`] across the fetch-family so connection
-/// pooling and tls handshake cost is amortized; the parameter also
-/// gives tests a fault-injection seam (point the client at an
-/// httpmock-style local mock server).
+/// `client` is the HTTP client to use. Top-level CLI entries pass
+/// [`shared_client`] to reuse the process-wide singleton so connection
+/// pooling and TLS handshake cost is amortized across repeated calls
+/// to the same host (kernel.org here) within a single run — reqwest's
+/// connection pool keys on host, so cross-host fetches in the same
+/// run re-handshake anyway. Tests pass a locally-constructed `Client`
+/// for fault injection (e.g. point the client at an httpmock-style
+/// local mock server).
 pub(crate) fn fetch_releases(client: &Client) -> Result<Vec<(String, String)>> {
     let url = "https://www.kernel.org/releases.json";
     let response = client

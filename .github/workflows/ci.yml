@@ -22,6 +22,13 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
       - run: cargo fmt -- --check
+      # `--all-targets` is required for this to catch cfg(test) flips on
+      # pub items: a `pub fn` in a `pub mod` gated by `#[cfg(test)]`
+      # compiles under `cargo check --lib` but breaks the `ktstr` /
+      # `cargo-ktstr` / `ktstr-jemalloc-*` bin targets that import it.
+      # Any change that tightens cfg(test) visibility on a public symbol
+      # MUST verify against `--all-targets` before merge.
+      - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets
 
   test-x64:

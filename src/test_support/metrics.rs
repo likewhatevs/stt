@@ -192,13 +192,26 @@ pub(crate) const MAX_WALK_DEPTH: usize = 64;
 /// dropped by the depth cap" scan the returned `Vec<Metric>` for
 /// a metric whose `name` equals this constant — its `value` is
 /// the depth at which truncation occurred, so nested failures at
-/// different subtrees produce one sentinel per trigger. The name
-/// starts with a double underscore so collision is extremely
-/// unlikely — only a top-level JSON key with this exact literal
-/// name would produce a non-truncation metric that compares equal,
-/// since every non-top-level leaf gets at least one `.` injected
-/// by `walk`. Callers that depend on zero-collision guarantees
-/// should reject sentinel-named paths from their input schema.
+/// different subtrees produce one sentinel per trigger.
+///
+/// # Accepted collision risk
+///
+/// The double-underscore prefix makes collision extremely unlikely
+/// in practice, but not impossible: a benchmark whose JSON has
+/// this exact literal string as a **top-level** key produces a
+/// `Metric.name` indistinguishable from the cap-hit sentinel
+/// (nested leaves get at least one `.` injected by `walk`, so only
+/// the top-level depth-0 push can produce a name without a `.`).
+/// Consumers treat the sentinel as advisory, not authoritative —
+/// a caller that depends on zero-collision guarantees must reject
+/// sentinel-named paths from its input schema.
+///
+/// A future refactor could eliminate the risk structurally by
+/// widening the return type to `WalkResult { metrics: Vec<Metric>,
+/// truncated: Option<u64> }` — separating the truncation signal
+/// from the metric stream. Held off pending a consumer that
+/// materially benefits from zero-collision certainty; the current
+/// advisory contract is sufficient for every in-crate consumer.
 pub(crate) const WALK_TRUNCATION_SENTINEL_NAME: &str = "__walk_json_leaves_truncated";
 
 fn walk(

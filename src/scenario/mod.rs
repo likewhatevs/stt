@@ -577,17 +577,6 @@ impl Scenario {
         let excl: Vec<&'static str> = self.excluded_flags.iter().map(|d| d.name).collect();
         generate_profiles(&req, &excl)
     }
-    #[cfg(test)]
-    pub fn profiles_with(&self, active: &[&str]) -> Vec<FlagProfile> {
-        let req: Vec<&'static str> = self.required_flags.iter().map(|d| d.name).collect();
-        let mut excl: Vec<&'static str> = self.excluded_flags.iter().map(|d| d.name).collect();
-        for &f in flags::ALL {
-            if !active.contains(&f) && !req.contains(&f) {
-                excl.push(f);
-            }
-        }
-        generate_profiles(&req, &excl)
-    }
     /// Returns `"{name}/{profile_name}"` (e.g. `"cgroup_steady/llc+borrow"`).
     pub fn qualified_name(&self, p: &FlagProfile) -> String {
         format!("{}/{}", self.name, p.name())
@@ -1618,22 +1607,6 @@ mod tests {
                 assert_eq!(count, 2); // half of 4
             }
             other => panic!("expected Random, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn profiles_with_filters_correctly() {
-        let s = &all_scenarios()[0]; // proportional, no required/excluded
-        let profiles = s.profiles_with(&[flags::BORROW]);
-        for p in &profiles {
-            // Only borrow (and its dependencies) should be possible
-            for f in &p.flags {
-                assert!(
-                    *f == flags::BORROW || flag_requires(flags::BORROW).contains(f),
-                    "unexpected flag {:?}",
-                    f
-                );
-            }
         }
     }
 

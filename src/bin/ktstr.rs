@@ -220,7 +220,7 @@ fn kernel_build(
     let tmp_dir = tempfile::TempDir::new()?;
 
     // Acquire source.
-    let client = reqwest::blocking::Client::new();
+    let client = fetch::shared_client();
     let acquired = if let Some(ref src_path) = source {
         fetch::local_source(src_path, "ktstr")?
     } else if let Some(ref url) = git {
@@ -231,10 +231,10 @@ fn kernel_build(
         let ver = match version {
             Some(v) if fetch::is_major_minor_prefix(&v) => {
                 // Major.minor prefix (e.g., "6.12") — resolve latest patch.
-                fetch::fetch_version_for_prefix(&client, &v, "ktstr")?
+                fetch::fetch_version_for_prefix(client, &v, "ktstr")?
             }
             Some(v) => v,
-            None => fetch::fetch_latest_stable_version(&client, "ktstr")?,
+            None => fetch::fetch_latest_stable_version(client, "ktstr")?,
         };
         // Check cache before downloading.
         let (arch, _) = fetch::arch_info();
@@ -245,7 +245,7 @@ fn kernel_build(
             return Ok(());
         }
         let sp = cli::Spinner::start("Downloading kernel...");
-        let result = fetch::download_tarball(&client, &ver, tmp_dir.path(), "ktstr");
+        let result = fetch::download_tarball(client, &ver, tmp_dir.path(), "ktstr");
         drop(sp);
         result?
     };

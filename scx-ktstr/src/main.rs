@@ -39,6 +39,27 @@ fn has_flag(flag: &str) -> bool {
 fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
     let stall_after = parse_delay_flag("--stall-after");
     let degrade_after = parse_delay_flag("--degrade-after");
+    // The main poll cadence is `thread::sleep(Duration::from_secs(1))`
+    // (see the loop below). Delay flags are checked inline at each tick,
+    // so the trigger fires at the NEXT poll after `elapsed >= delay` —
+    // i.e. the actual trigger can land up to 1s after the requested
+    // delay. Values of 0 fire immediately before the loop (see below)
+    // and are unaffected. Warn the operator on `1..=4` so short-delay
+    // scenarios do not attribute a late trigger to scheduler behavior.
+    for (name, maybe) in [
+        ("--stall-after", stall_after),
+        ("--degrade-after", degrade_after),
+    ] {
+        if let Some(delay_s) = maybe
+            && (1..5).contains(&delay_s)
+        {
+            eprintln!(
+                "scx-ktstr: WARNING: {name}={delay_s}s can exhibit up to 1s \
+                 poll-granularity jitter under load. Delays of 5s or greater \
+                 keep the jitter well within the intended delay.",
+            );
+        }
+    }
     let degrade = has_flag("--degrade");
     let fail_verify = has_flag("--fail-verify");
     let scattershot = has_flag("--scattershot");
