@@ -94,7 +94,7 @@
 //!         ..Default::default()
 //!     };
 //!     let mut handle = WorkloadHandle::spawn(&cfg)?;
-//!     ctx.cgroups.move_tasks("workers", &handle.tids())?;
+//!     ctx.cgroups.move_tasks("workers", &handle.worker_pids())?;
 //!     handle.start();
 //!
 //!     std::thread::sleep(ctx.duration);

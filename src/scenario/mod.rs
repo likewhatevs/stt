@@ -937,8 +937,8 @@ impl<'a> Ctx<'a> {
 /// `details`, not an error. On workload failure, captures the guest
 /// kernel console via `read_kmsg` so diagnostics include the stall
 /// or crash context.
-/// Spawn workers per cgroup, move each handle's tids into its
-/// cgroup, then start all handles in a second pass.
+/// Spawn workers per cgroup, move each handle's worker pids into
+/// its cgroup, then start all handles in a second pass.
 ///
 /// Shared scaffolding for [`run_scenario`] and [`setup_cgroups`] —
 /// both defer `.start()` until every handle has been spawned and
@@ -969,10 +969,10 @@ where
         tracing::debug!(
             cgroup = %name,
             workers = wl.num_workers,
-            tids = h.tids().len(),
+            pids = h.worker_pids().len(),
             "spawned workers",
         );
-        ctx.cgroups.move_tasks(name.as_str(), &h.tids())?;
+        ctx.cgroups.move_tasks(name.as_str(), &h.worker_pids())?;
         handles.push(h);
     }
     for h in &mut handles {
@@ -1400,7 +1400,7 @@ pub fn spawn_diverse(ctx: &Ctx, cgroup_names: &[&str]) -> Result<Vec<WorkloadHan
             work_type: wt,
             ..Default::default()
         })?;
-        ctx.cgroups.move_tasks(name, &h.tids())?;
+        ctx.cgroups.move_tasks(name, &h.worker_pids())?;
         h.start();
         handles.push(h);
     }

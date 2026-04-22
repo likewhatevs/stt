@@ -114,7 +114,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
         work_type: WorkType::bursty(10, 5),
         ..Default::default()
     })?;
-    ctx.cgroups.move_tasks("cg_0", &h_cgroup.tids())?;
+    ctx.cgroups.move_tasks("cg_0", &h_cgroup.worker_pids())?;
 
     let n_pinned = last.min(4);
     let mut pinned_handles = Vec::new();
@@ -125,7 +125,7 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
             work_type: WorkType::bursty(10, 5),
             ..Default::default()
         })?;
-        ctx.cgroups.move_tasks("cg_0", &h.tids())?;
+        ctx.cgroups.move_tasks("cg_0", &h.worker_pids())?;
         pinned_handles.push(h);
     }
 
@@ -223,7 +223,7 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
         work_type: WorkType::bursty(100, 50),
         ..Default::default()
     })?;
-    ctx.cgroups.move_tasks("cg_3", &h.tids())?;
+    ctx.cgroups.move_tasks("cg_3", &h.worker_pids())?;
     h.start();
     handles.push(h);
     thread::sleep(ctx.duration / 3);
@@ -277,13 +277,13 @@ pub fn custom_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
         work_type: WorkType::Mixed,
         ..Default::default()
     })?;
-    ctx.cgroups.move_tasks("cg_0", &h0.tids())?;
+    ctx.cgroups.move_tasks("cg_0", &h0.worker_pids())?;
     let mut h1 = WorkloadHandle::spawn(&WorkloadConfig {
         num_workers: n,
         work_type: WorkType::Mixed,
         ..Default::default()
     })?;
-    ctx.cgroups.move_tasks("cg_1", &h1.tids())?;
+    ctx.cgroups.move_tasks("cg_1", &h1.worker_pids())?;
     h0.start();
     h1.start();
 

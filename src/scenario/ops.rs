@@ -2335,7 +2335,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 mpol_flags: work.mpol_flags,
             };
             let mut h = WorkloadHandle::spawn(&wl)?;
-            ctx.cgroups.move_tasks(&def.name, &h.tids())?;
+            ctx.cgroups.move_tasks(&def.name, &h.worker_pids())?;
             h.start();
             state.target_handles().push((def.name.to_string(), h));
         }
@@ -2514,7 +2514,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     mpol_flags: work.mpol_flags,
                 };
                 let mut h = WorkloadHandle::spawn(&wl)?;
-                ctx.cgroups.move_tasks(cgroup, &h.tids())?;
+                ctx.cgroups.move_tasks(cgroup, &h.worker_pids())?;
                 h.start();
                 state.target_handles().push((cgroup.to_string(), h));
             }
@@ -2548,7 +2548,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                         match &resolved {
                             crate::workload::AffinityMode::None => {}
                             crate::workload::AffinityMode::Fixed(cpus) => {
-                                for idx in 0..handle.tids().len() {
+                                for idx in 0..handle.worker_pids().len() {
                                     let _ = handle.set_affinity(idx, cpus);
                                 }
                             }
@@ -2557,7 +2557,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                             {
                                 use rand::seq::IndexedRandom;
                                 let v: Vec<usize> = from.iter().copied().collect();
-                                for idx in 0..handle.tids().len() {
+                                for idx in 0..handle.worker_pids().len() {
                                     let chosen: BTreeSet<usize> =
                                         v.sample(&mut rand::rng(), *count).copied().collect();
                                     let _ = handle.set_affinity(idx, &chosen);
@@ -2578,7 +2578,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                             crate::workload::AffinityMode::Random { .. } => {}
                             crate::workload::AffinityMode::SingleCpu(cpu) => {
                                 let cpus: BTreeSet<usize> = [*cpu].into_iter().collect();
-                                for idx in 0..handle.tids().len() {
+                                for idx in 0..handle.worker_pids().len() {
                                     let _ = handle.set_affinity(idx, &cpus);
                                 }
                             }
@@ -2641,7 +2641,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 // currently keyed under `from` (step-local and backdrop).
                 for (name, handle) in state.all_handles() {
                     if name.as_str() == *from {
-                        ctx.cgroups.move_tasks(to, &handle.tids())?;
+                        ctx.cgroups.move_tasks(to, &handle.worker_pids())?;
                     }
                 }
                 // Re-key handles under `to` and transfer ownership

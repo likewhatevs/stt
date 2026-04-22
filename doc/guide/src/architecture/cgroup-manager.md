@@ -82,7 +82,7 @@ fn custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
     ctx.cgroups.set_cpuset("cg_0", &cpuset)?;
 
     let mut h = WorkloadHandle::spawn(&config)?;
-    ctx.cgroups.move_tasks("cg_0", &h.tids())?;
+    ctx.cgroups.move_tasks("cg_0", &h.worker_pids())?;
     h.start(); // workers block until start() is called
 
     // ... run workload ...

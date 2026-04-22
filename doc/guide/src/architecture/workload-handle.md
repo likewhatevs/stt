@@ -34,9 +34,9 @@ the group size and sets up inter-worker communication (pipes for
 
 ## Methods
 
-**`tids() -> Vec<u32>`** -- PIDs of all worker processes. Used with
-`CgroupManager::move_task()` or `move_tasks()` to place workers in
-cgroups before starting them.
+**`worker_pids() -> Vec<libc::pid_t>`** -- PIDs of all worker
+processes. Used with `CgroupManager::move_task()` or `move_tasks()`
+to place workers in cgroups before starting them.
 
 **`start()`** -- signals all workers to begin their workload by writing
 to their start pipes. Idempotent: calling it twice has no effect.
@@ -63,7 +63,7 @@ killed with SIGKILL. Consumes the handle.
 let mut handle = WorkloadHandle::spawn(&config)?;
 
 // 2. Move workers into their target cgroup
-ctx.cgroups.move_tasks("cg_0", &handle.tids())?;
+ctx.cgroups.move_tasks("cg_0", &handle.worker_pids())?;
 
 // 3. Signal workers to start
 handle.start();

@@ -1658,7 +1658,7 @@ impl WorkloadHandle {
     /// callers feed them directly into `kill`, `waitpid`,
     /// `Pid::from_raw`, and `cgroup.procs` writes without any
     /// sign-cast at the libc boundary.
-    pub fn tids(&self) -> Vec<libc::pid_t> {
+    pub fn worker_pids(&self) -> Vec<libc::pid_t> {
         self.children.iter().map(|(pid, _, _)| *pid).collect()
     }
 
@@ -3446,7 +3446,7 @@ mod tests {
             ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
-        assert_eq!(h.tids().len(), 2);
+        assert_eq!(h.worker_pids().len(), 2);
         h.start();
         std::thread::sleep(std::time::Duration::from_millis(200));
         let reports = h.stop_and_collect();
@@ -3508,12 +3508,13 @@ mod tests {
     }
 
     /// Regression guard for the sign-cast bug: every pid returned
-    /// from `tids()` must be a positive, live `pid_t` that round-trips
-    /// through `Pid::from_raw` + `kill(_, None)` (the "exists" probe).
-    /// A negative pid would silently broadcast SIGKILL to a process
-    /// group; a stale/reaped pid would fail the probe with ESRCH.
-    /// Either indicates storage upstream re-introduced the u32
-    /// wraparound or dropped a child on the floor.
+    /// from `worker_pids()` must be a positive, live `pid_t` that
+    /// round-trips through `Pid::from_raw` + `kill(_, None)` (the
+    /// "exists" probe). A negative pid would silently broadcast
+    /// SIGKILL to a process group; a stale/reaped pid would fail the
+    /// probe with ESRCH. Either indicates storage upstream
+    /// re-introduced the u32 wraparound or dropped a child on the
+    /// floor.
     #[test]
     fn spawn_pids_fit_in_pid_t() {
         let config = WorkloadConfig {
@@ -3524,7 +3525,7 @@ mod tests {
             ..Default::default()
         };
         let h = WorkloadHandle::spawn(&config).unwrap();
-        for pid in h.tids() {
+        for pid in h.worker_pids() {
             assert!(pid > 0, "child pid must be positive, got {pid}");
             // Signal 0 (None) only checks existence; it does not
             // deliver anything. Proves the pid is a real, live
@@ -3559,7 +3560,7 @@ mod tests {
             ..Default::default()
         };
         let h = WorkloadHandle::spawn(&config).unwrap();
-        let pids = h.tids();
+        let pids = h.worker_pids();
         assert_eq!(pids.len(), 2, "both workers spawned");
         // Drop without calling start() or stop_and_collect() — this
         // exercises the WorkloadHandle::Drop path, which has the
@@ -3594,9 +3595,9 @@ mod tests {
             ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
-        let tids = h.tids();
-        assert_eq!(tids.len(), 4);
-        let unique: std::collections::HashSet<libc::pid_t> = tids.iter().copied().collect();
+        let pids = h.worker_pids();
+        assert_eq!(pids.len(), 4);
+        let unique: std::collections::HashSet<libc::pid_t> = pids.iter().copied().collect();
         assert_eq!(unique.len(), 4, "all worker PIDs should be distinct");
         h.start();
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -3629,7 +3630,7 @@ mod tests {
             ..Default::default()
         };
         let h = WorkloadHandle::spawn(&config).unwrap();
-        let pids = h.tids();
+        let pids = h.worker_pids();
         drop(h);
         // After drop, children should be dead.
         for pid in pids {
@@ -4016,13 +4017,13 @@ mod tests {
             ..Default::default()
         };
         let h = WorkloadHandle::spawn(&config).unwrap();
-        assert!(h.tids().is_empty());
+        assert!(h.worker_pids().is_empty());
         let reports = h.stop_and_collect();
         assert!(reports.is_empty());
     }
 
     #[test]
-    fn tids_count_matches_num_workers() {
+    fn worker_pids_count_matches_num_workers() {
         for n in [1, 3, 5] {
             let config = WorkloadConfig {
                 num_workers: n,
@@ -4030,9 +4031,9 @@ mod tests {
             };
             let h = WorkloadHandle::spawn(&config).unwrap();
             assert_eq!(
-                h.tids().len(),
+                h.worker_pids().len(),
                 n,
-                "tids().len() should match num_workers={n}"
+                "worker_pids().len() should match num_workers={n}"
             );
             drop(h);
         }
@@ -4213,7 +4214,7 @@ mod tests {
             ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
-        assert_eq!(h.tids().len(), 4);
+        assert_eq!(h.worker_pids().len(), 4);
         h.start();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let reports = h.stop_and_collect();
@@ -4768,7 +4769,7 @@ mod tests {
             ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
-        assert_eq!(h.tids().len(), 10);
+        assert_eq!(h.worker_pids().len(), 10);
         h.start();
         std::thread::sleep(std::time::Duration::from_millis(500));
         let reports = h.stop_and_collect();
@@ -5313,8 +5314,16 @@ mod tests {
         // definitely installed. The poll interval is 10ms and the
         // ceiling is 2s (~10× the old sleep) to cover CPU-starved
         // hosts without silently hanging.
-        let worker_pid = h.tids()[0];
+        let worker_pid = h.worker_pids()[0];
         let ready_path = ready_file_path(worker_pid);
+        // Remove any stale ready file from a prior run that happened
+        // to land the same PID — `ready_path.exists()` in the poll
+        // loop below would otherwise short-circuit on the stale file
+        // and the parent would send SIGUSR1 before SIG_IGN was
+        // actually installed. PID reuse across test runs in the same
+        // session is plausible because fork() picks from the kernel's
+        // recycled PID pool.
+        let _ = std::fs::remove_file(&ready_path);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !ready_path.exists() {
             if Instant::now() >= deadline {
@@ -5479,7 +5488,7 @@ mod tests {
             ..Default::default()
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
-        assert_eq!(h.tids().len(), 10);
+        assert_eq!(h.worker_pids().len(), 10);
         h.start();
         std::thread::sleep(std::time::Duration::from_millis(500));
         let reports = h.stop_and_collect();

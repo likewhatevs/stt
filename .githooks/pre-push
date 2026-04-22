@@ -36,6 +36,24 @@ if ! git diff --cached --quiet; then
     exit 1
 fi
 
+# Untracked-file check: warn (do not block) when the worktree contains
+# files not known to git. Untracked files are not compiled by
+# `cargo build --tests` and are not part of the pushed SHA, so they
+# cannot miscertify the push the way a dirty tracked file does — but
+# they are often forgotten new sources, test fixtures, or working
+# artifacts that the author meant to `git add` before pushing. A
+# warning surfaces the oversight without blocking pushes when the
+# untracked files are genuinely local-only (e.g. profraw, scratch
+# notes).
+untracked=$(git ls-files --others --exclude-standard)
+if [ -n "$untracked" ]; then
+    echo "pre-push: WARNING — untracked files present in worktree:"
+    echo "$untracked" | sed 's/^/          /'
+    echo "          These are not part of the pushed SHA. If any are"
+    echo "          new sources you meant to include, abort, add them,"
+    echo "          and re-push."
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
     echo "pre-push: cargo not found, skipping test-build gate"
     exit 0
