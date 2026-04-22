@@ -889,6 +889,48 @@ mod tests {
         assert_eq!(decoded, ctx);
     }
 
+    /// Partial-None round-trip: mixed `Some`/`None` fields plus a
+    /// `Some(BTreeMap)` that is intentionally empty. Covers the gap
+    /// between the fully-None and fully-populated endpoints — a
+    /// regression that drops a specific `Some` into `None` (or
+    /// coerces `Some(empty map)` into `None` on deserialize) would
+    /// pass both existing tests while breaking real sidecars where
+    /// partial host-state captures are the norm (first `/proc`
+    /// entry unreadable, sched_* dir readable but filtered to
+    /// empty, etc.). Struct-level `PartialEq` catches the whole
+    /// shape in one assertion.
+    #[test]
+    fn host_context_partial_none_round_trips_via_json() {
+        let ctx = HostContext {
+            // Identity captured on the production path.
+            uname_sysname: Some("Linux".to_string()),
+            // Release read failed (e.g. uname syscall error on the
+            // simulated failure path).
+            uname_release: None,
+            uname_machine: Some("x86_64".to_string()),
+            // Map was captured but is empty — the `read_dir` of
+            // /proc/sys/kernel succeeded, no entries matched the
+            // `sched_*` filter (unusual but the code contract
+            // explicitly distinguishes this from `None`).
+            sched_tunables: Some(BTreeMap::new()),
+            // Rest: None to exercise the omitted-key deserialize
+            // path for every other Option field.
+            cpu_model: None,
+            cpu_vendor: None,
+            total_memory_kb: None,
+            hugepages_total: None,
+            hugepages_free: None,
+            hugepages_size_kb: None,
+            thp_enabled: None,
+            thp_defrag: None,
+            numa_nodes: None,
+            cmdline: None,
+        };
+        let json = serde_json::to_string(&ctx).expect("serialize");
+        let decoded: HostContext = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, ctx);
+    }
+
     #[test]
     fn parse_cpuinfo_identity_happy_path() {
         let text = "\

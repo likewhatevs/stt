@@ -215,13 +215,17 @@ impl Runner {
             let needs_cpu_ctrl = !profile.flags.contains(&flags::NO_CTRL);
             cgroups.setup(needs_cpu_ctrl).context("cgroup setup")?;
 
+            // workload TLS keeps the 0-sentinel (atomic `Option` is
+            // expensive); `Ctx::sched_pid` uses `Option<pid_t>` with
+            // `None` as the unconfigured state — the two channels are
+            // deliberately split.
             crate::workload::set_sched_pid(0);
             let ctx = Ctx {
                 cgroups: &cgroups,
                 topo: &self.topo,
                 duration: self.config.duration,
                 workers_per_cgroup: self.config.workers_per_cgroup,
-                sched_pid: 0,
+                sched_pid: None,
                 settle: self.config.settle,
                 work_type_override: self.config.work_type_override.clone(),
                 assert: crate::assert::Assert::default_checks().merge(&self.config.assert),

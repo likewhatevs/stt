@@ -726,13 +726,17 @@ pub struct Ctx<'a> {
     pub duration: Duration,
     /// Default number of workers per cgroup.
     pub workers_per_cgroup: usize,
-    /// PID of the running scheduler (for liveness checks). Stored as
-    /// `pid_t` to match the kernel's native type — avoids u32→i32
-    /// sign-cast wraparound at the `kill`/`process_alive` boundary.
+    /// PID of the running scheduler (for liveness checks), or `None`
+    /// when no scheduler is attached. Stored as `Option<pid_t>` so
+    /// the "no scheduler" state is a distinct variant rather than a
+    /// 0-sentinel — `run_scenario` and step-level liveness probes
+    /// destructure via `if let Some(pid)` instead of `!= 0` guards.
     ///
-    /// A value of `0` means no scheduler is attached; `run_scenario`
-    /// and step-level liveness probes skip the check in that case.
-    pub sched_pid: libc::pid_t,
+    /// Note: the workload-side thread-local (`workload::SCHED_PID`,
+    /// an `AtomicI32`) keeps its 0-sentinel form because `AtomicOption`
+    /// is expensive; the sentinel is contained there and documented at
+    /// the `set_sched_pid` call site.
+    pub sched_pid: Option<libc::pid_t>,
     /// Time to wait after cgroup creation for scheduler stabilization.
     pub settle: Duration,
     /// Override work type for scenarios that use `CpuSpin` by default.
@@ -782,9 +786,8 @@ impl std::fmt::Debug for Ctx<'_> {
 /// - `duration`: 1 s — matches the `scenario::basic` test helper
 ///   (`scenario::stress` uses 2 s and sets it explicitly)
 /// - `workers_per_cgroup`: 1
-/// - `sched_pid`: 0 — matches `Ctx` consumers that treat 0 as
-///   "no scheduler attached"; [`run_scenario`] uses this to short-circuit
-///   liveness checks via [`crate::workload::set_sched_pid`].
+/// - `sched_pid`: `None` — [`run_scenario`] short-circuits the
+///   liveness checks when `sched_pid.is_none()`.
 /// - `settle`: 0 ms — tests do not need to wait for scheduler stabilisation
 /// - `work_type_override`: `None`
 /// - `assert`: [`crate::assert::Assert::default_checks()`] —
@@ -808,7 +811,7 @@ pub struct CtxBuilder<'a> {
     topo: &'a TestTopology,
     duration: Duration,
     workers_per_cgroup: usize,
-    sched_pid: libc::pid_t,
+    sched_pid: Option<libc::pid_t>,
     settle: Duration,
     work_type_override: Option<WorkType>,
     assert: crate::assert::Assert,
@@ -828,9 +831,9 @@ impl<'a> CtxBuilder<'a> {
         self
     }
 
-    /// PID of the scheduler process; `0` means "no scheduler attached"
-    /// and disables the liveness checks in [`run_scenario`].
-    pub fn sched_pid(mut self, pid: libc::pid_t) -> Self {
+    /// PID of the scheduler process; `None` disables the liveness
+    /// checks in [`run_scenario`].
+    pub fn sched_pid(mut self, pid: Option<libc::pid_t>) -> Self {
         self.sched_pid = pid;
         self
     }
@@ -894,7 +897,7 @@ impl<'a> Ctx<'a> {
             topo,
             duration: Duration::from_secs(1),
             workers_per_cgroup: 1,
-            sched_pid: 0,
+            sched_pid: None,
             settle: Duration::from_millis(0),
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),
@@ -1009,14 +1012,16 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     thread::sleep(ctx.settle);
 
     // Bail early if the scheduler process is no longer running after
-    // cgroup creation. sched_pid == 0 means no scheduler was
+    // cgroup creation. sched_pid == None means no scheduler was
     // configured (kernel-default path), so liveness is not
     // applicable and there is nothing to bail on.
-    if ctx.sched_pid != 0 && !process_alive(ctx.sched_pid) {
+    if let Some(pid) = ctx.sched_pid
+        && !process_alive(pid)
+    {
         anyhow::bail!(
             "{} after cgroup creation (pid={})",
             crate::assert::SCHED_NO_LONGER_RUNNING_PREFIX,
-            ctx.sched_pid,
+            pid,
         );
     }
 
@@ -1070,14 +1075,14 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     // Poll scheduler liveness during the workload phase instead of a
     // single sleep. Detects scheduler exit within 500ms rather than
     // waiting the full duration and collecting misleading results.
-    // sched_pid == 0 means no scheduler was configured (kernel-default
-    // path); skip liveness polling entirely and sleep the full
-    // duration.
+    // sched_pid == None means no scheduler was configured
+    // (kernel-default path); skip liveness polling entirely and sleep
+    // the full duration.
     let deadline = std::time::Instant::now() + ctx.duration;
     let mut sched_dead = false;
-    if ctx.sched_pid != 0 {
+    if let Some(pid) = ctx.sched_pid {
         while std::time::Instant::now() < deadline {
-            if !process_alive(ctx.sched_pid) {
+            if !process_alive(pid) {
                 sched_dead = true;
                 tracing::warn!("scheduler process exited during workload phase");
                 break;
@@ -1087,7 +1092,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         }
 
         if !sched_dead {
-            sched_dead = !process_alive(ctx.sched_pid);
+            sched_dead = !process_alive(pid);
         }
     } else {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -1115,7 +1120,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     if sched_dead {
         result.passed = false;
         result.details.push(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::Monitor,
+            crate::assert::DetailKind::SchedulerExited,
             format!(
                 "{} unexpectedly during workload ({:.1}s into test)",
                 crate::assert::SCHED_EXITED_PREFIX,
@@ -1303,13 +1308,15 @@ pub fn setup_cgroups<'a>(
         guard.add_cgroup_no_cpuset(&format!("cg_{i}"))?;
     }
     thread::sleep(ctx.settle);
-    // sched_pid == 0 means no scheduler was configured
+    // sched_pid == None means no scheduler was configured
     // (kernel-default path); skip the liveness-based bail.
-    if ctx.sched_pid != 0 && !process_alive(ctx.sched_pid) {
+    if let Some(pid) = ctx.sched_pid
+        && !process_alive(pid)
+    {
         anyhow::bail!(
             "{} after cgroup creation (pid={})",
             crate::assert::SCHED_NO_LONGER_RUNNING_PREFIX,
-            ctx.sched_pid,
+            pid,
         );
     }
     let names: Vec<String> = (0..n).map(|i| format!("cg_{i}")).collect();
@@ -1804,7 +1811,7 @@ mod tests {
             topo: &t,
             duration: std::time::Duration::from_secs(1),
             workers_per_cgroup: 4,
-            sched_pid: 0,
+            sched_pid: None,
             settle: Duration::from_millis(3000),
             work_type_override: None,
             assert: assert::Assert::default_checks(),
@@ -1825,7 +1832,7 @@ mod tests {
             topo: &t,
             duration: std::time::Duration::from_secs(1),
             workers_per_cgroup: 1,
-            sched_pid: 0,
+            sched_pid: None,
             settle: Duration::from_millis(3000),
             work_type_override: None,
             assert: assert::Assert::default_checks(),
@@ -1844,7 +1851,7 @@ mod tests {
             topo: &t,
             duration: std::time::Duration::from_secs(1),
             workers_per_cgroup: 7,
-            sched_pid: 0,
+            sched_pid: None,
             settle: Duration::from_millis(3000),
             work_type_override: None,
             assert: assert::Assert::default_checks(),

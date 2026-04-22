@@ -94,7 +94,7 @@ mod tests {
             topo,
             duration: Duration::from_secs(1),
             workers_per_cgroup: 3,
-            sched_pid: 1,
+            sched_pid: Some(1),
             settle: Duration::from_millis(100),
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),

@@ -2184,8 +2184,15 @@ mod tests {
     /// proves they succeeded too.
     #[test]
     fn run_make_with_output_surfaces_actionable_error_when_kernel_dir_missing() {
-        let missing = std::path::Path::new("/this/path/should/not/exist/ktstr_test");
-        let err = run_make_with_output(missing, &["foo"], None)
+        // Per-invocation tempdir gives us a guaranteed-unique parent;
+        // joining a nonexistent child name produces a path that is
+        // provably-absent (the parent is fresh empty on every run).
+        // Avoids a hardcoded `/this/path/should/not/exist/...` literal
+        // that could collide across parallel test-runner instances and
+        // becomes wrong the moment someone pollutes /this on the host.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("nonexistent_child");
+        let err = run_make_with_output(&missing, &["foo"], None)
             .expect_err("nonexistent kernel_dir must surface a spawn failure");
         let rendered = format!("{err:#}");
         assert!(
@@ -2284,9 +2291,29 @@ mod tests {
     ///
     /// Test-only utility — no production caller. Lives in this test
     /// module so its scope is bounded.
+    ///
+    /// Serializes with [`STDERR_CAPTURE_LOCK`] so concurrent tests
+    /// running under nextest (one process, many threads) do not
+    /// race each other's fd-2 swap. The swap is a process-wide
+    /// mutation; any other thread writing to stderr while another
+    /// holds the swap would land its output in the captured
+    /// tempfile instead of the real stderr. Poison-recovery via
+    /// `unwrap_or_else(|e| e.into_inner())` keeps a panicked
+    /// earlier test from wedging every subsequent capture.
+    ///
+    /// [`StderrRestoreGuard`] is an RAII shield: even if `f()`
+    /// panics under the `panic = unwind` test profile, fd 2 is
+    /// restored from `saved` on the guard's Drop before the unwind
+    /// propagates. Without this guard a panicking `f` would leave
+    /// fd 2 pointing at the tempfile for every subsequent caller
+    /// — including the test harness's own failure messages, which
+    /// would silently disappear into the sink.
     fn capture_test_stderr<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
         use nix::unistd::{dup, dup2_stderr};
         use std::io::{Read, Seek, SeekFrom, Write};
+        let _lock = STDERR_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut sink = tempfile::tempfile().expect("create stderr-capture tempfile");
         // Flush any pending stderr buffering before redirect. eprintln!
         // is line-buffered to a Stderr lock; flush ensures pre-call
@@ -2295,14 +2322,59 @@ mod tests {
         std::io::stderr().flush().ok();
         let saved = dup(std::io::stderr()).expect("dup(stderr) failed");
         dup2_stderr(&sink).expect("dup2_stderr(sink) failed");
+        // Install the RAII guard BEFORE running f so a panic inside
+        // f triggers Drop-based restore. The guard owns `saved` and
+        // installs it onto fd 2 on Drop via `dup2_stderr`.
+        let guard = StderrRestoreGuard { saved: Some(saved) };
         let result = f();
         // Flush before restore so all of f's writes land in the sink.
         std::io::stderr().flush().ok();
-        dup2_stderr(&saved).expect("dup2_stderr(saved) failed");
+        // Drop the guard explicitly so the dup2 happens before we
+        // read from the sink below — ordering matters: reading
+        // while fd 2 still points at the sink would lose any bytes
+        // f emitted just before its last flush, and reads on the
+        // still-writable tempfile would race against in-flight
+        // buffered writes from the stdlib.
+        drop(guard);
         sink.seek(SeekFrom::Start(0)).expect("rewind sink");
         let mut bytes = Vec::new();
         sink.read_to_end(&mut bytes).expect("read sink");
         (result, bytes)
+    }
+
+    /// Process-wide mutex serializing [`capture_test_stderr`] calls.
+    /// Rustc + nextest can schedule multiple `#[test]` fns onto the
+    /// same process; the fd-2 swap inside `capture_test_stderr` is a
+    /// non-reentrant process-global mutation. Without this lock two
+    /// concurrent capture calls would each see the other's output
+    /// land in their sink, or the save/restore pair would interleave
+    /// and permanently break fd 2 for every thread.
+    static STDERR_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII shield that restores fd 2 from the stashed `saved`
+    /// OwnedFd on Drop. The capture path can panic inside `f()`
+    /// under the `panic = unwind` test profile; without this guard
+    /// the swap would leak and every subsequent stderr write in
+    /// the test process would land in the (now-orphaned) tempfile.
+    /// `saved` is `Option` so Drop can `take()` and consume it
+    /// without an `&mut` borrow fight.
+    struct StderrRestoreGuard {
+        saved: Option<std::os::fd::OwnedFd>,
+    }
+
+    impl Drop for StderrRestoreGuard {
+        fn drop(&mut self) {
+            if let Some(saved) = self.saved.take() {
+                // `dup2_stderr` is infallible here under normal
+                // conditions (the saved fd is live and fd 2 is
+                // always open); if it somehow fails we are already
+                // unwinding and cannot do better than eprintln —
+                // which itself goes through the very fd we are
+                // trying to restore, so we silently swallow the
+                // error rather than risk a double-panic.
+                let _ = nix::unistd::dup2_stderr(&saved);
+            }
+        }
     }
 
     /// Direct proof of the merge: emit a unique marker on stdout and
@@ -2431,11 +2503,7 @@ mod tests {
     fn run_make_with_output_releases_fds_on_spawn_failure() {
         let proc_fd = std::path::Path::new("/proc/self/fd");
         if !proc_fd.is_dir() {
-            eprintln!(
-                "skipping run_make_with_output_releases_fds_on_spawn_failure: \
-                 /proc/self/fd not available"
-            );
-            return;
+            skip!("/proc/self/fd not available");
         }
         let count_fds = || -> usize {
             std::fs::read_dir(proc_fd)
@@ -2448,15 +2516,22 @@ mod tests {
         // the std/anyhow paths) that look like fd growth on a single
         // before/after measurement. Run once outside the measurement
         // window so steady-state fd usage is what we sample.
-        let missing = std::path::Path::new("/this/path/should/not/exist/ktstr_test_fdcheck");
-        let _ = run_make_with_output(missing, &["foo"], None);
+        //
+        // Per-invocation tempdir yields a guaranteed-absent child path
+        // without relying on a hardcoded `/this/path/should/not/exist`
+        // literal that could collide across parallel test-runner
+        // instances or become wrong the moment /this is polluted on
+        // the host.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("nonexistent_child");
+        let _ = run_make_with_output(&missing, &["foo"], None);
         let before = count_fds();
         // Run the failing path several times — a per-call leak of
         // even one fd would compound here and surface as a clear
         // delta. A single-call measurement could miss small leaks
         // masked by transient fd churn from the test runtime.
         for _ in 0..16 {
-            let _ = run_make_with_output(missing, &["foo"], None);
+            let _ = run_make_with_output(&missing, &["foo"], None);
         }
         let after = count_fds();
         assert!(

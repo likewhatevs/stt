@@ -1842,10 +1842,13 @@ fn run_scenario(
     // --- Step loop with per-Step teardown ---
     for (step_idx, step) in steps.iter().enumerate() {
         // Check scheduler liveness between steps (skip before first).
-        // sched_pid == 0 means no scheduler was configured
+        // sched_pid == None means no scheduler was configured
         // (kernel-default path); the liveness probe cannot
         // meaningfully report on a pid that was never set.
-        if step_idx > 0 && ctx.sched_pid != 0 && !process_alive(ctx.sched_pid) {
+        if step_idx > 0
+            && let Some(pid) = ctx.sched_pid
+            && !process_alive(pid)
+        {
             // Collect backdrop-owned workload handles into the
             // result before reporting the crash so whatever the
             // persistent workers produced is still assertable.
@@ -1853,7 +1856,7 @@ fn run_scenario(
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::Monitor,
+                crate::assert::DetailKind::SchedulerExited,
                 format!(
                     "{} unexpectedly after completing step {} of {} ({:.1}s into test)",
                     crate::assert::SCHED_EXITED_PREFIX,
@@ -1917,9 +1920,11 @@ fn run_scenario(
         w.write(shm_ring::MSG_TYPE_SCENARIO_END, &elapsed.to_ne_bytes());
     }
 
-    // Final liveness check. sched_pid == 0 ⇒ no scheduler configured
-    // (kernel-default path); no liveness to report on.
-    let sched_dead = ctx.sched_pid != 0 && !process_alive(ctx.sched_pid);
+    // Final liveness check. sched_pid == None ⇒ no scheduler
+    // configured (kernel-default path); no liveness to report on.
+    let sched_dead = ctx
+        .sched_pid
+        .is_some_and(|pid| !process_alive(pid));
 
     // --- Backdrop teardown ---
     let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
@@ -1928,7 +1933,7 @@ fn run_scenario(
     if sched_dead {
         result.passed = false;
         result.details.push(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::Monitor,
+            crate::assert::DetailKind::SchedulerExited,
             format!(
                 "{} unexpectedly (detected after all {} steps completed, {:.1}s elapsed)",
                 crate::assert::SCHED_EXITED_PREFIX,
@@ -2053,29 +2058,65 @@ fn build_stimulus(
 }
 
 /// Validate that a MemPolicy's node set is consistent with the
-/// cpuset the cgroup runs in and with the host topology, before
-/// `set_mempolicy(2)` gets a chance to silently mis-behave or
-/// return a generic `EINVAL`.
+/// cgroup's scenario intent — the cpuset the cgroup runs in and
+/// the host topology.
 ///
-/// Flag-specific handling (in order of evaluation):
+/// # Why this is a scenario-intent check, not a kernel guard
+///
+/// ktstr only writes `cpuset.cpus` on each cgroup; it never writes
+/// `cpuset.mems`, so `cpuset.mems` inherits its parent's permissive
+/// "all nodes" default. Under that layout the kernel's
+/// `set_mempolicy(2)` path does NOT silently intersect the nodemask
+/// with the cpuset — the cpuset's `mems_allowed` covers every node,
+/// so the policy's explicit nodemask is used as-written.
+///
+/// This holds when ktstr is the cgroup root (typical: PID 1 in a
+/// guest VM, the default deployment shape). Under a nested-cgroup
+/// layout with a narrowed parent `cpuset.mems` — container-in-
+/// container, systemd slices with `AllowedMemoryNodes=`, a host-run
+/// via `ktstr-jemalloc-probe` wrapped by another cgroup controller —
+/// the inherited `mems_allowed` IS restricted, and the kernel DOES
+/// intersect `set_mempolicy`'s nodemask with it. In that shape the
+/// validator additionally functions as a kernel guard: it catches
+/// policy nodes the kernel would silently drop before they reach
+/// the syscall.
+///
+/// What the validator catches is a **scenario-design mismatch**:
+/// you pinned CPUs on NUMA node X (via `CpusetSpec::Numa(X)`) but
+/// asked the mempolicy to bind/prefer/interleave a disjoint node Y,
+/// meaning the worker's compute is local to node X while its
+/// allocations live on node Y — producing cross-socket traffic
+/// that the test author almost certainly did not intend. Surface
+/// the mismatch here before `run_steps` commits to the policy.
+///
+/// `MpolFlags::STATIC_NODES` is the rebind-behavior flag (see
+/// `mm/mempolicy.c: mpol_relative_nodemask` + the `MPOL_F_*`
+/// handling in `mpol_rebind_policy`): with it set, the nodemask
+/// survives cpuset rebind operations unchanged; without it, the
+/// nodemask is remapped when the cpuset's `mems_allowed` changes
+/// after the policy was installed. Since ktstr never rebinds
+/// `cpuset.mems` mid-run, the flag is effectively a
+/// cross-node-intent declaration for the validator's purposes — a
+/// sign the author knows the intent is "allocations on a node
+/// outside the CPU-affinity cpuset" and has opted in to that shape.
+///
+/// # Flag-specific handling (in order of evaluation)
 ///
 /// - `STATIC_NODES | RELATIVE_NODES` both set → bail: the kernel
 ///   rejects this combination with `EINVAL`; surfacing it here
 ///   names the offender before the syscall.
-/// - `STATIC_NODES` only → the nodemask is absolute and is NOT
-///   intersected with the cpuset. Cpuset coverage does not apply,
-///   but each referenced node must exist on the host topology or
-///   the kernel will reject the policy. Verify existence; bail
-///   with the missing nodes if any.
+/// - `STATIC_NODES` only → the caller has declared intentional
+///   cross-node placement. Skip the cpuset-intent check, but each
+///   referenced node must exist on the host topology or the
+///   kernel will reject the policy. Verify existence; bail with
+///   the missing nodes if any.
 /// - `RELATIVE_NODES` only → the nodemask is an ordinal into the
-///   cpuset's allowed-nodes set (the kernel performs the
-///   relative→absolute remap internally). Cpuset coverage does not
-///   apply in absolute-id terms, so bypass.
-/// - No relevant flag set → default kernel path silently
-///   intersects the nodemask with the cpuset. Enforce coverage
-///   here so cross-node tests do not collapse into degenerate
-///   same-cpuset-only observations; bail naming the uncovered
-///   nodes and the `.mpol_flags(MpolFlags::STATIC_NODES)` opt-in.
+///   cpuset's allowed-nodes set. Cpuset coverage does not apply in
+///   absolute-id terms, so bypass.
+/// - No relevant flag set → enforce cpuset-intent coverage:
+///   every policy node must appear in the cpuset's covered NUMA
+///   nodes. Bail naming the uncovered nodes AND both escape
+///   hatches (STATIC_NODES opt-in; widening the cpuset).
 fn validate_mempolicy_cpuset(
     policy: &MemPolicy,
     flags: crate::workload::MpolFlags,
@@ -2154,10 +2195,17 @@ fn validate_mempolicy_cpuset(
     if !uncovered.is_empty() {
         anyhow::bail!(
             "cgroup '{}': MemPolicy references NUMA node(s) {:?} \
-             but cpuset covers only node(s) {:?} (without MPOL_F_STATIC_NODES \
-             the kernel silently intersects the nodemask with the cpuset — \
-             add .mpol_flags(MpolFlags::STATIC_NODES) if cross-node \
-             placement is intentional)",
+             outside the cpuset's coverage (cpuset covers node(s) \
+             {:?}) — some or all of the worker's allocations would \
+             live on NUMA nodes its CPUs cannot reach locally, \
+             producing cross-socket allocation traffic that is \
+             almost certainly unintended. Two fixes: \
+             (a) add .mpol_flags(MpolFlags::STATIC_NODES) to \
+             declare the cross-node placement intentional (the \
+             flag survives cpuset rebinds; see MpolFlags doc), or \
+             (b) widen the cpuset to cover the policy's nodes \
+             (e.g. CpusetSpec::Numa(N) for each referenced N, or \
+             a CpusetSpec::Exact set that spans both).",
             cgroup_name,
             uncovered,
             cpuset_numa,
@@ -3232,7 +3280,7 @@ mod tests {
             topo: &topo,
             duration: Duration::from_secs(10),
             workers_per_cgroup: 4,
-            sched_pid: 0,
+            sched_pid: None,
             settle: Duration::from_millis(1000),
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),
@@ -3353,7 +3401,7 @@ mod tests {
             topo,
             duration: Duration::from_secs(10),
             workers_per_cgroup: 4,
-            sched_pid: 0,
+            sched_pid: None,
             settle: Duration::ZERO,
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),
@@ -4229,15 +4277,31 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
         let policy = MemPolicy::Bind([1].into_iter().collect()); // node 1 not in cpuset
+        let err = validate_mempolicy_cpuset(
+            &policy,
+            crate::workload::MpolFlags::NONE,
+            &cpuset,
+            &ctx,
+            "cg_bind_test",
+        )
+        .unwrap_err()
+        .to_string();
+        // Cgroup name must appear so multi-cgroup scenarios can
+        // triage which entry triggered the bail.
+        assert!(err.contains("cg_bind_test"), "bail must name cgroup: {err}");
+        // Uncovered node (1) and the covering cpuset node (0) must
+        // both appear so the reader sees the exact disjoint pair.
+        assert!(err.contains("[1]"), "bail must name uncovered node 1: {err}");
+        assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
+        // Both escape hatches must surface: STATIC_NODES opt-in
+        // AND cpuset widening.
         assert!(
-            validate_mempolicy_cpuset(
-                &policy,
-                crate::workload::MpolFlags::NONE,
-                &cpuset,
-                &ctx,
-                "cg_0",
-            )
-            .is_err()
+            err.contains("STATIC_NODES"),
+            "bail must name STATIC_NODES escape hatch: {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Exact"),
+            "bail must name the CpusetSpec::Exact cpuset-widening escape hatch: {err}",
         );
     }
 
@@ -4265,16 +4329,20 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
         let policy = MemPolicy::Preferred(1);
-        assert!(
-            validate_mempolicy_cpuset(
-                &policy,
-                crate::workload::MpolFlags::NONE,
-                &cpuset,
-                &ctx,
-                "cg_0",
-            )
-            .is_err()
-        );
+        let err = validate_mempolicy_cpuset(
+            &policy,
+            crate::workload::MpolFlags::NONE,
+            &cpuset,
+            &ctx,
+            "cg_preferred_test",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cg_preferred_test"), "bail must name cgroup: {err}");
+        assert!(err.contains("[1]"), "bail must name uncovered node 1: {err}");
+        assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
+        assert!(err.contains("STATIC_NODES"), "bail must name STATIC_NODES: {err}");
+        assert!(err.contains("CpusetSpec::Exact"), "bail must name CpusetSpec::Exact widening: {err}");
     }
 
     #[test]
@@ -4283,16 +4351,22 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
         let policy = MemPolicy::Interleave([0, 1].into_iter().collect());
-        assert!(
-            validate_mempolicy_cpuset(
-                &policy,
-                crate::workload::MpolFlags::NONE,
-                &cpuset,
-                &ctx,
-                "cg_0",
-            )
-            .is_err()
-        );
+        let err = validate_mempolicy_cpuset(
+            &policy,
+            crate::workload::MpolFlags::NONE,
+            &cpuset,
+            &ctx,
+            "cg_interleave_test",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cg_interleave_test"), "bail must name cgroup: {err}");
+        // Only node 1 is uncovered (node 0 is covered by cpuset); the
+        // bail should not list node 0 in the uncovered set.
+        assert!(err.contains("[1]"), "bail must name uncovered node 1: {err}");
+        assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
+        assert!(err.contains("STATIC_NODES"), "bail must name STATIC_NODES: {err}");
+        assert!(err.contains("CpusetSpec::Exact"), "bail must name CpusetSpec::Exact widening: {err}");
     }
 
     /// `MPOL_F_STATIC_NODES` is the kernel's explicit opt-in for
@@ -4472,7 +4546,7 @@ mod tests {
             topo,
             duration: Duration::from_secs(1),
             workers_per_cgroup: 1,
-            sched_pid: 0,
+            sched_pid: None,
             settle: Duration::ZERO,
             work_type_override: None,
             assert: crate::assert::Assert::default_checks(),

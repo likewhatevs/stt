@@ -604,7 +604,7 @@ fn build_dispatch_ctx_parts(
 ) -> (
     crate::topology::TestTopology,
     crate::cgroup::CgroupManager,
-    libc::pid_t,
+    Option<libc::pid_t>,
     crate::assert::Assert,
 ) {
     // Sysfs is ground truth: CPUID, ACPI MADT, and MPTABLE all
@@ -625,7 +625,7 @@ fn build_dispatch_ctx_parts(
     let sched_pid = std::env::var("SCHED_PID")
         .ok()
         .and_then(|s| s.parse::<libc::pid_t>().ok())
-        .unwrap_or(0);
+        .filter(|&pid| pid != 0);
     // Three-layer merge: default_checks → scheduler.assert → entry.assert.
     let merged_assert = crate::assert::Assert::default_checks()
         .merge(entry.scheduler.assert())

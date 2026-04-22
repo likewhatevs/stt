@@ -148,10 +148,11 @@ pub enum DetailKind {
     CrossNodeMigration,
     /// Slow-tier (memory tier) threshold failure.
     SlowTier,
-    /// Scheduler-health diagnostic — includes monitor-subsystem anomalies
-    /// (imbalance, DSQ depth, rq_clock stall) and scheduler-liveness
-    /// detection (process crashes).
+    /// Monitor-subsystem anomaly (imbalance, DSQ depth, rq_clock stall).
     Monitor,
+    /// Scheduler process observed to have exited (via `sched_pid`
+    /// probe returning ESRCH or wait on the leader).
+    SchedulerExited,
     /// Skip notification (scenario could not run under this topology/flags).
     Skip,
     /// Uncategorized — falls through when a detail has no specific kind.
@@ -240,6 +241,12 @@ impl AssertDetail {
     /// form matched emitters that mentioned either phrase anywhere
     /// in a longer detail, which allowed unrelated diagnostics to
     /// accidentally trip the scheduler-death console-dump path.
+    ///
+    /// The contract applies in particular to details emitted with
+    /// `DetailKind::SchedulerExited`: keeping [`SCHED_EXITED_PREFIX`]
+    /// at the start of the message preserves this predicate as a
+    /// defense-in-depth catch if a future consumer emits a
+    /// scheduler-exit message with a mis-set kind.
     ///
     /// **Defense-in-depth note on `SCHED_NO_LONGER_RUNNING_PREFIX`:**
     /// every current emitter of this prefix (see `scenario::mod.rs`

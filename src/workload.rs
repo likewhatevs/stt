@@ -1108,7 +1108,13 @@ fn classify_wait_outcome(
     }
 }
 
-/// PID of the scheduler process. Workers kill it on stall to trigger dump.
+/// PID of the scheduler process. Workers kill it on stall to trigger
+/// dump. `0` encodes "no scheduler configured"; the TLS keeps the
+/// sentinel (rather than `Option<i32>`) because `AtomicOption` is
+/// materially more expensive on the hot watchdog path. The
+/// scenario-side [`crate::scenario::Ctx::sched_pid`] uses
+/// `Option<pid_t>` with `None` as the unconfigured state — the two
+/// channels are deliberately split.
 static SCHED_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// In repro mode, don't kill the scheduler on stall — keep it alive for assertions.

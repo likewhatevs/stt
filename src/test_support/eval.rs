@@ -454,11 +454,19 @@ fn evaluate_vm_result(
             } else {
                 String::new()
             };
-            let console_section = if check_result
-                .details
-                .iter()
-                .any(crate::assert::AssertDetail::is_scheduler_death)
-                || verbose()
+            // Dual filter for the console-dump gate:
+            //   Primary: structured `DetailKind::SchedulerExited` tag —
+            //     every current scheduler-exit emitter sets it, and
+            //     the enum variant is cheap to match.
+            //   Fallback: `is_scheduler_death` prefix-match on the
+            //     message — catches any future detail that carries
+            //     the scheduler-exit wording but a mis-set kind, so
+            //     a regression in one emit site still surfaces the
+            //     console section instead of silently dropping it.
+            let console_section = if check_result.details.iter().any(|d| {
+                d.kind == crate::assert::DetailKind::SchedulerExited
+                    || d.is_scheduler_death()
+            }) || verbose()
             {
                 let init_stage = classify_init_stage(output);
                 format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
@@ -1817,7 +1825,7 @@ mod tests {
 
     #[test]
     fn eval_sched_exit_includes_console() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler process exited unexpectedly after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"SchedulerExited","message":"scheduler process exited unexpectedly after completing step 1 of 2 (0.5s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_exit_console__");
         let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
@@ -1842,7 +1850,7 @@ mod tests {
 
     #[test]
     fn eval_sched_exit_includes_monitor() {
-        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Monitor","message":"scheduler process exited unexpectedly during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
+        let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"SchedulerExited","message":"scheduler process exited unexpectedly during workload (2.0s into test)"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_exit_monitor__");
         let result = crate::vmm::VmResult {
