@@ -360,7 +360,13 @@ impl Runner {
                 None
             };
 
-            let _ = cgroups.cleanup_all();
+            if let Err(e) = cgroups.cleanup_all() {
+                tracing::warn!(
+                    qname,
+                    err = %format!("{e:#}"),
+                    "cgroup cleanup_all returned error; leaked directories may remain under parent",
+                );
+            }
             std::thread::sleep(self.config.cleanup);
 
             let r = match res {

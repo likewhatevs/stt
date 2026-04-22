@@ -229,7 +229,7 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
 /// / [`METRICS`] rather than dereferencing fields directly so new
 /// metrics can land through the registry without touching every
 /// reader.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GauntletRow {
     pub scenario: String,
     pub topology: String,
@@ -2005,8 +2005,9 @@ mod tests {
 
     /// Empty collections are elided on serialize. Regression guard for
     /// the `skip_serializing_if` pair — dropping either arm would make
-    /// sidecar files carry `"flags":[]` / `"ext_metrics":{}` noise and
-    /// silently change the on-disk schema for existing runs.
+    /// the writer emit `"flags":[]` / `"ext_metrics":{}` and break the
+    /// symmetric contract the `default` half relies on (writer omits,
+    /// reader defaults).
     #[test]
     fn gauntlet_row_empty_collections_omit_keys() {
         let row = make_row("scn", "topo", true, 0.0);
@@ -2043,20 +2044,18 @@ mod tests {
         );
     }
 
-    /// Round-trip with empty collections: `serde(default)` must
-    /// repopulate the absent keys with empty values so the reconstructed
-    /// row compares equal on those fields. Regression guard for the
-    /// `default` half of the symmetric pair — removing it would make
-    /// deserialize fail on any row written before the fields existed.
+    /// Round-trip with empty collections: the writer omits the keys
+    /// (via `skip_serializing_if`), so the reader must default them
+    /// back to empty for the round-trip to close. Regression guard
+    /// for the `default` half of the symmetric pair — removing it
+    /// would make deserialize fail on JSON this same process just
+    /// produced.
     #[test]
     fn gauntlet_row_round_trip_empty_collections() {
         let row = make_row("scn", "topo", true, 1.5);
         let json = serde_json::to_string(&row).unwrap();
         let back: GauntletRow = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.flags, row.flags);
-        assert_eq!(back.ext_metrics, row.ext_metrics);
-        assert_eq!(back.scenario, row.scenario);
-        assert_eq!(back.spread, row.spread);
+        assert_eq!(back, row);
         assert!(back.flags.is_empty());
         assert!(back.ext_metrics.is_empty());
     }
@@ -2073,7 +2072,6 @@ mod tests {
         row.ext_metrics.insert("m2".into(), 2.5);
         let json = serde_json::to_string(&row).unwrap();
         let back: GauntletRow = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.flags, row.flags);
-        assert_eq!(back.ext_metrics, row.ext_metrics);
+        assert_eq!(back, row);
     }
 }

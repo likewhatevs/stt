@@ -25,8 +25,8 @@ let mut handle = WorkloadHandle::spawn(&config)?;
 Set only the fields that matter for the test and let
 `..Default::default()` fill in the rest. The spread-default form is the
 canonical style in the ktstr codebase — it keeps examples pinned to
-intent (`num_workers`, `work_type`) and survives additions to
-`WorkloadConfig` (e.g. NUMA memory-policy fields) without rotting.
+intent (`num_workers`, `work_type`) and has already absorbed additions
+to `WorkloadConfig` (the NUMA memory-policy fields) without rotting.
 Consult the `WorkloadConfig` rustdoc for the current field list.
 
 `spawn()` forks `num_workers` child processes. Each child installs a

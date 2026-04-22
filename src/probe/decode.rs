@@ -152,10 +152,23 @@ pub(crate) fn decode_named_value_hinted(
     hint: Option<super::btf::RenderHint>,
 ) -> String {
     let as_u64 = || -> u64 {
-        if let Some(hex) = val.strip_prefix("0x") {
-            u64::from_str_radix(hex, 16).unwrap_or(0)
+        let parsed = if let Some(hex) = val.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16)
         } else {
-            val.parse().unwrap_or(0)
+            val.parse::<u64>()
+        };
+        match parsed {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    struct_name,
+                    key,
+                    val,
+                    err = %e,
+                    "malformed probe value; falling back to 0",
+                );
+                0
+            }
         }
     };
 

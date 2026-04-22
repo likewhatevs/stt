@@ -161,12 +161,23 @@ fn find_llc_index(cpu: usize) -> Result<usize> {
             && let Ok(level) = level_str.trim().parse::<usize>()
             && level > max_level
         {
-            max_level = level;
-            llc_index = name
+            let idx_str = name
                 .strip_prefix("index")
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
+                .expect("filtered by starts_with(\"index\") above");
+            match idx_str.parse::<usize>() {
+                Ok(idx) => {
+                    max_level = level;
+                    llc_index = idx;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        cache_dir = %cache_dir,
+                        entry = %name,
+                        err = %e,
+                        "malformed sysfs cache index name; skipping entry",
+                    );
+                }
+            }
         }
     }
     Ok(llc_index)
