@@ -127,16 +127,16 @@ pub struct SidecarResult {
     /// hash and a monotonic counter to distinguish runs within the same
     /// build.
     pub run_id: String,
-    /// Host fingerprint — static-ish runtime context (CPU model,
+    /// Host context — static-ish runtime state (CPU model,
     /// memory size, THP policy, kernel release, host cmdline,
     /// scheduler tunables). Populated at sidecar-write time from
-    /// `host_state::collect_host_fingerprint`. `None` only on the
+    /// `host_state::collect_host_context`. `None` only on the
     /// test-fixture path where the sidecar is constructed by hand;
     /// deliberately excluded from [`sidecar_variant_hash`] so
     /// gauntlet variants on different hosts collapse into the same
     /// hash bucket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<crate::host_state::HostFingerprint>,
+    pub host: Option<crate::host_state::HostContext>,
 }
 
 /// Scan a directory for ktstr sidecar JSON files. Recurses one level
@@ -583,7 +583,7 @@ pub(crate) fn write_skip_sidecar(
         kernel_version: detect_kernel_version(),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
-        host: Some(crate::host_state::collect_host_fingerprint()),
+        host: Some(crate::host_state::collect_host_context()),
     };
     serialize_and_write_sidecar(&sidecar, "skip sidecar")
 }
@@ -633,7 +633,7 @@ pub(crate) fn write_sidecar(
         kernel_version: detect_kernel_version(),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
-        host: Some(crate::host_state::collect_host_fingerprint()),
+        host: Some(crate::host_state::collect_host_context()),
     };
     serialize_and_write_sidecar(&sidecar, "sidecar")
 }
@@ -1905,12 +1905,12 @@ mod tests {
     /// two gauntlet variants run on different hosts must collapse
     /// into the same hash bucket so downstream stats tooling groups
     /// them together. If a future change accidentally folds
-    /// `HostFingerprint` into the hash, this test catches it before
+    /// `HostContext` into the hash, this test catches it before
     /// the run-key split reaches on-disk sidecars.
     #[test]
-    fn sidecar_variant_hash_excludes_host_fingerprint() {
+    fn sidecar_variant_hash_excludes_host_context() {
         use crate::assert::ScenarioStats;
-        use crate::host_state::HostFingerprint;
+        use crate::host_state::HostContext;
         let base = || SidecarResult {
             test_name: String::new(),
             topology: "1n1l2c1t".to_string(),
@@ -1934,7 +1934,7 @@ mod tests {
             host: None,
         };
         let without_host = base();
-        let populated = HostFingerprint {
+        let populated = HostContext {
             cpu_model: Some("Example CPU".to_string()),
             cpu_vendor: Some("GenuineExample".to_string()),
             total_memory_kb: Some(16_384_000),
@@ -1957,24 +1957,24 @@ mod tests {
         assert_eq!(
             sidecar_variant_hash(&without_host),
             sidecar_variant_hash(&with_host),
-            "host fingerprint must not influence variant hash",
+            "host context must not influence variant hash",
         );
     }
 
-    /// A `SidecarResult` carrying a fully populated `HostFingerprint`
+    /// A `SidecarResult` carrying a fully populated `HostContext`
     /// round-trips through serde_json without losing fields. Pins
     /// the combined schema so a future change that breaks
     /// composition between the outer `SidecarResult` and the
-    /// `HostFingerprint` it embeds is caught at the seam.
+    /// `HostContext` it embeds is caught at the seam.
     #[test]
-    fn sidecar_result_roundtrip_with_populated_host_fingerprint() {
-        use crate::host_state::HostFingerprint;
+    fn sidecar_result_roundtrip_with_populated_host_context() {
+        use crate::host_state::HostContext;
         let mut tunables = std::collections::BTreeMap::new();
         tunables.insert(
             "sched_migration_cost_ns".to_string(),
             "500000".to_string(),
         );
-        let fp = HostFingerprint {
+        let ctx = HostContext {
             cpu_model: Some("Example CPU".to_string()),
             cpu_vendor: Some("GenuineExample".to_string()),
             total_memory_kb: Some(16_384_000),
@@ -2010,7 +2010,7 @@ mod tests {
             kernel_version: None,
             timestamp: String::new(),
             run_id: String::new(),
-            host: Some(fp),
+            host: Some(ctx),
         };
         let json = serde_json::to_string(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();

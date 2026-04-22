@@ -1,6 +1,6 @@
 //! Host runtime state captured at sidecar-write time.
 //!
-//! [`HostFingerprint`] is a snapshot of the host running the tool:
+//! [`HostContext`] is a snapshot of the host running the tool:
 //! kernel release, CPU identity, memory size, hugepages config,
 //! transparent-hugepage policy, kernel scheduler tunables, NUMA
 //! node count, and kernel cmdline. Static fields (CPU identity,
@@ -17,9 +17,9 @@ use std::sync::OnceLock;
 /// [`SidecarResult`](crate::test_support::SidecarResult). Every
 /// field is optional so a partial read (missing /proc entry,
 /// permission denied, parse failure) still records the fields that
-/// did succeed instead of dropping the whole fingerprint.
+/// did succeed instead of dropping the whole snapshot.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct HostFingerprint {
+pub struct HostContext {
     /// CPU model string — the `model name` line of `/proc/cpuinfo`.
     /// Single value (first processor entry) since heterogeneous
     /// CPU models on a single host are rare enough that the
@@ -125,22 +125,22 @@ struct StaticHostInfo {
 
 static STATIC_HOST_INFO: OnceLock<StaticHostInfo> = OnceLock::new();
 
-/// Capture the host fingerprint. Static fields are collected once
+/// Capture the host context. Static fields are collected once
 /// and cached; dynamic fields are re-read on every call so
 /// intra-run sysctl / hugepage / THP changes are reflected.
 ///
 /// Every sub-read is fallible; individual failures leave the
-/// corresponding field `None` and the rest of the fingerprint
+/// corresponding field `None` and the rest of the context
 /// proceeds. A host with `/proc` entirely unmounted (extreme test
-/// fixture) returns a `HostFingerprint` with every field `None` —
+/// fixture) returns a `HostContext` with every field `None` —
 /// which serializes to an empty JSON object and distinguishes
 /// "collection attempted, nothing known" from "collection not
-/// attempted" (represented at the enclosing `Option<HostFingerprint>`
+/// attempted" (represented at the enclosing `Option<HostContext>`
 /// layer on [`SidecarResult`](crate::test_support::SidecarResult)).
-pub(crate) fn collect_host_fingerprint() -> HostFingerprint {
+pub(crate) fn collect_host_context() -> HostContext {
     let static_info = STATIC_HOST_INFO.get_or_init(compute_static_host_info).clone();
     let meminfo = read_meminfo();
-    HostFingerprint {
+    HostContext {
         cpu_model: static_info.cpu_model,
         cpu_vendor: static_info.cpu_vendor,
         total_memory_kb: static_info.total_memory_kb,
@@ -211,7 +211,7 @@ fn read_cpuinfo_identity() -> (Option<String>, Option<String>) {
     (model, vendor)
 }
 
-/// The `/proc/meminfo` fields the fingerprint consumes. A
+/// The `/proc/meminfo` fields the host-context snapshot consumes. A
 /// purpose-built struct avoids the BTreeMap lookup/clone dance and
 /// makes the set of captured fields explicit at the type level.
 #[derive(Default)]
@@ -222,7 +222,7 @@ struct MeminfoFields {
     hugepagesize_kb: Option<u64>,
 }
 
-/// Return the four `/proc/meminfo` fields the fingerprint needs.
+/// Return the four `/proc/meminfo` fields the host context needs.
 /// Lines without a numeric first token are silently skipped so a
 /// kernel that introduces a new non-numeric line (e.g. a future
 /// flags field) does not poison the struct.
@@ -254,7 +254,7 @@ fn read_meminfo() -> MeminfoFields {
 /// Read a sysfs leaf (or `/proc` pseudofile), trimming leading and
 /// trailing whitespace. Returns `None` on any read error (ENOENT,
 /// EACCES, EIO) so the caller records the field as absent without
-/// treating it as a fatal fingerprint failure. Empty files after
+/// treating it as a fatal context-collection failure. Empty files after
 /// trim map to `None` too — an empty cmdline or thp file is not
 /// useful to record.
 fn read_trimmed_sysfs(path: impl AsRef<std::path::Path>) -> Option<String> {
@@ -319,41 +319,43 @@ fn count_numa_nodes_via_topology() -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// Fingerprint reads are host-dependent: we assert the
+    /// Host-context reads are host-dependent: we assert the
     /// collector returns SOMETHING, not specific values. On Linux
     /// CI the uname fields at least should populate.
     #[test]
-    fn collect_host_fingerprint_returns_populated_struct_on_linux() {
-        let fp = collect_host_fingerprint();
+    fn collect_host_context_returns_populated_struct_on_linux() {
+        let ctx = collect_host_context();
         // uname is always readable on Linux (it's a syscall, no
         // filesystem dependency), so these three must populate.
-        assert_eq!(fp.uname_sysname.as_deref(), Some("Linux"));
-        assert!(fp.uname_release.is_some(), "uname release present");
-        assert!(fp.uname_machine.is_some(), "uname machine present");
+        assert_eq!(ctx.uname_sysname.as_deref(), Some("Linux"));
+        assert!(ctx.uname_release.is_some(), "uname release present");
+        assert!(ctx.uname_machine.is_some(), "uname machine present");
     }
 
     /// `/proc/cmdline` is always readable on a running Linux system
-    /// (the kernel exposes it unconditionally). The filter keeps
-    /// scheduler-relevant tokens; when none are present the field
-    /// is `None`. The assertion only requires that, when populated,
-    /// the captured value is trimmed (no stray whitespace).
+    /// (the kernel exposes it unconditionally). The capture is
+    /// verbatim — `read_trimmed_sysfs` trims leading/trailing
+    /// whitespace and returns `None` only when the read fails or
+    /// the file is empty after trim. No token filtering is applied.
+    /// The assertion only requires that, when populated, the
+    /// captured value is trimmed (no stray whitespace).
     #[test]
-    fn collect_host_fingerprint_captures_host_cmdline_on_linux() {
-        let fp = collect_host_fingerprint();
-        if let Some(cmdline) = fp.host_cmdline.as_ref() {
+    fn collect_host_context_captures_host_cmdline_on_linux() {
+        let ctx = collect_host_context();
+        if let Some(cmdline) = ctx.host_cmdline.as_ref() {
             assert!(!cmdline.is_empty(), "populated cmdline must not be empty");
             assert_eq!(cmdline.as_str(), cmdline.trim());
         }
     }
 
     /// Stability regression — repeated calls return equal
-    /// `HostFingerprint` values. Proves stability across calls:
+    /// `HostContext` values. Proves stability across calls:
     /// static fields come from the cache, dynamic fields match
     /// between back-to-back reads on a quiescent host.
     #[test]
-    fn collect_host_fingerprint_is_stable_across_calls() {
-        let a = collect_host_fingerprint();
-        let b = collect_host_fingerprint();
+    fn collect_host_context_is_stable_across_calls() {
+        let a = collect_host_context();
+        let b = collect_host_context();
         assert_eq!(a.uname_sysname, b.uname_sysname);
         assert_eq!(a.uname_release, b.uname_release);
         assert_eq!(a.uname_machine, b.uname_machine);
@@ -362,31 +364,31 @@ mod tests {
         assert_eq!(a.host_cmdline, b.host_cmdline);
     }
 
-    /// Fingerprint round-trips through JSON — every field uses
+    /// Host context round-trips through JSON — every field uses
     /// `#[serde(default, skip_serializing_if)]` so absent Options
     /// do not appear in the output and empty output parses back to
-    /// `HostFingerprint::default()`.
+    /// `HostContext::default()`.
     #[test]
-    fn host_fingerprint_empty_round_trips_via_json() {
-        let empty = HostFingerprint::default();
+    fn host_context_empty_round_trips_via_json() {
+        let empty = HostContext::default();
         let json = serde_json::to_string(&empty).expect("serialize empty");
-        assert_eq!(json, "{}", "default fingerprint must serialize to empty object");
-        let decoded: HostFingerprint =
+        assert_eq!(json, "{}", "default host context must serialize to empty object");
+        let decoded: HostContext =
             serde_json::from_str(&json).expect("deserialize empty");
         assert!(decoded.cpu_model.is_none());
         assert!(decoded.uname_sysname.is_none());
         assert!(decoded.host_cmdline.is_none());
     }
 
-    /// Populated fingerprint round-trips — every field's
+    /// Populated host context round-trips — every field's
     /// serde_json shape is stable. Asserts ALL fields, not just a
     /// handful, so a future field addition or serde-attr change
     /// that breaks a subset of the shape is caught by this test.
     #[test]
-    fn host_fingerprint_populated_round_trips_via_json() {
+    fn host_context_populated_round_trips_via_json() {
         let mut tunables = BTreeMap::new();
         tunables.insert("sched_migration_cost_ns".to_string(), "500000".to_string());
-        let fp = HostFingerprint {
+        let ctx = HostContext {
             cpu_model: Some("Example CPU".to_string()),
             cpu_vendor: Some("GenuineExample".to_string()),
             total_memory_kb: Some(16_384_000),
@@ -402,8 +404,8 @@ mod tests {
             uname_machine: Some("x86_64".to_string()),
             host_cmdline: Some("preempt=lazy transparent_hugepage=madvise".to_string()),
         };
-        let json = serde_json::to_string(&fp).expect("serialize");
-        let decoded: HostFingerprint = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&ctx).expect("serialize");
+        let decoded: HostContext = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.cpu_model.as_deref(), Some("Example CPU"));
         assert_eq!(decoded.cpu_vendor.as_deref(), Some("GenuineExample"));
         assert_eq!(decoded.total_memory_kb, Some(16_384_000));
