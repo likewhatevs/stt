@@ -175,11 +175,11 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 ///
 /// **First-call blocking.** The first caller to reach
 /// [`memoized_inference`] with an empty slot runs `load_inference`
-/// inside the outer lock. That load mmap's the pinned Qwen3-4B
-/// Q4_K_M GGUF (~2.44 GiB) and parses it into `ModelWeights` — a
-/// few seconds of wall time on a warm disk cache, tens of seconds
-/// on a cold cache (block-backed read + quantization layer
-/// initialization). Every concurrent caller queued behind the
+/// inside the outer lock. That load opens the pinned Qwen3-4B
+/// Q4_K_M GGUF (~2.44 GiB): `std::fs::File::open` +
+/// `gguf_file::Content::read` parse the header, then
+/// `ModelWeights::from_gguf` reads the per-layer quantized tensors
+/// into `ModelWeights`. Every concurrent caller queued behind the
 /// outer mutex blocks for that entire window. Under nextest's
 /// default parallel execution, every `LlmExtract` test racing
 /// into the first call serializes here until the loader returns.
@@ -214,7 +214,7 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 ///
 /// An `Err(_)` slot is memoized exactly like an `Ok(_)` slot.
 /// If the first call fails — missing weights, SHA mismatch, a
-/// corrupt GGUF mmap, offline-gate trip — every subsequent call in
+/// corrupt GGUF read, offline-gate trip — every subsequent call in
 /// the same process returns that cached error without retrying the
 /// load. Production has no escape hatch: there is no public
 /// `clear_model_cache()` and `reset` is `#[cfg(test)]`-only.

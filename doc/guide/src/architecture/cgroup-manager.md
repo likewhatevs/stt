@@ -43,10 +43,10 @@ The `BTreeSet<usize>` is formatted as a compact range string via
 **`clear_cpuset(name)`** -- writes an empty string to `cpuset.cpus`,
 which inherits the parent's cpuset.
 
-**`move_task(name, tid)`** -- writes a single PID to the child cgroup's
+**`move_task(name, pid)`** -- writes a single PID to the child cgroup's
 `cgroup.procs`.
 
-**`move_tasks(name, tids)`** -- moves all PIDs from a slice into the
+**`move_tasks(name, pids)`** -- moves all PIDs from a slice into the
 child cgroup. Tolerates ESRCH (task exited between listing and
 migration) with a warning. Retries EBUSY up to 3 times with 100ms
 backoff for transient rejections from sched_ext BPF
@@ -78,8 +78,8 @@ pattern is:
 
 ```rust,ignore
 fn custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
-    ctx.cgroups.create_cgroup("cg_0")?;
-    ctx.cgroups.set_cpuset("cg_0", &cpuset)?;
+    let mut guard = CgroupGroup::new(ctx.cgroups);
+    guard.add_cgroup("cg_0", &cpuset)?;
 
     let mut h = WorkloadHandle::spawn(&config)?;
     ctx.cgroups.move_tasks("cg_0", &h.worker_pids())?;
@@ -87,10 +87,15 @@ fn custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
 
     // ... run workload ...
 
-    // CgroupGroup handles cleanup on drop (see [CgroupGroup](cgroup-group.md))
+    // `guard` drops at end of scope and removes cg_0 even on error.
     Ok(result)
 }
 ```
+
+Bypass [`CgroupGroup`](cgroup-group.md) only when you need to hand the
+cgroup's lifetime to a different owner; the RAII wrapper is the default
+because it removes the cgroup on every error path, not just the happy
+path.
 
 See also: [CgroupGroup](cgroup-group.md) for RAII cleanup,
 [WorkloadHandle](workload-handle.md) for worker lifecycle,

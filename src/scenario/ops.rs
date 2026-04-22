@@ -4670,11 +4670,11 @@ mod tests {
         fn clear_cpuset(&self, name: &str) -> Result<()> {
             self.record(CgroupCall::ClearCpuset(name.to_string()))
         }
-        fn move_task(&self, name: &str, tid: libc::pid_t) -> Result<()> {
-            self.record(CgroupCall::MoveTask(name.to_string(), tid))
+        fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
+            self.record(CgroupCall::MoveTask(name.to_string(), pid))
         }
-        fn move_tasks(&self, name: &str, tids: &[libc::pid_t]) -> Result<()> {
-            self.record(CgroupCall::MoveTasks(name.to_string(), tids.len()))
+        fn move_tasks(&self, name: &str, pids: &[libc::pid_t]) -> Result<()> {
+            self.record(CgroupCall::MoveTasks(name.to_string(), pids.len()))
         }
         fn clear_subtree_control(&self, name: &str) -> Result<()> {
             self.record(CgroupCall::ClearSubtreeControl(name.to_string()))

@@ -43,12 +43,24 @@ to their start pipes. Idempotent: calling it twice has no effect.
 Call this after moving workers into their target cgroups.
 
 **`set_affinity(idx, cpus) -> Result<()>`** -- sets CPU affinity for
-the worker at index `idx` via `sched_setaffinity`.
+the worker at index `idx` via `sched_setaffinity`. Use this for
+per-worker pinning outside any cgroup, or when you need to change one
+worker's affinity without disturbing the rest. When all workers in a
+cgroup should share the same CPU set, prefer
+[`CgroupGroup::add_cgroup`](cgroup-group.md) — it creates the cgroup,
+writes `cpuset.cpus` once for the whole cgroup, and RAII-removes the
+cgroup on drop (including error paths). Reach for
+[`CgroupManager::set_cpuset`](cgroup-manager.md) directly only when
+the cgroup's lifetime must outlive the current scope; the RAII
+wrapper is the default because it cleans up on every error path.
 
 **`snapshot_iterations() -> Vec<u64>`** -- reads all workers' current
 iteration counts from a shared memory region (MAP_SHARED). Each count
 is monotonically increasing, read with relaxed ordering. Returns an
-empty vec if no workers were spawned.
+empty vec if no workers were spawned. Call periodically during the
+workload's run window to sample forward progress (e.g. to detect stalls
+or compute instantaneous rates); the final per-worker totals come back
+through `stop_and_collect()`.
 
 **`stop_and_collect(self) -> Vec<WorkerReport>`** -- sends SIGUSR1 to
 all workers, reads their serialized `WorkerReport` from report pipes,

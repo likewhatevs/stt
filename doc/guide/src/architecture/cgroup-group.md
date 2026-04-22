@@ -9,15 +9,17 @@ use ktstr::prelude::*;
 
 #[must_use = "dropping a CgroupGroup immediately destroys the cgroups it manages"]
 pub struct CgroupGroup<'a> {
-    cgroups: &'a CgroupManager,
+    cgroups: &'a dyn CgroupOps,
     names: Vec<String>,
 }
 ```
 
 ## Methods
 
-**`new(cgroups: &CgroupManager) -> Self`** -- creates an empty group
-bound to a `CgroupManager`.
+**`new(cgroups: &dyn CgroupOps) -> Self`** -- creates an empty group
+bound to any implementor of `CgroupOps` (e.g.
+[`CgroupManager`](cgroup-manager.md) in production, an in-memory fake
+in tests).
 
 **`add_cgroup(name, cpuset) -> Result<()>`** -- creates a cgroup and
 sets its cpuset. The cgroup is tracked for removal on drop.
@@ -29,9 +31,20 @@ without setting a cpuset. The cgroup is tracked for removal on drop.
 
 ## Drop behavior
 
-When the `CgroupGroup` is dropped, it calls
-`CgroupManager::remove_cgroup()` on each tracked cgroup. Removal
-errors are silently ignored (best-effort cleanup).
+When the `CgroupGroup` is dropped, it calls `remove_cgroup()` on each
+tracked cgroup in reverse insertion order so nested children are
+removed before their parents (a parent still holding child
+directories would fail with `ENOTEMPTY`).
+
+`ENOENT` is the one errno the drop swallows silently — it indicates
+the directory is already gone (the post-condition cleanup owes), which
+can legitimately happen via a TOCTOU race between the inner
+`exists()` check and `remove_dir`. Every other error (`EBUSY` from a
+surviving task, `EACCES`, a broken `cgroupfs` mount, etc.) is emitted
+as a `tracing::warn!` record carrying the cgroup name, the full error
+chain, and — for `EBUSY` or `EACCES` — a short remediation hint. The
+drop never panics and never returns an error (it cannot), but
+teardown failures are visible in logs rather than silently swallowed.
 
 ## Usage
 
@@ -57,8 +70,8 @@ fn custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-The helper function `setup_cgroups()` returns a `CgroupGroup` alongside
-the worker handles:
+The helper function [`setup_cgroups()`](../writing-tests/custom-scenarios.md#helper-functions)
+returns a `CgroupGroup` alongside the worker handles:
 
 ```rust,ignore
 let (handles, _guard) = setup_cgroups(ctx, 2, &wl)?;

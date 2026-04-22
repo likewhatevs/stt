@@ -249,7 +249,7 @@ pub struct GauntletRow {
     /// Carrying the full flag list here keeps the (scenario,
     /// topology, work_type, flags) identity tuple unambiguous and
     /// lets the substring filter match on flag names too.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<String>,
     pub passed: bool,
     /// True when the run was skipped (topology mismatch, missing

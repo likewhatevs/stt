@@ -196,9 +196,9 @@ impl CgroupManager {
     }
 
     /// Move a single task into a child cgroup via `cgroup.procs`.
-    pub fn move_task(&self, name: &str, tid: libc::pid_t) -> Result<()> {
+    pub fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
         let p = self.parent.join(name).join("cgroup.procs");
-        write_with_timeout(&p, &tid.to_string(), CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(&p, &pid.to_string(), CGROUP_WRITE_TIMEOUT)
     }
 
     /// Move multiple tasks into a child cgroup by PID.
@@ -208,11 +208,11 @@ impl CgroupManager {
     /// rejections from sched_ext BPF `cgroup_prep_move` callbacks
     /// (`scx_cgroup_can_attach`). Propagates EBUSY after retries
     /// exhausted. Propagates all other errors immediately.
-    pub fn move_tasks(&self, name: &str, tids: &[libc::pid_t]) -> Result<()> {
-        for &t in tids {
-            if let Err(e) = self.move_task_with_retry(name, t) {
+    pub fn move_tasks(&self, name: &str, pids: &[libc::pid_t]) -> Result<()> {
+        for &pid in pids {
+            if let Err(e) = self.move_task_with_retry(name, pid) {
                 if is_esrch(&e) {
-                    tracing::warn!(tid = t, cgroup = name, "task vanished during migration");
+                    tracing::warn!(pid, cgroup = name, "task vanished during migration");
                     continue;
                 }
                 return Err(e);
@@ -222,16 +222,16 @@ impl CgroupManager {
     }
 
     /// Move a single task with bounded EBUSY retry.
-    fn move_task_with_retry(&self, name: &str, tid: libc::pid_t) -> Result<()> {
+    fn move_task_with_retry(&self, name: &str, pid: libc::pid_t) -> Result<()> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY: Duration = Duration::from_millis(100);
 
         for attempt in 0..MAX_RETRIES {
-            match self.move_task(name, tid) {
+            match self.move_task(name, pid) {
                 Ok(()) => return Ok(()),
                 Err(e) if is_ebusy(&e) && attempt + 1 < MAX_RETRIES => {
                     tracing::debug!(
-                        tid,
+                        pid,
                         cgroup = name,
                         attempt = attempt + 1,
                         "EBUSY on cgroup.procs write, retrying"
@@ -341,10 +341,10 @@ pub trait CgroupOps {
     fn clear_cpuset(&self, name: &str) -> Result<()>;
     /// Move a single task via `cgroup.procs`. See
     /// [`CgroupManager::move_task`].
-    fn move_task(&self, name: &str, tid: libc::pid_t) -> Result<()>;
+    fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()>;
     /// Move multiple tasks (tolerates ESRCH, retries EBUSY). See
     /// [`CgroupManager::move_tasks`].
-    fn move_tasks(&self, name: &str, tids: &[libc::pid_t]) -> Result<()>;
+    fn move_tasks(&self, name: &str, pids: &[libc::pid_t]) -> Result<()>;
     /// Clear `cgroup.subtree_control` on a child. See
     /// [`CgroupManager::clear_subtree_control`].
     fn clear_subtree_control(&self, name: &str) -> Result<()>;
@@ -375,11 +375,11 @@ impl CgroupOps for CgroupManager {
     fn clear_cpuset(&self, name: &str) -> Result<()> {
         CgroupManager::clear_cpuset(self, name)
     }
-    fn move_task(&self, name: &str, tid: libc::pid_t) -> Result<()> {
-        CgroupManager::move_task(self, name, tid)
+    fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
+        CgroupManager::move_task(self, name, pid)
     }
-    fn move_tasks(&self, name: &str, tids: &[libc::pid_t]) -> Result<()> {
-        CgroupManager::move_tasks(self, name, tids)
+    fn move_tasks(&self, name: &str, pids: &[libc::pid_t]) -> Result<()> {
+        CgroupManager::move_tasks(self, name, pids)
     }
     fn clear_subtree_control(&self, name: &str) -> Result<()> {
         CgroupManager::clear_subtree_control(self, name)
@@ -547,7 +547,7 @@ mod tests {
         // move_tasks propagates non-ESRCH errors immediately
         let cg = CgroupManager::new("/nonexistent/ktstr-partial");
         let err = cg.move_tasks("cg", &[1, 2, 3]).unwrap_err();
-        // The error comes from the first tid (write to nonexistent path)
+        // The error comes from the first pid (write to nonexistent path)
         let msg = format!("{err:#}");
         assert!(msg.contains("cgroup.procs"), "unexpected error: {msg}");
     }

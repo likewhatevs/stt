@@ -924,19 +924,6 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// Run a scenario and return its assertion result.
-///
-/// Skips early (returning `AssertResult::skip`) when the scenario's
-/// requested cpuset partitioning produces an empty cpuset for any
-/// cgroup under the current topology. Polls scheduler liveness at
-/// 500ms intervals. If the scheduler exits after cgroup creation but
-/// before the workload starts, returns an `Err` so callers can treat
-/// the run as a setup failure. A scheduler exit mid-workload is
-/// reported as a completed-but-failed `AssertResult` with
-/// "scheduler process exited unexpectedly during workload" in
-/// `details`, not an error. On workload failure, captures the guest
-/// kernel console via `read_kmsg` so diagnostics include the stall
-/// or crash context.
 /// Spawn workers per cgroup, move each handle's worker pids into
 /// its cgroup, then start all handles in a second pass.
 ///
@@ -982,6 +969,19 @@ where
     Ok(handles)
 }
 
+/// Run a scenario and return its assertion result.
+///
+/// Skips early (returning `AssertResult::skip`) when the scenario's
+/// requested cpuset partitioning produces an empty cpuset for any
+/// cgroup under the current topology. Polls scheduler liveness at
+/// 500ms intervals. If the scheduler exits after cgroup creation but
+/// before the workload starts, returns an `Err` so callers can treat
+/// the run as a setup failure. A scheduler exit mid-workload is
+/// reported as a completed-but-failed `AssertResult` with
+/// "scheduler process exited unexpectedly during workload" in
+/// `details`, not an error. On workload failure, captures the guest
+/// kernel console via `read_kmsg` so diagnostics include the stall
+/// or crash context.
 pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     tracing::info!(scenario = scenario.name, "running");
     if let Action::Custom(f) = &scenario.action {
