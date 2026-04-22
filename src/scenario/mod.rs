@@ -624,6 +624,39 @@ impl<'a> CgroupGroup<'a> {
     }
 }
 
+/// True when `err`'s root cause is an `io::Error` with kind
+/// `NotFound` (ENOENT). Used by `CgroupGroup::drop` and
+/// `Op::RemoveCgroup` to classify a TOCTOU ENOENT as benign
+/// (post-condition "no dir" already holds) so it is filtered
+/// from warn output. Extracting the predicate keeps the two
+/// sites in lock-step — a classification change only edits
+/// this function, not both call sites.
+pub(crate) fn is_io_not_found(err: &anyhow::Error) -> bool {
+    err.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Map a cgroup `remove_cgroup` error's root-cause errno to a
+/// short remediation hint appended to warn messages. Only
+/// EBUSY and EACCES — the two errnos callers can act on — get
+/// specific hints; every other errno yields `None` so the warn
+/// stays terse with just the underlying error chain. Extracted
+/// so both `CgroupGroup::drop` and `Op::RemoveCgroup` stay
+/// synchronized; a new hint (e.g. ENOTEMPTY for un-cleaned
+/// children) only needs to be wired here.
+pub(crate) fn remove_cgroup_errno_hint(err: &anyhow::Error) -> Option<&'static str> {
+    let raw = err
+        .root_cause()
+        .downcast_ref::<std::io::Error>()?
+        .raw_os_error()?;
+    match raw {
+        libc::EBUSY => Some("EBUSY: cgroup still has live tasks — workloads were not drained before teardown"),
+        libc::EACCES => Some("EACCES: permission denied — check cgroup owner / `user.slice` delegation"),
+        _ => None,
+    }
+}
+
 impl Drop for CgroupGroup<'_> {
     fn drop(&mut self) {
         // Reverse-iterate so nested cgroups (children created AFTER
@@ -643,17 +676,16 @@ impl Drop for CgroupGroup<'_> {
         // stay consistent.
         for name in self.names.iter().rev() {
             if let Err(err) = self.cgroups.remove_cgroup(name) {
-                let is_enoent = err
-                    .root_cause()
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
-                if !is_enoent {
-                    tracing::warn!(
-                        cgroup = %name,
-                        err = %format!("{err:#}"),
-                        "CgroupGroup::drop: remove_cgroup returned non-ENOENT error",
-                    );
+                if is_io_not_found(&err) {
+                    continue;
                 }
+                let hint = remove_cgroup_errno_hint(&err).unwrap_or("");
+                tracing::warn!(
+                    cgroup = %name,
+                    err = %format!("{err:#}"),
+                    hint,
+                    "CgroupGroup::drop: remove_cgroup returned non-ENOENT error",
+                );
             }
         }
     }
@@ -2180,5 +2212,175 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Minimal `CgroupOps` double for `CgroupGroup::drop` error-path
+    /// tests. Injects a caller-supplied `io::Error` into the
+    /// `remove_cgroup` chain so the test can cover both the ENOENT
+    /// (benign TOCTOU) branch and the non-ENOENT warn branch without
+    /// touching cgroupfs. Every other trait method is a no-op — the
+    /// drop path only calls `remove_cgroup`.
+    struct DropErrCgroupOps {
+        parent: std::path::PathBuf,
+        remove_kind: std::io::ErrorKind,
+        raw_os_error: Option<i32>,
+        remove_calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl DropErrCgroupOps {
+        fn new(kind: std::io::ErrorKind, raw: Option<i32>) -> Self {
+            Self {
+                parent: std::path::PathBuf::from("/mock/cgroup"),
+                remove_kind: kind,
+                raw_os_error: raw,
+                remove_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.remove_calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::cgroup::CgroupOps for DropErrCgroupOps {
+        fn parent_path(&self) -> &std::path::Path {
+            &self.parent
+        }
+        fn setup(&self, _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn create_cgroup(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn remove_cgroup(&self, name: &str) -> Result<()> {
+            self.remove_calls.lock().unwrap().push(name.to_string());
+            let io = match self.raw_os_error {
+                Some(errno) => std::io::Error::from_raw_os_error(errno),
+                None => std::io::Error::from(self.remove_kind),
+            };
+            // Wrap in anyhow::Context the same way the real CgroupManager
+            // does, so `err.root_cause().downcast_ref::<io::Error>()`
+            // traverses the chain identically to production.
+            Err(anyhow::Error::new(io).context("remove_dir cgroup"))
+        }
+        fn set_cpuset(&self, _: &str, _: &BTreeSet<usize>) -> Result<()> {
+            Ok(())
+        }
+        fn clear_cpuset(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn move_task(&self, _: &str, _: libc::pid_t) -> Result<()> {
+            Ok(())
+        }
+        fn move_tasks(&self, _: &str, _: &[libc::pid_t]) -> Result<()> {
+            Ok(())
+        }
+        fn clear_subtree_control(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn drain_tasks(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn cleanup_all(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Drop must iterate every tracked name regardless of error kind —
+    /// ENOENT is classified benign and dropped silently; any other
+    /// error path (EBUSY, EACCES, generic IO) takes the warn branch.
+    /// Neither path may panic (panic in Drop under `panic = "abort"`
+    /// aborts the whole process). This test is a panic-free crash-test
+    /// plus a call-count pin: every tracked cgroup must see exactly
+    /// one `remove_cgroup` call, in reverse-insertion order, in every
+    /// branch — so the iteration contract doesn't silently shrink.
+    #[test]
+    fn cgroup_group_drop_is_panic_free_on_every_error_kind() {
+        for (label, kind, raw) in [
+            ("ENOENT", std::io::ErrorKind::NotFound, Some(libc::ENOENT)),
+            (
+                "EBUSY",
+                std::io::ErrorKind::Other,
+                Some(libc::EBUSY),
+            ),
+            (
+                "EACCES",
+                std::io::ErrorKind::PermissionDenied,
+                Some(libc::EACCES),
+            ),
+            ("generic-IO", std::io::ErrorKind::Other, None),
+        ] {
+            let mock = DropErrCgroupOps::new(kind, raw);
+            {
+                let mut group = CgroupGroup::new(&mock);
+                group.names.push("child-a".to_string());
+                group.names.push("child-b".to_string());
+                // drop at end of scope must not panic.
+            }
+            let calls = mock.calls();
+            // Reverse-insertion order: child-b first, then child-a —
+            // pins the nested-cleanup invariant documented in Drop.
+            assert_eq!(
+                calls,
+                vec!["child-b".to_string(), "child-a".to_string()],
+                "[{label}] Drop must call remove_cgroup for every tracked name in reverse order",
+            );
+        }
+    }
+
+    /// `is_io_not_found` is the one-place classifier for the "benign
+    /// TOCTOU ENOENT" branch in both `CgroupGroup::drop` and
+    /// `Op::RemoveCgroup`. Pin the contract: NotFound → true; every
+    /// other kind → false. A regression that mis-classifies EBUSY or
+    /// EACCES as "not found" would silently swallow a real teardown
+    /// failure.
+    #[test]
+    fn is_io_not_found_matches_only_notfound() {
+        let wrap = |k: std::io::ErrorKind| -> anyhow::Error {
+            anyhow::Error::new(std::io::Error::from(k)).context("wrap")
+        };
+        assert!(is_io_not_found(&wrap(std::io::ErrorKind::NotFound)));
+        assert!(!is_io_not_found(&wrap(std::io::ErrorKind::PermissionDenied)));
+        assert!(!is_io_not_found(&wrap(std::io::ErrorKind::Other)));
+        // anyhow::anyhow! without an underlying io::Error must not
+        // look like NotFound even if the message contains "not found".
+        let no_io = anyhow::anyhow!("cgroup not found in parent");
+        assert!(!is_io_not_found(&no_io));
+    }
+
+    /// `remove_cgroup_errno_hint` gives actionable remediation for
+    /// the two errnos users can fix (EBUSY, EACCES) and stays quiet
+    /// for everything else. The hint strings end up rendered into
+    /// warn output; pin their presence/absence so a regression that
+    /// drops the hint (or hallucinates one) surfaces in test output.
+    #[test]
+    fn remove_cgroup_errno_hint_covers_ebusy_and_eacces() {
+        let busy = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EBUSY))
+            .context("wrap");
+        let acces = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EACCES))
+            .context("wrap");
+        let enotempty = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOTEMPTY))
+            .context("wrap");
+        let non_io = anyhow::anyhow!("not an io error");
+
+        assert!(
+            remove_cgroup_errno_hint(&busy)
+                .is_some_and(|h| h.contains("EBUSY") && h.contains("drain")),
+            "EBUSY hint must name the errno and the drain remediation",
+        );
+        assert!(
+            remove_cgroup_errno_hint(&acces)
+                .is_some_and(|h| h.contains("EACCES") && h.contains("permission")),
+            "EACCES hint must name the errno and the permission angle",
+        );
+        assert_eq!(
+            remove_cgroup_errno_hint(&enotempty),
+            None,
+            "unclassified errnos must yield no hint so warn stays terse",
+        );
+        assert_eq!(
+            remove_cgroup_errno_hint(&non_io),
+            None,
+            "non-io root causes must yield no hint",
+        );
     }
 }

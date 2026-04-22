@@ -2288,18 +2288,17 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 // errors from a broken cgroupfs mount — gets logged
                 // so the failure surfaces in test output instead of
                 // being swallowed by `let _ = `.
-                if let Err(err) = ctx.cgroups.remove_cgroup(cgroup) {
-                    let is_enoent = err
-                        .root_cause()
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
-                    if !is_enoent {
-                        tracing::warn!(
-                            cgroup = %cgroup,
-                            err = %format!("{err:#}"),
-                            "Op::RemoveCgroup: rmdir returned non-ENOENT error",
-                        );
-                    }
+                if let Err(err) = ctx.cgroups.remove_cgroup(cgroup)
+                    && !crate::scenario::is_io_not_found(&err)
+                {
+                    let hint = crate::scenario::remove_cgroup_errno_hint(&err)
+                        .unwrap_or("");
+                    tracing::warn!(
+                        cgroup = %cgroup,
+                        err = %format!("{err:#}"),
+                        hint,
+                        "Op::RemoveCgroup: remove_cgroup returned non-ENOENT error",
+                    );
                 }
             }
             Op::SetCpuset { cgroup, cpus } => {
