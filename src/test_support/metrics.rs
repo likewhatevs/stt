@@ -43,6 +43,22 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 /// JSON with [`MetricSource::LlmExtract`]. An unavailable inference
 /// backend (missing cache, forward-pass failure) yields an empty
 /// metric set, matching the non-fatal contract above.
+///
+/// # Known truncation point: depth cap
+///
+/// Both the `Json` and `LlmExtract` arms route through
+/// [`walk_json_leaves`], which enforces a hard recursion cap of
+/// [`MAX_WALK_DEPTH`] (currently 64). Subtrees past that depth are
+/// silently dropped from the metric list — a `tracing::warn!` fires
+/// and a sentinel metric named [`WALK_TRUNCATION_SENTINEL_NAME`]
+/// (`__walk_json_leaves_truncated`) is appended to the return
+/// value, with `value` set to the depth at which truncation
+/// occurred. Callers that want to distinguish "no deep metrics"
+/// from "deep metrics dropped by the cap" scan the returned `Vec`
+/// for a metric with that name. Practical upper bound: 64 is well
+/// below serde_json's default parse recursion limit (128) and
+/// covers every realistic payload schema observed in the crate
+/// (fio maxes out around depth 8, schbench around depth 3).
 pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Result<Vec<Metric>, String> {
     match format {
         OutputFormat::ExitCode => Ok(Vec::new()),
@@ -167,7 +183,23 @@ pub(crate) fn walk_json_leaves(value: &serde_json::Value, source: MetricSource) 
 /// `serde_json::Value` that bypasses the parser can still reach
 /// arbitrary depth, so an explicit walker guard is the last line of
 /// defence against a stack overflow.
-const MAX_WALK_DEPTH: usize = 64;
+pub(crate) const MAX_WALK_DEPTH: usize = 64;
+
+/// Sentinel metric name emitted when [`walk`] hits
+/// [`MAX_WALK_DEPTH`] and skips a subtree. Callers of
+/// [`walk_json_leaves`] / [`extract_metrics`] that want to
+/// distinguish "no deep metrics present" from "deep metrics
+/// dropped by the depth cap" scan the returned `Vec<Metric>` for
+/// a metric whose `name` equals this constant — its `value` is
+/// the depth at which truncation occurred, so nested failures at
+/// different subtrees produce one sentinel per trigger. The name
+/// starts with a double underscore so collision is extremely
+/// unlikely — only a top-level JSON key with this exact literal
+/// name would produce a non-truncation metric that compares equal,
+/// since every non-top-level leaf gets at least one `.` injected
+/// by `walk`. Callers that depend on zero-collision guarantees
+/// should reject sentinel-named paths from their input schema.
+pub(crate) const WALK_TRUNCATION_SENTINEL_NAME: &str = "__walk_json_leaves_truncated";
 
 fn walk(
     value: &serde_json::Value,
@@ -183,6 +215,19 @@ fn walk(
             path = %path,
             "walk_json_leaves: depth cap hit, subtree skipped",
         );
+        // Emit a sentinel metric so callers inspecting only the
+        // returned `Vec<Metric>` see the truncation — the
+        // `tracing::warn!` above only reaches a subscriber, which
+        // the default test dispatch path does not install. See
+        // [`WALK_TRUNCATION_SENTINEL_NAME`] for the discrimination
+        // contract.
+        out.push(Metric {
+            name: WALK_TRUNCATION_SENTINEL_NAME.to_string(),
+            value: depth as f64,
+            polarity: Polarity::Unknown,
+            unit: String::new(),
+            source,
+        });
         return;
     }
     match value {
@@ -749,7 +794,10 @@ mod tests {
     fn walk_json_leaves_depth_cap_skips_deeply_nested_subtree() {
         // Build an Object nested 100 deep with a numeric leaf at the
         // bottom. The leaf at depth > MAX_WALK_DEPTH (64) must be
-        // skipped by the guard.
+        // skipped by the guard. A sentinel metric with
+        // `WALK_TRUNCATION_SENTINEL_NAME` MUST appear in the return
+        // so callers without a tracing subscriber still observe the
+        // truncation.
         let mut value = serde_json::json!({"leaf": 42.0});
         for _ in 0..100 {
             let mut m = serde_json::Map::new();
@@ -757,9 +805,22 @@ mod tests {
             value = serde_json::Value::Object(m);
         }
         let metrics = walk_json_leaves(&value, MetricSource::Json);
+        let real_leaves: Vec<_> = metrics
+            .iter()
+            .filter(|m| m.name != WALK_TRUNCATION_SENTINEL_NAME)
+            .collect();
         assert!(
-            metrics.is_empty(),
-            "leaf beyond MAX_WALK_DEPTH cap must not be emitted, got {metrics:?}"
+            real_leaves.is_empty(),
+            "leaf beyond MAX_WALK_DEPTH cap must not be emitted, got {real_leaves:?}"
+        );
+        let sentinel = metrics
+            .iter()
+            .find(|m| m.name == WALK_TRUNCATION_SENTINEL_NAME)
+            .expect("truncation sentinel must be present on cap hit");
+        assert!(
+            sentinel.value > MAX_WALK_DEPTH as f64,
+            "sentinel value must carry the depth at which truncation fired, got {}",
+            sentinel.value,
         );
     }
 
@@ -785,6 +846,106 @@ mod tests {
         let metrics = walk_json_leaves(&value, MetricSource::Json);
         assert_eq!(metrics.len(), 1, "boundary leaf must be preserved");
         assert_eq!(metrics[0].value, 42.0);
+    }
+
+    /// Mixed-depth invariant: a single walk must emit every finite
+    /// numeric leaf regardless of the depth at which it appears, so
+    /// long as the depth is ≤ MAX_WALK_DEPTH. Mirrors real payload
+    /// schemas (fio's `jobs[0].read.lat_ns.mean` sits at depth 5
+    /// while `jobs[0].jobname` sits at depth 2). A single-depth
+    /// regression — e.g. a premature `return` inside the Object arm
+    /// — would skip the shallower siblings of a deep subtree.
+    #[test]
+    fn walk_json_leaves_mixed_depth_leaves_all_emitted() {
+        let value = serde_json::json!({
+            "shallow": 1.0,
+            "mid": {
+                "leaf": 2.0,
+                "deeper": {
+                    "still": {
+                        "further": 3.0
+                    }
+                }
+            },
+            "also_shallow": 4.0,
+            "deeper_sibling": {
+                "only_child": 5.0
+            }
+        });
+        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        let by_name: std::collections::BTreeMap<&str, f64> =
+            metrics.iter().map(|m| (m.name.as_str(), m.value)).collect();
+        assert_eq!(by_name.get("shallow"), Some(&1.0));
+        assert_eq!(by_name.get("mid.leaf"), Some(&2.0));
+        assert_eq!(by_name.get("mid.deeper.still.further"), Some(&3.0));
+        assert_eq!(by_name.get("also_shallow"), Some(&4.0));
+        assert_eq!(by_name.get("deeper_sibling.only_child"), Some(&5.0));
+        assert_eq!(metrics.len(), 5, "exactly five numeric leaves expected");
+    }
+
+    /// Array-chain invariant: nested arrays produce dotted-index
+    /// paths with no stray separators. An off-by-one in the
+    /// separator injection at :203-205 (array arm) or a swapped
+    /// push-path/truncate order would surface as either a leading
+    /// dot, a doubled separator, or an index segment merged into
+    /// the previous one.
+    #[test]
+    fn walk_json_leaves_array_chain_paths_correct() {
+        // `a` is a 2x2x2 array of numeric leaves; the walker must
+        // produce paths `a.0.0.0`, `a.0.0.1`, `a.0.1.0`, …, `a.1.1.1`.
+        let value = serde_json::json!({
+            "a": [
+                [[1.0, 2.0], [3.0, 4.0]],
+                [[5.0, 6.0], [7.0, 8.0]]
+            ]
+        });
+        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+        // 8 leaves in lexicographic index order.
+        assert_eq!(names.len(), 8);
+        assert_eq!(names[0], "a.0.0.0");
+        assert_eq!(names[1], "a.0.0.1");
+        assert_eq!(names[2], "a.0.1.0");
+        assert_eq!(names[3], "a.0.1.1");
+        assert_eq!(names[4], "a.1.0.0");
+        assert_eq!(names[5], "a.1.0.1");
+        assert_eq!(names[6], "a.1.1.0");
+        assert_eq!(names[7], "a.1.1.1");
+        // Values map 1:1 against path order — confirm no segment
+        // got dropped or reordered.
+        assert_eq!(metrics[0].value, 1.0);
+        assert_eq!(metrics[7].value, 8.0);
+    }
+
+    /// Null-at-boundary invariant: a `serde_json::Value::Null` leaf
+    /// is skipped by the `_ => {}` arm and contributes nothing — no
+    /// metric, no sentinel, no side effect — regardless of the
+    /// depth at which it sits. Specifically pins the case where the
+    /// null is the direct child of a depth-MAX_WALK_DEPTH container,
+    /// ensuring the cap check fires first when the container would
+    /// itself be above the cap rather than the null stopping
+    /// recursion harmlessly short. A regression that treats Null
+    /// the same as a Number would surface as a spurious leaf with
+    /// `value = 0.0` (or a panic) on this fixture.
+    #[test]
+    fn walk_json_leaves_null_at_boundary_produces_no_metric() {
+        // Build `{a: {a: {a: ... {a: null}}}}` at exactly
+        // MAX_WALK_DEPTH nesting — the Null sits at depth
+        // MAX_WALK_DEPTH; the walker recurses into the outer Objects
+        // at depths 0..=MAX_WALK_DEPTH-1, sees Null at the
+        // boundary, and falls through the `_ => {}` arm.
+        let mut value = serde_json::Value::Null;
+        for _ in 0..MAX_WALK_DEPTH {
+            let mut m = serde_json::Map::new();
+            m.insert("a".to_string(), value);
+            value = serde_json::Value::Object(m);
+        }
+        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        assert!(
+            metrics.is_empty(),
+            "Null leaves must produce no metrics (and no truncation sentinel), \
+             got {metrics:?}",
+        );
     }
 
     #[test]

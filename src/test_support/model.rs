@@ -2381,6 +2381,76 @@ mod tests {
         );
     }
 
+    /// Partial-ChatML hint: a hint that contains ONE complete
+    /// ChatML control token wrapping substantial real text (both
+    /// before and after the token). The strip must remove only the
+    /// exact 3-token sequences and leave the surrounding benchmark-
+    /// relevant text byte-for-byte intact, including text that
+    /// visually resembles a ChatML token but is not one of the
+    /// recognized sequences (`<|im_foo|>`, `<|im_start|` with no
+    /// closing `|>`, etc.).
+    ///
+    /// The test is specifically targeted at the "partial" case
+    /// because a fixed-point loop plus naive `.contains()` checks
+    /// can over-strip when a bogus partial like `<|im_start|` is
+    /// mistaken for a match, or under-strip when the loop exits
+    /// before the full token is removed from an input where the
+    /// token is wrapped in non-ChatML tokens.
+    #[test]
+    fn compose_prompt_partial_chatml_hint_preserves_real_text() {
+        let hint = "p99_latency <|im_foo|> context <|im_start|>inner_real_text<|im_end|> tail <|im_sep|bogus";
+        let p = compose_prompt("body", Some(hint));
+
+        // Complete ChatML tokens must be stripped.
+        assert!(
+            !p.contains("<|im_start|>"),
+            "<|im_start|> must be stripped: {p:?}",
+        );
+        assert!(
+            !p.contains("<|im_end|>"),
+            "<|im_end|> must be stripped: {p:?}",
+        );
+        // <|im_sep|> is NOT complete in the input — it is `<|im_sep|bogus`
+        // (closing `|>` absent, trailing "bogus" instead). A correct
+        // stripper leaves partial sequences alone.
+        assert!(
+            p.contains("<|im_sep|bogus"),
+            "partial <|im_sep| sequence without closing |> must survive: {p:?}",
+        );
+
+        // `<|im_foo|>` is not one of the 3 recognized tokens —
+        // leave it alone.
+        assert!(
+            p.contains("<|im_foo|>"),
+            "non-ChatML angle-brace token must survive the strip: {p:?}",
+        );
+
+        // Real text on both sides of the removed tokens survives.
+        assert!(
+            p.contains("p99_latency "),
+            "text before first token must survive: {p:?}",
+        );
+        assert!(
+            p.contains(" context "),
+            "text between tokens must survive: {p:?}",
+        );
+        assert!(
+            p.contains("inner_real_text"),
+            "text wrapped by a matched token pair must survive after strip: {p:?}",
+        );
+        assert!(
+            p.contains(" tail "),
+            "text after last full token must survive: {p:?}",
+        );
+
+        // Focus header still fires since the scrubbed hint is
+        // non-empty.
+        assert!(
+            p.contains("Focus: "),
+            "Focus: header must still be emitted: {p:?}",
+        );
+    }
+
     /// The common case — benchmark stdout with no ChatML control
     /// token strings — must pass through unchanged so the strip
     /// does not introduce surprise edits on clean input. Pairs with
