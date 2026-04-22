@@ -1,16 +1,22 @@
 //! Metric extraction pipeline for payload outputs.
 //!
-//! Payloads declared with [`OutputFormat::Json`] emit JSON to stdout;
-//! this module finds the JSON document region inside mixed text
-//! output (many benchmark tools emit a banner line before their
-//! structured body) and walks numeric leaves into
-//! [`Metric`]s keyed by dotted paths.
+//! Payloads declared with [`OutputFormat::Json`] emit JSON to either
+//! stdout or stderr — `PayloadRun` applies a stdout-primary /
+//! stderr-fallback contract and hands whichever stream produced a
+//! non-empty metric set to this module. Benchmark tools split
+//! across the two conventions (schbench writes structured summaries
+//! to stderr, fio / stress-ng to stdout); the fallback lets either
+//! discipline round-trip through the same extractor. This module
+//! locates the JSON document region inside mixed text output
+//! (many tools emit a banner line before their structured body) and
+//! walks numeric leaves into [`Metric`]s keyed by dotted paths.
 //!
 //! [`OutputFormat::ExitCode`] returns an empty metric set; exit-code
 //! pass/fail is handled by the [`Check::ExitCodeEq`] pre-pass
 //! elsewhere.
 //!
-//! [`OutputFormat::LlmExtract`] routes stdout through
+//! [`OutputFormat::LlmExtract`] routes the same (possibly
+//! stderr-sourced) output through
 //! [`crate::test_support::model::extract_via_llm`]: the model owns
 //! prompt composition and the initial JSON-from-prose parse, then
 //! feeds the resulting `serde_json::Value` into this module's
@@ -20,8 +26,14 @@
 
 use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 
-/// Extract metrics from a payload's stdout per its declared
+/// Extract metrics from a payload's captured output per its declared
 /// [`OutputFormat`].
+///
+/// `output` carries whichever stream `PayloadRun` decided to extract
+/// from — stdout on the happy path, stderr under the stdout-primary
+/// stderr-fallback contract when stdout produced an empty result.
+/// The extractor itself is stream-agnostic; it parses whatever byte
+/// blob it is handed.
 ///
 /// Returns an empty `Vec` for [`OutputFormat::ExitCode`] and for
 /// [`OutputFormat::Json`] when no JSON document is located or the
@@ -29,12 +41,6 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 /// non-fatal: the extraction returns `Vec::new()` so downstream
 /// [`Check`](crate::test_support::Check) evaluation reports each
 /// referenced metric as missing rather than failing the whole run.
-///
-/// `PayloadRun` calls this once against stdout and, on an empty
-/// result, retries against stderr — the stdout-primary /
-/// stderr-fallback contract documented in `scenario::payload_run`.
-/// The extractor itself is stream-agnostic; it parses whatever byte
-/// blob it is handed.
 ///
 /// [`OutputFormat::LlmExtract`] with an optional `hint` delegates to
 /// [`crate::test_support::model::extract_via_llm`], which composes a
@@ -59,13 +65,13 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 /// below serde_json's default parse recursion limit (128) and
 /// covers every realistic payload schema observed in the crate
 /// (fio maxes out around depth 8, schbench around depth 3).
-pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Result<Vec<Metric>, String> {
+pub fn extract_metrics(output: &str, format: &OutputFormat) -> Result<Vec<Metric>, String> {
     match format {
         OutputFormat::ExitCode => Ok(Vec::new()),
-        OutputFormat::Json => Ok(find_and_parse_json(stdout)
+        OutputFormat::Json => Ok(find_and_parse_json(output)
             .map(|v| walk_json_leaves(&v, MetricSource::Json))
             .unwrap_or_default()),
-        OutputFormat::LlmExtract(hint) => super::model::extract_via_llm(stdout, *hint),
+        OutputFormat::LlmExtract(hint) => super::model::extract_via_llm(output, *hint),
     }
 }
 

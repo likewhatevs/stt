@@ -1121,15 +1121,15 @@ metrics are present, emit `{}`.";
 /// Compose the full prompt sent to the inference backend for an
 /// [`OutputFormat::LlmExtract`] invocation.
 ///
-/// Shape: `{TEMPLATE}\n\n{hint_line}STDOUT:\n{sanitized_stdout}` —
-/// the hint is appended as its own line before the stdout block so
+/// Shape: `{TEMPLATE}\n\n{hint_line}STDOUT:\n{sanitized_output}` —
+/// the hint is appended as its own line before the STDOUT block so
 /// the model sees the user-declared focus before the raw content. An
 /// empty or absent hint degrades to the bare template without
 /// leaving a dangling "Focus:" header. A hint that reduces to empty
 /// or whitespace-only after ChatML sanitization is treated the same
 /// way.
 ///
-/// Both the `stdout` body and the `hint` pass through
+/// Both the `output` body and the `hint` pass through
 /// [`strip_chatml_control_tokens`] before they are embedded.
 /// [`wrap_chatml_no_think`] later wraps the composed prompt in Qwen3
 /// ChatML (`<|im_start|>user\n…<|im_end|>`); any literal
@@ -1144,15 +1144,15 @@ metrics are present, emit `{}`.";
 /// the scrub is defense-in-depth against a future API change that
 /// could route caller-supplied strings into the hint; it is not a
 /// response to a current exploit path.
-pub(crate) fn compose_prompt(stdout: &str, hint: Option<&str>) -> String {
-    let safe_stdout = strip_chatml_control_tokens(stdout);
+pub(crate) fn compose_prompt(output: &str, hint: Option<&str>) -> String {
+    let safe_output = strip_chatml_control_tokens(output);
     let safe_hint = hint
         .map(|h| h.trim())
         .map(strip_chatml_control_tokens)
         .filter(|h| !h.trim().is_empty());
     let mut out = String::with_capacity(
         LLM_EXTRACT_PROMPT_TEMPLATE.len()
-            + safe_stdout.len()
+            + safe_output.len()
             + 64
             + safe_hint.as_deref().map_or(0, |h| h.len() + 16),
     );
@@ -1163,8 +1163,11 @@ pub(crate) fn compose_prompt(stdout: &str, hint: Option<&str>) -> String {
         out.push_str(h);
         out.push_str("\n\n");
     }
+    // Label frozen as "STDOUT:" for LLM prompt compatibility even
+    // when `output` is stderr-sourced via the fallback contract —
+    // renaming would re-key the model's prompt/response pattern.
     out.push_str("STDOUT:\n");
-    out.push_str(&safe_stdout);
+    out.push_str(&safe_output);
     out
 }
 
@@ -1567,7 +1570,7 @@ pub(crate) fn reset() {
     *guard = None;
 }
 
-/// Run the full LlmExtract pipeline against `stdout` and return the
+/// Run the full LlmExtract pipeline against `output` and return the
 /// resulting metrics, all pre-tagged with
 /// [`MetricSource::LlmExtract`](super::MetricSource::LlmExtract).
 ///
@@ -1600,10 +1603,10 @@ pub(crate) fn reset() {
 ///   opaque "metric 'foo' not found" when the real failure was
 ///   that the model never loaded.
 pub(crate) fn extract_via_llm(
-    stdout: &str,
+    output: &str,
     hint: Option<&str>,
 ) -> Result<Vec<super::Metric>, String> {
-    let prompt = compose_prompt(stdout, hint);
+    let prompt = compose_prompt(output, hint);
 
     // `memoized_inference` serializes concurrent first-call races on
     // the outer mutex: every caller observes the same stored value,
