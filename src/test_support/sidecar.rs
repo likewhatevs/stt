@@ -714,6 +714,20 @@ mod tests {
     /// is opaque to the test so prefix match is how the file is
     /// recovered); tests that assert on the number of gauntlet
     /// variants use `.len()`.
+    ///
+    /// **Prefer this over hand-rolling read_dir/filter_map in new
+    /// write_sidecar tests** — the 7 pre-existing call sites were
+    /// near-identical inline blocks; funneling new tests through
+    /// this helper keeps the lookup contract in one place.
+    ///
+    /// The `.ktstr.json` suffix filter is an intentional tightening
+    /// relative to two of the original inline patterns
+    /// (`write_sidecar_variant_hash_distinguishes_active_flags` and
+    /// `_work_types`), which filtered only by prefix. The write-side
+    /// tests only ever produce `.ktstr.json` files in their temp
+    /// dirs, so the tightening is safe and rules out future stray
+    /// files (a `.json.tmp` atomic-write residue, for instance) from
+    /// inflating the count assertions.
     fn find_sidecars_by_prefix(
         dir: &std::path::Path,
         prefix: &str,
@@ -727,6 +741,77 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    // -- find_sidecars_by_prefix self-tests --
+    //
+    // Pin the helper's filter behavior so changes to its logic
+    // surface as failures here rather than as behavior shifts in
+    // call sites.
+
+    /// The `.ktstr.json` suffix filter must exclude files that share
+    /// the prefix but carry a different extension. Without the
+    /// suffix check, an atomic-write residue (`.json.tmp`) or a
+    /// non-ktstr `.json` written into the same directory would
+    /// inflate the match count.
+    #[test]
+    fn find_sidecars_by_prefix_filters_suffix() {
+        let tmp = std::env::temp_dir().join("ktstr-helper-suffix-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("foo-0001.ktstr.json"), b"{}").unwrap();
+        std::fs::write(tmp.join("foo-0002.ktstr.json.tmp"), b"{}").unwrap();
+        std::fs::write(tmp.join("foo-0003.json"), b"{}").unwrap();
+        std::fs::write(tmp.join("foo-0004.ktstr.txt"), b"{}").unwrap();
+        let paths = find_sidecars_by_prefix(&tmp, "foo-");
+        assert_eq!(
+            paths.len(),
+            1,
+            "only the .ktstr.json file must match, got {paths:?}",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The prefix filter must reject filenames whose prefix does
+    /// not match, so the count-based gauntlet-variant tests
+    /// (`write_sidecar_variant_hash_distinguishes_*`) can coexist
+    /// safely with sidecars from unrelated tests that happen to
+    /// share a parent directory.
+    #[test]
+    fn find_sidecars_by_prefix_filters_prefix() {
+        let tmp = std::env::temp_dir().join("ktstr-helper-prefix-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("foo-0001.ktstr.json"), b"{}").unwrap();
+        std::fs::write(tmp.join("bar-0002.ktstr.json"), b"{}").unwrap();
+        std::fs::write(tmp.join("foobar-0003.ktstr.json"), b"{}").unwrap();
+        let paths = find_sidecars_by_prefix(&tmp, "foo-");
+        assert_eq!(
+            paths.len(),
+            1,
+            "only files starting with 'foo-' must match (not 'foobar-'), got {paths:?}",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A directory that contains nothing matching the `prefix` +
+    /// `.ktstr.json` contract must yield an empty `Vec`, not panic.
+    /// Call sites that use `.into_iter().next().expect(..)` rely on
+    /// this — an empty Vec lets them surface a descriptive "sidecar
+    /// file ... should be written" error rather than an opaque
+    /// helper-internal panic.
+    #[test]
+    fn find_sidecars_by_prefix_empty_when_no_match() {
+        let tmp = std::env::temp_dir().join("ktstr-helper-empty-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("bar-0001.ktstr.json"), b"{}").unwrap();
+        let paths = find_sidecars_by_prefix(&tmp, "foo-");
+        assert!(
+            paths.is_empty(),
+            "no prefix match must yield empty Vec, got {paths:?}",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // -- test_fixture self-tests --
