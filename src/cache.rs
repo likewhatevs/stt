@@ -1531,7 +1531,7 @@ mod tests {
     #[test]
     fn cache_dir_resolve_root_returns_path() {
         let tmp = TempDir::new().unwrap();
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path().to_str().unwrap());
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         let resolved = CacheDir::resolve_root().unwrap();
         assert_eq!(resolved, tmp.path());
         // Side-effect-free: calling resolve_root() must not create
@@ -1983,7 +1983,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("custom-cache");
         // Temporarily set env var for this test.
-        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", dir.to_str().unwrap());
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &dir);
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, dir);
     }
@@ -1992,7 +1992,7 @@ mod tests {
     fn cache_resolve_root_xdg_cache_home() {
         let tmp = TempDir::new().unwrap();
         let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
-        let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path().to_str().unwrap());
+        let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path());
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, tmp.path().join("ktstr").join("kernels"));
     }
@@ -2001,7 +2001,7 @@ mod tests {
     fn cache_resolve_root_empty_ktstr_cache_dir_falls_through() {
         let tmp = TempDir::new().unwrap();
         let _guard1 = EnvVarGuard::set("KTSTR_CACHE_DIR", "");
-        let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path().to_str().unwrap());
+        let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path());
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, tmp.path().join("ktstr").join("kernels"));
     }
@@ -2011,7 +2011,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
         let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", "");
-        let _guard3 = EnvVarGuard::set("HOME", tmp.path().to_str().unwrap());
+        let _guard3 = EnvVarGuard::set("HOME", tmp.path());
         let root = resolve_cache_root().unwrap();
         assert_eq!(
             root,

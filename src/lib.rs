@@ -742,7 +742,7 @@ mod tests {
         // result.
         let tmp = tempfile::TempDir::new().unwrap();
         let cache_root = tmp.path().join("cache");
-        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.to_str().unwrap());
+        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
 
         // Stage one valid image with `ktstr_kconfig_hash = None`
         // (Untracked). `has_vmlinux` stays false so find_kernel's
@@ -812,7 +812,7 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let cache_root = tmp.path().join("cache");
-        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.to_str().unwrap());
+        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
 
         let current_hash = crate::kconfig_hash();
         let stale_hash = format!("{current_hash}-stale");

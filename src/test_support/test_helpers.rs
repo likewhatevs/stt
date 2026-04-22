@@ -11,6 +11,7 @@
 
 #![cfg(test)]
 
+use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -75,12 +76,7 @@ impl IsolatedCacheDir {
 /// [`IsolatedCacheDir`] for drop semantics.
 pub(crate) fn isolated_cache_dir() -> IsolatedCacheDir {
     let tmp = TempDir::new().expect("tempdir for isolated cache root");
-    let guard = EnvVarGuard::set(
-        "KTSTR_CACHE_DIR",
-        tmp.path()
-            .to_str()
-            .expect("tempdir path is UTF-8 on every supported target"),
-    );
+    let guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
     IsolatedCacheDir { _guard: guard, tmp }
 }
 
@@ -106,36 +102,39 @@ pub(crate) fn dummy_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
 /// tests don't need the lock — the lock is only needed when multiple
 /// tests in a single process mutate overlapping keys.
 ///
+/// Keys and saved originals are stored as [`OsString`] so callers
+/// can pass `Path`, `PathBuf`, `&OsStr`, or `&str` without a UTF-8
+/// bridge — `&str: AsRef<OsStr>` keeps existing string-literal call
+/// sites working unchanged. Storage is `OsString` because non-UTF-8
+/// env values are valid on Unix and the guard must restore them
+/// exactly.
+///
 /// Shared across cache / remote_cache / anywhere else that needs to
 /// rewrite HOME / XDG_CACHE_HOME / KTSTR_CACHE_DIR / ACTIONS_CACHE_URL
 /// and friends during a test run. Previously duplicated in
 /// `cache::tests` and `remote_cache::tests`.
 pub(crate) struct EnvVarGuard {
-    key: String,
-    original: Option<String>,
+    key: OsString,
+    original: Option<OsString>,
 }
 
 impl EnvVarGuard {
-    pub(crate) fn set(key: &str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
+    pub(crate) fn set(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        let key = key.as_ref().to_owned();
+        let original = std::env::var_os(&key);
         // SAFETY: nextest runs each test in its own process; callers
         // that share a key across concurrent tests in the same process
-        // must take `ENV_LOCK` before constructing the guard.
-        unsafe { std::env::set_var(key, value) };
-        EnvVarGuard {
-            key: key.to_string(),
-            original,
-        }
+        // must call `lock_env()` before constructing the guard.
+        unsafe { std::env::set_var(&key, value) };
+        EnvVarGuard { key, original }
     }
 
-    pub(crate) fn remove(key: &str) -> Self {
-        let original = std::env::var(key).ok();
+    pub(crate) fn remove(key: impl AsRef<OsStr>) -> Self {
+        let key = key.as_ref().to_owned();
+        let original = std::env::var_os(&key);
         // SAFETY: same rationale as `set`.
-        unsafe { std::env::remove_var(key) };
-        EnvVarGuard {
-            key: key.to_string(),
-            original,
-        }
+        unsafe { std::env::remove_var(&key) };
+        EnvVarGuard { key, original }
     }
 }
 
@@ -388,6 +387,43 @@ fn env_var_guard_remove_restores_original_value_on_drop() {
         std::env::var(KEY).ok().as_deref(),
         Some("pre-existing"),
         "EnvVarGuard::remove must restore the pre-existing value on drop"
+    );
+    unsafe { std::env::remove_var(KEY) };
+}
+
+/// Non-UTF-8 env values are valid on Unix, and the guard's
+/// [`OsString`] storage must round-trip them exactly. If storage
+/// had been kept as `String` or the read had used `std::env::var`
+/// (which rejects non-UTF-8), a pre-existing non-UTF-8 original
+/// would be silently converted into absence or lossily decoded —
+/// and the drop-time restore would put back a *different* byte
+/// sequence than what the test environment originally held.
+#[cfg(unix)]
+#[test]
+fn env_var_guard_restores_non_utf8_original_exactly() {
+    use std::os::unix::ffi::OsStrExt;
+
+    const KEY: &str = "KTSTR_TEST_ENV_VAR_GUARD_RESTORES_NON_UTF8";
+    // A byte sequence with a lone 0xFF — not valid UTF-8.
+    let original_bytes: &[u8] = b"foo\xFFbar";
+    let original = OsStr::from_bytes(original_bytes);
+
+    let _lock = lock_env();
+    // SAFETY: process-wide env mutation; we hold `lock_env()`.
+    unsafe { std::env::set_var(KEY, original) };
+    {
+        let _g = EnvVarGuard::set(KEY, "replacement");
+        assert_eq!(
+            std::env::var_os(KEY).as_deref(),
+            Some(OsStr::new("replacement")),
+            "EnvVarGuard::set must overwrite the key while the guard is live",
+        );
+    }
+    let restored = std::env::var_os(KEY).expect("restored value must be present after drop");
+    assert_eq!(
+        restored.as_bytes(),
+        original_bytes,
+        "EnvVarGuard must restore non-UTF-8 originals byte-for-byte",
     );
     unsafe { std::env::remove_var(KEY) };
 }

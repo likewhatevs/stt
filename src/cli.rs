@@ -157,12 +157,18 @@ fn is_eol(version: &str, active_prefixes: &[String]) -> bool {
 }
 
 /// Fetch active kernel series prefixes from releases.json.
-/// Returns major.minor prefixes for all stable/longterm/mainline entries.
-pub fn fetch_active_prefixes() -> Vec<String> {
-    let releases = match crate::fetch::fetch_releases() {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
+///
+/// Returns major.minor prefixes for every stable/longterm/mainline
+/// entry on success. Propagates the underlying
+/// [`crate::fetch::fetch_releases`] error on failure (network error,
+/// HTTP status, JSON parse failure, missing releases array) so
+/// callers can distinguish "fetched and empty" (kernel.org shipped
+/// no active series — a violated assumption) from "fetch failed"
+/// (transient outage where EOL annotation must degrade, not flip).
+///
+/// See [`is_eol`]'s empty-slice guard for the recommended fallback pattern.
+pub(crate) fn fetch_active_prefixes() -> Result<Vec<String>, String> {
+    let releases = crate::fetch::fetch_releases()?;
     let mut prefixes = Vec::new();
     for (moniker, version) in &releases {
         if moniker == "linux-next" {
@@ -174,7 +180,7 @@ pub fn fetch_active_prefixes() -> Vec<String> {
             prefixes.push(prefix);
         }
     }
-    prefixes
+    Ok(prefixes)
 }
 
 /// Format a human-readable table row for a cache entry.
@@ -211,7 +217,16 @@ pub fn kernel_list(json: bool) -> Result<()> {
     let entries = cache.list()?;
     let kconfig_hash = embedded_kconfig_hash();
 
-    let active_prefixes = fetch_active_prefixes();
+    let active_prefixes = match fetch_active_prefixes() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "kernel list: failed to fetch active kernel series ({e}); \
+                 EOL annotation disabled for this run",
+            );
+            Vec::new()
+        }
+    };
 
     if json {
         let json_entries: Vec<serde_json::Value> = entries
@@ -2720,5 +2735,60 @@ mod tests {
     #[test]
     fn is_eol_unparseable_version_returns_false() {
         assert!(!is_eol("abc", &["6.14".to_string()]));
+    }
+
+    /// Regression pin for `format_entry_row` with empty
+    /// `active_prefixes` — the fallback path `kernel_list` enters
+    /// when [`fetch_active_prefixes`] returns `Err`. The `(EOL)` tag
+    /// must not appear on the rendered row regardless of how old the
+    /// entry's version is, since "fetch failed" is an
+    /// unknown-active-list signal, not a universal-EOL signal.
+    /// Cross-checked against the non-empty branch so the suppression
+    /// is owned by the empty-slice fallback, not by some other code
+    /// path that happens to be quiet on this fixture.
+    #[test]
+    fn format_entry_row_empty_active_prefixes_does_not_tag_eol() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src = tempfile::TempDir::new().unwrap();
+        let image = src.path().join("bzImage");
+        std::fs::write(&image, b"fake kernel").unwrap();
+        // Ancient long-EOL version: if the active list contained only
+        // modern series, is_eol would return true. The empty slice
+        // forces the guard branch instead.
+        let meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_version(Some("2.6.32".to_string()));
+        let entry = cache
+            .store(
+                "fetch-failed-fallback",
+                &CacheArtifacts::new(&image),
+                &meta,
+            )
+            .unwrap();
+
+        let row_fallback = format_entry_row(&entry, "kconfig_hash", &[]);
+        assert!(
+            !row_fallback.contains("(EOL)"),
+            "empty active_prefixes (fetch-failed fallback) must not tag any entry EOL, \
+             got row: {row_fallback:?}",
+        );
+
+        // Sanity: the same entry IS tagged EOL when a non-empty active
+        // list excludes its prefix. Confirms the suppression above
+        // flows through the empty-slice guard, not some unrelated
+        // short-circuit.
+        let row_with_active = format_entry_row(&entry, "kconfig_hash", &["6.14".to_string()]);
+        assert!(
+            row_with_active.contains("(EOL)"),
+            "non-empty active_prefixes excluding entry's prefix must tag EOL, \
+             got row: {row_with_active:?}",
+        );
     }
 }
