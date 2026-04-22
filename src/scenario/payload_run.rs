@@ -1069,12 +1069,18 @@ fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
     if err.kind() == std::io::ErrorKind::NotFound {
         anyhow::Error::new(err).context(format!(
             "spawn '{binary}': binary not found on guest PATH. \
-             Remediation: for CLI invocations (ktstr / cargo-ktstr \
-             shell, run, …), package the binary with \
-             `-i {binary}` / `--include-files {binary}` so it lands \
-             on the guest PATH under `/include-files/`. For \
-             `#[ktstr_test]` entries, pre-install the binary in the \
-             base initramfs — the macro surface does not expose `-i`."
+             Note: ENOENT on execve also fires when `{binary}` is a \
+             script whose `#!` shebang points at an interpreter that \
+             is missing in the guest (per execve(2)); in that case \
+             the error names the script but the missing file is the \
+             interpreter. Remediation: for CLI invocations (ktstr / \
+             cargo-ktstr shell, run, …), package every missing \
+             artifact with `-i {binary}` / `--include-files {binary}` \
+             (and `-i <interpreter>` if the script names one) so each \
+             lands on the guest PATH under `/include-files/`. For \
+             `#[ktstr_test]` entries, pre-install the binary AND its \
+             shebang interpreter in the base initramfs — the macro \
+             surface does not expose `-i`."
         ))
     } else {
         anyhow::Error::new(err).context(format!("spawn '{binary}'"))

@@ -193,6 +193,23 @@ pub(crate) fn format_corrupt_footer(cache_root: &Path) -> String {
     )
 }
 
+/// Decide whether to emit the corrupt-entry footer under the
+/// `kernel list` table. Mirrors [`eol_legend_if_any`] and
+/// [`untracked_legend_if_any`] so the three "tag → footer" gates
+/// share one shape (boolean in, `Option<String>` out) and every
+/// branch is unit-testable without stderr capture. The
+/// unconditional emission-only-when-tag-rendered invariant is the
+/// signal that keeps the normal no-corrupt case noise-free; a
+/// regression that unconditionally emitted the footer would show
+/// up as a red test on the `false` branch here.
+pub(crate) fn corrupt_footer_if_any(any_corrupt: bool, cache_root: &Path) -> Option<String> {
+    if any_corrupt {
+        Some(format_corrupt_footer(cache_root))
+    } else {
+        None
+    }
+}
+
 /// ktstr.kconfig embedded at compile time.
 pub const EMBEDDED_KCONFIG: &str = crate::EMBEDDED_KCONFIG;
 
@@ -514,8 +531,8 @@ pub fn kernel_list(json: bool) -> Result<()> {
              Rebuild with: kernel build --force VERSION"
         );
     }
-    if any_corrupt {
-        eprintln!("{}", format_corrupt_footer(cache.root()));
+    if let Some(footer) = corrupt_footer_if_any(any_corrupt, cache.root()) {
+        eprintln!("{footer}");
     }
     Ok(())
 }
@@ -3494,6 +3511,24 @@ mod tests {
             Some(UNTRACKED_KCONFIG_EXPLANATION),
         );
         assert_eq!(untracked_legend_if_any(false), None);
+    }
+
+    /// `corrupt_footer_if_any` completes the trio of `*_if_any`
+    /// tag-gate helpers. True branch must carry the same
+    /// `format_corrupt_footer` content the production path would
+    /// print, and the cache_root path must appear verbatim so
+    /// operators know exactly which directory to inspect. False
+    /// branch must be `None` — a regression that unconditionally
+    /// emitted the footer would show here instead of shipping noise
+    /// to every clean `kernel list` run.
+    #[test]
+    fn corrupt_footer_if_any_branches() {
+        let root = std::path::Path::new("/tmp/ktstr-cache-test-root");
+        assert_eq!(
+            corrupt_footer_if_any(true, root),
+            Some(format_corrupt_footer(root)),
+        );
+        assert_eq!(corrupt_footer_if_any(false, root), None);
     }
 
     /// The `UNTRACKED_KCONFIG_EXPLANATION` must reference the tag word
