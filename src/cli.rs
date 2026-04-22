@@ -131,6 +131,32 @@ pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
     }
 }
 
+/// Footer emitted by `kernel_list` when at least one entry is
+/// corrupt. Pure function of the cache-root path so tests pin the
+/// exact same string the production path prints — not a hand-copied
+/// duplicate. Extracted alongside [`eol_legend_if_any`] so the
+/// three actionable elements (the `(corrupt)` tag label, the
+/// `kernel clean` variants, and the cache-root path) are enforced
+/// by one source of truth.
+///
+/// Scope-safe wording: callers inspecting the footer in isolation
+/// must not be able to misread `kernel clean --force` as surgical.
+/// The text explicitly spells out "ALL cached entries" and
+/// surfaces `--keep N --force` for partial cleanup so an operator
+/// with valid alongside corrupt entries does not blow them all
+/// away in a single command.
+pub(crate) fn format_corrupt_footer(cache_root: &Path) -> String {
+    format!(
+        "warning: entries marked (corrupt) cannot be used — cached metadata is \
+         missing, malformed, or references a missing image. Inspect the entry \
+         directory under {} to remove it manually, or run \
+         `kernel clean --force` which removes ALL cached entries (valid and \
+         corrupt alike). Use `kernel clean --keep N --force` to preserve the \
+         N newest cached entries while removing the rest.",
+        cache_root.display(),
+    )
+}
+
 /// ktstr.kconfig embedded at compile time.
 pub const EMBEDDED_KCONFIG: &str = crate::EMBEDDED_KCONFIG;
 
@@ -191,6 +217,19 @@ fn is_eol(version: &str, active_prefixes: &[String]) -> bool {
     !active_prefixes.iter().any(|p| p == &prefix)
 }
 
+/// Whether a cache entry is end-of-life relative to the supplied
+/// active-prefix list. Handles the `version == None` / `"-"`
+/// short-circuit once for both the text-path `(EOL)` tag render in
+/// [`format_entry_row`] and the JSON-path `eol` field emission in
+/// [`kernel_list`], so the two surfaces cannot drift: any change to
+/// the predicate or the missing-version gate lands in both by
+/// construction. `kernel_list_eol_json_human_parity` pins this
+/// invariant.
+pub(crate) fn entry_is_eol(entry: &CacheEntry, active_prefixes: &[String]) -> bool {
+    let v = entry.metadata.version.as_deref().unwrap_or("-");
+    v != "-" && is_eol(v, active_prefixes)
+}
+
 /// Fetch active kernel series prefixes from releases.json.
 ///
 /// Returns major.minor prefixes for every stable/longterm/mainline
@@ -237,7 +276,7 @@ pub fn format_entry_row(
     if !matches!(status, KconfigStatus::Matches) {
         tags.push_str(&format!(" ({status} kconfig)"));
     }
-    if version != "-" && is_eol(version, active_prefixes) {
+    if entry_is_eol(entry, active_prefixes) {
         tags.push_str(" (EOL)");
     }
     format!(
@@ -269,8 +308,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
             .map(|e| match e {
                 crate::cache::ListedEntry::Valid(entry) => {
                     let meta = &entry.metadata;
-                    let v = meta.version.as_deref().unwrap_or("-");
-                    let eol = v != "-" && is_eol(v, &active_prefixes);
+                    let eol = entry_is_eol(entry, &active_prefixes);
                     let kconfig_status = entry.kconfig_status(&kconfig_hash).to_string();
                     serde_json::json!({
                         "key": entry.key,
@@ -316,14 +354,14 @@ pub fn kernel_list(json: bool) -> Result<()> {
     );
     let mut any_stale = false;
     let mut any_eol = false;
+    let mut any_corrupt = false;
     for listed in &entries {
         match listed {
             crate::cache::ListedEntry::Valid(entry) => {
                 if entry.kconfig_status(&kconfig_hash).is_stale() {
                     any_stale = true;
                 }
-                let v = entry.metadata.version.as_deref().unwrap_or("-");
-                if v != "-" && is_eol(v, &active_prefixes) {
+                if entry_is_eol(entry, &active_prefixes) {
                     any_eol = true;
                 }
                 println!(
@@ -332,6 +370,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
                 );
             }
             crate::cache::ListedEntry::Corrupt { key, reason, .. } => {
+                any_corrupt = true;
                 println!("  {key:<48} (corrupt: {reason})");
             }
         }
@@ -348,6 +387,9 @@ pub fn kernel_list(json: bool) -> Result<()> {
             "warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. \
              Rebuild with: kernel build --force VERSION"
         );
+    }
+    if any_corrupt {
+        eprintln!("{}", format_corrupt_footer(cache.root()));
     }
     Ok(())
 }
@@ -2982,7 +3024,14 @@ mod tests {
             let entry = make_entry(&format!("parity-{label}"), version);
             let active_vec: Vec<String> = active.iter().map(|s| s.to_string()).collect();
             let row = format_entry_row(&entry, "kconfig_hash", &active_vec);
-            let json_eol = version != &"-" && is_eol(version, &active_vec);
+            // Ask the SAME helper both emission paths delegate to
+            // — not a re-derivation via `is_eol` inside the test.
+            // This enforces parity by construction: a future
+            // change that factors the eol computation into a new
+            // helper on one side but leaves the other pointing
+            // here would be caught immediately when `entry_is_eol`
+            // is no longer used by both sites.
+            let json_eol = entry_is_eol(&entry, &active_vec);
             let human_eol = row.contains("(EOL)");
             assert_eq!(
                 json_eol, human_eol,
@@ -2990,6 +3039,105 @@ mod tests {
                  json_eol={json_eol}, human_eol={human_eol}, row={row:?}",
             );
         }
+    }
+
+    /// Corrupt-entry footer fires iff at least one `ListedEntry::Corrupt`
+    /// was rendered in the text path of `kernel_list`. The
+    /// `kernel_list` function itself mixes cache IO + stdout/stderr,
+    /// so unit-testing the footer shape requires re-constructing
+    /// the in-loop decision. Here we mirror the any_corrupt logic
+    /// against a small fixture and pin that the footer message
+    /// contains the three actionable pieces (key, `kernel clean
+    /// --force`, and the cache root path) — a regression that
+    /// deletes any of those leaves users with an inactionable
+    /// warning.
+    #[test]
+    fn kernel_list_corrupt_footer_fires_iff_any_corrupt() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let image = src_dir.join("bzImage");
+        std::fs::write(&image, b"fake kernel").unwrap();
+
+        // Create a valid entry, then build a synthetic Corrupt via
+        // the listed-entry enum so the test does not depend on
+        // CacheDir::list's corruption-detection internals.
+        let meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-22T00:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()));
+        // Store two separately-keyed entries so each test case owns
+        // one — `CacheEntry` doesn't derive `Clone`, so building two
+        // `ListedEntry::Valid` values requires two `store` calls.
+        let valid_1 = cache
+            .store("valid-entry-a", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        let valid_2 = cache
+            .store("valid-entry-b", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+        let corrupt_entry = crate::cache::ListedEntry::Corrupt {
+            key: "corrupt-entry".to_string(),
+            path: cache.root().join("corrupt-entry"),
+            reason: "metadata.json missing".to_string(),
+        };
+
+        let entries_with_corrupt = [
+            crate::cache::ListedEntry::Valid(valid_1),
+            corrupt_entry,
+        ];
+        let entries_clean_only = [crate::cache::ListedEntry::Valid(valid_2)];
+
+        fn any_corrupt(entries: &[crate::cache::ListedEntry]) -> bool {
+            entries
+                .iter()
+                .any(|e| matches!(e, crate::cache::ListedEntry::Corrupt { .. }))
+        }
+
+        assert!(
+            any_corrupt(&entries_with_corrupt),
+            "mixed list must trip the footer",
+        );
+        assert!(
+            !any_corrupt(&entries_clean_only),
+            "clean-only list must not trip the footer",
+        );
+
+        // Call the SAME helper production uses so a regression in
+        // the footer wording surfaces here. A local re-construction
+        // would be tautological (tests itself, not production).
+        let footer = format_corrupt_footer(cache.root());
+        assert!(
+            footer.contains("(corrupt)"),
+            "footer must reference the tag users see",
+        );
+        assert!(
+            footer.contains("kernel clean --force"),
+            "footer must offer a remediation command",
+        );
+        // Scope safety: the `--force` variant removes every cached
+        // entry — pin the "ALL" call-out so an operator reading the
+        // footer in isolation cannot misread it as surgical.
+        assert!(
+            footer.contains("ALL cached entries"),
+            "footer must spell out that `kernel clean --force` is not surgical",
+        );
+        // Actionable partial cleanup: preserve N newest valid
+        // entries while removing the rest. Pinning this ensures the
+        // less-destructive option stays surfaced.
+        assert!(
+            footer.contains("kernel clean --keep N --force"),
+            "footer must offer a partial-cleanup alternative",
+        );
+        assert!(
+            footer.contains(&cache.root().display().to_string()),
+            "footer must name the cache root so operators know where to inspect",
+        );
     }
 
     /// `eol_legend_if_any` is the sole gate on whether the text

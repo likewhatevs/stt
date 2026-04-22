@@ -65,8 +65,12 @@ pub struct HostContext {
     pub thp_defrag: Option<String>,
     /// `/proc/sys/kernel/sched_*` tunables. Keys are the leaf
     /// basename (e.g. `sched_migration_cost_ns`); values are the
-    /// single-line content trimmed of leading and trailing
-    /// whitespace. `None` when the `read_dir` of
+    /// file content trimmed of leading and trailing whitespace
+    /// (internal whitespace preserved — `read_trimmed_sysfs` uses
+    /// `str::trim`, which only strips edges). Every current
+    /// `sched_*` tunable is a scalar, but a future kernel that
+    /// exposes a multi-line tunable would land here as a
+    /// multi-line `String`. `None` when the `read_dir` of
     /// `/proc/sys/kernel` fails; empty map when the directory is
     /// readable but contains no entries starting with `sched_`
     /// (or all such entries fail the per-file read or trim to
