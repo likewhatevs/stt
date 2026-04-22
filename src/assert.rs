@@ -15,6 +15,17 @@
 //! Assertion uses a three-layer merge: [`Assert::default_checks()`] ->
 //! `Scheduler.assert` -> per-test `assert`.
 //!
+//! # Statistical conventions
+//!
+//! - **Percentiles / medians**: nearest-rank (see [`percentile`]),
+//!   value at index `ceil(n * p) - 1`. Unlike interpolated
+//!   percentiles, every reported p99 is an actual observed sample,
+//!   not a synthetic midpoint. Consistent across every
+//!   [`CgroupStats`] and [`ScenarioStats`] latency field.
+//! - **CV (coefficient of variation)** is stddev/mean computed over
+//!   the pooled latency samples, not as a mean of per-worker CVs —
+//!   see [`CgroupStats::wake_latency_cv`] for the masking caveat.
+//!
 //! See the [Checking](https://likewhatevs.github.io/ktstr/guide/concepts/checking.html)
 //! chapter of the guide.
 
@@ -452,6 +463,14 @@ pub struct CgroupStats {
     /// Median wake latency across all workers (microseconds).
     pub median_wake_latency_us: f64,
     /// Coefficient of variation (stddev / mean) of wake latencies.
+    ///
+    /// Computed over the POOLED latency samples from every worker in
+    /// the cgroup, not as a mean of per-worker CVs. Per-worker
+    /// dispersion is therefore masked: a cgroup with one tight
+    /// worker and one wildly variable worker can report a moderate
+    /// pooled CV that looks healthier than either constituent. Use
+    /// [`WorkerReport::resume_latencies_ns`] directly if per-worker
+    /// CV is needed.
     pub wake_latency_cv: f64,
     /// Sum of iteration counts across all workers.
     pub total_iterations: u64,
