@@ -647,6 +647,13 @@ impl MpolFlags {
     }
 
     /// Whether every bit in `other` is set in `self`.
+    ///
+    /// Set-theoretic, not syntactic: `contains(NONE)` returns `true`
+    /// for any `self` (vacuous truth — the empty set is a subset of
+    /// everything). Callers who want "has a non-empty intersection
+    /// with `other`" must compare `self.bits() & other.bits() != 0`
+    /// explicitly; using `contains` for that query silently returns
+    /// `true` when the operand is `NONE` regardless of `self`.
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }

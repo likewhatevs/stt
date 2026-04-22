@@ -490,15 +490,20 @@ impl Payload {
 /// non-empty does it retry against stderr. Well-behaved binaries
 /// keep stdout canonical; payloads that emit structured output only
 /// on stderr (schbench's `show_latencies` → `fprintf(stderr, ...)`)
-/// still parse. The streams are never merged. `ExitCode` does
-/// neither the stdout pass nor the stderr fallback — it records the
-/// exit code and nothing else, so there is no extraction step and
-/// no fallback is needed.
+/// still parse. The streams are never merged. `ExitCode` produces
+/// no metrics from either stream — `extract_metrics` is invoked
+/// (the control flow is variant-agnostic for simplicity) but the
+/// `ExitCode` arm returns `Ok(vec![])` immediately, so the stderr
+/// fallback runs and also returns empty. Observable behavior:
+/// exit code only, no metrics.
 #[derive(Debug, Clone, Copy)]
 pub enum OutputFormat {
     /// Pass/fail from exit code alone. Stdout is archived for
-    /// debugging but not parsed. No stderr fallback — there is no
-    /// extraction step to fall back from.
+    /// debugging but not parsed. `extract_metrics` is still invoked
+    /// in the evaluate pipeline (variant-agnostic control flow) but
+    /// returns `Ok(vec![])` immediately for this variant; the
+    /// stderr fallback runs too and also returns empty. Observable
+    /// behavior: no metrics extracted regardless of stream content.
     ExitCode,
     /// Parse the primary stream (stdout, or stderr on fallback) as
     /// JSON: find the JSON region within mixed output, extract

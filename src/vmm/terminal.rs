@@ -95,6 +95,20 @@ extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
 /// default handler runs. SIGABRT catches the `panic = "abort"`
 /// release-build path where an unwind-less panic calls `abort(3)`
 /// instead of unwinding Drop.
+///
+/// # Guard bypass paths
+///
+/// Neither the Drop path nor the SA_RESETHAND handler fires in these
+/// cases, leaving the terminal in raw mode after process exit:
+/// - **SIGSEGV / SIGBUS / SIGILL**: not in the guard's handler list
+///   and the kernel's default action produces a core dump without
+///   running userspace recovery.
+/// - **`std::process::exit` / `libc::_exit`**: skip Drop entirely.
+/// - **SIGKILL**: uncatchable by design, no handler runs.
+///
+/// If any of these fires, the shell will appear broken (no echo, no
+/// line editing). Run `stty sane` (or `reset`) in the shell to
+/// restore cooked mode.
 pub(crate) struct TerminalRawGuard {
     original: nix::sys::termios::Termios,
     fd: std::os::unix::io::RawFd,
