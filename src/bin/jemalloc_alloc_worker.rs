@@ -45,10 +45,29 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .expect("usage: jemalloc-alloc-worker <BYTES>");
 
+    // A zero-length allocation would indexing-panic on `known[0]`
+    // in the black_box triple below (both post-alloc and park-loop
+    // sites dereference index 0 to force a heap read). Reject here
+    // with a diagnostic rather than letting the panic surface as a
+    // test timeout: the test is always paired with a positive size
+    // (see KNOWN_BYTES in tests/jemalloc_probe_tests.rs), so a zero
+    // arg indicates a caller-side bug worth surfacing loudly.
+    if bytes == 0 {
+        eprintln!(
+            "jemalloc-alloc-worker: bytes=0 is not a valid allocation size; \
+             caller must pass a positive byte count"
+        );
+        std::process::exit(2);
+    }
+
     // Fail fast if the process is not single-threaded. `/proc/self/task`
     // lists one directory entry per TID; more than one means an
     // unexpected helper thread is running and the `tid == pid`
-    // invariant the test body relies on is already broken.
+    // invariant the test body relies on is already broken. Note that
+    // the test-side `thread_count(&metrics) != 1` assertion in
+    // tests/jemalloc_probe_tests.rs is the authoritative guard — this
+    // check only exits early with an actionable diagnostic instead of
+    // letting the probe observe a silently-broken worker.
     match std::fs::read_dir("/proc/self/task") {
         Ok(iter) => {
             let n = iter.filter(|e| e.is_ok()).count();
@@ -69,17 +88,39 @@ fn main() {
     // Allocate + hold under black_box so the optimizer cannot
     // elide the vector. The allocation runs on the main thread,
     // which is also the thread jemalloc updates thread_allocated
-    // on.
+    // on. Using `black_box(&known)` on a reference is not strong
+    // enough — LLVM can in principle observe that the `Vec`'s
+    // heap buffer is never read through the pointer and fold the
+    // zero-fill away. Force an actual heap read (through `[0]`)
+    // and black-box the raw pointer + length so the allocation is
+    // provably materialized and jemalloc sees the accounting.
     let known: Vec<u8> = vec![0u8; bytes];
-    std::hint::black_box(&known);
+    let _ = std::hint::black_box(known[0]);
+    std::hint::black_box(known.as_ptr());
+    std::hint::black_box(known.len());
 
-    // Flush stdout with a single readiness line. The test body
-    // doesn't parse this (it reads the worker pid from
-    // `PayloadHandle::pid()` and derives tid from a
-    // single-threaded-process identity), but the line is a
-    // human-useful breadcrumb if the test fails and the log is
-    // inspected.
+    // Signal readiness via a pid-scoped marker file. The test body
+    // polls `/tmp/ktstr-worker-ready-{pid}` for existence — cheaper
+    // and tighter than a fixed 500ms sleep, and safe because each
+    // `#[ktstr_test]` boots a fresh VM with a clean /tmp (so no
+    // stale file from a prior run can race the poll). The file must
+    // be written AFTER the allocation + black_box triple above so
+    // the test observes a worker that has already materialized the
+    // heap buffer; writing it earlier would let the probe race
+    // against the allocation. A write failure is fatal — a worker
+    // that cannot signal readiness leaves the test hanging on the
+    // poll timeout, which is strictly worse than a clean exit code.
     let pid = std::process::id();
+    let ready_path = format!("/tmp/ktstr-worker-ready-{pid}");
+    if let Err(e) = std::fs::write(&ready_path, b"ready\n") {
+        eprintln!(
+            "jemalloc-alloc-worker: failed to write ready marker {ready_path}: {e}"
+        );
+        std::process::exit(2);
+    }
+    // The stdout line is a human-useful breadcrumb if the test
+    // fails and the log is inspected; the test body does not parse
+    // it (readiness is communicated via the marker file above).
     println!("jemalloc-alloc-worker ready pid={pid} bytes={bytes}");
     let _ = std::io::stdout().flush();
 
@@ -87,9 +128,12 @@ fn main() {
     // optimizer cannot move the free before the park. The test
     // body's `PayloadHandle::kill` delivers SIGKILL via `killpg`
     // on the child's process group, reaching us without further
-    // cooperation.
+    // cooperation. Mirrors the strong black_box pattern above:
+    // a heap read through `[0]` plus a pointer/len materialize.
     loop {
-        std::hint::black_box(&known);
+        let _ = std::hint::black_box(known[0]);
+        std::hint::black_box(known.as_ptr());
+        std::hint::black_box(known.len());
         std::thread::sleep(Duration::from_secs(3600));
     }
 }

@@ -542,7 +542,17 @@ fn parse_trimmed(text: &str) -> Option<String> {
 /// starting with `sched_`, or every such entry failed the
 /// per-file read or trim to empty.
 fn read_sched_tunables() -> Option<BTreeMap<String, String>> {
-    let entries = std::fs::read_dir("/proc/sys/kernel").ok()?;
+    read_sched_tunables_from(std::path::Path::new("/proc/sys/kernel"))
+}
+
+/// Path-parameterized walk used by [`read_sched_tunables`]. Seam for
+/// unit tests that drive the walk with a tempdir full of `sched_*`
+/// fixture files — everything the production caller does is mirrored
+/// here except the hardcoded sysfs path, so a future test can
+/// exercise the real walk + filter + read pipeline against a
+/// controlled directory rather than against `/proc`.
+fn read_sched_tunables_from(dir: &std::path::Path) -> Option<BTreeMap<String, String>> {
+    let entries = std::fs::read_dir(dir).ok()?;
     let mut out = BTreeMap::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -1329,6 +1339,39 @@ Hugepagesize:       2048 kB
         assert_eq!(
             read_trimmed_sysfs(f.path()).as_deref(),
             Some("always [madvise] never"),
+        );
+    }
+
+    /// `read_sched_tunables_from` happy path: only regular files whose
+    /// names start with `sched_` are included, non-prefix files are
+    /// ignored, subdirectories are filtered by the `is_file` guard,
+    /// and each value is trimmed by the existing `read_trimmed_sysfs`
+    /// hop. Drives the path-parameterized seam against a controlled
+    /// tempdir so the walk + filter + read pipeline is exercised end
+    /// to end without touching `/proc`.
+    #[test]
+    fn read_sched_tunables_from_filters_and_trims() {
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let dir = tmp.path();
+        std::fs::write(dir.join("sched_foo"), b"42\n").expect("write sched_foo");
+        std::fs::write(dir.join("sched_bar"), b"1\n").expect("write sched_bar");
+        // Non-`sched_` prefix — filtered out by the name check.
+        std::fs::write(dir.join("not_sched_baz"), b"99\n").expect("write not_sched_baz");
+        // Subdirectory whose name starts with `sched_` — filtered
+        // out by the `is_file` guard.
+        std::fs::create_dir(dir.join("sched_subdir")).expect("create sched_subdir");
+
+        let out = read_sched_tunables_from(dir).expect("walk must succeed on readable dir");
+        assert_eq!(out.len(), 2, "expected only two sched_* files, got {out:?}");
+        assert_eq!(out.get("sched_foo").map(String::as_str), Some("42"));
+        assert_eq!(out.get("sched_bar").map(String::as_str), Some("1"));
+        assert!(
+            !out.contains_key("not_sched_baz"),
+            "non-sched_ prefix must be filtered out"
+        );
+        assert!(
+            !out.contains_key("sched_subdir"),
+            "subdirectories must be filtered by is_file"
         );
     }
 

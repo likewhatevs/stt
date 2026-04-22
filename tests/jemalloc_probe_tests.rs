@@ -292,14 +292,13 @@ fn jemalloc_probe_single_worker_observes_known_allocation(ctx: &Ctx) -> Result<A
 ///
 /// The worker is single-threaded so its `tid == pid` — the test
 /// body uses `PayloadHandle::pid()` as the match key against the
-/// probe's `threads[N].tid` entries. The 500 ms settle before
-/// the probe runs gives the worker's scheduler dispatch + initial
-/// allocation time to complete; without it the probe can race and
-/// either not find the pid (fork-but-no-exec yet) or read the
-/// counter before the allocation lands. A proper stdout readiness
-/// handshake would be tighter, but `PayloadHandle` does not
-/// expose the child's stdout — when that surface arrives, replace
-/// this sleep with a read of the worker's "ready" line.
+/// probe's `threads[N].tid` entries. Readiness is communicated
+/// through a pid-scoped marker file the worker writes AFTER its
+/// allocation + black_box triple (see jemalloc_alloc_worker.rs);
+/// the test polls for that file's existence before launching the
+/// probe. The marker replaces the prior fixed-500ms settle — each
+/// `#[ktstr_test]` boots a fresh VM with a clean `/tmp`, so there
+/// is no stale-file race to defend against.
 #[ktstr_test(llcs = 1, cores = 1, threads = 1)]
 fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result<AssertResult> {
     const KNOWN_BYTES: u64 = 16 * 1024 * 1024;
@@ -319,9 +318,24 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     let worker_pid = worker
         .pid()
         .ok_or_else(|| anyhow!("worker PayloadHandle has no pid (child already consumed)"))?;
-    // Give the worker time to reach the allocation + park loop
-    // so the probe reads stable TSD state.
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Wait for the worker's pid-scoped ready marker. The worker
+    // writes this file after its allocation + black_box triple
+    // completes, so a successful poll implies the probe will see a
+    // materialized heap buffer and a stable `thread_allocated`.
+    // 5s is generous vs the worker's expected sub-50ms dispatch +
+    // 16 MiB allocation time on a warm guest; a timeout implies
+    // the worker died during startup or the VM is heavily stalled.
+    let ready_path = format!("/tmp/ktstr-worker-ready-{worker_pid}");
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !std::path::Path::new(&ready_path).exists() {
+        if std::time::Instant::now() >= ready_deadline {
+            let _ = worker.kill();
+            return Err(anyhow!(
+                "worker pid={worker_pid} did not create ready marker {ready_path} within 5s"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 
     let run_outcome = ctx
         .payload(&JEMALLOC_PROBE_EXTERNAL)
