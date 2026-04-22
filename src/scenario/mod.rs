@@ -630,8 +630,31 @@ impl Drop for CgroupGroup<'_> {
         // their parents) are removed before their parents. Removing a
         // cgroup directory that still has child cgroup directories
         // under it fails with ENOTEMPTY.
+        //
+        // ENOENT is expected: `CgroupManager::remove_cgroup` returns
+        // Ok when the dir is already gone, so the only way ENOENT
+        // reaches here is the narrow TOCTOU race where another process
+        // unlinks between `exists()` and `remove_dir` — the post-
+        // condition (no dir) still holds and no cleanup is owed. Every
+        // other error (EBUSY from a surviving task, EACCES, broken
+        // cgroupfs mount) surfaces via `tracing::warn!` so a teardown
+        // failure is visible instead of silently swallowed; mirrors
+        // the same handling in `Op::RemoveCgroup` so the two paths
+        // stay consistent.
         for name in self.names.iter().rev() {
-            let _ = self.cgroups.remove_cgroup(name);
+            if let Err(err) = self.cgroups.remove_cgroup(name) {
+                let is_enoent = err
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+                if !is_enoent {
+                    tracing::warn!(
+                        cgroup = %name,
+                        err = %format!("{err:#}"),
+                        "CgroupGroup::drop: remove_cgroup returned non-ENOENT error",
+                    );
+                }
+            }
         }
     }
 }

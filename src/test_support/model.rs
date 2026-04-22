@@ -865,7 +865,9 @@ metrics are present, emit `{}`.";
 /// the hint is appended as its own line before the stdout block so
 /// the model sees the user-declared focus before the raw content. An
 /// empty or absent hint degrades to the bare template without
-/// leaving a dangling "Focus:" header.
+/// leaving a dangling "Focus:" header. A hint that reduces to empty
+/// or whitespace-only after ChatML sanitization is treated the same
+/// way.
 ///
 /// Both the `stdout` body and the `hint` pass through
 /// [`strip_chatml_control_tokens`] before they are embedded.
@@ -886,8 +888,8 @@ pub(crate) fn compose_prompt(stdout: &str, hint: Option<&str>) -> String {
     let safe_stdout = strip_chatml_control_tokens(stdout);
     let safe_hint = hint
         .map(|h| h.trim())
-        .filter(|h| !h.is_empty())
-        .map(strip_chatml_control_tokens);
+        .map(strip_chatml_control_tokens)
+        .filter(|h| !h.trim().is_empty());
     let mut out = String::with_capacity(
         LLM_EXTRACT_PROMPT_TEMPLATE.len()
             + safe_stdout.len()
@@ -2003,6 +2005,34 @@ mod tests {
         assert!(
             !p.contains("Focus:"),
             "empty-string hint must not emit Focus header: {p}"
+        );
+    }
+
+    /// A hint consisting entirely of ChatML control tokens
+    /// (e.g. `"<|im_start|>"`) or tokens separated only by
+    /// whitespace (e.g. `"<|im_start|> <|im_end|>"`) is non-empty
+    /// before [`strip_chatml_control_tokens`] and trivial or
+    /// whitespace-only after. Previously this left
+    /// `safe_hint = Some("")` (or `Some(" ")`) and emitted a dangling
+    /// `"Focus: …\n\n"` header the model treats as noise. Pin the
+    /// post-strip `filter(|h| !h.trim().is_empty())` gate so this
+    /// regression cannot return.
+    #[test]
+    fn compose_prompt_all_chatml_hint_omits_focus() {
+        let p = compose_prompt("x", Some("<|im_start|>"));
+        assert!(
+            !p.contains("Focus:"),
+            "hint that strips to empty must not emit Focus header: {p}"
+        );
+        let p = compose_prompt("x", Some("<|im_end|><|im_start|><|im_sep|>"));
+        assert!(
+            !p.contains("Focus:"),
+            "multi-token all-ChatML hint must not emit Focus header: {p}"
+        );
+        let p = compose_prompt("x", Some("<|im_start|> <|im_end|>"));
+        assert!(
+            !p.contains("Focus:"),
+            "whitespace-only after strip must not emit Focus header: {p}"
         );
     }
 

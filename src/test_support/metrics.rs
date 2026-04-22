@@ -150,11 +150,36 @@ pub(crate) fn walk_json_leaves(value: &serde_json::Value, source: MetricSource) 
     // recurse, then truncate back. O(total_path_chars) work across
     // the whole walk instead of O(depth × path_chars) per leaf.
     let mut path = String::new();
-    walk(value, &mut path, source, &mut out);
+    walk(value, &mut path, 0, source, &mut out);
     out
 }
 
-fn walk(value: &serde_json::Value, path: &mut String, source: MetricSource, out: &mut Vec<Metric>) {
+
+/// Hard cap on recursion depth in [`walk`]. Object and array
+/// children past this depth are skipped and a single
+/// [`tracing::warn!`] fires. Serde_json's default parser recursion
+/// limit is 128, so this caps us well below that; a hand-built
+/// `serde_json::Value` that bypasses the parser can still reach
+/// arbitrary depth, so an explicit walker guard is the last line of
+/// defence against a stack overflow.
+const MAX_WALK_DEPTH: usize = 64;
+
+fn walk(
+    value: &serde_json::Value,
+    path: &mut String,
+    depth: usize,
+    source: MetricSource,
+    out: &mut Vec<Metric>,
+) {
+    if depth > MAX_WALK_DEPTH {
+        tracing::warn!(
+            depth,
+            max = MAX_WALK_DEPTH,
+            path = %path,
+            "walk_json_leaves: depth cap hit, subtree skipped",
+        );
+        return;
+    }
     match value {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
@@ -163,7 +188,7 @@ fn walk(value: &serde_json::Value, path: &mut String, source: MetricSource, out:
                     path.push('.');
                 }
                 path.push_str(k);
-                walk(v, path, source, out);
+                walk(v, path, depth + 1, source, out);
                 path.truncate(saved_len);
             }
         }
@@ -178,7 +203,7 @@ fn walk(value: &serde_json::Value, path: &mut String, source: MetricSource, out:
                 // fmt::Write impl (infallible for String).
                 use std::fmt::Write;
                 let _ = write!(path, "{i}");
-                walk(v, path, source, out);
+                walk(v, path, depth + 1, source, out);
                 path.truncate(saved_len);
             }
         }
@@ -693,6 +718,56 @@ mod tests {
         assert_eq!(by_name.get("data.0.vals.1"), Some(&20.0));
         assert_eq!(by_name.get("data.1.vals.0"), Some(&30.0));
         assert_eq!(by_name.len(), 3);
+    }
+
+    /// Programmatically build a `serde_json::Value` nested deeper than
+    /// [`MAX_WALK_DEPTH`] and confirm that `walk_json_leaves` returns
+    /// without a stack overflow and without emitting metrics from
+    /// beyond the cap. Serde_json's own parser depth limit (128 by
+    /// default) blocks malicious JSON strings before the walker sees
+    /// them, so a parser-bypass (direct `Value::Object` construction)
+    /// is the only way to reach this depth — the test exercises
+    /// exactly that path.
+    #[test]
+    fn walk_json_leaves_depth_cap_skips_deeply_nested_subtree() {
+        // Build an Object nested 100 deep with a numeric leaf at the
+        // bottom. The leaf at depth > MAX_WALK_DEPTH (64) must be
+        // skipped by the guard.
+        let mut value = serde_json::json!({"leaf": 42.0});
+        for _ in 0..100 {
+            let mut m = serde_json::Map::new();
+            m.insert("x".to_string(), value);
+            value = serde_json::Value::Object(m);
+        }
+        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        assert!(
+            metrics.is_empty(),
+            "leaf beyond MAX_WALK_DEPTH cap must not be emitted, got {metrics:?}"
+        );
+    }
+
+    /// A leaf exactly at [`MAX_WALK_DEPTH`] is still emitted — the
+    /// cap bails BEFORE recursing past `depth > MAX_WALK_DEPTH`, so a
+    /// leaf reached at `depth == MAX_WALK_DEPTH` is preserved.
+    /// Boundary pair with the depth_cap_skips test above so an
+    /// off-by-one in the guard (e.g. `>=` instead of `>`) surfaces.
+    #[test]
+    fn walk_json_leaves_depth_cap_boundary_leaf_preserved() {
+        // Build Object of exactly MAX_WALK_DEPTH nesting: top-level
+        // holds an Object, which holds an Object, ... for
+        // MAX_WALK_DEPTH levels, with the numeric leaf at the bottom.
+        // The leaf's path has MAX_WALK_DEPTH segments and walk() is
+        // called at depths 0..=MAX_WALK_DEPTH — the leaf call at
+        // depth MAX_WALK_DEPTH must pass the guard.
+        let mut value = serde_json::Value::Number(serde_json::Number::from_f64(42.0).unwrap());
+        for _ in 0..MAX_WALK_DEPTH {
+            let mut m = serde_json::Map::new();
+            m.insert("x".to_string(), value);
+            value = serde_json::Value::Object(m);
+        }
+        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        assert_eq!(metrics.len(), 1, "boundary leaf must be preserved");
+        assert_eq!(metrics[0].value, 42.0);
     }
 
     #[test]
