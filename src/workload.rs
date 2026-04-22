@@ -633,6 +633,11 @@ impl MpolFlags {
     pub const fn bits(self) -> u32 {
         self.0
     }
+
+    /// Whether every bit in `other` is set in `self`.
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
 }
 
 impl std::ops::BitOr for MpolFlags {

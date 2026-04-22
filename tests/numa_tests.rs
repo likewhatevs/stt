@@ -5,7 +5,7 @@ use ktstr::scenario::ops::{
     CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps, execute_steps_with,
 };
 use ktstr::test_support::{KtstrTestEntry, NumaDistance, NumaNode, Topology, TopologyConstraints};
-use ktstr::workload::MemPolicy;
+use ktstr::workload::{MemPolicy, MpolFlags};
 
 // All NUMA tests use auto_repro: false — these verify topology plumbing,
 // not scheduler behavior, so BPF crash probes add no diagnostic value.
@@ -187,6 +187,11 @@ static __KTSTR_ENTRY_VMSTAT_MIGRATION: KtstrTestEntry = KtstrTestEntry {
 // scenario pins workers to node 0 via cpuset but interleaves their pages
 // across nodes 0 and 1, so the locality assertion sets a low minimum.
 // Exercises the round-robin nodemask path that Bind/Preferred don't reach.
+//
+// `MpolFlags::STATIC_NODES` is required because without it the kernel
+// silently intersects the interleave nodemask with the task's cpuset —
+// which would degenerate to "interleave across {0} only" and defeat the
+// cross-node intent.
 // ---------------------------------------------------------------------------
 
 fn scenario_mempolicy_interleave_cross_node(ctx: &Ctx) -> Result<AssertResult> {
@@ -196,7 +201,8 @@ fn scenario_mempolicy_interleave_cross_node(ctx: &Ctx) -> Result<AssertResult> {
             CgroupDef::named("cg_0")
                 .workers(ctx.workers_per_cgroup)
                 .with_cpuset(CpusetSpec::Numa(0))
-                .mem_policy(MemPolicy::interleave([0, 1])),
+                .mem_policy(MemPolicy::interleave([0, 1]))
+                .mpol_flags(MpolFlags::STATIC_NODES),
         ]
         .into(),
         ops: vec![],
@@ -228,6 +234,11 @@ static __KTSTR_ENTRY_MEMPOLICY_INTERLEAVE: KtstrTestEntry = KtstrTestEntry {
 // pages should land on node 0 with the minority spilling to node 1.
 // Exercises the MPOL_PREFERRED_MANY (kernel 5.15+) path that
 // `MemPolicy::Preferred` cannot express.
+//
+// `MpolFlags::STATIC_NODES` is required so node 1 stays in the preferred
+// set — without it the kernel narrows the nodemask to the cpuset (node 0
+// only), collapsing the PreferredMany semantics into a single-node
+// preferred that this test is not exercising.
 // ---------------------------------------------------------------------------
 
 fn scenario_mempolicy_preferred_many_locality(ctx: &Ctx) -> Result<AssertResult> {
@@ -237,7 +248,8 @@ fn scenario_mempolicy_preferred_many_locality(ctx: &Ctx) -> Result<AssertResult>
             CgroupDef::named("cg_0")
                 .workers(ctx.workers_per_cgroup)
                 .with_cpuset(CpusetSpec::Numa(0))
-                .mem_policy(MemPolicy::preferred_many([0, 1])),
+                .mem_policy(MemPolicy::preferred_many([0, 1]))
+                .mpol_flags(MpolFlags::STATIC_NODES),
         ]
         .into(),
         ops: vec![],

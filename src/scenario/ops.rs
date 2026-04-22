@@ -2055,12 +2055,25 @@ fn build_stimulus(
 /// Validate that a MemPolicy's nodes are covered by the NUMA nodes
 /// reachable from the resolved cpuset. Returns `Err` with a description
 /// when the policy requests nodes outside the cpuset's NUMA coverage.
+///
+/// Bypassed when `flags` contains `MpolFlags::STATIC_NODES`:
+/// `MPOL_F_STATIC_NODES` tells the kernel to keep the policy
+/// nodemask absolute across cpuset changes, which is the explicit
+/// opt-in for referencing nodes outside the task's cpuset.
+/// Without it, the kernel silently intersects the policy nodemask
+/// with the cpuset-allowed nodes — which is what this check
+/// prevents, because it collapses cross-node tests into degenerate
+/// same-cpuset-only observations.
 fn validate_mempolicy_cpuset(
     policy: &MemPolicy,
+    flags: crate::workload::MpolFlags,
     cpuset: &BTreeSet<usize>,
     ctx: &Ctx,
     cgroup_name: &str,
 ) -> Result<()> {
+    if flags.contains(crate::workload::MpolFlags::STATIC_NODES) {
+        return Ok(());
+    }
     let policy_nodes = policy.node_set();
     if policy_nodes.is_empty() {
         return Ok(());
@@ -2074,7 +2087,10 @@ fn validate_mempolicy_cpuset(
     if !uncovered.is_empty() {
         anyhow::bail!(
             "cgroup '{}': MemPolicy references NUMA node(s) {:?} \
-             but cpuset covers only node(s) {:?}",
+             but cpuset covers only node(s) {:?} (without MPOL_F_STATIC_NODES \
+             the kernel silently intersects the nodemask with the cpuset — \
+             add .mpol_flags(MpolFlags::STATIC_NODES) if cross-node \
+             placement is intentional)",
             cgroup_name,
             uncovered,
             cpuset_numa,
@@ -2133,7 +2149,13 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
         let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(&def.name).cloned();
         if let Some(ref resolved) = cgroup_cpuset {
             for work in effective_works {
-                validate_mempolicy_cpuset(&work.mem_policy, resolved, ctx, &def.name)?;
+                validate_mempolicy_cpuset(
+                    &work.mem_policy,
+                    work.mpol_flags,
+                    resolved,
+                    ctx,
+                    &def.name,
+                )?;
             }
         }
         for work in effective_works {
@@ -2316,7 +2338,13 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 let n = super::resolve_num_workers(work, ctx.workers_per_cgroup, cgroup)?;
                 let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(cgroup).cloned();
                 if let Some(ref resolved) = cgroup_cpuset {
-                    validate_mempolicy_cpuset(&work.mem_policy, resolved, ctx, cgroup)?;
+                    validate_mempolicy_cpuset(
+                        &work.mem_policy,
+                        work.mpol_flags,
+                        resolved,
+                        ctx,
+                        cgroup,
+                    )?;
                 }
                 let affinity = super::resolve_affinity_for_cgroup(
                     &work.affinity,
@@ -4080,7 +4108,16 @@ mod tests {
         let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..4).collect();
-        assert!(validate_mempolicy_cpuset(&MemPolicy::Default, &cpuset, &ctx, "cg_0").is_ok());
+        assert!(
+            validate_mempolicy_cpuset(
+                &MemPolicy::Default,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -4088,7 +4125,16 @@ mod tests {
         let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..4).collect();
-        assert!(validate_mempolicy_cpuset(&MemPolicy::Local, &cpuset, &ctx, "cg_0").is_ok());
+        assert!(
+            validate_mempolicy_cpuset(
+                &MemPolicy::Local,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -4099,7 +4145,16 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..8).collect(); // covers both nodes
         let policy = MemPolicy::Bind([0, 1].into_iter().collect());
-        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_ok());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -4108,7 +4163,16 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
         let policy = MemPolicy::Bind([1].into_iter().collect()); // node 1 not in cpuset
-        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_err());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4117,7 +4181,16 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (4..8).collect(); // NUMA node 1
         let policy = MemPolicy::Preferred(1);
-        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_ok());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -4126,7 +4199,16 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
         let policy = MemPolicy::Preferred(1);
-        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_err());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4135,7 +4217,39 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
         let policy = MemPolicy::Interleave([0, 1].into_iter().collect());
-        assert!(validate_mempolicy_cpuset(&policy, &cpuset, &ctx, "cg_0").is_err());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::NONE,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_err()
+        );
+    }
+
+    /// `MPOL_F_STATIC_NODES` is the kernel's explicit opt-in for
+    /// keeping a mempolicy nodemask absolute across cpuset changes,
+    /// so the validator must NOT reject a policy referencing nodes
+    /// outside the cpuset when that flag is set — the caller has
+    /// signaled intentional cross-node placement.
+    #[test]
+    fn validate_mempolicy_static_nodes_bypasses_cpuset_check() {
+        let (cg, topo) = make_numa_ctx(2, 2, 4, 1);
+        let ctx = ctx_from(&cg, &topo);
+        let cpuset: BTreeSet<usize> = (0..4).collect(); // NUMA node 0 only
+        let policy = MemPolicy::Interleave([0, 1].into_iter().collect());
+        assert!(
+            validate_mempolicy_cpuset(
+                &policy,
+                crate::workload::MpolFlags::STATIC_NODES,
+                &cpuset,
+                &ctx,
+                "cg_0",
+            )
+            .is_ok()
+        );
     }
 
     #[test]
