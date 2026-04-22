@@ -94,6 +94,8 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use super::KTSTR_TESTS;
@@ -209,6 +211,16 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// memoized state.
 type CachedInference = Result<Mutex<LoadedInference>, String>;
 static MODEL_CACHE: Mutex<Option<Arc<CachedInference>>> = Mutex::new(None);
+
+/// Test-only counter incremented each time [`memoized_inference`]
+/// takes the slow path (observes `None` in [`MODEL_CACHE`] and calls
+/// [`load_inference`]). Pins the at-most-one-load-per-slot invariant
+/// empirically: a cached `Ok`/`Err` entry must short-circuit every
+/// future call without re-invoking the load pipeline. Under the
+/// outer `Mutex`, increments are serialized with slot population, so
+/// a plain `AtomicUsize` suffices.
+#[cfg(test)]
+static MODEL_CACHE_LOAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Pinned description of a model artifact the cache knows how to
 /// fetch and check.
@@ -749,23 +761,12 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     Ok(final_path.to_path_buf())
 }
 
-/// Canonical predicate for a well-formed SHA-256 hex pin: exactly
-/// 64 ASCII characters, each a hex digit (`0-9a-fA-F`). Shared by
-/// [`ensure`] (pre-fetch shape check on [`ModelSpec::sha256_hex`])
-/// and [`check_sha256`] (post-read validation of the expected pin);
-/// centralizing the rule prevents drift between the two call sites.
-/// Callers that need to distinguish "wrong length" from "non-hex"
-/// for diagnostics still need their own branching — this helper
-/// collapses the predicate, not the error messages.
-const fn is_valid_sha256_hex(s: &str) -> bool {
-    // `const fn` requires byte-level iteration — `.chars().all(...)`
-    // depends on non-const iterator adapters. `u8::is_ascii_hexdigit`
-    // has been `const fn` since Rust 1.47, so the per-byte predicate
-    // is a direct one-liner with identical semantics.
+/// True iff `s` contains only ASCII hex digits (`0-9a-fA-F`).
+/// Length is not checked. Split from [`is_valid_sha256_hex`] so
+/// [`check_sha256`] can pick a non-hex-specific diagnostic without
+/// re-running the length check that the caller already evaluated.
+const fn is_all_hex_ascii(s: &str) -> bool {
     let bytes = s.as_bytes();
-    if bytes.len() != 64 {
-        return false;
-    }
     let mut i = 0;
     while i < bytes.len() {
         if !bytes[i].is_ascii_hexdigit() {
@@ -774,6 +775,22 @@ const fn is_valid_sha256_hex(s: &str) -> bool {
         i += 1;
     }
     true
+}
+
+/// Canonical predicate for a well-formed SHA-256 hex pin: exactly
+/// 64 ASCII characters, each a hex digit (`0-9a-fA-F`). Shared by
+/// [`ensure`] (pre-fetch shape check on [`ModelSpec::sha256_hex`])
+/// and [`check_sha256`] (post-read validation of the expected pin);
+/// centralizing the rule prevents drift between the call sites.
+/// Composed from a length gate and [`is_all_hex_ascii`] so callers
+/// that need to distinguish "wrong length" from "non-hex" for
+/// diagnostics can call the sub-predicate directly rather than
+/// re-deriving the length check (see [`check_sha256`]).
+const fn is_valid_sha256_hex(s: &str) -> bool {
+    // `const fn` requires byte-level iteration — `.chars().all(...)`
+    // depends on non-const iterator adapters. `u8::is_ascii_hexdigit`
+    // has been `const fn` since Rust 1.47.
+    s.len() == 64 && is_all_hex_ascii(s)
 }
 
 /// Return `Ok(true)` when the file's SHA-256 matches the expected
@@ -786,20 +803,20 @@ fn check_sha256(path: &std::path::Path, expected_hex: &str) -> Result<bool> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
-    if !is_valid_sha256_hex(expected_hex) {
-        // The helper unified the predicate; pick the specific
-        // diagnostic wording from the same two branches the tests
-        // pin (`check_sha256_rejects_malformed_hex_length` expects
-        // "64 chars", `check_sha256_rejects_non_hex_chars` expects
-        // "non-hex"). Length is checked first so a non-64 string of
-        // all hex digits surfaces as a length error.
-        if expected_hex.len() != 64 {
-            anyhow::bail!(
-                "expected SHA-256 hex must be 64 chars, got {} ({:?})",
-                expected_hex.len(),
-                expected_hex,
-            );
-        }
+    // Branch on the two sub-predicates directly rather than
+    // re-deriving a length check after asking `is_valid_sha256_hex`:
+    // length first so a non-64 string of all hex digits surfaces as
+    // a length error, then `is_all_hex_ascii` for the non-hex case.
+    // The wording matches `check_sha256_rejects_malformed_hex_length`
+    // and `check_sha256_rejects_non_hex_chars`.
+    if expected_hex.len() != 64 {
+        anyhow::bail!(
+            "expected SHA-256 hex must be 64 chars, got {} ({:?})",
+            expected_hex.len(),
+            expected_hex,
+        );
+    }
+    if !is_all_hex_ascii(expected_hex) {
         anyhow::bail!(
             "expected SHA-256 hex contains non-hex chars: {:?}",
             expected_hex,
@@ -1368,6 +1385,8 @@ fn memoized_inference() -> Arc<CachedInference> {
     if let Some(arc) = guard.as_ref() {
         return Arc::clone(arc);
     }
+    #[cfg(test)]
+    MODEL_CACHE_LOAD_COUNT.fetch_add(1, Ordering::AcqRel);
     let result = load_inference()
         .map(Mutex::new)
         .map_err(|e| format!("{e:#}"));
@@ -1406,6 +1425,7 @@ fn memoized_inference() -> Arc<CachedInference> {
 #[cfg(test)]
 pub(crate) fn reset() {
     PREFETCH_CHECKED.store(false, Ordering::Release);
+    MODEL_CACHE_LOAD_COUNT.store(0, Ordering::Release);
     let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
@@ -2891,6 +2911,70 @@ mod tests {
             ),
             Ok(_) => panic!("post-reset cached entry should be Err under offline gate"),
         }
+    }
+
+    /// At-most-one-load-per-slot invariant for [`MODEL_CACHE`].
+    ///
+    /// [`memoized_inference`] takes its slow path — the branch that
+    /// calls [`load_inference`] — only when the outer slot is
+    /// observed as `None`. Once populated (with `Ok` or `Err`), every
+    /// subsequent call must short-circuit through the `Arc::clone`
+    /// fast path without re-invoking the load pipeline. Breaking this
+    /// invariant would re-run the 2.44 GiB GGUF load (or, in offline
+    /// mode, re-trip `ensure()`'s gate) on every metric extraction.
+    ///
+    /// The test pins the invariant empirically via a test-only
+    /// counter ([`MODEL_CACHE_LOAD_COUNT`]) incremented on every
+    /// slow-path entry:
+    ///
+    /// 1. `reset()` zeroes the counter and clears the slot.
+    /// 2. Three successive `extract_via_llm` calls (under the offline
+    ///    gate so no real load is attempted; a cached `Err` is still
+    ///    a cached entry and must short-circuit identically to a
+    ///    cached `Ok`) drive the memoized path.
+    /// 3. Counter asserted to be exactly `1` — one slow-path entry on
+    ///    the first call, zero on calls two and three.
+    /// 4. A subsequent `reset()` + call round-trips the counter: it
+    ///    returns to `0` at reset, and back to `1` after the next
+    ///    slow-path entry. This proves `reset()` participates
+    ///    correctly in the spy and that each cleared-slot interval
+    ///    permits exactly one load.
+    #[test]
+    fn model_cache_loads_at_most_once_per_populated_slot() {
+        let _lock = lock_env();
+        reset();
+        let _cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
+
+        assert_eq!(
+            MODEL_CACHE_LOAD_COUNT.load(Ordering::Acquire),
+            0,
+            "reset() must zero the load counter",
+        );
+
+        let _ = extract_via_llm("first", None);
+        let _ = extract_via_llm("second", None);
+        let _ = extract_via_llm("third", None);
+        assert_eq!(
+            MODEL_CACHE_LOAD_COUNT.load(Ordering::Acquire),
+            1,
+            "three sequential extract_via_llm calls must enter the \
+             slow path exactly once — a second slow-path entry would \
+             indicate the memoized slot is being ignored",
+        );
+
+        reset();
+        assert_eq!(
+            MODEL_CACHE_LOAD_COUNT.load(Ordering::Acquire),
+            0,
+            "reset() must zero the load counter on every call",
+        );
+        let _ = extract_via_llm("post-reset", None);
+        assert_eq!(
+            MODEL_CACHE_LOAD_COUNT.load(Ordering::Acquire),
+            1,
+            "post-reset call must re-enter the slow path exactly once",
+        );
     }
 
     /// `any_test_requires_model()` scans [`KTSTR_TESTS`] and returns

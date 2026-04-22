@@ -191,6 +191,29 @@ pub struct StressNgPayload;
 /// exercise the LLM extraction pipeline (schbench supports `--json`
 /// but this fixture intentionally uses the third acquisition path).
 ///
+/// **Contract — empty metric set by design.** A bare
+/// `ctx.payload(&SCHBENCH)` run produces **zero extracted metrics**.
+/// Not a bug, not a pipeline failure: the fixture's default argv
+/// deliberately leaves stdout empty so the LlmExtract path receives
+/// an empty body, and `metrics = []` so no hint is ever applied. The
+/// happy-path assertion is the exit-code gate; anything else is the
+/// caller's responsibility. Two orthogonal reasons drive this, each
+/// expanded below:
+///
+/// 1. schbench writes latency tables and summary lines to **stderr**
+///    by default — stdout is empty unless `--json -` is passed.
+///    [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun)
+///    extracts from stdout only.
+/// 2. LLM-extracted metric names are non-deterministic, so any hint
+///    declared on this fixture would silently fail to match. The
+///    fixture ships with `metrics = []` so the absence of polarity
+///    classification is visible by construction rather than implied.
+///
+/// Tests that want actual schbench metrics should use
+/// [`SCHBENCH_JSON`] (pre-baked `--json -`, stable dotted-path
+/// schema, no LLM in the loop) or append `--json -` to this
+/// fixture's builder.
+///
 /// **No metric hints.** schbench emits canonical latency stats
 /// (`Wakeup Latencies`, `Request Latencies`, `RPS`) with standard
 /// percentiles that would otherwise be obvious
