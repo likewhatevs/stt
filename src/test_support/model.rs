@@ -979,6 +979,20 @@ fn check_sha256(path: &std::path::Path, expected_hex: &str) -> Result<bool> {
 /// Reject `http://` URLs so a placeholder typo can't leak the SHA-
 /// pinned artifact request over cleartext. The fetcher is only ever
 /// correct for `https://`.
+///
+/// Scheme match is case-SENSITIVE: only the exact lowercase
+/// `"https://"` prefix passes. Uppercase (`"HTTPS://"`) or mixed
+/// case (`"Https://"`) variants are rejected alongside `http://`
+/// and every other scheme. RFC 3986 §3.1 declares URL schemes
+/// case-insensitive, so in principle this is stricter than the
+/// spec — but every pin in this crate ([`DEFAULT_MODEL`],
+/// [`DEFAULT_TOKENIZER`], and the fixtures in the nearby tests)
+/// uses lowercase, the compile-time `is_valid_sha256_hex` guards
+/// do not reach scheme validation, and a mixed-case scheme in a
+/// `ModelSpec::url` field is almost certainly a typo worth failing
+/// closed on rather than silently normalizing. The
+/// `reject_insecure_url_rejects_non_https_schemes` test pins the
+/// strict behavior against `HTTPS://`.
 fn reject_insecure_url(url: &str) -> Result<()> {
     if !url.starts_with("https://") {
         anyhow::bail!("model cache fetcher refuses non-HTTPS URL: {}", url,);

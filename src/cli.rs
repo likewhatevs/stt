@@ -733,6 +733,15 @@ pub fn configure_kernel(kernel_dir: &Path, fragment: &str) -> Result<()> {
 /// Calls `on_line` for each line before appending to the returned
 /// `Vec`.
 ///
+/// Returned entries and the `on_line` argument never carry their
+/// terminating `\n` (or `\r\n`) — the strip runs before emission, so
+/// callers that re-emit with `println!` get clean single-newline
+/// formatting and callers that persist the strings do not double-
+/// count line terminators. Interior `\r` bytes (lone CR not paired
+/// with a trailing LF) pass through verbatim, matching the unit
+/// coverage in `drain_lines_lossy_lone_cr_at_eof_is_preserved` and
+/// `drain_lines_lossy_interior_cr_is_preserved`.
+///
 /// Extracted from [`run_make_with_output`] so the read logic is
 /// testable with in-memory readers (the caller still owns child
 /// kill+wait).
