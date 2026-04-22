@@ -1511,6 +1511,28 @@ impl WorkloadHandle {
                     unsafe {
                         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                     }
+                    // Make this worker its own process-group leader so
+                    // any descendants it spawns inherit `pgid == worker_pid`.
+                    // `stop_and_collect` / Drop issue `killpg(worker_pid,
+                    // SIGKILL)` alongside the direct `kill` — without a
+                    // private pgid, descendants forked by a
+                    // [`WorkType::Custom`] body (or any future workload
+                    // that spawns helpers) stay in the parent Rust
+                    // process's pgid, survive the worker's SIGKILL, and
+                    // orphan onto init. PR_SET_PDEATHSIG handles the
+                    // "parent crashes" case but is per-task and cleared
+                    // on fork, so grandchildren don't inherit it — the
+                    // pgid route is the only safe reach for them when
+                    // teardown is explicit. Failure is silently ignored:
+                    // the only reachable failure mode for setpgid(0, 0)
+                    // in a just-forked child is EPERM from an earlier
+                    // setsid (we never call it), so a return of -1 here
+                    // means the kernel invariant changed and the reach
+                    // degrades to "leader only" — same as the pre-batch
+                    // behavior. Async-signal-safe per signal-safety(7).
+                    unsafe {
+                        libc::setpgid(0, 0);
+                    }
                     // Install signal handler FIRST (before start wait)
                     // to prevent SIGUSR1 killing us before we're ready
                     STOP.store(false, Ordering::Relaxed);
@@ -1848,6 +1870,17 @@ impl WorkloadHandle {
             // was past its deadline).
             let exit_info_source: Result<nix::sys::wait::WaitStatus, nix::errno::Errno> =
                 if still_running {
+                    // killpg reaches any descendants the worker forked
+                    // (Custom closures, ForkExit grandchildren caught
+                    // mid-fork) — the worker set up its own pgid at
+                    // spawn, so pgid == worker pid. Issue killpg BEFORE
+                    // the direct kill so descendants start dying in
+                    // parallel with the leader; the follow-up `kill`
+                    // is the single-process fallback when the worker's
+                    // `setpgid(0, 0)` at fork time somehow failed.
+                    // ESRCH is the expected return when the group has
+                    // no non-leader members.
+                    let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::wait::waitpid(npid, None);
                     Ok(nix::sys::wait::WaitStatus::StillAlive)
@@ -1889,6 +1922,18 @@ impl Drop for WorkloadHandle {
         // (including -1, i.e. every process in the session).
         for &(pid, rfd, wfd) in &self.children {
             let nix_pid = Pid::from_raw(pid);
+            // killpg first: reach descendants the worker may have
+            // forked (Custom workloads, ForkExit caught mid-fork).
+            // pgid == worker pid because the worker called
+            // `setpgid(0, 0)` at fork time. ESRCH (group gone / no
+            // members) is expected and not a warning-worthy failure;
+            // swallow it to keep the log clean when the common
+            // no-descendants case drops.
+            if let Err(e) = nix::sys::signal::killpg(nix_pid, Signal::SIGKILL)
+                && e != nix::errno::Errno::ESRCH
+            {
+                tracing::warn!(pid, %e, "killpg failed in WorkloadHandle::drop");
+            }
             if let Err(e) = kill(nix_pid, Signal::SIGKILL) {
                 tracing::warn!(pid, %e, "kill failed in WorkloadHandle::drop");
             }
