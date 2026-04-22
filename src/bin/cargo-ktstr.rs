@@ -935,9 +935,11 @@ fn main() {
                 force,
                 clean,
             } => kernel_build(version, source, git, git_ref, force, clean),
-            KernelCommand::Clean { keep, force } => {
-                cli::kernel_clean(keep, force).map_err(|e| format!("{e:#}"))
-            }
+            KernelCommand::Clean {
+                keep,
+                force,
+                corrupt_only,
+            } => cli::kernel_clean(keep, force, corrupt_only).map_err(|e| format!("{e:#}"))
         },
         KtstrCommand::Model { command } => match command {
             ModelCommand::Fetch => run_model_fetch(),

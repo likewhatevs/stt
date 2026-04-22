@@ -95,6 +95,20 @@ fn is_rc(version: &str) -> bool {
     version.contains("-rc")
 }
 
+/// Is this releases.json moniker one that the version-resolution
+/// pipeline should skip?
+///
+/// `linux-next` is a rolling integration branch whose version strings
+/// carry a date suffix rather than a stable tag, so it does not fit
+/// the major.minor.patch resolution model used by `latest_in_series`,
+/// `fetch_version_for_prefix`, and `cli::fetch_active_prefixes`. The
+/// release iteration in all three sites filters it out; this helper
+/// is the single point of truth for that decision so a future moniker
+/// that also warrants skipping can be added in one place.
+pub(crate) fn is_skippable_release_moniker(moniker: &str) -> bool {
+    moniker == "linux-next"
+}
+
 /// Find the latest version in the same major.minor series from releases.json.
 ///
 /// Returns `Some("6.14.10")` for prefix `"6.14"` if that series exists in
@@ -112,7 +126,7 @@ fn latest_in_series(client: &Client, version: &str) -> Option<String> {
     let releases = fetch_releases(client).ok()?;
     let mut best: Option<(String, (u32, u32, u32))> = None;
     for (moniker, ver) in &releases {
-        if moniker == "linux-next" {
+        if is_skippable_release_moniker(moniker) {
             continue;
         }
         if !ver.starts_with(&prefix) {
@@ -409,7 +423,7 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
 
     let mut best: Option<(&str, (u32, u32, u32))> = None;
     for (moniker, version) in &releases {
-        if moniker == "linux-next" {
+        if is_skippable_release_moniker(moniker) {
             continue;
         }
         if !version.starts_with(prefix) {

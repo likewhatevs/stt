@@ -416,7 +416,11 @@ fn main() -> Result<()> {
                 force,
                 clean,
             } => kernel_build(version, source, git, git_ref, force, clean)?,
-            KernelCommand::Clean { keep, force } => cli::kernel_clean(keep, force)?,
+            KernelCommand::Clean {
+                keep,
+                force,
+                corrupt_only,
+            } => cli::kernel_clean(keep, force, corrupt_only)?,
         },
 
         Command::Shell {

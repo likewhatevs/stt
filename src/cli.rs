@@ -60,8 +60,11 @@ pub enum KernelCommand {
     },
     /// Remove cached kernel images.
     Clean {
-        /// Keep the N most recent cached kernels. When absent, removes
-        /// every cached entry.
+        /// Keep the N most recent VALID cached kernels. When absent,
+        /// removes every valid entry. Corrupt entries are always
+        /// candidates for removal regardless of this value — they
+        /// waste disk space and serve no build — so a corrupt entry
+        /// never consumes a keep slot.
         #[arg(long)]
         keep: Option<usize>,
         /// Skip the y/N confirmation prompt before deleting. Always
@@ -71,6 +74,17 @@ pub enum KernelCommand {
         /// `--force` to be prompted.
         #[arg(long)]
         force: bool,
+        /// Remove only corrupt cache entries (metadata missing or
+        /// unparseable, image file absent). Valid entries are left
+        /// untouched regardless of `--force`. Useful for clearing
+        /// broken entries after an interrupted build without
+        /// risking the curated set of good kernels. Mutually
+        /// exclusive with `--keep`: `--corrupt-only` never touches
+        /// valid entries, so a keep budget would silently be
+        /// ignored; rejecting at parse time surfaces the
+        /// misunderstanding instead.
+        #[arg(long, conflicts_with = "keep")]
+        corrupt_only: bool,
     },
 }
 
@@ -267,7 +281,7 @@ pub(crate) fn fetch_active_prefixes() -> anyhow::Result<Vec<String>> {
     let releases = crate::fetch::fetch_releases(crate::fetch::shared_client())?;
     let mut prefixes = Vec::new();
     for (moniker, version) in &releases {
-        if moniker == "linux-next" {
+        if crate::fetch::is_skippable_release_moniker(moniker) {
             continue;
         }
         if let Some(prefix) = version_prefix(version)
@@ -507,7 +521,19 @@ pub fn kernel_list(json: bool) -> Result<()> {
 }
 
 /// Remove cached kernels with optional keep-N and confirmation prompt.
-pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
+///
+/// `corrupt_only = true` narrows removal to `ListedEntry::Corrupt`
+/// (metadata missing or unparseable, image file absent); valid
+/// entries are left untouched regardless of `keep` / `force`.
+///
+/// `keep = Some(N)` retains the N newest **valid** entries.
+/// Corrupt entries never consume a keep slot — they are always
+/// removal candidates when `corrupt_only = false`, since they
+/// occupy disk without being usable. This avoids the pathological
+/// case where `cache.list()` sorts a corrupt entry into the top N
+/// and `--keep N` ends up preserving junk while removing real
+/// kernels.
+pub fn kernel_clean(keep: Option<usize>, force: bool, corrupt_only: bool) -> Result<()> {
     let cache = CacheDir::new()?;
     let entries = cache.list()?;
 
@@ -518,7 +544,32 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
 
     let kconfig_hash = embedded_kconfig_hash();
     let skip = keep.unwrap_or(0);
-    let to_remove: Vec<&crate::cache::ListedEntry> = entries.iter().skip(skip).collect();
+
+    // Partition into removal candidates:
+    // - Corrupt: always a candidate (unless `corrupt_only` is the
+    //   no-op case of zero corrupt entries found below).
+    // - Valid: candidate only when `corrupt_only = false`, and the
+    //   N newest valid entries (by `cache.list()`'s built_at-desc
+    //   ordering) are retained when `keep = Some(N)`.
+    let mut valid_kept = 0usize;
+    let mut to_remove: Vec<&crate::cache::ListedEntry> = Vec::new();
+    for listed in &entries {
+        match listed {
+            crate::cache::ListedEntry::Valid(_) => {
+                if corrupt_only {
+                    continue;
+                }
+                if valid_kept < skip {
+                    valid_kept += 1;
+                    continue;
+                }
+                to_remove.push(listed);
+            }
+            crate::cache::ListedEntry::Corrupt { .. } => {
+                to_remove.push(listed);
+            }
+        }
+    }
 
     if to_remove.is_empty() {
         println!("nothing to clean");
@@ -530,11 +581,29 @@ pub fn kernel_clean(keep: Option<usize>, force: bool) -> Result<()> {
         if !std::io::stdin().is_terminal() {
             bail!("confirmation requires a terminal. Use --force to skip.");
         }
+        // Fetch active-series prefixes for the (EOL) annotation on
+        // the confirmation prompt. Scoped to the `!force` branch —
+        // force mode skips the prompt, so there's no point burning
+        // a network roundtrip to kernel.org. A fetch failure is
+        // surfaced via `eprintln!` (mirroring `kernel_list`'s
+        // diagnostic) so the operator knows why the `(EOL)`
+        // annotations are missing instead of silently degrading.
+        let active_prefixes = match fetch_active_prefixes() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "kernel clean: failed to fetch active kernel series ({e:#}); \
+                     EOL annotation disabled for this run. \
+                     Check that kernel.org is reachable from this host."
+                );
+                Vec::new()
+            }
+        };
         println!("the following entries will be removed:");
         for listed in &to_remove {
             match listed {
                 crate::cache::ListedEntry::Valid(entry) => {
-                    println!("{}", format_entry_row(entry, &kconfig_hash, &[]));
+                    println!("{}", format_entry_row(entry, &kconfig_hash, &active_prefixes));
                 }
                 crate::cache::ListedEntry::Corrupt { key, reason, .. } => {
                     println!("  {key:<48} (corrupt: {reason})");
