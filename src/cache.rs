@@ -258,6 +258,14 @@ impl KconfigStatus {
     pub fn is_stale(&self) -> bool {
         matches!(self, Self::Stale { .. })
     }
+
+    /// Single source of truth for the "does the entry lack a
+    /// recorded kconfig hash?" predicate. Parallels [`is_stale`] so
+    /// `kernel list`'s tag-aggregation loop can track the two
+    /// non-Matches variants with one predicate each.
+    pub fn is_untracked(&self) -> bool {
+        matches!(self, Self::Untracked)
+    }
 }
 
 impl fmt::Display for KconfigStatus {
@@ -1263,6 +1271,34 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Decode an ELF section `sh_type` integer to its `SHT_*` constant
+    /// name. Strip-helper assertions embed the decoded name alongside
+    /// the raw integer so a failing diagnostic like "left: 8 right: 1"
+    /// reads as "sh_type=8 (SHT_NOBITS)" / "sh_type=1 (SHT_PROGBITS)"
+    /// — immediately actionable instead of requiring the reader to
+    /// look up the ELF spec table.
+    fn sh_type_name(t: u32) -> &'static str {
+        use goblin::elf::section_header::{
+            SHT_DYNAMIC, SHT_DYNSYM, SHT_HASH, SHT_NOBITS, SHT_NOTE, SHT_NULL, SHT_PROGBITS,
+            SHT_REL, SHT_RELA, SHT_SHLIB, SHT_STRTAB, SHT_SYMTAB,
+        };
+        match t {
+            SHT_NULL => "SHT_NULL",
+            SHT_PROGBITS => "SHT_PROGBITS",
+            SHT_SYMTAB => "SHT_SYMTAB",
+            SHT_STRTAB => "SHT_STRTAB",
+            SHT_RELA => "SHT_RELA",
+            SHT_HASH => "SHT_HASH",
+            SHT_DYNAMIC => "SHT_DYNAMIC",
+            SHT_NOTE => "SHT_NOTE",
+            SHT_NOBITS => "SHT_NOBITS",
+            SHT_REL => "SHT_REL",
+            SHT_SHLIB => "SHT_SHLIB",
+            SHT_DYNSYM => "SHT_DYNSYM",
+            _ => "SHT_UNKNOWN",
+        }
+    }
+
     fn test_metadata(version: &str) -> KernelMetadata {
         KernelMetadata {
             version: Some(version.to_string()),
@@ -1568,6 +1604,30 @@ mod tests {
                 source_tree_path: None,
                 git_hash: None,
             }
+        ));
+
+        // Local with only source_tree_path present.
+        let local_path_only: KernelSource =
+            serde_json::from_str(r#"{"type":"local","source_tree_path":"/tmp/linux"}"#)
+                .expect("Local with only source_tree_path must deserialize");
+        assert!(matches!(
+            local_path_only,
+            KernelSource::Local {
+                source_tree_path: Some(ref p),
+                git_hash: None,
+            } if p.to_str() == Some("/tmp/linux")
+        ));
+
+        // Local with only git_hash present.
+        let local_hash_only: KernelSource =
+            serde_json::from_str(r#"{"type":"local","git_hash":"deadbeef"}"#)
+                .expect("Local with only git_hash must deserialize");
+        assert!(matches!(
+            local_hash_only,
+            KernelSource::Local {
+                source_tree_path: None,
+                git_hash: Some(ref h),
+            } if h == "deadbeef"
         ));
     }
 
@@ -3300,8 +3360,11 @@ mod tests {
                 .find(|s| source_elf.shdr_strtab.get_at(s.sh_name) == Some(name))
                 .unwrap_or_else(|| panic!("fixture missing expected {name}"));
             assert_ne!(
-                sh.sh_type, SHT_NOBITS,
-                "fixture {name} must start non-SHT_NOBITS so the strip is observable"
+                sh.sh_type,
+                SHT_NOBITS,
+                "fixture {name} must start non-SHT_NOBITS so the strip is observable; got sh_type={} ({})",
+                sh.sh_type,
+                sh_type_name(sh.sh_type),
             );
             assert!(
                 sh.sh_size > 0,
@@ -3325,8 +3388,10 @@ mod tests {
             let sh_type = sh.sh_type;
             let sh_size = sh.sh_size;
             assert_eq!(
-                sh_type, SHT_NOBITS,
-                "section {name} should be SHT_NOBITS after strip, got sh_type={sh_type}",
+                sh_type,
+                SHT_NOBITS,
+                "section {name} should be SHT_NOBITS after strip, got sh_type={sh_type} ({})",
+                sh_type_name(sh_type),
             );
             assert_eq!(
                 sh_size, 0,
@@ -3582,8 +3647,11 @@ mod tests {
         let pre_rdbg = pre_rdbg.expect("fixture must carry .rela.debug_info");
         let pre_text = pre_text.expect("fixture must carry .text");
         assert_eq!(
-            pre_kaslr.sh_type, SHT_RELA,
-            ".rela.kaslr sh_type must be SHT_RELA"
+            pre_kaslr.sh_type,
+            SHT_RELA,
+            ".rela.kaslr sh_type must be SHT_RELA; got sh_type={} ({})",
+            pre_kaslr.sh_type,
+            sh_type_name(pre_kaslr.sh_type),
         );
         assert!(
             pre_kaslr.sh_flags & u64::from(SHF_ALLOC) != 0,
@@ -3594,7 +3662,13 @@ mod tests {
             pre_kaslr.sh_size, 32,
             ".rela.kaslr sh_size must match 32-byte payload"
         );
-        assert_eq!(pre_rel.sh_type, SHT_REL, ".rel.foo sh_type must be SHT_REL");
+        assert_eq!(
+            pre_rel.sh_type,
+            SHT_REL,
+            ".rel.foo sh_type must be SHT_REL; got sh_type={} ({})",
+            pre_rel.sh_type,
+            sh_type_name(pre_rel.sh_type),
+        );
         assert!(
             pre_rel.sh_flags & u64::from(SHF_ALLOC) != 0,
             ".rel.foo must carry SHF_ALLOC; got sh_flags={:#x}",
@@ -3605,8 +3679,11 @@ mod tests {
             ".rel.foo sh_size must match 24-byte payload"
         );
         assert_eq!(
-            pre_rdbg.sh_type, SHT_RELA,
-            ".rela.debug_info sh_type must be SHT_RELA"
+            pre_rdbg.sh_type,
+            SHT_RELA,
+            ".rela.debug_info sh_type must be SHT_RELA; got sh_type={} ({})",
+            pre_rdbg.sh_type,
+            sh_type_name(pre_rdbg.sh_type),
         );
         assert_eq!(
             pre_rdbg.sh_flags & u64::from(SHF_ALLOC),
@@ -3697,8 +3774,13 @@ mod tests {
             "sh_offset must be preserved"
         );
         assert_eq!(
-            post_kaslr.sh_type, pre_kaslr.sh_type,
-            "sh_type must be preserved"
+            post_kaslr.sh_type,
+            pre_kaslr.sh_type,
+            "sh_type must be preserved; pre={} ({}) post={} ({})",
+            pre_kaslr.sh_type,
+            sh_type_name(pre_kaslr.sh_type),
+            post_kaslr.sh_type,
+            sh_type_name(post_kaslr.sh_type),
         );
         assert_eq!(
             post_kaslr.sh_flags, pre_kaslr.sh_flags,
@@ -4028,8 +4110,11 @@ mod tests {
             .expect("fixture must carry .rel.foo")
             .clone();
         assert_eq!(
-            pre_kaslr.sh_type, SHT_RELA,
-            ".rela.kaslr sh_type must be SHT_RELA"
+            pre_kaslr.sh_type,
+            SHT_RELA,
+            ".rela.kaslr sh_type must be SHT_RELA; got sh_type={} ({})",
+            pre_kaslr.sh_type,
+            sh_type_name(pre_kaslr.sh_type),
         );
         assert!(
             pre_kaslr.sh_flags & u64::from(SHF_ALLOC) != 0,
@@ -4040,7 +4125,13 @@ mod tests {
             pre_kaslr.sh_size, 16,
             ".rela.kaslr sh_size must match 16-byte payload pre-call"
         );
-        assert_eq!(pre_rel.sh_type, SHT_REL, ".rel.foo sh_type must be SHT_REL");
+        assert_eq!(
+            pre_rel.sh_type,
+            SHT_REL,
+            ".rel.foo sh_type must be SHT_REL; got sh_type={} ({})",
+            pre_rel.sh_type,
+            sh_type_name(pre_rel.sh_type),
+        );
         assert!(
             pre_rel.sh_flags & u64::from(SHF_ALLOC) != 0,
             ".rel.foo must carry SHF_ALLOC; got sh_flags={:#x}",

@@ -131,6 +131,28 @@ pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
     }
 }
 
+/// Explanation of the `(untracked kconfig)` tag. Consumer-facing
+/// wording mirrors `EOL_EXPLANATION`'s "one-const, one-surface"
+/// pattern so a doc-drift between the tag word and the legend
+/// cannot silently slip. The `(stale kconfig)` tag already has a
+/// warning line wired below the table; `(untracked kconfig)` had
+/// no such legend before this, so a reader inspecting the tag had
+/// to dig through source to learn what it meant.
+pub const UNTRACKED_KCONFIG_EXPLANATION: &str =
+    "(untracked kconfig) marks entries with no recorded ktstr.kconfig hash \
+     (pre-dates kconfig hash tracking). Rebuild with: kernel build --force VERSION";
+
+/// Decide whether to emit the `(untracked kconfig)` legend under the
+/// `kernel list` table. Parallels [`eol_legend_if_any`] so both
+/// branches are unit-testable without stderr capture.
+pub(crate) fn untracked_legend_if_any(any_untracked: bool) -> Option<&'static str> {
+    if any_untracked {
+        Some(UNTRACKED_KCONFIG_EXPLANATION)
+    } else {
+        None
+    }
+}
+
 /// Footer emitted by `kernel_list` when at least one entry is
 /// corrupt. Pure function of the cache-root path so tests pin the
 /// exact same string the production path prints — not a hand-copied
@@ -371,7 +393,8 @@ pub fn kernel_list(json: bool) -> Result<()> {
                 let msg = format!("{e:#}");
                 eprintln!(
                     "kernel list: failed to fetch active kernel series ({msg}); \
-                     EOL annotation disabled for this run",
+                     EOL annotation disabled for this run. \
+                     Check that kernel.org is reachable from this host.",
                 );
                 (Vec::new(), Some(msg))
             }
@@ -435,13 +458,18 @@ pub fn kernel_list(json: bool) -> Result<()> {
         "KEY", "VERSION", "SOURCE", "ARCH"
     );
     let mut any_stale = false;
+    let mut any_untracked = false;
     let mut any_eol = false;
     let mut any_corrupt = false;
     for listed in &entries {
         match listed {
             crate::cache::ListedEntry::Valid(entry) => {
-                if entry.kconfig_status(&kconfig_hash).is_stale() {
+                let status = entry.kconfig_status(&kconfig_hash);
+                if status.is_stale() {
                     any_stale = true;
+                }
+                if status.is_untracked() {
+                    any_untracked = true;
                 }
                 if entry_is_eol(entry, &active_prefixes) {
                     any_eol = true;
@@ -462,6 +490,9 @@ pub fn kernel_list(json: bool) -> Result<()> {
     // pattern below. Decision routed through `eol_legend_if_any` so
     // both branches are unit-testable.
     if let Some(legend) = eol_legend_if_any(any_eol) {
+        eprintln!("{legend}");
+    }
+    if let Some(legend) = untracked_legend_if_any(any_untracked) {
         eprintln!("{legend}");
     }
     if any_stale {
@@ -1086,8 +1117,14 @@ pub fn list_runs() -> Result<()> {
 }
 
 /// Compare two test runs and report regressions.
-pub fn compare_runs(a: &str, b: &str, filter: Option<&str>, threshold: Option<f64>) -> Result<i32> {
-    crate::stats::compare_runs(a, b, filter, threshold)
+pub fn compare_runs(
+    a: &str,
+    b: &str,
+    filter: Option<&str>,
+    threshold: Option<f64>,
+    dir: Option<&Path>,
+) -> Result<i32> {
+    crate::stats::compare_runs(a, b, filter, threshold, dir)
 }
 
 /// Collect the current host context via
@@ -3251,6 +3288,35 @@ mod tests {
         assert_eq!(eol_legend_if_any(false), None);
     }
 
+    /// `untracked_legend_if_any` mirrors `eol_legend_if_any`'s
+    /// gate-is-the-contract discipline. Both branches pinned so
+    /// the legend can't silently disappear on an untracked run or
+    /// show as noise on a clean run. Gives `(untracked kconfig)` tag
+    /// readers a one-line explanation of the tag on par with `(EOL)`.
+    #[test]
+    fn untracked_legend_if_any_branches() {
+        assert_eq!(
+            untracked_legend_if_any(true),
+            Some(UNTRACKED_KCONFIG_EXPLANATION),
+        );
+        assert_eq!(untracked_legend_if_any(false), None);
+    }
+
+    /// The `UNTRACKED_KCONFIG_EXPLANATION` must reference the tag word
+    /// `untracked kconfig` verbatim so the legend under the table
+    /// matches the per-row tag produced by `format_entry_row`
+    /// (which formats via `KconfigStatus`'s Display impl at
+    /// cache.rs). If the Display word drifts, this test catches
+    /// the mismatch before the CLI ships a legend that doesn't
+    /// describe what users see.
+    #[test]
+    fn untracked_legend_names_the_tag_word() {
+        assert!(
+            UNTRACKED_KCONFIG_EXPLANATION.contains("(untracked kconfig)"),
+            "legend must name the tag it explains: {UNTRACKED_KCONFIG_EXPLANATION}",
+        );
+    }
+
     /// Snapshot pin for `format_entry_row` across the 6-case outcome
     /// matrix over (EOL, not-EOL) × (Matches, Stale, Untracked);
     /// empty and unparseable `active_prefixes` branches are pinned by
@@ -3304,6 +3370,20 @@ mod tests {
                 format_entry_row(&entry, current_hash, &active_prefixes)
             };
 
+        // c8 is exactly 48 chars to pin column-boundary behavior:
+        // `format!("{:<48}", key)` emits the key with exactly ONE
+        // trailing space before `version`, matching the normal-
+        // padding rows. Any regression that shrinks the `:<48` pad
+        // or applies a hidden truncation surfaces on this row.
+        //
+        // c9 is 59 chars to pin overflow behavior: Rust's `:<48`
+        // pads to AT LEAST 48 chars without truncating, so the long
+        // key spills past the nominal column. Regressing to
+        // `{:48.48}` (which would truncate) fails this snapshot.
+        let c8_key = "c8-long-key-exactly-forty-eight-chars-xxxxxxxxxx";
+        let c9_key = "c9-key-longer-than-forty-eight-chars-by-twelve-xxxxxxxxxxxx";
+        debug_assert_eq!(c8_key.len(), 48);
+        debug_assert_eq!(c9_key.len(), 59);
         let rows = [
             build_row("c1-active-matches", Some("6.14.2"), Some(current_hash)),
             build_row("c2-active-stale", Some("6.14.2"), Some("deadbeef")),
@@ -3312,6 +3392,8 @@ mod tests {
             build_row("c5-eol-stale", Some("2.6.32"), Some("deadbeef")),
             build_row("c6-eol-untracked", Some("2.6.32"), None),
             build_row("c7-active-no-version", None, Some(current_hash)),
+            build_row(c8_key, Some("6.14.2"), Some(current_hash)),
+            build_row(c9_key, Some("6.14.2"), Some(current_hash)),
         ];
         let joined = rows.join("\n");
         insta::assert_snapshot!(joined, @r"
@@ -3322,6 +3404,8 @@ mod tests {
           c5-eol-stale                                     2.6.32       tarball  x86_64  2026-04-12T10:00:00Z (stale kconfig) (EOL)
           c6-eol-untracked                                 2.6.32       tarball  x86_64  2026-04-12T10:00:00Z (untracked kconfig) (EOL)
           c7-active-no-version                             -            tarball  x86_64  2026-04-12T10:00:00Z
+          c8-long-key-exactly-forty-eight-chars-xxxxxxxxxx 6.14.2       tarball  x86_64  2026-04-12T10:00:00Z
+          c9-key-longer-than-forty-eight-chars-by-twelve-xxxxxxxxxxxx 6.14.2       tarball  x86_64  2026-04-12T10:00:00Z
         ");
     }
 
