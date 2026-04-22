@@ -658,6 +658,23 @@ impl Drop for PayloadHandle {
 /// yet set up"; the follow-up direct `kill` plus the leader's
 /// eventual `waitpid` consumer handle both.
 ///
+/// # Process-group escape (not handled here)
+///
+/// `killpg` reaches every process whose `getpgrp()` equals the
+/// leader's pgid. A descendant that calls `setpgid(0, 0)` or
+/// `setsid(2)` between fork and exit leaves the leader's process
+/// group and becomes invisible to this helper — the escaping
+/// descendant keeps running after SIGKILL and may continue holding
+/// pipe fds that stall `wait_and_capture`. None of the payloads this
+/// crate ships today (stress-ng, schbench, fio) call those syscalls
+/// on their workers, and `build_command` does not place an exec'd
+/// child into any other group; this limitation applies only to
+/// third-party payloads that deliberately re-parent themselves. The
+/// mitigation path is the caller's: wrap the misbehaving payload in
+/// a shell that traps SIGTERM → SIGKILL of its own descendants, or
+/// register the leader as a subreaper
+/// (`PR_SET_CHILD_SUBREAPER`) and reap orphans explicitly.
+///
 /// # Caller contract
 ///
 /// Every caller MUST hold a live [`SigchldScope`] for the duration of

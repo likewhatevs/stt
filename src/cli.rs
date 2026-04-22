@@ -132,6 +132,20 @@ pub const EOL_EXPLANATION: &str =
      kernel.org's current active releases. Suppressed when the \
      active-release list cannot be fetched.";
 
+/// Emitted by `kernel build` when a local source tree has
+/// uncommitted index/worktree changes. Caching would key the built
+/// artifact on a git hash that does not describe the actual tree,
+/// so the build completes but the result is not archived. The
+/// hint names the two remediation paths (commit or stash) so an
+/// operator re-running the build after cleaning the tree benefits
+/// from the cache. Extracted from the call site so a wording drift
+/// between what's printed and what's documented elsewhere is
+/// impossible by construction; pinned by
+/// `dirty_tree_cache_skip_hint_shape` below.
+pub const DIRTY_TREE_CACHE_SKIP_HINT: &str =
+    "skipping cache — working tree has uncommitted changes; \
+     commit or stash to enable caching";
+
 /// Decide whether to emit the `(EOL)` legend under the `kernel list`
 /// table. Returns `Some(EOL_EXPLANATION)` iff at least one rendered
 /// row carried the tag, else `None`. Splitting the conditional out
@@ -1144,10 +1158,7 @@ pub fn kernel_build_pipeline(
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
         eprintln!("{cli_label}: kernel built at {}", image_path.display());
-        eprintln!(
-            "{cli_label}: skipping cache — working tree has uncommitted changes; \
-             commit or stash to enable caching"
-        );
+        eprintln!("{cli_label}: {DIRTY_TREE_CACHE_SKIP_HINT}");
         return Ok(KernelBuildResult {
             entry: None,
             image_path,
@@ -3529,6 +3540,32 @@ mod tests {
             Some(format_corrupt_footer(root)),
         );
         assert_eq!(corrupt_footer_if_any(false, root), None);
+    }
+
+    /// `DIRTY_TREE_CACHE_SKIP_HINT` is the exact text the
+    /// `kernel build` path prints after the `{cli_label}: ` prefix
+    /// when the local tree is dirty. Pinning the shape here means a
+    /// reword that drops either the cache-skip reason or the
+    /// remediation path trips this test instead of slipping into a
+    /// release. The three actionable elements — the "skipping cache"
+    /// preamble, the dirty-tree cause, and the commit/stash remedy —
+    /// are each asserted so a partial truncation (e.g. losing the
+    /// remedy) is caught.
+    #[test]
+    fn dirty_tree_cache_skip_hint_shape() {
+        assert!(
+            DIRTY_TREE_CACHE_SKIP_HINT.contains("skipping cache"),
+            "dirty-tree hint must name the cache-skip outcome: {DIRTY_TREE_CACHE_SKIP_HINT}",
+        );
+        assert!(
+            DIRTY_TREE_CACHE_SKIP_HINT.contains("uncommitted changes"),
+            "dirty-tree hint must name the cause: {DIRTY_TREE_CACHE_SKIP_HINT}",
+        );
+        assert!(
+            DIRTY_TREE_CACHE_SKIP_HINT.contains("commit")
+                && DIRTY_TREE_CACHE_SKIP_HINT.contains("stash"),
+            "dirty-tree hint must name the commit-or-stash remediation: {DIRTY_TREE_CACHE_SKIP_HINT}",
+        );
     }
 
     /// The `UNTRACKED_KCONFIG_EXPLANATION` must reference the tag word
