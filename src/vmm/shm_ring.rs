@@ -893,6 +893,40 @@ mod tests {
         assert_eq!(std::mem::size_of::<ShmMessage>(), 16);
     }
 
+    // ---- ShmRingHeader::new saturating-sub boundaries ---------------
+    //
+    // `new` subtracts `HEADER_SIZE` from `shm_size` via `saturating_sub`
+    // so a mis-sized region surfaces as a zero-capacity ring rather than
+    // panicking the VMM on integer underflow before the layout error can
+    // surface. The four fixtures pin the three "too small" shapes and
+    // the "just enough for a non-empty data area" shape against the
+    // HEADER_SIZE boundary.
+
+    #[test]
+    fn shm_ring_header_new_zero_input_clamps_to_zero_capacity() {
+        assert_eq!(ShmRingHeader::new(0).capacity, 0);
+    }
+
+    #[test]
+    fn shm_ring_header_new_below_header_size_clamps_to_zero_capacity() {
+        // HEADER_SIZE - 1: saturating_sub returns 0, no underflow.
+        assert_eq!(ShmRingHeader::new(HEADER_SIZE - 1).capacity, 0);
+    }
+
+    #[test]
+    fn shm_ring_header_new_exactly_header_size_yields_zero_capacity() {
+        // HEADER_SIZE exactly: data area is empty but the header is
+        // well-formed. `shm_write` hits the ring-full branch on every
+        // call — internally consistent, not a panic.
+        assert_eq!(ShmRingHeader::new(HEADER_SIZE).capacity, 0);
+    }
+
+    #[test]
+    fn shm_ring_header_new_above_header_size_carries_delta_as_capacity() {
+        // HEADER_SIZE + 100: 100 bytes of data area is addressable.
+        assert_eq!(ShmRingHeader::new(HEADER_SIZE + 100).capacity, 100);
+    }
+
     /// Allocate a buffer and initialize a ring of the given size.
     fn make_ring(shm_size: usize) -> Vec<u8> {
         let mut buf = vec![0u8; shm_size];

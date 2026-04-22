@@ -1071,6 +1071,38 @@ pub enum WorkerExitInfo {
     WaitFailed(String),
 }
 
+/// Pure mapping from a `waitpid` outcome to the diagnostic
+/// [`WorkerExitInfo`] attached to a sentinel [`WorkerReport`].
+///
+/// Split out of [`WorkloadHandle::stop_and_collect`] so the four
+/// shapes each resolve to a `WorkerExitInfo` variant without pulling
+/// in the full collection loop's state (pipe drain, SIGKILL
+/// escalation, pid lifetime). Pure input → output means the variant
+/// matrix is directly testable without spawning children.
+///
+/// Shape → variant:
+/// - `Ok(Exited(_, code))` → [`WorkerExitInfo::Exited`]
+/// - `Ok(Signaled(_, sig, _))` → [`WorkerExitInfo::Signaled`]
+/// - `Ok(StillAlive)` → [`WorkerExitInfo::TimedOut`]
+/// - `Ok(_ exotic)` → [`WorkerExitInfo::TimedOut`] (Stopped /
+///   PtraceEvent / PtraceSyscall / Continued; not reachable for a
+///   plain forked worker with no ptrace parent, but collapsed rather
+///   than silently dropped so coverage stays exhaustive)
+/// - `Err(errno)` → [`WorkerExitInfo::WaitFailed`]
+fn classify_wait_outcome(
+    source: Result<nix::sys::wait::WaitStatus, nix::errno::Errno>,
+) -> WorkerExitInfo {
+    match source {
+        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => WorkerExitInfo::Exited(code),
+        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+            WorkerExitInfo::Signaled(sig as i32)
+        }
+        Ok(nix::sys::wait::WaitStatus::StillAlive) => WorkerExitInfo::TimedOut,
+        Ok(_) => WorkerExitInfo::TimedOut,
+        Err(e) => WorkerExitInfo::WaitFailed(e.to_string()),
+    }
+}
+
 /// PID of the scheduler process. Workers kill it on stall to trigger dump.
 static SCHED_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -1767,25 +1799,7 @@ impl WorkloadHandle {
             if let Ok(report) = serde_json::from_slice::<WorkerReport>(&buf) {
                 reports.push(report);
             } else {
-                let exit_info = match exit_info_source {
-                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
-                        WorkerExitInfo::Exited(code)
-                    }
-                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
-                        WorkerExitInfo::Signaled(sig as i32)
-                    }
-                    Ok(nix::sys::wait::WaitStatus::StillAlive) => WorkerExitInfo::TimedOut,
-                    // Every other WaitStatus variant (Stopped /
-                    // PtraceEvent / PtraceSyscall / Continued) means
-                    // the child is still under the kernel's
-                    // child-state machine and neither "exited" nor
-                    // "signaled" describes the terminal state —
-                    // shouldn't happen for a plain forked worker with
-                    // no ptrace parent, but collapse to TimedOut
-                    // rather than silently dropping the case.
-                    Ok(_) => WorkerExitInfo::TimedOut,
-                    Err(e) => WorkerExitInfo::WaitFailed(e.to_string()),
-                };
+                let exit_info = classify_wait_outcome(exit_info_source);
                 eprintln!(
                     "ktstr: worker pid={pid} returned no report ({} bytes read, exit={exit_info:?})",
                     buf.len()
@@ -3053,6 +3067,81 @@ pub fn set_thread_affinity(pid: libc::pid_t, cpus: &BTreeSet<usize>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- classify_wait_outcome variant coverage ------------------------
+    //
+    // Five fixtures pin the `waitpid` → `WorkerExitInfo` mapping that the
+    // sentinel path in [`WorkloadHandle::stop_and_collect`] depends on.
+    // A silent table drift here would misreport panic / signal / timeout
+    // root cause on every failed worker, so this is the canonical test
+    // for each shape.
+
+    #[test]
+    fn classify_wait_outcome_exited_preserves_code() {
+        let status = nix::sys::wait::WaitStatus::Exited(
+            nix::unistd::Pid::from_raw(123),
+            42,
+        );
+        match classify_wait_outcome(Ok(status)) {
+            WorkerExitInfo::Exited(code) => assert_eq!(code, 42),
+            other => panic!("expected Exited(42), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_wait_outcome_signaled_preserves_signum() {
+        let status = nix::sys::wait::WaitStatus::Signaled(
+            nix::unistd::Pid::from_raw(123),
+            nix::sys::signal::Signal::SIGABRT,
+            false,
+        );
+        match classify_wait_outcome(Ok(status)) {
+            WorkerExitInfo::Signaled(sig) => {
+                assert_eq!(sig, nix::sys::signal::Signal::SIGABRT as i32);
+            }
+            other => panic!("expected Signaled(SIGABRT), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_wait_outcome_still_alive_maps_to_timed_out() {
+        match classify_wait_outcome(Ok(nix::sys::wait::WaitStatus::StillAlive)) {
+            WorkerExitInfo::TimedOut => {}
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_wait_outcome_exotic_continued_maps_to_timed_out() {
+        // `Continued` is one of the non-terminal WaitStatus variants
+        // that can't describe a worker exit for a ptrace-free fork —
+        // the catch-all arm must collapse it to TimedOut rather than
+        // silently dropping the reap.
+        let status = nix::sys::wait::WaitStatus::Continued(
+            nix::unistd::Pid::from_raw(123),
+        );
+        match classify_wait_outcome(Ok(status)) {
+            WorkerExitInfo::TimedOut => {}
+            other => panic!("expected TimedOut (exotic→TimedOut), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_wait_outcome_errno_maps_to_wait_failed() {
+        match classify_wait_outcome(Err(nix::errno::Errno::ECHILD)) {
+            WorkerExitInfo::WaitFailed(msg) => {
+                // nix renders Errno via Display — the string carries
+                // the canonical ECHILD description. Substring-match
+                // keeps the test robust against OS-specific wording
+                // variations without hardcoding a specific phrase.
+                assert!(
+                    msg.to_ascii_lowercase().contains("child"),
+                    "expected ECHILD description to mention 'child', got {msg:?}",
+                );
+            }
+            other => panic!("expected WaitFailed, got {other:?}"),
+        }
+    }
 
     #[test]
     fn work_type_name_roundtrip() {
