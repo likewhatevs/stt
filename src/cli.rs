@@ -268,7 +268,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
     for listed in &entries {
         match listed {
             crate::cache::ListedEntry::Valid(entry) => {
-                if let KconfigStatus::Stale { .. } = entry.kconfig_status(&kconfig_hash) {
+                if entry.kconfig_status(&kconfig_hash).is_stale() {
                     any_stale = true;
                 }
                 println!(
@@ -2654,7 +2654,7 @@ mod tests {
                 .store(label, &CacheArtifacts::new(&image), &meta)
                 .unwrap();
 
-            let json_stale = matches!(entry.kconfig_status(current_hash), KconfigStatus::Stale { .. });
+            let json_stale = entry.kconfig_status(current_hash).is_stale();
 
             // Human branch: format_entry_row emits "(stale kconfig)"
             // iff kconfig_status returns Stale.

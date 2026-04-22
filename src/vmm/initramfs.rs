@@ -1405,7 +1405,11 @@ pub(crate) fn lz4_legacy_compress(data: &[u8]) -> Vec<u8> {
 /// Concatenate `base` and `suffix` into a single buffer and compress it
 /// with [`lz4_legacy_compress`]. Used by the aarch64 path, which loads
 /// initramfs as one compressed blob rather than streaming per-part.
-#[cfg(target_arch = "aarch64")]
+/// The body is arch-neutral (concat + compress); the `dead_code` allow
+/// is a no-op on aarch64 where the aarch64 loader is the sole caller,
+/// and keeps the helper callable from cross-arch tests or a future
+/// x86_64 caller without re-deriving it.
+#[allow(dead_code)]
 pub(crate) fn lz4_compress_combined(base: &[u8], suffix: &[u8]) -> Vec<u8> {
     let mut full = Vec::with_capacity(base.len() + suffix.len());
     full.extend_from_slice(base);

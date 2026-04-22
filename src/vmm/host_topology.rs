@@ -641,6 +641,21 @@ mod tests {
     use super::*;
     use crate::vmm::topology::Topology;
 
+    /// Collect the distinct host NUMA node IDs the given CPUs belong
+    /// to. Tests that assert "these N CPUs all live on one NUMA node"
+    /// (or span two) route through this helper so the CPU → node
+    /// lookup and the single-CPU default stay in one place rather
+    /// than duplicating the same closure across every assertion
+    /// site.
+    fn numa_nodes_for_cpus(
+        topo: &HostTopology,
+        cpus: &[usize],
+    ) -> std::collections::BTreeSet<usize> {
+        cpus.iter()
+            .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
+            .collect()
+    }
+
     #[test]
     fn parse_cpu_list_range() {
         assert_eq!(parse_cpu_list_lenient("0-3"), vec![0, 1, 2, 3]);
@@ -1190,10 +1205,7 @@ mod tests {
             .filter(|(vcpu, _)| *vcpu < 4) // vLLC 0,1 = vCPUs 0-3
             .map(|(_, cpu)| *cpu)
             .collect();
-        let node_0_host_nodes: std::collections::BTreeSet<usize> = node_0_cpus
-            .iter()
-            .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
-            .collect();
+        let node_0_host_nodes = numa_nodes_for_cpus(&topo, &node_0_cpus);
         assert_eq!(
             node_0_host_nodes.len(),
             1,
@@ -1209,10 +1221,7 @@ mod tests {
             .filter(|(vcpu, _)| *vcpu >= 4) // vLLC 2,3 = vCPUs 4-7
             .map(|(_, cpu)| *cpu)
             .collect();
-        let node_1_host_nodes: std::collections::BTreeSet<usize> = node_1_cpus
-            .iter()
-            .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
-            .collect();
+        let node_1_host_nodes = numa_nodes_for_cpus(&topo, &node_1_cpus);
         assert_eq!(
             node_1_host_nodes.len(),
             1,
@@ -1373,10 +1382,7 @@ mod tests {
                 .filter(|(vcpu, _)| *vcpu >= start && *vcpu < end)
                 .map(|(_, cpu)| *cpu)
                 .collect();
-            let nodes: std::collections::BTreeSet<usize> = cpus
-                .iter()
-                .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
-                .collect();
+            let nodes = numa_nodes_for_cpus(&topo, &cpus);
             assert_eq!(
                 nodes.len(),
                 1,

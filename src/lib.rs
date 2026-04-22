@@ -479,7 +479,7 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
             // (pre-kconfig-tracking) entries are reused — their image
             // could still boot correctly, and skipping them would
             // permanently orphan legacy cache entries.
-            if let cache::KconfigStatus::Stale { .. } = entry.kconfig_status(&kc_hash) {
+            if entry.kconfig_status(&kc_hash).is_stale() {
                 continue;
             }
             let image = entry.image_path();

@@ -241,6 +241,18 @@ pub enum KconfigStatus {
     Untracked,
 }
 
+impl KconfigStatus {
+    /// Single source of truth for the "is the entry stale against
+    /// the current kconfig?" predicate. Callers that previously
+    /// open-coded `matches!(status, KconfigStatus::Stale { .. })`
+    /// should use this method so future variants that also mean
+    /// "stale" (e.g. a hypothetical version-mismatch variant) are
+    /// picked up in one place.
+    pub fn is_stale(&self) -> bool {
+        matches!(self, Self::Stale { .. })
+    }
+}
+
 impl fmt::Display for KconfigStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
