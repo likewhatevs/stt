@@ -450,11 +450,11 @@ impl Timeline {
         }
     }
 
-    /// Collect all degradation changes across phases. Test-only after
-    /// the gauntlet analyzer was removed; the scenarios pipeline
-    /// consumes `Timeline` via `format_with_context` and does not read
-    /// degradations directly.
-    #[allow(dead_code)]
+    /// Test helper — collect all degradation changes across phases.
+    /// Retained after the gauntlet analyzer was removed; the scenarios
+    /// pipeline consumes `Timeline` via `format_with_context` and does
+    /// not read degradations directly.
+    #[cfg(test)]
     pub fn degradations(&self) -> Vec<(&Phase, &PhaseChange)> {
         let mut out = Vec::new();
         for phase in &self.phases {

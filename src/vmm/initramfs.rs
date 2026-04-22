@@ -1238,8 +1238,9 @@ pub(crate) fn shm_store_base(content_hash: u64, data: &[u8]) -> Result<()> {
     shm_store(&shm_segment_name(content_hash), data)
 }
 
-/// Remove the POSIX shared-memory segment identified by `content_hash`.
-#[allow(dead_code)]
+/// Test helper — remove the POSIX shared-memory segment identified
+/// by `content_hash`.
+#[cfg(test)]
 pub(crate) fn shm_unlink_base(content_hash: u64) {
     let _ = rustix::shm::unlink(shm_segment_name(content_hash).as_str());
 }

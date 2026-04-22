@@ -141,8 +141,8 @@ pub struct StackFunction {
     pub bpf_prog_id: Option<u32>,
 }
 
-/// Extract function names as strings for auto-repro.
-#[allow(dead_code)]
+/// Test helper — extract function names as strings for auto-repro.
+#[cfg(test)]
 pub(crate) fn extract_stack_function_names(stack: &str) -> Vec<String> {
     extract_stack_functions_all(stack)
         .into_iter()

@@ -553,7 +553,7 @@ impl Scenario {
         let excl: Vec<&'static str> = self.excluded_flags.iter().map(|d| d.name).collect();
         generate_profiles(&req, &excl)
     }
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn profiles_with(&self, active: &[&str]) -> Vec<FlagProfile> {
         let req: Vec<&'static str> = self.required_flags.iter().map(|d| d.name).collect();
         let mut excl: Vec<&'static str> = self.excluded_flags.iter().map(|d| d.name).collect();

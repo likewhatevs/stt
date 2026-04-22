@@ -118,8 +118,9 @@ pub const DUMP_REQ_SYSRQ_D: u8 = b'D';
 /// this byte, creates /tmp/ktstr_stall, and clears it back to 0.
 pub const STALL_REQ_OFFSET: usize = 13;
 
-/// Value written to STALL_REQ_OFFSET to request a scheduler stall.
-#[allow(dead_code)]
+/// Test helper — value written to STALL_REQ_OFFSET to request a
+/// scheduler stall.
+#[cfg(test)]
 pub const STALL_REQ_ACTIVATE: u8 = b'S';
 
 /// Base offset within the SHM region for numbered signal slots.
@@ -473,11 +474,12 @@ impl StimulusEvent {
     }
 }
 
-/// Initialize the SHM ring header at the given offset in guest memory.
+/// Test helper — initialize the SHM ring header at the given
+/// offset in guest memory.
 ///
 /// `buf` is the full guest memory slice. `shm_offset` is the byte offset
 /// where the SHM region starts. `shm_size` is the total region size.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn shm_init(buf: &mut [u8], shm_offset: usize, shm_size: usize) {
     // Clamp to 0 when the caller mis-sized the region: a 0-capacity ring
     // is internally consistent (every `shm_write` hits the ring-full
@@ -613,6 +615,17 @@ pub fn shm_drain_live(mem: &crate::monitor::reader::GuestMem, shm_base_pa: u64) 
     }
 
     let capacity = mem.read_u32(shm_base_pa, 8) as usize;
+    // `capacity` is guest-supplied and not covered by the magic gate
+    // above — a torn init (guest writes magic before capacity) or
+    // corruption can leave capacity at zero while magic reads valid.
+    // `read_ring_volatile` would then compute `ptr % capacity as u64`
+    // and divide by zero, panicking the monitor thread and — under
+    // `panic = "abort"` — aborting the entire host. Treat as
+    // uninitialized: return an empty drain and let the next tick
+    // re-read the header.
+    if capacity == 0 {
+        return ShmDrainResult::default();
+    }
     let write_ptr = mem.read_u64(shm_base_pa, 16);
     let read_ptr = mem.read_u64(shm_base_pa, 24);
     let drops = mem.read_u64(shm_base_pa, 32);

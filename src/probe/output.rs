@@ -154,7 +154,7 @@ pub(crate) fn make_relative(path: &str) -> String {
     path.to_string()
 }
 
-/// Format probe events into a human-readable report.
+/// Test helper — format probe events into a human-readable report.
 ///
 /// Groups fields by parameter, emits type headers for struct pointer
 /// params (e.g. `task_struct *p`), coalesces cpumask_0..3 into a
@@ -165,7 +165,7 @@ pub(crate) fn make_relative(path: &str) -> String {
 /// When `kernel_dir` is set and contains a vmlinux, resolves source
 /// locations from DWARF via ELF symbol table addresses (not host
 /// kallsyms).
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn format_probe_events(
     events: &[super::process::ProbeEvent],
     func_names: &[(u32, String)], // (func_idx, display_name)

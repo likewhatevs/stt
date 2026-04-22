@@ -96,8 +96,9 @@ impl Serial {
         self.inner.read(offset)
     }
 
-    /// Queue input bytes for host->guest communication.
-    #[allow(dead_code)]
+    /// Test helper — queue input bytes for host->guest
+    /// communication.
+    #[cfg(test)]
     pub fn queue_input(&mut self, bytes: &[u8]) {
         let _ = self.inner.enqueue_raw_bytes(bytes);
     }
