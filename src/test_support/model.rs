@@ -166,6 +166,16 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// panic (e.g. candle-side allocation failure) do not poison the
 /// cache.
 ///
+/// The panic-then-retry behavior described above only applies under
+/// the `panic = "unwind"` strategy — i.e. the default debug/test
+/// profile. ktstr's release profile sets `panic = "abort"` (see
+/// `Cargo.toml [profile.release]`); under abort a panic inside the
+/// initializer aborts the process before control returns to
+/// [`memoized_inference`], so there is no "next caller" within the
+/// same process and the "both `Ok` and `Err` are cached" guarantee
+/// is moot for panics. Only values returned through the `Result`
+/// channel are cached in release builds; panics terminate.
+///
 /// # Lock layering
 ///
 /// The outer `Mutex<Option<Arc<...>>>` is held only across the slot

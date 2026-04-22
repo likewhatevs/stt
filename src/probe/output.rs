@@ -362,7 +362,12 @@ fn format_probe_events_inner(
 
     let func_addrs: Vec<(String, u64)> = if use_vmlinux {
         // Resolve addresses from vmlinux ELF symbol table.
-        resolve_addrs_from_elf(vmlinux_path.as_ref().unwrap(), func_names)
+        resolve_addrs_from_elf(
+            vmlinux_path
+                .as_ref()
+                .expect("vmlinux_path is Some whenever use_vmlinux is true — the latter is computed on the previous line as vmlinux_path.as_ref().map(|p| p.exists()).unwrap_or(false)"),
+            func_names,
+        )
     } else {
         // Fall back to host kallsyms.
         func_names

@@ -1439,7 +1439,12 @@ impl KtstrVm {
         // and load kernel now. Deferred path does this in setup_memory.
         let kernel_result = if self.memory_mb.is_some() {
             if self.performance_mode && !self.mbind_node_map.is_empty() {
-                let layout = vm.numa_layout.as_ref().unwrap();
+                let layout = vm.numa_layout.as_ref().expect(
+                    "numa_layout is Some on the non-deferred allocation path: \
+                     allocate_and_register_memory ran during `vm_new` because \
+                     memory_mb was provided up front, and that call sets \
+                     numa_layout to Some(...) in src/vmm/{x86_64,aarch64}/kvm.rs",
+                );
                 layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
             }
 
@@ -2000,7 +2005,11 @@ impl KtstrVm {
             };
 
             if self.performance_mode && !self.mbind_node_map.is_empty() {
-                let layout = vm.numa_layout.as_ref().unwrap();
+                let layout = vm.numa_layout.as_ref().expect(
+                    "numa_layout is Some after the deferred allocate_and_register_memory \
+                     call above: that call sets numa_layout to Some(...) in \
+                     src/vmm/{x86_64,aarch64}/kvm.rs before this branch can reach here",
+                );
                 layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
             }
 
@@ -2108,7 +2117,12 @@ impl KtstrVm {
         let _acpi_layout = acpi::setup_acpi(
             &vm.guest_mem,
             &self.topology,
-            vm.numa_layout.as_ref().unwrap(),
+            vm.numa_layout.as_ref().expect(
+                "numa_layout is Some by the time setup_acpi runs: \
+                 memory allocation (whether deferred or not) ran earlier \
+                 in this function and set numa_layout via \
+                 allocate_and_register_memory in src/vmm/x86_64/kvm.rs",
+            ),
         )?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
 
@@ -3254,7 +3268,12 @@ impl KtstrVm {
             self.shm_size,
             hw_cache_level,
             guest_l1_unified,
-            vm.numa_layout.as_ref().unwrap(),
+            vm.numa_layout.as_ref().expect(
+                "numa_layout is Some by the time FDT creation runs: \
+                 memory allocation (whether deferred or not) ran earlier \
+                 in this function and set numa_layout via \
+                 allocate_and_register_memory in src/vmm/aarch64/kvm.rs",
+            ),
         )
         .context("create FDT")?;
         vm.guest_mem
