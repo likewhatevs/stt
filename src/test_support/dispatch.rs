@@ -844,7 +844,8 @@ mod tests {
             u32::MAX,
             |_, _| count += 1,
         );
-        // `__unit_test_dummy__` uses Scheduler::EEVDF which has no
+        // `__unit_test_dummy__` defaults to Payload::KERNEL_DEFAULT
+        // (which wraps Scheduler::EEVDF) and Scheduler::EEVDF has no
         // flags → exactly one profile per accepted preset.
         // Asserting `count >= 1` proves at least one preset was
         // accepted and visited. Coupling to the exact preset count

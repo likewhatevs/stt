@@ -520,7 +520,7 @@ pub struct KtstrTestEntry {
     /// Guest memory in MB.
     pub memory_mb: u32,
     /// Primary payload that drives the test. Defaults to
-    /// `Payload::EEVDF` (the no-scx-scheduler placeholder).
+    /// `Payload::KERNEL_DEFAULT` (the no-scx-scheduler placeholder).
     ///
     /// For scheduler-centric tests this is a scheduler-kind
     /// `Payload` (typically the `{NAME}_PAYLOAD` wrapper emitted by
@@ -636,7 +636,7 @@ impl KtstrTestEntry {
     /// static ENTRY: KtstrTestEntry = KtstrTestEntry {
     ///     name: "my_test",
     ///     func: my_test_fn,
-    ///     scheduler: &Payload::EEVDF,
+    ///     scheduler: &Payload::KERNEL_DEFAULT,
     ///     ..KtstrTestEntry::DEFAULT
     /// };
     /// ```
@@ -653,7 +653,7 @@ impl KtstrTestEntry {
         },
         constraints: TopologyConstraints::DEFAULT,
         memory_mb: 2048,
-        scheduler: &crate::test_support::Payload::EEVDF,
+        scheduler: &crate::test_support::Payload::KERNEL_DEFAULT,
         payload: None,
         workloads: &[],
         auto_repro: true,
@@ -730,7 +730,7 @@ impl KtstrTestEntry {
         // `workloads` slot is for userspace binaries composed with
         // the primary payload under the scheduler; a scheduler-kind
         // Payload here would be silently ignored at spawn time and
-        // is almost always a `Payload::EEVDF`-shaped typo in a
+        // is almost always a `Payload::KERNEL_DEFAULT`-shaped typo in a
         // `workloads = [...]` attribute.
         for (idx, w) in self.workloads.iter().enumerate() {
             if w.is_scheduler() {
@@ -857,7 +857,11 @@ mod tests {
         assert!(d.topology.distances.is_none());
         assert_eq!(d.constraints, TopologyConstraints::DEFAULT);
         assert_eq!(d.memory_mb, 2048);
-        // scheduler defaults to the crate's &Payload::EEVDF.
+        // scheduler defaults to the crate's &Payload::KERNEL_DEFAULT.
+        // `Payload::scheduler_name()` forwards to the inner
+        // `Scheduler::EEVDF.name` on the scheduler-kind path, so the
+        // returned string is `"eevdf"` (the kernel scheduler name),
+        // not the payload's own `"kernel_default"` wire name.
         assert_eq!(d.scheduler.scheduler_name(), "eevdf");
         assert!(!d.scheduler.has_active_scheduling());
         assert!(d.auto_repro);
@@ -931,7 +935,7 @@ mod tests {
     /// `validate()` rejects any `workloads[i]` that is a
     /// Scheduler-kind Payload — symmetric with the existing
     /// `payload`-slot rejection. Catches the typo where a test
-    /// author writes `workloads = [Payload::EEVDF]` instead of a
+    /// author writes `workloads = [Payload::KERNEL_DEFAULT]` instead of a
     /// binary payload.
     #[test]
     fn validate_rejects_scheduler_kind_in_workloads() {
@@ -951,7 +955,7 @@ mod tests {
             name: "mixed_kinds",
             func: good_test_func,
             // Second workload is scheduler-kind → must bail.
-            workloads: &[&GOOD, &Payload::EEVDF],
+            workloads: &[&GOOD, &Payload::KERNEL_DEFAULT],
             ..KtstrTestEntry::DEFAULT
         };
         let err = entry.validate().unwrap_err();
@@ -961,7 +965,7 @@ mod tests {
             "expected workloads[1] Scheduler-kind bail, got: {msg}"
         );
         assert!(
-            msg.contains("eevdf"),
+            msg.contains("kernel_default"),
             "error must name the offending workload entry, got: {msg}"
         );
     }
@@ -1149,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_with_verify() {
+    fn scheduler_with_check() {
         let v = crate::assert::Assert::NO_OVERRIDES
             .check_not_starved()
             .max_imbalance_ratio(3.0);

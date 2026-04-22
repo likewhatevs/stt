@@ -43,7 +43,7 @@ fn external_context_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
 static EXTERNAL_CONTEXT_MARKER: KtstrTestEntry = KtstrTestEntry {
     name: "external_context_marker",
     func: external_context_test_fn,
-    scheduler: &Payload::EEVDF,
+    scheduler: &Payload::KERNEL_DEFAULT,
     auto_repro: false,
     ..KtstrTestEntry::DEFAULT
 };

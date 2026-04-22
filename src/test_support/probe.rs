@@ -658,7 +658,22 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     // Parse --ktstr-work-type=NAME for work type override.
     let work_type_override = extract_work_type_arg(args).and_then(|s| {
         crate::workload::WorkType::from_name(&s).or_else(|| {
-            eprintln!("ktstr_test: unknown work type '{s}'");
+            // `from_name` is exact-match on the PascalCase canonical
+            // form. A user typo (`cpuspin`, `CPUSPIN`) lands here;
+            // call `WorkType::suggest` for the canonical spelling
+            // and surface it in the diagnostic so the user doesn't
+            // have to guess the correct casing.
+            match crate::workload::WorkType::suggest(&s) {
+                Some(canonical) => eprintln!(
+                    "ktstr_test: unknown work type '{s}'; did you mean \
+                     '{canonical}'? Valid types: {:?}",
+                    crate::workload::WorkType::ALL_NAMES,
+                ),
+                None => eprintln!(
+                    "ktstr_test: unknown work type '{s}'. Valid types: {:?}",
+                    crate::workload::WorkType::ALL_NAMES,
+                ),
+            }
             None
         })
     });
@@ -1054,7 +1069,22 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
 
     let work_type_override = extract_work_type_arg(args).and_then(|s| {
         crate::workload::WorkType::from_name(&s).or_else(|| {
-            eprintln!("ktstr_test: unknown work type '{s}'");
+            // `from_name` is exact-match on the PascalCase canonical
+            // form. A user typo (`cpuspin`, `CPUSPIN`) lands here;
+            // call `WorkType::suggest` for the canonical spelling
+            // and surface it in the diagnostic so the user doesn't
+            // have to guess the correct casing.
+            match crate::workload::WorkType::suggest(&s) {
+                Some(canonical) => eprintln!(
+                    "ktstr_test: unknown work type '{s}'; did you mean \
+                     '{canonical}'? Valid types: {:?}",
+                    crate::workload::WorkType::ALL_NAMES,
+                ),
+                None => eprintln!(
+                    "ktstr_test: unknown work type '{s}'. Valid types: {:?}",
+                    crate::workload::WorkType::ALL_NAMES,
+                ),
+            }
             None
         })
     });

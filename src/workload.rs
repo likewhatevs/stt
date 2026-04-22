@@ -343,6 +343,33 @@ impl WorkType {
         }
     }
 
+    /// Case-insensitive lookup that returns the canonical PascalCase
+    /// entry from [`ALL_NAMES`](Self::ALL_NAMES) matching the input,
+    /// or `None` when no entry matches.
+    ///
+    /// Distinct from [`from_name`](Self::from_name) in two ways:
+    ///
+    /// 1. It matches case-insensitively, so `"cpuspin"` / `"CPUSPIN"`
+    ///    / `"CpuSpin"` all map to the same canonical `"CpuSpin"`.
+    /// 2. It returns the name string rather than a default-parameter
+    ///    [`WorkType`] value, so callers can quote the canonical
+    ///    spelling in error messages without also instantiating the
+    ///    variant.
+    ///
+    /// Intended as a CLI / config-parser helper: when `from_name`
+    /// returns `None` for the user's input, pass the same string
+    /// here to recover the canonical spelling (if any) for a
+    /// friendlier "did you mean `CpuSpin`?" diagnostic. Includes
+    /// `"Sequence"` and `"Custom"` in the match space even though
+    /// `from_name` refuses to construct them — the point of
+    /// [`suggest`](Self::suggest) is naming, not construction.
+    pub fn suggest(s: &str) -> Option<&'static str> {
+        Self::ALL_NAMES
+            .iter()
+            .copied()
+            .find(|n| n.eq_ignore_ascii_case(s))
+    }
+
     /// Worker group size for this work type, or None if ungrouped.
     ///
     /// `num_workers` must be divisible by this value. Paired types return 2,
@@ -2822,6 +2849,76 @@ mod tests {
     #[test]
     fn work_type_from_name_unknown() {
         assert!(WorkType::from_name("Nonexistent").is_none());
+    }
+
+    /// [`WorkType::suggest`] matches case-insensitively and
+    /// returns the canonical PascalCase entry. A user who types
+    /// `"cpuspin"`, `"CPUSPIN"`, or the already-canonical `"CpuSpin"`
+    /// all land on the same `"CpuSpin"` suggestion; truly unknown
+    /// inputs return `None` so the caller can distinguish "typo of a
+    /// known variant" from "wholly unknown name".
+    /// Composition pin: the intended CLI recovery flow is
+    /// `from_name(user_input)` → on `None`, `suggest(user_input)` →
+    /// on `Some(canonical)`, feed `canonical` back into `from_name`
+    /// to obtain the `WorkType` value. Each arrow must be a stable
+    /// equivalence so a diagnostic message's "did you mean
+    /// '{canonical}'?" always resolves to a constructible variant.
+    /// `Sequence` and `Custom` participate in the naming side
+    /// (`suggest`) but `from_name` still refuses to build them —
+    /// construction requires explicit phases / function pointers,
+    /// which a CLI string cannot supply. Pin both facets so a
+    /// regression that (a) adds fuzzy matching to `suggest` or
+    /// (b) lets `from_name` construct `Sequence`/`Custom` from a
+    /// bare name surfaces here.
+    #[test]
+    fn suggest_then_from_name_roundtrips_for_buildable_variants() {
+        // Lowercase user input: from_name misses, suggest hits,
+        // from_name on the canonical spelling succeeds.
+        assert!(WorkType::from_name("cpuspin").is_none());
+        let canonical =
+            WorkType::suggest("cpuspin").expect("suggest must find CpuSpin");
+        assert_eq!(canonical, "CpuSpin");
+        let wt = WorkType::from_name(canonical)
+            .expect("from_name must build from canonical spelling");
+        assert!(matches!(wt, WorkType::CpuSpin));
+
+        // Uppercase user input roundtrips too.
+        assert!(WorkType::from_name("YIELDHEAVY").is_none());
+        let canonical =
+            WorkType::suggest("YIELDHEAVY").expect("suggest must find YieldHeavy");
+        assert_eq!(canonical, "YieldHeavy");
+        let wt = WorkType::from_name(canonical).expect("from_name must build");
+        assert!(matches!(wt, WorkType::YieldHeavy));
+
+        // Sequence and Custom are suggest-only: suggest emits them
+        // so a diagnostic can name them, but from_name returns None
+        // because they need explicit phases / function pointers that
+        // a bare string cannot carry.
+        assert_eq!(WorkType::suggest("sequence"), Some("Sequence"));
+        assert!(WorkType::from_name("Sequence").is_none());
+        assert_eq!(WorkType::suggest("custom"), Some("Custom"));
+        assert!(WorkType::from_name("Custom").is_none());
+    }
+
+    #[test]
+    fn suggest_is_case_insensitive_and_canonical() {
+        assert_eq!(WorkType::suggest("cpuspin"), Some("CpuSpin"));
+        assert_eq!(WorkType::suggest("CPUSPIN"), Some("CpuSpin"));
+        assert_eq!(WorkType::suggest("CpuSpin"), Some("CpuSpin"));
+        assert_eq!(WorkType::suggest("YIELDHEAVY"), Some("YieldHeavy"));
+        // Sequence and Custom are in the match space even though
+        // `from_name` refuses to construct them — point of the
+        // helper is naming, not construction.
+        assert_eq!(WorkType::suggest("sequence"), Some("Sequence"));
+        assert_eq!(WorkType::suggest("custom"), Some("Custom"));
+        // Truly unknown names return None. Distinguishes "no suggestion
+        // available" from "canonicalized spelling of a known variant".
+        assert!(WorkType::suggest("nonexistent").is_none());
+        assert!(WorkType::suggest("").is_none());
+        // A partial match is NOT fuzzy-accepted — "cpu" does not
+        // shorten to "CpuSpin". The helper pins exact case-insensitive
+        // equality, not prefix or substring semantics.
+        assert!(WorkType::suggest("cpu").is_none());
     }
 
     #[test]

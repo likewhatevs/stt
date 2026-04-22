@@ -8,9 +8,13 @@
 //! via the runtime [`PayloadRun`](crate::scenario::payload_run::PayloadRun)
 //! builder.
 //!
-//! The constants this module exposes — particularly [`Payload::EEVDF`] —
-//! are used as the default scheduler slot when no `scheduler = ...`
-//! attribute is supplied on a `#[ktstr_test]`.
+//! The constants this module exposes — particularly
+//! [`Payload::KERNEL_DEFAULT`] — are used as the default scheduler
+//! slot when no `scheduler = ...` attribute is supplied on a
+//! `#[ktstr_test]`. `KERNEL_DEFAULT` wraps whatever scheduler the
+//! running kernel selects when no sched_ext scheduler is attached
+//! (EEVDF on Linux 6.6+) and surfaces on the wire as
+//! `"kernel_default"`.
 //!
 //! [`KtstrTestEntry`](crate::test_support::KtstrTestEntry) carries
 //! `payload` and `workloads` fields populated by the `#[ktstr_test]`
@@ -31,8 +35,10 @@ use crate::test_support::Scheduler;
 /// both with `workloads = [...]` to compose binaries under a
 /// scheduler. See [`PayloadKind`] for the two variants.
 ///
-/// Use [`Payload::EEVDF`] as the default scheduler placeholder (no scx
-/// scheduler, kernel default).
+/// Use [`Payload::KERNEL_DEFAULT`] as the default scheduler
+/// placeholder when a test doesn't attach a sched_ext scheduler —
+/// it wraps the kernel's default scheduler (EEVDF on Linux 6.6+)
+/// via [`Scheduler::EEVDF`].
 ///
 /// `Payload` intentionally does NOT implement [`serde::Serialize`] /
 /// [`serde::Deserialize`]. It is a compile-time-static definition that
@@ -47,7 +53,10 @@ pub struct Payload {
     pub name: &'static str,
     /// Launch kind — scheduler reference or binary name.
     pub kind: PayloadKind,
-    /// How the framework extracts metrics from the payload's stdout.
+    /// How the framework extracts metrics from the payload's
+    /// stdout, with stderr fallback when stdout yields no metrics.
+    /// See [`OutputFormat`] for the per-variant contract and
+    /// `scenario::payload_run` for the fallback mechanics.
     pub output: OutputFormat,
     /// Default CLI args appended when this payload runs. Test bodies
     /// can extend via `.arg(...)` or replace via `.clear_args()` +
@@ -171,13 +180,19 @@ impl std::fmt::Debug for PayloadKind {
 }
 
 impl Payload {
-    /// Placeholder payload that wraps [`Scheduler::EEVDF`], the "no
-    /// scx scheduler" const. Used as the default value of the
-    /// `scheduler` slot on [`KtstrTestEntry`](crate::test_support::KtstrTestEntry)
-    /// so tests without an explicit `scheduler = ...` attribute still
-    /// get a valid, non-optional reference.
-    pub const EEVDF: Payload = Payload {
-        name: "eevdf",
+    /// Placeholder payload that wraps the current kernel-default
+    /// scheduler — [`Scheduler::EEVDF`] on Linux 6.6+ (the "no scx
+    /// scheduler attached" case). Used as the default value of the
+    /// `scheduler` slot on
+    /// [`KtstrTestEntry`](crate::test_support::KtstrTestEntry) so
+    /// tests without an explicit `scheduler = ...` attribute still
+    /// get a valid, non-optional reference. Wire name is
+    /// `"kernel_default"` — the Rust const and the serialized form
+    /// agree, so the const describes what it selects for (the
+    /// kernel's default) rather than naming a specific scheduler that
+    /// a future kernel release could replace.
+    pub const KERNEL_DEFAULT: Payload = Payload {
+        name: "kernel_default",
         kind: PayloadKind::Scheduler(&Scheduler::EEVDF),
         output: OutputFormat::ExitCode,
         default_args: &[],
@@ -222,6 +237,32 @@ impl Payload {
         }
     }
 
+    /// Minimal const constructor for a binary-kind [`Payload`]. Fills
+    /// the non-identity fields with the exit-code-only defaults — no
+    /// CLI args, no author-declared checks, no metric hints, and
+    /// [`OutputFormat::ExitCode`] — so a `#[ktstr_test]` entry or a
+    /// direct unit test can declare a runnable binary with one line
+    /// instead of spelling out the full struct literal.
+    ///
+    /// The `binary` string is the executable name passed to
+    /// `std::process::Command::new` inside the guest. Supply it to
+    /// the guest via `-i` / `--include-files` for CLI invocations or
+    /// pre-install it in the initramfs for `#[ktstr_test]` entries —
+    /// see [`PayloadKind::Binary`] for the full packaging contract.
+    ///
+    /// Pair with [`Payload::from_scheduler`] for the scheduler side
+    /// of the same constructor surface.
+    pub const fn binary(name: &'static str, binary: &'static str) -> Payload {
+        Payload {
+            name,
+            kind: PayloadKind::Binary(binary),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+        }
+    }
+
     // -----------------------------------------------------------------
     // Scheduler-slot forwarding accessors
     //
@@ -243,11 +284,12 @@ impl Payload {
 
     /// The scheduler's display name. For scheduler-kind payloads this
     /// is the inner `Scheduler::name`; for binary-kind it is
-    /// `"eevdf"` (a binary payload runs under the kernel default).
+    /// `"kernel_default"` (a binary payload runs under the kernel
+    /// default).
     pub const fn scheduler_name(&self) -> &'static str {
         match self.kind {
             PayloadKind::Scheduler(s) => s.name,
-            PayloadKind::Binary(_) => "eevdf",
+            PayloadKind::Binary(_) => "kernel_default",
         }
     }
 
@@ -406,26 +448,38 @@ impl Payload {
 // OutputFormat
 // ---------------------------------------------------------------------------
 
-/// How the framework extracts metrics from a payload's stdout.
+/// How the framework extracts metrics from a payload's output.
 ///
-/// `ExitCode` records only the exit code; no stdout parsing. `Json`
-/// finds a JSON document region within stdout and walks numeric
-/// leaves into [`Metric`] values. `LlmExtract` routes stdout through a
+/// `ExitCode` records only the exit code; no text parsing. `Json`
+/// finds a JSON document region and walks numeric leaves into
+/// [`Metric`] values. `LlmExtract` routes the same text through a
 /// local small-model prompt that produces JSON, then runs the same
 /// JSON walker — one extraction pipeline, two acquisition paths.
+///
+/// For `Json` and `LlmExtract`, extraction is stdout-primary with a
+/// stderr fallback: the extractor runs first against stdout, and
+/// only when that yields an empty metric set AND stderr is
+/// non-empty does it retry against stderr. Well-behaved binaries
+/// keep stdout canonical; payloads that emit structured output only
+/// on stderr (schbench's `show_latencies` → `fprintf(stderr, ...)`)
+/// still parse. The streams are never merged. `ExitCode` skips both
+/// passes.
 #[derive(Debug, Clone, Copy)]
 pub enum OutputFormat {
     /// Pass/fail from exit code alone. Stdout is archived for
-    /// debugging but not parsed.
+    /// debugging but not parsed. No stderr fallback — there is no
+    /// extraction step to fall back from.
     ExitCode,
-    /// Parse stdout as JSON (finding the JSON region within mixed
-    /// output), extract numeric leaves as metrics keyed by dotted
-    /// path (e.g. `jobs.0.read.iops`).
+    /// Parse the primary stream (stdout, or stderr on fallback) as
+    /// JSON: find the JSON region within mixed output, extract
+    /// numeric leaves as metrics keyed by dotted path (e.g.
+    /// `jobs.0.read.iops`).
     Json,
-    /// Feed stdout to a local small model; model emits JSON; walk
-    /// that JSON as in [`OutputFormat::Json`] but tag each metric with
-    /// [`MetricSource::LlmExtract`]. The optional `&'static str` is a
-    /// user-provided focus hint appended to the default prompt.
+    /// Feed the primary stream (stdout, or stderr on fallback) to a
+    /// local small model; model emits JSON; walk that JSON as in
+    /// [`OutputFormat::Json`] but tag each metric with
+    /// [`MetricSource::LlmExtract`]. The optional `&'static str` is
+    /// a user-provided focus hint appended to the default prompt.
     LlmExtract(Option<&'static str>),
 }
 
@@ -633,23 +687,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn payload_eevdf_const_is_scheduler_kind() {
-        assert!(matches!(Payload::EEVDF.kind, PayloadKind::Scheduler(_)));
-        assert_eq!(Payload::EEVDF.display_name(), "eevdf");
-        assert!(matches!(Payload::EEVDF.output, OutputFormat::ExitCode));
-        assert!(Payload::EEVDF.default_args.is_empty());
-        assert!(Payload::EEVDF.default_checks.is_empty());
-        assert!(Payload::EEVDF.metrics.is_empty());
+    fn payload_kernel_default_const_is_scheduler_kind() {
+        assert!(matches!(Payload::KERNEL_DEFAULT.kind, PayloadKind::Scheduler(_)));
+        assert_eq!(Payload::KERNEL_DEFAULT.display_name(), "kernel_default");
+        assert!(matches!(Payload::KERNEL_DEFAULT.output, OutputFormat::ExitCode));
+        assert!(Payload::KERNEL_DEFAULT.default_args.is_empty());
+        assert!(Payload::KERNEL_DEFAULT.default_checks.is_empty());
+        assert!(Payload::KERNEL_DEFAULT.metrics.is_empty());
     }
 
     #[test]
-    fn payload_eevdf_wraps_scheduler_eevdf() {
-        match Payload::EEVDF.kind {
+    fn payload_kernel_default_wraps_scheduler_eevdf() {
+        match Payload::KERNEL_DEFAULT.kind {
             PayloadKind::Scheduler(s) => {
                 assert_eq!(s.name, Scheduler::EEVDF.name);
             }
             PayloadKind::Binary(_) => panic!("EEVDF should be Scheduler-kind, got Binary"),
         }
+    }
+
+    /// [`Payload::binary`] fills a binary-kind [`Payload`] with the
+    /// exit-code-only defaults — empty `default_args`,
+    /// `default_checks`, `metrics`, and `OutputFormat::ExitCode`.
+    /// Evaluated in a `const` block so any future drift that makes
+    /// the constructor non-const surfaces here at compile time; the
+    /// runtime assertions pin the field-level defaults so a
+    /// drive-by change (e.g. flipping `output` to `Json`) reshapes
+    /// every `Payload::binary(…)` call site visibly.
+    #[test]
+    fn payload_binary_const_constructor_shape() {
+        const P: Payload = Payload::binary("fio_payload", "fio");
+        assert_eq!(P.name, "fio_payload");
+        assert!(matches!(P.kind, PayloadKind::Binary("fio")));
+        assert!(matches!(P.output, OutputFormat::ExitCode));
+        assert!(P.default_args.is_empty());
+        assert!(P.default_checks.is_empty());
+        assert!(P.metrics.is_empty());
+        assert!(!P.is_scheduler());
+        assert!(P.as_scheduler().is_none());
     }
 
     #[test]
@@ -743,11 +818,11 @@ mod tests {
     const _RANGE: Check = Check::range("x", 1.0, 2.0);
     const _EXISTS: Check = Check::exists("x");
     const _EXIT: Check = Check::exit_code_eq(0);
-    const _EEVDF_REF: &Payload = &Payload::EEVDF;
-    const _EEVDF_IS_SCHED: bool = Payload::EEVDF.is_scheduler();
-    const _EEVDF_DISPLAY: &str = Payload::EEVDF.display_name();
+    const _KERNEL_DEFAULT_REF: &Payload = &Payload::KERNEL_DEFAULT;
+    const _KERNEL_DEFAULT_IS_SCHED: bool = Payload::KERNEL_DEFAULT.is_scheduler();
+    const _KERNEL_DEFAULT_DISPLAY: &str = Payload::KERNEL_DEFAULT.display_name();
 
-    // Proves an arbitrary `Payload` (not just `Payload::EEVDF`) is
+    // Proves an arbitrary `Payload` (not just `Payload::KERNEL_DEFAULT`) is
     // const-constructible via struct literal — the #[derive(Payload)]
     // proc-macro emits exactly this shape.
     const _PAYLOAD_CONST_BUILD: Payload = Payload {
@@ -770,9 +845,9 @@ mod tests {
         assert!(matches!(_RANGE, Check::Range { .. }));
         assert!(matches!(_EXISTS, Check::Exists("x")));
         assert!(matches!(_EXIT, Check::ExitCodeEq(0)));
-        assert_eq!(_EEVDF_REF.name, "eevdf");
-        const { assert!(_EEVDF_IS_SCHED) };
-        assert_eq!(_EEVDF_DISPLAY, "eevdf");
+        assert_eq!(_KERNEL_DEFAULT_REF.name, "kernel_default");
+        const { assert!(_KERNEL_DEFAULT_IS_SCHED) };
+        assert_eq!(_KERNEL_DEFAULT_DISPLAY, "kernel_default");
     }
 
     // Item 5: from_higher_is_worse helper.
@@ -950,7 +1025,7 @@ mod tests {
     // Item 1 + 2: Debug + helper method surface.
     #[test]
     fn payload_debug_renders_identity_fields() {
-        let s = format!("{:?}", Payload::EEVDF);
+        let s = format!("{:?}", Payload::KERNEL_DEFAULT);
         assert!(s.contains("Payload"), "debug output: {s}");
         assert!(s.contains("eevdf"), "debug output: {s}");
         assert!(
@@ -966,7 +1041,7 @@ mod tests {
         assert!(s.contains("Binary"), "debug output: {s}");
         assert!(s.contains("fio"), "debug output: {s}");
 
-        let sched = Payload::EEVDF.kind;
+        let sched = Payload::KERNEL_DEFAULT.kind;
         let s = format!("{sched:?}");
         assert!(s.contains("Scheduler"), "debug output: {s}");
         assert!(s.contains("eevdf"), "debug output: {s}");
@@ -981,15 +1056,15 @@ mod tests {
 
     #[test]
     fn as_scheduler_extracts_ref_for_scheduler_kind() {
-        let s = Payload::EEVDF.as_scheduler().expect("Scheduler kind");
+        let s = Payload::KERNEL_DEFAULT.as_scheduler().expect("Scheduler kind");
         assert_eq!(s.name, "eevdf");
     }
 
     #[test]
     fn payload_clone_preserves_identity() {
-        let a = Payload::EEVDF;
-        assert_eq!(a.name, Payload::EEVDF.name);
-        assert_eq!(a.is_scheduler(), Payload::EEVDF.is_scheduler());
+        let a = Payload::KERNEL_DEFAULT;
+        assert_eq!(a.name, Payload::KERNEL_DEFAULT.name);
+        assert_eq!(a.is_scheduler(), Payload::KERNEL_DEFAULT.is_scheduler());
         assert_eq!(a.as_scheduler().map(|s| s.name), Some("eevdf"));
     }
 }

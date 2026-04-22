@@ -751,14 +751,14 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Build the scheduler reference token. The `scheduler` slot on
     // `KtstrTestEntry` is `&'static Payload`; callers pass either a
     // `{NAME}_PAYLOAD` wrapper emitted by `#[derive(Scheduler)]` or
-    // `Payload::EEVDF` directly. The default is the kernel-default
-    // placeholder.
+    // `Payload::KERNEL_DEFAULT` directly. The default is the
+    // kernel-default placeholder.
     let scheduler_tokens = match &scheduler {
         Some(p) => {
             quote! { &#p }
         }
         None => {
-            quote! { &::ktstr::test_support::Payload::EEVDF }
+            quote! { &::ktstr::test_support::Payload::KERNEL_DEFAULT }
         }
     };
 

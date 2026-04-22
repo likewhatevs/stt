@@ -464,7 +464,7 @@ impl CgroupDef {
     ///    state. A caller that catches the panic via
     ///    `catch_unwind` sees a valid CgroupDef either way.
     /// 3. **Scheduler-kind is always a programming error here.**
-    ///    `Payload::EEVDF` in `CgroupDef::workload` is never a
+    ///    `Payload::KERNEL_DEFAULT` in `CgroupDef::workload` is never a
     ///    legitimate use case — it means the author confused the
     ///    `scheduler` slot (test-level) with the `workload` slot
     ///    (cgroup-level). There is no recovery path; the only
@@ -4643,7 +4643,7 @@ mod tests {
     #[should_panic(expected = "CgroupDef::workload called with a scheduler-kind Payload")]
     fn cgroup_def_workload_rejects_scheduler_kind_payload() {
         use crate::test_support::Payload;
-        let _ = CgroupDef::named("cg_0").workload(&Payload::EEVDF);
+        let _ = CgroupDef::named("cg_0").workload(&Payload::KERNEL_DEFAULT);
     }
 
     /// The drain helper kills + removes entries whose cgroup name
@@ -4813,14 +4813,14 @@ mod tests {
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let ops = vec![Op::RunPayload {
-            payload: &Payload::EEVDF,
+            payload: &Payload::KERNEL_DEFAULT,
             args: vec![],
             cgroup: None,
         }];
         let err = apply_ops_test(&ctx, &mut state, &ops).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("scheduler-kind Payload") && msg.contains("eevdf"),
+            msg.contains("scheduler-kind Payload") && msg.contains("kernel_default"),
             "error must name the scheduler-kind reason AND the payload name, got: {msg}"
         );
         assert!(
@@ -5344,7 +5344,7 @@ mod tests {
         let cgroups = CgroupManager::new("/nonexistent");
         let topo = mock_topo();
         let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
-        let backdrop = super::super::backdrop::Backdrop::new().with_payload(&Payload::EEVDF);
+        let backdrop = super::super::backdrop::Backdrop::new().with_payload(&Payload::KERNEL_DEFAULT);
         let err = execute_scenario_with(
             &ctx,
             backdrop,
