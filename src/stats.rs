@@ -229,16 +229,9 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
 /// / [`METRICS`] rather than dereferencing fields directly so new
 /// metrics can land through the registry without touching every
 /// reader.
-///
-/// The `worst_degradation_*` and `degradation_count` fields are read by
-/// [`build_dataframe`] but are always zero when populated via
-/// [`sidecar_to_row`]: sidecars carry the aggregate `MonitorSummary`
-/// but not the per-sample trace that would populate the degradation
-/// fields.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GauntletRow {
     pub scenario: String,
-    pub flags: String,
     pub topology: String,
     pub work_type: String,
     /// Scheduler binary name carried from the source sidecar
@@ -246,7 +239,6 @@ pub struct GauntletRow {
     /// filter in [`compare_rows`] so users can narrow A/B comparisons
     /// by scheduler name.
     pub scheduler: String,
-    pub replica: u32,
     pub passed: bool,
     /// True when the run was skipped (topology mismatch, missing
     /// resource). `passed` stays `true` for gate-compat; `skipped`
@@ -273,12 +265,6 @@ pub struct GauntletRow {
     // NUMA fields.
     pub page_locality: f64,
     pub cross_node_migration_ratio: f64,
-    pub worst_degradation_op: String,
-    pub worst_imbalance_delta: f64,
-    pub worst_dsq_delta: f64,
-    pub worst_fallback_delta: f64,
-    pub worst_keep_last_delta: f64,
-    pub degradation_count: u32,
     /// Extensible metrics populated by scenarios and processed by the
     /// comparison pipeline. Keyed by metric name; looked up via
     /// [`metric_def`] when a matching entry exists in [`METRICS`].
@@ -290,11 +276,9 @@ pub struct GauntletRow {
 pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
     GauntletRow {
         scenario: sc.test_name.clone(),
-        flags: String::new(),
         topology: sc.topology.clone(),
         work_type: sc.work_type.clone(),
         scheduler: sc.scheduler.clone(),
-        replica: 1,
         passed: sc.passed,
         skipped: sc.skipped,
         spread: sc.stats.worst_spread,
@@ -336,12 +320,6 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         worst_run_delay_us: sc.stats.worst_run_delay_us,
         page_locality: sc.stats.worst_page_locality,
         cross_node_migration_ratio: sc.stats.worst_cross_node_migration_ratio,
-        worst_degradation_op: String::new(),
-        worst_imbalance_delta: 0.0,
-        worst_dsq_delta: 0.0,
-        worst_fallback_delta: 0.0,
-        worst_keep_last_delta: 0.0,
-        degradation_count: 0,
         ext_metrics: sc.stats.ext_metrics.clone(),
     }
 }
@@ -349,10 +327,8 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
 /// Build a polars DataFrame from gauntlet rows.
 fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let scenario: Vec<&str> = rows.iter().map(|r| r.scenario.as_str()).collect();
-    let flags: Vec<&str> = rows.iter().map(|r| r.flags.as_str()).collect();
     let topology: Vec<&str> = rows.iter().map(|r| r.topology.as_str()).collect();
     let work_type: Vec<&str> = rows.iter().map(|r| r.work_type.as_str()).collect();
-    let replica: Vec<u32> = rows.iter().map(|r| r.replica).collect();
     let passed: Vec<bool> = rows.iter().map(|r| r.passed).collect();
     let skipped: Vec<bool> = rows.iter().map(|r| r.skipped).collect();
     let spread: Vec<f64> = rows.iter().map(|r| r.spread).collect();
@@ -372,22 +348,11 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let worst_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_run_delay_us).collect();
     let page_locality: Vec<f64> = rows.iter().map(|r| r.page_locality).collect();
     let cross_node_mig: Vec<f64> = rows.iter().map(|r| r.cross_node_migration_ratio).collect();
-    let worst_deg_op: Vec<&str> = rows
-        .iter()
-        .map(|r| r.worst_degradation_op.as_str())
-        .collect();
-    let imbalance_delta: Vec<f64> = rows.iter().map(|r| r.worst_imbalance_delta).collect();
-    let dsq_delta: Vec<f64> = rows.iter().map(|r| r.worst_dsq_delta).collect();
-    let fallback_delta: Vec<f64> = rows.iter().map(|r| r.worst_fallback_delta).collect();
-    let keep_last_delta: Vec<f64> = rows.iter().map(|r| r.worst_keep_last_delta).collect();
-    let degradation_count: Vec<u32> = rows.iter().map(|r| r.degradation_count).collect();
 
     df!(
         "scenario" => &scenario,
-        "flags" => &flags,
         "topology" => &topology,
         "work_type" => &work_type,
-        "replica" => &replica,
         "passed" => &passed,
         "skipped" => &skipped,
         "spread" => &spread,
@@ -407,19 +372,12 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
         "worst_run_delay_us" => &worst_run_delay,
         "page_locality" => &page_locality,
         "cross_node_migration_ratio" => &cross_node_mig,
-        "worst_deg_op" => &worst_deg_op,
-        "imbalance_delta" => &imbalance_delta,
-        "dsq_delta" => &dsq_delta,
-        "fallback_delta" => &fallback_delta,
-        "keep_last_delta" => &keep_last_delta,
-        "degradation_count" => &degradation_count
     )
 }
 
-/// Detected outlier: a (scenario, flags) pair with an anomalous stat.
+/// Detected outlier: a scenario with an anomalous stat.
 struct Outlier {
     scenario: String,
-    flags: String,
     metric: &'static str,
     value: f64,
     overall_mean: f64,
@@ -431,8 +389,8 @@ impl std::fmt::Display for Outlier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} + {}: {} {:.1} (overall avg {:.1}, +{:.1}\u{03c3})",
-            self.scenario, self.flags, self.metric, self.value, self.overall_mean, self.sigma
+            "{}: {} {:.1} (overall avg {:.1}, +{:.1}\u{03c3})",
+            self.scenario, self.metric, self.value, self.overall_mean, self.sigma
         )?;
         if !self.worst_topos.is_empty() {
             write!(f, "\n    worst on: {}", self.worst_topos.join(", "))?;
@@ -500,11 +458,11 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
         }
         let threshold = overall_mean + 2.0 * overall_std;
 
-        // Group by (scenario, flags), compute mean of metric across topologies.
+        // Group by scenario, compute mean of metric across topologies.
         let grouped = df
             .clone()
             .lazy()
-            .group_by([col("scenario"), col("flags")])
+            .group_by([col("scenario")])
             .agg([
                 col(metric).mean().alias("metric_mean"),
                 col(metric).max().alias("metric_max"),
@@ -517,11 +475,10 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
         };
 
         let scenarios = col_str(&grouped, "scenario");
-        let flags_col = col_str(&grouped, "flags");
         let means = col_f64(&grouped, "metric_mean");
 
-        let (scenarios, flags_col, means) = match (scenarios, flags_col, means) {
-            (Some(s), Some(f), Some(m)) => (s, f, m),
+        let (scenarios, means) = match (scenarios, means) {
+            (Some(s), Some(m)) => (s, m),
             _ => continue,
         };
 
@@ -532,14 +489,12 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
             }
             let sigma = (mean_val - overall_mean) / overall_std;
             let sc = scenarios.get(i).unwrap_or("");
-            let fl = flags_col.get(i).unwrap_or("");
 
-            // Find worst topologies for this pair.
-            let worst = find_worst_topos(df, sc, fl, metric, threshold);
+            // Find worst topologies for this scenario.
+            let worst = find_worst_topos(df, sc, metric, threshold);
 
             outliers.push(Outlier {
                 scenario: sc.to_string(),
-                flags: fl.to_string(),
                 metric,
                 value: mean_val,
                 overall_mean,
@@ -557,11 +512,10 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
     outliers
 }
 
-/// Find topology names where a (scenario, flags) pair exceeds the threshold.
+/// Find topology names where a scenario exceeds the threshold.
 fn find_worst_topos(
     df: &DataFrame,
     scenario: &str,
-    flags: &str,
     metric: &str,
     threshold: f64,
 ) -> Vec<String> {
@@ -571,7 +525,6 @@ fn find_worst_topos(
         .filter(
             col("scenario")
                 .eq(lit(scenario))
-                .and(col("flags").eq(lit(flags)))
                 .and(col(metric).gt(lit(threshold))),
         )
         .select([col("topology")])
@@ -686,398 +639,6 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
     out
 }
 
-/// Classify a topology name into a CPU-count bucket.
-///
-/// CPU counts are derived from [`crate::vm::gauntlet_presets()`] at
-/// first call and cached. Preset names not found in the cache return
-/// `"unknown"`.
-fn topo_bucket(topo: &str) -> &'static str {
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-
-    static MAP: OnceLock<HashMap<String, u32>> = OnceLock::new();
-    let map = MAP.get_or_init(|| {
-        crate::vm::gauntlet_presets()
-            .into_iter()
-            .map(|p| (p.name.to_string(), p.topology.total_cpus()))
-            .collect()
-    });
-
-    let cpus = match map.get(topo) {
-        Some(&c) => c,
-        None => return "unknown",
-    };
-    match cpus {
-        0..=8 => "<=8cpu",
-        9..=32 => "9-32cpu",
-        33..=128 => "33-128cpu",
-        _ => ">128cpu",
-    }
-}
-
-/// Decompose a combo flag string like "borrow+rebal" into individual flags.
-fn decompose_flags(flags: &str) -> Vec<&str> {
-    if flags == "default" || flags.is_empty() {
-        return vec![];
-    }
-    flags.split('+').collect()
-}
-
-/// Format the stimulus cross-tab analysis from the DataFrame.
-fn format_stimulus_crosstab(df: &DataFrame) -> String {
-    let mut out = String::new();
-
-    // Check if any rows have degradation data.
-    let has_data = col_u32(df, "degradation_count")
-        .map(|ca| ca.sum().unwrap_or(0) > 0)
-        .unwrap_or(false);
-
-    if !has_data {
-        return out;
-    }
-
-    out.push_str("\n=== STIMULUS CROSS-TAB ===\n");
-
-    // --- Part 1: Worst stimulus by metric ---
-    out.push_str("\nWorst stimulus by metric:\n");
-    let delta_metrics: &[(&str, &str)] = &[
-        ("imbalance", "imbalance_delta"),
-        ("dsq_depth", "dsq_delta"),
-        ("fallback", "fallback_delta"),
-        ("keep_last", "keep_last_delta"),
-    ];
-    for &(metric, col_name) in delta_metrics {
-        let grouped = df
-            .clone()
-            .lazy()
-            .filter(col(col_name).gt(lit(0.0)))
-            .group_by([col("worst_deg_op"), col("flags")])
-            .agg([
-                col(col_name).mean().alias("avg_delta"),
-                col(col_name).count().alias("hit_count"),
-            ])
-            .sort(
-                ["avg_delta"],
-                SortMultipleOptions::new().with_order_descending(true),
-            )
-            .limit(1)
-            .collect();
-
-        match grouped {
-            Ok(g) if g.height() > 0 => {
-                let op = col_str(&g, "worst_deg_op")
-                    .and_then(|ca| ca.get(0).map(|s| s.to_string()))
-                    .unwrap_or_else(|| "?".to_string());
-                let fl = col_str(&g, "flags")
-                    .and_then(|ca| ca.get(0).map(|s| s.to_string()))
-                    .unwrap_or_else(|| "?".to_string());
-                let avg = col_f64(&g, "avg_delta")
-                    .and_then(|ca| ca.get(0))
-                    .unwrap_or(0.0);
-                let hits = col_u32(&g, "hit_count")
-                    .and_then(|ca| ca.get(0))
-                    .unwrap_or(0);
-                out.push_str(&format!(
-                    "  {:<12} {} + {:<12} avg_delta={:+.1}  in {} runs\n",
-                    metric, &op, &fl, avg, hits
-                ));
-            }
-            _ => {
-                out.push_str(&format!("  {:<12} (no significant degradation)\n", metric));
-            }
-        }
-    }
-
-    // Stalls: count runs with stalls > 0, grouped by worst_deg_op + flags.
-    let stall_grouped = df
-        .clone()
-        .lazy()
-        .filter(col("stalls").gt(lit(0.0)))
-        .group_by([col("worst_deg_op"), col("flags")])
-        .agg([
-            col("stalls").sum().alias("total_stalls"),
-            col("stalls").count().alias("run_count"),
-        ])
-        .sort(
-            ["total_stalls"],
-            SortMultipleOptions::new().with_order_descending(true),
-        )
-        .limit(1)
-        .collect();
-
-    match stall_grouped {
-        Ok(g) if g.height() > 0 => {
-            let op = col_str(&g, "worst_deg_op")
-                .and_then(|ca| ca.get(0).map(|s| s.to_string()))
-                .unwrap_or_else(|| "?".to_string());
-            let fl = col_str(&g, "flags")
-                .and_then(|ca| ca.get(0).map(|s| s.to_string()))
-                .unwrap_or_else(|| "?".to_string());
-            let total = col_f64(&g, "total_stalls")
-                .and_then(|ca| ca.get(0))
-                .unwrap_or(0.0) as u64;
-            let runs = col_u32(&g, "run_count")
-                .and_then(|ca| ca.get(0))
-                .unwrap_or(0);
-            if total > 0 {
-                out.push_str(&format!(
-                    "  {:<12} {} + {:<12} {} stalls in {} runs\n",
-                    "stalls", &op, &fl, total, runs
-                ));
-            }
-        }
-        _ => {}
-    }
-
-    // --- Part 2: Flag decomposition ---
-    // Decompose combo flags and compute avg metric delta per individual flag.
-    // Done via row iteration since the polars `strings` feature is not enabled.
-    let flags_ca = col_str(df, "flags");
-
-    let all_flags_set: std::collections::BTreeSet<String> = flags_ca
-        .as_ref()
-        .map(|ca| {
-            let mut s = std::collections::BTreeSet::new();
-            for v in ca.into_iter().flatten() {
-                for f in decompose_flags(v) {
-                    s.insert(f.to_string());
-                }
-            }
-            s
-        })
-        .unwrap_or_default();
-
-    if !all_flags_set.is_empty() {
-        let metric_cols = &["imbalance_delta", "dsq_delta", "fallback_delta"];
-        let metric_labels = &["imbalance", "dsq_depth", "fallback"];
-
-        let overall_means: Vec<f64> = metric_cols.iter().map(|m| col_mean_std(df, m).0).collect();
-
-        out.push_str("\nFlag decomposition (avg metric delta when flag present vs absent):\n");
-        out.push_str(&format!("  {:<14}", ""));
-        for label in metric_labels {
-            out.push_str(&format!("{:<14}", label));
-        }
-        out.push_str("stalls\n");
-
-        // Build row-level flag membership mask and compute per-flag averages.
-        let flags_ca = flags_ca.unwrap();
-        let n = df.height();
-
-        for flag in &all_flags_set {
-            out.push_str(&format!("  {:<14}", flag));
-
-            // Build boolean mask: rows where flags contains this individual flag.
-            let mask: Vec<bool> = (0..n)
-                .map(|i| {
-                    flags_ca
-                        .get(i)
-                        .is_some_and(|v| decompose_flags(v).contains(&flag.as_str()))
-                })
-                .collect();
-
-            for (mi, mc) in metric_cols.iter().enumerate() {
-                let vals = col_f64(df, mc);
-                let avg = vals
-                    .as_ref()
-                    .map(|ca| {
-                        let masked: Vec<f64> = mask
-                            .iter()
-                            .enumerate()
-                            .filter(|&(_, &m)| m)
-                            .map(|(i, _)| ca.get(i).unwrap_or(0.0))
-                            .collect();
-                        if masked.is_empty() {
-                            0.0
-                        } else {
-                            masked.iter().sum::<f64>() / masked.len() as f64
-                        }
-                    })
-                    .unwrap_or(0.0);
-                let delta = avg - overall_means[mi];
-                out.push_str(&format!("{:+.1}{:<8}", delta, ""));
-            }
-
-            // Stalls for this flag.
-            let stall_vals = col_f64(df, "stalls");
-            let stall_avg = stall_vals
-                .as_ref()
-                .map(|ca| {
-                    let masked: Vec<f64> = mask
-                        .iter()
-                        .enumerate()
-                        .filter(|&(_, &m)| m)
-                        .map(|(i, _)| ca.get(i).unwrap_or(0.0))
-                        .collect();
-                    if masked.is_empty() {
-                        0.0
-                    } else {
-                        masked.iter().sum::<f64>() / masked.len() as f64
-                    }
-                })
-                .unwrap_or(0.0);
-            out.push_str(&format!("{:.1}\n", stall_avg));
-        }
-    }
-
-    // --- Part 3: Flag x topology bucket ---
-    if !all_flags_set.is_empty() {
-        let buckets = &["<=8cpu", "9-32cpu", "33-128cpu", ">128cpu"];
-        let n = df.height();
-
-        let topo_ca = col_str(df, "topology");
-        let flags_ca = col_str(df, "flags");
-        let imb_ca = col_f64(df, "imbalance_delta");
-
-        if let (Some(topo_ca), Some(flags_ca), Some(imb_ca)) = (topo_ca, flags_ca, imb_ca) {
-            out.push_str("\nFlag x topology (imbalance delta):\n");
-            out.push_str(&format!("  {:<14}", ""));
-            for b in buckets {
-                out.push_str(&format!("{:<12}", b));
-            }
-            out.push('\n');
-
-            for flag in &all_flags_set {
-                out.push_str(&format!("  {:<14}", flag));
-                for &bucket in buckets {
-                    let masked: Vec<f64> = (0..n)
-                        .filter(|&i| {
-                            flags_ca
-                                .get(i)
-                                .is_some_and(|v| decompose_flags(v).contains(&flag.as_str()))
-                                && topo_ca.get(i).is_some_and(|v| topo_bucket(v) == bucket)
-                        })
-                        .map(|i| imb_ca.get(i).unwrap_or(0.0))
-                        .collect();
-                    let avg = if masked.is_empty() {
-                        0.0
-                    } else {
-                        masked.iter().sum::<f64>() / masked.len() as f64
-                    };
-                    out.push_str(&format!("{:+.1}{:<6}", avg, ""));
-                }
-                out.push('\n');
-            }
-        }
-    }
-
-    out
-}
-
-/// Format per-cgroup pass rates, flagging cgroups below 100%.
-fn format_cgroup_pass_rates(df: &DataFrame) -> String {
-    let grouped = df
-        .clone()
-        .lazy()
-        .group_by([
-            col("scenario"),
-            col("flags"),
-            col("topology"),
-            col("work_type"),
-        ])
-        .agg([
-            // pass_count excludes skipped rows.
-            (col("passed").and(col("skipped").not()))
-                .cast(DataType::UInt32)
-                .sum()
-                .alias("pass_count"),
-            col("skipped")
-                .cast(DataType::UInt32)
-                .sum()
-                .alias("skip_count"),
-            col("passed").count().cast(DataType::UInt32).alias("total"),
-            col("spread").mean().alias("avg_spread"),
-            col("spread").std(1).alias("std_spread"),
-            col("gap_ms").mean().alias("avg_gap_ms"),
-            col("gap_ms").min().alias("min_gap_ms"),
-            col("gap_ms").max().alias("max_gap_ms"),
-            col("imbalance").mean().alias("avg_imbalance"),
-            col("dsq_depth").mean().alias("avg_dsq_depth"),
-            col("fallback").mean().alias("avg_fallback"),
-        ])
-        .sort(
-            ["pass_count"],
-            SortMultipleOptions::new().with_order_descending(false),
-        )
-        .collect();
-
-    let grouped = match grouped {
-        Ok(g) => g,
-        Err(_) => return String::new(),
-    };
-
-    let scenarios = col_str(&grouped, "scenario");
-    let flags_col = col_str(&grouped, "flags");
-    let topos = col_str(&grouped, "topology");
-    let pass_counts = col_u32(&grouped, "pass_count");
-    let skip_counts = col_u32(&grouped, "skip_count");
-    let totals = col_u32(&grouped, "total");
-    let spreads = col_f64(&grouped, "avg_spread");
-    let std_spreads = col_f64(&grouped, "std_spread");
-    let gaps = col_f64(&grouped, "avg_gap_ms");
-    let min_gaps = col_f64(&grouped, "min_gap_ms");
-    let max_gaps = col_f64(&grouped, "max_gap_ms");
-
-    let (scenarios, flags_col, topos, pass_counts, totals) =
-        match (scenarios, flags_col, topos, pass_counts, totals) {
-            (Some(s), Some(f), Some(t), Some(p), Some(n)) => (s, f, t, p, n),
-            _ => return String::new(),
-        };
-
-    let mut flaky = String::new();
-    let mut all_pass = true;
-
-    for i in 0..grouped.height() {
-        let pass = pass_counts.get(i).unwrap_or(0);
-        let skip = skip_counts.as_ref().and_then(|s| s.get(i)).unwrap_or(0);
-        let total = totals.get(i).unwrap_or(0);
-        // A group is "clean" when every executed (non-skipped) row
-        // passed. Skipped rows are neither passes nor flakes.
-        if total == 0 || pass + skip == total {
-            continue;
-        }
-        all_pass = false;
-        let sc = scenarios.get(i).unwrap_or("?");
-        let fl = flags_col.get(i).unwrap_or("?");
-        let tp = topos.get(i).unwrap_or("?");
-        let fail = total.saturating_sub(pass).saturating_sub(skip);
-        let mut line = if skip > 0 {
-            format!("  {tp}/{sc}/{fl}  {pass}/{total} ({skip} skipped, {fail} failed)")
-        } else {
-            format!("  {tp}/{sc}/{fl}  {pass}/{total}")
-        };
-        if let Some(ref sp) = spreads {
-            let avg = sp.get(i).unwrap_or(0.0);
-            line.push_str(&format!("  spread={:.1}", avg));
-        }
-        if let Some(ref sp) = std_spreads {
-            let std = sp.get(i).unwrap_or(0.0);
-            if std > 0.0 {
-                line.push_str(&format!("\u{00b1}{:.1}", std));
-            }
-        }
-        if let Some(ref g) = gaps {
-            let avg = g.get(i).unwrap_or(0.0);
-            line.push_str(&format!("  gap={:.0}", avg));
-        }
-        if let (Some(mn), Some(mx)) = (&min_gaps, &max_gaps) {
-            let min_v = mn.get(i).unwrap_or(0.0);
-            let max_v = mx.get(i).unwrap_or(0.0);
-            if max_v > min_v {
-                line.push_str(&format!("[{:.0}-{:.0}]", min_v, max_v));
-            }
-        }
-        line.push('\n');
-        flaky.push_str(&line);
-    }
-
-    if all_pass {
-        "All cgroups passed across all replicas.\n\n".to_string()
-    } else {
-        format!("Cgroups with <100% pass rate:\n{flaky}\n")
-    }
-}
-
 /// Analyze pre-built gauntlet rows and return a formatted report.
 pub fn analyze_rows(rows: &[GauntletRow]) -> String {
     if rows.is_empty() {
@@ -1090,14 +651,6 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
     };
 
     let mut report = String::from("\n=== GAUNTLET ANALYSIS ===\n\n");
-
-    let has_replicas = col_u32(&df, "replica")
-        .map(|ca| ca.max().unwrap_or(1) > 1)
-        .unwrap_or(false);
-
-    if has_replicas {
-        report.push_str(&format_cgroup_pass_rates(&df));
-    }
 
     let outliers = find_outliers(&df);
     if outliers.is_empty() {
@@ -1112,9 +665,6 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
     report.push_str("\nBy scenario (worst first):\n");
     report.push_str(&format_dimension_summary(&df, "scenario"));
 
-    report.push_str("\nBy flags:\n");
-    report.push_str(&format_dimension_summary(&df, "flags"));
-
     report.push_str("\nBy topology:\n");
     report.push_str(&format_dimension_summary(&df, "topology"));
 
@@ -1125,8 +675,6 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
         report.push_str("\nBy work_type:\n");
         report.push_str(&format_dimension_summary(&df, "work_type"));
     }
-
-    report.push_str(&format_stimulus_crosstab(&df));
 
     report
 }
@@ -1524,15 +1072,13 @@ mod tests {
         assert_eq!(std, 0.0);
     }
 
-    fn make_row(scenario: &str, flags: &str, topo: &str, passed: bool, spread: f64) -> GauntletRow {
+    fn make_row(scenario: &str, topo: &str, passed: bool, spread: f64) -> GauntletRow {
         GauntletRow {
             scenario: scenario.into(),
-            flags: flags.into(),
             topology: topo.into(),
             work_type: "CpuSpin".into(),
             scheduler: String::new(),
             skipped: false,
-            replica: 1,
             passed,
             spread,
             gap_ms: 50,
@@ -1551,287 +1097,8 @@ mod tests {
             worst_run_delay_us: 0.0,
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
-            worst_degradation_op: String::new(),
-            worst_imbalance_delta: 0.0,
-            worst_dsq_delta: 0.0,
-            worst_fallback_delta: 0.0,
-            worst_keep_last_delta: 0.0,
-            degradation_count: 0,
             ext_metrics: BTreeMap::new(),
         }
-    }
-
-    // -- topo_bucket tests --
-
-    #[test]
-    fn topo_bucket_tiny() {
-        assert_eq!(topo_bucket("tiny-1llc"), "<=8cpu");
-        assert_eq!(topo_bucket("tiny-2llc"), "<=8cpu");
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("smt-2llc"), "<=8cpu");
-    }
-
-    #[test]
-    fn topo_bucket_small() {
-        assert_eq!(topo_bucket("odd-3llc"), "9-32cpu");
-        assert_eq!(topo_bucket("odd-5llc"), "9-32cpu");
-        assert_eq!(topo_bucket("odd-7llc"), "9-32cpu");
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("smt-3llc"), "9-32cpu");
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("medium-4llc"), "9-32cpu");
-        assert_eq!(topo_bucket("medium-4llc-nosmt"), "9-32cpu");
-        assert_eq!(topo_bucket("numa2-4llc"), "9-32cpu");
-        assert_eq!(topo_bucket("numa4-8llc"), "9-32cpu");
-    }
-
-    #[test]
-    fn topo_bucket_medium() {
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("medium-8llc"), "33-128cpu");
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("large-4llc"), "33-128cpu");
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("large-8llc"), "33-128cpu");
-        assert_eq!(topo_bucket("medium-8llc-nosmt"), "33-128cpu");
-        assert_eq!(topo_bucket("large-4llc-nosmt"), "33-128cpu");
-        assert_eq!(topo_bucket("large-8llc-nosmt"), "33-128cpu");
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("numa2-8llc"), "33-128cpu");
-        assert_eq!(topo_bucket("numa2-8llc-nosmt"), "33-128cpu");
-    }
-
-    #[test]
-    fn topo_bucket_large() {
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("near-max-llc"), ">128cpu");
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("max-cpu"), ">128cpu");
-        assert_eq!(topo_bucket("near-max-llc-nosmt"), ">128cpu");
-        assert_eq!(topo_bucket("max-cpu-nosmt"), ">128cpu");
-        #[cfg(not(target_arch = "aarch64"))]
-        assert_eq!(topo_bucket("numa4-12llc"), ">128cpu");
-    }
-
-    #[test]
-    fn topo_bucket_unknown() {
-        assert_eq!(topo_bucket("not-a-preset"), "unknown");
-        assert_eq!(topo_bucket(""), "unknown");
-    }
-
-    // -- decompose_flags tests --
-
-    #[test]
-    fn decompose_flags_single() {
-        assert_eq!(decompose_flags("borrow"), vec!["borrow"]);
-    }
-
-    #[test]
-    fn decompose_flags_multiple() {
-        assert_eq!(decompose_flags("borrow+rebal"), vec!["borrow", "rebal"]);
-    }
-
-    #[test]
-    fn decompose_flags_default() {
-        assert!(decompose_flags("default").is_empty());
-    }
-
-    #[test]
-    fn decompose_flags_empty() {
-        assert!(decompose_flags("").is_empty());
-    }
-
-    // -- format_stimulus_crosstab tests --
-
-    #[test]
-    fn format_stimulus_crosstab_no_degradation_data() {
-        let rows = vec![
-            make_row("a", "borrow+rebal", "tiny-1llc", true, 5.0),
-            make_row("b", "rebal", "medium-4llc", true, 8.0),
-        ];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_stimulus_crosstab(&df);
-        assert!(
-            out.is_empty(),
-            "no degradation data should produce empty output"
-        );
-    }
-
-    #[test]
-    fn format_stimulus_crosstab_computes_avg_delta() {
-        // Two rows with imbalance_delta > 0 for the same (op, flags) group.
-        // avg_delta should be (2.0 + 4.0) / 2 = 3.0, formatted as "+3.0".
-        let mut r1 = make_row("a", "borrow", "tiny-1llc", true, 5.0);
-        r1.worst_degradation_op = "SetCpuset".into();
-        r1.worst_imbalance_delta = 2.0;
-        r1.degradation_count = 1;
-        let mut r2 = make_row("a", "borrow", "medium-4llc", true, 5.0);
-        r2.worst_degradation_op = "SetCpuset".into();
-        r2.worst_imbalance_delta = 4.0;
-        r2.degradation_count = 1;
-        let rows = vec![r1, r2];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_stimulus_crosstab(&df);
-        // "imbalance    SetCpuset + borrow       avg_delta=+3.0  in 2 runs"
-        assert!(
-            out.contains("avg_delta=+3.0"),
-            "expected avg_delta=+3.0, got:\n{out}"
-        );
-        assert!(
-            out.contains("in 2 runs"),
-            "expected 'in 2 runs', got:\n{out}"
-        );
-        assert!(
-            out.contains("SetCpuset"),
-            "expected op name SetCpuset, got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn format_stimulus_crosstab_stalls_section() {
-        // Row with stall_count=3 should produce "3 stalls in 1 runs".
-        let mut r1 = make_row("a", "borrow", "tiny-1llc", true, 5.0);
-        r1.worst_degradation_op = "Spawn".into();
-        r1.stall_count = 3;
-        r1.degradation_count = 1;
-        let rows = vec![r1];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_stimulus_crosstab(&df);
-        assert!(
-            out.contains("3 stalls in 1 runs"),
-            "expected stall count, got:\n{out}"
-        );
-        assert!(out.contains("Spawn"), "expected op Spawn, got:\n{out}");
-    }
-
-    #[test]
-    fn format_stimulus_crosstab_flag_decomposition_values() {
-        // Two flags: "borrow" with imbalance_delta=4.0, "rebal" with imbalance_delta=2.0.
-        // Overall mean = (4.0 + 2.0) / 2 = 3.0.
-        // borrow delta from mean = 4.0 - 3.0 = +1.0
-        // rebal delta from mean = 2.0 - 3.0 = -1.0
-        let mut r1 = make_row("a", "borrow", "tiny-1llc", true, 5.0);
-        r1.worst_degradation_op = "SetCpuset".into();
-        r1.worst_imbalance_delta = 4.0;
-        r1.degradation_count = 1;
-        let mut r2 = make_row("b", "rebal", "medium-4llc", true, 5.0);
-        r2.worst_degradation_op = "Spawn".into();
-        r2.worst_imbalance_delta = 2.0;
-        r2.degradation_count = 1;
-        let rows = vec![r1, r2];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_stimulus_crosstab(&df);
-        // Flag decomposition should show "+1.0" for borrow and "-1.0" for rebal
-        // in the imbalance column.
-        assert!(
-            out.contains("+1.0"),
-            "borrow should be +1.0 above mean, got:\n{out}"
-        );
-        assert!(
-            out.contains("-1.0"),
-            "rebal should be -1.0 below mean, got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn format_stimulus_crosstab_flag_x_topo_values() {
-        // borrow on tiny-1llc (<=8cpu bucket) with imbalance_delta=3.0.
-        // borrow on medium-4llc-nosmt (9-32cpu bucket) with imbalance_delta=7.0.
-        // Use nosmt preset so the topology exists on aarch64 (which filters SMT presets).
-        // The flag x topo table should show +3.0 for <=8cpu and +7.0 for 9-32cpu.
-        let mut r1 = make_row("a", "borrow", "tiny-1llc", true, 5.0);
-        r1.worst_degradation_op = "SetCpuset".into();
-        r1.worst_imbalance_delta = 3.0;
-        r1.degradation_count = 1;
-        let mut r2 = make_row("a", "borrow", "medium-4llc-nosmt", true, 5.0);
-        r2.worst_degradation_op = "SetCpuset".into();
-        r2.worst_imbalance_delta = 7.0;
-        r2.degradation_count = 1;
-        let rows = vec![r1, r2];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_stimulus_crosstab(&df);
-        assert!(
-            out.contains("+3.0"),
-            "<=8cpu bucket should show +3.0, got:\n{out}"
-        );
-        assert!(
-            out.contains("+7.0"),
-            "9-32cpu bucket should show +7.0, got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn format_stimulus_crosstab_no_significant_metric() {
-        // dsq_delta=0 for all rows -> dsq_depth line should say "(no significant degradation)".
-        let mut r1 = make_row("a", "borrow", "tiny-1llc", true, 5.0);
-        r1.worst_degradation_op = "SetCpuset".into();
-        r1.worst_imbalance_delta = 2.0;
-        r1.worst_dsq_delta = 0.0;
-        r1.degradation_count = 1;
-        let rows = vec![r1];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_stimulus_crosstab(&df);
-        assert!(
-            out.contains("dsq_depth") && out.contains("(no significant degradation)"),
-            "dsq_depth should show no degradation, got:\n{out}"
-        );
-    }
-
-    // -- format_cgroup_pass_rates tests --
-
-    #[test]
-    fn format_cgroup_pass_rates_all_pass() {
-        let rows = vec![
-            make_row("a", "f1", "t1", true, 5.0),
-            make_row("a", "f1", "t1", true, 6.0),
-        ];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_cgroup_pass_rates(&df);
-        assert_eq!(out, "All cgroups passed across all replicas.\n\n");
-    }
-
-    #[test]
-    fn format_cgroup_pass_rates_computed_values() {
-        // 3 replicas: spread 10.0, 20.0, 30.0 -> avg=20.0, std>0.
-        // gap_ms: 100, 200, 300 -> avg=200, min=100, max=300.
-        // 2 pass, 1 fail.
-        let mut rows = vec![
-            make_row("scenario_a", "flags_x", "topo_y", true, 10.0),
-            make_row("scenario_a", "flags_x", "topo_y", false, 20.0),
-            make_row("scenario_a", "flags_x", "topo_y", true, 30.0),
-        ];
-        rows[0].gap_ms = 100;
-        rows[1].gap_ms = 200;
-        rows[2].gap_ms = 300;
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_cgroup_pass_rates(&df);
-        // Format: "  {tp}/{sc}/{fl}  {pass}/{total}  spread={avg}  gap={avg}[{min}-{max}]"
-        assert!(out.contains("2/3"), "2/3 pass rate, got:\n{out}");
-        assert!(out.contains("spread=20.0"), "avg spread=20.0, got:\n{out}");
-        assert!(out.contains("gap=200"), "avg gap=200, got:\n{out}");
-        assert!(
-            out.contains("[100-300]"),
-            "gap range [100-300], got:\n{out}"
-        );
-        // std_spread of [10,20,30] is 10.0 -> shows ±10.0
-        assert!(out.contains("±10.0"), "std spread ±10.0, got:\n{out}");
-    }
-
-    #[test]
-    fn format_cgroup_pass_rates_no_gap_range_when_equal() {
-        // All same gap_ms -> no range shown.
-        let rows = vec![
-            make_row("a", "f1", "t1", true, 5.0),
-            make_row("a", "f1", "t1", false, 5.0),
-        ];
-        let df = build_dataframe(&rows).unwrap();
-        let out = format_cgroup_pass_rates(&df);
-        assert!(out.contains("1/2"), "1/2, got:\n{out}");
-        // gap_ms=50 for both via make_row -> no range brackets
-        assert!(
-            !out.contains("[50-50]"),
-            "equal gaps should not show range, got:\n{out}"
-        );
     }
 
     // -- format_dimension_summary tests --
@@ -1840,13 +1107,13 @@ mod tests {
     fn format_dimension_summary_computed_values() {
         // Two scenarios: "fast" with spread=4.0, gap=40, and "slow" with spread=20.0, gap=200.
         // Each has 1 row. format_dimension_summary sorts by avg_spread descending.
-        let mut r1 = make_row("slow", "default", "tiny-1llc", false, 20.0);
+        let mut r1 = make_row("slow", "tiny-1llc", false, 20.0);
         r1.gap_ms = 200;
         r1.imbalance_ratio = 2.5; // > 1.0, should show imbal=2.5
         r1.max_dsq_depth = 8; // > 0, should show dsq=8
         r1.stall_count = 2; // > 0, should show stalls=2
         r1.fallback_count = 15; // > 0, should show fallback=15
-        let r2 = make_row("fast", "default", "tiny-1llc", true, 4.0);
+        let r2 = make_row("fast", "tiny-1llc", true, 4.0);
         let rows = vec![r1, r2];
         let df = build_dataframe(&rows).unwrap();
         let out = format_dimension_summary(&df, "scenario");
@@ -1888,8 +1155,8 @@ mod tests {
     #[test]
     fn analyze_rows_with_work_type_diversity() {
         let mut rows = vec![
-            make_row("a", "f1", "t1", true, 5.0),
-            make_row("a", "f1", "t1", true, 6.0),
+            make_row("a", "t1", true, 5.0),
+            make_row("a", "t1", true, 6.0),
         ];
         rows[0].work_type = "CpuSpin".into();
         rows[1].work_type = "Bursty".into();
@@ -1905,8 +1172,8 @@ mod tests {
     #[test]
     fn analyze_rows_no_work_type_section_when_uniform() {
         let rows = vec![
-            make_row("a", "f1", "t1", true, 5.0),
-            make_row("b", "f2", "t2", true, 8.0),
+            make_row("a", "t1", true, 5.0),
+            make_row("b", "t2", true, 8.0),
         ];
         let report = analyze_rows(&rows);
         assert!(
@@ -1969,8 +1236,6 @@ mod tests {
         assert_eq!(row.stall_count, 1);
         assert_eq!(row.fallback_count, 7);
         assert_eq!(row.keep_last_count, 3);
-        assert!(row.flags.is_empty());
-        assert_eq!(row.replica, 1);
     }
 
     #[test]
@@ -2085,7 +1350,7 @@ mod tests {
 
     #[test]
     fn metric_def_read_named_fields() {
-        let mut row = make_row("a", "f", "t", true, 42.0);
+        let mut row = make_row("a", "t", true, 42.0);
         row.gap_ms = 100;
         row.migrations = 7;
         row.migration_ratio = 0.3;
@@ -2130,7 +1395,7 @@ mod tests {
         // Even if ext_metrics carries a colliding entry for the
         // same name, MetricDef::read returns the accessor's value
         // — built-in fields are the authoritative source.
-        let mut row = make_row("a", "f", "t", true, 5.0);
+        let mut row = make_row("a", "t", true, 5.0);
         row.ext_metrics.insert("worst_spread".into(), 999.0);
         assert_eq!(read_metric(&row, "worst_spread"), Some(5.0));
 
@@ -2144,11 +1409,11 @@ mod tests {
 
     // -- compare_rows tests --
 
-    /// Build a row matching the sidecar-derived schema: empty `flags`,
-    /// `replica = 1`, `work_type = "CpuSpin"`, all metrics zeroed
-    /// except `spread` and `total_iterations`.
+    /// Build a row matching the sidecar-derived schema:
+    /// `work_type = "CpuSpin"`, all metrics zeroed except `spread`
+    /// and `total_iterations`.
     fn cmp_row(scenario: &str, topo: &str, passed: bool, spread: f64, iters: u64) -> GauntletRow {
-        let mut r = make_row(scenario, "", topo, passed, spread);
+        let mut r = make_row(scenario, topo, passed, spread);
         r.gap_ms = 0;
         r.migrations = 0;
         r.imbalance_ratio = 0.0;
