@@ -224,6 +224,35 @@ struct ProbeOutput {
     threads: Vec<ThreadResult>,
 }
 
+/// Per-thread probe outcome.
+///
+/// **Wire format: `#[serde(untagged)]` by deliberate choice.** The
+/// two variants have disjoint field sets (`allocated_bytes` /
+/// `deallocated_bytes` on `Ok`; `error` / `error_kind` on `Err`),
+/// so downstream consumers can discriminate via field presence
+/// without a tag. The evaluated alternative was
+/// `#[serde(tag = "status")]`, which would add a `"status": "ok"` /
+/// `"status": "err"` discriminator to every thread entry.
+///
+/// Retained untagged on this pass because:
+/// * **No present consumer hardship.** The probe's own tests pin
+///   the exact shape (see `thread_result_json_shape`), and no
+///   external consumer has reported presence-sniffing pain.
+/// * **Breaking change cost without a use case.** Flipping to
+///   tagged renames every entry on the wire and forces every
+///   external parser to update. ktstr is pre-1.0, so the break
+///   itself is cheap — but the benefit is speculative until a
+///   concrete consumer asks for it.
+/// * **Disjoint fields are the natural discriminant.** `error`
+///   cannot appear on `Ok`, `allocated_bytes` cannot appear on
+///   `Err`. A single field presence check is sufficient
+///   (`has("error")` → Err arm, else Ok arm).
+///
+/// **Re-evaluate** if either (a) a future variant introduces a
+/// field that overlaps with the Ok/Err field sets (discriminant
+/// collision), or (b) a consumer needs to round-trip the JSON
+/// back into a Rust enum — `#[serde(untagged)]` deserialization
+/// is order-sensitive and errors less helpfully than tagged.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ThreadResult {
@@ -268,11 +297,26 @@ enum ThreadResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 enum ThreadErrorKind {
-    /// `ptrace(PTRACE_SEIZE)` or `ptrace(PTRACE_INTERRUPT)` failed.
-    /// Typical causes: ESRCH (tid exited between enumeration and
-    /// attach — the race is the common case, not exceptional) or
-    /// EPERM (yama/uid policy). Transient under workload churn.
-    PtraceAttach,
+    /// `ptrace(PTRACE_SEIZE)` failed. Typical causes: ESRCH (tid
+    /// exited between enumeration and attach — the race is the
+    /// common case, not exceptional), EPERM (yama / uid policy /
+    /// missing `CAP_SYS_PTRACE`), EBUSY (another tracer already
+    /// attached). An operator hitting a persistent EPERM is the
+    /// canonical signal to revisit scope / caps / uid — this
+    /// variant is distinct from [`Self::PtraceInterrupt`] so
+    /// machine consumers can bucket "config problem" vs
+    /// "in-flight race" without substring-matching the `error`
+    /// field.
+    PtraceSeize,
+    /// `ptrace(PTRACE_INTERRUPT)` failed after a successful seize.
+    /// Separate variant from [`Self::PtraceSeize`] because the
+    /// failure mode is narrower: EPERM cannot surface here (the
+    /// permission gate already cleared at seize time), so
+    /// interrupt failures are effectively race-only — ESRCH if the
+    /// tid exited between seize and interrupt. An operator seeing
+    /// an elevated `ptrace_interrupt` rate should look at workload
+    /// thread churn rather than ptrace configuration.
+    PtraceInterrupt,
     /// `waitpid` after interrupt returned an error or an unexpected
     /// status. The tid may have exited between seize and wait; the
     /// kernel reports either `Err(ECHILD)` or a non-Stopped wait
@@ -287,8 +331,8 @@ enum ThreadErrorKind {
     /// `process_vm_readv` against the computed TLS address failed or
     /// returned a short read. The address may be unmapped or the tid
     /// may have exited mid-read. Different root cause from
-    /// `PtraceAttach` — we already have the register set when this
-    /// fires.
+    /// [`Self::PtraceSeize`] / [`Self::PtraceInterrupt`] — we
+    /// already have the register set when this fires.
     ProcessVmReadv,
     /// TLS-offset arithmetic overflowed (e.g. `fs_base -
     /// aligned_size + st_value` underflowed in the symbol-pin math).
@@ -307,7 +351,8 @@ impl std::fmt::Display for ThreadErrorKind {
     /// with the serde tokens by a parity test in the tests module.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let token = match self {
-            Self::PtraceAttach => "ptrace_attach",
+            Self::PtraceSeize => "ptrace_seize",
+            Self::PtraceInterrupt => "ptrace_interrupt",
             Self::Waitpid => "waitpid",
             Self::GetRegset => "get_regset",
             Self::ProcessVmReadv => "process_vm_readv",
@@ -824,7 +869,6 @@ fn install_cleanup_handler() {
     }
 }
 
-/// Perform the full seize → interrupt → wait → read-regs →
 /// Per-thread probe error carrying both a human rendering and a
 /// structural classifier. Produced by [`probe_single_thread`];
 /// consumed at the caller to populate [`ThreadResult::Err`].
@@ -854,12 +898,12 @@ impl ThreadProbeError {
         } else {
             anyhow!("ptrace(PTRACE_SEIZE) on tid {tid}: {e}")
         };
-        Self::new(ThreadErrorKind::PtraceAttach, source)
+        Self::new(ThreadErrorKind::PtraceSeize, source)
     }
 
     fn ptrace_interrupt(tid: i32, e: nix::errno::Errno) -> Self {
         Self::new(
-            ThreadErrorKind::PtraceAttach,
+            ThreadErrorKind::PtraceInterrupt,
             anyhow!("ptrace(PTRACE_INTERRUPT) on tid {tid}: {e}"),
         )
     }
@@ -904,6 +948,7 @@ impl ThreadProbeError {
     }
 }
 
+/// Perform the full seize → interrupt → wait → read-regs →
 /// read-counters → detach sequence for a single target tid.
 fn probe_single_thread(
     tid: i32,
@@ -1594,7 +1639,8 @@ mod tests {
     /// slip through untested.
     fn expected_error_kind_token(k: ThreadErrorKind) -> &'static str {
         match k {
-            ThreadErrorKind::PtraceAttach => "ptrace_attach",
+            ThreadErrorKind::PtraceSeize => "ptrace_seize",
+            ThreadErrorKind::PtraceInterrupt => "ptrace_interrupt",
             ThreadErrorKind::Waitpid => "waitpid",
             ThreadErrorKind::GetRegset => "get_regset",
             ThreadErrorKind::ProcessVmReadv => "process_vm_readv",
@@ -1653,10 +1699,10 @@ mod tests {
     /// token as the serde JSON serialization AND the canonical
     /// expected-token mapping. The stderr render path (`print_output`)
     /// uses `{error_kind}` so operators matching on
-    /// `warning: tid ... [ptrace_attach]: ...` share a pattern with
-    /// the JSON `"error_kind": "ptrace_attach"` consumers. A drift
-    /// (e.g. Display rendering `PtraceAttach` while serde still emits
-    /// `ptrace_attach`) would silently fork the two vocabularies.
+    /// `warning: tid ... [ptrace_seize]: ...` share a pattern with
+    /// the JSON `"error_kind": "ptrace_seize"` consumers. A drift
+    /// (e.g. Display rendering `PtraceSeize` while serde still emits
+    /// `ptrace_seize`) would silently fork the two vocabularies.
     /// Iterates via `strum::EnumIter` so a newly-added variant is
     /// covered without a parallel array edit.
     #[test]
@@ -1764,7 +1810,7 @@ mod tests {
     #[test]
     fn ptrace_seize_eperm_renders_operator_hint() {
         let err = ThreadProbeError::ptrace_seize(42, nix::errno::Errno::EPERM);
-        assert_eq!(err.kind, ThreadErrorKind::PtraceAttach);
+        assert_eq!(err.kind, ThreadErrorKind::PtraceSeize);
         let msg = format!("{}", err.source);
         assert!(msg.contains("tid 42"), "got: {msg}");
         assert!(msg.contains("permission denied"), "got: {msg}");
@@ -1782,7 +1828,7 @@ mod tests {
         // operator into chasing a permission issue for a transient
         // exit).
         let err = ThreadProbeError::ptrace_seize(42, nix::errno::Errno::ESRCH);
-        assert_eq!(err.kind, ThreadErrorKind::PtraceAttach);
+        assert_eq!(err.kind, ThreadErrorKind::PtraceSeize);
         let msg = format!("{}", err.source);
         assert!(msg.contains("ptrace(PTRACE_SEIZE) on tid 42"), "got: {msg}");
         assert!(!msg.contains("permission denied"), "got: {msg}");
@@ -1792,7 +1838,7 @@ mod tests {
     #[test]
     fn ptrace_interrupt_formats_tid_and_errno() {
         let err = ThreadProbeError::ptrace_interrupt(17, nix::errno::Errno::ESRCH);
-        assert_eq!(err.kind, ThreadErrorKind::PtraceAttach);
+        assert_eq!(err.kind, ThreadErrorKind::PtraceInterrupt);
         let msg = format!("{}", err.source);
         assert!(msg.contains("ptrace(PTRACE_INTERRUPT) on tid 17"), "got: {msg}");
     }

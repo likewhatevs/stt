@@ -3247,6 +3247,34 @@ mod tests {
         assert_eq!(strip_think_block(s), "</think></think>");
     }
 
+    /// Interleaved orphan close BEFORE an opener: a `</think>` sits in
+    /// the stream ahead of the paired `<think>body</think>` block. The
+    /// fast path trips on the opener (so the slow path runs), and the
+    /// slow path must emit the pre-opener text — including the orphan
+    /// closer — verbatim before the paired block is stripped. A regex
+    /// or `contains(CLOSE)`-first implementation would mistakenly
+    /// consume the orphan closer as if it paired with nothing.
+    #[test]
+    fn strip_think_block_preserves_orphan_close_before_paired_block() {
+        let s = "pre </think> mid <think>body</think> post";
+        assert_eq!(strip_think_block(s), "pre </think> mid  post");
+    }
+
+    /// Interleaved orphan close BETWEEN two paired blocks: the first
+    /// paired block closes cleanly on its own `</think>`, then an
+    /// orphan `</think>` sits in the inter-block text before the next
+    /// opener. The scanner's outer loop re-enters on find(OPEN) after
+    /// consuming the first block, so `rest` points at `</think><think>b</think>`.
+    /// The orphan closer gets emitted as pre-opener text, then the
+    /// second paired block is stripped. Pins that the scanner's
+    /// restart-after-pair behavior leaves interleaved orphan closers
+    /// untouched rather than fusing them into a phantom span.
+    #[test]
+    fn strip_think_block_preserves_orphan_close_between_paired_blocks() {
+        let s = "<think>a</think></think><think>b</think>post";
+        assert_eq!(strip_think_block(s), "</think>post");
+    }
+
     /// EOF immediately after an opening `<think>` with no body and no
     /// close tag. Same semantics as `preserves_unterminated_open_tag`:
     /// the unterminated block is emitted verbatim from the opener to

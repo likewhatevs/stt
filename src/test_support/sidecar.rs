@@ -1233,24 +1233,72 @@ mod tests {
     /// picking one is sufficient to guard the policy.
     #[test]
     fn sidecar_result_missing_required_field_rejected_by_deserialize() {
+        // Table-driven expansion covering every non-`Option` field of
+        // `SidecarResult`. Each must fail deserialize when absent with
+        // a missing-field error naming the removed key.
+        //
+        // **Why Option fields are excluded**: serde treats
+        // `Option<T>` as tolerant-of-absence natively (no explicit
+        // `#[serde(default)]` needed — it's a builtin rule), so
+        // removing e.g. `payload: Option<String>` from the JSON
+        // yields `None` on the parsed struct rather than a rejection.
+        // The module doc at src/test_support/sidecar.rs promises
+        // "required on deserialize" for Option fields, but that's
+        // enforced at the writer (always-emitted) side, not the
+        // parser side. The `serialize_always_emits_option_keys`
+        // sibling tests pin the writer half; this test pins the
+        // parser-side strictness for every non-Option field.
+        //
+        // Old single-field-sentinel form (checking only `test_name`)
+        // would pass silently if e.g. a regression added
+        // `#[serde(default)]` to `run_id` alone — this loop catches
+        // that class of softening across every non-Option field.
+        const REQUIRED_NON_OPTION_FIELDS: &[&str] = &[
+            "test_name",
+            "topology",
+            "scheduler",
+            "metrics",
+            "passed",
+            "skipped",
+            "stats",
+            "stimulus_events",
+            "work_type",
+            "active_flags",
+            "verifier_stats",
+            "sysctls",
+            "kargs",
+            "timestamp",
+            "run_id",
+        ];
+
         let fixture = SidecarResult::test_fixture();
-        let full = serde_json::to_value(&fixture).unwrap();
-        let mut obj = match full {
+        let full = match serde_json::to_value(&fixture).unwrap() {
             serde_json::Value::Object(m) => m,
             other => panic!("expected object, got {other:?}"),
         };
-        assert!(
-            obj.remove("test_name").is_some(),
-            "test fixture must emit `test_name` for this rejection test to be meaningful",
-        );
-        let without_test_name = serde_json::Value::Object(obj).to_string();
-        let err = serde_json::from_str::<SidecarResult>(&without_test_name)
-            .expect_err("deserialize must reject SidecarResult with `test_name` removed");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("test_name"),
-            "missing-field error must name the missing field, got: {msg}",
-        );
+
+        for field in REQUIRED_NON_OPTION_FIELDS {
+            let mut obj = full.clone();
+            assert!(
+                obj.remove(*field).is_some(),
+                "SidecarResult test fixture must emit `{field}` for its \
+                 rejection case to be meaningful — the required-fields \
+                 list has drifted from the struct definition",
+            );
+            let json = serde_json::Value::Object(obj).to_string();
+            let err = serde_json::from_str::<SidecarResult>(&json).err().unwrap_or_else(
+                || panic!(
+                    "deserialize must reject SidecarResult with `{field}` removed, \
+                     but succeeded — a regression may have added \
+                     `#[serde(default)]` to this field",
+                ),
+            );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(field),
+                "missing-field error for `{field}` must name the field; got: {msg}",
+            );
+        }
     }
 
     // -- collect_sidecars tests --

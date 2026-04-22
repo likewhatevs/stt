@@ -17,6 +17,25 @@
 # Skip with --no-verify if you have a deliberate WIP-push need; prefer
 # fixing the breakage instead.
 
+# Dirty-tree check: refuse to push when the worktree has uncommitted
+# changes or staged-but-uncommitted changes. A dirty tree during push
+# means the test-build gate below is running against a mix of the
+# pushed SHA plus local edits, so a passing build doesn't actually
+# prove the pushed SHA is green. Either commit, stash, or pass
+# --no-verify after confirming the dirty state is benign.
+if ! git diff --quiet; then
+    echo "pre-push: working tree has uncommitted changes. Commit or stash"
+    echo "          before pushing; the test-build gate runs against the"
+    echo "          worktree (not the pushed SHA in isolation), so a"
+    echo "          dirty tree would miscertify the push."
+    exit 1
+fi
+if ! git diff --cached --quiet; then
+    echo "pre-push: index has staged-but-uncommitted changes. Commit or"
+    echo "          stash before pushing — same rationale as above."
+    exit 1
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
     echo "pre-push: cargo not found, skipping test-build gate"
     exit 0

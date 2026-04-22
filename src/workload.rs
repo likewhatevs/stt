@@ -5223,6 +5223,16 @@ mod tests {
         assert!(reports[0].wall_time_ns > 0);
     }
 
+    /// Ready-file path shared between [`ignores_sigusr1_fn`] and
+    /// `stop_and_collect_sentinel_exits_for_sigusr1_ignoring_worker`.
+    /// The worker writes a zero-byte file at this path after
+    /// installing `SIG_IGN` for SIGUSR1; the parent polls for the
+    /// file's appearance before sending SIGUSR1, eliminating the
+    /// race the old 200ms sleep papered over.
+    fn ready_file_path(pid: libc::pid_t) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ktstr-sigusr1-ignore-ready-{pid}"))
+    }
+
     /// Worker function that installs `SIG_IGN` for SIGUSR1 — overriding
     /// the `sigusr1_handler` the child set up post-fork — and spins
     /// for long enough to outlive the parent's 5s collection deadline.
@@ -5238,6 +5248,17 @@ mod tests {
             libc::signal(libc::SIGUSR1, libc::SIG_IGN);
         }
         let tid: libc::pid_t = unsafe { libc::getpid() };
+        // Readiness handshake: after SIG_IGN is installed, write a
+        // zero-byte ready file so the parent can proceed without
+        // waiting on a fixed-duration sleep. Without the handshake
+        // the parent had to guess a safe delay (200ms) covering
+        // fork + signal(2) syscalls plus CPU contention —
+        // too short and the parent's SIGUSR1 races the handler
+        // replacement and the test fails spuriously. See
+        // `stop_and_collect_sentinel_exits_for_sigusr1_ignoring_worker`
+        // below for the reader side.
+        let ready_path = ready_file_path(tid);
+        let _ = std::fs::write(&ready_path, []);
         // Spin for 7s — well past stop_and_collect's 5s shared
         // deadline. The `!stop.load` check is kept honest (no infinite
         // loop) but is only observed via the fallback timeout: with
@@ -5285,8 +5306,32 @@ mod tests {
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Readiness handshake — poll for the ready file the worker
+        // writes after its `libc::signal(SIGUSR1, SIG_IGN)` call
+        // completes. Replaces a fixed 200ms sleep with progress-
+        // driven waiting: we send SIGUSR1 only once SIG_IGN is
+        // definitely installed. The poll interval is 10ms and the
+        // ceiling is 2s (~10× the old sleep) to cover CPU-starved
+        // hosts without silently hanging.
+        let worker_pid = h.tids()[0];
+        let ready_path = ready_file_path(worker_pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready_path.exists() {
+            if Instant::now() >= deadline {
+                panic!(
+                    "worker at pid {worker_pid} never wrote ready file {ready_path:?} \
+                     — SIG_IGN install may have failed or child never reached \
+                     `ignores_sigusr1_fn`",
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let reports = h.stop_and_collect();
+        // Ready file outlives the worker (written early, never
+        // cleaned up by the child because the parent SIGKILLs it
+        // before any cleanup could run). Remove it here so repeated
+        // test runs don't observe a stale file from a prior run.
+        let _ = std::fs::remove_file(&ready_path);
         assert_eq!(reports.len(), 1);
         let r = &reports[0];
         // Sentinel path: the worker never wrote JSON to the pipe

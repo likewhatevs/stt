@@ -299,6 +299,36 @@ fn evaluate(
         // metrics nor a load-failure reason (a load failure is
         // sticky across stdout/stderr — reason string is identical,
         // no point re-invoking inference).
+        //
+        // The fallback is deliberately GLOBAL (variant-agnostic)
+        // rather than a per-`OutputFormat` opt-in. Evaluated
+        // alternatives + why this is the right shape:
+        //
+        // * `ExitCode`: `extract_metrics` returns `Ok(vec![])` on
+        //   both stdout and stderr for this variant (no parsing
+        //   path), so running the fallback is a no-op — no stored
+        //   state, no wasted work beyond one function call. Adding
+        //   a per-variant gate would be complexity without
+        //   behavioral difference.
+        // * `Json` / `LlmExtract`: both BENEFIT from the fallback.
+        //   The motivating case is schbench-like payloads that
+        //   write structured output to stderr only (see
+        //   `SchbenchPayload` in tests/common/fixtures.rs for the
+        //   long-form rationale). A per-variant knob would require
+        //   every new fixture declaring those variants to also
+        //   remember to opt in — easy to miss, and the default
+        //   should match the common case.
+        // * A future "stdout-only" variant would be the one case
+        //   where opt-in is appropriate. That's the trigger for
+        //   adding the knob: a concrete use case, not speculative
+        //   flexibility. Do NOT introduce a `stderr_fallback:
+        //   bool` field on `OutputFormat` in anticipation.
+        //
+        // The streams are never merged — fallback replaces, not
+        // concatenates — so an upstream that genuinely writes to
+        // both stdout and stderr gets only the stdout metrics,
+        // which matches the "well-behaved binaries keep stdout
+        // canonical" language on the `OutputFormat` doc.
         if extract_err.is_none() {
             match extract_metrics(&output.stderr, &payload.output) {
                 Ok(m) => metrics = m,

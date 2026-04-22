@@ -202,6 +202,11 @@ pub(crate) fn format_sched_exited_after_step(
 /// Format the scheduler-exited detail message for the post-loop
 /// liveness probe (the scheduler was alive throughout the step loop
 /// but ESRCH'd after the last step completed).
+///
+/// Begins with [`SCHED_EXITED_PREFIX`] verbatim — the emit-site
+/// contract consumed by [`AssertDetail::is_scheduler_death`]. Shares
+/// the prefix invariant documented on
+/// [`format_sched_exited_after_step`].
 pub(crate) fn format_sched_exited_after_all_steps(
     total_steps: usize,
     elapsed_s: f64,
@@ -214,6 +219,11 @@ pub(crate) fn format_sched_exited_after_all_steps(
 /// Format the scheduler-exited detail message for in-workload
 /// detection (the mid-workload watchdog observed the scheduler exit
 /// during the running phase of a single-scenario run).
+///
+/// Begins with [`SCHED_EXITED_PREFIX`] verbatim — the emit-site
+/// contract consumed by [`AssertDetail::is_scheduler_death`]. Shares
+/// the prefix invariant documented on
+/// [`format_sched_exited_after_step`].
 pub(crate) fn format_sched_exited_during_workload(elapsed_s: f64) -> String {
     format!("{SCHED_EXITED_PREFIX} unexpectedly during workload ({elapsed_s:.1}s into test)")
 }
@@ -2440,24 +2450,66 @@ mod tests {
     /// trips.
     #[test]
     fn scenario_stats_missing_required_scalar_rejected_by_deserialize() {
+        // Table-driven expansion covering EVERY required scalar field
+        // instead of a single `total_workers` sentinel. Each removal
+        // must produce a missing-field error naming the removed
+        // field. The loop forces a pass-or-fail result per field, so
+        // a regression that softens just one field (e.g. adds
+        // `#[serde(default)]` to `worst_gap_cpu` alone) trips this
+        // test with a field-level assertion message — the old single-
+        // sentinel form would have passed silently on any field
+        // other than `total_workers`.
+        //
+        // `ext_metrics` is intentionally NOT in this list: it carries
+        // `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
+        // and is pinned as tolerated by the sibling
+        // `scenario_stats_missing_ext_metrics_tolerated_by_deserialize`
+        // test. A field added with `#[serde(default)]` going forward
+        // must be added to that sibling's rationale, not this list.
+        const REQUIRED_FIELDS: &[&str] = &[
+            "cgroups",
+            "total_workers",
+            "total_cpus",
+            "total_migrations",
+            "worst_spread",
+            "worst_gap_ms",
+            "worst_gap_cpu",
+            "worst_migration_ratio",
+            "worst_p99_wake_latency_us",
+            "worst_median_wake_latency_us",
+            "worst_wake_latency_cv",
+            "total_iterations",
+            "worst_mean_run_delay_us",
+            "worst_run_delay_us",
+            "worst_page_locality",
+            "worst_cross_node_migration_ratio",
+        ];
+
         let s = ScenarioStats::default();
-        let mut obj = match serde_json::to_value(&s).unwrap() {
+        let full = match serde_json::to_value(&s).unwrap() {
             serde_json::Value::Object(m) => m,
             other => panic!("expected object, got {other:?}"),
         };
-        assert!(
-            obj.remove("total_workers").is_some(),
-            "ScenarioStats must emit `total_workers` for this rejection test to be meaningful",
-        );
-        let without_total_workers = serde_json::Value::Object(obj).to_string();
-        let err = serde_json::from_str::<ScenarioStats>(&without_total_workers).expect_err(
-            "deserialize must reject ScenarioStats with `total_workers` removed",
-        );
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("total_workers"),
-            "missing-field error must name the missing field, got: {msg}",
-        );
+
+        for field in REQUIRED_FIELDS {
+            let mut obj = full.clone();
+            assert!(
+                obj.remove(*field).is_some(),
+                "ScenarioStats must emit `{field}` for its rejection case to be meaningful — \
+                 the field list in this test has drifted from the struct definition",
+            );
+            let json = serde_json::Value::Object(obj).to_string();
+            let err = serde_json::from_str::<ScenarioStats>(&json).err().unwrap_or_else(
+                || panic!(
+                    "deserialize must reject ScenarioStats with `{field}` removed, but succeeded",
+                ),
+            );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(field),
+                "missing-field error for `{field}` must name the field; got: {msg}",
+            );
+        }
     }
 
     /// Positive control for the `ext_metrics` exemption: omitting
@@ -2496,28 +2548,41 @@ mod tests {
     /// details / stats trips this test.
     #[test]
     fn assert_result_missing_required_field_rejected_by_deserialize() {
+        // All four `AssertResult` fields are wire-required (the struct
+        // has no `Default` derive and no `#[serde(default)]` on any
+        // field). Loop over each; each removal must fail deserialize
+        // with a missing-field error naming the removed field.
+        const REQUIRED_FIELDS: &[&str] = &["passed", "skipped", "details", "stats"];
+
         let r = AssertResult {
             passed: false,
             skipped: false,
             details: vec!["detail".into()],
             stats: ScenarioStats::default(),
         };
-        let mut obj = match serde_json::to_value(&r).unwrap() {
+        let full = match serde_json::to_value(&r).unwrap() {
             serde_json::Value::Object(m) => m,
             other => panic!("expected object, got {other:?}"),
         };
-        assert!(
-            obj.remove("passed").is_some(),
-            "AssertResult must emit `passed` for this rejection test to be meaningful",
-        );
-        let without_passed = serde_json::Value::Object(obj).to_string();
-        let err = serde_json::from_str::<AssertResult>(&without_passed)
-            .expect_err("deserialize must reject AssertResult with `passed` removed");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("passed"),
-            "missing-field error must name the missing field, got: {msg}",
-        );
+
+        for field in REQUIRED_FIELDS {
+            let mut obj = full.clone();
+            assert!(
+                obj.remove(*field).is_some(),
+                "AssertResult must emit `{field}` for its rejection case to be meaningful",
+            );
+            let json = serde_json::Value::Object(obj).to_string();
+            let err = serde_json::from_str::<AssertResult>(&json).err().unwrap_or_else(
+                || panic!(
+                    "deserialize must reject AssertResult with `{field}` removed, but succeeded",
+                ),
+            );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(field),
+                "missing-field error for `{field}` must name the field; got: {msg}",
+            );
+        }
     }
 
     #[test]
