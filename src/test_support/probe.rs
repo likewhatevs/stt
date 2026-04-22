@@ -877,7 +877,7 @@ struct ProbeHandle {
 /// attached). `stop` and `output_done` remain `AtomicBool` because
 /// they are consulted inside the probe-thread's ring-buffer poll loop
 /// where a blocking wait would stall diagnostics collection;
-/// `probes_ready` uses [`crate::probe::process::Latch`] so the
+/// `probes_ready` uses [`crate::sync::Latch`] so the
 /// dispatch path blocks on a condvar instead of sleep-polling.
 /// [`Clone`] is the expected way to produce the thread-side view
 /// before calling `std::thread::spawn` — each clone bumps refcounts
@@ -886,7 +886,7 @@ struct ProbeHandle {
 pub(crate) struct ProbePipeline {
     pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub output_done: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub probes_ready: std::sync::Arc<crate::probe::process::Latch>,
+    pub probes_ready: std::sync::Arc<crate::sync::Latch>,
 }
 
 impl ProbePipeline {
@@ -1147,7 +1147,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
             ));
         }
 
-        let phase_b_done = std::sync::Arc::new(crate::probe::process::Latch::new());
+        let phase_b_done = std::sync::Arc::new(crate::sync::Latch::new());
         let phase_b_done_clone = phase_b_done.clone();
 
         let phase_b_input = crate::probe::process::PhaseBInput {

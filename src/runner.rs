@@ -297,7 +297,7 @@ impl Runner {
                     let param_names = crate::probe::output::build_param_names(&btf_funcs);
                     let render_hints = crate::probe::output::build_render_hints(&btf_funcs);
                     let stop_clone = probe_stop.clone();
-                    let probes_ready = std::sync::Arc::new(crate::probe::process::Latch::new());
+                    let probes_ready = std::sync::Arc::new(crate::sync::Latch::new());
                     let probes_ready_thread = probes_ready.clone();
                     let handle = std::thread::spawn(move || {
                         crate::probe::process::run_probe_skeleton(

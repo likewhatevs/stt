@@ -39,7 +39,7 @@ flate2 = "1"
 glob = "0.3"
 ctor = "0.8"
 libc = "0.2"
-nix = { version = "0.31", features = ["feature", "fs", "mount", "poll", "process", "ptrace", "reboot", "sched", "signal", "term", "uio", "user"] }
+nix = { version = "0.31", features = ["feature", "fs", "mount", "poll", "process", "ptrace", "reboot", "sched", "signal", "term", "uio"] }
 blazesym = { version = "0.2", features = ["dwarf"] }
 rand = "0.10"
 rmesg = { version = "1", default-features = false, features = ["sync"] }

@@ -12,52 +12,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use super::btf::{BtfFunc, RenderHint, STRUCT_FIELDS};
 use super::stack::StackFunction;
 
 use crate::bpf_skel::types;
-
-/// One-shot signal from a producer thread to one or more waiters.
-///
-/// `set` flips the state and wakes every waiter currently blocked in
-/// `wait`; subsequent waiters return immediately. Uses
-/// `Mutex<bool> + Condvar` under the hood so waiters block in the
-/// kernel instead of spinning. Replaces the `Arc<AtomicBool>` +
-/// `while !flag { thread::sleep(10ms) }` pattern the probe pipeline
-/// used to hand off readiness between the worker thread and the
-/// dispatch paths in `test_support::probe` and `runner`.
-#[derive(Default)]
-pub struct Latch {
-    set: Mutex<bool>,
-    cv: Condvar,
-}
-
-impl Latch {
-    /// Create a new latch in the unset state.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the latch and wake every waiter. Idempotent: a second call
-    /// is a no-op beyond re-notifying, matching the previous
-    /// `AtomicBool::store(true, Release)` semantics.
-    pub fn set(&self) {
-        let mut guard = self.set.lock().unwrap();
-        *guard = true;
-        self.cv.notify_all();
-    }
-
-    /// Block until `set` is called. Returns immediately if already set.
-    pub fn wait(&self) {
-        let mut guard = self.set.lock().unwrap();
-        while !*guard {
-            guard = self.cv.wait(guard).unwrap();
-        }
-    }
-}
+use crate::sync::Latch;
 
 /// Input for Phase B probe attachment (BPF fentry/fexit).
 ///
