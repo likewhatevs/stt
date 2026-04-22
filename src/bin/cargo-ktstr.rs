@@ -220,31 +220,40 @@ enum StatsCommand {
 }
 
 /// Configure if needed and build the kernel.
-fn build_kernel(kernel_dir: &Path, clean: bool) -> Result<(), String> {
+///
+/// Returns `anyhow::Result<()>` so the five `cli::*` calls below
+/// chain directly with `?` — the outer bin surface is still
+/// `Result<(), String>` (a broader anyhow migration across
+/// cargo-ktstr.rs is pending), and callers bridge at the
+/// boundary. Internally, anyhow lets this function propagate the
+/// already-`anyhow::Error` returns from `cli::run_make` /
+/// `configure_kernel` / `make_kernel_with_output` /
+/// `validate_kernel_config` / `run_make_with_output` without a
+/// `.map_err(|e| format!("{e:#}"))` stringification per call.
+fn build_kernel(kernel_dir: &Path, clean: bool) -> anyhow::Result<()> {
     if !kernel_dir.is_dir() {
-        return Err(format!("{}: not a directory", kernel_dir.display()));
+        anyhow::bail!("{}: not a directory", kernel_dir.display());
     }
 
     if clean {
         eprintln!("cargo ktstr: make mrproper");
-        cli::run_make(kernel_dir, &["mrproper"]).map_err(|e| format!("{e:#}"))?;
+        cli::run_make(kernel_dir, &["mrproper"])?;
     }
 
     if !cli::has_sched_ext(kernel_dir) {
         cli::Spinner::with_progress("Configuring kernel...", "Kernel configured", |_| {
-            cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG).map_err(|e| format!("{e:#}"))
+            cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG)
         })?;
     }
 
     cli::Spinner::with_progress("Building kernel...", "Kernel built", |sp| {
-        cli::make_kernel_with_output(kernel_dir, Some(sp)).map_err(|e| format!("{e:#}"))
+        cli::make_kernel_with_output(kernel_dir, Some(sp))
     })?;
 
-    cli::validate_kernel_config(kernel_dir).map_err(|e| format!("{e:#}"))?;
+    cli::validate_kernel_config(kernel_dir)?;
 
     cli::Spinner::with_progress("Generating compile_commands.json...", "Done", |sp| {
         cli::run_make_with_output(kernel_dir, &["compile_commands.json"], Some(sp))
-            .map_err(|e| format!("{e:#}"))
     })?;
     Ok(())
 }
@@ -279,7 +288,13 @@ fn run_cargo_sub(
         match KernelId::parse(val) {
             KernelId::Path(p) => {
                 let dir = std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(&p));
-                build_kernel(&dir, false)?;
+                // Boundary bridge: `build_kernel` returns
+                // `anyhow::Result<()>` while this function still
+                // returns `Result<(), String>`, so we stringify at
+                // the call site. A broader anyhow migration across
+                // cargo-ktstr.rs is pending and would drop this
+                // last bridge.
+                build_kernel(&dir, false).map_err(|e| format!("{e:#}"))?;
                 cmd.env("KTSTR_KERNEL", &dir);
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {

@@ -556,6 +556,19 @@ impl CacheDir {
         if tmp_dir.exists() {
             fs::remove_dir_all(&tmp_dir)?;
         }
+        // Scan-and-clean orphaned `.tmp-*` siblings from prior
+        // panic/abort debris across OTHER PIDs. The same-PID cleanup
+        // above only fires for the current PID's tmp dir; a prior
+        // run that died with a different PID leaves debris behind,
+        // which accumulates across crashes and takes disk space.
+        // `clean_orphaned_tmp_dirs` reads the cache root, inspects
+        // each `.tmp-{key}-{pid}` name, and removes entries whose
+        // `{pid}` is no longer a live Linux pid. Errors are logged
+        // and swallowed — a failure to clean orphans must not block
+        // a successful store.
+        if let Err(e) = clean_orphaned_tmp_dirs(&self.root) {
+            tracing::warn!(error = ?e, "clean_orphaned_tmp_dirs failed; continuing store");
+        }
         fs::create_dir_all(&tmp_dir)?;
 
         // TmpGuard ensures tmp_dir is cleaned up on any error path
@@ -679,6 +692,98 @@ impl CacheDir {
 
 /// Validate a cache key.
 ///
+/// Scan `cache_root` for `.tmp-{key}-{pid}` directories whose `{pid}`
+/// is no longer a live process and remove them.
+///
+/// Same-PID orphan cleanup lives in `store()`; this helper handles
+/// the cross-PID case — debris left by a prior process that died
+/// with a different PID. Without periodic cleanup, crashes
+/// accumulate directories forever. Called from the start of every
+/// `store()` so ordinary fetch traffic cleans up without a
+/// dedicated CLI knob.
+///
+/// Discrimination: parse the trailing `-{digits}` suffix as a pid
+/// and probe liveness via `kill(pid, None)` (the standard
+/// signal-zero probe). `Err(ESRCH)` is the only outcome that
+/// justifies removal; `Ok(())` and `Err(EPERM)` both indicate a
+/// live pid whose debris we leave alone. A pid recycled between
+/// orphan creation and this scan is treated as alive — false
+/// negative, preserves debris — but never false positive.
+///
+/// Errors during individual entry walks are swallowed and logged
+/// (each one would prevent a store that otherwise has nothing to
+/// do with the unreadable entry). Filesystem-level read errors on
+/// the cache root itself are propagated.
+fn clean_orphaned_tmp_dirs(cache_root: &Path) -> anyhow::Result<()> {
+    if !cache_root.is_dir() {
+        return Ok(());
+    }
+    let read_dir = match fs::read_dir(cache_root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => anyhow::bail!("read cache root {}: {e}", cache_root.display()),
+    };
+    for dir_entry in read_dir {
+        let dir_entry = match dir_entry {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = ?e, "skip unreadable cache root entry");
+                continue;
+            }
+        };
+        let name = match dir_entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue, // non-UTF-8, not a `.tmp-` we created
+        };
+        if !name.starts_with(".tmp-") {
+            continue;
+        }
+        // Suffix parse: `.tmp-{key}-{pid}`. Key may itself contain
+        // `-`; the PID is the last `-`-separated token.
+        let pid_str = match name.rsplit_once('-') {
+            Some((_, suffix)) if !suffix.is_empty() => suffix,
+            _ => continue, // malformed — not our format
+        };
+        let pid: i32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue, // non-numeric suffix — not our format
+        };
+        // Portable liveness probe via `kill(pid, signal=None)`:
+        // `Ok(())` — signal could have been delivered, pid is alive
+        // (same uid or we hold CAP_KILL). `Err(ESRCH)` — pid is
+        // dead; the only case where removal is safe. `Err(EPERM)` —
+        // pid is alive but owned by another uid; its debris is not
+        // ours to touch. Any other errno treats the pid as alive and
+        // preserves the debris (false negatives are recoverable;
+        // false positives delete live state).
+        let dead = matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH),
+        );
+        if !dead {
+            continue;
+        }
+        let path = dir_entry.path();
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    orphan_pid = pid,
+                    "cleaned orphaned .tmp- dir from prior crashed process",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    path = %path.display(),
+                    "failed to remove orphaned .tmp- dir; leaving in place",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Rejects empty keys, whitespace-only keys, keys starting with
 /// `.tmp-` (reserved for in-progress stores), and keys containing
 /// path separators (`/`, `\`), parent-directory traversal (`..`),

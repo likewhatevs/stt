@@ -292,16 +292,24 @@ pub fn kernel_list(json: bool) -> Result<()> {
     let entries = cache.list()?;
     let kconfig_hash = embedded_kconfig_hash();
 
-    let active_prefixes = match fetch_active_prefixes() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "kernel list: failed to fetch active kernel series ({e}); \
-                 EOL annotation disabled for this run",
-            );
-            Vec::new()
-        }
-    };
+    // Track the fetch result so the `--json` path can surface the
+    // error string to scripted consumers. Before this, a failure
+    // was eprintln'd but never appeared in the JSON wrapper, so
+    // downstream tooling could only observe "all entries are
+    // non-EOL" without any signal that the prefix list was
+    // actually empty because the network fetch failed.
+    let (active_prefixes, active_prefixes_fetch_error): (Vec<String>, Option<String>) =
+        match fetch_active_prefixes() {
+            Ok(p) => (p, None),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                eprintln!(
+                    "kernel list: failed to fetch active kernel series ({msg}); \
+                     EOL annotation disabled for this run",
+                );
+                (Vec::new(), Some(msg))
+            }
+        };
 
     if json {
         let json_entries: Vec<serde_json::Value> = entries
@@ -334,8 +342,15 @@ pub fn kernel_list(json: bool) -> Result<()> {
                 }),
             })
             .collect();
+        // `active_prefixes_fetch_error` is `null` on success and a
+        // human-readable string on fetch failure, so JSON consumers
+        // can distinguish "no active prefixes learned" (fetch
+        // failed, EOL annotation was disabled for this run) from
+        // "all kernels are current" (fetch succeeded, list is
+        // simply not gating any entry).
         let wrapper = serde_json::json!({
             "current_ktstr_kconfig_hash": kconfig_hash,
+            "active_prefixes_fetch_error": active_prefixes_fetch_error,
             "entries": json_entries,
         });
         println!("{}", serde_json::to_string_pretty(&wrapper)?);
