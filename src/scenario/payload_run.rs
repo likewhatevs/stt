@@ -763,7 +763,7 @@ fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> Asser
         if let Check::ExitCodeEq(expected) = check
             && pm.exit_code != *expected
         {
-            result.merge(fail_result(AssertDetail {
+            result.merge(AssertResult::fail(AssertDetail {
                 kind: DetailKind::Other,
                 message: format_exit_mismatch(pm.exit_code, *expected, stderr),
             }));
@@ -806,23 +806,10 @@ fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> Asser
             Check::ExitCodeEq(_) => None, // already evaluated in pre-pass
         };
         if let Some(d) = detail {
-            result.merge(fail_result(d));
+            result.merge(AssertResult::fail(d));
         }
     }
     result
-}
-
-/// Build a failing [`AssertResult`] from a single [`AssertDetail`].
-/// [`AssertResult`] itself has no `fail()` constructor; this helper
-/// centralizes the struct-literal shape so callers don't each need
-/// to reach for stats defaults.
-fn fail_result(detail: AssertDetail) -> AssertResult {
-    AssertResult {
-        passed: false,
-        skipped: false,
-        details: vec![detail],
-        stats: Default::default(),
-    }
 }
 
 fn missing_metric(metric: &str) -> AssertDetail {

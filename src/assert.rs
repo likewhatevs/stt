@@ -507,6 +507,19 @@ impl AssertResult {
             stats: Default::default(),
         }
     }
+    /// Failing result carrying a single [`AssertDetail`]. Mirrors
+    /// [`Self::pass`] / [`Self::skip`] for the failure axis so callers
+    /// don't hand-roll the struct-literal shape (`passed: false,
+    /// skipped: false, details: vec![d], stats: Default::default()`)
+    /// at every diagnostic-only failure site.
+    pub fn fail(detail: AssertDetail) -> Self {
+        Self {
+            passed: false,
+            skipped: false,
+            details: vec![detail],
+            stats: Default::default(),
+        }
+    }
     /// Convenience accessor returning [`Self::skipped`]. Stats tooling
     /// uses this to subtract non-executions from pass counts so
     /// "topology mismatch" runs don't inflate the pass rate.

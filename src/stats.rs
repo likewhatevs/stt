@@ -1484,6 +1484,45 @@ mod tests {
         serde_json::to_string(&row).expect("filtered row must serialize cleanly");
     }
 
+    /// `sidecar_to_row` must drop the JSON-walker depth-cap sentinel
+    /// [`crate::test_support::WALK_TRUNCATION_SENTINEL_NAME`] from
+    /// `ext_metrics`. The sentinel is diagnostic metadata about the
+    /// extraction pass (depth cap hit), not a scenario metric, so it
+    /// must not leak into A/B comparison output where it would be
+    /// mistaken for a real measurement and skew filter / aggregation
+    /// logic. Sibling finite entries must survive untouched.
+    #[test]
+    fn sidecar_to_row_drops_walk_truncation_sentinel() {
+        use crate::assert::ScenarioStats;
+        use crate::test_support;
+        let mut ext = BTreeMap::new();
+        ext.insert("good".to_string(), 1.0);
+        ext.insert(
+            test_support::WALK_TRUNCATION_SENTINEL_NAME.to_string(),
+            72.0,
+        );
+        let sc = test_support::SidecarResult {
+            stats: ScenarioStats {
+                ext_metrics: ext,
+                ..Default::default()
+            },
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row = sidecar_to_row(&sc);
+        assert_eq!(
+            row.ext_metrics.len(),
+            1,
+            "only the real metric should survive: {:?}",
+            row.ext_metrics,
+        );
+        assert_eq!(row.ext_metrics.get("good"), Some(&1.0));
+        assert!(
+            !row.ext_metrics
+                .contains_key(test_support::WALK_TRUNCATION_SENTINEL_NAME),
+            "sentinel must not appear in the row's ext_metrics",
+        );
+    }
+
     // -- metric_def tests --
 
     #[test]
