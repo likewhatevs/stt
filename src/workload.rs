@@ -1475,7 +1475,26 @@ impl WorkloadHandle {
                     anyhow::bail!("fork failed: {}", std::io::Error::last_os_error());
                 }
                 0 => {
-                    // Child: install signal handler FIRST (before start wait)
+                    // Child: set parent-death signal BEFORE any other
+                    // post-fork setup so the kernel SIGKILLs this worker
+                    // immediately if the parent dies during the remaining
+                    // init (close fd loops, signal handler install, start-
+                    // pipe wait, worker_main). Without PR_SET_PDEATHSIG,
+                    // a parent crash between fork and start leaves workers
+                    // reparented to init and spinning indefinitely —
+                    // they'd outlive the test run, consume the cgroup's
+                    // CPU, and block the next scenario's cgroup teardown
+                    // with EBUSY. SIGKILL is the only safe choice: it
+                    // cannot be masked and runs before any of this child's
+                    // destructors execute (good — those destructors still
+                    // reference the parent's guard). The call is
+                    // async-signal-safe (in the post-fork AS-safe list per
+                    // signal-safety(7)) so running it here before STOP's
+                    // atomic store and the sigaction install is fine.
+                    unsafe {
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    }
+                    // Install signal handler FIRST (before start wait)
                     // to prevent SIGUSR1 killing us before we're ready
                     STOP.store(false, Ordering::Relaxed);
                     unsafe {
