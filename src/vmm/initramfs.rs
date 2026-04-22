@@ -2235,8 +2235,12 @@ mod tests {
     #[test]
     fn busybox_with_include_files() {
         let exe = crate::resolve_current_exe().unwrap();
-        // Create a temp file to include.
-        let tmp = std::env::temp_dir().join("ktstr-test-include-busybox");
+        // Per-test tempdir: TempDir generates a unique directory name
+        // per invocation and cleans up on Drop. Replaces a fixed
+        // `/tmp/ktstr-test-include-busybox` path that collided across
+        // parallel nextest runs and left orphans after test panics.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path().join("included");
         std::fs::write(&tmp, b"hello").unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/test.txt", tmp.as_path())];
         let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
@@ -2246,7 +2250,6 @@ mod tests {
             "busybox=true should have bin/busybox entry: {:?}",
             names
         );
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -2263,7 +2266,8 @@ mod tests {
 
     #[test]
     fn include_files_preserves_mode() {
-        let tmp = std::env::temp_dir().join("ktstr-test-include-mode");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path().join("script");
         std::fs::write(&tmp, b"script content").unwrap();
         // Set executable mode.
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o100755)).unwrap();
@@ -2276,7 +2280,6 @@ mod tests {
             s.contains("include-files/run.sh"),
             "include path should appear in cpio"
         );
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -2306,7 +2309,8 @@ mod tests {
 
     #[test]
     fn include_files_non_elf_no_shared_libs() {
-        let tmp = std::env::temp_dir().join("ktstr-test-include-nonelf");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path().join("hello.sh");
         std::fs::write(&tmp, b"#!/bin/sh\necho hello\n").unwrap();
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/hello.sh", tmp.as_path())];
@@ -2314,12 +2318,12 @@ mod tests {
         let base = build_initramfs_base(&exe, &[], &includes, true).unwrap();
         let s = String::from_utf8_lossy(&base);
         assert!(s.contains("include-files/hello.sh"));
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn include_files_adds_directory_entries() {
-        let tmp = std::env::temp_dir().join("ktstr-test-include-dirs");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path().join("file.txt");
         std::fs::write(&tmp, b"data").unwrap();
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> =
@@ -2336,7 +2340,6 @@ mod tests {
             "should have nested subdir entry"
         );
         assert!(s.contains("bin"), "should have bin dir for busybox");
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -2347,18 +2350,18 @@ mod tests {
 
     #[test]
     fn is_elf_rejects_non_elf() {
-        let tmp = std::env::temp_dir().join("ktstr-test-not-elf");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path().join("not-elf");
         std::fs::write(&tmp, b"not an elf file").unwrap();
         assert!(!is_elf(&tmp));
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn is_elf_rejects_short_file() {
-        let tmp = std::env::temp_dir().join("ktstr-test-short-elf");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path().join("short-elf");
         std::fs::write(&tmp, b"ab").unwrap();
         assert!(!is_elf(&tmp));
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -2368,7 +2371,8 @@ mod tests {
 
     #[test]
     fn include_files_rejects_path_traversal() {
-        let tmp = std::env::temp_dir().join("ktstr-test-traversal");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path().join("payload");
         std::fs::write(&tmp, b"data").unwrap();
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/../etc/passwd", tmp.as_path())];
@@ -2379,13 +2383,12 @@ mod tests {
             err.contains(".."),
             "error should mention path traversal: {err}"
         );
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn include_files_rejects_fifo() {
-        let fifo_path = std::env::temp_dir().join("ktstr-test-fifo");
-        let _ = std::fs::remove_file(&fifo_path);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let fifo_path = tmp_dir.path().join("fifo");
         // Create a FIFO.
         let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
         let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
@@ -2404,13 +2407,13 @@ mod tests {
             err.contains("not a regular file"),
             "error should reject FIFO: {err}"
         );
-        let _ = std::fs::remove_file(&fifo_path);
     }
 
     #[test]
     fn include_files_rejects_directory() {
-        let dir_path = std::env::temp_dir().join("ktstr-test-include-dir");
-        let _ = std::fs::create_dir(&dir_path);
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let dir_path = tmp_dir.path().join("mydir");
+        std::fs::create_dir(&dir_path).unwrap();
         let exe = crate::resolve_current_exe().unwrap();
         let includes: Vec<(&str, &Path)> = vec![("include-files/mydir", dir_path.as_path())];
         let result = build_initramfs_base(&exe, &[], &includes, true);
@@ -2420,7 +2423,6 @@ mod tests {
             err.contains("not a regular file"),
             "error should reject directory: {err}"
         );
-        let _ = std::fs::remove_dir(&dir_path);
     }
 
     #[test]
@@ -2463,23 +2465,23 @@ mod tests {
 
     #[test]
     fn parse_ld_so_cache_bad_magic_returns_empty() {
-        let tmp = std::env::temp_dir().join("ktstr-test-ldcache-bad");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path().join("ldcache");
         std::fs::write(&tmp, b"not a valid cache file").unwrap();
         let cache = parse_ld_so_cache(&tmp);
         assert!(cache.is_empty());
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn parse_ld_so_cache_truncated_returns_empty() {
-        let tmp = std::env::temp_dir().join("ktstr-test-ldcache-trunc");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path().join("ldcache");
         // Valid magic but truncated header.
         let mut data = LD_CACHE_MAGIC.to_vec();
         data.extend_from_slice(&[0u8; 10]); // not enough for full header
         std::fs::write(&tmp, &data).unwrap();
         let cache = parse_ld_so_cache(&tmp);
         assert!(cache.is_empty());
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -2517,8 +2519,8 @@ mod tests {
         let exe = crate::resolve_current_exe().unwrap();
         // Create include files in a deeply nested path mimicking custom
         // linker library directories.
-        let tmp_dir = std::env::temp_dir().join("ktstr-test-cpio-dedup");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+        let tmp_dir_guard = tempfile::TempDir::new().unwrap();
+        let tmp_dir = tmp_dir_guard.path();
         let lib_data = vec![0xCCu8; 4096];
         let f1 = tmp_dir.join("libcustom1.so");
         let f2 = tmp_dir.join("libcustom2.so");
@@ -2609,8 +2611,6 @@ mod tests {
             "duplicate entries in archive: {:?}",
             duplicates
         );
-
-        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
