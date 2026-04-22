@@ -642,8 +642,13 @@ impl MpolFlags {
 
 impl std::ops::BitOr for MpolFlags {
     type Output = Self;
+    /// Delegates to [`MpolFlags::union`] so the bitwise-OR logic
+    /// lives in one place. `union` is `const fn` (usable in
+    /// const contexts like `const` initializers); `BitOr::bitor`
+    /// cannot currently be `const` on stable, so keeping both
+    /// entry points is necessary, but they must never diverge.
     fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
+        self.union(rhs)
     }
 }
 

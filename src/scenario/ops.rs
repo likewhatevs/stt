@@ -2052,20 +2052,30 @@ fn build_stimulus(
     }
 }
 
-/// Create cgroups, set cpusets, and spawn workers from CgroupDefs.
+/// Validate that a MemPolicy's node set is consistent with the
+/// cpuset the cgroup runs in and with the host topology, before
+/// `set_mempolicy(2)` gets a chance to silently mis-behave or
+/// return a generic `EINVAL`.
 ///
-/// Validate that a MemPolicy's nodes are covered by the NUMA nodes
-/// reachable from the resolved cpuset. Returns `Err` with a description
-/// when the policy requests nodes outside the cpuset's NUMA coverage.
+/// Flag-specific handling (in order of evaluation):
 ///
-/// Bypassed when `flags` contains `MpolFlags::STATIC_NODES`:
-/// `MPOL_F_STATIC_NODES` tells the kernel to keep the policy
-/// nodemask absolute across cpuset changes, which is the explicit
-/// opt-in for referencing nodes outside the task's cpuset.
-/// Without it, the kernel silently intersects the policy nodemask
-/// with the cpuset-allowed nodes — which is what this check
-/// prevents, because it collapses cross-node tests into degenerate
-/// same-cpuset-only observations.
+/// - `STATIC_NODES | RELATIVE_NODES` both set → bail: the kernel
+///   rejects this combination with `EINVAL`; surfacing it here
+///   names the offender before the syscall.
+/// - `STATIC_NODES` only → the nodemask is absolute and is NOT
+///   intersected with the cpuset. Cpuset coverage does not apply,
+///   but each referenced node must exist on the host topology or
+///   the kernel will reject the policy. Verify existence; bail
+///   with the missing nodes if any.
+/// - `RELATIVE_NODES` only → the nodemask is an ordinal into the
+///   cpuset's allowed-nodes set (the kernel performs the
+///   relative→absolute remap internally). Cpuset coverage does not
+///   apply in absolute-id terms, so bypass.
+/// - No relevant flag set → default kernel path silently
+///   intersects the nodemask with the cpuset. Enforce coverage
+///   here so cross-node tests do not collapse into degenerate
+///   same-cpuset-only observations; bail naming the uncovered
+///   nodes and the `.mpol_flags(MpolFlags::STATIC_NODES)` opt-in.
 fn validate_mempolicy_cpuset(
     policy: &MemPolicy,
     flags: crate::workload::MpolFlags,
@@ -2073,13 +2083,68 @@ fn validate_mempolicy_cpuset(
     ctx: &Ctx,
     cgroup_name: &str,
 ) -> Result<()> {
-    if flags.contains(crate::workload::MpolFlags::STATIC_NODES) {
-        return Ok(());
+    use crate::workload::MpolFlags;
+
+    // `STATIC_NODES | RELATIVE_NODES` is a kernel-rejected combination —
+    // `MPOL_F_STATIC_NODES` and `MPOL_F_RELATIVE_NODES` are mutually
+    // exclusive (see `include/uapi/linux/mempolicy.h` + the
+    // `sanitize_mpol_flags` helper in `mm/mempolicy.c`, which bails
+    // with `EINVAL` if both are set). Fail early here instead of
+    // letting the syscall return a generic error — the scenario
+    // caller almost certainly meant one or the other, not both.
+    if flags.contains(MpolFlags::STATIC_NODES) && flags.contains(MpolFlags::RELATIVE_NODES) {
+        anyhow::bail!(
+            "cgroup '{}': MpolFlags::STATIC_NODES and MpolFlags::RELATIVE_NODES are \
+             mutually exclusive (the kernel will reject the set_mempolicy syscall with \
+             EINVAL); pick whichever matches the intended semantics — STATIC_NODES \
+             for absolute node ids that survive cpuset changes, RELATIVE_NODES for \
+             cpuset-relative indices",
+            cgroup_name,
+        );
     }
+
     let policy_nodes = policy.node_set();
     if policy_nodes.is_empty() {
         return Ok(());
     }
+
+    // `STATIC_NODES`: nodemask is treated as absolute node ids and NOT
+    // intersected with the cpuset. The cpuset-coverage check below
+    // does not apply, but we DO need to verify the referenced nodes
+    // actually exist on the host — a policy pinning node 7 on a
+    // 2-node host would fail at syscall time; surfacing it here
+    // names the offender.
+    if flags.contains(MpolFlags::STATIC_NODES) {
+        let host_nodes = ctx.topo.numa_node_ids();
+        let missing: Vec<usize> = policy_nodes
+            .iter()
+            .copied()
+            .filter(|n| !host_nodes.contains(n))
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "cgroup '{}': MemPolicy with MpolFlags::STATIC_NODES references \
+                 NUMA node(s) {:?} that do not exist on this host (host nodes: {:?}); \
+                 the kernel will reject the policy — fix the MemPolicy or pick a \
+                 host with the required nodes",
+                cgroup_name,
+                missing,
+                host_nodes,
+            );
+        }
+        return Ok(());
+    }
+
+    // `RELATIVE_NODES`: nodemask is an ordinal into the cpuset's
+    // allowed nodes, not an absolute node id set. The cpuset-coverage
+    // check compares absolute ids, so it does not apply here — the
+    // kernel does the relative-to-absolute remap internally. Trust
+    // the caller and bypass the coverage bail, same shape as the
+    // STATIC_NODES early return.
+    if flags.contains(MpolFlags::RELATIVE_NODES) {
+        return Ok(());
+    }
+
     let cpuset_numa = ctx.topo.numa_nodes_for_cpuset(cpuset);
     let uncovered: Vec<usize> = policy_nodes
         .iter()
