@@ -24,14 +24,9 @@ use crate::workload::WorkType;
 #[derive(Subcommand)]
 pub enum KernelCommand {
     /// List cached kernel images.
+    #[command(long_about = EOL_EXPLANATION)]
     List {
-        /// Output in JSON format for CI scripting. Each entry's
-        /// `eol` boolean is derived by fetching kernel.org's
-        /// `releases.json` to learn the active series prefixes; on
-        /// fetch failure (offline, kernel.org unreachable, response
-        /// malformed) the active list is empty and no entry is
-        /// flagged EOL. The cache listing itself is local and
-        /// always succeeds; only the EOL annotation degrades.
+        /// Output in JSON format for CI scripting.
         #[arg(long)]
         json: bool,
     },
@@ -111,6 +106,31 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
      on cache miss. When absent, resolves via cache then filesystem, \
      falling back to downloading the latest stable kernel.";
 
+/// Explanation of the `(EOL)` tag, shared between the text-output
+/// legend printed after `kernel list` and the `kernel list --help`
+/// long description. One const → one source of truth, so a wording
+/// drift cannot put the two surfaces out of sync. `pub` matches the
+/// visibility of the sibling `KERNEL_HELP_*` constants so downstream
+/// consumers (e.g. documentation generators) can reference the exact
+/// text the CLI prints.
+pub const EOL_EXPLANATION: &str =
+    "(EOL) marks entries whose major.minor series is absent from \
+     kernel.org's current active releases. Suppressed when the \
+     active-release list cannot be fetched.";
+
+/// Decide whether to emit the `(EOL)` legend under the `kernel list`
+/// table. Returns `Some(EOL_EXPLANATION)` iff at least one rendered
+/// row carried the tag, else `None`. Splitting the conditional out
+/// of `kernel_list` lets both branches be pinned in unit tests
+/// without capturing stderr.
+pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
+    if any_eol {
+        Some(EOL_EXPLANATION)
+    } else {
+        None
+    }
+}
+
 /// ktstr.kconfig embedded at compile time.
 pub const EMBEDDED_KCONFIG: &str = crate::EMBEDDED_KCONFIG;
 
@@ -119,15 +139,30 @@ pub fn embedded_kconfig_hash() -> String {
     crate::kconfig_hash()
 }
 
-/// Extract major.minor prefix from a version string.
-/// "6.12.81" → "6.12", "7.0" → "7.0", "abc" → None.
+/// Extract the `major.minor` series prefix from a version string.
+///
+/// The minor component is normalized to its leading ASCII-digit run
+/// so RC, linux-next, and any other `-suffix` strings collapse to
+/// the same prefix as a released kernel in the same series:
+/// - `"6.12.81"` → `"6.12"`
+/// - `"7.0"` → `"7.0"`
+/// - `"6.15-rc3"` → `"6.15"` (RC folds into series)
+/// - `"6.16-rc2-next-20260420"` → `"6.16"` (linux-next folds too)
+/// - `"7.0-rc1"` → `"7.0"` (brand-new RC matches non-RC same-series)
+/// - `"abc"` → `None` (no `.`)
+/// - `"6.abc"` → `None` (no digits in minor)
+///
+/// Returning the same prefix for both sides of the
+/// [`is_eol`] comparison is what makes the predicate immune to
+/// releases.json and local-cache versions using different
+/// RC / pre-release suffixes within the same series.
 fn version_prefix(version: &str) -> Option<String> {
-    let parts: Vec<&str> = version.split('.').collect();
-    if parts.len() >= 2 {
-        Some(format!("{}.{}", parts[0], parts[1]))
-    } else {
-        None
+    let (major, rest) = version.split_once('.')?;
+    let minor_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if minor_digits.is_empty() {
+        return None;
     }
+    Some(format!("{major}.{minor_digits}"))
 }
 
 /// Return `true` when `version`'s major.minor series is absent
@@ -280,11 +315,16 @@ pub fn kernel_list(json: bool) -> Result<()> {
         "KEY", "VERSION", "SOURCE", "ARCH"
     );
     let mut any_stale = false;
+    let mut any_eol = false;
     for listed in &entries {
         match listed {
             crate::cache::ListedEntry::Valid(entry) => {
                 if entry.kconfig_status(&kconfig_hash).is_stale() {
                     any_stale = true;
+                }
+                let v = entry.metadata.version.as_deref().unwrap_or("-");
+                if v != "-" && is_eol(v, &active_prefixes) {
+                    any_eol = true;
                 }
                 println!(
                     "{}",
@@ -295,6 +335,13 @@ pub fn kernel_list(json: bool) -> Result<()> {
                 println!("  {key:<48} (corrupt: {reason})");
             }
         }
+    }
+    // Legend surfaces only when a tag was actually rendered, so the
+    // normal (no-EOL) case stays noise-free. Mirrors the any_stale
+    // pattern below. Decision routed through `eol_legend_if_any` so
+    // both branches are unit-testable.
+    if let Some(legend) = eol_legend_if_any(any_eol) {
+        eprintln!("{legend}");
     }
     if any_stale {
         eprintln!(
@@ -2722,6 +2769,70 @@ mod tests {
         }
     }
 
+    // -- version_prefix normalization --
+    //
+    // The minor-digit-only normalization is what makes `is_eol`
+    // immune to RC and linux-next suffix drift between releases.json
+    // and the local cache. Each case here pins one class of input
+    // that previously produced a prefix collision mismatch.
+
+    /// Stable release path — the original supported form.
+    #[test]
+    fn version_prefix_stable_release() {
+        assert_eq!(version_prefix("6.14.2").as_deref(), Some("6.14"));
+        assert_eq!(version_prefix("6.12.81").as_deref(), Some("6.12"));
+        assert_eq!(version_prefix("7.0").as_deref(), Some("7.0"));
+    }
+
+    /// RC suffix must collapse into the same series as the final
+    /// release. releases.json mainline cycles `6.15-rc1` → `-rc2` →
+    /// … → `6.15`; every step must share the `6.15` prefix so a
+    /// cache entry from an earlier RC stays non-EOL once a newer
+    /// RC ships.
+    #[test]
+    fn version_prefix_strips_rc_suffix() {
+        assert_eq!(version_prefix("6.15-rc1").as_deref(), Some("6.15"));
+        assert_eq!(version_prefix("6.15-rc3").as_deref(), Some("6.15"));
+        assert_eq!(version_prefix("7.0-rc1").as_deref(), Some("7.0"));
+    }
+
+    /// linux-next has versions like `6.16-rc2-next-20260420`. The
+    /// `fetch_active_prefixes` walk already skips the `linux-next`
+    /// moniker, but the PREFIX of a linux-next-derived cache key
+    /// must still collapse to the target merge window (`6.16`) so
+    /// it matches mainline's entry and stays non-EOL.
+    #[test]
+    fn version_prefix_strips_linux_next_suffix() {
+        assert_eq!(
+            version_prefix("6.16-rc2-next-20260420").as_deref(),
+            Some("6.16"),
+        );
+        assert_eq!(
+            version_prefix("7.1-rc1-next-20260501").as_deref(),
+            Some("7.1"),
+        );
+    }
+
+    /// `version.split_once('.')` returns `None` on a string with no
+    /// `.`, so `"abc"`, `"6"`, and the empty string all fall through
+    /// to the outer `None`.
+    #[test]
+    fn version_prefix_rejects_no_dot() {
+        assert!(version_prefix("abc").is_none());
+        assert!(version_prefix("6").is_none());
+        assert!(version_prefix("").is_none());
+    }
+
+    /// A minor component with no leading digits (e.g. `"6.x"`) fails
+    /// the `minor_digits.is_empty()` guard. Distinct from the no-dot
+    /// path: we got past `split_once` but could not extract a
+    /// numeric series.
+    #[test]
+    fn version_prefix_rejects_non_numeric_minor() {
+        assert!(version_prefix("6.x").is_none());
+        assert!(version_prefix("6.-rc1").is_none());
+    }
+
     // -- is_eol predicate --
     //
     // Pure function, no env / fixtures. Pins every return branch
@@ -2772,6 +2883,127 @@ mod tests {
     #[test]
     fn is_eol_unparseable_version_returns_false() {
         assert!(!is_eol("abc", &["6.14".to_string()]));
+    }
+
+    /// The #212 regression: a cache entry on `6.15-rc1` compared
+    /// against an active list that advanced to `6.15-rc4` must NOT
+    /// be tagged EOL. Both prefixes normalize to `6.15`, so the
+    /// comparison succeeds regardless of which RC the two sides
+    /// happened to observe.
+    #[test]
+    fn is_eol_rc_suffix_mismatch_does_not_flag() {
+        let active = ["6.15".to_string()];
+        assert!(!is_eol("6.15-rc1", &active));
+        assert!(!is_eol("6.15-rc4", &active));
+    }
+
+    /// linux-next cache keys (`6.16-rc2-next-YYYYMMDD`) must match
+    /// mainline's entry for `6.16`. The prefix normalization in
+    /// `version_prefix` collapses the `-rcN-next-*` chain.
+    #[test]
+    fn is_eol_linux_next_matches_mainline_prefix() {
+        let active = ["6.16".to_string()];
+        assert!(!is_eol("6.16-rc2-next-20260420", &active));
+    }
+
+    /// Brand-new major: releases.json has `"7.0-rc1"` mainline and
+    /// the cache has a just-built `"7.0"` (or vice versa). Both
+    /// collapse to `"7.0"` → not EOL.
+    #[test]
+    fn is_eol_brand_new_major_matches_rc_variant() {
+        assert!(!is_eol("7.0", &["7.0".to_string()]));
+        assert!(!is_eol("7.0-rc1", &["7.0".to_string()]));
+    }
+
+    /// A linux-next-derived cache entry targets the NEXT merge
+    /// window, so its `major.minor` can precede any entry in the
+    /// current stable/longterm active list. After the #212 prefix
+    /// normalization, `"6.16-rc1"` → `"6.16"`; when the active list
+    /// (`fetch_active_prefixes` skips `linux-next` monikers by
+    /// construction — see src/cli.rs) only carries older stable
+    /// series like `"6.14"` / `"6.13"`, `"6.16"` is absent and the
+    /// predicate returns true. This is INTENTIONAL — a linux-next
+    /// kernel whose target merge window has not yet shipped on
+    /// mainline is not a maintained series, so `(EOL)` accurately
+    /// tells the user it is not receiving upstream fixes. The
+    /// tag transitions to not-EOL as soon as mainline catches up
+    /// (covered by `is_eol_linux_next_matches_mainline_prefix`).
+    #[test]
+    fn is_eol_linux_next_version_not_falsely_tagged() {
+        assert!(
+            is_eol("6.16-rc1", &["6.14".to_string(), "6.13".to_string()]),
+            "linux-next cache entry whose merge-window target is ahead \
+             of every stable series must be tagged EOL",
+        );
+    }
+
+    /// Pins JSON/human-output parity for the `(EOL)` annotation:
+    /// any cache entry where the rendered text row contains
+    /// `(EOL)` must also produce `eol: true` in the JSON view, and
+    /// vice versa. Both code paths in `kernel_list` delegate to
+    /// `is_eol`, so this test guards against a future change that
+    /// introduces a second `is_eol`-like predicate in one branch
+    /// and leaves the other behind — the exact drift mode that the
+    /// kconfig-status parity test already guards against.
+    #[test]
+    fn kernel_list_eol_json_human_parity() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let image = src_dir.join("bzImage");
+        std::fs::write(&image, b"fake kernel").unwrap();
+
+        let make_entry = |key: &str, version: &str| {
+            let meta = KernelMetadata::new(
+                KernelSource::Tarball,
+                "x86_64".to_string(),
+                "bzImage".to_string(),
+                "2026-04-12T10:00:00Z".to_string(),
+            )
+            .with_version(Some(version.to_string()));
+            cache
+                .store(key, &CacheArtifacts::new(&image), &meta)
+                .unwrap()
+        };
+
+        // Three cases: active-not-EOL, EOL (non-empty active list),
+        // and empty active list (fetch-failed fallback — neither side
+        // may flag EOL).
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("active", "6.14.2", &["6.14"]),
+            ("eol", "2.6.32", &["6.14"]),
+            ("fetch-fail", "2.6.32", &[]),
+        ];
+
+        for (label, version, active) in cases {
+            let entry = make_entry(&format!("parity-{label}"), version);
+            let active_vec: Vec<String> = active.iter().map(|s| s.to_string()).collect();
+            let row = format_entry_row(&entry, "kconfig_hash", &active_vec);
+            let json_eol = version != &"-" && is_eol(version, &active_vec);
+            let human_eol = row.contains("(EOL)");
+            assert_eq!(
+                json_eol, human_eol,
+                "JSON/human parity broken for case {label}: \
+                 json_eol={json_eol}, human_eol={human_eol}, row={row:?}",
+            );
+        }
+    }
+
+    /// `eol_legend_if_any` is the sole gate on whether the text
+    /// output under `kernel list` emits the `(EOL)` legend. Pinning
+    /// both branches avoids a regression that would print the legend
+    /// on clean no-EOL runs (noise) or suppress it on EOL runs
+    /// (users cannot interpret the tag). The returned `&'static str`
+    /// is the same `EOL_EXPLANATION` shown by `--json --help`, so
+    /// drift between legend and help copy is impossible by
+    /// construction.
+    #[test]
+    fn eol_legend_if_any_branches() {
+        assert_eq!(eol_legend_if_any(true), Some(EOL_EXPLANATION));
+        assert_eq!(eol_legend_if_any(false), None);
     }
 
     /// Snapshot pin for `format_entry_row` across the 6-case outcome
