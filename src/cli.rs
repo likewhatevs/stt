@@ -1984,10 +1984,12 @@ mod tests {
         use std::io::{BufReader, ErrorKind, Read};
 
         // Reader returns "line1\n" on the first read, then BrokenPipe
-        // on the second. `drain_lines_lossy` must surface the Err —
-        // the pre-refactor `.lines()` + `Result::ok` formulation
-        // silently dropped errors and this test guards against that
-        // regression.
+        // on the second. `drain_lines_lossy` must surface the Err
+        // (return `Err(BrokenPipe)`) rather than silently ending the
+        // read loop on mid-stream I/O failure. A mid-stream
+        // broken-pipe that looks like EOF would drop the child's tail
+        // output without a diagnostic; this test pins the contract
+        // "error after first read propagates as Err".
         struct FlakyReader {
             calls: usize,
         }

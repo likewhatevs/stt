@@ -3805,9 +3805,10 @@ mod tests {
     }
 
     /// `neutralize_alloc_relocs` must be byte-identity idempotent:
-    /// `f(f(x)) == f(x)`. The production filter at cache.rs:937-960
-    /// keys on `sh_type` and `sh_flags` — neither of which the
-    /// function ever writes, only `sh_size` is rewritten. On the
+    /// `f(f(x)) == f(x)`. The production filter inside
+    /// [`neutralize_alloc_relocs`] keys on `sh_type` and `sh_flags`
+    /// — neither of which the function ever writes, only `sh_size`
+    /// is rewritten. On the
     /// second pass every matching section header is re-matched (same
     /// sh_type and sh_flags) and `out[size_offset..size_end].fill(0)`
     /// rewrites already-zero bytes; every other byte is left untouched
@@ -4178,6 +4179,154 @@ mod tests {
             post_rel.sh_size, 0,
             "ELF32 .rel.foo sh_size must be zeroed (SHT_REL arm); got {}",
             post_rel.sh_size
+        );
+    }
+
+    /// ELF32 counterpart of
+    /// [`neutralize_alloc_relocs_noop_when_no_alloc_reloc_sections`].
+    ///
+    /// When the input carries no SHF_ALLOC reloc sections, the ELF32
+    /// code path in `neutralize_alloc_relocs` must return a byte-
+    /// identity copy of the input — same invariant as ELF64, but
+    /// exercised through the `(20, 4)` offset/width branch. A
+    /// regression that filled zeros even on the "no match" path, or
+    /// mis-read the section header count / size on 32-bit inputs,
+    /// would break byte-identity here without tripping the ELF64
+    /// sibling test.
+    #[test]
+    fn neutralize_alloc_relocs_noop_when_no_alloc_reloc_sections_elf32() {
+        use object::write;
+
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::I386,
+            object::Endianness::Little,
+        );
+        // .text + symbol mirror the sibling fixture so object::write
+        // emits a valid ELF32 with the same structural sections but
+        // zero reloc entries.
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 1);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_text_symbol".to_vec(),
+            value: 0x0,
+            size: 4,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        let data = obj.write().unwrap();
+
+        // Positive-control: the fixture must parse as ELF32
+        // (is_64 == false) so the no-match path through the
+        // `(20, 4)` branch is what gets exercised. A future object
+        // change that remapped I386 to ELF64 would turn this into a
+        // duplicate of the ELF64 sibling without visible failure.
+        let pre_elf = goblin::elf::Elf::parse(&data).unwrap();
+        assert!(
+            !pre_elf.is_64,
+            "fixture must produce ELF32 (is_64 == false) to exercise the (20, 4) branch",
+        );
+
+        let processed = neutralize_alloc_relocs(&data).unwrap();
+        assert_eq!(
+            processed, data,
+            "neutralize_alloc_relocs must be byte-identity on ELF32 when no SHF_ALLOC reloc sections are present",
+        );
+    }
+
+    /// ELF32 counterpart of
+    /// [`neutralize_alloc_relocs_is_idempotent`].
+    ///
+    /// Idempotence (`f(f(x)) == f(x)`) must hold through the ELF32
+    /// `(20, 4)` branch of `neutralize_alloc_relocs`. The ELF64
+    /// sibling covers the `(32, 8)` branch; pinning both prevents a
+    /// future offset-width mismatch where e.g. the second pass on
+    /// ELF32 reads sh_size through an ELF64 offset and silently
+    /// tripped idempotence on 32-bit inputs.
+    ///
+    /// Uses the same SHT_RELA+ALLOC / SHT_REL+ALLOC / SHT_RELA-no-
+    /// ALLOC section mix as the ELF32 zeros fixture so both arms
+    /// of the `is_rela` predicate re-walk on the second pass, and
+    /// a no-match section is present to rule out a degenerate
+    /// "zero every sh_size" implementation.
+    #[test]
+    fn neutralize_alloc_relocs_is_idempotent_elf32() {
+        use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
+        use object::write;
+
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::I386,
+            object::Endianness::Little,
+        );
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 1);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"test_text_symbol".to_vec(),
+            value: 0x0,
+            size: 4,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        // .rela.kaslr — SHT_RELA + SHF_ALLOC.
+        let kaslr_id = obj.add_section(
+            Vec::new(),
+            b".rela.kaslr".to_vec(),
+            object::SectionKind::Elf(SHT_RELA),
+        );
+        obj.append_section_data(kaslr_id, &[0xA5; 16], 1);
+        obj.section_mut(kaslr_id).flags = object::SectionFlags::Elf {
+            sh_flags: u64::from(SHF_ALLOC),
+        };
+        // .rel.foo — SHT_REL + SHF_ALLOC. Second filter arm.
+        let rel_id = obj.add_section(
+            Vec::new(),
+            b".rel.foo".to_vec(),
+            object::SectionKind::Elf(SHT_REL),
+        );
+        obj.append_section_data(rel_id, &[0xC7; 12], 1);
+        obj.section_mut(rel_id).flags = object::SectionFlags::Elf {
+            sh_flags: u64::from(SHF_ALLOC),
+        };
+        // .rela.debug_info — SHT_RELA without SHF_ALLOC. Negative
+        // control — must re-match "no ALLOC flag" on the second pass.
+        let rdbg_id = obj.add_section(
+            Vec::new(),
+            b".rela.debug_info".to_vec(),
+            object::SectionKind::Elf(SHT_RELA),
+        );
+        obj.append_section_data(rdbg_id, &[0xB6; 8], 1);
+
+        let data = obj.write().unwrap();
+
+        // Positive-control ELF32: any post-parse assertion depends on
+        // this; a silent promotion to ELF64 would make the idempotence
+        // check run through the (32, 8) branch instead.
+        assert!(
+            !goblin::elf::Elf::parse(&data).unwrap().is_64,
+            "fixture must be ELF32 to exercise the (20, 4) idempotence path",
+        );
+
+        let first_pass = neutralize_alloc_relocs(&data).unwrap();
+        let second_pass = neutralize_alloc_relocs(&first_pass).unwrap();
+
+        // Non-vacuous guard: first pass must actually rewrite bytes on
+        // this fixture. Without this the test could false-pass on a
+        // degenerate no-op implementation that trivially satisfies
+        // idempotence.
+        assert_ne!(
+            first_pass, data,
+            "first pass must rewrite sh_size on ELF32 SHF_ALLOC reloc sections",
+        );
+        assert_eq!(
+            second_pass, first_pass,
+            "neutralize_alloc_relocs must be byte-identity idempotent on ELF32",
         );
     }
 

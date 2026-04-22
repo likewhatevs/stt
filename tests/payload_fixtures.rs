@@ -207,13 +207,16 @@ fn schbench_hinted_output_carries_hint_through_derive() {
 }
 
 /// SCHBENCH and SCHBENCH_HINTED share the same binary ("schbench")
-/// but use distinct `name` fields — the same pairwise-dedup rule
-/// that lets FIO and FIO_JSON coexist as workloads in one
-/// `#[ktstr_test(workloads = [...])]`. Asserting the distinction
-/// here pins the coexistence contract so a rename that collapsed
-/// the two fixtures into a single `name` breaks this test rather
-/// than surfacing as a pairwise-dedup rejection at scenario
-/// compile time.
+/// but use distinct `name` fields. The `name` is threaded through
+/// every log + error context in [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun)
+/// (e.g. `spawn payload '{name}'`, `reap payload '{name}'`,
+/// `with_context(|| format!("… payload '{name}'"))` sites) and into
+/// the `Debug` impl on `Payload`, so if both fixtures shared a name
+/// a run that used both would emit log lines that could not be
+/// attributed to the right fixture after the fact. Asserting the
+/// distinction here pins the log-attribution contract so a rename
+/// that collapsed the two fixtures into a single `name` breaks
+/// this test rather than surfacing as ambiguous log output.
 #[test]
 fn schbench_and_schbench_hinted_have_distinct_names() {
     assert_ne!(SCHBENCH.name, SCHBENCH_HINTED.name);
