@@ -72,7 +72,7 @@ pub(crate) use args::{
 pub use sidecar::{SidecarResult, newest_run_dir, runs_root};
 pub(crate) use sidecar::{
     collect_sidecars, format_callback_profile, format_kvm_stats, format_verifier_stats,
-    sidecar_dir, write_skip_sidecar,
+    sidecar_dir,
 };
 
 pub use dispatch::{analyze_sidecars, ktstr_main, ktstr_test_early_dispatch, run_ktstr_test};
@@ -81,7 +81,7 @@ pub use entry::{
     BpfMapWrite, CgroupPath, KTSTR_TESTS, KtstrTestEntry, MemSideCache, NumaDistance, NumaNode,
     Scheduler, SchedulerSpec, Sysctl, Topology, TopologyConstraints, find_test,
 };
-pub(crate) use eval::run_ktstr_test_inner;
+pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
 pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
 pub use metrics::extract_metrics;
 pub use model::{
