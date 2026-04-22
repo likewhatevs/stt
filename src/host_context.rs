@@ -45,7 +45,7 @@ pub struct HostContext {
     pub hugepages_free: Option<u64>,
     /// Hugepage size in KiB — `Hugepagesize:` from `/proc/meminfo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hugepagesize_kb: Option<u64>,
+    pub hugepages_size_kb: Option<u64>,
     /// Active THP policy — content of
     /// `/sys/kernel/mm/transparent_hugepage/enabled` with the
     /// bracketed selection preserved verbatim (e.g.
@@ -139,7 +139,7 @@ impl HostContext {
             total_memory_kb,
             hugepages_total,
             hugepages_free,
-            hugepagesize_kb,
+            hugepages_size_kb,
             thp_enabled,
             thp_defrag,
             sched_tunables,
@@ -168,7 +168,7 @@ impl HostContext {
         row(&mut out, "total_memory_kb", total_memory_kb.as_ref());
         row(&mut out, "hugepages_total", hugepages_total.as_ref());
         row(&mut out, "hugepages_free", hugepages_free.as_ref());
-        row(&mut out, "hugepagesize_kb", hugepagesize_kb.as_ref());
+        row(&mut out, "hugepages_size_kb", hugepages_size_kb.as_ref());
         row(&mut out, "numa_nodes", numa_nodes.as_ref());
         row(&mut out, "thp_enabled", thp_enabled.as_ref());
         row(&mut out, "thp_defrag", thp_defrag.as_ref());
@@ -212,7 +212,7 @@ impl HostContext {
             total_memory_kb: a_total_memory_kb,
             hugepages_total: a_hugepages_total,
             hugepages_free: a_hugepages_free,
-            hugepagesize_kb: a_hugepagesize_kb,
+            hugepages_size_kb: a_hugepages_size_kb,
             thp_enabled: a_thp_enabled,
             thp_defrag: a_thp_defrag,
             sched_tunables: a_sched_tunables,
@@ -228,7 +228,7 @@ impl HostContext {
             total_memory_kb: b_total_memory_kb,
             hugepages_total: b_hugepages_total,
             hugepages_free: b_hugepages_free,
-            hugepagesize_kb: b_hugepagesize_kb,
+            hugepages_size_kb: b_hugepages_size_kb,
             thp_enabled: b_thp_enabled,
             thp_defrag: b_thp_defrag,
             sched_tunables: b_sched_tunables,
@@ -289,9 +289,9 @@ impl HostContext {
         );
         row(
             &mut out,
-            "hugepagesize_kb",
-            a_hugepagesize_kb.as_ref(),
-            b_hugepagesize_kb.as_ref(),
+            "hugepages_size_kb",
+            a_hugepages_size_kb.as_ref(),
+            b_hugepages_size_kb.as_ref(),
         );
         row(&mut out, "numa_nodes", a_numa_nodes.as_ref(), b_numa_nodes.as_ref());
         row(&mut out, "thp_enabled", a_thp_enabled.as_ref(), b_thp_enabled.as_ref());
@@ -343,7 +343,7 @@ struct StaticHostInfo {
     cpu_model: Option<String>,
     cpu_vendor: Option<String>,
     total_memory_kb: Option<u64>,
-    hugepagesize_kb: Option<u64>,
+    hugepages_size_kb: Option<u64>,
     numa_nodes: Option<usize>,
     uname_sysname: Option<String>,
     uname_release: Option<String>,
@@ -351,6 +351,24 @@ struct StaticHostInfo {
 }
 
 static STATIC_HOST_INFO: OnceLock<StaticHostInfo> = OnceLock::new();
+
+/// Test-only call counter for [`compute_static_host_info`]. Pinned
+/// by `call_counts_*` tests to prove the OnceLock is exercised at
+/// most once per process, independent of how many
+/// `collect_host_context` calls happen. Production builds do not
+/// carry the counter.
+#[cfg(test)]
+static STATIC_INIT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only call counter for [`read_meminfo`]. Pinned by
+/// `call_counts_*` tests to prove the `/proc/meminfo` dedup holds
+/// — exactly one read per `collect_host_context` call, not the
+/// pre-dedup two reads on the cold path. Production builds do not
+/// carry the counter.
+#[cfg(test)]
+static MEMINFO_READ_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Capture the host context. Static fields are collected once
 /// and cached; dynamic fields are re-read on every call so
@@ -369,7 +387,7 @@ static STATIC_HOST_INFO: OnceLock<StaticHostInfo> = OnceLock::new();
 pub fn collect_host_context() -> HostContext {
     // Read `/proc/meminfo` exactly once per call and share the
     // parsed fields with `compute_static_host_info` (for `mem_total_kb`
-    // / `hugepagesize_kb` on cold init) and with the per-call
+    // / `hugepages_size_kb` on cold init) and with the per-call
     // hugepage counters. The prior formulation read `/proc/meminfo`
     // twice on the cold path — once here for the dynamic counters
     // and once inside the `OnceLock` init for the static fields —
@@ -384,7 +402,7 @@ pub fn collect_host_context() -> HostContext {
         total_memory_kb: static_info.total_memory_kb,
         hugepages_total: meminfo.hugepages_total,
         hugepages_free: meminfo.hugepages_free,
-        hugepagesize_kb: static_info.hugepagesize_kb,
+        hugepages_size_kb: static_info.hugepages_size_kb,
         thp_enabled: read_trimmed_sysfs("/sys/kernel/mm/transparent_hugepage/enabled"),
         thp_defrag: read_trimmed_sysfs("/sys/kernel/mm/transparent_hugepage/defrag"),
         sched_tunables: read_sched_tunables(),
@@ -401,13 +419,27 @@ pub fn collect_host_context() -> HostContext {
 /// does not re-read the file. Reads `/proc/cpuinfo` (CPU identity),
 /// the host NUMA topology, and a single `uname()` call.
 fn compute_static_host_info(meminfo: &MeminfoFields) -> StaticHostInfo {
+    #[cfg(test)]
+    STATIC_INIT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (cpu_model, cpu_vendor) = read_cpuinfo_identity();
+    // `uname(2)` is unit-tested only through
+    // `collect_host_context_returns_populated_struct_on_linux`
+    // (integration-style — runs the real syscall and asserts the
+    // sysname field populates). No injection seam exists by design:
+    // the only post-syscall logic here is `.to_str().ok().map(...)`,
+    // which is three method calls on `rustix::system::UtsName`'s
+    // already-null-terminated-`CStr` accessors. Extracting that into
+    // a pure parser would test `CStr::to_str` — std's invariant, not
+    // ours — and the real fragility (syscall return, encoding on
+    // non-Linux hosts) is untestable without a kernel mock, which
+    // is outside ktstr's scope. Marking this not-unit-tested by
+    // design.
     let u = rustix::system::uname();
     StaticHostInfo {
         cpu_model,
         cpu_vendor,
         total_memory_kb: meminfo.mem_total_kb,
-        hugepagesize_kb: meminfo.hugepagesize_kb,
+        hugepages_size_kb: meminfo.hugepages_size_kb,
         numa_nodes: count_numa_nodes_via_topology(),
         uname_sysname: u.sysname().to_str().ok().map(|s| s.to_string()),
         uname_release: u.release().to_str().ok().map(|s| s.to_string()),
@@ -466,7 +498,7 @@ struct MeminfoFields {
     mem_total_kb: Option<u64>,
     hugepages_total: Option<u64>,
     hugepages_free: Option<u64>,
-    hugepagesize_kb: Option<u64>,
+    hugepages_size_kb: Option<u64>,
 }
 
 /// Read `/proc/meminfo` and extract the four fields the host
@@ -474,6 +506,8 @@ struct MeminfoFields {
 /// [`parse_meminfo`] so it can be unit-tested with synthetic
 /// fixtures.
 fn read_meminfo() -> MeminfoFields {
+    #[cfg(test)]
+    MEMINFO_READ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
         return MeminfoFields::default();
     };
@@ -501,7 +535,7 @@ fn parse_meminfo(text: &str) -> MeminfoFields {
             "MemTotal" => out.mem_total_kb = Some(n),
             "HugePages_Total" => out.hugepages_total = Some(n),
             "HugePages_Free" => out.hugepages_free = Some(n),
-            "Hugepagesize" => out.hugepagesize_kb = Some(n),
+            "Hugepagesize" => out.hugepages_size_kb = Some(n),
             _ => {}
         }
     }
@@ -748,7 +782,7 @@ mod tests {
             total_memory_kb: Some(16_384_000),
             hugepages_total: Some(0),
             hugepages_free: Some(0),
-            hugepagesize_kb: Some(2048),
+            hugepages_size_kb: Some(2048),
             thp_enabled: Some("always [madvise] never".to_string()),
             thp_defrag: Some("[always] defer defer+madvise madvise never".to_string()),
             sched_tunables: Some(tunables),
@@ -869,7 +903,7 @@ Hugepagesize:       2048 kB
         assert_eq!(out.mem_total_kb, Some(16_384_000));
         assert_eq!(out.hugepages_total, Some(42));
         assert_eq!(out.hugepages_free, Some(40));
-        assert_eq!(out.hugepagesize_kb, Some(2048));
+        assert_eq!(out.hugepages_size_kb, Some(2048));
     }
 
     #[test]
@@ -878,7 +912,7 @@ Hugepagesize:       2048 kB
         assert!(out.mem_total_kb.is_none());
         assert!(out.hugepages_total.is_none());
         assert!(out.hugepages_free.is_none());
-        assert!(out.hugepagesize_kb.is_none());
+        assert!(out.hugepages_size_kb.is_none());
     }
 
     #[test]
@@ -891,7 +925,7 @@ Hugepagesize:       2048 kB
         assert_eq!(out.mem_total_kb, Some(1024));
         assert!(out.hugepages_total.is_none());
         assert!(out.hugepages_free.is_none());
-        assert!(out.hugepagesize_kb.is_none());
+        assert!(out.hugepages_size_kb.is_none());
     }
 
     #[test]
@@ -906,7 +940,7 @@ Hugepagesize:      2048 kB
 ";
         let out = parse_meminfo(text);
         assert_eq!(out.mem_total_kb, Some(2048));
-        assert_eq!(out.hugepagesize_kb, Some(2048));
+        assert_eq!(out.hugepages_size_kb, Some(2048));
     }
 
     #[test]
@@ -933,7 +967,7 @@ Another_Unknown: 77 kB
         let out = parse_meminfo(text);
         assert_eq!(out.mem_total_kb, Some(512));
         assert_eq!(out.hugepages_total, Some(2));
-        assert_eq!(out.hugepagesize_kb, Some(2048));
+        assert_eq!(out.hugepages_size_kb, Some(2048));
     }
 
     #[test]
@@ -1047,7 +1081,7 @@ Hugepagesize:       2048 kB
             "overflow value must fail u64 parse and skip",
         );
         assert_eq!(
-            out.hugepagesize_kb,
+            out.hugepages_size_kb,
             Some(2048),
             "later valid line must still parse",
         );
@@ -1105,7 +1139,7 @@ Hugepagesize:       2048 kB
             "total_memory_kb",
             "hugepages_total",
             "hugepages_free",
-            "hugepagesize_kb",
+            "hugepages_size_kb",
             "numa_nodes",
             "thp_enabled",
             "thp_defrag",
@@ -1512,6 +1546,109 @@ Hugepagesize:       2048 kB
             count_numa_nodes_in_topology(&topo),
             3,
             "sparse IDs {{0, 2, 5}} must count as 3, not max_id+1",
+        );
+    }
+
+    /// Pin both caching invariants with a direct call-count probe:
+    ///
+    /// 1. `compute_static_host_info` runs at MOST once per process
+    ///    — the `OnceLock::get_or_init` contract. Across N repeated
+    ///    `collect_host_context()` calls, the delta must stay ≤ 1
+    ///    (the first call from-cold executes the closure; every
+    ///    subsequent call hits the cache).
+    /// 2. `read_meminfo` runs EXACTLY N times across N calls — one
+    ///    read per `collect_host_context` invocation, regardless of
+    ///    cache state. The cold path no longer double-reads
+    ///    meminfo (the dedup shares the parsed struct between the
+    ///    init closure and the per-call path); this test pins the
+    ///    dedup so a regression that re-adds a second read inside
+    ///    `compute_static_host_info` trips the assertion.
+    /// 3. Cold-init anchor: if `STATIC_HOST_INFO` was not yet
+    ///    populated when the test started, exactly one
+    ///    `compute_static_host_info` call must run during this test.
+    ///
+    /// Deltas (`load() - before-snapshot`) absorb pre-population
+    /// from sibling tests: the test is robust to execution order.
+    #[test]
+    fn collect_host_context_call_counts_match_caching_invariants() {
+        use std::sync::atomic::Ordering;
+        const N: usize = 5;
+
+        let static_was_populated_pre = STATIC_HOST_INFO.get().is_some();
+        let init_before = STATIC_INIT_CALLS.load(Ordering::Relaxed);
+        let meminfo_before = MEMINFO_READ_CALLS.load(Ordering::Relaxed);
+
+        for _ in 0..N {
+            let _ = collect_host_context();
+        }
+
+        let init_delta = STATIC_INIT_CALLS.load(Ordering::Relaxed) - init_before;
+        let meminfo_delta = MEMINFO_READ_CALLS.load(Ordering::Relaxed) - meminfo_before;
+
+        assert!(
+            init_delta <= 1,
+            "compute_static_host_info must run at most once across {N} collect_host_context calls, ran {init_delta}",
+        );
+        assert_eq!(
+            meminfo_delta, N,
+            "read_meminfo must run exactly {N} times across {N} collect_host_context calls, ran {meminfo_delta} — the dedup would regress if this trips",
+        );
+
+        if !static_was_populated_pre {
+            assert_eq!(
+                init_delta, 1,
+                "cold-init anchor: compute_static_host_info must run exactly once on the populate path, not {init_delta}",
+            );
+        }
+
+        assert!(
+            STATIC_HOST_INFO.get().is_some(),
+            "STATIC_HOST_INFO must be populated after at least one collect_host_context call",
+        );
+    }
+
+    /// Memory-only NUMA nodes (CXL / Intel Optane / persistent
+    /// memory tiers) have no CPUs assigned. They do not appear in
+    /// `cpu_to_node`, so the counter — which iterates
+    /// `cpu_to_node.values()` — MUST exclude them. The counter is
+    /// the "CPU-bearing nodes" count, not the "all nodes" count.
+    ///
+    /// This invariant is deliberate: cgroup cpuset assignments,
+    /// scheduler placement, and the NUMA memory-policy paths ktstr
+    /// tests care about are all CPU-keyed. A memory-only node is
+    /// irrelevant to those flows. Surfacing it in the count would
+    /// inflate the denominator for "CPUs per node" and similar
+    /// derivations downstream.
+    ///
+    /// Pin the behavior with a topology where 4 CPUs map across
+    /// nodes 0 and 1 and an extra node id (2) has ZERO cpu_to_node
+    /// entries — representing a memory-only tier. The count must
+    /// come back as 2 (the CPU-bearing nodes), not 3. A regression
+    /// that added `+1` for every memory-only node — or switched
+    /// the implementation to read a separate `all_nodes` field —
+    /// would trip this assertion.
+    #[test]
+    fn count_numa_nodes_in_topology_excludes_memory_only_nodes() {
+        let mut cpu_to_node = std::collections::HashMap::new();
+        cpu_to_node.insert(0, 0);
+        cpu_to_node.insert(1, 0);
+        cpu_to_node.insert(2, 1);
+        cpu_to_node.insert(3, 1);
+        // Node id 2 intentionally absent from cpu_to_node — it is
+        // the memory-only tier under test. The function has no
+        // other channel to learn about node 2, so a future change
+        // that adds awareness of memory-only nodes (via a separate
+        // field) would need to opt-in explicitly — this test pins
+        // the current silent-exclusion contract.
+        let topo = crate::vmm::host_topology::HostTopology {
+            llc_groups: Vec::new(),
+            online_cpus: vec![0, 1, 2, 3],
+            cpu_to_node,
+        };
+        assert_eq!(
+            count_numa_nodes_in_topology(&topo),
+            2,
+            "memory-only nodes must not inflate the CPU-bearing node count",
         );
     }
 
