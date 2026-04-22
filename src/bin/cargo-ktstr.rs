@@ -83,7 +83,7 @@ enum KtstrCommand {
     /// Manage the LLM model cache used by `OutputFormat::LlmExtract`
     /// payloads. `fetch` downloads the default pinned model to
     /// `~/.cache/ktstr/models/` (respecting `KTSTR_CACHE_DIR` /
-    /// `XDG_CACHE_HOME`); `status` reports whether a verified copy
+    /// `XDG_CACHE_HOME`); `status` reports whether a SHA-checked copy
     /// is already cached.
     Model {
         #[command(subcommand)]
@@ -175,12 +175,13 @@ enum KtstrCommand {
 
 #[derive(Subcommand)]
 enum ModelCommand {
-    /// Download the default pinned model and verify its SHA-256.
-    /// No-op when the cache already holds a verified copy. Respects
-    /// `KTSTR_MODEL_OFFLINE` — set to `1` to refuse network fetches.
+    /// Download the default pinned model and check its SHA-256.
+    /// No-op when the cache already holds a SHA-checked copy.
+    /// Respects `KTSTR_MODEL_OFFLINE` — set to `1` to refuse network
+    /// fetches.
     Fetch,
     /// Print the cache path for the default model and whether a
-    /// verified copy is already present.
+    /// SHA-checked copy is already present.
     Status,
 }
 
@@ -772,7 +773,7 @@ fn run_completions(shell: clap_complete::Shell, binary: &str) {
     clap_complete::generate(shell, &mut cmd, binary, &mut std::io::stdout());
 }
 
-/// `cargo ktstr model fetch` — download + verify the default model
+/// `cargo ktstr model fetch` — download + SHA-check the default model
 /// into the user's cache. Wraps `ktstr::test_support::ensure` with a
 /// human-readable progress line; the status is printed after so
 /// users can see the final cache path regardless of whether the
@@ -793,14 +794,14 @@ fn run_model_fetch() -> Result<(), String> {
 }
 
 /// `cargo ktstr model status` — report the cache path and whether a
-/// verified copy of the default model is already present.
+/// SHA-checked copy of the default model is already present.
 fn run_model_status() -> Result<(), String> {
     let spec = ktstr::test_support::DEFAULT_MODEL;
     let status = ktstr::test_support::status(&spec).map_err(|e| format!("{e:#}"))?;
     println!("model:    {}", status.spec.file_name);
     println!("path:     {}", status.path.display());
     println!("cached:   {}", status.cached);
-    println!("verified: {}", status.sha_matches);
+    println!("checked:  {}", status.sha_matches);
     if !status.cached {
         println!(
             "(no cached copy — run `cargo ktstr model fetch` to download {} MiB)",
@@ -825,6 +826,19 @@ fn run_model_status() -> Result<(), String> {
 }
 
 fn main() {
+    // Mirror `ktstr`'s tracing init (src/bin/ktstr.rs main()) so
+    // `tracing::warn!` calls inside `cli::` / `test_support::` surface
+    // on stderr instead of being silently dropped. Default to `warn`
+    // so normal CLI invocations (kernel build, model fetch, etc.) stay
+    // quiet; users who want finer detail set `RUST_LOG=info,debug,...`.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let Cargo {
         command: CargoSub::Ktstr(ktstr),
     } = Cargo::parse();

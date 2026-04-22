@@ -6,7 +6,7 @@
 //! [`walk_json_leaves`](crate::test_support::metrics) pipeline then
 //! consumes. The model binary itself lives under
 //! `~/.cache/ktstr/models/`. This module owns both the cache
-//! surface (locate + fetch + verify) and the LlmExtract pipeline
+//! surface (locate + fetch + check) and the LlmExtract pipeline
 //! that composes a prompt, invokes inference, and routes the
 //! response back through the JSON walker.
 //!
@@ -56,7 +56,7 @@
 //!
 //! 1. [`compose_prompt`] assembles `{LLM_EXTRACT_PROMPT_TEMPLATE}\n\n{focus}STDOUT:\n{body}`.
 //! 2. `load_inference` (module-private) routes both artifact paths
-//!    through [`ensure`] — SHA-verifying the cached GGUF model and
+//!    through [`ensure`] — SHA-checking the cached GGUF model and
 //!    tokenizer or surfacing the offline-gate/missing-cache error —
 //!    then opens the GGUF, builds the Qwen3 `ModelWeights`, loads
 //!    the tokenizer, and resolves the `<|im_end|>` EOS token id.
@@ -114,7 +114,7 @@ use super::payload::OutputFormat;
 /// Stays `false` on every prefetch short-circuit (no-test-needs-it,
 /// offline gate, ensure error) so `load_inference` falls back to
 /// [`ensure`] and first-use SHA checking still happens.
-static PREFETCH_VERIFIED: AtomicBool = AtomicBool::new(false);
+static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 
 /// Process-wide memoized inference state.
 ///
@@ -189,7 +189,7 @@ type CachedInference = Result<Mutex<LoadedInference>, String>;
 static MODEL_CACHE: Mutex<Option<Arc<CachedInference>>> = Mutex::new(None);
 
 /// Pinned description of a model artifact the cache knows how to
-/// fetch and verify.
+/// fetch and check.
 ///
 /// The fields are `&'static` so a `ModelSpec` can live in a
 /// top-level `const` — the default model used by
@@ -312,7 +312,7 @@ fn sanitize_env_value(raw: &str) -> String {
 }
 
 /// Status record returned by [`status`]: where the model would live
-/// on disk and whether a verified copy is already there.
+/// on disk and whether a checked copy is already there.
 #[derive(Debug, Clone)]
 pub struct ModelStatus {
     pub spec: ModelSpec,
@@ -364,7 +364,7 @@ pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
 }
 
 /// Return the on-disk path the spec would occupy and whether a
-/// verified copy is already present. Used by both the CLI's
+/// checked copy is already present. Used by both the CLI's
 /// `model status` subcommand and the eager prefetch fast-path.
 pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
     let root = resolve_cache_root()?;
@@ -389,7 +389,7 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
                 Err(e) => {
                     if !is_valid_sha256_hex(spec.sha256_hex) {
                         return Err(e).with_context(|| {
-                            format!("verify SHA-256 pin for cached model '{}'", spec.file_name,)
+                            format!("check SHA-256 pin for cached model '{}'", spec.file_name,)
                         });
                     }
                     (false, Some(format!("{e:#}")))
@@ -409,10 +409,10 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
 }
 
 /// Ensure the model artifact described by `spec` is present and
-/// SHA-verified in the cache, downloading if necessary.
+/// SHA-checked in the cache, downloading if necessary.
 ///
 /// Fast path: existing file whose SHA matches — no-op.
-/// Slow path: tempfile download + SHA verify + atomic rename.
+/// Slow path: tempfile download + SHA check + atomic rename.
 ///
 /// Respects `KTSTR_MODEL_OFFLINE`: when set to a non-empty value,
 /// returns `Err` immediately without issuing a network request. This
@@ -597,7 +597,7 @@ fn ensure_free_space(parent: &std::path::Path, spec: &ModelSpec) -> Result<()> {
     Ok(())
 }
 
-/// Download the spec to `final_path` through a tempfile, verify SHA,
+/// Download the spec to `final_path` through a tempfile, check SHA,
 /// then atomically rename. Errors are actionable (includes URL +
 /// final path) so a test author can reproduce the fetch by hand.
 fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
@@ -790,11 +790,11 @@ pub fn any_test_requires_model() -> bool {
 /// deferring the tokenizer to first-call would only move a failure
 /// that setup already has the authority to surface.
 ///
-/// On full success sets [`PREFETCH_VERIFIED`] so [`load_inference`]
+/// On full success sets [`PREFETCH_CHECKED`] so [`load_inference`]
 /// can skip re-hashing.
 ///
 /// Returns `Ok(None)` when no fetch was attempted; `Ok(Some(path))`
-/// with the model path on success; `Err` on fetch/verify failure.
+/// with the model path on success; `Err` on fetch/check failure.
 pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     if !any_test_requires_model() {
         return Ok(None);
@@ -813,14 +813,14 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     // Release pairs with Acquire in load_inference to establish
     // happens-before between the ensure-side filesystem writes
     // (tempfile persist) and the fast-path reader.
-    PREFETCH_VERIFIED.store(true, Ordering::Release);
+    PREFETCH_CHECKED.store(true, Ordering::Release);
     Ok(Some(model_path))
 }
 
 /// Resolve the cache path for `spec` without re-hashing. Fails if
 /// the file is missing.
 ///
-/// Callers must have already SHA-verified the artifact in this
+/// Callers must have already SHA-checked the artifact in this
 /// process (via [`prefetch_if_required`]); otherwise use [`ensure`]
 /// so the first use triggers a SHA check.
 fn locate(spec: &ModelSpec) -> Result<PathBuf> {
@@ -828,7 +828,7 @@ fn locate(spec: &ModelSpec) -> Result<PathBuf> {
     let path = root.join(spec.file_name);
     if !path.is_file() {
         anyhow::bail!(
-            "model '{}' not present at {} — was SHA-verified earlier in this process \
+            "model '{}' not present at {} — was SHA-checked earlier in this process \
              but has since been removed; re-run to re-fetch, or check whether another \
              process cleared the cache",
             spec.file_name,
@@ -993,7 +993,7 @@ struct LoadedInference {
 
 /// Build the bundled Qwen3 weights + tokenizer + EOS id.
 ///
-/// When [`PREFETCH_VERIFIED`] is set, uses [`locate`] and skips
+/// When [`PREFETCH_CHECKED`] is set, uses [`locate`] and skips
 /// re-hashing the model's ~2.5 GiB. Otherwise falls back to
 /// [`ensure`] so first use triggers a SHA check.
 fn load_inference() -> anyhow::Result<LoadedInference> {
@@ -1002,7 +1002,7 @@ fn load_inference() -> anyhow::Result<LoadedInference> {
     use tokenizers::Tokenizer;
 
     // Acquire pairs with the Release store in prefetch_if_required.
-    let (model_path, tokenizer_path) = if PREFETCH_VERIFIED.load(Ordering::Acquire) {
+    let (model_path, tokenizer_path) = if PREFETCH_CHECKED.load(Ordering::Acquire) {
         (locate(&DEFAULT_MODEL)?, locate(&DEFAULT_TOKENIZER)?)
     } else {
         (ensure(&DEFAULT_MODEL)?, ensure(&DEFAULT_TOKENIZER)?)
@@ -1257,7 +1257,7 @@ fn memoized_inference() -> Arc<CachedInference> {
     arc
 }
 
-/// Clear [`MODEL_CACHE`] and [`PREFETCH_VERIFIED`] so the next
+/// Clear [`MODEL_CACHE`] and [`PREFETCH_CHECKED`] so the next
 /// [`extract_via_llm`] / [`load_inference`] call re-runs the load
 /// path end-to-end (including [`ensure`]'s offline-gate check).
 ///
@@ -1286,7 +1286,7 @@ fn memoized_inference() -> Arc<CachedInference> {
 /// affordance for re-exercising the load path.
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
-    PREFETCH_VERIFIED.store(false, Ordering::Release);
+    PREFETCH_CHECKED.store(false, Ordering::Release);
     let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
@@ -1469,7 +1469,7 @@ mod tests {
         let expected_hex = hex::encode(expected_bytes);
         assert!(check_sha256(tmp.path(), &expected_hex).unwrap());
 
-        // Negative: flip one byte at the far end and verify the
+        // Negative: flip one byte at the far end and check the
         // digest rejects, proving the hasher walked past the first
         // chunk.
         let mut tampered = data;
@@ -1913,7 +1913,7 @@ mod tests {
     /// ensure()'s offline-bail error echoes the env value
     /// through `sanitize_env_value`. Set `OFFLINE_ENV` to a value
     /// containing both control chars and overlong content, and
-    /// verify the error string contains neither a raw newline nor
+    /// check the error string contains neither a raw newline nor
     /// the full 200-char payload.
     #[test]
     fn ensure_offline_error_sanitizes_env_value_in_message() {
@@ -2288,7 +2288,7 @@ mod tests {
     /// digits, no more, no less. A placeholder or malformed pin
     /// would fail this check at build time (via
     /// `default_tokenizer_sha_is_valid_shape`) instead of surfacing
-    /// mid-CI when prefetch tries to verify.
+    /// mid-CI when prefetch tries to check.
     #[test]
     fn default_tokenizer_sha_is_valid_shape() {
         assert!(
@@ -2466,7 +2466,7 @@ mod tests {
     /// the offline-gate trip point so a regression that swallowed
     /// the env var context would fire here first.
     ///
-    /// Calls [`reset_for_test`] under [`lock_env`] so a `PREFETCH_VERIFIED
+    /// Calls [`reset_for_test`] under [`lock_env`] so a `PREFETCH_CHECKED
     /// = true` set by an earlier test does not route this call through
     /// `locate()` (which skips the offline-gate `ensure()` it expects).
     #[test]
@@ -2515,14 +2515,14 @@ mod tests {
     }
 
     /// `reset_for_test()` clears both [`MODEL_CACHE`] and
-    /// [`PREFETCH_VERIFIED`] so the next `extract_via_llm` /
+    /// [`PREFETCH_CHECKED`] so the next `extract_via_llm` /
     /// `load_inference` call re-runs the load path end-to-end.
     ///
     /// The contract this pins:
     /// 1. After `reset_for_test()`, the outer `MODEL_CACHE` slot is
     ///    `None` — the next `extract_via_llm` call re-runs
     ///    `load_inference` (and through it, `ensure()`'s offline gate).
-    /// 2. After `reset_for_test()`, `PREFETCH_VERIFIED` is `false` so
+    /// 2. After `reset_for_test()`, `PREFETCH_CHECKED` is `false` so
     ///    the next `load_inference` falls back to `ensure()` rather
     ///    than `locate()` and the offline gate is consulted again.
     ///
@@ -2537,7 +2537,7 @@ mod tests {
     /// the rendered error chains proves the same offline-gate code
     /// path ran both times.
     #[test]
-    fn reset_for_test_clears_model_cache_and_prefetch_verified() {
+    fn reset_for_test_clears_model_cache_and_prefetch_checked() {
         let _lock = lock_env();
         // Seed a populated slot so we can prove reset clears it. Use
         // the offline-gate path so seeding doesn't try to load the
@@ -2554,9 +2554,9 @@ mod tests {
                 "first extract_via_llm should populate MODEL_CACHE"
             );
         }
-        // Stamp PREFETCH_VERIFIED so we can prove the reset clears it
+        // Stamp PREFETCH_CHECKED so we can prove the reset clears it
         // alongside the cache.
-        PREFETCH_VERIFIED.store(true, Ordering::Release);
+        PREFETCH_CHECKED.store(true, Ordering::Release);
         // Reset: both must be cleared.
         reset_for_test();
         {
@@ -2567,8 +2567,8 @@ mod tests {
             );
         }
         assert!(
-            !PREFETCH_VERIFIED.load(Ordering::Acquire),
-            "reset_for_test must clear PREFETCH_VERIFIED to false"
+            !PREFETCH_CHECKED.load(Ordering::Acquire),
+            "reset_for_test must clear PREFETCH_CHECKED to false"
         );
         // Subsequent extract_via_llm under the same offline gate must
         // re-trip ensure() rather than reading a stale cached entry.
@@ -3033,7 +3033,7 @@ mod tests {
     }
 
     /// `locate()` is the fast-path sibling of `ensure()` used by
-    /// `load_inference` when `PREFETCH_VERIFIED` is set: it resolves
+    /// `load_inference` when `PREFETCH_CHECKED` is set: it resolves
     /// the cache path without re-hashing, but bails if the file has
     /// disappeared between the successful prefetch and the lazy load.
     /// Pins the error wording for that bail so a caller relying on
@@ -3067,7 +3067,7 @@ mod tests {
     /// must return Ok with the resolved PathBuf — no SHA check, no
     /// network. File contents are irrelevant: locate() gates on
     /// `path.is_file()` only (the caller contract is that SHA was
-    /// verified earlier via `prefetch_if_required`). An empty file is
+    /// checked earlier via `prefetch_if_required`). An empty file is
     /// enough to pass `is_file()` and prove the Ok branch returns the
     /// expected `root.join(file_name)` path.
     #[test]

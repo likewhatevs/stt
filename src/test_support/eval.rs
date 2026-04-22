@@ -66,7 +66,7 @@ pub(crate) const ERR_NO_TEST_RESULT_FROM_GUEST: &str = "no test result received 
      before reaching the host)";
 
 /// Reason body when EEVDF (no scheduler) produced no AssertResult.
-/// Pinned by `eval_eevdf_no_com2_output` and `eval_payload_exits_no_verify_result`.
+/// Pinned by `eval_eevdf_no_com2_output` and `eval_payload_exits_no_check_result`.
 pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
     "test function produced no output (no test result found)";
 
@@ -380,7 +380,7 @@ fn evaluate_vm_result(
         }
     };
 
-    if let Ok(verify_result) =
+    if let Ok(check_result) =
         parse_assert_result_shm(result.shm_data.as_ref()).or_else(|_| parse_assert_result(output))
     {
         // Write sidecar before checking pass/fail so both outcomes are captured.
@@ -394,7 +394,7 @@ fn evaluate_vm_result(
             entry,
             result,
             stimulus_events,
-            &verify_result,
+            &check_result,
             &work_type,
             active_flags,
             payload_metrics,
@@ -402,8 +402,8 @@ fn evaluate_vm_result(
             eprintln!("ktstr_test: {e:#}");
         }
 
-        if !verify_result.passed {
-            let details = verify_result
+        if !check_result.passed {
+            let details = check_result
                 .details
                 .iter()
                 .map(|d| d.message.as_str())
@@ -418,8 +418,8 @@ fn evaluate_vm_result(
                 .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
                 .unwrap_or_default();
             let timeline_section = build_timeline_section();
-            let stats_section = if !verify_result.stats.cgroups.is_empty() {
-                let s = &verify_result.stats;
+            let stats_section = if !check_result.stats.cgroups.is_empty() {
+                let s = &check_result.stats;
                 let mut lines = vec![format!(
                     "\n\n--- stats ---\n{} workers, {} cpus, {} migrations, worst_spread={:.1}%, worst_gap={}ms",
                     s.total_workers,
@@ -444,7 +444,7 @@ fn evaluate_vm_result(
             } else {
                 String::new()
             };
-            let console_section = if verify_result
+            let console_section = if check_result
                 .details
                 .iter()
                 .any(|d| d.contains("scheduler died") || d.contains("scheduler crashed"))
@@ -508,7 +508,7 @@ fn evaluate_vm_result(
             }
         }
 
-        return Ok(verify_result);
+        return Ok(check_result);
     }
 
     // No parseable result — no AssertResult found in SHM or COM2.
@@ -1263,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_payload_exits_no_verify_result() {
+    fn eval_payload_exits_no_check_result() {
         // Payload wrote something to COM2 but not a valid AssertResult.
         let entry = eevdf_entry("__eval_no_verify__");
         let result = make_vm_result(
@@ -1324,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_verify_result_passed_returns_ok() {
+    fn eval_check_result_passed_returns_ok() {
         let json = r#"{"passed":true,"skipped":false,"details":[],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_pass__");
@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_verify_result_failed_includes_details() {
+    fn eval_check_result_failed_includes_details() {
         let json = r#"{"passed":false,"skipped":false,"details":[{"kind":"Stuck","message":"stuck 3000ms"},{"kind":"Unfair","message":"spread 45%"}],"stats":{"cgroups":[],"total_workers":0,"total_cpus":0,"total_migrations":0,"worst_spread":0.0,"worst_gap_ms":0,"worst_gap_cpu":0,"worst_migration_ratio":0.0,"p99_wake_latency_us":0.0,"median_wake_latency_us":0.0,"wake_latency_cv":0.0,"total_iterations":0,"mean_run_delay_us":0.0,"worst_run_delay_us":0.0,"worst_page_locality":0.0,"worst_cross_node_migration_ratio":0.0}}"#;
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_fail_details__");

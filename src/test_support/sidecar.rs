@@ -594,7 +594,7 @@ pub(crate) fn write_sidecar(
     entry: &KtstrTestEntry,
     vm_result: &vmm::VmResult,
     stimulus_events: &[StimulusEvent],
-    verify_result: &AssertResult,
+    check_result: &AssertResult,
     work_type: &str,
     active_flags: &[String],
     payload_metrics: &[PayloadMetrics],
@@ -606,9 +606,9 @@ pub(crate) fn write_sidecar(
         scheduler,
         payload: entry.payload.map(|p| p.name.to_string()),
         metrics: payload_metrics.to_vec(),
-        passed: verify_result.passed,
-        skipped: verify_result.is_skipped(),
-        stats: verify_result.stats.clone(),
+        passed: check_result.passed,
+        skipped: check_result.is_skipped(),
+        stats: check_result.stats.clone(),
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
         stimulus_events: stimulus_events.to_vec(),
         work_type: work_type.to_string(),
@@ -985,8 +985,8 @@ mod tests {
             kvm_stats: None,
             crash_message: None,
         };
-        let verify_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[], &[]).unwrap();
+        let check_result = AssertResult::pass();
+        write_sidecar(&entry, &vm_result, &[], &check_result, "CpuSpin", &[], &[]).unwrap();
 
         // Clean up written file.
         let path = dir.join("__sidecar_default_dir__.ktstr.json");
@@ -1026,8 +1026,8 @@ mod tests {
             kvm_stats: None,
             crash_message: None,
         };
-        let verify_result = AssertResult::pass();
-        write_sidecar(&entry, &vm_result, &[], &verify_result, "CpuSpin", &[], &[]).unwrap();
+        let check_result = AssertResult::pass();
+        write_sidecar(&entry, &vm_result, &[], &check_result, "CpuSpin", &[], &[]).unwrap();
 
         // Sidecar filename now includes a variant hash suffix so
         // gauntlet variants don't clobber each other. Find the file

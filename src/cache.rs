@@ -1347,6 +1347,50 @@ mod tests {
         assert!(matches!(parsed, KernelSource::Local { git_hash: None, .. }));
     }
 
+    /// Pins the post-shim wire format: `Option` payload fields inside
+    /// every [`KernelSource`] variant serialize as explicit `null`
+    /// rather than being omitted. The `serde(default)` /
+    /// `skip_serializing_if` compat shims were removed for pre-1.0;
+    /// [`kernel_source_local_git_hash_serde_round_trip_none`] already
+    /// covers the round-trip statement for the single Local.git_hash
+    /// slot. This test extends that guarantee across every Option
+    /// payload on both Git and Local so `cargo ktstr kernel list
+    /// --json` consumers see stable key presence regardless of which
+    /// optional values are set — absent keys would mean the emitted
+    /// schema has silently regressed.
+    #[test]
+    fn kernel_source_option_fields_serialize_as_explicit_null() {
+        let local = KernelSource::Local {
+            source_tree_path: None,
+            git_hash: None,
+        };
+        let local_json = serde_json::to_string(&local).unwrap();
+        assert!(
+            local_json.contains(r#""source_tree_path":null"#),
+            "Local.source_tree_path=None must serialize as explicit null, got {local_json}"
+        );
+        assert!(
+            local_json.contains(r#""git_hash":null"#),
+            "Local.git_hash=None must serialize as explicit null, got {local_json}"
+        );
+
+        let git = KernelSource::Git {
+            git_hash: None,
+            git_ref: None,
+        };
+        let git_json = serde_json::to_string(&git).unwrap();
+        assert!(
+            git_json.contains(r#""git_hash":null"#),
+            "Git.git_hash=None must serialize as explicit null, got {git_json}"
+        );
+        // The struct field is `git_ref` but `#[serde(rename = "ref")]`
+        // renames the JSON key — check the renamed key, not the field.
+        assert!(
+            git_json.contains(r#""ref":null"#),
+            "Git.git_ref=None must serialize as explicit null under the `ref` key, got {git_json}"
+        );
+    }
+
     /// Older `metadata.json` files written before `Option` fields
     /// were emitted as explicit `null` simply omit the keys. The
     /// [`KernelSource`] doc states absent `Option` keys must
