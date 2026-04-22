@@ -1948,16 +1948,7 @@ impl KtstrVm {
 
     /// Initialize the SHM ring buffer header at `shm_base` in guest memory.
     fn init_shm_region(&self, guest_mem: &GuestMemoryMmap, shm_base: u64) -> Result<()> {
-        let shm_size = self.shm_size as usize;
-        let header = shm_ring::ShmRingHeader {
-            magic: shm_ring::SHM_RING_MAGIC,
-            version: shm_ring::SHM_RING_VERSION,
-            capacity: (shm_size - shm_ring::HEADER_SIZE) as u32,
-            control_bytes: 0,
-            write_ptr: 0,
-            read_ptr: 0,
-            drops: 0,
-        };
+        let header = shm_ring::ShmRingHeader::new(self.shm_size as usize);
         guest_mem
             .write_slice(
                 zerocopy::IntoBytes::as_bytes(&header),

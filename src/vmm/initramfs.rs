@@ -988,6 +988,41 @@ pub(crate) fn shm_segment_name(content_hash: u64) -> String {
 /// Holds the shared flock (`LOCK_SH`) for the lifetime of the mapping
 /// so that a concurrent writer cannot `ftruncate` the segment beneath
 /// us, which would cause `SIGBUS` on access to the truncated pages.
+///
+/// # Drop under `panic = "abort"`
+///
+/// Cargo.toml release profile sets `panic = "abort"`, so a panic in
+/// the release binary aborts the process without unwinding — Drop
+/// impls are **not run**. For `MappedShm` this means `munmap` and
+/// the `flock` unlock are skipped on the abort path. Neither is a
+/// resource leak in practice:
+///
+/// - **mmap**: the kernel reclaims all mappings on process exit.
+/// - **flock**: the lock is released when the fd is closed, which
+///   the kernel does on process exit.
+///
+/// The **SHM segment itself**, however, persists in `/dev/shm` until
+/// something calls `shm_unlink` on it. An aborted process never
+/// reaches its normal unlink sites, and `libc::atexit` handlers do
+/// not run on `abort()` either — so the segment leaks *from this
+/// run's perspective*. Cleanup is deferred: the next ktstr run
+/// sweeps orphans via [`crate::vmm::cleanup_stale_shm`], which
+/// non-blockingly `LOCK_EX`'s each stale entry and unlinks it when
+/// no other process holds a lock.
+///
+/// The resulting accumulation is bounded in the common case:
+/// repeated aborts during iterative local development trigger the
+/// next-run sweep, and /dev/shm is typically sized at ~50% of RAM
+/// (tmpfs default) which can hold many orphans before disk pressure.
+/// The pathological case is **one-shot CI jobs** that panic-abort
+/// and are never re-run: the segment remains until host reboot or
+/// manual `rm /dev/shm/ktstr-*` cleanup. An `atexit`-based cleanup
+/// would not help (`abort()` bypasses atexit); a signal handler
+/// that runs before the abort could, but would have to be
+/// async-signal-safe and cannot reliably walk the tracked-segment
+/// set under arbitrary signal arrival. Accepting the bounded leak
+/// is the design tradeoff from the panic-strategy decision
+/// (panic=abort with audited threads).
 pub(crate) struct MappedShm {
     ptr: *const u8,
     len: usize,
@@ -1014,6 +1049,10 @@ impl AsRef<[u8]> for MappedShm {
 
 impl Drop for MappedShm {
     fn drop(&mut self) {
+        // Note: under `panic = "abort"` this Drop is skipped entirely.
+        // See `MappedShm`'s type doc for the /dev/shm accumulation
+        // discussion and the `cleanup_stale_shm` recovery path.
+        //
         // SAFETY: ptr/len are from mmap; fd is an OwnedFd opened via
         // rustix::shm::open with LOCK_SH held. Release the mapping
         // first so the lock still protects it, then drop the flock

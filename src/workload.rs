@@ -1004,6 +1004,71 @@ pub struct WorkerReport {
     pub numa_pages: BTreeMap<usize, u64>,
     /// Delta of `/proc/vmstat` `numa_pages_migrated` over the work loop.
     pub vmstat_numa_pages_migrated: u64,
+    /// Diagnostic attached only to sentinel reports — populated when
+    /// `stop_and_collect` synthesized the entry because no (or
+    /// unparseable) JSON came back on the report pipe. `None` on every
+    /// real worker-produced report. Lets operators distinguish the
+    /// four failure shapes that all collapse to "empty pipe + no
+    /// report":
+    ///
+    /// - [`WorkerExitInfo::Exited`] with a non-zero code: worker
+    ///   reached `_exit(code)` without writing JSON — typically the
+    ///   `catch_unwind` Err arm in the worker-child closure (panic
+    ///   under `panic = "unwind"`) or the 30s poll-start timeout's
+    ///   early `_exit(1)`.
+    /// - [`WorkerExitInfo::Signaled`]: worker was killed — SIGABRT
+    ///   under `panic = "abort"`, SIGKILL from the still-alive
+    ///   escalation in `stop_and_collect`, or an external signal
+    ///   (OOM killer, operator SIGKILL).
+    /// - [`WorkerExitInfo::TimedOut`]: worker never exited within the
+    ///   5s collection deadline and the WNOHANG reap observed
+    ///   `StillAlive` — escalated via SIGKILL + `waitpid(None)`.
+    /// - [`WorkerExitInfo::WaitFailed`]: `waitpid` itself returned an
+    ///   error (ECHILD / EINTR). Typically a plumbing bug — the child
+    ///   was reaped by an external signal handler, a double-reap
+    ///   regression, or the pid was recycled.
+    ///
+    /// `skip_serializing_if = "Option::is_none"` keeps live-worker
+    /// reports compact: only sentinel reports carry the field over
+    /// the pipe. There is no cross-version compatibility concern
+    /// here — `WorkerReport` is pipe-transited child→parent within
+    /// a single `ktstr` process, never read back from a persisted
+    /// sidecar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_info: Option<WorkerExitInfo>,
+}
+
+/// Reason a sentinel [`WorkerReport`] was synthesized — attached to
+/// the report's `exit_info` field so operators can triage a missing
+/// JSON payload without cross-referencing parent-side logs.
+///
+/// Invariant: every variant carries the `waitpid`-derived status for
+/// the worker PID as of the end of `stop_and_collect`. Ordered from
+/// most-informative (exit code) to least (plumbing failure).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum WorkerExitInfo {
+    /// `WIFEXITED=true` with the given exit code. Non-zero under
+    /// `panic = "unwind"` means catch_unwind caught a panic in the
+    /// worker-child closure and `_exit(1)` fired, or the 30s
+    /// parent-ready poll timed out. Zero means the worker ran to
+    /// completion but failed to write / serialize the report — a
+    /// serde_json or pipe-write failure that didn't panic.
+    Exited(i32),
+    /// `WIFSIGNALED=true` with the given signal number. Under
+    /// `panic = "abort"` a worker panic raises SIGABRT (signal 6);
+    /// other values indicate external kill, OOM killer, or the
+    /// still-alive-escalation SIGKILL (signal 9) from this function.
+    Signaled(i32),
+    /// Worker was still running after the 5s shared collection
+    /// deadline; escalated via SIGKILL + blocking `waitpid`. The
+    /// child's final status is not retained — the reap happened past
+    /// the point where operator diagnostics would differ between a
+    /// clean timeout and a signal storm.
+    TimedOut,
+    /// `waitpid` itself returned `Err` — typically ECHILD (child
+    /// already reaped by an external signal handler or a double-reap
+    /// regression) or EINTR. Message is the rendered `errno` string.
+    WaitFailed(String),
 }
 
 /// PID of the scheduler process. Workers kill it on stall to trigger dump.
@@ -1593,6 +1658,29 @@ impl WorkloadHandle {
     /// corrupt data) get a zeroed-out sentinel report with `work_units: 0`.
     /// This ensures `assert_not_starved` catches dead workers as starvation
     /// failures.
+    ///
+    /// # Exit-shape invariance
+    ///
+    /// Collection discriminates purely on the presence and validity of
+    /// the worker's pipe-delivered JSON — **not** on `waitpid` exit
+    /// status. Under `panic = "unwind"` (dev/test profile) the worker's
+    /// `catch_unwind` arm calls `_exit(1)` so the parent sees
+    /// `WIFEXITED=true`, `WEXITSTATUS=1`; under `panic = "abort"`
+    /// (release profile) the worker aborts with `SIGABRT` so the parent
+    /// sees `WIFEXITED=false`, `WTERMSIG=6`. Either way, a panicking
+    /// worker never finishes `f.write_all(&json)` on the report pipe,
+    /// so `poll` + `read_to_end` hands back an empty (or truncated)
+    /// buffer, `serde_json::from_slice` fails, and the sentinel path
+    /// fires. Partial writes from a panic between successful
+    /// `write_all` and `_exit(0)` are not reachable — the write is the
+    /// last non-trivial statement inside the catch_unwind closure.
+    /// The `waitpid` call later in this function exists solely for
+    /// reaping zombies; its return value feeds only the "still alive
+    /// → SIGKILL escalate" branch and is never mapped to report
+    /// state (the sentinel path DOES now read it to populate
+    /// [`WorkerExitInfo`] on the attached diagnostic, but the
+    /// correctness discrimination — sentinel vs real report — still
+    /// happens purely on pipe payload presence).
     pub fn stop_and_collect(mut self) -> Vec<WorkerReport> {
         // Auto-start if not explicitly started (workers in parent cgroup)
         let was_started = self.started;
@@ -1660,39 +1748,54 @@ impl WorkloadHandle {
                 waited,
                 Ok(nix::sys::wait::WaitStatus::StillAlive),
             );
-            if still_running {
-                let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
-                let _ = nix::sys::wait::waitpid(npid, None);
-            }
+            // Preserve the reap shape for the sentinel path below:
+            // the WNOHANG attempt tells us "exited / signaled /
+            // still running" on the fast path; the SIGKILL + blocking
+            // waitpid below collapses "still running" into
+            // `WorkerExitInfo::TimedOut` without retaining the final
+            // status (the reap itself is the diagnostic — the child
+            // was past its deadline).
+            let exit_info_source: Result<nix::sys::wait::WaitStatus, nix::errno::Errno> =
+                if still_running {
+                    let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
+                    let _ = nix::sys::wait::waitpid(npid, None);
+                    Ok(nix::sys::wait::WaitStatus::StillAlive)
+                } else {
+                    waited
+                };
 
             if let Ok(report) = serde_json::from_slice::<WorkerReport>(&buf) {
                 reports.push(report);
             } else {
+                let exit_info = match exit_info_source {
+                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                        WorkerExitInfo::Exited(code)
+                    }
+                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+                        WorkerExitInfo::Signaled(sig as i32)
+                    }
+                    Ok(nix::sys::wait::WaitStatus::StillAlive) => WorkerExitInfo::TimedOut,
+                    // Every other WaitStatus variant (Stopped /
+                    // PtraceEvent / PtraceSyscall / Continued) means
+                    // the child is still under the kernel's
+                    // child-state machine and neither "exited" nor
+                    // "signaled" describes the terminal state —
+                    // shouldn't happen for a plain forked worker with
+                    // no ptrace parent, but collapse to TimedOut
+                    // rather than silently dropping the case.
+                    Ok(_) => WorkerExitInfo::TimedOut,
+                    Err(e) => WorkerExitInfo::WaitFailed(e.to_string()),
+                };
                 eprintln!(
-                    "ktstr: worker pid={pid} returned no report ({} bytes read)",
+                    "ktstr: worker pid={pid} returned no report ({} bytes read, exit={exit_info:?})",
                     buf.len()
                 );
                 reports.push(WorkerReport {
                     // Both `pid` and `WorkerReport.tid` are `pid_t`
                     // (i32) now — no cast needed.
                     tid: pid,
-                    work_units: 0,
-                    cpu_time_ns: 0,
-                    wall_time_ns: 0,
-                    off_cpu_ns: 0,
-                    migration_count: 0,
-                    cpus_used: BTreeSet::new(),
-                    migrations: Vec::new(),
-                    max_gap_ms: 0,
-                    max_gap_cpu: 0,
-                    max_gap_at_ms: 0,
-                    resume_latencies_ns: Vec::new(),
-                    iterations: 0,
-                    schedstat_run_delay_ns: 0,
-                    schedstat_ctx_switches: 0,
-                    schedstat_cpu_time_ns: 0,
-                    numa_pages: BTreeMap::new(),
-                    vmstat_numa_pages_migrated: 0,
+                    exit_info: Some(exit_info),
+                    ..WorkerReport::default()
                 });
             }
         }
@@ -2618,6 +2721,11 @@ fn worker_main(
         schedstat_cpu_time_ns: ss_cpu_delta,
         numa_pages,
         vmstat_numa_pages_migrated: vmstat_migrated_delta,
+        // Populated by the sentinel path in `stop_and_collect`; a
+        // report emitted from this (live) worker path always carries
+        // `None` — the child reached the `f.write_all(&json)` site
+        // and handed a complete report back to the parent.
+        exit_info: None,
     }
 }
 
@@ -3191,6 +3299,7 @@ mod tests {
             schedstat_cpu_time_ns: 4_000_000_000,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
+            exit_info: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -3839,6 +3948,7 @@ mod tests {
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
+            exit_info: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -3866,6 +3976,7 @@ mod tests {
             schedstat_cpu_time_ns: u64::MAX,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
+            exit_info: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -4232,6 +4343,7 @@ mod tests {
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
+            exit_info: None,
         };
         let s = format!("{:?}", r);
         assert!(s.contains("42"), "must show tid value");
@@ -4284,6 +4396,7 @@ mod tests {
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
+            exit_info: None,
         };
         assert_eq!(r.off_cpu_ns, r.wall_time_ns - r.cpu_time_ns);
     }
@@ -4928,6 +5041,7 @@ mod tests {
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
+            exit_info: None,
         }
     }
 
@@ -4971,6 +5085,7 @@ mod tests {
             schedstat_cpu_time_ns: 0,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
+            exit_info: None,
         }
     }
 

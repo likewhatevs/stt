@@ -173,6 +173,7 @@ fn fault_under_lock(stop: &AtomicBool) -> WorkerReport {
         schedstat_cpu_time_ns: 0,
         numa_pages: BTreeMap::new(),
         vmstat_numa_pages_migrated: 0,
+        exit_info: None,
     }
 }
 
@@ -196,6 +197,7 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
         schedstat_cpu_time_ns: 0,
         numa_pages: BTreeMap::new(),
         vmstat_numa_pages_migrated: 0,
+        exit_info: None,
     }
 }
 

@@ -134,9 +134,16 @@ pub const DUMP_REQ_SYSRQ_D: u8 = b'D';
 /// this byte, creates /tmp/ktstr_stall, and clears it back to 0.
 pub const STALL_REQ_OFFSET: usize = 13;
 
-/// Test helper — value written to STALL_REQ_OFFSET to request a
-/// scheduler stall.
-#[cfg(test)]
+/// Value written to STALL_REQ_OFFSET to request a scheduler stall.
+///
+/// Consumed by the guest-side poll in `rust_init::shm_poll_loop`
+/// (src/vmm/rust_init.rs). No production host-side writer exists yet
+/// — the stall is activated by out-of-band pokes to the SHM byte
+/// during debugging sessions. The const is kept in the lib crate (not
+/// `#[cfg(test)]`) so the guest reader can reference it by name,
+/// giving the wire protocol a single source of truth: a future
+/// byte-value change at this definition automatically reaches the
+/// reader without a hand-sync step.
 pub const STALL_REQ_ACTIVATE: u8 = b'S';
 
 /// Base offset within the SHM region for numbered signal slots.
@@ -389,6 +396,33 @@ pub struct ShmRingHeader {
 
 const _HEADER_SIZE: () = assert!(std::mem::size_of::<ShmRingHeader>() == 40);
 
+impl ShmRingHeader {
+    /// Build a fresh ring header for an SHM region of `shm_size` bytes.
+    /// Saturating subtraction on `shm_size - HEADER_SIZE` means a mis-
+    /// sized region (`shm_size < HEADER_SIZE`) surfaces as a zero-
+    /// capacity ring rather than a panic — every `shm_write` then hits
+    /// the ring-full branch and the operator sees the empty data area
+    /// instead of losing the VMM to an arithmetic underflow before the
+    /// layout error can surface.
+    ///
+    /// Single source of truth for magic/version/capacity field
+    /// population: production `VmmState::init_shm_region`
+    /// (src/vmm/mod.rs) and the `#[cfg(test)] shm_init` helper both
+    /// call this, so a schema edit lands once.
+    pub fn new(shm_size: usize) -> Self {
+        let capacity = shm_size.saturating_sub(HEADER_SIZE);
+        Self {
+            magic: SHM_RING_MAGIC,
+            version: SHM_RING_VERSION,
+            capacity: capacity as u32,
+            control_bytes: 0,
+            write_ptr: 0,
+            read_ptr: 0,
+            drops: 0,
+        }
+    }
+}
+
 /// TLV message header preceding each payload in the ring.
 ///
 /// CRC32 covers only the payload bytes (not this header).
@@ -495,22 +529,13 @@ impl StimulusEvent {
 ///
 /// `buf` is the full guest memory slice. `shm_offset` is the byte offset
 /// where the SHM region starts. `shm_size` is the total region size.
+///
+/// The header is built via [`ShmRingHeader::new`], the same constructor
+/// production `VmmState::init_shm_region` uses — a schema change lands
+/// once and both sites pick it up.
 #[cfg(test)]
 pub fn shm_init(buf: &mut [u8], shm_offset: usize, shm_size: usize) {
-    // Clamp to 0 when the caller mis-sized the region: a 0-capacity ring
-    // is internally consistent (every `shm_write` hits the ring-full
-    // branch and drops), whereas an arithmetic underflow would panic the
-    // VMM before the shm layout error could surface to the operator.
-    let capacity = shm_size.saturating_sub(HEADER_SIZE);
-    let header = ShmRingHeader {
-        magic: SHM_RING_MAGIC,
-        version: SHM_RING_VERSION,
-        capacity: capacity as u32,
-        control_bytes: 0,
-        write_ptr: 0,
-        read_ptr: 0,
-        drops: 0,
-    };
+    let header = ShmRingHeader::new(shm_size);
     let hdr_bytes = header.as_bytes();
     buf[shm_offset..shm_offset + HEADER_SIZE].copy_from_slice(hdr_bytes);
     // Zero the data area.

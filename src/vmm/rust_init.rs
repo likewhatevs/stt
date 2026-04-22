@@ -1337,13 +1337,13 @@ fn shm_poll_loop(shm_base: u64, shm_size: u64, stop: &AtomicBool, trace_stop: Op
     while !stop.load(Ordering::Acquire) {
         unsafe {
             let dump_byte = *(shm_ptr.add(dump_offset));
-            if dump_byte == b'D' {
+            if dump_byte == crate::vmm::shm_ring::DUMP_REQ_SYSRQ_D {
                 let _ = fs::write("/proc/sysrq-trigger", "D");
                 *(shm_ptr.add(dump_offset)) = 0;
             }
 
             let stall_byte = *(shm_ptr.add(stall_offset));
-            if stall_byte == b'S' {
+            if stall_byte == crate::vmm::shm_ring::STALL_REQ_ACTIVATE {
                 let _ = fs::File::create("/tmp/ktstr_stall");
                 *(shm_ptr.add(stall_offset)) = 0;
             }
