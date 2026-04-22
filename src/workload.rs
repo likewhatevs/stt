@@ -1123,21 +1123,22 @@ impl Drop for SpawnGuard {
     fn drop(&mut self) {
         // Kill and reap any already-forked children first, so their
         // pipe ends are not left blocked when we close the parent
-        // side.
+        // side. `nix` wrappers replace the raw libc calls — kill
+        // returns `Result<()>` (we swallow ECHILD/ESRCH in the
+        // already-exited case), waitpid returns `Result<WaitStatus>`
+        // (we discard the status in the cleanup path), close returns
+        // `Result<()>` (we swallow EBADF for fds an earlier arm may
+        // have already closed).
         for &(pid, _, _) in &self.children {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                let mut status = 0i32;
-                libc::waitpid(pid, &mut status, 0);
-            }
+            let npid = nix::unistd::Pid::from_raw(pid);
+            let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
+            let _ = nix::sys::wait::waitpid(npid, None);
         }
         // Close each child's parent-side report/start fds.
         for &(_, rfd, wfd) in &self.children {
             for fd in [rfd, wfd] {
                 if fd >= 0 {
-                    unsafe {
-                        libc::close(fd);
-                    }
+                    let _ = nix::unistd::close(fd);
                 }
             }
         }
@@ -1146,9 +1147,7 @@ impl Drop for SpawnGuard {
         // only remaining references.
         for (ab, ba) in &self.pipe_pairs {
             for fd in [ab[0], ab[1], ba[0], ba[1]] {
-                unsafe {
-                    libc::close(fd);
-                }
+                let _ = nix::unistd::close(fd);
             }
         }
         // Munmap shared regions.
@@ -1642,26 +1641,28 @@ impl WorkloadHandle {
                     let _ = f.read_to_end(&mut buf);
                     drop(f);
                 } else {
-                    unsafe {
-                        libc::close(read_fd);
-                    }
+                    let _ = nix::unistd::close(read_fd);
                 }
             } else {
-                unsafe {
-                    libc::close(read_fd);
-                }
+                let _ = nix::unistd::close(read_fd);
             }
 
             // Wait for child (WNOHANG first, then SIGKILL if still alive).
-            // `pid` is already `libc::pid_t`, so no sign cast is
-            // needed at the libc boundary.
-            let mut status = 0i32;
-            let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if ret == 0 {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                    libc::waitpid(pid, &mut status, 0);
-                }
+            // `pid` is `libc::pid_t` (= i32 on Linux), which passes
+            // straight into `Pid::from_raw` without a sign cast —
+            // the old u32→i32 session-wide-reap hazard is avoided.
+            let npid = nix::unistd::Pid::from_raw(pid);
+            let waited = nix::sys::wait::waitpid(
+                npid,
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+            );
+            let still_running = matches!(
+                waited,
+                Ok(nix::sys::wait::WaitStatus::StillAlive),
+            );
+            if still_running {
+                let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(npid, None);
             }
 
             if let Ok(report) = serde_json::from_slice::<WorkerReport>(&buf) {

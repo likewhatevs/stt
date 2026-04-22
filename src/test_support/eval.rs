@@ -783,10 +783,21 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
     // genuinely missing at test time.
     match super::model::prefetch_if_required() {
         Ok(Some(path)) => {
+            // `prefetch_if_required` owns the stderr "model cache
+            // ready" notice (only emitted on a cache miss, to avoid
+            // noise on every warm-cache run). Keep the tracing
+            // line here for structured-log consumers — it always
+            // fires, miss or hit.
             tracing::info!(path = %path.display(), "model cache ready");
         }
         Ok(None) => {}
         Err(e) => {
+            // Dual-emit: stderr for nextest-direct first-time-user
+            // visibility (no tracing subscriber installed in the
+            // default test dispatch path), tracing for
+            // cargo-ktstr-wrapped runs and structured-log
+            // consumers.
+            eprintln!("ktstr: model prefetch failed; LlmExtract tests may fail: {e:#}");
             tracing::warn!(
                 error = ?e,
                 "model prefetch failed; LlmExtract tests may fail",

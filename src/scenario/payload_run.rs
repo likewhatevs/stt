@@ -279,9 +279,28 @@ fn evaluate(
     checks: &[Check],
     output: SpawnOutput,
 ) -> (AssertResult, PayloadMetrics) {
-    let mut metrics = extract_metrics(&output.stdout, &payload.output);
+    // `extract_metrics` returns Result specifically so an
+    // `OutputFormat::LlmExtract` setup failure (model cache load,
+    // not mere "no metrics extracted") can surface its reason into
+    // the AssertResult rather than collapse into a vague
+    // "metric 'X' not found" downstream. Non-LlmExtract formats are
+    // infallible and always Ok.
+    let stdout_result = extract_metrics(&output.stdout, &payload.output);
+    let (mut metrics, mut extract_err) = match stdout_result {
+        Ok(m) => (m, None::<String>),
+        Err(msg) => (Vec::new(), Some(msg)),
+    };
     if metrics.is_empty() && !output.stderr.is_empty() {
-        metrics = extract_metrics(&output.stderr, &payload.output);
+        // Stderr fallback — only retry if stdout produced neither
+        // metrics nor a load-failure reason (a load failure is
+        // sticky across stdout/stderr — reason string is identical,
+        // no point re-invoking inference).
+        if extract_err.is_none() {
+            match extract_metrics(&output.stderr, &payload.output) {
+                Ok(m) => metrics = m,
+                Err(msg) => extract_err = Some(msg),
+            }
+        }
     }
     resolve_polarities(&mut metrics, payload);
 
@@ -291,6 +310,42 @@ fn evaluate(
     };
 
     emit_payload_metrics_to_shm(&payload_metrics);
+
+    // Short-circuit when LlmExtract load failed: running
+    // `evaluate_checks` against an empty metrics vec would flood
+    // the AssertResult with a cascade of "metric 'X' not found"
+    // Other-kind details, burying the real root cause. Surface
+    // the load-failure detail as the sole (and first) entry and
+    // set passed=false directly.
+    if let Some(reason) = extract_err {
+        let mut result = AssertResult {
+            passed: false,
+            skipped: false,
+            details: vec![crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!("LlmExtract model load failed: {reason}"),
+            )],
+            stats: Default::default(),
+        };
+        // Still run the exit-code gate if a Check::ExitCodeEq is
+        // set on the payload — exit code is orthogonal to the
+        // metric pipeline and may still be meaningful (e.g. the
+        // payload itself crashed before the model-load cache check
+        // returned Err, so the user wants both signals). Reuse
+        // `format_exit_mismatch` + `DetailKind::Other` for shape
+        // parity with `evaluate_checks`'s own exit-code branch.
+        for check in checks {
+            if let Check::ExitCodeEq(expected) = check
+                && output.exit_code != *expected
+            {
+                result.details.push(crate::assert::AssertDetail::new(
+                    crate::assert::DetailKind::Other,
+                    format_exit_mismatch(output.exit_code, *expected, &output.stderr),
+                ));
+            }
+        }
+        return (result, payload_metrics);
+    }
 
     let result = evaluate_checks(checks, &payload_metrics, &output.stderr);
     (result, payload_metrics)
@@ -1137,6 +1192,18 @@ fn spawn_child(
     Ok((child, sigchld))
 }
 
+/// Per-stream cap on captured child output. 16 MiB covers every
+/// realistic benchmark stdout in the crate (typical schbench /
+/// stress-ng / LLM-extract flows emit kilobytes to low-hundreds-of-KB)
+/// with multiple orders of magnitude of slack, while cutting off
+/// OOM pressure from a pathological payload that prints unbounded
+/// GBs. Output past the cap is truncated, not errored, so downstream
+/// (metric extraction, sidecar) still sees a prefix — the only loss
+/// is the tail, which is rarely load-bearing. Each truncation emits
+/// a paired `eprintln!` + `tracing::warn!` notice naming the stream
+/// and the cap byte count.
+pub(crate) const MAX_CAPTURED_STREAM_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Reap a (possibly already-killed) [`Child`]: wait for it to
 /// exit, drain stdout + stderr, return the captured output.
 ///
@@ -1153,42 +1220,94 @@ fn spawn_child(
 /// of the empty pipe. Drain both pipes concurrently via helper
 /// threads, mirroring what `std::process::Command::output` does
 /// for the foreground path.
+///
+/// Each reader thread wraps its source in
+/// `Read::take(MAX_CAPTURED_STREAM_BYTES)` — see the constant's
+/// rationale — so a runaway child cannot OOM the host. The tail
+/// past the cap is discarded; `compose_prompt` / metric pipelines
+/// always receive a bounded buffer.
 fn wait_and_capture(child: &mut std::process::Child) -> Result<SpawnOutput> {
-    use std::io::Read;
-    let stdout_handle = child.stdout.take().map(|mut out| {
-        std::thread::spawn(move || -> std::io::Result<String> {
-            let mut buf = String::new();
-            out.read_to_string(&mut buf)?;
-            Ok(buf)
+    let stdout_handle = child.stdout.take().map(|out| {
+        std::thread::spawn(move || -> std::io::Result<(String, bool)> {
+            drain_capped(out, "stdout")
         })
     });
-    let stderr_handle = child.stderr.take().map(|mut err| {
-        std::thread::spawn(move || -> std::io::Result<String> {
-            let mut buf = String::new();
-            err.read_to_string(&mut buf)?;
-            Ok(buf)
+    let stderr_handle = child.stderr.take().map(|err| {
+        std::thread::spawn(move || -> std::io::Result<(String, bool)> {
+            drain_capped(err, "stderr")
         })
     });
     let status = child.wait().with_context(|| "wait child")?;
-    let stdout = match stdout_handle {
+    let (stdout, _stdout_truncated) = match stdout_handle {
         Some(h) => h
             .join()
             .map_err(|_| anyhow!("stdout reader thread panicked"))?
             .with_context(|| "read child stdout")?,
-        None => String::new(),
+        None => (String::new(), false),
     };
-    let stderr = match stderr_handle {
+    let (stderr, _stderr_truncated) = match stderr_handle {
         Some(h) => h
             .join()
             .map_err(|_| anyhow!("stderr reader thread panicked"))?
             .with_context(|| "read child stderr")?,
-        None => String::new(),
+        None => (String::new(), false),
     };
     Ok(SpawnOutput {
         stdout,
         stderr,
         exit_code: status.code().unwrap_or(-1),
     })
+}
+
+/// Read `src` into a `String` with `MAX_CAPTURED_STREAM_BYTES` cap.
+/// Returns `(buf, truncated)`. Emits a paired `eprintln!` +
+/// `tracing::warn!` notice with the stream label (e.g. "stdout" /
+/// "stderr") and cap byte count when the cap is hit.
+///
+/// Truncation is performed at the byte level on a `Vec<u8>` so a
+/// split multi-byte UTF-8 char at the cap boundary cannot panic.
+/// The final `String::from_utf8_lossy` replaces any invalid UTF-8
+/// bytes with U+FFFD — including the partial-char split that byte
+/// truncation can introduce. Non-truncated output preserves the
+/// original bytes verbatim when it is already valid UTF-8; the
+/// only behavioral delta vs the pre-cap `read_to_string` path is
+/// that invalid UTF-8 in the child's full output now produces
+/// replacement chars instead of an `io::ErrorKind::InvalidData`
+/// upstream error. That trade is deliberate: past the cap there is
+/// no way to report "invalid UTF-8" meaningfully since the tail is
+/// gone, and making the pre-cap path lossy keeps semantics uniform.
+fn drain_capped(
+    src: impl std::io::Read,
+    label: &'static str,
+) -> std::io::Result<(String, bool)> {
+    use std::io::Read;
+    // One extra byte probes whether the source had more to offer —
+    // `Take` returns EOF at exactly the cap, indistinguishable from
+    // a child that emitted exactly `cap` bytes. We cap our own buffer
+    // at MAX + 1 and check the read count.
+    let mut raw: Vec<u8> = Vec::new();
+    let n = src
+        .take(MAX_CAPTURED_STREAM_BYTES + 1)
+        .read_to_end(&mut raw)?;
+    let truncated = n as u64 > MAX_CAPTURED_STREAM_BYTES;
+    if truncated {
+        raw.truncate(MAX_CAPTURED_STREAM_BYTES as usize);
+        // Dual-emit: stderr for nextest-direct test runs (no
+        // tracing subscriber installed in the default test-support
+        // dispatch path), tracing for cargo-ktstr-wrapped runs and
+        // structured-log consumers. Same rationale as the prefetch
+        // notices — a silent-truncation warn that only reaches the
+        // no-op dispatcher fails the visibility goal of this check.
+        eprintln!(
+            "ktstr: payload {label} exceeded {MAX_CAPTURED_STREAM_BYTES} bytes; tail discarded"
+        );
+        tracing::warn!(
+            stream = label,
+            cap_bytes = MAX_CAPTURED_STREAM_BYTES,
+            "payload {label} exceeded capture cap; tail discarded",
+        );
+    }
+    Ok((String::from_utf8_lossy(&raw).into_owned(), truncated))
 }
 
 #[cfg(test)]

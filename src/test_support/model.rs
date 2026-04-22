@@ -848,6 +848,13 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     }
     if let Some(v) = read_offline_env() {
         let v_safe = sanitize_env_value(&v);
+        // Dual-emit: stderr for nextest-direct first-time-user
+        // visibility (no tracing subscriber is installed in the
+        // test-support dispatch path), tracing for structured-log
+        // consumers (cargo-ktstr, downstream pipelines).
+        eprintln!(
+            "ktstr: LlmExtract offline gate set ({OFFLINE_ENV}={v_safe}); skipping model prefetch"
+        );
         tracing::warn!(
             env_var = OFFLINE_ENV,
             value = %v_safe,
@@ -855,12 +862,42 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
         );
         return Ok(None);
     }
+    // Probe cache status before kicking off the (potentially
+    // ~2-minute, ~2.4 GiB) download so first-time users get a line
+    // of feedback instead of staring at a silent stall. Any status
+    // error here is non-fatal — we fall through to `ensure`, which
+    // surfaces the real failure with full context. On an already-
+    // populated cache both probes succeed with `cached && sha_matches`
+    // and we skip the announcement entirely, matching the existing
+    // "zero noise on cache hit" semantics.
+    let model_missing = matches!(
+        status(&DEFAULT_MODEL),
+        Ok(s) if !s.cached || !s.sha_matches,
+    );
+    let tokenizer_missing = matches!(
+        status(&DEFAULT_TOKENIZER),
+        Ok(s) if !s.cached || !s.sha_matches,
+    );
+    let announced = model_missing || tokenizer_missing;
+    if announced {
+        eprintln!(
+            "ktstr: downloading LlmExtract model (~2.4 GiB; first run only) …"
+        );
+        tracing::info!(
+            model_missing,
+            tokenizer_missing,
+            "downloading LlmExtract model on first run",
+        );
+    }
     let model_path = ensure(&DEFAULT_MODEL)?;
     ensure(&DEFAULT_TOKENIZER)?;
     // Release pairs with Acquire in load_inference to establish
     // happens-before between the ensure-side filesystem writes
     // (tempfile persist) and the fast-path reader.
     PREFETCH_CHECKED.store(true, Ordering::Release);
+    if announced {
+        eprintln!("ktstr: model cache ready");
+    }
     Ok(Some(model_path))
 }
 
@@ -1355,20 +1392,40 @@ pub(crate) fn reset() {
 /// inference call on the same prompt + weights produces byte-
 /// identical output. Retrying would only burn wall time without
 /// changing the result.
-pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Metric> {
+/// Return signature — `Result<Vec<Metric>, String>` — distinguishes
+/// three outcomes:
+///
+/// - `Ok(metrics)` — inference ran, JSON parsed; `metrics` may be
+///   empty if the model emitted a valid-JSON-but-no-numeric-leaves
+///   response (documented contract).
+/// - `Ok(Vec::new())` — model inference ran but response was not
+///   parseable JSON, or inference itself failed mid-forward-pass.
+///   These paths are non-fatal (documented "empty metric set on
+///   inference hiccup") and the caller keeps going.
+/// - `Err(reason)` — the **model cache load** failed. This is a
+///   setup-level problem (missing weights, bad SHA, corrupt GGUF).
+///   The `Check` evaluator translates the reason into a
+///   `DetailKind::Other` entry on the `AssertResult` so the user
+///   sees "LlmExtract model load failed: <reason>" instead of an
+///   opaque "metric 'foo' not found" when the real failure was
+///   that the model never loaded.
+pub(crate) fn extract_via_llm(
+    stdout: &str,
+    hint: Option<&str>,
+) -> Result<Vec<super::Metric>, String> {
     let prompt = compose_prompt(stdout, hint);
 
     // `memoized_inference` serializes concurrent first-call races on
     // the outer mutex: every caller observes the same stored value,
     // and exactly one caller's closure runs end-to-end. A failed load
-    // is memoized as `Err` so subsequent calls return an empty metric
-    // set without repeating the 2.44 GiB load.
+    // is memoized as `Err` so subsequent calls return the same
+    // reason string without repeating the 2.44 GiB load.
     let cached = memoized_inference();
     let cache = match cached.as_ref() {
         Ok(c) => c,
         Err(msg) => {
             tracing::warn!(%msg, "LlmExtract model load failed (cached)");
-            return Vec::new();
+            return Err(msg.clone());
         }
     };
     let mut state = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -1377,11 +1434,14 @@ pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Me
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = ?e, "LlmExtract inference failed");
-            return Vec::new();
+            return Ok(Vec::new());
         }
     };
     match super::metrics::find_and_parse_json(&response) {
-        Some(json) => super::metrics::walk_json_leaves(&json, super::MetricSource::LlmExtract),
+        Some(json) => Ok(super::metrics::walk_json_leaves(
+            &json,
+            super::MetricSource::LlmExtract,
+        )),
         None => {
             // Intentionally log only `response.len()` (byte count), not
             // the body. The response can run up to SAMPLE_LEN tokens —
@@ -1395,7 +1455,7 @@ pub(crate) fn extract_via_llm(stdout: &str, hint: Option<&str>) -> Vec<super::Me
                 response_bytes = response.len(),
                 "LlmExtract response was not parseable JSON; returning empty metric set",
             );
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 }
@@ -1739,13 +1799,13 @@ mod tests {
     #[test]
     fn status_captures_io_error_for_unreadable_cached_file() {
         use std::os::unix::fs::PermissionsExt;
-        // SAFETY: libc::geteuid is documented (POSIX) to always succeed
-        // with no errno side effect — there's nothing to synchronize
-        // and the call is thread-safe by POSIX contract. nix's own
-        // wrapper would be preferable but ktstr's nix feature set
-        // omits "user", so reaching for libc directly avoids a
-        // Cargo.toml change for a test-only root check.
-        if unsafe { libc::geteuid() } == 0 {
+        // `nix::unistd::geteuid()` is a safe wrapper over the POSIX
+        // `geteuid(2)` syscall — infallible by spec, no errno side
+        // effect. The `user` feature on the nix dep (Cargo.toml)
+        // gates this wrapper; with the feature enabled we avoid the
+        // `unsafe` block and the manual integer compare the earlier
+        // code needed.
+        if nix::unistd::geteuid().is_root() {
             eprintln!(
                 "skipping status_captures_io_error_for_unreadable_cached_file: \
                  running as root, mode 0o000 does not block reads under DAC"
@@ -2635,10 +2695,20 @@ mod tests {
         reset();
         let _cache = isolated_cache_dir();
         let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
-        let metrics = extract_via_llm("arbitrary stdout", None);
-        assert!(metrics.is_empty());
-        let metrics = extract_via_llm("stdout with hint", Some("focus"));
-        assert!(metrics.is_empty());
+        // A cache-load failure (the offline gate in this test) now
+        // surfaces as `Err(reason)` rather than `Ok(Vec::new())` so
+        // the Check evaluator can thread the reason into the
+        // AssertResult. The "returns empty" test-name predates the
+        // signature change — kept for git blame continuity.
+        let err = extract_via_llm("arbitrary stdout", None)
+            .expect_err("offline gate must produce Err");
+        assert!(
+            err.contains(OFFLINE_ENV),
+            "reason should name the offline env var, got: {err}"
+        );
+        let err = extract_via_llm("stdout with hint", Some("focus"))
+            .expect_err("offline gate must produce Err with hint variant");
+        assert!(err.contains(OFFLINE_ENV));
     }
 
     /// `reset()` clears both [`MODEL_CACHE`] and

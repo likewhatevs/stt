@@ -107,7 +107,7 @@ fn fio_extract_metrics_smoke_from_realistic_json() {
         "write": {"iops": 78.9,    "lat_ns": {"mean": 2500.0}}
       }]
     }"#;
-    let metrics = extract_metrics(stdout, &FIO.output);
+    let metrics = extract_metrics(stdout, &FIO.output).unwrap();
     let by_name: std::collections::BTreeMap<&str, f64> =
         metrics.iter().map(|m| (m.name.as_str(), m.value)).collect();
 
@@ -129,7 +129,7 @@ fn fio_extract_metrics_smoke_from_realistic_json() {
 /// pre-pass, not by metric values).
 #[test]
 fn stress_ng_extract_metrics_smoke_returns_empty() {
-    let metrics = extract_metrics("irrelevant stdout", &STRESS_NG.output);
+    let metrics = extract_metrics("irrelevant stdout", &STRESS_NG.output).unwrap();
     assert!(
         metrics.is_empty(),
         "ExitCode output emits no metrics; got {metrics:?}"
@@ -246,7 +246,7 @@ fn fixtures_are_not_scheduler_kind() {
 #[test]
 fn extract_metrics_does_not_apply_polarity_hints() {
     let stdout = r#"{"jobs":[{"read":{"iops": 1.0}}]}"#;
-    let metrics = extract_metrics(stdout, &FIO.output);
+    let metrics = extract_metrics(stdout, &FIO.output).unwrap();
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].name, "jobs.0.read.iops");
     // The hint says HigherBetter + "iops"; extract_metrics leaves

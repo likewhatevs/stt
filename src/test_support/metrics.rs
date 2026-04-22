@@ -43,12 +43,12 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 /// JSON with [`MetricSource::LlmExtract`]. An unavailable inference
 /// backend (missing cache, forward-pass failure) yields an empty
 /// metric set, matching the non-fatal contract above.
-pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Vec<Metric> {
+pub fn extract_metrics(stdout: &str, format: &OutputFormat) -> Result<Vec<Metric>, String> {
     match format {
-        OutputFormat::ExitCode => Vec::new(),
-        OutputFormat::Json => find_and_parse_json(stdout)
+        OutputFormat::ExitCode => Ok(Vec::new()),
+        OutputFormat::Json => Ok(find_and_parse_json(stdout)
             .map(|v| walk_json_leaves(&v, MetricSource::Json))
-            .unwrap_or_default(),
+            .unwrap_or_default()),
         OutputFormat::LlmExtract(hint) => super::model::extract_via_llm(stdout, *hint),
     }
 }
@@ -242,14 +242,14 @@ mod tests {
 
     #[test]
     fn exit_code_returns_empty() {
-        let m = extract_metrics("whatever", &OutputFormat::ExitCode);
+        let m = extract_metrics("whatever", &OutputFormat::ExitCode).unwrap();
         assert!(m.is_empty());
     }
 
     #[test]
     fn json_full_document_extracts_numeric_leaves() {
         let s = r#"{"iops": 10000, "lat_ns": 500}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 2);
         let names: Vec<_> = m.iter().map(|x| x.name.as_str()).collect();
         assert!(names.contains(&"iops"));
@@ -265,7 +265,7 @@ mod tests {
     fn json_with_banner_prefix_extracts_region() {
         // Fio-style: banner line then JSON body.
         let s = "fio-3.36 starting up\n{\"iops\": 500}";
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "iops");
         assert_eq!(m[0].value, 500.0);
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn json_nested_objects_use_dotted_paths() {
         let s = r#"{"jobs": {"0": {"read": {"iops": 123}}}}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "jobs.0.read.iops");
         assert_eq!(m[0].value, 123.0);
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn json_arrays_use_numeric_index_paths() {
         let s = r#"{"samples": [100, 200, 300]}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 3);
         let mut actual: Vec<(&str, f64)> = m.iter().map(|x| (x.name.as_str(), x.value)).collect();
         actual.sort_by_key(|(n, _)| n.to_string());
@@ -299,20 +299,20 @@ mod tests {
 
     #[test]
     fn json_malformed_returns_empty() {
-        let m = extract_metrics("garbage not json", &OutputFormat::Json);
+        let m = extract_metrics("garbage not json", &OutputFormat::Json).unwrap();
         assert!(m.is_empty());
     }
 
     #[test]
     fn json_empty_stdout_returns_empty() {
-        let m = extract_metrics("", &OutputFormat::Json);
+        let m = extract_metrics("", &OutputFormat::Json).unwrap();
         assert!(m.is_empty());
     }
 
     #[test]
     fn json_skips_string_and_bool_leaves() {
         let s = r#"{"name": "fio", "ok": true, "iops": 42}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         // Only iops is numeric.
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "iops");
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn json_top_level_array_extracts_entries() {
         let s = "[1, 2, 3]";
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 3);
     }
 
@@ -346,8 +346,16 @@ mod tests {
         super::super::model::reset();
         let _cache = super::super::test_helpers::isolated_cache_dir();
         let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
-        let m = extract_metrics("anything", &OutputFormat::LlmExtract(None));
-        assert!(m.is_empty());
+        // Return is `Err(reason)` — a model-cache load failure is
+        // surfaced as a threaded reason string so the Check
+        // evaluator can attach it to the AssertResult. The exact
+        // reason message includes the offline-gate env-var name.
+        let err = extract_metrics("anything", &OutputFormat::LlmExtract(None))
+            .expect_err("offline gate must produce Err from extract_metrics");
+        assert!(
+            err.contains(super::super::model::OFFLINE_ENV),
+            "reason should name the offline env var, got: {err}"
+        );
     }
 
     #[test]
@@ -362,11 +370,15 @@ mod tests {
         super::super::model::reset();
         let _cache = super::super::test_helpers::isolated_cache_dir();
         let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
-        let m = extract_metrics(
+        let err = extract_metrics(
             "anything",
             &OutputFormat::LlmExtract(Some("focus on latency")),
+        )
+        .expect_err("offline gate must produce Err from extract_metrics");
+        assert!(
+            err.contains(super::super::model::OFFLINE_ENV),
+            "reason should name the offline env var, got: {err}"
         );
-        assert!(m.is_empty());
     }
 
     #[test]
@@ -426,7 +438,7 @@ mod tests {
         // Edge case: array of objects. Each object's field should
         // emit `samples.N.field` paths.
         let s = r#"{"samples": [{"iops": 100}, {"iops": 200}, {"iops": 300}]}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 3);
         let names: Vec<&str> = m.iter().map(|x| x.name.as_str()).collect();
         assert!(names.contains(&"samples.0.iops"));
@@ -440,7 +452,7 @@ mod tests {
         // Number::as_f64 lossily converts any JSON number to f64;
         // values below 2^53 are exact.
         let s = r#"{"big_iops": 1000000000000}"#; // 1e12 = 2^40
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].value, 1_000_000_000_000.0);
     }
@@ -456,7 +468,7 @@ mod tests {
                  \n\
                  {\"jobs\": [{\"jobname\": \"test\", \"read\": {\"iops\": 12345, \"bw_bytes\": 50593792}}], \
                  \"disk_util\": [{\"util\": 99.5}]}";
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         // Extracted: jobs.0.read.iops, jobs.0.read.bw_bytes, disk_util.0.util.
         // jobname is a string, skipped.
         assert_eq!(m.len(), 3);
@@ -499,7 +511,7 @@ mod tests {
         // 2^53+1 would itself round at parse time, obscuring what
         // the walker did.
         let s = r#"{"huge": 9007199254740993}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 1);
         // The emitted f64 IS the nearest representable value —
         // which is 2^53, not 2^53+1. Both literals happen to print
@@ -526,7 +538,7 @@ mod tests {
     #[test]
     fn json_integer_at_2_pow_53_is_exact() {
         let s = r#"{"exact": 9007199254740992}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].value, 9_007_199_254_740_992.0_f64);
     }
@@ -604,7 +616,7 @@ mod tests {
     #[test]
     fn json_negative_numbers_extract_preserving_sign() {
         let s = r#"{"delta_ns": -500.5, "underflow": -1000000}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         let by_name: std::collections::BTreeMap<&str, f64> =
             m.iter().map(|x| (x.name.as_str(), x.value)).collect();
         assert_eq!(by_name.get("delta_ns"), Some(&-500.5));
@@ -620,7 +632,7 @@ mod tests {
     #[test]
     fn json_zero_values_are_emitted_not_filtered() {
         let s = r#"{"errors": 0, "cpu_idle_pct": 0.0, "count": -0.0}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         let by_name: std::collections::BTreeMap<&str, f64> =
             m.iter().map(|x| (x.name.as_str(), x.value)).collect();
         assert_eq!(by_name.len(), 3, "all three zeros must extract: {m:?}");
@@ -635,7 +647,7 @@ mod tests {
     #[test]
     fn json_mixed_signs_and_zero_all_extract() {
         let s = r#"{"pos": 10.0, "neg": -10.0, "zero": 0.0}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 3);
     }
 
@@ -645,7 +657,7 @@ mod tests {
     /// empty Vec. No `None` return, no panic.
     #[test]
     fn json_empty_object_yields_no_metrics() {
-        let m = extract_metrics("{}", &OutputFormat::Json);
+        let m = extract_metrics("{}", &OutputFormat::Json).unwrap();
         assert!(m.is_empty(), "empty object has no leaves: {m:?}");
     }
 
@@ -653,7 +665,7 @@ mod tests {
     /// metrics.
     #[test]
     fn json_empty_array_yields_no_metrics() {
-        let m = extract_metrics("[]", &OutputFormat::Json);
+        let m = extract_metrics("[]", &OutputFormat::Json).unwrap();
         assert!(m.is_empty(), "empty array has no leaves: {m:?}");
     }
 
@@ -664,7 +676,7 @@ mod tests {
     #[test]
     fn json_nested_empty_containers_yield_no_metrics() {
         let s = r#"{"outer": {"inner": {}, "also": []}}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert!(m.is_empty(), "nested empties emit nothing: {m:?}");
     }
 
@@ -673,7 +685,7 @@ mod tests {
     #[test]
     fn json_empty_container_mixed_with_real_metrics() {
         let s = r#"{"iops": 100.0, "meta": {}, "samples": []}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "iops");
         assert_eq!(m[0].value, 100.0);
@@ -688,7 +700,7 @@ mod tests {
     fn walk_json_leaves_deep_nesting_paths_are_correct() {
         // 6 levels deep → one leaf at a.b.c.d.e.f.
         let s = r#"{"a":{"b":{"c":{"d":{"e":{"f": 42.0}}}}}}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "a.b.c.d.e.f");
         assert_eq!(m[0].value, 42.0);
@@ -702,7 +714,7 @@ mod tests {
     #[test]
     fn walk_json_leaves_siblings_do_not_accumulate_path() {
         let s = r#"{"root":{"a": 1, "b": 2, "c": 3}}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         assert_eq!(m.len(), 3);
         let names: std::collections::BTreeSet<&str> = m.iter().map(|x| x.name.as_str()).collect();
         let expected: std::collections::BTreeSet<&str> =
@@ -716,7 +728,7 @@ mod tests {
     #[test]
     fn walk_json_leaves_deep_array_object_interleaving() {
         let s = r#"{"data":[{"vals":[10.0, 20.0]},{"vals":[30.0]}]}"#;
-        let m = extract_metrics(s, &OutputFormat::Json);
+        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
         let by_name: std::collections::BTreeMap<&str, f64> =
             m.iter().map(|x| (x.name.as_str(), x.value)).collect();
         assert_eq!(by_name.get("data.0.vals.0"), Some(&10.0));
@@ -788,7 +800,7 @@ mod tests {
             metrics: &[],
         };
         let stdout = r#"{"throughput": 42.5}"#;
-        let m = extract_metrics(stdout, &EXAMPLE_PAYLOAD.output);
+        let m = extract_metrics(stdout, &EXAMPLE_PAYLOAD.output).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "throughput");
         assert_eq!(m[0].value, 42.5);
