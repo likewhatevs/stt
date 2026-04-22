@@ -30,6 +30,12 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 /// [`Check`](crate::test_support::Check) evaluation reports each
 /// referenced metric as missing rather than failing the whole run.
 ///
+/// `PayloadRun` calls this once against stdout and, on an empty
+/// result, retries against stderr — the stdout-primary /
+/// stderr-fallback contract documented in `scenario::payload_run`.
+/// The extractor itself is stream-agnostic; it parses whatever byte
+/// blob it is handed.
+///
 /// [`OutputFormat::LlmExtract`] with an optional `hint` delegates to
 /// [`crate::test_support::model::extract_via_llm`], which composes a
 /// prompt (appending the hint when present), runs a single
@@ -153,7 +159,6 @@ pub(crate) fn walk_json_leaves(value: &serde_json::Value, source: MetricSource) 
     walk(value, &mut path, 0, source, &mut out);
     out
 }
-
 
 /// Hard cap on recursion depth in [`walk`]. Object and array
 /// children past this depth are skipped and a single

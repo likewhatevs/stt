@@ -20,21 +20,24 @@
 //!
 //! Checks composition is identical in shape.
 //!
-//! # Stdout-only metric extraction
+//! # Stdout-primary, stderr-fallback metric extraction
 //!
-//! The extraction pipeline consumes **stdout only**. Stderr is
-//! captured and forwarded verbatim into the exit-code-mismatch
+//! The extraction pipeline runs [`extract_metrics`](crate::test_support::extract_metrics)
+//! against **stdout first**. When that returns an empty metric set
+//! AND stderr is non-empty, the extractor retries against stderr.
+//! This preserves the stdout-primary contract for well-behaved
+//! binaries (noisy stderr never corrupts the metric stream) while
+//! still handling payloads that emit their structured output only on
+//! stderr — e.g. schbench's default percentile tables via
+//! `show_latencies` → `fprintf(stderr, ...)`. The two streams are
+//! never merged: concurrent drain threads for stdout/stderr provide
+//! no ordering guarantee, so interleaving would corrupt any document
+//! whose bytes span both streams.
+//!
+//! Stderr is still forwarded verbatim into the exit-code-mismatch
 //! detail produced by [`Check::ExitCodeEq`] (see the
-//! `format_exit_mismatch` path) but is NEVER fed to
-//! [`crate::test_support::extract_metrics`] — neither the
-//! `OutputFormat::Json` walker nor the `OutputFormat::LlmExtract`
-//! prompt sees a stderr byte. Payloads that emit their structured
-//! output on stderr (e.g. schbench's default percentile tables via
-//! `show_latencies` → `fprintf(stderr, ...)`) therefore hand the
-//! extractor an empty string and produce zero metrics. Redirect the
-//! payload's output to stdout at the invocation site (schbench:
-//! `--json -`) or declare an `OutputFormat::ExitCode` fixture for
-//! stderr-only binaries.
+//! `format_exit_mismatch` path) so failing binaries surface their
+//! error output directly.
 
 use std::borrow::Cow;
 use std::ffi::CString;
@@ -212,12 +215,28 @@ fn payload_binary(payload: &Payload) -> Result<&'static str> {
 /// serialized to the guest-to-host SHM ring here — once per
 /// invocation — so the host can reconstruct per-call provenance in
 /// the sidecar without any Ctx-side accumulator.
+///
+/// Metric extraction is stdout-primary, stderr-fallback:
+/// [`extract_metrics`] runs first against stdout, and only when the
+/// result is empty AND stderr is non-empty is it retried against
+/// stderr. Well-behaved binaries keep stdout as the canonical metric
+/// stream; payloads like schbench that write structured output only
+/// to stderr (`show_latencies` → `fprintf(stderr, ...)`) are still
+/// parsed. The streams are never concatenated — the two drain
+/// threads in [`wait_and_capture`] run concurrently and provide no
+/// ordering guarantee, so a merged blob would corrupt any document
+/// whose bytes span both. Stderr is still passed separately to
+/// [`evaluate_checks`] so the exit-code-mismatch detail renders
+/// stderr without stdout prefix.
 fn evaluate(
     payload: &Payload,
     checks: &[Check],
     output: SpawnOutput,
 ) -> (AssertResult, PayloadMetrics) {
     let mut metrics = extract_metrics(&output.stdout, &payload.output);
+    if metrics.is_empty() && !output.stderr.is_empty() {
+        metrics = extract_metrics(&output.stderr, &payload.output);
+    }
     resolve_polarities(&mut metrics, payload);
 
     let payload_metrics = PayloadMetrics {
@@ -269,14 +288,18 @@ fn emit_payload_metrics_to_shm(pm: &PayloadMetrics) {
 /// and return the collected metrics + assertion verdict.
 ///
 /// Drop behavior: if the handle is dropped without `wait`/`kill`,
-/// the child is SIGKILLed to prevent runaway processes from
-/// outliving the test, and a stderr warning is emitted so the test
-/// author sees the implicit drop.
+/// the child and every process it forked are SIGKILLed via the
+/// process group headed by the child, then the child is reaped with
+/// `child.wait()`, and a stderr warning is emitted so the test
+/// author sees the implicit drop. The process-group kill reaches
+/// every descendant of multi-process payloads (stress-ng, schbench
+/// worker mode, fio `--numjobs`); without it the orphans keep
+/// stdout/stderr open, block [`wait_and_capture`], and lose metrics.
 ///
 /// When multiple handles are active, sidecar entries appear in
 /// finalization order (the order `.wait()`/`.kill()` are called),
 /// not spawn order.
-#[must_use = "dropping a PayloadHandle kills the child process; call .wait() or .kill() explicitly"]
+#[must_use = "dropping a PayloadHandle SIGKILLs the child's process group; call .wait() or .kill() explicitly"]
 pub struct PayloadHandle {
     /// Live child process. Wrapped in `Option` so consumers can
     /// take ownership in `wait`/`kill` without making the drop-guard
@@ -310,6 +333,17 @@ impl PayloadHandle {
         self.payload.name
     }
 
+    /// Live child's OS-level pid, or `None` once `wait`/`kill`/
+    /// `try_wait` has consumed the child.
+    ///
+    /// Test-only: used by the fork-descendant reap test to probe the
+    /// process group via `killpg(_, 0)` after calling `kill()`
+    /// without reaching into the private `child` field.
+    #[cfg(test)]
+    fn child_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
     /// Block until the child exits naturally, then extract metrics
     /// and evaluate checks, matching the foreground `.run()` return
     /// shape.
@@ -327,19 +361,27 @@ impl PayloadHandle {
         Ok(evaluate(self.payload, &self.checks, output))
     }
 
-    /// SIGKILL the child, reap it, and return whatever stdout was
-    /// captured along with the process exit code. Suitable for
-    /// time-boxed background loads.
+    /// SIGKILL the child **and every process it forked**, reap it,
+    /// and return whatever stdout+stderr was captured along with the
+    /// process exit code. Suitable for time-boxed background loads.
+    ///
+    /// The signal is delivered via `killpg(child_pid, SIGKILL)`
+    /// rather than `child.kill()` because `build_command` places the
+    /// payload at the head of its own process group. Multi-process
+    /// payloads (stress-ng, schbench worker mode, fio --numjobs) fork
+    /// descendants that keep stdout/stderr open; killing only the
+    /// head would orphan those writers and block
+    /// [`wait_and_capture`] forever, losing every metric.
     ///
     /// Metrics are also recorded to the per-test sidecar via the
     /// SHM ring; the returned tuple is a convenience view of the
     /// same values.
     pub fn kill(mut self) -> Result<(AssertResult, PayloadMetrics)> {
-        let mut child = self
+        let child = self
             .child
             .take()
             .ok_or_else(|| already_consumed(self.payload))?;
-        let _ = child.kill();
+        kill_payload_process_group(&child);
         let output = wait_and_capture(child)
             .with_context(|| format!("reap killed payload '{}'", self.payload.name))?;
         Ok(evaluate(self.payload, &self.checks, output))
@@ -391,13 +433,50 @@ fn already_consumed(payload: &'static Payload) -> anyhow::Error {
 impl Drop for PayloadHandle {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            kill_payload_process_group(&child);
             let _ = child.wait();
             eprintln!(
                 "ktstr: PayloadHandle for '{}' dropped without wait/kill — \
-                 child SIGKILLed, metrics not recorded.",
+                 process group SIGKILLed, metrics not recorded.",
                 self.payload.name,
             );
+        }
+    }
+}
+
+/// Send `SIGKILL` to the process group headed by `child`.
+///
+/// `build_command` installs a `setpgid(0, 0)` pre_exec hook that
+/// makes the child's pid its own process-group leader, so signalling
+/// that pgid reaches every fork descendant. The pid → pgid identity
+/// depends on `setpgid` succeeding; if the pre_exec hook failed,
+/// `spawn()` returns `Err` before a `PayloadHandle` is built, so a
+/// live handle here always has a valid pgid.
+///
+/// `child.id()` returns `u32` for API ergonomics; on Linux the
+/// kernel's `pid_max ≤ 2²²` guarantees the value fits in
+/// [`libc::pid_t`]'s positive `i32` range, so `try_from` succeeds on
+/// every live child. `debug_assert!(pgid > 0)` catches the
+/// theoretically-impossible non-positive case before
+/// [`nix::sys::signal::killpg`] would otherwise interpret it as a
+/// broadcast target. `ESRCH` (no such group) is treated as success:
+/// the payload and every fork descendant have already exited, which
+/// is the terminal state `kill()` is trying to reach anyway.
+fn kill_payload_process_group(child: &std::process::Child) {
+    let pgid = libc::pid_t::try_from(child.id())
+        .expect("child pid fits in pid_t (Linux pid_max <= 2^22)");
+    debug_assert!(pgid > 0, "child pid must be positive, got {pgid}");
+    match nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    ) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => {
+            // "No such process group" — every member already exited
+            // and was reaped, so the kill goal is already satisfied.
+        }
+        Err(e) => {
+            tracing::warn!(pgid, %e, "killpg failed for payload process group");
         }
     }
 }
@@ -599,9 +678,11 @@ fn resolve_cgroup_path(ctx: &Ctx<'_>, name: Option<&str>) -> Result<Option<PathB
     Ok(Some(ctx.cgroups.parent_path().join(relative)))
 }
 
-/// Build a [`Command`] with args, piped stdout/stderr, and an
-/// optional `pre_exec` hook that writes the child's PID into the
-/// specified cgroup's `cgroup.procs` before `execve`.
+/// Build a [`Command`] with args, piped stdout/stderr, a `pre_exec`
+/// hook that places the child at the head of its own process group
+/// (so [`PayloadHandle::kill`] can signal every descendant), and an
+/// optional second `pre_exec` hook that writes the child's PID into
+/// the specified cgroup's `cgroup.procs` before `execve`.
 ///
 /// Returns `Err` if the cgroup path cannot be converted to a
 /// NUL-terminated C string — `resolve_cgroup_path` already rejects
@@ -618,6 +699,24 @@ fn build_command(
 
     let mut cmd = Command::new(binary);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    // SAFETY: `setpgid(0, 0)` is async-signal-safe (POSIX.1-2017,
+    // 2.4.3) and only adjusts the calling process's own
+    // process-group membership. Placing the payload at the head of a
+    // fresh process group means `killpg` on the child's pid reaches
+    // every fork descendant — a single `child.kill()` would otherwise
+    // miss grandchildren of multi-process payloads (stress-ng,
+    // schbench with worker processes, fio with multiple jobs), and
+    // those orphans keep the stdout/stderr pipes open, hanging
+    // `wait_and_capture` and discarding the metrics.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     if let Some(cg) = cgroup_path {
         // Precompute the full `.../cgroup.procs` CString on the
@@ -731,6 +830,29 @@ fn render_pid(pid: libc::pid_t, buf: &mut [u8]) -> usize {
     out
 }
 
+/// Actionable error wrapper for Command::spawn/.output failures.
+/// ENOENT — the binary isn't on PATH inside the guest — gets the
+/// remediation paths spelled out: `-i`/`--include-files` for CLI
+/// invocations, pre-install in the initramfs for `#[ktstr_test]`
+/// entries (which cannot pass `-i`). Other errors keep the minimal
+/// `"spawn '<binary>'"` context so the underlying io::Error chain
+/// surfaces unchanged.
+fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        anyhow::Error::new(err).context(format!(
+            "spawn '{binary}': binary not found on guest PATH. \
+             Remediation: for CLI invocations (ktstr / cargo-ktstr \
+             shell, run, …), package the binary with \
+             `-i {binary}` / `--include-files {binary}` so it lands \
+             on the guest PATH under `/include-files/`. For \
+             `#[ktstr_test]` entries, pre-install the binary in the \
+             base initramfs — the macro surface does not expose `-i`."
+        ))
+    } else {
+        anyhow::Error::new(err).context(format!("spawn '{binary}'"))
+    }
+}
+
 /// Foreground path: spawn + wait + capture. Used by `.run()`.
 fn spawn_and_wait(
     binary: &str,
@@ -739,7 +861,7 @@ fn spawn_and_wait(
 ) -> Result<SpawnOutput> {
     let output = build_command(binary, args, cgroup_path)?
         .output()
-        .with_context(|| format!("spawn '{binary}'"))?;
+        .map_err(|e| spawn_error_context(e, binary))?;
     Ok(SpawnOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -756,7 +878,7 @@ fn spawn_child(
 ) -> Result<std::process::Child> {
     build_command(binary, args, cgroup_path)?
         .spawn()
-        .with_context(|| format!("spawn '{binary}'"))
+        .map_err(|e| spawn_error_context(e, binary))
 }
 
 /// Reap a (possibly already-killed) [`Child`]: wait for it to
@@ -1498,23 +1620,8 @@ mod tests {
 
     // -- PayloadHandle + .spawn() tests --
 
-    const TRUE_BIN: Payload = Payload {
-        name: "true_bin",
-        kind: PayloadKind::Binary("/bin/true"),
-        output: crate::test_support::OutputFormat::ExitCode,
-        default_args: &[],
-        default_checks: &[],
-        metrics: &[],
-    };
-
-    const FALSE_BIN: Payload = Payload {
-        name: "false_bin",
-        kind: PayloadKind::Binary("/bin/false"),
-        output: crate::test_support::OutputFormat::ExitCode,
-        default_args: &[],
-        default_checks: &[],
-        metrics: &[],
-    };
+    const TRUE_BIN: Payload = Payload::binary("true_bin", "/bin/true");
+    const FALSE_BIN: Payload = Payload::binary("false_bin", "/bin/false");
 
     #[test]
     fn spawn_rejects_scheduler_kind() {
@@ -2122,6 +2229,212 @@ mod tests {
         assert!(
             msg.contains("already consumed") && msg.contains("true_bin"),
             "error must name the handle + misuse, got: {msg}"
+        );
+    }
+
+    // -- stdout-primary / stderr-fallback evaluation --
+
+    const JSON_PAYLOAD: Payload = Payload {
+        name: "json_payload",
+        kind: PayloadKind::Binary("json_payload"),
+        output: OutputFormat::Json,
+        default_args: &[],
+        default_checks: &[],
+        metrics: &[],
+    };
+
+    /// Well-behaved case: stdout carries the JSON document; stderr
+    /// carries banner noise the extractor must NOT see. Merging the
+    /// streams would pull the banner into the metric blob; the
+    /// fallback contract keeps stdout canonical.
+    #[test]
+    fn evaluate_prefers_stdout_when_stdout_yields_metrics() {
+        let output = SpawnOutput {
+            stdout: r#"{"iops": 500}"#.to_string(),
+            stderr: "unrelated banner: open fd error (ignore)".to_string(),
+            exit_code: 0,
+        };
+        let (_, pm) = evaluate(&JSON_PAYLOAD, &[], output);
+        assert_eq!(pm.metrics.len(), 1, "stdout JSON must win");
+        assert_eq!(pm.metrics[0].name, "iops");
+        assert_eq!(pm.metrics[0].value, 500.0);
+    }
+
+    /// schbench-style: the payload emits JSON percentiles on stderr,
+    /// leaves stdout empty. Stdout-primary extraction returns an
+    /// empty Vec, then the stderr fallback runs and produces the
+    /// real metrics.
+    #[test]
+    fn evaluate_falls_back_to_stderr_when_stdout_empty() {
+        let output = SpawnOutput {
+            stdout: String::new(),
+            stderr: r#"{"latency_ns": 1234}"#.to_string(),
+            exit_code: 0,
+        };
+        let (_, pm) = evaluate(&JSON_PAYLOAD, &[], output);
+        assert_eq!(pm.metrics.len(), 1, "stderr fallback must fire");
+        assert_eq!(pm.metrics[0].name, "latency_ns");
+        assert_eq!(pm.metrics[0].value, 1234.0);
+    }
+
+    /// Stdout present but unparseable (not-JSON prose); stderr
+    /// carries the real document. `extract_metrics` returns `Vec`
+    /// empty for malformed stdout, so the fallback runs against
+    /// stderr and recovers the metrics. Pins that "non-empty stdout
+    /// that yields no metrics" still triggers the retry — the
+    /// stdout-primary contract gates on the result, not on emptiness.
+    #[test]
+    fn evaluate_falls_back_to_stderr_when_stdout_yields_no_metrics() {
+        let output = SpawnOutput {
+            stdout: "no json here, just prose from a banner line\n".to_string(),
+            stderr: r#"{"throughput": 42}"#.to_string(),
+            exit_code: 0,
+        };
+        let (_, pm) = evaluate(&JSON_PAYLOAD, &[], output);
+        assert_eq!(pm.metrics.len(), 1, "stderr fallback must fire on empty result");
+        assert_eq!(pm.metrics[0].name, "throughput");
+        assert_eq!(pm.metrics[0].value, 42.0);
+    }
+
+    /// Both streams empty ⇒ no metrics; the fallback guard
+    /// (`!output.stderr.is_empty()`) skips the second call and the
+    /// extractor is invoked exactly once against empty stdout.
+    #[test]
+    fn evaluate_returns_empty_metrics_on_empty_stdout_and_stderr() {
+        let output = SpawnOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        let (_, pm) = evaluate(&JSON_PAYLOAD, &[], output);
+        assert!(pm.metrics.is_empty(), "both-empty must produce no metrics");
+        assert_eq!(pm.exit_code, 0);
+    }
+
+    /// Multi-process payloads (schbench worker mode, stress-ng, fio)
+    /// fork descendants that keep stdout/stderr open past the head
+    /// process. Without a process-group kill, `wait_and_capture`
+    /// would block on a pipe that never EOFs and the test would
+    /// either hang or time out without metrics.
+    ///
+    /// The payload `/bin/sh -c 'sleep 60 & exec sleep 60'` uses the
+    /// shell's head process to exec into `sleep 60` (pid == pgid)
+    /// while a background `sleep 60` descendant inherits the pgid.
+    /// A single-process SIGKILL would leave the background sleeper
+    /// alive; `killpg` must reach it.
+    ///
+    /// The existence probe reaps may lag the SIGKILL delivery — the
+    /// loop waits up to 30s, which covers slow CI runners, a
+    /// heavily-loaded host, and the `waitpid` race where the child
+    /// is dying but not yet reaped.
+    #[cfg(unix)]
+    #[test]
+    fn kill_reaps_fork_descendants_via_process_group() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        const MULTI_SLEEPER: Payload = Payload {
+            name: "multi_sleeper",
+            kind: PayloadKind::Binary("/bin/sh"),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &["-c", "sleep 60 & exec sleep 60"],
+            default_checks: &[],
+            metrics: &[],
+        };
+        let handle = PayloadRun::new(&ctx, &MULTI_SLEEPER)
+            .spawn()
+            .expect("spawn multi-sleeper");
+        // The pgid equals the head child's pid. Capture it via the
+        // #[cfg(test)] accessor so the test does not reach into the
+        // private `child` field.
+        let pgid = libc::pid_t::try_from(handle.child_pid().expect("child still present"))
+            .expect("child pid fits in pid_t");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (_, _) = handle.kill().expect("kill+reap");
+        // After kill+reap the whole process group must be gone.
+        // Poll `killpg(pgid, 0)` (existence probe) until ESRCH;
+        // SIGKILL delivery + reap can lag the caller.
+        loop {
+            // SAFETY: killpg with signal 0 is a pure existence query
+            // with no side effects beyond errno.
+            let rc = unsafe { libc::killpg(pgid, 0) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(libc::ESRCH),
+                    "unexpected errno from killpg probe: {err}",
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("process group {pgid} still alive after kill+reap");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// [`spawn_error_context`] is the sole place the spawn-error
+    /// surface is shaped. An `ErrorKind::NotFound` must grow the full
+    /// remediation chain (include-files for CLI invocations,
+    /// pre-install for `#[ktstr_test]` entries); every other errno
+    /// MUST keep the minimal `"spawn '<binary>'"` context so the
+    /// underlying `io::Error` chain surfaces unchanged. Pin both
+    /// directions so a regression that (a) swallows the NotFound
+    /// remediation or (b) sprays the remediation across unrelated
+    /// errno paths surfaces here.
+    #[test]
+    fn spawn_error_context_enoent_attaches_remediation() {
+        let err =
+            std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let wrapped = super::spawn_error_context(err, "fio");
+        let rendered = format!("{wrapped:#}");
+        // Binary name still appears so `grep fio` still finds the error.
+        assert!(rendered.contains("spawn 'fio'"), "got: {rendered}");
+        // Remediation text must surface both mitigation paths.
+        assert!(
+            rendered.contains("not found on guest PATH"),
+            "ENOENT branch must name the PATH miss: {rendered}"
+        );
+        assert!(
+            rendered.contains("-i fio") || rendered.contains("--include-files fio"),
+            "ENOENT branch must name the `-i <binary>` remediation: {rendered}"
+        );
+        assert!(
+            rendered.contains("#[ktstr_test]"),
+            "ENOENT branch must name the ktstr_test pre-install remediation: {rendered}"
+        );
+    }
+
+    #[test]
+    fn spawn_error_context_non_enoent_keeps_minimal_context() {
+        // EACCES is a representative non-NotFound errno. Any
+        // remediation text leaking onto this path would mislead
+        // users who e.g. hit a permission problem — the remediation
+        // paths above (include-files, pre-install) are orthogonal
+        // to the failure mode. Pin the absence.
+        let err =
+            std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        let wrapped = super::spawn_error_context(err, "fio");
+        let rendered = format!("{wrapped:#}");
+        assert!(rendered.contains("spawn 'fio'"), "got: {rendered}");
+        assert!(
+            !rendered.contains("-i fio"),
+            "non-ENOENT must not leak the `-i` remediation: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--include-files"),
+            "non-ENOENT must not leak the --include-files remediation: {rendered}"
+        );
+        assert!(
+            !rendered.contains("#[ktstr_test]"),
+            "non-ENOENT must not leak the ktstr_test remediation: {rendered}"
+        );
+        assert!(
+            !rendered.contains("not found on guest PATH"),
+            "non-ENOENT must not claim 'not found on PATH': {rendered}"
         );
     }
 }
