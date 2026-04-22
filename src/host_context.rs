@@ -9,6 +9,21 @@
 //! (sched tunables, hugepages totals, THP policy, cmdline) are
 //! re-read on every call so run-time sysctl changes or hugepage
 //! reservations between tests are not hidden by the cache.
+//!
+//! ## Static-cache staleness under hotplug
+//!
+//! The static-field cache assumes hotplug-invariant topology. CPU
+//! / NUMA / memory hotplug between the first collect call and a
+//! later one will leave [`STATIC_HOST_INFO`] pinned to the
+//! pre-hotplug values — `total_memory_kb` stays at the original
+//! snapshot, `numa_nodes` does not reflect an added/removed node,
+//! and `uname_machine` (which cannot change without a reboot) is
+//! the only field genuinely immune. Tests that run on a hotplug-
+//! live host must either (a) avoid reading HostContext after the
+//! hotplug event, or (b) restart the process to invalidate the
+//! cache. No `reset` hook is exposed in production; the
+//! `#[cfg(test)]`-only reset machinery is for unit tests, not
+//! runtime recapture.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -224,6 +239,19 @@ impl HostContext {
     /// against the [`HostContext`] struct — the text format here is
     /// not a stable serialization contract and may be retuned for
     /// readability without notice.
+    ///
+    /// Naming: the name pair (`format_human` with no
+    /// `format_machine`) is intentional rather than accidental
+    /// asymmetry. The "machine" surface is serde JSON — callers
+    /// that want a machine-readable rendering use
+    /// `serde_json::to_string(ctx)` directly. A dedicated
+    /// `format_machine` wrapper around that one line would add no
+    /// value. `format_human` stays named as it is (not as
+    /// `impl Display`) because it prints a multi-line block with
+    /// its own newline, which clashes with `Display`'s implicit
+    /// one-value-per-formatter convention; embedding this in
+    /// `format!("{ctx}")` would surprise callers used to single-
+    /// line Display output.
     pub fn format_human(&self) -> String {
         use std::fmt::Write;
         // Destructuring bind forces every field of HostContext to

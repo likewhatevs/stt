@@ -505,6 +505,23 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// stability reason as the initramfs cache keys — the discriminator
 /// must be the same across Rust toolchain versions or downstream
 /// tooling that groups variants by filename breaks.
+///
+/// # Host-state collision caveat
+///
+/// The hash is over test-identity fields (topology, scheduler,
+/// payload, work_type, flags, sysctls, kargs) — NOT over
+/// [`HostContext`]. This is deliberate: two gauntlet variants run
+/// on different hosts must collapse into the same bucket so
+/// downstream stats tooling groups them together (see
+/// [`sidecar_variant_hash_excludes_host_context`]). The corollary:
+/// if the host's observable state mutates mid-suite — NUMA hotplug,
+/// hugepage reconfiguration, a `sysctl -w` from a parallel process
+/// — two runs of the same test will produce the same sidecar
+/// filename and the later write clobbers the earlier. ktstr treats
+/// host state as stable-enough for a single suite run; callers
+/// mutating host state during a run own the ordering themselves
+/// (e.g. by writing to a different `KTSTR_SIDECAR_DIR` per host
+/// snapshot).
 pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
     use siphasher::sip::SipHasher13;
     use std::hash::Hasher;
