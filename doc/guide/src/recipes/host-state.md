@@ -50,14 +50,14 @@ sidecars disagree on a host field):
 
 ```
 host delta ('RUN_A' → 'RUN_B'):
-  uname_release: 6.14.2 → 6.15.0
+  kernel_release: 6.14.2 → 6.15.0
   thp_enabled: always [madvise] never → always madvise [never]
   sched_tunables.sched_migration_cost_ns: 500000 → 100000
 ```
 
 Fields that match in both runs are suppressed by design — this
 is a diff, not a snapshot. Missing-on-one-side rendering differs
-by layer: top-level `Option<T>` host fields (e.g. `uname_release`,
+by layer: top-level `Option<T>` host fields (e.g. `kernel_release`,
 `thp_enabled`, the whole `sched_tunables` map) render with
 `(unknown)` on the None side so a regression in the capture
 pipeline surfaces instead of silently hiding. Per-key diffs
@@ -92,7 +92,7 @@ any host field differs. A CI job can:
   are all boot-time and change the whole scheduling surface.
   Rebooting the host to match is the correct remediation when
   you need the comparison to hold.
-- `uname_release` differs → the kernel itself changed; every
+- `kernel_release` differs → the kernel itself changed; every
   other host dimension is suspect under cross-kernel comparison.
 
 ## Seeing the raw sidecar field

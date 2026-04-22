@@ -113,7 +113,7 @@ pub struct SidecarResult {
     /// e.g. `"6.14.2"`). Populated from the VM's `/proc/version` or
     /// the cache entry metadata; `None` for host-only tests or when
     /// the version could not be determined. The host's running
-    /// kernel release is carried separately in `host.uname_release`.
+    /// kernel release is carried separately in `host.kernel_release`.
     /// Always emitted (`"kernel_version": null` on absence); required
     /// on deserialize.
     pub kernel_version: Option<String>,
@@ -1164,7 +1164,7 @@ mod tests {
             timestamp: "audit-timestamp".to_string(),
             run_id: "audit-run-id".to_string(),
             host: Some(HostContext {
-                uname_sysname: Some("AuditLinux".to_string()),
+                kernel_name: Some("AuditLinux".to_string()),
                 ..Default::default()
             }),
         };
@@ -1204,7 +1204,7 @@ mod tests {
         assert_eq!(loaded.timestamp, "audit-timestamp");
         assert_eq!(loaded.run_id, "audit-run-id");
         let host = loaded.host.expect("host round-trips");
-        assert_eq!(host.uname_sysname.as_deref(), Some("AuditLinux"));
+        assert_eq!(host.kernel_name.as_deref(), Some("AuditLinux"));
     }
 
     #[test]
@@ -1540,17 +1540,17 @@ mod tests {
         // downstream `stats compare --runs a b` can diff hosts.
         // Without this assertion, a regression that dropped the
         // `host: Some(collect_host_context())` builder line would
-        // land silently. `uname_sysname` is always `Some("Linux")`
+        // land silently. `kernel_name` is always `Some("Linux")`
         // on a running Linux process (uname syscall, no filesystem
         // dependency), matching the baseline asserted by
         // `host_context::tests::collect_host_context_returns_populated_struct_on_linux`.
         let host = loaded.host.as_ref().expect(
             "write_sidecar must populate host field from collect_host_context",
         );
-        assert_eq!(host.uname_sysname.as_deref(), Some("Linux"));
+        assert_eq!(host.kernel_name.as_deref(), Some("Linux"));
         // Pair the uname check with a field that `HostContext::default()`
         // leaves None. A regression that swapped the full
-        // `collect_host_context()` call for `HostContext { uname_sysname:
+        // `collect_host_context()` call for `HostContext { kernel_name:
         // Some("Linux".into()), ..Default::default() }` would pass the
         // uname assertion but drop every other captured field —
         // `cmdline` is present on every live Linux process (/proc/cmdline
@@ -1562,17 +1562,17 @@ mod tests {
             "write_sidecar must capture full HostContext, not Default::default() — \
              /proc/cmdline is always readable on Linux (see host_context tests)",
         );
-        // Second Default-distinguishing field: `uname_release` is
+        // Second Default-distinguishing field: `kernel_release` is
         // populated by the uname() syscall on any live Linux host
         // (filesystem-independent — no /proc/sys dependency), so a
         // `None` here would indicate the default-substitution
         // regression reached the uname path. Pairing cmdline
-        // (filesystem-sourced) with uname_release (syscall-sourced)
+        // (filesystem-sourced) with kernel_release (syscall-sourced)
         // gives two independent capture paths, so a regression that
         // broke only one collection site is still caught.
         assert!(
-            host.uname_release.is_some(),
-            "write_sidecar must capture uname_release — uname() is \
+            host.kernel_release.is_some(),
+            "write_sidecar must capture kernel_release — uname() is \
              filesystem-independent; a None here means the default \
              substitution bypassed the full collect_host_context()",
         );
@@ -2014,7 +2014,7 @@ mod tests {
         let host = loaded.host.as_ref().expect(
             "write_skip_sidecar must populate host field from collect_host_context",
         );
-        assert_eq!(host.uname_sysname.as_deref(), Some("Linux"));
+        assert_eq!(host.kernel_name.as_deref(), Some("Linux"));
         // Pair the uname check with a Default-distinguishing field —
         // see `write_sidecar_writes_file` for the rationale. Keeps
         // both the happy-path writer and the skip-path writer guarded
@@ -2027,8 +2027,8 @@ mod tests {
         // `cmdline` check — see `write_sidecar_writes_file` for the
         // two-independent-paths rationale.
         assert!(
-            host.uname_release.is_some(),
-            "write_skip_sidecar must capture uname_release (syscall-sourced)",
+            host.kernel_release.is_some(),
+            "write_skip_sidecar must capture kernel_release (syscall-sourced)",
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2333,9 +2333,9 @@ mod tests {
             thp_defrag: Some("[always] defer madvise never".to_string()),
             sched_tunables: None,
             numa_nodes: Some(2),
-            uname_sysname: Some("Linux".to_string()),
-            uname_release: Some("6.11.0".to_string()),
-            uname_machine: Some("x86_64".to_string()),
+            kernel_name: Some("Linux".to_string()),
+            kernel_release: Some("6.11.0".to_string()),
+            arch: Some("x86_64".to_string()),
             cmdline: Some("preempt=lazy".to_string()),
         };
         let without_host = SidecarResult {
@@ -2380,9 +2380,9 @@ mod tests {
             thp_defrag: Some("[always] defer madvise never".to_string()),
             sched_tunables: Some(tunables),
             numa_nodes: Some(2),
-            uname_sysname: Some("Linux".to_string()),
-            uname_release: Some("6.11.0".to_string()),
-            uname_machine: Some("x86_64".to_string()),
+            kernel_name: Some("Linux".to_string()),
+            kernel_release: Some("6.11.0".to_string()),
+            arch: Some("x86_64".to_string()),
             cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
         };
         let sc = SidecarResult {

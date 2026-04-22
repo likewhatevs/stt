@@ -2102,8 +2102,8 @@ mod tests {
     /// `Default` so each test varies only the field under study.
     fn host_ctx(release: &str, cmdline: Option<&str>) -> crate::host_context::HostContext {
         crate::host_context::HostContext {
-            uname_sysname: Some("Linux".to_string()),
-            uname_release: Some(release.to_string()),
+            kernel_name: Some("Linux".to_string()),
+            kernel_release: Some(release.to_string()),
             cmdline: cmdline.map(str::to_string),
             ..Default::default()
         }
@@ -2131,7 +2131,7 @@ mod tests {
         let hb = host_ctx("6.15.1", Some("preempt=lazy"));
         let out = format_host_delta(Some(&ha), Some(&hb), "a", "b");
         assert!(out.starts_with("\nhost delta ('a' → 'b'):\n"), "got: {out:?}");
-        // `uname_release` differs between the two contexts so the
+        // `kernel_release` differs between the two contexts so the
         // diff body must be non-empty — confirms we routed through
         // the `else` arm and not the `identical` arm.
         let body = &out["\nhost delta ('a' → 'b'):\n".len()..];

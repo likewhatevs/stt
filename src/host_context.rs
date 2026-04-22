@@ -17,7 +17,7 @@
 //! later one will leave [`STATIC_HOST_INFO`] pinned to the
 //! pre-hotplug values — `total_memory_kb` stays at the original
 //! snapshot, `numa_nodes` does not reflect an added/removed node,
-//! and `uname_machine` (which cannot change without a reboot) is
+//! and `arch` (which cannot change without a reboot) is
 //! the only field genuinely immune. Tests that run on a hotplug-
 //! live host must either (a) avoid reading HostContext after the
 //! hotplug event, or (b) restart the process to invalidate the
@@ -143,17 +143,17 @@ pub struct HostContext {
     /// The nodename field is intentionally dropped; it's a local
     /// hostname and has no place in a published sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uname_sysname: Option<String>,
+    pub kernel_name: Option<String>,
     /// Kernel release — `uname.release` (e.g. `"6.11.0-rc3"`).
     /// The full `/proc/version` banner is NOT captured because it
     /// embeds the build host + gcc version string, which is
     /// environment leakage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uname_release: Option<String>,
+    pub kernel_release: Option<String>,
     /// Machine architecture — `uname.machine` (e.g. `"x86_64"`,
     /// `"aarch64"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uname_machine: Option<String>,
+    pub arch: Option<String>,
     /// `/proc/cmdline` verbatim (trimmed of leading and trailing
     /// whitespace). Captures boot-time parameters that materially
     /// affect scheduler behavior — `preempt=`, `isolcpus=`,
@@ -217,9 +217,9 @@ impl HostContext {
             thp_defrag: Some("always defer defer+madvise [madvise] never".to_string()),
             sched_tunables: Some(sched_tunables),
             numa_nodes: Some(2),
-            uname_sysname: Some("Linux".to_string()),
-            uname_release: Some("6.16.0-test".to_string()),
-            uname_machine: Some("x86_64".to_string()),
+            kernel_name: Some("Linux".to_string()),
+            kernel_release: Some("6.16.0-test".to_string()),
+            arch: Some("x86_64".to_string()),
             cmdline: Some(
                 "BOOT_IMAGE=/boot/vmlinuz-test root=/dev/sda1".to_string(),
             ),
@@ -270,9 +270,9 @@ impl HostContext {
             thp_defrag,
             sched_tunables,
             numa_nodes,
-            uname_sysname,
-            uname_release,
-            uname_machine,
+            kernel_name,
+            kernel_release,
+            arch,
             cmdline,
         } = self;
         fn row<T: std::fmt::Display>(out: &mut String, key: &str, value: Option<&T>) {
@@ -286,9 +286,9 @@ impl HostContext {
             }
         }
         let mut out = String::new();
-        row(&mut out, "uname_sysname", uname_sysname.as_ref());
-        row(&mut out, "uname_release", uname_release.as_ref());
-        row(&mut out, "uname_machine", uname_machine.as_ref());
+        row(&mut out, "kernel_name", kernel_name.as_ref());
+        row(&mut out, "kernel_release", kernel_release.as_ref());
+        row(&mut out, "arch", arch.as_ref());
         row(&mut out, "cpu_model", cpu_model.as_ref());
         row(&mut out, "cpu_vendor", cpu_vendor.as_ref());
         row(&mut out, "total_memory_kb", total_memory_kb.as_ref());
@@ -343,9 +343,9 @@ impl HostContext {
             thp_defrag: a_thp_defrag,
             sched_tunables: a_sched_tunables,
             numa_nodes: a_numa_nodes,
-            uname_sysname: a_uname_sysname,
-            uname_release: a_uname_release,
-            uname_machine: a_uname_machine,
+            kernel_name: a_kernel_name,
+            kernel_release: a_kernel_release,
+            arch: a_arch,
             cmdline: a_cmdline,
         } = a;
         let HostContext {
@@ -359,9 +359,9 @@ impl HostContext {
             thp_defrag: b_thp_defrag,
             sched_tunables: b_sched_tunables,
             numa_nodes: b_numa_nodes,
-            uname_sysname: b_uname_sysname,
-            uname_release: b_uname_release,
-            uname_machine: b_uname_machine,
+            kernel_name: b_kernel_name,
+            kernel_release: b_kernel_release,
+            arch: b_arch,
             cmdline: b_cmdline,
         } = b;
         fn fmt_opt<T: std::fmt::Display>(v: Option<&T>) -> String {
@@ -390,9 +390,9 @@ impl HostContext {
             }
         }
         let mut out = String::new();
-        row(&mut out, "uname_sysname", a_uname_sysname.as_ref(), b_uname_sysname.as_ref());
-        row(&mut out, "uname_release", a_uname_release.as_ref(), b_uname_release.as_ref());
-        row(&mut out, "uname_machine", a_uname_machine.as_ref(), b_uname_machine.as_ref());
+        row(&mut out, "kernel_name", a_kernel_name.as_ref(), b_kernel_name.as_ref());
+        row(&mut out, "kernel_release", a_kernel_release.as_ref(), b_kernel_release.as_ref());
+        row(&mut out, "arch", a_arch.as_ref(), b_arch.as_ref());
         row(&mut out, "cpu_model", a_cpu_model.as_ref(), b_cpu_model.as_ref());
         row(&mut out, "cpu_vendor", a_cpu_vendor.as_ref(), b_cpu_vendor.as_ref());
         row(
@@ -471,9 +471,9 @@ struct StaticHostInfo {
     total_memory_kb: Option<u64>,
     hugepages_size_kb: Option<u64>,
     numa_nodes: Option<usize>,
-    uname_sysname: Option<String>,
-    uname_release: Option<String>,
-    uname_machine: Option<String>,
+    kernel_name: Option<String>,
+    kernel_release: Option<String>,
+    arch: Option<String>,
 }
 
 static STATIC_HOST_INFO: OnceLock<StaticHostInfo> = OnceLock::new();
@@ -533,9 +533,9 @@ pub fn collect_host_context() -> HostContext {
         thp_defrag: read_trimmed_sysfs("/sys/kernel/mm/transparent_hugepage/defrag"),
         sched_tunables: read_sched_tunables(),
         numa_nodes: static_info.numa_nodes,
-        uname_sysname: static_info.uname_sysname,
-        uname_release: static_info.uname_release,
-        uname_machine: static_info.uname_machine,
+        kernel_name: static_info.kernel_name,
+        kernel_release: static_info.kernel_release,
+        arch: static_info.arch,
         cmdline: read_trimmed_sysfs("/proc/cmdline"),
     }
 }
@@ -567,9 +567,9 @@ fn compute_static_host_info(meminfo: &MeminfoFields) -> StaticHostInfo {
         total_memory_kb: meminfo.mem_total_kb,
         hugepages_size_kb: meminfo.hugepages_size_kb,
         numa_nodes: count_numa_nodes_via_topology(),
-        uname_sysname: u.sysname().to_str().ok().map(|s| s.to_string()),
-        uname_release: u.release().to_str().ok().map(|s| s.to_string()),
-        uname_machine: u.machine().to_str().ok().map(|s| s.to_string()),
+        kernel_name: u.sysname().to_str().ok().map(|s| s.to_string()),
+        kernel_release: u.release().to_str().ok().map(|s| s.to_string()),
+        arch: u.machine().to_str().ok().map(|s| s.to_string()),
     }
 }
 
@@ -779,7 +779,7 @@ pub(crate) fn count_numa_nodes_in_topology(
 
 // Most tests in this module are pure parsers / formatters / diff
 // helpers that compile and pass on any target. The handful that
-// actually read `/proc`, `/sys`, or assert `uname_sysname == "Linux"`
+// actually read `/proc`, `/sys`, or assert `kernel_name == "Linux"`
 // are individually gated with `#[cfg(target_os = "linux")]` at the
 // test-fn level so non-Linux contributors still get coverage of the
 // portable surface.
@@ -796,9 +796,9 @@ mod tests {
         let ctx = collect_host_context();
         // uname is always readable on Linux (it's a syscall, no
         // filesystem dependency), so these three must populate.
-        assert_eq!(ctx.uname_sysname.as_deref(), Some("Linux"));
-        assert!(ctx.uname_release.is_some(), "uname release present");
-        assert!(ctx.uname_machine.is_some(), "uname machine present");
+        assert_eq!(ctx.kernel_name.as_deref(), Some("Linux"));
+        assert!(ctx.kernel_release.is_some(), "uname release present");
+        assert!(ctx.arch.is_some(), "uname machine present");
     }
 
     /// `/proc/cmdline` is always readable on a running Linux system
@@ -831,9 +831,9 @@ mod tests {
     fn collect_host_context_is_stable_across_calls() {
         let a = collect_host_context();
         let b = collect_host_context();
-        assert_eq!(a.uname_sysname, b.uname_sysname);
-        assert_eq!(a.uname_release, b.uname_release);
-        assert_eq!(a.uname_machine, b.uname_machine);
+        assert_eq!(a.kernel_name, b.kernel_name);
+        assert_eq!(a.kernel_release, b.kernel_release);
+        assert_eq!(a.arch, b.arch);
         assert_eq!(a.cpu_model, b.cpu_model);
         assert_eq!(a.cpu_vendor, b.cpu_vendor);
         assert_eq!(a.cmdline, b.cmdline);
@@ -883,7 +883,7 @@ mod tests {
         // of `OnceLock` with something that clones on access still
         // fails loudly rather than silently weakening the cache.
         assert_eq!(first.cpu_model, second.cpu_model);
-        assert_eq!(first.uname_release, second.uname_release);
+        assert_eq!(first.kernel_release, second.kernel_release);
         assert_eq!(first.total_memory_kb, second.total_memory_kb);
     }
 
@@ -899,7 +899,7 @@ mod tests {
         let decoded: HostContext =
             serde_json::from_str(&json).expect("deserialize empty");
         assert!(decoded.cpu_model.is_none());
-        assert!(decoded.uname_sysname.is_none());
+        assert!(decoded.kernel_name.is_none());
         assert!(decoded.cmdline.is_none());
     }
 
@@ -923,9 +923,9 @@ mod tests {
             thp_defrag: Some("[always] defer defer+madvise madvise never".to_string()),
             sched_tunables: Some(tunables),
             numa_nodes: Some(2),
-            uname_sysname: Some("Linux".to_string()),
-            uname_release: Some("6.11.0".to_string()),
-            uname_machine: Some("x86_64".to_string()),
+            kernel_name: Some("Linux".to_string()),
+            kernel_release: Some("6.11.0".to_string()),
+            arch: Some("x86_64".to_string()),
             cmdline: Some("preempt=lazy transparent_hugepage=madvise".to_string()),
         };
         let json = serde_json::to_string(&ctx).expect("serialize");
@@ -947,11 +947,11 @@ mod tests {
     fn host_context_partial_none_round_trips_via_json() {
         let ctx = HostContext {
             // Identity captured on the production path.
-            uname_sysname: Some("Linux".to_string()),
+            kernel_name: Some("Linux".to_string()),
             // Release read failed (e.g. uname syscall error on the
             // simulated failure path).
-            uname_release: None,
-            uname_machine: Some("x86_64".to_string()),
+            kernel_release: None,
+            arch: Some("x86_64".to_string()),
             // Map was captured but is empty — the `read_dir` of
             // /proc/sys/kernel succeeded, no entries matched the
             // `sched_*` filter (unusual but the code contract
@@ -1321,9 +1321,9 @@ Hugepagesize:       2048 kB
         assert_eq!(
             labels,
             vec![
-                "uname_sysname",
-                "uname_release",
-                "uname_machine",
+                "kernel_name",
+                "kernel_release",
+                "arch",
                 "cpu_model",
                 "cpu_vendor",
                 "total_memory_kb",
@@ -1350,9 +1350,9 @@ Hugepagesize:       2048 kB
     fn format_human_default_renders_unknown_everywhere() {
         let out = HostContext::default().format_human();
         for key in [
-            "uname_sysname",
-            "uname_release",
-            "uname_machine",
+            "kernel_name",
+            "kernel_release",
+            "arch",
             "cpu_model",
             "cpu_vendor",
             "total_memory_kb",
@@ -1384,9 +1384,9 @@ Hugepagesize:       2048 kB
         tunables.insert("sched_migration_cost_ns".to_string(), "500000".to_string());
         tunables.insert("sched_min_granularity_ns".to_string(), "750000".to_string());
         let ctx = HostContext {
-            uname_sysname: Some("Linux".to_string()),
-            uname_release: Some("6.11.0".to_string()),
-            uname_machine: Some("x86_64".to_string()),
+            kernel_name: Some("Linux".to_string()),
+            kernel_release: Some("6.11.0".to_string()),
+            arch: Some("x86_64".to_string()),
             cpu_model: Some("Example CPU".to_string()),
             total_memory_kb: Some(16_384_000),
             sched_tunables: Some(tunables),
@@ -1394,8 +1394,8 @@ Hugepagesize:       2048 kB
             ..HostContext::default()
         };
         let out = ctx.format_human();
-        assert!(out.contains("uname_sysname: Linux"), "{out}");
-        assert!(out.contains("uname_release: 6.11.0"), "{out}");
+        assert!(out.contains("kernel_name: Linux"), "{out}");
+        assert!(out.contains("kernel_release: 6.11.0"), "{out}");
         assert!(out.contains("cpu_model: Example CPU"), "{out}");
         assert!(out.contains("total_memory_kb: 16384000"), "{out}");
         assert!(out.contains("cmdline: preempt=lazy"), "{out}");
@@ -1449,7 +1449,7 @@ Hugepagesize:       2048 kB
     #[test]
     fn diff_identical_is_empty() {
         let ctx = HostContext {
-            uname_sysname: Some("Linux".to_string()),
+            kernel_name: Some("Linux".to_string()),
             cpu_model: Some("Example CPU".to_string()),
             ..HostContext::default()
         };
@@ -1463,12 +1463,12 @@ Hugepagesize:       2048 kB
     fn diff_single_field_surfaces_only_that_field() {
         let a = HostContext {
             cmdline: Some("preempt=lazy".to_string()),
-            uname_release: Some("6.11.0".to_string()),
+            kernel_release: Some("6.11.0".to_string()),
             ..HostContext::default()
         };
         let b = HostContext {
             cmdline: Some("preempt=full".to_string()),
-            uname_release: Some("6.11.0".to_string()),
+            kernel_release: Some("6.11.0".to_string()),
             ..HostContext::default()
         };
         let out = HostContext::diff(&a, &b);
@@ -1477,8 +1477,8 @@ Hugepagesize:       2048 kB
             "cmdline change must appear: {out}",
         );
         assert!(
-            !out.contains("uname_release"),
-            "unchanged uname_release must not appear: {out}",
+            !out.contains("kernel_release"),
+            "unchanged kernel_release must not appear: {out}",
         );
     }
 
@@ -1489,12 +1489,12 @@ Hugepagesize:       2048 kB
     fn diff_none_to_some_shows_unknown_arrow() {
         let a = HostContext::default();
         let b = HostContext {
-            uname_sysname: Some("Linux".to_string()),
+            kernel_name: Some("Linux".to_string()),
             ..HostContext::default()
         };
         let out = HostContext::diff(&a, &b);
         assert!(
-            out.contains("uname_sysname: (unknown) → Linux"),
+            out.contains("kernel_name: (unknown) → Linux"),
             "(unknown) → Linux must appear: {out}",
         );
     }
@@ -1563,13 +1563,13 @@ Hugepagesize:       2048 kB
     #[test]
     fn diff_some_to_none_shows_arrow_unknown() {
         let a = HostContext {
-            uname_release: Some("6.11.0".to_string()),
+            kernel_release: Some("6.11.0".to_string()),
             ..HostContext::default()
         };
         let b = HostContext::default();
         let out = HostContext::diff(&a, &b);
         assert!(
-            out.contains("uname_release: 6.11.0 → (unknown)"),
+            out.contains("kernel_release: 6.11.0 → (unknown)"),
             "Some → None must surface as <value> → (unknown): {out}",
         );
     }

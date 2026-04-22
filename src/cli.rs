@@ -2008,7 +2008,7 @@ mod tests {
     // -- show_host smoke --
 
     /// `show_host` must return a non-empty, newline-terminated
-    /// human-readable report. On Linux, `uname_sysname` is
+    /// human-readable report. On Linux, `kernel_name` is
     /// populated from the `uname()` syscall regardless of `/proc`
     /// or `/sys` availability, so the output is guaranteed to
     /// contain that key. This also guards the
@@ -2025,8 +2025,8 @@ mod tests {
             "show_host output must end with a newline for print! use: {out:?}",
         );
         assert!(
-            out.contains("uname_sysname"),
-            "show_host must surface the uname_sysname field: {out}",
+            out.contains("kernel_name"),
+            "show_host must surface the kernel_name field: {out}",
         );
     }
 
