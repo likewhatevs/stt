@@ -25,6 +25,7 @@ pub(crate) mod rust_init;
 pub mod shm_ring;
 mod terminal;
 pub mod topology;
+mod vcpu_panic;
 pub(crate) mod virtio_console;
 mod vmlinux;
 
@@ -2377,17 +2378,32 @@ impl KtstrVm {
             })
             .context("spawn watchdog thread")?;
 
-        // BSP run loop.
+        // BSP run loop. Wrapped in the same `with_vcpu_panic_ctx`
+        // scope the APs use (symmetric panic-hook signaling) —
+        // `kill` plus `bsp_done` are the pair analogous to a
+        // vCPU thread's `kill` + `exited` so a BSP panic flips the
+        // watchdog-observed flags before the panic=abort teardown.
+        // `vcpu_panic::install_once` was already called in
+        // `spawn_ap_threads` above, which runs even for a zero-AP VM,
+        // so the hook is live by the time BSP enters its loop.
         eprintln!("BSP: entering run loop");
-        let (exit_code, timed_out) = self.run_bsp_loop(
-            &mut bsp,
-            &com1,
-            &com2,
-            None,
-            &kill,
-            has_immediate_exit,
-            start,
-            timeout,
+        let (exit_code, timed_out) = vcpu_panic::with_vcpu_panic_ctx(
+            vcpu_panic::VcpuPanicCtx {
+                kill: kill.clone(),
+                exited: bsp_done.clone(),
+            },
+            || {
+                self.run_bsp_loop(
+                    &mut bsp,
+                    &com1,
+                    &com2,
+                    None,
+                    &kill,
+                    has_immediate_exit,
+                    start,
+                    timeout,
+                )
+            },
         );
         bsp_done.store(true, Ordering::Release);
         eprintln!("BSP: exited run loop, code={exit_code} timed_out={timed_out}");
@@ -2423,6 +2439,11 @@ impl KtstrVm {
         kill: &Arc<AtomicBool>,
         pin_targets: &[Option<usize>],
     ) -> Result<Vec<VcpuThread>> {
+        // Register the process-wide panic hook that flips `kill` +
+        // `exited` on a panicking vCPU thread before the
+        // panic=abort-induced process teardown. Idempotent via
+        // `Once`; safe to call on every VM spawn.
+        vcpu_panic::install_once();
         let mut ap_threads: Vec<VcpuThread> = Vec::new();
         for (i, mut vcpu) in vcpus.into_iter().enumerate() {
             let ie_handle = if has_immediate_exit {
@@ -2439,6 +2460,10 @@ impl KtstrVm {
             let pin_cpu = pin_targets.get(i).copied().flatten();
 
             let rt = self.performance_mode;
+            let panic_ctx = vcpu_panic::VcpuPanicCtx {
+                kill: kill.clone(),
+                exited: exited.clone(),
+            };
             let handle = std::thread::Builder::new()
                 .name(format!("vcpu-{}", i + 1))
                 .spawn(move || {
@@ -2449,13 +2474,15 @@ impl KtstrVm {
                     if rt {
                         set_rt_priority(1, &format!("vCPU {}", i + 1));
                     }
-                    vcpu_run_loop_unified(
-                        &mut vcpu,
-                        &com1_clone,
-                        &com2_clone,
-                        vc_clone.as_ref(),
-                        &kill_clone,
-                    );
+                    vcpu_panic::with_vcpu_panic_ctx(panic_ctx, || {
+                        vcpu_run_loop_unified(
+                            &mut vcpu,
+                            &com1_clone,
+                            &com2_clone,
+                            vc_clone.as_ref(),
+                            &kill_clone,
+                        );
+                    });
                     exited_clone.store(true, Ordering::Release);
                     vcpu
                 })
