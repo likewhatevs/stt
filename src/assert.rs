@@ -396,6 +396,35 @@ pub struct AssertResult {
 }
 
 /// Per-cgroup statistics from worker telemetry.
+///
+/// # Percentile convention
+///
+/// `p99_wake_latency_us` and `median_wake_latency_us` are computed
+/// by [`percentile`] using the NEAREST-RANK (Type 1) definition:
+/// the value at `ceil(n * p) - 1` in sorted order. No interpolation
+/// between samples. This matches the percentile convention used
+/// throughout schbench and the BPF latency histograms the project
+/// cross-references, so a `ktstr` p99 reading aligns with a
+/// schbench `lat99` without adjustment. For small `n` (wake
+/// reservoirs cap at `WAKE_LATENCY_SAMPLE_CAP`, typically 4096 per
+/// worker) nearest-rank is also numerically stable — interpolation
+/// between the two nearest ranks would be implementation-defined
+/// at sample-set boundaries.
+///
+/// # CV pooling scope
+///
+/// `wake_latency_cv` is POOLED across every sample from every
+/// worker in the cgroup, not a per-worker CV averaged back. That
+/// collapses per-worker dispersion into the cgroup-wide signal:
+/// two workers with uniformly low jitter but different means
+/// produce a high pooled CV (mean-shift between workers inflates
+/// stddev), while per-worker CV would show neither worker as
+/// bad. This is intentional for the fairness threshold
+/// (`max_wake_latency_cv`): a scheduler that gives worker A
+/// 10µs wakes and worker B 1ms wakes is failing fairness even if
+/// each worker on its own is tight. Tests comparing single-worker
+/// behavior should scope their assertions to per-worker data
+/// rather than this aggregate.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CgroupStats {
     /// Number of workers in this cgroup.

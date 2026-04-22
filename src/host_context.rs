@@ -39,6 +39,22 @@ use std::sync::OnceLock;
 /// For tests that want a populated baseline (non-trivial defaults
 /// for every field) instead of `Default`'s all-`None` minimum, use
 /// [`HostContext::test_fixture`].
+///
+/// # Forward-compatible deserialization
+///
+/// The `Deserialize` impl is derived WITHOUT
+/// `#[serde(deny_unknown_fields)]`. An older binary reading a
+/// sidecar written by a newer binary therefore silently ignores
+/// any fields it does not recognize, and the downstream
+/// `SidecarResult` parse succeeds with the older struct shape.
+/// This is the intentional forward-compat contract: adding a new
+/// `Option<T>` field to `HostContext` does NOT break consumers
+/// built against a prior schema. Paired with the per-field
+/// `#[serde(default)]` on every attribute, missing fields also
+/// default cleanly — so a newer binary reading an older sidecar
+/// that lacks a newly-added field gets `None` rather than a
+/// deserialize error. Both directions of the version skew are
+/// covered by this policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct HostContext {
