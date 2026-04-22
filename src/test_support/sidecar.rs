@@ -748,6 +748,37 @@ mod tests {
             .collect()
     }
 
+    /// Single-file variant of [`find_sidecars_by_prefix`] for tests
+    /// that exercise one variant per run. Asserts exactly one match
+    /// and returns the owned path.
+    ///
+    /// What the length assertion catches: a test producing MORE than
+    /// one sidecar under the given prefix — typically a stray
+    /// leftover from a prior run (if the temp-dir cleanup is stale),
+    /// or a call-site bug that invokes the writer twice. A
+    /// variant-hash collision on its own would overwrite the file
+    /// in place (same hash → same filename → single file), so this
+    /// assertion is NOT a collision detector; it's a
+    /// "one-call-one-file" invariant for single-variant tests.
+    /// Centralizes the pattern so the 5 single-variant writer tests
+    /// share one length check + error message.
+    fn find_single_sidecar_by_prefix(
+        dir: &std::path::Path,
+        prefix: &str,
+    ) -> std::path::PathBuf {
+        let paths = find_sidecars_by_prefix(dir, prefix);
+        assert_eq!(
+            paths.len(),
+            1,
+            "single-variant test must produce exactly one sidecar under \
+             prefix {prefix:?}; got {paths:?}",
+        );
+        paths
+            .into_iter()
+            .next()
+            .expect("length-1 vec yields Some on first next()")
+    }
+
     // -- find_sidecars_by_prefix self-tests --
     //
     // Pin the helper's filter behavior so changes to its logic
@@ -1394,23 +1425,10 @@ mod tests {
         write_sidecar(&entry, &vm_result, &[], &check_result, "CpuSpin", &[], &[]).unwrap();
 
         // Sidecar filename now includes a variant hash suffix so
-        // gauntlet variants don't clobber each other. Find the file
-        // by prefix match rather than exact path.
-        let paths = find_sidecars_by_prefix(tmp, "__sidecar_write_test__-");
-        // Single-variant test: if a future variant-hash collision
-        // produced two files sharing the prefix, `.next()` would
-        // silently pick one and the test would pass unpredictably.
-        // Pin `paths.len() == 1` to surface the collision as a
-        // test failure instead.
-        assert_eq!(
-            paths.len(),
-            1,
-            "single-variant test must produce exactly one sidecar, got {paths:?}",
-        );
-        let path = paths
-            .into_iter()
-            .next()
-            .expect("sidecar file with variant suffix should be written");
+        // gauntlet variants don't clobber each other. Use the
+        // single-match helper, which also guards against stray
+        // leftover files from prior runs or double-writer bugs.
+        let path = find_single_sidecar_by_prefix(tmp, "__sidecar_write_test__-");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
         assert_eq!(loaded.test_name, "__sidecar_write_test__");
@@ -1441,6 +1459,20 @@ mod tests {
             host.cmdline.is_some(),
             "write_sidecar must capture full HostContext, not Default::default() — \
              /proc/cmdline is always readable on Linux (see host_context tests)",
+        );
+        // Second Default-distinguishing field: `uname_release` is
+        // populated by the uname() syscall on any live Linux host
+        // (filesystem-independent — no /proc/sys dependency), so a
+        // `None` here would indicate the default-substitution
+        // regression reached the uname path. Pairing cmdline
+        // (filesystem-sourced) with uname_release (syscall-sourced)
+        // gives two independent capture paths, so a regression that
+        // broke only one collection site is still caught.
+        assert!(
+            host.uname_release.is_some(),
+            "write_sidecar must capture uname_release — uname() is \
+             filesystem-independent; a None here means the default \
+             substitution bypassed the full collect_host_context()",
         );
     }
 
@@ -1854,16 +1886,7 @@ mod tests {
         let active_flags: Vec<String> = vec!["llc".to_string()];
         write_skip_sidecar(&entry, &active_flags).expect("skip sidecar must write");
 
-        let paths = find_sidecars_by_prefix(&tmp, "__skip_sidecar_test__-");
-        assert_eq!(
-            paths.len(),
-            1,
-            "single-variant skip test must produce exactly one sidecar, got {paths:?}",
-        );
-        let path = paths
-            .into_iter()
-            .next()
-            .expect("skip sidecar file with variant suffix should be written");
+        let path = find_single_sidecar_by_prefix(&tmp, "__skip_sidecar_test__-");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
         assert_eq!(loaded.test_name, "__skip_sidecar_test__");
@@ -1897,6 +1920,13 @@ mod tests {
         assert!(
             host.cmdline.is_some(),
             "write_skip_sidecar must capture full HostContext, not Default::default()",
+        );
+        // Syscall-sourced companion to the filesystem-sourced
+        // `cmdline` check — see `write_sidecar_writes_file` for the
+        // two-independent-paths rationale.
+        assert!(
+            host.uname_release.is_some(),
+            "write_skip_sidecar must capture uname_release (syscall-sourced)",
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2054,16 +2084,7 @@ mod tests {
         let ok = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
 
-        let paths = find_sidecars_by_prefix(&tmp, "__payload_name_test__-");
-        assert_eq!(
-            paths.len(),
-            1,
-            "single-variant payload-name test must produce exactly one sidecar, got {paths:?}",
-        );
-        let path = paths
-            .into_iter()
-            .next()
-            .expect("sidecar file with variant suffix should be written");
+        let path = find_single_sidecar_by_prefix(&tmp, "__payload_name_test__-");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
         assert_eq!(loaded.payload.as_deref(), Some("fio"));
@@ -2130,16 +2151,7 @@ mod tests {
         ];
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &metrics).unwrap();
 
-        let paths = find_sidecars_by_prefix(&tmp, "__metrics_slice_test__-");
-        assert_eq!(
-            paths.len(),
-            1,
-            "single-variant metrics-slice test must produce exactly one sidecar, got {paths:?}",
-        );
-        let path = paths
-            .into_iter()
-            .next()
-            .expect("sidecar file should be written");
+        let path = find_single_sidecar_by_prefix(&tmp, "__metrics_slice_test__-");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
         assert_eq!(loaded.metrics.len(), 2);
@@ -2186,16 +2198,7 @@ mod tests {
         };
         write_skip_sidecar(&entry, &[]).unwrap();
 
-        let paths = find_sidecars_by_prefix(&tmp, "__skip_payload_name_test__-");
-        assert_eq!(
-            paths.len(),
-            1,
-            "single-variant skip-payload-name test must produce exactly one sidecar, got {paths:?}",
-        );
-        let path = paths
-            .into_iter()
-            .next()
-            .expect("sidecar file should be written");
+        let path = find_single_sidecar_by_prefix(&tmp, "__skip_payload_name_test__-");
         let data = std::fs::read_to_string(&path).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
         assert_eq!(loaded.payload.as_deref(), Some("stress-ng"));

@@ -149,6 +149,7 @@ pub enum DetailKind {
     /// Slow-tier (memory tier) threshold failure.
     SlowTier,
     /// Monitor-subsystem anomaly (imbalance, DSQ depth, rq_clock stall).
+    /// Use `DetailKind::SchedulerExited` for scheduler-liveness failures.
     Monitor,
     /// Scheduler process observed to have exited (via `sched_pid`
     /// probe returning ESRCH or wait on the leader).
@@ -403,29 +404,31 @@ pub struct ScenarioStats {
     pub total_cpus: usize,
     /// Sum of migration counts across all cgroups.
     pub total_migrations: u64,
-    /// Worst spread across any cgroup.
+    /// Worst spread across any cgroup (highest).
     pub worst_spread: f64,
-    /// Worst gap across any cgroup (ms).
+    /// Worst gap across any cgroup (highest, ms). Paired with
+    /// `worst_gap_cpu` — both come from the same cgroup.
     pub worst_gap_ms: u64,
-    /// CPU where the worst gap occurred across all cgroups.
+    /// CPU where the worst gap occurred across all cgroups. Paired
+    /// with `worst_gap_ms` — both come from the same cgroup.
     pub worst_gap_cpu: usize,
-    /// Worst migration ratio across any cgroup.
+    /// Worst migration ratio across any cgroup (highest).
     pub worst_migration_ratio: f64,
-    /// Worst p99 wake latency across all cgroups (microseconds).
+    /// Worst p99 wake latency across all cgroups (highest, microseconds).
     pub worst_p99_wake_latency_us: f64,
-    /// Worst median wake latency across all cgroups (microseconds).
+    /// Worst median wake latency across all cgroups (highest, microseconds).
     pub worst_median_wake_latency_us: f64,
-    /// Worst wake latency coefficient of variation across all cgroups.
+    /// Worst wake latency coefficient of variation across all cgroups (highest).
     pub worst_wake_latency_cv: f64,
     /// Sum of iteration counts across all cgroups.
     pub total_iterations: u64,
-    /// Worst mean schedstat run delay across all cgroups (microseconds).
+    /// Worst mean schedstat run delay across all cgroups (highest, microseconds).
     pub worst_mean_run_delay_us: f64,
-    /// Worst schedstat run delay across all cgroups (microseconds).
+    /// Worst schedstat run delay across all cgroups (highest, microseconds).
     pub worst_run_delay_us: f64,
-    /// Worst (lowest) page locality fraction across cgroups.
+    /// Worst page locality fraction across cgroups (lowest non-zero).
     pub worst_page_locality: f64,
-    /// Worst (highest) cross-node migration ratio across cgroups.
+    /// Worst cross-node migration ratio across cgroups (highest).
     pub worst_cross_node_migration_ratio: f64,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
@@ -1974,6 +1977,39 @@ mod tests {
         m.merge(r2);
         assert_eq!(m.stats.worst_gap_ms, 500);
         assert_eq!(m.stats.worst_gap_cpu, 1);
+    }
+
+    /// Reverse direction of [`merge_takes_worst_gap`]: the forward
+    /// case picks `other`'s larger gap and must re-couple to
+    /// `other`'s CPU. This test pins the self-retains branch — when
+    /// `self.worst_gap_ms > other.worst_gap_ms`, `worst_gap_cpu`
+    /// must stay on `self`'s CPU and NOT leak over to `other`'s.
+    ///
+    /// Without both directions pinned, a regression that always
+    /// overwrote `worst_gap_cpu` from `other` (regardless of which
+    /// gap won) would pass the forward test — the forward case
+    /// already asks for `other`'s cpu anyway — and land silently.
+    /// Pairing the two directions is what actually guards the
+    /// "coupled fields stay coupled" invariant from the merge doc.
+    #[test]
+    fn merge_takes_worst_gap_reverse_self_retains() {
+        // r1 has the larger gap (700ms on cpu 0); r2 has the smaller
+        // gap (200ms on cpu 1). After merge, self must keep both
+        // its 700ms AND its cpu 0 — not adopt cpu 1 from the
+        // loser's report.
+        let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 700)]);
+        let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 200)]);
+        let mut m = r1;
+        m.merge(r2);
+        assert_eq!(
+            m.stats.worst_gap_ms, 700,
+            "self's larger gap must be retained",
+        );
+        assert_eq!(
+            m.stats.worst_gap_cpu, 0,
+            "worst_gap_cpu must stay coupled to self's worst_gap_ms — \
+             a regression overwriting cpu from other would set this to 1",
+        );
     }
 
     #[test]
@@ -4163,6 +4199,60 @@ numa_miss 5";
         assert!(
             !detail.is_scheduler_death(),
             "message with prefix mid-string must NOT be detected — only starts_with counts",
+        );
+    }
+
+    /// Exact-prefix-only boundary: a message that equals
+    /// `SCHED_EXITED_PREFIX` with no trailing context must still be
+    /// detected. `starts_with` against the full string is reflexively
+    /// true, but pinning the case guards against a future tightening
+    /// (e.g. requiring a separator like `" "` or `":"` after the
+    /// prefix) that would silently drop emitters who format the
+    /// message without appending context.
+    #[test]
+    fn is_scheduler_death_matches_exact_prefix_no_suffix() {
+        let detail = AssertDetail::new(DetailKind::Monitor, SCHED_EXITED_PREFIX);
+        assert!(
+            detail.is_scheduler_death(),
+            "message equal to SCHED_EXITED_PREFIX must match — starts_with is reflexive",
+        );
+    }
+
+    /// Empty-message boundary: `"".starts_with(non_empty)` is false
+    /// by stdlib definition, so an empty detail cannot trip the
+    /// detector. Pin the behavior so a future reimplementation that
+    /// accidentally accepts empty messages (e.g. a hand-rolled
+    /// comparison, or a regression to a zero-length-prefix case)
+    /// gets caught.
+    #[test]
+    fn is_scheduler_death_rejects_empty_message() {
+        let detail = AssertDetail::new(DetailKind::Monitor, "");
+        assert!(
+            !detail.is_scheduler_death(),
+            "empty message must not match any non-empty prefix",
+        );
+    }
+
+    /// `is_scheduler_death` is kind-blind by design: it filters on
+    /// message prefix only, and a detail carrying
+    /// `DetailKind::SchedulerExited` with an unrelated message must
+    /// NOT trip the detector. Pins the emit-site contract documented
+    /// on the predicate: emitters MUST start the message with
+    /// `SCHED_EXITED_PREFIX` or `SCHED_NO_LONGER_RUNNING_PREFIX`;
+    /// setting the kind is not enough. A regression that loosens the
+    /// predicate to `kind == SchedulerExited || message.starts_with(...)`
+    /// would turn the kind into a second primary detection path,
+    /// letting emitters drop the prefix contract without consequence
+    /// — this test fails on that regression.
+    #[test]
+    fn is_scheduler_death_is_kind_blind_scheduler_exited_with_unrelated_message() {
+        let detail = AssertDetail::new(
+            DetailKind::SchedulerExited,
+            "unrelated diagnostic that does not start with any death prefix",
+        );
+        assert!(
+            !detail.is_scheduler_death(),
+            "predicate must filter on message prefix only; a mis-set kind does not imply scheduler death",
         );
     }
 }

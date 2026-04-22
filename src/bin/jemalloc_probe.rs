@@ -297,6 +297,26 @@ enum ThreadErrorKind {
     TlsArithmetic,
 }
 
+impl std::fmt::Display for ThreadErrorKind {
+    /// Renders the same snake_case tokens emitted by the
+    /// `#[serde(rename_all = "snake_case")]` JSON serialization.
+    /// The human stderr path (`print_output`) uses this Display so
+    /// operators grepping `warning: tid ... [<kind>]: ...` lines
+    /// match against the same tokens that appear in the JSON
+    /// `error_kind` field — no second vocabulary. Kept in lock-step
+    /// with the serde tokens by a parity test in the tests module.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let token = match self {
+            Self::PtraceAttach => "ptrace_attach",
+            Self::Waitpid => "waitpid",
+            Self::GetRegset => "get_regset",
+            Self::ProcessVmReadv => "process_vm_readv",
+            Self::TlsArithmetic => "tls_arithmetic",
+        };
+        f.write_str(token)
+    }
+}
+
 // ---------------------------------------------------------------------
 // ELF + DWARF resolution (pure, testable seams)
 // ---------------------------------------------------------------------
@@ -1106,7 +1126,7 @@ fn print_output(cli: &Cli, out: &ProbeOutput) -> Result<()> {
                         .as_deref()
                         .map(|c| format!(" comm={c}"))
                         .unwrap_or_default();
-                    eprintln!("warning: tid {tid}{comm_suffix} [{error_kind:?}]: {error}");
+                    eprintln!("warning: tid {tid}{comm_suffix} [{error_kind}]: {error}");
                 }
             }
         }
@@ -1584,5 +1604,65 @@ mod tests {
         assert_eq!(round_up(512, 16), 512);
         assert_eq!(round_up(513, 16), 528);
         assert_eq!(round_up(0, 1), 0);
+    }
+
+    /// `Display` for `ThreadErrorKind` must render the same snake_case
+    /// token as the serde JSON serialization. The stderr render path
+    /// (`print_output`) uses `{error_kind}` so operators grepping
+    /// `warning: tid ... [ptrace_attach]: ...` can share a pattern
+    /// with the JSON `"error_kind": "ptrace_attach"` consumers. A
+    /// drift (e.g. Display rendering `PtraceAttach` while serde still
+    /// emits `ptrace_attach`) would silently fork the two vocabularies.
+    #[test]
+    fn thread_error_kind_display_matches_serde_token() {
+        for k in [
+            ThreadErrorKind::PtraceAttach,
+            ThreadErrorKind::Waitpid,
+            ThreadErrorKind::GetRegset,
+            ThreadErrorKind::ProcessVmReadv,
+            ThreadErrorKind::TlsArithmetic,
+        ] {
+            let json = serde_json::to_string(&k).unwrap();
+            let serde_token = json.trim_matches('"');
+            let display_token = format!("{k}");
+            assert_eq!(
+                display_token, serde_token,
+                "Display and serde token diverged for {k:?}",
+            );
+        }
+    }
+
+    /// `run()` must short-circuit to `RunOutcome::Fatal` when `--pid`
+    /// matches the probe's own pid. PTRACE_SEIZE rejects self-attach
+    /// at the kernel level, so without this gate every tid would
+    /// fail with EPERM mid-loop and the user would see a per-thread
+    /// permission cascade instead of an actionable "cannot probe
+    /// self" error. Pins the early-return AND the error wording
+    /// (`refusing to probe self`) that downstream tests and error-
+    /// message consumers match against.
+    #[test]
+    fn run_rejects_self_probe() {
+        let cli = Cli {
+            pid: Some(std::process::id() as i32),
+            json: false,
+            self_test: None,
+        };
+        match run(&cli) {
+            RunOutcome::Fatal(err) => {
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("refusing to probe self"),
+                    "expected self-probe rejection wording, got: {msg}",
+                );
+            }
+            other => panic!(
+                "expected Fatal for pid==self_pid, got variant: {}",
+                match other {
+                    RunOutcome::Ok(_) => "Ok",
+                    RunOutcome::AllFailed(_) => "AllFailed",
+                    RunOutcome::Fatal(_) => unreachable!(),
+                },
+            ),
+        }
     }
 }

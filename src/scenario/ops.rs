@@ -2073,9 +2073,8 @@ fn build_stimulus(
 /// This holds when ktstr is the cgroup root (typical: PID 1 in a
 /// guest VM, the default deployment shape). Under a nested-cgroup
 /// layout with a narrowed parent `cpuset.mems` — container-in-
-/// container, systemd slices with `AllowedMemoryNodes=`, a host-run
-/// via `ktstr-jemalloc-probe` wrapped by another cgroup controller —
-/// the inherited `mems_allowed` IS restricted, and the kernel DOES
+/// container, systemd slices with `AllowedMemoryNodes=` — the
+/// inherited `mems_allowed` IS restricted, and the kernel DOES
 /// intersect `set_mempolicy`'s nodemask with it. In that shape the
 /// validator additionally functions as a kernel guard: it catches
 /// policy nodes the kernel would silently drop before they reach
