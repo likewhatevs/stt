@@ -311,7 +311,7 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     // indicates either a test-side leak (the worker is freeing
     // its Vec) or the probe reading the wrong offset.
     const DEALLOC_CAP: u64 = 1024 * 1024;
-    let worker: PayloadHandle = ctx
+    let mut worker: PayloadHandle = ctx
         .payload(&JEMALLOC_ALLOC_WORKER)
         .arg(KNOWN_BYTES.to_string())
         .spawn()?;
@@ -325,9 +325,21 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     // 5s is generous vs the worker's expected sub-50ms dispatch +
     // 16 MiB allocation time on a warm guest; a timeout implies
     // the worker died during startup or the VM is heavily stalled.
+    // `try_wait` each tick so a worker that exits BEFORE creating
+    // the marker (e.g. the single-thread self-check failed, or
+    // allocation OOM'd) is detected immediately instead of waiting
+    // the full 5s deadline with stale pid-scoped path polling.
     let ready_path = format!("/tmp/ktstr-worker-ready-{worker_pid}");
     let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !std::path::Path::new(&ready_path).exists() {
+        if worker.try_wait()?.is_some() {
+            return Err(anyhow!(
+                "worker pid={worker_pid} exited before creating ready marker {ready_path} \
+                 — check stderr for the exit reason (typical causes: \
+                 /proc/self/task self-check failed, allocation OOM, \
+                 bytes=0 argument)"
+            ));
+        }
         if std::time::Instant::now() >= ready_deadline {
             let _ = worker.kill();
             return Err(anyhow!(
@@ -335,6 +347,20 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Narrow race close: the worker may have written the ready
+    // marker and then died between the marker write and this probe
+    // invocation (unusual — the worker is supposed to park — but a
+    // fatal Drop or SIGKILL from the VM's init could still fire).
+    // One more try_wait surfaces that case with an actionable
+    // error instead of letting the probe waste its wall time on a
+    // dead pid.
+    if worker.try_wait()?.is_some() {
+        return Err(anyhow!(
+            "worker pid={worker_pid} exited after writing ready marker but \
+             before probe dispatch — check stderr for the exit reason"
+        ));
     }
 
     let run_outcome = ctx

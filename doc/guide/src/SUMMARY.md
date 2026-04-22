@@ -35,6 +35,7 @@
   - [Test a New Scheduler](recipes/test-new-scheduler.md)
   - [Investigate a Crash](recipes/investigate-crash.md)
   - [A/B Compare Branches](recipes/ab-compare.md)
+  - [Capture and Compare Host State](recipes/host-state.md)
   - [Write a Dynamic Scenario](recipes/dynamic-scenario.md)
   - [Customize Checking](recipes/custom-checking.md)
   - [Benchmarking and Negative Tests](recipes/benchmarking-tests.md)

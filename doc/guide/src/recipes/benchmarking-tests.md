@@ -106,3 +106,29 @@ Key points:
   want to exercise in a negative test.
 - The test function returns the scenario result normally; the harness
   checks that it produces an error.
+
+## Metric extraction from stderr
+
+`OutputFormat::Json` and `OutputFormat::LlmExtract` read the
+payload's STDOUT as the primary stream, then fall back to STDERR if
+stdout is empty or yields no metrics. Some benchmarks emit their
+numbers only to stderr — `schbench`, for example, writes its
+`Wakeup Latencies percentiles` / `Request Latencies percentiles`
+blocks via `fprintf(stderr, ...)` and leaves stdout blank. The
+fallback keeps those benchmarks usable without a redirect.
+
+Consequence: a payload that writes mixed output to both streams
+will have metrics extracted from stdout **only**, because the
+fallback fires solely when the primary stream is empty or yields
+nothing parseable. If you care about stderr-side numbers for a
+stdout-emitting binary, redirect stderr into stdout at the payload
+layer (`extra_args = ["-c", "cmd 2>&1"]` for shell-wrapped
+invocations, or whatever equivalent the binary supports).
+
+`stress-ng` is the mirror trap: progress / per-stressor summaries
+go to stderr and stdout is blank, so the fallback sees stress-ng's
+prose. `OutputFormat::Json` returns zero metrics (stderr is prose,
+not JSON); `OutputFormat::LlmExtract` may extract numbers from the
+fallback but results depend on the local model's tolerance for
+that prose format. Keep `OutputFormat::ExitCode` for stress-ng
+unless you are prepared for that tradeoff.
