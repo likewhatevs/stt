@@ -44,6 +44,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+// serde(default) is stripped from cache types so an old metadata.json
+// missing a required non-Option field (e.g. has_vmlinux) fails at
+// deserialize time → ListedEntry::Corrupt. Option fields tolerate
+// absent keys via serde_json's native handling. Other modules use
+// serde(default, skip_serializing_if) for producer-omitted fields
+// (JSON minification, not compat shims); do not import that pattern here.
+
 /// How a cached kernel's source was acquired, with per-variant
 /// payload (git details for `Git`, source-tree path and git hash for
 /// `Local`).
@@ -1085,7 +1092,7 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
         }
     }
 
-    // Verify symtab survivors BEFORE writing. The `Builder` state
+    // Check symtab survivors BEFORE writing. The `Builder` state
     // already holds every parsed symbol; counting named, non-deleted
     // entries here lets us fail fast without the post-write
     // `goblin::elf::Elf::parse(&out)` we used to run. The null symbol
@@ -1461,7 +1468,7 @@ mod tests {
 
     #[test]
     fn kernel_source_serde_tagged_representation() {
-        // Verify the tagged JSON shape on each variant.
+        // Check the tagged JSON shape on each variant.
         let t = serde_json::to_string(&KernelSource::Tarball).unwrap();
         assert_eq!(t, r#"{"type":"tarball"}"#);
         let g = serde_json::to_string(&KernelSource::Git {
@@ -2432,7 +2439,7 @@ mod tests {
         let atomicity_violations = Arc::new(AtomicUsize::new(0));
 
         // Spawn reader threads. Each reader loops until `stop` is
-        // set, calling lookup() and verifying that when Some(entry)
+        // set, calling lookup() and checking that when Some(entry)
         // comes back, the image file exists and matches one of the
         // two known writer contents byte-for-byte.
         let reader_count = 4;
@@ -2637,7 +2644,7 @@ mod tests {
 
     #[test]
     fn cache_dir_store_preserves_original_vmlinux() {
-        // strip_vmlinux_debug reads the source path; verify the
+        // strip_vmlinux_debug reads the source path; check the
         // source file is still there after store() (no move, no
         // truncate).
         let tmp = TempDir::new().unwrap();
@@ -2754,7 +2761,7 @@ mod tests {
         // Pre-kconfig-tracking cache entries (ktstr_kconfig_hash == None)
         // must surface as `Untracked`, not `Stale`. `find_kernel`'s
         // stale-filter at lib.rs treats `Untracked` as "keep" so legacy
-        // entries remain usable — verified here so a regression that
+        // entries remain usable — checked here so a regression that
         // conflates "no recorded hash" with "different hash" surfaces
         // at unit-test time.
         let tmp = TempDir::new().unwrap();

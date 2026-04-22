@@ -4277,7 +4277,7 @@ mod tests {
 
     #[test]
     fn read_schedstat_returns_triple() {
-        // Verifies the function parses without panicking.
+        // Checks that the function parses without panicking.
         let (cpu_time, run_delay, timeslices) = read_schedstat();
         let _ = (cpu_time, run_delay, timeslices);
     }

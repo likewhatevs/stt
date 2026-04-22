@@ -1565,7 +1565,7 @@ mod tests {
 
     #[test]
     fn read_u32_nonzero_pa_and_offset() {
-        // Verify that PA + offset are combined correctly.
+        // Check that PA + offset are combined correctly.
         let mut buf = [0u8; 32];
         // Place 0xDEADBEEF at byte 20 (PA=12, offset=8).
         buf[20..24].copy_from_slice(&0xDEADBEEFu32.to_ne_bytes());
@@ -2015,11 +2015,11 @@ mod tests {
         handle.join().unwrap();
 
         assert!(!samples.is_empty());
-        // Verify the watchdog value was written at sch_pa + watchdog_offset.
+        // Check the watchdog value was written at sch_pa + watchdog_offset.
         let write_pa = sch_pa as usize + watchdog_offset;
         let written = u64::from_ne_bytes(combined[write_pa..write_pa + 8].try_into().unwrap());
         assert_eq!(written, 99999);
-        // Verify monitor_loop recorded the observation.
+        // Check monitor_loop recorded the observation.
         let obs = watchdog_observation.expect("watchdog_observation should be Some after write");
         assert_eq!(obs.expected_jiffies, 99999);
         assert_eq!(obs.observed_jiffies, 99999);
@@ -2195,7 +2195,7 @@ mod tests {
         handle.join().unwrap();
 
         assert!(!samples.is_empty());
-        // Verify dump request was written to SHM.
+        // Check dump request was written to SHM.
         let dump_byte = combined[shm_pa as usize + crate::vmm::shm_ring::DUMP_REQ_OFFSET];
         assert_eq!(
             dump_byte,
@@ -2497,7 +2497,7 @@ mod tests {
 
     #[test]
     fn reactive_and_evaluate_stall_consistency() {
-        // Verify that the reactive path (monitor_loop with dump_trigger)
+        // Check that the reactive path (monitor_loop with dump_trigger)
         // and the post-hoc path (evaluate) agree on stall detection.
         // Build a scenario where stall fires: stuck rq_clock, nr_running>0,
         // sustained_samples=2.

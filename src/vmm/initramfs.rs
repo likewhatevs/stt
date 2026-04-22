@@ -1671,7 +1671,7 @@ mod tests {
         // which means bytes outside the validated range stay
         // untouched. We simulate "before" bytes in region B, run the
         // same bounds check try_cow_overlay uses, observe that it
-        // rejects the request, and verify region B's bytes survive.
+        // rejects the request, and check region B's bytes survive.
         use vm_memory::{Bytes, GuestAddress, GuestMemory};
         let region_a_size: usize = 64 * 1024;
         let region_b_size: usize = 64 * 1024;
@@ -2402,7 +2402,7 @@ mod tests {
         let entries = cpio_entries(&base);
         let entry_names: Vec<&str> = entries.iter().map(|(n, _, _, _)| n.as_str()).collect();
 
-        // Verify all include files are present.
+        // Check that all include files are present.
         for (archive_path, _) in &includes {
             assert!(
                 entry_names.contains(archive_path),
@@ -2412,7 +2412,7 @@ mod tests {
             );
         }
 
-        // Verify all include files have correct size.
+        // Check that all include files have correct size.
         for (archive_path, _) in &includes {
             let entry = entries.iter().find(|(n, _, _, _)| n == archive_path);
             assert!(
@@ -2423,7 +2423,7 @@ mod tests {
             );
         }
 
-        // Verify directory entries exist for the nested path.
+        // Check that directory entries exist for the nested path.
         assert!(entry_names.contains(&"usr"), "missing 'usr' dir entry");
         assert!(
             entry_names.contains(&"usr/local"),
@@ -2442,7 +2442,7 @@ mod tests {
             "missing 'usr/local/custom/platform/lib' dir entry"
         );
 
-        // Verify directories come before files they contain.
+        // Check that directories come before files they contain.
         let dir_pos = entries
             .iter()
             .position(|(n, _, _, _)| n == "usr/local/custom/platform/lib")
@@ -2515,7 +2515,7 @@ mod tests {
             );
         }
 
-        // Verify the include file itself is present.
+        // Check the include file itself is present.
         assert!(
             entry_map.contains_key("include-files/sh"),
             "include file itself missing from archive"
@@ -2524,7 +2524,7 @@ mod tests {
 
     #[test]
     fn all_inode_zero_entries_have_nlink_one() {
-        // Verify that all entries use ino=0 and nlink=1, so the kernel
+        // Check that all entries use ino=0 and nlink=1, so the kernel
         // initramfs unpacker never enters the hardlink path.
         let exe = crate::resolve_current_exe().unwrap();
         let base = build_initramfs_base(&exe, &[], &[], false).unwrap();
@@ -2567,7 +2567,7 @@ mod tests {
             "compressed chunk should be non-empty and smaller than input: {}",
             chunk_size
         );
-        // Decompress and verify roundtrip.
+        // Decompress and check roundtrip.
         let decompressed = lz4_flex::block::decompress(&compressed[8..8 + chunk_size], data.len())
             .expect("lz4 block decompress failed");
         assert_eq!(decompressed, data);
@@ -2771,7 +2771,7 @@ mod tests {
         assert_eq!(decompressed, expected);
     }
 
-    /// Verify lz4_flex block output is decompressible by the C lz4
+    /// Check lz4_flex block output is decompressible by the C lz4
     /// library (same decompressor as the kernel's LZ4_decompress_safe).
     /// Uses synthetic cpio data with generic paths.
     #[test]
@@ -2809,7 +2809,7 @@ mod tests {
         assert_eq!(&result[..], &data[..], "decompressed content mismatch");
     }
 
-    /// Verify our output can be decompressed by `lz4 -d` when compressed
+    /// Check our output can be decompressed by `lz4 -d` when compressed
     /// with `lz4 -l` as reference. Tests cross-compatibility of our
     /// legacy format framing with the reference implementation.
     #[test]

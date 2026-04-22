@@ -4212,7 +4212,7 @@ mod tests {
         }
 
         /// Return an error from the Nth call (0-indexed from now) with
-        /// the given message. Used by tests that verify error
+        /// the given message. Used by tests that check error
         /// propagation through apply_setup.
         fn fail_call_at(&self, index: usize, message: &str) {
             *self.fail_at.lock().unwrap() = Some((index, message.to_string()));
@@ -4552,7 +4552,7 @@ mod tests {
             msg.contains("set_cpuset kernel EBUSY"),
             "set_cpuset error must propagate, got: {msg}"
         );
-        // Verify the failure halted apply_setup before reaching spawn:
+        // Check the failure halted apply_setup before reaching spawn:
         // no MoveTasks call should have been recorded.
         let calls = mock.calls();
         let has_move = calls
@@ -5450,7 +5450,7 @@ mod tests {
         // The `find_live_payload_with_cgroup` lookup for ("sleeper", "cg_c")
         // returns None because no live entry matches that pair — so
         // the dup check passes and run_scenario would let the spawn
-        // proceed. We verify the lookup directly (spawning against
+        // proceed. We check the lookup directly (spawning against
         // MockCgroupOps would fail on the pre_exec cgroup write).
         assert!(
             scenario

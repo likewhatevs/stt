@@ -722,7 +722,7 @@ mod tests {
 
     #[test]
     fn tsc_stability_check_roundtrip() {
-        // Verify the get→set→get roundtrip succeeds with
+        // Check the get→set→get roundtrip succeeds with
         // performance_mode=true (which enables the TSC check).
         let topo = Topology {
             llcs: 1,

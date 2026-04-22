@@ -23,14 +23,14 @@ fn basic_topology_check(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Second ktstr_test with default attributes to verify defaults work.
+/// Second ktstr_test with default attributes to check defaults work.
 #[ktstr_test]
 fn default_attrs_compile(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
 }
 
-/// ktstr_test with host_only = true to verify the macro accepts the
+/// ktstr_test with host_only = true to check the macro accepts the
 /// attribute and wires it into KtstrTestEntry.host_only.
 #[ktstr_test(host_only = true)]
 fn host_only_attr_compile(ctx: &Ctx) -> Result<AssertResult> {
@@ -50,7 +50,7 @@ fn empty_workloads_compiles(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify resolve_func_ip returns a real nonzero address inside the VM.
+/// Check resolve_func_ip returns a real nonzero address inside the VM.
 /// On the host, kptr_restrict or kernel lockdown hides addresses.
 #[cfg(feature = "integration")]
 #[ktstr_test(llcs = 1, cores = 1, threads = 1)]
@@ -70,7 +70,7 @@ fn resolve_func_ip_known_symbol(ctx: &Ctx) -> Result<AssertResult> {
     })
 }
 
-/// Verify that find_test can locate registered entries.
+/// Check that find_test can locate registered entries.
 #[test]
 fn find_registered_tests() {
     assert!(
@@ -83,7 +83,7 @@ fn find_registered_tests() {
     );
 }
 
-/// Verify entry field values match the macro attributes.
+/// Check entry field values match the macro attributes.
 #[test]
 fn entry_fields_match_attrs() {
     let entry = ktstr::test_support::find_test("basic_topology_check").unwrap();
@@ -93,7 +93,7 @@ fn entry_fields_match_attrs() {
     assert_eq!(entry.memory_mb, 2048);
 }
 
-/// Verify default attribute values.
+/// Check default attribute values.
 #[test]
 fn entry_default_fields() {
     let entry = ktstr::test_support::find_test("default_attrs_compile").unwrap();
@@ -113,7 +113,7 @@ fn entry_default_fields() {
     assert!(!entry.host_only);
 }
 
-/// Verify that host_only = true is threaded into KtstrTestEntry.
+/// Check that host_only = true is threaded into KtstrTestEntry.
 #[test]
 fn entry_host_only_attr() {
     let entry = ktstr::test_support::find_test("host_only_attr_compile").unwrap();
@@ -133,7 +133,7 @@ fn entry_host_only_attr() {
 #[allow(dead_code)]
 enum SysKargsTestFlag {}
 
-/// Verify the derive threads sysctls + kargs into the Scheduler const.
+/// Check the derive threads sysctls + kargs into the Scheduler const.
 #[test]
 fn derive_scheduler_sysctls_kargs() {
     assert_eq!(SYS_KARGS_TEST.sysctls.len(), 2);
@@ -171,7 +171,7 @@ fn flags_attrs_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify required_flags and excluded_flags propagate to the entry.
+/// Check required_flags and excluded_flags propagate to the entry.
 #[test]
 fn entry_flags_match_attrs() {
     let entry = ktstr::test_support::find_test("flags_attrs_compile").unwrap();
@@ -195,7 +195,7 @@ fn topo_constraints_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify topology constraints propagate to the entry.
+/// Check topology constraints propagate to the entry.
 #[test]
 fn entry_topo_constraints_match_attrs() {
     let entry = ktstr::test_support::find_test("topo_constraints_compile").unwrap();
@@ -215,7 +215,7 @@ fn max_constraints_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify max constraint attributes propagate to the entry.
+/// Check max constraint attributes propagate to the entry.
 #[test]
 fn entry_max_constraints_match_attrs() {
     let entry = ktstr::test_support::find_test("max_constraints_compile").unwrap();
@@ -246,7 +246,7 @@ fn inherit_sched_constraints(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify inherited constraint values match the scheduler definition.
+/// Check inherited constraint values match the scheduler definition.
 #[test]
 fn entry_inherit_sched_constraints() {
     let entry = ktstr::test_support::find_test("inherit_sched_constraints").unwrap();
@@ -266,7 +266,7 @@ fn override_sched_constraint(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify the override applies while other fields are still inherited.
+/// Check the override applies while other fields are still inherited.
 #[test]
 fn entry_override_sched_constraint() {
     let entry = ktstr::test_support::find_test("override_sched_constraint").unwrap();
@@ -298,7 +298,7 @@ fn topo_inherit_partial(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify full topology inheritance from scheduler.
+/// Check full topology inheritance from scheduler.
 #[test]
 fn entry_topo_inherit_full() {
     let entry = ktstr::test_support::find_test("topo_inherit_full").unwrap();
@@ -307,7 +307,7 @@ fn entry_topo_inherit_full() {
     assert_eq!(entry.topology.threads_per_core, 1);
 }
 
-/// Verify partial topology inheritance: threads overridden, rest inherited.
+/// Check partial topology inheritance: threads overridden, rest inherited.
 #[test]
 fn entry_topo_inherit_partial() {
     let entry = ktstr::test_support::find_test("topo_inherit_partial").unwrap();
@@ -323,7 +323,7 @@ fn performance_mode_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify performance_mode is set in generated entry.
+/// Check performance_mode is set in generated entry.
 #[test]
 fn entry_performance_mode_set() {
     let entry = ktstr::test_support::find_test("performance_mode_compile").unwrap();
@@ -356,14 +356,14 @@ enum TestDeriveFlag {
     GammaDelta,
 }
 
-/// Verify the derive generates a const Scheduler with the correct name.
+/// Check the derive generates a const Scheduler with the correct name.
 #[test]
 fn derive_scheduler_const_name() {
     let _ = &TEST_DERIVE;
     assert_eq!(TEST_DERIVE.name, "test_derive");
 }
 
-/// Verify scheduler binary spec.
+/// Check scheduler binary spec.
 #[test]
 fn derive_scheduler_binary() {
     assert!(matches!(
@@ -372,7 +372,7 @@ fn derive_scheduler_binary() {
     ));
 }
 
-/// Verify scheduler topology.
+/// Check scheduler topology.
 #[test]
 fn derive_scheduler_topology() {
     assert_eq!(TEST_DERIVE.topology.llcs, 2);
@@ -380,7 +380,7 @@ fn derive_scheduler_topology() {
     assert_eq!(TEST_DERIVE.topology.threads_per_core, 1);
 }
 
-/// Verify scheduler cgroup_parent.
+/// Check scheduler cgroup_parent.
 #[test]
 fn derive_scheduler_cgroup_parent() {
     assert_eq!(
@@ -389,25 +389,25 @@ fn derive_scheduler_cgroup_parent() {
     );
 }
 
-/// Verify scheduler sched_args.
+/// Check scheduler sched_args.
 #[test]
 fn derive_scheduler_sched_args() {
     assert_eq!(TEST_DERIVE.sched_args, &["--arg1", "--arg2"]);
 }
 
-/// Verify scheduler config_file.
+/// Check scheduler config_file.
 #[test]
 fn derive_scheduler_config_file() {
     assert_eq!(TEST_DERIVE.config_file, Some("test-config.toml"));
 }
 
-/// Verify the derive generates the correct number of flags.
+/// Check the derive generates the correct number of flags.
 #[test]
 fn derive_scheduler_flag_count() {
     assert_eq!(TEST_DERIVE.flags.len(), 3);
 }
 
-/// Verify flag names are kebab-cased from variant names.
+/// Check flag names are kebab-cased from variant names.
 #[test]
 fn derive_flag_names() {
     assert_eq!(TEST_DERIVE.flags[0].name, "alpha");
@@ -415,7 +415,7 @@ fn derive_flag_names() {
     assert_eq!(TEST_DERIVE.flags[2].name, "gamma-delta");
 }
 
-/// Verify flag args.
+/// Check flag args.
 #[test]
 fn derive_flag_args() {
     assert_eq!(TEST_DERIVE.flags[0].args, &["--enable-alpha"]);
@@ -423,7 +423,7 @@ fn derive_flag_args() {
     assert_eq!(TEST_DERIVE.flags[2].args, &["--enable-gamma-delta"]);
 }
 
-/// Verify flag requires dependencies.
+/// Check flag requires dependencies.
 #[test]
 fn derive_flag_requires() {
     assert!(TEST_DERIVE.flags[0].requires.is_empty());
@@ -432,7 +432,7 @@ fn derive_flag_requires() {
     assert!(TEST_DERIVE.flags[2].requires.is_empty());
 }
 
-/// Verify associated name constants.
+/// Check associated name constants.
 #[test]
 fn derive_name_constants() {
     assert_eq!(TestDeriveFlag::ALPHA, "alpha");
@@ -440,7 +440,7 @@ fn derive_name_constants() {
     assert_eq!(TestDeriveFlag::GAMMA_DELTA, "gamma-delta");
 }
 
-/// Verify profile generation respects requires dependencies.
+/// Check profile generation respects requires dependencies.
 #[test]
 fn derive_profiles_respect_requires() {
     let profiles = TEST_DERIVE.generate_profiles(&[TestDeriveFlag::BETA], &[]);
@@ -453,7 +453,7 @@ fn derive_profiles_respect_requires() {
     }
 }
 
-/// Verify typed flag refs work in #[ktstr_test] required_flags.
+/// Check typed flag refs work in #[ktstr_test] required_flags.
 #[ktstr_test(
     scheduler = TEST_DERIVE_PAYLOAD,
     required_flags = [TestDeriveFlag::ALPHA, TestDeriveFlag::BETA],
@@ -464,7 +464,7 @@ fn typed_flags_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify typed flag refs propagate correctly to the entry.
+/// Check typed flag refs propagate correctly to the entry.
 #[test]
 fn entry_typed_flags_match() {
     let entry = ktstr::test_support::find_test("typed_flags_compile").unwrap();
@@ -472,7 +472,7 @@ fn entry_typed_flags_match() {
     assert_eq!(entry.excluded_flags, &["gamma-delta"]);
 }
 
-/// Verify mixed string/path flag refs work.
+/// Check mixed string/path flag refs work.
 #[ktstr_test(
     scheduler = TEST_DERIVE_PAYLOAD,
     required_flags = ["alpha", TestDeriveFlag::BETA]
@@ -482,21 +482,21 @@ fn mixed_flags_compile(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-/// Verify mixed flag refs propagate correctly.
+/// Check mixed flag refs propagate correctly.
 #[test]
 fn entry_mixed_flags_match() {
     let entry = ktstr::test_support::find_test("mixed_flags_compile").unwrap();
     assert_eq!(entry.required_flags, &["alpha", "beta"]);
 }
 
-/// Verify topology inheritance from derived scheduler.
+/// Check topology inheritance from derived scheduler.
 #[ktstr_test(scheduler = TEST_DERIVE_PAYLOAD)]
 fn derive_topo_inherit(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
 }
 
-/// Verify topology inheritance from derived scheduler.
+/// Check topology inheritance from derived scheduler.
 #[test]
 fn entry_derive_topo_inherit() {
     let entry = ktstr::test_support::find_test("derive_topo_inherit").unwrap();
@@ -514,19 +514,19 @@ fn entry_derive_topo_inherit() {
 #[allow(dead_code)]
 enum EmptySchedFlag {}
 
-/// Verify the const name is derived correctly for an empty enum.
+/// Check the const name is derived correctly for an empty enum.
 #[test]
 fn derive_empty_enum_const_name() {
     assert_eq!(EMPTY_SCHED.name, "empty_sched");
 }
 
-/// Verify an empty enum produces an empty flags slice.
+/// Check an empty enum produces an empty flags slice.
 #[test]
 fn derive_empty_enum_no_flags() {
     assert!(EMPTY_SCHED.flags.is_empty());
 }
 
-/// Verify binary is set even with no flags.
+/// Check binary is set even with no flags.
 #[test]
 fn derive_empty_enum_binary() {
     assert!(matches!(
@@ -535,7 +535,7 @@ fn derive_empty_enum_binary() {
     ));
 }
 
-/// Verify profile generation works with zero flags: exactly one profile
+/// Check profile generation works with zero flags: exactly one profile
 /// (the empty "default" profile).
 #[test]
 fn derive_empty_enum_profiles() {
@@ -557,7 +557,7 @@ enum TestFlags {
     Xray,
 }
 
-/// Verify "Flags" suffix is stripped: TestFlags -> TEST.
+/// Check "Flags" suffix is stripped: TestFlags -> TEST.
 #[test]
 fn derive_flags_suffix_stripping() {
     assert_eq!(TEST.name, "test_flags");
@@ -578,7 +578,7 @@ enum PlainSched {
     Yankee,
 }
 
-/// Verify enum without "Flag"/"Flags" suffix uses full name: PlainSched -> PLAIN_SCHED.
+/// Check enum without "Flag"/"Flags" suffix uses full name: PlainSched -> PLAIN_SCHED.
 #[test]
 fn derive_no_suffix_const_name() {
     assert_eq!(PLAIN_SCHED.name, "plain");
@@ -599,7 +599,7 @@ enum BareVariantFlag {
     WithArgs,
 }
 
-/// Verify a variant without #[flag(...)] produces a FlagDecl with empty
+/// Check a variant without #[flag(...)] produces a FlagDecl with empty
 /// args and empty requires.
 #[test]
 fn derive_bare_variant_empty_args() {
@@ -609,7 +609,7 @@ fn derive_bare_variant_empty_args() {
     assert!(naked.requires.is_empty());
 }
 
-/// Verify the other variant still has its args.
+/// Check the other variant still has its args.
 #[test]
 fn derive_bare_variant_other_has_args() {
     let with_args = BARE_VARIANT.flags[1];
@@ -631,17 +631,17 @@ enum AcronymFlag {
     IOHeavy,
 }
 
-/// Verify all-caps "LLC" produces kebab name "llc".
+/// Check all-caps "LLC" produces kebab name "llc".
 /// Note: AcronymFlag::LLC resolves as the enum variant (not the &str
 /// constant) because the variant and constant share the same identifier.
-/// Verify via the flags array instead.
+/// Check via the flags array instead.
 #[test]
 fn derive_acronym_llc() {
     assert_eq!(ACRONYM.flags[0].name, "llc");
     assert_eq!(ACRONYM.flags[0].args, &["--llc"]);
 }
 
-/// Verify "IOHeavy" produces kebab name "io-heavy" and constant IO_HEAVY.
+/// Check "IOHeavy" produces kebab name "io-heavy" and constant IO_HEAVY.
 #[test]
 fn derive_acronym_io_heavy() {
     assert_eq!(ACRONYM.flags[1].name, "io-heavy");
@@ -657,7 +657,7 @@ fn derive_acronym_io_heavy() {
 #[allow(dead_code)]
 enum MinimalFlag {}
 
-/// Verify a minimal derive with only name produces correct defaults:
+/// Check a minimal derive with only name produces correct defaults:
 /// no binary, default topology, no flags, no sched_args, no cgroup_parent.
 #[test]
 fn derive_minimal_defaults() {
@@ -676,7 +676,7 @@ fn derive_minimal_defaults() {
     assert_eq!(MINIMAL.config_file, None);
 }
 
-/// Topology validation: boot a multi-LLC VM and verify the guest sees
+/// Topology validation: boot a multi-LLC VM and check the guest sees
 /// more than the 2-CPU default. The base test boots 2l2c1t (4 CPUs, 2
 /// LLCs); gauntlet variants boot larger topologies. Catches regressions
 /// where guest-side topology discovery falls back to incorrect defaults.

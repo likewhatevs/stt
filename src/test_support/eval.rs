@@ -210,7 +210,7 @@ pub(crate) fn run_ktstr_test_inner(
         );
     }
 
-    // When running with a struct_ops scheduler, verify that host-side
+    // When running with a struct_ops scheduler, check that host-side
     // BPF program enumeration found programs with non-zero verified_insns.
     if entry.scheduler.has_active_scheduling() && result.success && result.verifier_stats.is_empty()
     {
@@ -728,7 +728,7 @@ pub(crate) fn trim_settle_samples(
     }
 }
 
-/// Verify that `/dev/kvm` is accessible for read+write.
+/// Check that `/dev/kvm` is accessible for read+write.
 ///
 /// Pre-flight check for VM-booting test runs: every ktstr test needs
 /// a KVM fd, and failing fast here yields an actionable error
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn kvm_accessible_on_test_host() {
-        // Verifies /dev/kvm is accessible with read+write permissions.
+        // Checks that /dev/kvm is accessible with read+write permissions.
         ensure_kvm().expect("/dev/kvm not accessible");
     }
 

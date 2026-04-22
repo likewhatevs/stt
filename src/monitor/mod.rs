@@ -1384,7 +1384,7 @@ mod tests {
 
     /// Complement: with `kernel_path=None` (virtme-style run), the
     /// host config IS authoritative and may legitimately override
-    /// `DEFAULT_HZ`. Verify the returned value is a plausible HZ
+    /// `DEFAULT_HZ`. Check the returned value is a plausible HZ
     /// value — i.e., the code path still works when we explicitly
     /// want host fallback.
     #[test]
@@ -3174,7 +3174,7 @@ mod tests {
 
     #[test]
     fn from_samples_empty_all_defaults() {
-        // Verify every field of MonitorSummary defaults correctly for empty input,
+        // Check that every field of MonitorSummary defaults correctly for empty input,
         // including event_deltas which empty_samples_default_summary does not check.
         let summary = MonitorSummary::from_samples(&[]);
         assert_eq!(summary.total_samples, 0);
@@ -3191,7 +3191,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Negative tests: verify monitor diagnostics catch controlled failures
+    // Negative tests: check monitor diagnostics catch controlled failures
     // ---------------------------------------------------------------
 
     #[test]
