@@ -44,6 +44,17 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Filename prefix that marks an in-progress atomic-store directory
+/// under the cache root. Format: `{TMP_DIR_PREFIX}{cache_key}-{pid}`.
+/// Emitted by [`CacheDir::store`] when composing the tempdir path,
+/// recognized by the list/lookup scanners and by the orphan-sweep
+/// path in [`clean_orphaned_tmp_dirs`] so a scanner that sees this
+/// prefix on a directory name knows to skip (in-progress), and the
+/// validator in [`validate_cache_key`] rejects keys starting with it
+/// so user input cannot shadow a real tempdir. Centralized here so
+/// the three roles — emitter, scanner, validator — cannot drift.
+const TMP_DIR_PREFIX: &str = ".tmp-";
+
 // serde(default) is stripped from cache types so an old metadata.json
 // missing a required non-Option field (e.g. has_vmlinux) fails at
 // deserialize time → ListedEntry::Corrupt. Option fields tolerate
@@ -482,7 +493,7 @@ impl CacheDir {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            if name.starts_with(".tmp-") {
+            if name.starts_with(TMP_DIR_PREFIX) {
                 continue;
             }
             match read_metadata(&path) {
@@ -557,7 +568,11 @@ impl CacheDir {
         let final_dir = self.root.join(cache_key);
         let tmp_dir = self
             .root
-            .join(format!(".tmp-{}-{}", cache_key, std::process::id()));
+            .join(format!(
+                "{TMP_DIR_PREFIX}{}-{}",
+                cache_key,
+                std::process::id(),
+            ));
 
         // Clean up any stale temp dir from a prior crash. create_dir_all
         // on tmp_dir also creates self.root lazily on first store.
@@ -741,7 +756,7 @@ fn clean_orphaned_tmp_dirs(cache_root: &Path) -> anyhow::Result<()> {
             Ok(n) => n,
             Err(_) => continue, // non-UTF-8, not a `.tmp-` we created
         };
-        if !name.starts_with(".tmp-") {
+        if !name.starts_with(TMP_DIR_PREFIX) {
             continue;
         }
         // Suffix parse: `.tmp-{key}-{pid}`. Key may itself contain
@@ -810,8 +825,10 @@ fn validate_cache_key(key: &str) -> anyhow::Result<()> {
     if key.contains('\0') {
         anyhow::bail!("cache key must not contain null bytes");
     }
-    if key.starts_with(".tmp-") {
-        anyhow::bail!("cache key must not start with .tmp- (reserved): {key:?}");
+    if key.starts_with(TMP_DIR_PREFIX) {
+        anyhow::bail!(
+            "cache key must not start with {TMP_DIR_PREFIX} (reserved): {key:?}",
+        );
     }
     Ok(())
 }

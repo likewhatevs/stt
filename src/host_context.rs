@@ -1320,6 +1320,11 @@ Hugepagesize:       2048 kB
         // Non-populated fields still render as (unknown) — show-host
         // never silently hides a field.
         assert!(out.contains("cpu_vendor: (unknown)"), "{out}");
+        assert!(
+            out.ends_with('\n'),
+            "format_human output must terminate with a newline so the \
+             next line the operator sees sits on its own row: {out:?}",
+        );
     }
 
     /// `sched_tunables: Some(empty)` must not render as the generic
@@ -1335,11 +1340,21 @@ Hugepagesize:       2048 kB
             out_empty.contains("sched_tunables: (empty)"),
             "empty map must render distinctly from None: {out_empty}",
         );
+        assert!(
+            out_empty.ends_with('\n'),
+            "format_human with empty tunables must still end with a \
+             newline: {out_empty:?}",
+        );
         ctx.sched_tunables = None;
         let out_none = ctx.format_human();
         assert!(
             out_none.contains("sched_tunables: (unknown)"),
             "None map must render as (unknown): {out_none}",
+        );
+        assert!(
+            out_none.ends_with('\n'),
+            "format_human with no tunables must still end with a \
+             newline: {out_none:?}",
         );
     }
 

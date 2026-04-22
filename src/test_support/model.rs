@@ -281,7 +281,7 @@ pub struct ModelSpec {
     /// ```
     ///
     /// The leading 64-hex token of the output is this field. The
-    /// [`is_valid_sha256_hex`] gate at module scope compile-fails
+    /// `is_valid_sha256_hex` gate at module scope compile-fails
     /// any pin that is not exactly 64 ASCII hex chars, so
     /// pasting the trailing filename or a truncated prefix trips a
     /// `const { assert!(...) }` at crate build time rather than at
@@ -1555,7 +1555,12 @@ fn memoized_inference() -> Arc<CachedInference> {
         return Arc::clone(arc);
     }
     #[cfg(test)]
-    MODEL_CACHE_LOAD_COUNT.fetch_add(1, Ordering::AcqRel);
+    // Relaxed is sufficient: the outer MODEL_CACHE mutex already
+    // establishes the happens-before edge between the load-count
+    // increment and the slot write. No thread reads the counter
+    // without holding the same lock, so no additional ordering on
+    // the atomic is needed.
+    MODEL_CACHE_LOAD_COUNT.fetch_add(1, Ordering::Relaxed);
     let result = load_inference()
         .map(Mutex::new)
         .map_err(|e| format!("{e:#}"));
@@ -1594,7 +1599,7 @@ fn memoized_inference() -> Arc<CachedInference> {
 #[cfg(test)]
 pub(crate) fn reset() {
     PREFETCH_CHECKED.store(false, Ordering::Release);
-    MODEL_CACHE_LOAD_COUNT.store(0, Ordering::Release);
+    MODEL_CACHE_LOAD_COUNT.store(0, Ordering::Relaxed);
     let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
@@ -3106,7 +3111,7 @@ mod tests {
         let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
 
         assert_eq!(
-            MODEL_CACHE_LOAD_COUNT.load(Ordering::Acquire),
+            MODEL_CACHE_LOAD_COUNT.load(Ordering::Relaxed),
             0,
             "reset() must zero the load counter",
         );
@@ -3115,7 +3120,7 @@ mod tests {
         let _ = extract_via_llm("second", None);
         let _ = extract_via_llm("third", None);
         assert_eq!(
-            MODEL_CACHE_LOAD_COUNT.load(Ordering::Acquire),
+            MODEL_CACHE_LOAD_COUNT.load(Ordering::Relaxed),
             1,
             "three sequential extract_via_llm calls must enter the \
              slow path exactly once — a second slow-path entry would \
@@ -3124,13 +3129,13 @@ mod tests {
 
         reset();
         assert_eq!(
-            MODEL_CACHE_LOAD_COUNT.load(Ordering::Acquire),
+            MODEL_CACHE_LOAD_COUNT.load(Ordering::Relaxed),
             0,
             "reset() must zero the load counter on every call",
         );
         let _ = extract_via_llm("post-reset", None);
         assert_eq!(
-            MODEL_CACHE_LOAD_COUNT.load(Ordering::Acquire),
+            MODEL_CACHE_LOAD_COUNT.load(Ordering::Relaxed),
             1,
             "post-reset call must re-enter the slow path exactly once",
         );
