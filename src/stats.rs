@@ -1453,35 +1453,48 @@ pub fn compare_runs(
     // run. Picking the first `Some(host)` we encounter is a
     // representative baseline, not a replay of every sample.
     // For full timeseries, inspect individual sidecar JSON files.
-    // Surface the delta when both runs carry host data; when only
-    // one side has it (mixed tooling version, partial migration)
-    // say so explicitly rather than silently suppressing the
-    // section.
     let host_a = sidecars_a.iter().find_map(|s| s.host.as_ref());
     let host_b = sidecars_b.iter().find_map(|s| s.host.as_ref());
+    print!("{}", format_host_delta(host_a, host_b, a, b));
+
+    Ok(if report.regressions > 0 { 1 } else { 0 })
+}
+
+/// Render the host-context delta section of `stats compare --runs`
+/// as a block of text ready to `print!`. Extracted as a pure
+/// function of `(Option<&HostContext>, Option<&HostContext>, &str,
+/// &str)` so the five match arms can be unit-tested without
+/// fixturing a real run directory.
+///
+/// The returned string is either empty (when both sides have no
+/// host data — nothing to print) or ends with a newline so callers
+/// can chain further output. Single-side cases print a clear
+/// "captured in X only, delta unavailable" message rather than
+/// silently suppressing the section — a mixed-tooling-version run
+/// comparison should surface the asymmetry.
+pub(crate) fn format_host_delta(
+    host_a: Option<&crate::host_context::HostContext>,
+    host_b: Option<&crate::host_context::HostContext>,
+    a: &str,
+    b: &str,
+) -> String {
     match (host_a, host_b) {
         (Some(ha), Some(hb)) => {
             let delta = crate::host_context::HostContext::diff(ha, hb);
-            println!();
             if delta.is_empty() {
-                println!("host: identical between '{a}' and '{b}'");
+                format!("\nhost: identical between '{a}' and '{b}'\n")
             } else {
-                println!("host delta ('{a}' → '{b}'):");
-                print!("{delta}");
+                format!("\nhost delta ('{a}' → '{b}'):\n{delta}")
             }
         }
         (Some(_), None) => {
-            println!();
-            println!("host: captured in '{a}' only, delta unavailable");
+            format!("\nhost: captured in '{a}' only, delta unavailable\n")
         }
         (None, Some(_)) => {
-            println!();
-            println!("host: captured in '{b}' only, delta unavailable");
+            format!("\nhost: captured in '{b}' only, delta unavailable\n")
         }
-        (None, None) => {}
+        (None, None) => String::new(),
     }
-
-    Ok(if report.regressions > 0 { 1 } else { 0 })
 }
 
 #[cfg(test)]
@@ -2524,5 +2537,79 @@ mod tests {
         assert_eq!(res.regressions, 1);
         assert_eq!(res.new_in_b, 0, "beta is filtered out, not new");
         assert_eq!(res.removed_from_a, 0, "gamma is filtered out, not removed");
+    }
+
+    // -- format_host_delta: the 5 match arms of the host-delta
+    //    section emitted under `stats compare --runs a b`. --
+
+    /// Builder for a `HostContext` with enough populated fields to
+    /// exercise `HostContext::diff`. Leaves everything else at its
+    /// `Default` so each test varies only the field under study.
+    fn host_ctx(release: &str, cmdline: Option<&str>) -> crate::host_context::HostContext {
+        crate::host_context::HostContext {
+            uname_sysname: Some("Linux".to_string()),
+            uname_release: Some(release.to_string()),
+            cmdline: cmdline.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// `(Some, Some)` identical: the helper emits a one-line
+    /// confirmation so users running `stats compare` can distinguish
+    /// "same host" from "captured but unused" without inspecting
+    /// individual sidecars.
+    #[test]
+    fn format_host_delta_both_present_identical() {
+        let ctx = host_ctx("6.14.0", Some("preempt=lazy"));
+        let out = format_host_delta(Some(&ctx), Some(&ctx), "a-run", "b-run");
+        assert_eq!(out, "\nhost: identical between 'a-run' and 'b-run'\n");
+    }
+
+    /// `(Some, Some)` differing: the helper emits the header line
+    /// followed by whatever `HostContext::diff` produced. Asserts
+    /// the structural shape (header present, delta body present)
+    /// rather than the exact diff formatting so this test stays
+    /// robust to future tweaks to the diff renderer.
+    #[test]
+    fn format_host_delta_both_present_differ() {
+        let ha = host_ctx("6.14.0", Some("preempt=lazy"));
+        let hb = host_ctx("6.15.1", Some("preempt=lazy"));
+        let out = format_host_delta(Some(&ha), Some(&hb), "a", "b");
+        assert!(out.starts_with("\nhost delta ('a' → 'b'):\n"), "got: {out:?}");
+        // `uname_release` differs between the two contexts so the
+        // diff body must be non-empty — confirms we routed through
+        // the `else` arm and not the `identical` arm.
+        let body = &out["\nhost delta ('a' → 'b'):\n".len()..];
+        assert!(!body.is_empty(), "differing contexts must produce a diff body");
+    }
+
+    /// `(Some, None)` left-only: one run captured host data, the
+    /// other did not (mixed tooling version, partial migration
+    /// window). Surface the asymmetry explicitly so the missing
+    /// side is diagnosable.
+    #[test]
+    fn format_host_delta_left_only() {
+        let ctx = host_ctx("6.14.0", Some("preempt=lazy"));
+        let out = format_host_delta(Some(&ctx), None, "a-run", "b-run");
+        assert_eq!(out, "\nhost: captured in 'a-run' only, delta unavailable\n");
+    }
+
+    /// `(None, Some)` right-only: symmetric complement to
+    /// `left_only`. The `b`-name must appear (not `a`) — guards
+    /// against a future copy-paste typo that swaps the names.
+    #[test]
+    fn format_host_delta_right_only() {
+        let ctx = host_ctx("6.14.0", Some("preempt=lazy"));
+        let out = format_host_delta(None, Some(&ctx), "a-run", "b-run");
+        assert_eq!(out, "\nhost: captured in 'b-run' only, delta unavailable\n");
+    }
+
+    /// `(None, None)`: neither side carries host data. The section
+    /// is fully suppressed — no blank line, no header, nothing.
+    /// Pinning this prevents a regression that introduces a
+    /// spurious "host: none" footer on legacy runs.
+    #[test]
+    fn format_host_delta_both_absent_emits_nothing() {
+        assert_eq!(format_host_delta(None, None, "a", "b"), "");
     }
 }

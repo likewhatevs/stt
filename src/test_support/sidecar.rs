@@ -1166,9 +1166,14 @@ mod tests {
         let check_result = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &check_result, "CpuSpin", &[], &[]).unwrap();
 
-        // Clean up written file.
-        let path = dir.join("__sidecar_default_dir__.ktstr.json");
-        let _ = std::fs::remove_file(&path);
+        // Clean up written files. The actual on-disk filename
+        // embeds a variant-hash suffix (see
+        // `serialize_and_write_sidecar`), so a fixed `test_name +
+        // ".ktstr.json"` path never matches — use the
+        // prefix-scan helper the sibling tests use.
+        for p in find_sidecars_by_prefix(&dir, "__sidecar_default_dir__-") {
+            let _ = std::fs::remove_file(&p);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1216,6 +1221,18 @@ mod tests {
         assert_eq!(loaded.test_name, "__sidecar_write_test__");
         assert!(loaded.passed);
         assert!(!loaded.skipped, "pass result is not a skip");
+        // write_sidecar must populate the host-context snapshot so
+        // downstream `stats compare --runs a b` can diff hosts.
+        // Without this assertion, a regression that dropped the
+        // `host: Some(collect_host_context())` builder line would
+        // land silently. `uname_sysname` is always `Some("Linux")`
+        // on a running Linux process (uname syscall, no filesystem
+        // dependency), matching the baseline asserted by
+        // `host_context::tests::collect_host_context_returns_populated_struct_on_linux`.
+        let host = loaded.host.as_ref().expect(
+            "write_sidecar must populate host field from collect_host_context",
+        );
+        assert_eq!(host.uname_sysname.as_deref(), Some("Linux"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1647,6 +1664,16 @@ mod tests {
             "skip path uses the 'skipped' work_type bucket so grouping keeps the skip distinguishable",
         );
         assert_eq!(loaded.active_flags, active_flags);
+        // write_skip_sidecar shares the host-context capture with
+        // write_sidecar (same `collect_host_context()` builder line)
+        // so skip paths still give `stats compare --runs` a host
+        // baseline. A regression that dropped the skip-path capture
+        // would leave `host: None` in only the skip bucket, producing
+        // silent per-run partial data.
+        let host = loaded.host.as_ref().expect(
+            "write_skip_sidecar must populate host field from collect_host_context",
+        );
+        assert_eq!(host.uname_sysname.as_deref(), Some("Linux"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
