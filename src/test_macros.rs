@@ -17,6 +17,14 @@
 /// [`crate::report::test_skip`] directly and drives its own control
 /// flow.
 macro_rules! skip {
+    // Zero-args arm: `skip!()` emits the banner with an empty
+    // reason. `format_args!()` itself requires at least a format
+    // string, so the variadic arm below cannot handle this case
+    // — a dedicated rule routes it to an empty literal.
+    () => {{
+        $crate::report::test_skip(format_args!(""));
+        return;
+    }};
     ($($arg:tt)*) => {{
         $crate::report::test_skip(format_args!($($arg)*));
         return;
@@ -106,5 +114,84 @@ mod tests {
             let _: () = skip_on_contention!(Err::<(), _>(err));
         }
         skip_fn();
+    }
+
+    /// The `skip!` macro must emit the canonical `ktstr: SKIP:
+    /// <reason>` banner to stderr AND early-return from the calling
+    /// function. Prior tests exercise `test_skip` (the lower-level
+    /// emitter) and `skip_on_contention!` (the wrapper macro) but
+    /// the bare `skip!` macro was left uncovered — a regression that
+    /// silently broke the format_args expansion or the `return;`
+    /// tail would slip through until a downstream consumer
+    /// parsed the wrong line.
+    ///
+    /// This test uses the crate-shared stderr-capture helper and
+    /// verifies BOTH invariants: the captured bytes carry the
+    /// canonical banner, and a post-`skip!` line in the helper fn
+    /// is never reached (pinned via a sentinel flag).
+    #[test]
+    fn skip_macro_emits_banner_and_early_returns() {
+        use crate::test_support::test_helpers::capture_stderr;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let reached_tail = AtomicBool::new(false);
+        let (_, bytes) = capture_stderr(|| {
+            // Helper fn returning `()` so `skip!` can emit its
+            // `return;` tail. The AtomicBool is set only if the
+            // line AFTER `skip!` executes — a regression that
+            // dropped the `return;` tail would trip it.
+            fn helper(reached: &AtomicBool) {
+                skip!("macro-level reason with {} substitution", "format-args");
+                reached.store(true, Ordering::SeqCst);
+            }
+            helper(&reached_tail);
+        });
+        let text = std::str::from_utf8(&bytes).expect("stderr is UTF-8");
+        assert_eq!(
+            text,
+            "ktstr: SKIP: macro-level reason with format-args substitution\n",
+            "expected canonical banner with format-args substitution",
+        );
+        assert!(
+            !reached_tail.load(Ordering::SeqCst),
+            "skip! must early-return; lines after the macro must not execute",
+        );
+    }
+
+    /// `skip!` with a literal (no format args) still emits the
+    /// banner. Pairs with the substitution test above to cover the
+    /// no-args branch of the `format_args!($($arg)*)` expansion.
+    #[test]
+    fn skip_macro_literal_reason_emits_banner() {
+        use crate::test_support::test_helpers::capture_stderr;
+        let (_, bytes) = capture_stderr(|| {
+            fn helper() {
+                skip!("literal skip reason");
+            }
+            helper();
+        });
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(text, "ktstr: SKIP: literal skip reason\n");
+    }
+
+    /// `skip!()` with ZERO arguments expands to
+    /// `format_args!()` — an empty reason. The banner still fires
+    /// with the canonical prefix + colon + empty tail + newline.
+    /// Pins the degenerate-input behavior so a regression that
+    /// rejected zero-argument expansion (e.g. a macro arm
+    /// requiring at least one token tree) fails here instead of at
+    /// some downstream call site that happens to call `skip!()`
+    /// for "I don't care why, just skip" semantics.
+    #[test]
+    fn skip_macro_zero_args_emits_banner_with_empty_reason() {
+        use crate::test_support::test_helpers::capture_stderr;
+        let (_, bytes) = capture_stderr(|| {
+            fn helper() {
+                skip!();
+            }
+            helper();
+        });
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(text, "ktstr: SKIP: \n");
     }
 }

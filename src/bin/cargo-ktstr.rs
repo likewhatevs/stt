@@ -220,6 +220,37 @@ enum ModelCommand {
 enum StatsCommand {
     /// List test runs under `{CARGO_TARGET_DIR or "target"}/ktstr/`.
     List,
+    /// Print the archived host context for a specific run.
+    ///
+    /// Resolves `--run <id>` against `test_support::runs_root()`
+    /// (or `--dir` when set), loads any sidecar file under that
+    /// run directory, and renders the `host` field via
+    /// `HostContext::format_human`. Useful for inspecting the
+    /// CPU model, memory config, THP policy, and sched_* tunables
+    /// captured at archive time — the same fingerprint
+    /// `compare_runs` uses for its host-delta section, now
+    /// available on a single run.
+    ///
+    /// Scans sidecars in iteration order and returns the FIRST
+    /// sidecar with a populated host field. Every sidecar in a
+    /// single run captures the same host, but older pre-
+    /// enrichment sidecars may have `host: None`; the forward
+    /// scan tolerates those without false-failing as long as at
+    /// least one sidecar carries the data. If NO sidecar has a
+    /// populated host field, the command fails with an actionable
+    /// error naming the likely cause (pre-enrichment run) rather
+    /// than silently returning empty output.
+    ShowHost {
+        /// Run key (from `cargo ktstr stats list`).
+        #[arg(long)]
+        run: String,
+        /// Alternate run root to resolve `--run` against. Defaults
+        /// to `test_support::runs_root()` (typically
+        /// `target/ktstr/`). Same semantics as
+        /// `cargo ktstr stats compare --dir`.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
     /// Compare two test runs and report regressions.
     Compare {
         /// Run key A (from `cargo ktstr stats list`).
@@ -366,6 +397,15 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             Ok(())
         }
         Some(StatsCommand::List) => cli::list_runs().map_err(|e| format!("{e:#}")),
+        Some(StatsCommand::ShowHost { run, dir }) => {
+            match cli::show_run_host(run, dir.as_deref()) {
+                Ok(s) => {
+                    print!("{s}");
+                    Ok(())
+                }
+                Err(e) => Err(format!("{e:#}")),
+            }
+        }
         Some(StatsCommand::Compare {
             a,
             b,
@@ -887,6 +927,11 @@ fn run_model_status() -> Result<(), String> {
 }
 
 fn main() {
+    // Restore SIGPIPE so piping `cargo ktstr ... | head` doesn't
+    // panic inside `print!`. See `ktstr::cli::restore_sigpipe_default`
+    // for the full rationale; shared across all three ktstr bins so
+    // the rationale + SAFETY text lives in one place.
+    ktstr::cli::restore_sigpipe_default();
     // Mirror `ktstr`'s tracing init (src/bin/ktstr.rs main()) so
     // `tracing::warn!` calls inside `cli::` / `test_support::` surface
     // on stderr instead of being silently dropped. Default to `warn`
@@ -1270,6 +1315,81 @@ mod tests {
             }
             _ => panic!("expected Stats Compare"),
         }
+    }
+
+    /// `cargo ktstr stats show-host --run X` parses to
+    /// `StatsCommand::ShowHost { run: X, dir: None }`.
+    #[test]
+    fn parse_stats_show_host_with_run() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "show-host",
+            "--run",
+            "my-run-id",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::ShowHost { run, dir }),
+                ..
+            } => {
+                assert_eq!(run, "my-run-id");
+                assert!(dir.is_none(), "bare --run must not populate --dir");
+            }
+            _ => panic!("expected Stats ShowHost"),
+        }
+    }
+
+    /// `cargo ktstr stats show-host --run X --dir PATH` carries
+    /// both flags through. Same --dir threading contract as
+    /// `compare` — parse layer preserves the PathBuf; resolution
+    /// against `runs_root()` is `cli::show_run_host`'s job.
+    #[test]
+    fn parse_stats_show_host_with_dir() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "show-host",
+            "--run",
+            "archive-2024-01-15",
+            "--dir",
+            "/tmp/archived-runs",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::ShowHost { run, dir }),
+                ..
+            } => {
+                assert_eq!(run, "archive-2024-01-15");
+                assert_eq!(
+                    dir.as_deref(),
+                    Some(std::path::Path::new("/tmp/archived-runs")),
+                );
+            }
+            _ => panic!("expected Stats ShowHost"),
+        }
+    }
+
+    /// `cargo ktstr stats show-host` WITHOUT `--run` must fail at
+    /// parse time — the flag is required and clap's default shape
+    /// says so. A regression that accidentally made `--run`
+    /// optional would silently let operators invoke the command
+    /// with no target, producing a no-op failure.
+    #[test]
+    fn parse_stats_show_host_missing_run_rejected() {
+        let rejected = Cargo::try_parse_from(["cargo", "ktstr", "stats", "show-host"]);
+        assert!(
+            rejected.is_err(),
+            "stats show-host must require --run",
+        );
     }
 
     // -- try_get_matches_from: kernel list --
@@ -1847,6 +1967,101 @@ mod tests {
         assert!(
             rejected.is_err(),
             "show-host must reject positional arguments",
+        );
+    }
+
+    /// `cargo ktstr show-thresholds <test>` parses with exactly one
+    /// positional argument and maps to the `ShowThresholds` variant
+    /// carrying the test name. Missing argument rejected at parse
+    /// time; extra argument rejected too. Pins the arg count so a
+    /// future variadic refactor surfaces here.
+    #[test]
+    fn parse_show_thresholds_with_test_arg() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "show-thresholds",
+            "my_test_fn",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::ShowThresholds { test } => {
+                assert_eq!(test, "my_test_fn");
+            }
+            other => panic!("expected ShowThresholds, got {other:?}"),
+        }
+    }
+
+    /// `show-thresholds` without the test-name argument must fail
+    /// at parse time — the positional is required.
+    #[test]
+    fn parse_show_thresholds_without_arg_rejected() {
+        let rejected = Cargo::try_parse_from(["cargo", "ktstr", "show-thresholds"]);
+        assert!(
+            rejected.is_err(),
+            "show-thresholds requires a test-name argument",
+        );
+    }
+
+    /// `show-thresholds <a> <b>` is rejected — variadic inputs would
+    /// silently drop the second arg or reinterpret it as a flag.
+    #[test]
+    fn parse_show_thresholds_extra_arg_rejected() {
+        let rejected = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "show-thresholds",
+            "a",
+            "b",
+        ]);
+        assert!(
+            rejected.is_err(),
+            "show-thresholds must accept exactly one positional arg",
+        );
+    }
+
+    /// `cli::show_host` produces a non-empty report under normal
+    /// Linux CI conditions. Catches a regression in the underlying
+    /// `HostContext::format_human` (e.g. a panic in the
+    /// destructuring bind that surfaces every field) before the
+    /// ShowHost dispatch arm reaches it. Named without a
+    /// `dispatch_` prefix because this exercises the leaf helper
+    /// directly; true dispatch-path coverage lives in the parse
+    /// tests above + the binary's `main` call.
+    #[test]
+    fn show_host_helper_produces_non_empty_output() {
+        let out = cli::show_host();
+        assert!(
+            !out.is_empty(),
+            "show_host must return a non-empty report under normal Linux CI",
+        );
+        // Stronger pin: `HostContext::format_human` always includes
+        // `kernel_release` even when most other fields are `None`
+        // (uname is a syscall, filesystem-independent). Asserting
+        // the stable field name catches a regression that returned
+        // a non-empty but garbage report (e.g. only comments).
+        assert!(
+            out.contains("kernel_release"),
+            "show_host output must include the stable `kernel_release` row: {out}",
+        );
+    }
+
+    /// `cli::show_thresholds` returns `Err` with the actionable
+    /// "no registered ktstr test named" diagnostic when called with
+    /// an unknown test name. Named without a `dispatch_` prefix for
+    /// the same reason as `show_host_helper_produces_non_empty_output`
+    /// — this exercises the leaf helper, not the dispatch path
+    /// wrapping it.
+    #[test]
+    fn show_thresholds_helper_unknown_test_returns_error() {
+        let err = cli::show_thresholds("definitely_not_a_registered_test_xyz")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no registered ktstr test named"),
+            "error path must preserve the actionable diagnostic: {msg}",
         );
     }
 }

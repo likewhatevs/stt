@@ -2062,6 +2062,11 @@ fn append_probe_output_to_sidecar(
 }
 
 fn main() {
+    // Restore SIGPIPE so piping the probe's JSON output to `jq | less`
+    // or similar doesn't panic inside `print!`. Shared helper lives
+    // in `ktstr::cli::restore_sigpipe_default`; see that doc for the
+    // rationale + SAFETY text.
+    ktstr::cli::restore_sigpipe_default();
     install_cleanup_handler();
     let cli = Cli::parse();
     if let Err(e) = cli.validate_sampling_flags() {
@@ -3451,6 +3456,7 @@ mod tests {
             test_name: "t".to_string(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
+            scheduler_commit: None,
             payload: None,
             metrics: Vec::new(),
             passed: true,

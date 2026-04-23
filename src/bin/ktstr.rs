@@ -272,6 +272,11 @@ fn run_completions(shell: clap_complete::Shell, binary: &str) {
 }
 
 fn main() -> Result<()> {
+    // Restore SIGPIPE so piping ktstr output to `head` / `less` /
+    // similar doesn't panic inside `print!`. Shared helper lives
+    // in `cli::restore_sigpipe_default`; see that doc for the
+    // rationale + SAFETY text.
+    ktstr::cli::restore_sigpipe_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

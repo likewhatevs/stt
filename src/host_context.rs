@@ -223,6 +223,32 @@ pub struct HostContext {
     pub kernel_cmdline: Option<String>,
 }
 
+/// Extract the bracketed active policy from a kernel mm
+/// menu-style string such as `"always [madvise] never"` (THP
+/// enabled) or `"always defer defer+madvise [madvise] never"`
+/// (THP defrag). Returns the content between the first `[` and
+/// first subsequent `]`, or `None` if either bracket is missing.
+///
+/// **First-bracket-wins**: if the string contains multiple `[..]`
+/// pairs (e.g. a hand-written test fixture or a malformed sysfs
+/// read), only the FIRST pair is returned; later pairs are
+/// ignored. The kernel emits exactly one bracketed token in
+/// practice — this scanner exists to decode that canonical shape,
+/// not to validate arbitrary input.
+///
+/// Exposed as a pure helper so downstream tooling that wants the
+/// active policy (not the full menu) does not have to re-implement
+/// the bracket scan. The raw field is kept on [`HostContext`] for
+/// consumers that want the menu; [`HostContext::thp_enabled_active`]
+/// and [`HostContext::thp_defrag_active`] route through this
+/// helper.
+pub fn parse_bracketed_active_policy(s: &str) -> Option<&str> {
+    let open = s.find('[')?;
+    let rest = &s[open + 1..];
+    let close = rest.find(']')?;
+    Some(&rest[..close])
+}
+
 impl HostContext {
     /// Populated [`HostContext`] for unit tests. Every field carries
     /// a reasonable non-trivial value so call sites only spell out
@@ -388,6 +414,32 @@ impl HostContext {
             None => out.push_str("sched_tunables: (unknown)\n"),
         }
         out
+    }
+
+    /// Active THP-enabled policy, extracted from the bracketed
+    /// `[...]` token inside [`Self::thp_enabled`]. Returns the
+    /// content between the first `[` and subsequent `]` (e.g.
+    /// `"madvise"` from `"always [madvise] never"`). `None` when
+    /// `thp_enabled` is `None`, empty, or carries no bracketed
+    /// token (kernels that reshape the menu format).
+    ///
+    /// Provided so downstream tooling (`cargo ktstr stats`, CI
+    /// regression gates, custom dashboards) can consume the active
+    /// policy as a bare token without re-implementing the bracket
+    /// scan in every caller.
+    pub fn thp_enabled_active(&self) -> Option<&str> {
+        self.thp_enabled
+            .as_deref()
+            .and_then(parse_bracketed_active_policy)
+    }
+
+    /// Active THP-defrag policy, extracted the same way as
+    /// [`Self::thp_enabled_active`]. Returns e.g. `"madvise"` from
+    /// `"always defer defer+madvise [madvise] never"`.
+    pub fn thp_defrag_active(&self) -> Option<&str> {
+        self.thp_defrag
+            .as_deref()
+            .and_then(parse_bracketed_active_policy)
     }
 
     /// Render the differences between two host contexts as
@@ -2274,4 +2326,109 @@ Hugepagesize:       2048 kB
         );
     }
 
+    /// `parse_bracketed_active_policy` extracts the content between
+    /// the first `[` and subsequent `]`. Covers the canonical THP-
+    /// enabled menu shape `"always [madvise] never"`.
+    #[test]
+    fn parse_bracketed_active_policy_middle_selection() {
+        assert_eq!(
+            parse_bracketed_active_policy("always [madvise] never"),
+            Some("madvise"),
+        );
+    }
+
+    /// Leading-slot selection: the bracket is at the front of the
+    /// menu, and the extracted token must not be empty.
+    #[test]
+    fn parse_bracketed_active_policy_leading_selection() {
+        assert_eq!(
+            parse_bracketed_active_policy("[always] madvise never"),
+            Some("always"),
+        );
+    }
+
+    /// Trailing-slot selection covers the other edge.
+    #[test]
+    fn parse_bracketed_active_policy_trailing_selection() {
+        assert_eq!(
+            parse_bracketed_active_policy("always madvise [never]"),
+            Some("never"),
+        );
+    }
+
+    /// THP-defrag menu format is longer but uses the same bracket
+    /// convention. Pins that the multi-word hyphenated option
+    /// `defer+madvise` round-trips correctly — the parser doesn't
+    /// split on `+` or whitespace inside the brackets.
+    #[test]
+    fn parse_bracketed_active_policy_thp_defrag_hyphenated() {
+        assert_eq!(
+            parse_bracketed_active_policy(
+                "always defer [defer+madvise] madvise never",
+            ),
+            Some("defer+madvise"),
+        );
+    }
+
+    /// No brackets at all → None. Guards against a kernel whose
+    /// THP-enabled output lost the brackets entirely; downstream
+    /// tooling sees the raw menu via `thp_enabled` and this helper
+    /// returns None rather than inventing a fake active value.
+    #[test]
+    fn parse_bracketed_active_policy_no_brackets_is_none() {
+        assert_eq!(parse_bracketed_active_policy("always madvise never"), None);
+    }
+
+    /// Empty string → None. Boundary.
+    #[test]
+    fn parse_bracketed_active_policy_empty_is_none() {
+        assert_eq!(parse_bracketed_active_policy(""), None);
+    }
+
+    /// Unbalanced `[` with no `]` → None. A malformed sysfs read
+    /// (truncated by a concurrent write) must not panic or return
+    /// a half-parsed substring.
+    #[test]
+    fn parse_bracketed_active_policy_unclosed_bracket_is_none() {
+        assert_eq!(parse_bracketed_active_policy("always [madvise never"), None);
+    }
+
+    /// Unopened `]` with no preceding `[` → None. The scanner
+    /// requires a leading `[` before it looks for `]`; a stray
+    /// closing bracket mid-string (e.g. a malformed menu written
+    /// as `"always madvise] never"`) must not be misread as a
+    /// zero-length active token.
+    #[test]
+    fn parse_bracketed_active_policy_unopened_bracket_is_none() {
+        assert_eq!(parse_bracketed_active_policy("always madvise] never"), None);
+    }
+
+    /// Multiple `[..]` pairs → the FIRST pair wins. Pins the
+    /// first-bracket-wins invariant documented on the parser so a
+    /// future refactor that switched to "last wins" or merged the
+    /// tokens would trip this test. The kernel only emits one pair
+    /// in practice; this test exists to lock the degenerate-input
+    /// behavior, not to describe reality.
+    #[test]
+    fn parse_bracketed_active_policy_multiple_pairs_first_wins() {
+        assert_eq!(
+            parse_bracketed_active_policy("[always] [never]"),
+            Some("always"),
+        );
+    }
+
+    /// `HostContext::thp_enabled_active` routes through the parser
+    /// and returns `None` when the field is absent. Pins the
+    /// method-level contract alongside the parser-level tests.
+    #[test]
+    fn host_context_thp_active_methods_extract_bracketed_choice() {
+        let mut ctx = HostContext::test_fixture();
+        // Fixture defaults: "always [madvise] never" / "... [madvise] ...".
+        assert_eq!(ctx.thp_enabled_active(), Some("madvise"));
+        assert_eq!(ctx.thp_defrag_active(), Some("madvise"));
+        ctx.thp_enabled = None;
+        assert_eq!(ctx.thp_enabled_active(), None);
+        ctx.thp_defrag = Some("no brackets here".to_string());
+        assert_eq!(ctx.thp_defrag_active(), None);
+    }
 }

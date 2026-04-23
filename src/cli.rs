@@ -1424,6 +1424,87 @@ pub fn show_host() -> String {
     crate::host_context::collect_host_context().format_human()
 }
 
+/// Restore SIGPIPE to its default action (terminate the process)
+/// so piping a ktstr binary's output to a reader that closes
+/// early (e.g. `... | head`) does not panic inside `print!` /
+/// `println!`. Rust's startup code sets SIGPIPE to `SIG_IGN`,
+/// which turns the broken-pipe write into an `io::Error` that
+/// `print!` escalates to a panic. Setting `SIG_DFL` restores the
+/// POSIX "process terminates on SIGPIPE" convention that Unix
+/// CLI tools rely on.
+///
+/// Call this at the TOP of every `ktstr*` binary's `main` —
+/// before the tracing subscriber installs its stderr handler and
+/// before any stdout write. Shared across `src/bin/ktstr.rs`,
+/// `src/bin/cargo-ktstr.rs`, and `src/bin/jemalloc_probe.rs` so
+/// the three CLIs behave identically under `|` pipelines and a
+/// future reword of the SAFETY rationale lands in one place.
+///
+/// No return value; the call is effectively infallible (libc's
+/// `signal(2)` can't fail for a standard signal + SIG_DFL
+/// handler on a live process).
+///
+/// # Safety (FFI)
+///
+/// `libc::signal` is an FFI call with no memory effects (no
+/// pointer dereferences, no mutation of Rust state). `SIG_DFL`
+/// is a well-known constant handler. Call must run before any
+/// stdout writes so the handler is in place by the time
+/// `print!` fires.
+pub fn restore_sigpipe_default() {
+    // SAFETY: see fn-level doc comment.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// Render the archived host context for the named run, resolved
+/// against `dir` (or `test_support::runs_root()` when `dir` is
+/// `None`). Loads sidecars under the run directory and returns the
+/// `HostContext::format_human` of the first sidecar that has a
+/// populated `host` field — every sidecar in a single run captures
+/// the same host, so first-wins is adequate.
+///
+/// Returns `Err` when:
+/// - The run directory does not exist (actionable message names
+///   the expected root),
+/// - The run directory exists but has no sidecar data (matches
+///   the `compare_runs` error shape),
+/// - Every sidecar carried `host: None` (older pre-enrichment
+///   runs won't have the field).
+pub fn show_run_host(run: &str, dir: Option<&Path>) -> Result<String> {
+    let root: std::path::PathBuf = match dir {
+        Some(d) => d.to_path_buf(),
+        None => crate::test_support::runs_root(),
+    };
+    let run_dir = root.join(run);
+    if !run_dir.exists() {
+        bail!("run '{run}' not found under {}", root.display());
+    }
+    let sidecars = crate::test_support::collect_sidecars(&run_dir);
+    if sidecars.is_empty() {
+        bail!("run '{run}' has no sidecar data");
+    }
+    // First sidecar with a populated host wins. Every sidecar in a
+    // single run captures the same host; pre-enrichment sidecars
+    // may have `host: None`. Scan forward rather than take the
+    // first entry so older data doesn't force a "no host context"
+    // error when newer sidecars in the same run DO have it.
+    let host = sidecars
+        .iter()
+        .find_map(|sc| sc.host.as_ref())
+        .ok_or_else(|| {
+            anyhow!(
+                "run '{run}' has {} sidecar(s) but none carries a populated \
+                 host context; this usually means the run predates host-context \
+                 enrichment. Re-run the test to produce a sidecar with the \
+                 current schema.",
+                sidecars.len(),
+            )
+        })?;
+    Ok(host.format_human())
+}
+
 /// Render the resolved, merged `Assert` thresholds for the named
 /// test — the same merge chain evaluated at run time in
 /// `run_ktstr_test_inner`:
@@ -2211,6 +2292,138 @@ mod tests {
         assert!(
             out.contains("kernel_name"),
             "show_host must surface the kernel_name field: {out}",
+        );
+    }
+
+    // -- show_run_host error paths + happy path --
+    //
+    // Each test builds an isolated `runs_root()` via `tempdir()`
+    // and passes it through `--dir`, so no test touches the real
+    // target/ktstr tree. Sidecars are constructed via
+    // `SidecarResult::test_fixture()` to keep every required field
+    // populated without hand-rolling 20 field values per test.
+
+    /// Error path: the named run directory does not exist. Returns
+    /// `Err` whose message names the missing run + expected root
+    /// so an operator running `cargo ktstr stats show-host --run
+    /// typo` sees an actionable message instead of a generic file-
+    /// not-found error.
+    #[test]
+    fn show_run_host_missing_run_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = show_run_host("nonexistent-run", Some(tmp.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("run 'nonexistent-run' not found"),
+            "missing-run error must name the run: {msg}",
+        );
+    }
+
+    /// Error path: the run directory exists but has no sidecars.
+    /// Returns `Err` with the `no sidecar data` diagnostic to
+    /// match the `compare_runs` error shape — consistency across
+    /// the two stats subcommands.
+    #[test]
+    fn show_run_host_empty_run_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("run-empty")).unwrap();
+        let err = show_run_host("run-empty", Some(tmp.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no sidecar data"),
+            "empty-run error must name the condition: {msg}",
+        );
+    }
+
+    /// Error path: every sidecar in the run carries `host: None`
+    /// (older pre-enrichment runs). Returns `Err` explaining the
+    /// likely cause so the operator doesn't mistake this for a
+    /// tooling bug.
+    #[test]
+    fn show_run_host_all_host_none_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-no-host");
+        std::fs::create_dir(&run_dir).unwrap();
+        // Write a sidecar with host: None. `SidecarResult::test_fixture`
+        // defaults `host: None`, so the fixture shape matches the
+        // pre-enrichment scenario.
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        let json = serde_json::to_string(&sc).unwrap();
+        std::fs::write(run_dir.join("t-0000000000000000.ktstr.json"), json).unwrap();
+        let err = show_run_host("run-no-host", Some(tmp.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no sidecar with a populated host")
+                || msg.contains("none carries a populated host context"),
+            "all-host-None error must name the pre-enrichment likely cause: {msg}",
+        );
+    }
+
+    /// Happy path: a run with at least one sidecar carrying a
+    /// populated host context returns the host's `format_human`
+    /// output. Uses `HostContext::test_fixture()` to produce a
+    /// predictable host; asserts the output contains a stable
+    /// field that survives the fixture defaults.
+    #[test]
+    fn show_run_host_populated_sidecar_returns_format_human() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-with-host");
+        std::fs::create_dir(&run_dir).unwrap();
+        let mut sc = crate::test_support::SidecarResult::test_fixture();
+        sc.host = Some(crate::host_context::HostContext::test_fixture());
+        let json = serde_json::to_string(&sc).unwrap();
+        std::fs::write(run_dir.join("t-0000000000000000.ktstr.json"), json).unwrap();
+
+        let out = show_run_host("run-with-host", Some(tmp.path())).unwrap();
+        // `HostContext::format_human` always surfaces kernel_name;
+        // the fixture populates it to a plausible value.
+        assert!(
+            out.contains("kernel_name"),
+            "populated host output must include the kernel_name row: {out}",
+        );
+        assert!(
+            out.ends_with('\n'),
+            "output must end with newline for print!: {out:?}",
+        );
+    }
+
+    /// Happy-path forward-scan: multiple sidecars where the FIRST
+    /// has `host: None` but a later one has a populated host. The
+    /// scanner uses `iter().find_map` so the populated sidecar is
+    /// picked up; a regression that switched to `iter().next()`
+    /// alone would fail here with the "all-host-None" error even
+    /// though at least one sidecar carries host data.
+    #[test]
+    fn show_run_host_forward_scans_past_none_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-mixed");
+        std::fs::create_dir(&run_dir).unwrap();
+        // First sidecar: host None. File-name prefix `a-` ensures
+        // this sorts before `b-` so iteration sees it first on
+        // typical filesystems. `collect_sidecars` does not
+        // guarantee order across filesystems; the forward-scan
+        // invariant is order-independent, but the test is
+        // deterministic within this single-filesystem env.
+        let sc_none = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("a-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc_none).unwrap(),
+        )
+        .unwrap();
+        // Second sidecar: host populated.
+        let mut sc_host = crate::test_support::SidecarResult::test_fixture();
+        sc_host.host = Some(crate::host_context::HostContext::test_fixture());
+        std::fs::write(
+            run_dir.join("b-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc_host).unwrap(),
+        )
+        .unwrap();
+
+        let out = show_run_host("run-mixed", Some(tmp.path()))
+            .expect("forward scan must find the populated sidecar");
+        assert!(
+            out.contains("kernel_name"),
+            "output from populated sidecar must include kernel_name: {out}",
         );
     }
 
