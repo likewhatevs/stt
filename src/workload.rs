@@ -1488,7 +1488,12 @@ impl WorkloadHandle {
             // half closes here before the bail.
             let mut report_fds = [0i32; 2];
             if unsafe { libc::pipe(report_fds.as_mut_ptr()) } != 0 {
-                anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
+                anyhow::bail!(
+                    "worker {}/{}: report pipe failed: {}",
+                    i,
+                    config.num_workers,
+                    std::io::Error::last_os_error(),
+                );
             }
             let mut start_fds = [0i32; 2];
             if unsafe { libc::pipe(start_fds.as_mut_ptr()) } != 0 {
@@ -1496,7 +1501,12 @@ impl WorkloadHandle {
                     libc::close(report_fds[0]);
                     libc::close(report_fds[1]);
                 }
-                anyhow::bail!("pipe failed: {}", std::io::Error::last_os_error());
+                anyhow::bail!(
+                    "worker {}/{}: start pipe failed: {}",
+                    i,
+                    config.num_workers,
+                    std::io::Error::last_os_error(),
+                );
             }
 
             let pid = unsafe { libc::fork() };
@@ -1511,7 +1521,12 @@ impl WorkloadHandle {
                         libc::close(start_fds[0]);
                         libc::close(start_fds[1]);
                     }
-                    anyhow::bail!("fork failed: {}", std::io::Error::last_os_error());
+                    anyhow::bail!(
+                        "worker {}/{}: fork failed: {}",
+                        i,
+                        config.num_workers,
+                        std::io::Error::last_os_error(),
+                    );
                 }
                 0 => {
                     // Child: set parent-death signal BEFORE any other
@@ -5454,14 +5469,19 @@ mod tests {
 
     /// Sleep-based deadline loop shared by the SIGUSR1-ignoring test
     /// closures. Returns when either `stop` flips (SIGUSR1 handler
-    /// path, never fires under SIG_IGN — kept honest) or
-    /// `secs` elapse. Uses `thread::sleep(10ms)` rather than
-    /// `spin_loop()`: the closures' purpose is to outlive
-    /// stop_and_collect's 5s collection deadline, not to respond to
-    /// cache-coherent store visibility at CPU speed, so a ~100x lower
-    /// CPU footprint is strictly better under CI contention.
-    fn wait_for_deadline(stop: &AtomicBool, secs: u64) {
-        let deadline = Instant::now() + Duration::from_secs(secs);
+    /// path, never fires under SIG_IGN — kept honest) or `timeout`
+    /// elapses. Takes a [`Duration`] to match
+    /// [`wait_for_file_or_panic`]'s signature; callers that want to
+    /// spell the value as "seven seconds" still write
+    /// `Duration::from_secs(7)`.
+    ///
+    /// Uses `thread::sleep(10ms)` rather than `spin_loop()`: the
+    /// closures' purpose is to outlive stop_and_collect's 5s
+    /// collection deadline, not to respond to cache-coherent store
+    /// visibility at CPU speed, so a ~100x lower CPU footprint is
+    /// strictly better under CI contention.
+    fn wait_for_deadline(stop: &AtomicBool, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
         while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -5525,7 +5545,7 @@ mod tests {
         // `wait_for_deadline` (no infinite loop) but is only
         // observed via the fallback timeout: with SIG_IGN in place,
         // the parent's SIGUSR1 doesn't flip STOP.
-        wait_for_deadline(stop, 7);
+        wait_for_deadline(stop, Duration::from_secs(7));
         // Report body is never observed — the parent SIGKILLs the
         // worker before any `f.write_all(&json)` could run. Per the
         // `WorkerReport` doc, sentinel-shape constructions use
@@ -5821,6 +5841,19 @@ mod tests {
             unsafe { libc::_exit(127); }
         }
         if gpid == 0 {
+            // Close every inherited fd above stdio BEFORE exec so the
+            // grandchild does not keep the parent-worker's pipes open.
+            // The worker's report-pipe write end is especially
+            // load-bearing: if the grandchild inherits it, the test's
+            // parent-side `read_to_end` in `stop_and_collect` blocks on
+            // EOF until the grandchild itself dies, turning a fast
+            // graceful-exit test into a /bin/sleep-wall-clock-long run
+            // (observed: 60s). 3..256 covers any reasonable test
+            // configuration without requiring /proc/self/fd iteration
+            // post-fork. EBADF on a closed fd is silently ignored.
+            for fd in 3..256 {
+                unsafe { libc::close(fd); }
+            }
             // Grandchild: exec immediately. `execv` returns only on
             // failure; any return is a setup error → _exit(127).
             // CStrings live on the child's CoW'd heap from the
@@ -5868,7 +5901,7 @@ mod tests {
         // kept honest inside `wait_for_deadline` even though SIG_IGN
         // prevents SIGUSR1 from flipping STOP; the 7s deadline is
         // the real terminator.
-        wait_for_deadline(stop, 7);
+        wait_for_deadline(stop, Duration::from_secs(7));
         WorkerReport {
             tid: worker_pid,
             ..WorkerReport::default()
@@ -5876,23 +5909,20 @@ mod tests {
     }
 
     /// Graceful-exit variant: forks the grandchild and then waits on
-    /// the `stop` flag at 10ms granularity. Does NOT install
+    /// the `stop` flag via [`wait_for_deadline`]. Does NOT install
     /// SIG_IGN — the worker's inherited `SIGUSR1 → STOP` handler
     /// fires on stop_and_collect's signal and flips `stop`, letting
     /// this closure return cleanly BEFORE the 5s collection deadline.
     /// stop_and_collect therefore hits its graceful-exit branch;
     /// killpg on that branch must still reap the grandchild.
+    ///
+    /// 10s upper bound on the wait is purely a liveness sentinel —
+    /// stop_and_collect sends SIGUSR1 within milliseconds of its
+    /// own invocation, so in practice `stop` flips well before 10s
+    /// elapses.
     fn forks_grandchild_and_exits_cleanly_fn(stop: &AtomicBool) -> WorkerReport {
         let worker_pid = fork_and_exec_grandchild_and_publish_pidfile();
-        // Poll `stop` at 10ms granularity — matches `wait_for_deadline`'s
-        // cadence. A fast graceful exit (within a tick or two of
-        // stop_and_collect's SIGUSR1) is precisely what routes
-        // stop_and_collect into the `waited` / graceful-exit branch
-        // of its match, which is what this closure exists to
-        // exercise.
-        while !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_deadline(stop, Duration::from_secs(10));
         WorkerReport {
             tid: worker_pid,
             ..WorkerReport::default()
@@ -6134,6 +6164,7 @@ mod tests {
     #[test]
     fn stop_and_collect_reaps_grandchild_from_graceful_custom_closure() {
         require_grandchild_sleep_binary();
+        let test_start = Instant::now();
         let config = WorkloadConfig {
             num_workers: 1,
             affinity: AffinityMode::None,
@@ -6144,23 +6175,30 @@ mod tests {
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
+        eprintln!("T+{:?}: spawning", test_start.elapsed());
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         let worker_pid = h.worker_pids()[0];
         let pidfile = grandchild_pidfile_path(worker_pid);
         let _ = std::fs::remove_file(&pidfile);
         let _pidfile_cleanup = PidfileCleanup(vec![pidfile.clone()]);
+        eprintln!("T+{:?}: starting", test_start.elapsed());
         h.start();
+        eprintln!("T+{:?}: reading gpid", test_start.elapsed());
         let gpid = read_grandchild_gpid_from_pidfile(worker_pid, &pidfile);
+        eprintln!("T+{:?}: gpid={gpid}", test_start.elapsed());
         assert!(
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(gpid), None).is_ok(),
             "grandchild {gpid} must be alive before stop_and_collect",
         );
+        eprintln!("T+{:?}: calling stop_and_collect", test_start.elapsed());
         let _reports = h.stop_and_collect();
+        eprintln!("T+{:?}: stop_and_collect returned", test_start.elapsed());
         assert_grandchild_reaped_within(
             gpid,
             Duration::from_secs(5),
             "stop_and_collect (graceful-exit)",
         );
+        eprintln!("T+{:?}: assert completed", test_start.elapsed());
     }
 
     // -- Test-helper unit tests --
@@ -6268,7 +6306,7 @@ mod tests {
     fn wait_for_deadline_waits_full_duration_when_stop_stays_false() {
         let stop = AtomicBool::new(false);
         let start = Instant::now();
-        wait_for_deadline(&stop, 1);
+        wait_for_deadline(&stop, Duration::from_secs(1));
         let elapsed = start.elapsed();
         assert!(
             elapsed >= Duration::from_millis(900),
@@ -6293,7 +6331,7 @@ mod tests {
             stop_setter.store(true, Ordering::Relaxed);
         });
         let start = Instant::now();
-        wait_for_deadline(&stop, 10); // 10s deadline — should never hit
+        wait_for_deadline(&stop, Duration::from_secs(10)); // 10s deadline — should never hit
         let elapsed = start.elapsed();
         flipper.join().unwrap();
         assert!(

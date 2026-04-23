@@ -72,8 +72,9 @@ pub struct WorkerReport {
   `stop_and_collect` synthesises a sentinel `WorkerReport` with
   `Some(_)` when the worker handed back no (or unparseable) JSON,
   using the `WorkerExitInfo` enum
-  (`Exited(code)` / `Signaled(signum)` / `TimedOut` / `WaitFailed`)
-  to preserve the reap shape for post-mortem.
+  (`Exited(code)` / `Signaled(signum)` / `TimedOut` /
+  `WaitFailed(String)` — the string carries the underlying `waitpid`
+  errno rendering) to preserve the reap shape for post-mortem.
 - Migrations are tracked every 1024 work units: after each outer
   iteration the worker checks `work_units.is_multiple_of(1024)`
   and runs the migration-detect body iff that is true. The check
@@ -107,13 +108,11 @@ pub struct WorkerReport {
     ForkExit (1 unit per fork+wait), FanOutCompute worker
     (`operations`=5 matrix multiplies per wake, one `work_units`
     tick per multiply → `gcd(5, 1024) = 1`).
-  - **Phase-inherited**: Sequence inherits the unit cadence of
-    whichever phase is currently active — `Phase::Spin` runs
-    `spin_burst(1024)` inside its own deadline loop (multiple-of-
-    1024 units per phase tick), `Phase::Yield` adds 1 unit per
-    yield, `Phase::Io` matches IoSync's 16-per-cycle rate,
-    `Phase::Sleep` contributes no `work_units` and so blocks
-    migration checks while it runs.
+  - **Phase-inherited**: Sequence inherits whichever phase is
+    currently active — Spin / Yield / Io use the same per-unit
+    accounting as the CpuSpin / YieldHeavy / IoSync groups above;
+    Sleep contributes no `work_units` and so pauses migration
+    checks while it runs.
   - **Not tracked by the framework**: Custom workers do not
     contribute to `work_units` on the framework's behalf —
     migration tracking fires only if the user's `run` function
@@ -143,26 +142,16 @@ start and end. Three fields:
 - `schedstat_cpu_time_ns` -- delta of field 1 (on-CPU time)
 - `schedstat_run_delay_ns` -- delta of field 2 (time spent waiting
   for a CPU)
-- `schedstat_run_count` -- delta of field 3 (**pcount** — the
-  scheduler-in count, incremented each time the scheduler picks
-  this task to execute). pcount is scheduling-class-agnostic: it
-  increments under fair (CFS/EEVDF), realtime (FIFO/RR), and
-  sched_ext alike, because it is recorded in the core
-  scheduler's enqueue path rather than a class-specific one.
-  pcount is NOT a context-switch count: one schedule-in event
-  increments pcount, while a context switch is the switch-OUT
-  event. In steady state every schedule-in is eventually paired
-  with a schedule-out so the counts track each other, but the
-  semantics differ: pcount rises whenever the scheduler re-picks
-  this task after a preemption or a voluntary block (the
-  increment is on schedule-in, NOT per tick — a task that keeps
-  running on the same CPU without ever leaving the runqueue will
-  not see pcount advance while it runs). The canonical
-  context-switch counters are `/proc/<pid>/status`'s
-  `voluntary_ctxt_switches` and `nonvoluntary_ctxt_switches`;
-  the worker does not read those because schedstat already
-  delivers pcount alongside `run_delay` / `cpu_time` in a single
-  file read.
+- `schedstat_run_count` -- delta of field 3 (**pcount** —
+  scheduler-in count: incremented each time the scheduler picks
+  this task to execute, across CFS/EEVDF, FIFO/RR, and sched_ext
+  alike). Not a context-switch count — a task that keeps running
+  on the same CPU without leaving the runqueue does not see
+  pcount advance while it runs. For true context-switch counts
+  read `/proc/<pid>/status`'s `voluntary_ctxt_switches` and
+  `nonvoluntary_ctxt_switches`; the worker reads pcount instead
+  because schedstat delivers it alongside `run_delay` /
+  `cpu_time` in a single file read.
 
 `iterations` counts outer-loop iterations.
 

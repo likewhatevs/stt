@@ -8,12 +8,15 @@
 //!   [`ktstr::worker_ready::worker_ready_marker_path`], then parks
 //!   forever. Single-threaded so `tid == pid` and the test can
 //!   match on `threads[N].tid` without a TID handshake; a
-//!   `/proc/self/task` self-check rejects any silent extra thread.
+//!   `/proc/self/task` self-check rejects any silent extra thread
+//!   (e.g. an allocator background thread or a runtime pulled in
+//!   by a new dep).
 //! - **`--churn`**: after the main allocation and ready-marker,
 //!   loops spawn+join on helper threads to exercise the probe's
 //!   ESRCH handling in
 //!   `jemalloc_probe_survives_thread_churn`. Relaxes the
-//!   single-thread self-check.
+//!   single-thread self-check — the `tid == pid` invariant is
+//!   therefore not guaranteed in this mode.
 //!
 //! Links `tikv_jemallocator` so the probe's DWARF-backed lookup
 //! finds `tsd_s.thread_allocated`. Minimum allocation is 16 KiB (to
@@ -26,9 +29,12 @@
 //! Process termination is always by external signal; any non-zero
 //! exit is a setup failure:
 //! - `2`: `bytes == 0` (caller bug — zero-size alloc would panic in `touch`).
-//! - `3`: default-mode `/proc/self/task` self-check failed.
+//! - `3`: default-mode `/proc/self/task` self-check saw a thread count != 1.
 //! - `4`: ready-marker write failed.
 //! - `5`: argv parse failed (missing `<BYTES>` or not a `usize`).
+//! - `6`: default-mode `read_dir("/proc/self/task")` itself failed
+//!   (procfs unreadable — distinct from code 3's "procfs readable
+//!   but reported extra threads").
 //!
 //! Argv is hand-rolled (one flag, one positional). The tipping
 //! point for switching to `clap-derive` is when the surface needs
@@ -73,6 +79,16 @@ use worker_ready::worker_ready_marker_path;
 /// cannot move the free before the loop iteration.
 #[inline]
 fn touch(v: &[u8]) {
+    // v[0] panics on an empty slice. The caller guarantees
+    // non-empty via the bytes==0 rejection in `main` (exit code 2),
+    // but a future caller that skips that gate would produce a
+    // generic "index out of bounds" panic at this line with no
+    // context. `debug_assert!` costs nothing in release builds and
+    // surfaces the precondition at the site where it matters.
+    debug_assert!(
+        !v.is_empty(),
+        "touch() called with an empty slice; caller must gate bytes==0 before allocating",
+    );
     let _ = std::hint::black_box(v[0]);
     std::hint::black_box(v.as_ptr());
     std::hint::black_box(v.len());
@@ -139,12 +155,23 @@ fn main() {
                         "jemalloc-alloc-worker: /proc/self/task has {n} entries, expected 1; \
                          extra threads break the tid==pid identity"
                     );
+                    // Exit code 3: self-check saw >1 TID. The test
+                    // body uses this to distinguish "a helper thread
+                    // materialized somehow" from "procfs itself
+                    // broke" (exit code 6 below) since the
+                    // remediation differs (inspect the worker's
+                    // build for a new dep that spawns threads, vs
+                    // investigate a broken or unmounted /proc).
                     std::process::exit(3);
                 }
             }
             Err(e) => {
                 eprintln!("jemalloc-alloc-worker: read_dir(/proc/self/task) failed: {e}");
-                std::process::exit(3);
+                // Exit code 6: procfs itself was unreadable. Distinct
+                // from exit 3 (threads!=1) because the failure class
+                // is different — 3 points at the worker build, 6
+                // points at the guest kernel / mount config.
+                std::process::exit(6);
             }
         }
     }
@@ -166,7 +193,17 @@ fn main() {
     // probe race against the allocation. Path format is centralized
     // in `ktstr::worker_ready` so worker and test cannot drift.
     let pid = std::process::id();
-    let ready_path = worker_ready_marker_path(pid);
+    // Test hook: `KTSTR_WORKER_READY_MARKER_OVERRIDE` replaces the
+    // pid-scoped default when set and non-empty. Used by
+    // `worker_exits_4_on_ready_marker_write_fail` to point the write
+    // at a deliberately-unwritable path (e.g. a non-existent parent
+    // directory) so the exit-4 branch fires deterministically instead
+    // of racing a pre-mkdir against the worker's own `fs::write`.
+    // Production callers never set this env var.
+    let ready_path = match std::env::var("KTSTR_WORKER_READY_MARKER_OVERRIDE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => worker_ready_marker_path(pid),
+    };
     if let Err(e) = std::fs::write(&ready_path, b"ready\n") {
         eprintln!(
             "jemalloc-alloc-worker: failed to write ready marker {ready_path}: {e}"

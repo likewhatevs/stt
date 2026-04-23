@@ -177,11 +177,23 @@ pub enum PayloadKind {
     /// no auto-derivation from the `PayloadKind::Binary(name)` they
     /// carry — that `name` is the spawn target only. Host binaries
     /// and fixtures a binary-kind payload needs in the guest must
-    /// be declared explicitly via `include_files` on
+    /// be declared explicitly via
+    /// [`Payload::include_files`](Payload::include_files) on
     /// `#[derive(Payload)]` or `extra_include_files` on
-    /// `#[ktstr_test]` (see the prior section); the packaging
-    /// mechanism is the same declarative pipeline, but the input
-    /// is a separate explicit list rather than the binary name.
+    /// `#[ktstr_test]`; the packaging mechanism is the same
+    /// declarative pipeline, but the input is a separate explicit
+    /// list rather than the binary name.
+    ///
+    /// **If a Binary-kind payload's spawn target is a host binary
+    /// that should be packaged into the guest, that binary's name
+    /// MUST also appear in the payload's `include_files`.** The
+    /// harness does not derive `include_files` from the
+    /// `PayloadKind::Binary(name)`; a binary referenced at spawn
+    /// time but not listed as an include is expected to already
+    /// be present in the guest filesystem (e.g. a standard
+    /// `busybox` applet on the base image). Forgetting the
+    /// include-entry surfaces as an `ENOENT` at `exec` time inside
+    /// the guest.
     ///
     /// # Fork / kill semantics
     ///
@@ -242,20 +254,28 @@ impl Payload {
     /// `KERNEL_DEFAULT.name` is `"kernel_default"` (the intent-level
     /// label), while `KERNEL_DEFAULT.scheduler_name()` returns
     /// `"eevdf"` (the inner [`Scheduler::EEVDF`]'s `.name`). The two
-    /// names are deliberate, not a drift:
+    /// names answer different questions:
     ///
     /// - `"kernel_default"` answers "what did the test author select?"
     ///   — a future kernel release replacing EEVDF keeps this label
-    ///   stable, so sidecars written now still compare meaningfully.
+    ///   stable, so an in-memory match on author intent survives
+    ///   kernel upgrades.
     /// - `"eevdf"` answers "what scheduler actually ran?" — the
-    ///   historical record of the scheduling class in effect, which
-    ///   lets cross-kernel-version comparisons distinguish same-intent
-    ///   runs on different schedulers.
+    ///   concrete scheduling class in effect.
     ///
-    /// Consumers should read `.name` when they want the author's
-    /// declaration and `.scheduler_name()` when they want the actual
-    /// scheduler. Sidecar writers emit both fields so downstream
-    /// tooling can pick.
+    /// **Only `scheduler_name()` reaches the sidecar.** The
+    /// `SidecarResult.scheduler` field
+    /// (src/test_support/sidecar.rs) is populated via
+    /// `entry.scheduler.scheduler_name()`, which emits `"eevdf"` for
+    /// `KERNEL_DEFAULT`. The outer `Payload.name`
+    /// (`"kernel_default"`) is NOT written to the sidecar — it stays
+    /// in-memory only, used by logs, `#[ktstr_test]`-declaration
+    /// lookups, and `Payload::display_name()`. Cross-kernel-version
+    /// comparisons via sidecar `scheduler` therefore see `"eevdf"`
+    /// today and whatever future scheduling class replaces EEVDF
+    /// tomorrow; author-intent filtering on `"kernel_default"`
+    /// requires consulting the in-memory `Payload::name` directly,
+    /// not the sidecar.
     pub const KERNEL_DEFAULT: Payload = Payload {
         name: "kernel_default",
         kind: PayloadKind::Scheduler(&Scheduler::EEVDF),
@@ -350,10 +370,22 @@ impl Payload {
     // below returns exactly what that scenario should see.
     // -----------------------------------------------------------------
 
-    /// The scheduler's display name. For scheduler-kind payloads this
-    /// is the inner `Scheduler::name`; for binary-kind it is
-    /// `"kernel_default"` (a binary payload runs under the kernel
-    /// default).
+    /// The scheduler's display name.
+    ///
+    /// Branch behavior:
+    /// - `PayloadKind::Scheduler(s)` → `s.name` — the specific
+    ///   scheduler's identifier, e.g. `"eevdf"` for
+    ///   [`Scheduler::EEVDF`] or `"scx_rusty"` for a scx_*
+    ///   scheduler. This is what scheduler-kind payloads
+    ///   (including `Payload::KERNEL_DEFAULT`, which wraps
+    ///   [`Scheduler::EEVDF`]) surface.
+    /// - `PayloadKind::Binary(_)` → `"kernel_default"` — a binary
+    ///   payload runs under whatever scheduler the test declares
+    ///   elsewhere (or the kernel default if it declares none),
+    ///   so the binary-kind payload carries no scheduler identity
+    ///   of its own. NOTE: this is the intent-level label, NOT
+    ///   `"eevdf"`; only a scheduler-kind payload explicitly
+    ///   wrapping [`Scheduler::EEVDF`] returns `"eevdf"` here.
     pub const fn scheduler_name(&self) -> &'static str {
         match self.kind {
             PayloadKind::Scheduler(s) => s.name,

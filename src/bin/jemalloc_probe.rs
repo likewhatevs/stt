@@ -1432,10 +1432,45 @@ fn main() {
             std::process::exit(1);
         }
         RunOutcome::Fatal(e) => {
+            // Emit a single structured tag alongside the human
+            // rendering so test bodies that want variant-specific
+            // pinning (e.g. "probe bailed because the target pid
+            // did not exist", as distinct from "target existed but
+            // was not jemalloc-linked") can match on a stable
+            // substring rather than the free-form `{e:#}` text.
+            // The tag shape is intentionally grep-friendly:
+            // `ktstr-probe-fatal: <kind>` with `kind` drawn from
+            // a short, closed vocabulary. Consumers can filter on
+            // the `ktstr-probe-fatal:` prefix to harvest only
+            // structured lines even if the underlying human text
+            // changes.
+            let kind = classify_fatal(&e);
+            eprintln!("ktstr-probe-fatal: {kind}");
             eprintln!("error: {e:#}");
             detach_all_attached();
             std::process::exit(1);
         }
+    }
+}
+
+/// Classify a `RunOutcome::Fatal` error into a short tag for
+/// structured stderr emission in [`main`]. Matches the underlying
+/// `anyhow::Error` root-cause display against a small set of
+/// closed substrings; unknown shapes fall through to `other` so
+/// the tag stream stays well-formed even on unexpected errors.
+/// The vocabulary is intentionally tiny — adding a new kind is
+/// always safe; removing or renaming one is a breaking change to
+/// downstream test consumers that match on the substring.
+fn classify_fatal(e: &anyhow::Error) -> &'static str {
+    let msg = format!("{e:#}");
+    if msg.contains("does not exist") {
+        "pid-missing"
+    } else if msg.contains("jemalloc") && msg.contains("not") {
+        "not-jemalloc"
+    } else if msg.contains("self-test") {
+        "self-test"
+    } else {
+        "other"
     }
 }
 

@@ -295,13 +295,22 @@ impl Scheduler {
     /// launched. Useful as a baseline and for tests that exercise
     /// framework behavior independent of any scx scheduler.
     ///
-    /// The `.name` is `"eevdf"` — the historical record of the
-    /// scheduling class in effect. This is distinct from
-    /// [`Payload::KERNEL_DEFAULT.name`](crate::test_support::Payload::KERNEL_DEFAULT),
-    /// which is `"kernel_default"` (an intent-level label that stays
-    /// stable across kernel releases). See the docs on
-    /// `Payload::KERNEL_DEFAULT` for the rationale behind keeping
-    /// both names in the sidecar.
+    /// The `.name` is the compile-time-fixed string `"eevdf"`. It is
+    /// NOT runtime-derived from the live kernel: a sidecar written
+    /// on a kernel that replaces EEVDF with a successor scheduling
+    /// class still records `"eevdf"` here as long as the test
+    /// attributes this `Scheduler` to a run. The pairing with
+    /// [`Payload::KERNEL_DEFAULT.name`](crate::test_support::Payload::KERNEL_DEFAULT)
+    /// (`"kernel_default"`, also compile-time-fixed) gives consumers
+    /// two static labels per sidecar: `"kernel_default"` captures
+    /// the test author's intent (use whatever scheduler the kernel
+    /// hands us); `"eevdf"` captures the scheduling class this
+    /// placeholder was authored against. Neither label observes the
+    /// running kernel's actual scheduler; for that, consumers must
+    /// cross-reference the sidecar's host block (e.g.
+    /// `host.kernel_release`) with kernel-version-to-scheduler
+    /// knowledge. See the docs on `Payload::KERNEL_DEFAULT` for why
+    /// both labels are carried in the sidecar.
     pub const EEVDF: Scheduler = Scheduler {
         name: "eevdf",
         binary: SchedulerSpec::Eevdf,

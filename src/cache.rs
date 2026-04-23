@@ -160,7 +160,15 @@ pub struct KernelMetadata {
     /// `#[serde(default)]` must be present during deserialization, so
     /// entries that predate this field surface as Corrupt rather than
     /// defaulting to `false`.
-    pub has_vmlinux: bool,
+    ///
+    /// Visibility: private field, [`KernelMetadata::has_vmlinux`]
+    /// reader is public and [`KernelMetadata::set_has_vmlinux`]
+    /// mutator is `pub(crate)`. The authoritative writer is
+    /// [`CacheDir::store`]; making the field crate-writable-only
+    /// enforces that ownership statically instead of leaving the
+    /// "don't set this directly" guidance purely advisory (see the
+    /// note on `new()` below).
+    has_vmlinux: bool,
 }
 
 impl KernelMetadata {
@@ -211,6 +219,29 @@ impl KernelMetadata {
     pub fn with_ktstr_kconfig_hash(mut self, hash: Option<String>) -> Self {
         self.ktstr_kconfig_hash = hash;
         self
+    }
+
+    /// Whether a stripped vmlinux ELF was cached alongside the image.
+    ///
+    /// Public reader for the private `has_vmlinux` field; consumers
+    /// outside this crate must use this method to observe the field
+    /// (the field itself is no longer directly accessible). Lookups
+    /// that consume the bool to decide whether to resolve
+    /// `vmlinux_path()` should read through this accessor.
+    pub fn has_vmlinux(&self) -> bool {
+        self.has_vmlinux
+    }
+
+    /// Crate-only mutator for `has_vmlinux`.
+    ///
+    /// Exists to allow [`CacheDir::store`] (the authoritative
+    /// writer) to record whether the stripped vmlinux was actually
+    /// persisted into the entry directory. Not public: external
+    /// callers mutating this bit would risk drift between the
+    /// field and the on-disk contents, which is exactly what
+    /// `store()` ownership is supposed to prevent.
+    pub(crate) fn set_has_vmlinux(&mut self, value: bool) {
+        self.has_vmlinux = value;
     }
 }
 
@@ -656,7 +687,7 @@ impl CacheDir {
         // Write metadata. has_vmlinux reflects whether we actually
         // stored a vmlinux sidecar, overriding whatever the caller set.
         let mut meta = metadata.clone();
-        meta.has_vmlinux = has_vmlinux;
+        meta.set_has_vmlinux(has_vmlinux);
         let meta_json = serde_json::to_string_pretty(&meta)?;
         fs::write(tmp_dir.join("metadata.json"), meta_json)
             .map_err(|e| anyhow::anyhow!("write cache metadata: {e}"))?;

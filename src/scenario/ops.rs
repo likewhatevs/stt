@@ -29,6 +29,15 @@ use super::{CgroupGroup, Ctx, process_alive};
 ///
 /// Names use `Cow<'static, str>` so ops can reference compile-time
 /// literals (zero-cost) or runtime-generated strings (owned).
+///
+/// # `#[non_exhaustive]` migration note
+///
+/// Downstream code that matches on an `Op` variant must include a
+/// wildcard `_ =>` arm — a future op added to the enum otherwise
+/// breaks every matcher. Use the per-op constructors (e.g.
+/// `Op::add_cgroup`, `Op::run_payload`) to build values instead of
+/// naming variants directly; new constructors are added alongside
+/// new variants and are the stable surface.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Op {
@@ -196,6 +205,12 @@ pub enum Op {
 }
 
 /// How to compute a cpuset from topology.
+///
+/// # `#[non_exhaustive]` migration note
+///
+/// Pattern matches over `CpusetSpec` must include a wildcard
+/// `_ =>` arm so future cpuset-derivation strategies can land
+/// without breaking existing matchers.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum CpusetSpec {
@@ -2031,17 +2046,18 @@ fn run_step<'a>(
 ///
 /// `step_idx` is a `usize` on the caller side but the wire
 /// `StimulusPayload.step_index` is a `u16` — the slot is sized for
-/// realistic scenarios (≤ 65 535 steps). Any `step_idx` >
-/// `u16::MAX as usize` is clamped to `u16::MAX` by `to_u16` below,
-/// with a `tracing::warn!` that names the overflow. Downstream
-/// consumers of the StepStart wire frame therefore see every step
-/// beyond the 65 535th collapsed onto the same `step_index` value
-/// (`u16::MAX`) — the ordering is preserved for the first 65 535
-/// steps, but labels saturate and become ambiguous once the
-/// scenario crosses the boundary. Scenarios that need to
-/// distinguish individual steps past `u16::MAX` must widen the
-/// wire schema field; the saturating-clip preserves visible wake
-/// ordering at the cost of individuality in the deep tail.
+/// realistic scenarios (≤ 65 536 distinct indices, `0..=u16::MAX`).
+/// Any `step_idx` > `u16::MAX as usize` is clamped to `u16::MAX` by
+/// `to_u16` below, with a `tracing::warn!` that names the overflow.
+/// Downstream consumers of the StepStart wire frame therefore see
+/// every step past index `u16::MAX` collapsed onto the same
+/// `step_index` value (`u16::MAX`) — the ordering is preserved for
+/// the first 65 536 steps (indices `0..=u16::MAX`), but labels
+/// saturate and become ambiguous once the scenario crosses the
+/// boundary. Scenarios that need to distinguish individual steps
+/// past `u16::MAX` must widen the wire schema field; the
+/// saturating-clip preserves visible wake ordering at the cost of
+/// individuality in the deep tail.
 fn build_stimulus(
     scenario_start: &std::time::Instant,
     step_idx: usize,
@@ -2318,8 +2334,9 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
     for def in defs {
         if state.cgroup_name_is_tracked(&def.name) {
             anyhow::bail!(
-                "cgroup '{}' is already tracked (by a prior Backdrop or step-local CgroupDef) — \
-                 declare it in exactly one place; use a fresh name for the step-local cgroup",
+                "CgroupDef '{}' collides with a cgroup already tracked \
+                 (by a prior Backdrop or step-local CgroupDef) — declare it \
+                 in exactly one place; use a fresh name for the step-local cgroup",
                 def.name,
             );
         }
@@ -6444,16 +6461,110 @@ mod tests {
 
         // Far-overflow smoke check: u32::MAX as usize is well past
         // the saturation boundary. The helper must still return
-        // u16::MAX; a wrap would produce a small value like 65535
-        // which would coincidentally match, but a truncated `as u16`
-        // on e.g. u16::MAX as usize + 2 yields 0, so the previous
-        // assertion already catches the wrap bug. This one guards
-        // the far-overflow edge.
+        // u16::MAX. Note the coincidence that `u32::MAX as u16` also
+        // equals `u16::MAX` (the low 16 bits of `0xFFFF_FFFF_u32`
+        // are `0xFFFF`), so this specific input cannot distinguish
+        // saturation from a straight `as u16` truncation — the
+        // `u16::MAX as usize + 1` assertion above is what pins
+        // saturation (that input truncates to 0, so only saturation
+        // returns u16::MAX). This check therefore guards only the
+        // far-overflow call path (helper handles values past
+        // u16::MAX by orders of magnitude without panicking or
+        // returning nonsense), not the saturation semantics.
         let far = build_stimulus(&start, u32::MAX as usize, &[], &scenario);
         assert_eq!(
             far.step_index,
             u16::MAX,
             "far-overflow step_idx must saturate to u16::MAX",
+        );
+    }
+
+    /// Saturation without a warn would silently clip the wire field;
+    /// the `tracing::warn!` inside `to_u16` is the only observable
+    /// signal an operator gets when a scenario blew past `u16::MAX`.
+    /// Install a minimal capturing subscriber, run a saturation-
+    /// triggering call, and assert the warn event fired.
+    #[test]
+    fn build_stimulus_warns_on_step_idx_saturation() {
+        use std::sync::{Arc, Mutex};
+        use tracing::{Event, Subscriber};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Level, Metadata};
+
+        // Capturing subscriber that records `(level, message)` pairs
+        // for every event. Span-related methods are implemented as
+        // no-ops; the test only cares about event emission.
+        #[derive(Default)]
+        struct CaptureSubscriber {
+            events: Arc<Mutex<Vec<(Level, String)>>>,
+        }
+        struct MessageVisitor<'a>(&'a mut String);
+        impl<'a> Visit for MessageVisitor<'a> {
+            fn record_debug(&mut self, _field: &Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{value:?} ");
+            }
+            fn record_str(&mut self, _field: &Field, value: &str) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{value} ");
+            }
+        }
+        impl Subscriber for CaptureSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut msg = String::new();
+                event.record(&mut MessageVisitor(&mut msg));
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), msg));
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        let events: Arc<Mutex<Vec<(Level, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sub = CaptureSubscriber { events: events.clone() };
+
+        tracing::subscriber::with_default(sub, || {
+            let mock = MockCgroupOps::new();
+            let topo = mock_topo();
+            let ctx = mock_ctx(&mock, &topo);
+            let mut step_state = StepState::empty(&ctx);
+            let mut backdrop_state = BackdropState::empty(&ctx);
+            let scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+            let start = std::time::Instant::now();
+
+            // In-range call: no saturation, no warn expected.
+            let _ = build_stimulus(&start, 0, &[], &scenario);
+            // Saturating call: must emit a warn naming the
+            // overflowing field and the offending value.
+            let _ = build_stimulus(&start, u16::MAX as usize + 1, &[], &scenario);
+        });
+
+        let captured = events.lock().unwrap();
+        let warn_hits: Vec<&String> = captured
+            .iter()
+            .filter(|(lvl, _)| *lvl == Level::WARN)
+            .map(|(_, msg)| msg)
+            .collect();
+        assert!(
+            warn_hits.iter().any(|m| m.contains("step_index")
+                && m.contains("StimulusPayload field overflowed u16")),
+            "saturation must emit a tracing::warn naming step_index; got warns: {warn_hits:?}",
+        );
+        // Sanity: no warn should fire for the in-range 0 call.
+        // Since we can't easily partition the two calls, we assert
+        // the total count is exactly one: saturating call fires
+        // once, in-range call fires zero.
+        assert_eq!(
+            warn_hits.len(),
+            1,
+            "exactly one saturation warn expected; got: {warn_hits:?}",
         );
     }
 }

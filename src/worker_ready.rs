@@ -9,13 +9,41 @@
 //! (`tests/jemalloc_probe_tests.rs`) in sync — a rename changes one
 //! place, not two.
 //!
-//! This file is also included directly into the worker bin crate via
-//! `#[path]` (see the bin's source) to avoid linking the entire ktstr
-//! library into the worker binary. Consequently, this module must not
-//! reference any other ktstr types or modules. The `wait_for_worker_ready`
-//! helper lives in the sibling [`crate::worker_ready_wait`] module
-//! because it needs `PayloadHandle` and therefore depends on the rest
-//! of the library.
+//! # Dual-compilation constraint — MUST STAY STD-ONLY
+//!
+//! This source file is compiled TWICE by the same `cargo build`:
+//! once as `ktstr::worker_ready` (a lib-crate module) and once as the
+//! worker bin's own `mod worker_ready` via
+//! `#[path = "../worker_ready.rs"]` (see
+//! `src/bin/jemalloc_alloc_worker.rs`). The `#[path]` include is
+//! deliberate: linking the entire ktstr library into a worker
+//! process would pull thousands of unused symbols and perturb the
+//! probe's cross-process timing.
+//!
+//! Consequences for this file:
+//! - **No `crate::…` or `super::…` paths**, no `use crate::…`
+//!   statements. `crate` resolves to two different crates (ktstr vs.
+//!   the bin) on the two compilation paths; anything that names the
+//!   other crate's types breaks one of the two builds.
+//! - **No ktstr-library types or modules.** Only `std` items,
+//!   language primitives, and `core` types are safe. Anything that
+//!   depends on `PayloadHandle`, scenario `Ctx`, `anyhow`, or any
+//!   other lib-only item must live in
+//!   [`crate::worker_ready_wait`](../worker_ready_wait/index.html)
+//!   (lib-only) — not here.
+//! - **No external crate imports that only the lib or only the bin
+//!   has.** Adding a non-std dependency requires a matching `Cargo.toml`
+//!   stanza for both the lib and the bin; otherwise one build path
+//!   fails to resolve the crate.
+//! - **No `#[cfg(feature = "…")]` that differs across the two
+//!   crates.** Feature gates evaluate per-crate, so a gate that's
+//!   satisfied for the lib but not the bin (or vice versa) will
+//!   silently diverge the two compiled copies.
+//!
+//! The `wait_for_worker_ready` helper lives in the sibling
+//! [`crate::worker_ready_wait`] module because it needs
+//! `PayloadHandle` and therefore depends on the rest of the
+//! library.
 //!
 //! # Host ↔ guest assumptions
 //!
@@ -48,7 +76,13 @@
 
 /// Prefix for the pid-scoped ready-marker path. The final segment is
 /// the worker's pid rendered as a decimal ASCII integer.
-pub const WORKER_READY_MARKER_PREFIX: &str = "/tmp/ktstr-worker-ready-";
+///
+/// Visibility: `pub(crate)` — the prefix is an internal
+/// implementation detail of the worker-ready-marker convention.
+/// [`worker_ready_marker_path`] is the stable surface; hiding the
+/// prefix prevents external consumers from inlining the literal and
+/// silently drifting on a rename.
+pub(crate) const WORKER_READY_MARKER_PREFIX: &str = "/tmp/ktstr-worker-ready-";
 
 /// Construct the ready-marker path for a worker with the given pid.
 ///

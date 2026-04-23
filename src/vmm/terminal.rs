@@ -111,7 +111,31 @@ extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
 ///   `SIGUSR2`, `SIGTSTP`, etc.): bypassed by design. Only the five
 ///   signals above arm a restore-on-delivery handler; every other
 ///   signal runs under whatever disposition was installed before the
-///   guard was entered.
+///   guard was entered. Per `signal(7)` defaults, the consequences
+///   split into three groups:
+///     - `SIGTSTP`: default is **Stop**, not Term. The process
+///       suspends and Drop runs normally when the shell resumes
+///       it (`fg`); the termios is restored on that return. No
+///       leak.
+///     - `SIGHUP`: default is **Term**. The controlling terminal
+///       has typically gone away by the time SIGHUP fires
+///       (hangup of the pty / tty), so terminal restoration is
+///       moot — the device the guard would write to no longer
+///       exists. No leak in practice.
+///     - `SIGUSR1` / `SIGUSR2` / `SIGALRM` / `SIGPIPE`: default
+///       is **Term**. A process receiving one of these without
+///       its own handler exits immediately without running Drop
+///       or the guard's SA_RESETHAND restore path, so the
+///       terminal stays in raw mode after the process dies.
+///       This is a known gap: the guard covers the common
+///       termination shapes (Ctrl-C via SIGINT, `kill` via
+///       SIGTERM, core-dump signals via SIGQUIT/SIGABRT/SIGFPE)
+///       but not every Term-default signal. Applications that
+///       take these signals routinely (background alarm timers,
+///       user-signal IPC, pipe-reader/writer patterns) should
+///       install their own handler that either ignores the
+///       signal or calls the same termios-restore shim the
+///       guard uses.
 /// - **`std::process::exit` / `libc::_exit`**: skip Drop entirely.
 /// - **SIGKILL**: uncatchable by design, no handler runs.
 ///

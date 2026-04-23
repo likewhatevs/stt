@@ -345,9 +345,10 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
         worker_pid,
         std::time::Duration::from_secs(5),
         "worker",
-        "2=bytes==0, 3=/proc/self/task self-check failed, \
+        "2=bytes==0, 3=/proc/self/task thread count != 1, \
          4=ready-marker write failed, 5=argument parse failed, \
-         101=Rust panic, negative=killed by signal",
+         6=/proc/self/task unreadable, 101=Rust panic, \
+         negative=killed by signal",
     )?;
 
     let run_outcome = ctx
@@ -499,14 +500,17 @@ fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
     //      rules out signal-kill (negative, probe crashed, which is
     //      the regression) and unexpected success (`0`). The
     //      Fatal-vs-AllFailed distinction is carried by assertion 2.
-    //   2. No ProbeOutput JSON fields (`pid`, `schema_version`,
-    //      `threads.N.*`) in the flat metric list. This IS
-    //      Fatal-exclusive: AllFailed still emits ProbeOutput via
-    //      `print_output()` (populating `pid` and `schema_version`
-    //      even with an empty or all-Err `threads` array). Their
-    //      absence proves the probe took the Fatal arm and exited
-    //      via stderr before reaching `print_output()`, which is
-    //      what a nonexistent pid must trigger.
+    //   2. The flat metric list is empty. This IS Fatal-exclusive:
+    //      AllFailed still emits ProbeOutput via `print_output()`
+    //      (populating `pid` and `schema_version` numerics even with
+    //      an empty or all-Err `threads` array), so the metric list
+    //      would carry at least `pid` and `schema_version` under
+    //      AllFailed. Empty-metrics proves the probe took the Fatal
+    //      arm and exited via stderr before reaching
+    //      `print_output()`, which is what a nonexistent pid must
+    //      trigger. Checking emptiness (rather than maintaining an
+    //      allowlist of ProbeOutput field names) keeps the test
+    //      agnostic to future ProbeOutput field additions.
     if metrics.exit_code != 1 {
         return Ok(AssertResult::fail_other(format!(
                 "probe exit_code={} against nonexistent pid {fake_pid}; \
@@ -515,17 +519,14 @@ fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
                 metrics.exit_code,
             )));
     }
-    let structured_fields: Vec<&str> = metrics
-        .metrics
-        .iter()
-        .map(|m| m.name.as_str())
-        .filter(|n| *n == "pid" || *n == "schema_version" || n.starts_with("threads."))
-        .collect();
-    if !structured_fields.is_empty() {
+    if !metrics.metrics.is_empty() {
+        let names: Vec<&str> = metrics.metrics.iter().map(|m| m.name.as_str()).collect();
         return Ok(AssertResult::fail_other(format!(
-                "probe against nonexistent pid {fake_pid} emitted ProbeOutput JSON \
-                 fields {structured_fields:?}; Fatal arm should exit via stderr \
-                 before print_output() populates ProbeOutput"
+                "probe against nonexistent pid {fake_pid} emitted {} metric(s) \
+                 {names:?}; Fatal arm should exit via stderr before \
+                 print_output() populates ProbeOutput, leaving the metric \
+                 list empty",
+                metrics.metrics.len(),
             )));
     }
     Ok(AssertResult::pass())
@@ -683,4 +684,102 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
         .details
         .push(AssertDetail::new(DetailKind::Other, message));
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Worker-binary exit-code tests (non-VM)
+// ---------------------------------------------------------------------------
+//
+// These spawn the alloc-worker binary directly via `Command::new`
+// and assert the exit-code contract spelled out in the worker's
+// module doc. No VM, no probe — pure host-side exercise of the
+// fail-fast branches. Runs in under a second per test.
+
+/// bytes=0 must exit with code 2. The worker's module doc pins
+/// `2: bytes == 0`; this test catches any refactor that silently
+/// re-routes the zero-size alloc guard to a different code or drops
+/// it entirely.
+#[test]
+fn worker_exits_2_on_bytes_zero() {
+    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
+    let output = std::process::Command::new(worker)
+        .arg("0")
+        .output()
+        .expect("spawn worker");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "bytes=0 must exit with code 2; got {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Missing positional `<BYTES>` must exit with code 5 (argument
+/// parse failure). Covers the argv-absent branch of the
+/// `expect() → exit(5)` refactor.
+#[test]
+fn worker_exits_5_on_missing_bytes_arg() {
+    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
+    let output = std::process::Command::new(worker)
+        .output()
+        .expect("spawn worker");
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "missing BYTES must exit with code 5; got {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Non-numeric `<BYTES>` must exit with code 5. Covers the
+/// parse-error branch.
+#[test]
+fn worker_exits_5_on_non_numeric_bytes_arg() {
+    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
+    let output = std::process::Command::new(worker)
+        .arg("not-a-number")
+        .output()
+        .expect("spawn worker");
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "non-numeric BYTES must exit with code 5; got {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Ready-marker write failure must exit with code 4. Uses the
+/// `KTSTR_WORKER_READY_MARKER_OVERRIDE` test-only env hook to point
+/// the write at a path under a non-existent parent directory, which
+/// `std::fs::write`'s internal `open(..., O_CREAT)` can't create →
+/// ENOENT → exit 4. Bypasses the race-prone alternative of
+/// pre-creating a directory at the pid-scoped default path. Passes
+/// `1024` as BYTES so the self-check + allocation succeed; the
+/// ready-marker write is the first failure the worker hits.
+#[test]
+fn worker_exits_4_on_ready_marker_write_fail() {
+    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
+    let output = std::process::Command::new(worker)
+        .arg("1024")
+        .env(
+            "KTSTR_WORKER_READY_MARKER_OVERRIDE",
+            "/nonexistent-ktstr-test-dir/marker",
+        )
+        .output()
+        .expect("spawn worker");
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "ready-marker write failure must exit with code 4; got {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to write ready marker"),
+        "stderr must name the failure; got: {stderr}",
+    );
 }

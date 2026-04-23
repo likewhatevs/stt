@@ -17,10 +17,40 @@ use polars::prelude::*;
 /// [`GauntletRow`] without a hand-maintained name→field match.
 ///
 /// The `accessor` field is skipped in serde output because `fn`
-/// pointers are not serializable. If a `Deserialize` impl is
-/// added later, callers must re-hydrate the accessor by looking
-/// up `name` via [`metric_def`] — the static `METRICS` table is
-/// the authoritative source of the function identity.
+/// pointers are not serializable. A future `Deserialize` impl
+/// would need callers to re-hydrate the accessor by looking up
+/// `name` via [`metric_def`] — the static [`METRICS`] table is
+/// the authoritative source of the function identity. No such
+/// impl exists today; the note is a forward-conditional so that
+/// if one is added, the migration path is spelled out rather
+/// than reinvented per site.
+///
+/// # Registered vs unregistered metrics
+///
+/// The static [`METRICS`] registry is the "core metric" set with
+/// hand-authored accessors, hand-tuned dual-gate thresholds
+/// (`default_abs` / `default_rel`), and display units. Each
+/// registered `MetricDef.accessor` reads a typed field on
+/// `GauntletRow` directly (e.g. `r.spread`, `r.gap_ms`).
+///
+/// Metrics that fall OUTSIDE this registry are carried on
+/// `GauntletRow.ext_metrics: BTreeMap<String, f64>`. Registered
+/// metrics never flow through `ext_metrics`; unregistered metrics
+/// never flow through the typed fields. [`MetricDef::read`] and
+/// [`read_metric`] check the registered-field accessor first and
+/// fall back to an `ext_metrics.get(name)` lookup — a name that
+/// matches neither returns `None`. Consumers that want to
+/// distinguish "registered-but-null" from "unregistered-and-
+/// absent" must inspect the registry directly rather than rely
+/// on the fallback.
+///
+/// # `#[non_exhaustive]` migration note
+///
+/// Downstream code that pattern-matches an instance of `MetricDef`
+/// must end the match with `..` so a future field addition does
+/// not become a breaking change. Prefer reading values through
+/// the static [`METRICS`] registry and [`metric_def`] lookup
+/// rather than constructing `MetricDef` values by hand.
 #[derive(Debug, Clone, serde::Serialize)]
 #[non_exhaustive]
 pub struct MetricDef {
@@ -79,6 +109,47 @@ impl MetricDef {
 /// this registry) default to max; register a `MetricDef` here before
 /// relying on min-polarity merge. The comparison system
 /// ([`compare_runs`]) uses `higher_is_worse` for delta direction.
+///
+/// # Metric-name triples (registry / field / DataFrame column)
+///
+/// Each metric is referenced by three names across the pipeline.
+/// The registry name is the stable surface — sidecars, CI gates,
+/// and `cargo ktstr stats compare` output all quote it verbatim —
+/// and cannot be renamed without silently invalidating downstream
+/// consumers. The field name on [`GauntletRow`] and the polars
+/// DataFrame column name are internal; they are kept terse and
+/// match each other, but diverge from the registry name where
+/// the domain-level wording adds context (`worst_*`, `total_*`,
+/// `max_*`) that would be noise on an already-qualified field.
+/// Nine divergent triples:
+///
+/// | Registry (`MetricDef.name`) | `GauntletRow` field | DataFrame column |
+/// |---|---|---|
+/// | `worst_spread` | `spread` | `spread` |
+/// | `worst_gap_ms` | `gap_ms` | `gap_ms` |
+/// | `total_migrations` | `migrations` | `migrations` |
+/// | `worst_migration_ratio` | `migration_ratio` | `migration_ratio` |
+/// | `max_imbalance_ratio` | `imbalance_ratio` | `imbalance` |
+/// | `max_dsq_depth` | `max_dsq_depth` | `dsq_depth` |
+/// | `stall_count` | `stall_count` | `stalls` |
+/// | `total_fallback` | `fallback_count` | `fallback` |
+/// | `total_keep_last` | `keep_last_count` | `keep_last` |
+///
+/// Metrics with matching names (`worst_p99_wake_latency_us`,
+/// `worst_median_wake_latency_us`, `worst_wake_latency_cv`,
+/// `total_iterations`, `worst_mean_run_delay_us`,
+/// `worst_run_delay_us`, `worst_page_locality`,
+/// `worst_cross_node_migration_ratio`) are not listed — the
+/// registry name, field, and DataFrame column are all identical,
+/// so there is no translation to document.
+///
+/// Consumers that cross the registry / DataFrame boundary should
+/// go through [`MetricDef::read`] / the accessor closure rather
+/// than hand-translating by string. The four-name mapping for
+/// `worst_spread` specifically is documented in detail on the
+/// [`GauntletRow::spread`] field (adds the
+/// [`ScenarioStats::worst_spread`](crate::assert::ScenarioStats::worst_spread)
+/// upstream source as a fourth name).
 pub static METRICS: &[MetricDef] = &[
     MetricDef {
         // `"worst_spread"` is the wire/surface name — emitted in
@@ -238,6 +309,29 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
 /// / [`METRICS`] rather than dereferencing fields directly so new
 /// metrics can land through the registry without touching every
 /// reader.
+///
+/// # NaN-ambiguity on direct f64 fields
+///
+/// All direct f64 fields on this struct are sanitized via
+/// `finite_or_zero` at [`sidecar_to_row`] ingress. A `0.0` on any
+/// direct f64 field may represent either a genuine zero measurement
+/// or a sanitized non-finite upstream value (NaN / ±Infinity). See
+/// [`sidecar_to_row`]'s NaN-ambiguity doc for the full policy;
+/// `tracing::warn!` is the disambiguation channel — the sanitizer
+/// warns on every non-finite it rewrites to zero, so the log
+/// timeline tells you which run's zeroes were real. Consumers that
+/// cannot accept the ambiguity should prefer metric paths that
+/// flow through `ext_metrics` (which keep non-finite values as
+/// explicit `Option::None` rather than collapsing to zero).
+///
+/// # `#[non_exhaustive]` migration note
+///
+/// Downstream code that pattern-matches a `GauntletRow` must end
+/// the match with `..`; future fields added alongside new metrics
+/// otherwise break every matcher. Prefer reading values via
+/// [`MetricDef::read`] / the registry — the point of the
+/// registry indirection is that new metrics do not touch
+/// existing readers.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct GauntletRow {
@@ -267,17 +361,28 @@ pub struct GauntletRow {
     /// lets stats tooling exclude these from pass counts so skipped
     /// runs don't inflate the apparent pass rate.
     pub skipped: bool,
-    /// Worst-case per-cgroup spread across the run. The [`METRICS`]
-    /// registry entry for this value is named `"worst_spread"` (the
-    /// domain-level name that appears in sidecars, CI gates, and
-    /// comparison output); the struct field and the polars DataFrame
-    /// column stick with `spread` for terseness. The three names
-    /// (`MetricDef.name = "worst_spread"`, `GauntletRow.spread`,
-    /// DataFrame column `"spread"`) describe the same quantity —
-    /// the registry name is not renamed to match the field name
+    /// Worst-case per-cgroup spread across the run. Four names
+    /// describe the same quantity across the pipeline:
+    /// - [`ScenarioStats::worst_spread`](crate::assert::ScenarioStats::worst_spread)
+    ///   — the upstream source. `sidecar_to_row` reads it and
+    ///   writes the value into this field via `finite_or_zero`.
+    /// - `GauntletRow.spread` (this field) — the Rust-side
+    ///   struct access path inside the comparison pipeline.
+    /// - `MetricDef.name == "worst_spread"` — the [`METRICS`]
+    ///   registry key, which is the domain-level name that appears
+    ///   in sidecars, CI gates, and `cargo ktstr stats compare`
+    ///   output.
+    /// - DataFrame column `"spread"` — the polars column name used
+    ///   when the rows are projected into a DataFrame for group /
+    ///   aggregate operations.
+    ///
+    /// The registry name is not renamed to match the field name
     /// because existing sidecars and CI regression gates reference
     /// `"worst_spread"` by string and a rename would silently
-    /// invalidate them.
+    /// invalidate them. The DataFrame column stays `"spread"` for
+    /// terseness and to match the field; consumers that cross
+    /// the registry / DataFrame boundary translate via
+    /// [`MetricDef::read`] rather than by string comparison.
     pub spread: f64,
     pub gap_ms: u64,
     pub migrations: u64,
@@ -870,7 +975,6 @@ pub fn list_runs() -> anyhow::Result<()> {
 /// polarity, display unit, and name through it directly without
 /// re-looking up [`metric_def`].
 #[derive(Debug, Clone, serde::Serialize)]
-#[non_exhaustive]
 pub(crate) struct Finding {
     pub scenario: String,
     pub topology: String,
@@ -892,7 +996,6 @@ pub(crate) struct Finding {
 /// converse is `removed_from_a`. The filter (when set) applies to
 /// every counter, so excluded rows do not contribute.
 #[derive(Debug, Clone, Default, serde::Serialize)]
-#[non_exhaustive]
 pub(crate) struct CompareReport {
     pub regressions: u32,
     pub improvements: u32,

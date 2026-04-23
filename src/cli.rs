@@ -465,7 +465,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
                         "config_hash": meta.config_hash,
                         "image_name": meta.image_name,
                         "image_path": entry.image_path().display().to_string(),
-                        "has_vmlinux": meta.has_vmlinux,
+                        "has_vmlinux": meta.has_vmlinux(),
                     })
                 }
                 crate::cache::ListedEntry::Corrupt { key, path, reason } => serde_json::json!({

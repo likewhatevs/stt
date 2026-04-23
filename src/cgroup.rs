@@ -382,9 +382,20 @@ pub trait CgroupOps {
 // Caller audit: `move_task` is not test-only. Outside the test
 // module there is one production caller at `move_task_with_retry`
 // (above), which is in turn called from `move_tasks` in the same
-// file. Removing `move_task` would force inlining its body into
-// `move_task_with_retry` and dropping the retry-free fast path that
-// the test at the bottom of this file pins.
+// file. That call site — `self.move_task(name, pid)` — resolves
+// to the INHERENT `CgroupManager::move_task`, NOT the trait
+// method below, because `move_task_with_retry` is defined in the
+// `impl CgroupManager` block where inherent methods win over
+// trait methods of the same name. The trait method in this `impl
+// CgroupOps for CgroupManager` block is reached only via
+// dynamic dispatch through `&dyn CgroupOps`, which today has no
+// production callers of `move_task` — the trait method exists
+// solely so the shape is complete for the test-double. Removing
+// the inherent `move_task` would force inlining its body into
+// `move_task_with_retry` and dropping the retry-free fast path
+// that the test at the bottom of this file pins; removing the
+// trait method would shrink the test-double surface but leave
+// inherent callers untouched.
 impl CgroupOps for CgroupManager {
     fn parent_path(&self) -> &Path {
         CgroupManager::parent_path(self)

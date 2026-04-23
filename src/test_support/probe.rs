@@ -138,11 +138,20 @@ fn classify_repro_vm_status(
         // Describe qemu's exit disposition precisely: a crash sentinel
         // in `output` can coincide with qemu itself exiting 0 (guest
         // panic handler + orderly reboot), >0 (propagated non-zero),
-        // or <0 (signal-kill per the caller's sign convention).
-        // Labeling all three as "crashed (exit N)" conflates the
+        // -1 (VMM internal sentinel — the BSP run loop seeds
+        // `VmResult::exit_code = -1` and leaves it at -1 on error
+        // paths that did not emit `MSG_TYPE_EXIT`; watchdog-fire is
+        // caught earlier via `timed_out`, so a -1 reaching THIS
+        // branch indicates a code-unsetting error path, not a
+        // signal-kill), or <-1 (signal-kill / other VMM convention).
+        // Labeling all four as "crashed (exit N)" conflates the
         // guest-scheduler failure with qemu's own exit, making the
-        // qemu-clean case especially misleading.
-        let exit_clause = if exit_code < 0 {
+        // qemu-clean and VMM-sentinel cases especially misleading.
+        let exit_clause = if exit_code == -1 {
+            "VMM exit-code sentinel (BSP run loop left VmResult::exit_code \
+             at its -1 seed — scheduler did not emit MSG_TYPE_EXIT)"
+                .to_string()
+        } else if exit_code < 0 {
             format!("killed by signal ({exit_code})")
         } else if exit_code == 0 {
             "exited cleanly".to_string()
@@ -1748,6 +1757,24 @@ mod tests {
         assert_eq!(
             status,
             "repro VM: scheduler crashed — killed by signal (-9)",
+        );
+    }
+
+    /// `exit_code == -1` on the crash branch is the VMM sentinel —
+    /// `VmResult::exit_code` is seeded to `-1` at the top of the BSP
+    /// run loop and left there when the scheduler did not emit
+    /// `MSG_TYPE_EXIT`. Watchdog-fire is caught earlier via the
+    /// `timed_out` branch, so a `-1` here means the BSP ran a
+    /// code-unsetting error path — not a signal-kill. Distinct
+    /// clause so users don't misread this as "signal 1" (SIGHUP).
+    #[test]
+    fn classify_repro_vm_status_crashed_from_sentinel_vmm_exit_code_unset() {
+        let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", -1);
+        assert_eq!(
+            status,
+            "repro VM: scheduler crashed — VMM exit-code sentinel \
+             (BSP run loop left VmResult::exit_code at its -1 seed — \
+             scheduler did not emit MSG_TYPE_EXIT)",
         );
     }
 

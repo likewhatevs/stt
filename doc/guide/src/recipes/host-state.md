@@ -112,7 +112,14 @@ the same key out of a sidecar via `jq '.host.<field>'`.
   (`sched_wakeup_granularity_ns`, `sched_min_granularity_ns`,
   `sched_latency_ns`, `sched_rt_runtime_us`, etc.) have the same
   shape — the full set is whatever `/proc/sys/kernel/sched_*`
-  lists at capture time.
+  lists at capture time. Note: the examples above are CFS-era
+  tunables; several of them (`sched_wakeup_granularity_ns`,
+  `sched_min_granularity_ns`, `sched_latency_ns`) were dropped
+  when CFS was replaced by EEVDF in Linux 6.6+, so a run on an
+  EEVDF kernel will simply not have those keys in the map —
+  their absence is a kernel-version fact, not a capture failure.
+  What you get in practice is whatever `/proc/sys/kernel/sched_*`
+  exposes on the running kernel.
 - `cmdline` diverges → `isolcpus=` / `nohz_full=` / `mitigations=`
   / `transparent_hugepage=` / `numa_balancing=` are all boot-time
   and change the whole scheduling surface. Rebooting the host to

@@ -180,7 +180,8 @@ resolved against the harness's current working directory at test
 time, plus the host `PATH` for bare names. The attribute parser
 accepts string literals only, so paths must be plain quoted
 strings rather than compile-time expressions like
-`concat!(env!("CARGO_MANIFEST_DIR"), …)`. For test fixtures
+`concat!(env!("CARGO_MANIFEST_DIR"), "/test-fixtures/foo.json")`.
+For test fixtures
 shipped alongside the test source, the reliable options are
 either a bare name that a build script or test-setup stage has
 placed on `PATH`, or a relative path rooted at the directory
@@ -228,6 +229,10 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
 #[include_files("bench-driver", "bench-helper")]
 #[metric(name = "ops_per_sec", polarity = HigherBetter, unit = "ops/s")]
 struct BenchDriver;
+// The macro generates the `BENCH_DRIVER` const used below — `BenchDriver`
+// (UpperCamelCase struct) → `BENCH_DRIVER` (SCREAMING_SNAKE_CASE, `Payload`
+// suffix stripped). This is the only way to reference the payload from
+// `#[ktstr_test]` attributes and from `ctx.payload(&...)` inside the body.
 
 #[ktstr_test(
     scheduler = MY_SCHED,
@@ -241,7 +246,12 @@ fn bench_driver_runs_with_declared_helpers(ctx: &Ctx) -> Result<AssertResult> {
     // Both land in the guest initramfs at `/include-files/` and are
     // on the worker's `PATH` during execution. The test body itself
     // does not touch the include set — it runs through `ctx.payload`.
-    ctx.payload(&BENCH_DRIVER).run().map(|(a, _)| a)
+    // `.run()` returns `(AssertResult, PayloadMetrics)`; the test
+    // body only wants the AssertResult here, so discard the metrics
+    // half of the tuple.
+    ctx.payload(&BENCH_DRIVER)
+        .run()
+        .map(|(assert_result, _metrics)| assert_result)
 }
 ```
 
@@ -268,8 +278,12 @@ fn fio_with_fixture(ctx: &Ctx) -> Result<AssertResult> {
 
 The declarative set (scheduler's `include_files` + payload's +
 workloads' + `extra_include_files`) is aggregated at test time
-and resolved through the same include-file pipeline
-the `ktstr shell -i` path uses. The union is deduped on identical
+and resolved through the same include-file pipeline the CLI's
+`-i` / `--include-files` flag uses (exposed on both
+`cargo ktstr test` / `cargo ktstr shell` and the standalone
+`ktstr` entry point — `#[ktstr_test]` resolution and the CLI
+share the same resolver, just fed from different sources). The
+union is deduped on identical
 `(archive_path, host_path)` pairs. Two declarations that resolve
 to the same archive slot with different host paths surface as a
 hard error with both host paths in the diagnostic, rather than one
