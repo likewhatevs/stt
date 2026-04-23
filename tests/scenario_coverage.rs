@@ -367,7 +367,7 @@ static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
-    name: "neg_sched_death_no_verify_result",
+    name: "neg_sched_death_no_check_result",
     func: scenario_sched_mixed,
     topology: Topology {
         llcs: 1,
@@ -387,8 +387,8 @@ static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
 
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
-static __KTSTR_ENTRY_AUTO_REPRO_VERIFY: KtstrTestEntry = KtstrTestEntry {
-    name: "neg_auto_repro_on_verify_failure",
+static __KTSTR_ENTRY_AUTO_REPRO_CHECK: KtstrTestEntry = KtstrTestEntry {
+    name: "neg_auto_repro_on_check_failure",
     func: scenario_forced_failure,
     topology: Topology {
         llcs: 1,
