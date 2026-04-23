@@ -229,8 +229,9 @@ pub enum PayloadKind {
     /// and fixtures a binary-kind payload needs in the guest must
     /// be declared explicitly via
     /// [`Payload::include_files`](Payload::include_files) on
-    /// `#[derive(Payload)]` or `extra_include_files` on
-    /// `#[ktstr_test]`; the packaging mechanism is the same
+    /// `#[derive(Payload)]` or
+    /// [`extra_include_files`](crate::test_support::KtstrTestEntry::extra_include_files)
+    /// on `#[ktstr_test]`; the packaging mechanism is the same
     /// declarative pipeline, but the input is a separate explicit
     /// list rather than the binary name.
     ///

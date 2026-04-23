@@ -137,12 +137,12 @@ impl MetricDef {
 /// | `worst_page_locality` | `page_locality` | `page_locality` |
 /// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
-/// Metrics with matching names (`worst_p99_wake_latency_us`,
-/// `worst_median_wake_latency_us`, `worst_wake_latency_cv`,
-/// `total_iterations`, `worst_mean_run_delay_us`,
-/// `worst_run_delay_us`) are not listed — the registry name,
-/// field, and DataFrame column are all identical, so there is no
-/// translation to document.
+/// The remaining six metrics in [`METRICS`] have matching
+/// registry / field / DataFrame column names and are not listed —
+/// no translation to document. Quoting a count instead of each
+/// metric name keeps this doc from silently drifting when a
+/// matching-name metric is renamed without the divergence
+/// classification changing.
 ///
 /// Consumers that cross the registry / DataFrame boundary should
 /// go through [`MetricDef::read`] / the accessor closure rather

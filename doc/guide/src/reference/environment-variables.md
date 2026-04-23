@@ -18,6 +18,23 @@ Environment variables that control ktstr behavior.
 | `RUST_BACKTRACE` | Gates verbose diagnostic output on failure. Also enables verbose VM console output (same as `KTSTR_VERBOSE=1`) when set to `"1"` or `"full"`. Propagated to the guest. | None |
 | `RUST_LOG` | Controls tracing filter for guest-side logging. Propagated to the VM kernel command line and parsed by the guest tracing subscriber. | None |
 
+## jemalloc probe wiring
+
+These variables are only consulted by integration tests that boot a
+jemalloc-linked allocator worker inside the VM and attach the
+`ktstr-jemalloc-probe` to it (see `tests/jemalloc_probe_tests.rs`).
+Both are set from a `#[ctor]` in the test binary so they land before
+the test harness dispatches; the ctor hook runs under the `ctor`
+crate re-exported at `ktstr::__private::ctor`, so a new test crate
+does not need to add `ctor` to its own dependencies. Leaving either
+variable unset is the normal case — the VM launcher skips probe
+wiring entirely, and no initramfs entry is added.
+
+| Variable | Description | Default |
+|---|---|---|
+| `KTSTR_JEMALLOC_PROBE_BINARY` | Absolute host path to the `ktstr-jemalloc-probe` binary. When set, the probe is packed into every VM's base initramfs at `/bin/ktstr-jemalloc-probe`. Typically set by a `#[ctor]` in the integration test crate to `env!("CARGO_BIN_EXE_ktstr-jemalloc-probe")`. Empty string is treated the same as unset. | None (no probe packed) |
+| `KTSTR_JEMALLOC_ALLOC_WORKER_BINARY` | Absolute host path to the paired `ktstr-jemalloc-alloc-worker` binary. Packed alongside the probe for the closed-loop tests that run the probe against a live allocator target. Same `#[ctor]` shape as above using `env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker")`. Empty string is treated the same as unset. | None (no worker packed) |
+
 ## LLVM coverage
 
 | Variable | Description | Default |

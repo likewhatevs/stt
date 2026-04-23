@@ -18,6 +18,43 @@
 //! returns false, the intercept is skipped, and the standard
 //! rustc test harness picks up the `#[test]` functions below.
 
+use ktstr::worker_ready::WORKER_READY_MARKER_OVERRIDE_ENV;
+
+/// Render a `std::process::ExitStatus` as a human-actionable string
+/// for assertion-failure diagnostics.
+///
+/// The default `Debug` / `{:?}` for `status.code()` collapses every
+/// signal-kill to a bare `None`, which strips the single most
+/// important fact a failing test needs: whether the worker was
+/// terminated by a signal at all and, if so, which one. A reader
+/// staring at `got None; stderr: ""` in CI output cannot
+/// distinguish SIGSEGV from SIGKILL from a genuinely-missing exit
+/// code, and must cross-reference the binary's behavior to decide
+/// whether the failure is a crash or an orderly signal-kill.
+///
+/// This helper produces one of:
+/// - `"exit code N"` when `status.code()` is `Some(N)` — the
+///   normal setup-failure path documented in the worker's "Exit
+///   codes" legend.
+/// - `"signal-killed (signal N)"` when `status.code()` is `None`
+///   and `ExitStatusExt::signal()` yields `Some(N)` on unix.
+/// - `"signal-killed"` when both are `None` (the non-unix fallback
+///   / defense-in-depth — unreachable on the Linux test platform
+///   but kept so the helper compiles everywhere and never panics).
+fn format_exit_status(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit code {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("signal-killed (signal {sig})");
+        }
+    }
+    "signal-killed".to_string()
+}
+
 /// bytes=0 must exit with code 2. The worker's module doc pins
 /// `2: bytes == 0`; this test catches any refactor that silently
 /// re-routes the zero-size alloc guard to a different code or drops
@@ -32,8 +69,8 @@ fn worker_exits_2_on_bytes_zero() {
     assert_eq!(
         output.status.code(),
         Some(2),
-        "bytes=0 must exit with code 2; got {:?}; stderr: {}",
-        output.status.code(),
+        "bytes=0 must exit with code 2; got {}; stderr: {}",
+        format_exit_status(output.status),
         String::from_utf8_lossy(&output.stderr),
     );
 }
@@ -50,8 +87,8 @@ fn worker_exits_5_on_missing_bytes_arg() {
     assert_eq!(
         output.status.code(),
         Some(5),
-        "missing BYTES must exit with code 5; got {:?}; stderr: {}",
-        output.status.code(),
+        "missing BYTES must exit with code 5; got {}; stderr: {}",
+        format_exit_status(output.status),
         String::from_utf8_lossy(&output.stderr),
     );
 }
@@ -68,27 +105,28 @@ fn worker_exits_5_on_non_numeric_bytes_arg() {
     assert_eq!(
         output.status.code(),
         Some(5),
-        "non-numeric BYTES must exit with code 5; got {:?}; stderr: {}",
-        output.status.code(),
+        "non-numeric BYTES must exit with code 5; got {}; stderr: {}",
+        format_exit_status(output.status),
         String::from_utf8_lossy(&output.stderr),
     );
 }
 
 /// Ready-marker write failure must exit with code 4. Uses the
-/// `KTSTR_WORKER_READY_MARKER_OVERRIDE` test-only env hook to point
-/// the write at a path under a non-existent parent directory, which
-/// `std::fs::write`'s internal `open(..., O_CREAT)` can't create →
-/// ENOENT → exit 4. Bypasses the race-prone alternative of
-/// pre-creating a directory at the pid-scoped default path. Passes
-/// `1024` as BYTES so the self-check + allocation succeed; the
-/// ready-marker write is the first failure the worker hits.
+/// [`ktstr::worker_ready::WORKER_READY_MARKER_OVERRIDE_ENV`]
+/// test-only env hook to point the write at a path under a
+/// non-existent parent directory, which `std::fs::write`'s internal
+/// `open(..., O_CREAT)` can't create → ENOENT → exit 4. Bypasses
+/// the race-prone alternative of pre-creating a directory at the
+/// pid-scoped default path. Passes `1024` as BYTES so the
+/// self-check + allocation succeed; the ready-marker write is the
+/// first failure the worker hits.
 #[test]
 fn worker_exits_4_on_ready_marker_write_fail() {
     let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
     let output = std::process::Command::new(worker)
         .arg("1024")
         .env(
-            "KTSTR_WORKER_READY_MARKER_OVERRIDE",
+            WORKER_READY_MARKER_OVERRIDE_ENV,
             "/nonexistent-ktstr-test-dir/marker",
         )
         .output()
@@ -96,13 +134,57 @@ fn worker_exits_4_on_ready_marker_write_fail() {
     assert_eq!(
         output.status.code(),
         Some(4),
-        "ready-marker write failure must exit with code 4; got {:?}; stderr: {}",
-        output.status.code(),
+        "ready-marker write failure must exit with code 4; got {}; stderr: {}",
+        format_exit_status(output.status),
         String::from_utf8_lossy(&output.stderr),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("failed to write ready marker"),
         "stderr must name the failure; got: {stderr}",
+    );
+}
+
+/// `/proc/self/task` thread count != 1 must exit with code 3. The
+/// worker's default mode rejects any silent extra thread (background
+/// allocator threads, a runtime pulled in by a new dep, etc.) via
+/// the single-thread self-check in `main` before the allocation is
+/// materialized. Forcing that branch from the host side requires
+/// the worker to start with a helper thread already alive at the
+/// self-check; the cleanest way without patching the binary is to
+/// opt into jemalloc's background-thread worker via
+/// `background_thread:true`, which spawns the helper during
+/// allocator init (before `main` reads `/proc/self/task`).
+///
+/// The env var is set under both the generic `MALLOC_CONF` name and
+/// the tikv-jemallocator runtime-prefix alias `_RJEM_MALLOC_CONF`.
+/// tikv-jemallocator's default build prefixes the symbol table with
+/// `_rjem_` (the `unprefixed_malloc_on_supported_platforms` Cargo
+/// feature is NOT enabled in this workspace — see `Cargo.toml`'s
+/// `tikv-jemallocator = { version = "0.6", features = ["stats"] }`
+/// stanza), so the generic `MALLOC_CONF` is not read by the
+/// in-process jemalloc copy. Setting both variants keeps the test
+/// robust against a future feature flip that unprefixes the symbols.
+#[test]
+fn worker_exits_3_on_thread_count_not_one() {
+    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
+    let output = std::process::Command::new(worker)
+        .arg("1024")
+        .env("MALLOC_CONF", "background_thread:true")
+        .env("_RJEM_MALLOC_CONF", "background_thread:true")
+        .output()
+        .expect("spawn worker");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "background_thread:true must spawn a helper thread before \
+         the /proc/self/task self-check and exit 3; got {}; stderr: {}",
+        format_exit_status(output.status),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("/proc/self/task has"),
+        "stderr must name the self-check that fired; got: {stderr}",
     );
 }

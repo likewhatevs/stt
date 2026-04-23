@@ -507,3 +507,59 @@ pub(crate) fn capture_stderr<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
     sink.read_to_end(&mut bytes).expect("read sink");
     (result, bytes)
 }
+
+/// Concurrent capture-stderr calls MUST observe only their own
+/// emitted bytes. Without [`STDERR_CAPTURE_LOCK`] the two threads'
+/// `fd 2 → tempfile` swaps would race: thread A's
+/// `dup2_stderr(sink_a)` followed by thread B's `dup2_stderr(sink_b)`
+/// would leave A's `eprintln!` output in B's sink and vice versa,
+/// and the subsequent `dup2_stderr(saved)` restores could leave fd 2
+/// permanently pointing at a stale tempfile. Either outcome would
+/// permanently break every subsequent stderr write in the test
+/// process.
+///
+/// This test spawns N threads that each emit a unique marker,
+/// capture, and assert their marker is present AND no OTHER
+/// thread's marker leaked in. Under a broken or absent lock this
+/// fails almost immediately on a multi-core host; under the
+/// present lock the N captures serialize and every thread sees
+/// only its own bytes.
+#[test]
+fn capture_stderr_serializes_concurrent_callers() {
+    const N: usize = 8;
+    let markers: Vec<String> = (0..N)
+        .map(|i| format!("KTSTR_CAPTURE_LOCK_MARKER_{i:03}"))
+        .collect();
+    let handles: Vec<std::thread::JoinHandle<(usize, Vec<u8>)>> = (0..N)
+        .map(|i| {
+            let mine = markers[i].clone();
+            let others: Vec<String> = markers
+                .iter()
+                .enumerate()
+                .filter_map(|(j, m)| (j != i).then(|| m.clone()))
+                .collect();
+            std::thread::spawn(move || {
+                let (_, bytes) = capture_stderr(|| {
+                    eprintln!("{mine}");
+                });
+                let captured = String::from_utf8_lossy(&bytes);
+                assert!(
+                    captured.contains(&mine),
+                    "thread {i}: own marker missing from captured output: {captured:?}",
+                );
+                for other in &others {
+                    assert!(
+                        !captured.contains(other.as_str()),
+                        "thread {i}: foreign marker '{other}' leaked into captured \
+                         output — STDERR_CAPTURE_LOCK failed to serialize \
+                         concurrent callers: {captured:?}",
+                    );
+                }
+                (i, bytes)
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("capture thread panicked");
+    }
+}

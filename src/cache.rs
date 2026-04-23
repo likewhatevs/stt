@@ -1329,12 +1329,36 @@ fn strip_debug_prefix(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 ///
 /// Does not create the directory -- the caller is responsible for
 /// ensuring it exists.
+///
+/// Non-UTF-8 handling: `KTSTR_CACHE_DIR` is the explicit operator
+/// override and a silent fall-through on a non-UTF-8 value would
+/// leave the operator debugging why their override "didn't work"
+/// when the fallback `$HOME/.cache/ktstr` took over instead.
+/// [`crate::test_support::test_helpers::EnvVarGuard`] accepts
+/// arbitrary `OsStr`, so a test fixture or a real-world
+/// locale-encoded path can legally put non-UTF-8 bytes in this
+/// variable. Previously `std::env::var` would swallow such values
+/// as `Err(VarError::NotUnicode)` and the `if let Ok(..)` guard
+/// dropped them without a diagnostic. Now a non-UTF-8
+/// `KTSTR_CACHE_DIR` surfaces as an actionable error naming the
+/// variable and pointing at a UTF-8 replacement path — the
+/// override no longer fails silently.
 fn resolve_cache_root() -> anyhow::Result<PathBuf> {
     // 1. Explicit override.
-    if let Ok(dir) = std::env::var("KTSTR_CACHE_DIR")
-        && !dir.is_empty()
-    {
-        return Ok(PathBuf::from(dir));
+    match std::env::var("KTSTR_CACHE_DIR") {
+        Ok(dir) if !dir.is_empty() => return Ok(PathBuf::from(dir)),
+        Ok(_) => { /* empty string -> fall through to fallbacks */ }
+        Err(std::env::VarError::NotPresent) => { /* unset -> fall through */ }
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            anyhow::bail!(
+                "KTSTR_CACHE_DIR contains non-UTF-8 bytes ({} bytes): {:?}. \
+                 ktstr requires a UTF-8 cache path — set KTSTR_CACHE_DIR \
+                 to an ASCII/UTF-8 directory (e.g. `/tmp/ktstr-cache`) or \
+                 unset it to fall back to $XDG_CACHE_HOME/$HOME.",
+                raw.len(),
+                raw,
+            );
+        }
     }
     // 2. XDG_CACHE_HOME/ktstr/kernels.
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
@@ -2320,6 +2344,48 @@ mod tests {
         assert!(
             msg.contains("KTSTR_CACHE_DIR"),
             "error should suggest KTSTR_CACHE_DIR, got: {msg}"
+        );
+    }
+
+    /// A non-UTF-8 `KTSTR_CACHE_DIR` must fail fast with an
+    /// actionable diagnostic rather than silently falling through to
+    /// `$XDG_CACHE_HOME` / `$HOME`. Before the `NotUnicode` branch
+    /// existed, `std::env::var` returned `Err` and the old `if let
+    /// Ok(..)` guard dropped the override without a trace — an
+    /// operator who set the variable would see ktstr write to a
+    /// surprising directory under `$HOME` and have no clue why the
+    /// override was ignored.
+    ///
+    /// `EnvVarGuard::set` accepts arbitrary `OsStr`, so the test can
+    /// plant a lone 0xFF byte (valid on Unix filesystems, invalid as
+    /// UTF-8) and observe the bail.
+    #[test]
+    #[cfg(unix)]
+    fn cache_resolve_root_non_utf8_ktstr_cache_dir_bails() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bytes: &[u8] = b"/tmp/ktstr-\xFFcache";
+        let value = OsStr::from_bytes(bytes);
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", value);
+        let err = resolve_cache_root().expect_err(
+            "non-UTF-8 KTSTR_CACHE_DIR must bail, not silently fall through",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("KTSTR_CACHE_DIR"),
+            "error must name the offending variable, got: {msg}",
+        );
+        assert!(
+            msg.contains("non-UTF-8"),
+            "error must mention non-UTF-8 so the operator knows the encoding, \
+             got: {msg}",
+        );
+        assert!(
+            msg.contains("UTF-8")
+                || msg.contains("unset")
+                || msg.contains("ASCII"),
+            "error must name a remediation (UTF-8 replacement or unset), \
+             got: {msg}",
         );
     }
 

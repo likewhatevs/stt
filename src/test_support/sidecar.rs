@@ -2865,4 +2865,135 @@ mod tests {
         let host = loaded.host.expect("host must round-trip");
         assert_eq!(host, ctx);
     }
+
+    /// Every sidecar produced within a single ktstr run records the
+    /// SAME host context — all writers call
+    /// [`crate::host_context::collect_host_context`], which
+    /// memoises the static subset in a process-global `OnceLock`
+    /// (`STATIC_HOST_INFO`) and re-reads the dynamic subset from
+    /// the same `/proc` / `/sys` sources on every call. Runtime
+    /// drift in the captured struct across sidecars in one run
+    /// would mean one of two bad outcomes:
+    ///   - a regression in the static memoisation (cache key / init
+    ///     closure), producing per-call distinct values for fields
+    ///     that cannot change across a process lifetime (uname,
+    ///     CPU model, NUMA topology);
+    ///   - a test concurrently mutating a dynamic field
+    ///     (`thp_enabled`, `sched_tunables`, hugepage reservations)
+    ///     while another test writes a sidecar, which would be a
+    ///     test-isolation bug — every in-tree test treats host
+    ///     tunables as read-only.
+    ///
+    /// This "property test" samples the contract across N
+    /// back-to-back sidecar writes (simulating the per-test
+    /// sidecar drumbeat of a gauntlet run): every resulting `host`
+    /// field must compare equal. The sibling
+    /// [`crate::host_context`] tests already pin `collect_host_context`
+    /// internal stability; this test pins the SIDECAR surface so a
+    /// regression that threaded a partial context through
+    /// `write_sidecar` / `write_skip_sidecar` would fail here even
+    /// if `collect_host_context` itself stayed stable.
+    ///
+    /// Bounded N=8: enough samples to catch intermittent drift
+    /// without bloating the test runtime — `collect_host_context`
+    /// does ~20 sysfs/procfs reads per call, so the cost scales
+    /// linearly and must stay modest.
+    ///
+    /// `#[cfg(target_os = "linux")]`: `collect_host_context` only
+    /// reads meaningful data on Linux — on other hosts every field
+    /// is `None` and the equality would trivially hold without
+    /// exercising the contract.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sidecars_in_a_run_carry_identical_host_context() {
+        const N: usize = 8;
+        let samples: Vec<crate::host_context::HostContext> =
+            (0..N).map(|_| crate::host_context::collect_host_context()).collect();
+        let first = samples
+            .first()
+            .expect("N > 0 samples must produce at least one host context");
+
+        // Fields expected to stay STRICTLY equal — either memoised
+        // in STATIC_HOST_INFO (uname, CPU, memory, topology) or
+        // effectively reboot-static (kernel_cmdline). A regression
+        // that broke the cache or mis-read /proc would diverge here.
+        for (i, s) in samples.iter().enumerate() {
+            assert_eq!(
+                s.kernel_name, first.kernel_name,
+                "sidecar {i}: kernel_name drifted from first sample",
+            );
+            assert_eq!(
+                s.kernel_release, first.kernel_release,
+                "sidecar {i}: kernel_release drifted — STATIC_HOST_INFO cache broken?",
+            );
+            assert_eq!(
+                s.arch, first.arch,
+                "sidecar {i}: arch drifted — STATIC_HOST_INFO cache broken?",
+            );
+            assert_eq!(
+                s.cpu_model, first.cpu_model,
+                "sidecar {i}: cpu_model drifted — STATIC_HOST_INFO cache broken?",
+            );
+            assert_eq!(
+                s.cpu_vendor, first.cpu_vendor,
+                "sidecar {i}: cpu_vendor drifted — STATIC_HOST_INFO cache broken?",
+            );
+            assert_eq!(
+                s.total_memory_kb, first.total_memory_kb,
+                "sidecar {i}: total_memory_kb drifted — STATIC_HOST_INFO cache broken?",
+            );
+            assert_eq!(
+                s.hugepages_size_kb, first.hugepages_size_kb,
+                "sidecar {i}: hugepages_size_kb drifted — STATIC_HOST_INFO cache broken?",
+            );
+            assert_eq!(
+                s.online_cpus, first.online_cpus,
+                "sidecar {i}: online_cpus drifted — STATIC_HOST_INFO cache broken?",
+            );
+            assert_eq!(
+                s.numa_nodes, first.numa_nodes,
+                "sidecar {i}: numa_nodes drifted — STATIC_HOST_INFO cache broken?",
+            );
+            assert_eq!(
+                s.kernel_cmdline, first.kernel_cmdline,
+                "sidecar {i}: kernel_cmdline drifted — only a reboot can change it",
+            );
+        }
+
+        // Dynamic fields are allowed to vary in value under
+        // concurrent sysctl/THP/hugepage twiddles (see the sibling
+        // `collect_host_context_dynamic_subset_is_stable_across_calls`
+        // test for the rationale), but the PRESENCE of each field
+        // must stay consistent — a sidecar that suddenly loses the
+        // THP row means the collector silently degraded, which
+        // stats tooling would read as "no THP data on that host"
+        // rather than the truth ("collector broke").
+        for (i, s) in samples.iter().enumerate() {
+            assert_eq!(
+                s.hugepages_total.is_some(),
+                first.hugepages_total.is_some(),
+                "sidecar {i}: hugepages_total presence flipped across sidecars",
+            );
+            assert_eq!(
+                s.hugepages_free.is_some(),
+                first.hugepages_free.is_some(),
+                "sidecar {i}: hugepages_free presence flipped across sidecars",
+            );
+            assert_eq!(
+                s.thp_enabled.is_some(),
+                first.thp_enabled.is_some(),
+                "sidecar {i}: thp_enabled presence flipped across sidecars",
+            );
+            assert_eq!(
+                s.thp_defrag.is_some(),
+                first.thp_defrag.is_some(),
+                "sidecar {i}: thp_defrag presence flipped across sidecars",
+            );
+            assert_eq!(
+                s.sched_tunables.is_some(),
+                first.sched_tunables.is_some(),
+                "sidecar {i}: sched_tunables presence flipped across sidecars",
+            );
+        }
+    }
 }

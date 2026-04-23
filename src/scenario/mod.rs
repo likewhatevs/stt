@@ -773,6 +773,32 @@ impl std::fmt::Debug for Ctx<'_> {
     }
 }
 
+impl Ctx<'_> {
+    /// Scheduler pid, filtered to the `> 0` range that
+    /// [`process_alive`] treats as signalable.
+    ///
+    /// `Ctx::sched_pid` documents `None` as the "no scheduler
+    /// configured" state, and the liveness sites destructure with
+    /// `if let Some(pid)`. Nothing in the builder, however, prevents
+    /// a caller from passing `Some(0)` or a negative pid — an easy
+    /// mistake for callers used to the workload-side `0` sentinel
+    /// (`workload::SCHED_PID`). A bare `Some(0)` would reach
+    /// `process_alive`, which returns `false` for any pid `<= 0`,
+    /// and the liveness sites would then bail with `scheduler died`
+    /// even though no scheduler was ever running — a false
+    /// positive that turns a misconfiguration into a misleading
+    /// scheduler-death diagnostic.
+    ///
+    /// Centralising the filter here means every liveness callsite
+    /// (`run_scenario` post-settle bail, workload-phase polling,
+    /// `setup_cgroups` post-settle bail) uses the same predicate:
+    /// only a positive pid is "configured". Callers must use this
+    /// accessor rather than destructuring `sched_pid` directly.
+    pub(crate) fn active_sched_pid(&self) -> Option<libc::pid_t> {
+        self.sched_pid.filter(|&p| p > 0)
+    }
+}
+
 /// Fluent builder for [`Ctx`].
 ///
 /// Scenario unit tests reach for a [`Ctx`] with sane defaults so they
@@ -1013,10 +1039,12 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     thread::sleep(ctx.settle);
 
     // Bail early if the scheduler process is no longer running after
-    // cgroup creation. sched_pid == None means no scheduler was
-    // configured (kernel-default path), so liveness is not
-    // applicable and there is nothing to bail on.
-    if let Some(pid) = ctx.sched_pid
+    // cgroup creation. `active_sched_pid` returns `None` when no
+    // scheduler was configured (kernel-default path) OR when the
+    // caller planted a `<= 0` sentinel by mistake — both cases skip
+    // the bail, because `process_alive(<= 0)` would otherwise
+    // produce a false-positive scheduler-died diagnostic.
+    if let Some(pid) = ctx.active_sched_pid()
         && !process_alive(pid)
     {
         anyhow::bail!(
@@ -1076,12 +1104,16 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     // Poll scheduler liveness during the workload phase instead of a
     // single sleep. Detects scheduler exit within 500ms rather than
     // waiting the full duration and collecting misleading results.
-    // sched_pid == None means no scheduler was configured
-    // (kernel-default path); skip liveness polling entirely and sleep
-    // the full duration.
+    // `active_sched_pid()` returns `None` when no scheduler was
+    // configured (kernel-default path) OR when a `<= 0` sentinel
+    // slipped through the builder; in either case skip liveness
+    // polling entirely and sleep the full duration. Passing a `0`
+    // into `process_alive` would otherwise mark `sched_dead = true`
+    // every iteration and fail the test with a spurious
+    // scheduler-died detail.
     let deadline = std::time::Instant::now() + ctx.duration;
     let mut sched_dead = false;
-    if let Some(pid) = ctx.sched_pid {
+    if let Some(pid) = ctx.active_sched_pid() {
         while std::time::Instant::now() < deadline {
             if !process_alive(pid) {
                 sched_dead = true;
@@ -1307,9 +1339,10 @@ pub fn setup_cgroups<'a>(
         guard.add_cgroup_no_cpuset(&format!("cg_{i}"))?;
     }
     thread::sleep(ctx.settle);
-    // sched_pid == None means no scheduler was configured
-    // (kernel-default path); skip the liveness-based bail.
-    if let Some(pid) = ctx.sched_pid
+    // `active_sched_pid()` returns `None` when no scheduler was
+    // configured (kernel-default path) OR when the caller planted a
+    // `<= 0` sentinel; both cases skip the liveness-based bail.
+    if let Some(pid) = ctx.active_sched_pid()
         && !process_alive(pid)
     {
         anyhow::bail!(
@@ -1865,6 +1898,63 @@ mod tests {
     fn process_alive_self_is_true() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         assert!(process_alive(pid));
+    }
+
+    /// `Ctx::active_sched_pid` filters `Some(0)` — and any negative
+    /// pid — out of the "configured scheduler" set. Without the
+    /// filter, a `Some(0)` would reach `process_alive(0)`, which
+    /// returns `false`, and the three liveness call sites
+    /// (`run_scenario` post-settle, workload-phase polling,
+    /// `setup_cgroups` post-settle) would each raise a spurious
+    /// scheduler-died diagnostic on a test that never had a
+    /// scheduler to begin with. The "configured" definition has to
+    /// agree across all three sites, so the gate lives on `Ctx`
+    /// rather than being re-inlined three times.
+    #[test]
+    fn ctx_active_sched_pid_treats_nonpositive_as_unconfigured() {
+        let cg = crate::cgroup::CgroupManager::new("/nonexistent");
+        let topo = crate::topology::TestTopology::synthetic(1, 1);
+
+        // Some(0) — the most likely mistake when a caller confuses
+        // `Ctx::sched_pid` (Option<pid_t>) with the workload TLS's
+        // 0-sentinel.
+        let ctx_zero = Ctx::builder(&cg, &topo).sched_pid(Some(0)).build();
+        assert_eq!(
+            ctx_zero.sched_pid,
+            Some(0),
+            "builder must preserve the literal value — the gate lives in the accessor",
+        );
+        assert_eq!(
+            ctx_zero.active_sched_pid(),
+            None,
+            "Some(0) must be treated as unconfigured, otherwise the liveness \
+             bails fire on tests that never ran a scheduler",
+        );
+
+        // Negative pids: `kill(negative, sig)` is a process-group
+        // broadcast, not a live-process query — also unconfigured.
+        let ctx_neg = Ctx::builder(&cg, &topo).sched_pid(Some(-1)).build();
+        assert_eq!(
+            ctx_neg.active_sched_pid(),
+            None,
+            "negative pid must be treated as unconfigured",
+        );
+
+        // Sanity: a positive pid survives the filter.
+        let ctx_pos = Ctx::builder(&cg, &topo).sched_pid(Some(1234)).build();
+        assert_eq!(
+            ctx_pos.active_sched_pid(),
+            Some(1234),
+            "positive pid must pass through unchanged",
+        );
+
+        // Sanity: None stays None.
+        let ctx_none = Ctx::builder(&cg, &topo).sched_pid(None).build();
+        assert_eq!(
+            ctx_none.active_sched_pid(),
+            None,
+            "None must pass through unchanged",
+        );
     }
 
     #[test]

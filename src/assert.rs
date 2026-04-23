@@ -1172,7 +1172,31 @@ pub struct Assert {
     pub min_work_rate: Option<f64>,
 
     // Benchmarking checks
-    /// Max p99 wake latency (ns). Fails if any cgroup's p99 exceeds this.
+    /// Max p99 wake latency in NANOSECONDS. Fails if the pooled
+    /// p99 across every worker's `resume_latencies_ns` exceeds this.
+    ///
+    /// # Unit-name gotcha
+    ///
+    /// The threshold is `_ns`, but the paired reporting field on
+    /// [`CgroupStats::p99_wake_latency_us`] and the roll-up
+    /// [`ScenarioStats::worst_p99_wake_latency_us`] are
+    /// MICROSECONDS. The two surfaces are intentionally split:
+    ///   - the threshold uses NS for precision (typical scheduler
+    ///     wake latencies are single-digit µs, so sub-µs resolution
+    ///     matters for regression gates);
+    ///   - the reporting fields use US for readability in
+    ///     `stats compare` / dashboard output.
+    ///
+    /// Both are computed from the same underlying
+    /// [`WorkerReport::resume_latencies_ns`] samples — see
+    /// [`assert_benchmarks`] for the threshold path and
+    /// [`assert_not_starved`] for the reporting path. A bare
+    /// comparison of `max_p99_wake_latency_ns` against
+    /// `CgroupStats::p99_wake_latency_us` is a unit-mismatch bug;
+    /// `assert_benchmarks` never does this — it consumes the raw
+    /// `resume_latencies_ns` directly — and
+    /// `assert_p99_ns_threshold_compares_against_ns_latencies` pins
+    /// that contract.
     pub max_p99_wake_latency_ns: Option<u64>,
     /// Max wake latency coefficient of variation. Fails if CV exceeds this.
     pub max_wake_latency_cv: Option<f64>,
@@ -2482,6 +2506,102 @@ mod tests {
         m.merge(r2);
         assert_eq!(m.stats.total_workers, 2);
         assert_eq!(m.stats.total_cpus, 2);
+    }
+
+    /// Multi-cgroup merge-aggregation contract: merging `N > 2`
+    /// `AssertResult`s (each carrying one populated `CgroupStats`
+    /// plus `ScenarioStats` headline fields) must:
+    ///   - append every per-cgroup entry into `stats.cgroups` in
+    ///     merge order, preserving cardinality;
+    ///   - pick the worst value of every higher-is-worse
+    ///     `worst_*` field across all merged cgroups;
+    ///   - pick the lowest-non-zero value of every lower-is-worse
+    ///     field (`worst_page_locality`,
+    ///     `worst_iterations_per_worker`);
+    ///   - SUM `total_iterations` across all cgroups, not max it.
+    ///
+    /// Sibling `merge_scenario_stats_worst_wins_and_iterations_sum`
+    /// already covers the 2-cgroup case with headline fields only;
+    /// this test exercises 3 cgroups AND the per-cgroup accumulator
+    /// (`stats.cgroups.extend`) so a regression that dropped
+    /// cgroups, clobbered the per-cgroup vector, or flipped one of
+    /// the polarity folds surfaces in the stronger form.
+    #[test]
+    fn merge_three_cgroups_worst_wins_and_iterations_sum() {
+        fn mk(
+            worst_spread: f64,
+            worst_mig: f64,
+            worst_p99_us: f64,
+            total_iters: u64,
+            page_locality: f64,
+            iters_per_worker: f64,
+            cg_total_iters: u64,
+        ) -> AssertResult {
+            let cg = CgroupStats {
+                total_iterations: cg_total_iters,
+                page_locality,
+                iterations_per_worker: iters_per_worker,
+                ..CgroupStats::default()
+            };
+            AssertResult {
+                passed: true,
+                skipped: false,
+                details: vec![],
+                stats: ScenarioStats {
+                    total_iterations: total_iters,
+                    worst_spread,
+                    worst_migration_ratio: worst_mig,
+                    worst_p99_wake_latency_us: worst_p99_us,
+                    worst_page_locality: page_locality,
+                    worst_iterations_per_worker: iters_per_worker,
+                    cgroups: vec![cg],
+                    ..ScenarioStats::default()
+                },
+            }
+        }
+
+        // Three cgroups with deliberately heterogeneous values so
+        // each `worst_*` aggregation is sourced from a DIFFERENT
+        // cgroup — a regression that folded only within-cgroup
+        // would still produce a plausible-looking aggregate on a
+        // 2-cgroup test but would fail here.
+        let mut acc = mk(10.0, 0.1, 50.0, 100, 0.8, 300.0, 100);
+        acc.merge(mk(5.0, 0.3, 20.0, 200, 0.5, 150.0, 200));
+        acc.merge(mk(20.0, 0.2, 70.0, 400, 0.9, 500.0, 400));
+
+        let s = &acc.stats;
+        assert_eq!(
+            s.cgroups.len(),
+            3,
+            "3 cgroups must accumulate; a missing entry means stats.cgroups.extend dropped a merge",
+        );
+        // Per-cgroup order is preserved (merge calls, in order):
+        assert_eq!(s.cgroups[0].total_iterations, 100);
+        assert_eq!(s.cgroups[1].total_iterations, 200);
+        assert_eq!(s.cgroups[2].total_iterations, 400);
+
+        // Worst-wins across 3 cgroups (higher-is-worse):
+        assert_eq!(s.worst_spread, 20.0, "third cgroup's 20.0 is worst");
+        assert_eq!(s.worst_migration_ratio, 0.3, "second cgroup's 0.3 is worst");
+        assert_eq!(
+            s.worst_p99_wake_latency_us, 70.0,
+            "third cgroup's 70.0us p99 is worst",
+        );
+        // Lowest-non-zero across 3 cgroups (lower-is-worse):
+        assert_eq!(
+            s.worst_page_locality, 0.5,
+            "second cgroup's 0.5 is the lowest-non-zero — 0 sentinel never wins",
+        );
+        assert_eq!(
+            s.worst_iterations_per_worker, 150.0,
+            "second cgroup's 150 is the lowest-non-zero per-worker throughput",
+        );
+        // total_iterations SUMS across cgroups, not maxes:
+        assert_eq!(
+            s.total_iterations,
+            100 + 200 + 400,
+            "total_iterations must sum (not max) across all merged cgroups",
+        );
     }
 
     #[test]
@@ -4194,6 +4314,62 @@ mod tests {
         let r = assert_benchmarks(&reports, Some(1000), None, None);
         assert!(!r.passed);
         assert!(r.details.iter().any(|d| d.contains("p99 wake latency")));
+    }
+
+    /// Unit-boundary pin: the `max_p99_wake_latency_ns` threshold
+    /// MUST be compared against `WorkerReport::resume_latencies_ns`
+    /// (nanoseconds) — never against the microsecond-valued
+    /// `CgroupStats::p99_wake_latency_us` field. A regression that
+    /// divided either side by 1000 (or multiplied by 1000) would
+    /// make the threshold fire 1000× too often or 1000× too rarely,
+    /// silently corrupting every regression gate that uses this
+    /// field.
+    ///
+    /// Construction: plant `resume_latencies_ns` values that are
+    /// clearly in the NS scale (e.g. 5000 ns = 5 µs) and set a
+    /// threshold of 4999 ns. The assertion must FAIL at 4999 ns and
+    /// PASS at 5001 ns. If the comparison were accidentally
+    /// converting the threshold to µs (dividing by 1000), 4999
+    /// would behave like "4.999 µs threshold against a 5 µs p99"
+    /// — technically still a fail but for the wrong reason. The
+    /// bracket here (5000-1 vs 5000+1) sits inside the 1000× slop
+    /// so a unit-swap regression would flip the verdict on one of
+    /// the two cases.
+    #[test]
+    fn assert_p99_ns_threshold_compares_against_ns_latencies() {
+        // Single-sample latency set: p99 == the sample value.
+        let reports = [rpt_with_latencies(1, vec![5000], 10, 5_000_000_000)];
+
+        // Threshold just below the 5000 ns sample -> FAIL.
+        let fail = assert_benchmarks(&reports, Some(4999), None, None);
+        assert!(
+            !fail.passed,
+            "threshold 4999 ns against 5000 ns p99 must fail — if this \
+             passes, the comparison may be converting to µs and eating \
+             3 digits of resolution",
+        );
+
+        // Threshold just above the 5000 ns sample -> PASS.
+        let pass = assert_benchmarks(&reports, Some(5001), None, None);
+        assert!(
+            pass.passed,
+            "threshold 5001 ns against 5000 ns p99 must pass — if this \
+             fails, the comparison may be multiplying the threshold by \
+             1000 (treating it as µs)",
+        );
+
+        // Cross-check the reporting path: `assert_not_starved`
+        // populates `worst_p99_wake_latency_us` in MICROSECONDS
+        // (ns / 1000). A regression that conflated the reporting
+        // field with the threshold input would surface as either
+        // `us == ns` (forgot to divide) or `us == ns/1_000_000`
+        // (double-converted).
+        let stats = assert_not_starved(&reports);
+        assert_eq!(
+            stats.stats.worst_p99_wake_latency_us, 5.0,
+            "5000 ns / 1000 = 5.0 µs — if this renders as 5000 (forgot /1000) \
+             or 0.005 (extra /1000), the reporting-path unit conversion drifted",
+        );
     }
 
     #[test]

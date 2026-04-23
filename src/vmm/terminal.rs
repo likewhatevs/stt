@@ -98,8 +98,18 @@ extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
 /// # Guard bypass paths
 ///
 /// Handled set: `SIGINT`, `SIGTERM`, `SIGQUIT`, `SIGABRT`, `SIGFPE`.
-/// Any signal not in that set is bypassed — the guard does NOT
-/// install a handler for it, so termios is not restored on delivery.
+/// Each handler is installed with `SA_RESETHAND`: on the first
+/// delivery of one of these signals the kernel reverts the
+/// disposition to `SIG_DFL` before entering user space, so
+/// [`terminal_restore_signal_handler`] runs once, restores termios
+/// via `tcsetattr`, and `raise`s the signal against the now-default
+/// disposition to produce the normal termination / core dump.
+/// Subsequent deliveries of the same signal hit `SIG_DFL` directly —
+/// the handler does NOT fire again — so restoration is a
+/// one-shot-per-signal operation, not a repeated per-delivery hook.
+/// Any signal not in the handled set is bypassed — the guard does
+/// NOT install a handler for it, so termios is not restored on
+/// delivery.
 /// Neither the Drop path nor the SA_RESETHAND handler fires in these
 /// cases, leaving the terminal in raw mode after process exit:
 /// - **SIGSEGV / SIGBUS / SIGILL**: synchronous hardware-fault
@@ -114,9 +124,16 @@ extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
 ///   guard was entered. Per `signal(7)` defaults, the consequences
 ///   split into three groups:
 ///     - `SIGTSTP`: default is **Stop**, not Term. The process
-///       suspends and Drop runs normally when the shell resumes
-///       it (`fg`); the termios is restored on that return. No
-///       leak.
+///       suspends until the shell resumes it (e.g. via `fg`).
+///       Resuming does NOT run Drop — execution simply continues
+///       from where it was suspended, and the
+///       [`TerminalRawGuard`] variable stays live in whatever
+///       scope still holds it. Drop fires later at that scope's
+///       normal exit (function return, block end, explicit
+///       `drop(...)`), restoring termios at that point — not at
+///       fg-time. No leak past scope exit, but the tty remains in
+///       raw mode for the entire resume-to-scope-exit interval
+///       on top of the original stop duration.
 ///     - `SIGHUP`: default is **Term**. The controlling terminal
 ///       has typically gone away by the time SIGHUP fires
 ///       (hangup of the pty / tty), so terminal restoration is

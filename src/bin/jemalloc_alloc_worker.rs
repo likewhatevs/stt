@@ -27,7 +27,22 @@
 //! # Exit codes
 //!
 //! Process termination is always by external signal; any non-zero
-//! exit is a setup failure:
+//! exit is a setup failure. Negative `status.code()` (via
+//! `ExitStatus::signal()` on unix) means the worker was killed by a
+//! signal — the expected termination path in the VM-based
+//! `jemalloc_probe_tests` (`PayloadHandle::kill` → SIGKILL). The
+//! table below enumerates every observable exit status the worker
+//! can produce so a failing test can grep the full set in one pass:
+//!
+//! - `0`: normal `exit(0)`. The worker never reaches this path —
+//!   the default mode parks forever (`sleep(3600s)` loop) and the
+//!   `--churn` mode spins a `loop { spawn+join }` with no break —
+//!   so `0` in practice means a refactor silently dropped the
+//!   terminal-loop black-boxing and let the optimizer fold it away,
+//!   or the park loop returned Ok on a deliberate shutdown path.
+//!   Listed for grep-friendliness: a reader sweeping the legend for
+//!   "exit code 0" finds the row here rather than wondering whether
+//!   it was intentionally undocumented.
 //! - `2`: `bytes == 0` (caller bug — zero-size alloc would panic in `touch`).
 //! - `3`: default-mode `/proc/self/task` self-check saw a thread count != 1.
 //! - `4`: ready-marker write failed.
@@ -35,6 +50,12 @@
 //! - `6`: default-mode `read_dir("/proc/self/task")` itself failed
 //!   (procfs unreadable — distinct from code 3's "procfs readable
 //!   but reported extra threads").
+//! - `101`: Rust panic. Any `panic!` / `debug_assert!` / indexing
+//!   out-of-bounds inside this binary converts to a `101` exit via
+//!   the default panic hook. Matches the
+//!   `jemalloc_probe_tests.rs` ready-marker-wait legend so a test
+//!   operator seeing `101` can locate it here without cross-
+//!   referencing the panic hook behavior elsewhere.
 //!
 //! Argv is hand-rolled (one flag, one positional). The tipping
 //! point for switching to `clap-derive` is when the surface needs
@@ -63,7 +84,7 @@ use std::time::Duration;
 // single-source-of-truth behavior.
 #[path = "../worker_ready.rs"]
 mod worker_ready;
-use worker_ready::worker_ready_marker_path;
+use worker_ready::{WORKER_READY_MARKER_OVERRIDE_ENV, worker_ready_marker_path};
 
 /// Force jemalloc to observe the heap buffer by reading through it.
 ///
@@ -193,14 +214,16 @@ fn main() {
     // probe race against the allocation. Path format is centralized
     // in `ktstr::worker_ready` so worker and test cannot drift.
     let pid = std::process::id();
-    // Test hook: `KTSTR_WORKER_READY_MARKER_OVERRIDE` replaces the
+    // Test hook: `WORKER_READY_MARKER_OVERRIDE_ENV` replaces the
     // pid-scoped default when set and non-empty. Used by
     // `worker_exits_4_on_ready_marker_write_fail` to point the write
     // at a deliberately-unwritable path (e.g. a non-existent parent
     // directory) so the exit-4 branch fires deterministically instead
     // of racing a pre-mkdir against the worker's own `fs::write`.
-    // Production callers never set this env var.
-    let ready_path = match std::env::var("KTSTR_WORKER_READY_MARKER_OVERRIDE") {
+    // Production callers never set this env var. The env-var name
+    // lives in `worker_ready.rs` as a `pub const` so worker and test
+    // cannot drift on spelling.
+    let ready_path = match std::env::var(WORKER_READY_MARKER_OVERRIDE_ENV) {
         Ok(p) if !p.is_empty() => p,
         _ => worker_ready_marker_path(pid),
     };

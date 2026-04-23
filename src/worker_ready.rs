@@ -17,7 +17,10 @@
 //! The worker issues `std::fs::write(path, b"ready\n")` on
 //! ready; the test polls `Path::exists` in a bounded loop (see
 //! `wait_for_worker_ready` in the sibling `worker_ready_wait`
-//! module).
+//! module). A test-only env override —
+//! [`WORKER_READY_MARKER_OVERRIDE_ENV`] — replaces the default
+//! pid-scoped path when set and non-empty; production callers
+//! never set it.
 //!
 //! Why a file-on-tmp rather than a pipe / unix socket / vsock /
 //! stdout-token?
@@ -58,16 +61,20 @@
 //! probe's cross-process timing.
 //!
 //! Consequences for this file:
-//! - **No `crate::…` or `super::…` paths**, no `use crate::…`
-//!   statements. `crate` resolves to two different crates (ktstr vs.
+//! - **No `crate::…` paths**, no `use crate::…` statements.
+//!   `crate` resolves to two different crates (ktstr vs.
 //!   the bin) on the two compilation paths; anything that names the
-//!   other crate's types breaks one of the two builds.
+//!   other crate's types breaks one of the two builds. `super::*`
+//!   inside a nested `#[cfg(test)] mod tests { … }` block is the one
+//!   carve-out: `super::` from a child `mod tests` resolves to items
+//!   defined in this file itself, not to the enclosing crate, and
+//!   those items exist identically under both compilation paths — no
+//!   lib-vs-bin divergence.
 //! - **No ktstr-library types or modules.** Only `std` items,
 //!   language primitives, and `core` types are safe. Anything that
 //!   depends on `PayloadHandle`, scenario `Ctx`, `anyhow`, or any
 //!   other lib-only item must live in
-//!   [`crate::worker_ready_wait`](../worker_ready_wait/index.html)
-//!   (lib-only) — not here.
+//!   [`crate::worker_ready_wait`] (lib-only) — not here.
 //! - **No external crate imports that only the lib or only the bin
 //!   has.** Adding a non-std dependency requires a matching `Cargo.toml`
 //!   stanza for both the lib and the bin; otherwise one build path
@@ -125,6 +132,19 @@
 /// silently drifting on a rename.
 pub(crate) const WORKER_READY_MARKER_PREFIX: &str = "/tmp/ktstr-worker-ready-";
 
+/// Name of the test-only env var that overrides the pid-scoped
+/// default path. When set and non-empty, the worker writes the
+/// ready marker at the override path instead of
+/// [`worker_ready_marker_path(pid)`](worker_ready_marker_path);
+/// when unset (or empty) the default pid-scoped path applies.
+///
+/// Exported as a `pub const` so both the worker binary and the
+/// integration tests that drive it share a single source of truth
+/// — eliminating the string-literal drift window where the worker
+/// and a test disagree on the env-var name and the override
+/// silently fails to take effect.
+pub const WORKER_READY_MARKER_OVERRIDE_ENV: &str = "KTSTR_WORKER_READY_MARKER_OVERRIDE";
+
 /// Construct the ready-marker path for a worker with the given pid.
 ///
 /// The worker uses [`std::process::id()`] (`u32`) as the pid source;
@@ -135,21 +155,3 @@ pub fn worker_ready_marker_path(pid: u32) -> String {
     format!("{WORKER_READY_MARKER_PREFIX}{pid}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Pin the path format. If this ever changes the worker binary
-    /// and test body must stay in sync, so a rename here fails every
-    /// downstream caller's path-literal expectations at build time.
-    #[test]
-    fn worker_ready_marker_path_format_is_stable() {
-        assert_eq!(WORKER_READY_MARKER_PREFIX, "/tmp/ktstr-worker-ready-");
-        assert_eq!(worker_ready_marker_path(0), "/tmp/ktstr-worker-ready-0");
-        assert_eq!(worker_ready_marker_path(12345), "/tmp/ktstr-worker-ready-12345");
-        assert_eq!(
-            worker_ready_marker_path(u32::MAX),
-            "/tmp/ktstr-worker-ready-4294967295"
-        );
-    }
-}

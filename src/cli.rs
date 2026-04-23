@@ -455,8 +455,21 @@ pub(crate) fn entry_is_eol(entry: &CacheEntry, active_prefixes: &[String]) -> bo
 /// See [`is_eol`]'s empty-slice guard for the recommended fallback pattern.
 pub(crate) fn fetch_active_prefixes() -> anyhow::Result<Vec<String>> {
     let releases = crate::fetch::fetch_releases(crate::fetch::shared_client())?;
+    Ok(active_prefixes_from_releases(&releases))
+}
+
+/// Reduce `(moniker, version)` pairs to the deduplicated list of
+/// major.minor prefixes the `(EOL)` annotation compares against.
+///
+/// Separated from [`fetch_active_prefixes`] so the normalization path
+/// — `linux-next` skip, RC-suffix collapse via [`version_prefix`], and
+/// first-seen dedup preserving input order — is testable without
+/// hitting the network. The on-network wrapper is a one-line adapter
+/// over this helper, so any future change to the normalization lands
+/// here once and both call sites consume it.
+fn active_prefixes_from_releases(releases: &[(String, String)]) -> Vec<String> {
     let mut prefixes = Vec::new();
-    for (moniker, version) in &releases {
+    for (moniker, version) in releases {
         if crate::fetch::is_skippable_release_moniker(moniker) {
             continue;
         }
@@ -466,7 +479,7 @@ pub(crate) fn fetch_active_prefixes() -> anyhow::Result<Vec<String>> {
             prefixes.push(prefix);
         }
     }
-    Ok(prefixes)
+    prefixes
 }
 
 /// Format a human-readable table row for a cache entry.
@@ -3719,6 +3732,28 @@ mod tests {
         assert!(!is_eol("7.0-rc1", &["7.0".to_string()]));
     }
 
+    /// First-release flavor: a brand-new `.0` release whose series is
+    /// present in the active list must NOT be tagged EOL. Distinct
+    /// from `is_eol_brand_new_major_matches_rc_variant` — that test
+    /// pins the RC-cache-vs-release-list collapse; this one pins the
+    /// pure released-.0 path, where both sides carry the `"7.0"`
+    /// prefix directly. Includes the `"7.0.0"` alias form (same
+    /// prefix `"7.0"` via `version_prefix`) so a regression that
+    /// re-slices the minor component on a patch-suffixed brand-new
+    /// release still holds.
+    #[test]
+    fn is_eol_brand_new_zero_release_in_active_list() {
+        let active = ["7.0".to_string()];
+        assert!(
+            !is_eol("7.0", &active),
+            "brand-new 7.0 release matching active prefix 7.0 must not be EOL",
+        );
+        assert!(
+            !is_eol("7.0.0", &active),
+            "7.0.0 carries prefix 7.0 via version_prefix and must not be EOL",
+        );
+    }
+
     /// A linux-next-derived cache entry targets the NEXT merge
     /// window, so its `major.minor` can precede any entry in the
     /// current stable/longterm active list. After the prefix
@@ -3738,6 +3773,85 @@ mod tests {
             is_eol("6.16-rc1", &["6.14".to_string(), "6.13".to_string()]),
             "linux-next cache entry whose merge-window target is ahead \
              of every stable series must be tagged EOL",
+        );
+    }
+
+    // -- active_prefixes_from_releases normalization --
+    //
+    // Pure reducer feeding `fetch_active_prefixes`. Tests pin the
+    // three behaviors the network wrapper could never exercise in
+    // isolation: RC-suffix normalization, `linux-next` skip, and
+    // first-seen dedup with input order preserved.
+
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(m, v)| ((*m).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// Mainline entries in releases.json carry an `-rcN` suffix
+    /// (`"6.16-rc3"`) whereas cached entries from an already-released
+    /// series carry the bare form (`"6.16.2"`). Both sides must land
+    /// on the same `"6.16"` prefix after normalization, otherwise the
+    /// `(EOL)` annotation would flip on mainline entries every time a
+    /// new `-rcN` ships.
+    #[test]
+    fn active_prefixes_from_releases_normalizes_rc_versions() {
+        let releases = owned(&[
+            ("mainline", "6.16-rc3"),
+            ("stable", "6.15.2"),
+            ("longterm", "6.12.81"),
+        ]);
+        let prefixes = active_prefixes_from_releases(&releases);
+        assert_eq!(
+            prefixes,
+            vec!["6.16".to_string(), "6.15".to_string(), "6.12".to_string()],
+            "RC-suffixed mainline entry must normalize to its merge-window series",
+        );
+    }
+
+    /// `linux-next` moniker must be filtered BEFORE
+    /// `version_prefix` so a `"6.17-rc2-next-YYYYMMDD"` entry does
+    /// not seed a phantom `"6.17"` prefix that then shadows the
+    /// mainline entry for a genuine merge window. The filter is
+    /// moniker-based (not version-based) so the skip survives any
+    /// future shape change in the linux-next version string.
+    #[test]
+    fn active_prefixes_from_releases_skips_linux_next_moniker() {
+        let releases = owned(&[
+            ("linux-next", "6.17-rc2-next-20260421"),
+            ("mainline", "6.16-rc3"),
+            ("stable", "6.15.2"),
+        ]);
+        let prefixes = active_prefixes_from_releases(&releases);
+        assert!(
+            !prefixes.contains(&"6.17".to_string()),
+            "linux-next moniker must not seed a 6.17 prefix, got {prefixes:?}",
+        );
+        assert_eq!(
+            prefixes,
+            vec!["6.16".to_string(), "6.15".to_string()],
+            "surviving prefixes come from mainline + stable only",
+        );
+    }
+
+    /// First-seen dedup. releases.json ships the same series in
+    /// both `stable` and a `longterm` row during the backport window
+    /// around an LTS cut-over; both normalize to the same prefix
+    /// and the helper must emit it once.
+    #[test]
+    fn active_prefixes_from_releases_dedups_in_input_order() {
+        let releases = owned(&[
+            ("stable", "6.14.2"),
+            ("longterm", "6.14.1"),
+            ("longterm", "6.12.81"),
+        ]);
+        let prefixes = active_prefixes_from_releases(&releases);
+        assert_eq!(
+            prefixes,
+            vec!["6.14".to_string(), "6.12".to_string()],
+            "dedup preserves first-seen order; 6.14 appears once",
         );
     }
 

@@ -878,4 +878,32 @@ mod tests {
              skip branch in find_kernel's cache-scan loop",
         );
     }
+
+    // -- worker_ready marker path format --
+
+    /// Pin the path format produced by
+    /// [`crate::worker_ready::worker_ready_marker_path`].
+    /// Downstream callers never spell the marker path as a literal —
+    /// the worker writes it via `worker_ready_marker_path(pid)` and
+    /// the test side polls via the same function — so a rename of
+    /// the prefix does not surface at any caller's build time. This
+    /// test's literal assertions are where the drift lands: changing
+    /// the prefix breaks these equalities, catching the serialized-
+    /// form change that would otherwise go silent.
+    ///
+    /// Lives in lib.rs (not in `worker_ready.rs`) because that file
+    /// is dual-compiled via `#[path]` into the worker bin; a
+    /// `#[cfg(test)] mod tests` inside it would duplicate the test
+    /// into both the lib test binary and the bin test binary.
+    #[test]
+    fn worker_ready_marker_path_format_is_stable() {
+        use crate::worker_ready::{WORKER_READY_MARKER_PREFIX, worker_ready_marker_path};
+        assert_eq!(WORKER_READY_MARKER_PREFIX, "/tmp/ktstr-worker-ready-");
+        assert_eq!(worker_ready_marker_path(0), "/tmp/ktstr-worker-ready-0");
+        assert_eq!(worker_ready_marker_path(12345), "/tmp/ktstr-worker-ready-12345");
+        assert_eq!(
+            worker_ready_marker_path(u32::MAX),
+            "/tmp/ktstr-worker-ready-4294967295"
+        );
+    }
 }

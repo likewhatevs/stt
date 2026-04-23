@@ -196,6 +196,16 @@ fn format_comm_suffix(comm: Option<&str>) -> String {
 mod arch {
     use super::*;
 
+    // Reject builds for arches the probe does not support. Without
+    // this gate the module compiles with every const and fn missing,
+    // surfacing as a confusing "cannot find" cascade at use sites.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    compile_error!(
+        "ktstr-jemalloc-probe supports only x86_64 and aarch64 targets; \
+         ptrace is same-arch and the TLS address math is arch-specific \
+         (Variant II on x86_64, Variant I on aarch64)"
+    );
+
     /// ELF `e_machine` value the probe is willing to probe. Matches
     /// `target_arch`: a probe built for x86_64 rejects aarch64 targets
     /// and vice versa. The check lives in [`find_jemalloc_via_maps`]
@@ -905,6 +915,20 @@ fn find_symbol_by_name(
     None
 }
 
+/// Round `value` up to a multiple of `align`, returning `None` on
+/// arithmetic overflow. `align` must be a power of two (or zero, which
+/// is clamped to 1); callers encoding the ELF power-of-two invariant
+/// rely on `& !(align - 1)` rather than `% align` for the masking.
+///
+/// Shared between `extract_pt_tls_layout` (for the Variant II TLS
+/// image size) and `compute_tls_address_variant_i` (for the Variant I
+/// TCB-to-TLS-image offset) so both sites apply the same overflow
+/// discipline and degenerate-align handling.
+fn round_up_pow2(value: u64, align: u64) -> Option<u64> {
+    let align = align.max(1);
+    value.checked_add(align - 1).map(|v| v & !(align - 1))
+}
+
 /// Extract both `round_up(p_memsz, p_align)` and the raw `p_align`
 /// from the ELF's `PT_TLS` program header. The first is Variant II's
 /// TP-to-TLS-image delta (subtracted); the second feeds Variant I's
@@ -918,21 +942,18 @@ fn extract_pt_tls_layout(elf: &Elf<'_>) -> Result<(u64, u64)> {
         .ok_or_else(|| anyhow!("ELF has no PT_TLS segment — target does not use static TLS"))?;
     // PT_TLS.p_align is a power of two (or zero) per the ELF spec
     // (and in practice for every Linux toolchain). The `& !(align - 1)`
-    // round-up trick below assumes this invariant; `debug_assert!`
-    // surfaces a non-power-of-two in debug builds before the silent
-    // miscomputation reaches the probe's address arithmetic. Release
-    // builds accept the ELF as-is — a malicious target isn't the
-    // threat model.
+    // round-up trick inside `round_up_pow2` assumes this invariant;
+    // `debug_assert!` surfaces a non-power-of-two in debug builds
+    // before the silent miscomputation reaches the probe's address
+    // arithmetic. Release builds accept the ELF as-is — a malicious
+    // target isn't the threat model.
     debug_assert!(
         tls_hdr.p_align == 0 || tls_hdr.p_align.is_power_of_two(),
         "PT_TLS.p_align must be 0 or a power of two, got {}",
         tls_hdr.p_align,
     );
     let align = tls_hdr.p_align.max(1);
-    let rounded = tls_hdr
-        .p_memsz
-        .checked_add(align - 1)
-        .map(|v| v & !(align - 1))
+    let rounded = round_up_pow2(tls_hdr.p_memsz, align)
         .ok_or_else(|| anyhow!("PT_TLS size arithmetic overflow"))?;
     Ok((rounded, align))
 }
@@ -1368,19 +1389,17 @@ pub(crate) fn compute_tls_address_variant_i(
     st_value: u64,
     field_offset: u64,
 ) -> Result<u64> {
-    // Round the TCB reserved area up to the TLS block's alignment.
-    // Rust's integer arithmetic traps on underflow in debug builds;
-    // the `.max(1)` guards against p_align=0 in a degenerate ELF.
-    let align = p_align.max(1);
-    let image_offset = TCB_SIZE_AARCH64
-        .checked_add(align - 1)
-        .map(|v| v & !(align - 1))
-        .ok_or_else(|| {
-            anyhow!(
-                "TLS image offset overflow: tcb={} align={align:#x}",
-                TCB_SIZE_AARCH64,
-            )
-        })?;
+    // Round the TCB reserved area up to the TLS block's alignment
+    // via the shared `round_up_pow2` helper (zero-align clamp,
+    // overflow detection). Rust's integer arithmetic traps on
+    // underflow in debug builds; the helper's `.max(1)` guards
+    // against p_align=0 in a degenerate ELF.
+    let image_offset = round_up_pow2(TCB_SIZE_AARCH64, p_align).ok_or_else(|| {
+        anyhow!(
+            "TLS image offset overflow: tcb={} align={p_align:#x}",
+            TCB_SIZE_AARCH64,
+        )
+    })?;
     tpidr_el0
         .checked_add(image_offset)
         .and_then(|v| v.checked_add(st_value))
@@ -1444,14 +1463,19 @@ pub(crate) fn iter_task_ids(pid: i32) -> Result<Vec<i32>> {
 /// which v1 does not implement.
 pub(crate) fn find_jemalloc_via_maps(
     pid: i32,
-) -> Result<(TsdTlsSymbol, CounterOffsets)> {
+) -> std::result::Result<(TsdTlsSymbol, CounterOffsets), FatalError> {
     let exe_link = format!("/proc/{pid}/exe");
-    let exe_path = fs::read_link(&exe_link)
-        .with_context(|| format!("readlink {exe_link} (need it to gate static-TLS match)"))?;
+    let exe_path = fs::read_link(&exe_link).map_err(|e| {
+        FatalError::other(
+            anyhow::Error::from(e)
+                .context(format!("readlink {exe_link} (need it to gate static-TLS match)")),
+        )
+    })?;
 
     let maps_path = format!("/proc/{pid}/maps");
-    let contents =
-        fs::read_to_string(&maps_path).with_context(|| format!("read {maps_path}"))?;
+    let contents = fs::read_to_string(&maps_path).map_err(|e| {
+        FatalError::other(anyhow::Error::from(e).context(format!("read {maps_path}")))
+    })?;
 
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     let mut last_symbol_err: Option<anyhow::Error> = None;
@@ -1483,13 +1507,13 @@ pub(crate) fn find_jemalloc_via_maps(
         // A hit in a DSO is not something v1 can address correctly
         // (no DTV walk).
         if path != exe_path {
-            bail!(
+            return Err(FatalError::not_jemalloc(anyhow!(
                 "jemalloc TLS symbol found in {} but static-TLS probe requires \
                  the match be in the main executable ({}); dynamic-TLS lookups \
                  in shared objects are not supported in v1",
                 path.display(),
                 exe_path.display(),
-            );
+            )));
         }
         // Arch check runs before the (slow) DWARF walk so a
         // cross-arch target fails fast with the right message instead
@@ -1498,7 +1522,7 @@ pub(crate) fn find_jemalloc_via_maps(
         // x86_64 targets; aarch64 build only probes aarch64. Cross-
         // arch ptrace is not supported.
         if symbol.e_machine != arch::EXPECTED_E_MACHINE {
-            bail!(
+            return Err(FatalError::other(anyhow!(
                 "probe is {}-only; target ELF {} is {} (e_machine={:#x}). \
                  Obtain or build a probe matching the target's architecture \
                  (ptrace is same-arch only — the probe and its target must \
@@ -1507,21 +1531,21 @@ pub(crate) fn find_jemalloc_via_maps(
                 symbol.elf_path.display(),
                 e_machine_name(symbol.e_machine),
                 symbol.e_machine,
-            );
+            )));
         }
-        let offsets = resolve_field_offsets(&path)?;
+        let offsets = resolve_field_offsets(&path).map_err(FatalError::other)?;
         return Ok((symbol, offsets));
     }
 
     let context = last_symbol_err
         .map(|e| format!(" — last per-ELF error: {e}"))
         .unwrap_or_default();
-    bail!(
+    Err(FatalError::not_jemalloc(anyhow!(
         "jemalloc TLS symbol ({}) not found in any r-x mapping under {}{}",
         TSD_TLS_SYMBOL_NAMES.join(" / "),
         maps_path,
-        context
-    )
+        context,
+    )))
 }
 
 /// Human-readable name for an ELF e_machine value. Used in error
@@ -1702,38 +1726,73 @@ impl ThreadProbeError {
     }
 }
 
-/// Perform the full seize → interrupt → wait → read-regs →
-/// read-counters → detach sequence for a single target tid.
+/// Perform the seize → interrupt → wait → read-regs → read-counters
+/// → detach sequence for a single target tid, OR — when
+/// `cached_thread_pointer` is `Some` — reuse the cached TP and skip
+/// the ptrace dance entirely, taking only the `process_vm_readv`.
+///
+/// Under glibc/musl nptl, a thread's TLS base (x86_64 `fs_base`,
+/// aarch64 `TPIDR_EL0`) is set once during `pthread_create` and does
+/// not change during normal execution — caching the first snapshot's
+/// observation lets snapshots 2..N read counters without stopping
+/// the target. Exotic runtimes that relocate TLS (Wine, some Go
+/// builds, hand-rolled libc) or direct
+/// `arch_prctl(ARCH_SET_FS)` / `WRFSBASE` (user-mode on
+/// Ivy Bridge+ with `CR4.FSGSBASE`) usage would desync the cache;
+/// the per-snapshot eviction of exited tids (see
+/// [`take_snapshot`]) limits the stale window but does not detect
+/// mid-lifetime TLS relocation. Trade-off: the `process_vm_readv`
+/// on the fast path races the target's ongoing counter updates —
+/// each u64 load is naturally atomic on x86_64/aarch64, so
+/// `allocated_bytes` and `deallocated_bytes` individually remain
+/// consistent, but the pair may be sampled a few instructions
+/// apart. Cumulative monotonic counters tolerate that skew.
+///
+/// Returns the counter pair plus the observed thread pointer so the
+/// caller can populate the cache entry for this tid on the
+/// cache-miss path.
 fn probe_single_thread(
     tid: i32,
     symbol: &TsdTlsSymbol,
     offsets: &CounterOffsets,
-) -> std::result::Result<ThreadCounters, ThreadProbeError> {
+    cached_thread_pointer: Option<u64>,
+) -> std::result::Result<(ThreadCounters, u64), ThreadProbeError> {
     let pid = Pid::from_raw(tid);
 
-    ptrace::seize(pid, Options::empty())
-        .map_err(|e| ThreadProbeError::ptrace_seize(tid, e))?;
-    // Construct the detach guard IMMEDIATELY after a successful seize
-    // — before the `attached` set insert, before interrupt, before any
-    // subsequent fallible step. If the following `attached().lock()`
-    // panics (poisoned mutex), the guard's Drop still runs and the
-    // tid is detached. A reversed order (insert → guard) would leak
-    // the attach on that narrow window.
-    let _attached_guard = ScopeDetach(tid);
-    // Record the attach so the SIGINT handler's `detach_all_attached`
-    // sweep sees this tid even if we crash or are interrupted before
-    // `interrupt`/`waitpid`.
-    attached_lock().insert(tid);
+    // `_attached_guard` lives only on the slow path — the fast path
+    // never seizes, so it has nothing to detach. Named `_guard` on
+    // both arms to keep the binding type uniform while preserving the
+    // Drop-on-scope-exit semantics that the slow path depends on.
+    let (thread_pointer, _attached_guard) = match cached_thread_pointer {
+        Some(tp) => (tp, None),
+        None => {
+            ptrace::seize(pid, Options::empty())
+                .map_err(|e| ThreadProbeError::ptrace_seize(tid, e))?;
+            // Construct the detach guard IMMEDIATELY after a
+            // successful seize — before the `attached` set insert,
+            // before interrupt, before any subsequent fallible step.
+            // If the following `attached().lock()` panics (poisoned
+            // mutex), the guard's Drop still runs and the tid is
+            // detached.
+            let guard = ScopeDetach(tid);
+            // Record the attach so the SIGINT handler's
+            // `detach_all_attached` sweep sees this tid even if we
+            // crash or are interrupted before `interrupt`/`waitpid`.
+            attached_lock().insert(tid);
 
-    ptrace::interrupt(pid).map_err(|e| ThreadProbeError::ptrace_interrupt(tid, e))?;
-    match waitpid(pid, None) {
-        Ok(WaitStatus::Stopped(_, _) | WaitStatus::PtraceEvent(_, _, _)) => {}
-        Ok(other) => return Err(ThreadProbeError::waitpid_unexpected(tid, other)),
-        Err(e) => return Err(ThreadProbeError::waitpid_err(tid, e)),
-    }
+            ptrace::interrupt(pid)
+                .map_err(|e| ThreadProbeError::ptrace_interrupt(tid, e))?;
+            match waitpid(pid, None) {
+                Ok(WaitStatus::Stopped(_, _) | WaitStatus::PtraceEvent(_, _, _)) => {}
+                Ok(other) => return Err(ThreadProbeError::waitpid_unexpected(tid, other)),
+                Err(e) => return Err(ThreadProbeError::waitpid_err(tid, e)),
+            }
 
-    let thread_pointer = arch::read_thread_pointer_ptrace(pid)
-        .map_err(|e| ThreadProbeError::getregset(tid, e))?;
+            let tp = arch::read_thread_pointer_ptrace(pid)
+                .map_err(|e| ThreadProbeError::getregset(tid, e))?;
+            (tp, Some(guard))
+        }
+    };
 
     let addr = compute_tls_address(
         thread_pointer,
@@ -1763,10 +1822,13 @@ fn probe_single_thread(
     let deallocated =
         u64::from_le_bytes(buf[dealloc_offset..dealloc_offset + 8].try_into().unwrap());
 
-    Ok(ThreadCounters {
-        allocated_bytes: allocated,
-        deallocated_bytes: deallocated,
-    })
+    Ok((
+        ThreadCounters {
+            allocated_bytes: allocated,
+            deallocated_bytes: deallocated,
+        },
+        thread_pointer,
+    ))
 }
 
 /// Best-effort read of `/proc/{pid}/task/{tid}/comm`. Trims
@@ -1834,7 +1896,79 @@ fn detach_all_attached() {
 enum RunOutcome {
     Ok(ProbeOutput),
     AllFailed(ProbeOutput),
-    Fatal(anyhow::Error),
+    Fatal(FatalError),
+}
+
+/// Closed vocabulary for `RunOutcome::Fatal` structured stderr tags.
+/// Tagged at the construction site of every fatal error so the
+/// `ktstr-probe-fatal:` stderr category is typed rather than
+/// recovered by substring matching against the rendered
+/// `anyhow::Error`. Adding a new kind is always safe; removing or
+/// renaming one breaks downstream test consumers that pin the
+/// substring, so [`FatalKind::tag`] is the wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FatalKind {
+    /// `/proc/<pid>` does not exist at run start — the target pid
+    /// was never live, or exited before the probe opened it.
+    PidMissing,
+    /// The target's `/proc/<pid>/exe` changed between the run-start
+    /// ELF/DWARF parse and a subsequent re-stat. Covers both the
+    /// mid-parse gate and the between-snapshot gate inside
+    /// [`run`]; the human-readable message carries the specific
+    /// phase.
+    ExeIdentityChanged,
+    /// The target is not jemalloc-linked in a shape this probe can
+    /// read — either no `tsd_tls` symbol in any r-x mapping, or the
+    /// symbol lives in a DSO (v1 is static-TLS only).
+    NotJemalloc,
+    /// Anything else: readlink / maps read failures, architecture
+    /// mismatch, self-probe rejection, DWARF parse errors, tid
+    /// enumeration failures.
+    Other,
+}
+
+impl FatalKind {
+    /// Short token emitted after `ktstr-probe-fatal:` on stderr. The
+    /// vocabulary is intentionally tiny — consumers grepping this
+    /// stream rely on stable tokens.
+    fn tag(self) -> &'static str {
+        match self {
+            Self::PidMissing => "pid-missing",
+            Self::ExeIdentityChanged => "exe-identity-changed",
+            Self::NotJemalloc => "not-jemalloc",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// A [`FatalKind`] paired with the underlying error so the fatal
+/// branch in [`main`] can emit both the structured tag and the
+/// operator-facing message without re-classifying.
+struct FatalError {
+    kind: FatalKind,
+    error: anyhow::Error,
+}
+
+impl FatalError {
+    fn new(kind: FatalKind, error: anyhow::Error) -> Self {
+        Self { kind, error }
+    }
+
+    fn pid_missing(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::PidMissing, error)
+    }
+
+    fn exe_identity_changed(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::ExeIdentityChanged, error)
+    }
+
+    fn not_jemalloc(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::NotJemalloc, error)
+    }
+
+    fn other(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::Other, error)
+    }
 }
 
 /// Granularity (ms) at which [`sleep_with_cancel`] wakes to poll
@@ -1897,6 +2031,7 @@ fn take_snapshot(
     offsets: &CounterOffsets,
     tids: &[i32],
     run_start: std::time::Instant,
+    tp_cache: &mut std::collections::HashMap<i32, u64>,
 ) -> (Snapshot, bool) {
     // Capture both timestamps BEFORE iterating threads so the fields
     // represent "start of this snapshot" — a post-loop capture
@@ -1907,6 +2042,19 @@ fn take_snapshot(
     // second) and immune to wall-clock jumps.
     let timestamp_unix_sec = now_unix_sec();
     let elapsed_since_start_ns = run_start.elapsed().as_nanos() as u64;
+    // Evict cache entries for tids that are no longer in the live
+    // enumeration BEFORE any lookups this snapshot. An exited tid
+    // eventually drops out of `/proc/<pid>/task/`; the kernel may
+    // then recycle that tid for a freshly-created thread inside the
+    // same tgid (tid_max = pid_max, ~4M on x86_64). Without this
+    // eviction, the recycled tid would hit a stale fs_base entry
+    // cached against the prior thread and `process_vm_readv` would
+    // read garbage from the new thread's unrelated TLS. The narrow
+    // window this fix cannot close is exit + recycle fully inside
+    // ONE inter-snapshot gap — see `probe_single_thread`'s doc for
+    // the acknowledged limitation.
+    let live_tids: BTreeSet<i32> = tids.iter().copied().collect();
+    tp_cache.retain(|tid, _| live_tids.contains(tid));
     let mut threads: Vec<ThreadResult> = Vec::with_capacity(tids.len());
     let mut interrupted = false;
     for &tid in tids {
@@ -1920,13 +2068,22 @@ fn take_snapshot(
         // of catching a populated comm. Best-effort either way — a
         // `None` comm never upgrades a per-thread result to Err.
         let comm = read_thread_comm(pid, tid);
-        match probe_single_thread(tid, symbol, offsets) {
-            Ok(c) => threads.push(ThreadResult::Ok {
-                tid,
-                comm,
-                allocated_bytes: c.allocated_bytes,
-                deallocated_bytes: c.deallocated_bytes,
-            }),
+        // Cache hit skips the per-snapshot ptrace dance on snapshots
+        // 2..N for a tid observed on a prior snapshot. Stale entries
+        // (tid exited and dropped out of the enumeration) were
+        // evicted above so a tid-recycle across at least one
+        // snapshot boundary cannot produce a false hit here.
+        let cached_tp = tp_cache.get(&tid).copied();
+        match probe_single_thread(tid, symbol, offsets, cached_tp) {
+            Ok((c, observed_tp)) => {
+                tp_cache.insert(tid, observed_tp);
+                threads.push(ThreadResult::Ok {
+                    tid,
+                    comm,
+                    allocated_bytes: c.allocated_bytes,
+                    deallocated_bytes: c.deallocated_bytes,
+                });
+            }
             Err(e) => threads.push(ThreadResult::Err {
                 tid,
                 comm,
@@ -2037,14 +2194,16 @@ fn run(cli: &Cli) -> RunOutcome {
     // problem.
     let self_pid = self_pid();
     if pid == self_pid {
-        return RunOutcome::Fatal(anyhow!(
+        return RunOutcome::Fatal(FatalError::other(anyhow!(
             "refusing to probe self (pid {pid} == ktstr-jemalloc-probe's own pid). \
              ptrace(PTRACE_SEIZE) rejects self-attach — a process cannot trace \
              itself. Run the probe from a separate process against the target's pid."
-        ));
+        )));
     }
     if !Path::new(&format!("/proc/{pid}")).exists() {
-        return RunOutcome::Fatal(anyhow!("pid {pid} does not exist"));
+        return RunOutcome::Fatal(FatalError::pid_missing(anyhow!(
+            "pid {pid} does not exist"
+        )));
     }
 
     // Capture the target ELF's (dev, inode) BEFORE the ELF/DWARF
@@ -2055,7 +2214,13 @@ fn run(cli: &Cli) -> RunOutcome {
     // binary by the time we start sampling.
     let exe_identity = match ExeIdentity::capture(pid) {
         Ok(v) => v,
-        Err(e) => return RunOutcome::Fatal(e),
+        // A `stat(/proc/<pid>/exe)` failure here races the
+        // `/proc/<pid>` existence check above — if the target exited
+        // in the narrow window between them, readlink / stat returns
+        // ENOENT. Tag as `PidMissing` so consumers keying on that
+        // stderr tag catch the race instead of bucketing it under the
+        // generic `other` catch-all.
+        Err(e) => return RunOutcome::Fatal(FatalError::pid_missing(e)),
     };
 
     // Symbol + offset resolution and tid enumeration are run ONCE
@@ -2074,7 +2239,7 @@ fn run(cli: &Cli) -> RunOutcome {
     // offsets from a DIFFERENT binary. Bail before any per-tid
     // ptrace work runs.
     if let Err(e) = ensure_exe_identity_unchanged(pid, &exe_identity, "during ELF/DWARF parse") {
-        return RunOutcome::Fatal(e);
+        return RunOutcome::Fatal(FatalError::exe_identity_changed(e));
     }
 
     // `validate_sampling_flags` enforced that `interval_ms` is Some
@@ -2083,6 +2248,14 @@ fn run(cli: &Cli) -> RunOutcome {
     let snapshot_count = cli.snapshots as usize;
     let mut snapshots: Vec<Snapshot> = Vec::with_capacity(snapshot_count);
     let mut interrupted = false;
+    // Per-tid cache of thread_pointer observations. Populated on the
+    // first snapshot that successfully reaches a tid; subsequent
+    // snapshots skip the ptrace seize/interrupt/wait/getregset dance
+    // for cached tids and read counters directly via
+    // `process_vm_readv`. See `probe_single_thread` for the
+    // consistency trade-off.
+    let mut tp_cache: std::collections::HashMap<i32, u64> =
+        std::collections::HashMap::new();
     for i in 0..cli.snapshots {
         if CLEANUP_REQUESTED.load(Ordering::SeqCst) {
             interrupted = true;
@@ -2097,12 +2270,12 @@ fn run(cli: &Cli) -> RunOutcome {
         if i > 0 {
             if let Err(e) = ensure_exe_identity_unchanged(pid, &exe_identity, "between snapshots")
             {
-                return RunOutcome::Fatal(e);
+                return RunOutcome::Fatal(FatalError::exe_identity_changed(e));
             }
         }
         // Re-enumerate /proc/<pid>/task per snapshot so threads
-        // spawned AFTER the previous enumeration are visible in this
-        // snapshot forward. Freezing the list at run start missed
+        // spawned AFTER the previous enumeration are visible from
+        // this snapshot forward. Freezing the list at run start missed
         // late-created threads entirely; for long multi-snapshot
         // runs against a growing thread pool that is the common
         // shape. Per-snapshot enumeration is
@@ -2112,10 +2285,10 @@ fn run(cli: &Cli) -> RunOutcome {
         // been reaped yet, then drop out of subsequent enumerations.
         let tids = match iter_task_ids(pid) {
             Ok(v) => v,
-            Err(e) => return RunOutcome::Fatal(e),
+            Err(e) => return RunOutcome::Fatal(FatalError::other(e)),
         };
         let (snap, snap_interrupted) =
-            take_snapshot(pid, &symbol, &offsets, &tids, run_start);
+            take_snapshot(pid, &symbol, &offsets, &tids, run_start, &mut tp_cache);
         snapshots.push(snap);
         if snap_interrupted {
             interrupted = true;
@@ -2523,7 +2696,7 @@ fn main() {
             detach_all_attached();
             std::process::exit(1);
         }
-        RunOutcome::Fatal(e) => {
+        RunOutcome::Fatal(fatal) => {
             // Emit a single structured tag alongside the human
             // rendering so test bodies that want variant-specific
             // pinning (e.g. "probe bailed because the target pid
@@ -2532,42 +2705,14 @@ fn main() {
             // substring rather than the free-form `{e:#}` text.
             // The tag shape is intentionally grep-friendly:
             // `ktstr-probe-fatal: <kind>` with `kind` drawn from
-            // a short, closed vocabulary. Consumers can filter on
-            // the `ktstr-probe-fatal:` prefix to harvest only
-            // structured lines even if the underlying human text
-            // changes.
-            let kind = classify_fatal(&e);
-            eprintln!("ktstr-probe-fatal: {kind}");
-            eprintln!("error: {e:#}");
+            // [`FatalKind`]'s closed vocabulary, tagged at the
+            // source of the error instead of recovered by
+            // substring matching the rendered message.
+            eprintln!("ktstr-probe-fatal: {}", fatal.kind.tag());
+            eprintln!("error: {:#}", fatal.error);
             detach_all_attached();
             std::process::exit(1);
         }
-    }
-}
-
-/// Classify a `RunOutcome::Fatal` error into a short tag for
-/// structured stderr emission in [`main`]. Matches the underlying
-/// `anyhow::Error` root-cause display against a small set of
-/// closed substrings; unknown shapes fall through to `other` so
-/// the tag stream stays well-formed even on unexpected errors.
-/// The vocabulary is intentionally tiny — adding a new kind is
-/// always safe; removing or renaming one is a breaking change to
-/// downstream test consumers that match on the substring.
-fn classify_fatal(e: &anyhow::Error) -> &'static str {
-    let msg = format!("{e:#}");
-    if msg.contains("does not exist") {
-        "pid-missing"
-    } else if msg.contains("/proc/<pid>/exe changed") {
-        // Both re-stat gates (mid-parse and between-snapshot) share
-        // the "/proc/<pid>/exe changed" wording — see run() for the
-        // two emission sites. Consumers keying on `exe-identity-changed`
-        // see mid-parse and between-snapshot events as a single
-        // category; the human line carries the specific phase.
-        "exe-identity-changed"
-    } else if msg.contains("jemalloc") && msg.contains("not") {
-        "not-jemalloc"
-    } else {
-        "other"
     }
 }
 
@@ -3049,8 +3194,8 @@ mod tests {
             abort_after_ms: None,
         };
         match run(&cli) {
-            RunOutcome::Fatal(err) => {
-                let msg = format!("{err:#}");
+            RunOutcome::Fatal(fatal) => {
+                let msg = format!("{:#}", fatal.error);
                 assert!(
                     msg.contains("refusing to probe self"),
                     "expected self-probe rejection wording, got: {msg}",
@@ -3108,8 +3253,8 @@ mod tests {
         let outcome = run(&cli);
         let _ = child.kill();
         let _ = child.wait();
-        if let RunOutcome::Fatal(err) = outcome {
-            let msg = format!("{err:#}");
+        if let RunOutcome::Fatal(fatal) = outcome {
+            let msg = format!("{:#}", fatal.error);
             assert!(
                 !msg.contains("refusing to probe self"),
                 "self-probe gate must NOT fire for non-self pid {child_pid} (self={self_pid}), got: {msg}",
@@ -3696,9 +3841,10 @@ mod tests {
             "every snapshot's threads empty must classify as MultiAllFailed",
         );
 
-        // Vacuously true on an empty snapshots slice — documented
-        // unreachable in production but a test guard keeps the
-        // semantics stable under future refactors.
+        // Vacuously true on an empty snapshots slice — unreachable
+        // from `run()`'s call path (the empty case is guarded upstream
+        // and surfaced as `RunOutcome::Ok`); vacuous-truth behavior
+        // pinned for external callers.
         let empty_snapshots: &[Snapshot] = &[];
         assert!(multi_snapshot_all_failed(empty_snapshots));
     }
@@ -3877,8 +4023,15 @@ mod tests {
         let offsets = CounterOffsets::new(0, 8).expect("0 < 8 satisfies layout invariant");
         let tids = vec![1, 2, 3];
         let run_start = std::time::Instant::now();
-        let (snap, interrupted) =
-            take_snapshot(self_pid(), &symbol, &offsets, &tids, run_start);
+        let mut tp_cache = std::collections::HashMap::new();
+        let (snap, interrupted) = take_snapshot(
+            self_pid(),
+            &symbol,
+            &offsets,
+            &tids,
+            run_start,
+            &mut tp_cache,
+        );
         // Reset for other tests.
         CLEANUP_REQUESTED.store(false, Ordering::SeqCst);
 
@@ -3927,8 +4080,15 @@ mod tests {
         // branch which requires the loop to iterate at least once.
         let tids: Vec<i32> = vec![];
         let run_start = std::time::Instant::now();
-        let (snap, interrupted) =
-            take_snapshot(self_pid(), &symbol, &offsets, &tids, run_start);
+        let mut tp_cache = std::collections::HashMap::new();
+        let (snap, interrupted) = take_snapshot(
+            self_pid(),
+            &symbol,
+            &offsets,
+            &tids,
+            run_start,
+            &mut tp_cache,
+        );
         assert!(!interrupted, "clear flag + empty tids must not mark interrupted");
         assert!(snap.threads.is_empty());
     }
@@ -3995,10 +4155,11 @@ mod tests {
         let err = ensure_exe_identity_unchanged(pid, &baseline, "between snapshots")
             .expect_err("synthetic mismatch");
         // Simulate the `run()` call-site: wrap in RunOutcome::Fatal.
-        let outcome = RunOutcome::Fatal(err);
+        let outcome = RunOutcome::Fatal(FatalError::exe_identity_changed(err));
         match outcome {
-            RunOutcome::Fatal(e) => {
-                let msg = format!("{e}");
+            RunOutcome::Fatal(fatal) => {
+                assert_eq!(fatal.kind, FatalKind::ExeIdentityChanged);
+                let msg = format!("{}", fatal.error);
                 assert!(msg.contains("between snapshots"));
             }
             _ => panic!("expected RunOutcome::Fatal"),

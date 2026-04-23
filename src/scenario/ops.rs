@@ -2136,19 +2136,22 @@ fn build_stimulus(
 ///
 /// # Why this is a scenario-intent check, not a kernel guard
 ///
-/// ktstr only writes `cpuset.cpus` on each cgroup; it never writes
-/// `cpuset.mems`, so `cpuset.mems` inherits its parent's default.
-/// In every ktstr deployment shape — PID 1 in the guest VM, the
-/// cgroup root on the host — that default is the permissive
-/// "all nodes" set. Under that layout the kernel's
-/// `set_mempolicy(2)` path does NOT intersect the nodemask with
-/// the cpuset: `mems_allowed` covers every node, so the policy's
-/// explicit nodemask is used as-written and the kernel will not
-/// reject or silently trim it. The validator is therefore the
-/// **only** layer that rejects a mismatched policy — if it does
-/// not bail here, the policy lands on the syscall unchanged and
-/// `run_steps` commits to running the worker with a misconfigured
-/// allocation target.
+/// ktstr writes `cpuset.cpus` on each cgroup but never writes
+/// `cpuset.mems`, so `cpuset.mems` keeps its inherited default —
+/// the permissive "all nodes" set in every ktstr deployment
+/// shape (PID 1 inside the guest VM, cgroup root on the host).
+/// The kernel's `set_mempolicy(2)` path always runs the policy's
+/// nodemask through `mpol_set_nodemask` in `mm/mempolicy.c`, which
+/// intersects it with the caller's `mems_allowed` before it is
+/// stored on the task; because ktstr never narrows `mems_allowed`,
+/// that intersection is an identity operation under ktstr's
+/// deployment — the stored nodemask equals the one the caller
+/// supplied, and the kernel never rejects or silently trims the
+/// policy the way it would if `mems_allowed` were disjoint from
+/// the requested set. Rejection of a mismatched policy is
+/// therefore validator-only: if this function does not bail, the
+/// policy lands on the syscall unchanged and `run_steps` commits
+/// to running the worker with a misconfigured allocation target.
 ///
 /// What the validator catches is a **scenario-design mismatch**:
 /// you pinned CPUs on NUMA node X (via `CpusetSpec::Numa(X)`) but
@@ -6844,6 +6847,123 @@ mod tests {
             warn_hits.len(),
             1,
             "exactly one saturation warn expected; got: {warn_hits:?}",
+        );
+    }
+
+    // -- Op variant constructor coverage --
+    //
+    // `Op` is `#[non_exhaustive]` — its doc directs downstream
+    // authors to use the per-op constructors (`Op::add_cgroup`,
+    // `Op::run_payload`, …) rather than naming variants directly so
+    // new variants can land without breaking matchers. This test is
+    // the enforcement seam: it exercises every documented constructor
+    // once AND pattern-matches the produced value against every Op
+    // variant without a wildcard arm. Either half failing catches a
+    // different regression:
+    //
+    // - A new variant added without a constructor fails the match
+    //   compilation (non-exhaustive pattern).
+    // - A new variant with a constructor but no test coverage
+    //   survives compilation but the constructor block below won't
+    //   cover it — a reviewer adding a variant + constructor must
+    //   also add a call here.
+    //
+    // The guard is build-time rather than runtime: removing the
+    // wildcard `_ =>` arm makes the rustc exhaustiveness checker
+    // own the constructor-per-variant contract.
+
+    /// Static binary-kind Payload used only to address the
+    /// `RunPayload` / `WaitPayload` / `KillPayload` constructors.
+    /// The test never spawns or runs this payload — only the
+    /// `&'static Payload` reference is consumed.
+    static CONSTRUCTOR_TEST_PAYLOAD: crate::test_support::Payload =
+        crate::test_support::Payload::binary("constructor-test", "/bin/true");
+
+    #[test]
+    fn op_constructor_coverage_is_exhaustive() {
+        let w = Work::default();
+        let constructed: Vec<Op> = vec![
+            Op::add_cgroup("a"),
+            Op::remove_cgroup("a"),
+            Op::set_cpuset("a", CpusetSpec::Llc(0)),
+            Op::clear_cpuset("a"),
+            Op::swap_cpusets("a", "b"),
+            Op::spawn("a", w.clone()),
+            Op::stop_cgroup("a"),
+            Op::set_affinity("a", AffinityKind::Inherit),
+            Op::spawn_host(w.clone()),
+            Op::move_all_tasks("a", "b"),
+            Op::run_payload(&CONSTRUCTOR_TEST_PAYLOAD, Vec::new()),
+            Op::run_payload_in_cgroup(&CONSTRUCTOR_TEST_PAYLOAD, Vec::new(), "a"),
+            Op::wait_payload("constructor-test"),
+            Op::wait_payload_in_cgroup("constructor-test", "a"),
+            Op::kill_payload("constructor-test"),
+            Op::kill_payload_in_cgroup("constructor-test", "a"),
+        ];
+
+        // Track which variants we observed. Adding a variant to `Op`
+        // without a constructor call above leaves one slot `false`,
+        // and adding a variant without a match arm below fails to
+        // compile (no `_ =>` on purpose).
+        let mut seen = [false; 13];
+        for op in &constructed {
+            let idx = match op {
+                Op::AddCgroup { .. } => 0,
+                Op::RemoveCgroup { .. } => 1,
+                Op::SetCpuset { .. } => 2,
+                Op::ClearCpuset { .. } => 3,
+                Op::SwapCpusets { .. } => 4,
+                Op::Spawn { .. } => 5,
+                Op::StopCgroup { .. } => 6,
+                Op::SetAffinity { .. } => 7,
+                Op::SpawnHost { .. } => 8,
+                Op::MoveAllTasks { .. } => 9,
+                Op::RunPayload { .. } => 10,
+                Op::WaitPayload { .. } => 11,
+                Op::KillPayload { .. } => 12,
+            };
+            seen[idx] = true;
+        }
+
+        let missing: Vec<usize> = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| !**hit)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "Op variant discriminants with no constructor coverage: {missing:?}. \
+             Every Op variant must have a public constructor under impl Op per the \
+             non_exhaustive migration note on the enum.",
+        );
+    }
+
+    #[test]
+    fn cpuset_spec_constructor_coverage_is_exhaustive() {
+        let constructed = [
+            CpusetSpec::llc(0),
+            CpusetSpec::numa(0),
+            CpusetSpec::range(0.0, 1.0),
+            CpusetSpec::disjoint(0, 2),
+            CpusetSpec::overlap(0, 2, 0.25),
+            CpusetSpec::exact([0usize]),
+        ];
+        let mut seen = [false; 6];
+        for spec in &constructed {
+            let idx = match spec {
+                CpusetSpec::Llc(_) => 0,
+                CpusetSpec::Numa(_) => 1,
+                CpusetSpec::Range { .. } => 2,
+                CpusetSpec::Disjoint { .. } => 3,
+                CpusetSpec::Overlap { .. } => 4,
+                CpusetSpec::Exact(_) => 5,
+            };
+            seen[idx] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "every CpusetSpec variant must have a matching constructor, seen={seen:?}",
         );
     }
 }

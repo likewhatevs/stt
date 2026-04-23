@@ -1000,7 +1000,7 @@ fn run_model_status() -> Result<(), String> {
             // causes with `: ` and is single-line in practice;
             // this replace is a guard against a future error
             // source whose Display impl injects its own
-            // newlines (std::io errors wrapping mutli-line OS
+            // newlines (std::io errors wrapping multi-line OS
             // messages, third-party crates formatting
             // call-chain trees). Keeping the output on one
             // line preserves the visual grouping the other

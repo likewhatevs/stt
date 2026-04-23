@@ -667,13 +667,6 @@ mod tests {
         assert!(t.phases[1].metrics.sample_count > 0);
     }
 
-    // `degradation_detected` smoke test deleted — subsumed by
-    // `neg_timeline_detects_imbalance_degradation` below, which
-    // covers the same imbalance-degradation path with additional
-    // pins on phase count, per-phase metric shape, delta sign,
-    // threshold crossing, and format-output contents. Keeping both
-    // duplicated coverage without adding signal.
-
     #[test]
     fn improvement_detected() {
         // Phase 0: imbalanced
@@ -701,11 +694,6 @@ mod tests {
             .collect();
         assert!(!improvements.is_empty());
     }
-
-    // `stable_no_changes` smoke test deleted — subsumed by
-    // `neg_timeline_no_degradation_when_stable` below, which
-    // covers the same stable-phase-no-degradation path with
-    // richer assertions on phase metrics and change-list shape.
 
     #[test]
     fn format_non_empty() {
@@ -742,12 +730,6 @@ mod tests {
         let t = Timeline::build(&events, &samples);
         assert_eq!(t.phases[0].metrics.stall_count, 1);
     }
-
-    // `dsq_degradation_detected` smoke test deleted — subsumed by
-    // `neg_timeline_detects_dsq_depth_degradation` below, which
-    // covers the same dsq_depth degradation path with additional
-    // pins on the detected change's direction, delta sign,
-    // threshold crossing, and per-phase metric shape.
 
     #[test]
     fn compute_metrics_empty() {

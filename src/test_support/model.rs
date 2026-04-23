@@ -894,34 +894,47 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
 /// Compute the overall HTTP-request timeout for a download of
 /// `size_bytes`. Formula:
 ///
-/// `max(FETCH_MIN_TIMEOUT_SECS, size_bytes / FETCH_MIN_BANDWIDTH_BYTES_PER_SEC)`
+/// `min(FETCH_MAX_TIMEOUT_SECS,
+///      max(FETCH_MIN_TIMEOUT_SECS,
+///          size_bytes / FETCH_MIN_BANDWIDTH_BYTES_PER_SEC))`
 ///
 /// where `FETCH_MIN_BANDWIDTH_BYTES_PER_SEC` is 3 MB/s
-/// (`3_000_000`) and `FETCH_MIN_TIMEOUT_SECS` is 60 s. The
-/// proportional term budgets a 3 MB/s sustained-throughput floor
-/// over the artifact body; the 60 s floor keeps small artifacts
+/// (`3_000_000`), `FETCH_MIN_TIMEOUT_SECS` is 60 s, and
+/// `FETCH_MAX_TIMEOUT_SECS` is 1800 s (30 min). The proportional
+/// term budgets a 3 MB/s sustained-throughput floor over the
+/// artifact body; the 60 s floor keeps small artifacts
 /// (kilobyte-scale tokenizers, future micro-pins) from getting a
 /// sub-second cap that TLS handshake + request/response round-trip
 /// would blow past before the first body byte arrives. A regression
 /// below the 3 MB/s floor surfaces as a timeout rather than hanging
-/// the test setup until an external watchdog fires. A fixed ceiling
-/// would either over-budget the 11 MiB tokenizer (letting a wedged
-/// download sit for the same 15 min budget a 2.44 GiB model needs)
-/// or starve the model on CDN-throttled CI runners — the linear
-/// formula sizes each artifact independently, and the floor keeps
-/// a pin bump to a future larger model (e.g. 8B ≈ 5 GiB) working
-/// without hand-editing the constant.
+/// the test setup until an external watchdog fires.
+///
+/// The 30 min ceiling bounds the wall clock that a single fetch can
+/// consume regardless of how large the declared size is — without it,
+/// a typo'd or unexpectedly large pin (e.g. a 20 GiB `size_bytes`)
+/// would demand roughly 2 h of linear budget with no CI wall-clock
+/// cap to stop it. The ceiling kicks in at `1800 s × 3 MB/s =
+/// 5.4 GB` of body; every current pin (`DEFAULT_MODEL` ≈ 2.44 GiB,
+/// `DEFAULT_TOKENIZER` ≈ 11 MiB) is well under that crossover and
+/// continues to receive its linear budget unchanged, and a future 5
+/// GiB model pin (`5 × 1024³ / 3_000_000 ≈ 1789 s`) also sits just
+/// under the cap. Pins beyond ~5 GB are the ones we explicitly want
+/// bounded — the ceiling says "any artifact this codebase fetches
+/// either finishes within 30 min or is pathological and should
+/// fail fast so the operator notices."
 ///
 /// No overflow path exists: integer division by the nonzero constant
 /// `FETCH_MIN_BANDWIDTH_BYTES_PER_SEC` cannot panic and produces a
-/// `u64` bounded by `size_bytes`; `u64::max` returns one of its `u64`
-/// operands unchanged; and `Duration::from_secs` accepts any `u64`
-/// without panicking.
+/// `u64` bounded by `size_bytes`; `u64::max` / `u64::min` return one
+/// of their `u64` operands unchanged; and `Duration::from_secs`
+/// accepts any `u64` without panicking.
 fn fetch_timeout_for_size(size_bytes: u64) -> std::time::Duration {
     const FETCH_MIN_TIMEOUT_SECS: u64 = 60;
+    const FETCH_MAX_TIMEOUT_SECS: u64 = 1800;
     const FETCH_MIN_BANDWIDTH_BYTES_PER_SEC: u64 = 3_000_000;
     let body_secs = size_bytes / FETCH_MIN_BANDWIDTH_BYTES_PER_SEC;
-    std::time::Duration::from_secs(body_secs.max(FETCH_MIN_TIMEOUT_SECS))
+    let raw = body_secs.max(FETCH_MIN_TIMEOUT_SECS);
+    std::time::Duration::from_secs(raw.min(FETCH_MAX_TIMEOUT_SECS))
 }
 
 /// Combine `blocks_available` and `fragment_size` from statvfs into
@@ -4534,6 +4547,33 @@ mod tests {
         let tokenizer = fetch_timeout_for_size(DEFAULT_TOKENIZER.size_bytes);
         assert_eq!(tiny, std::time::Duration::from_secs(60));
         assert_eq!(tokenizer, std::time::Duration::from_secs(60));
+    }
+
+    /// Artifacts large enough that the proportional term would
+    /// exceed the 30 min ceiling must clamp to `FETCH_MAX_TIMEOUT_SECS`
+    /// (1800 s). A 20 GiB pin would otherwise demand
+    /// `20 × 1024³ / 3_000_000 ≈ 7158 s` (≈ 2 h) — far longer than
+    /// any CI wall-clock budget — so the ceiling is the thing
+    /// that makes a typo'd or unexpectedly large `size_bytes` fail
+    /// fast instead of sitting wedged until the outer harness
+    /// kills the job. Also pins the ceiling identity: doubling
+    /// the size past the crossover does NOT double the timeout.
+    #[test]
+    fn fetch_timeout_for_size_clamps_to_ceiling_on_oversized_pin() {
+        let twenty_gib: u64 = 20 * 1024 * 1024 * 1024;
+        let got = fetch_timeout_for_size(twenty_gib);
+        assert_eq!(
+            got,
+            std::time::Duration::from_secs(1800),
+            "20 GiB pin must clamp to the 30-minute ceiling, not scale linearly",
+        );
+        let forty_gib: u64 = 40 * 1024 * 1024 * 1024;
+        let got_double = fetch_timeout_for_size(forty_gib);
+        assert_eq!(
+            got_double, got,
+            "doubling size past the ceiling must NOT double the timeout — \
+             ceiling is the thing being pinned",
+        );
     }
 
     /// `filesystem_available_bytes` on a real tempdir must return a

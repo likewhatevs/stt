@@ -1659,18 +1659,254 @@ Hugepagesize:       2048 kB
 
     // -- format_human / diff --
 
+    /// Canonical list of every `HostContext` field name that
+    /// [`HostContext::format_human`] and [`HostContext::diff`] must
+    /// render. Used to pin both surfaces against the same enumeration
+    /// so a new field landing on the struct is caught in the
+    /// render-check tests even if the author remembered to extend
+    /// the destructure bindings but forgot the corresponding `row()`
+    /// call.
+    ///
+    /// The destructuring binds in `format_human` / `diff` already
+    /// force every struct field to appear by NAME (exhaustive
+    /// pattern — a new field without a binding fails to compile).
+    /// What destructure-binding does NOT catch is the follow-on
+    /// "added binding, forgot `row()` call" drift: an unused
+    /// destructure binding is a warning, not an error, under the
+    /// default lint profile, so the renderer can silently drop a
+    /// field. This constant + the paired enumeration-coverage tests
+    /// below close that gap — the test iterates every name here
+    /// against the actual render output.
+    ///
+    /// **When adding a `HostContext` field:** extend this list AND
+    /// both render functions. A missing entry here surfaces as a
+    /// test failure in `format_human_renders_every_documented_field`
+    /// / `diff_renders_every_documented_field`; a missing
+    /// `row()`/destructure binding surfaces as a compile error in
+    /// the render function itself; a struct-field-count / list-
+    /// cardinality mismatch surfaces as a compile error in
+    /// [`struct_field_array`] below (see `_HOST_CONTEXT_FIELD_COUNT_PIN`).
+    const HOST_CONTEXT_FIELDS: &[&str] = &[
+        "kernel_name",
+        "kernel_release",
+        "arch",
+        "cpu_model",
+        "cpu_vendor",
+        "total_memory_kb",
+        "hugepages_total",
+        "hugepages_free",
+        "hugepages_size_kb",
+        "online_cpus",
+        "numa_nodes",
+        "thp_enabled",
+        "thp_defrag",
+        "kernel_cmdline",
+        "cpufreq_governor",
+        "sched_tunables",
+        "heap_state",
+    ];
+
+    /// Consume any value, returning `()`. Test-only helper used
+    /// by [`struct_field_array`] to turn each destructured
+    /// [`HostContext`] field into a `()` slot so the resulting
+    /// fixed-size array's length IS the field count.
+    fn drop_to_unit<T>(_: T) {}
+
+    /// Exhaustive destructure of an owned [`HostContext`] into a
+    /// fixed-size array whose length is statically typed as
+    /// [`HOST_CONTEXT_FIELDS.len()`]. Never called at runtime
+    /// (marked dead_code) — exists purely to cross-enforce the
+    /// three cardinalities that must agree whenever
+    /// [`HostContext`] grows a field.
+    ///
+    /// Compile-time cross-check:
+    ///
+    ///   1. Adding a struct field WITHOUT updating the destructure
+    ///      pattern here triggers `missing fields in pattern` —
+    ///      the destructure uses no `..` rest, so exhaustiveness
+    ///      is enforced by the compiler.
+    ///   2. Adding a destructure binding WITHOUT extending the
+    ///      array initializer below triggers an unused-variable
+    ///      warning AND a length mismatch against the return
+    ///      type `[(); HOST_CONTEXT_FIELDS.len()]`.
+    ///   3. Extending the array initializer WITHOUT growing
+    ///      [`HOST_CONTEXT_FIELDS`] fails at the return-type
+    ///      check: the literal has N+1 elements, the return type
+    ///      demands N.
+    ///
+    /// Dropped by value (non-const fn) — [`HostContext`] owns
+    /// `String`/`Option<String>` which is not const-droppable, so
+    /// this cannot be a `const fn`. The compile-time value is not
+    /// in the call but in the TYPE-CHECKED destructure: the
+    /// function's body is still type-checked by the compiler even
+    /// though no call site exists, which is all this pin needs.
+    #[allow(dead_code)]
+    fn struct_field_array(ctx: HostContext) -> [(); HOST_CONTEXT_FIELDS.len()] {
+        let HostContext {
+            cpu_model,
+            cpu_vendor,
+            total_memory_kb,
+            hugepages_total,
+            hugepages_free,
+            hugepages_size_kb,
+            thp_enabled,
+            thp_defrag,
+            sched_tunables,
+            online_cpus,
+            numa_nodes,
+            cpufreq_governor,
+            kernel_name,
+            kernel_release,
+            arch,
+            kernel_cmdline,
+            heap_state,
+        } = ctx;
+        [
+            drop_to_unit(cpu_model),
+            drop_to_unit(cpu_vendor),
+            drop_to_unit(total_memory_kb),
+            drop_to_unit(hugepages_total),
+            drop_to_unit(hugepages_free),
+            drop_to_unit(hugepages_size_kb),
+            drop_to_unit(thp_enabled),
+            drop_to_unit(thp_defrag),
+            drop_to_unit(sched_tunables),
+            drop_to_unit(online_cpus),
+            drop_to_unit(numa_nodes),
+            drop_to_unit(cpufreq_governor),
+            drop_to_unit(kernel_name),
+            drop_to_unit(kernel_release),
+            drop_to_unit(arch),
+            drop_to_unit(kernel_cmdline),
+            drop_to_unit(heap_state),
+        ]
+    }
+
+    /// Compile-time cardinality pin. The three surfaces that
+    /// must stay in lock-step when [`HostContext`] grows a
+    /// field:
+    ///
+    ///   - struct field count (source of truth),
+    ///   - [`struct_field_array`] destructure + initializer
+    ///     (three-way compile-time cross-check per its doc),
+    ///   - [`HOST_CONTEXT_FIELDS`] name list (runtime
+    ///     enumeration-coverage tests consume this).
+    ///
+    /// The struct ↔ destructure link is compile-enforced by the
+    /// exhaustive pattern; the destructure ↔ array link is
+    /// compile-enforced by the return-type literal length. This
+    /// `const {}` block closes the remaining link by asserting
+    /// the name list length equals the array length. A mismatch
+    /// on any of the three surfaces aborts the build with a
+    /// named diagnostic.
+    #[allow(dead_code)]
+    const _HOST_CONTEXT_FIELD_COUNT_PIN: () = {
+        assert!(
+            HOST_CONTEXT_FIELDS.len() == 17,
+            "HOST_CONTEXT_FIELDS cardinality drifted from the \
+             HostContext struct — if a field was added, extend \
+             HOST_CONTEXT_FIELDS, struct_field_array's destructure, \
+             and struct_field_array's initializer together; then \
+             bump this literal from 17 to the new field count",
+        );
+    };
+
+    /// `format_human` must emit a row for every name in
+    /// [`HOST_CONTEXT_FIELDS`]. Runs against the default context
+    /// because every row renders regardless of value — the
+    /// enumeration check is about which NAMES land in the output,
+    /// not what values sit on the right of each colon.
+    ///
+    /// Catches the "added a struct field, extended the
+    /// destructure, forgot the `row(&mut out, "foo", ...)` call"
+    /// regression that the compile-time destructure check does not
+    /// catch.
+    #[test]
+    fn format_human_renders_every_documented_field() {
+        let out = HostContext::default().format_human();
+        for key in HOST_CONTEXT_FIELDS {
+            assert!(
+                out.contains(&format!("{key}:")),
+                "field '{key}' is declared in HOST_CONTEXT_FIELDS but does \
+                 not appear in format_human output — either the `row()` \
+                 call was forgotten or the field name drifted:\n{out}",
+            );
+        }
+    }
+
+    /// `diff` must emit a row for every name in
+    /// [`HOST_CONTEXT_FIELDS`] when the two contexts differ on
+    /// every field. Mirror of
+    /// `format_human_renders_every_documented_field` for the diff
+    /// surface — a field that is destructured on both halves but
+    /// never reaches a `row()` / per-key diff loop silently
+    /// disappears from `show-host` diff output.
+    ///
+    /// Construction: fixture A is the default (every Option
+    /// `None`); fixture B flips each field to a distinct
+    /// populated value. The expected diff therefore names every
+    /// field.
+    #[test]
+    fn diff_renders_every_documented_field() {
+        let a = HostContext::default();
+        let mut b = HostContext::default();
+        b.kernel_name = Some("Linux".to_string());
+        b.kernel_release = Some("6.11.0".to_string());
+        b.arch = Some("x86_64".to_string());
+        b.cpu_model = Some("Example CPU".to_string());
+        b.cpu_vendor = Some("GenuineIntel".to_string());
+        b.total_memory_kb = Some(16_384_000);
+        b.hugepages_total = Some(0);
+        b.hugepages_free = Some(0);
+        b.hugepages_size_kb = Some(2048);
+        b.online_cpus = Some(8);
+        b.numa_nodes = Some(1);
+        b.thp_enabled = Some("always [madvise] never".to_string());
+        b.thp_defrag = Some("always [madvise] never".to_string());
+        b.kernel_cmdline = Some("preempt=lazy".to_string());
+        b.cpufreq_governor
+            .insert(0, "performance".to_string());
+        let mut tunables = BTreeMap::new();
+        tunables.insert("sched_migration_cost_ns".to_string(), "500000".to_string());
+        b.sched_tunables = Some(tunables);
+        let mut heap = crate::host_heap::HostHeapState::default();
+        heap.active_bytes = Some(1);
+        heap.allocated_bytes = Some(2);
+        heap.resident_bytes = Some(3);
+        heap.mapped_bytes = Some(4);
+        heap.narenas = Some(1);
+        b.heap_state = Some(heap);
+
+        let out = a.diff(&b);
+        for key in HOST_CONTEXT_FIELDS {
+            // Accept both forms that the diff renderer uses:
+            //   `{key}:` — scalar/Option fields emitted by the
+            //       shared `row()` helper;
+            //   `{key}.` — structured/map fields (`cpufreq_governor`,
+            //       `sched_tunables`) emitted as dotted per-key rows.
+            let direct = format!("{key}:");
+            let dotted = format!("{key}.");
+            assert!(
+                out.contains(&direct) || out.contains(&dotted),
+                "field '{key}' is declared in HOST_CONTEXT_FIELDS but does \
+                 not appear (as '{direct}' or '{dotted}') in diff output \
+                 against a fully-populated partner — either the per-field \
+                 row was forgotten or the field name drifted:\n{out}",
+            );
+        }
+    }
+
     /// Snapshot-style pin of the label sequence `format_human`
     /// emits. The order is load-bearing — downstream diff tools and
     /// operator-eye scanning depend on a stable top-to-bottom field
     /// ordering (uname → CPU → memory → hugepages → online_cpus →
     /// NUMA → THP → kernel_cmdline → cpufreq_governor →
-    /// sched_tunables → heap_state). A silent
-    /// reorder from a future edit that shuffles the `row(...)`
-    /// calls would slip past the existing `.contains(...)` checks,
-    /// which are order-blind. This test fails the moment the
-    /// sequence drifts; updating it forces the author to
-    /// acknowledge the reorder and double-check that downstream
-    /// consumers can absorb it.
+    /// sched_tunables → heap_state). A silent reorder from a future
+    /// edit that shuffles the `row(...)` calls would slip past the
+    /// existing `.contains(...)` checks, which are order-blind.
+    /// This test fails the moment the sequence drifts; updating it
+    /// forces the author to acknowledge the reorder and
+    /// double-check that downstream consumers can absorb it.
     #[test]
     fn format_human_field_order_is_stable() {
         let out = HostContext::default().format_human();

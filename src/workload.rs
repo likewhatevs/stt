@@ -889,6 +889,16 @@ const MPOL_WEIGHTED_INTERLEAVE: i32 = 6;
 /// paragraph for the caller-facing contract.
 const WORKER_STOP_POLL_NS: libc::c_long = 100_000_000;
 
+/// Packaged [`libc::timespec`] for every worker-side `futex_wait`
+/// across the blocking workload primitives. Duplicating the struct
+/// literal per call site drifted the `tv_nsec` field between variants
+/// during earlier edits; a single const keeps the shutdown-latency
+/// budget documented on [`WORKER_STOP_POLL_NS`] authoritative.
+const FUTEX_WAIT_TIMEOUT: libc::timespec = libc::timespec {
+    tv_sec: 0,
+    tv_nsec: WORKER_STOP_POLL_NS,
+};
+
 /// Call `set_mempolicy(2)` for the current process with mode flags.
 ///
 /// No-op for `MemPolicy::Default`. Logs a warning on syscall failure.
@@ -1572,7 +1582,31 @@ impl WorkloadHandle {
                     )
                 };
                 if ptr == libc::MAP_FAILED {
-                    anyhow::bail!("mmap failed: {}", std::io::Error::last_os_error());
+                    let errno = std::io::Error::last_os_error();
+                    let hint = match errno.raw_os_error() {
+                        Some(libc::ENOMEM) => " (ENOMEM: host is out of memory \
+                             or /proc/sys/vm/max_map_count is too low — \
+                             check `sysctl vm.max_map_count` and `free -h`)",
+                        Some(libc::EPERM) => " (EPERM: the caller is not \
+                             permitted to create this mapping — check \
+                             MAP_SHARED restrictions on the mount or \
+                             memory cgroup limits)",
+                        Some(libc::EINVAL) => " (EINVAL: invalid length or \
+                             flag combination — likely a future caller \
+                             passed a zero or misaligned region size)",
+                        _ => "",
+                    };
+                    anyhow::bail!(
+                        "mmap(MAP_SHARED|MAP_ANONYMOUS, {futex_region_size} bytes) \
+                         for a futex shared-memory region failed: {errno}{hint}; \
+                         this region backs the {:?} worker-group's \
+                         inter-process futex word and is allocated \
+                         before fork so every child inherits the same \
+                         mapping. Remediation: reduce num_workers (each \
+                         futex group consumes one shared page) or raise \
+                         `vm.max_map_count` / the memory cgroup limit.",
+                        config.work_type.name(),
+                    );
                 }
                 unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, futex_region_size) };
                 guard.futex_ptrs.push(ptr as *mut u32);
@@ -1605,9 +1639,28 @@ impl WorkloadHandle {
                 )
             };
             if ptr == libc::MAP_FAILED {
+                let errno = std::io::Error::last_os_error();
+                let hint = match errno.raw_os_error() {
+                    Some(libc::ENOMEM) => " (ENOMEM: host is out of memory \
+                         or /proc/sys/vm/max_map_count is too low — check \
+                         `sysctl vm.max_map_count` and `free -h`)",
+                    Some(libc::EPERM) => " (EPERM: MAP_SHARED|MAP_ANONYMOUS \
+                         rejected by the kernel — check memory cgroup \
+                         limits and container seccomp policy)",
+                    Some(libc::EINVAL) => " (EINVAL: invalid length or \
+                         flag combination — iter_counter_len may have \
+                         produced a zero or overflowing size)",
+                    _ => "",
+                };
                 anyhow::bail!(
-                    "mmap iter_counters failed: {}",
-                    std::io::Error::last_os_error()
+                    "mmap(MAP_SHARED|MAP_ANONYMOUS, {size} bytes) for the \
+                     per-worker iter_counters region failed: {errno}{hint}; \
+                     this region holds one AtomicU64 per worker \
+                     ({iter_counter_len} slots) so the parent can snapshot \
+                     iteration counts via `snapshot_iterations()`. \
+                     Remediation: reduce num_workers (each worker consumes \
+                     8 bytes of this region, rounded up to a page) or raise \
+                     `vm.max_map_count` / the memory cgroup limit.",
                 );
             }
             guard.iter_counters = ptr as *mut AtomicU64;
@@ -2603,23 +2656,23 @@ fn worker_main(
                 // Worker B waits for 1, wakes partner with 0.
                 let my_val: u32 = if is_first { 0 } else { 1 };
                 let partner_val: u32 = if is_first { 1 } else { 0 };
-                // Wake partner
-                unsafe {
-                    std::ptr::write_volatile(futex_ptr, partner_val);
-                    futex_wake(futex_ptr, 1);
-                }
+                // Wake partner. The signal value is the token itself;
+                // Relaxed matches the FanOutCompute / MutexContention
+                // idiom — the futex syscall provides the kernel-side
+                // cross-thread ordering, no extra user-space barrier
+                // is needed for this single-word handshake.
+                let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
+                atom.store(partner_val, Ordering::Relaxed);
+                unsafe { futex_wake(futex_ptr, 1) };
                 // Wait for partner to set our expected value, with timeout
                 // to avoid blocking forever if partner has stopped.
                 let before_block = Instant::now();
-                let ts = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: WORKER_STOP_POLL_NS,
-                };
+                let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
                 loop {
                     if STOP.load(Ordering::Relaxed) {
                         break;
                     }
-                    let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
+                    let cur = atom.load(Ordering::Relaxed);
                     if cur == my_val {
                         reservoir_push(
                             &mut resume_latencies_ns,
@@ -2629,7 +2682,7 @@ fn worker_main(
                         );
                         break;
                     }
-                    unsafe { futex_wait(futex_ptr, partner_val, &ts) };
+                    unsafe { futex_wait(futex_ptr, partner_val, &FUTEX_WAIT_TIMEOUT) };
                 }
                 // Reset last_iter_time after blocking step
                 last_iter_time = Instant::now();
@@ -2691,31 +2744,29 @@ fn worker_main(
                     None => break,
                 };
                 spin_burst(&mut work_units, spin_iters);
+                // Atomic-Relaxed idiom matches FanOutCompute /
+                // MutexContention; futex syscalls supply the kernel-
+                // side ordering for this generation-counter advance.
+                let atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
                 if is_messenger {
                     // Increment generation counter and wake all receivers.
-                    let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
+                    let next = atom.load(Ordering::Relaxed).wrapping_add(1);
                     let wake_n = clamp_futex_wake_n(fan_out);
-                    unsafe {
-                        std::ptr::write_volatile(futex_ptr, next);
-                        futex_wake(futex_ptr, wake_n);
-                    }
+                    atom.store(next, Ordering::Relaxed);
+                    unsafe { futex_wake(futex_ptr, wake_n) };
                     // Short spin to let receivers run before next wake cycle.
                     for _ in 0..256 {
                         std::hint::spin_loop();
                     }
                 } else {
                     // Receiver: wait for the generation counter to advance.
-                    let expected = unsafe { std::ptr::read_volatile(futex_ptr) };
+                    let expected = atom.load(Ordering::Relaxed);
                     let before_block = Instant::now();
-                    let ts = libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: WORKER_STOP_POLL_NS,
-                    };
                     loop {
                         if STOP.load(Ordering::Relaxed) {
                             break;
                         }
-                        let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
+                        let cur = atom.load(Ordering::Relaxed);
                         if cur != expected {
                             reservoir_push(
                                 &mut resume_latencies_ns,
@@ -2725,7 +2776,7 @@ fn worker_main(
                             );
                             break;
                         }
-                        unsafe { futex_wait(futex_ptr, expected, &ts) };
+                        unsafe { futex_wait(futex_ptr, expected, &FUTEX_WAIT_TIMEOUT) };
                     }
                 }
                 last_iter_time = Instant::now();
@@ -3048,10 +3099,6 @@ fn worker_main(
                     // correctly on every advance.
                     let expected = gen_atom.load(Ordering::Relaxed);
                     let expected_low = expected as u32;
-                    let ts = libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: WORKER_STOP_POLL_NS,
-                    };
                     loop {
                         if STOP.load(Ordering::Relaxed) {
                             break;
@@ -3081,7 +3128,7 @@ fn worker_main(
                             }
                             break;
                         }
-                        unsafe { futex_wait(futex_ptr, expected_low, &ts) };
+                        unsafe { futex_wait(futex_ptr, expected_low, &FUTEX_WAIT_TIMEOUT) };
                     }
                     if sleep_usec > 0 && !STOP.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_micros(sleep_usec));
@@ -3106,7 +3153,15 @@ fn worker_main(
                 let (ptr, region_size) = match page_fault_region {
                     Some(p) => p,
                     None => {
-                        let region_size = region_kb * 1024;
+                        // `region_kb * 1024` overflows usize on 32-bit
+                        // targets for region_kb >= 4 MiB-equivalent;
+                        // `checked_mul` returns None there and the
+                        // workload silently finishes this iteration
+                        // rather than wrapping to a tiny region.
+                        let region_size = match region_kb.checked_mul(1024) {
+                            Some(v) => v,
+                            None => break,
+                        };
                         let ptr = unsafe {
                             libc::mmap(
                                 std::ptr::null_mut(),
@@ -3186,12 +3241,12 @@ fn worker_main(
                         break;
                     }
                     let before_block = Instant::now();
-                    let ts = libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: WORKER_STOP_POLL_NS,
-                    };
                     unsafe {
-                        futex_wait(futex_ptr, 1u32 /* expected value (locked) */, &ts)
+                        futex_wait(
+                            futex_ptr,
+                            1u32, /* expected value (locked) */
+                            &FUTEX_WAIT_TIMEOUT,
+                        )
                     };
                     reservoir_push(
                         &mut resume_latencies_ns,
@@ -3697,6 +3752,26 @@ pub fn set_thread_affinity(pid: libc::pid_t, cpus: &BTreeSet<usize>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `clock_gettime_ns(CLOCK_MONOTONIC)` must never observe time
+    /// moving backwards between two sequential calls on the same
+    /// thread. Pins the non-decreasing contract the wake-latency
+    /// reservoirs depend on: the messenger stamps `wake_ns` into
+    /// shared memory and the worker subtracts to compute
+    /// `now_ns - wake_ns`; a backward step would saturate to zero
+    /// in the subtractor and silently discard a valid sample, or
+    /// (without the saturator) wrap to `u64::MAX`.
+    #[test]
+    fn clock_gettime_ns_monotonic_non_decreasing() {
+        let first = clock_gettime_ns(libc::CLOCK_MONOTONIC)
+            .expect("CLOCK_MONOTONIC must be readable on any Linux host");
+        let second = clock_gettime_ns(libc::CLOCK_MONOTONIC)
+            .expect("CLOCK_MONOTONIC must be readable on any Linux host");
+        assert!(
+            second >= first,
+            "CLOCK_MONOTONIC went backwards: first={first} second={second}",
+        );
+    }
 
     // ---- classify_wait_outcome variant coverage ------------------------
     //
