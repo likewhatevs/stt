@@ -171,6 +171,25 @@ pub struct HostContext {
     /// for synthetic/test topologies).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub numa_nodes: Option<usize>,
+    /// Per-CPU scaling_governor string, keyed by CPU id. Read
+    /// from `/sys/devices/system/cpu/cpu{N}/cpufreq/scaling_governor`
+    /// for every online CPU. Value is the trimmed governor name
+    /// as written by the kernel (e.g. `"performance"`,
+    /// `"powersave"`, `"schedutil"`, `"ondemand"`).
+    ///
+    /// Per-CPU granularity matters: heterogeneous hosts (big.LITTLE,
+    /// P/E cores) can carry different governors on different CPUs,
+    /// and a scheduler micro-benchmark landing on a `powersave`
+    /// CPU sees 2× the latency of one landing on a `performance`
+    /// CPU. A run-level single-governor field would average this
+    /// out and hide the variance.
+    ///
+    /// Empty map when `/sys/devices/system/cpu/online` is
+    /// unreadable (sysfs absent, container without it mounted)
+    /// or when every per-CPU read fails. `skip_serializing_if`
+    /// keeps the sidecar compact on hosts without the data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cpufreq_governor: BTreeMap<usize, String>,
     /// Kernel name — `uname.sysname` (typically `"Linux"`).
     /// The nodename field is intentionally dropped; it's a local
     /// hostname and has no place in a published sidecar.
@@ -258,6 +277,13 @@ impl HostContext {
             sched_tunables: Some(sched_tunables),
             online_cpus: Some(16),
             numa_nodes: Some(2),
+            cpufreq_governor: {
+                let mut m = BTreeMap::new();
+                for cpu in 0..16 {
+                    m.insert(cpu, "performance".to_string());
+                }
+                m
+            },
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some("6.16.0-test".to_string()),
             arch: Some("x86_64".to_string()),
@@ -312,6 +338,7 @@ impl HostContext {
             sched_tunables,
             online_cpus,
             numa_nodes,
+            cpufreq_governor,
             kernel_name,
             kernel_release,
             arch,
@@ -342,6 +369,14 @@ impl HostContext {
         row(&mut out, "thp_enabled", thp_enabled.as_ref());
         row(&mut out, "thp_defrag", thp_defrag.as_ref());
         row(&mut out, "kernel_cmdline", kernel_cmdline.as_ref());
+        if cpufreq_governor.is_empty() {
+            out.push_str("cpufreq_governor: (empty)\n");
+        } else {
+            out.push_str("cpufreq_governor:\n");
+            for (cpu, gov) in cpufreq_governor {
+                let _ = writeln!(&mut out, "  cpu{cpu} = {gov}");
+            }
+        }
         match sched_tunables {
             Some(map) if !map.is_empty() => {
                 out.push_str("sched_tunables:\n");
@@ -387,6 +422,7 @@ impl HostContext {
             sched_tunables: a_sched_tunables,
             online_cpus: a_online_cpus,
             numa_nodes: a_numa_nodes,
+            cpufreq_governor: a_cpufreq_governor,
             kernel_name: a_kernel_name,
             kernel_release: a_kernel_release,
             arch: a_arch,
@@ -404,6 +440,7 @@ impl HostContext {
             sched_tunables: b_sched_tunables,
             online_cpus: b_online_cpus,
             numa_nodes: b_numa_nodes,
+            cpufreq_governor: b_cpufreq_governor,
             kernel_name: b_kernel_name,
             kernel_release: b_kernel_release,
             arch: b_arch,
@@ -469,6 +506,24 @@ impl HostContext {
         row(&mut out, "thp_enabled", a_thp_enabled.as_ref(), b_thp_enabled.as_ref());
         row(&mut out, "thp_defrag", a_thp_defrag.as_ref(), b_thp_defrag.as_ref());
         row(&mut out, "kernel_cmdline", a_kernel_cmdline.as_ref(), b_kernel_cmdline.as_ref());
+        {
+            let mut cpus: std::collections::BTreeSet<usize> =
+                std::collections::BTreeSet::new();
+            cpus.extend(a_cpufreq_governor.keys().copied());
+            cpus.extend(b_cpufreq_governor.keys().copied());
+            for cpu in cpus {
+                let av = a_cpufreq_governor.get(&cpu);
+                let bv = b_cpufreq_governor.get(&cpu);
+                if av != bv {
+                    let _ = writeln!(
+                        &mut out,
+                        "  cpufreq_governor.cpu{cpu}: {} → {}",
+                        av.map(String::as_str).unwrap_or("(absent)"),
+                        bv.map(String::as_str).unwrap_or("(absent)"),
+                    );
+                }
+            }
+        }
         match (a_sched_tunables.as_ref(), b_sched_tunables.as_ref()) {
             (Some(am), Some(bm)) => {
                 let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -619,11 +674,38 @@ pub fn collect_host_context() -> HostContext {
         sched_tunables: read_sched_tunables(),
         online_cpus: static_info.online_cpus,
         numa_nodes: static_info.numa_nodes,
+        cpufreq_governor: read_cpufreq_governors(),
         kernel_name: static_info.kernel_name,
         kernel_release: static_info.kernel_release,
         arch: static_info.arch,
         kernel_cmdline: read_trimmed_sysfs("/proc/cmdline"),
     }
+}
+
+/// Read `scaling_governor` for every online CPU, keyed by CPU
+/// id. Reads `/sys/devices/system/cpu/cpu{N}/cpufreq/scaling_governor`
+/// for each entry in `/sys/devices/system/cpu/online`. Returns an
+/// empty map when `/sys/devices/system/cpu/online` is unreadable
+/// (sysfs absent, constrained container) or when every per-CPU
+/// read fails. A CPU with no `cpufreq/` directory (non-CPUFREQ
+/// kernel, VM without passthrough) contributes no entry — the
+/// missing-key shape is the "no governor reported" signal for
+/// consumers.
+fn read_cpufreq_governors() -> BTreeMap<usize, String> {
+    let Ok(online_raw) = std::fs::read_to_string("/sys/devices/system/cpu/online") else {
+        return BTreeMap::new();
+    };
+    let Ok(cpus) = crate::topology::parse_cpu_list(&online_raw) else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    for cpu in cpus {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor");
+        if let Some(gov) = read_trimmed_sysfs(&path) {
+            out.insert(cpu, gov);
+        }
+    }
+    out
 }
 
 /// Populate the static-fields cache on first access. Takes the
@@ -1078,6 +1160,7 @@ mod tests {
             sched_tunables: Some(tunables),
             online_cpus: Some(16),
             numa_nodes: Some(2),
+            cpufreq_governor: BTreeMap::new(),
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
@@ -1124,6 +1207,7 @@ mod tests {
             thp_defrag: None,
             online_cpus: None,
             numa_nodes: None,
+            cpufreq_governor: BTreeMap::new(),
             kernel_cmdline: None,
         };
         let json = serde_json::to_string(&ctx).expect("serialize");
@@ -1460,7 +1544,8 @@ Hugepagesize:       2048 kB
     /// emits. The order is load-bearing — downstream diff tools and
     /// operator-eye scanning depend on a stable top-to-bottom field
     /// ordering (uname → CPU → memory → hugepages → online_cpus →
-    /// NUMA → THP → kernel_cmdline → sched_tunables). A silent
+    /// NUMA → THP → kernel_cmdline → cpufreq_governor →
+    /// sched_tunables). A silent
     /// reorder from a future edit that shuffles the `row(...)`
     /// calls would slip past the existing `.contains(...)` checks,
     /// which are order-blind. This test fails the moment the
@@ -1492,6 +1577,7 @@ Hugepagesize:       2048 kB
                 "thp_enabled",
                 "thp_defrag",
                 "kernel_cmdline",
+                "cpufreq_governor",
                 "sched_tunables",
             ],
             "format_human field order drifted — if intentional, update \
@@ -1499,14 +1585,17 @@ Hugepagesize:       2048 kB
         );
     }
 
-    /// `format_human` on a default (all-`None`) context must
-    /// render every field explicitly as `(unknown)` rather than
-    /// dropping the field. Silently suppressing absent fields
-    /// would hide collection failures from the operator running
+    /// `format_human` on a default context must render every
+    /// field visibly — scalar/Option fields as `(unknown)`, and
+    /// collection-typed fields (cpufreq_governor, sched_tunables)
+    /// as `(empty)` when their default-construct is a zero-length
+    /// map. Silently suppressing absent or empty fields would
+    /// hide collection failures from the operator running
     /// `cargo ktstr show-host` on a degraded host.
     #[test]
     fn format_human_default_renders_unknown_everywhere() {
         let out = HostContext::default().format_human();
+        // Scalar / Option fields render as `(unknown)`.
         for key in [
             "kernel_name",
             "kernel_release",
@@ -1529,6 +1618,16 @@ Hugepagesize:       2048 kB
                 "key '{key}' must render as (unknown) on a default context, got:\n{out}",
             );
         }
+        // Collection-typed fields whose default is an EMPTY map
+        // (not `None` — the struct field type is `BTreeMap`, not
+        // `Option<BTreeMap>`). They render as `(empty)` to
+        // distinguish "collected an empty set" from "not
+        // collected". cpufreq_governor's type is `BTreeMap`,
+        // so `Default::default()` gives an empty map.
+        assert!(
+            out.contains("cpufreq_governor: (empty)"),
+            "cpufreq_governor must render as (empty) on default context, got:\n{out}",
+        );
         assert!(
             out.ends_with('\n'),
             "format_human must end with a newline for direct print!() use",
@@ -1639,6 +1738,100 @@ Hugepagesize:       2048 kB
             !out.contains("kernel_release"),
             "unchanged kernel_release must not appear: {out}",
         );
+    }
+
+    /// Per-CPU cpufreq_governor diff: unchanged CPUs omitted,
+    /// a CPU present in one side only renders as `(absent)`, a
+    /// value change renders as `old → new`. Mirrors the
+    /// `sched_tunables.<key>` per-key pattern so operators
+    /// running `stats compare` see governor churn per-CPU rather
+    /// than a collapsed "N entries changed" summary.
+    #[test]
+    fn diff_cpufreq_governor_both_empty_produces_no_lines() {
+        let a = HostContext::default();
+        let b = HostContext::default();
+        let out = a.diff(&b);
+        assert!(
+            !out.contains("cpufreq_governor"),
+            "two empty cpufreq_governor maps must not emit any \
+             diff lines: {out}",
+        );
+    }
+
+    #[test]
+    fn diff_cpufreq_governor_cpu_only_in_a_shows_absent() {
+        let mut a_gov = BTreeMap::new();
+        a_gov.insert(0, "performance".to_string());
+        let a = HostContext {
+            cpufreq_governor: a_gov,
+            ..HostContext::default()
+        };
+        let b = HostContext::default();
+        let out = a.diff(&b);
+        assert!(
+            out.contains("cpufreq_governor.cpu0: performance → (absent)"),
+            "cpu0 removed must render as <value> → (absent): {out}",
+        );
+    }
+
+    #[test]
+    fn diff_cpufreq_governor_value_change_shows_old_arrow_new() {
+        let mut a_gov = BTreeMap::new();
+        a_gov.insert(0, "performance".to_string());
+        a_gov.insert(1, "powersave".to_string());
+        let mut b_gov = BTreeMap::new();
+        b_gov.insert(0, "schedutil".to_string());
+        b_gov.insert(1, "powersave".to_string());
+        let a = HostContext {
+            cpufreq_governor: a_gov,
+            ..HostContext::default()
+        };
+        let b = HostContext {
+            cpufreq_governor: b_gov,
+            ..HostContext::default()
+        };
+        let out = a.diff(&b);
+        assert!(
+            out.contains("cpufreq_governor.cpu0: performance → schedutil"),
+            "cpu0 change must appear as old → new: {out}",
+        );
+        assert!(
+            !out.contains("cpufreq_governor.cpu1"),
+            "unchanged cpu1 (both powersave) must not appear: {out}",
+        );
+    }
+
+    /// When the host exposes `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`,
+    /// `read_cpufreq_governors` must return a non-empty map with
+    /// non-empty trimmed governor values. Kernels compiled
+    /// without `CONFIG_CPU_FREQ` — most VMs, many containers —
+    /// have no `cpufreq/` directory per-CPU; treat that as a
+    /// skip rather than a failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_cpufreq_governors_returns_populated_map_when_sysfs_exposes_it() {
+        use std::path::Path;
+        let cpu0_gov = Path::new("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+        if !cpu0_gov.exists() {
+            eprintln!(
+                "skipping: /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor \
+                 absent (kernel without CONFIG_CPU_FREQ or VM without passthrough)"
+            );
+            return;
+        }
+        let m = read_cpufreq_governors();
+        assert!(
+            !m.is_empty(),
+            "cpu0 scaling_governor is present on-disk — map must be \
+             non-empty; got {m:?}"
+        );
+        for (cpu, gov) in &m {
+            assert!(
+                !gov.is_empty(),
+                "cpu{cpu} governor string is empty after trim; sysfs \
+                 usually writes non-empty content",
+            );
+        }
     }
 
     /// `None → Some(..)` renders as `(unknown) → <value>` so a

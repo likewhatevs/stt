@@ -2,12 +2,49 @@
 //! `ktstr-jemalloc-alloc-worker` binary and the integration tests
 //! that drive it.
 //!
-//! The worker writes a pid-scoped file after its allocation + black-box
-//! triple completes; the test body polls for that file before launching
-//! the probe. Centralizing the path format here keeps the worker
-//! (`src/bin/jemalloc_alloc_worker.rs`) and the test
-//! (`tests/jemalloc_probe_tests.rs`) in sync — a rename changes one
-//! place, not two.
+//! # Worker → probe ready signaling mechanism (design)
+//!
+//! The worker writes a pid-scoped file after its allocation +
+//! black-box triple completes; the test body polls for that file
+//! before launching the probe. Centralizing the path format here
+//! keeps the worker (`src/bin/jemalloc_alloc_worker.rs`) and the
+//! test (`tests/jemalloc_probe_tests.rs`) in sync — a rename
+//! changes one place, not two.
+//!
+//! Medium: **a file on the shared `/tmp`**. The path is
+//! `/tmp/ktstr-worker-ready-<pid>` where `<pid>` is the worker's
+//! decimal pid (see [`worker_ready_marker_path`] / [`WORKER_READY_MARKER_PREFIX`]).
+//! The worker issues `std::fs::write(path, b"ready\n")` on
+//! ready; the test polls `Path::exists` in a bounded loop (see
+//! `wait_for_worker_ready` in the sibling `worker_ready_wait`
+//! module).
+//!
+//! Why a file-on-tmp rather than a pipe / unix socket / vsock /
+//! stdout-token?
+//!
+//! - **Minimal setup before the worker's own allocation path.**
+//!   The probe must observe the worker's post-allocation heap
+//!   state, not any pre-signaling setup cost. `std::fs::write`
+//!   against an existing tmp directory is three syscalls
+//!   (`openat` + `write` + `close`) on already-hot kernel
+//!   caches; a socket would add `socket` + `connect` +
+//!   `sendto` against a daemon that would itself need to be
+//!   provisioned by the harness.
+//! - **Shared filesystem namespace without dedicated plumbing.**
+//!   Both the worker and the test body run as subprocesses
+//!   inside the SAME `#[ktstr_test]` guest VM.
+//!   `PayloadRun::spawn` creates the worker via
+//!   `std::process::Command`, which inherits the parent's
+//!   (guest-side) filesystem namespace, so the two processes
+//!   see the same guest-VM tmpfs `/tmp`. No host involvement,
+//!   no bind-mount, no guest↔host bridge. A socket path would
+//!   still require a dedicated in-VM dispatcher; vsock would
+//!   require a cid allocation.
+//! - **No process-of-write hard dependency.** A pipe close or
+//!   EOF on the worker's stdout would also signal readiness,
+//!   but any crashing worker would look the same — the file
+//!   approach surfaces "worker reached the signaling point"
+//!   distinctly from "worker died before signaling".
 //!
 //! # Dual-compilation constraint — MUST STAY STD-ONLY
 //!
@@ -45,29 +82,33 @@
 //! `PayloadHandle` and therefore depends on the rest of the
 //! library.
 //!
-//! # Host ↔ guest assumptions
+//! # In-VM invariants
 //!
-//! The ready-marker scheme relies on two properties that the ktstr
-//! harness supplies:
+//! The ready-marker scheme relies on two properties that the
+//! `#[ktstr_test]` VM environment supplies:
 //!
-//! - **Shared `/tmp` between worker and reader.** The `#[ktstr_test]`
-//!   integration-test flow reads the marker from the host-side
-//!   `PayloadHandle::pid()` after the worker writes the file inside
-//!   the guest VM — same logical `/tmp` because the harness bind-
-//!   mounts the host's `/tmp` into the guest at boot (see
-//!   `build_vm_builder_base`). The marker is NOT transported over a
-//!   socket / pipe: if the harness ever stops sharing `/tmp`, the
-//!   poll will always time out and the ready-signal must move to a
-//!   different medium (unix socket, `vsock`, or a stdout-token parse).
+//! - **Shared `/tmp` between worker and reader.** Both the
+//!   worker and the test body run as subprocesses inside the
+//!   same guest VM, spawned via `PayloadRun::spawn` →
+//!   `std::process::Command`. The child inherits the parent's
+//!   guest-side filesystem namespace, so both processes see
+//!   the same guest-VM tmpfs `/tmp`. The marker is NOT
+//!   transported over a socket / pipe: if a future refactor
+//!   puts the worker in a distinct filesystem namespace
+//!   (e.g. via `unshare --mount` or a separate VM), the poll
+//!   will always time out and the ready-signal must move to a
+//!   different medium (unix socket, `vsock`, or a stdout-token
+//!   parse).
 //! - **`PayloadHandle::pid() == std::process::id()` inside the guest.**
-//!   Host-side `PayloadHandle::pid()` returns the pid the harness
-//!   allocated for the payload process, which is the same pid the
-//!   worker observes via `getpid()` / `std::process::id()` inside
-//!   the guest — single-namespace because the worker runs without
-//!   a separate pid-namespace. Consumers that add a pid-namespace
-//!   or run the worker under something like `unshare --fork --pid`
-//!   must also translate the pid before constructing the path, or
-//!   the reader polls a path that the writer never materialized.
+//!   The test body reads `PayloadHandle::pid()` to learn the
+//!   worker's pid, which is the same pid the worker observes
+//!   via `getpid()` / `std::process::id()` inside the VM —
+//!   single-namespace because the worker runs without a
+//!   separate pid-namespace. Consumers that add a pid-namespace
+//!   or run the worker under something like `unshare --fork
+//!   --pid` must also translate the pid before constructing
+//!   the path, or the reader polls a path that the writer
+//!   never materialized.
 //!
 //! Both properties are invariants the `ktstr-jemalloc-alloc-worker`
 //! + `jemalloc_probe_tests.rs` pair depends on; breaking either

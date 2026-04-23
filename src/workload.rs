@@ -1118,6 +1118,19 @@ pub struct WorkerReport {
     pub schedstat_run_count: u64,
     /// Delta of /proc/self/schedstat field 1 (cpu_time) over the work loop.
     pub schedstat_cpu_time_ns: u64,
+    /// `true` when the worker reached its natural end — either the
+    /// outer work loop observed STOP and exited cleanly, or a
+    /// custom-closure payload returned from its `run` function. A
+    /// sentinel report synthesised by
+    /// [`WorkloadHandle::stop_and_collect`]'s JSON-parse fallback
+    /// (see `exit_info` below) carries `false`. Lets downstream
+    /// consumers distinguish "worker ran to completion and
+    /// observed zero iterations" (`completed: true, iterations: 0`
+    /// — legitimate for pathologically short test windows) from
+    /// "worker died / timed out before recording anything"
+    /// (`completed: false, iterations: 0` — the sentinel shape).
+    #[serde(default)]
+    pub completed: bool,
     /// Per-NUMA-node page counts from `/proc/self/numa_maps` after workload.
     /// Keyed by node ID. Empty when numa_maps is unavailable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -3145,6 +3158,7 @@ fn worker_main(
         schedstat_run_delay_ns: ss_delay_delta,
         schedstat_run_count: ss_ts_delta,
         schedstat_cpu_time_ns: ss_cpu_delta,
+        completed: true,
         numa_pages,
         vmstat_numa_pages_migrated: vmstat_migrated_delta,
         // Populated by the sentinel path in `stop_and_collect`; a
@@ -3846,6 +3860,7 @@ mod tests {
             schedstat_run_delay_ns: 500_000,
             schedstat_run_count: 20,
             schedstat_cpu_time_ns: 4_000_000_000,
+            completed: true,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
@@ -3858,6 +3873,7 @@ mod tests {
         assert_eq!(r.cpus_used, r2.cpus_used);
         assert_eq!(r.max_gap_ms, r2.max_gap_ms);
         assert_eq!(r.wake_sample_total, r2.wake_sample_total);
+        assert_eq!(r.completed, r2.completed);
     }
 
     #[test]
@@ -4543,6 +4559,7 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
+            completed: true,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
@@ -4572,6 +4589,7 @@ mod tests {
             schedstat_run_delay_ns: u64::MAX,
             schedstat_run_count: u64::MAX,
             schedstat_cpu_time_ns: u64::MAX,
+            completed: true,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
@@ -4940,6 +4958,7 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
+            completed: true,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
@@ -4994,6 +5013,7 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
+            completed: true,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
@@ -5696,6 +5716,7 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
+            completed: true,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
@@ -5741,6 +5762,7 @@ mod tests {
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
             schedstat_cpu_time_ns: 0,
+            completed: true,
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
@@ -5767,6 +5789,13 @@ mod tests {
             reports[0].work_units
         );
         assert!(reports[0].wall_time_ns > 0);
+        assert!(
+            reports.iter().all(|r| r.completed),
+            "every worker report on the live / non-sentinel path \
+             must carry completed=true — pairs with the
+             completed=false assertion in \
+             stop_and_collect_reaps_grandchild_from_panicking_custom_closure",
+        );
     }
 
     /// Ready-file path shared between [`ignores_sigusr1_fn`] and
@@ -6472,6 +6501,16 @@ mod tests {
             "sentinel must be zeroed; non-zero work_units would mean \
              a worker-authored report leaked through the JSON-parse \
              branch despite the panic",
+        );
+        assert!(
+            !r.completed,
+            "sentinel must carry completed=false so downstream \
+             consumers distinguish '0 iterations by design / fast \
+             exit' (completed=true) from '0 iterations because the \
+             worker crashed before producing a report' (this case); \
+             `..WorkerReport::default()` gives the bool-default \
+             `false` at the sentinel construction site in \
+             `stop_and_collect`",
         );
         match &r.exit_info {
             Some(WorkerExitInfo::Signaled(sig)) if *sig == libc::SIGABRT => {}
