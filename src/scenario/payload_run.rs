@@ -40,7 +40,6 @@
 //! error output directly.
 
 use std::borrow::Cow;
-use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -991,8 +990,12 @@ struct SpawnOutput {
 /// - `None` → child inherits caller's cgroup (returns `Ok(None)`).
 /// - A leading `/` is tolerated and stripped so `"/workload"` and
 ///   `"workload"` behave identically.
-/// - NUL bytes are rejected (would break `CString` used by the
-///   child's `pre_exec` write).
+/// - NUL bytes are rejected — a resolved path with an interior
+///   NUL would truncate inside any `libc` layer that handles it,
+///   and even though the parent-side `std::fs::OpenOptions::open`
+///   used by [`spawn_with_cgroup_sync`] rejects NUL-bearing
+///   paths, catching the bad name up-front gives a clearer
+///   diagnostic than the underlying `open` error.
 /// - Any `..` component is rejected to prevent the name from
 ///   escaping the parent cgroup.
 /// - Empty names (or names that strip to empty) are rejected so a
@@ -1023,23 +1026,36 @@ fn resolve_cgroup_path(ctx: &Ctx<'_>, name: Option<&str>) -> Result<Option<PathB
     Ok(Some(ctx.cgroups.parent_path().join(relative)))
 }
 
-/// Build a [`Command`] with args, piped stdout/stderr, a `pre_exec`
-/// hook that places the child at the head of its own process group
-/// (so [`PayloadHandle::kill`] can signal every descendant), and an
-/// optional second `pre_exec` hook that writes the child's PID into
-/// the specified cgroup's `cgroup.procs` before `execve`.
+/// Build a [`Command`] with args, piped stdout/stderr, a
+/// `process_group(0)` request when the payload is not
+/// `uses_parent_pgrp`, and (optionally) a cgroup-placement
+/// pre_exec hook that BLOCKS the child on a read from a
+/// caller-owned release pipe until the parent has written the
+/// child's pid to the target `cgroup.procs` via stdlib I/O.
 ///
-/// Returns `Err` if the cgroup path cannot be converted to a
-/// NUL-terminated C string — `resolve_cgroup_path` already rejects
-/// interior NULs, but a `PathBuf` built from `OsStr` can still
-/// carry one on exotic platforms, so we check explicitly.
+/// When `cgroup_path` is `Some`, the returned tuple's second
+/// element is `Some(CgroupSyncHandles)` — a parent-side bundle
+/// of (a) the write end of the release pipe, (b) the read end
+/// of the child-side pid-notify pipe, and (c) the
+/// `cgroup.procs` path. The caller passes it to
+/// [`spawn_with_cgroup_sync`], which drives the placement
+/// protocol by reading the child pid, writing it to
+/// `cgroup.procs`, then releasing the child via a single-byte
+/// write on the release pipe.
+///
+/// When `cgroup_path` is `None`, the returned handle is `None`
+/// and callers may invoke `Command::spawn()` on the returned
+/// `Command` directly — no placement protocol is required and
+/// the child's cgroup is inherited from the parent (the ktstr
+/// process).
+///
+/// Returns `Err` if the pipe(2) pair allocation fails.
 fn build_command(
     binary: &str,
     args: &[String],
     cgroup_path: Option<&std::path::Path>,
     uses_parent_pgrp: bool,
-) -> Result<std::process::Command> {
-    use std::os::unix::ffi::OsStrExt;
+) -> Result<(std::process::Command, Option<CgroupSyncHandles>)> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -1086,116 +1102,510 @@ fn build_command(
         cmd.process_group(0);
     }
 
-    if let Some(cg) = cgroup_path {
-        // Precompute the full `.../cgroup.procs` CString on the
-        // PARENT side so the pre_exec closure never allocates.
-        // Between `fork(2)` and `execve(2)` a multithreaded parent's
-        // child can deadlock on any malloc-holding mutex, so no
-        // allocation may happen in the closure body. See
-        // signal-safety(7).
-        let procs_path = cg.join("cgroup.procs");
-        let cstr = CString::new(procs_path.as_os_str().as_bytes()).with_context(|| {
-            format!(
-                "cgroup path {} contains an interior NUL byte",
-                procs_path.display(),
-            )
-        })?;
+    if cgroup_path.is_some() {
+        // Two-pipe cgroup-placement handshake. `notify_*` carries
+        // the child's pid from its pre_exec hook up to the parent
+        // so the parent can address the `cgroup.procs` write
+        // (`Command::spawn()` blocks on the stdlib CLOEXEC status
+        // pipe until the child execve's, so the pid from
+        // `Child::id()` is NOT available to the parent in time).
+        // `release_*` is the reverse channel — the parent writes a
+        // single byte once the `cgroup.procs` update has been
+        // committed, and the child's pre_exec blocks on that byte
+        // so its execve cannot race the placement.
+        //
+        // Both pipes are created with O_CLOEXEC so the parent's
+        // copies never leak to the child (only the fds we
+        // explicitly hand into the pre_exec closure via raw fd
+        // numbers are touched by the child, and those are closed
+        // on execve once pre_exec returns). This matches the
+        // pre_exec AS-safety contract — only `read(2)` /
+        // `write(2)` / `close(2)` / `getpid(2)` run between fork
+        // and execve, all of which are explicitly AS-safe per
+        // POSIX.1-2017 §2.4.3.
+        let notify = PipePair::new().context("allocate cgroup sync pid-notify pipe")?;
+        let release = PipePair::new().context("allocate cgroup sync release pipe")?;
+        let notify_read_fd = notify.r_fd();
+        let notify_write_fd = notify.w_fd();
+        let release_read_fd = release.r_fd();
+        let release_write_fd = release.w_fd();
+        // SAFETY: the pre_exec closure runs in the child between
+        // fork and execve. The body uses only getpid / write /
+        // read / close, all AS-safe. All four fds are raw numbers
+        // inherited by the child via the fork; the pre_exec hook
+        // ALSO closes the child's own inherited copies of the
+        // ends the parent will hold (`notify_read_fd`,
+        // `release_write_fd`) BEFORE blocking on read, so the
+        // parent's drop of the release write end actually reaches
+        // the child as EOF instead of being masked by the child's
+        // own inherited writer copy (which would otherwise leave
+        // `read(release_read_fd)` blocked indefinitely — the
+        // cross-fork pipe-sync deadlock). On the parent side we
+        // hold owned copies in `notify` / `release` which we
+        // close after consuming them in `drive_cgroup_handshake`.
         unsafe {
-            cmd.pre_exec(move || write_pid_to_cgroup(&cstr));
+            cmd.pre_exec(move || {
+                cgroup_sync_pre_exec(
+                    notify_read_fd,
+                    notify_write_fd,
+                    release_read_fd,
+                    release_write_fd,
+                )
+            });
         }
+        let handles = CgroupSyncHandles {
+            notify,
+            release,
+            cgroup_procs_path: cgroup_path.unwrap().join("cgroup.procs"),
+        };
+        return Ok((cmd, Some(handles)));
     }
-    Ok(cmd)
+    Ok((cmd, None))
 }
 
-/// Async-signal-safe body of the cgroup-placement `pre_exec` hook:
-/// open `cgroup.procs` for write-only/append, render `getpid()` to
-/// a stack buffer with no allocation, write it, close the fd.
+/// Owned pipe(2) pair. Tracks both fds as raw numbers so the
+/// struct stays `Copy`-free and explicit about lifetime (closed
+/// via `Drop` when no longer needed). The parent keeps one half
+/// of each direction; the other halves are inherited by the
+/// child through fork and consumed by `cgroup_sync_pre_exec`.
+///
+/// `O_CLOEXEC` is set on both ends at creation via `pipe2(2)` so
+/// the parent's references do not leak into any subsequent
+/// `Command::spawn()` that might run from a reader thread while
+/// the handshake is in flight. The child's copies are closed by
+/// the kernel on execve.
+struct PipePair {
+    read_fd: std::os::fd::OwnedFd,
+    write_fd: std::os::fd::OwnedFd,
+}
+
+impl PipePair {
+    fn new() -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        // SAFETY: `pipe2` writes two fds into the provided slot on
+        // success. O_CLOEXEC ensures the fds are not leaked across
+        // later execve calls on the parent side.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: pipe2 returned success and gave us two fresh fds.
+        let read_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let write_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        Ok(Self { read_fd, write_fd })
+    }
+
+    fn r_fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.read_fd.as_raw_fd()
+    }
+
+    fn w_fd(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.write_fd.as_raw_fd()
+    }
+}
+
+/// Parent-side bundle carrying every resource the cgroup-placement
+/// handshake needs after fork. Owned by the caller of
+/// [`build_command`] until
+/// [`spawn_with_cgroup_sync`] consumes it.
+///
+/// `notify` — the child writes its pid's bytes to the write end
+/// as its first pre_exec step; the parent reads from the read end.
+///
+/// `release` — the parent writes a single byte to the write end
+/// once the cgroup-placement update is committed; the child's
+/// pre_exec blocks on a read of the read end.
+///
+/// `cgroup_procs_path` — the absolute `<cgroup>/cgroup.procs`
+/// path the parent writes the child pid to.
+struct CgroupSyncHandles {
+    notify: PipePair,
+    release: PipePair,
+    cgroup_procs_path: PathBuf,
+}
+
+/// Async-signal-safe body of the cgroup-placement `pre_exec`
+/// hook. Runs between fork and execve in the child.
+///
+/// Protocol:
+/// 0. Close the child's inherited copies of the parent-owned
+///    ends — `notify_read_fd` (child never reads notify) and
+///    `release_write_fd` (child never writes release). This is
+///    MANDATORY: without it the kernel still sees two writers on
+///    the release pipe (parent's + child's own inherited copy),
+///    so the parent's Drop of the release write end does NOT
+///    deliver EOF to the child's `read(release_read_fd)` — the
+///    child blocks forever. This is the canonical pipe-sync
+///    fork-inherited-fd deadlock; closing the inherited copies
+///    is what makes the sync work.
+/// 1. Write the child's pid (as an LE i32, 4 bytes) to
+///    `notify_write_fd` so the parent can begin the `cgroup.procs`
+///    write. Close `notify_write_fd` immediately after so the
+///    parent's read sees a fast EOF if the child crashes before
+///    reaching the release read.
+/// 2. Read a single release byte from `release_read_fd` to block
+///    until the parent has committed the cgroup-placement write.
+/// 3. Close `release_read_fd` (the kernel will also close it via
+///    O_CLOEXEC on execve, but a prompt close frees the fd before
+///    any user-provided pre_exec extension could observe it).
 ///
 /// # Safety
 ///
-/// Runs between fork and execve. Only async-signal-safe operations
-/// are permitted — no `malloc`, no `std::fs`, no `libc::printf`
-/// family, no locks (including the jemalloc arena). This function
-/// uses only `open`/`write`/`close`/`getpid` (all AS-safe per
-/// POSIX.1-2017, 2.4.3) and stack-buffer integer formatting.
+/// This function runs between `fork(2)` and `execve(2)` in the
+/// child. Only async-signal-safe operations are permitted — no
+/// `malloc`, no `std::fs`, no `libc::printf`, no locks (including
+/// the jemalloc arena). Every operation here is `getpid` / `write`
+/// / `read` / `close`, all of which POSIX.1-2017 §2.4.3 lists as
+/// AS-safe. In particular there is NO stdlib I/O, NO integer
+/// formatting, and NO allocation — the pid is sent as 4 raw
+/// little-endian bytes rather than an ASCII render, so no
+/// formatting helper is reachable from the child side.
 ///
-/// Errors are mapped to `io::Error::from_raw_os_error` so the
-/// parent `spawn()` returns an actionable errno rather than the
-/// child silently racing through the cgroup-placement step.
-fn write_pid_to_cgroup(procs_path: &CString) -> std::io::Result<()> {
-    // getpid() is AS-safe. Stack-render the i32 with no alloc —
-    // 12 bytes cover i32::MIN's sign + 10 digits + a trailing LF
-    // that some cgroup writers expect.
-    let pid = unsafe { libc::getpid() };
-    let mut buf = [0u8; 12];
-    let len = render_pid(pid, &mut buf);
-
-    // O_WRONLY | O_CLOEXEC — the fd must not leak across the
-    // upcoming execve(2) in case the binary later opens high-FD
-    // numbers.
-    let fd = unsafe { libc::open(procs_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a valid open file descriptor until we close
-    // it below; `buf[..len]` is a live stack buffer of known size.
-    let written = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, len) };
-    let write_err = if written < 0 {
-        Some(std::io::Error::last_os_error())
-    } else {
-        None
-    };
-    // Close unconditionally; preserve the write error if one
-    // occurred so the parent sees the underlying failure.
+/// Errors from `write(2)` or `read(2)` (short writes, EPIPE from
+/// a parent that abandoned the handshake) are mapped to
+/// `io::Error::from_raw_os_error` and returned. The stdlib's
+/// spawn loop forwards the errno through its CLOEXEC status pipe
+/// so the parent's `spawn()` returns an actionable error rather
+/// than silently racing through the placement step. Step 0's
+/// `close(2)` failures are intentionally IGNORED — EBADF is
+/// expected if the kernel is unusual about inherited fd numbering,
+/// and any other errno here cannot be recovered from (the parent's
+/// handshake still needs to run). The subsequent `write` / `read`
+/// surfaces any real breakage.
+fn cgroup_sync_pre_exec(
+    notify_read_fd: libc::c_int,
+    notify_write_fd: libc::c_int,
+    release_read_fd: libc::c_int,
+    release_write_fd: libc::c_int,
+) -> std::io::Result<()> {
+    // Step 0: close the child's inherited copies of the
+    // parent-owned ends. MANDATORY to avoid deadlocking on the
+    // subsequent `read(release_read_fd)` — without closing
+    // `release_write_fd`, the kernel keeps the release pipe's
+    // writer-count non-zero even when the parent drops its own
+    // copy, so the child's read never EOFs. Symmetrically,
+    // closing `notify_read_fd` frees a descriptor slot and keeps
+    // the parent's notify read end the sole reader (defense in
+    // depth — the protocol doesn't strictly require it since we
+    // never EOF the notify pipe, but a tidy close is cheap).
+    //
+    // `libc::close` is AS-safe. Return codes are ignored: EBADF
+    // is theoretically possible if the kernel ever renumbered
+    // the inherited fd, and any other errno is non-actionable
+    // between fork and execve. The write/read below surfaces any
+    // real breakage.
+    //
+    // SAFETY: all four fd numbers were valid on the parent side
+    // at the time of fork and the kernel duplicates them into
+    // the child's fd table. Closing a fd that the kernel already
+    // renumbered returns EBADF without effect — no memory
+    // safety concern.
     unsafe {
-        libc::close(fd);
+        libc::close(notify_read_fd);
+        libc::close(release_write_fd);
     }
-    if let Some(e) = write_err {
-        return Err(e);
+
+    // Step 1: publish pid. getpid(2) is AS-safe; the pid is a
+    // raw i32, so we send its 4-byte little-endian encoding and
+    // spare the child any integer-formatting work. A stack
+    // buffer is the only storage; no allocation.
+    let pid = unsafe { libc::getpid() };
+    let pid_bytes = pid.to_le_bytes();
+    let mut written = 0usize;
+    while written < pid_bytes.len() {
+        // SAFETY: writing into a raw fd that the parent owns the
+        // read end of. `pid_bytes` is a live stack buffer.
+        let n = unsafe {
+            libc::write(
+                notify_write_fd,
+                pid_bytes.as_ptr().add(written) as *const libc::c_void,
+                pid_bytes.len() - written,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            // EINTR: retry. Every other errno (EPIPE from a
+            // collapsed parent read end, EBADF, ...) is terminal
+            // — surface it to the parent via the stdlib spawn
+            // error channel.
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            // Zero-byte write is not defined for pipes; treat as
+            // EIO rather than loop forever.
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        written += n as usize;
+    }
+    // Close the notify write end so the parent's read gets EOF if
+    // the child subsequently crashes before the release read.
+    // SAFETY: notify_write_fd is a valid fd the child inherited
+    // from the parent; closing it here does not affect the parent's
+    // read end.
+    unsafe {
+        libc::close(notify_write_fd);
+    }
+
+    // Step 2: block on the release byte. One byte is enough — the
+    // payload is a synchronization token, not data. Loop to handle
+    // EINTR and short reads (partial-byte reads are impossible on
+    // a 1-byte read, but the loop keeps the code uniform with the
+    // write side).
+    let mut buf = [0u8; 1];
+    let mut read_total = 0usize;
+    while read_total < buf.len() {
+        // SAFETY: reading from a raw fd that the parent owns the
+        // write end of. `buf` is a live stack buffer.
+        let n = unsafe {
+            libc::read(
+                release_read_fd,
+                buf.as_mut_ptr().add(read_total) as *mut libc::c_void,
+                buf.len() - read_total,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            // EOF before the release byte arrived — the parent
+            // abandoned the handshake (crashed / failed cgroup
+            // write). Fail the pre_exec so the stdlib spawn path
+            // surfaces the abort instead of letting the child
+            // execve into an unplaced cgroup.
+            return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
+        }
+        read_total += n as usize;
+    }
+    // Step 3: close the release read end. The kernel would do
+    // this on execve via O_CLOEXEC anyway, but an explicit close
+    // frees the fd now.
+    // SAFETY: release_read_fd is a valid fd the child inherited
+    // from the parent.
+    unsafe {
+        libc::close(release_read_fd);
     }
     Ok(())
 }
 
-/// Render a PID (signed 32-bit) into `buf`, returning the number
-/// of bytes written. A trailing LF is appended. No allocation —
-/// safe to call between fork and execve.
+/// Complete the cgroup-placement handshake on a child that was
+/// spawned with a [`build_command`]-supplied pre_exec hook.
 ///
-/// `buf` must be at least 12 bytes (worst case: sign + 10 digits +
-/// LF).
-fn render_pid(pid: libc::pid_t, buf: &mut [u8]) -> usize {
-    debug_assert!(buf.len() >= 12);
-    // PIDs on Linux are non-negative, but handle the signed range
-    // correctly via i64 to avoid a panic on i32::MIN negation.
-    let mut n = i64::from(pid);
-    let negative = n < 0;
-    if negative {
-        n = -n;
-    }
-    // Write digits in reverse, then reverse in place.
-    let mut tmp = [0u8; 11];
-    let mut i = 0;
-    if n == 0 {
-        tmp[0] = b'0';
-        i = 1;
-    } else {
-        while n > 0 {
-            tmp[i] = b'0' + (n % 10) as u8;
-            n /= 10;
-            i += 1;
+/// The caller MUST run `Command::spawn()` on a dedicated thread
+/// because the stdlib's `spawn()` blocks on its CLOEXEC status
+/// pipe until the child has successfully execve'd — and the
+/// child's pre_exec blocks on the release read until this
+/// function finishes. Without the thread split the two would
+/// deadlock.
+///
+/// Protocol (parent side, main thread):
+/// 1. Read the child's pid bytes from the notify read end.
+/// 2. Open `cgroup.procs` via stdlib (`std::fs::OpenOptions`)
+///    and write the pid's ASCII form plus trailing LF — the
+///    cgroupfs writer accepts either form but many downstream
+///    tools expect LF-terminated decimal. This runs on the
+///    parent (which is ALREADY past `fork(2)` on the main
+///    thread; no AS-safety constraint applies to stdlib paths
+///    that run here).
+/// 3. Write the single release byte to the release write end,
+///    then close it so any subsequent short-read / EOF on the
+///    child side is prompt.
+/// 4. Close the notify read end.
+///
+/// The function returns the child pid so callers can cross-check
+/// it against `Child::id()` once the spawn thread returns.
+/// Wrapped in `Result<libc::pid_t>` because the notify read or
+/// the cgroup.procs open/write can fail; a failure drops the
+/// handle, which also closes the release write end, giving the
+/// child's pre_exec a fast EOF-driven bail.
+fn spawn_with_cgroup_sync(
+    handles: CgroupSyncHandles,
+) -> Result<libc::pid_t> {
+    use std::io::{Read, Write};
+    let CgroupSyncHandles {
+        notify,
+        release,
+        cgroup_procs_path,
+    } = handles;
+    // Step 1: read child pid. Keep the parent-side notify_w
+    // OPEN during the read — closing it before fork would let
+    // stdlib's internal `pipe2` for the CLOEXEC status pipe
+    // recycle our fd number; the child then inherits a state
+    // where its `notify_write_fd` points at stdlib's status
+    // pipe, not our notify pipe. `write(notify_write_fd, pid)`
+    // in the child would corrupt stdlib's protocol and the
+    // parent's `read_exact` on our notify pipe would see an
+    // indefinite wait because no data ever arrives on the
+    // intended pipe. The canonical rule: drop your parent
+    // copy of the child's write end AFTER the child has
+    // written (or died), not before. We achieve that here by
+    // holding `notify_w` alive across the read and dropping
+    // it only at the end.
+    //
+    // Child-died-without-writing detection: if the child
+    // dies before step 1's write, its inherited `notify_w`
+    // closes on `_exit`. The pipe then has ONLY the parent's
+    // `notify_w` as a writer — still non-zero — and our
+    // `read_exact` would block indefinitely. Guard against
+    // that with a bounded `poll(2)`: wait up to 5s for data,
+    // then bail with an actionable error naming the
+    // probable cause (child pre_exec failed before writing).
+    // The spawn thread's own error (`cmd.spawn() → Err`)
+    // surfaces too, and `drive_cgroup_handshake` returns
+    // whichever the caller sees first.
+    let PipePair {
+        read_fd: notify_r,
+        write_fd: notify_w,
+    } = notify;
+    {
+        let pfd_fd = std::os::fd::AsRawFd::as_raw_fd(&notify_r);
+        let mut pfd = libc::pollfd {
+            fd: pfd_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // 5s ceiling. Any legitimate fork + pre_exec sequence
+        // completes in low milliseconds; 5s is loose for even
+        // the most contended CI host and tight enough to
+        // flag a silent child-death promptly.
+        let poll_ms: libc::c_int = 5_000;
+        let ready = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
+        if ready < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                return Err(anyhow::Error::new(e)
+                    .context("poll(notify_r) for cgroup-sync pid-notify"));
+            }
+        } else if ready == 0 {
+            anyhow::bail!(
+                "cgroup-sync notify pipe: no pid written by child within 5s. \
+                 The child's pre_exec likely failed before Step 1 (possibly \
+                 EBADF on `notify_write_fd` because the fd number was \
+                 recycled by stdlib's internal pipe2). Check the spawn \
+                 thread's error for the underlying cause."
+            );
         }
     }
-    let mut out = 0;
-    if negative {
-        buf[out] = b'-';
-        out += 1;
-    }
-    for d in tmp[..i].iter().rev() {
-        buf[out] = *d;
-        out += 1;
-    }
-    buf[out] = b'\n';
-    out += 1;
-    out
+    let mut notify_file = std::fs::File::from(notify_r);
+    let mut pid_bytes = [0u8; 4];
+    notify_file
+        .read_exact(&mut pid_bytes)
+        .context("read child pid from cgroup-sync notify pipe")?;
+    drop(notify_file);
+    // Now it is safe to close parent's notify write end:
+    // the child has either written its pid (success path) or
+    // the poll bailed (failure path, already returned above).
+    drop(notify_w);
+    let child_pid = libc::pid_t::from_le_bytes(pid_bytes);
+    anyhow::ensure!(
+        child_pid > 0,
+        "cgroup-sync notify pipe returned non-positive pid {child_pid}; \
+         the child's pre_exec hook sent a corrupted pid — fail the \
+         handshake rather than write a bad value to cgroup.procs"
+    );
+
+    // Step 2: write pid to cgroup.procs. Stdlib open+write — safe
+    // because we are on the parent's main thread post-fork, not in
+    // a pre_exec context. The payload is LF-terminated decimal so
+    // cgroup_procs_write accepts it regardless of whether the
+    // kernel kstrtoint or token-parse path is in effect.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&cgroup_procs_path)
+        .with_context(|| {
+            format!(
+                "open cgroup.procs at {} for cgroup-sync placement",
+                cgroup_procs_path.display(),
+            )
+        })?;
+    let line = format!("{child_pid}\n");
+    f.write_all(line.as_bytes()).with_context(|| {
+        format!(
+            "write pid {child_pid} to {}",
+            cgroup_procs_path.display(),
+        )
+    })?;
+    drop(f);
+
+    // Step 3: release the child. One byte is enough; the content
+    // is ignored by the reader.
+    let PipePair {
+        read_fd: release_r,
+        write_fd: release_w,
+    } = release;
+    drop(release_r);
+    let mut release_file = std::fs::File::from(release_w);
+    release_file
+        .write_all(&[1u8])
+        .context("write release byte to cgroup-sync release pipe")?;
+    drop(release_file);
+
+    Ok(child_pid)
+}
+
+/// Spawn a Command that carries a cgroup-sync pre_exec hook.
+/// Runs `Command::spawn()` on a dedicated thread (it blocks on
+/// the stdlib CLOEXEC status pipe until the child execve's,
+/// which can't happen until the parent's main thread has
+/// released the pre_exec handshake), drives the
+/// [`spawn_with_cgroup_sync`] protocol on the main thread, then
+/// joins the spawn thread to collect the resulting [`Child`].
+///
+/// If either the spawn or the handshake fails, the caller drops
+/// the remaining pipe handles (via the [`CgroupSyncHandles`]
+/// consumption in `spawn_with_cgroup_sync`), which causes the
+/// child's pre_exec read to unblock with EOF and fail with
+/// EPIPE. The child never reaches execve, the spawn thread
+/// surfaces the pre_exec error through its stdlib error
+/// channel, and we propagate the first error the caller sees.
+fn drive_cgroup_handshake(
+    cmd: std::process::Command,
+    handles: CgroupSyncHandles,
+    binary: &str,
+) -> Result<std::process::Child> {
+    // Move the Command into a thread so its blocking `spawn()`
+    // doesn't deadlock with the child's pre_exec handshake.
+    let binary_owned = binary.to_string();
+    let spawn_thread = std::thread::spawn(move || -> Result<std::process::Child> {
+        let mut cmd = cmd;
+        cmd.spawn()
+            .map_err(|e| spawn_error_context(e, &binary_owned))
+    });
+
+    // Drive the placement protocol on the main thread. If this
+    // fails we drop the remaining handle bits so the child sees
+    // EOF on its release read; the spawn thread will then
+    // surface the pre_exec EPIPE through its stdlib error
+    // channel.
+    let sync_result = spawn_with_cgroup_sync(handles);
+
+    // Join the spawn thread regardless of sync outcome so a
+    // failing handshake does not leak a background std thread.
+    // A join error is either a panic in the spawn closure (very
+    // rare under `panic = "unwind"`) or an explicit poisoning;
+    // we map it to a generic anyhow error so the caller still
+    // gets a meaningful chain.
+    let spawn_result = spawn_thread
+        .join()
+        .map_err(|_| anyhow!("cgroup-sync spawn thread panicked"))?;
+
+    // Precedence: if the sync failed, that error is the root
+    // cause (the spawn will have failed TOO because the child
+    // bailed on EPIPE, but the sync error carries the actionable
+    // diagnostic — "failed to open cgroup.procs" / "short read
+    // from notify pipe"). Return the sync error first and
+    // discard the spawn error.
+    sync_result?;
+    spawn_result
 }
 
 /// Actionable error wrapper for Command::spawn/.output failures.
@@ -1400,9 +1810,15 @@ fn spawn_and_wait(
     uses_parent_pgrp: bool,
 ) -> Result<SpawnOutput> {
     let _sigchld = SigchldScope::new();
-    let mut child = build_command(binary, args, cgroup_path, uses_parent_pgrp)?
-        .spawn()
-        .map_err(|e| spawn_error_context(e, binary))?;
+    let (cmd, sync_handles) =
+        build_command(binary, args, cgroup_path, uses_parent_pgrp)?;
+    let mut child = match sync_handles {
+        Some(handles) => drive_cgroup_handshake(cmd, handles, binary)?,
+        None => {
+            let mut cmd = cmd;
+            cmd.spawn().map_err(|e| spawn_error_context(e, binary))?
+        }
+    };
     match timeout {
         Some(deadline) => wait_with_deadline(&mut child, deadline, binary, uses_parent_pgrp),
         None => match wait_and_capture(&mut child) {
@@ -1537,9 +1953,15 @@ fn spawn_child(
     uses_parent_pgrp: bool,
 ) -> Result<(std::process::Child, SigchldScope)> {
     let sigchld = SigchldScope::new();
-    let child = build_command(binary, args, cgroup_path, uses_parent_pgrp)?
-        .spawn()
-        .map_err(|e| spawn_error_context(e, binary))?;
+    let (cmd, sync_handles) =
+        build_command(binary, args, cgroup_path, uses_parent_pgrp)?;
+    let child = match sync_handles {
+        Some(handles) => drive_cgroup_handshake(cmd, handles, binary)?,
+        None => {
+            let mut cmd = cmd;
+            cmd.spawn().map_err(|e| spawn_error_context(e, binary))?
+        }
+    };
     Ok((child, sigchld))
 }
 
@@ -2692,39 +3114,6 @@ mod tests {
         assert!(cleared.checks.is_empty());
     }
 
-    // -- render_pid (async-signal-safe helper) --
-
-    #[test]
-    fn render_pid_zero() {
-        let mut buf = [0u8; 12];
-        let n = render_pid(0, &mut buf);
-        assert_eq!(&buf[..n], b"0\n");
-    }
-
-    #[test]
-    fn render_pid_typical_linux_pid() {
-        let mut buf = [0u8; 12];
-        let n = render_pid(12345, &mut buf);
-        assert_eq!(&buf[..n], b"12345\n");
-    }
-
-    #[test]
-    fn render_pid_i32_max() {
-        let mut buf = [0u8; 12];
-        let n = render_pid(i32::MAX, &mut buf);
-        assert_eq!(&buf[..n], b"2147483647\n");
-    }
-
-    #[test]
-    fn render_pid_i32_min_no_panic() {
-        // i32::MIN cannot be negated within i32 — the helper must
-        // promote to i64 to handle this without panicking. Linux
-        // does not emit negative PIDs, but the helper is defensive.
-        let mut buf = [0u8; 12];
-        let n = render_pid(i32::MIN, &mut buf);
-        assert_eq!(&buf[..n], b"-2147483648\n");
-    }
-
     #[test]
     fn in_cgroup_accepts_static_str_zero_alloc() {
         // Static &'static str goes in as Cow::Borrowed; no heap
@@ -3709,5 +4098,370 @@ mod tests {
             !rendered.contains("not found on guest PATH"),
             "non-ENOENT must not claim 'not found on PATH': {rendered}"
         );
+    }
+
+    // -- cgroup-sync placement protocol --
+
+    /// When `cgroup_path` is `None`, `build_command` must return a
+    /// Command with NO cgroup-sync handles. Regression guard
+    /// against accidentally wiring the sync for inherited-cgroup
+    /// placements, where the handshake would produce spurious
+    /// pipe allocations and a spawn-thread round-trip for every
+    /// payload run.
+    #[test]
+    fn build_command_without_cgroup_returns_no_sync_handles() {
+        let (_cmd, handles) =
+            super::build_command("/bin/true", &[], None, false).unwrap();
+        assert!(
+            handles.is_none(),
+            "no cgroup_path ⇒ no sync handles — got Some(_)",
+        );
+    }
+
+    /// When `cgroup_path` is `Some(_)`, `build_command` must
+    /// allocate both pipes and populate the cgroup.procs path.
+    /// The target directory does NOT need to exist at build
+    /// time — the write is deferred to `spawn_with_cgroup_sync`,
+    /// where a missing path surfaces as an actionable "open
+    /// cgroup.procs" error rather than a bail at build.
+    #[test]
+    fn build_command_with_cgroup_returns_sync_handles() {
+        let fake_cg = std::path::PathBuf::from("/nonexistent/fake-cgroup");
+        let (_cmd, handles) =
+            super::build_command("/bin/true", &[], Some(&fake_cg), false)
+                .expect("build_command must defer cgroup-path validation to sync");
+        let handles = handles.expect("cgroup path ⇒ handles");
+        assert_eq!(
+            handles.cgroup_procs_path,
+            fake_cg.join("cgroup.procs"),
+            "handles must carry <cg>/cgroup.procs verbatim",
+        );
+        // Both pipes must have valid fds on both ends (pipe2
+        // succeeded).
+        assert!(handles.notify.r_fd() >= 0);
+        assert!(handles.notify.w_fd() >= 0);
+        assert!(handles.release.r_fd() >= 0);
+        assert!(handles.release.w_fd() >= 0);
+    }
+
+    /// `PipePair::new` allocates a fresh pipe on every call;
+    /// pins the Drop path closes both fds so repeated calls
+    /// don't leak fd-table entries under test iteration.
+    #[test]
+    fn pipe_pair_allocates_fresh_pipe_on_each_call() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let a = super::PipePair::new().unwrap();
+        let b = super::PipePair::new().unwrap();
+        // Distinct fd pairs.
+        assert_ne!(a.r_fd(), b.r_fd());
+        assert_ne!(a.w_fd(), b.w_fd());
+        // Each pipe is a plumbed byte channel: write one byte
+        // into A's write end, read it from A's read end.
+        //
+        // Drive the roundtrip via std::fs::File so we don't hit
+        // libc directly in the test.
+        {
+            let mut w = unsafe { std::fs::File::from_raw_fd(a.w_fd()) };
+            w.write_all(&[42u8]).unwrap();
+            // Detach — the File closes the fd when dropped, but
+            // we want the OwnedFd on the PipePair to handle it.
+            std::mem::forget(w);
+        }
+        let mut buf = [0u8; 1];
+        let mut r = unsafe { std::fs::File::from_raw_fd(a.read_fd.as_raw_fd()) };
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(buf[0], 42);
+        std::mem::forget(r);
+        // Drop the second pipe explicitly to exercise the Drop path.
+        drop(b.read_fd);
+        drop(b.write_fd);
+    }
+
+    /// End-to-end: `drive_cgroup_handshake` reads a pid sent via the
+    /// notify pipe, writes it to a temp "cgroup.procs" file, and
+    /// releases the "child" via the release pipe. Exercises the
+    /// real protocol without requiring a real cgroup — the temp
+    /// file stands in for `/sys/fs/cgroup/<cg>/cgroup.procs`,
+    /// whose acceptable write format is `<pid>\n`.
+    ///
+    /// Uses a synthetic Command that can't actually reach spawn
+    /// (`/nonexistent`), but the test only drives the
+    /// handshake half via a fake `CgroupSyncHandles`; the spawn
+    /// side is stubbed by running the handshake directly, not
+    /// through `drive_cgroup_handshake`'s thread wrapper.
+    #[test]
+    fn spawn_with_cgroup_sync_writes_pid_and_releases_child() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+
+        // Stand-in for cgroup.procs in a temp dir.
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("ktstr-cgroup-sync-test-{}", unsafe { libc::getpid() }));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let procs_path = tmp_dir.join("cgroup.procs");
+        std::fs::write(&procs_path, b"").unwrap();
+
+        // Allocate two pipe pairs — one notify, one release.
+        let notify = super::PipePair::new().unwrap();
+        let release = super::PipePair::new().unwrap();
+
+        // Simulate child pre_exec: write pid into notify,
+        // block on release. Run on a thread so the main test
+        // thread can drive the handshake without a deadlock.
+        let child_pid: libc::pid_t = 99999;
+        let notify_w_fd = notify.w_fd();
+        let release_r_fd = release.r_fd();
+        let child_thread = std::thread::spawn(move || {
+            use std::io::Write;
+            // Write pid as LE bytes, matching the real pre_exec.
+            let mut w = unsafe { std::fs::File::from_raw_fd(notify_w_fd) };
+            w.write_all(&child_pid.to_le_bytes()).unwrap();
+            drop(w);
+            // Block on release.
+            let mut r = unsafe { std::fs::File::from_raw_fd(release_r_fd) };
+            let mut buf = [0u8; 1];
+            r.read_exact(&mut buf).unwrap();
+            assert_eq!(buf[0], 1, "release byte must be 1");
+            drop(r);
+        });
+
+        // Prevent PipePair's Drop from closing the fds we
+        // handed to the thread — the thread owns them now.
+        std::mem::forget(notify.write_fd);
+        std::mem::forget(release.read_fd);
+
+        // Reassemble the handles into the bundle
+        // `spawn_with_cgroup_sync` consumes. We MUST rebuild the
+        // PipePair with the remaining fds so its Drop closes
+        // them on exit.
+        let notify_r = notify.read_fd;
+        let release_w = release.write_fd;
+        let handles = super::CgroupSyncHandles {
+            notify: super::PipePair {
+                read_fd: notify_r,
+                // Dummy fd the drop will close — we need
+                // something valid. /dev/null satisfies that.
+                write_fd: unsafe {
+                    std::os::fd::OwnedFd::from_raw_fd(
+                        libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY),
+                    )
+                },
+            },
+            release: super::PipePair {
+                read_fd: unsafe {
+                    std::os::fd::OwnedFd::from_raw_fd(
+                        libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY),
+                    )
+                },
+                write_fd: release_w,
+            },
+            cgroup_procs_path: procs_path.clone(),
+        };
+
+        // Drive the handshake on the main thread.
+        let returned_pid = super::spawn_with_cgroup_sync(handles).unwrap();
+        assert_eq!(
+            returned_pid, child_pid,
+            "spawn_with_cgroup_sync must return the pid it read \
+             from the notify pipe",
+        );
+
+        // The child thread must complete after the release byte
+        // arrives — join here and capture any panic propagation.
+        child_thread.join().expect("child thread completes after release");
+
+        // The temp cgroup.procs file must now contain the pid
+        // followed by a newline.
+        let written = std::fs::read_to_string(&procs_path).unwrap();
+        assert_eq!(
+            written,
+            format!("{child_pid}\n"),
+            "spawn_with_cgroup_sync must write <pid>\\n to cgroup.procs; \
+             got {written:?}",
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&procs_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    /// Failure shape: if the cgroup.procs path cannot be opened
+    /// (parent dir missing), the handshake surfaces an error
+    /// that names the path. The child thread must NOT hang —
+    /// it receives EOF on its release read because the
+    /// handles (carrying the release write end) are dropped on
+    /// the error path.
+    #[test]
+    fn spawn_with_cgroup_sync_errors_on_missing_cgroup_procs_path() {
+        use std::os::fd::FromRawFd;
+        let missing_path = std::path::PathBuf::from(
+            "/nonexistent/dir/that/does/not/exist/cgroup.procs",
+        );
+
+        let notify = super::PipePair::new().unwrap();
+        let release = super::PipePair::new().unwrap();
+
+        let child_pid: libc::pid_t = 12345;
+        let notify_w_fd = notify.w_fd();
+        let release_r_fd = release.r_fd();
+        let child_thread = std::thread::spawn(move || -> std::io::Error {
+            use std::io::{Read, Write};
+            let mut w = unsafe { std::fs::File::from_raw_fd(notify_w_fd) };
+            let _ = w.write_all(&child_pid.to_le_bytes());
+            drop(w);
+            // Block on release. Expect EOF (read_exact → Err
+            // when the parent drops its write end on the error
+            // path).
+            let mut r = unsafe { std::fs::File::from_raw_fd(release_r_fd) };
+            let mut buf = [0u8; 1];
+            let err = r.read_exact(&mut buf).unwrap_err();
+            drop(r);
+            err
+        });
+
+        std::mem::forget(notify.write_fd);
+        std::mem::forget(release.read_fd);
+
+        let notify_r = notify.read_fd;
+        let release_w = release.write_fd;
+        let handles = super::CgroupSyncHandles {
+            notify: super::PipePair {
+                read_fd: notify_r,
+                write_fd: unsafe {
+                    std::os::fd::OwnedFd::from_raw_fd(
+                        libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY),
+                    )
+                },
+            },
+            release: super::PipePair {
+                read_fd: unsafe {
+                    std::os::fd::OwnedFd::from_raw_fd(
+                        libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY),
+                    )
+                },
+                write_fd: release_w,
+            },
+            cgroup_procs_path: missing_path.clone(),
+        };
+
+        let err = super::spawn_with_cgroup_sync(handles).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("open cgroup.procs"),
+            "error must name the open step: {rendered}",
+        );
+        assert!(
+            rendered.contains("/nonexistent/dir/that/does/not/exist"),
+            "error must name the failing path: {rendered}",
+        );
+
+        // Child thread sees EOF because the release write end
+        // was dropped on the error path.
+        let child_err = child_thread.join().expect("child thread returns");
+        assert_eq!(
+            child_err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "child's release read must hit EOF when parent abandons sync; got {child_err}",
+        );
+    }
+
+    /// **Regression guard for the cross-fork inherited-fd
+    /// deadlock.** Exercises the REAL fork path: builds a
+    /// cgroup-sync Command targeting `/bin/true` against a
+    /// nonexistent cgroup path, then calls
+    /// [`drive_cgroup_handshake`] (which runs `Command::spawn()`
+    /// on a thread and drives the parent-side protocol on the
+    /// main thread).
+    ///
+    /// On the error path the parent drops its owned
+    /// `release.write_fd` when `drive_cgroup_handshake` bails
+    /// on the missing cgroup.procs. **Without `cgroup_sync_pre_exec`
+    /// closing the CHILD's inherited copy of `release_write_fd`
+    /// (Step 0 of the pre_exec protocol)**, the kernel still
+    /// sees the child's inherited writer alive — the pipe never
+    /// EOFs — the child's `read(release_read_fd)` blocks forever
+    /// — `drive_cgroup_handshake` returns the error but the
+    /// spawn thread's `join()` blocks indefinitely.
+    ///
+    /// With the Step 0 close in place, the child's pre_exec
+    /// read hits EOF (→ EPIPE), the stdlib spawn path writes
+    /// the errno to its CLOEXEC error channel and tears down
+    /// the child, the spawn thread's `cmd.spawn()` returns
+    /// `Err`, and our `join()` completes within the test
+    /// deadline. A 10s timeout wraps the whole handshake —
+    /// a regression that re-introduces the inherited-fd leak
+    /// surfaces as a timeout panic, not a hang.
+    #[test]
+    fn drive_cgroup_handshake_does_not_deadlock_on_failing_cgroup_write() {
+        use std::sync::mpsc;
+
+        // Pick a path that cannot possibly open — including a
+        // guaranteed-missing parent dir so the open step fails
+        // hard in `drive_cgroup_handshake`.
+        let missing_cgroup = std::path::PathBuf::from(
+            "/nonexistent/ktstr-cgroup-sync-deadlock-guard",
+        );
+
+        // Run the whole exercise in a worker thread so the test
+        // driver can time-box it: if the child's release read
+        // ever blocks past the 10s budget we PANIC the timer
+        // thread rather than hang the test harness.
+        let (tx, rx) = mpsc::channel::<anyhow::Result<()>>();
+        let worker = std::thread::spawn(move || {
+            let (cmd, handles) = super::build_command(
+                "/bin/true",
+                &[],
+                Some(&missing_cgroup),
+                false,
+            )
+            .expect("build_command");
+            let handles = handles.expect("handles present when cgroup_path is Some");
+            let result = super::drive_cgroup_handshake(cmd, handles, "/bin/true");
+            // drive_cgroup_handshake must surface an error
+            // (the cgroup-path open failed) — if it succeeds
+            // that's also a correctness violation because the
+            // target directory does not exist.
+            let err = result.expect_err(
+                "handshake against nonexistent cgroup.procs must Err",
+            );
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("open cgroup.procs")
+                    || rendered.contains("cgroup.procs"),
+                "handshake error must name the failing step: {rendered}",
+            );
+            let _ = tx.send(Ok(()));
+        });
+
+        // 10s deadline — well beyond any legitimate stdlib spawn
+        // + fork + pre_exec + error-channel latency on a loaded
+        // CI host, tight enough to flag a real deadlock quickly.
+        let deadline = std::time::Duration::from_secs(10);
+        match rx.recv_timeout(deadline) {
+            Ok(Ok(())) => {
+                // Worker thread finished cleanly within budget.
+                worker
+                    .join()
+                    .expect("worker thread completes without panic");
+            }
+            Ok(Err(e)) => panic!("worker thread reported error: {e:#}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "drive_cgroup_handshake did not return within \
+                 {deadline:?} — cross-fork inherited-fd deadlock \
+                 has regressed. The child's pre_exec is almost \
+                 certainly blocking on `read(release_read_fd)` \
+                 because it still holds its own inherited copy of \
+                 `release_write_fd` open; Step 0 of \
+                 `cgroup_sync_pre_exec` must `close()` both \
+                 `notify_read_fd` and `release_write_fd` BEFORE \
+                 the release-read block, otherwise the kernel \
+                 never delivers EOF when the parent drops its \
+                 write end.",
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "worker thread disconnected without reporting",
+            ),
+        }
     }
 }

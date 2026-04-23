@@ -465,8 +465,9 @@ struct Cli {
     /// snapshots keys on the snapshot index in the metric name.
     ///
     /// **Fatal errors do NOT modify the sidecar** — a `Fatal`
-    /// outcome (pid missing, exe-identity-changed, not-jemalloc)
-    /// never produces a usable `ProbeOutput` to flatten.
+    /// outcome (pid-missing, exe-identity-changed, jemalloc-not-found,
+    /// jemalloc-in-dso) never produces a usable `ProbeOutput` to
+    /// flatten.
     /// `AllFailed` DOES append with `exit_code: 1` so consumers
     /// keying on `ExitCodeEq(0)`-equivalents see the failure.
     ///
@@ -1591,10 +1592,13 @@ pub(crate) fn find_jemalloc_via_maps(
         // A hit in a DSO is not something v1 can address correctly
         // (no DTV walk).
         if path != exe_path {
-            return Err(FatalError::not_jemalloc(anyhow!(
+            return Err(FatalError::jemalloc_in_dso(anyhow!(
                 "jemalloc TLS symbol found in {} but static-TLS probe requires \
                  the match be in the main executable ({}); dynamic-TLS lookups \
-                 in shared objects are not supported in v1",
+                 in shared objects are not supported in v1. Remediation: relink \
+                 the target to embed jemalloc statically (e.g. build against \
+                 tikv-jemallocator-sys rather than a system libjemalloc.so), or \
+                 wait for a future DTV-walking probe variant.",
                 path.display(),
                 exe_path.display(),
             )));
@@ -1624,8 +1628,13 @@ pub(crate) fn find_jemalloc_via_maps(
     let context = last_symbol_err
         .map(|e| format!(" — last per-ELF error: {e}"))
         .unwrap_or_default();
-    Err(FatalError::not_jemalloc(anyhow!(
-        "jemalloc TLS symbol ({}) not found in any r-x mapping under {}{}",
+    Err(FatalError::jemalloc_not_found(anyhow!(
+        "jemalloc TLS symbol ({}) not found in any r-x mapping under {}. \
+         Remediation: confirm the target is linked against a supported \
+         jemalloc build (tikv-jemallocator-sys, or a je_/unprefixed \
+         libjemalloc), rebuild against one of the accepted name prefixes, \
+         or extend TSD_TLS_SYMBOL_NAMES if you are carrying a new \
+         prefix.{}",
         TSD_TLS_SYMBOL_NAMES.join(" / "),
         maps_path,
         context,
@@ -2173,6 +2182,23 @@ fn detach_all_attached() {
 /// but produced at least one successful per-thread observation
 /// surfaces as `Ok` with `interrupted: true` on the output — the
 /// partial data is still useful to the caller.
+///
+/// # TODO: `PartialFatal` variant
+///
+/// A future variant `PartialFatal(ProbeOutput, FatalError)` would
+/// carry BOTH a usable `ProbeOutput` (at least one Ok per-thread
+/// observation landed) AND a fatal reason that cut the run short
+/// (e.g. target `execve`'d mid-sampling, or a snapshot boundary
+/// crossed the `--abort-after-ms` deadline with data already in
+/// hand). Today the `Fatal` arm drops any partial `ProbeOutput` on
+/// the floor and the append-to-sidecar path is skipped.
+/// `PartialFatal` would let the caller keep the successful
+/// snapshots, flag the fatal cause, and let downstream stats
+/// tooling decide whether the partial data is actionable. Blocked
+/// on: (a) a concrete consumer asking for the shape (no current
+/// one does), and (b) deciding how exit-code classification
+/// interacts — `AllFailed` is 1, a `PartialFatal` that carries
+/// real data might warrant a distinct exit code.
 enum RunOutcome {
     Ok(ProbeOutput),
     AllFailed(ProbeOutput),
@@ -2197,10 +2223,24 @@ enum FatalKind {
     /// [`run`]; the human-readable message carries the specific
     /// phase.
     ExeIdentityChanged,
-    /// The target is not jemalloc-linked in a shape this probe can
-    /// read — either no `tsd_tls` symbol in any r-x mapping, or the
-    /// symbol lives in a DSO (v1 is static-TLS only).
-    NotJemalloc,
+    /// No jemalloc `tsd_tls` symbol turned up in ANY r-x mapping
+    /// enumerated from `/proc/<pid>/maps`. The target is either not
+    /// jemalloc-linked at all (glibc malloc, mimalloc, tcmalloc, …)
+    /// or was linked against a jemalloc build whose symbol-name
+    /// prefix is not in [`TSD_TLS_SYMBOL_NAMES`]. Remediation: rebuild
+    /// the target against a supported jemalloc, or extend the symbol
+    /// name list. Distinct from [`Self::JemallocInDso`] so machine
+    /// consumers can bucket "absent" from "wrong shape".
+    JemallocNotFound,
+    /// A jemalloc `tsd_tls` symbol was located, but in a shared object
+    /// rather than the main executable's static-TLS image. v1 does
+    /// not walk the DTV, so the per-thread TP-relative math is only
+    /// correct for symbols in the target's own ELF. Remediation:
+    /// relink the target to embed jemalloc statically, or wait for a
+    /// future DTV-walking probe variant. Distinct from
+    /// [`Self::JemallocNotFound`] — the symbol IS present, the
+    /// probe just can't address it.
+    JemallocInDso,
     /// Anything else: readlink / maps read failures, architecture
     /// mismatch, self-probe rejection, DWARF parse errors, tid
     /// enumeration failures.
@@ -2215,7 +2255,8 @@ impl FatalKind {
         match self {
             Self::PidMissing => "pid-missing",
             Self::ExeIdentityChanged => "exe-identity-changed",
-            Self::NotJemalloc => "not-jemalloc",
+            Self::JemallocNotFound => "jemalloc-not-found",
+            Self::JemallocInDso => "jemalloc-in-dso",
             Self::Other => "other",
         }
     }
@@ -2242,8 +2283,12 @@ impl FatalError {
         Self::new(FatalKind::ExeIdentityChanged, error)
     }
 
-    fn not_jemalloc(error: anyhow::Error) -> Self {
-        Self::new(FatalKind::NotJemalloc, error)
+    fn jemalloc_not_found(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::JemallocNotFound, error)
+    }
+
+    fn jemalloc_in_dso(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::JemallocInDso, error)
     }
 
     fn other(error: anyhow::Error) -> Self {
@@ -2995,8 +3040,38 @@ fn append_probe_output_to_sidecar(
     // would have bailed on before we reach here — kept as
     // defense-in-depth against a future refactor that loosens the
     // parent-check.
-    if let Ok(parent) = std::fs::File::open(path.parent().unwrap_or(Path::new("."))) {
-        let _ = parent.sync_all();
+    //
+    // Log-and-continue on failure: a silent swallow would make the
+    // durability regression invisible to operators, hiding a
+    // filesystem / mount-option misconfiguration (e.g. readonly
+    // remount between open and sync, or a volatile bind-mount
+    // that refuses fdatasync). `main()` installs
+    // `tracing_subscriber` so `tracing::warn!` lands on stderr by
+    // default; without the init, these structured events would be
+    // dropped. Mirrors the sibling `atomic_mutate_sidecar` warn at
+    // `src/test_support/sidecar.rs` so both routes surface the
+    // same failure mode with the same fields.
+    let parent_dir = path.parent().unwrap_or(Path::new("."));
+    match std::fs::File::open(parent_dir) {
+        Ok(parent) => {
+            if let Err(e) = parent.sync_all() {
+                tracing::warn!(
+                    dir = %parent_dir.display(),
+                    err = %format!("{e:#}"),
+                    "jemalloc_probe: parent-directory fsync failed after \
+                     rename; the renamed sidecar is visible in the VFS but a \
+                     concurrent crash could drop the directory-entry update \
+                     from durable storage",
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            dir = %parent_dir.display(),
+            err = %format!("{e:#}"),
+            "jemalloc_probe: could not open parent directory for fsync; \
+             the rename already committed but the directory entry has no \
+             explicit durability guarantee",
+        ),
     }
 
     // `lock_fd` drops here; flock is released. Drop order: the
@@ -3013,6 +3088,32 @@ fn main() {
     // in `ktstr::cli::restore_sigpipe_default`; see that doc for the
     // rationale + SAFETY text.
     ktstr::cli::restore_sigpipe_default();
+    // Mirror `cargo-ktstr`'s tracing init (src/bin/cargo-ktstr.rs
+    // main()) so `tracing::warn!` calls inside the `--sidecar`
+    // atomic-mutate path — most notably the parent-directory fsync
+    // log-and-continue — surface on stderr instead of being silently
+    // dropped. Default to `warn` so normal probe runs stay quiet;
+    // users who want finer detail set `RUST_LOG=info,debug,...`.
+    //
+    // `try_init()` (not `.init()`): in test contexts — and any future
+    // harness that links the probe as a library inside a process that
+    // has already set a global subscriber — `.init()` PANICS on
+    // "a global default trace dispatcher has already been set."
+    // That is a hostile default for a probe binary that may be
+    // invoked under many test runners. `try_init()` returns `Err`
+    // without panicking when a subscriber is already installed; we
+    // silently discard the error because the probe's warn/info
+    // output is still routed to whichever subscriber got there
+    // first (a valid subscriber for the same warn events). Logging
+    // the error would itself require tracing, which is exactly the
+    // facility the failure says is unavailable — so swallow.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
     install_cleanup_handler();
     let cli = Cli::parse();
     if let Err(e) = cli.validate_sampling_flags() {
@@ -5291,7 +5392,8 @@ mod tests {
             FatalKind::ExeIdentityChanged.tag(),
             "exe-identity-changed",
         );
-        assert_eq!(FatalKind::NotJemalloc.tag(), "not-jemalloc");
+        assert_eq!(FatalKind::JemallocNotFound.tag(), "jemalloc-not-found");
+        assert_eq!(FatalKind::JemallocInDso.tag(), "jemalloc-in-dso");
         assert_eq!(FatalKind::Other.tag(), "other");
     }
 
@@ -5337,15 +5439,28 @@ mod tests {
             match kind {
                 FatalKind::PidMissing
                 | FatalKind::ExeIdentityChanged
-                | FatalKind::NotJemalloc
+                | FatalKind::JemallocNotFound
+                | FatalKind::JemallocInDso
                 | FatalKind::Other => {}
             }
             count += 1;
         }
-        assert!(
-            count >= 4,
-            "FatalKind::iter() produced fewer variants than the four pinned in \
-             `fatal_kind_tag_strings_pinned`; strum::EnumIter drift suspected"
+        // Strict equality (not `>=`) so adding a new variant
+        // produces a test failure HERE, forcing the author to also
+        // add an explicit assertion in
+        // `fatal_kind_tag_strings_pinned` for the new tag string.
+        // A `>=` floor would let a silently-untested new variant
+        // ship — its tag would still pass the kebab-case check in
+        // this loop, but no test would pin the literal token, so
+        // a drift in the new variant's tag would go unnoticed by
+        // downstream consumers that grep the stderr tag.
+        assert_eq!(
+            count, 5,
+            "FatalKind::iter() must yield exactly the five variants pinned in \
+             `fatal_kind_tag_strings_pinned`; drift means either strum::EnumIter \
+             is broken or a new variant was added without updating the tag-string \
+             pin — fix by adding the new tag literal to `fatal_kind_tag_strings_pinned` \
+             and bumping this expected count",
         );
     }
 
@@ -5750,6 +5865,163 @@ mod tests {
             "test binary must carry at least one STT_FUNC symbol in \
              .symtab; a fully-stripped binary would have zero and \
              silently invalidate symbol-resolution pin tests",
+        );
+    }
+
+    /// `build_id = Some(_), debuglink = None`: only the build-id
+    /// candidate emits (1 entry). A target that carries an
+    /// NT_GNU_BUILD_ID note but no `.gnu_debuglink` section is the
+    /// distro-debuginfo-installed shape — the `-dbg` / `-debuginfo`
+    /// package ships a shadow tree under `/usr/lib/debug/.build-id/`
+    /// and the target's linker-emitted build-id is the only pointer
+    /// to it. Separate from the combined-both test (which exercises
+    /// ORDERING) — this one pins the count under the degenerate
+    /// debuglink-absent shape.
+    #[test]
+    fn candidate_debuginfo_paths_build_id_only() {
+        let target = Path::new("/usr/bin/ktstr-test-target");
+        let paths = candidate_debuginfo_paths(target, None, Some("abcdef0123456789"));
+        assert_eq!(
+            paths.len(),
+            1,
+            "build-id alone must emit exactly one candidate; got {paths:?}",
+        );
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/usr/lib/debug/.build-id/ab/cdef0123456789.debug"),
+        );
+    }
+
+    /// `debuglink = Some(_), build_id = None`: only the three
+    /// debuglink paths emit (parent-relative, `.debug` subdir,
+    /// `/usr/lib/debug`-rooted). Mirror of the build-id-only test —
+    /// pins that the two hint sources are independent, so a target
+    /// with a `.gnu_debuglink` section but no build-id note still
+    /// produces the full set of debuglink candidates.
+    #[test]
+    fn candidate_debuginfo_paths_debuglink_only() {
+        let target = Path::new("/usr/bin/ktstr-test-target");
+        let paths = candidate_debuginfo_paths(target, Some("ktstr-test-target.debug"), None);
+        assert_eq!(
+            paths.len(),
+            3,
+            "debuglink alone on an absolute target must emit exactly three \
+             candidates (parent, parent/.debug, /usr/lib/debug + strip-root); \
+             got {paths:?}",
+        );
+        assert_eq!(paths[0], PathBuf::from("/usr/bin/ktstr-test-target.debug"));
+        assert_eq!(
+            paths[1],
+            PathBuf::from("/usr/bin/.debug/ktstr-test-target.debug"),
+        );
+        assert_eq!(
+            paths[2],
+            PathBuf::from("/usr/lib/debug/usr/bin/ktstr-test-target.debug"),
+        );
+        assert!(
+            !paths.iter().any(|p| p.to_string_lossy().contains(".build-id")),
+            "no build-id candidate must appear when build_id hint is None; \
+             got {paths:?}",
+        );
+    }
+
+    /// Build-id with exactly 2 hex characters: boundary of the
+    /// `hex.len() >= 2` gate. `"ab".split_at(2)` yields
+    /// `("ab", "")`, so the emitted path is
+    /// `/usr/lib/debug/.build-id/ab/.debug` — unusual (no hex body
+    /// between the `/` and the `.debug` suffix) but legitimate: the
+    /// gate admits it, and `Path::new` does not reject empty path
+    /// components. This test pins that boundary behavior so a
+    /// future tightening of the gate to `>= 3` or `== 40`
+    /// (full SHA-1 length) would be caught explicitly rather than
+    /// silently shifting the cutoff.
+    #[test]
+    fn candidate_debuginfo_paths_build_id_exactly_two_chars() {
+        let target = Path::new("/usr/bin/ktstr-test-target");
+        let paths = candidate_debuginfo_paths(target, None, Some("ab"));
+        assert_eq!(
+            paths.len(),
+            1,
+            "2-char build-id must be accepted (>= 2 gate) and produce one \
+             candidate; got {paths:?}",
+        );
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/usr/lib/debug/.build-id/ab/.debug"),
+            "2-char build-id splits into prefix=\"ab\", rest=\"\", producing \
+             a degenerate-but-well-formed /usr/lib/debug/.build-id/ab/.debug \
+             path (empty hex body between the subdir and the .debug suffix)",
+        );
+    }
+
+    /// Target path with no parent directory (`/`): the `target_path.parent()`
+    /// call returns `None`, so the debuglink branch emits zero
+    /// candidates regardless of whether `debuglink_name` is supplied.
+    /// Build-id is orthogonal and still emits. Pins the tuple-pattern
+    /// guard `(Some(name), Some(parent))` — a regression that
+    /// switched to `if let Some(name) = debuglink_name` (dropping the
+    /// parent check) would try to `parent.join("foo")` against a
+    /// nonexistent parent and either panic or silently fall back to
+    /// a wrong path. The two sub-cases (with / without build-id)
+    /// both emit the expected count under the "no parent" shape.
+    #[test]
+    fn candidate_debuginfo_paths_no_parent_skips_debuglink() {
+        let target = Path::new("/");
+        // Both hints present: build-id still emits, debuglink branch
+        // skips (parent = None).
+        let paths = candidate_debuginfo_paths(
+            target,
+            Some("orphan.debug"),
+            Some("abcdef0123456789"),
+        );
+        assert_eq!(
+            paths.len(),
+            1,
+            "root-path target with no parent must skip debuglink candidates; \
+             build-id candidate still emits; got {paths:?}",
+        );
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/usr/lib/debug/.build-id/ab/cdef0123456789.debug"),
+        );
+        // Debuglink alone on a parent-less target must produce zero
+        // candidates — not one, not a panic, not a fall-through to
+        // a root-relative path.
+        let paths = candidate_debuginfo_paths(target, Some("orphan.debug"), None);
+        assert!(
+            paths.is_empty(),
+            "debuglink-only with no parent must produce zero candidates; \
+             got {paths:?}",
+        );
+    }
+
+    /// Empty-string build-id: `Some("")` fails the `hex.len() >= 2`
+    /// gate and the build-id branch is skipped. Distinct from
+    /// `None` (which skips the whole branch before the gate) and
+    /// distinct from the short-build-id test (1 char vs 0 chars) —
+    /// pins the zero-length boundary of the gate. A corrupt
+    /// NT_GNU_BUILD_ID note whose descriptor rendered to an empty
+    /// string would hit this path; the helper must not trip its
+    /// `split_at(2)` on an empty &str (which would panic: range
+    /// end out of bounds).
+    #[test]
+    fn candidate_debuginfo_paths_empty_build_id_skipped() {
+        let target = Path::new("/usr/bin/ktstr-test-target");
+        let paths = candidate_debuginfo_paths(
+            target,
+            Some("ktstr-test-target.debug"),
+            Some(""), // zero-length — must NOT panic, must NOT emit a build-id path
+        );
+        assert_eq!(
+            paths.len(),
+            3,
+            "empty build-id must be skipped; debuglink paths still emit \
+             (3 on an absolute target); got {paths:?}",
+        );
+        assert!(
+            !paths.iter().any(|p| p.to_string_lossy().contains(".build-id")),
+            "no build-id candidate must appear when hint is an empty string; \
+             got {paths:?}",
         );
     }
 }

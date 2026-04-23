@@ -58,6 +58,15 @@ fn help_shell_shows_include_files() {
 }
 
 #[test]
+fn help_shell_shows_no_perf_mode() {
+    ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-perf-mode"));
+}
+
+#[test]
 fn help_kernel() {
     ktstr()
         .args(["kernel", "--help"])

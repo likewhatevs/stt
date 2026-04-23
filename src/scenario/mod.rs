@@ -800,8 +800,36 @@ impl Ctx<'_> {
     /// `setup_cgroups` post-settle bail) uses the same predicate:
     /// only a positive pid is "configured". Callers must use this
     /// accessor rather than destructuring `sched_pid` directly.
+    ///
+    /// A `Some(n)` where `n <= 0` is a caller bug — the builder
+    /// documents `None` as the unconfigured shape, and every
+    /// positive value flows through unchanged. When the accessor
+    /// squashes such a value to `None`, it emits a `tracing::warn!`
+    /// naming the offending pid so the misuse surfaces in
+    /// structured logs instead of manifesting downstream as a
+    /// silent "scheduler died" verdict or, worse, a `kill(0, …)`
+    /// reaching the caller's own process group. The warn is
+    /// bounded: there are exactly three callsites
+    /// (`run_scenario` post-settle bail, workload-phase polling,
+    /// `setup_cgroups` post-settle bail), so the volume is O(3)
+    /// per scenario run even for a sustained
+    /// misconfiguration — tight enough to leave in place without
+    /// a rate limiter.
     pub(crate) fn active_sched_pid(&self) -> Option<libc::pid_t> {
-        self.sched_pid.filter(|&p| p > 0)
+        match self.sched_pid {
+            Some(p) if p > 0 => Some(p),
+            Some(p) => {
+                tracing::warn!(
+                    pid = p,
+                    "Ctx::active_sched_pid: sched_pid=Some({p}) squashed to None; \
+                     only positive pids are configured-scheduler values — use \
+                     None for the unconfigured shape instead of a 0-sentinel or \
+                     negative pid"
+                );
+                None
+            }
+            None => None,
+        }
     }
 }
 

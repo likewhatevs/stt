@@ -6324,8 +6324,14 @@ mod tests {
         // completes. Replaces a fixed 200ms sleep with progress-
         // driven waiting: we send SIGUSR1 only once SIG_IGN is
         // definitely installed. The poll interval is 10ms and the
-        // ceiling is 2s (~10× the old sleep) to cover CPU-starved
-        // hosts without silently hanging.
+        // ceiling is 3s (~15× the old sleep) to cover CPU-starved
+        // hosts without silently hanging — the earlier 2s ceiling
+        // was tight enough that heavily-loaded CI runners (many
+        // parallel cargo nextest workers competing for CPU during
+        // fork + signal-handler install) occasionally missed the
+        // deadline on valid SIG_IGN installs; bumping to 3s
+        // preserves the "bounded, actionable" intent without the
+        // flake.
         let worker_pid = h.worker_pids()[0];
         let ready_path = ready_file_path(worker_pid);
         // Remove any stale ready file from a prior run that happened
@@ -6342,7 +6348,7 @@ mod tests {
         h.start();
         wait_for_file_or_panic(
             &ready_path,
-            Duration::from_secs(2),
+            Duration::from_secs(3),
             worker_pid,
             "SIG_IGN install may have failed or child never reached \
              ignores_sigusr1_fn's ready-file write",
@@ -6452,7 +6458,7 @@ mod tests {
             worker_pid,
             "fork+exec path likely broken — check /bin/sleep exists and is executable",
         );
-        let read_deadline = Instant::now() + Duration::from_secs(2);
+        let read_deadline = Instant::now() + Duration::from_secs(3);
         let gpid_str = loop {
             let s = std::fs::read_to_string(pidfile)
                 .expect("pidfile readable once exists");
@@ -6461,7 +6467,7 @@ mod tests {
             }
             if Instant::now() >= read_deadline {
                 panic!(
-                    "pidfile {pidfile:?} stayed empty for 2s after exists() \
+                    "pidfile {pidfile:?} stayed empty for 3s after exists() \
                      returned true — writer may have crashed between O_TRUNC \
                      and write",
                 );

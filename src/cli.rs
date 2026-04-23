@@ -561,7 +561,7 @@ pub fn format_entry_row(
 ///     {
 ///       "key": "6.12.0-broken",
 ///       "path": "/path/to/cache/broken-entry",
-///       "error": "metadata.json missing required field `version`"
+///       "error": "metadata.json schema drift: missing field `source` at line 1 column 21"
 ///     }
 ///   ]
 /// }
@@ -601,6 +601,34 @@ pub fn format_entry_row(
 ///   "ref": ?}`, `{"type": "local", "source_tree_path": ?, "git_hash":
 ///   ?}`. Variant-specific fields are nullable — consumers must
 ///   dispatch on `"type"` before reading them. See `cache::KernelSource`.
+///
+/// **Entry fields (corrupt entries):**
+/// - `error`: human-readable reason from `cache::read_metadata`,
+///   prefixed by failure class so programmatic consumers can branch
+///   on `starts_with` without parsing the free-form tail. Prefixes:
+///   - `"metadata.json missing"` — file absent (not a cache entry).
+///   - `"metadata.json unreadable: ..."` — I/O error on
+///     `fs::read_to_string` other than ENOENT (e.g. EISDIR,
+///     permission).
+///   - `"metadata.json schema drift: ..."` — JSON parsed but does
+///     not match the `KernelMetadata` shape (serde_json
+///     `Category::Data`). Typical cause: older cache from a ktstr
+///     whose schema has since changed.
+///   - `"metadata.json malformed: ..."` — not valid JSON at all
+///     (serde_json `Category::Syntax`).
+///   - `"metadata.json truncated: ..."` — JSON ends mid-value
+///     (serde_json `Category::Eof`), e.g. a partially-written
+///     metadata from a crashed `store()`.
+///   - `"metadata.json parse error: ..."` — fallback for an
+///     unexpected `Category::Io` from `from_str`; does not fire on
+///     the current serde_json version but kept as a defense-in-depth
+///     fallback so the field is never absent.
+///   - `"image file <name> missing from entry directory"` —
+///     metadata parsed cleanly but the declared image file is gone
+///     (partial download, manual deletion, failed strip+rename).
+///   The example above shows the schema-drift case; consumers that
+///   treat corrupt entries as a single category can key on the
+///   `"error"` key alone.
 pub fn kernel_list(json: bool) -> Result<()> {
     let cache = CacheDir::new()?;
     let entries = cache.list()?;

@@ -34,6 +34,7 @@ struct Ktstr {
 #[derive(Subcommand)]
 enum KtstrCommand {
     /// Build the kernel (if needed) and run tests via cargo nextest.
+    #[command(visible_alias = "nextest")]
     Test {
         #[arg(long, help = KERNEL_HELP_NO_RAW)]
         kernel: Option<String>,
@@ -47,7 +48,9 @@ enum KtstrCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Build the kernel (if needed) and run tests with coverage via cargo llvm-cov nextest.
+    /// Build the kernel (if needed) and run tests with coverage via
+    /// cargo llvm-cov nextest. For other llvm-cov subcommands
+    /// (`report`, `clean`, `show-env`), use `cargo ktstr llvm-cov`.
     Coverage {
         #[arg(long, help = KERNEL_HELP_NO_RAW)]
         kernel: Option<String>,
@@ -58,6 +61,29 @@ enum KtstrCommand {
         #[arg(long)]
         no_perf_mode: bool,
         /// Arguments passed through to cargo llvm-cov nextest.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run `cargo llvm-cov` with arbitrary arguments.
+    ///
+    /// When you want `cargo llvm-cov nextest`, prefer `cargo ktstr
+    /// coverage` — this subcommand is the raw passthrough for
+    /// `llvm-cov` invocations that don't fit the coverage flow
+    /// (e.g. `report`, `clean`, `show-env`).
+    ///
+    /// Note: bare `cargo ktstr llvm-cov` (no subcommand) dispatches
+    /// to `cargo llvm-cov` which runs `cargo test` — not useful for
+    /// ktstr tests. Always pass a subcommand.
+    LlvmCov {
+        #[arg(long, help = KERNEL_HELP_NO_RAW)]
+        kernel: Option<String>,
+        /// Disable all performance mode features (flock, pinning, RT
+        /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
+        /// For shared runners or unprivileged containers.
+        /// Also settable via KTSTR_NO_PERF_MODE env var.
+        #[arg(long)]
+        no_perf_mode: bool,
+        /// Arguments passed through to cargo llvm-cov.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -210,6 +236,13 @@ enum KtstrCommand {
         /// The VM exits after the command completes.
         #[arg(long)]
         exec: Option<String>,
+
+        /// Disable all performance mode features (flock, pinning, RT
+        /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
+        /// For shared runners or unprivileged containers.
+        /// Also settable via KTSTR_NO_PERF_MODE env var.
+        #[arg(long)]
+        no_perf_mode: bool,
     },
 }
 
@@ -361,16 +394,17 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Shared runner for `cargo ktstr test` and `cargo ktstr coverage`.
+/// Shared runner for `cargo ktstr test`, `cargo ktstr coverage`, and
+/// `cargo ktstr llvm-cov`.
 ///
-/// Both subcommands have the same plumbing: resolve `--kernel` to a
-/// cache entry or source-tree build, propagate `--no-perf-mode` via an
-/// env var, append the user's trailing args, and `exec` into the
+/// All three subcommands have the same plumbing: resolve `--kernel` to
+/// a cache entry or source-tree build, propagate `--no-perf-mode` via
+/// an env var, append the user's trailing args, and `exec` into the
 /// chosen cargo subcommand. The only differences are the cargo
-/// subcommand name (`["nextest","run"]` vs `["llvm-cov","nextest"]`)
-/// and the log / error-message prefix. Consolidating here ensures
-/// both flows evolve together — a kernel-resolution fix in one used
-/// to drift against the other.
+/// subcommand name (`["nextest","run"]` vs `["llvm-cov","nextest"]`
+/// vs `["llvm-cov"]`) and the log / error-message prefix.
+/// Consolidating here ensures all flows evolve together — a
+/// kernel-resolution fix in one used to drift against the others.
 fn run_cargo_sub(
     sub_argv: &[&str],
     label: &str,
@@ -414,8 +448,20 @@ fn run_cargo_sub(
     Err(format!("exec cargo {}: {err}", sub_argv.join(" ")))
 }
 
+/// Cargo sub-argv that `run_test` passes to `run_cargo_sub`. Named
+/// constant so the dispatch wiring is pinnable from a test — see
+/// `cargo_sub_argv_constants_are_pinned`.
+const TEST_SUB_ARGV: &[&str] = &["nextest", "run"];
+/// Cargo sub-argv for the `coverage` subcommand (cargo llvm-cov
+/// nextest).
+const COVERAGE_SUB_ARGV: &[&str] = &["llvm-cov", "nextest"];
+/// Cargo sub-argv for the `llvm-cov` raw-passthrough subcommand.
+/// Single element — the user's trailing args supply the llvm-cov
+/// subcommand (`report`, `clean`, `show-env`, ...).
+const LLVM_COV_SUB_ARGV: &[&str] = &["llvm-cov"];
+
 fn run_test(kernel: Option<String>, no_perf_mode: bool, args: Vec<String>) -> Result<(), String> {
-    run_cargo_sub(&["nextest", "run"], "tests", kernel, no_perf_mode, args)
+    run_cargo_sub(TEST_SUB_ARGV, "tests", kernel, no_perf_mode, args)
 }
 
 fn run_coverage(
@@ -423,13 +469,15 @@ fn run_coverage(
     no_perf_mode: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
-    run_cargo_sub(
-        &["llvm-cov", "nextest"],
-        "coverage",
-        kernel,
-        no_perf_mode,
-        args,
-    )
+    run_cargo_sub(COVERAGE_SUB_ARGV, "coverage", kernel, no_perf_mode, args)
+}
+
+fn run_llvm_cov(
+    kernel: Option<String>,
+    no_perf_mode: bool,
+    args: Vec<String>,
+) -> Result<(), String> {
+    run_cargo_sub(LLVM_COV_SUB_ARGV, "llvm-cov", kernel, no_perf_mode, args)
 }
 
 fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
@@ -595,7 +643,11 @@ fn run_shell(
     memory_mb: Option<u32>,
     dmesg: bool,
     exec: Option<String>,
+    no_perf_mode: bool,
 ) -> Result<(), String> {
+    if no_perf_mode {
+        unsafe { std::env::set_var("KTSTR_NO_PERF_MODE", "1") };
+    }
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
 
@@ -1068,6 +1120,11 @@ fn main() {
             no_perf_mode,
             args,
         } => run_coverage(kernel, no_perf_mode, args),
+        KtstrCommand::LlvmCov {
+            kernel,
+            no_perf_mode,
+            args,
+        } => run_llvm_cov(kernel, no_perf_mode, args),
         KtstrCommand::Verifier {
             scheduler,
             scheduler_bin,
@@ -1091,7 +1148,16 @@ fn main() {
             memory_mb,
             dmesg,
             exec,
-        } => run_shell(kernel, topology, include_files, memory_mb, dmesg, exec),
+            no_perf_mode,
+        } => run_shell(
+            kernel,
+            topology,
+            include_files,
+            memory_mb,
+            dmesg,
+            exec,
+            no_perf_mode,
+        ),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             KernelCommand::Build {
@@ -1183,6 +1249,86 @@ mod tests {
         }
     }
 
+    // -- try_get_matches_from: `test` visible alias `nextest` --
+
+    /// `cargo ktstr nextest` resolves to the canonical `Test`
+    /// variant. `visible_alias = "nextest"` on the variant makes
+    /// the alias user-facing (shows in --help) and dispatch-
+    /// transparent (the existing `KtstrCommand::Test` arm handles
+    /// both spellings). A regression that dropped the attribute
+    /// would fail this test at runtime.
+    #[test]
+    fn parse_nextest_alias_dispatches_to_test() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "nextest"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(k.command, KtstrCommand::Test { .. }),
+            "`nextest` alias must dispatch to the Test variant",
+        );
+    }
+
+    /// `nextest` alias carries trailing args through the same
+    /// `trailing_var_arg` pipeline as `test`. Pins the alias's
+    /// passthrough behaviour byte-exactly so a clap regression
+    /// that treated the alias as a distinct parse tree surfaces
+    /// here rather than in runtime dispatch.
+    #[test]
+    fn parse_nextest_alias_with_passthrough_args() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "nextest",
+            "--",
+            "-p",
+            "ktstr",
+            "--no-capture",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Test { args, .. } => {
+                assert_eq!(args, vec!["-p", "ktstr", "--no-capture"]);
+            }
+            _ => panic!("expected Test (via `nextest` alias)"),
+        }
+    }
+
+    /// Verify the `nextest` alias preserves all Test fields in a
+    /// single invocation: `--kernel`, `--no-perf-mode`, and empty
+    /// trailing `args`. A clap regression that silently dropped a
+    /// field on the alias path (e.g. a derive bug that re-generated
+    /// the subcommand without inheriting the Test variant's args)
+    /// would surface here.
+    #[test]
+    fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "nextest",
+            "--kernel",
+            "6.14.2",
+            "--no-perf-mode",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Test {
+                kernel,
+                no_perf_mode,
+                args,
+            } => {
+                assert_eq!(kernel.as_deref(), Some("6.14.2"));
+                assert!(no_perf_mode);
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected Test (via `nextest` alias)"),
+        }
+    }
+
     // -- try_get_matches_from: coverage subcommand --
 
     #[test]
@@ -1221,6 +1367,141 @@ mod tests {
             }
             _ => panic!("expected Coverage"),
         }
+    }
+
+    /// Combined round-trip for Coverage: `--kernel`, `--no-perf-mode`,
+    /// AND trailing args all populate on a single invocation. Mirrors
+    /// `parse_llvm_cov_with_kernel_and_no_perf_mode` — a clap
+    /// regression that dropped one field on the multi-flag path (or
+    /// mis-ordered `--` with flags) would surface here for the
+    /// Coverage variant.
+    #[test]
+    fn parse_coverage_with_kernel_and_no_perf_mode() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "coverage",
+            "--kernel",
+            "6.14.2",
+            "--no-perf-mode",
+            "--",
+            "--workspace",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Coverage {
+                kernel,
+                no_perf_mode,
+                args,
+            } => {
+                assert_eq!(kernel.as_deref(), Some("6.14.2"));
+                assert!(no_perf_mode);
+                assert_eq!(args, vec!["--workspace"]);
+            }
+            _ => panic!("expected Coverage"),
+        }
+    }
+
+    // -- try_get_matches_from: llvm-cov raw passthrough subcommand --
+
+    #[test]
+    fn parse_llvm_cov_minimal() {
+        let m = Cargo::try_parse_from(["cargo", "ktstr", "llvm-cov"]);
+        assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    #[test]
+    fn parse_llvm_cov_with_kernel() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "llvm-cov", "--kernel", "6.14.2"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::LlvmCov { kernel, .. } => {
+                assert_eq!(kernel.as_deref(), Some("6.14.2"));
+            }
+            _ => panic!("expected LlvmCov"),
+        }
+    }
+
+    #[test]
+    fn parse_llvm_cov_with_passthrough_args() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "llvm-cov",
+            "--",
+            "report",
+            "--lcov",
+            "--output-path",
+            "lcov.info",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::LlvmCov { args, .. } => {
+                assert_eq!(
+                    args,
+                    vec!["report", "--lcov", "--output-path", "lcov.info"]
+                );
+            }
+            _ => panic!("expected LlvmCov"),
+        }
+    }
+
+    /// Combined round-trip: `--kernel`, `--no-perf-mode`, AND
+    /// trailing args all populate on a single LlvmCov invocation.
+    /// A clap regression that dropped one field on the multi-flag
+    /// path (or mis-ordered `--` with flags) would surface here.
+    #[test]
+    fn parse_llvm_cov_with_kernel_and_no_perf_mode() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "llvm-cov",
+            "--kernel",
+            "6.14.2",
+            "--no-perf-mode",
+            "--",
+            "report",
+            "--lcov",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::LlvmCov {
+                kernel,
+                no_perf_mode,
+                args,
+            } => {
+                assert_eq!(kernel.as_deref(), Some("6.14.2"));
+                assert!(no_perf_mode);
+                assert_eq!(args, vec!["report", "--lcov"]);
+            }
+            _ => panic!("expected LlvmCov"),
+        }
+    }
+
+    /// Negative pin: the variant is `LlvmCov`, and clap derive's
+    /// default casing is kebab-case (see clap_derive
+    /// `DEFAULT_CASING`), so the subcommand name is `llvm-cov`,
+    /// NOT `llvm_cov`. A regression that switched the derive's
+    /// rename_all default (or silently aliased the underscore
+    /// form) would turn this negative pin positive. The parent-
+    /// level `aliases` slot is empty, so clap rejects the
+    /// underscore form with an unknown-subcommand error.
+    #[test]
+    fn parse_llvm_cov_underscore_rejected() {
+        let rejected = Cargo::try_parse_from(["cargo", "ktstr", "llvm_cov"]);
+        assert!(
+            rejected.is_err(),
+            "`llvm_cov` (underscore) must be rejected — the \
+             canonical name is `llvm-cov` (kebab-case)",
+        );
     }
 
     // -- try_get_matches_from: shell subcommand --
@@ -1853,16 +2134,68 @@ mod tests {
         let mut cmd = Cargo::command();
         clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, "cargo", &mut buf);
         let output = String::from_utf8(buf).expect("completions should be valid UTF-8");
-        assert!(output.contains("test"), "zsh completions missing 'test'");
+        // clap_complete's zsh generator emits each subcommand as a
+        // `'NAME:HELP'` describe-list entry (see `add_subcommands`
+        // in clap_complete-4.6.1/src/aot/shells/zsh.rs:163). The
+        // `'<name>:` prefix pin identifies an actual subcommand
+        // completion, not an incidental substring match inside
+        // rendered doc text.
         assert!(
-            output.contains("coverage"),
-            "zsh completions missing 'coverage'"
+            output.contains("'test:"),
+            "zsh completions missing 'test:' describe-list entry"
         );
-        assert!(output.contains("shell"), "zsh completions missing 'shell'");
         assert!(
-            output.contains("kernel"),
-            "zsh completions missing 'kernel'"
+            output.contains("'coverage:"),
+            "zsh completions missing 'coverage:' describe-list entry"
         );
+        assert!(
+            output.contains("'shell:"),
+            "zsh completions missing 'shell:' describe-list entry"
+        );
+        assert!(
+            output.contains("'kernel:"),
+            "zsh completions missing 'kernel:' describe-list entry"
+        );
+        // `visible_alias = "nextest"` on the Test variant makes the
+        // alias user-facing — clap_complete's zsh generator iterates
+        // `get_visible_aliases` (zsh.rs:177) and emits a dedicated
+        // describe entry per alias. A regression that dropped the
+        // attribute (or silently switched to `alias` which is
+        // NON-visible) would drop the entry and fail this assertion.
+        assert!(
+            output.contains("'nextest:"),
+            "zsh completions missing 'nextest:' describe-list \
+             entry (visible alias of `test`)"
+        );
+        // `LlvmCov` variant renders as the kebab-case `llvm-cov`
+        // subcommand (clap derive default rename — see
+        // clap_derive-4.6.0/src/item.rs:27 `DEFAULT_CASING =
+        // CasingStyle::Kebab`). Pinned with the same `'name:`
+        // prefix so an accidental doc-text match doesn't mask a
+        // missing registration.
+        assert!(
+            output.contains("'llvm-cov:"),
+            "zsh completions missing 'llvm-cov:' describe-list entry"
+        );
+    }
+
+    // -- dispatch wiring: sub_argv constants --
+
+    /// Byte-exact pin on the three `*_SUB_ARGV` constants that drive
+    /// `run_test`, `run_coverage`, and `run_llvm_cov` into
+    /// `run_cargo_sub`. A regression that re-ordered the Coverage
+    /// tokens (e.g. swapped `["llvm-cov","nextest"]` → `["nextest",
+    /// "llvm-cov"]`) would exec `cargo nextest llvm-cov` which is
+    /// not a valid cargo subcommand, silently failing coverage
+    /// runs. A regression that added a second token to
+    /// `LLVM_COV_SUB_ARGV` (e.g. `["llvm-cov","test"]`) would
+    /// prepend an implicit subcommand and override the user's
+    /// trailing args. Both are caught here.
+    #[test]
+    fn cargo_sub_argv_constants_are_pinned() {
+        assert_eq!(TEST_SUB_ARGV, &["nextest", "run"]);
+        assert_eq!(COVERAGE_SUB_ARGV, &["llvm-cov", "nextest"]);
+        assert_eq!(LLVM_COV_SUB_ARGV, &["llvm-cov"]);
     }
 
     // -- generate_flag_profiles --

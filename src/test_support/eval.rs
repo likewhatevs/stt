@@ -215,7 +215,15 @@ pub(crate) fn run_ktstr_test_inner(
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;
     let scheduler = match entry.scheduler.scheduler_binary() {
-        Some(b) => resolve_scheduler(b)?,
+        Some(b) => {
+            // Drop the ResolveSource on this path — the downstream
+            // sites (VM builder, auto_repro) only need the PathBuf.
+            // Consumers that want provenance (sidecar stamping,
+            // cache-key construction) must call resolve_scheduler
+            // directly on the same spec; the source is stable across
+            // identical inputs within a single process run.
+            resolve_scheduler(b)?.0
+        }
         None => None,
     };
     let ktstr_bin = crate::resolve_current_exe()?;
@@ -976,26 +984,109 @@ fn scheduler_label(spec: &SchedulerSpec) -> String {
 // Scheduler resolution
 // ---------------------------------------------------------------------------
 
+/// Provenance of a scheduler binary returned by [`resolve_scheduler`].
+///
+/// Each variant identifies the discovery branch that produced the
+/// path, so downstream tooling (sidecar, cache-key construction, log
+/// lines) can distinguish "we found a pre-built binary in a target
+/// directory whose git hash we don't control" from "we just built
+/// this binary from HEAD in the current workspace and therefore know
+/// its git hash matches [`crate::GIT_HASH`]."
+///
+/// Only the [`AutoBuilt`](Self::AutoBuilt) variant carries an honest
+/// git-hash guarantee: every other branch locates an *existing* file
+/// whose provenance is outside this process's knowledge. Callers that
+/// need to stamp a sidecar with a scheduler-specific commit must
+/// discard the hash for every non-`AutoBuilt` resolution — a stale
+/// `target/debug/` binary looks identical to a fresh `AutoBuilt` one
+/// but can be arbitrarily old.
+///
+/// `Eevdf` / `KernelBuiltin` / `Path` resolutions do not go through
+/// the discovery cascade; they map to [`EnvVar`](Self::EnvVar) style
+/// variants only by analogy. For those, the source is:
+/// - `Eevdf` / `KernelBuiltin` → [`NotFound`](Self::NotFound) (no
+///   user-space binary involved; the tuple's `Option<PathBuf>` is
+///   `None`).
+/// - `Path(p)` → [`EnvVar`](Self::EnvVar) (the caller named the path
+///   explicitly, which is the most authoritative source).
+///
+/// The variant ordering in the enum mirrors the discovery cascade
+/// order in [`resolve_scheduler`] so a reviewer can scan both lists
+/// in lockstep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveSource {
+    /// Resolved via an explicit environment variable or caller-
+    /// provided path (`KTSTR_SCHEDULER` for `Discover`, the literal
+    /// path for `SchedulerSpec::Path`). Trusted to the extent the
+    /// caller trusts the variable or argument; git-hash provenance
+    /// is UNKNOWN to this process.
+    EnvVar,
+    /// Resolved via a sibling of [`crate::resolve_current_exe`]
+    /// (same directory, or the sibling of a `deps/` directory for
+    /// integration tests / nextest). Git-hash provenance UNKNOWN
+    /// — the binary may be from any previous build.
+    SiblingDir,
+    /// Resolved via a fallback search in `target/debug/`. Git-hash
+    /// provenance UNKNOWN — a stale binary from an older tree
+    /// passes this check identically to a fresh one.
+    TargetDebug,
+    /// Resolved via a fallback search in `target/release/`. Git-hash
+    /// provenance UNKNOWN — same stale-binary hazard as
+    /// [`TargetDebug`](Self::TargetDebug).
+    TargetRelease,
+    /// Built on demand by [`crate::build_and_find_binary`] inside this
+    /// process. The build targets the current workspace's HEAD, so
+    /// the resulting binary's source matches [`crate::GIT_HASH`]
+    /// by construction — the ONLY variant where the git hash is
+    /// honest.
+    AutoBuilt,
+    /// No user-space binary path was produced. Returned for
+    /// `SchedulerSpec::Eevdf` and `SchedulerSpec::KernelBuiltin` (the
+    /// kernel supplies the scheduler — no binary to locate). The
+    /// tuple's `Option<PathBuf>` is always `None` for this variant.
+    NotFound,
+}
+
 /// Resolve a scheduler binary from a `SchedulerSpec`.
 ///
-/// Returns `Ok(None)` for `SchedulerSpec::Eevdf` (EEVDF).
-/// For `Discover`, searches: `KTSTR_SCHEDULER` env, sibling of current_exe,
-/// `target/debug/`, `target/release/`.
-/// For `Path`, validates the file exists.
-pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
+/// Returns the resolved path (if any) paired with the
+/// [`ResolveSource`] naming the discovery branch that produced it.
+/// The source is load-bearing for downstream provenance: only
+/// [`ResolveSource::AutoBuilt`] guarantees the binary matches the
+/// current workspace's [`crate::GIT_HASH`]; every other variant
+/// locates a pre-existing file whose git hash is UNKNOWN to this
+/// process.
+///
+/// Variant mapping:
+/// - `Eevdf` / `KernelBuiltin { .. }` → `(None, NotFound)` (no
+///   user-space binary).
+/// - `Path(p)` → `(Some(p), EnvVar)` (explicit caller-named path;
+///   validated for existence).
+/// - `Discover(name)` → cascade through `KTSTR_SCHEDULER` env
+///   ([`EnvVar`](ResolveSource::EnvVar)), sibling of
+///   `current_exe` ([`SiblingDir`](ResolveSource::SiblingDir)),
+///   `target/debug/` ([`TargetDebug`](ResolveSource::TargetDebug)),
+///   `target/release/` ([`TargetRelease`](ResolveSource::TargetRelease)),
+///   on-demand build ([`AutoBuilt`](ResolveSource::AutoBuilt)).
+///   Exhausting every branch is a hard error.
+pub fn resolve_scheduler(
+    spec: &SchedulerSpec,
+) -> Result<(Option<PathBuf>, ResolveSource)> {
     match spec {
-        SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => Ok(None),
+        SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => {
+            Ok((None, ResolveSource::NotFound))
+        }
         SchedulerSpec::Path(p) => {
             let path = PathBuf::from(p);
             anyhow::ensure!(path.exists(), "scheduler not found: {p}");
-            Ok(Some(path))
+            Ok((Some(path), ResolveSource::EnvVar))
         }
         SchedulerSpec::Discover(name) => {
             // 1. KTSTR_SCHEDULER env var
             if let Ok(p) = std::env::var("KTSTR_SCHEDULER") {
                 let path = PathBuf::from(&p);
                 if path.exists() {
-                    return Ok(Some(path));
+                    return Ok((Some(path), ResolveSource::EnvVar));
                 }
             }
 
@@ -1005,7 +1096,7 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
             {
                 let candidate = dir.join(name);
                 if candidate.exists() {
-                    return Ok(Some(candidate));
+                    return Ok((Some(candidate), ResolveSource::SiblingDir));
                 }
                 // Integration tests and nextest place test binaries in
                 // target/{debug,release}/deps/. The scheduler binary is
@@ -1015,7 +1106,7 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
                 {
                     let candidate = parent.join(name);
                     if candidate.exists() {
-                        return Ok(Some(candidate));
+                        return Ok((Some(candidate), ResolveSource::SiblingDir));
                     }
                 }
             }
@@ -1023,18 +1114,18 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
             // 3. target/debug/
             let candidate = PathBuf::from("target/debug").join(name);
             if candidate.exists() {
-                return Ok(Some(candidate));
+                return Ok((Some(candidate), ResolveSource::TargetDebug));
             }
 
             // 4. target/release/
             let candidate = PathBuf::from("target/release").join(name);
             if candidate.exists() {
-                return Ok(Some(candidate));
+                return Ok((Some(candidate), ResolveSource::TargetRelease));
             }
 
             // 5. Build the scheduler package on demand.
             match crate::build_and_find_binary(name) {
-                Ok(path) => return Ok(Some(path)),
+                Ok(path) => return Ok((Some(path), ResolveSource::AutoBuilt)),
                 Err(e) => eprintln!("ktstr_test: auto-build scheduler '{name}' failed: {e:#}"),
             }
 
@@ -1232,18 +1323,43 @@ mod tests {
 
     #[test]
     fn resolve_scheduler_eevdf() {
-        let result = resolve_scheduler(&SchedulerSpec::Eevdf).unwrap();
-        assert!(result.is_none());
+        let (path, source) = resolve_scheduler(&SchedulerSpec::Eevdf).unwrap();
+        assert!(path.is_none());
+        assert_eq!(
+            source,
+            ResolveSource::NotFound,
+            "Eevdf has no user-space binary — source must be NotFound",
+        );
+    }
+
+    #[test]
+    fn resolve_scheduler_kernel_builtin_is_not_found() {
+        let (path, source) = resolve_scheduler(&SchedulerSpec::KernelBuiltin {
+            enable: &[],
+            disable: &[],
+        })
+        .unwrap();
+        assert!(path.is_none());
+        assert_eq!(
+            source,
+            ResolveSource::NotFound,
+            "KernelBuiltin has no user-space binary — source must be NotFound",
+        );
     }
 
     #[test]
     fn resolve_scheduler_path_exists() {
         let exe = crate::resolve_current_exe().unwrap();
-        let result = resolve_scheduler(&SchedulerSpec::Path(Box::leak(
+        let (path, source) = resolve_scheduler(&SchedulerSpec::Path(Box::leak(
             exe.to_str().unwrap().to_string().into_boxed_str(),
         )))
         .unwrap();
-        assert!(result.is_some());
+        assert!(path.is_some());
+        assert_eq!(
+            source,
+            ResolveSource::EnvVar,
+            "explicit Path(_) is the most authoritative source — maps to EnvVar",
+        );
     }
 
     #[test]
@@ -1265,9 +1381,13 @@ mod tests {
         let _lock = lock_env();
         let exe = crate::resolve_current_exe().unwrap();
         let _env = EnvVarGuard::set("KTSTR_SCHEDULER", &exe);
-        let result = resolve_scheduler(&SchedulerSpec::Discover("anything"));
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().unwrap(), exe);
+        let (path, source) = resolve_scheduler(&SchedulerSpec::Discover("anything")).unwrap();
+        assert_eq!(path.unwrap(), exe);
+        assert_eq!(
+            source,
+            ResolveSource::EnvVar,
+            "KTSTR_SCHEDULER hit must tag the result EnvVar",
+        );
     }
 
     // -- scheduler_label tests --

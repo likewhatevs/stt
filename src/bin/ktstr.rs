@@ -178,6 +178,13 @@ enum Command {
         /// The VM exits after the command completes.
         #[arg(long)]
         exec: Option<String>,
+
+        /// Disable all performance mode features (flock, pinning, RT
+        /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
+        /// For shared runners or unprivileged containers.
+        /// Also settable via KTSTR_NO_PERF_MODE env var.
+        #[arg(long)]
+        no_perf_mode: bool,
     },
     /// Capture or compare a host-wide per-thread state snapshot.
     ///
@@ -469,7 +476,11 @@ fn main() -> Result<()> {
             memory_mb,
             dmesg,
             exec,
+            no_perf_mode,
         } => {
+            if no_perf_mode {
+                unsafe { std::env::set_var("KTSTR_NO_PERF_MODE", "1") };
+            }
             cli::check_kvm()?;
             let kernel_path = cli::resolve_kernel_image(
                 kernel.as_deref(),

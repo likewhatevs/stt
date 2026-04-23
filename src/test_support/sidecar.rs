@@ -639,25 +639,58 @@ pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
     h.finish()
 }
 
-/// Materialize the entry-derived scheduler metadata that every
-/// sidecar carries regardless of pass/fail/skip: formatted sysctl
-/// lines, kargs, and the pretty scheduler name.
+/// Entry-derived scheduler metadata that every sidecar carries
+/// regardless of pass/fail/skip.
 ///
-/// Both write paths (`write_sidecar` and `write_skip_sidecar`) need
-/// this exact triple; keeping the derivation in one place means a
-/// change to the sidecar schema (e.g. a new scheduler-level field)
-/// shows up in all writers automatically.
-fn scheduler_fingerprint(
-    entry: &KtstrTestEntry,
-) -> (String, Option<String>, Vec<String>, Vec<String>) {
-    let sched_name = entry.scheduler.scheduler_name().to_string();
+/// Both write paths ([`write_sidecar`] and [`write_skip_sidecar`])
+/// thread the same materialized fields through to their
+/// `SidecarResult` constructors; keeping the derivation in a
+/// named struct (rather than a 4-tuple) means a new
+/// scheduler-level field shows up as a named field at both
+/// writer sites and in every call-site binding, instead of as
+/// an additional anonymous tuple slot that readers have to
+/// remember the ordering of.
+///
+/// `pub(crate)` rather than `pub`: the intermediate struct is a
+/// write-path detail, not a public API surface. No serde — this
+/// is not a persisted shape, just a grouped return value.
+///
+/// Derives `Debug` for `assert_eq!` diagnostics, `Clone` so tests
+/// can materialize a fixture once and reuse it across assertions,
+/// and `PartialEq`/`Eq` so tests can compare whole fingerprints
+/// in one statement rather than destructuring and asserting on
+/// each field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchedulerFingerprint {
+    /// Pretty scheduler name (matches `SidecarResult::scheduler`),
+    /// e.g. `"eevdf"` or a scheduler-kind payload's declared name.
+    pub(crate) scheduler: String,
+    /// Best-effort userspace scheduler commit; `None` for every
+    /// current variant per
+    /// [`crate::test_support::SchedulerSpec::scheduler_commit`].
+    pub(crate) scheduler_commit: Option<String>,
+    /// Formatted `sysctl.<key>=<value>` lines derived from the
+    /// scheduler's declared `sysctls()`.
+    pub(crate) sysctls: Vec<String>,
+    /// Kernel command-line args declared by the scheduler,
+    /// forwarded verbatim.
+    pub(crate) kargs: Vec<String>,
+}
+
+/// Materialize the [`SchedulerFingerprint`] for a test entry.
+///
+/// A change to the sidecar schema (e.g. a new scheduler-level
+/// field) extends this function + [`SchedulerFingerprint`] in
+/// one place and every writer picks it up automatically.
+fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
+    let scheduler = entry.scheduler.scheduler_name().to_string();
     // `entry.scheduler` is a `&Payload` wrapper, not a `&Scheduler`
     // directly — routing through `scheduler_binary()` returns the
     // underlying `Option<&SchedulerSpec>` (None for binary-kind
     // payloads). Flatten with `and_then` so a binary-kind payload
     // naturally yields `None` without duplicating the
     // binary-vs-scheduler dispatch logic here.
-    let sched_commit = entry
+    let scheduler_commit = entry
         .scheduler
         .scheduler_binary()
         .and_then(|s| s.scheduler_commit())
@@ -674,7 +707,12 @@ fn scheduler_fingerprint(
         .iter()
         .map(|s| s.to_string())
         .collect();
-    (sched_name, sched_commit, sysctls, kargs)
+    SchedulerFingerprint {
+        scheduler,
+        scheduler_commit,
+        sysctls,
+        kargs,
+    }
 }
 
 /// Compute the per-variant sidecar path and serialize + write the
@@ -714,22 +752,163 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
 #[allow(dead_code)]
 const SIDECAR_FLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Sleep between retry attempts inside
-/// [`atomic_mutate_sidecar`]'s flock wait loop. Keeps CPU cost
-/// bounded while letting contended writers resume within roughly
-/// the delay a legitimate predecessor takes to finish its mutate
-/// cycle.
+/// Base delay for [`atomic_mutate_sidecar`]'s exponential-backoff
+/// flock retry loop. The Nth consecutive `WOULDBLOCK` (0-indexed)
+/// computes a deterministic ceiling of `BASE * 2^N`, which
+/// [`flock_backoff_sleep`] caps at [`SIDECAR_FLOCK_BACKOFF_CAP`]
+/// and then full-jitters uniformly in `[0, ceiling]`. A 10 ms base
+/// wakes contended writers within a single scheduler quantum on
+/// the fast path; full jitter avoids the thundering-herd pattern
+/// that a fixed interval would produce when N writers all wake
+/// together after a predecessor releases its lock.
 #[allow(dead_code)]
-const SIDECAR_FLOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const SIDECAR_FLOCK_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Upper bound on [`flock_backoff_sleep`]'s jitter range, reached
+/// after roughly `log2(CAP_MS / BASE_MS) = log2(20) ≈ 4-5`
+/// consecutive `WOULDBLOCK`s. Cap of 200 ms keeps long contention
+/// waits bounded so the 30 s [`SIDECAR_FLOCK_BUDGET`] still
+/// admits ~150 retries at steady state; a lower cap would spin
+/// the CPU unnecessarily, a higher one would miss a briefly-held
+/// lock's release window.
+#[allow(dead_code)]
+const SIDECAR_FLOCK_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Age at which a `.lock` sibling file next to a sidecar JSON is
 /// considered "orphaned" and eligible for best-effort cleanup in
-/// [`clean_orphaned_sidecar_locks`]. Chosen well above the flock
-/// budget above (30 s) so a legitimate concurrent writer holding
-/// the lock for its full retry window is never cleaned up out
-/// from under itself.
+/// [`clean_orphaned_sidecar_locks`]. Derived as
+/// `10 * SIDECAR_FLOCK_BUDGET` at const-eval so the "orphan age
+/// strictly dominates the flock budget" invariant cannot drift
+/// if the budget is ever retuned: any writer still holding its
+/// lock during its full retry window keeps a fresh mtime (the
+/// [`rustix::fs::utimensat`] UTIME_NOW touch inside
+/// [`atomic_mutate_sidecar`]), so a concurrent orphan sweep that
+/// only wipes files older than `BUDGET * 10` never races a live
+/// holder.
+///
+/// # Clock-domain comparison caveats
+///
+/// The orphan check in [`clean_orphaned_sidecar_locks`]
+/// subtracts a file's `modified()` timestamp from
+/// [`std::time::SystemTime::now()`] and compares against this
+/// constant. Both values are wall-clock, so the arithmetic is at
+/// least commensurable — but wall-clock is not monotonic, and
+/// this pair of edge cases must be understood before tuning the
+/// constant:
+///
+/// ## (a) Backward NTP skew during a sweep
+///
+/// An NTP correction that steps the wall clock backward by `B`
+/// seconds between a lock file's write and the sweep's `now`
+/// makes the file APPEAR `B` seconds younger than it is. A
+/// backward skew larger than the 10× budget headroom would let
+/// a truly-stale lock slip past the age gate for one sweep
+/// cycle; the next sweep (after fresh mtime or further clock
+/// progress) would catch it. This is acceptable because the
+/// sweep is best-effort and any missed cleanup is recovered on
+/// the next call. A skew larger than the age threshold is a
+/// pathological system-administration event, not a correctness
+/// bug — `man adjtimex` explicitly warns that `settimeofday`
+/// users shouldn't expect monotonic behavior.
+///
+/// ## (b) Why CLOCK_MONOTONIC cannot substitute
+///
+/// `CLOCK_MONOTONIC` would be the correct clock for duration
+/// reasoning, but it is INCOMMENSURABLE with file mtime. mtime
+/// is recorded by the kernel as wall-clock seconds since the
+/// Unix epoch (`struct timespec` from `current_time(inode)` at
+/// `fs/inode.c:2382` routing through
+/// `ktime_get_coarse_real_ts64_mg` on the common path), not
+/// monotonic ticks — there is no syscall that returns a file's
+/// last-modified moment in `CLOCK_MONOTONIC`. Any attempt to
+/// compare a monotonic `Instant` against `metadata.modified()`
+/// would require trusting an epoch translation that is itself
+/// wall-clock-based, so nothing is gained by switching clocks
+/// and everything is lost to a more fragile conversion.
+///
+/// ## (c) Forward skew mitigated by inode-verify + 10× budget
+///
+/// An NTP correction that steps the clock FORWARD by `F`
+/// seconds between a lock acquire and the sweep's `now` makes a
+/// live lock APPEAR `F` seconds older than it is. The 10×
+/// budget headroom tolerates `F < 9 * BUDGET` before a false
+/// unlink is possible; even in that case the inode-verify loop
+/// in [`atomic_mutate_sidecar`] detects the inode flip (the
+/// sweep's unlink + next writer's `O_CREAT` produce a distinct
+/// st_ino), drops the stale fd, and retries against the new
+/// path. The combined defense — 10× headroom as first line,
+/// inode-verify as backstop — means even a pathological
+/// forward-skew event cannot corrupt the mutate; it can only
+/// force additional retries, which the deadline check
+/// terminates cleanly if they persist.
 #[allow(dead_code)]
-const SIDECAR_LOCK_ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+const SIDECAR_LOCK_ORPHAN_AGE: std::time::Duration = SIDECAR_FLOCK_BUDGET.saturating_mul(10);
+
+/// Compute the per-attempt jitter ceiling in milliseconds for
+/// [`flock_backoff_sleep`]. Pure function of `attempt` and the
+/// two backoff constants — no clock reads, no RNG — so unit
+/// tests can pin the ceiling curve without waiting on wall-clock
+/// time.
+///
+/// Logic: `min(BASE * 2^attempt, CAP)`. `checked_shl` guards the
+/// pathological `attempt == u32::MAX` case that would overflow
+/// the shift; on overflow, saturate to `CAP` so the caller's
+/// jitter range stays bounded rather than panicking. The shift
+/// operand is the base-in-milliseconds, not the Duration itself,
+/// because `Duration::mul` takes `u32` (not `1 << u32`) and
+/// there is no `Duration::checked_shl`.
+///
+/// Return type is `u64` rather than `Duration` so the test that
+/// pins `u32::MAX` against `CAP` can compare raw millisecond
+/// values without a conversion-layer dependency.
+#[allow(dead_code)]
+fn flock_backoff_ceiling_ms(attempt: u32) -> u64 {
+    let base_ms = SIDECAR_FLOCK_BACKOFF_BASE.as_millis() as u64;
+    let cap_ms = SIDECAR_FLOCK_BACKOFF_CAP.as_millis() as u64;
+    base_ms
+        .checked_shl(attempt)
+        .map(|v| v.min(cap_ms))
+        .unwrap_or(cap_ms)
+}
+
+/// Sleep with full-jitter exponential backoff inside
+/// [`atomic_mutate_sidecar`]'s flock retry loops. `attempt` is
+/// the 0-indexed count of consecutive `WOULDBLOCK` returns; the
+/// per-attempt ceiling grows as `min(BASE * 2^attempt, CAP)`
+/// (computed by [`flock_backoff_ceiling_ms`]), and the actual
+/// sleep is sampled uniformly from `[0, ceiling]` to decorrelate
+/// concurrent writers racing for the same lock. The final sleep
+/// is clamped to the remaining deadline so a writer on the edge
+/// of timeout does not oversleep and miss its budget.
+///
+/// A standalone helper (rather than inline backoff arithmetic)
+/// keeps both retry sites — the flock `WOULDBLOCK` loop and the
+/// outer inode-flip retry — on the same schedule, so a future
+/// change to the backoff curve shows up at both call sites
+/// automatically.
+#[allow(dead_code)]
+fn flock_backoff_sleep(attempt: u32, deadline: std::time::Instant) {
+    use rand::RngExt;
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return;
+    }
+    let ceiling_ms = flock_backoff_ceiling_ms(attempt);
+    // Full jitter: uniform on `[0, ceiling_ms]` via inclusive
+    // `..=` range. Matches the "AWS full-jitter" recipe that
+    // minimises retry-herd variance at low N without sacrificing
+    // maximum throughput at high N.
+    let jittered_ms = rand::rng().random_range(0..=ceiling_ms);
+    let jittered = std::time::Duration::from_millis(jittered_ms);
+    // Clamp to remaining deadline: a writer one millisecond from
+    // timeout must not oversleep past its budget. `saturating_sub`
+    // on `Instant`-pair arithmetic would panic (Durations are
+    // not signed); use `saturating_duration_since` which returns
+    // zero on underflow instead.
+    let remaining = deadline.saturating_duration_since(now);
+    let sleep = jittered.min(remaining);
+    std::thread::sleep(sleep);
+}
 
 /// Derive the sibling lock-file path for a sidecar. Keeps the
 /// lock-path computation in one place so every writer and every
@@ -816,6 +995,12 @@ where
     // target dirs). Mismatch-retries consume the same wall-clock
     // budget as the flock-waits, so a pathological inode-flip
     // loop still times out cleanly rather than spinning forever.
+    //
+    // `outer_attempt` is the 0-indexed count of consecutive
+    // inode-flip retries fed to `flock_backoff_sleep`; the inner
+    // flock wait loop keeps its own attempt counter independent of
+    // this one so the two retry axes backoff at their own pace.
+    let mut outer_attempt: u32 = 0;
     let lock_fd = loop {
         let candidate_fd = open(
             &lock_path,
@@ -825,14 +1010,40 @@ where
         .with_context(|| format!("open lock file {}", lock_path.display()))?;
 
         // Inner loop: acquire flock, respecting the same deadline.
+        // `inner_attempt` is the 0-indexed count of consecutive
+        // `WOULDBLOCK`s fed to `flock_backoff_sleep` so the Nth
+        // retry waits uniformly in `[0, min(BASE * 2^N, CAP)]` —
+        // the full-jitter recipe avoids the thundering-herd
+        // coupling that a fixed retry interval produces when
+        // multiple writers wake together after a predecessor
+        // releases its lock.
+        let mut inner_attempt: u32 = 0;
         loop {
             match flock(&candidate_fd, FlockOperation::NonBlockingLockExclusive) {
                 Ok(()) => break,
-                Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(SIDECAR_FLOCK_RETRY_INTERVAL);
+                // EAGAIN and EWOULDBLOCK share a numeric value on
+                // Linux (see `include/uapi/asm-generic/errno.h`:
+                // `#define EWOULDBLOCK EAGAIN`), so rustix's
+                // `Errno::AGAIN` and `Errno::WOULDBLOCK` resolve
+                // to the same const. `#[allow(unreachable_patterns)]`
+                // keeps the explicit match arm in place as
+                // future-proofing: a hypothetical platform (or
+                // future rustix revision) where the two diverge
+                // would otherwise classify `AGAIN` as the
+                // unreachable `Err(e)` arm and abort the loop
+                // with an unexpected error. Matching both makes
+                // the retry discipline intent-level regardless
+                // of errno aliasing.
+                #[allow(unreachable_patterns)]
+                Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::AGAIN)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    flock_backoff_sleep(inner_attempt, deadline);
+                    inner_attempt = inner_attempt.saturating_add(1);
                     continue;
                 }
-                Err(rustix::io::Errno::WOULDBLOCK) => anyhow::bail!(
+                #[allow(unreachable_patterns)]
+                Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::AGAIN) => anyhow::bail!(
                     "flock(LOCK_EX) on {} timed out after {:?} — another \
                      writer holds the lock. Run `lslocks | grep {}` or \
                      `fuser {}` to identify the flock holder; if it is a \
@@ -937,8 +1148,12 @@ where
         }
         // Small sleep between reopen attempts so the flip-retry
         // loop doesn't busy-spin against a racing writer that is
-        // still in the narrow (unlink → creat) window.
-        std::thread::sleep(SIDECAR_FLOCK_RETRY_INTERVAL);
+        // still in the narrow (unlink → creat) window. Shares
+        // the backoff helper with the inner flock-retry loop so
+        // both retry axes decorrelate on their own schedules
+        // against the shared deadline.
+        flock_backoff_sleep(outer_attempt, deadline);
+        outer_attempt = outer_attempt.saturating_add(1);
     };
 
     // Read INSIDE the flock window — no separate `exists()` call.
@@ -1005,8 +1220,34 @@ where
     // sidecar into a hard failure for the caller. Mirrors the
     // same pattern applied at the jemalloc probe's in-binary
     // appender so both routes close the same durability gap.
-    if let Ok(parent) = std::fs::File::open(dir) {
-        let _ = parent.sync_all();
+    //
+    // Log-and-continue on failure: a silent swallow would make
+    // the durability regression invisible to operators, hiding a
+    // filesystem / mount-option misconfiguration (e.g. readonly
+    // remount between open and sync, or a volatile bind-mount
+    // that refuses fdatasync). Structured `dir` + `err` fields
+    // let log aggregators thread the failure back to the right
+    // run without needing to parse free-form text.
+    match std::fs::File::open(dir) {
+        Ok(parent) => {
+            if let Err(e) = parent.sync_all() {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    err = %format!("{e:#}"),
+                    "atomic_mutate_sidecar: parent-directory fsync failed after \
+                     rename; the renamed sidecar is visible in the VFS but a \
+                     concurrent crash could drop the directory-entry update \
+                     from durable storage",
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            dir = %dir.display(),
+            err = %format!("{e:#}"),
+            "atomic_mutate_sidecar: could not open parent directory for fsync; \
+             the rename already committed but the directory entry has no \
+             explicit durability guarantee",
+        ),
     }
 
     // Drop the lock BEFORE the orphan-cleanup sweep so the sweep's
@@ -1032,18 +1273,69 @@ where
 /// leaving a growing pile of `.lock` files in `target/ktstr`
 /// over many runs. This cleaner sweeps them opportunistically.
 ///
-/// Safety:
+/// # Why sweep-based GC rather than unlink-on-exit
+///
+/// A natural instinct is to have every writer `unlink(lock_path)`
+/// after releasing its flock — but that design is actively
+/// unsafe for advisory locks in the ways below. A periodic
+/// sweep gated on age + inode-verify is the correct discipline.
+///
+/// ## Crash-path signal loss
+///
+/// `unlink` runs from a best-effort cleanup path after the
+/// mutate succeeds. A process that crashes, OOM-kills, or is
+/// SIGKILLed between acquiring the flock and running its
+/// cleanup arm leaves the `.lock` file on disk forever. Unlike
+/// an in-kernel flock (which is released automatically on the
+/// fd's last close regardless of how the process exited), the
+/// on-disk lock-file inode has no equivalent auto-release —
+/// the VFS only reclaims the storage when the last dentry is
+/// removed. An `unlink-on-exit` design therefore leaks the
+/// file on the exact crash paths a lock-cleanup mechanism is
+/// supposed to tolerate. Sweep-based GC has no such hole: a
+/// file older than the threshold is reclaimed regardless of
+/// how its last owner exited.
+///
+/// ## Inode-flip race against active writers
+///
+/// An `unlink-on-exit` from writer A can race writer B's
+/// `open(O_CREAT)`: A unlinks while B is between its open and
+/// its flock, which means B's fd now points at a dentry that
+/// no future opener will resolve to. A third writer C's
+/// `O_CREAT` then creates a fresh inode, C acquires a flock on
+/// THAT inode, and B and C believe they both hold the lock.
+/// [`atomic_mutate_sidecar`]'s inode-verify loop already
+/// defends against this race under sweep-based GC (the sweep
+/// only unlinks files whose mtime exceeds the orphan age, so
+/// no active writer's lock file is ever a sweep target), but
+/// under unlink-on-exit the race is triggered by every lock
+/// release, converting a rare pathological sweep event into a
+/// routine write-path bug.
+///
+/// ## Why sweep-based GC is correct
+///
+/// A writer that is alive refreshes the lock file's mtime
+/// via `UTIME_NOW` on every flock acquire (see the `utimensat`
+/// call in [`atomic_mutate_sidecar`]) so the age gate never
+/// classifies a live holder as stale. A writer that has died
+/// leaves a stale mtime that ages past the threshold, at which
+/// point the sweep reclaims the file without any coupling to
+/// the dead process's exit path. The inode-verify loop
+/// provides a second line of defense for the narrow unlink →
+/// recreate → reopen window that a sweep can open.
+///
+/// # Safety
 ///
 ///   - Age gate: only files older than
-///     [`SIDECAR_LOCK_ORPHAN_AGE`] (5 min) are removed, well
-///     above the 30 s flock budget. A legitimate concurrent
-///     writer that took out the lock seconds ago keeps its
-///     file — the mtime is fresh.
-///   - Extension gate: only files whose name ends in `.lock`
-///     under a `.ktstr.` namespace (via the `.ktstr.` substring
-///     check that mirrors [`collect_sidecars`]) are considered,
-///     so random `.lock` files belonging to other tools never
-///     get touched.
+///     [`SIDECAR_LOCK_ORPHAN_AGE`] (10× the flock budget) are
+///     removed. A legitimate concurrent writer that touched
+///     the file within the budget window keeps its file — the
+///     mtime is fresh.
+///   - Extension gate: only files whose name matches the exact
+///     `<prefix>.ktstr.json.lock` shape produced by
+///     [`sidecar_lock_path`] are considered, so adjacent
+///     `.lock` files belonging to other tools never get
+///     touched.
 ///   - Error tolerance: per-file removal failures log and
 ///     continue rather than bailing the sweep. Other processes
 ///     may still be creating/opening locks concurrently.
@@ -1223,7 +1515,12 @@ pub(crate) fn write_skip_sidecar(
     entry: &KtstrTestEntry,
     active_flags: &[String],
 ) -> anyhow::Result<()> {
-    let (scheduler, scheduler_commit, sysctls, kargs) = scheduler_fingerprint(entry);
+    let SchedulerFingerprint {
+        scheduler,
+        scheduler_commit,
+        sysctls,
+        kargs,
+    } = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
         topology: entry.topology.to_string(),
@@ -1281,7 +1578,12 @@ pub(crate) fn write_sidecar(
     active_flags: &[String],
     payload_metrics: &[PayloadMetrics],
 ) -> anyhow::Result<()> {
-    let (scheduler, scheduler_commit, sysctls, kargs) = scheduler_fingerprint(entry);
+    let SchedulerFingerprint {
+        scheduler,
+        scheduler_commit,
+        sysctls,
+        kargs,
+    } = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
         topology: entry.topology.to_string(),
@@ -2808,7 +3110,12 @@ mod tests {
             name: "eevdf_test",
             ..KtstrTestEntry::DEFAULT
         };
-        let (name, commit, sysctls, kargs) = scheduler_fingerprint(&entry);
+        let SchedulerFingerprint {
+            scheduler: name,
+            scheduler_commit: commit,
+            sysctls,
+            kargs,
+        } = scheduler_fingerprint(&entry);
         assert_eq!(name, "eevdf");
         assert!(
             commit.is_none(),
@@ -2835,7 +3142,12 @@ mod tests {
             scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
-        let (name, _commit, sysctls, kargs) = scheduler_fingerprint(&entry);
+        let SchedulerFingerprint {
+            scheduler: name,
+            scheduler_commit: _,
+            sysctls,
+            kargs,
+        } = scheduler_fingerprint(&entry);
         assert_eq!(name, "s");
         assert_eq!(
             sysctls,
@@ -2858,7 +3170,12 @@ mod tests {
             scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
-        let (_name, _commit, sysctls, kargs) = scheduler_fingerprint(&entry);
+        let SchedulerFingerprint {
+            scheduler: _,
+            scheduler_commit: _,
+            sysctls,
+            kargs,
+        } = scheduler_fingerprint(&entry);
         assert_eq!(kargs, vec!["quiet".to_string(), "splash".to_string()]);
         assert!(sysctls.is_empty());
     }
@@ -2875,7 +3192,12 @@ mod tests {
             scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
-        let (name, commit, _, _) = scheduler_fingerprint(&entry);
+        let SchedulerFingerprint {
+            scheduler: name,
+            scheduler_commit: commit,
+            sysctls: _,
+            kargs: _,
+        } = scheduler_fingerprint(&entry);
         assert_eq!(name, "s");
         assert!(
             commit.is_none(),
@@ -2914,7 +3236,12 @@ mod tests {
             scheduler: &BINARY_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
-        let (name, commit, sysctls, kargs) = scheduler_fingerprint(&entry);
+        let SchedulerFingerprint {
+            scheduler: name,
+            scheduler_commit: commit,
+            sysctls,
+            kargs,
+        } = scheduler_fingerprint(&entry);
         // Per `Payload::scheduler_name`, binary-kind payloads
         // carry the intent-level label `"kernel_default"` — pinning
         // this alongside the None-commit keeps the binary-kind
@@ -3794,5 +4121,159 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let never = tmp.path().join("never-created");
         assert_eq!(clean_orphaned_sidecar_locks(&never), 0);
+    }
+
+    // -- flock_backoff_ceiling_ms + flock_backoff_sleep --
+    //
+    // Pin the exponential-backoff curve against the two tunables
+    // (`SIDECAR_FLOCK_BACKOFF_BASE` = 10 ms, `SIDECAR_FLOCK_BACKOFF_CAP`
+    // = 200 ms). A change to either constant is a deliberate retune
+    // of contention behaviour; these tests fail loudly so the retune
+    // cannot slip silently past review.
+
+    /// attempt=0 yields the base: `10 * 2^0 == 10 ms`.
+    #[test]
+    fn flock_backoff_ceiling_ms_attempt_zero_is_base() {
+        assert_eq!(
+            flock_backoff_ceiling_ms(0),
+            SIDECAR_FLOCK_BACKOFF_BASE.as_millis() as u64,
+            "attempt=0 must equal BASE exactly — any shift there would \
+             mean the first retry waits longer than intended",
+        );
+    }
+
+    /// attempt=4 yields `10 * 2^4 == 160 ms`, which is below the
+    /// 200 ms CAP so no clamping is applied. Boundary case: one
+    /// step below where the cap engages.
+    #[test]
+    fn flock_backoff_ceiling_ms_below_cap() {
+        assert_eq!(
+            flock_backoff_ceiling_ms(4),
+            160,
+            "attempt=4 must exactly equal BASE * 2^4 = 160 ms \
+             (below the 200 ms cap)",
+        );
+        assert!(
+            flock_backoff_ceiling_ms(4) < SIDECAR_FLOCK_BACKOFF_CAP.as_millis() as u64,
+            "attempt=4 must still be under the cap so the cap is engaged \
+             first at attempt=5, not before",
+        );
+    }
+
+    /// attempt=5 yields `10 * 2^5 == 320 ms`, which exceeds the
+    /// CAP and must be clamped to exactly `CAP`. Boundary case:
+    /// one step above where the cap engages.
+    #[test]
+    fn flock_backoff_ceiling_ms_at_cap() {
+        assert_eq!(
+            flock_backoff_ceiling_ms(5),
+            SIDECAR_FLOCK_BACKOFF_CAP.as_millis() as u64,
+            "attempt=5 (10 * 32 = 320 ms) must clamp to CAP (200 ms); \
+             a regression that dropped the `.min(cap_ms)` would return \
+             320 here and let the jitter range grow without bound",
+        );
+    }
+
+    /// attempt=u32::MAX triggers the `checked_shl` overflow path
+    /// (`10u64 << u32::MAX` overflows the shift width of u64) and
+    /// must saturate to CAP rather than panic. This is the
+    /// pathological-caller guard documented in the function body.
+    #[test]
+    fn flock_backoff_ceiling_ms_overflow_saturates_to_cap() {
+        assert_eq!(
+            flock_backoff_ceiling_ms(u32::MAX),
+            SIDECAR_FLOCK_BACKOFF_CAP.as_millis() as u64,
+            "attempt=u32::MAX must saturate to CAP via the \
+             `checked_shl` + `unwrap_or(cap_ms)` fallback; a \
+             regression that used plain `<<` would panic in debug \
+             and silently produce 0 in release",
+        );
+    }
+
+    /// A deadline strictly before `Instant::now()` must trigger the
+    /// early-return at the top of `flock_backoff_sleep` so the
+    /// function returns without sleeping (and without reaching the
+    /// RNG, which would otherwise fire even if the sleep itself
+    /// were zero). Wall-clock pinned: the full call must complete
+    /// within a margin well below the backoff cap, proving the
+    /// body never slept.
+    #[test]
+    fn flock_backoff_sleep_zero_when_deadline_past() {
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let t0 = std::time::Instant::now();
+        flock_backoff_sleep(0, past);
+        let elapsed = t0.elapsed();
+        // 10 ms is generous: the function does a single
+        // `Instant::now()` + compare + return. A failure here
+        // means the early-return path regressed and the RNG /
+        // sleep arm ran when it shouldn't have.
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "flock_backoff_sleep with past deadline must early-return; \
+             elapsed was {elapsed:?}",
+        );
+    }
+
+    // -- const-level invariants on SIDECAR_LOCK_ORPHAN_AGE --
+
+    /// Pin the "orphan age strictly dominates the flock budget"
+    /// invariant that the derivation is meant to uphold. A
+    /// regression that changed the multiplier to 1 (or 0, or
+    /// shrank the budget without re-tuning) would break the
+    /// guarantee that a live writer holding its lock for the full
+    /// flock budget is never a cleanup target.
+    ///
+    /// Two-line check:
+    ///   - `>= BUDGET * 2` pins the dominance relation in the
+    ///     derivation. The review list asked for `* 2`, which is
+    ///     a lower bound; the actual derivation is `* 10`, so a
+    ///     regression would have to drop below `* 2` before this
+    ///     test trips. Keeping the lower bound conservative makes
+    ///     the invariant survive a future retune of the
+    ///     multiplier that stays within a sane band.
+    ///   - `>= 60 s` pins an absolute floor so a regression that
+    ///     collapsed `BUDGET` to a tiny value (say 1 s) would not
+    ///     silently produce a 10 s orphan age that a routine
+    ///     real-system pause could exceed.
+    #[test]
+    fn sidecar_lock_orphan_age_dominates_flock_budget() {
+        assert!(
+            SIDECAR_LOCK_ORPHAN_AGE >= SIDECAR_FLOCK_BUDGET * 2,
+            "orphan age ({SIDECAR_LOCK_ORPHAN_AGE:?}) must be at least \
+             2x the flock budget ({SIDECAR_FLOCK_BUDGET:?}) so a live \
+             writer is never cleaned up mid-hold",
+        );
+        assert!(
+            SIDECAR_LOCK_ORPHAN_AGE.as_secs() >= 60,
+            "orphan age must exceed 60 s in absolute terms; a sub-minute \
+             threshold would let routine real-system pauses (cgroup throttle, \
+             debugger attach) trigger false cleanups",
+        );
+    }
+
+    // -- EAGAIN / EWOULDBLOCK aliasing --
+
+    /// The `flock` retry loop matches `Errno::WOULDBLOCK | Errno::AGAIN`
+    /// under `#[allow(unreachable_patterns)]` because the two
+    /// constants alias on Linux (`include/uapi/asm-generic/errno.h`
+    /// declares `EWOULDBLOCK EAGAIN`). The
+    /// `unreachable_patterns` allow is load-bearing only while
+    /// that alias holds; pin the assumption explicitly so a
+    /// platform where the two diverged would fail here — at
+    /// which point the `unreachable_patterns` arm would no
+    /// longer be unreachable, and the allow would want to move
+    /// (or be removed entirely). `raw_os_error()` is const and
+    /// returns the bare i32 errno value, which is what the
+    /// kernel header defines equality against.
+    #[test]
+    fn rustix_errno_wouldblock_aliases_again() {
+        assert_eq!(
+            rustix::io::Errno::WOULDBLOCK.raw_os_error(),
+            rustix::io::Errno::AGAIN.raw_os_error(),
+            "rustix's WOULDBLOCK and AGAIN must alias on this target; \
+             a divergence means the `Err(WOULDBLOCK | AGAIN)` match \
+             arm in `atomic_mutate_sidecar` is no longer redundant \
+             and `#[allow(unreachable_patterns)]` should be removed",
+        );
     }
 }

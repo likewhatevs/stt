@@ -55,24 +55,58 @@ fn format_exit_status(status: std::process::ExitStatus) -> String {
     "signal-killed".to_string()
 }
 
+/// Spawn the alloc-worker with `args` and the env pairs in `envs`,
+/// then assert it exited with exactly `expected_code`. Returns the
+/// captured `Output` so the caller can chain stderr-substring asserts.
+///
+/// `reason` is a short fragment (e.g. "bytes=0") that appears in the
+/// assertion failure message so a failing test's banner names the
+/// branch under test — a bare "got exit code X" without context would
+/// force the reader to map the call site back to the branch by hand.
+///
+/// Centralises the spawn + `output.status.code()` + `format_exit_status`
+/// + stderr-lossy render triad that every test in this file otherwise
+/// retypes. A retype-drift (e.g. swapping `Some(expected)` for
+/// `Ok(expected)`, or dropping the stderr render on failure) would
+/// previously hide in one test's boilerplate; centralising forces
+/// every caller through the same assertion shape.
+///
+/// Most callers hand a `&[(&str, &str)]` slice literal for `envs`;
+/// tests that set zero env vars pass `&[]`. The `&[(&str, &str)]`
+/// signature is load-bearing: a `HashMap` would drop the ordering
+/// guarantee that the caller-side comment-beside-env pairing
+/// implicitly relies on (`background_thread:false` stability under
+/// sibling-test env leakage, etc.).
+fn assert_worker_exits(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    expected_code: i32,
+    reason: &str,
+) -> std::process::Output {
+    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
+    let mut cmd = std::process::Command::new(worker);
+    cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("spawn worker");
+    assert_eq!(
+        output.status.code(),
+        Some(expected_code),
+        "{reason} must exit with code {expected_code}; got {}; stderr: {}",
+        format_exit_status(output.status),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
 /// bytes=0 must exit with code 2. The worker's module doc pins
 /// `2: bytes == 0`; this test catches any refactor that silently
 /// re-routes the zero-size alloc guard to a different code or drops
 /// it entirely.
 #[test]
 fn worker_exits_2_on_bytes_zero() {
-    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
-    let output = std::process::Command::new(worker)
-        .arg("0")
-        .output()
-        .expect("spawn worker");
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "bytes=0 must exit with code 2; got {}; stderr: {}",
-        format_exit_status(output.status),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    assert_worker_exits(&["0"], &[], 2, "bytes=0");
 }
 
 /// Missing positional `<BYTES>` must exit with code 5 (argument
@@ -80,35 +114,14 @@ fn worker_exits_2_on_bytes_zero() {
 /// `expect() → exit(5)` refactor.
 #[test]
 fn worker_exits_5_on_missing_bytes_arg() {
-    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
-    let output = std::process::Command::new(worker)
-        .output()
-        .expect("spawn worker");
-    assert_eq!(
-        output.status.code(),
-        Some(5),
-        "missing BYTES must exit with code 5; got {}; stderr: {}",
-        format_exit_status(output.status),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    assert_worker_exits(&[], &[], 5, "missing BYTES");
 }
 
 /// Non-numeric `<BYTES>` must exit with code 5. Covers the
 /// parse-error branch.
 #[test]
 fn worker_exits_5_on_non_numeric_bytes_arg() {
-    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
-    let output = std::process::Command::new(worker)
-        .arg("not-a-number")
-        .output()
-        .expect("spawn worker");
-    assert_eq!(
-        output.status.code(),
-        Some(5),
-        "non-numeric BYTES must exit with code 5; got {}; stderr: {}",
-        format_exit_status(output.status),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    assert_worker_exits(&["not-a-number"], &[], 5, "non-numeric BYTES");
 }
 
 /// Ready-marker write failure must exit with code 4. Uses the
@@ -122,36 +135,27 @@ fn worker_exits_5_on_non_numeric_bytes_arg() {
 /// first failure the worker hits.
 #[test]
 fn worker_exits_4_on_ready_marker_write_fail() {
-    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
-    let output = std::process::Command::new(worker)
-        .arg("1024")
-        .env(
-            WORKER_READY_MARKER_OVERRIDE_ENV,
-            "/nonexistent-ktstr-test-dir/marker",
-        )
-        // Pin MALLOC_CONF to background_thread:false so that an
-        // operator with the opposite setting in their shell (or a
-        // sibling test that set it on its own invocation and had the
-        // state leak through an inheritance path we haven't caught)
-        // cannot race the worker into exiting 3 (thread count != 1)
-        // before it reaches the ready-marker branch we're trying to
-        // assert. Without this pin, a stray MALLOC_CONF would make
-        // this test flaky in exactly the conditions that
-        // `worker_exits_3_on_thread_count_not_one` deliberately
-        // exercises. Setting both the generic and tikv-jemallocator
-        // prefixed forms mirrors worker_exits_3's rationale (the
-        // `_rjem_` symbol prefix gates which variant the in-process
-        // allocator reads).
-        .env("MALLOC_CONF", "background_thread:false")
-        .env("_RJEM_MALLOC_CONF", "background_thread:false")
-        .output()
-        .expect("spawn worker");
-    assert_eq!(
-        output.status.code(),
-        Some(4),
-        "ready-marker write failure must exit with code 4; got {}; stderr: {}",
-        format_exit_status(output.status),
-        String::from_utf8_lossy(&output.stderr),
+    // MALLOC_CONF pinned to background_thread:false: an operator with
+    // the opposite setting in their shell (or a sibling test whose
+    // invocation state leaked through an inheritance path we haven't
+    // caught) cannot race the worker into exiting 3 (thread count != 1)
+    // before it reaches the ready-marker branch we're trying to
+    // assert. Without this pin, a stray MALLOC_CONF would make this
+    // test flaky in exactly the conditions that
+    // `worker_exits_3_on_thread_count_not_one` deliberately
+    // exercises. Setting both the generic and tikv-jemallocator
+    // prefixed forms mirrors worker_exits_3's rationale (the `_rjem_`
+    // symbol prefix gates which variant the in-process allocator
+    // reads).
+    let output = assert_worker_exits(
+        &["1024"],
+        &[
+            (WORKER_READY_MARKER_OVERRIDE_ENV, "/nonexistent-ktstr-test-dir/marker"),
+            ("MALLOC_CONF", "background_thread:false"),
+            ("_RJEM_MALLOC_CONF", "background_thread:false"),
+        ],
+        4,
+        "ready-marker write failure",
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -213,7 +217,6 @@ fn worker_exits_4_on_ready_marker_write_fail() {
 /// switch to a more robust forcing mechanism.
 #[test]
 fn worker_exits_3_on_thread_count_not_one() {
-    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
     // MALLOC_CONF is LOAD-BEARING here: the `background_thread:true`
     // setting is the only reason the worker ever reaches the exit-3
     // branch. Without this env, jemalloc starts in single-thread
@@ -225,24 +228,27 @@ fn worker_exits_3_on_thread_count_not_one() {
     // `background_thread:false` as BELT-AND-SUSPENDERS — defensive
     // pins against a leaking env var from an operator's shell or a
     // sibling test, not a prerequisite for the branch under test.
-    let output = std::process::Command::new(worker)
-        .arg("1024")
-        .env("MALLOC_CONF", "background_thread:true")
-        .env("_RJEM_MALLOC_CONF", "background_thread:true")
-        .output()
-        .expect("spawn worker");
-    assert_eq!(
-        output.status.code(),
-        Some(3),
-        "background_thread:true must spawn a helper thread before \
-         the /proc/self/task self-check and exit 3; got {}; stderr: {}",
-        format_exit_status(output.status),
-        String::from_utf8_lossy(&output.stderr),
+    let output = assert_worker_exits(
+        &["1024"],
+        &[
+            ("MALLOC_CONF", "background_thread:true"),
+            ("_RJEM_MALLOC_CONF", "background_thread:true"),
+        ],
+        3,
+        "background_thread:true helper spawn (exit-3 branch)",
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("/proc/self/task has"),
         "stderr must name the self-check that fired; got: {stderr}",
+    );
+    // The MALLOC_CONF hint added to the exit-3 stderr (see worker
+    // src) must be present so an operator hitting the branch
+    // unexpectedly (leaked env, not this test) knows where to look.
+    assert!(
+        stderr.contains("MALLOC_CONF") && stderr.contains("background_thread"),
+        "stderr must include the MALLOC_CONF / background_thread hint so an \
+         operator hitting the branch unexpectedly sees the cause; got: {stderr}",
     );
 }
 
@@ -257,11 +263,8 @@ fn worker_exits_3_on_thread_count_not_one() {
 /// emitting branch is sampled at least once.
 #[test]
 fn worker_stderr_lines_share_centralized_prefix() {
-    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
     // Exit 5: missing BYTES.
-    let output = std::process::Command::new(worker)
-        .output()
-        .expect("spawn worker (missing-bytes case)");
+    let output = assert_worker_exits(&[], &[], 5, "prefix check (missing BYTES)");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.starts_with(WORKER_STDERR_PREFIX),
@@ -269,10 +272,7 @@ fn worker_stderr_lines_share_centralized_prefix() {
          got: {stderr}",
     );
     // Exit 2: bytes=0.
-    let output = std::process::Command::new(worker)
-        .arg("0")
-        .output()
-        .expect("spawn worker (bytes=0 case)");
+    let output = assert_worker_exits(&["0"], &[], 2, "prefix check (bytes=0)");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.starts_with(WORKER_STDERR_PREFIX),
@@ -284,16 +284,16 @@ fn worker_stderr_lines_share_centralized_prefix() {
     // reason `worker_exits_4_on_ready_marker_write_fail` does — a
     // leaking background_thread:true setting would race this case
     // into exit 3 before the marker write is attempted.
-    let output = std::process::Command::new(worker)
-        .arg("1024")
-        .env(
-            WORKER_READY_MARKER_OVERRIDE_ENV,
-            "/nonexistent-ktstr-test-dir/marker",
-        )
-        .env("MALLOC_CONF", "background_thread:false")
-        .env("_RJEM_MALLOC_CONF", "background_thread:false")
-        .output()
-        .expect("spawn worker (marker-write case)");
+    let output = assert_worker_exits(
+        &["1024"],
+        &[
+            (WORKER_READY_MARKER_OVERRIDE_ENV, "/nonexistent-ktstr-test-dir/marker"),
+            ("MALLOC_CONF", "background_thread:false"),
+            ("_RJEM_MALLOC_CONF", "background_thread:false"),
+        ],
+        4,
+        "prefix check (marker-write)",
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.starts_with(WORKER_STDERR_PREFIX),

@@ -62,13 +62,17 @@ filter = "test(shell_exec_)"
 test-group = "vm-cli"
 threads-required = 1
 
-# ── perf-vm ──────────────────────────────────────────────────────────
-[test-groups.perf-vm]
+# ── vm-perf ──────────────────────────────────────────────────────────
+# Caps concurrent perf-sensitive VM tests at 8 on high-core hosts.
+# On hosts with fewer than 8 effective test-threads, nextest's global
+# parallelism is the binding limit, so no explicit lower floor is
+# needed.
+[test-groups.vm-perf]
 max-threads = 8
 
 [[profile.default.overrides]]
 filter = "test(sched_perf_)"
-test-group = "perf-vm"
+test-group = "vm-perf"
 threads-required = 1
 
 # Quick profile: short-circuit long-running tests.

@@ -585,23 +585,20 @@ impl CacheDir {
                     }
                 }
                 Err(reason) => {
-                    // Emit a `tracing::info` so operators
-                    // reviewing logs can distinguish a schema-drift
-                    // corruption (metadata.json parse failure —
-                    // typical cause: older sidecar format, a
-                    // partially-written metadata, or a field rename
-                    // in `KernelMetadata`) from other
-                    // corruption modes (missing image file, path
-                    // access errors). The on-disk
-                    // `ListedEntry::Corrupt` record carries `reason`
-                    // for the CLI table; the tracing event adds a
-                    // per-entry log line that CI / monitoring can
-                    // aggregate without scraping table output.
+                    // Emit a `tracing::info` so operators reviewing
+                    // logs can see per-entry corruption without
+                    // scraping the CLI table. `reason` carries a
+                    // self-classified prefix from `read_metadata` —
+                    // `"metadata.json missing"`, `"... unreadable: "`,
+                    // `"... schema drift: "`, `"... malformed: "`, or
+                    // `"... truncated: "`. The log message itself
+                    // stays neutral; downstream log parsers key on
+                    // the `reason` prefix rather than the message.
                     tracing::info!(
                         entry = %name,
                         path = %path.display(),
                         %reason,
-                        "cache entry corrupt at list-time (likely schema drift)",
+                        "cache entry corrupt at list-time",
                     );
                     entries.push(ListedEntry::Corrupt {
                         key: name,
@@ -1061,10 +1058,23 @@ fn atomic_swap_dirs(src: &Path, dst: &Path) -> anyhow::Result<()> {
 ///   (scanner stumbled onto an unrelated dir).
 /// - `"metadata.json unreadable: {e}"` — other I/O error from
 ///   `fs::read_to_string` (permissions, dangling symlink, etc.).
-/// - `"metadata.json parse error: {e}"` — serde_json rejected the
-///   file. The underlying `serde_json::Error` display is appended,
-///   which names the malformed or missing required field plus its
-///   line/column in the JSON.
+/// - `"metadata.json schema drift: {e}"` — serde_json's
+///   `Category::Data` branch: JSON parsed cleanly but does not match
+///   the [`KernelMetadata`] shape (missing required field, wrong
+///   type on a present field). Signals a cache written by a ktstr
+///   version whose `KernelMetadata` schema has since changed.
+/// - `"metadata.json malformed: {e}"` — serde_json's
+///   `Category::Syntax` branch: the file is not valid JSON at all
+///   (stray characters, unbalanced braces, etc.).
+/// - `"metadata.json truncated: {e}"` — serde_json's `Category::Eof`
+///   branch: the file ends mid-value. Typical cause is a
+///   partially-written metadata from a crashed store.
+///
+/// `Category::Io` is not reachable from `from_str`, which only sees
+/// an in-memory `&str` — the I/O branch exists for `from_reader`
+/// callers. If a future serde_json promotes `Category::Io` onto the
+/// `from_str` path, the fallback arm in the match below keeps the
+/// entry classified (generic "parse error") rather than panicking.
 fn read_metadata(dir: &Path) -> Result<KernelMetadata, String> {
     let meta_path = dir.join("metadata.json");
     let contents = match fs::read_to_string(&meta_path) {
@@ -1074,7 +1084,18 @@ fn read_metadata(dir: &Path) -> Result<KernelMetadata, String> {
         }
         Err(e) => return Err(format!("metadata.json unreadable: {e}")),
     };
-    serde_json::from_str(&contents).map_err(|e| format!("metadata.json parse error: {e}"))
+    serde_json::from_str(&contents).map_err(|e| match e.classify() {
+        serde_json::error::Category::Data => format!("metadata.json schema drift: {e}"),
+        serde_json::error::Category::Syntax => format!("metadata.json malformed: {e}"),
+        serde_json::error::Category::Eof => format!("metadata.json truncated: {e}"),
+        serde_json::error::Category::Io => {
+            tracing::error!(
+                err = %e,
+                "serde_json::from_str returned Category::Io — unexpected for in-memory input",
+            );
+            format!("metadata.json parse error: {e}")
+        }
+    })
 }
 
 /// Re-route a cache-entry directory to its original source tree when
@@ -2136,16 +2157,17 @@ mod tests {
 
     #[test]
     fn cache_dir_list_classifies_unreadable_metadata_as_corrupt() {
-        // The `missing` and `parse error` branches of `read_metadata`
-        // are covered elsewhere; the third branch — any I/O error on
-        // `fs::read_to_string` that is NOT `ErrorKind::NotFound` — is
-        // exercised here. Forcing a non-ENOENT error without relying
-        // on filesystem permissions (which vary across rootless
+        // The `missing` and parse-family branches (schema drift,
+        // malformed, truncated) of `read_metadata` are covered
+        // elsewhere; the I/O-error branch — any `fs::read_to_string`
+        // failure that is NOT `ErrorKind::NotFound` — is exercised
+        // here. Forcing a non-ENOENT error without relying on
+        // filesystem permissions (which vary across rootless
         // containers and CI sandboxes) is awkward, so we make
         // `metadata.json` a DIRECTORY: `read_to_string` then fails
-        // with `EISDIR`, which read_metadata must map to the
+        // with `EISDIR`, which `read_metadata` must map to the
         // `"metadata.json unreadable: "` prefix rather than the
-        // missing or parse-error labels. This pins the three-way
+        // missing or any parse-family label. This pins the
         // distinction so a future refactor that collapses the arms
         // back into a single generic "corrupt" reason breaks this
         // test before it ships a less-actionable diagnostic.
@@ -2165,17 +2187,19 @@ mod tests {
         assert!(
             reason.starts_with("metadata.json unreadable: "),
             "unreadable-metadata reason should carry the unreadable prefix distinct from the \
-             missing / parse-error prefixes, got: {reason}",
+             missing / schema-drift / malformed / truncated prefixes, got: {reason}",
         );
     }
 
     #[test]
     fn cache_dir_list_classifies_malformed_json_as_corrupt() {
-        // metadata.json exists but is not valid JSON. `read_metadata`
-        // maps the serde_json::Error into
-        // `"metadata.json parse error: {e}"`, so list() must surface
-        // the entry as Corrupt with that prefix and the underlying
-        // parse-error message preserved for actionable diagnostics.
+        // metadata.json exists but is not valid JSON at all (unbalanced
+        // punctuation / stray characters). `read_metadata` must route
+        // this through `serde_json::Error::classify() ==
+        // Category::Syntax` to produce the
+        // `"metadata.json malformed: {e}"` prefix — distinct from the
+        // schema-drift prefix that fires when JSON parses but does
+        // not match the `KernelMetadata` shape.
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().to_path_buf());
         let entry_dir = tmp.path().join("malformed-json");
@@ -2191,8 +2215,9 @@ mod tests {
             panic!("expected Corrupt variant for malformed-json entry");
         };
         assert!(
-            reason.starts_with("metadata.json parse error: "),
-            "malformed-JSON reason should carry the parse-error prefix, got: {reason}",
+            reason.starts_with("metadata.json malformed: "),
+            "malformed-JSON reason should carry the malformed prefix \
+             (Category::Syntax route), got: {reason}",
         );
     }
 
@@ -2202,15 +2227,15 @@ mod tests {
         // `KernelMetadata` schema requires: `source`, `arch`,
         // `image_name`, `built_at`, and `has_vmlinux`. These are
         // non-`Option`, non-`#[serde(default)]` fields, so
-        // `serde_json::from_str` fails when they are absent. Note
-        // `has_vmlinux: bool` is required even though it is not
-        // wrapped in `Option` — a plain `bool` with no
-        // `#[serde(default)]` attribute must still be present in the
-        // JSON payload. serde_json reports the first missing required
-        // field in declaration order (`source`), and `read_metadata`
-        // propagates that message as the Corrupt reason so the user
-        // sees which specific field is absent rather than a generic
-        // "unparseable metadata" blob.
+        // `serde_json::from_str` fails with `Category::Data` when
+        // they are absent. Note `has_vmlinux: bool` is required even
+        // though it is not wrapped in `Option` — a plain `bool` with
+        // no `#[serde(default)]` attribute must still be present in
+        // the JSON payload. serde_json reports the first missing
+        // required field in declaration order (`source`), and
+        // `read_metadata` wraps it under the schema-drift prefix so
+        // the user sees both the classification ("schema drift") and
+        // the specific missing field.
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().to_path_buf());
         let entry_dir = tmp.path().join("incomplete-metadata");
@@ -2229,12 +2254,47 @@ mod tests {
             panic!("expected Corrupt variant for entry with incomplete metadata");
         };
         assert!(
-            reason.starts_with("metadata.json parse error: "),
-            "incomplete-metadata reason should carry the parse-error prefix, got: {reason}",
+            reason.starts_with("metadata.json schema drift: "),
+            "incomplete-metadata reason should carry the schema-drift \
+             prefix (Category::Data route), got: {reason}",
         );
         assert!(
             reason.contains("missing field `source`"),
             "incomplete-metadata reason should name the first missing required field, got: {reason}",
+        );
+    }
+
+    #[test]
+    fn cache_dir_list_classifies_truncated_json_as_corrupt() {
+        // metadata.json ends mid-value: `{"source":` stops after the
+        // colon with no value byte. serde_json surfaces this as
+        // `Category::Eof`, which `read_metadata` wraps under the
+        // `"metadata.json truncated: {e}"` prefix. Covers the Eof
+        // branch of the classify() match — distinct from the schema-
+        // drift (Data) and malformed (Syntax) branches exercised by
+        // the sibling tests above.
+        //
+        // Typical real-world cause: a crashed `store()` whose atomic
+        // rename never completed, leaving a partially-written
+        // metadata.json in a surviving entry directory.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let entry_dir = tmp.path().join("truncated-json");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("metadata.json"), br#"{"source":"#).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        let listed = &entries[0];
+        assert_eq!(listed.key(), "truncated-json");
+        assert!(listed.as_valid().is_none());
+        let ListedEntry::Corrupt { reason, .. } = listed else {
+            panic!("expected Corrupt variant for truncated-json entry");
+        };
+        assert!(
+            reason.starts_with("metadata.json truncated: "),
+            "truncated-JSON reason should carry the truncated prefix \
+             (Category::Eof route), got: {reason}",
         );
     }
 

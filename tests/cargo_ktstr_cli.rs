@@ -19,7 +19,28 @@ fn help_lists_subcommands() {
         .stdout(predicate::str::contains("shell"))
         .stdout(predicate::str::contains("kernel"))
         .stdout(predicate::str::contains("verifier"))
-        .stdout(predicate::str::contains("completions"));
+        .stdout(predicate::str::contains("completions"))
+        // `LlvmCov` variant renders as `llvm-cov` (clap derive
+        // kebab-case default). Pinned with the two-space leading
+        // indent that `HelpTemplate::subcmd` emits before every
+        // subcommand name (clap_builder-4.6.0/src/output/mod.rs:21
+        // `TAB = "  "` + help_template.rs:1070-1071 which pushes
+        // TAB then the name). This discriminates the subcommand
+        // list entry from incidental doc-text occurrences of
+        // "llvm-cov" that would satisfy a bare substring check.
+        .stdout(predicate::str::contains("  llvm-cov"))
+        // `visible_alias = "nextest"` on the Test variant makes
+        // the alias user-facing. Pinned by the literal
+        // `[aliases: nextest]` tag emitted by
+        // `HelpTemplate::sc_spec_vals` at clap_builder-4.6.0/src/
+        // output/help_template.rs:1043 — the styled-ANSI wrappers
+        // collapse to empty strings under `assert_cmd`'s non-TTY
+        // capture so the plain tag appears verbatim. A regression
+        // that dropped `visible_alias` (or switched to the
+        // non-visible `alias` form, which `sc_spec_vals` ignores
+        // at :1026 where it calls `get_visible_aliases`) would
+        // strip the tag and fail this assertion.
+        .stdout(predicate::str::contains("[aliases: nextest]"));
 }
 
 #[test]
@@ -33,6 +54,38 @@ fn help_test() {
         .stdout(predicate::str::contains("cargo nextest"));
 }
 
+/// `cargo ktstr nextest --help` reaches the same help page as
+/// `cargo ktstr test --help` via the `visible_alias = "nextest"`
+/// on the Test variant. Pins that the alias is wired as an alias
+/// (not a separate variant) — the help page inherits `--kernel`,
+/// `--no-perf-mode`, and the "cargo nextest" passthrough doc.
+#[test]
+fn help_nextest_alias() {
+    cargo_ktstr()
+        .args(["nextest", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--no-perf-mode"));
+}
+
+/// `cargo ktstr llvm-cov --help` renders the LlvmCov variant's
+/// help page. The variant's about text advertises `cargo llvm-cov`
+/// passthrough, and both `--kernel` + `--no-perf-mode` are
+/// declared on the variant — any of the three would fail if a
+/// clap regression re-generated the subcommand with drifted
+/// metadata.
+#[test]
+fn help_llvm_cov() {
+    cargo_ktstr()
+        .args(["llvm-cov", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--no-perf-mode"))
+        .stdout(predicate::str::contains("cargo llvm-cov"));
+}
+
 #[test]
 fn help_shell() {
     cargo_ktstr()
@@ -41,7 +94,8 @@ fn help_shell() {
         .success()
         .stdout(predicate::str::contains("--kernel"))
         .stdout(predicate::str::contains("--topology"))
-        .stdout(predicate::str::contains("--memory-mb"));
+        .stdout(predicate::str::contains("--memory-mb"))
+        .stdout(predicate::str::contains("--no-perf-mode"));
 }
 
 #[test]

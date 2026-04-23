@@ -167,6 +167,24 @@ fn main() {
     // check only exits early with an actionable diagnostic instead of
     // letting the probe observe a silently-broken worker.
     //
+    // Race against jemalloc's `background_thread` worker: the
+    // tikv-jemallocator default is `background_thread:false`, so a
+    // clean invocation reaches this self-check with exactly one TID
+    // (the main thread). An operator with `MALLOC_CONF=background_thread:true`
+    // in their shell (or a sibling test that set
+    // `_RJEM_MALLOC_CONF=background_thread:true` on an inherited env)
+    // unblocks jemalloc's helper thread during allocator init — which
+    // runs during the `std::env::args().collect()` Vec allocation above,
+    // BEFORE control reaches this self-check. The self-check then sees
+    // two TIDs and the worker exits 3. This is the exact branch
+    // `worker_exits_3_on_thread_count_not_one` in
+    // `tests/jemalloc_alloc_worker_exit_codes.rs` exercises on
+    // purpose; the other exit-code tests (bytes=0 → 2, marker fail → 4,
+    // argv → 5) deliberately pin
+    // `MALLOC_CONF=background_thread:false` + `_RJEM_MALLOC_CONF=…:false`
+    // so a leaky env var cannot race them into exit 3 before the branch
+    // under test fires.
+    //
     // Skipped under `--churn`: churn mode intentionally runs many
     // short-lived helper threads, breaking the tid==pid invariant on
     // purpose. The ESRCH-stress test does NOT rely on that invariant
@@ -179,7 +197,12 @@ fn main() {
                 if n != 1 {
                     eprintln!(
                         "{WORKER_STDERR_PREFIX} /proc/self/task has {n} entries, expected 1; \
-                         extra threads break the tid==pid identity"
+                         extra threads break the tid==pid identity. \
+                         Hint: check MALLOC_CONF / _RJEM_MALLOC_CONF for \
+                         `background_thread:true` — jemalloc spawns a helper \
+                         during init when that option is set, which trips \
+                         this self-check unless the caller pins \
+                         `background_thread:false`."
                     );
                     // Exit code 3: self-check saw >1 TID. The test
                     // body uses this to distinguish "a helper thread

@@ -83,7 +83,7 @@ pub use entry::{
     Scheduler, SchedulerSpec, Sysctl, Topology, TopologyConstraints, find_test,
 };
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
-pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
+pub use eval::{ResolveSource, nextest_setup, resolve_scheduler, resolve_test_kernel};
 pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
     walk_json_leaves,

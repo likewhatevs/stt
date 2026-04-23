@@ -188,7 +188,7 @@ are only meaningful under performance mode's controlled environment.
 ## Nextest parallelism
 
 Performance-mode tests each consume one LLC group on the host.
-The `perf-vm` test group in `.config/nextest.toml` sets a static
+The `vm-perf` test group in `.config/nextest.toml` sets a static
 `max-threads` limit. The flock-based LLC slot reservation
 (`acquire_resource_locks`) handles runtime contention: if all LLC
 slots are busy, the test returns `ResourceContention`.

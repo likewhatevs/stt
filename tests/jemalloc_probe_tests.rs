@@ -331,16 +331,26 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
 ///
 /// Coverage scope: this test only exercises the pid-not-found
 /// branch (`find_jemalloc_via_maps` fails on a missing
-/// `/proc/<pid>`). It does NOT cover the complementary
-/// "target exists but is not jemalloc-linked" branch — that
-/// path is reachable only by spawning a live non-jemalloc process
-/// (e.g. busybox), which a `#[ktstr_test]` VM cannot do without
-/// extra initramfs wiring (no busybox applets are packed in the
-/// test-only base image). Both branches funnel into the same
-/// `RunOutcome::Fatal` emission, so the guarantee tested here is
-/// "probe reports fatal and exits non-zero on an invalid pid".
-/// The not-jemalloc branch is tracked as a follow-up task and
-/// exercised by unit tests in the probe crate.
+/// `/proc/<pid>`). It does NOT cover the two complementary
+/// "target exists but the probe cannot read its jemalloc state"
+/// branches:
+/// - `jemalloc-not-found`: no `tsd_tls` symbol in any r-x mapping
+///   (target is linked against a different allocator, or a
+///   jemalloc build whose symbol-name prefix is not in
+///   [`TSD_TLS_SYMBOL_NAMES`]).
+/// - `jemalloc-in-dso`: `tsd_tls` present, but in a shared object
+///   rather than the main executable's static-TLS image. v1 cannot
+///   address dynamic-TLS symbols.
+///
+/// Reaching either branch from a `#[ktstr_test]` VM requires
+/// spawning a live non-jemalloc (or DSO-jemalloc) process inside
+/// the guest, which the test-only base image does not support
+/// (no busybox applets packed in). All three branches funnel into
+/// `RunOutcome::Fatal` with exit code 1, so the guarantee tested
+/// here is "probe reports fatal and exits non-zero on an invalid
+/// pid". The two skipped branches are tracked as follow-up tasks
+/// and exercised by unit tests in the probe crate
+/// (`find_jemalloc_via_maps` error paths).
 #[ktstr_test(llcs = 1, cores = 1, threads = 1)]
 fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
     let fake_pid: i32 = 999_999_999;
