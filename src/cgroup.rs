@@ -362,6 +362,29 @@ pub trait CgroupOps {
     fn cleanup_all(&self) -> Result<()>;
 }
 
+// The impl below is a thin forwarding layer from the `CgroupOps`
+// trait to the inherent `CgroupManager` methods. The duplication is
+// intentional: the inherent impl carries the real bodies (and the
+// fast-path monomorphic calls compile against it directly), while
+// this trait impl exists so the scenario layer can hold a
+// `&dyn CgroupOps` for test-double injection without a generic
+// parameter threaded through every caller. `CgroupOps` methods
+// cannot provide default bodies that access `CgroupManager`'s
+// private fields, so the forwarding cannot be collapsed via
+// trait-default-methods without exposing the internals. A
+// macro-generated delegation would cut the line count but lose the
+// method-by-method per-callsite `Go To Definition` discoverability;
+// the explicit forwarding is the cheaper trade. If a future refactor
+// shrinks `CgroupOps` toward just the methods the trait object
+// consumers actually use, the inherent methods that lose trait-level
+// callers can be deleted outright.
+//
+// Caller audit: `move_task` is not test-only. Outside the test
+// module there is one production caller at `move_task_with_retry`
+// (above), which is in turn called from `move_tasks` in the same
+// file. Removing `move_task` would force inlining its body into
+// `move_task_with_retry` and dropping the retry-free fast path that
+// the test at the bottom of this file pins.
 impl CgroupOps for CgroupManager {
     fn parent_path(&self) -> &Path {
         CgroupManager::parent_path(self)

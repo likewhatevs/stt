@@ -294,6 +294,14 @@ impl Scheduler {
     /// scheduler (EEVDF on current kernels), with no scheduler binary
     /// launched. Useful as a baseline and for tests that exercise
     /// framework behavior independent of any scx scheduler.
+    ///
+    /// The `.name` is `"eevdf"` — the historical record of the
+    /// scheduling class in effect. This is distinct from
+    /// [`Payload::KERNEL_DEFAULT.name`](crate::test_support::Payload::KERNEL_DEFAULT),
+    /// which is `"kernel_default"` (an intent-level label that stays
+    /// stable across kernel releases). See the docs on
+    /// `Payload::KERNEL_DEFAULT` for the rationale behind keeping
+    /// both names in the sidecar.
     pub const EEVDF: Scheduler = Scheduler {
         name: "eevdf",
         binary: SchedulerSpec::Eevdf,

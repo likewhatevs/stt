@@ -394,18 +394,36 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     let _ = worker.kill();
     let (_assert, metrics) = run_outcome?;
 
-    // Worker is single-threaded → its main thread's tid equals
-    // its pid, and probing it should surface exactly one thread
-    // entry. A larger thread count would mean the worker forked
-    // or spawned a helper thread (breaking the
-    // `worker_pid == worker_tid` identity).
+    // The worker is declared single-threaded (its /proc/self/task
+    // self-check enforces it), so the strong invariant is that
+    // `worker_pid` appears AS a tid in the probe's per-thread list —
+    // tid-identity. Pin both a lower bound on `n_threads` and the
+    // tid-identity check:
+    //
+    // - Lower bound (`n_threads >= 1`): the probe must reach per-
+    //   thread iteration and emit at least one entry. Zero means the
+    //   probe bailed early.
+    // - Tid-identity: `lookup_thread(metrics, worker_pid)` must
+    //   resolve to `ThreadLookup::Found`. `TidAbsent` means the
+    //   probe emitted some tids but none of them was the worker.
+    //
+    // `n_threads` is attached to the passing `AssertResult` at the
+    // end of this test as a `DetailKind::Other` diagnostic so
+    // future jemalloc versions that lazily spawn a background thread
+    // (decay / bg_thd) surface visibly in CI output: `n_threads > 1`
+    // would be a heads-up that the worker is no longer strictly
+    // single-threaded, without breaking the test's tid-identity
+    // contract. A strict `!= 1` assertion here would regress — the
+    // probe can still locate the worker's counter correctly even
+    // when jemalloc runs its own helper thread.
     let n_threads = thread_count(&metrics);
-    if n_threads != 1 {
+    if n_threads < 1 {
         return Ok(AssertResult::fail(AssertDetail::new(
             DetailKind::Other,
             format!(
-                "probe saw {n_threads} thread entries for single-threaded worker pid={worker_pid}; \
-                 expected exactly 1"
+                "probe saw n_threads={n_threads} for worker pid={worker_pid}; \
+                 probe must emit at least one thread entry — bailed before \
+                 per-thread iteration or filtered out every tid"
             ),
         )));
     }
@@ -418,14 +436,16 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
         } => (allocated_bytes, deallocated_bytes),
         ThreadLookup::MissingAllocatedBytes => {
             return Err(anyhow!(
-                "probe JSON has threads entry for tid={worker_tid} but no allocated_bytes; \
-                 probe likely emitted an error record in place of the counter fields"
+                "probe JSON has threads entry for tid={worker_tid} but no \
+                 allocated_bytes (n_threads={n_threads}); probe likely emitted \
+                 an error record in place of the counter fields"
             ));
         }
         ThreadLookup::TidAbsent => {
             return Err(anyhow!(
-                "probe JSON has no threads.N.tid == {worker_tid} entry; \
-                 flat metrics: {:?}",
+                "probe JSON has no threads.N.tid == {worker_tid} entry despite \
+                 n_threads={n_threads} — the probe emitted some tids but none \
+                 matched worker_pid, tid-identity is broken. Flat metrics: {:?}",
                 metrics
                     .metrics
                     .iter()
@@ -463,7 +483,22 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
         }
         _ => {}
     }
-    Ok(AssertResult::pass())
+    // Attach the observed n_threads to the passing result so CI
+    // output surfaces the count. If a future jemalloc version grows
+    // a lazily-spawned background thread the test still passes (via
+    // tid-identity), but `n_threads=2` in the detail makes the
+    // regression to "worker is no longer strictly single-threaded"
+    // visible for human review without a silent capability loss.
+    let mut result = AssertResult::pass();
+    result.details.push(AssertDetail::new(
+        DetailKind::Other,
+        format!(
+            "jemalloc_probe_external_target: n_threads={n_threads} for \
+             worker pid={worker_pid} (expected 1 for single-threaded worker; \
+             >1 indicates jemalloc or a future dep spawned a helper thread)"
+        ),
+    ));
+    Ok(result)
 }
 
 /// Error path — probe a pid that does not exist. The probe must

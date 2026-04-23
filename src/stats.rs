@@ -22,6 +22,7 @@ use polars::prelude::*;
 /// up `name` via [`metric_def`] — the static `METRICS` table is
 /// the authoritative source of the function identity.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct MetricDef {
     pub name: &'static str,
     /// Regression direction for this metric. A metric that
@@ -80,6 +81,14 @@ impl MetricDef {
 /// ([`compare_runs`]) uses `higher_is_worse` for delta direction.
 pub static METRICS: &[MetricDef] = &[
     MetricDef {
+        // `"worst_spread"` is the wire/surface name — emitted in
+        // sidecars, referenced by CI gates, and printed by
+        // `cargo ktstr stats compare`. Internally the field on
+        // `GauntletRow` is named `spread` and the polars DataFrame
+        // column keeps that shorter name; see the doc on
+        // `GauntletRow.spread` for the rationale (rename-of-
+        // registry-name is not safe because existing gate configs
+        // match this string by value).
         name: "worst_spread",
         polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 5.0,
@@ -230,6 +239,7 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
 /// metrics can land through the registry without touching every
 /// reader.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct GauntletRow {
     pub scenario: String,
     pub topology: String,
@@ -257,6 +267,17 @@ pub struct GauntletRow {
     /// lets stats tooling exclude these from pass counts so skipped
     /// runs don't inflate the apparent pass rate.
     pub skipped: bool,
+    /// Worst-case per-cgroup spread across the run. The [`METRICS`]
+    /// registry entry for this value is named `"worst_spread"` (the
+    /// domain-level name that appears in sidecars, CI gates, and
+    /// comparison output); the struct field and the polars DataFrame
+    /// column stick with `spread` for terseness. The three names
+    /// (`MetricDef.name = "worst_spread"`, `GauntletRow.spread`,
+    /// DataFrame column `"spread"`) describe the same quantity —
+    /// the registry name is not renamed to match the field name
+    /// because existing sidecars and CI regression gates reference
+    /// `"worst_spread"` by string and a rename would silently
+    /// invalidate them.
     pub spread: f64,
     pub gap_ms: u64,
     pub migrations: u64,
@@ -849,6 +870,7 @@ pub fn list_runs() -> anyhow::Result<()> {
 /// polarity, display unit, and name through it directly without
 /// re-looking up [`metric_def`].
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub(crate) struct Finding {
     pub scenario: String,
     pub topology: String,
@@ -870,6 +892,7 @@ pub(crate) struct Finding {
 /// converse is `removed_from_a`. The filter (when set) applies to
 /// every counter, so excluded rows do not contribute.
 #[derive(Debug, Clone, Default, serde::Serialize)]
+#[non_exhaustive]
 pub(crate) struct CompareReport {
     pub regressions: u32,
     pub improvements: u32,
@@ -1523,6 +1546,109 @@ mod tests {
     #[test]
     fn sidecar_to_row_zeros_neg_infinity_in_every_direct_f64_field() {
         assert_all_direct_f64_fields_sanitized(f64::NEG_INFINITY);
+    }
+
+    /// Subnormal f64 values (IEEE 754 denormals) are finite —
+    /// `is_finite()` returns `true` for them — and must pass through
+    /// `finite_or_zero` unchanged. Guards against a future refactor
+    /// that reaches for `is_normal()` instead of `is_finite()`,
+    /// which would incorrectly collapse subnormals to 0.0 and erase
+    /// very-small legitimate measurements. `f64::MIN_POSITIVE` is the
+    /// smallest normal positive; `/ 2.0` lands in the subnormal
+    /// range.
+    #[test]
+    fn sidecar_to_row_preserves_subnormal_f64_in_direct_fields() {
+        use crate::assert::ScenarioStats;
+        use crate::test_support;
+        let subnormal = f64::MIN_POSITIVE / 2.0;
+        assert!(subnormal.is_finite(), "subnormal must still be finite");
+        assert!(!subnormal.is_normal(), "subnormal must not be normal");
+        assert!(subnormal > 0.0, "subnormal is positive");
+        let sc = test_support::SidecarResult {
+            stats: ScenarioStats {
+                worst_spread: subnormal,
+                worst_page_locality: -subnormal,
+                worst_wake_latency_cv: subnormal,
+                ..Default::default()
+            },
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row = sidecar_to_row(&sc);
+        assert_eq!(
+            row.spread, subnormal,
+            "positive subnormal must pass through finite_or_zero unchanged",
+        );
+        assert_eq!(
+            row.page_locality, -subnormal,
+            "negative subnormal must pass through finite_or_zero unchanged",
+        );
+        assert_eq!(
+            row.worst_wake_latency_cv, subnormal,
+            "subnormal on a second direct-f64 field must also pass through",
+        );
+        // Motivation check: subnormals serialize (unlike NaN / ±Inf,
+        // serde_json emits them as standard decimal literals).
+        serde_json::to_string(&row).expect("subnormals serialize cleanly");
+    }
+
+    /// Pins that the direct-field NaN sanitization in
+    /// `sidecar_to_row` does NOT reach into `ext_metrics`. Finite
+    /// `ext_metrics` entries must survive untouched even when every
+    /// direct f64 field collapses to 0.0, and the `ext_metrics` map
+    /// must not grow a sanitization-synthesized entry. Complements
+    /// [`sidecar_to_row_drops_non_finite_ext_metrics`] (which pins
+    /// that non-finite `ext_metrics` entries are DROPPED) by pinning
+    /// the orthogonal claim: direct-field sanitization never writes
+    /// into `ext_metrics` regardless of the direct values.
+    #[test]
+    fn sidecar_to_row_direct_field_nan_does_not_touch_ext_metrics() {
+        use crate::assert::ScenarioStats;
+        use crate::test_support;
+        let mut ext = BTreeMap::new();
+        ext.insert("finite_nonzero".to_string(), 2.5);
+        ext.insert("finite_zero".to_string(), 0.0);
+        ext.insert("finite_negative".to_string(), -7.25);
+        let sc = test_support::SidecarResult {
+            stats: ScenarioStats {
+                // Every direct f64 field non-finite.
+                worst_spread: f64::NAN,
+                worst_migration_ratio: f64::INFINITY,
+                worst_p99_wake_latency_us: f64::NEG_INFINITY,
+                worst_median_wake_latency_us: f64::NAN,
+                worst_wake_latency_cv: f64::INFINITY,
+                worst_mean_run_delay_us: f64::NEG_INFINITY,
+                worst_run_delay_us: f64::NAN,
+                worst_page_locality: f64::INFINITY,
+                worst_cross_node_migration_ratio: f64::NEG_INFINITY,
+                ext_metrics: ext.clone(),
+                ..Default::default()
+            },
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row = sidecar_to_row(&sc);
+
+        // Direct-field collapse still works.
+        assert_eq!(row.spread, 0.0);
+        assert_eq!(row.migration_ratio, 0.0);
+        assert_eq!(row.page_locality, 0.0);
+
+        // ext_metrics survives unchanged — same length, same keys,
+        // same values.
+        assert_eq!(
+            row.ext_metrics.len(),
+            ext.len(),
+            "direct-field sanitization must not add or drop ext_metrics entries",
+        );
+        for (k, v) in &ext {
+            assert_eq!(
+                row.ext_metrics.get(k),
+                Some(v),
+                "ext_metrics entry {k:?} must pass through unchanged",
+            );
+        }
+
+        // Motivation check: the full row still serializes.
+        serde_json::to_string(&row).expect("sanitized row must serialize cleanly");
     }
 
     /// `sidecar_to_row` must drop NaN / +Infinity / -Infinity from

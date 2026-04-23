@@ -168,6 +168,20 @@ impl KernelMetadata {
     ///
     /// Optional fields default to `None` / `false`. Use setter methods
     /// to populate them.
+    ///
+    /// Note on `has_vmlinux`: builders leave this `false` on
+    /// construction and the setter should not be called directly.
+    /// The authoritative writer is [`CacheDir::store`], which
+    /// inspects the artifacts it's asked to persist and sets
+    /// `has_vmlinux = true` iff a stripped `vmlinux` ELF was
+    /// actually written into the entry directory. Setting
+    /// `has_vmlinux` anywhere else risks drift between the field
+    /// and the on-disk contents; that drift stays hidden until a
+    /// caller of [`vmlinux_path()`](CacheEntry::vmlinux_path)
+    /// consumes a path that doesn't exist, or silently skips a
+    /// vmlinux that's there but marked absent. `list()` does not
+    /// verify vmlinux presence, so the field alone is the source
+    /// of truth for lookups.
     pub fn new(source: KernelSource, arch: String, image_name: String, built_at: String) -> Self {
         KernelMetadata {
             version: None,
@@ -428,11 +442,20 @@ impl CacheDir {
     ///
     /// Returns the path that [`new`](Self::new) would use, without
     /// constructing a [`CacheDir`] or touching the filesystem.
-    pub fn resolve_root() -> anyhow::Result<PathBuf> {
+    /// Renamed from `resolve_root` to `default_root` so the name
+    /// describes what the returned path represents (the default
+    /// the constructor *would* pick), while
+    /// [`root`](Self::root) on an instance returns the root a
+    /// particular `CacheDir` actually points at — the two names
+    /// no longer share a noun.
+    pub fn default_root() -> anyhow::Result<PathBuf> {
         resolve_cache_root()
     }
 
-    /// Root directory of the cache.
+    /// Root directory this `CacheDir` is anchored at. Distinct from
+    /// [`default_root`](Self::default_root) (static): `default_root`
+    /// says "the default constructor would build here";
+    /// `root` says "this specific instance lives here".
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -1740,12 +1763,12 @@ mod tests {
     }
 
     #[test]
-    fn cache_dir_resolve_root_returns_path() {
+    fn cache_dir_default_root_returns_path() {
         let tmp = TempDir::new().unwrap();
         let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
-        let resolved = CacheDir::resolve_root().unwrap();
+        let resolved = CacheDir::default_root().unwrap();
         assert_eq!(resolved, tmp.path());
-        // Side-effect-free: calling resolve_root() must not create
+        // Side-effect-free: calling default_root() must not create
         // any directories beyond what the env var already pointed at.
     }
 

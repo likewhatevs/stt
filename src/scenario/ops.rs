@@ -30,6 +30,7 @@ use super::{CgroupGroup, Ctx, process_alive};
 /// Names use `Cow<'static, str>` so ops can reference compile-time
 /// literals (zero-cost) or runtime-generated strings (owned).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Op {
     /// Create a new cgroup under the managed cgroup parent.
     AddCgroup { name: Cow<'static, str> },
@@ -196,6 +197,7 @@ pub enum Op {
 
 /// How to compute a cpuset from topology.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum CpusetSpec {
     /// All CPUs in a given LLC index.
     Llc(usize),
@@ -2428,6 +2430,22 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
     for op in ops {
         match op {
             Op::AddCgroup { name } => {
+                // Mirror the collision check in `apply_setup`
+                // (`CgroupDef`) so the same name declared via `Op`
+                // is rejected the same way. Without this, an
+                // `Op::AddCgroup` could silently shadow a
+                // Backdrop-owned or step-local `CgroupDef`-created
+                // cgroup and the two writers could clobber each
+                // other's cpuset / subtree_control state.
+                if state.cgroup_name_is_tracked(name) {
+                    anyhow::bail!(
+                        "Op::AddCgroup '{}' collides with a cgroup already \
+                         tracked (by a prior Backdrop or step-local CgroupDef) — \
+                         declare it in exactly one place; use a fresh name for \
+                         the step-local cgroup",
+                        name,
+                    );
+                }
                 state.target_cgroups().add_cgroup_no_cpuset(name)?;
             }
             Op::RemoveCgroup { cgroup } => {
@@ -6209,16 +6227,13 @@ mod tests {
 
     /// Step-local `Op::AddCgroup` with a name that already lives
     /// in the Backdrop must route through the same
-    /// `cgroup_name_is_tracked` collision guard as `apply_setup`,
-    /// rather than letting the CgroupGroup push a shadow entry that
-    /// later steps could address. Currently
-    /// `apply_ops`/`Op::AddCgroup` calls
-    /// `target_cgroups().add_cgroup_no_cpuset(name)` with no
-    /// collision check — this test documents the current behavior
-    /// so a future refactor that adds the guard at the op level
-    /// (mirroring apply_setup) flips the assertion.
+    /// `cgroup_name_is_tracked` collision guard as `apply_setup`
+    /// — otherwise the CgroupGroup would push a shadow step-local
+    /// entry that later steps could address, silently racing the
+    /// Backdrop's own writes to cpuset / subtree_control on the
+    /// same cgroupfs path.
     #[test]
-    fn op_add_cgroup_step_local_allows_collision_with_backdrop_today() {
+    fn op_add_cgroup_step_local_rejects_collision_with_backdrop() {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
@@ -6229,48 +6244,57 @@ mod tests {
             .add_cgroup_no_cpuset("shared")
             .expect("add backdrop cgroup");
         let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-        // Current behavior: no collision guard at apply_ops level
-        // — the op succeeds and the CgroupGroup's name list gains
-        // a step-local copy of the same name. If a future change
-        // lifts the apply_setup-style guard into apply_ops, this
-        // assertion becomes an unwrap_err instead.
-        let result = apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("shared")]);
+        let err = apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("shared")])
+            .expect_err("apply_ops must reject a step-local AddCgroup whose \
+                         name already lives in the Backdrop");
+        let msg = format!("{err:?}");
         assert!(
-            result.is_ok(),
-            "current apply_ops does not collision-check Op::AddCgroup; got: {result:?}",
+            msg.contains("'shared'") && msg.contains("collides"),
+            "error must name the colliding cgroup and explain the collision; got: {msg}",
         );
+        // Step-local names must NOT gain a shadow entry after the
+        // guard fires.
         assert!(
-            step_state.cgroups.names().iter().any(|n| n == "shared"),
-            "step-local names must include the new copy",
+            step_state.cgroups.names().iter().all(|n| n != "shared"),
+            "step-local names must not contain the rejected name; got: {:?}",
+            step_state.cgroups.names(),
         );
+        // Backdrop copy is untouched.
         assert!(
             backdrop_state.cgroups.names().iter().any(|n| n == "shared"),
-            "backdrop copy must survive the op",
+            "backdrop copy must survive the rejected op",
         );
     }
 
-    /// `Op::AddCgroup` applied twice in one step pushes
-    /// two entries into the same CgroupGroup's `names` vec. Drop then
-    /// calls `remove_cgroup` for each — the second hits an
-    /// already-removed cgroup (safe via `let _ = `).
+    /// `Op::AddCgroup` applied twice in one step with the same name
+    /// is rejected by the `cgroup_name_is_tracked` collision guard.
+    /// The first op adds the name to step-local tracking; the second
+    /// sees it already tracked and bails, so the CgroupGroup's name
+    /// vec gains exactly one entry and Drop's remove_cgroup runs
+    /// once per unique name.
     #[test]
-    fn op_add_cgroup_duplicate_in_same_step_pushes_twice() {
+    fn op_add_cgroup_duplicate_in_same_step_is_rejected() {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
-        apply_ops_test(
+        let err = apply_ops_test(
             &ctx,
             &mut state,
             &[Op::add_cgroup("cg_dup"), Op::add_cgroup("cg_dup")],
         )
-        .unwrap();
+        .expect_err("second AddCgroup must fail against the same step-local name");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("'cg_dup'") && msg.contains("collides"),
+            "error must name the colliding cgroup and explain the collision; got: {msg}",
+        );
         let names = state.cgroups.names();
         assert_eq!(
             names.iter().filter(|n| n.as_str() == "cg_dup").count(),
-            2,
-            "current apply_ops pushes a name entry per Op::AddCgroup, even \
-             on duplicate names; got: {names:?}",
+            1,
+            "the first op must register the name exactly once; the second op \
+             must not push a shadow entry; got: {names:?}",
         );
     }
 
@@ -6360,6 +6384,60 @@ mod tests {
             "per-step teardown must rmdir in reverse addition order so a \
              child cgroup's directory is gone before its parent's rmdir \
              runs",
+        );
+    }
+
+    /// `build_stimulus` passes `step_idx` through the `to_u16` helper
+    /// which saturates to `u16::MAX` with a `tracing::warn!` on
+    /// overflow. The saturation arm is unreachable under realistic
+    /// gauntlet runs — scenarios do not hold 65k+ steps — but the
+    /// guard exists so a pathological scenario cannot silently wrap
+    /// the wire field. Exercise the three interesting values:
+    ///
+    /// - `step_idx == 0`: lower boundary, no saturation.
+    /// - `step_idx == u16::MAX as usize`: highest value that fits,
+    ///   still no saturation.
+    /// - `step_idx == u16::MAX as usize + 1`: first overflow, must
+    ///   saturate to `u16::MAX`.
+    #[test]
+    fn build_stimulus_saturates_step_idx_at_u16_max() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut step_state = StepState::empty(&ctx);
+        let mut backdrop_state = BackdropState::empty(&ctx);
+        let scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
+        let start = std::time::Instant::now();
+
+        let zero = build_stimulus(&start, 0, &[], &scenario);
+        assert_eq!(zero.step_index, 0, "step_idx=0 passes through");
+
+        let max = build_stimulus(&start, u16::MAX as usize, &[], &scenario);
+        assert_eq!(
+            max.step_index,
+            u16::MAX,
+            "step_idx=u16::MAX passes through unchanged (no saturation)",
+        );
+
+        let overflow = build_stimulus(&start, u16::MAX as usize + 1, &[], &scenario);
+        assert_eq!(
+            overflow.step_index,
+            u16::MAX,
+            "step_idx beyond u16::MAX must saturate to u16::MAX, not wrap",
+        );
+
+        // Far-overflow smoke check: u32::MAX as usize is well past
+        // the saturation boundary. The helper must still return
+        // u16::MAX; a wrap would produce a small value like 65535
+        // which would coincidentally match, but a truncated `as u16`
+        // on e.g. u16::MAX as usize + 2 yields 0, so the previous
+        // assertion already catches the wrap bug. This one guards
+        // the far-overflow edge.
+        let far = build_stimulus(&start, u32::MAX as usize, &[], &scenario);
+        assert_eq!(
+            far.step_index,
+            u16::MAX,
+            "far-overflow step_idx must saturate to u16::MAX",
         );
     }
 }

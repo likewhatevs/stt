@@ -229,6 +229,26 @@ impl Payload {
     /// agree, so the const describes what it selects for (the
     /// kernel's default) rather than naming a specific scheduler that
     /// a future kernel release could replace.
+    ///
+    /// ## `kernel_default` vs `eevdf` in sidecars
+    ///
+    /// `KERNEL_DEFAULT.name` is `"kernel_default"` (the intent-level
+    /// label), while `KERNEL_DEFAULT.scheduler_name()` returns
+    /// `"eevdf"` (the inner [`Scheduler::EEVDF`]'s `.name`). The two
+    /// names are deliberate, not a drift:
+    ///
+    /// - `"kernel_default"` answers "what did the test author select?"
+    ///   — a future kernel release replacing EEVDF keeps this label
+    ///   stable, so sidecars written now still compare meaningfully.
+    /// - `"eevdf"` answers "what scheduler actually ran?" — the
+    ///   historical record of the scheduling class in effect, which
+    ///   lets cross-kernel-version comparisons distinguish same-intent
+    ///   runs on different schedulers.
+    ///
+    /// Consumers should read `.name` when they want the author's
+    /// declaration and `.scheduler_name()` when they want the actual
+    /// scheduler. Sidecar writers emit both fields so downstream
+    /// tooling can pick.
     pub const KERNEL_DEFAULT: Payload = Payload {
         name: "kernel_default",
         kind: PayloadKind::Scheduler(&Scheduler::EEVDF),
