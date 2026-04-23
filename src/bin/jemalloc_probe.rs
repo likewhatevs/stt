@@ -88,7 +88,7 @@ use serde::Serialize;
 /// range) trigger a version increment. This keeps the rolling
 /// enrichment cadence (per-thread comm, timestamp, error_kind, etc.)
 /// from generating spurious version churn.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Capture the current wall-clock as Unix epoch seconds. `unwrap_or(0)`
 /// handles the impossible pre-epoch-clock case defensively — KVM
@@ -102,6 +102,29 @@ fn now_unix_sec() -> u64 {
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The probe's own pid as an `i32`. Linux enforces `pid_max <= 2^22`
+/// (kernel/pid.c), so the `u32 → i32` conversion is infallible in
+/// practice; the `expect` documents that invariant. Used in the
+/// self-probe guard, `--self-test` worker wiring, and test bodies —
+/// centralized so a future platform constraint change lands in one
+/// place.
+fn self_pid() -> i32 {
+    libc::pid_t::try_from(std::process::id())
+        .expect("Linux pid_max <= 2^22 so pid fits in pid_t")
+}
+
+/// Render the optional per-thread comm string as a trailing
+/// `" comm=<name>"` fragment for the human-readable output path, or
+/// the empty string when comm is absent. Shared by the Ok and Err
+/// arms of [`print_thread_result`] so both lines use identical
+/// formatting — a future consumer that greps for ` comm=` catches
+/// both. Factored to eliminate the open-coded
+/// `.as_deref().map(|c| format!(" comm={c}")).unwrap_or_default()`
+/// chain duplicated at every call site.
+fn format_comm_suffix(comm: Option<&str>) -> String {
+    comm.map(|c| format!(" comm={c}")).unwrap_or_default()
 }
 
 /// Candidate symbol names for jemalloc's per-thread state.
@@ -153,6 +176,22 @@ const DEALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_deallocate
 
 /// Probe a running jemalloc-linked process and report per-thread
 /// allocated / deallocated byte counters.
+///
+/// # Sampling modes
+///
+/// - **Single snapshot (default)**: `--snapshots 1` or omitted. The
+///   probe emits one entry in the top-level `snapshots` array with
+///   `interval_ms` absent.
+/// - **Multi-snapshot**: `--snapshots N --interval-ms MS` for
+///   `N > 1`. The probe resolves jemalloc symbols + enumerates tids
+///   ONCE up-front, then performs N attach/read/detach cycles per
+///   tid separated by `interval_ms` of sleep. The repeated work is
+///   the per-tid ptrace dance; the setup (ELF/DWARF parse, tid
+///   enumeration) is amortized across all N snapshots. The top-level
+///   `snapshots` array carries one entry per snapshot. Threads are
+///   NOT held stopped between snapshots — each tid is detached
+///   before the inter-snapshot sleep so the target workload
+///   continues to run.
 #[derive(Parser, Debug)]
 #[command(
     name = "ktstr-jemalloc-probe",
@@ -166,11 +205,23 @@ const DEALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_deallocate
                   binary carrying the jemalloc TLS symbol.\n\n\
                   The `--enable-stats` jemalloc build flag is NOT required: `thread.allocated` / \
                   `thread.deallocated` use jemalloc's `CTL_RO_NL_GEN` (ungated) and the fast/slow \
-                  path writes are unconditional."
+                  path writes are unconditional.\n\n\
+                  Sampling mode (external-pid only): pass `--snapshots N --interval-ms MS` to \
+                  take N snapshots separated by MS milliseconds. Symbol resolution and tid \
+                  enumeration run once; each snapshot attach/detaches per tid and threads are \
+                  released during the inter-snapshot sleep so the workload is not held stopped \
+                  across the run. The JSON output always carries a `snapshots` array — single \
+                  snapshot is an array of length 1."
 )]
 struct Cli {
     /// Target process id. Required unless `--self-test` is set.
-    #[arg(long, required_unless_present = "self_test")]
+    /// Must be a positive integer; pid 0 and negative values are
+    /// rejected at parse time since Linux tgids start at 1.
+    #[arg(
+        long,
+        required_unless_present = "self_test",
+        value_parser = clap::value_parser!(i32).range(1..),
+    )]
     pid: Option<i32>,
     /// Emit JSON on stdout instead of a human-readable table.
     #[arg(long)]
@@ -186,23 +237,115 @@ struct Cli {
     /// stripped external target would fail. Used by
     /// `tests/jemalloc_probe_tests.rs` for the closed-loop VM
     /// validation.
-    #[arg(long, conflicts_with = "pid", value_name = "BYTES")]
+    #[arg(
+        long,
+        conflicts_with_all = ["pid", "snapshots", "interval_ms"],
+        value_name = "BYTES",
+    )]
     self_test: Option<u64>,
+    /// Number of snapshots to take. Defaults to 1 (single-snapshot
+    /// mode). Values > 1 engage multi-snapshot mode and require
+    /// `--interval-ms`. Range is 1..=100_000; the upper cap bounds
+    /// the pre-allocated snapshot vector so a runaway `--snapshots`
+    /// cannot request a multi-GiB allocation before any ptrace work
+    /// runs.
+    ///
+    /// External-pid only; conflicts with `--self-test`.
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=100_000),
+        value_name = "N",
+    )]
+    snapshots: u32,
+    /// Milliseconds to wait between consecutive snapshots. Required
+    /// (and only meaningful) when `--snapshots > 1`. Range is
+    /// 1..=3_600_000 (1 ms to 1 hour); the upper cap bounds the
+    /// max single-run duration and guarantees the `Instant + Duration`
+    /// deadline math in [`sleep_with_cancel`] cannot overflow.
+    ///
+    /// **Delay precision** (`--interval-ms` → actual wait): the
+    /// configured delay is honored at the requested millisecond
+    /// granularity. `sleep_with_cancel` computes a deadline once at
+    /// entry and returns precisely when `Instant::now() >= deadline`;
+    /// sub-1ms clock jitter only affects the return instant, not the
+    /// accrued delay.
+    ///
+    /// **SIGINT response latency**: orthogonal to delay precision.
+    /// `std::thread::sleep` is not signal-aware, so SIGINT / SIGTERM
+    /// cannot shorten an in-flight sleep directly. The loop chunks
+    /// the remaining wait by `remaining.min(tick)` with `tick =`
+    /// [`CANCEL_POLL_TICK_MS`] (10 ms). For intervals >=
+    /// `CANCEL_POLL_TICK_MS` the SIGINT latency is bounded by one
+    /// poll tick (~10 ms). For intervals < 10 ms the per-iteration
+    /// sleep equals the configured interval, so latency degrades
+    /// gracefully. Upper bound is always 10 ms, independent of how
+    /// large the configured interval is.
+    ///
+    /// External-pid only; conflicts with `--self-test`.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..=3_600_000),
+        value_name = "MS",
+    )]
+    interval_ms: Option<u64>,
+}
+
+impl Cli {
+    /// Validate `--snapshots` / `--interval-ms` combination consistency
+    /// beyond what clap's declarative attributes cover. Specifically:
+    /// `--snapshots > 1` requires `--interval-ms`, and `--interval-ms`
+    /// without `--snapshots > 1` is rejected as a user-intent mismatch.
+    ///
+    /// Run from [`main`] immediately after `Cli::parse()`; a failure
+    /// here aborts the run with a usage-style stderr message and
+    /// non-zero exit.
+    fn validate_sampling_flags(&self) -> Result<()> {
+        if self.snapshots > 1 && self.interval_ms.is_none() {
+            bail!(
+                "--snapshots {} requires --interval-ms <MS>; multi-snapshot sampling \
+                 needs an explicit inter-snapshot wait",
+                self.snapshots,
+            );
+        }
+        if self.snapshots == 1 && self.interval_ms.is_some() {
+            bail!(
+                "--interval-ms is only meaningful with --snapshots > 1; omit --interval-ms \
+                 for a single-snapshot run",
+            );
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------
 // Output schema
 // ---------------------------------------------------------------------
 
+/// Unified probe JSON body. Single-snapshot and multi-snapshot runs
+/// both emit this shape; single-snapshot produces a `snapshots` array
+/// of length 1 with `interval_ms` absent. Consumers distinguish the
+/// two modes by `interval_ms` presence or `snapshots.len()`.
+///
+/// **Tid enumeration is frozen at run start.** `iter_task_ids` runs
+/// once before the first snapshot and the same tid list is reused
+/// for every subsequent snapshot. Threads spawned AFTER the initial
+/// enumeration are invisible to the probe — they will not appear
+/// in any snapshot even if they outlive the run. Threads that exit
+/// between snapshots produce [`ThreadResult::Err`] entries (typically
+/// `PtraceSeize` with ESRCH) on subsequent snapshots rather than
+/// disappearing, so index-wise diffing across `snapshots[*].threads`
+/// is stable.
 #[derive(Debug, Serialize)]
 struct ProbeOutput {
     schema_version: u32,
     pid: i32,
     tool_version: &'static str,
-    /// Unix-epoch seconds at the start of the probe run. Intended for
-    /// downstream diff tooling that correlates multiple probe
-    /// snapshots against a workload timeline — an absolute timestamp
-    /// lets callers align probe captures with other sidecar-emitted
+    /// Unix-epoch seconds at the start of the probe run (before any
+    /// per-tid work, before the first snapshot). Intended for
+    /// downstream diff tooling that correlates multiple probe runs
+    /// against a workload timeline — an absolute timestamp lets
+    /// callers align probe captures with other sidecar-emitted
     /// events. Unix seconds rather than ISO-8601 because this bin
     /// lives in its own compilation unit with no dependency on the
     /// lib crate's `test_support::timefmt` helper, and a `u64` is
@@ -220,6 +363,40 @@ struct ProbeOutput {
     /// guest events must re-anchor against each run's timestamps
     /// rather than applying a constant offset, or the correlation
     /// silently drifts.
+    started_at_unix_sec: u64,
+    /// Configured inter-snapshot delay in milliseconds. Present only
+    /// on multi-snapshot runs (`--snapshots > 1`); omitted via
+    /// `skip_serializing_if` for single-snapshot runs so the wire
+    /// shape flags mode explicitly. Useful for downstream tooling
+    /// that wants to correlate observed `snapshots[*].timestamp_unix_sec`
+    /// deltas against the configured cadence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interval_ms: Option<u64>,
+    /// `true` iff the run ended early because a SIGINT / SIGTERM
+    /// arrived during the snapshot loop or inter-snapshot sleep.
+    /// The `snapshots` array carries every snapshot started before
+    /// the signal landed, INCLUDING a partial final snapshot whose
+    /// per-tid loop was interrupted mid-iteration: its `threads`
+    /// array is truncated to the tids that completed before the
+    /// signal. Callers observing `interrupted: true` must expect
+    /// the last entry in `snapshots` to potentially cover fewer
+    /// tids than earlier entries.
+    ///
+    /// `false` on a normal completion.
+    interrupted: bool,
+    snapshots: Vec<Snapshot>,
+}
+
+/// One snapshot inside [`ProbeOutput::snapshots`]. Carries the
+/// timestamp + per-thread counters observed by a single iteration
+/// of the sampling loop. Thread ids come from the tid enumeration
+/// captured ONCE at run start (see [`ProbeOutput`] for the frozen-
+/// tid-list contract).
+#[derive(Debug, Serialize)]
+struct Snapshot {
+    /// Unix-epoch seconds at the start of this snapshot's per-tid
+    /// attach/read/detach loop. Same clock-source semantics as
+    /// [`ProbeOutput::started_at_unix_sec`].
     timestamp_unix_sec: u64,
     threads: Vec<ThreadResult>,
 }
@@ -456,7 +633,7 @@ fn extract_pt_tls_size(elf: &Elf<'_>) -> Result<u64> {
     let rounded = tls_hdr
         .p_memsz
         .checked_add(align - 1)
-        .and_then(|v| Some(v & !(align - 1)))
+        .map(|v| v & !(align - 1))
         .ok_or_else(|| anyhow!("PT_TLS size arithmetic overflow"))?;
     Ok(rounded)
 }
@@ -709,7 +886,7 @@ pub(crate) fn iter_task_ids(pid: i32) -> Result<Vec<i32>> {
 /// turns up in some other ELF (a shared library loaded separately),
 /// we bail — the TP math in this tool is only correct for the static
 /// TLS image in the main executable; dynamic-TLS DSOs need DTV walks
-/// (follow-up #558).
+/// which v1 does not implement.
 pub(crate) fn find_jemalloc_via_maps(
     pid: i32,
 ) -> Result<(TsdTlsSymbol, CounterOffsets)> {
@@ -847,6 +1024,18 @@ fn attached() -> &'static Mutex<BTreeSet<i32>> {
     ATTACHED.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
+/// Acquire the ATTACHED mutex, recovering from poisoning so a panic
+/// in one thread cannot prevent detach cleanup from running in the
+/// next. The tracked set is a plain `BTreeSet<i32>` of tids; any
+/// panic that poisoned it left the set in a valid state (inserts /
+/// removes are transactional), so `into_inner` on the poison error
+/// yields the same usable guard. `.unwrap()` was a double-panic
+/// hazard — if `ScopeDetach::drop` runs after another site poisoned
+/// the mutex, unwrapping would unwind a Drop and abort the process.
+fn attached_lock() -> std::sync::MutexGuard<'static, BTreeSet<i32>> {
+    attached().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 extern "C" fn on_sigint(_sig: i32) {
     // Async-signal-safe subset: just flip the flag and let the main
     // loop drain. We cannot touch the Mutex from signal context, but
@@ -959,11 +1148,17 @@ fn probe_single_thread(
 
     ptrace::seize(pid, Options::empty())
         .map_err(|e| ThreadProbeError::ptrace_seize(tid, e))?;
-    // Record the attach BEFORE we try to interrupt, so a failure in
-    // interrupt still lets cleanup detach us.
-    attached().lock().unwrap().insert(tid);
-
+    // Construct the detach guard IMMEDIATELY after a successful seize
+    // — before the `attached` set insert, before interrupt, before any
+    // subsequent fallible step. If the following `attached().lock()`
+    // panics (poisoned mutex), the guard's Drop still runs and the
+    // tid is detached. A reversed order (insert → guard) would leak
+    // the attach on that narrow window.
     let _attached_guard = ScopeDetach(tid);
+    // Record the attach so the SIGINT handler's `detach_all_attached`
+    // sweep sees this tid even if we crash or are interrupted before
+    // `interrupt`/`waitpid`.
+    attached_lock().insert(tid);
 
     ptrace::interrupt(pid).map_err(|e| ThreadProbeError::ptrace_interrupt(tid, e))?;
     match waitpid(pid, None) {
@@ -1040,17 +1235,17 @@ impl Drop for ScopeDetach {
     fn drop(&mut self) {
         let pid = Pid::from_raw(self.0);
         let _ = ptrace::detach(pid, None);
-        attached().lock().unwrap().remove(&self.0);
+        attached_lock().remove(&self.0);
     }
 }
 
 /// Detach everything still in `ATTACHED`. Called from the main loop
 /// when SIGINT arrived between tids.
 fn detach_all_attached() {
-    let tids: Vec<i32> = attached().lock().unwrap().iter().copied().collect();
+    let tids: Vec<i32> = attached_lock().iter().copied().collect();
     for tid in tids {
         let _ = ptrace::detach(Pid::from_raw(tid), None);
-        attached().lock().unwrap().remove(&tid);
+        attached_lock().remove(&tid);
     }
 }
 
@@ -1059,17 +1254,165 @@ fn detach_all_attached() {
 // ---------------------------------------------------------------------
 
 /// Outcome classification so `main` can decide the exit code without
-/// re-inspecting the `threads` vec. `AllFailed` still emits JSON so
-/// callers have a machine-parseable explanation; `Fatal` is for
+/// re-inspecting the `snapshots` vec. `AllFailed` still emits JSON
+/// so callers have a machine-parseable explanation; `Fatal` is for
 /// pre-probe errors (pid missing, no jemalloc, arch mismatch) where
 /// there's no per-thread error to surface.
+///
+/// The classification criterion for `AllFailed` is "every
+/// `ThreadResult` in every snapshot is an `Err`", i.e. the probe
+/// never observed a single live counter across the whole run.
+/// A multi-snapshot run that was interrupted by SIGINT / SIGTERM
+/// but produced at least one successful per-thread observation
+/// surfaces as `Ok` with `interrupted: true` on the output — the
+/// partial data is still useful to the caller.
 enum RunOutcome {
     Ok(ProbeOutput),
     AllFailed(ProbeOutput),
     Fatal(anyhow::Error),
 }
 
+/// Granularity (ms) at which [`sleep_with_cancel`] wakes to poll
+/// [`CLEANUP_REQUESTED`]. Small enough that SIGINT / SIGTERM during a
+/// multi-second interval aborts within one tick, large enough that the
+/// polling itself is not measurable load.
+const CANCEL_POLL_TICK_MS: u64 = 10;
+
+/// Sleep for `total_ms` milliseconds or until [`CLEANUP_REQUESTED`] is
+/// observed, whichever is first. Returns `true` if the sleep was
+/// cancelled by the cleanup flag, `false` if it completed normally.
+///
+/// `std::thread::sleep` is not signal-aware — a signal delivered
+/// during a long sleep does not shorten it — so the loop polls at
+/// [`CANCEL_POLL_TICK_MS`] granularity. A signal handler that sets
+/// the flag therefore unblocks cleanup within one tick regardless of
+/// the configured inter-snapshot interval.
+///
+/// Clap bounds `--interval-ms` to `1..=3_600_000`, so on a normal
+/// invocation the `Instant + Duration` deadline math cannot overflow.
+/// [`Instant::checked_add`] below is a belt-and-suspenders saturation:
+/// an `Instant` near the platform representation's upper bound would
+/// otherwise panic on overflow in debug builds. `Instant` has no
+/// `saturating_add`, so on `None` we pin the deadline to `now` —
+/// the function returns `false` without sleeping, which is the
+/// correct degenerate behavior for a deadline that cannot be
+/// represented.
+fn sleep_with_cancel(total_ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    let deadline = start
+        .checked_add(std::time::Duration::from_millis(total_ms))
+        .unwrap_or(start);
+    loop {
+        if CLEANUP_REQUESTED.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline - now;
+        let tick = std::time::Duration::from_millis(CANCEL_POLL_TICK_MS);
+        std::thread::sleep(remaining.min(tick));
+    }
+}
+
+/// Take one snapshot: iterate the tids, probe each, return a
+/// [`Snapshot`] carrying the timestamp + per-thread results. Shared
+/// symbol + offsets are passed in so the expensive ELF/DWARF parse
+/// and tid enumeration amortize across all snapshots in a multi-
+/// snapshot run.
+///
+/// On SIGINT / SIGTERM between tids the function detaches every
+/// still-attached tid and returns the partial snapshot with
+/// `interrupted = true`. The caller is responsible for turning that
+/// into a `RunOutcome::Fatal`.
+fn take_snapshot(
+    pid: i32,
+    symbol: &TsdTlsSymbol,
+    offsets: &CounterOffsets,
+    tids: &[i32],
+) -> (Snapshot, bool) {
+    // Capture timestamp BEFORE iterating threads so the field
+    // represents "start of this snapshot" — a post-loop capture
+    // would tail the variable-length per-thread ptrace work and
+    // drift as the snapshot progresses.
+    let timestamp_unix_sec = now_unix_sec();
+    let mut threads: Vec<ThreadResult> = Vec::with_capacity(tids.len());
+    let mut interrupted = false;
+    for &tid in tids {
+        if CLEANUP_REQUESTED.load(Ordering::SeqCst) {
+            detach_all_attached();
+            interrupted = true;
+            break;
+        }
+        // Read comm BEFORE probe: on failure paths the tid may
+        // exit mid-probe, and the pre-probe read has the best chance
+        // of catching a populated comm. Best-effort either way — a
+        // `None` comm never upgrades a per-thread result to Err.
+        let comm = read_thread_comm(pid, tid);
+        match probe_single_thread(tid, symbol, offsets) {
+            Ok(c) => threads.push(ThreadResult::Ok {
+                tid,
+                comm,
+                allocated_bytes: c.allocated_bytes,
+                deallocated_bytes: c.deallocated_bytes,
+            }),
+            Err(e) => threads.push(ThreadResult::Err {
+                tid,
+                comm,
+                error: format!("{:#}", e.source),
+                error_kind: e.kind,
+            }),
+        }
+    }
+    (
+        Snapshot {
+            timestamp_unix_sec,
+            threads,
+        },
+        interrupted,
+    )
+}
+
+/// True iff `threads` is empty or every entry is a
+/// [`ThreadResult::Err`]. Used to decide between the
+/// `Ok` / `AllFailed` run outcomes for single-snapshot runs and
+/// (collectively across all snapshots) for multi-snapshot runs.
+fn all_failed(threads: &[ThreadResult]) -> bool {
+    threads.is_empty() || threads.iter().all(|t| matches!(t, ThreadResult::Err { .. }))
+}
+
+/// Stable identity of the target's on-disk executable, captured by
+/// `stat(2)` on `/proc/<pid>/exe`. (dev, inode) uniquely identifies
+/// the file; re-stating between snapshots lets the probe detect a
+/// mid-run `execve` (new inode, same pid) or pid recycling (pid
+/// reused for a different executable) and bail with `Fatal` rather
+/// than reading stale TLS offsets from a process that no longer
+/// matches the ELF/DWARF parse done at run start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExeIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl ExeIdentity {
+    fn capture(pid: i32) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let path = format!("/proc/{pid}/exe");
+        let md = fs::metadata(&path).with_context(|| format!("stat {path}"))?;
+        Ok(Self {
+            dev: md.dev(),
+            ino: md.ino(),
+        })
+    }
+}
+
 fn run(cli: &Cli) -> RunOutcome {
+    // Capture run-start timestamp first so every `ProbeOutput` built
+    // below — success, all-failed, interrupted — carries the same
+    // `started_at_unix_sec`. Taking it inside each arm would drift
+    // with the variable pre-probe setup latency.
+    let started_at_unix_sec = now_unix_sec();
     // `required_unless_present = "self_test"` in the Cli derive
     // guarantees `pid` is Some whenever we reach this path.
     let pid = match cli.pid {
@@ -1085,8 +1428,7 @@ fn run(cli: &Cli) -> RunOutcome {
     // this at the CLI boundary produces an actionable error instead of
     // a per-thread EPERM cascade mid-run that looks like a permissions
     // problem.
-    let self_pid = libc::pid_t::try_from(std::process::id())
-        .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
+    let self_pid = self_pid();
     if pid == self_pid {
         return RunOutcome::Fatal(anyhow!(
             "refusing to probe self (pid {pid} == ktstr-jemalloc-probe's own pid). \
@@ -1098,48 +1440,107 @@ fn run(cli: &Cli) -> RunOutcome {
         return RunOutcome::Fatal(anyhow!("pid {pid} does not exist"));
     }
 
+    // Capture the target ELF's (dev, inode) BEFORE the ELF/DWARF
+    // parse so the parse itself is inside the identity window. A
+    // capture taken only AFTER the parse would miss an execve that
+    // landed DURING the parse — the symbol + offsets from
+    // `find_jemalloc_via_maps` could already be tied to a replaced
+    // binary by the time we start sampling.
+    let exe_identity = match ExeIdentity::capture(pid) {
+        Ok(v) => v,
+        Err(e) => return RunOutcome::Fatal(e),
+    };
+
+    // Symbol + offset resolution and tid enumeration are run ONCE
+    // even when `--snapshots > 1`. The ELF/DWARF parse in
+    // `find_jemalloc_via_maps` is the expensive non-per-thread step
+    // and was the motivation for sampling mode — repeating it per
+    // snapshot would defeat the amortization.
     let (symbol, offsets) = match find_jemalloc_via_maps(pid) {
         Ok(v) => v,
         Err(e) => return RunOutcome::Fatal(e),
     };
+
+    // Re-stat AFTER the parse. If the target execve'd during the
+    // parse window the symbol/offsets we cached no longer match
+    // /proc/<pid>/exe, and subsequent snapshots would read TLS
+    // offsets from a DIFFERENT binary. Bail before any per-tid
+    // ptrace work runs.
+    match ExeIdentity::capture(pid) {
+        Ok(current) if current != exe_identity => {
+            return RunOutcome::Fatal(anyhow!(
+                "target pid {pid} /proc/<pid>/exe changed during ELF/DWARF parse \
+                 (captured dev={:#x} ino={}, now dev={:#x} ino={}); \
+                 target execve'd mid-parse or pid recycled, TLS offsets invalid",
+                exe_identity.dev,
+                exe_identity.ino,
+                current.dev,
+                current.ino,
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => return RunOutcome::Fatal(e),
+    }
 
     let tids = match iter_task_ids(pid) {
         Ok(v) => v,
         Err(e) => return RunOutcome::Fatal(e),
     };
 
-    // Capture timestamp BEFORE iterating threads so the field
-    // represents "start of probe run" as its doc claims — a
-    // post-loop capture would tail the variable-length per-thread
-    // ptrace work and drift into meaninglessness for long traces.
-    let timestamp_unix_sec = now_unix_sec();
-
-    let mut threads: Vec<ThreadResult> = Vec::with_capacity(tids.len());
+    // `validate_sampling_flags` enforced that `interval_ms` is Some
+    // exactly when `snapshots > 1`; unwrap is guarded by that check
+    // in the multi-snapshot branch below.
+    let snapshot_count = cli.snapshots as usize;
+    let mut snapshots: Vec<Snapshot> = Vec::with_capacity(snapshot_count);
     let mut interrupted = false;
-    for tid in tids {
+    for i in 0..cli.snapshots {
         if CLEANUP_REQUESTED.load(Ordering::SeqCst) {
-            detach_all_attached();
             interrupted = true;
             break;
         }
-        // Read comm BEFORE probe: on failure paths the tid may
-        // exit mid-probe, and the pre-probe read has the best chance
-        // of catching a populated comm. Best-effort either way — a
-        // `None` comm never upgrades a per-thread result to Err.
-        let comm = read_thread_comm(pid, tid);
-        match probe_single_thread(tid, &symbol, &offsets) {
-            Ok(c) => threads.push(ThreadResult::Ok {
-                tid,
-                comm,
-                allocated_bytes: c.allocated_bytes,
-                deallocated_bytes: c.deallocated_bytes,
-            }),
-            Err(e) => threads.push(ThreadResult::Err {
-                tid,
-                comm,
-                error: format!("{:#}", e.source),
-                error_kind: e.kind,
-            }),
+        // Re-stat the target's /proc/<pid>/exe between snapshots.
+        // A changed (dev, ino) means the target execve'd or pid
+        // recycled — either way the TLS offsets we cached are no
+        // longer valid and subsequent snapshots would read garbage.
+        // Skip on iteration 0 because `exe_identity` was just
+        // captured before the loop.
+        if i > 0 {
+            match ExeIdentity::capture(pid) {
+                Ok(current) if current != exe_identity => {
+                    return RunOutcome::Fatal(anyhow!(
+                        "target pid {pid} /proc/<pid>/exe changed between snapshots \
+                         (captured dev={:#x} ino={}, now dev={:#x} ino={}); \
+                         target execve'd mid-run or pid recycled, TLS offsets invalid",
+                        exe_identity.dev,
+                        exe_identity.ino,
+                        current.dev,
+                        current.ino,
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => return RunOutcome::Fatal(e),
+            }
+        }
+        let (snap, snap_interrupted) = take_snapshot(pid, &symbol, &offsets, &tids);
+        snapshots.push(snap);
+        if snap_interrupted {
+            interrupted = true;
+            break;
+        }
+        // No sleep after the LAST snapshot — the interval separates
+        // consecutive snapshots, so N-1 sleeps for N snapshots. The
+        // single-snapshot branch threads through here with no sleep
+        // (the condition is false on the only iteration). Sleep is
+        // cancellable; a SIGINT mid-sleep ends the run with the
+        // snapshots taken so far + `interrupted: true` on the output.
+        if i + 1 < cli.snapshots {
+            let interval_ms = cli.interval_ms.expect(
+                "interval_ms guaranteed Some for snapshots > 1 by validate_sampling_flags",
+            );
+            if sleep_with_cancel(interval_ms) {
+                interrupted = true;
+                break;
+            }
         }
     }
 
@@ -1147,58 +1548,73 @@ fn run(cli: &Cli) -> RunOutcome {
         schema_version: SCHEMA_VERSION,
         pid,
         tool_version: env!("CARGO_PKG_VERSION"),
-        timestamp_unix_sec,
-        threads,
+        started_at_unix_sec,
+        interval_ms: cli.interval_ms,
+        interrupted,
+        snapshots,
     };
-
-    if interrupted {
-        return RunOutcome::Fatal(anyhow!(
-            "probe interrupted by signal — attached threads detached"
-        ));
-    }
-
-    if out.threads.is_empty() || out.threads.iter().all(|t| matches!(t, ThreadResult::Err { .. }))
-    {
+    let all_err = out
+        .snapshots
+        .iter()
+        .all(|s| all_failed(&s.threads));
+    if all_err {
         RunOutcome::AllFailed(out)
     } else {
         RunOutcome::Ok(out)
     }
 }
 
+/// Render one `ThreadResult` to stdout (Ok path) or stderr (Err
+/// path) in the human-readable format shared by single-snapshot
+/// and multi-snapshot modes. Extracted so both code paths stay in
+/// lock-step for the exact wording every operator greps against.
+fn print_thread_result(t: &ThreadResult) {
+    match t {
+        ThreadResult::Ok {
+            tid,
+            comm,
+            allocated_bytes,
+            deallocated_bytes,
+        } => {
+            let comm_suffix = format_comm_suffix(comm.as_deref());
+            println!(
+                "tid={tid}{comm_suffix} allocated_bytes={allocated_bytes} deallocated_bytes={deallocated_bytes}",
+            );
+        }
+        ThreadResult::Err {
+            tid,
+            comm,
+            error,
+            error_kind,
+        } => {
+            let comm_suffix = format_comm_suffix(comm.as_deref());
+            eprintln!("warning: tid {tid}{comm_suffix} [{error_kind}]: {error}");
+        }
+    }
+}
+
+/// Emit [`ProbeOutput`] in the selected format. JSON wraps the
+/// whole structure; human-readable text prefixes each snapshot with
+/// a `--- snapshot N/M @ <unix_sec>s ---` banner so a text consumer
+/// can `grep '^---'` to find snapshot boundaries. The banner is
+/// emitted in BOTH single- and multi-snapshot runs so the text
+/// format stays constant — a consumer parsing text does not need to
+/// branch on the snapshot count.
 fn print_output(cli: &Cli, out: &ProbeOutput) -> Result<()> {
     if cli.json {
         let s = serde_json::to_string_pretty(out)?;
         println!("{s}");
     } else {
         println!("pid={} tool_version={}", out.pid, out.tool_version);
-        for t in &out.threads {
-            match t {
-                ThreadResult::Ok {
-                    tid,
-                    comm,
-                    allocated_bytes,
-                    deallocated_bytes,
-                } => {
-                    let comm_suffix = comm
-                        .as_deref()
-                        .map(|c| format!(" comm={c}"))
-                        .unwrap_or_default();
-                    println!(
-                        "tid={tid}{comm_suffix} allocated_bytes={allocated_bytes} deallocated_bytes={deallocated_bytes}",
-                    );
-                }
-                ThreadResult::Err {
-                    tid,
-                    comm,
-                    error,
-                    error_kind,
-                } => {
-                    let comm_suffix = comm
-                        .as_deref()
-                        .map(|c| format!(" comm={c}"))
-                        .unwrap_or_default();
-                    eprintln!("warning: tid {tid}{comm_suffix} [{error_kind}]: {error}");
-                }
+        let total = out.snapshots.len();
+        for (i, snap) in out.snapshots.iter().enumerate() {
+            println!(
+                "--- snapshot {n}/{total} @ {ts}s ---",
+                n = i + 1,
+                ts = snap.timestamp_unix_sec,
+            );
+            for t in &snap.threads {
+                print_thread_result(t);
             }
         }
     }
@@ -1260,8 +1676,33 @@ fn run_self_test(bytes: u64) -> RunOutcome {
         Ok(fs_base)
     }
 
-    let self_pid: i32 = libc::pid_t::try_from(std::process::id())
-        .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
+    /// RAII guard that signals the self-test worker to exit
+    /// (`stop_tx.send(())`) and joins it on scope exit. Previously
+    /// every error path in `run_self_test` open-coded
+    /// `let _ = stop_tx.send(()); let _ = worker.join();` before
+    /// returning `RunOutcome::Fatal(...)`; missing the pair on any
+    /// new early return would leak the worker thread holding its
+    /// 16 MiB buffer. The guard ensures cleanup runs exactly once
+    /// regardless of return path — including the happy path, which
+    /// formerly open-coded the same sequence after the successful
+    /// read. `Option<JoinHandle<()>>` lets Drop take the handle
+    /// without requiring `worker` to be Copy.
+    struct WorkerGuard {
+        stop_tx: Option<mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            if let Some(tx) = self.stop_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(handle) = self.worker.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    let self_pid: i32 = self_pid();
     // Capture timestamp BEFORE spawning the self-test worker so the
     // field represents "start of probe run" per its doc, not the
     // post-join point that would slide with `bytes` or worker
@@ -1296,14 +1737,16 @@ fn run_self_test(bytes: u64) -> RunOutcome {
         let _ = stop_rx.recv();
         drop(known);
     });
+    let _guard = WorkerGuard {
+        stop_tx: Some(stop_tx),
+        worker: Some(worker),
+    };
 
     let ready = match ready_rx.recv() {
         Ok(r) => r,
         Err(e) => return RunOutcome::Fatal(anyhow!("self-test ready recv: {e}")),
     };
     if let Err(msg) = ready {
-        let _ = stop_tx.send(());
-        let _ = worker.join();
         return RunOutcome::Fatal(anyhow!("self-test worker: {msg}"));
     }
 
@@ -1315,11 +1758,7 @@ fn run_self_test(bytes: u64) -> RunOutcome {
     // binary, not the target of an external probe.
     let (symbol, offsets) = match find_jemalloc_via_maps(self_pid) {
         Ok(v) => v,
-        Err(e) => {
-            let _ = stop_tx.send(());
-            let _ = worker.join();
-            return RunOutcome::Fatal(e);
-        }
+        Err(e) => return RunOutcome::Fatal(e),
     };
 
     let addr = match compute_tls_address(
@@ -1329,11 +1768,7 @@ fn run_self_test(bytes: u64) -> RunOutcome {
         offsets.thread_allocated,
     ) {
         Ok(a) => a,
-        Err(e) => {
-            let _ = stop_tx.send(());
-            let _ = worker.join();
-            return RunOutcome::Fatal(e);
-        }
+        Err(e) => return RunOutcome::Fatal(e),
     };
 
     let mut buf = [0u8; 8];
@@ -1345,15 +1780,11 @@ fn run_self_test(bytes: u64) -> RunOutcome {
     let n = match process_vm_readv(Pid::from_raw(self_pid), &mut local, &[remote]) {
         Ok(n) => n,
         Err(e) => {
-            let _ = stop_tx.send(());
-            let _ = worker.join();
             return RunOutcome::Fatal(anyhow!(
                 "process_vm_readv(self_pid={self_pid}, addr={addr:#x}): {e}"
             ));
         }
     };
-    let _ = stop_tx.send(());
-    let _ = worker.join();
     if n != 8 {
         return RunOutcome::Fatal(anyhow!(
             "short process_vm_readv: got {n} bytes, expected 8"
@@ -1374,32 +1805,41 @@ fn run_self_test(bytes: u64) -> RunOutcome {
             return RunOutcome::Fatal(anyhow!("serialize self-test output: {e}"));
         }
     }
+    // Stub ProbeOutput carries the self-test run's started-at
+    // timestamp and no snapshots. `run_self_test` owns its own JSON
+    // emission (SelfTestOutput above), so this value only feeds
+    // `main`'s exit-code translation — the empty `snapshots` never
+    // reach print_output.
+    let stub = ProbeOutput {
+        schema_version: SCHEMA_VERSION,
+        pid: self_pid,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        started_at_unix_sec: timestamp_unix_sec,
+        interval_ms: None,
+        interrupted: false,
+        snapshots: Vec::new(),
+    };
     if out.passed {
-        RunOutcome::Ok(ProbeOutput {
-            schema_version: SCHEMA_VERSION,
-            pid: self_pid,
-            tool_version: env!("CARGO_PKG_VERSION"),
-            timestamp_unix_sec,
-            threads: Vec::new(),
-        })
+        RunOutcome::Ok(stub)
     } else {
-        RunOutcome::AllFailed(ProbeOutput {
-            schema_version: SCHEMA_VERSION,
-            pid: self_pid,
-            tool_version: env!("CARGO_PKG_VERSION"),
-            timestamp_unix_sec,
-            threads: Vec::new(),
-        })
+        RunOutcome::AllFailed(stub)
     }
 }
 
 fn main() {
     install_cleanup_handler();
     let cli = Cli::parse();
+    if let Err(e) = cli.validate_sampling_flags() {
+        eprintln!("error: {e:#}");
+        std::process::exit(2);
+    }
     // `--self-test` is an alternative entry point; its JSON shape
     // is `SelfTestOutput`, not `ProbeOutput`. Emission happens
     // inside `run_self_test`, so main only needs to translate
-    // the `RunOutcome` to an exit code.
+    // the `RunOutcome` to an exit code. `validate_sampling_flags`
+    // above plus the clap `conflicts_with_all` on `--self-test`
+    // combine to rule out any snapshots/interval-ms input reaching
+    // this arm.
     if let Some(bytes) = cli.self_test {
         match run_self_test(bytes) {
             RunOutcome::Ok(_) => return,
@@ -1423,11 +1863,26 @@ fn main() {
         RunOutcome::AllFailed(out) => {
             // Emit the structured output anyway so callers have the
             // per-thread error reasons; exit non-zero to signal that
-            // nothing succeeded.
+            // nothing succeeded. The `ktstr-probe-all-failed:` tag
+            // mirrors the `ktstr-probe-fatal:` convention so test
+            // consumers grepping stderr can distinguish "every tid
+            // produced an Err" from "pre-probe error" without
+            // inspecting the stdout JSON. The trailing marker keys
+            // off `cli.snapshots` (the REQUESTED snapshot count),
+            // not `out.snapshots.len()` (the observed count): an
+            // interrupted multi-snapshot run with one partial
+            // snapshot would otherwise be misclassified as
+            // `single` purely because it was cancelled early.
+            let is_multi = cli.snapshots > 1;
+            let marker = if is_multi { "multi" } else { "single" };
             if let Err(e) = print_output(&cli, &out) {
                 eprintln!("error writing output: {e:#}");
             }
-            eprintln!("error: all threads failed probe");
+            eprintln!("ktstr-probe-all-failed: {marker}");
+            eprintln!(
+                "error: all threads failed probe{}",
+                if is_multi { " in every snapshot" } else { "" },
+            );
             detach_all_attached();
             std::process::exit(1);
         }
@@ -1465,6 +1920,13 @@ fn classify_fatal(e: &anyhow::Error) -> &'static str {
     let msg = format!("{e:#}");
     if msg.contains("does not exist") {
         "pid-missing"
+    } else if msg.contains("/proc/<pid>/exe changed") {
+        // Both re-stat gates (mid-parse and between-snapshot) share
+        // the "/proc/<pid>/exe changed" wording — see run() for the
+        // two emission sites. Consumers keying on `exe-identity-changed`
+        // see mid-parse and between-snapshot events as a single
+        // category; the human line carries the specific phase.
+        "exe-identity-changed"
     } else if msg.contains("jemalloc") && msg.contains("not") {
         "not-jemalloc"
     } else if msg.contains("self-test") {
@@ -1615,7 +2077,7 @@ mod tests {
         assert!(find_symbol_by_name(&tab, &strs, "tsd_tls").is_none());
     }
 
-    /// JSON schema v1: success + error arms round-trip via serde,
+    /// JSON schema v2: success + error arms round-trip via serde,
     /// with the batch-47 enrichment fields (`comm`, `error_kind`,
     /// `timestamp_unix_sec`) present where expected. Includes a
     /// third entry — an `Ok` with `comm: None` — to pin the
@@ -1644,14 +2106,22 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             pid: 100,
             tool_version: "0.0.0",
-            timestamp_unix_sec: 1_700_000_000,
-            threads: vec![ok, ok_no_comm, err],
+            started_at_unix_sec: 1_700_000_000,
+            interval_ms: None,
+            interrupted: false,
+            snapshots: vec![Snapshot {
+                timestamp_unix_sec: 1_700_000_000,
+                threads: vec![ok, ok_no_comm, err],
+            }],
         };
         let s = serde_json::to_string(&out).unwrap();
-        assert!(s.contains("\"schema_version\":1"));
+        assert!(s.contains("\"schema_version\":2"));
         assert!(s.contains("\"pid\":100"));
         assert!(s.contains("\"tool_version\":\"0.0.0\""));
+        assert!(s.contains("\"started_at_unix_sec\":1700000000"));
         assert!(s.contains("\"timestamp_unix_sec\":1700000000"));
+        assert!(s.contains("\"interrupted\":false"));
+        assert!(s.contains("\"snapshots\":["));
         assert!(s.contains("\"allocated_bytes\":1024"));
         assert!(s.contains("\"deallocated_bytes\":512"));
         assert!(s.contains("\"allocated_bytes\":2048"));
@@ -1666,6 +2136,10 @@ mod tests {
         // The ok_no_comm and Err entries both have comm: None, so the
         // serialized blob must carry zero `"comm":null` occurrences.
         assert!(!s.contains("\"comm\":null"));
+        // `interval_ms: None` on single-snapshot output must be omitted
+        // (skip_serializing_if) so the wire shape discriminates single
+        // from multi via field presence, not null sentinel.
+        assert!(!s.contains("\"interval_ms\":null"));
     }
 
     /// Canonical snake_case token for each `ThreadErrorKind` variant.
@@ -1711,8 +2185,7 @@ mod tests {
     /// current thread. Sorted ascending.
     #[test]
     fn iter_task_ids_self() {
-        let pid = libc::pid_t::try_from(std::process::id())
-            .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
+        let pid = self_pid();
         let tids = iter_task_ids(pid).expect("self/task must be readable");
         assert!(!tids.is_empty());
         assert!(tids.windows(2).all(|w| w[0] <= w[1]), "tids must be sorted");
@@ -1768,12 +2241,11 @@ mod tests {
     #[test]
     fn run_rejects_self_probe() {
         let cli = Cli {
-            pid: Some(
-                libc::pid_t::try_from(std::process::id())
-                    .expect("Linux pid_max <= 2^22 so pid fits in pid_t"),
-            ),
+            pid: Some(self_pid()),
             json: false,
             self_test: None,
+            snapshots: 1,
+            interval_ms: None,
         };
         match run(&cli) {
             RunOutcome::Fatal(err) => {
@@ -1819,8 +2291,7 @@ mod tests {
             .expect("spawn sleep for non-self pid acceptance test");
         let child_pid = libc::pid_t::try_from(child.id())
             .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
-        let self_pid = libc::pid_t::try_from(std::process::id())
-            .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
+        let self_pid = self_pid();
         assert_ne!(
             child_pid, self_pid,
             "spawned child pid must differ from parent for this test to be meaningful",
@@ -1829,6 +2300,8 @@ mod tests {
             pid: Some(child_pid),
             json: false,
             self_test: None,
+            snapshots: 1,
+            interval_ms: None,
         };
         let outcome = run(&cli);
         let _ = child.kill();
@@ -1950,5 +2423,468 @@ mod tests {
         assert!(msg.contains("short process_vm_readv on tid 200"), "got: {msg}");
         assert!(msg.contains("got 12 bytes"), "got: {msg}");
         assert!(msg.contains("expected 24"), "got: {msg}");
+    }
+
+    // ---- sampling-mode CLI parsing + validation ----
+    //
+    // `clap::Parser` is already in scope via `use super::*` (the top
+    // of `jemalloc_probe.rs` imports it for the `Cli` derive), so
+    // `Cli::try_parse_from` resolves without a redundant re-import.
+
+    /// Default invocation (no `--snapshots` / `--interval-ms`): clap
+    /// fills `snapshots = 1` and `interval_ms = None`, and
+    /// `validate_sampling_flags` accepts the combination.
+    #[test]
+    fn cli_default_sampling_count_is_one() {
+        let cli = Cli::try_parse_from(["ktstr-jemalloc-probe", "--pid", "42"]).unwrap();
+        assert_eq!(cli.snapshots, 1);
+        assert!(cli.interval_ms.is_none());
+        assert!(cli.validate_sampling_flags().is_ok());
+    }
+
+    /// Explicit `--snapshots 1` without `--interval-ms` is the same
+    /// as the default; validation passes.
+    #[test]
+    fn cli_explicit_count_one_without_interval_accepted() {
+        let cli = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--snapshots",
+            "1",
+        ])
+        .unwrap();
+        assert_eq!(cli.snapshots, 1);
+        assert!(cli.interval_ms.is_none());
+        assert!(cli.validate_sampling_flags().is_ok());
+    }
+
+    /// Multi-snapshot invocation with `--snapshots > 1` and a positive
+    /// `--interval-ms`: both flags parse, validation passes.
+    #[test]
+    fn cli_multi_snapshot_accepts_count_and_interval() {
+        let cli = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--snapshots",
+            "3",
+            "--interval-ms",
+            "50",
+        ])
+        .unwrap();
+        assert_eq!(cli.snapshots, 3);
+        assert_eq!(cli.interval_ms, Some(50));
+        assert!(cli.validate_sampling_flags().is_ok());
+    }
+
+    /// `--snapshots 0` is rejected at parse time by the
+    /// `clap::value_parser!(u32).range(1..=100_000)` attribute —
+    /// a zero-count run has no useful output and would only emit
+    /// an empty `snapshots` array.
+    #[test]
+    fn cli_count_zero_rejected() {
+        let err = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--snapshots",
+            "0",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0 is not in") || msg.contains("invalid value"),
+            "expected clap range-rejection message, got: {msg}",
+        );
+    }
+
+    /// `--snapshots 100_001` is rejected at parse time by the upper
+    /// bound on the range parser. The cap bounds the pre-allocated
+    /// snapshot vector so a runaway `--snapshots` cannot request a
+    /// multi-GiB allocation.
+    #[test]
+    fn cli_snapshots_upper_bound_rejected() {
+        let err = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--snapshots",
+            "100001",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not in") || msg.contains("invalid value"),
+            "expected clap range-rejection message, got: {msg}",
+        );
+    }
+
+    /// `--interval-ms 0` is rejected at parse time — a zero-ms
+    /// interval is semantically back-to-back snapshots with no delay.
+    #[test]
+    fn cli_interval_zero_rejected() {
+        let err = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--snapshots",
+            "2",
+            "--interval-ms",
+            "0",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0 is not in") || msg.contains("invalid value"),
+            "expected clap range-rejection message, got: {msg}",
+        );
+    }
+
+    /// `--interval-ms 3_600_001` (>1 hour) is rejected at parse time
+    /// by the upper bound on the range parser. The cap bounds the
+    /// max single-run duration and guarantees the `Instant + Duration`
+    /// deadline math in `sleep_with_cancel` cannot overflow.
+    #[test]
+    fn cli_interval_upper_bound_rejected() {
+        let err = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--snapshots",
+            "2",
+            "--interval-ms",
+            "3600001",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not in") || msg.contains("invalid value"),
+            "expected clap range-rejection message, got: {msg}",
+        );
+    }
+
+    /// `--pid 0` is rejected at parse time: Linux tgids start at 1.
+    #[test]
+    fn cli_pid_zero_rejected() {
+        let err =
+            Cli::try_parse_from(["ktstr-jemalloc-probe", "--pid", "0"]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0 is not in") || msg.contains("invalid value"),
+            "expected clap range-rejection message, got: {msg}",
+        );
+    }
+
+    /// `--pid=-1` is rejected at parse time: negative values are not
+    /// valid Linux pids. The `=` form is required because the
+    /// standalone `--pid -1` sequence parses `-1` as an unknown flag
+    /// rather than the pid value.
+    #[test]
+    fn cli_pid_negative_rejected() {
+        let err = Cli::try_parse_from(["ktstr-jemalloc-probe", "--pid=-1"]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not in") || msg.contains("invalid value"),
+            "expected clap range-rejection message, got: {msg}",
+        );
+    }
+
+    /// `--snapshots > 1` without `--interval-ms` clears clap parsing
+    /// but fails `validate_sampling_flags` — multi-snapshot mode must
+    /// be explicit about the inter-snapshot wait.
+    #[test]
+    fn cli_count_greater_than_one_requires_interval() {
+        let cli = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--snapshots",
+            "3",
+        ])
+        .unwrap();
+        let err = cli.validate_sampling_flags().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("requires --interval-ms"), "got: {msg}");
+    }
+
+    /// `--interval-ms` with `--snapshots 1` (default) is a user-intent
+    /// mismatch — the interval has nothing to separate. Rejected at
+    /// the `validate_sampling_flags` gate.
+    #[test]
+    fn cli_interval_requires_count_greater_than_one() {
+        let cli = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--interval-ms",
+            "100",
+        ])
+        .unwrap();
+        let err = cli.validate_sampling_flags().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("only meaningful with --snapshots > 1"),
+            "got: {msg}",
+        );
+    }
+
+    /// `--self-test` conflicts with `--snapshots` at the clap layer —
+    /// clap emits an error before `validate_sampling_flags` runs.
+    #[test]
+    fn cli_self_test_conflicts_with_count() {
+        let err = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--self-test",
+            "1024",
+            "--snapshots",
+            "2",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflicts"),
+            "expected clap conflict message, got: {msg}",
+        );
+    }
+
+    /// `--self-test` conflicts with `--interval-ms` at the clap layer.
+    #[test]
+    fn cli_self_test_conflicts_with_interval() {
+        let err = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--self-test",
+            "1024",
+            "--interval-ms",
+            "100",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflicts"),
+            "expected clap conflict message, got: {msg}",
+        );
+    }
+
+    /// `--self-test` with default `--snapshots 1` (implicit) is
+    /// accepted — clap's `conflicts_with` only fires on explicit
+    /// presence, so the defaulted value does not trigger a conflict.
+    /// Mirrors the real CLI: `ktstr-jemalloc-probe --self-test 1024`
+    /// must parse.
+    #[test]
+    fn cli_self_test_with_default_count_parses() {
+        let cli =
+            Cli::try_parse_from(["ktstr-jemalloc-probe", "--self-test", "1024"]).unwrap();
+        assert_eq!(cli.self_test, Some(1024));
+        assert_eq!(cli.snapshots, 1);
+        assert!(cli.interval_ms.is_none());
+        assert!(cli.validate_sampling_flags().is_ok());
+    }
+
+    // ---- take_snapshot / sleep_with_cancel helpers ----
+
+    /// `sleep_with_cancel` returns `false` for a normal (uninterrupted)
+    /// sleep and consumes roughly the requested duration.
+    /// Uses a short wait so the test stays fast; the exact lower bound
+    /// guards against a future regression that returns immediately
+    /// without sleeping.
+    #[test]
+    fn sleep_with_cancel_completes_without_flag_set() {
+        // Ensure the flag is clear (another test may have set it, but
+        // tests run in parallel by default and the atomic is global —
+        // safest to reset unconditionally before the observation).
+        CLEANUP_REQUESTED.store(false, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let cancelled = sleep_with_cancel(25);
+        let elapsed = start.elapsed();
+        assert!(!cancelled, "sleep should not report cancellation when flag stays clear");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(20),
+            "sleep returned too fast: {elapsed:?}",
+        );
+    }
+
+    /// `sleep_with_cancel` returns `true` promptly when
+    /// `CLEANUP_REQUESTED` is already set on entry.
+    #[test]
+    fn sleep_with_cancel_observes_pre_set_flag() {
+        CLEANUP_REQUESTED.store(true, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let cancelled = sleep_with_cancel(10_000);
+        let elapsed = start.elapsed();
+        // Reset for other tests. Multiple tests poke this static so
+        // leaving it set would bleed between runs.
+        CLEANUP_REQUESTED.store(false, Ordering::SeqCst);
+        assert!(cancelled, "pre-set flag must cause immediate cancel");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "cancel path should return within a poll tick, got: {elapsed:?}",
+        );
+    }
+
+    /// `all_failed` semantics: empty vec is "all failed" (no live
+    /// observations); a vec with only `Err` arms is all-failed; any
+    /// `Ok` arm disqualifies.
+    #[test]
+    fn all_failed_classification() {
+        assert!(all_failed(&[]), "empty threads vec is all-failed");
+        let only_err = vec![ThreadResult::Err {
+            tid: 1,
+            comm: None,
+            error: "e".into(),
+            error_kind: ThreadErrorKind::PtraceSeize,
+        }];
+        assert!(all_failed(&only_err));
+        let mixed = vec![
+            ThreadResult::Err {
+                tid: 1,
+                comm: None,
+                error: "e".into(),
+                error_kind: ThreadErrorKind::PtraceSeize,
+            },
+            ThreadResult::Ok {
+                tid: 2,
+                comm: None,
+                allocated_bytes: 10,
+                deallocated_bytes: 0,
+            },
+        ];
+        assert!(!all_failed(&mixed));
+    }
+
+    /// Multi-snapshot JSON shape: `snapshots` array with per-
+    /// snapshot `timestamp_unix_sec` + `threads`; top-level
+    /// `pid` / `tool_version` / `schema_version` / `started_at_unix_sec`
+    /// / `interval_ms` / `interrupted` carry the run-invariant
+    /// metadata. Pins the wire contract consumed by the integration
+    /// test's multi-snapshot assertions.
+    #[test]
+    fn multi_snapshot_output_json_shape() {
+        let out = ProbeOutput {
+            schema_version: SCHEMA_VERSION,
+            pid: 777,
+            tool_version: "0.0.0",
+            started_at_unix_sec: 1_699_999_999,
+            interval_ms: Some(50),
+            interrupted: false,
+            snapshots: vec![
+                Snapshot {
+                    timestamp_unix_sec: 1_700_000_000,
+                    threads: vec![ThreadResult::Ok {
+                        tid: 42,
+                        comm: Some("worker".to_string()),
+                        allocated_bytes: 1024,
+                        deallocated_bytes: 0,
+                    }],
+                },
+                Snapshot {
+                    timestamp_unix_sec: 1_700_000_001,
+                    threads: vec![ThreadResult::Ok {
+                        tid: 42,
+                        comm: Some("worker".to_string()),
+                        allocated_bytes: 2048,
+                        deallocated_bytes: 0,
+                    }],
+                },
+            ],
+        };
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(s.contains("\"schema_version\":2"));
+        assert!(s.contains("\"pid\":777"));
+        assert!(s.contains("\"started_at_unix_sec\":1699999999"));
+        assert!(s.contains("\"interval_ms\":50"));
+        assert!(s.contains("\"interrupted\":false"));
+        assert!(s.contains("\"snapshots\":["));
+        assert!(s.contains("\"timestamp_unix_sec\":1700000000"));
+        assert!(s.contains("\"timestamp_unix_sec\":1700000001"));
+        assert!(s.contains("\"allocated_bytes\":1024"));
+        assert!(s.contains("\"allocated_bytes\":2048"));
+        // Per-snapshot timestamps move into each snapshot entry; the
+        // top-level carries only `started_at_unix_sec`.
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(
+            v.get("timestamp_unix_sec").is_none(),
+            "top-level timestamp_unix_sec must not appear on ProbeOutput: {s}",
+        );
+        assert!(
+            v.get("threads").is_none(),
+            "top-level threads must not appear on ProbeOutput: {s}",
+        );
+        assert!(v.get("snapshots").is_some(), "snapshots array required: {s}");
+        assert!(v.get("started_at_unix_sec").is_some());
+        assert!(v.get("interval_ms").is_some());
+        assert!(v.get("interrupted").is_some());
+    }
+
+    /// Single-snapshot `ProbeOutput` must emit `snapshots` with one
+    /// element and omit `interval_ms` via `skip_serializing_if`.
+    /// Consumers distinguish single- vs multi-snapshot by
+    /// `interval_ms` presence.
+    #[test]
+    fn single_snapshot_output_omits_interval_ms() {
+        let out = ProbeOutput {
+            schema_version: SCHEMA_VERSION,
+            pid: 555,
+            tool_version: "0.0.0",
+            started_at_unix_sec: 1_700_000_000,
+            interval_ms: None,
+            interrupted: false,
+            snapshots: vec![Snapshot {
+                timestamp_unix_sec: 1_700_000_000,
+                threads: vec![ThreadResult::Ok {
+                    tid: 99,
+                    comm: None,
+                    allocated_bytes: 10,
+                    deallocated_bytes: 0,
+                }],
+            }],
+        };
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains("\"interval_ms\""), "interval_ms must be omitted when None: {s}");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v.get("interval_ms").is_none());
+        let snaps = v.get("snapshots").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(snaps.len(), 1, "single-snapshot must emit snapshots of length 1");
+    }
+
+    /// `ExeIdentity::capture` on the probe's own pid round-trips
+    /// equal to itself across two back-to-back calls — the probe
+    /// binary's on-disk identity is stable within a single run, so
+    /// the re-stat gate in `run()` does not false-positive on a
+    /// normal invocation.
+    #[test]
+    fn exe_identity_stable_within_run() {
+        let pid = self_pid();
+        let a = ExeIdentity::capture(pid).expect("stat /proc/self/exe");
+        let b = ExeIdentity::capture(pid).expect("stat /proc/self/exe");
+        assert_eq!(a, b, "ExeIdentity must be stable across back-to-back captures");
+    }
+
+    /// `interrupted: true` round-trips through serde. Pins the JSON
+    /// literal so downstream consumers keying on `"interrupted":true`
+    /// to distinguish partial from complete runs see a stable token.
+    /// Pairs with the `false` case already exercised by
+    /// `thread_result_json_shape` and `multi_snapshot_output_json_shape`.
+    #[test]
+    fn interrupted_true_serializes_as_json_true() {
+        let out = ProbeOutput {
+            schema_version: SCHEMA_VERSION,
+            pid: 321,
+            tool_version: "0.0.0",
+            started_at_unix_sec: 1_700_000_000,
+            interval_ms: Some(100),
+            interrupted: true,
+            snapshots: vec![Snapshot {
+                timestamp_unix_sec: 1_700_000_000,
+                threads: Vec::new(),
+            }],
+        };
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(
+            s.contains("\"interrupted\":true"),
+            "expected `\"interrupted\":true` literal, got: {s}",
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v.get("interrupted").and_then(|b| b.as_bool()), Some(true));
     }
 }

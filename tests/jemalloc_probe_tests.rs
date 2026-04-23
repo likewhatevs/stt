@@ -145,46 +145,48 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload {
 /// `allocated_bytes` missing" so the caller can issue a precise
 /// diagnostic instead of a blanket "not found".
 enum ThreadLookup {
-    /// `threads.N.tid == worker_tid` and `threads.N.allocated_bytes`
-    /// are both present. Returns the observed counter plus the
-    /// companion `deallocated_bytes` (if emitted).
+    /// `snapshots.0.threads.N.tid == worker_tid` and
+    /// `snapshots.0.threads.N.allocated_bytes` are both present.
+    /// Returns the observed counter plus the companion
+    /// `deallocated_bytes` (if emitted).
     Found {
         allocated_bytes: u64,
         deallocated_bytes: Option<u64>,
     },
-    /// Probe emitted a `threads.N.tid` matching `worker_tid`, but
-    /// no `threads.N.allocated_bytes` sibling. The probe hit an
-    /// error on that thread — typically an `error` entry replaces
-    /// the counter fields.
+    /// Probe emitted a `snapshots.0.threads.N.tid` matching
+    /// `worker_tid`, but no `snapshots.0.threads.N.allocated_bytes`
+    /// sibling. The probe hit an error on that thread — typically
+    /// an `error` entry replaces the counter fields.
     MissingAllocatedBytes,
-    /// No `threads.N.tid == worker_tid` entry in the flat metric
-    /// list. Probe did not visit the worker at all.
+    /// No `snapshots.0.threads.N.tid == worker_tid` entry in the
+    /// flat metric list. Probe did not visit the worker at all.
     TidAbsent,
 }
 
 /// Extract the `allocated_bytes` / `deallocated_bytes` values for
-/// `worker_tid` from the flat metric list produced by
+/// `worker_tid` from snapshot 0 in the flat metric list produced by
 /// `walk_json_leaves` over the probe's JSON output.
 ///
 /// The probe emits
-/// `{"pid":P,"threads":[{"tid":T,"allocated_bytes":A,"deallocated_bytes":D,...}, ...]}`
+/// `{"pid":P,"snapshots":[{"timestamp_unix_sec":T,"threads":[{"tid":T,"allocated_bytes":A,"deallocated_bytes":D,...}, ...]}, ...]}`
 /// which `walk_json_leaves` flattens per array index into contiguous
-/// keys `threads.0.tid`, `threads.1.tid`, … with no gaps. The scan
-/// below stops at the first `threads.N.tid` miss, which is the
-/// natural array terminator. The 1024 cap is a belt-and-suspenders
-/// safety bound — realistic probe runs see at most a few dozen
-/// threads in a single-allocator worker process.
+/// keys `snapshots.0.threads.0.tid`, `snapshots.0.threads.1.tid`, …
+/// with no gaps. The scan below stops at the first
+/// `snapshots.0.threads.N.tid` miss, which is the natural array
+/// terminator. The 1024 cap is a belt-and-suspenders safety bound —
+/// realistic probe runs see at most a few dozen threads in a
+/// single-allocator worker process.
 fn lookup_thread(metrics: &PayloadMetrics, worker_tid: i32) -> ThreadLookup {
     let worker_tid_f64 = worker_tid as f64;
     for i in 0..1024 {
-        let tid_key = format!("threads.{i}.tid");
+        let tid_key = format!("snapshots.0.threads.{i}.tid");
         let tid_m = match metrics.metrics.iter().find(|m| m.name == tid_key) {
             Some(m) => m,
             None => return ThreadLookup::TidAbsent,
         };
         if tid_m.value == worker_tid_f64 {
-            let alloc_key = format!("threads.{i}.allocated_bytes");
-            let dealloc_key = format!("threads.{i}.deallocated_bytes");
+            let alloc_key = format!("snapshots.0.threads.{i}.allocated_bytes");
+            let dealloc_key = format!("snapshots.0.threads.{i}.deallocated_bytes");
             let allocated_bytes = match metrics
                 .metrics
                 .iter()
@@ -208,14 +210,14 @@ fn lookup_thread(metrics: &PayloadMetrics, worker_tid: i32) -> ThreadLookup {
     ThreadLookup::TidAbsent
 }
 
-/// Count the number of `threads.N.tid` entries in the flat metric
-/// list. Walk uses the same contiguous-index property documented on
-/// [`lookup_thread`]: array flattening yields indices 0..N without
-/// gaps, so scanning stops at the first miss.
+/// Count the number of `snapshots.0.threads.N.tid` entries in the
+/// flat metric list. Walk uses the same contiguous-index property
+/// documented on [`lookup_thread`]: array flattening yields indices
+/// 0..N without gaps, so scanning stops at the first miss.
 fn thread_count(metrics: &PayloadMetrics) -> usize {
     let mut n = 0;
     for i in 0..1024 {
-        let tid_key = format!("threads.{i}.tid");
+        let tid_key = format!("snapshots.0.threads.{i}.tid");
         if metrics.metrics.iter().any(|m| m.name == tid_key) {
             n += 1;
         } else {
@@ -303,7 +305,7 @@ fn jemalloc_probe_single_worker_observes_known_allocation(ctx: &Ctx) -> Result<A
 ///
 /// The worker is single-threaded so its `tid == pid` — the test
 /// body uses `PayloadHandle::pid()` as the match key against the
-/// probe's `threads[N].tid` entries. Readiness is communicated
+/// probe's `snapshots[0].threads[N].tid` entries. Readiness is communicated
 /// through a pid-scoped marker file the worker writes AFTER its
 /// allocation + black_box triple (see jemalloc_alloc_worker.rs);
 /// the test polls for that file's existence before launching the
@@ -409,7 +411,7 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
         }
         ThreadLookup::TidAbsent => {
             return Err(anyhow!(
-                "probe JSON has no threads.N.tid == {worker_tid} entry despite \
+                "probe JSON has no snapshots.0.threads.N.tid == {worker_tid} entry despite \
                  n_threads={n_threads} — the probe emitted some tids but none \
                  matched worker_pid, tid-identity is broken. Flat metrics: {:?}",
                 metrics
@@ -502,15 +504,17 @@ fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
     //      Fatal-vs-AllFailed distinction is carried by assertion 2.
     //   2. The flat metric list is empty. This IS Fatal-exclusive:
     //      AllFailed still emits ProbeOutput via `print_output()`
-    //      (populating `pid` and `schema_version` numerics even with
-    //      an empty or all-Err `threads` array), so the metric list
-    //      would carry at least `pid` and `schema_version` under
-    //      AllFailed. Empty-metrics proves the probe took the Fatal
-    //      arm and exited via stderr before reaching
-    //      `print_output()`, which is what a nonexistent pid must
-    //      trigger. Checking emptiness (rather than maintaining an
-    //      allowlist of ProbeOutput field names) keeps the test
-    //      agnostic to future ProbeOutput field additions.
+    //      (populating `pid`, `schema_version`, `started_at_unix_sec`,
+    //      `interval_ms` when multi-snapshot, `interrupted`, and
+    //      per-snapshot `snapshots.N.timestamp_unix_sec` even with
+    //      all-Err `threads` arrays), so the metric list would carry
+    //      at least those top-level numerics under AllFailed. Empty-
+    //      metrics proves the probe took the Fatal arm and exited
+    //      via stderr before reaching `print_output()`, which is
+    //      what a nonexistent pid must trigger. Checking emptiness
+    //      (rather than maintaining an allowlist of ProbeOutput
+    //      field names) keeps the test agnostic to future
+    //      ProbeOutput field additions.
     if metrics.exit_code != 1 {
         return Ok(AssertResult::fail_other(format!(
                 "probe exit_code={} against nonexistent pid {fake_pid}; \
@@ -588,11 +592,11 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
     )?;
 
     let mut any_multi_thread_seen = false;
-    // A `threads.N.tid` entry without the sibling
-    // `threads.N.allocated_bytes` numeric is the probe emitting an
-    // Err arm — `walk_json_leaves` drops the string-valued `error`
-    // field, so the absence of `allocated_bytes` is the only signal
-    // for an ESRCH / PtraceSeize error surfaced through the flat
+    // A `snapshots.0.threads.N.tid` entry without the sibling
+    // `snapshots.0.threads.N.allocated_bytes` numeric is the probe
+    // emitting an Err arm — `walk_json_leaves` drops the string-valued
+    // `error` field, so the absence of `allocated_bytes` is the only
+    // signal for an ESRCH / PtraceSeize error surfaced through the flat
     // metric layout. Counted per-invocation so the returned
     // AssertResult can carry the observed count as a diagnostic
     // detail even on the pass paths.
@@ -633,16 +637,16 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
             any_multi_thread_seen = true;
         }
         // Scan for an error entry on this invocation: the probe's Err
-        // arm emits `threads.N.tid` without an `allocated_bytes`
-        // sibling (the `error` string is flattened-away by
-        // walk_json_leaves). Any such pair is evidence the ESRCH race
-        // actually fired on this invocation.
+        // arm emits `snapshots.0.threads.N.tid` without an
+        // `allocated_bytes` sibling (the `error` string is flattened-
+        // away by walk_json_leaves). Any such pair is evidence the
+        // ESRCH race actually fired on this invocation.
         for j in 0..1024 {
-            let tid_key = format!("threads.{j}.tid");
+            let tid_key = format!("snapshots.0.threads.{j}.tid");
             if !metrics.metrics.iter().any(|m| m.name == tid_key) {
                 break;
             }
-            let alloc_key = format!("threads.{j}.allocated_bytes");
+            let alloc_key = format!("snapshots.0.threads.{j}.allocated_bytes");
             if !metrics.metrics.iter().any(|m| m.name == alloc_key) {
                 error_invocations += 1;
                 break;
@@ -684,6 +688,237 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
         .details
         .push(AssertDetail::new(DetailKind::Other, message));
     Ok(result)
+}
+
+/// Count the number of `snapshots.N.timestamp_unix_sec` entries in
+/// the flat metric list. Same contiguous-index contract as
+/// [`thread_count`]; scans from 0 and stops at the first miss.
+fn snapshot_count(metrics: &PayloadMetrics) -> usize {
+    let mut n = 0;
+    for i in 0..1024 {
+        let key = format!("snapshots.{i}.timestamp_unix_sec");
+        if metrics.metrics.iter().any(|m| m.name == key) {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n
+}
+
+/// Extract `snapshots.{snap_idx}.threads[*].allocated_bytes` for the
+/// thread whose tid matches `worker_tid`. Returns `None` if the
+/// tid is not present (e.g. probe emitted an Err arm for that
+/// snapshot) or if the `allocated_bytes` sibling is missing.
+fn snapshot_worker_allocated(
+    metrics: &PayloadMetrics,
+    snap_idx: usize,
+    worker_tid: i32,
+) -> Option<u64> {
+    let worker_tid_f64 = worker_tid as f64;
+    for j in 0..1024 {
+        let tid_key = format!("snapshots.{snap_idx}.threads.{j}.tid");
+        let tid_m = metrics.metrics.iter().find(|m| m.name == tid_key)?;
+        if tid_m.value == worker_tid_f64 {
+            let alloc_key =
+                format!("snapshots.{snap_idx}.threads.{j}.allocated_bytes");
+            return metrics
+                .metrics
+                .iter()
+                .find(|m| m.name == alloc_key)
+                .map(|m| m.value as u64);
+        }
+    }
+    None
+}
+
+/// Extract `snapshots.{snap_idx}.timestamp_unix_sec` for the given
+/// snapshot index.
+fn snapshot_timestamp(metrics: &PayloadMetrics, snap_idx: usize) -> Option<u64> {
+    let key = format!("snapshots.{snap_idx}.timestamp_unix_sec");
+    metrics
+        .metrics
+        .iter()
+        .find(|m| m.name == key)
+        .map(|m| m.value as u64)
+}
+
+/// Multi-snapshot sampling mode: run the probe with `--snapshots 3
+/// --interval-ms 50` against a live jemalloc-linked worker. Asserts:
+///
+/// 1. Probe exits 0.
+/// 2. Three snapshots appear in the JSON output.
+/// 3. Each snapshot's `timestamp_unix_sec` is monotone
+///    non-decreasing across snapshots (guest `CLOCK_REALTIME` is
+///    monotone under kvm-clock on an uncontended probe run).
+/// 4. The worker's tid appears in every snapshot's `threads` array
+///    with a resolvable `allocated_bytes`.
+/// 5. `allocated_bytes` is monotone non-decreasing across snapshots
+///    — the worker holds its 16 MiB `Vec` parked and never frees,
+///    so jemalloc's `thread_allocated` counter only grows (metadata
+///    arenas + any rust runtime allocations).
+#[ktstr_test(llcs = 1, cores = 1, threads = 1)]
+fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
+    const KNOWN_BYTES: u64 = 16 * 1024 * 1024;
+    const SNAPSHOTS: usize = 3;
+    const INTERVAL_MS: u64 = 50;
+    // Same slop rationale as `jemalloc_probe_single_worker_*`: 4 MiB
+    // covers kernel + jemalloc startup noise with slack. A larger
+    // per-snapshot `allocated_bytes` would indicate a leak or the
+    // probe reading the wrong address.
+    const MAX_SLOP: u64 = 4 * 1024 * 1024;
+
+    let mut worker: PayloadHandle = ctx
+        .payload(&JEMALLOC_ALLOC_WORKER)
+        .arg(KNOWN_BYTES.to_string())
+        .spawn()?;
+    let worker_pid = worker
+        .pid()
+        .ok_or_else(|| anyhow!("worker PayloadHandle has no pid (child already consumed)"))?;
+    wait_for_worker_ready(
+        &mut worker,
+        worker_pid,
+        std::time::Duration::from_secs(5),
+        "worker",
+        "2=bytes==0, 3=/proc/self/task thread count != 1, \
+         4=ready-marker write failed, 5=argument parse failed, \
+         6=/proc/self/task unreadable, 101=Rust panic, \
+         negative=killed by signal",
+    )?;
+
+    let run_outcome = ctx
+        .payload(&JEMALLOC_PROBE_EXTERNAL)
+        .arg("--pid")
+        .arg(worker_pid.to_string())
+        .arg("--json")
+        .arg("--snapshots")
+        .arg(SNAPSHOTS.to_string())
+        .arg("--interval-ms")
+        .arg(INTERVAL_MS.to_string())
+        .run();
+
+    let _ = worker.kill();
+    let (_assert, metrics) = run_outcome?;
+
+    let n_snaps = snapshot_count(&metrics);
+    if n_snaps != SNAPSHOTS {
+        return Ok(AssertResult::fail_other(format!(
+            "multi-snapshot probe emitted {n_snaps} snapshots, expected {SNAPSHOTS}; \
+             flat metrics: {:?}",
+            metrics
+                .metrics
+                .iter()
+                .map(|m| (m.name.as_str(), m.value))
+                .collect::<Vec<_>>(),
+        )));
+    }
+
+    let worker_tid = worker_pid as i32;
+    let mut timestamps: Vec<u64> = Vec::with_capacity(SNAPSHOTS);
+    let mut allocations: Vec<u64> = Vec::with_capacity(SNAPSHOTS);
+    for i in 0..SNAPSHOTS {
+        let ts = snapshot_timestamp(&metrics, i).ok_or_else(|| {
+            anyhow!("snapshots.{i}.timestamp_unix_sec missing from probe output")
+        })?;
+        timestamps.push(ts);
+        let alloc = snapshot_worker_allocated(&metrics, i, worker_tid).ok_or_else(|| {
+            anyhow!(
+                "worker tid {worker_tid} not found (or no allocated_bytes) in \
+                 snapshots.{i}; flat metrics: {:?}",
+                metrics
+                    .metrics
+                    .iter()
+                    .map(|m| (m.name.as_str(), m.value))
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+        allocations.push(alloc);
+    }
+
+    // Timestamps must be monotone non-decreasing. The probe captures
+    // `SystemTime::now()` at the start of each snapshot and the
+    // snapshots run serially, so a backwards step would indicate a
+    // clock-source bug (or NTP step during the test window, which
+    // would also be a test failure mode worth surfacing).
+    for i in 1..SNAPSHOTS {
+        if timestamps[i] < timestamps[i - 1] {
+            return Ok(AssertResult::fail_other(format!(
+                "snapshot {i} timestamp {} is less than snapshot {} timestamp {}; \
+                 CLOCK_REALTIME went backwards across snapshots",
+                timestamps[i],
+                i - 1,
+                timestamps[i - 1],
+            )));
+        }
+    }
+
+    // Worker is parked holding a 16 MiB `Vec<u8>`, so jemalloc's
+    // `thread_allocated` counter on the worker tid is cumulative-
+    // from-creation and cannot shrink. A decrease across snapshots
+    // indicates the probe read the wrong counter (or the wrong
+    // address) on one of the iterations.
+    for i in 1..SNAPSHOTS {
+        if allocations[i] < allocations[i - 1] {
+            return Ok(AssertResult::fail_other(format!(
+                "snapshot {i} allocated_bytes={} < snapshot {} allocated_bytes={}; \
+                 jemalloc cumulative counter must not decrease for a parked worker \
+                 that holds its Vec",
+                allocations[i],
+                i - 1,
+                allocations[i - 1],
+            )));
+        }
+    }
+
+    // Lower + upper bound sanity: every snapshot must show at least
+    // the known 16 MiB allocation (the worker has allocated + touched
+    // before the ready marker fires) and at most KNOWN_BYTES + MAX_SLOP
+    // (bookkeeping overhead). A snapshot above the upper bound
+    // indicates either a test-side leak or the probe reading the
+    // wrong address.
+    for (i, a) in allocations.iter().enumerate() {
+        if *a < KNOWN_BYTES {
+            return Ok(AssertResult::fail_other(format!(
+                "snapshot {i} allocated_bytes={a} is below known {KNOWN_BYTES} — \
+                 probe may be reading the wrong address or the counter was not \
+                 yet propagated to the TSD slot",
+            )));
+        }
+        if *a > KNOWN_BYTES + MAX_SLOP {
+            return Ok(AssertResult::fail_other(format!(
+                "snapshot {i} allocated_bytes={a} exceeds known={KNOWN_BYTES} \
+                 + slop={MAX_SLOP}; probe may be reading the wrong address \
+                 or the worker leaked extra allocations between snapshots",
+            )));
+        }
+    }
+
+    // `started_at_unix_sec` is captured by the probe before any
+    // per-snapshot work; the earliest snapshot's `timestamp_unix_sec`
+    // must not precede it. Enforces the contract documented on
+    // `ProbeOutput::started_at_unix_sec` ("start of the probe run
+    // (before any per-tid work, before the first snapshot)").
+    let started_at = metric_u64(&metrics, "started_at_unix_sec").ok_or_else(|| {
+        anyhow!(
+            "top-level started_at_unix_sec missing from probe output; \
+             flat metrics: {:?}",
+            metrics
+                .metrics
+                .iter()
+                .map(|m| (m.name.as_str(), m.value))
+                .collect::<Vec<_>>(),
+        )
+    })?;
+    if timestamps[0] < started_at {
+        return Ok(AssertResult::fail_other(format!(
+            "snapshots.0.timestamp_unix_sec={} < top-level started_at_unix_sec={}; \
+             started_at must precede every snapshot timestamp",
+            timestamps[0],
+            started_at,
+        )));
+    }
+
+    Ok(AssertResult::pass())
 }
 
 // Host-side worker exit-code tests (exit codes 2/4/5) live in their
