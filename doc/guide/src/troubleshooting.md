@@ -190,13 +190,13 @@ binary in:
 - Set `KTSTR_SCHEDULER=/path/to/binary`.
 - Use `SchedulerSpec::Path` for an explicit path in `#[ktstr_test]`.
 
-## Scheduler crashed
+## Scheduler died
 
 ```text
-scheduler crashed after completing step 2 of 5 (12.3s into test)
+scheduler process died unexpectedly after completing step 2 of 5 (12.3s into test)
 ```
 
-The scheduler process exited while the scenario was running. This
+The scheduler process died while the scenario was running. This
 is usually a crash. The exact message varies by when the crash was
 detected (between steps, during workload, after completion).
 

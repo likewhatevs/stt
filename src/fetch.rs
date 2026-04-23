@@ -60,6 +60,26 @@ pub struct AcquiredSource {
     /// For local sources: whether the working tree is dirty.
     /// Dirty trees must not be cached.
     pub is_dirty: bool,
+    /// For local sources: whether the source is an actual git
+    /// repository. `true` when `gix::discover` succeeded and the
+    /// crate could compute index + worktree dirty state; `false`
+    /// for non-git source trees (tarball-extracted, rsync'd,
+    /// hand-assembled) where dirty detection is impossible and
+    /// the source is always cache-skipped pessimistically. Lets
+    /// the cache-skip hint branch on whether `commit` / `stash`
+    /// are actionable remediations (they aren't for non-git
+    /// sources).
+    ///
+    /// For non-local sources (tarball, git clone) the field is
+    /// set to `true` by convention — these paths are always
+    /// `is_dirty = false`, so the cache-skip branch that reads
+    /// `is_git` is never reached and the value is inert. Pinning
+    /// to `true` (rather than leaving the field meaningless)
+    /// keeps the invariant "is_git is meaningful only when
+    /// is_dirty is true, but always set" so a future code path
+    /// that reaches `is_git` outside the cache-skip context does
+    /// not trip on an `is_git = false` under a known-good source.
+    pub is_git: bool,
 }
 
 /// Target architecture string and boot image name.
@@ -290,6 +310,7 @@ pub fn download_tarball(
         kernel_source: crate::cache::KernelSource::Tarball,
         is_temp: true,
         is_dirty: false,
+        is_git: true,
     })
 }
 
@@ -606,6 +627,7 @@ pub fn git_clone(
         },
         is_temp: true,
         is_dirty: false,
+        is_git: true,
     })
 }
 
@@ -637,8 +659,10 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
 
     // Git hash extraction and dirty detection via gix.
     // Submodule checks are skipped (false positives on kernel
-    // trees with uninitialized submodules).
-    let (short_hash, is_dirty) = match gix::discover(&canonical) {
+    // trees with uninitialized submodules). The tuple return carries
+    // `(hash, is_dirty, is_git)` so the non-git arm can signal
+    // "this isn't a git repo" to the cache-skip hint at the caller.
+    let (short_hash, is_dirty, is_git) = match gix::discover(&canonical) {
         Ok(repo) => {
             let head = repo.head_id().with_context(|| "read HEAD")?;
             let short_hash = format!("{}", head).chars().take(7).collect::<String>();
@@ -694,14 +718,14 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
             // it via git_hash / cache_key would misidentify the
             // build input.
             let hash = if is_dirty { None } else { Some(short_hash) };
-            (hash, is_dirty)
+            (hash, is_dirty, true)
         }
         Err(_) => {
             eprintln!(
                 "{cli_label}: warning: {} is not a git repository, cannot detect dirty state",
                 source_path.display()
             );
-            (None, true)
+            (None, true, false)
         }
     };
 
@@ -721,6 +745,7 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
         },
         is_temp: false,
         is_dirty,
+        is_git,
     })
 }
 

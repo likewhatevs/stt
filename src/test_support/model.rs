@@ -1740,27 +1740,39 @@ pub(crate) fn reset() {
 ///   opaque "metric 'foo' not found" when the real failure was
 ///   that the model never loaded.
 ///
-/// # MODEL_CACHE memoization + panic=abort (external harness authors)
+/// # MODEL_CACHE memoization + panic-retry invariant (external harness authors)
 ///
 /// Each caller routes through [`memoized_inference`]: the first call
 /// runs `load_inference` once under the global [`MODEL_CACHE`] mutex
 /// and stores the `Result` (success OR error); every subsequent call
-/// observes the cached value with no re-load. That means a load
-/// failure is cached — `Err(reason)` is identical across every call
-/// within the process lifetime once the first call sees it. This is
-/// the "fail-closed-forever" contract documented on [`MODEL_CACHE`].
+/// observes the cached value with no re-load. Three outcomes follow
+/// from this shape:
 ///
-/// Panics inside the load are NOT cached. Under the test/debug
-/// profile (`panic = "unwind"`) the slot remains `None` and the next
-/// caller retries. Under the release profile
-/// (`panic = "abort"`, see `Cargo.toml [profile.release]`) the
-/// process aborts before control returns, so retry is
-/// process-terminal rather than next-call-observable.
-/// External harnesses that embed ktstr must plan for this:
-/// (a) treat a first `Err(reason)` as terminal for the lifetime of
-/// the process — there is no public `clear_model_cache()` hook, and
-/// (b) expect a hard abort rather than an unwind on a load-side
-/// panic under release builds.
+/// 1. **`Ok(cache)` — cached forever**. The loaded model stays in
+///    memory for the process lifetime; the ~2.44 GiB slot is never
+///    evicted. Subsequent `extract_via_llm` calls reuse the same
+///    inference state.
+/// 2. **`Err(reason)` — cached forever**. A load failure is cached
+///    identically to a successful load: every subsequent call returns
+///    the same `Err(reason)` string without re-attempting. This is
+///    the "fail-closed-forever" contract documented on
+///    [`MODEL_CACHE`] — there is no public `clear_model_cache()` hook,
+///    so external harnesses must treat a first `Err` as terminal for
+///    the process lifetime.
+/// 3. **Panic mid-load — NOT cached, but process-terminal in release**.
+///    A panic inside `load_inference` does NOT populate the cache slot:
+///    - Under the test/debug profile (`panic = "unwind"`) the mutex
+///      unwinds, the slot stays `None`, and the next caller retries
+///      `load_inference` from scratch. Panic-retry is observable.
+///    - Under the release profile (`panic = "abort"`, see
+///      `Cargo.toml [profile.release]`) the process aborts before
+///      control returns to the caller. Retry is process-terminal
+///      rather than next-call-observable — there is no "next call."
+///
+/// External-harness checklist: (a) a first `Err(reason)` is
+/// terminal for the process lifetime; (b) a panic during load
+/// aborts the process under release builds, so plan for no
+/// re-entry on that path.
 pub(crate) fn extract_via_llm(
     output: &str,
     hint: Option<&str>,

@@ -7,7 +7,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
 
 use crate::cache::{CacheDir, CacheEntry, KconfigStatus};
@@ -227,6 +227,19 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
 pub const DIRTY_TREE_CACHE_SKIP_HINT: &str =
     "skipping cache — working tree has uncommitted changes; \
      commit or stash to enable caching";
+
+/// Hint shown in place of [`DIRTY_TREE_CACHE_SKIP_HINT`] when the
+/// source tree is not a git repository at all. `commit` / `stash`
+/// are not actionable remediations in that case — the operator's
+/// only path to caching is to put the source under git (or use a
+/// kernel-source fetch mode that produces a git-tracked tree).
+/// Pinned by `non_git_tree_cache_skip_hint_shape` below so a
+/// wording drift is caught in unit tests.
+pub const NON_GIT_TREE_CACHE_SKIP_HINT: &str =
+    "skipping cache — source tree is not a git repository so dirty \
+     state cannot be detected; put the source under git (or use a \
+     kernel fetch mode that produces a git-tracked tree) to enable \
+     caching";
 
 /// Decide whether to emit the `(EOL)` legend under the `kernel list`
 /// table. Returns `Some(EOL_EXPLANATION)` iff at least one rendered
@@ -1290,7 +1303,17 @@ pub fn kernel_build_pipeline(
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
         eprintln!("{cli_label}: kernel built at {}", image_path.display());
-        eprintln!("{cli_label}: {DIRTY_TREE_CACHE_SKIP_HINT}");
+        // Branch the hint wording: commit/stash is only an actionable
+        // remediation for an actual git repo. A non-git source tree
+        // is force-marked dirty (see `acquire_local_source` in
+        // `fetch.rs`) because dirty detection is impossible, and
+        // telling the operator to "commit or stash" leads nowhere.
+        let hint = if acquired.is_git {
+            DIRTY_TREE_CACHE_SKIP_HINT
+        } else {
+            NON_GIT_TREE_CACHE_SKIP_HINT
+        };
+        eprintln!("{cli_label}: {hint}");
         return Ok(KernelBuildResult {
             entry: None,
             image_path,
@@ -1399,6 +1422,35 @@ pub fn compare_runs(
 /// ends with a newline; callers print it verbatim.
 pub fn show_host() -> String {
     crate::host_context::collect_host_context().format_human()
+}
+
+/// Render the resolved, merged `Assert` thresholds for the named
+/// test — the same merge chain evaluated at run time in
+/// `run_ktstr_test_inner`:
+/// `Assert::default_checks().merge(entry.scheduler.assert()).merge(&entry.assert)`.
+///
+/// Returns `Err` when no registered test matches `test_name`. The
+/// CLI wiring (`cargo ktstr show-thresholds <test>`) surfaces this
+/// to the operator without requiring them to read the source, the
+/// nextest `--list` output, or the Debug impl of `Assert`.
+pub fn show_thresholds(test_name: &str) -> Result<String> {
+    let entry = crate::test_support::find_test(test_name).ok_or_else(|| {
+        anyhow!(
+            "no registered ktstr test named '{test_name}'. Run `cargo nextest list` to see \
+             the available test names — then pass just the function-name component to \
+             `show-thresholds`, not the `<binary>::` prefix that nextest prepends to each line."
+        )
+    })?;
+    let merged = crate::assert::Assert::default_checks()
+        .merge(entry.scheduler.assert())
+        .merge(&entry.assert);
+    let mut out = format!("Test: {}\n", entry.name);
+    out.push_str(&format!(
+        "Scheduler: {}\n",
+        entry.scheduler.scheduler_name(),
+    ));
+    out.push_str(&merged.format_human());
+    Ok(out)
 }
 
 /// Pre-flight check for /dev/kvm availability and permissions.
@@ -2472,90 +2524,17 @@ mod tests {
     /// Test-only utility — no production caller. Lives in this test
     /// module so its scope is bounded.
     ///
-    /// Serializes with [`STDERR_CAPTURE_LOCK`] so concurrent tests
-    /// running under nextest (one process, many threads) do not
-    /// race each other's fd-2 swap. The swap is a process-wide
-    /// mutation; any other thread writing to stderr while another
-    /// holds the swap would land its output in the captured
-    /// tempfile instead of the real stderr. Poison-recovery via
-    /// `unwrap_or_else(|e| e.into_inner())` keeps a panicked
-    /// earlier test from wedging every subsequent capture.
-    ///
-    /// [`StderrRestoreGuard`] is an RAII shield: even if `f()`
-    /// panics under the `panic = unwind` test profile, fd 2 is
-    /// restored from `saved` on the guard's Drop before the unwind
-    /// propagates. Without this guard a panicking `f` would leave
-    /// fd 2 pointing at the tempfile for every subsequent caller
-    /// — including the test harness's own failure messages, which
-    /// would silently disappear into the sink.
-    fn capture_test_stderr<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
-        use nix::unistd::{dup, dup2_stderr};
-        use std::io::{Read, Seek, SeekFrom, Write};
-        let _lock = STDERR_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut sink = tempfile::tempfile().expect("create stderr-capture tempfile");
-        // Flush any pending stderr buffering before redirect. eprintln!
-        // is line-buffered to a Stderr lock; flush ensures pre-call
-        // output reaches the original fd 2 instead of leaking into
-        // the captured tempfile.
-        std::io::stderr().flush().ok();
-        let saved = dup(std::io::stderr()).expect("dup(stderr) failed");
-        dup2_stderr(&sink).expect("dup2_stderr(sink) failed");
-        // Install the RAII guard BEFORE running f so a panic inside
-        // f triggers Drop-based restore. The guard owns `saved` and
-        // installs it onto fd 2 on Drop via `dup2_stderr`.
-        let guard = StderrRestoreGuard { saved: Some(saved) };
-        let result = f();
-        // Flush before restore so all of f's writes land in the sink.
-        std::io::stderr().flush().ok();
-        // Drop the guard explicitly so the dup2 happens before we
-        // read from the sink below — ordering matters: reading
-        // while fd 2 still points at the sink would lose any bytes
-        // f emitted just before its last flush, and reads on the
-        // still-writable tempfile would race against in-flight
-        // buffered writes from the stdlib.
-        drop(guard);
-        sink.seek(SeekFrom::Start(0)).expect("rewind sink");
-        let mut bytes = Vec::new();
-        sink.read_to_end(&mut bytes).expect("read sink");
-        (result, bytes)
-    }
-
-    /// Process-wide mutex serializing [`capture_test_stderr`] calls.
-    /// Rustc + nextest can schedule multiple `#[test]` fns onto the
-    /// same process; the fd-2 swap inside `capture_test_stderr` is a
-    /// non-reentrant process-global mutation. Without this lock two
-    /// concurrent capture calls would each see the other's output
-    /// land in their sink, or the save/restore pair would interleave
-    /// and permanently break fd 2 for every thread.
-    static STDERR_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII shield that restores fd 2 from the stashed `saved`
-    /// OwnedFd on Drop. The capture path can panic inside `f()`
-    /// under the `panic = unwind` test profile; without this guard
-    /// the swap would leak and every subsequent stderr write in
-    /// the test process would land in the (now-orphaned) tempfile.
-    /// `saved` is `Option` so Drop can `take()` and consume it
-    /// without an `&mut` borrow fight.
-    struct StderrRestoreGuard {
-        saved: Option<std::os::fd::OwnedFd>,
-    }
-
-    impl Drop for StderrRestoreGuard {
-        fn drop(&mut self) {
-            if let Some(saved) = self.saved.take() {
-                // `dup2_stderr` is infallible here under normal
-                // conditions (the saved fd is live and fd 2 is
-                // always open); if it somehow fails we are already
-                // unwinding and cannot do better than eprintln —
-                // which itself goes through the very fd we are
-                // trying to restore, so we silently swallow the
-                // error rather than risk a double-panic.
-                let _ = nix::unistd::dup2_stderr(&saved);
-            }
-        }
-    }
+    /// Alias for the crate-shared stderr-capture helper from
+    /// `test_support::test_helpers`. Kept under the local
+    /// `capture_test_stderr` name so existing call sites below do
+    /// not need renames. The prior module-local
+    /// `STDERR_CAPTURE_LOCK` + `StderrRestoreGuard` + capture
+    /// function that lived here were moved to
+    /// `test_helpers::capture_stderr` so this module, `report.rs`,
+    /// and any future capture site share ONE process-wide mutex on
+    /// fd 2. Per-module mutexes would fail to serialize cross-module
+    /// captures and race on the fd-2 swap.
+    use crate::test_support::test_helpers::capture_stderr as capture_test_stderr;
 
     /// Direct proof of the merge: emit a unique marker on stdout and
     /// a different unique marker on stderr from a child process,
@@ -3995,6 +3974,106 @@ mod tests {
             DIRTY_TREE_CACHE_SKIP_HINT.contains("commit")
                 && DIRTY_TREE_CACHE_SKIP_HINT.contains("stash"),
             "dirty-tree hint must name the commit-or-stash remediation: {DIRTY_TREE_CACHE_SKIP_HINT}",
+        );
+    }
+
+    /// `NON_GIT_TREE_CACHE_SKIP_HINT` is the hint fired when the
+    /// local source tree is not a git repository — `commit` / `stash`
+    /// do not apply, so the wording must avoid them and instead
+    /// point to the two actionable remediations: put the source
+    /// under git, or pick a fetch mode that produces a git-tracked
+    /// tree. Pinning the shape catches a reword that (a) drops the
+    /// "skipping cache" preamble, (b) invents a commit/stash
+    /// remediation that's not actionable, or (c) loses the
+    /// actionable remediation pointer.
+    #[test]
+    fn non_git_tree_cache_skip_hint_shape() {
+        assert!(
+            NON_GIT_TREE_CACHE_SKIP_HINT.starts_with("skipping cache"),
+            "non-git hint must be left-anchored on the cache-skip outcome: {NON_GIT_TREE_CACHE_SKIP_HINT}",
+        );
+        assert!(
+            NON_GIT_TREE_CACHE_SKIP_HINT.contains("not a git repository"),
+            "non-git hint must name the cause: {NON_GIT_TREE_CACHE_SKIP_HINT}",
+        );
+        assert!(
+            NON_GIT_TREE_CACHE_SKIP_HINT.contains("put the source under git"),
+            "non-git hint must name the actionable remediation: {NON_GIT_TREE_CACHE_SKIP_HINT}",
+        );
+        assert!(
+            !NON_GIT_TREE_CACHE_SKIP_HINT.contains("stash"),
+            "non-git hint must NOT suggest stash (no git = no stash): {NON_GIT_TREE_CACHE_SKIP_HINT}",
+        );
+        assert!(
+            !NON_GIT_TREE_CACHE_SKIP_HINT.contains("commit"),
+            "non-git hint must NOT suggest commit (no git = no commit): {NON_GIT_TREE_CACHE_SKIP_HINT}",
+        );
+    }
+
+    /// `show_thresholds` happy path: a known registered test resolves
+    /// to a Result carrying both the `Test:` and `Scheduler:` header
+    /// lines plus the human-formatted threshold dump from
+    /// `Assert::format_human`. Pins the composition order — header
+    /// lines before the threshold block — so a future reorder that
+    /// mixed the headers into the field rows would trip this test.
+    #[test]
+    fn show_thresholds_known_test_returns_populated_report() {
+        // Pick the first registered test — any KTSTR_TESTS entry is
+        // an acceptable target for the shape assertions below, and
+        // iterating avoids hardcoding a specific test name that
+        // could be renamed later.
+        let Some(entry) = crate::test_support::KTSTR_TESTS.iter().next() else {
+            // No registered tests in this build — skip without
+            // failing (some lean build configs exclude the
+            // test-registry).
+            eprintln!(
+                "ktstr: SKIP: show_thresholds_known_test_returns_populated_report — no entries in KTSTR_TESTS",
+            );
+            return;
+        };
+        let out = show_thresholds(entry.name).expect("show_thresholds must resolve known test");
+        assert!(
+            out.contains("Test:"),
+            "output missing `Test:` header: {out}",
+        );
+        assert!(
+            out.contains("Scheduler:"),
+            "output missing `Scheduler:` header: {out}",
+        );
+        assert!(
+            out.contains("Resolved assertion thresholds:"),
+            "output missing thresholds section: {out}",
+        );
+        // Header precedes threshold block (composition order).
+        let test_idx = out.find("Test:").unwrap();
+        let thresholds_idx = out.find("Resolved assertion thresholds:").unwrap();
+        assert!(
+            test_idx < thresholds_idx,
+            "`Test:` header must precede threshold dump",
+        );
+    }
+
+    /// `show_thresholds` error path: an unknown test name surfaces
+    /// the actionable `no registered ktstr test named` diagnostic
+    /// plus the operator hint pointing at `cargo nextest list` and
+    /// the `<binary>::` prefix caveat. Pins the wording so a
+    /// reword that drops the name or the nextest pointer fails
+    /// this test.
+    #[test]
+    fn show_thresholds_unknown_test_returns_actionable_error() {
+        let err = show_thresholds("definitely_not_a_registered_test_xyz123").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no registered ktstr test named"),
+            "error must name the missing-test condition: {msg}",
+        );
+        assert!(
+            msg.contains("cargo nextest list"),
+            "error must point at the discovery command: {msg}",
+        );
+        assert!(
+            msg.contains("function-name component"),
+            "error must flag the nextest binary:: prefix caveat: {msg}",
         );
     }
 

@@ -561,7 +561,7 @@ fn evaluate_vm_result(
                 String::new()
             };
             // Dual filter for the console-dump gate:
-            //   Primary: structured `DetailKind::SchedulerExited` tag —
+            //   Primary: structured `DetailKind::SchedulerDied` tag —
             //     every current scheduler-exit emitter sets it, and
             //     the enum variant is cheap to match.
             //   Fallback: `is_scheduler_death` prefix-match on the
@@ -570,7 +570,7 @@ fn evaluate_vm_result(
             //     a regression in one emit site still surfaces the
             //     console section instead of silently dropping it.
             let console_section = if check_result.details.iter().any(|d| {
-                d.kind == crate::assert::DetailKind::SchedulerExited
+                d.kind == crate::assert::DetailKind::SchedulerDied
                     || d.is_scheduler_death()
             }) || verbose()
             {
@@ -2071,8 +2071,8 @@ mod tests {
         let json = build_assert_result_json(
             false,
             vec![AssertDetail::new(
-                DetailKind::SchedulerExited,
-                "scheduler process exited unexpectedly after completing step 1 of 2 (0.5s into test)",
+                DetailKind::SchedulerDied,
+                "scheduler process died unexpectedly after completing step 1 of 2 (0.5s into test)",
             )],
         );
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
@@ -2102,8 +2102,8 @@ mod tests {
         let json = build_assert_result_json(
             false,
             vec![AssertDetail::new(
-                DetailKind::SchedulerExited,
-                "scheduler process exited unexpectedly during workload (2.0s into test)",
+                DetailKind::SchedulerDied,
+                "scheduler process died unexpectedly during workload (2.0s into test)",
             )],
         );
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");

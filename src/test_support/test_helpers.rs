@@ -451,3 +451,59 @@ fn env_var_guard_restores_non_utf8_original_exactly() {
     );
     unsafe { std::env::remove_var(KEY) };
 }
+
+/// Process-wide mutex serializing every stderr-capture call across
+/// the crate. `fd 2 → tempfile` redirection is a non-reentrant
+/// process-global mutation — two concurrent callers in DIFFERENT
+/// modules would see each other's output land in their sink (or
+/// worse, the save/restore pair could interleave and permanently
+/// break fd 2). Before this lock existed, `src/cli.rs` and
+/// `src/report.rs` each had their own module-local mutex, which
+/// serialized within-module calls but did NOT coordinate across
+/// modules. The ONE mutex here guards every capture site in the
+/// crate.
+pub(crate) static STDERR_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard that restores the saved stderr fd on Drop, even if
+/// the captured closure panics under the `panic = "unwind"` test
+/// profile. Without this guard a panicking closure would leak the
+/// fd-2 swap and every subsequent stderr write in the test process
+/// would land in the orphaned tempfile. `saved` is `Option` so Drop
+/// can `take()` and consume it without an `&mut` borrow fight.
+pub(crate) struct StderrRestoreGuard {
+    saved: Option<std::os::fd::OwnedFd>,
+}
+impl Drop for StderrRestoreGuard {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            let _ = nix::unistd::dup2_stderr(&saved);
+        }
+    }
+}
+
+/// Run `f` with stderr redirected to an in-memory tempfile; return
+/// both `f`'s value and the captured bytes. Uses the process-wide
+/// [`STDERR_CAPTURE_LOCK`] to serialize against every other capture
+/// call in the crate. The RAII [`StderrRestoreGuard`] restores fd 2
+/// even if `f` panics under `panic = "unwind"`.
+pub(crate) fn capture_stderr<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let _lock = STDERR_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut sink = tempfile::tempfile().expect("create stderr-capture tempfile");
+    // Flush before redirect: eprintln! is line-buffered behind the
+    // Stderr lock; pre-call bytes need to reach the ORIGINAL fd 2
+    // or they leak into the captured tempfile.
+    std::io::stderr().flush().ok();
+    let saved = nix::unistd::dup(std::io::stderr()).expect("dup(stderr)");
+    nix::unistd::dup2_stderr(&sink).expect("dup2_stderr(sink)");
+    let guard = StderrRestoreGuard { saved: Some(saved) };
+    let result = f();
+    std::io::stderr().flush().ok();
+    drop(guard);
+    sink.seek(SeekFrom::Start(0)).expect("rewind sink");
+    let mut bytes = Vec::new();
+    sink.read_to_end(&mut bytes).expect("read sink");
+    (result, bytes)
+}

@@ -1874,8 +1874,8 @@ fn run_scenario(
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::SchedulerExited,
-                crate::assert::format_sched_exited_after_step(
+                crate::assert::DetailKind::SchedulerDied,
+                crate::assert::format_sched_died_after_step(
                     step_idx,
                     steps.len(),
                     scenario_start.elapsed().as_secs_f64(),
@@ -1949,8 +1949,8 @@ fn run_scenario(
     if sched_dead {
         result.passed = false;
         result.details.push(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::SchedulerExited,
-            crate::assert::format_sched_exited_after_all_steps(
+            crate::assert::DetailKind::SchedulerDied,
+            crate::assert::format_sched_died_after_all_steps(
                 steps.len(),
                 scenario_start.elapsed().as_secs_f64(),
             ),
@@ -3162,6 +3162,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let ops: Vec<Op> = vec![
             Op::AddCgroup { name: "a".into() },
@@ -3222,6 +3224,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         assert_eq!(Op::AddCgroup { name: "a".into() }.discriminant(), 0);
         assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 1);
@@ -5121,6 +5125,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let def = CgroupDef::named("cg_0").workload(&FIO);
         let p = def.payload.expect("workload was attached");
@@ -5157,6 +5163,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
 
         let cgroups = CgroupManager::new("/nonexistent");
@@ -5207,6 +5215,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let step = Step::with_payload(&FIO, HoldSpec::Fixed(Duration::from_millis(50)));
         assert_eq!(step.ops.len(), 1);
@@ -5240,6 +5250,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
 
         let op = Op::run_payload(&FIO, vec!["--warmup".into()]);
@@ -5390,6 +5402,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
 
         let mock = MockCgroupOps::new();
@@ -5428,6 +5442,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
 
         let mock = MockCgroupOps::new();
@@ -5498,6 +5514,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
 
         let mock = MockCgroupOps::new();
@@ -5604,6 +5622,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -5925,6 +5945,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -5982,6 +6004,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6031,6 +6055,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6079,6 +6105,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6119,6 +6147,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();

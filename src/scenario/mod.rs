@@ -978,7 +978,7 @@ where
 /// before the workload starts, returns an `Err` so callers can treat
 /// the run as a setup failure. A scheduler exit mid-workload is
 /// reported as a completed-but-failed `AssertResult` with
-/// "scheduler process exited unexpectedly during workload" in
+/// "scheduler process died unexpectedly during workload" in
 /// `details`, not an error. On workload failure, captures the guest
 /// kernel console via `read_kmsg` so diagnostics include the stall
 /// or crash context.
@@ -1021,7 +1021,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     {
         anyhow::bail!(
             "{} after cgroup creation (pid={})",
-            crate::assert::SCHED_NO_LONGER_RUNNING_PREFIX,
+            crate::assert::SCHED_DIED_PREFIX,
             pid,
         );
     }
@@ -1085,7 +1085,7 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
         while std::time::Instant::now() < deadline {
             if !process_alive(pid) {
                 sched_dead = true;
-                tracing::warn!("scheduler process exited during workload phase");
+                tracing::warn!("scheduler process died during workload phase");
                 break;
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -1121,8 +1121,8 @@ pub fn run_scenario(scenario: &Scenario, ctx: &Ctx) -> Result<AssertResult> {
     if sched_dead {
         result.passed = false;
         result.details.push(crate::assert::AssertDetail::new(
-            crate::assert::DetailKind::SchedulerExited,
-            crate::assert::format_sched_exited_during_workload(
+            crate::assert::DetailKind::SchedulerDied,
+            crate::assert::format_sched_died_during_workload(
                 scenario_start.elapsed().as_secs_f64(),
             ),
         ));
@@ -1314,7 +1314,7 @@ pub fn setup_cgroups<'a>(
     {
         anyhow::bail!(
             "{} after cgroup creation (pid={})",
-            crate::assert::SCHED_NO_LONGER_RUNNING_PREFIX,
+            crate::assert::SCHED_DIED_PREFIX,
             pid,
         );
     }

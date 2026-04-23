@@ -139,6 +139,24 @@ enum KtstrCommand {
     /// reports which host-context fields changed between run A
     /// and run B using the same [`HostContext::diff`] logic.
     ShowHost,
+    /// Print the resolved assertion thresholds for the named test.
+    ///
+    /// Dumps the merged `Assert` produced by the runtime merge chain
+    /// `Assert::default_checks().merge(entry.scheduler.assert()).merge(&entry.assert)`
+    /// — the same value `run_ktstr_test_inner` evaluates against
+    /// worker reports. Surfaces every threshold field (or `none`
+    /// when inherited / unset) so an operator can see what the test
+    /// will actually check against without reading source or
+    /// guessing which layer contributed each bound.
+    ///
+    /// Fails with an actionable message when no registered test
+    /// matches the given name. Use `cargo nextest list` to
+    /// enumerate test names.
+    ShowThresholds {
+        /// Fully qualified test name as registered in
+        /// `#[ktstr_test]` (e.g. `preempt_regression_fault_under_load`).
+        test: String,
+    },
     /// Clean up leftover ktstr cgroups.
     ///
     /// Without `--parent-cgroup`, scans `/sys/fs/cgroup` for the default
@@ -952,6 +970,13 @@ fn main() {
             print!("{}", cli::show_host());
             Ok(())
         }
+        KtstrCommand::ShowThresholds { test } => match cli::show_thresholds(&test) {
+            Ok(s) => {
+                print!("{s}");
+                Ok(())
+            }
+            Err(e) => Err(format!("{e:#}")),
+        },
     };
 
     if let Err(e) = result {
