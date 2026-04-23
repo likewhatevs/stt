@@ -1553,12 +1553,13 @@ mod tests {
         // `collect_host_context()` call for `HostContext { kernel_name:
         // Some("Linux".into()), ..Default::default() }` would pass the
         // uname assertion but drop every other captured field —
-        // `cmdline` is present on every live Linux process (/proc/cmdline
-        // is always readable; see host_context::tests:
+        // `kernel_cmdline` is present on every live Linux process
+        // (/proc/cmdline is always readable; see host_context::tests:
         // collect_host_context_captures_cmdline_on_linux) so
-        // `cmdline.is_some()` catches the default-substitution regression.
+        // `kernel_cmdline.is_some()` catches the default-substitution
+        // regression.
         assert!(
-            host.cmdline.is_some(),
+            host.kernel_cmdline.is_some(),
             "write_sidecar must capture full HostContext, not Default::default() — \
              /proc/cmdline is always readable on Linux (see host_context tests)",
         );
@@ -2020,12 +2021,12 @@ mod tests {
         // both the happy-path writer and the skip-path writer guarded
         // against the same default-substitution regression.
         assert!(
-            host.cmdline.is_some(),
+            host.kernel_cmdline.is_some(),
             "write_skip_sidecar must capture full HostContext, not Default::default()",
         );
         // Syscall-sourced companion to the filesystem-sourced
-        // `cmdline` check — see `write_sidecar_writes_file` for the
-        // two-independent-paths rationale.
+        // `kernel_cmdline` check — see `write_sidecar_writes_file`
+        // for the two-independent-paths rationale.
         assert!(
             host.kernel_release.is_some(),
             "write_skip_sidecar must capture kernel_release (syscall-sourced)",
@@ -2334,11 +2335,12 @@ mod tests {
             thp_enabled: Some("always [madvise] never".to_string()),
             thp_defrag: Some("[always] defer madvise never".to_string()),
             sched_tunables: None,
+            online_cpus: Some(8),
             numa_nodes: Some(2),
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
-            cmdline: Some("preempt=lazy".to_string()),
+            kernel_cmdline: Some("preempt=lazy".to_string()),
         };
         let without_host = SidecarResult {
             topology: "1n1l2c1t".to_string(),
@@ -2381,11 +2383,12 @@ mod tests {
             thp_enabled: Some("always [madvise] never".to_string()),
             thp_defrag: Some("[always] defer madvise never".to_string()),
             sched_tunables: Some(tunables),
+            online_cpus: Some(8),
             numa_nodes: Some(2),
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
-            cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
+            kernel_cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
         };
         let sc = SidecarResult {
             topology: "1n1l2c1t".to_string(),

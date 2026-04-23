@@ -727,18 +727,32 @@ mod tests {
 
     #[test]
     fn hugepages_free_runs() {
-        // Should not panic. Returns 0 if hugepages not configured.
+        // `hugepages_free` returns 0 (not Err / not panic) when
+        // `/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages`
+        // is absent, so this smoke test is safe to run on any host
+        // regardless of hugetlbfs configuration. Only the 2 MiB
+        // pool is consulted (matches the exact path the
+        // implementation opens); other hugepage sizes are not
+        // read here.
         let _ = hugepages_free();
     }
 
     #[test]
     fn host_load_estimate_runs() {
         let result = host_load_estimate();
-        // Should succeed on any Linux host.
+        // `host_load_estimate` reads `/proc/stat` (scanning for
+        // the `procs_running` line) and
+        // `/sys/devices/system/cpu/online`. Both are mandatory on
+        // any Linux kernel with CONFIG_PROC_FS + CONFIG_SYSFS, so
+        // `Some(_)` is guaranteed when the test runs on a Linux
+        // host.
         assert!(result.is_some());
         let (running, total) = result.unwrap();
         assert!(total > 0);
-        // At least this test is running.
+        // `running` is the `procs_running` counter from
+        // `/proc/stat` — number of processes currently in state
+        // `R`. This test thread itself is running at observation
+        // time, so the floor is 1.
         assert!(running >= 1);
     }
 
@@ -1136,7 +1150,11 @@ mod tests {
 
     #[test]
     fn mbind_to_nodes_empty_is_noop() {
-        // Should not panic.
+        // Empty `nodes` slice short-circuits before the `mbind(2)`
+        // syscall, so neither a null pointer nor a non-zero size
+        // reaches the kernel. Guards against a regression where a
+        // caller passing `&[]` would either fault on the null ptr
+        // or silently mbind the "all nodes" default set.
         mbind_to_nodes(std::ptr::null_mut(), 0, &[]);
         mbind_to_nodes(std::ptr::null_mut(), 4096, &[]);
     }
@@ -1321,8 +1339,13 @@ mod tests {
 
     #[test]
     fn numa_pinning_fallback_insufficient_nodes() {
-        // Host: 4 LLCs all on NUMA node 0. Guest wants 2 NUMA nodes.
-        // Should fall back to sequential mapping.
+        // Host: 4 LLCs all on NUMA node 0; guest requests 2 NUMA
+        // nodes. The host cannot distribute LLCs across distinct
+        // nodes (there is only one), so `compute_pinning` falls
+        // back to the single-node sequential mapping rather than
+        // erroring. The fallback still produces 8 unique host-CPU
+        // assignments so the VM boots on the same host memory
+        // throughout.
         let topo = synthetic_topo_numa(vec![
             (0, vec![0, 1]),
             (0, vec![2, 3]),
@@ -1333,7 +1356,6 @@ mod tests {
             .compute_pinning(&Topology::new(2, 4, 2, 1), false, 0)
             .unwrap();
         assert_eq!(plan.assignments.len(), 8);
-        // All assignments should be valid (sequential fallback).
         let cpus: Vec<usize> = plan.assignments.iter().map(|a| a.1).collect();
         let unique: std::collections::HashSet<usize> = cpus.iter().copied().collect();
         assert_eq!(cpus.len(), unique.len());

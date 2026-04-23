@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Scenario-level affinity intent for a group of workers.
@@ -1208,12 +1208,20 @@ pub struct WorkloadHandle {
     futex_ptrs: Vec<*mut u32>,
     /// Size of each futex mmap region (4 for FutexPingPong/FutexFanOut/MutexContention, 16 for FanOutCompute).
     futex_region_size: usize,
-    /// MAP_SHARED region of per-worker u64 iteration counters. Workers
+    /// MAP_SHARED region of per-worker iteration counters. Workers
     /// atomically store their iteration count; parent reads via
     /// `snapshot_iterations()`. Pointer to the first element; length
-    /// is `children.len()`.
-    iter_counters: *mut u64,
-    /// Number of u64 slots in iter_counters (== num_workers at spawn time).
+    /// is `children.len()`. Typed as `*mut AtomicU64` rather than
+    /// `*mut u64` so the 8-byte alignment guarantee (inherited from
+    /// the page-aligned iter_counters mmap site in
+    /// `WorkloadHandle::spawn`) and the atomic-only-access
+    /// invariant are encoded in the type system instead of prose.
+    /// `AtomicU64` is layout-compatible with `u64`:
+    /// `std::mem::size_of::<AtomicU64>() == std::mem::align_of::<AtomicU64>() == 8`
+    /// on every supported target, so casting the `*mut c_void`
+    /// returned by `mmap` to `*mut AtomicU64` is sound.
+    iter_counters: *mut AtomicU64,
+    /// Number of AtomicU64 slots in iter_counters (== num_workers at spawn time).
     iter_counter_len: usize,
 }
 
@@ -1238,7 +1246,8 @@ struct SpawnGuard {
     futex_ptrs: Vec<*mut u32>,
     futex_region_size: usize,
     /// Per-worker iteration counter region (transferred on success).
-    iter_counters: *mut u64,
+    /// Typed matches the handle field; see `WorkloadHandle::iter_counters`.
+    iter_counters: *mut AtomicU64,
     iter_counter_bytes: usize,
     /// Already-forked children with their parent-side pipe fds
     /// (transferred to handle on success).
@@ -1266,7 +1275,7 @@ impl SpawnGuard {
         let futex_ptrs = std::mem::take(&mut self.futex_ptrs);
         let iter_counters = std::mem::replace(&mut self.iter_counters, std::ptr::null_mut());
         let iter_counter_bytes = std::mem::replace(&mut self.iter_counter_bytes, 0);
-        let iter_counter_len = iter_counter_bytes / std::mem::size_of::<u64>();
+        let iter_counter_len = iter_counter_bytes / std::mem::size_of::<AtomicU64>();
         WorkloadHandle {
             children,
             started: false,
@@ -1334,7 +1343,8 @@ impl Drop for SpawnGuard {
 // re-derived from the raw pointer for FanOutCompute, which needs
 // release-acquire ordering to publish `wake_ns` alongside the
 // generation advance — and atomically store into their dedicated
-// iter_counters slot (via `AtomicU64::from_ptr`); the parent reads
+// iter_counters slot (via a shared `&AtomicU64` reference derived
+// from the `*mut AtomicU64` region pointer); the parent reads
 // all slots via `snapshot_iterations` and is the sole process that
 // munmaps the region, on WorkloadHandle::drop after every child has
 // been reaped. Each process constructs its own process-local
@@ -1429,12 +1439,21 @@ impl WorkloadHandle {
             }
         }
 
-        // Per-worker iteration counter region (MAP_SHARED). Each worker
-        // atomically stores its iteration count to slot [i]. The parent
-        // reads all slots via snapshot_iterations().
+        // Per-worker iteration counter region (MAP_SHARED). Each
+        // worker atomically stores its iteration count to slot [i];
+        // the parent reads all slots via `snapshot_iterations()`.
+        // The mmap base is page-aligned (kernel guarantee), so
+        // casting to `*mut AtomicU64` is sound: page alignment (≥
+        // 4096) ≥ AtomicU64 alignment (8), and the region size is
+        // an exact multiple of `size_of::<AtomicU64>()` (== 8).
+        // Each `.add(i)` moves by `i * 8` bytes, preserving the
+        // 8-byte alignment invariant. No non-atomic access to the
+        // region exists anywhere in the crate, so the atomic-only
+        // aliasing rule (workers + parent share `&AtomicU64`
+        // references derived from the raw pointer) holds.
         let iter_counter_len = config.num_workers;
         if iter_counter_len > 0 {
-            let size = iter_counter_len * std::mem::size_of::<u64>();
+            let size = iter_counter_len * std::mem::size_of::<AtomicU64>();
             let ptr = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
@@ -1451,7 +1470,7 @@ impl WorkloadHandle {
                     std::io::Error::last_os_error()
                 );
             }
-            guard.iter_counters = ptr as *mut u64;
+            guard.iter_counters = ptr as *mut AtomicU64;
             guard.iter_counter_bytes = size;
         }
 
@@ -1483,7 +1502,7 @@ impl WorkloadHandle {
             };
 
             // Shared iteration counter slot for this worker.
-            let iter_slot: *mut u64 = if !guard.iter_counters.is_null() {
+            let iter_slot: *mut AtomicU64 = if !guard.iter_counters.is_null() {
                 unsafe { guard.iter_counters.add(i) }
             } else {
                 std::ptr::null_mut()
@@ -1831,8 +1850,11 @@ impl WorkloadHandle {
         }
         (0..self.iter_counter_len)
             .map(|i| {
-                let ptr = unsafe { self.iter_counters.add(i) };
-                unsafe { std::sync::atomic::AtomicU64::from_ptr(ptr).load(Ordering::Relaxed) }
+                // SAFETY: alignment + atomic-only-access invariant
+                // established at the iter_counters mmap site in
+                // `WorkloadHandle::spawn` and carried by the
+                // `*mut AtomicU64` type.
+                unsafe { &*self.iter_counters.add(i) }.load(Ordering::Relaxed)
             })
             .collect()
     }
@@ -2131,7 +2153,7 @@ fn worker_main(
     mpol_flags: MpolFlags,
     pipe_fds: Option<(i32, i32)>,
     futex: Option<(*mut u32, bool)>,
-    iter_slot: *mut u64,
+    iter_slot: *mut AtomicU64,
 ) -> WorkerReport {
     // `getpid()` returns `pid_t` — keep the native type all the way
     // through to `WorkerReport.tid`.
@@ -2173,13 +2195,13 @@ fn worker_main(
     // match arm lets PageFaultChurn return to the outer work loop
     // after each touches_per_cycle + spin_burst cycle. This gives
     // two distinct cadences:
-    //   - iter_slot publish at src/workload.rs:2898-2902 fires on
-    //     EVERY outer iteration (unconditional in the outer-loop
-    //     tail), so host-side `snapshot_iterations` sees progress
-    //     in real time.
-    //   - migration check at src/workload.rs:2905 fires every
-    //     outer iteration but only triggers its body when
-    //     `work_units.is_multiple_of(1024)`. With 320 units per
+    //   - The iter_slot publish in the outer `worker_main` loop
+    //     fires on EVERY outer iteration (unconditional in the
+    //     outer-loop tail), so host-side `snapshot_iterations`
+    //     sees progress in real time.
+    //   - The migration check in the outer `worker_main` loop
+    //     fires every outer iteration but only triggers its body
+    //     when `work_units.is_multiple_of(1024)`. With 320 units per
     //     PageFaultChurn outer iter and gcd(320, 1024) = 64, that
     //     lands every 1024/64 = 16 outer iterations (see
     //     doc/guide/src/architecture/workers.md).
@@ -2681,9 +2703,9 @@ fn worker_main(
                 };
                 // Shared memory layout: [u32 generation @ offset 0]
                 // [u64 wake_ns @ offset 8]. The mmap base is
-                // page-aligned (see MAP_ANONYMOUS region allocated
-                // at src/workload.rs:1414), so offset 8 is 8-byte
-                // aligned, which AtomicU64 requires.
+                // page-aligned (see the futex-region MAP_ANONYMOUS
+                // allocation in `WorkloadHandle::spawn`), so offset 8
+                // is 8-byte aligned, which AtomicU64 requires.
                 let wake_ts_ptr = unsafe { (futex_ptr as *mut u8).add(8) as *mut u64 };
                 // Use Release/Acquire ordering so that when workers
                 // observe the generation advance, the matching
@@ -2905,12 +2927,13 @@ fn worker_main(
             WorkType::Custom { .. } => unreachable!("handled by early return"),
         }
 
-        // Publish iteration count to shared memory for host-side sampling.
+        // Publish iteration count to shared memory for host-side
+        // sampling. SAFETY: alignment + atomic-only-access invariant
+        // established at the iter_counters mmap site in
+        // `WorkloadHandle::spawn` and carried by the
+        // `*mut AtomicU64` type.
         if !iter_slot.is_null() {
-            unsafe {
-                std::sync::atomic::AtomicU64::from_ptr(iter_slot)
-                    .store(iterations, Ordering::Relaxed);
-            }
+            unsafe { &*iter_slot }.store(iterations, Ordering::Relaxed);
         }
 
         if work_units.is_multiple_of(1024) {
@@ -2974,10 +2997,10 @@ fn worker_main(
     }
 
     // Final iteration count store for host-side sampling.
+    // SAFETY: same as the iter_slot publish in the outer
+    // `worker_main` loop above.
     if !iter_slot.is_null() {
-        unsafe {
-            std::sync::atomic::AtomicU64::from_ptr(iter_slot).store(iterations, Ordering::Relaxed);
-        }
+        unsafe { &*iter_slot }.store(iterations, Ordering::Relaxed);
     }
 
     let wall_time = start.elapsed();
@@ -6146,9 +6169,10 @@ mod tests {
 
     /// Panic-path variant: the Custom closure panics after forking
     /// its grandchild. Under `panic = "unwind"` the worker's
-    /// `std::panic::catch_unwind` (around the child body at
-    /// src/workload.rs:1665) catches the panic and the child hits
-    /// `libc::_exit(1)` directly — no abort. Under `panic = "abort"`
+    /// `std::panic::catch_unwind` (around the child body in the
+    /// forked-child path of `WorkloadHandle::spawn`) catches the
+    /// panic and the child hits `libc::_exit(1)` directly — no
+    /// abort. Under `panic = "abort"`
     /// SIGABRT fires before catch_unwind runs. Either way the
     /// parent-worker process exits BEFORE `stop_and_collect` is
     /// called; stop_and_collect's graceful-exit branch must still
@@ -6883,23 +6907,23 @@ mod tests {
     ///    insensitive to worker start-up latency (the test would
     ///    otherwise race against workers whose first outer iter
     ///    lands after the first snapshot). Pre-fix, PageFaultChurn
-    ///    used an inner `while !STOP` loop that bypassed the outer
-    ///    `iter_slot.store` at src/workload.rs:2898-2902, so both
-    ///    snapshots were pinned at 0 and the delta would be 0.
+    ///    used an inner `while !STOP` loop that bypassed the
+    ///    iter_slot publish in the outer `worker_main` loop, so
+    ///    both snapshots were pinned at 0 and the delta would be 0.
     /// 3. On multi-CPU hosts, at least one worker records ≥ 1
     ///    migration. With `num_workers = available_parallelism() + 1`
     ///    the workload oversubscribes by one, forcing at least one
     ///    context switch and CPU re-dispatch in any realistic
-    ///    scheduler; combined with the outer migration check at
-    ///    `work_units.is_multiple_of(1024)` firing every 64 outer
+    ///    scheduler; combined with the migration check in the
+    ///    outer `worker_main` loop (gated on
+    ///    `work_units.is_multiple_of(1024)`) firing every 64 outer
     ///    iters for this test's parameters (touches_per_cycle=16
     ///    + spin_iters=32 = 48 work_units/iter,
     ///    gcd(48, 1024) = 16, period = 1024/16 = 64; the default
     ///    16-iter period documented in
     ///    doc/guide/src/architecture/workers.md assumes
-    ///    default params 256+64=320 instead). See also
-    ///    src/workload.rs:2905. This puts the assertion well
-    ///    above the flake threshold. Gated on
+    ///    default params 256+64=320 instead), this puts the
+    ///    assertion well above the flake threshold. Gated on
     ///    `available_parallelism() > 1` because single-CPU
     ///    sandboxes legitimately report 0 migrations.
     #[test]
@@ -6926,8 +6950,8 @@ mod tests {
         h.start();
         // Delta-based iter_slot assertion. Pre-fix these snapshots
         // were both 0 for PageFaultChurn (inner `while !STOP`
-        // blocked the outer iter_slot publish at
-        // src/workload.rs:2898-2902). Post-fix the outer loop
+        // blocked the iter_slot publish in the outer `worker_main`
+        // loop). Post-fix the outer loop
         // updates iter_slot every iteration, so the 150 ms gap
         // between snap1 and snap2 observes many iterations'
         // worth of progress.

@@ -4124,7 +4124,10 @@ mod tests {
         assert!(r.monitor.is_none());
         assert!(r.shm_data.is_none());
         assert!(r.stimulus_events.is_empty());
-        // Verify a failed result carries different values.
+        // Second construction covers the opposite polarity of
+        // every boolean/numeric field so no field is silently
+        // dropped by a future refactor that only exercises the
+        // success path.
         let r2 = VmResult {
             success: false,
             exit_code: 1,
@@ -5314,32 +5317,37 @@ mod tests {
 
     #[test]
     fn set_rt_priority_applies_when_capable() {
-        // Verify set_rt_priority sets SCHED_FIFO when the process has
-        // CAP_SYS_NICE. Skip (pass) if not capable.
+        // Probe CAP_SYS_NICE via a direct sched_setscheduler call
+        // first: RT policies require the capability, and CI
+        // containers frequently drop it. If the probe fails, skip
+        // rather than fail — the permission check is the feature
+        // under test.
         let param = libc::sched_param { sched_priority: 1 };
         let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
         if rc != 0 {
-            // No CAP_SYS_NICE — skip test.
             skip!("no CAP_SYS_NICE capability available");
         }
-        // Verify it took effect.
         let policy = unsafe { libc::sched_getscheduler(0) };
         assert_eq!(policy, libc::SCHED_FIFO);
         let mut out_param: libc::sched_param = unsafe { std::mem::zeroed() };
         unsafe { libc::sched_getparam(0, &mut out_param) };
         assert_eq!(out_param.sched_priority, 1);
-        // Restore SCHED_OTHER to avoid affecting other tests.
+        // Restore SCHED_OTHER so later tests in the same nextest
+        // process don't inherit this thread's RT policy.
         let restore = libc::sched_param { sched_priority: 0 };
         unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &restore) };
     }
 
     #[test]
     fn set_rt_priority_warns_without_cap() {
-        // Verify set_rt_priority does not panic when called without
-        // CAP_SYS_NICE — it should print a warning and continue.
-        // This test always passes; it exercises the warning path.
+        // `set_rt_priority` swallows EPERM with an unconditional
+        // stderr warning (one `eprintln!` per call, no
+        // once-gating) rather than panicking or propagating an
+        // error, so vCPU threads running in unprivileged
+        // containers keep booting with the default scheduling
+        // policy. This test exercises that warning path — its
+        // only guard is that the call doesn't panic.
         set_rt_priority(1, "test-thread");
-        // If we get here, set_rt_priority didn't panic.
     }
 
     // -- aarch64 boot tests --

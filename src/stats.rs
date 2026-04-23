@@ -1278,7 +1278,7 @@ pub fn compare_runs(
     // memoized once per process in [`host_context`]'s
     // `STATIC_HOST_INFO`, so every sidecar in a run carries
     // identical values for them. Dynamic fields (sched_tunables,
-    // hugepages_{total,free}, thp_enabled, thp_defrag, cmdline)
+    // hugepages_{total,free}, thp_enabled, thp_defrag, kernel_cmdline)
     // are re-read on every `collect_host_context` call, so an
     // operator who flips a sysctl or reserves hugepages
     // mid-run will see drift across sidecars within the same
@@ -1312,7 +1312,7 @@ pub(crate) fn format_host_delta(
 ) -> String {
     match (host_a, host_b) {
         (Some(ha), Some(hb)) => {
-            let delta = crate::host_context::HostContext::diff(ha, hb);
+            let delta = ha.diff(hb);
             if delta.is_empty() {
                 format!("\nhost: identical between '{a}' and '{b}'\n")
             } else {
@@ -2411,11 +2411,11 @@ mod tests {
     /// Builder for a `HostContext` with enough populated fields to
     /// exercise `HostContext::diff`. Leaves everything else at its
     /// `Default` so each test varies only the field under study.
-    fn host_ctx(release: &str, cmdline: Option<&str>) -> crate::host_context::HostContext {
+    fn host_ctx(release: &str, kernel_cmdline: Option<&str>) -> crate::host_context::HostContext {
         crate::host_context::HostContext {
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some(release.to_string()),
-            cmdline: cmdline.map(str::to_string),
+            kernel_cmdline: kernel_cmdline.map(str::to_string),
             ..Default::default()
         }
     }

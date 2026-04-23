@@ -3001,6 +3001,72 @@ mod tests {
         assert_eq!(pm.metrics[0].value, 42.0);
     }
 
+    /// Stdout is valid JSON but contains only non-numeric leaves
+    /// (strings, bools, nulls). `walk_json_leaves` at
+    /// src/test_support/metrics.rs skips non-numeric leaves, so
+    /// `extract_metrics` returns `Ok(vec![])` — a SUCCESSFUL parse
+    /// with zero metrics. This is distinct from the
+    /// "unparseable prose" case (`evaluate_falls_back_to_stderr_when_stdout_yields_no_metrics`
+    /// above): that path fails to find any JSON document at all.
+    /// The fallback condition at src/scenario/payload_run.rs:298
+    /// gates on `metrics.is_empty()`, not on parse success, so both
+    /// paths must fall back to stderr. This test pins that: the
+    /// fallback must not surface the empty stdout set as the
+    /// result, and the string/bool/null leaves from stdout must
+    /// not leak into the returned metrics (they can't — the walker
+    /// never emitted them — but a future refactor that concatenated
+    /// streams or merged results could regress this).
+    #[test]
+    fn evaluate_falls_back_when_stdout_json_has_no_numeric_leaves() {
+        let output = SpawnOutput {
+            stdout: r#"{"status": "ok", "ready": true, "note": null}"#
+                .to_string(),
+            stderr: r#"{"iops": 9001}"#.to_string(),
+            exit_code: 0,
+        };
+        let (_, pm) = evaluate(&JSON_PAYLOAD, &[], output);
+        assert_eq!(
+            pm.metrics.len(),
+            1,
+            "stderr fallback must fire when stdout parses but has \
+             no numeric leaves; got metrics: {:?}",
+            pm.metrics,
+        );
+        assert_eq!(pm.metrics[0].name, "iops");
+        assert_eq!(pm.metrics[0].value, 9001.0);
+        // No stray string/bool/null names leaked in from stdout.
+        for m in &pm.metrics {
+            assert!(
+                !matches!(m.name.as_str(), "status" | "ready" | "note"),
+                "non-numeric stdout leaf {:?} leaked into metrics",
+                m.name,
+            );
+        }
+    }
+
+    /// Inverse of the above: both streams parse to JSON with no
+    /// numeric leaves. Stdout extracts to `Ok(vec![])`, fallback
+    /// fires, stderr also extracts to `Ok(vec![])`. Final metric
+    /// set must be empty — not a synthetic pseudo-metric, not a
+    /// silent merge of the two empty results with added string
+    /// keys. Guards against a fallback refactor that might
+    /// misinterpret "both empty" as "degenerate, emit a sentinel".
+    #[test]
+    fn evaluate_returns_empty_when_both_streams_have_no_numeric_leaves() {
+        let output = SpawnOutput {
+            stdout: r#"{"phase": "warmup"}"#.to_string(),
+            stderr: r#"{"phase": "shutdown"}"#.to_string(),
+            exit_code: 0,
+        };
+        let (_, pm) = evaluate(&JSON_PAYLOAD, &[], output);
+        assert!(
+            pm.metrics.is_empty(),
+            "both-streams-non-numeric must produce no metrics; \
+             got: {:?}",
+            pm.metrics,
+        );
+    }
+
     /// Both streams empty ⇒ no metrics; the fallback guard
     /// (`!output.stderr.is_empty()`) skips the second call and the
     /// extractor is invoked exactly once against empty stdout.

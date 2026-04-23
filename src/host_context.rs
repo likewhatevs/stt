@@ -151,13 +151,25 @@ pub struct HostContext {
     /// empty).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sched_tunables: Option<BTreeMap<String, String>>,
+    /// Number of online host CPUs — `HostTopology::online_cpus.len()`
+    /// from the same `from_sysfs` probe that drives `numa_nodes`.
+    /// `None` when the topology probe fails. Captured as a discrete
+    /// field so downstream consumers (sidecar readers, scheduler
+    /// regression dashboards) don't need to reconstruct a
+    /// HostTopology just to learn the CPU count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online_cpus: Option<usize>,
     /// Count of NUMA nodes — derived from
     /// `HostTopology::from_sysfs` (the `cpu_to_node` map's distinct
     /// value count). `None` when the topology probe itself fails so
     /// "unknown" is distinguishable from a populated result. A probe
     /// that succeeds but reports no CPU→node entries defaults to
     /// `Some(1)` because every Linux system has at least one NUMA
-    /// node.
+    /// node — see `count_numa_nodes_in_topology` for the full
+    /// rationale (in production, empty `cpu_to_node` from a
+    /// successful probe cannot happen because `TestTopology::from_system`
+    /// bails on zero online CPUs; the `.max(1)` floor is a guard
+    /// for synthetic/test topologies).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub numa_nodes: Option<usize>,
     /// Kernel name — `uname.sysname` (typically `"Linux"`).
@@ -182,8 +194,15 @@ pub struct HostContext {
     /// `transparent_hugepage=`, and others. Stored as a single
     /// string because any split-into-pairs parser loses the
     /// quoted-value and flag-only variants the kernel accepts.
+    ///
+    /// Named `kernel_cmdline` rather than `cmdline` to disambiguate
+    /// from [`SidecarResult::kargs`](crate::test_support::SidecarResult):
+    /// that field carries the extra kargs the ktstr VMM appended
+    /// when booting the guest, NOT the running host's boot line.
+    /// Both are cmdline-shaped strings but describe different
+    /// systems.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cmdline: Option<String>,
+    pub kernel_cmdline: Option<String>,
 }
 
 impl HostContext {
@@ -238,11 +257,12 @@ impl HostContext {
             thp_enabled: Some("always [madvise] never".to_string()),
             thp_defrag: Some("always defer defer+madvise [madvise] never".to_string()),
             sched_tunables: Some(sched_tunables),
+            online_cpus: Some(16),
             numa_nodes: Some(2),
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some("6.16.0-test".to_string()),
             arch: Some("x86_64".to_string()),
-            cmdline: Some(
+            kernel_cmdline: Some(
                 "BOOT_IMAGE=/boot/vmlinuz-test root=/dev/sda1".to_string(),
             ),
         }
@@ -291,11 +311,12 @@ impl HostContext {
             thp_enabled,
             thp_defrag,
             sched_tunables,
+            online_cpus,
             numa_nodes,
             kernel_name,
             kernel_release,
             arch,
-            cmdline,
+            kernel_cmdline,
         } = self;
         fn row<T: std::fmt::Display>(out: &mut String, key: &str, value: Option<&T>) {
             match value {
@@ -317,10 +338,11 @@ impl HostContext {
         row(&mut out, "hugepages_total", hugepages_total.as_ref());
         row(&mut out, "hugepages_free", hugepages_free.as_ref());
         row(&mut out, "hugepages_size_kb", hugepages_size_kb.as_ref());
+        row(&mut out, "online_cpus", online_cpus.as_ref());
         row(&mut out, "numa_nodes", numa_nodes.as_ref());
         row(&mut out, "thp_enabled", thp_enabled.as_ref());
         row(&mut out, "thp_defrag", thp_defrag.as_ref());
-        row(&mut out, "cmdline", cmdline.as_ref());
+        row(&mut out, "kernel_cmdline", kernel_cmdline.as_ref());
         match sched_tunables {
             Some(map) if !map.is_empty() => {
                 out.push_str("sched_tunables:\n");
@@ -346,7 +368,7 @@ impl HostContext {
     /// `(unknown)`; the Some side renders as `(empty)` for an
     /// empty map or `(N entries)` for a populated one so the
     /// cardinality of the new data is visible at a glance.
-    pub fn diff(a: &HostContext, b: &HostContext) -> String {
+    pub fn diff(&self, other: &HostContext) -> String {
         use std::collections::BTreeMap;
         use std::fmt::Write;
         // Symmetric destructuring bind of both sides: forces every
@@ -364,12 +386,13 @@ impl HostContext {
             thp_enabled: a_thp_enabled,
             thp_defrag: a_thp_defrag,
             sched_tunables: a_sched_tunables,
+            online_cpus: a_online_cpus,
             numa_nodes: a_numa_nodes,
             kernel_name: a_kernel_name,
             kernel_release: a_kernel_release,
             arch: a_arch,
-            cmdline: a_cmdline,
-        } = a;
+            kernel_cmdline: a_kernel_cmdline,
+        } = self;
         let HostContext {
             cpu_model: b_cpu_model,
             cpu_vendor: b_cpu_vendor,
@@ -380,12 +403,13 @@ impl HostContext {
             thp_enabled: b_thp_enabled,
             thp_defrag: b_thp_defrag,
             sched_tunables: b_sched_tunables,
+            online_cpus: b_online_cpus,
             numa_nodes: b_numa_nodes,
             kernel_name: b_kernel_name,
             kernel_release: b_kernel_release,
             arch: b_arch,
-            cmdline: b_cmdline,
-        } = b;
+            kernel_cmdline: b_kernel_cmdline,
+        } = other;
         fn fmt_opt<T: std::fmt::Display>(v: Option<&T>) -> String {
             match v {
                 Some(v) => v.to_string(),
@@ -441,10 +465,11 @@ impl HostContext {
             a_hugepages_size_kb.as_ref(),
             b_hugepages_size_kb.as_ref(),
         );
+        row(&mut out, "online_cpus", a_online_cpus.as_ref(), b_online_cpus.as_ref());
         row(&mut out, "numa_nodes", a_numa_nodes.as_ref(), b_numa_nodes.as_ref());
         row(&mut out, "thp_enabled", a_thp_enabled.as_ref(), b_thp_enabled.as_ref());
         row(&mut out, "thp_defrag", a_thp_defrag.as_ref(), b_thp_defrag.as_ref());
-        row(&mut out, "cmdline", a_cmdline.as_ref(), b_cmdline.as_ref());
+        row(&mut out, "kernel_cmdline", a_kernel_cmdline.as_ref(), b_kernel_cmdline.as_ref());
         match (a_sched_tunables.as_ref(), b_sched_tunables.as_ref()) {
             (Some(am), Some(bm)) => {
                 let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -483,7 +508,7 @@ impl HostContext {
 /// `/proc` and `/sys` for them once and reusing the result avoids
 /// repeated syscalls on every sidecar write. Dynamic fields
 /// (sched_tunables, hugepages_total, hugepages_free, thp_enabled,
-/// thp_defrag, cmdline) are NOT cached — they can shift
+/// thp_defrag, kernel_cmdline) are NOT cached — they can shift
 /// between tests via sysctl, hugepage reservation, THP policy flip,
 /// or live kexec, and a cached snapshot would hide that change.
 #[derive(Clone)]
@@ -492,6 +517,7 @@ struct StaticHostInfo {
     cpu_vendor: Option<String>,
     total_memory_kb: Option<u64>,
     hugepages_size_kb: Option<u64>,
+    online_cpus: Option<usize>,
     numa_nodes: Option<usize>,
     kernel_name: Option<String>,
     kernel_release: Option<String>,
@@ -533,6 +559,38 @@ static MEMINFO_READ_CALLS: std::sync::atomic::AtomicUsize =
 /// from "collection not attempted" (represented at the enclosing
 /// `Option<HostContext>` layer on
 /// [`SidecarResult`](crate::test_support::SidecarResult)).
+///
+/// # Timing: post-run snapshot
+///
+/// Production call sites invoke this at sidecar-write time (see
+/// `test_support::sidecar::write_sidecar` and `write_skip_sidecar`),
+/// which runs AFTER the VM finishes. The returned snapshot
+/// therefore reflects post-run host state, not the pre-run
+/// environment the scheduler booted into. For most fields the
+/// distinction does not matter because they do not change during
+/// a test (static barring hotplug): the uname triple,
+/// `cpu_model` / `cpu_vendor`, `total_memory_kb`,
+/// `hugepages_size_kb`, `online_cpus`, and `numa_nodes` shift
+/// only under CPU, memory, or NUMA hotplug (which the
+/// [`STATIC_HOST_INFO`] cache pins for the process lifetime
+/// anyway — see module docs for staleness-under-hotplug
+/// semantics), and `kernel_cmdline` changes only across reboot.
+///
+/// The fields that CAN drift between pre-run and post-run:
+///
+/// - `sched_tunables`: a test that writes to `/proc/sys/kernel/sched_*`
+///   and does not restore the previous value will be observed
+///   with the test-mutated value.
+/// - `hugepages_total` / `hugepages_free`: a test that reserves
+///   or releases hugepages shifts the counts.
+/// - `thp_enabled` / `thp_defrag`: a test that flips THP policy
+///   is captured with the flipped policy.
+///
+/// Dashboards and regression tooling that need the environment
+/// the scheduler actually saw (not the post-run state) should
+/// treat the three drift-prone fields as "post-run snapshot" and
+/// either (a) disable them in the comparison, or (b) wait for
+/// pre-run capture to land (tracked separately; see backlog).
 pub fn collect_host_context() -> HostContext {
     // Read `/proc/meminfo` exactly once per call and share the
     // parsed fields with `compute_static_host_info` (for `mem_total_kb`
@@ -555,11 +613,12 @@ pub fn collect_host_context() -> HostContext {
         thp_enabled: read_trimmed_sysfs("/sys/kernel/mm/transparent_hugepage/enabled"),
         thp_defrag: read_trimmed_sysfs("/sys/kernel/mm/transparent_hugepage/defrag"),
         sched_tunables: read_sched_tunables(),
+        online_cpus: static_info.online_cpus,
         numa_nodes: static_info.numa_nodes,
         kernel_name: static_info.kernel_name,
         kernel_release: static_info.kernel_release,
         arch: static_info.arch,
-        cmdline: read_trimmed_sysfs("/proc/cmdline"),
+        kernel_cmdline: read_trimmed_sysfs("/proc/cmdline"),
     }
 }
 
@@ -584,15 +643,32 @@ fn compute_static_host_info(meminfo: &MeminfoFields) -> StaticHostInfo {
     // is outside ktstr's scope. Marking this not-unit-tested by
     // design.
     let u = rustix::system::uname();
+    let (online_cpus, numa_nodes) = probe_host_topology_counts();
     StaticHostInfo {
         cpu_model,
         cpu_vendor,
         total_memory_kb: meminfo.mem_total_kb,
         hugepages_size_kb: meminfo.hugepages_size_kb,
-        numa_nodes: count_numa_nodes_via_topology(),
+        online_cpus,
+        numa_nodes,
         kernel_name: u.sysname().to_str().ok().map(|s| s.to_string()),
         kernel_release: u.release().to_str().ok().map(|s| s.to_string()),
         arch: u.machine().to_str().ok().map(|s| s.to_string()),
+    }
+}
+
+/// One `HostTopology::from_sysfs` probe → both the online-CPU
+/// count and the NUMA-node count. Returning a tuple keeps the
+/// two derived values bound to the same probe, so a hotplug
+/// event between reads cannot make them disagree. Both values
+/// are `None` when the probe errors.
+fn probe_host_topology_counts() -> (Option<usize>, Option<usize>) {
+    match crate::vmm::host_topology::HostTopology::from_sysfs() {
+        Ok(topo) => (
+            Some(topo.online_cpus.len()),
+            Some(count_numa_nodes_in_topology(&topo)),
+        ),
+        Err(_) => (None, None),
     }
 }
 
@@ -765,30 +841,43 @@ fn read_sched_tunables_from(dir: &std::path::Path) -> Option<BTreeMap<String, St
     Some(out)
 }
 
-/// Count distinct NUMA nodes reported by `HostTopology::from_sysfs`.
-/// Reuses the existing topology probe rather than re-walking
-/// `/sys/devices/system/node` so a single implementation owns the
-/// "what counts as a NUMA node" decision. Returns `None` when the
-/// topology probe fails. An empty `cpu_to_node` map maps to
-/// `Some(1)` because every Linux system has at least one NUMA node
-/// — returning zero would misrepresent the topology.
-fn count_numa_nodes_via_topology() -> Option<usize> {
-    let topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok()?;
-    Some(count_numa_nodes_in_topology(&topo))
-}
-
-/// Pure-function seam split from [`count_numa_nodes_via_topology`]:
+/// Pure-function seam used by [`probe_host_topology_counts`]
+/// (which itself wraps
+/// [`HostTopology::from_sysfs`](crate::vmm::host_topology::HostTopology::from_sysfs),
+/// which in turn wraps
+/// [`TestTopology::from_system`](crate::topology::TestTopology::from_system)):
 /// given a [`HostTopology`](crate::vmm::host_topology::HostTopology),
 /// return the number of distinct NUMA nodes it claims. An empty
-/// `cpu_to_node` map maps to `1` because every Linux system has at
-/// least one NUMA node — returning zero would misrepresent the
-/// topology. Sparse / non-contiguous node IDs are counted correctly
-/// because `BTreeSet::from_iter` deduplicates on insert.
+/// `cpu_to_node` map maps to `1` because every Linux system has
+/// at least one NUMA node — returning zero would misrepresent the
+/// topology. Sparse / non-contiguous node IDs are counted
+/// correctly because `BTreeSet::from_iter` deduplicates on
+/// insert.
+///
+/// # Empty `cpu_to_node`: UMA or broken probe?
+///
+/// In production the answer is: empty cannot occur from a
+/// successful probe.
+/// [`TestTopology::from_system`](crate::topology::TestTopology::from_system)
+/// bails on `online_cpus.is_empty()`, and every online CPU
+/// whose `/sys/devices/system/cpu/cpuN/` directory exists falls
+/// through to at least `llc_id=0, node_id=0` when the per-CPU
+/// reads inside that directory fail. CPUs listed in
+/// `/sys/devices/system/cpu/online` whose sysfs directory is
+/// absent are dropped with a `tracing::warn!` rather than
+/// fallen-through — so on a host where every listed CPU lacks
+/// its sysfs dir, `llc_groups` would be empty and
+/// `cpu_to_node` would be empty too. That failure mode is
+/// degenerate (a listed-but-absent CPU is itself a kernel/sysfs
+/// bug) and not the common case. The `.max(1)` floor is
+/// therefore a guard for synthetic topologies (unit-test
+/// callers of this pure function) and for the degenerate
+/// "all-dropped" probe — treating "no entries, but probe said
+/// OK" as UMA is the conservative interpretation.
 ///
 /// Keeping the I/O (sysfs probe) separate from the pure counting
-/// logic lets unit tests exercise the UMA-fallback branch and the
-/// dedup path without standing up a real /sys layout. Also acts as
-/// a partial injection seam for #22.
+/// logic lets unit tests exercise the fallback branch and the
+/// dedup path without standing up a real /sys layout.
 pub(crate) fn count_numa_nodes_in_topology(
     topo: &crate::vmm::host_topology::HostTopology,
 ) -> usize {
@@ -838,10 +927,10 @@ mod tests {
     fn collect_host_context_captures_cmdline_on_linux() {
         let ctx = collect_host_context();
         let cmdline = ctx
-            .cmdline
+            .kernel_cmdline
             .as_deref()
             .expect("/proc/cmdline is always readable on a running Linux system");
-        assert!(!cmdline.is_empty(), "populated cmdline must not be empty");
+        assert!(!cmdline.is_empty(), "populated kernel_cmdline must not be empty");
         assert_eq!(cmdline, cmdline.trim());
     }
 
@@ -859,7 +948,7 @@ mod tests {
         assert_eq!(a.arch, b.arch);
         assert_eq!(a.cpu_model, b.cpu_model);
         assert_eq!(a.cpu_vendor, b.cpu_vendor);
-        assert_eq!(a.cmdline, b.cmdline);
+        assert_eq!(a.kernel_cmdline, b.kernel_cmdline);
     }
 
     /// Direct OnceLock caching test for `STATIC_HOST_INFO`. The
@@ -923,7 +1012,7 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize empty");
         assert!(decoded.cpu_model.is_none());
         assert!(decoded.kernel_name.is_none());
-        assert!(decoded.cmdline.is_none());
+        assert!(decoded.kernel_cmdline.is_none());
     }
 
     /// Populated host context round-trips — struct-level
@@ -945,11 +1034,12 @@ mod tests {
             thp_enabled: Some("always [madvise] never".to_string()),
             thp_defrag: Some("[always] defer defer+madvise madvise never".to_string()),
             sched_tunables: Some(tunables),
+            online_cpus: Some(16),
             numa_nodes: Some(2),
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
-            cmdline: Some("preempt=lazy transparent_hugepage=madvise".to_string()),
+            kernel_cmdline: Some("preempt=lazy transparent_hugepage=madvise".to_string()),
         };
         let json = serde_json::to_string(&ctx).expect("serialize");
         let decoded: HostContext = serde_json::from_str(&json).expect("deserialize");
@@ -990,8 +1080,9 @@ mod tests {
             hugepages_size_kb: None,
             thp_enabled: None,
             thp_defrag: None,
+            online_cpus: None,
             numa_nodes: None,
-            cmdline: None,
+            kernel_cmdline: None,
         };
         let json = serde_json::to_string(&ctx).expect("serialize");
         let decoded: HostContext = serde_json::from_str(&json).expect("deserialize");
@@ -1326,13 +1417,14 @@ Hugepagesize:       2048 kB
     /// Snapshot-style pin of the label sequence `format_human`
     /// emits. The order is load-bearing — downstream diff tools and
     /// operator-eye scanning depend on a stable top-to-bottom field
-    /// ordering (uname → CPU → memory → hugepages → NUMA → THP →
-    /// cmdline → sched_tunables). A silent reorder from a future
-    /// edit that shuffles the `row(...)` calls would slip past the
-    /// existing `.contains(...)` checks, which are order-blind.
-    /// This test fails the moment the sequence drifts; updating it
-    /// forces the author to acknowledge the reorder and double-check
-    /// that downstream consumers can absorb it.
+    /// ordering (uname → CPU → memory → hugepages → online_cpus →
+    /// NUMA → THP → kernel_cmdline → sched_tunables). A silent
+    /// reorder from a future edit that shuffles the `row(...)`
+    /// calls would slip past the existing `.contains(...)` checks,
+    /// which are order-blind. This test fails the moment the
+    /// sequence drifts; updating it forces the author to
+    /// acknowledge the reorder and double-check that downstream
+    /// consumers can absorb it.
     #[test]
     fn format_human_field_order_is_stable() {
         let out = HostContext::default().format_human();
@@ -1353,10 +1445,11 @@ Hugepagesize:       2048 kB
                 "hugepages_total",
                 "hugepages_free",
                 "hugepages_size_kb",
+                "online_cpus",
                 "numa_nodes",
                 "thp_enabled",
                 "thp_defrag",
-                "cmdline",
+                "kernel_cmdline",
                 "sched_tunables",
             ],
             "format_human field order drifted — if intentional, update \
@@ -1382,10 +1475,11 @@ Hugepagesize:       2048 kB
             "hugepages_total",
             "hugepages_free",
             "hugepages_size_kb",
+            "online_cpus",
             "numa_nodes",
             "thp_enabled",
             "thp_defrag",
-            "cmdline",
+            "kernel_cmdline",
             "sched_tunables",
         ] {
             assert!(
@@ -1413,7 +1507,7 @@ Hugepagesize:       2048 kB
             cpu_model: Some("Example CPU".to_string()),
             total_memory_kb: Some(16_384_000),
             sched_tunables: Some(tunables),
-            cmdline: Some("preempt=lazy".to_string()),
+            kernel_cmdline: Some("preempt=lazy".to_string()),
             ..HostContext::default()
         };
         let out = ctx.format_human();
@@ -1421,7 +1515,7 @@ Hugepagesize:       2048 kB
         assert!(out.contains("kernel_release: 6.11.0"), "{out}");
         assert!(out.contains("cpu_model: Example CPU"), "{out}");
         assert!(out.contains("total_memory_kb: 16384000"), "{out}");
-        assert!(out.contains("cmdline: preempt=lazy"), "{out}");
+        assert!(out.contains("kernel_cmdline: preempt=lazy"), "{out}");
         assert!(out.contains("sched_tunables:\n"), "{out}");
         assert!(out.contains("  sched_migration_cost_ns = 500000"), "{out}");
         assert!(out.contains("  sched_min_granularity_ns = 750000"), "{out}");
@@ -1476,7 +1570,7 @@ Hugepagesize:       2048 kB
             cpu_model: Some("Example CPU".to_string()),
             ..HostContext::default()
         };
-        assert_eq!(HostContext::diff(&ctx, &ctx), "");
+        assert_eq!(ctx.diff(&ctx), "");
     }
 
     /// A single changed field produces a single `key: before →
@@ -1485,19 +1579,19 @@ Hugepagesize:       2048 kB
     #[test]
     fn diff_single_field_surfaces_only_that_field() {
         let a = HostContext {
-            cmdline: Some("preempt=lazy".to_string()),
+            kernel_cmdline: Some("preempt=lazy".to_string()),
             kernel_release: Some("6.11.0".to_string()),
             ..HostContext::default()
         };
         let b = HostContext {
-            cmdline: Some("preempt=full".to_string()),
+            kernel_cmdline: Some("preempt=full".to_string()),
             kernel_release: Some("6.11.0".to_string()),
             ..HostContext::default()
         };
-        let out = HostContext::diff(&a, &b);
+        let out = a.diff(&b);
         assert!(
-            out.contains("cmdline: preempt=lazy → preempt=full"),
-            "cmdline change must appear: {out}",
+            out.contains("kernel_cmdline: preempt=lazy → preempt=full"),
+            "kernel_cmdline change must appear: {out}",
         );
         assert!(
             !out.contains("kernel_release"),
@@ -1515,7 +1609,7 @@ Hugepagesize:       2048 kB
             kernel_name: Some("Linux".to_string()),
             ..HostContext::default()
         };
-        let out = HostContext::diff(&a, &b);
+        let out = a.diff(&b);
         assert!(
             out.contains("kernel_name: (unknown) → Linux"),
             "(unknown) → Linux must appear: {out}",
@@ -1542,7 +1636,7 @@ Hugepagesize:       2048 kB
             sched_tunables: Some(bm),
             ..HostContext::default()
         };
-        let out = HostContext::diff(&a, &b);
+        let out = a.diff(&b);
         assert!(
             !out.contains("sched_tunables.sched_a"),
             "unchanged sched_a must not appear: {out}",
@@ -1571,7 +1665,7 @@ Hugepagesize:       2048 kB
             sched_tunables: Some(m),
             ..HostContext::default()
         };
-        let out = HostContext::diff(&a, &b);
+        let out = a.diff(&b);
         assert!(
             out.contains("sched_tunables: (unknown) → (1 entry)"),
             "None → Some(1 entry) must surface cardinality: {out}",
@@ -1579,8 +1673,10 @@ Hugepagesize:       2048 kB
     }
 
     /// A field that transitions from `Some(value)` → `None`
-    /// (for example the kernel `cmdline` becoming unreadable in a
-    /// later run) must surface as `<old> → (unknown)` so an
+    /// (for example `kernel_cmdline` becoming unreadable in a
+    /// later run — `/proc/cmdline` normally always readable, but
+    /// a restricted procfs mount could hide it) must surface as
+    /// `<old> → (unknown)` so an
     /// operator running `stats compare` sees the disappearance
     /// explicitly.
     #[test]
@@ -1590,7 +1686,7 @@ Hugepagesize:       2048 kB
             ..HostContext::default()
         };
         let b = HostContext::default();
-        let out = HostContext::diff(&a, &b);
+        let out = a.diff(&b);
         assert!(
             out.contains("kernel_release: 6.11.0 → (unknown)"),
             "Some → None must surface as <value> → (unknown): {out}",
@@ -1618,7 +1714,7 @@ Hugepagesize:       2048 kB
             sched_tunables: Some(bm),
             ..HostContext::default()
         };
-        let out = HostContext::diff(&a, &b);
+        let out = a.diff(&b);
         assert!(
             !out.contains("sched_tunables.sched_a"),
             "unchanged sched_a must not appear: {out}",
