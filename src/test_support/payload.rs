@@ -172,9 +172,16 @@ pub enum PayloadKind {
     /// Scheduler-kind payloads that set
     /// [`Scheduler`](crate::test_support::Scheduler)'s `config_file`
     /// field get automatic packaging: the config file is placed at
-    /// `/include-files/{filename}` without a `-i` flag. Binary-kind
-    /// payloads get the same auto-packaging through declarative
-    /// `include_files` / `extra_include_files` (see above).
+    /// `/include-files/{filename}` without a `-i` flag — the field
+    /// is the source the harness reads. Binary-kind payloads get
+    /// no auto-derivation from the `PayloadKind::Binary(name)` they
+    /// carry — that `name` is the spawn target only. Host binaries
+    /// and fixtures a binary-kind payload needs in the guest must
+    /// be declared explicitly via `include_files` on
+    /// `#[derive(Payload)]` or `extra_include_files` on
+    /// `#[ktstr_test]` (see the prior section); the packaging
+    /// mechanism is the same declarative pipeline, but the input
+    /// is a separate explicit list rather than the binary name.
     ///
     /// # Fork / kill semantics
     ///

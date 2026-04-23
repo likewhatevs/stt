@@ -1,82 +1,44 @@
 //! Tiny jemalloc-linked target for the probe's cross-process
 //! closed-loop test (see `tests/jemalloc_probe_tests.rs`).
 //!
-//! # Default mode
+//! # Modes
 //!
-//! Reads a byte count from argv[1], allocates that many bytes on
-//! the main thread, writes a pid-scoped ready marker via
-//! [`ktstr::worker_ready::worker_ready_marker_path`], and parks in a
-//! `std::thread::sleep` loop until SIGKILL (delivered by the test
-//! body via `PayloadHandle::kill`). Single-threaded on purpose — a
-//! single-thread process has `tid == pid` on Linux, so the test body
-//! can derive the worker's TID from the worker's pid and match on
-//! `threads[N].tid` in the probe's JSON output without a separate
-//! TID handshake. The worker enforces its own single-threadedness at
-//! startup by enumerating `/proc/self/task` and bailing with a
-//! non-zero exit if more than one TID is present — a silent extra
-//! thread (e.g. jemalloc background bg_thd or a tokio runtime pulled
-//! in by a future dep) would break the `tid == pid` identity.
+//! - **Default**: reads `<BYTES>` from argv, allocates on the main
+//!   thread, writes the pid-scoped ready marker via
+//!   [`ktstr::worker_ready::worker_ready_marker_path`], then parks
+//!   forever. Single-threaded so `tid == pid` and the test can
+//!   match on `threads[N].tid` without a TID handshake; a
+//!   `/proc/self/task` self-check rejects any silent extra thread.
+//! - **`--churn`**: after the main allocation and ready-marker,
+//!   loops spawn+join on helper threads to exercise the probe's
+//!   ESRCH handling in
+//!   `jemalloc_probe_survives_thread_churn`. Relaxes the
+//!   single-thread self-check.
 //!
-//! # `--churn` mode
-//!
-//! With `--churn` anywhere on the command line, the `tid == pid`
-//! single-thread invariant is RELAXED: the `/proc/self/task`
-//! self-check is skipped, and after the main-thread allocation +
-//! ready marker the worker enters a tight spawn+join loop to
-//! maximize the number of thread lifetimes the probe races against.
-//! Used by the ESRCH stress test in
-//! `tests/jemalloc_probe_tests.rs::jemalloc_probe_survives_thread_churn`,
-//! which asserts the probe's `PtraceSeize` / `PtraceInterrupt`
-//! error arms surface as `ThreadResult::Err` JSON entries rather
-//! than crashing.
-//!
-//! # Links
-//!
-//! Links `tikv_jemallocator` as the global allocator so jemalloc's
-//! `tsd_tls` symbol is present in the binary and the probe's
-//! DWARF-backed offset resolution finds a valid
-//! `tsd_s.thread_allocated` to read.
-//!
-//! Minimum useful allocation size: ≥ 16 KiB so the allocation lands
-//! on jemalloc's huge-size / large-size path and unconditionally
-//! updates `thread_allocated`. Smaller values may route through
-//! tcache with deferred counter updates and race the probe. The test
-//! body passes 16 MiB which is well above the threshold.
+//! Links `tikv_jemallocator` so the probe's DWARF-backed lookup
+//! finds `tsd_s.thread_allocated`. Minimum allocation is 16 KiB (to
+//! route through jemalloc's huge/large path and skip tcache
+//! deferred updates); the test passes 16 MiB. Keep the binary
+//! minimal — it travels in the guest initramfs next to the probe.
 //!
 //! # Exit codes
 //!
-//! - `0`: normal exit path does not exist — default mode parks
-//!   forever and churn mode loops forever; process termination is
-//!   always by external signal (typically SIGKILL from the test
-//!   body's `PayloadHandle::kill`).
-//! - `2`: `bytes == 0` — a zero allocation would indexing-panic on
-//!   `v[0]` in the `touch` helper. The test always passes a positive
-//!   size, so this indicates a caller-side bug.
-//! - `3`: `/proc/self/task` self-check saw more than one TID (or
-//!   could not be read) in default mode — the `tid == pid` identity
-//!   the test relies on is broken before allocation even begins.
-//! - `4`: pid-scoped ready-marker write failed. A worker that cannot
-//!   signal readiness leaves the test hanging on its poll deadline;
-//!   exiting loudly here is strictly better.
-//! - `5`: argument parse failure — missing positional `<BYTES>` or a
-//!   non-decimal token that did not parse as `usize`. Replaces the
-//!   implicit `expect()` panic (which would have exited 101) so every
-//!   caller-visible exit path lives in this table.
+//! Process termination is always by external signal; any non-zero
+//! exit is a setup failure:
+//! - `2`: `bytes == 0` (caller bug — zero-size alloc would panic in `touch`).
+//! - `3`: default-mode `/proc/self/task` self-check failed.
+//! - `4`: ready-marker write failed.
+//! - `5`: argv parse failed (missing `<BYTES>` or not a `usize`).
 //!
-//! Keep this binary minimal — the initramfs size cost is
-//! proportional to its text + PT_LOAD, not its allocation size, but
-//! the probe binary and this worker travel together in the guest
-//! initramfs.
-//!
-//! # Argument parsing
-//!
-//! Argv is deliberately hand-rolled: one optional flag (`--churn`)
-//! and one positional (`<BYTES>`). Pulling in `clap` or any other
-//! CLI crate adds a dependency, build time, and initramfs size for
-//! a surface that fits in five lines of std code. If a third argv
-//! shape lands (for example `--mode=churn|park --bytes=N`), switch
-//! to clap-derive at that point — the tipping point is about
-//! explicit help text, subcommand-like modes, or value validation.
+//! Argv is hand-rolled (one flag, one positional). The tipping
+//! point for switching to `clap-derive` is when the surface needs
+//! structured help text (`--help`), multiple subcommand-like modes,
+//! value validation beyond `str::parse`, or environment-variable
+//! fallbacks — any ONE of those lands in under ten lines of
+//! derive-macro annotations and would cost about the same in hand
+//! code. Adding a single extra `--flag` or positional while the
+//! surface still fits in ~10 lines of std code is not enough to
+//! pull in the dependency.
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -230,16 +192,24 @@ fn main() {
         //
         // No upper bound on iterations: the test body's
         // `PayloadHandle::kill` reaps the worker when probe runs are
-        // done. Tiny sleep inside the helper so the tid is live for
-        // ~100µs, maximizing the fraction of probe attempts that see
-        // a live tid on readdir and a dead tid on ptrace.
+        // done. The sleep below is nominally 100µs but the kernel
+        // rounds short sleeps up to its clock granularity — under
+        // `CONFIG_HZ=250`/`1000` with `hrtimers` that floor is ~1-4ms
+        // and under `CONFIG_HZ=100` closer to 10ms, so the tid lives
+        // for roughly a tick rather than the literal 100µs. The
+        // argument passed to `sleep` matters less than the fact that
+        // the tid is live long enough to appear on a readdir and
+        // dead by the time PTRACE_SEIZE / PTRACE_INTERRUPT lands —
+        // which is the race the probe must tolerate.
         loop {
             touch(&known);
             let handle = std::thread::spawn(|| {
-                // Micro-nap — keeps the tid alive for ~100µs so the
-                // probe's readdir(/proc/pid/task) has a non-trivial
-                // chance of listing it before PTRACE_SEIZE races
-                // thread exit.
+                // Nominal 100µs; actual sleep floors to the kernel's
+                // timer granularity (~1-10ms depending on HZ). Still
+                // short enough that the helper-tid churn rate stays
+                // well above the probe's per-tid attach latency, so
+                // the ESRCH race the stress test exercises fires
+                // within a handful of probe invocations.
                 std::thread::sleep(Duration::from_micros(100));
             });
             let _ = handle.join();

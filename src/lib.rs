@@ -267,6 +267,7 @@ pub mod verifier;
 pub(crate) mod vm;
 pub(crate) mod vmm;
 pub mod worker_ready;
+pub mod worker_ready_wait;
 pub mod workload;
 
 /// Static busybox binary compiled in build.rs for guest shell mode.

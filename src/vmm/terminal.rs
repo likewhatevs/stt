@@ -97,6 +97,9 @@ extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
 ///
 /// # Guard bypass paths
 ///
+/// Handled set: `SIGINT`, `SIGTERM`, `SIGQUIT`, `SIGABRT`, `SIGFPE`.
+/// Any signal not in that set is bypassed — the guard does NOT
+/// install a handler for it, so termios is not restored on delivery.
 /// Neither the Drop path nor the SA_RESETHAND handler fires in these
 /// cases, leaving the terminal in raw mode after process exit:
 /// - **SIGSEGV / SIGBUS / SIGILL**: synchronous hardware-fault
@@ -104,6 +107,11 @@ extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
 ///   `tcsetattr` is unsafe; deliberately left uncaught. The kernel's
 ///   default action produces a core dump without running userspace
 ///   recovery.
+/// - **Any other signal** (`SIGHUP`, `SIGPIPE`, `SIGALRM`, `SIGUSR1`,
+///   `SIGUSR2`, `SIGTSTP`, etc.): bypassed by design. Only the five
+///   signals above arm a restore-on-delivery handler; every other
+///   signal runs under whatever disposition was installed before the
+///   guard was entered.
 /// - **`std::process::exit` / `libc::_exit`**: skip Drop entirely.
 /// - **SIGKILL**: uncatchable by design, no handler runs.
 ///
@@ -490,9 +498,26 @@ mod tests {
 
         let guard = TerminalRawGuard::enter().expect("enter must succeed");
 
+        // After enter() the disposition MUST NOT be SIG_IGN (or
+        // SIG_DFL) — it must be a real handler function pointer,
+        // i.e. [`terminal_restore_signal_handler`]. Mirrors the gate
+        // pattern in the SIGABRT test so the same regression shape
+        // (enter() leaves sentinel in place, or clobbers to SIG_DFL
+        // re-enabling the core dump behavior the handler is meant
+        // to sequence around) is pinned for both signals.
         unsafe {
             libc::sigaction(libc::SIGFPE, std::ptr::null(), &mut current);
         }
+        assert_ne!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "enter() must replace the SIGFPE SIG_IGN sentinel with its own handler",
+        );
+        assert_ne!(
+            current.sa_sigaction,
+            libc::SIG_DFL,
+            "enter() must not leave SIGFPE at SIG_DFL",
+        );
         let expected = terminal_restore_signal_handler as *const () as usize;
         assert_eq!(
             current.sa_sigaction, expected,

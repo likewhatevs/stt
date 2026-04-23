@@ -2026,6 +2026,22 @@ fn run_step<'a>(
 }
 
 /// Build a StimulusPayload from the current scenario state (step + backdrop).
+///
+/// # step_idx u16 saturation
+///
+/// `step_idx` is a `usize` on the caller side but the wire
+/// `StimulusPayload.step_index` is a `u16` — the slot is sized for
+/// realistic scenarios (≤ 65 535 steps). Any `step_idx` >
+/// `u16::MAX as usize` is clamped to `u16::MAX` by `to_u16` below,
+/// with a `tracing::warn!` that names the overflow. Downstream
+/// consumers of the StepStart wire frame therefore see every step
+/// beyond the 65 535th collapsed onto the same `step_index` value
+/// (`u16::MAX`) — the ordering is preserved for the first 65 535
+/// steps, but labels saturate and become ambiguous once the
+/// scenario crosses the boundary. Scenarios that need to
+/// distinguish individual steps past `u16::MAX` must widen the
+/// wire schema field; the saturating-clip preserves visible wake
+/// ordering at the cost of individuality in the deep tail.
 fn build_stimulus(
     scenario_start: &std::time::Instant,
     step_idx: usize,

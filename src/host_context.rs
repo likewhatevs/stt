@@ -203,20 +203,21 @@ impl HostContext {
     /// CPU identity, 64 GiB memory, 2 NUMA nodes, default THP
     /// policies, a minimal `sched_*` tunable map, and a populated
     /// uname triple. Parity with
-    /// [`SidecarResult::test_fixture`](crate::test_support::SidecarResult::test_fixture) —
-    /// both fixtures exist so tests don't re-derive an "everything
-    /// populated" baseline in every call site.
+    /// [`SidecarResult::test_fixture`](crate::test_support::SidecarResult::test_fixture)
+    /// — both fixtures exist so tests don't re-derive an
+    /// "everything populated" baseline in every call site.
     ///
-    /// **Prefer this over local "populated default" helpers.** A
-    /// local closure duplicates the default set and drifts the
-    /// moment [`HostContext`] grows a field; this fixture is the
-    /// single place those defaults live.
+    /// # Usage guidance
     ///
-    /// **Hash-stability or serialization-pin tests must not rely on
-    /// these defaults.** Tests that fix a specific JSON/byte output
-    /// should spell every participating field out explicitly so a
-    /// future change to the fixture cannot silently shift the
-    /// pinned value.
+    /// Prefer this fixture over local "populated default" helpers
+    /// — a local closure duplicates the default set and drifts the
+    /// moment [`HostContext`] grows a field. This is the single
+    /// place those defaults live. Hash-stability and
+    /// serialization-pin tests are the one exception: they must
+    /// NOT rely on these defaults, because any future change to
+    /// the fixture would silently shift the pinned value. Spell
+    /// every participating field out explicitly in such tests so
+    /// the pin is robust against fixture evolution.
     pub fn test_fixture() -> HostContext {
         let mut sched_tunables = BTreeMap::new();
         sched_tunables.insert(

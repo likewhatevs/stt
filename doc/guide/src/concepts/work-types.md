@@ -190,6 +190,20 @@ tracking, gap detection, schedstat deltas, iteration counter updates)
 is not provided -- the user function is responsible for any telemetry
 it needs.
 
+**Warning — pgid SIGKILL sweep on teardown.** Every worker process
+calls `setpgid(0, 0)` immediately after fork, so the worker and any
+children a `Custom` closure spawns share a single process group.
+At teardown, `stop_and_collect` issues `killpg(worker_pid, SIGKILL)`
+on BOTH the graceful-exit and StillAlive-escalation paths, and
+`WorkloadHandle::drop` issues another `killpg` during handle
+destruction. Every descendant that inherits the worker's pgid
+(a helper binary via `execv`, a subshell via `sh -c`, a test
+fixture the closure forks to drive the scheduler) will be
+SIGKILLed at teardown. Closures that need a child to outlive the
+worker must either detach it from the worker's pgid (call
+`setpgid(child_pid, 0)` after fork) or wait on it explicitly
+before returning the `WorkerReport`.
+
 Function pointers (`fn(&AtomicBool) -> WorkerReport`) are fork-safe
 because they carry no captured state across the fork boundary. Closures
 are not supported. Cannot be constructed via `WorkType::from_name()`.

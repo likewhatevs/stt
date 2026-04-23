@@ -568,6 +568,14 @@ impl AssertResult {
             stats: Default::default(),
         }
     }
+    /// Failing result carrying a single [`DetailKind::Other`] detail
+    /// built from `msg`. Shortcut for the common three-deep nesting
+    /// `AssertResult::fail(AssertDetail::new(DetailKind::Other, msg))`
+    /// at call sites where the failure is a diagnostic message and
+    /// the kind is always `Other`.
+    pub fn fail_other(msg: impl Into<String>) -> Self {
+        Self::fail(AssertDetail::new(DetailKind::Other, msg))
+    }
     /// Convenience accessor returning [`Self::skipped`]. Stats tooling
     /// uses this to subtract non-executions from pass counts so
     /// "topology mismatch" runs don't inflate the pass rate.
