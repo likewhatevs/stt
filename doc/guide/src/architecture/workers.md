@@ -99,9 +99,16 @@ pub struct WorkerReport {
     release → `gcd(1280, 1024) = 256`, period = 4 iters).
     FanOutCompute messenger (`spin_burst(256)` per wake cycle
     → same 256-unit gcd).
-  - **Every 16 iterations**: PageFaultChurn
-    (`touches_per_cycle`=256 faults + `spin_iters`=64 = 320 per
-    iter → `gcd(320, 1024) = 64`).
+  - **Every 16 iterations**: PageFaultChurn — one persistent
+    `MAP_PRIVATE | MAP_ANONYMOUS` region per worker (default
+    4 MiB via `region_kb`=4096), re-faulted each outer
+    iteration via `madvise(MADV_DONTNEED)`. Each iteration
+    contributes `touches_per_cycle`=256 page writes (each first
+    write after `MADV_DONTNEED` triggers a minor fault; a
+    birthday-collision xorshift64 index may revisit a page
+    already faulted this cycle, so the fault count is a ceiling,
+    not a floor) + `spin_iters`=64 = 320 work units
+    (`gcd(320, 1024) = 64`).
   - **Every 64 iterations**: IoSync (16 4-KiB writes per
     write-then-sleep pair → `gcd(16, 1024) = 16`).
   - **Every 1024 iterations**: YieldHeavy (1 unit per yield),

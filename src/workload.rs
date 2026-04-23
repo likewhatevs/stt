@@ -2166,6 +2166,25 @@ fn worker_main(
     // Persistent temp file for IoSync / Phase::Io (opened on first use, removed on exit).
     let mut io_sync_file: Option<(std::fs::File, String)> = None;
     let mut io_seq_file: Option<(std::fs::File, String)> = None;
+    // PageFaultChurn: persistent anonymous mmap region and PRNG
+    // state, allocated on first outer iteration and reused across
+    // every subsequent iteration (`madvise(MADV_DONTNEED)` re-faults
+    // pages without re-mapping). Keeping the region outside the
+    // match arm lets PageFaultChurn return to the outer work loop
+    // after each touches_per_cycle + spin_burst cycle. This gives
+    // two distinct cadences:
+    //   - iter_slot publish at src/workload.rs:2898-2902 fires on
+    //     EVERY outer iteration (unconditional in the outer-loop
+    //     tail), so host-side `snapshot_iterations` sees progress
+    //     in real time.
+    //   - migration check at src/workload.rs:2905 fires every
+    //     outer iteration but only triggers its body when
+    //     `work_units.is_multiple_of(1024)`. With 320 units per
+    //     PageFaultChurn outer iter and gcd(320, 1024) = 64, that
+    //     lands every 1024/64 = 16 outer iterations (see
+    //     doc/guide/src/architecture/workers.md).
+    let mut page_fault_region: Option<(*mut libc::c_void, usize)> = None;
+    let mut page_fault_rng_state: u64 = 0;
     // Benchmarking: per-wakeup latency samples (reservoir-sampled) and iteration counter.
     const MAX_WAKE_SAMPLES: usize = 100_000;
     let mut resume_latencies_ns: Vec<u64> = Vec::with_capacity(MAX_WAKE_SAMPLES);
@@ -2788,26 +2807,34 @@ fn worker_main(
                 touches_per_cycle,
                 spin_iters,
             } => {
-                let region_size = region_kb * 1024;
-                let ptr = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
-                        region_size,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1,
-                        0,
-                    )
+                let (ptr, region_size) = match page_fault_region {
+                    Some(p) => p,
+                    None => {
+                        let region_size = region_kb * 1024;
+                        let ptr = unsafe {
+                            libc::mmap(
+                                std::ptr::null_mut(),
+                                region_size,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                                -1,
+                                0,
+                            )
+                        };
+                        if ptr == libc::MAP_FAILED {
+                            break;
+                        }
+                        unsafe {
+                            libc::madvise(ptr, region_size, libc::MADV_NOHUGEPAGE);
+                        }
+                        // xorshift64 requires a non-zero seed; OR-ing
+                        // tid with 1 forces the low bit on.
+                        page_fault_rng_state = (tid as u64) | 1;
+                        page_fault_region = Some((ptr, region_size));
+                        (ptr, region_size)
+                    }
                 };
-                if ptr == libc::MAP_FAILED {
-                    break;
-                }
-                unsafe {
-                    libc::madvise(ptr, region_size, libc::MADV_NOHUGEPAGE);
-                }
                 let page_count = region_size / 4096;
-                // xorshift64 PRNG seeded from process ID.
-                let mut rng_state = (tid as u64) | 1;
                 let xorshift64 = |state: &mut u64| -> u64 {
                     let mut x = *state;
                     x ^= x << 13;
@@ -2816,22 +2843,18 @@ fn worker_main(
                     *state = x;
                     x
                 };
-                while !STOP.load(Ordering::Relaxed) {
-                    for _ in 0..touches_per_cycle {
-                        let page_idx = (xorshift64(&mut rng_state) as usize) % page_count;
-                        let page_ptr = unsafe { (ptr as *mut u8).add(page_idx * 4096) };
-                        unsafe { std::ptr::write_volatile(page_ptr, 1u8) };
-                        work_units = work_units.wrapping_add(1);
-                    }
-                    unsafe {
-                        libc::madvise(ptr, region_size, libc::MADV_DONTNEED);
-                    }
-                    spin_burst(&mut work_units, spin_iters);
-                    iterations += 1;
+                for _ in 0..touches_per_cycle {
+                    let page_idx =
+                        (xorshift64(&mut page_fault_rng_state) as usize) % page_count;
+                    let page_ptr = unsafe { (ptr as *mut u8).add(page_idx * 4096) };
+                    unsafe { std::ptr::write_volatile(page_ptr, 1u8) };
+                    work_units = work_units.wrapping_add(1);
                 }
                 unsafe {
-                    libc::munmap(ptr, region_size);
+                    libc::madvise(ptr, region_size, libc::MADV_DONTNEED);
                 }
+                spin_burst(&mut work_units, spin_iters);
+                iterations += 1;
             }
             WorkType::MutexContention {
                 hold_iters,
@@ -2944,6 +2967,10 @@ fn worker_main(
     }
     if let Some((_, path)) = io_seq_file {
         let _ = std::fs::remove_file(&path);
+    }
+    // Clean up persistent PageFaultChurn mmap region.
+    if let Some((ptr, size)) = page_fault_region {
+        unsafe { libc::munmap(ptr, size) };
     }
 
     // Final iteration count store for host-side sampling.
@@ -6844,10 +6871,48 @@ mod tests {
         assert!(!WorkType::page_fault_churn(4096, 256, 64).needs_cache_buf());
     }
 
+    /// Guards three invariants of [`WorkType::PageFaultChurn`]:
+    ///
+    /// 1. Every spawned worker produces non-zero `work_units` and
+    ///    `iterations` (sanity — holds under the pre-fix bug too,
+    ///    so it's a basic progress check, not a regression guard).
+    /// 2. `iter_slot` (host-side iteration sampling, read via
+    ///    [`WorkloadHandle::snapshot_iterations`]) ADVANCES during
+    ///    the run. Asserted as a positive delta between two
+    ///    snapshots taken at 100 ms and 250 ms. A delta is
+    ///    insensitive to worker start-up latency (the test would
+    ///    otherwise race against workers whose first outer iter
+    ///    lands after the first snapshot). Pre-fix, PageFaultChurn
+    ///    used an inner `while !STOP` loop that bypassed the outer
+    ///    `iter_slot.store` at src/workload.rs:2898-2902, so both
+    ///    snapshots were pinned at 0 and the delta would be 0.
+    /// 3. On multi-CPU hosts, at least one worker records ≥ 1
+    ///    migration. With `num_workers = available_parallelism() + 1`
+    ///    the workload oversubscribes by one, forcing at least one
+    ///    context switch and CPU re-dispatch in any realistic
+    ///    scheduler; combined with the outer migration check at
+    ///    `work_units.is_multiple_of(1024)` firing every 64 outer
+    ///    iters for this test's parameters (touches_per_cycle=16
+    ///    + spin_iters=32 = 48 work_units/iter,
+    ///    gcd(48, 1024) = 16, period = 1024/16 = 64; the default
+    ///    16-iter period documented in
+    ///    doc/guide/src/architecture/workers.md assumes
+    ///    default params 256+64=320 instead). See also
+    ///    src/workload.rs:2905. This puts the assertion well
+    ///    above the flake threshold. Gated on
+    ///    `available_parallelism() > 1` because single-CPU
+    ///    sandboxes legitimately report 0 migrations.
     #[test]
     fn spawn_page_fault_churn_produces_work() {
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        // Oversubscribe by one to force CPU sharing even on fully
+        // idle hosts, so the migration-count assertion below has
+        // a reliable signal.
+        let num_workers = num_cpus + 1;
         let config = WorkloadConfig {
-            num_workers: 2,
+            num_workers,
             affinity: AffinityMode::None,
             work_type: WorkType::PageFaultChurn {
                 region_kb: 64,
@@ -6859,14 +6924,60 @@ mod tests {
         };
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         h.start();
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Delta-based iter_slot assertion. Pre-fix these snapshots
+        // were both 0 for PageFaultChurn (inner `while !STOP`
+        // blocked the outer iter_slot publish at
+        // src/workload.rs:2898-2902). Post-fix the outer loop
+        // updates iter_slot every iteration, so the 150 ms gap
+        // between snap1 and snap2 observes many iterations'
+        // worth of progress.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let snap1 = h.snapshot_iterations();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let snap2 = h.snapshot_iterations();
         let reports = h.stop_and_collect();
-        assert_eq!(reports.len(), 2);
+        assert_eq!(reports.len(), num_workers);
+        assert_eq!(snap1.len(), num_workers);
+        assert_eq!(snap2.len(), num_workers);
+        for i in 0..num_workers {
+            let delta = snap2[i].saturating_sub(snap1[i]);
+            assert!(
+                delta > 0,
+                "worker {i} iter_slot delta between 100 ms and 250 ms \
+                 was 0 (snap1={}, snap2={}); outer loop is not \
+                 advancing, indicating a regression that restores \
+                 the inner-`while !STOP` bug",
+                snap1[i],
+                snap2[i],
+            );
+        }
+        // Basic progress sanity — holds even under the pre-fix
+        // bug (inner loop still incremented work_units and
+        // iterations), so this is not a regression guard for the
+        // inner-while bug. Delta assertion above covers that.
         for r in &reports {
             assert!(
                 r.work_units > 0,
                 "PageFaultChurn worker {} did no work",
                 r.tid
+            );
+            assert!(
+                r.iterations > 0,
+                "PageFaultChurn worker {} final iterations = 0",
+                r.tid
+            );
+        }
+        if num_cpus > 1 {
+            let total_migrations: u64 =
+                reports.iter().map(|r| r.migration_count).sum();
+            assert!(
+                total_migrations > 0,
+                "expected ≥ 1 migration across {num_workers} \
+                 oversubscribed workers on {num_cpus}-cpu host; 0 \
+                 total migrations suggests the outer migration \
+                 check at work_units.is_multiple_of(1024) isn't \
+                 firing, indicating a regression that restores the \
+                 inner-`while !STOP` bug"
             );
         }
     }
