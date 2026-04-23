@@ -80,11 +80,11 @@
 ///
 /// # Constructing instances in tests
 ///
-/// Like [`HostContext`](crate::host_context::HostContext), this
-/// struct is `#[non_exhaustive]`: cross-crate consumers cannot build
-/// one with any struct-expression form. Start from
-/// [`HostHeapState::test_fixture`] (populated baseline) or
-/// [`HostHeapState::default`] (all-`None`) and mutate fields.
+/// `HostHeapState` is `#[non_exhaustive]` — see
+/// [`crate::non_exhaustive`] for the cross-crate construction and
+/// pattern-match rules. Start from [`HostHeapState::test_fixture`]
+/// (populated baseline) or [`HostHeapState::default`] (all-`None`)
+/// and mutate fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct HostHeapState {

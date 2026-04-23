@@ -163,6 +163,68 @@ mod bpf_skel;
 #[macro_use]
 mod test_macros;
 
+/// Shared guidance for every `#[non_exhaustive]` type in this
+/// crate. Individual types link here instead of repeating the
+/// same migration rules in every doc block.
+///
+/// # `#[non_exhaustive]` conventions in ktstr
+///
+/// Most of ktstr's public structs and enums carry `#[non_exhaustive]`
+/// so that adding a field or variant is not a breaking change for
+/// downstream crates. The attribute has two consequences downstream
+/// consumers must account for:
+///
+/// ## Pattern matching
+///
+/// Matches on a `#[non_exhaustive]` struct or enum from outside this
+/// crate must end with a wildcard `..` (for structs) or `_ =>` arm
+/// (for enums). Without it, a future addition to the type forces
+/// every matcher into a compile break even when the new field or
+/// variant is irrelevant to the caller.
+///
+/// ```ignore
+/// // Good: `..` absorbs future fields.
+/// if let MyStruct { name, .. } = value { /* ... */ }
+/// match my_enum {
+///     MyEnum::A => {}
+///     MyEnum::B => {}
+///     _ => {}          // absorbs future variants
+/// }
+/// ```
+///
+/// ## Construction
+///
+/// Cross-crate consumers **cannot** use any struct-expression form
+/// for a `#[non_exhaustive]` struct — bare literals
+/// (`MyStruct { name: "x", .. }`) and functional-update spreads
+/// (`MyStruct { name: "x", ..Default::default() }`) are both
+/// rejected by the compiler (E0639). Construction must go through
+/// one of:
+///
+/// 1. A dedicated constructor (`MyStruct::new(...)`,
+///    `MyStruct::from_*(...)`) exposed by the defining crate.
+/// 2. A [`Default`] instance followed by field mutation, when the
+///    type derives `Default`.
+/// 3. A named `test_fixture` or equivalent associated function for
+///    types that expose a populated baseline instead of the
+///    all-default minimum.
+///
+/// The per-type doc picks whichever of these the type actually
+/// supports; see [`host_context::HostContext`],
+/// [`host_heap::HostHeapState`], and the Op/CpusetSpec docs in
+/// [`scenario::ops`] for worked examples across the different
+/// shapes.
+///
+/// ## Pattern matching inside this crate
+///
+/// `#[non_exhaustive]` is enforced only across crate boundaries.
+/// In-crate matchers can remain exhaustive (and should, so the
+/// compiler flags forgotten variants at the definition site), and
+/// in-crate struct-literal construction still works for the tests
+/// and fixtures that live alongside the type.
+#[doc(hidden)]
+pub mod non_exhaustive {}
+
 pub mod cache;
 pub mod cgroup;
 

@@ -151,10 +151,19 @@ enum KtstrCommand {
     ///
     /// Fails with an actionable message when no registered test
     /// matches the given name. Use `cargo nextest list` to
-    /// enumerate test names.
+    /// enumerate test names — then pass just the FUNCTION-NAME
+    /// component to `show-thresholds`, not the `<binary>::`
+    /// prefix that nextest prepends to each line. The
+    /// `#[ktstr_test]` registry keys on the bare function name,
+    /// so `ktstr::preempt_regression_fault_under_load` (as
+    /// printed by nextest) must be trimmed to
+    /// `preempt_regression_fault_under_load` before it resolves.
     ShowThresholds {
-        /// Fully qualified test name as registered in
+        /// Function-name-only test identifier as registered in
         /// `#[ktstr_test]` (e.g. `preempt_regression_fault_under_load`).
+        /// Do NOT include the `<binary>::` prefix that
+        /// `cargo nextest list` prepends — strip it before
+        /// invoking this command.
         test: String,
     },
     /// Clean up leftover ktstr cgroups.
@@ -511,7 +520,7 @@ fn kernel_build(
     // Acquire source.
     let client = fetch::shared_client();
     let acquired = if let Some(ref src_path) = source {
-        fetch::local_source(src_path, "cargo ktstr").map_err(|e| format!("{e:#}"))?
+        fetch::local_source(src_path).map_err(|e| format!("{e:#}"))?
     } else if let Some(ref url) = git {
         let ref_name = git_ref.as_deref().expect("clap requires --ref with --git");
         fetch::git_clone(url, ref_name, tmp_dir.path(), "cargo ktstr")

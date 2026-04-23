@@ -46,12 +46,11 @@ use std::sync::OnceLock;
 ///
 /// # Constructing instances in tests
 ///
-/// `HostContext` is `#[non_exhaustive]`: downstream consumers
-/// cannot build one with any struct expression form (neither a
-/// bare struct literal `HostContext { ... }` nor a
-/// functional-update `HostContext { ..Default::default() }` — both
-/// are rejected cross-crate by E0639). The correct pattern is to
-/// start from a [`Default`] instance and mutate fields:
+/// `HostContext` is `#[non_exhaustive]` — see
+/// [`crate::non_exhaustive`] for the cross-crate construction and
+/// pattern-match rules shared by every such type in the crate. The
+/// concrete pattern for `HostContext` is to start from a [`Default`]
+/// instance and mutate fields:
 ///
 /// ```
 /// use ktstr::prelude::HostContext;
@@ -742,8 +741,9 @@ static MEMINFO_READ_CALLS: std::sync::atomic::AtomicUsize =
 /// Dashboards and regression tooling that need the environment
 /// the scheduler actually saw (not the post-run state) should
 /// treat the three drift-prone fields as "post-run snapshot" and
-/// either (a) disable them in the comparison, or (b) wait for
-/// pre-run capture to land (tracked separately; see backlog).
+/// either (a) disable them in the comparison, or (b) capture a
+/// pre-run snapshot via [`collect_host_context_pre_run`] and
+/// travel the pair via [`HostContextSnapshots`].
 pub fn collect_host_context() -> HostContext {
     // Read `/proc/meminfo` exactly once per call and share the
     // parsed fields with `compute_static_host_info` (for `mem_total_kb`
@@ -796,6 +796,112 @@ pub fn collect_host_context() -> HostContext {
                 Some(h)
             }
         },
+    }
+}
+
+/// Capture the host context at the start of a run, before the VM
+/// boots or the test body mutates any sysctl / hugepage / THP
+/// setting. Semantic alias for [`collect_host_context`] — the
+/// collection mechanism is identical (same static-cache + dynamic
+/// re-read policy) and callers remain free to call either function
+/// on either side of the run, but the name pins intent:
+/// `collect_host_context_pre_run` documents that the returned
+/// snapshot is the authoritative view of the drift-prone dynamic
+/// fields (`sched_tunables`, `hugepages_total` / `hugepages_free`,
+/// `thp_enabled` / `thp_defrag`) as the scheduler saw them.
+///
+/// Pair the pre-run snapshot with the post-run snapshot produced by
+/// [`collect_host_context`] via [`HostContextSnapshots`] so
+/// downstream consumers can diff the two and surface environment
+/// mutations attributable to the test body (e.g. "scheduler config
+/// reservoir bumped `/proc/sys/kernel/sched_migration_cost_ns` mid-run")
+/// rather than silently folding them into a single ambiguous
+/// "post-run" record.
+///
+/// Static fields (uname triple, CPU identity, total memory,
+/// hugepage size, online CPU count, NUMA node count) are
+/// memoised across every call in the process via
+/// [`STATIC_HOST_INFO`], so `collect_host_context_pre_run` and
+/// `collect_host_context` observing different values for a static
+/// field implies CPU/memory/NUMA hotplug between the two calls —
+/// see the module-level "Static-cache staleness under hotplug"
+/// section for the hotplug contract.
+pub fn collect_host_context_pre_run() -> HostContext {
+    // Intentional delegation rather than code duplication: the
+    // pre/post distinction is purely about WHEN the caller fires
+    // the snapshot, not HOW the fields are read. Forking the
+    // implementation would open the door to the two paths drifting
+    // apart (a fix to dynamic-field parsing landing in one but not
+    // the other), which is exactly the kind of bug the pair is
+    // meant to expose.
+    collect_host_context()
+}
+
+/// Paired pre-run / post-run [`HostContext`] snapshots captured
+/// from a single test run, intended for sidecar persistence so
+/// downstream analysis can diff the drift-prone dynamic fields
+/// (`sched_tunables`, `hugepages_*`, `thp_*`) between the two
+/// endpoints.
+///
+/// The struct deliberately carries both snapshots in full —
+/// including the static fields (uname triple, CPU identity, total
+/// memory) that are OnceLock-cached and therefore guaranteed equal
+/// across a single process. Duplicating them on the wire (a few
+/// hundred bytes of JSON per sidecar) keeps each snapshot
+/// self-describing so a consumer that only cares about the
+/// post-run state can read
+/// [`HostContextSnapshots::post`] in isolation without reassembling
+/// fields from [`HostContextSnapshots::pre`], and a consumer that
+/// diffs the pair does not have to special-case "which field is
+/// cached and which is dynamic".
+///
+/// Serde shape: both fields serialize as a full `HostContext`
+/// object under their own keys. The per-field
+/// `#[serde(default, skip_serializing_if = ...)]` policy on
+/// `HostContext` carries through, so populated snapshots stay
+/// compact. The whole struct is `#[non_exhaustive]` — see
+/// [`crate::non_exhaustive`] for construction and pattern-match
+/// rules.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct HostContextSnapshots {
+    /// Captured before the test body runs — typically via
+    /// [`collect_host_context_pre_run`] at the start of sidecar
+    /// setup.
+    pub pre: HostContext,
+    /// Captured after the test body finishes — typically via
+    /// [`collect_host_context`] at sidecar-write time.
+    pub post: HostContext,
+}
+
+impl HostContextSnapshots {
+    /// Construct a pair from explicit pre/post snapshots. Prefer
+    /// this constructor over a (forbidden cross-crate) struct
+    /// literal so future fields can land on
+    /// [`HostContextSnapshots`] without breaking callers.
+    pub fn new(pre: HostContext, post: HostContext) -> Self {
+        Self { pre, post }
+    }
+
+    /// Capture both endpoints in a single call. Useful for tests
+    /// and callers that don't observe a test body between the two
+    /// snapshots and only want to stamp the pair structurally (both
+    /// endpoints will reflect the same dynamic state because no
+    /// mutation happened in between).
+    ///
+    /// `#[cfg(test)]`-gated so production sidecar writers cannot
+    /// reach it by accident — they need
+    /// [`collect_host_context_pre_run`] before the run and
+    /// [`collect_host_context`] after, which
+    /// [`HostContextSnapshots::new`] then pairs. The compile-time
+    /// gate replaces the earlier doc-only warning.
+    #[cfg(test)]
+    pub fn capture_same_instant() -> Self {
+        let snap = collect_host_context();
+        Self {
+            pre: snap.clone(),
+            post: snap,
+        }
     }
 }
 
@@ -2719,6 +2825,47 @@ Hugepagesize:       2048 kB
         assert_eq!(
             parse_bracketed_active_policy("[always] [never]"),
             Some("always"),
+        );
+    }
+
+    /// Nested / doubled brackets truncate at the FIRST `]` after the
+    /// first `[`. The scanner does not balance brackets — it's a
+    /// two-step `find('[')` → `find(']')` on the remaining slice.
+    /// For a fixture like `"[a[b]c]"` the scan opens at index 0,
+    /// the remainder is `"a[b]c]"`, and the first `]` in that
+    /// remainder sits at index 3, so the returned slice is `"a[b"`.
+    /// Kernel-emitted menus never produce nested brackets; this
+    /// test pins the degenerate-input behavior so a future refactor
+    /// to bracket-balancing (or an off-by-one on the inner search)
+    /// cannot silently change the output for malformed fixtures or
+    /// hand-written test menus.
+    #[test]
+    fn parse_bracketed_active_policy_nested_brackets_truncate_at_inner_close() {
+        // Inner pair wholly inside the outer pair — the scan stops
+        // at the inner `]` and returns the partial token.
+        assert_eq!(
+            parse_bracketed_active_policy("[a[b]c]"),
+            Some("a[b"),
+            "nested-bracket fixture must truncate at the first inner `]`",
+        );
+        // Unpaired nest: `[` appears twice, only one `]` follows.
+        // Same truncation rule applies — the first `]` closes the
+        // scan, regardless of how many `[` it crossed.
+        assert_eq!(
+            parse_bracketed_active_policy("[a[b] c"),
+            Some("a[b"),
+            "unpaired nest must still close at the first inner `]`",
+        );
+        // Nested pair in the prose prefix preceding the real active
+        // token: because the scanner picks the FIRST `[`, the
+        // bracketed token in the prefix wins — even if it's the
+        // literal text the menu is commenting on rather than the
+        // kernel's own selection. Documents the "first-bracket-wins"
+        // rule's interaction with prefix text.
+        assert_eq!(
+            parse_bracketed_active_policy("prefix [lit] then [active] tail"),
+            Some("lit"),
+            "first-bracket-wins overrides any later 'real' active token",
         );
     }
 

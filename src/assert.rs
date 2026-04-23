@@ -547,17 +547,88 @@ impl CgroupStats {
     /// future call site share one definition of "no samples yet"
     /// (both yield `0.0`, which survives the downstream
     /// `finite_or_zero` filter).
+    ///
+    /// # Compile-time enforcement evaluation
+    ///
+    /// Two alternatives to the current populate-then-stamp
+    /// convention were considered and rejected:
+    ///
+    /// 1. **Finalize / typestate**: `CgroupStatsRaw::finalize()
+    ///    -> CgroupStats`, with only `CgroupStatsRaw` constructible
+    ///    externally and `CgroupStats` carrying the derive-completed
+    ///    invariant in its type. Rejected because `CgroupStats` is
+    ///    serialized on the sidecar wire format — splitting it into
+    ///    two types would force a schema decision (do sidecars
+    ///    carry the raw or finalized struct? both? neither?) that
+    ///    the "evaluate" scope cannot resolve. The invariant would
+    ///    be compile-time enforced only at construction; any
+    ///    deserialization path would need to re-run derive_ratios
+    ///    anyway, so the type-state guarantee dilutes at the wire
+    ///    boundary.
+    ///
+    /// 2. **Pure computed accessors, no stored fields**: drop
+    ///    `wake_latency_tail_ratio` / `iterations_per_worker` from
+    ///    the struct entirely and expose them only as methods.
+    ///    Rejected because `serde::Deserialize` + the
+    ///    `ScenarioStats` merge path both read the fields directly
+    ///    today, and the sidecar wire format already persists them
+    ///    — removing the fields would be a breaking schema change
+    ///    for an invariant that is trivially restored by the merge-
+    ///    time `derive_ratios` call.
+    ///
+    /// **Chosen middle ground**: `derive_ratios` remains the
+    /// populator, AND [`Self::computed_wake_latency_tail_ratio`] /
+    /// [`Self::computed_iterations_per_worker`] exist as reader-side
+    /// accessors that compute the ratios on demand from the raw
+    /// fields. Consumers that have a `CgroupStats` in hand but are
+    /// uncertain whether `derive_ratios` has fired (e.g. a
+    /// deserialized value from an older sidecar or a hand-
+    /// constructed test fixture) can call the computed accessors
+    /// and get the correct value without mutating the struct. The
+    /// stored fields remain the sidecar wire format.
     pub fn derive_ratios(&mut self) {
-        self.wake_latency_tail_ratio = if self.median_wake_latency_us > 0.0 {
+        self.wake_latency_tail_ratio = self.computed_wake_latency_tail_ratio();
+        self.iterations_per_worker = self.computed_iterations_per_worker();
+    }
+
+    /// Computed `p99_wake_latency_us / median_wake_latency_us`
+    /// (worst-case tail amplification), returning `0.0` when
+    /// `median_wake_latency_us <= 0.0` to avoid producing
+    /// `NaN` / `Infinity`. Mirrors the stored-field semantics
+    /// documented on [`Self::wake_latency_tail_ratio`].
+    ///
+    /// Prefer this accessor over a direct read of
+    /// [`Self::wake_latency_tail_ratio`] when you hold a
+    /// `CgroupStats` that may not have been finalized via
+    /// [`Self::derive_ratios`] — e.g. a deserialized sidecar from
+    /// a pre-derive build, or a hand-constructed test fixture.
+    /// The accessor recomputes from raw fields every call and
+    /// cannot be out of sync.
+    pub fn computed_wake_latency_tail_ratio(&self) -> f64 {
+        if self.median_wake_latency_us > 0.0 {
             self.p99_wake_latency_us / self.median_wake_latency_us
         } else {
             0.0
-        };
-        self.iterations_per_worker = if self.num_workers > 0 {
+        }
+    }
+
+    /// Computed `total_iterations / num_workers` (per-worker
+    /// throughput), returning `0.0` when `num_workers == 0` to
+    /// avoid producing `NaN` / `Infinity`. Mirrors the stored-field
+    /// semantics documented on [`Self::iterations_per_worker`].
+    ///
+    /// Prefer this accessor over a direct read of
+    /// [`Self::iterations_per_worker`] when you hold a `CgroupStats`
+    /// that may not have been finalized via [`Self::derive_ratios`]
+    /// — e.g. a deserialized sidecar from a pre-derive build or a
+    /// hand-constructed test fixture. The accessor recomputes from
+    /// raw fields every call and cannot be out of sync.
+    pub fn computed_iterations_per_worker(&self) -> f64 {
+        if self.num_workers > 0 {
             self.total_iterations as f64 / self.num_workers as f64
         } else {
             0.0
-        };
+        }
     }
 }
 
@@ -1251,10 +1322,16 @@ impl Assert {
     /// `cargo ktstr show-thresholds <test>` to expose the resolved
     /// merged `Assert` (`default_checks().merge(entry.scheduler.assert()).
     /// merge(&entry.assert)`) without forcing the operator to read
-    /// the Debug impl or source. Output ends with a newline.
+    /// the Debug impl or source. Output is a sequence of indented
+    /// `row` lines ending with a newline; the caller owns any
+    /// outer section header (the `show-thresholds` CLI already
+    /// prints `Test: ...` / `Scheduler: ...` lines above the
+    /// threshold block, which together establish context — an
+    /// additional `Resolved assertion thresholds:` banner here
+    /// would be a redundant third header).
     pub fn format_human(&self) -> String {
         use std::fmt::Write;
-        let mut out = String::from("Resolved assertion thresholds:\n");
+        let mut out = String::new();
         fn row<T: std::fmt::Display>(out: &mut String, name: &str, v: &Option<T>) {
             match v {
                 Some(x) => writeln!(out, "  {name:<38}: {x}").unwrap(),
@@ -2201,15 +2278,21 @@ mod tests {
     fn assert_format_human_no_overrides_renders_all_none() {
         let out = Assert::NO_OVERRIDES.format_human();
         // 19 threshold fields; each rendered as "none" means 19
-        // "none" occurrences in the output body (plus the header).
+        // "none" occurrences in the output.
         let none_count = out.matches(": none").count();
         assert_eq!(
             none_count, 19,
             "NO_OVERRIDES must render every field as `none`, got {none_count} `none` rows:\n{out}",
         );
+        // `format_human` is header-free — the first line carries
+        // the first threshold field. A reintroduced banner header
+        // would push `not_starved` off the first-line position
+        // and trip this assertion; pinning the first row's shape
+        // keeps the caller-owns-header contract intact.
         assert!(
-            out.starts_with("Resolved assertion thresholds:\n"),
-            "format_human must start with the header line: {out}",
+            out.starts_with("  not_starved"),
+            "format_human must open with the first threshold row \
+             (header ownership belongs to the caller); got: {out}",
         );
         assert!(out.ends_with('\n'), "format_human output must end with newline");
     }
@@ -2737,6 +2820,97 @@ mod tests {
              the independent tail_ratio (50 / 10 = 5); got {}",
             cg.wake_latency_tail_ratio,
         );
+    }
+
+    /// After `derive_ratios()`, the stored fields
+    /// (`wake_latency_tail_ratio` / `iterations_per_worker`) must
+    /// equal the computed accessors (`computed_wake_latency_tail_ratio`
+    /// / `computed_iterations_per_worker`). The store is just a
+    /// memo of the computation; any drift between stored and
+    /// computed values would mean either the populator or an
+    /// accessor has a bug. Pins the equivalence across the happy
+    /// path plus both zero-divisor branches.
+    ///
+    /// Motivation: the computed accessors exist so readers that
+    /// hold a `CgroupStats` from a deserialized pre-derive sidecar
+    /// can still get the ratio without mutating the struct. This
+    /// guarantee only holds if the populator and the accessor
+    /// agree on every branch, including the zero-divisor guards.
+    #[test]
+    fn computed_accessors_match_stored_fields_after_derive_ratios() {
+        use crate::assert::CgroupStats;
+
+        let fixtures: &[(&str, CgroupStats)] = &[
+            (
+                "happy-path",
+                CgroupStats {
+                    num_workers: 4,
+                    total_iterations: 800,
+                    p99_wake_latency_us: 50.0,
+                    median_wake_latency_us: 10.0,
+                    ..CgroupStats::default()
+                },
+            ),
+            (
+                "median-zero-guard",
+                CgroupStats {
+                    num_workers: 2,
+                    total_iterations: 100,
+                    p99_wake_latency_us: 50.0,
+                    median_wake_latency_us: 0.0,
+                    ..CgroupStats::default()
+                },
+            ),
+            (
+                "workers-zero-guard",
+                CgroupStats {
+                    num_workers: 0,
+                    total_iterations: 100,
+                    p99_wake_latency_us: 50.0,
+                    median_wake_latency_us: 10.0,
+                    ..CgroupStats::default()
+                },
+            ),
+        ];
+
+        for (label, cg_template) in fixtures {
+            let mut cg = cg_template.clone();
+            // Before derive_ratios, stored fields are default (0.0)
+            // but the computed accessors ALREADY return the right
+            // answer — that is the whole point of having them for
+            // deserialized-pre-derive sidecars.
+            let pre_tail = cg.computed_wake_latency_tail_ratio();
+            let pre_iter = cg.computed_iterations_per_worker();
+
+            cg.derive_ratios();
+
+            assert_eq!(
+                cg.wake_latency_tail_ratio,
+                cg.computed_wake_latency_tail_ratio(),
+                "[{label}] stored tail ratio must equal computed \
+                 accessor after derive_ratios",
+            );
+            assert_eq!(
+                cg.iterations_per_worker,
+                cg.computed_iterations_per_worker(),
+                "[{label}] stored iterations_per_worker must equal \
+                 computed accessor after derive_ratios",
+            );
+            // The computed accessor must be stable: calling before
+            // and after derive_ratios yields the same value. derive_
+            // ratios is just a memoization of the computation, not a
+            // transformation.
+            assert_eq!(
+                pre_tail, cg.computed_wake_latency_tail_ratio(),
+                "[{label}] computed accessor must not depend on \
+                 derive_ratios having fired",
+            );
+            assert_eq!(
+                pre_iter, cg.computed_iterations_per_worker(),
+                "[{label}] computed accessor must not depend on \
+                 derive_ratios having fired",
+            );
+        }
     }
 
     /// `ScenarioStats::merge` rolls up the new derived-ratio fields

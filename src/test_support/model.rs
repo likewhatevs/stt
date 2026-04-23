@@ -374,22 +374,48 @@ pub const DEFAULT_TOKENIZER: ModelSpec = ModelSpec {
     size_bytes: 11 * 1024 * 1024,
 };
 
-// Module-scope compile-time shape check on the DEFAULT_MODEL and
-// DEFAULT_TOKENIZER SHA pins: 64 ASCII hex chars, anything else is a
-// typo. Placed at module scope (not inside a `#[cfg(test)] fn`) so
-// the assertion fires on every `cargo check` / `cargo build`, not
-// only under `cargo check --tests`. A pin swap with a malformed hex
-// string now fails the default build before any runtime test hits
-// it. The `is_valid_sha256_hex` helper is const-evaluated, so the
+/// Canonical list of every [`ModelSpec`] declared in this module.
+/// Single source of truth for the "iterate all specs at compile
+/// time" shape checks below — adding a new `ModelSpec` const
+/// anywhere in the file requires appending a reference here, which
+/// forces the new pin through the compile-time validator without
+/// requiring the author to hand-roll per-spec `const _: () =
+/// assert!(..)` blocks at the declaration site.
+///
+/// The array is `&[&ModelSpec]` so the compile-time iterator below
+/// walks pointers, not values — the entries are `const` references
+/// to the module-level `DEFAULT_*` constants.
+const ALL_MODEL_SPECS: &[&ModelSpec] = &[&DEFAULT_MODEL, &DEFAULT_TOKENIZER];
+
+// Module-scope compile-time shape check on every ModelSpec's SHA
+// pin: 64 ASCII hex chars, anything else is a typo. Placed at
+// module scope (not inside a `#[cfg(test)] fn`) so the assertion
+// fires on every `cargo check` / `cargo build`, not only under
+// `cargo check --tests`. A pin swap with a malformed hex string
+// now fails the default build before any runtime test hits it.
+// The `is_valid_sha256_hex` helper is const-evaluated, so the
 // entire check folds at compile time with no runtime cost.
-const _: () = assert!(
-    is_valid_sha256_hex(DEFAULT_MODEL.sha256_hex),
-    "DEFAULT_MODEL.sha256_hex must be 64 ASCII hex characters",
-);
-const _: () = assert!(
-    is_valid_sha256_hex(DEFAULT_TOKENIZER.sha256_hex),
-    "DEFAULT_TOKENIZER.sha256_hex must be 64 ASCII hex characters",
-);
+//
+// Previously this was two hand-rolled per-spec asserts (one for
+// DEFAULT_MODEL, one for DEFAULT_TOKENIZER); a third ModelSpec
+// addition would have silently slipped past the check until
+// someone noticed the missing line. Iterating [`ALL_MODEL_SPECS`]
+// with a const `while` loop means the validator auto-applies to
+// every future spec, and forgetting to register a new spec is the
+// more likely (and easier-to-review) failure mode than forgetting
+// to hand-roll a matching assert.
+const _: () = {
+    let mut i = 0;
+    while i < ALL_MODEL_SPECS.len() {
+        assert!(
+            is_valid_sha256_hex(ALL_MODEL_SPECS[i].sha256_hex),
+            "ModelSpec.sha256_hex must be 64 ASCII hex characters — \
+             see ALL_MODEL_SPECS; add a registration line there when \
+             declaring a new ModelSpec const",
+        );
+        i += 1;
+    }
+};
 
 // Ballpark size bounds on the pinned artifacts. The pinned Qwen3-4B
 // Q4_K_M GGUF is ~2.44 GiB; bound tight at 3 GiB so a silent swap to a

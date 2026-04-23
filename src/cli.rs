@@ -1550,7 +1550,18 @@ pub fn show_run_host(run: &str, dir: Option<&Path>) -> Result<String> {
     };
     let run_dir = root.join(run);
     if !run_dir.exists() {
-        bail!("run '{run}' not found under {}", root.display());
+        // Name the discovery command alongside the error so an
+        // operator who fat-fingered a run key (common failure mode —
+        // the keys are auto-generated hex identifiers) doesn't have
+        // to reach for `--help` or source-reading to find the
+        // enumeration surface. `cargo ktstr stats list` is the
+        // authoritative run-key directory — see
+        // [`StatsCommand::List`] wiring in src/bin/cargo-ktstr.rs.
+        bail!(
+            "run '{run}' not found under {}. \
+             Run `cargo ktstr stats list` to enumerate available run keys.",
+            root.display(),
+        );
     }
     let sidecars = crate::test_support::collect_sidecars(&run_dir);
     if sidecars.is_empty() {
@@ -1601,6 +1612,13 @@ pub fn show_thresholds(test_name: &str) -> Result<String> {
         "Scheduler: {}\n",
         entry.scheduler.scheduler_name(),
     ));
+    // The `Test:` + `Scheduler:` lines above establish context for
+    // the indented threshold rows that follow; `Assert::format_human`
+    // renders only the rows (caller owns the section header).
+    // Prepending `Resolved assertion thresholds:` here keeps the
+    // operator-visible output unchanged from the pre-fold shape so
+    // shell pipelines grepping for the banner still match.
+    out.push_str("Resolved assertion thresholds:\n");
     out.push_str(&merged.format_human());
     Ok(out)
 }
@@ -2069,8 +2087,7 @@ pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std
         );
     }
 
-    let acquired =
-        crate::fetch::local_source(path, cli_label).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let cache_key = acquired.cache_key.clone();
 
     // Clean trees: cache lookup before build.
@@ -2452,6 +2469,15 @@ mod tests {
         assert!(
             msg.contains("run 'nonexistent-run' not found"),
             "missing-run error must name the run: {msg}",
+        );
+        // The error must also carry a discovery hint so an operator
+        // hitting a typo sees the enumeration command inline. Without
+        // this, the next recovery step is `--help` / source-reading.
+        assert!(
+            msg.contains("cargo ktstr stats list"),
+            "missing-run error must name the `stats list` discovery \
+             command so operators can enumerate available run keys \
+             without extra lookups: {msg}",
         );
     }
 
@@ -4823,6 +4849,95 @@ mod tests {
             row_with_active.contains("(EOL)"),
             "non-empty active_prefixes excluding entry's prefix must tag EOL, \
              got row: {row_with_active:?}",
+        );
+    }
+
+    /// Tag-ordering invariant: when a row carries BOTH a kconfig-state
+    /// tag (`(stale kconfig)` / `(untracked kconfig)`) AND the
+    /// `(EOL)` tag, the kconfig tag must appear FIRST. Dual-tag
+    /// snapshot rows in
+    /// [`format_entry_row_renders_eol_kconfig_matrix`] pin exact
+    /// column widths AND tag sequence together — a column-spacing
+    /// change forces re-snapshotting, which could accidentally
+    /// hide a reordered-tag regression. This test isolates the
+    /// order invariant so it stays pinned independent of snapshot
+    /// cadence: a tag swap surfaces here even if the matrix
+    /// snapshot is re-blessed for an unrelated column-width tweak.
+    ///
+    /// Exercises both dual-tag combinations (stale+EOL and
+    /// untracked+EOL) because the two kconfig-tag variants are
+    /// produced by different branches of [`KconfigStatus`] — a
+    /// regression that reordered only one of them (e.g. swapped
+    /// the push order in a match arm) would leak past a
+    /// single-variant test.
+    #[test]
+    fn format_entry_row_tags_appear_in_stable_order() {
+        use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src = tempfile::TempDir::new().unwrap();
+        let image = src.path().join("bzImage");
+        std::fs::write(&image, b"fake kernel").unwrap();
+        let current_hash = "a1b2c3d4";
+        let active_prefixes = ["6.14".to_string()];
+
+        // stale kconfig + EOL: entry hash differs from current AND
+        // entry version is outside the active-series list.
+        let stale_meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_version(Some("2.6.32".to_string()))
+        .with_ktstr_kconfig_hash(Some("deadbeef".to_string()));
+        let stale_entry = cache
+            .store("stale-eol", &CacheArtifacts::new(&image), &stale_meta)
+            .unwrap();
+        let stale_row = format_entry_row(&stale_entry, current_hash, &active_prefixes);
+        let stale_idx = stale_row
+            .find("(stale kconfig)")
+            .expect("stale-kconfig tag must appear on dual-tag row");
+        let eol_idx = stale_row
+            .find("(EOL)")
+            .expect("EOL tag must appear on dual-tag row");
+        assert!(
+            stale_idx < eol_idx,
+            "(stale kconfig) must precede (EOL) in the rendered row — a \
+             regression that reordered the two tags would break operator \
+             grep pipelines that key on the kconfig-tag being the first \
+             tag on a row:\n{stale_row}",
+        );
+
+        // untracked kconfig + EOL: separate branch of KconfigStatus,
+        // same ordering contract.
+        let untracked_meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        )
+        .with_version(Some("2.6.32".to_string()))
+        .with_ktstr_kconfig_hash(None);
+        let untracked_entry = cache
+            .store(
+                "untracked-eol",
+                &CacheArtifacts::new(&image),
+                &untracked_meta,
+            )
+            .unwrap();
+        let untracked_row = format_entry_row(&untracked_entry, current_hash, &active_prefixes);
+        let untracked_idx = untracked_row
+            .find("(untracked kconfig)")
+            .expect("untracked-kconfig tag must appear on dual-tag row");
+        let eol_idx = untracked_row
+            .find("(EOL)")
+            .expect("EOL tag must appear on dual-tag row");
+        assert!(
+            untracked_idx < eol_idx,
+            "(untracked kconfig) must precede (EOL) — same ordering \
+             contract as the stale branch:\n{untracked_row}",
         );
     }
 

@@ -127,9 +127,17 @@
 ///
 /// Visibility: `pub(crate)` — the prefix is an internal
 /// implementation detail of the worker-ready-marker convention.
-/// [`worker_ready_marker_path`] is the stable surface; hiding the
-/// prefix prevents external consumers from inlining the literal and
-/// silently drifting on a rename.
+/// Downstream callers (the worker binary's ready-path write and
+/// the host-side poll in `wait_for_worker_ready`) always go through
+/// [`worker_ready_marker_path`] / [`WORKER_READY_MARKER_OVERRIDE_ENV`]
+/// and never see the literal; the pin-tests that assert on the
+/// prefix value live in this module's own `#[cfg(test)]` block and
+/// reach the const via `super::`, which stays in lock-step with the
+/// definition by construction. External `/tmp/ktstr-worker-ready-`
+/// string literals elsewhere in the tree would be a drift bug —
+/// the prefix is kept `pub(crate)` so a rename updates one place
+/// and the compiler catches any new literal introduced outside
+/// this module.
 pub(crate) const WORKER_READY_MARKER_PREFIX: &str = "/tmp/ktstr-worker-ready-";
 
 /// Name of the test-only env var that overrides the pid-scoped

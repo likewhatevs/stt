@@ -295,6 +295,16 @@ pub struct SchbenchPayload;
 /// scheduler-author crates have a copy-ready template for the
 /// hint-carrying shape — the bare [`SCHBENCH`] covers the
 /// no-hint form, this fixture covers the with-hint form.
+///
+/// **Empty-metrics contract inherited from [`SCHBENCH`].** This
+/// fixture declares `metrics = []` just like its sibling, so the
+/// "no polarity-classified metrics by design" contract described
+/// on [`SCHBENCH`] applies here verbatim — the hint steers which
+/// numeric leaf the LLM surfaces, but every extracted metric
+/// still lands at [`Polarity::Unknown`](ktstr::test_support::Polarity::Unknown).
+/// See the SCHBENCH doc's "Contract — no polarity-classified
+/// metrics by design" section for the full rationale and the
+/// stdout-vs-stderr extraction fallback.
 #[derive(Payload)]
 #[payload(
     binary = "schbench",

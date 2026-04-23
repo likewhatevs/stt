@@ -30,14 +30,14 @@ use super::{CgroupGroup, Ctx, process_alive};
 /// Names use `Cow<'static, str>` so ops can reference compile-time
 /// literals (zero-cost) or runtime-generated strings (owned).
 ///
-/// # `#[non_exhaustive]` migration note
+/// # `#[non_exhaustive]`
 ///
-/// Downstream code that matches on an `Op` variant must include a
-/// wildcard `_ =>` arm — a future op added to the enum otherwise
-/// breaks every matcher. Use the per-op constructors (e.g.
-/// `Op::add_cgroup`, `Op::run_payload`) to build values instead of
-/// naming variants directly; new constructors are added alongside
-/// new variants and are the stable surface.
+/// `Op` is `#[non_exhaustive]` — see [`crate::non_exhaustive`] for
+/// the cross-crate pattern-match rule. `Op`-specific construction
+/// convention: prefer the per-op constructors (e.g. `Op::add_cgroup`,
+/// `Op::run_payload`) over naming variants directly; new
+/// constructors are added alongside new variants and are the stable
+/// surface.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Op {
@@ -206,18 +206,18 @@ pub enum Op {
 
 /// How to compute a cpuset from topology.
 ///
-/// # `#[non_exhaustive]` migration note
+/// # `#[non_exhaustive]`
 ///
-/// **Pattern-match side.** Matches over `CpusetSpec` must include a
-/// wildcard `_ =>` arm so future cpuset-derivation strategies can
-/// land without breaking existing matchers.
+/// `CpusetSpec` is `#[non_exhaustive]` — see
+/// [`crate::non_exhaustive`] for the cross-crate pattern-match and
+/// construction rules shared by every such type.
 ///
-/// **Construction side.** Prefer the associated constructor
-/// functions —
-/// [`Self::llc`], [`Self::numa`], [`Self::range`], [`Self::disjoint`],
-/// [`Self::overlap`], and [`Self::exact`] — over literal variant
-/// expressions like `CpusetSpec::Llc(0)` or `CpusetSpec::Range {
-/// start_frac, end_frac }`. Two reasons:
+/// Variant-specific guidance for `CpusetSpec`: prefer the
+/// associated constructor functions — [`Self::llc`], [`Self::numa`],
+/// [`Self::range`], [`Self::disjoint`], [`Self::overlap`], and
+/// [`Self::exact`] — over naming variant literals like
+/// `CpusetSpec::Llc(0)` or `CpusetSpec::Range { start_frac,
+/// end_frac }`. Two reasons:
 ///
 /// 1. **Stability across variant reshaping.** A future commit that
 ///    adds a field to `Range` (e.g. a stride parameter) breaks every
@@ -6965,7 +6965,7 @@ mod tests {
             missing.is_empty(),
             "Op variant discriminants with no constructor coverage: {missing:?}. \
              Every Op variant must have a public constructor under impl Op per the \
-             non_exhaustive migration note on the enum.",
+             non_exhaustive convention documented on the enum.",
         );
     }
 

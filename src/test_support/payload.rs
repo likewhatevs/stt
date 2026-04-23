@@ -314,19 +314,22 @@ impl Payload {
     /// - `"eevdf"` answers "what scheduler actually ran?" — the
     ///   concrete scheduling class in effect.
     ///
-    /// **Only `scheduler_name()` reaches the sidecar.** The
-    /// `SidecarResult.scheduler` field
+    /// **From the scheduler slot, only `scheduler_name()` reaches
+    /// the sidecar.** The `SidecarResult.scheduler` field
     /// (src/test_support/sidecar.rs) is populated via
-    /// `entry.scheduler.scheduler_name()`, which emits `"eevdf"` for
-    /// `KERNEL_DEFAULT`. The outer `Payload.name`
-    /// (`"kernel_default"`) is NOT written to the sidecar — it stays
-    /// in-memory only, used by logs, `#[ktstr_test]`-declaration
-    /// lookups, and `Payload::display_name()`. Cross-kernel-version
-    /// comparisons via sidecar `scheduler` therefore see `"eevdf"`
-    /// today and whatever future scheduling class replaces EEVDF
-    /// tomorrow; author-intent filtering on `"kernel_default"`
-    /// requires consulting the in-memory `Payload::name` directly,
-    /// not the sidecar.
+    /// `entry.scheduler.scheduler_name()` — the method is called on
+    /// the payload in the scheduler slot, not on payload / workload
+    /// slots, which route through separate serialization paths — and
+    /// emits `"eevdf"` when the scheduler slot holds `KERNEL_DEFAULT`.
+    /// The outer `Payload.name` (`"kernel_default"`) is NOT written
+    /// to the sidecar — it stays in-memory only, used by logs,
+    /// `#[ktstr_test]`-declaration lookups, and
+    /// `Payload::display_name()`. Cross-kernel-version comparisons
+    /// via sidecar `scheduler` therefore see `"eevdf"` today and
+    /// whatever future scheduling class replaces EEVDF tomorrow;
+    /// author-intent filtering on `"kernel_default"` requires
+    /// consulting the in-memory `Payload::name` directly, not the
+    /// sidecar.
     pub const KERNEL_DEFAULT: Payload = Payload {
         name: "kernel_default",
         kind: PayloadKind::Scheduler(&Scheduler::EEVDF),
@@ -429,20 +432,38 @@ impl Payload {
 
     /// The scheduler's display name.
     ///
+    /// Returns a compile-time-fixed LABEL, not a runtime reflection
+    /// of the scheduling class the live kernel is actually running.
+    /// A sidecar written on a kernel whose default is a successor
+    /// scheduling class still records whatever string this method
+    /// returns — the label comes from the `Payload` / inner
+    /// `Scheduler` definition, nothing queries `/proc` or the live
+    /// policy. Consumers that need to know the running kernel's
+    /// scheduling class must cross-reference the sidecar's
+    /// `host.kernel_release` with kernel-version-to-scheduler
+    /// knowledge maintained outside the sidecar.
+    ///
     /// Branch behavior:
-    /// - `PayloadKind::Scheduler(s)` → `s.name` — the specific
-    ///   scheduler's identifier, e.g. `"eevdf"` for
+    /// - `PayloadKind::Scheduler(s)` → `s.name` — the label attached
+    ///   to that specific scheduler, e.g. `"eevdf"` for
     ///   [`Scheduler::EEVDF`] or `"scx_rusty"` for a scx_*
-    ///   scheduler. This is what scheduler-kind payloads
-    ///   (including `Payload::KERNEL_DEFAULT`, which wraps
-    ///   [`Scheduler::EEVDF`]) surface.
+    ///   scheduler. This is what scheduler-kind payloads (including
+    ///   `Payload::KERNEL_DEFAULT`, which wraps [`Scheduler::EEVDF`])
+    ///   surface.
     /// - `PayloadKind::Binary(_)` → `"kernel_default"` — a binary
     ///   payload runs under whatever scheduler the test declares
-    ///   elsewhere (or the kernel default if it declares none),
-    ///   so the binary-kind payload carries no scheduler identity
-    ///   of its own. NOTE: this is the intent-level label, NOT
-    ///   `"eevdf"`; only a scheduler-kind payload explicitly
-    ///   wrapping [`Scheduler::EEVDF`] returns `"eevdf"` here.
+    ///   elsewhere (or the kernel default if it declares none), so
+    ///   the binary-kind payload carries no scheduler identity of
+    ///   its own. The returned string is a LABEL ("test author did
+    ///   not pin a scheduler here"), NOT a statement about which
+    ///   scheduling class the VM actually ran under — the live
+    ///   kernel may be running EEVDF, a successor class, or an scx
+    ///   scheduler the binary's test harness attached separately;
+    ///   `scheduler_name()` does not observe any of that. Only a
+    ///   scheduler-kind payload explicitly wrapping
+    ///   [`Scheduler::EEVDF`] returns the `"eevdf"` label; every
+    ///   binary-kind payload returns `"kernel_default"` regardless
+    ///   of what class is running.
     pub const fn scheduler_name(&self) -> &'static str {
         match self.kind {
             PayloadKind::Scheduler(s) => s.name,
@@ -834,6 +855,7 @@ pub enum MetricSource {
 /// consumer reads it yet. A follow-up task wires filtering into
 /// `stats compare` output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum MetricStream {
     /// Extracted from the payload's stdout (the happy path for
     /// fio / stress-ng / most benchmark tools).
@@ -843,6 +865,35 @@ pub enum MetricStream {
     /// stderr — e.g. schbench's `show_latencies` →
     /// `fprintf(stderr, ...)`).
     Stderr,
+    /// Synthesized by a host-side probe rather than parsed from a
+    /// child process's output streams. Used by payloads whose
+    /// "metrics" are derived from external observation — currently
+    /// the `ktstr-jemalloc-probe` family, which emits JSON
+    /// describing TID-keyed jemalloc counter values read via
+    /// `process_vm_readv` on the target process's address space,
+    /// not by the target process's own stdout/stderr.
+    ///
+    /// This variant is orthogonal to [`Stdout`](Self::Stdout) and
+    /// [`Stderr`](Self::Stderr): it does NOT mean "probe wrote to
+    /// stdout/stderr" (which would be stamped `Stdout` via the
+    /// usual extraction pipeline). It means the metric's ultimate
+    /// SOURCE is external introspection rather than a channel
+    /// emission by the measured process. Downstream review
+    /// tooling that filters on `MetricStream` can use `Synthesized`
+    /// to identify probe-authored metrics where the "keep stdout
+    /// canonical" convention does not apply — a probe's output
+    /// channel is an implementation detail of the probe binary,
+    /// not a claim about the subject process's channel hygiene.
+    ///
+    /// # `#[non_exhaustive]` migration note
+    ///
+    /// `MetricStream` gained this variant after `Stdout` / `Stderr`
+    /// were already serialized in on-disk sidecars; the enum is
+    /// `#[non_exhaustive]` so downstream pattern matches must
+    /// include a wildcard `_ =>` arm, and future probe-authored
+    /// stream sources (e.g. a BPF-map reader) can land without
+    /// a wire-format migration.
+    Synthesized,
 }
 
 /// A single extracted metric from a payload's output.
@@ -877,8 +928,11 @@ pub struct Metric {
 ///
 /// Each concurrent payload (primary or workload, foreground or
 /// background) produces one `PayloadMetrics` value. Sidecar stores
-/// these as a `Vec<PayloadMetrics>` keyed by payload name so
-/// per-payload provenance is preserved across composed tests.
+/// these as a `Vec<PayloadMetrics>` so per-payload provenance is
+/// preserved across composed tests. Payload identity (name and
+/// cgroup placement) is carried by the enclosing sidecar record —
+/// not by `PayloadMetrics` itself, which holds only the extracted
+/// metrics and exit code.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PayloadMetrics {
     /// Extracted metrics. Empty when [`OutputFormat::ExitCode`] is
@@ -1035,7 +1089,7 @@ mod tests {
         }
     }
 
-    // Item 3: PayloadKind::Binary construction + pattern match.
+    // PayloadKind::Binary construction + pattern match.
     #[test]
     fn payload_kind_binary_construction_and_match() {
         const FIO: Payload = Payload {
@@ -1057,7 +1111,7 @@ mod tests {
         assert!(FIO.as_scheduler().is_none());
     }
 
-    // Item 4: const bindings verify const-fn actually works in const context.
+    // Const bindings verify const-fn actually works in const context.
     const _MIN: Check = Check::min("x", 1.0);
     const _MAX: Check = Check::max("x", 2.0);
     const _RANGE: Check = Check::range("x", 1.0, 2.0);
@@ -1098,7 +1152,7 @@ mod tests {
         assert_eq!(_KERNEL_DEFAULT_DISPLAY, "kernel_default");
     }
 
-    // Item 5: from_higher_is_worse helper.
+    // from_higher_is_worse helper.
     #[test]
     fn polarity_from_higher_is_worse_flips_sense() {
         assert_eq!(Polarity::from_higher_is_worse(true), Polarity::LowerBetter);
@@ -1270,7 +1324,7 @@ mod tests {
         }
     }
 
-    // Item 1 + 2: Debug + helper method surface.
+    // Debug + helper method surface.
     #[test]
     fn payload_debug_renders_identity_fields() {
         let s = format!("{:?}", Payload::KERNEL_DEFAULT);

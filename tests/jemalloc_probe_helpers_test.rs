@@ -184,7 +184,7 @@ fn count_indexed_metrics_returns_zero_when_first_index_absent() {
     );
 }
 
-// --- ThreadLookup::ExceedsCap test (task #8 regression guard) ---
+// --- ThreadLookup::ExceedsCap regression guard ---
 
 #[test]
 fn lookup_thread_returns_exceeds_cap_on_saturated_scan() {

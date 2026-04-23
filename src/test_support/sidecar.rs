@@ -555,15 +555,26 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 ///
 /// The hash is over test-identity fields (topology, scheduler,
 /// payload, work_type, flags, sysctls, kargs) — NOT over
-/// [`HostContext`]. This is deliberate: two gauntlet variants run
-/// on different hosts must collapse into the same bucket so
-/// downstream stats tooling groups them together (see
-/// [`sidecar_variant_hash_excludes_host_context`]). The corollary:
-/// if the host's observable state mutates mid-suite — NUMA hotplug,
-/// hugepage reconfiguration, a `sysctl -w` from a parallel process
-/// — two runs of the same test will produce the same sidecar
-/// filename and the later write clobbers the earlier. ktstr treats
-/// host state as stable-enough for a single suite run; callers
+/// [`HostContext`], and NOT over `scheduler_commit`. The
+/// [`HostContext`] exclusion is pinned by
+/// [`sidecar_variant_hash_excludes_host_context`]; the
+/// `scheduler_commit` exclusion is deliberate for the same
+/// cross-host grouping reason — a gauntlet rebuilt against a
+/// different userspace scheduler commit (bumped ktstr checkout,
+/// different CI runner, different developer machine) must still
+/// bucket with the same-named variant so `compare_runs` can diff
+/// two runs of the "same" test without the commit hash shattering
+/// them into one-row-per-commit islands. Callers that want to
+/// detect a commit drift between two runs inspect
+/// `SidecarResult::scheduler_commit` directly; the filename stays
+/// stable across commits by design.
+///
+/// The corollary of the HostContext exclusion: if the host's
+/// observable state mutates mid-suite — NUMA hotplug, hugepage
+/// reconfiguration, a `sysctl -w` from a parallel process — two
+/// runs of the same test will produce the same sidecar filename
+/// and the later write clobbers the earlier. ktstr treats host
+/// state as stable-enough for a single suite run; callers
 /// mutating host state during a run own the ordering themselves
 /// (e.g. by writing to a different `KTSTR_SIDECAR_DIR` per host
 /// snapshot).
@@ -593,13 +604,28 @@ pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
         h.write(f.as_bytes());
         h.write(&[0]);
     }
+    // Sysctls and kargs are canonicalized at hash time — NOT at
+    // write time like `active_flags` — so the on-disk sidecar
+    // preserves the scheduler-declared order (useful for humans
+    // reading the JSON) while the filename suffix stays a pure
+    // function of the SET, not the sequence. Sorting lexically
+    // here means two schedulers that declare the same sysctls in
+    // different source-code orders fold to the same filename,
+    // matching the order-insensitivity contract documented on
+    // `canonicalize_active_flags`. Two small `Vec<&str>` per
+    // call — acceptable because `sidecar_variant_hash` runs
+    // once per `write_sidecar`, not on a hot path.
     h.write(&[0xfd]);
-    for s in &sidecar.sysctls {
+    let mut sorted_sysctls: Vec<&str> = sidecar.sysctls.iter().map(String::as_str).collect();
+    sorted_sysctls.sort_unstable();
+    for s in &sorted_sysctls {
         h.write(s.as_bytes());
         h.write(&[0]);
     }
     h.write(&[0xff]);
-    for k in &sidecar.kargs {
+    let mut sorted_kargs: Vec<&str> = sidecar.kargs.iter().map(String::as_str).collect();
+    sorted_kargs.sort_unstable();
+    for k in &sorted_kargs {
         h.write(k.as_bytes());
         h.write(&[0]);
     }
@@ -670,6 +696,367 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
         .with_context(|| format!("create sidecar dir {}", dir.display()))?;
     std::fs::write(&path, json).with_context(|| format!("write {label} {}", path.display()))?;
     Ok(())
+}
+
+/// Budget for [`atomic_mutate_sidecar`]'s non-blocking flock
+/// retry loop. A legitimate concurrent writer holds the lock only
+/// long enough to read + parse + mutate + rewrite a small JSON
+/// document, so 30 s is generous; a stuck holder (wedged probe,
+/// `kill -STOP`'d sibling) fails fast rather than hanging a CI
+/// job indefinitely on the previous bare `LOCK_EX` call.
+#[allow(dead_code)]
+const SIDECAR_FLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Sleep between retry attempts inside
+/// [`atomic_mutate_sidecar`]'s flock wait loop. Keeps CPU cost
+/// bounded while letting contended writers resume within roughly
+/// the delay a legitimate predecessor takes to finish its mutate
+/// cycle.
+#[allow(dead_code)]
+const SIDECAR_FLOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Age at which a `.lock` sibling file next to a sidecar JSON is
+/// considered "orphaned" and eligible for best-effort cleanup in
+/// [`clean_orphaned_sidecar_locks`]. Chosen well above the flock
+/// budget above (30 s) so a legitimate concurrent writer holding
+/// the lock for its full retry window is never cleaned up out
+/// from under itself.
+#[allow(dead_code)]
+const SIDECAR_LOCK_ORPHAN_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Derive the sibling lock-file path for a sidecar. Keeps the
+/// lock-path computation in one place so every writer and every
+/// cleaner agrees on the same object regardless of whether the
+/// sidecar has been rename-cycled (atomic-rename replaces the
+/// sidecar's inode, which would invalidate any lock held on the
+/// old inode — the fixed `<sidecar>.lock` path sidesteps that).
+#[allow(dead_code)]
+pub(crate) fn sidecar_lock_path(sidecar: &std::path::Path) -> PathBuf {
+    let ext = sidecar.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext.is_empty() {
+        sidecar.with_extension("lock")
+    } else {
+        sidecar.with_extension(format!("{ext}.lock"))
+    }
+}
+
+/// Atomically read, mutate, and rewrite a sidecar JSON file under
+/// an exclusive advisory lock.
+///
+/// Shared by the in-test sidecar writer path (future use) and the
+/// jemalloc probe's `--sidecar` append. The caller supplies a
+/// closure that mutates a parsed [`SidecarResult`] in place; the
+/// helper owns the lock lifecycle, the atomic-rename durability
+/// dance, and the stale-lock cleanup sweep. Contract:
+///
+///   1. Open (or create) a sibling `<path>.lock` file with
+///      `O_CREAT | O_RDWR | O_CLOEXEC`. The lock lives on the
+///      sibling so atomic-rename cycles of the sidecar cannot
+///      orphan the held lock object.
+///   2. Acquire `LOCK_EX` via a non-blocking retry loop bounded
+///      by [`SIDECAR_FLOCK_BUDGET`]. A stuck holder fails fast
+///      with an actionable error naming the `.lock` path; legit
+///      contention serializes cleanly.
+///   3. Read `path` INSIDE the flock window — no `exists()`
+///      probe, no TOCTOU. Missing file bails with
+///      `ErrorKind::NotFound` rewritten into an operator-
+///      actionable message; other I/O errors propagate.
+///   4. Parse into [`SidecarResult`]; malformed JSON is a hard
+///      error (pre-1.0: regenerate, do not migrate).
+///   5. Call the caller's `mutate` closure on the parsed
+///      struct. The closure owns the mutation semantics (append
+///      a payload, edit a field, clear a vec — whatever the
+///      call site needs).
+///   6. Re-serialize, write to a `NamedTempFile` in the same
+///      directory, `sync_all` for powerloss durability, then
+///      `persist` (rename) onto `path`.
+///   7. Release the lock by dropping `lock_fd`. Best-effort
+///      stale-lock cleanup runs via
+///      [`clean_orphaned_sidecar_locks`] on the parent dir
+///      before return; failures there are swallowed (the caller
+///      has already succeeded at the mutate).
+///
+/// Lift-point for future probe implementations: any probe that
+/// wants to enrich a sidecar with synthesized metrics routes
+/// through this helper rather than reimplementing the
+/// flock/read/mutate/rename/cleanup sequence.
+#[allow(dead_code)]
+pub(crate) fn atomic_mutate_sidecar<F>(path: &std::path::Path, mutate: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut SidecarResult) -> anyhow::Result<()>,
+{
+    use rustix::fs::{FlockOperation, Mode, OFlags, flock, fstat, open, stat};
+
+    let lock_path = sidecar_lock_path(path);
+    let deadline = std::time::Instant::now() + SIDECAR_FLOCK_BUDGET;
+
+    // Outer loop: (open, flock, verify-inode). The orphan-cleanup
+    // sweep — or any concurrent writer — may unlink and recreate
+    // the lock file between our open() and our flock(), giving
+    // two writers flocks on DIFFERENT inodes that do not
+    // serialize against each other (flock semantics are
+    // per-file-description; once the original inode is unlinked,
+    // a fresh open() produces a new file description with no
+    // relation to ours). After each successful `flock(LOCK_EX)`,
+    // `fstat(lock_fd)` vs `stat(lock_path)` compares the inode
+    // the fd points at with the inode the path currently
+    // resolves to. A mismatch means our fd is holding a lock on
+    // a stale inode that no one else can observe — close, reopen,
+    // retry. An identical (st_dev, st_ino) pair proves that every
+    // concurrent opener of `lock_path` resolves to the same
+    // inode and therefore contends for the same advisory lock
+    // (modulo ST_NOSUID-style mounts which don't apply to our
+    // target dirs). Mismatch-retries consume the same wall-clock
+    // budget as the flock-waits, so a pathological inode-flip
+    // loop still times out cleanly rather than spinning forever.
+    let lock_fd = loop {
+        let candidate_fd = open(
+            &lock_path,
+            OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .with_context(|| format!("open lock file {}", lock_path.display()))?;
+
+        // Inner loop: acquire flock, respecting the same deadline.
+        loop {
+            match flock(&candidate_fd, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(SIDECAR_FLOCK_RETRY_INTERVAL);
+                    continue;
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => anyhow::bail!(
+                    "flock(LOCK_EX) on {} timed out after {:?} — another \
+                     writer holds the lock. Run `lslocks | grep {}` or \
+                     `fuser {}` to identify the flock holder; if it is a \
+                     wedged process, kill it and retry. `lsof` enumerates \
+                     open files, not advisory-lock holders, so it is the \
+                     wrong tool here.",
+                    lock_path.display(),
+                    SIDECAR_FLOCK_BUDGET,
+                    lock_path.display(),
+                    lock_path.display(),
+                ),
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "flock(LOCK_EX, non-blocking) on {}",
+                        lock_path.display(),
+                    )));
+                }
+            }
+        }
+
+        // Verify (st_dev, st_ino) identity. `stat(lock_path)` may
+        // fail with ENOENT if the path was unlinked AND not yet
+        // recreated (a narrow window before the next opener runs
+        // `O_CREAT`) — treat that as "inode flipped" and retry:
+        // our fd is definitionally stale against a missing name.
+        let fd_ident = fstat(&candidate_fd)
+            .with_context(|| format!("fstat lock fd for {}", lock_path.display()))?;
+        let path_ident = match stat(&lock_path) {
+            Ok(s) => Some(s),
+            Err(rustix::io::Errno::NOENT) => None,
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "stat lock path {}",
+                    lock_path.display(),
+                )));
+            }
+        };
+        let matches = path_ident.as_ref().is_some_and(|p| {
+            p.st_dev == fd_ident.st_dev && p.st_ino == fd_ident.st_ino
+        });
+        if matches {
+            break candidate_fd;
+        }
+
+        // Inode mismatch (or path now ENOENT): drop our stale fd
+        // — this also releases the flock, so a concurrent writer
+        // already holding the new inode's flock is unaffected —
+        // and retry against the fresh path. Budget check so a
+        // sustained inode-flip (pathological cleaner loop) does
+        // not livelock: the same deadline bounds both WOULDBLOCK
+        // waits and inode-mismatch retries.
+        drop(candidate_fd);
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "flock(LOCK_EX) on {} gave up after {:?} — acquired the \
+                 lock but the file's inode kept flipping under us \
+                 (another writer or the orphan cleaner repeatedly \
+                 unlinked and recreated the lock file). Investigate \
+                 whether a concurrent sweep is mis-classifying this \
+                 path's age; the lock-file cleanup gate is a 5-minute \
+                 mtime threshold, well above the flock budget, so \
+                 healthy runs should never trigger this.",
+                lock_path.display(),
+                SIDECAR_FLOCK_BUDGET,
+            );
+        }
+        // Small sleep between reopen attempts so the flip-retry
+        // loop doesn't busy-spin against a racing writer that is
+        // still in the narrow (unlink → creat) window.
+        std::thread::sleep(SIDECAR_FLOCK_RETRY_INTERVAL);
+    };
+
+    // Read INSIDE the flock window — no separate `exists()` call.
+    // `fs::read_to_string` itself reports `ErrorKind::NotFound` if
+    // the file is absent, so we rewrite that one kind into the
+    // operator-actionable message and let every other I/O error
+    // propagate with the raw cause. One fewer syscall, no TOCTOU
+    // between `exists()` and `open()`.
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+            "sidecar file not found at {}; run the test first to \
+             generate it, then re-invoke the mutator",
+            path.display(),
+        ),
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("read {}", path.display())));
+        }
+    };
+    let mut sidecar: SidecarResult = serde_json::from_str(&existing).with_context(|| {
+        format!(
+            "parse {} as SidecarResult — sidecar may be from an \
+             incompatible schema version (pre-1.0 policy: regenerate, \
+             do not migrate)",
+            path.display(),
+        )
+    })?;
+
+    mutate(&mut sidecar)?;
+
+    let serialized = serde_json::to_string_pretty(&sidecar)
+        .context("re-serialize SidecarResult after mutate closure")?;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("sidecar path {} has no parent directory", path.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("create staging file in {}", dir.display()))?;
+    std::io::Write::write_all(tmp.as_file_mut(), serialized.as_bytes())
+        .with_context(|| format!("write staging file in {}", dir.display()))?;
+    // fsync BEFORE rename for powerloss durability. Without this
+    // call, a crash between write(2) and rename(2) can leave the
+    // target file visible (the rename's metadata update committed)
+    // but with zero-length or partial content on disk — the
+    // staging file's data blocks were not yet flushed. Explicit
+    // `sync_all` forces the data blocks out before the rename
+    // commits.
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("fsync staging file in {}", dir.display()))?;
+    tmp.persist(path)
+        .with_context(|| format!("atomic rename staging file into {}", path.display()))?;
+
+    // Parent-directory fsync AFTER the rename commits the
+    // directory entry to durable storage. Without this call, a
+    // post-rename crash within the fs writeback window can lose
+    // both the OLD and NEW sidecar: the old inode's directory
+    // entry was removed, the new inode's directory entry was
+    // not yet flushed, and the post-crash readdir sees neither.
+    // Best-effort — a parent-dir open/fsync failure is a
+    // durability regression, not a correctness failure (the
+    // rename itself already landed in the VFS), and bubbling
+    // the error up would convert an extant-but-not-yet-flushed
+    // sidecar into a hard failure for the caller. Mirrors the
+    // same pattern applied at the jemalloc probe's in-binary
+    // appender so both routes close the same durability gap.
+    if let Ok(parent) = std::fs::File::open(dir) {
+        let _ = parent.sync_all();
+    }
+
+    // Drop the lock BEFORE the orphan-cleanup sweep so the sweep's
+    // age check does not see our own lock as "recently touched"
+    // and skip everything in the dir.
+    drop(lock_fd);
+
+    // Best-effort cleanup of stale `.lock` files in the same dir.
+    // Failures here are swallowed — our append already succeeded,
+    // and a janitor-role cleanup should never surface as a
+    // mutator error.
+    let _ = clean_orphaned_sidecar_locks(dir);
+
+    Ok(())
+}
+
+/// Remove stale `.lock` sibling files older than
+/// [`SIDECAR_LOCK_ORPHAN_AGE`] in `dir`. These are the lock
+/// fd-objects created by [`atomic_mutate_sidecar`] (and the
+/// jemalloc probe's in-binary sidecar appender); the lock
+/// object lives on disk so cross-process serialization has a
+/// stable anchor, but no writer bothers to unlink it on exit —
+/// leaving a growing pile of `.lock` files in `target/ktstr`
+/// over many runs. This cleaner sweeps them opportunistically.
+///
+/// Safety:
+///
+///   - Age gate: only files older than
+///     [`SIDECAR_LOCK_ORPHAN_AGE`] (5 min) are removed, well
+///     above the 30 s flock budget. A legitimate concurrent
+///     writer that took out the lock seconds ago keeps its
+///     file — the mtime is fresh.
+///   - Extension gate: only files whose name ends in `.lock`
+///     under a `.ktstr.` namespace (via the `.ktstr.` substring
+///     check that mirrors [`collect_sidecars`]) are considered,
+///     so random `.lock` files belonging to other tools never
+///     get touched.
+///   - Error tolerance: per-file removal failures log and
+///     continue rather than bailing the sweep. Other processes
+///     may still be creating/opening locks concurrently.
+///
+/// Returns the number of lock files removed. On a dir that
+/// cannot be read (nonexistent, permission denied), returns 0
+/// silently — an offline cleaner must never break a callable
+/// operation.
+#[allow(dead_code)]
+pub(crate) fn clean_orphaned_sidecar_locks(dir: &std::path::Path) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Only the exact sidecar-lock shape produced by
+        // [`sidecar_lock_path`]: `<prefix>.ktstr.json.lock`. The
+        // previous looser filter (`ends_with(".lock") &&
+        // contains(".ktstr.")`) would have matched adjacent
+        // artifacts like `run.ktstr.meta.lock` or even
+        // `something.ktstr.profraw.lock` if a future tool adopted
+        // the ktstr namespace — expanding cleanup scope beyond
+        // what this module actually creates. The tight suffix
+        // match keeps the sweep bound to the files its owning
+        // writer path emits.
+        if !name.ends_with(".ktstr.json.lock") {
+            continue;
+        }
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified = match metadata.modified() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let age = match now.duration_since(modified) {
+            Ok(a) => a,
+            // mtime in the future (clock skew) — skip, never remove.
+            Err(_) => continue,
+        };
+        if age < SIDECAR_LOCK_ORPHAN_AGE {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Return `active_flags` sorted into canonical
@@ -1649,20 +2036,7 @@ mod tests {
             auto_repro: false,
             ..KtstrTestEntry::DEFAULT
         };
-        let vm_result = crate::vmm::VmResult {
-            success: true,
-            exit_code: 0,
-            duration: std::time::Duration::from_secs(1),
-            timed_out: false,
-            output: String::new(),
-            stderr: String::new(),
-            monitor: None,
-            shm_data: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
         let check_result = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &check_result, "CpuSpin", &[], &[]).unwrap();
 
@@ -1716,20 +2090,7 @@ mod tests {
             auto_repro: false,
             ..KtstrTestEntry::DEFAULT
         };
-        let vm_result = crate::vmm::VmResult {
-            success: true,
-            exit_code: 0,
-            duration: std::time::Duration::from_secs(1),
-            timed_out: false,
-            output: String::new(),
-            stderr: String::new(),
-            monitor: None,
-            shm_data: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
         let check_result = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &check_result, "CpuSpin", &[], &[]).unwrap();
 
@@ -1806,20 +2167,7 @@ mod tests {
             auto_repro: false,
             ..KtstrTestEntry::DEFAULT
         };
-        let vm_result = crate::vmm::VmResult {
-            success: true,
-            exit_code: 0,
-            duration: std::time::Duration::from_secs(1),
-            timed_out: false,
-            output: String::new(),
-            stderr: String::new(),
-            monitor: None,
-            shm_data: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
         let ok = AssertResult::pass();
         let flags_a = vec!["llc".to_string()];
         let flags_b = vec!["llc".to_string(), "steal".to_string()];
@@ -1873,20 +2221,7 @@ mod tests {
             auto_repro: false,
             ..KtstrTestEntry::DEFAULT
         };
-        let vm_result = crate::vmm::VmResult {
-            success: true,
-            exit_code: 0,
-            duration: std::time::Duration::from_secs(1),
-            timed_out: false,
-            output: String::new(),
-            stderr: String::new(),
-            monitor: None,
-            shm_data: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
         let ok = AssertResult::pass();
         // Same set of flags in reversed accumulation order. `llc` is
         // `ALL_DECLS[0].name` and `steal` is `ALL_DECLS[2].name`, so
@@ -1923,6 +2258,84 @@ mod tests {
             "on-disk active_flags must be sorted in \
              `scenario::flags::ALL` positional order; got: {:?}",
             loaded.active_flags,
+        );
+    }
+
+    /// `sidecar_variant_hash` is order-insensitive for `sysctls`
+    /// and `kargs` — same contract as `active_flags`, but
+    /// canonicalized at hash time (local sort inside
+    /// `sidecar_variant_hash`) rather than at write time. Pinning
+    /// the invariant directly against the hash function catches a
+    /// regression that drops the sort block (reverts to iterating
+    /// `&sidecar.sysctls` / `&sidecar.kargs` in-order) even if all
+    /// existing stability pins continue to pass — those pins use
+    /// single-element collections where sorting is a no-op, so
+    /// they cannot detect this regression by themselves.
+    ///
+    /// Calls the hash function directly rather than going through
+    /// `write_sidecar` because the sysctls/kargs come from
+    /// `entry.scheduler.sysctls()` / `kargs()` — static slices the
+    /// caller cannot reorder. The only path for a reordered input
+    /// is a direct `SidecarResult` construction with reordered
+    /// fields, which this test exercises.
+    #[test]
+    fn sidecar_variant_hash_is_order_invariant_for_sysctls_and_kargs() {
+        let forward = SidecarResult {
+            sysctls: vec![
+                "sysctl.a=1".to_string(),
+                "sysctl.b=2".to_string(),
+                "sysctl.c=3".to_string(),
+            ],
+            kargs: vec![
+                "karg_alpha".to_string(),
+                "karg_beta".to_string(),
+                "karg_gamma".to_string(),
+            ],
+            ..SidecarResult::test_fixture()
+        };
+        let reversed = SidecarResult {
+            sysctls: vec![
+                "sysctl.c=3".to_string(),
+                "sysctl.b=2".to_string(),
+                "sysctl.a=1".to_string(),
+            ],
+            kargs: vec![
+                "karg_gamma".to_string(),
+                "karg_beta".to_string(),
+                "karg_alpha".to_string(),
+            ],
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&forward),
+            sidecar_variant_hash(&reversed),
+            "reversed-order sysctls/kargs must hash identically — \
+             the hash sorts both collections lexically before \
+             folding bytes in, matching the set-determines-hash \
+             contract documented on `sidecar_variant_hash`. A \
+             regression that dropped the sort block would produce \
+             distinct hashes and duplicate sidecar files for the \
+             same semantic variant.",
+        );
+
+        // Permutation check: a partial reorder (sysctls same,
+        // kargs reversed) must also collapse. Guards against a
+        // partial revert that drops the sort in only one of the
+        // two collections.
+        let partial = SidecarResult {
+            sysctls: forward.sysctls.clone(),
+            kargs: reversed.kargs.clone(),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&forward),
+            sidecar_variant_hash(&partial),
+            "kargs-only reversal must still hash identically — \
+             partial revert (one of the two sorts dropped) must \
+             fail this assertion. Got distinct hashes for: \
+             sysctls={:?}, kargs={:?} vs sysctls={:?}, kargs={:?}",
+            forward.sysctls, forward.kargs,
+            partial.sysctls, partial.kargs,
         );
     }
 
@@ -2076,20 +2489,7 @@ mod tests {
             auto_repro: false,
             ..KtstrTestEntry::DEFAULT
         };
-        let vm_result = crate::vmm::VmResult {
-            success: true,
-            exit_code: 0,
-            duration: std::time::Duration::from_secs(1),
-            timed_out: false,
-            output: String::new(),
-            stderr: String::new(),
-            monitor: None,
-            shm_data: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
         let ok = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
         write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[], &[]).unwrap();
@@ -2722,20 +3122,7 @@ mod tests {
             payload: Some(&FIO),
             ..KtstrTestEntry::DEFAULT
         };
-        let vm_result = crate::vmm::VmResult {
-            success: true,
-            exit_code: 0,
-            duration: std::time::Duration::from_secs(1),
-            timed_out: false,
-            output: String::new(),
-            stderr: String::new(),
-            monitor: None,
-            shm_data: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
         let ok = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
 
@@ -2773,20 +3160,7 @@ mod tests {
             auto_repro: false,
             ..KtstrTestEntry::DEFAULT
         };
-        let vm_result = crate::vmm::VmResult {
-            success: true,
-            exit_code: 0,
-            duration: std::time::Duration::from_secs(1),
-            timed_out: false,
-            output: String::new(),
-            stderr: String::new(),
-            monitor: None,
-            shm_data: None,
-            stimulus_events: Vec::new(),
-            verifier_stats: Vec::new(),
-            kvm_stats: None,
-            crash_message: None,
-        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
         let ok = AssertResult::pass();
         let metrics = vec![
             PayloadMetrics {
@@ -3121,5 +3495,216 @@ mod tests {
                 "sidecar {i}: sched_tunables presence flipped across sidecars",
             );
         }
+    }
+
+    // -- atomic_mutate_sidecar + clean_orphaned_sidecar_locks --
+
+    fn write_seed_sidecar(path: &std::path::Path, test_name: &str) {
+        let mut sc = SidecarResult::test_fixture();
+        sc.test_name = test_name.to_string();
+        let json = serde_json::to_string_pretty(&sc).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, json).unwrap();
+    }
+
+    /// `sidecar_lock_path` must append `.lock` on top of whatever
+    /// extension the sidecar carries (never replace it). Covers
+    /// both the with-extension and without-extension shapes.
+    #[test]
+    fn sidecar_lock_path_appends_lock_extension() {
+        let with_ext = std::path::Path::new("/tmp/foo.ktstr.json");
+        assert_eq!(
+            sidecar_lock_path(with_ext),
+            std::path::PathBuf::from("/tmp/foo.ktstr.json.lock"),
+        );
+        let without_ext = std::path::Path::new("/tmp/foo");
+        assert_eq!(
+            sidecar_lock_path(without_ext),
+            std::path::PathBuf::from("/tmp/foo.lock"),
+        );
+    }
+
+    /// Happy path: the closure sees the parsed sidecar, mutates,
+    /// and the rewritten file reflects the change.
+    #[test]
+    fn atomic_mutate_sidecar_happy_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("happy.ktstr.json");
+        write_seed_sidecar(&path, "happy_test");
+
+        atomic_mutate_sidecar(&path, |sc| {
+            sc.test_name = "mutated".to_string();
+            Ok(())
+        })
+        .expect("happy-path mutate must succeed");
+
+        let reloaded: SidecarResult =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.test_name, "mutated",
+            "mutate closure's edits must land in the persisted file",
+        );
+    }
+
+    /// Missing-file input: `atomic_mutate_sidecar` surfaces an
+    /// operator-actionable "run the test first" error, not a
+    /// silent success or a raw `ErrorKind::NotFound`.
+    #[test]
+    fn atomic_mutate_sidecar_missing_file_bails_actionably() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("never-created.ktstr.json");
+        let err = atomic_mutate_sidecar(&path, |_| Ok(())).expect_err(
+            "missing sidecar must bail, not silently succeed",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sidecar file not found"),
+            "error must name the remediation, got: {msg}",
+        );
+        assert!(
+            msg.contains("run the test first"),
+            "error must tell the operator how to fix, got: {msg}",
+        );
+    }
+
+    /// Concurrent flock serialization regression. N threads
+    /// each call `atomic_mutate_sidecar` on the same file,
+    /// incrementing a counter embedded in `test_name`. Without
+    /// the flock, two threads would read the same value and one
+    /// increment would be lost; under the flock every mutation
+    /// observes the previous one and the final counter equals N.
+    #[test]
+    fn atomic_mutate_sidecar_serializes_concurrent_callers() {
+        const N: usize = 8;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("counter.ktstr.json");
+        {
+            let mut sc = SidecarResult::test_fixture();
+            sc.test_name = "mutated-0".to_string();
+            std::fs::write(&path, serde_json::to_string_pretty(&sc).unwrap()).unwrap();
+        }
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    atomic_mutate_sidecar(&p, |sc| {
+                        let current: u64 = sc
+                            .test_name
+                            .strip_prefix("mutated-")
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "test_name lost counter shape mid-run: {}",
+                                    sc.test_name,
+                                )
+                            })?;
+                        sc.test_name = format!("mutated-{}", current + 1);
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread panicked").expect("mutate failed");
+        }
+
+        let reloaded: SidecarResult =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let final_count: u64 = reloaded
+            .test_name
+            .strip_prefix("mutated-")
+            .and_then(|s| s.parse().ok())
+            .expect("final test_name must carry counter");
+        assert_eq!(
+            final_count, N as u64,
+            "flock must serialize the {N} concurrent mutators — a count < \
+             {N} means two threads read the same value and one increment \
+             was lost (read-modify-write race)",
+        );
+    }
+
+    /// Set `path`'s mtime to `seconds_ago` before now. Uses
+    /// `libc::utimes` directly rather than pulling in a new
+    /// dev-dep; nix has `nix::sys::stat::utimes` but the shape
+    /// of the TimeVal argument depends on the libc crate being
+    /// present anyway, so the lowest-level call keeps the test
+    /// helper dependency-light.
+    ///
+    /// Returns `None` when the filesystem refuses to round-trip
+    /// the requested mtime (some tmpfs configurations clamp).
+    /// Callers interpret `None` as "skip the check; the kernel
+    /// wouldn't honour the timestamp anyway" rather than panic —
+    /// a flaky timestamp-manipulation test is worse than a
+    /// skipped one.
+    fn set_mtime_secs_ago(path: &std::path::Path, seconds_ago: i64) -> Option<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime before UNIX_EPOCH");
+        let target_secs = now.as_secs() as i64 - seconds_ago;
+        let times = [
+            libc::timeval {
+                tv_sec: target_secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: target_secs,
+                tv_usec: 0,
+            },
+        ];
+        let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let rc = unsafe { libc::utimes(cstr.as_ptr(), times.as_ptr()) };
+        if rc == 0 { Some(()) } else { None }
+    }
+
+    /// `clean_orphaned_sidecar_locks` removes sidecar-
+    /// pattern `.lock` files older than
+    /// [`SIDECAR_LOCK_ORPHAN_AGE`] and preserves fresh ones AND
+    /// foreign `.lock` files. Ages are simulated via
+    /// `libc::utimes` so the test runs in milliseconds rather
+    /// than blocking on a real 5-minute wait.
+    #[test]
+    fn clean_orphaned_sidecar_locks_removes_only_old_sidecar_locks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let old_lock = dir.join("orphan.ktstr.json.lock");
+        std::fs::write(&old_lock, b"").unwrap();
+        let old_secs = SIDECAR_LOCK_ORPHAN_AGE.as_secs() as i64 + 60;
+        set_mtime_secs_ago(&old_lock, old_secs).expect("utimes(old_lock) must succeed");
+
+        let fresh_lock = dir.join("live.ktstr.json.lock");
+        std::fs::write(&fresh_lock, b"").unwrap();
+
+        // Non-sidecar .lock (missing the .ktstr. substring):
+        // must never be touched, even when ancient.
+        let foreign_lock = dir.join("unrelated-tool.lock");
+        std::fs::write(&foreign_lock, b"").unwrap();
+        set_mtime_secs_ago(&foreign_lock, old_secs).expect("utimes(foreign_lock) must succeed");
+
+        let sidecar = dir.join("live.ktstr.json");
+        std::fs::write(&sidecar, b"{}").unwrap();
+
+        let removed = clean_orphaned_sidecar_locks(dir);
+        assert_eq!(
+            removed, 1,
+            "exactly the one aged sidecar-pattern .lock must be removed",
+        );
+        assert!(!old_lock.exists(), "aged orphan must be gone");
+        assert!(fresh_lock.exists(), "fresh .lock must be preserved");
+        assert!(foreign_lock.exists(), "foreign .lock must be preserved");
+        assert!(sidecar.exists(), "the sidecar itself must be preserved");
+    }
+
+    /// Nonexistent dir: return 0 silently. An offline cleaner
+    /// that bailed on missing-dir would wedge the writer path
+    /// before the dir has been created.
+    #[test]
+    fn clean_orphaned_sidecar_locks_handles_missing_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let never = tmp.path().join("never-created");
+        assert_eq!(clean_orphaned_sidecar_locks(&never), 0);
     }
 }

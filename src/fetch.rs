@@ -644,9 +644,15 @@ pub fn git_clone(
 /// fact forward; callers (see [`crate::cli`]) use it to bypass the
 /// kernel cache entirely.
 ///
-/// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
-/// `"cargo ktstr"`).
-pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSource> {
+/// No diagnostic output: all operator-visible messaging for a
+/// local source is routed through `kernel_build_pipeline`'s
+/// cache-skip hint (`DIRTY_TREE_CACHE_SKIP_HINT` /
+/// `NON_GIT_TREE_CACHE_SKIP_HINT`), which has the full context
+/// to emit a single informational line rather than two redundant
+/// warnings. Sibling entries (`download_tarball`, `git_clone`)
+/// still take a `cli_label` because they genuinely print
+/// progress lines — `local_source` does not.
+pub fn local_source(source_path: &Path) -> Result<AcquiredSource> {
     let (arch, _) = arch_info();
 
     if !source_path.is_dir() {
@@ -721,10 +727,16 @@ pub fn local_source(source_path: &Path, cli_label: &str) -> Result<AcquiredSourc
             (hash, is_dirty, true)
         }
         Err(_) => {
-            eprintln!(
-                "{cli_label}: warning: {} is not a git repository, cannot detect dirty state",
-                source_path.display()
-            );
+            // The downstream kernel_build_pipeline (cli::kernel_build_pipeline)
+            // emits `NON_GIT_TREE_CACHE_SKIP_HINT` — a single
+            // informational line that names both the cause and the
+            // remediation paths — once the is_dirty=true branch
+            // decides to skip the cache. Emitting a second
+            // "not a git repository" warning here duplicated that
+            // content for every non-git `--source` run. The
+            // `(None, true, false)` tuple silently communicates
+            // the non-git state to the cache-skip decision site;
+            // no separate stderr line is needed on this path.
             (None, true, false)
         }
     };
@@ -955,7 +967,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         init_repo_with_commit(tmp.path());
 
-        let acquired = local_source(tmp.path(), "ktstr-test").expect("local_source ok");
+        let acquired = local_source(tmp.path()).expect("local_source ok");
         assert!(!acquired.is_dirty, "clean tree must not be dirty");
 
         let git_hash = match &acquired.kernel_source {
@@ -990,7 +1002,7 @@ mod tests {
         // Mutate the tracked file — index-vs-worktree becomes dirty.
         std::fs::write(tmp.path().join("file.txt"), "modified\n").unwrap();
 
-        let acquired = local_source(tmp.path(), "ktstr-test").expect("local_source ok");
+        let acquired = local_source(tmp.path()).expect("local_source ok");
         assert!(acquired.is_dirty, "worktree mutation must mark dirty");
         match &acquired.kernel_source {
             crate::cache::KernelSource::Local { git_hash, .. } => {
@@ -1033,7 +1045,7 @@ mod tests {
             .expect("git add");
         assert!(status.success());
 
-        let acquired = local_source(tmp.path(), "ktstr-test").expect("local_source ok");
+        let acquired = local_source(tmp.path()).expect("local_source ok");
         assert!(acquired.is_dirty, "staged-only change must mark dirty");
         match &acquired.kernel_source {
             crate::cache::KernelSource::Local { git_hash, .. } => {
@@ -1053,7 +1065,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("file.txt"), "no git here\n").unwrap();
 
-        let acquired = local_source(tmp.path(), "ktstr-test").expect("local_source ok");
+        let acquired = local_source(tmp.path()).expect("local_source ok");
         assert!(acquired.is_dirty, "non-git tree must mark dirty");
         match &acquired.kernel_source {
             crate::cache::KernelSource::Local { git_hash, .. } => {

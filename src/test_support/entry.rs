@@ -358,6 +358,19 @@ impl Scheduler {
     /// for which question each label answers, the sidecar-
     /// serialization split, and how to filter by author intent vs.
     /// by scheduling class.
+    ///
+    /// The sidecar itself does not carry the mapping from kernel
+    /// version to scheduling class: the `host.kernel_release`
+    /// field records the live kernel's release string (`6.6.12`,
+    /// `6.14.2`, …) and nothing else. Consumers that need to answer
+    /// "did this run actually use EEVDF?" must combine
+    /// `host.kernel_release` with version-to-class knowledge
+    /// maintained OUTSIDE the sidecar — e.g. an external lookup
+    /// table that records the default scheduling class per upstream
+    /// kernel release. A sidecar alone cannot distinguish a true
+    /// EEVDF run from a run on a successor-class kernel that
+    /// reused the same `"eevdf"` label via
+    /// [`Scheduler::EEVDF`]'s compile-time-fixed `.name`.
     pub const EEVDF: Scheduler = Scheduler {
         name: "eevdf",
         binary: SchedulerSpec::Eevdf,
@@ -1679,13 +1692,20 @@ mod tests {
 
     // -- SchedulerSpec::scheduler_commit --
     //
-    // Conservative by design: only `Discover(_)` returns Some
-    // (workspace-built via `cargo build` → `crate::GIT_HASH`
-    // is authoritative). Every other variant returns None — the
-    // sidecar's nullable semantics distinguish "unset" from a
-    // sentinel so consumers can tell "no userspace binary" from
-    // "external binary, commit unknown." See the method doc for
-    // the full rationale.
+    // Conservative by design: EVERY variant currently returns
+    // None, including `Discover(_)`. `resolve_scheduler`'s 5-path
+    // cascade can pick up a binary whose commit does not match
+    // `crate::GIT_HASH` in four of the five paths, so `Discover`
+    // returns None to avoid lying. The sidecar's nullable
+    // semantics distinguish "unset" from a sentinel so consumers
+    // can tell "no userspace binary" (Eevdf, KernelBuiltin) from
+    // "external binary, commit unknown" (Path) and "discovered
+    // binary, provenance unverified" (Discover). A future
+    // introspection path (`binary --version`, ELF note, BuildId
+    // lookup) can flip a variant to Some(..) when an authoritative
+    // commit is available; until then, None keeps consumers from
+    // attributing regressions to the wrong commit. See the method
+    // doc for the per-variant rationale.
 
     #[test]
     fn scheduler_commit_eevdf_returns_none() {

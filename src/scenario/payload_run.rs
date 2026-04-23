@@ -1597,14 +1597,23 @@ fn wait_and_capture(child: &mut std::process::Child) -> Result<SpawnOutput> {
     // historic `.map_err(|_| anyhow!("...panicked"))` arm could not
     // fire and misled readers into expecting a recoverable error.
     //
-    // Under cargo's default `panic = "unwind"` (dev + test profiles
-    // — only `[profile.release]` overrides to abort in this crate),
-    // a reader-thread panic DOES unwind into `thread::Result::Err`;
-    // `.unwrap()` re-panics on the main thread so the test harness
-    // sees the failure instead of hanging on a half-drained stream.
-    // The panic=abort caller contract holds in release; debug/test
-    // callers get a loud re-panic rather than a silent wrong answer.
-    // Either way no `Err` reaches the `?`.
+    // Under cargo's default `panic = "unwind"` (which the dev and
+    // test profiles both inherit — only `[profile.release]` flips
+    // to abort in this crate), a reader-thread panic DOES unwind
+    // into `thread::Result::Err`. The `.unwrap()` then re-panics on
+    // the main thread, which is the key test-profile behavior: the
+    // libtest / nextest harness installs a per-test panic hook that
+    // catches the re-panic and reports it as a failed test with the
+    // reader-thread's payload preserved. The alternative —
+    // `.map_err(|_| anyhow!("..."))` — would erase the reader-
+    // thread panic payload, surface a generic string through `?`,
+    // and make the test pass look like "drain step returned Err"
+    // when the true failure was a panic inside `drain_capped` (an
+    // indexing-out-of-bounds on a malformed stream, say). The
+    // panic=abort caller contract holds in release (whole-process
+    // abort); debug/test callers get a loud re-panic with the
+    // original panic payload visible. Either way no `Err` reaches
+    // the `?` below.
     let (stdout, _stdout_truncated) = match stdout_handle {
         Some(h) => h.join().unwrap().with_context(|| "read child stdout")?,
         None => (String::new(), false),
@@ -3133,6 +3142,64 @@ mod tests {
         assert_eq!(pm.metrics.len(), 1, "stderr fallback must fire");
         assert_eq!(pm.metrics[0].name, "latency_ns");
         assert_eq!(pm.metrics[0].value, 1234.0);
+    }
+
+    /// End-to-end stream-attribution pin for the stderr-fallback
+    /// branch. When stdout carries no extractable metrics and the
+    /// fallback pulls the real document from stderr, every emitted
+    /// metric's `stream` field must tag `MetricStream::Stderr` —
+    /// NOT `Stdout`. The attribution is what lets downstream review
+    /// tools filter stderr-sourced metrics (well-behaved payloads
+    /// keep stdout canonical; an all-stderr metric set is a review
+    /// hint that the payload may be violating the channel
+    /// convention). A regression that stamped `Stdout` on every
+    /// Metric regardless of source would silence that review
+    /// signal without changing the metric values themselves — this
+    /// test pins the attribution end-to-end so the regression
+    /// cannot slip past the existing value-only asserts on the
+    /// sibling fallback tests.
+    ///
+    /// Pairs three fallback shapes in one test: empty stdout, prose
+    /// stdout, and valid-JSON-no-numeric-leaves stdout. The three
+    /// share one fallback decision (`metrics.is_empty()` after
+    /// stdout attempt), so their attribution invariant is identical;
+    /// one test exercises all three to close the fallback-shape
+    /// coverage gap for the stream field specifically.
+    #[test]
+    fn stderr_fallback_tags_metrics_with_metric_stream_stderr() {
+        use crate::test_support::MetricStream;
+
+        for (label, stdout) in [
+            ("empty-stdout", String::new()),
+            (
+                "prose-stdout",
+                "no json here, just prose from a banner line\n".to_string(),
+            ),
+            (
+                "valid-json-no-numeric-leaves-stdout",
+                r#"{"status": "ok", "ready": true, "note": null}"#.to_string(),
+            ),
+        ] {
+            let output = SpawnOutput {
+                stdout,
+                stderr: r#"{"iops": 4242}"#.to_string(),
+                exit_code: 0,
+            };
+            let (_, pm) = evaluate(&JSON_PAYLOAD, &[], output);
+            assert_eq!(
+                pm.metrics.len(),
+                1,
+                "[{label}] stderr fallback must produce exactly one metric",
+            );
+            assert_eq!(
+                pm.metrics[0].stream,
+                MetricStream::Stderr,
+                "[{label}] fallback-extracted metric must carry MetricStream::Stderr \
+                 so downstream review tooling can distinguish stream origin; \
+                 got stream={:?}",
+                pm.metrics[0].stream,
+            );
+        }
     }
 
     /// Stdout present but unparseable (not-JSON prose); stderr

@@ -143,14 +143,15 @@ fn classify_repro_vm_status(
         // paths that did not deliver the guest's final exit message;
         // watchdog-fire is caught earlier via `timed_out`, so a -1
         // reaching THIS branch indicates a code-unsetting error
-        // path, not a signal-kill), or <-1 (signal-kill / other VMM
-        // convention). Labeling all four as "crashed (exit N)"
-        // conflates the guest-scheduler failure with qemu's own
-        // exit, making the qemu-clean and VMM-sentinel cases
-        // especially misleading. The -1 clause is phrased in
-        // end-user terms: the internals (boot-CPU run loop,
-        // scheduler-exit IPC message) belong in the code comment,
-        // not in the output a test operator reads at the console.
+        // path, not a signal-kill), or <-1 (signal-kill, rendered
+        // via `ExitStatus::signal()` as a negative i32 on unix).
+        // Labeling all four as "crashed (exit N)" conflates the
+        // guest-scheduler failure with qemu's own exit, making the
+        // qemu-clean and VMM-sentinel cases especially misleading.
+        // The -1 clause is phrased in end-user terms: the internals
+        // (boot-CPU run loop, scheduler-exit IPC message) belong in
+        // the code comment, not in the output a test operator reads
+        // at the console.
         let exit_clause = if exit_code == -1 {
             "VM host reported no final exit status (the scheduler did not \
              deliver an exit signal before the VM ended)"
@@ -1788,9 +1789,8 @@ mod tests {
              the VM ended)",
         );
         // Negative assertions: none of the internal vocabulary may
-        // leak into the user-facing status — each term was flagged
-        // as a usability bug in  and must stay out of the
-        // rendered string.
+        // leak into the user-facing status — each term is a
+        // usability bug and must stay out of the rendered string.
         assert!(!status.contains("BSP"), "user-facing status leaks BSP: {status}");
         assert!(
             !status.contains("VmResult::exit_code"),

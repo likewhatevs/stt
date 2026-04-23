@@ -1930,28 +1930,30 @@ impl WorkloadHandle {
                     //    default unwind semantics) still get a real
                     //    `catch_unwind` Err → `_exit(1)` fast-path.
                     //
-                    //    Global-state safety under unwind: the
-                    //    globals reachable from `worker_main`'s
-                    //    code path are atomic primitives
-                    //    (`STOP`: AtomicBool, `SCHED_PID`:
-                    //    AtomicI32, `REPRO_MODE`: AtomicBool) and
-                    //    `OnceLock` (`STATIC_HOST_INFO`). Other
-                    //    crate-wide statics (fetch, probe, vmm)
-                    //    exist but are not touched by the worker
-                    //    path. None of the worker-path globals
-                    //    carry Drop
-                    //    logic that touches the inherited MAP_SHARED
-                    //    regions or the parent-owned pipe fds.
-                    //    Under a hypothetical unwind that escaped
-                    //    `catch_unwind` (e.g. a double-panic that
+                    //    Global-state safety under unwind, scoped
+                    //    to `worker_main`'s reachable code path —
+                    //    the `fork()` child's observable set. Four
+                    //    items: `STOP: AtomicBool`, `SCHED_PID:
+                    //    AtomicI32`, `REPRO_MODE: AtomicBool`, and
+                    //    `STATIC_HOST_INFO: OnceLock<_>`. None of
+                    //    them carry a Drop whose body touches the
+                    //    inherited MAP_SHARED regions or the
+                    //    parent-owned pipe fds. Under a
+                    //    hypothetical unwind that escaped
+                    //    `catch_unwind` (a double-panic that
                     //    bypasses the landing pad), the only
-                    //    fork-child Drops that matter are on the
-                    //    guard (severed by `mem::forget` above) and
-                    //    on `resume_latencies_ns` / `migrations`
-                    //    (child-local Vec<T>, no cross-process
-                    //    impact). `STATIC_HOST_INFO`'s inner Drop
-                    //    frees a handful of Option<String>s; safe
-                    //    to run in either parent or child.
+                    //    fork-child Drops that actually matter are
+                    //    the guard (severed by `mem::forget`
+                    //    above) and the child-local
+                    //    `resume_latencies_ns` / `migrations`
+                    //    `Vec<T>` (per-process heap, no cross-
+                    //    process impact). `STATIC_HOST_INFO`'s
+                    //    inner Drop frees a handful of
+                    //    `Option<String>`s and is safe on either
+                    //    side of fork. Crate-wide statics outside
+                    //    this set (fetch, probe, vmm, …) are out
+                    //    of scope — this audit pins only what the
+                    //    fork-child can reach from `worker_main`.
                     //
                     // 4. `_exit(1)` on catch_unwind Err, `_exit(0)`
                     //    on Ok — bypasses Rust's global static
@@ -3767,6 +3769,54 @@ pub fn set_thread_affinity(pid: libc::pid_t, cpus: &BTreeSet<usize>) -> Result<(
 mod tests {
     use super::*;
 
+    /// Collapse the mechanical
+    /// `fn spawn_*_produces_work() { let config = WorkloadConfig
+    /// { .. }; let mut h = WorkloadHandle::spawn(&config).unwrap();
+    /// h.start(); sleep(ms); let reports = h.stop_and_collect(); ..
+    /// }` test patterns into a single helper call. The boilerplate
+    /// (`WorkloadConfig` literal, spawn, start, sleep, collect)
+    /// is identical across work types — the caller's only unique
+    /// contributions are the `WorkType` variant, the number of
+    /// workers, the sleep duration, and the per-test assertions
+    /// that follow. Every caller keeps its own assertions so the
+    /// helper does NOT homogenize what each test guards; it
+    /// collapses only the scaffolding.
+    ///
+    /// `num_workers` is explicit (not defaulted) because some
+    /// tests use 2 workers (e.g. PipeIo needs even counts,
+    /// futex pairs need 2-worker groups) and defaulting would
+    /// force a rewrite at a later date when a new caller adds a
+    /// 2-worker test.
+    ///
+    /// `sleep_ms` is explicit because different work types reach
+    /// steady state at different wall-clock budgets — defaulting
+    /// to a single value would make low-throughput work types
+    /// flake under CI's typical 2-core runners.
+    ///
+    /// Other `WorkloadConfig` fields (`affinity`, `sched_policy`,
+    /// `mem_policy`, `mpol_flags`) take
+    /// [`WorkloadConfig::default`] values. Tests that need to
+    /// override any of those fields construct the config
+    /// literally — this helper covers only the mechanical
+    /// "spawn, sleep, collect" shape.
+    fn spawn_and_collect_after(
+        work_type: WorkType,
+        num_workers: usize,
+        sleep_ms: u64,
+    ) -> Vec<WorkerReport> {
+        let config = WorkloadConfig {
+            num_workers,
+            affinity: AffinityMode::None,
+            work_type,
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+        h.stop_and_collect()
+    }
+
     /// `clock_gettime_ns(CLOCK_MONOTONIC)` must never observe time
     /// moving backwards between two sequential calls on the same
     /// thread. Pins the non-decreasing contract the wake-latency
@@ -4214,34 +4264,14 @@ mod tests {
 
     #[test]
     fn spawn_yield_heavy_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 1,
-            affinity: AffinityMode::None,
-            work_type: WorkType::YieldHeavy,
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let reports = h.stop_and_collect();
+        let reports = spawn_and_collect_after(WorkType::YieldHeavy, 1, 200);
         assert_eq!(reports.len(), 1);
         assert!(reports[0].work_units > 0);
     }
 
     #[test]
     fn spawn_mixed_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 1,
-            affinity: AffinityMode::None,
-            work_type: WorkType::Mixed,
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let reports = h.stop_and_collect();
+        let reports = spawn_and_collect_after(WorkType::Mixed, 1, 200);
         assert_eq!(reports.len(), 1);
         assert!(reports[0].work_units > 0);
     }
@@ -4648,54 +4678,28 @@ mod tests {
 
     #[test]
     fn spawn_io_sync_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 1,
-            affinity: AffinityMode::None,
-            work_type: WorkType::IoSync,
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let reports = h.stop_and_collect();
+        let reports = spawn_and_collect_after(WorkType::IoSync, 1, 200);
         assert_eq!(reports.len(), 1);
         assert!(reports[0].work_units > 0);
     }
 
     #[test]
     fn spawn_bursty_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 1,
-            affinity: AffinityMode::None,
-            work_type: WorkType::Bursty {
+        let reports = spawn_and_collect_after(
+            WorkType::Bursty {
                 burst_ms: 50,
                 sleep_ms: 50,
             },
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let reports = h.stop_and_collect();
+            1,
+            300,
+        );
         assert_eq!(reports.len(), 1);
         assert!(reports[0].work_units > 0);
     }
 
     #[test]
     fn spawn_pipeio_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 2,
-            affinity: AffinityMode::None,
-            work_type: WorkType::PipeIo { burst_iters: 1024 },
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let reports = h.stop_and_collect();
+        let reports = spawn_and_collect_after(WorkType::PipeIo { burst_iters: 1024 }, 2, 300);
         assert_eq!(reports.len(), 2);
         for r in &reports {
             assert!(r.work_units > 0, "PipeIo worker {} did no work", r.tid);
@@ -5546,20 +5550,14 @@ mod tests {
 
     #[test]
     fn spawn_futex_fan_out_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 5, // 1 messenger + 4 receivers
-            affinity: AffinityMode::None,
-            work_type: WorkType::FutexFanOut {
+        let reports = spawn_and_collect_after(
+            WorkType::FutexFanOut {
                 fan_out: 4,
                 spin_iters: 1024,
             },
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let reports = h.stop_and_collect();
+            5, // 1 messenger + 4 receivers
+            500,
+        );
         assert_eq!(reports.len(), 5);
         for r in &reports {
             assert!(r.work_units > 0, "FutexFanOut worker {} did no work", r.tid);
@@ -5881,17 +5879,11 @@ mod tests {
 
     #[test]
     fn spawn_futex_ping_pong_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 2,
-            affinity: AffinityMode::None,
-            work_type: WorkType::FutexPingPong { spin_iters: 1024 },
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let reports = h.stop_and_collect();
+        let reports = spawn_and_collect_after(
+            WorkType::FutexPingPong { spin_iters: 1024 },
+            2,
+            500,
+        );
         assert_eq!(reports.len(), 2);
         for r in &reports {
             assert!(
@@ -5904,60 +5896,42 @@ mod tests {
 
     #[test]
     fn spawn_cache_pressure_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 1,
-            affinity: AffinityMode::None,
-            work_type: WorkType::CachePressure {
+        let reports = spawn_and_collect_after(
+            WorkType::CachePressure {
                 size_kb: 32,
                 stride: 64,
             },
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let reports = h.stop_and_collect();
+            1,
+            200,
+        );
         assert_eq!(reports.len(), 1);
         assert!(reports[0].work_units > 0);
     }
 
     #[test]
     fn spawn_cache_yield_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 1,
-            affinity: AffinityMode::None,
-            work_type: WorkType::CacheYield {
+        let reports = spawn_and_collect_after(
+            WorkType::CacheYield {
                 size_kb: 32,
                 stride: 64,
             },
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let reports = h.stop_and_collect();
+            1,
+            200,
+        );
         assert_eq!(reports.len(), 1);
         assert!(reports[0].work_units > 0);
     }
 
     #[test]
     fn spawn_cache_pipe_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 2,
-            affinity: AffinityMode::None,
-            work_type: WorkType::CachePipe {
+        let reports = spawn_and_collect_after(
+            WorkType::CachePipe {
                 size_kb: 32,
                 burst_iters: 1024,
             },
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let reports = h.stop_and_collect();
+            2,
+            300,
+        );
         assert_eq!(reports.len(), 2);
         for r in &reports {
             assert!(r.work_units > 0, "CachePipe worker {} did no work", r.tid);
@@ -5966,20 +5940,14 @@ mod tests {
 
     #[test]
     fn spawn_sequence_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 1,
-            affinity: AffinityMode::None,
-            work_type: WorkType::Sequence {
+        let reports = spawn_and_collect_after(
+            WorkType::Sequence {
                 first: Phase::Spin(Duration::from_millis(10)),
                 rest: vec![Phase::Yield(Duration::from_millis(10))],
             },
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let reports = h.stop_and_collect();
+            1,
+            200,
+        );
         assert_eq!(reports.len(), 1);
         assert!(reports[0].work_units > 0);
     }
@@ -7737,21 +7705,15 @@ mod tests {
 
     #[test]
     fn spawn_mutex_contention_produces_work() {
-        let config = WorkloadConfig {
-            num_workers: 4,
-            affinity: AffinityMode::None,
-            work_type: WorkType::MutexContention {
+        let reports = spawn_and_collect_after(
+            WorkType::MutexContention {
                 contenders: 4,
                 hold_iters: 64,
                 work_iters: 256,
             },
-            sched_policy: SchedPolicy::Normal,
-            ..Default::default()
-        };
-        let mut h = WorkloadHandle::spawn(&config).unwrap();
-        h.start();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let reports = h.stop_and_collect();
+            4,
+            500,
+        );
         assert_eq!(reports.len(), 4);
         for r in &reports {
             assert!(

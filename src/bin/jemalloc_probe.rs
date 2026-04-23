@@ -129,7 +129,7 @@ use nix::sys::ptrace;
 use nix::sys::ptrace::Options;
 #[cfg(target_arch = "x86_64")]
 use nix::sys::ptrace::regset::NT_PRSTATUS;
-use nix::sys::signal::{SigHandler, Signal, signal};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction, signal};
 use nix::sys::uio::{RemoteIoVec, process_vm_readv};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
@@ -280,6 +280,24 @@ mod arch {
         };
         if res == -1 {
             return Err(nix::errno::Errno::last());
+        }
+        // PTRACE_GETREGSET writes the actual number of bytes the
+        // kernel produced back into `iov.iov_len`. A short write
+        // means the kernel emitted fewer bytes than our u64 slot —
+        // `tpidr` would carry only the low bytes with the high
+        // bytes unchanged from the zero-init above. Silently
+        // trusting that truncation would feed a zero-padded
+        // low-byte pattern through `compute_tls_address_variant_i`
+        // and surface as a `process_vm_readv` failure against a
+        // malformed address, obscuring the real root cause. Surface
+        // EIO here so the caller's `ThreadProbeError::getregset`
+        // arm reports a clear "regset truncated" shape instead.
+        // The failure mode is extremely narrow (any kernel with
+        // NT_ARM_TLS support writes at least TPIDR_EL0 as u64), so
+        // this gate mostly guards against a future regset trim
+        // rather than current kernels.
+        if iov.iov_len < std::mem::size_of::<u64>() {
+            return Err(nix::errno::Errno::EIO);
         }
         Ok(tpidr)
     }
@@ -725,6 +743,20 @@ enum ThreadResult {
         /// `None` here never fails the probe.
         #[serde(skip_serializing_if = "Option::is_none")]
         comm: Option<String>,
+        /// Per-thread `starttime` from field 22 of
+        /// `/proc/{pid}/task/{tid}/stat` (clock ticks since boot,
+        /// per `proc(5)`). Paired with `tid` this forms a composite
+        /// identity that is robust across pid reuse: a tid that
+        /// exits mid-run and is later recycled by the kernel for a
+        /// new thread will carry a different `starttime`, letting
+        /// diff tooling detect the change instead of silently
+        /// conflating two distinct threads. `None` when the stat
+        /// file cannot be read or parsed — same best-effort policy
+        /// as `comm`. Additive-safe per the `SCHEMA_VERSION`
+        /// contract: a consumer that ignores the field keeps its
+        /// tid-only keying.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        start_time_jiffies: Option<u64>,
         allocated_bytes: u64,
         deallocated_bytes: u64,
     },
@@ -736,6 +768,15 @@ enum ThreadResult {
         /// attach is harder from the tid alone.
         #[serde(skip_serializing_if = "Option::is_none")]
         comm: Option<String>,
+        /// Per-thread `starttime` paired with `tid`, same
+        /// composite-identity shape as the `Ok` arm. Useful on
+        /// failure paths for the same reason as `comm`: the tid
+        /// alone does not uniquely identify a thread across pid
+        /// reuse, so diff tooling keying on `(tid, start_time)`
+        /// distinguishes a racing re-spawn from a persistent
+        /// failure.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        start_time_jiffies: Option<u64>,
         /// Human-readable error rendering for log / stderr paths.
         error: String,
         /// Structural classification so machine consumers can bucket
@@ -1630,10 +1671,55 @@ extern "C" fn on_sigint(_sig: i32) {
     CLEANUP_REQUESTED.store(true, Ordering::SeqCst);
 }
 
-/// Install a SIGINT/SIGTERM handler that asks the main loop to detach
-/// every still-attached tid and exit. Returns `()` rather than
-/// failing — if signal install fails, the probe still works; only the
-/// Ctrl-C cleanup guarantee is weakened.
+/// No-op SIGALRM handler. Its sole purpose is to interrupt a
+/// blocking syscall on the main thread so the in-flight
+/// `waitpid` / `flock` / sleep returns `EINTR` and the main
+/// thread's retry loop can observe [`CLEANUP_REQUESTED`] on the
+/// next poll boundary.
+///
+/// CRITICAL: this handler MUST be installed via
+/// [`nix::sys::signal::sigaction`] with `SaFlags::empty()` —
+/// explicitly clearing `SA_RESTART`. The BSD-compatible
+/// `nix::sys::signal::signal` helper sets `SA_RESTART` by
+/// default (per the nix::signal doc), which causes the kernel
+/// to silently restart interrupted syscalls instead of
+/// surfacing `EINTR`. That route breaks the entire
+/// `--abort-after-ms` deadline mechanism: the signal fires,
+/// `on_sigalrm` runs, then the interrupted syscall resumes
+/// from the kernel's restart logic and the main thread never
+/// observes the cleanup flag it was supposed to notice between
+/// retries. See [`install_cleanup_handler`] for the explicit
+/// `SaFlags::empty()` install.
+///
+/// Distinct from [`on_sigint`] because SIGALRM arrives on the main
+/// thread from the deadline-timer thread via `tgkill(...SIGALRM)`
+/// — its body does not flip the cleanup flag itself (the timer
+/// thread already did that before sending the signal, so the
+/// race-free order is "flag then signal"). The handler just has
+/// to exist so the default `SIG_DFL` action — which would
+/// terminate the process for SIGALRM — is replaced with a
+/// user-space no-op whose only observable effect is EINTR.
+extern "C" fn on_sigalrm(_sig: i32) {
+    // Intentionally empty: the syscall interruption IS the work.
+}
+
+/// Install a SIGINT / SIGTERM / SIGALRM handler set. SIGINT /
+/// SIGTERM flip the cleanup flag directly. SIGALRM is installed as a
+/// no-op handler so the deadline-timer thread can interrupt a
+/// blocking syscall (waitpid after PTRACE_INTERRUPT, flock on
+/// sidecar) via `tgkill(main_tid, SIGALRM)` and the main thread
+/// observes the cleanup flag on its next poll boundary. Returns `()`
+/// rather than failing — if signal install fails, the probe still
+/// works; only the Ctrl-C / deadline cleanup guarantee is weakened.
+///
+/// SIGINT / SIGTERM ride on the BSD-compatible `signal()` helper
+/// because their handler body sets the flag directly and does not
+/// depend on syscall interruption — even if a syscall restarts,
+/// the next cleanup check catches the flag. SIGALRM needs
+/// `sigaction` with `SaFlags::empty()` instead because its ENTIRE
+/// purpose is to produce `EINTR`: under `signal()`'s default
+/// `SA_RESTART=1` the kernel silently restarts interrupted
+/// syscalls and the deadline mechanism breaks.
 fn install_cleanup_handler() {
     for sig in [Signal::SIGINT, Signal::SIGTERM] {
         // SAFETY: `on_sigint` only touches an `AtomicBool`, which is
@@ -1641,6 +1727,24 @@ fn install_cleanup_handler() {
         unsafe {
             let _ = signal(sig, SigHandler::Handler(on_sigint));
         }
+    }
+    // `SaFlags::empty()` explicitly clears `SA_RESTART` so a blocking
+    // syscall (waitpid, flock, nanosleep) on the main thread returns
+    // `EINTR` when SIGALRM fires, letting the outer retry loop observe
+    // `CLEANUP_REQUESTED`. An empty `SigSet` means no signals are
+    // masked during handler execution — acceptable because the handler
+    // body is trivially empty.
+    let action = SigAction::new(
+        SigHandler::Handler(on_sigalrm),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+    // SAFETY: `on_sigalrm` is empty — trivially async-signal-safe.
+    // Failure here weakens the deadline cleanup guarantee but does
+    // NOT break the probe; fall through silently, matching the
+    // SIGINT / SIGTERM policy above.
+    unsafe {
+        let _ = sigaction(Signal::SIGALRM, &action);
     }
 }
 
@@ -1854,6 +1958,59 @@ fn read_thread_comm(pid: i32, tid: i32) -> Option<String> {
     }
 }
 
+/// Best-effort read of field 22 (`starttime`) from
+/// `/proc/{pid}/task/{tid}/stat`: clock ticks since boot at which
+/// this task was started, per `proc(5)`. Paired with `tid` this
+/// forms a `(tid, start_time)` composite identity that survives
+/// kernel pid reuse — a recycled tid carries a different starttime.
+///
+/// Parsing contract: `/proc/<pid>/stat` is a single line of
+/// whitespace-separated fields. Field 2 (`comm`) is wrapped in
+/// parentheses and MAY contain embedded whitespace, parentheses,
+/// or unicode; every field after it is indexed relative to the
+/// LAST `)` in the line rather than a naive `split_whitespace`
+/// count. This parser splits only the tail after the final
+/// `)` — fields 3..N — and indexes `starttime` at offset 19
+/// from that tail (field 22 overall = offset 19 past field 3).
+///
+/// Returns `None` on any failure (race-exited tid, unreadable
+/// stat, missing `)`, or unparseable starttime field). The
+/// caller treats `None` the same as `comm`: best-effort, never
+/// escalates to a probe failure.
+fn read_thread_start_time(pid: i32, tid: i32) -> Option<u64> {
+    let path = format!("/proc/{pid}/task/{tid}/stat");
+    let raw = fs::read_to_string(path).ok()?;
+    parse_start_time_from_stat(&raw)
+}
+
+/// Pure parser for the `starttime` (field 22) extraction. Split
+/// from [`read_thread_start_time`] so unit tests exercise the
+/// comm-contains-`)` robustness without touching `/proc`.
+///
+/// See [`read_thread_start_time`] for the field-indexing rationale;
+/// `rfind(')')` locates the `comm` field's closing paren, and the
+/// whitespace-split tail past it is indexed at offset 19 to reach
+/// field 22 (fields 3 through 22 = 20 tokens, 0-indexed).
+///
+/// Single-line contract: `proc(5)` specifies `/proc/<pid>/task/<tid>/stat`
+/// as a single line, but hypothetical future kernel changes (or
+/// readers that include adjacent content) could yield multi-line
+/// input. `lines().next()` pins the parse to the first line so a
+/// trailing newline or appended content cannot let `rfind(')')`
+/// latch onto a `)` past the single `stat` record and misalign the
+/// field index.
+fn parse_start_time_from_stat(raw: &str) -> Option<u64> {
+    let line = raw.lines().next()?;
+    let last_close = line.rfind(')')?;
+    let tail = line.get(last_close + 1..)?;
+    let mut fields = tail.split_ascii_whitespace();
+    // Skip fields 3..=21 (19 tokens) to land on field 22.
+    for _ in 0..19 {
+        fields.next()?;
+    }
+    fields.next()?.parse::<u64>().ok()
+}
+
 /// Drop guard that detaches the tid on scope exit so a mid-read
 /// failure doesn't leave the target thread stopped.
 struct ScopeDetach(i32);
@@ -2063,11 +2220,13 @@ fn take_snapshot(
             interrupted = true;
             break;
         }
-        // Read comm BEFORE probe: on failure paths the tid may
-        // exit mid-probe, and the pre-probe read has the best chance
-        // of catching a populated comm. Best-effort either way — a
-        // `None` comm never upgrades a per-thread result to Err.
+        // Read comm + starttime BEFORE probe: on failure paths the
+        // tid may exit mid-probe, and the pre-probe read has the
+        // best chance of catching populated diagnostic fields.
+        // Best-effort either way — a `None` value never upgrades a
+        // per-thread result to Err.
         let comm = read_thread_comm(pid, tid);
+        let start_time_jiffies = read_thread_start_time(pid, tid);
         // Cache hit skips the per-snapshot ptrace dance on snapshots
         // 2..N for a tid observed on a prior snapshot. Stale entries
         // (tid exited and dropped out of the enumeration) were
@@ -2080,6 +2239,7 @@ fn take_snapshot(
                 threads.push(ThreadResult::Ok {
                     tid,
                     comm,
+                    start_time_jiffies,
                     allocated_bytes: c.allocated_bytes,
                     deallocated_bytes: c.deallocated_bytes,
                 });
@@ -2087,6 +2247,7 @@ fn take_snapshot(
             Err(e) => threads.push(ThreadResult::Err {
                 tid,
                 comm,
+                start_time_jiffies,
                 error: format!("{:#}", e.source),
                 error_kind: e.kind,
             }),
@@ -2278,9 +2439,17 @@ fn run(cli: &Cli) -> RunOutcome {
         // this snapshot forward. Freezing the list at run start missed
         // late-created threads entirely; for long multi-snapshot
         // runs against a growing thread pool that is the common
-        // shape. Per-snapshot enumeration is
-        // cheap (single `readdir` of /proc/<pid>/task, no ptrace
-        // work) and catches the "new tid" case; exits still surface
+        // shape.
+        //
+        // Per-snapshot enumeration is `O(threads)`: a single
+        // `readdir(/proc/<pid>/task)` walks one directory entry per
+        // live task. On a small allocator worker (tens of threads)
+        // the cost is negligible next to the per-tid ptrace dance
+        // on each snapshot; on a process with thousands of threads
+        // the `readdir` itself is the dominant non-ptrace cost of
+        // a snapshot. It still adds no ptrace work beyond what
+        // per-tid probing requires, and catches the "new tid" case;
+        // exits still surface
         // as ThreadResult::Err on snapshots where the tid hasn't
         // been reaped yet, then drop out of subsequent enumerations.
         let tids = match iter_task_ids(pid) {
@@ -2370,6 +2539,7 @@ fn print_thread_result(t: &ThreadResult) {
             comm,
             allocated_bytes,
             deallocated_bytes,
+            ..
         } => {
             let comm_suffix = format_comm_suffix(comm.as_deref());
             println!(
@@ -2381,6 +2551,7 @@ fn print_thread_result(t: &ThreadResult) {
             comm,
             error,
             error_kind,
+            ..
         } => {
             let comm_suffix = format_comm_suffix(comm.as_deref());
             eprintln!("warning: tid {tid}{comm_suffix} [{error_kind}]: {error}");
@@ -2559,6 +2730,23 @@ fn append_probe_output_to_sidecar(
     const FLOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     let deadline = std::time::Instant::now() + FLOCK_BUDGET;
     loop {
+        // Honor the probe-wide deadline / SIGINT / SIGTERM path.
+        // The SIGALRM-based syscall interruption in `main`'s timer
+        // thread wakes the `thread::sleep` below via EINTR (no
+        // SA_RESTART on the SIGALRM handler), the loop re-enters,
+        // this check fires, and we bail instead of burning the full
+        // 30 s flock budget. Without this gate an `--abort-after-ms
+        // 500` against a contested lock would hang for 30 s regardless
+        // of the configured probe deadline. Checked BEFORE the flock
+        // syscall so even a lock that's currently acquirable does not
+        // race past an already-flagged cleanup.
+        if CLEANUP_REQUESTED.load(Ordering::SeqCst) {
+            bail!(
+                "sidecar append aborted by probe deadline (SIGINT / SIGTERM / --abort-after-ms) \
+                 while waiting on flock(LOCK_EX) on {}",
+                lock_path.display(),
+            );
+        }
         match flock(&lock_fd, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => break,
             Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
@@ -2706,14 +2894,20 @@ fn main() {
         std::process::exit(2);
     }
     // `--abort-after-ms MS`: spawn a detached timer thread that
-    // flips `CLEANUP_REQUESTED` after MS milliseconds, reusing
+    // flips `CLEANUP_REQUESTED` after MS milliseconds, then sends
+    // SIGALRM to the main thread via `tgkill` so any in-flight
+    // blocking syscall (`waitpid` after `PTRACE_INTERRUPT`, `flock`
+    // on the `--sidecar` path) returns `EINTR` and the main thread
+    // observes the cleanup flag on its next poll boundary. Reuses
     // the existing SIGINT cleanup path (detach-all + partial
     // snapshot with `interrupted: true`). The thread holds no
-    // references and leaks on a fast-probe exit — `process::exit`
-    // reaps it unconditionally, and a probe that exits before the
-    // deadline simply never observes the flag flip. No
-    // synchronization with `main` is required; the atomic store
-    // is the full handoff.
+    // heap references and leaks on a fast-probe exit —
+    // `process::exit` reaps it unconditionally, and a probe that
+    // exits before the deadline simply never observes the flag flip
+    // or the signal. No synchronization with `main` is required
+    // beyond the ordered pair "store flag, then signal": the
+    // SeqCst store happens-before the `tgkill` syscall, and the
+    // main thread's post-EINTR flag-reload observes the store.
     //
     // The `ktstr-probe-deadline:` stderr line mirrors the
     // `ktstr-probe-fatal:` / `ktstr-probe-all-failed:` tag
@@ -2723,11 +2917,30 @@ fn main() {
     // Emitted BEFORE the atomic store so any downstream consumer
     // reading interleaved stderr + stdout sees the tag ahead of
     // the partial JSON.
+    //
+    // `main_tid` is captured via `gettid(2)` BEFORE the thread is
+    // spawned so the timer body targets the main thread
+    // specifically. `tgkill(pid, main_tid, SIGALRM)` routes the
+    // signal to that tid and no other — a plain `kill(pid, ...)`
+    // would deliver to an unspecified thread (the kernel picks)
+    // and could miss the blocked main thread entirely if another
+    // thread existed.
     if let Some(ms) = cli.abort_after_ms {
+        // SAFETY: `gettid(2)` takes no arguments and returns the
+        // calling thread's tid; always safe.
+        let main_tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+        let main_pid = std::process::id() as libc::pid_t;
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             eprintln!("ktstr-probe-deadline: abort after {ms}ms");
             CLEANUP_REQUESTED.store(true, Ordering::SeqCst);
+            // SAFETY: `tgkill(2)` is async-signal-safe and pure
+            // syscall dispatch; main_pid + main_tid are fixed for
+            // the lifetime of the probe process (no fork/exec on
+            // this code path).
+            unsafe {
+                libc::syscall(libc::SYS_tgkill, main_pid, main_tid, libc::SIGALRM);
+            }
         });
     }
     match run(&cli) {
@@ -2736,11 +2949,32 @@ fn main() {
                 eprintln!("error writing output: {e:#}");
                 std::process::exit(1);
             }
+            // Sidecar-append failure uses a DISTINCT exit
+            // code (3) from probe-failure (1). Without the split,
+            // a caller that reads `exit_code != 0` cannot tell
+            // whether the probe itself failed (real regression
+            // signal) or just the downstream sidecar enrichment
+            // (a benign bookkeeping failure). The probe stdout
+            // already carries the full `ProbeOutput` successfully
+            // on this branch — print_output succeeded above — so
+            // the primary data reached the caller. A consumer
+            // that cares about the sidecar-enrichment layer
+            // specifically (e.g. a CI job that only gates on
+            // sidecar presence) can key on exit-code 3; the
+            // default `!= 0` test treats it as a failure and
+            // surfaces the stderr diagnostic, same as today.
+            // Exit 1 is reserved for genuine probe failures on
+            // the other RunOutcome arms.
             if let Some(path) = cli.sidecar.as_deref()
                 && let Err(e) = append_probe_output_to_sidecar(path, &out, 0)
             {
-                eprintln!("error appending to sidecar {}: {e:#}", path.display());
-                std::process::exit(1);
+                eprintln!(
+                    "error appending to sidecar {} (probe output already \
+                     printed to stdout; exit 3 distinguishes \
+                     sidecar-append failure from probe failure): {e:#}",
+                    path.display(),
+                );
+                std::process::exit(3);
             }
         }
         RunOutcome::AllFailed(out) => {
@@ -2793,6 +3027,45 @@ fn main() {
             // [`FatalKind`]'s closed vocabulary, tagged at the
             // source of the error instead of recovered by
             // substring matching the rendered message.
+            //
+            // Asymmetry with the `Ok` and `AllFailed`
+            // arms: Fatal does NOT append a stub `PayloadMetrics`
+            // to the sidecar, even when `--sidecar PATH` is set.
+            // Decision rationale:
+            //
+            //   - A Fatal outcome carries a `FatalError`, not a
+            //     `ProbeOutput`. There is no per-thread data, no
+            //     snapshots, no metrics — the probe never reached
+            //     the point where `ProbeOutput` gets assembled.
+            //     A synthesized stub would either be all-None
+            //     (noise for stats tooling, same as a no-call)
+            //     or a fabricated single-metric entry keyed on
+            //     `fatal.kind.tag()` (inventing telemetry — a
+            //     correctness hazard for A/B regression analysis).
+            //
+            //   - The stderr `ktstr-probe-fatal: <kind>` tag +
+            //     exit-code 1 already carries the full fatal
+            //     signal. Test-harness consumers (nextest runners,
+            //     CI log scrapers) gate on that tag, not on the
+            //     sidecar. Adding a stub sidecar entry would
+            //     force every downstream consumer to disambiguate
+            //     "real Fatal" from "stub Fatal" via the metric
+            //     content — strictly harder than the existing
+            //     exit-code + tag pair.
+            //
+            //   - `AllFailed` DOES append because that branch
+            //     carries a real `ProbeOutput` with per-thread
+            //     error records; the exit_code=1 in the appended
+            //     PayloadMetrics marks it as a failed run without
+            //     fabrication. The Fatal branch has no such
+            //     ground-truth data to record.
+            //
+            // A future probe outcome that reaches a middle ground
+            // (carries a partial `ProbeOutput` + a fatal reason)
+            // should classify as `AllFailed` or a new variant,
+            // not as `Fatal`, so the append policy stays bound to
+            // "do we have ProbeOutput?" rather than growing
+            // synthesis logic here.
             eprintln!("ktstr-probe-fatal: {}", fatal.kind.tag());
             eprintln!("error: {:#}", fatal.error);
             detach_all_attached();
@@ -3116,18 +3389,21 @@ mod tests {
         let ok = ThreadResult::Ok {
             tid: 42,
             comm: Some("worker-0".to_string()),
+            start_time_jiffies: None,
             allocated_bytes: 1024,
             deallocated_bytes: 512,
         };
         let ok_no_comm = ThreadResult::Ok {
             tid: 44,
             comm: None,
+            start_time_jiffies: None,
             allocated_bytes: 2048,
             deallocated_bytes: 1024,
         };
         let err = ThreadResult::Err {
             tid: 43,
             comm: None,
+            start_time_jiffies: None,
             error: "thread exited before probe".to_string(),
             error_kind: ThreadErrorKind::Waitpid,
         };
@@ -3878,12 +4154,14 @@ mod tests {
         let err_thread = || ThreadResult::Err {
             tid: 1,
             comm: None,
+            start_time_jiffies: None,
             error: "e".into(),
             error_kind: ThreadErrorKind::PtraceSeize,
         };
         let ok_thread = || ThreadResult::Ok {
             tid: 2,
             comm: None,
+            start_time_jiffies: None,
             allocated_bytes: 10,
             deallocated_bytes: 0,
         };
@@ -3943,6 +4221,7 @@ mod tests {
         let only_err = vec![ThreadResult::Err {
             tid: 1,
             comm: None,
+            start_time_jiffies: None,
             error: "e".into(),
             error_kind: ThreadErrorKind::PtraceSeize,
         }];
@@ -3951,12 +4230,14 @@ mod tests {
             ThreadResult::Err {
                 tid: 1,
                 comm: None,
+                start_time_jiffies: None,
                 error: "e".into(),
                 error_kind: ThreadErrorKind::PtraceSeize,
             },
             ThreadResult::Ok {
                 tid: 2,
                 comm: None,
+                start_time_jiffies: None,
                 allocated_bytes: 10,
                 deallocated_bytes: 0,
             },
@@ -3986,6 +4267,7 @@ mod tests {
                     threads: vec![ThreadResult::Ok {
                         tid: 42,
                         comm: Some("worker".to_string()),
+                        start_time_jiffies: None,
                         allocated_bytes: 1024,
                         deallocated_bytes: 0,
                     }],
@@ -3996,6 +4278,7 @@ mod tests {
                     threads: vec![ThreadResult::Ok {
                         tid: 42,
                         comm: Some("worker".to_string()),
+                        start_time_jiffies: None,
                         allocated_bytes: 2048,
                         deallocated_bytes: 0,
                     }],
@@ -4049,6 +4332,7 @@ mod tests {
                 threads: vec![ThreadResult::Ok {
                     tid: 99,
                     comm: None,
+                    start_time_jiffies: None,
                     allocated_bytes: 10,
                     deallocated_bytes: 0,
                 }],
@@ -4331,6 +4615,7 @@ mod tests {
                 threads: vec![ThreadResult::Ok {
                     tid: 42,
                     comm: Some("worker".to_string()),
+                    start_time_jiffies: None,
                     allocated_bytes: 1024,
                     deallocated_bytes: 512,
                 }],
@@ -4688,12 +4973,14 @@ mod tests {
                     ThreadResult::Ok {
                         tid: 42,
                         comm: Some("ok-worker".to_string()),
+                        start_time_jiffies: None,
                         allocated_bytes: 2048,
                         deallocated_bytes: 128,
                     },
                     ThreadResult::Err {
                         tid: 99,
                         comm: Some("err-worker".to_string()),
+                        start_time_jiffies: None,
                         error: "ptrace(PTRACE_SEIZE): ESRCH".to_string(),
                         error_kind: ThreadErrorKind::PtraceSeize,
                     },
@@ -4751,5 +5038,320 @@ mod tests {
             .filter(|m| m.name.ends_with(".allocated_bytes"))
             .count();
         assert_eq!(alloc_count, 1, "one Ok thread emits one allocated_bytes");
+    }
+
+    /// [`round_up_pow2`] boundary matrix: degenerate-align, zero
+    /// value, max-value overflow, and the typical 8-byte-align
+    /// rounding triad (7 → 8, 8 → 8, 9 → 16). Pins the two corner
+    /// behaviors the ELF PT_TLS math depends on: `align == 0`
+    /// clamps to 1 rather than dividing by zero, and
+    /// `value + (align - 1)` overflow is detected via
+    /// `checked_add` instead of wrapping.
+    #[test]
+    fn round_up_pow2_boundary_matrix() {
+        // (value=0, align=0): align clamps to 1; round_up(0, 1) = 0.
+        assert_eq!(round_up_pow2(0, 0), Some(0));
+        // (value=0, align=1): round_up(0, 1) = 0.
+        assert_eq!(round_up_pow2(0, 1), Some(0));
+        // (value=u64::MAX, align=1): (MAX + 0) = MAX, masked by
+        // !(1-1)=!0 → MAX.
+        assert_eq!(round_up_pow2(u64::MAX, 1), Some(u64::MAX));
+        // (value=u64::MAX, align=2): MAX + 1 overflows u64 and
+        // checked_add returns None — the helper must surface None,
+        // not silently wrap to 0 (which would land the caller at a
+        // zero TLS-image size and then read from the low part of
+        // the address space).
+        assert_eq!(round_up_pow2(u64::MAX, 2), None);
+        // (7, 8): canonical round-up — 7 → 8.
+        assert_eq!(round_up_pow2(7, 8), Some(8));
+        // (8, 8): exact-multiple fixed point — 8 → 8 (no change).
+        assert_eq!(round_up_pow2(8, 8), Some(8));
+        // (9, 8): round-up across the boundary — 9 → 16.
+        assert_eq!(round_up_pow2(9, 8), Some(16));
+    }
+
+    /// Pin the wire-contract strings emitted after
+    /// `ktstr-probe-fatal:` on stderr. Test bodies and external
+    /// consumers key on these tokens; a rename would silently
+    /// break downstream matching. Every variant of [`FatalKind`]
+    /// gets an exact-literal assertion so adding a new variant
+    /// without updating the wire contract produces a compile /
+    /// test failure here.
+    #[test]
+    fn fatal_kind_tag_strings_pinned() {
+        assert_eq!(FatalKind::PidMissing.tag(), "pid-missing");
+        assert_eq!(
+            FatalKind::ExeIdentityChanged.tag(),
+            "exe-identity-changed",
+        );
+        assert_eq!(FatalKind::NotJemalloc.tag(), "not-jemalloc");
+        assert_eq!(FatalKind::Other.tag(), "other");
+    }
+
+    /// [`read_thread_start_time`] parser pin: exercise the
+    /// `rfind(')')` + offset-19 path against a fabricated /proc/stat
+    /// body with a comm field that itself contains `)`. A naive
+    /// `split_whitespace().nth(21)` would mis-index on that input;
+    /// this test proves the robust parser survives comm-embedded
+    /// parens. Uses the module-private [`parse_start_time_from_stat`]
+    /// extracted from [`read_thread_start_time`] so the assertion
+    /// runs without a real /proc path.
+    #[test]
+    fn start_time_parser_handles_parens_in_comm() {
+        // Fabricated /proc/<pid>/stat line: pid=1234, comm="a)b(c)",
+        // state='S', fields 4..21 as placeholder tokens, field 22
+        // (starttime) = 987654321.
+        let mut s = String::from("1234 (a)b(c)) S");
+        // Fields 4 through 21 — 18 tokens before starttime.
+        for i in 0..18 {
+            s.push(' ');
+            s.push_str(&i.to_string());
+        }
+        s.push_str(" 987654321 rest of line ignored");
+        assert_eq!(parse_start_time_from_stat(&s), Some(987654321));
+    }
+
+    // -- debuginfo discovery helpers (read_gnu_debuglink,
+    // read_build_id, candidate_debuginfo_paths) --
+
+    /// `read_build_id` on the probe's own test binary must surface
+    /// the `NT_GNU_BUILD_ID` note descriptor as a lowercase hex
+    /// string. Every Rust toolchain on modern Linux emits the note
+    /// (rustc links via `cc`, which by default passes
+    /// `--build-id=sha1` to the linker), so the positive path is
+    /// cheap to exercise against the current_exe ELF. Asserts
+    /// three invariants: Some-ness, non-empty, all lowercase hex.
+    /// A regression that returned the raw byte descriptor, used
+    /// uppercase hex, or misread the note type would trip this
+    /// test without needing a synthetic ELF fixture.
+    #[test]
+    fn read_build_id_on_real_elf_returns_lowercase_hex() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let data = std::fs::read(&exe).expect("read current_exe");
+        let elf = goblin::elf::Elf::parse(&data).expect("parse current_exe");
+        // Toolchain may omit NT_GNU_BUILD_ID — RUSTFLAGS override
+        // (`-C link-arg=-Wl,--build-id=none`), gold/mold/lld linkers
+        // that default to no build-id, musl-based distros, or cross
+        // targets whose `cc` wrapper does not pass `--build-id=sha1`
+        // all land in this skip. A `None` here is a valid return for
+        // the helper; the positive-path assertions below are
+        // toolchain-dependent, so gracefully skip with a descriptive
+        // stderr banner instead of panicking. The contract this
+        // test pins — lowercase hex, non-empty — is only testable
+        // when the note actually exists. The helper's negative path
+        // is covered by
+        // `candidate_debuginfo_paths_returns_empty_when_no_hints`
+        // + `candidate_debuginfo_paths_skips_short_build_id` which
+        // feed synthetic inputs and don't depend on the toolchain,
+        // so skipping here does not lose negative-path coverage.
+        let Some(hex) = read_build_id(&elf, &data) else {
+            eprintln!(
+                "ktstr_test: SKIP read_build_id_on_real_elf_returns_lowercase_hex — \
+                 current_exe ({}) carries no NT_GNU_BUILD_ID note; the host's linker \
+                 (or a RUSTFLAGS override) does not emit one. Positive-path \
+                 invariants are only testable when the note exists; negative-path \
+                 coverage is in candidate_debuginfo_paths_* tests.",
+                exe.display(),
+            );
+            return;
+        };
+        assert!(!hex.is_empty(), "build-id hex must be non-empty");
+        assert_eq!(
+            hex,
+            hex.to_ascii_lowercase(),
+            "build-id must be rendered in lowercase hex per the probe's \
+             /usr/lib/debug/.build-id/<xx>/<rest>.debug lookup convention",
+        );
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
+            "build-id must contain only ASCII hex digits [0-9a-f]; got {hex:?}",
+        );
+    }
+
+    /// `read_gnu_debuglink` on the probe's own test binary returns
+    /// `None` because the binary carries inline `.debug_info`
+    /// rather than referring to a separate `.debug` file. A
+    /// `Some` result here would mean the toolchain started
+    /// emitting a debuglink AND the linker separated the
+    /// debuginfo by default — neither is true today. The test
+    /// pins the negative-path invariant; a regression that
+    /// mis-parsed an empty-or-absent section as a valid
+    /// `(String, u32)` pair would fail here.
+    #[test]
+    fn read_gnu_debuglink_on_inline_debug_elf_returns_none() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let data = std::fs::read(&exe).expect("read current_exe");
+        let elf = goblin::elf::Elf::parse(&data).expect("parse current_exe");
+        assert!(
+            read_gnu_debuglink(&elf, &data).is_none(),
+            "test binary has inline .debug_info; .gnu_debuglink \
+             section must be absent and the parser must return None",
+        );
+    }
+
+    /// `candidate_debuginfo_paths` is a pure function of its
+    /// input triple (target path, optional debuglink name,
+    /// optional build-id hex). Pin the path-construction rules
+    /// independently of any ELF: the most-discriminating path
+    /// (build-id) comes first, then parent-relative debuglink
+    /// candidates, then the `.debug` subdir, then the absolute-
+    /// path-rooted `/usr/lib/debug/...` fallback when the target
+    /// path is absolute.
+    #[test]
+    fn candidate_debuginfo_paths_build_id_first_then_debuglink_then_debug_dir_then_lib_debug() {
+        let target = Path::new("/usr/bin/ktstr-test-target");
+        let paths = candidate_debuginfo_paths(
+            target,
+            Some("ktstr-test-target.debug"),
+            Some("abcdef0123456789"),
+        );
+        assert_eq!(
+            paths.len(),
+            4,
+            "with both debuglink + build-id and an absolute target path, \
+             the helper must emit 4 candidates: build-id first, then \
+             parent + parent/.debug + /usr/lib/debug-rooted; got {paths:?}",
+        );
+        // 1. build-id path.
+        assert_eq!(
+            paths[0],
+            PathBuf::from("/usr/lib/debug/.build-id/ab/cdef0123456789.debug"),
+            "build-id candidate must split after the first two hex chars \
+             (the distro convention documented in the helper's doc block)",
+        );
+        // 2. parent/debuglink_name.
+        assert_eq!(
+            paths[1],
+            PathBuf::from("/usr/bin/ktstr-test-target.debug"),
+        );
+        // 3. parent/.debug/debuglink_name.
+        assert_eq!(
+            paths[2],
+            PathBuf::from("/usr/bin/.debug/ktstr-test-target.debug"),
+        );
+        // 4. /usr/lib/debug + strip(parent.absolute()) + name.
+        assert_eq!(
+            paths[3],
+            PathBuf::from("/usr/lib/debug/usr/bin/ktstr-test-target.debug"),
+        );
+    }
+
+    /// No build-id and no debuglink → no candidates. Empty Vec,
+    /// not a `None` / `Err` return — callers iterate an empty
+    /// sequence naturally and fall through to the "nothing to
+    /// try" branch without a special case.
+    #[test]
+    fn candidate_debuginfo_paths_returns_empty_when_no_hints() {
+        let target = Path::new("/usr/bin/ktstr-test-target");
+        let paths = candidate_debuginfo_paths(target, None, None);
+        assert!(
+            paths.is_empty(),
+            "no debuglink and no build-id means no candidates; \
+             got {paths:?}",
+        );
+    }
+
+    /// Build-id shorter than 2 hex chars → the build-id path is
+    /// skipped (cannot do the `split_at(2)` prefix/rest split
+    /// that the distro `/usr/lib/debug/.build-id/<xx>/<rest>`
+    /// layout requires). Other candidates (debuglink-based) still
+    /// emit. Guards against a corrupt / truncated build-id note
+    /// breaking the whole candidate list.
+    #[test]
+    fn candidate_debuginfo_paths_skips_short_build_id() {
+        let target = Path::new("/usr/bin/ktstr-test-target");
+        let paths = candidate_debuginfo_paths(
+            target,
+            Some("ktstr-test-target.debug"),
+            Some("a"), // 1 char — can't split into prefix + rest
+        );
+        // Debuglink paths still emit (3 candidates); build-id path
+        // is skipped.
+        assert_eq!(
+            paths.len(),
+            3,
+            "short build-id must be skipped; debuglink paths still emit; \
+             got {paths:?}",
+        );
+        assert!(
+            !paths[0].to_string_lossy().contains("/.build-id/"),
+            "first candidate must be a debuglink path, not a build-id \
+             path with a degenerate split; got {:?}",
+            paths[0],
+        );
+    }
+
+    /// Relative target path: the absolute-path-rooted
+    /// `/usr/lib/debug/<...>` fallback is SKIPPED because the
+    /// debuglink convention only meaningfully applies to
+    /// absolute-path targets (the helper's `if parent.is_absolute()`
+    /// gate). Only parent-relative + `.debug` subdir candidates emit.
+    #[test]
+    fn candidate_debuginfo_paths_relative_target_skips_lib_debug_root() {
+        let target = Path::new("./ktstr-test-target");
+        let paths = candidate_debuginfo_paths(
+            target,
+            Some("ktstr-test-target.debug"),
+            Some("deadbeef12345678"),
+        );
+        // build-id + parent + parent/.debug = 3 candidates. No
+        // /usr/lib/debug-rooted candidate because parent is relative.
+        assert_eq!(paths.len(), 3, "relative target must skip lib-debug root; got {paths:?}");
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.starts_with("/usr/lib/debug") && !p.to_string_lossy().contains(".build-id")),
+            "no /usr/lib/debug-rooted debuglink candidate when target \
+             parent is relative; got {paths:?}",
+        );
+    }
+
+    /// A strengthened pin for the debug-info discovery fixture used by
+    /// `extract_pt_tls_layout_on_real_elf` and the debuglink / build-id
+    /// tests above: the probe's test binary must carry both a populated
+    /// `.debug_info` section AND at least one `STT_FUNC` symbol in
+    /// `.symtab`. Without those invariants, a future strip-debug or
+    /// link-stripping change would silently invalidate the fixture —
+    /// the dependent tests would start exercising a degenerate ELF
+    /// rather than the real tsd_s DWARF + symbol landscape they're
+    /// supposed to pin.
+    ///
+    /// Both sections are checked in one test so the fixture-health
+    /// pin is one screen of output on failure, not four.
+    #[test]
+    fn test_elf_has_populated_debug_info_section_and_stt_func_symbols() {
+        use goblin::elf::sym;
+        let exe = std::env::current_exe().expect("current_exe");
+        let data = std::fs::read(&exe).expect("read current_exe");
+        let elf = goblin::elf::Elf::parse(&data).expect("parse current_exe");
+
+        // .debug_info: the probe depends on this section's presence to
+        // decide between the inline-DWARF path and the external-
+        // debuglink path. Fixture health: the test binary retains
+        // inline DWARF.
+        assert!(
+            section_is_populated(&elf, &data, ".debug_info"),
+            "test binary must carry a populated .debug_info section; \
+             if this fails, the debuglink-discovery tests above are \
+             exercising the wrong code path",
+        );
+
+        // At least one STT_FUNC symbol: find_symbol_by_name scans the
+        // full symtab without filtering by symbol type, but in practice
+        // the probe's target symbol (`tsd_tls`) is an STT_TLS symbol.
+        // A broader health check is "does this ELF have ANY STT_FUNC
+        // entries?" — guards against a strip pass that removed .symtab
+        // entirely and left only .dynsym.
+        let func_count = elf
+            .syms
+            .iter()
+            .filter(|s| s.st_type() == sym::STT_FUNC)
+            .count();
+        assert!(
+            func_count > 0,
+            "test binary must carry at least one STT_FUNC symbol in \
+             .symtab; a fully-stripped binary would have zero and \
+             silently invalidate symbol-resolution pin tests",
+        );
     }
 }

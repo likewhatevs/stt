@@ -689,6 +689,46 @@ pub struct VmResult {
     pub crash_message: Option<String>,
 }
 
+impl VmResult {
+    /// Minimal "nothing happened" fixture for tests that exercise
+    /// code consuming a [`VmResult`] without actually booting a VM
+    /// (the sidecar-write tests in `src/test_support/sidecar.rs`
+    /// are the primary users). Every field carries the empty /
+    /// default / `None` value that `run_vm` would produce for a
+    /// VM that launched, exited cleanly with exit code 0, and
+    /// produced no telemetry. Tests that need a specific field
+    /// override it with a struct-update expression:
+    ///
+    /// ```ignore
+    /// let result = VmResult { success: false, ..VmResult::test_fixture() };
+    /// ```
+    ///
+    /// Gated on `#[cfg(test)]` so the symbol does not appear in
+    /// release builds — production `VmResult` values flow from
+    /// `run_vm` and never from this fixture. See
+    /// `sidecar_vm_result_is_test_fixture_boilerplate` in
+    /// `test_support/sidecar.rs` for the motivating deduplication
+    /// (7 identical literal constructions collapsed to a single
+    /// call).
+    #[cfg(test)]
+    pub fn test_fixture() -> Self {
+        Self {
+            success: true,
+            exit_code: 0,
+            duration: Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        }
+    }
+}
+
 /// Per-vCPU KVM stats read after VM exit. Each map holds cumulative
 /// counter values from the VM's lifetime.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
