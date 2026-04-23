@@ -843,27 +843,27 @@ fn run_model_status() -> Result<(), String> {
     let status = ktstr::test_support::status(&spec).map_err(|e| format!("{e:#}"))?;
     println!("model:    {}", status.spec.file_name);
     println!("path:     {}", status.path.display());
-    println!("cached:   {}", status.cached);
-    println!("checked:  {}", status.sha_matches);
-    if !status.cached {
-        println!(
+    println!("cached:   {}", status.sha_verdict.is_cached());
+    println!("checked:  {}", status.sha_verdict.is_match());
+    // Distinguish the four verdict variants so each gets a
+    // remediation-specific line: absent cache, I/O failure during
+    // the SHA check, successful hash that didn't match, and the
+    // all-clear case (no annotation needed). An I/O failure points
+    // at the filesystem entry (permissions, truncation); a mismatch
+    // points at the bytes themselves.
+    match &status.sha_verdict {
+        ktstr::test_support::ShaVerdict::NotCached => println!(
             "(no cached copy — run `cargo ktstr model fetch` to download {} MiB)",
-            status.spec.size_bytes / 1024 / 1024
-        );
-    } else if !status.sha_matches {
-        // Distinguish I/O failure during the SHA check from a
-        // successful hash that didn't match the pin. The two have
-        // different remediations: an I/O failure points at the
-        // filesystem entry (permissions, truncation); a mismatch
-        // points at the bytes themselves (re-fetch or re-pin).
-        if let Some(err) = status.sha_check_error.as_deref() {
-            println!(
-                "(cached file could not be checked: {err}; inspect the cache entry \
-                 or re-fetch to replace it)"
-            );
-        } else {
+            status.spec.size_bytes / 1024 / 1024,
+        ),
+        ktstr::test_support::ShaVerdict::CheckFailed(err) => println!(
+            "(cached file could not be checked: {err}; inspect the cache entry \
+             or re-fetch to replace it)",
+        ),
+        ktstr::test_support::ShaVerdict::Mismatches => {
             println!("(cached file failed SHA-256 check; re-fetch to replace it)");
         }
+        ktstr::test_support::ShaVerdict::Matches => {}
     }
     Ok(())
 }

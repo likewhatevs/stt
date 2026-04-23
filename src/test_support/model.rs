@@ -509,30 +509,90 @@ fn sanitize_env_value(raw: &str) -> String {
     cleaned
 }
 
+/// Outcome of the SHA-256 integrity check for a potentially-cached
+/// model artifact.
+///
+/// Collapses the former `(sha_matches: bool, sha_check_error:
+/// Option<String>)` pair on [`ModelStatus`] into a single enum so
+/// the impossible `(true, Some(_))` combination — "check succeeded
+/// AND recorded an error" — is unrepresentable at the type level.
+/// The four variants span every outcome [`status`] can produce; no
+/// other combination is constructible.
+///
+/// Remediation differs by variant so keeping them distinct matters:
+/// a [`Self::Mismatches`] points at the bytes (re-fetch or re-pin);
+/// a [`Self::CheckFailed`] points at the filesystem entry
+/// (permissions, truncation, filesystem errors). The CLI
+/// `model status` readout and the offline-gate bail in [`ensure`]
+/// both branch on the variant to name the specific remediation
+/// rather than defaulting to a generic "doesn't match."
+#[derive(Debug, Clone)]
+pub enum ShaVerdict {
+    /// No cached file was present at the expected path; no SHA-256
+    /// check was performed. The `_ => ...` arm of [`status`]'s
+    /// metadata probe produces this.
+    NotCached,
+    /// SHA-256 digest of the cached file equals the declared pin.
+    /// Ok(true) from [`check_sha256`].
+    Matches,
+    /// SHA-256 digest was computed successfully but did not equal
+    /// the declared pin. Ok(false) from [`check_sha256`].
+    /// Remediation: re-fetch, or re-pin if the cached bytes are
+    /// known-correct.
+    Mismatches,
+    /// Cached file existed but its SHA-256 could not be computed
+    /// due to an I/O failure (open/read/permission error). Carries
+    /// the rendered error chain (`{e:#}`) for diagnostic output.
+    /// Produced only when the pin itself parses as valid hex; a
+    /// malformed pin is a programmer error and still surfaces as
+    /// an `Err` from [`status`] rather than being folded in here.
+    CheckFailed(String),
+}
+
+impl ShaVerdict {
+    /// Whether a cached file is present. `true` for every variant
+    /// except [`Self::NotCached`]. Convenience for call sites that
+    /// only care about presence (e.g. the CLI readout's `cached:`
+    /// line, test assertions asserting a file landed on disk).
+    pub fn is_cached(&self) -> bool {
+        !matches!(self, Self::NotCached)
+    }
+
+    /// Whether the cached file passed its SHA-256 check. `true`
+    /// iff the variant is [`Self::Matches`]. [`ensure`]'s fast path
+    /// and the lazy-prefetch probe in [`prefetch_if_required`] gate
+    /// on this. Named `is_match` (not `matches`) to match the
+    /// `is_*` accessor convention used by sibling enums
+    /// (e.g. `KconfigStatus::{is_stale, is_untracked}` and the
+    /// `ShaVerdict::is_cached` accessor right above) and to avoid
+    /// collision with the `matches!` macro in call-site patterns.
+    pub fn is_match(&self) -> bool {
+        matches!(self, Self::Matches)
+    }
+
+    /// Rendered I/O-error string iff the variant is
+    /// [`Self::CheckFailed`], else `None`. Used by the CLI readout
+    /// and the offline-gate bail to name the underlying failure.
+    pub fn check_error(&self) -> Option<&str> {
+        match self {
+            Self::CheckFailed(e) => Some(e.as_str()),
+            _ => None,
+        }
+    }
+}
+
 /// Status record returned by [`status`]: where the model would live
-/// on disk and whether a checked copy is already there.
+/// on disk and the outcome of the SHA-256 check. Presence (former
+/// `cached: bool`) and check outcome (former `sha_matches: bool` +
+/// `sha_check_error: Option<String>`) are now unified in
+/// [`sha_verdict`](Self::sha_verdict); call sites use
+/// [`ShaVerdict::is_cached`] / [`ShaVerdict::is_match`] /
+/// [`ShaVerdict::check_error`] to read the fields they need.
 #[derive(Debug, Clone)]
 pub struct ModelStatus {
     pub spec: ModelSpec,
     pub path: PathBuf,
-    pub cached: bool,
-    pub sha_matches: bool,
-    /// Rendered error chain from [`check_sha256`] when the SHA check
-    /// could not complete due to an I/O failure (e.g. permission
-    /// denied, short read, file disappeared between the `metadata()`
-    /// probe and the read). `None` when the SHA check ran to
-    /// completion — regardless of whether the digest matched.
-    ///
-    /// Distinguishes "bytes don't hash to the pin" (`sha_matches =
-    /// false`, `sha_check_error = None`) from "we couldn't read the
-    /// bytes to compute a hash" (`sha_matches = false`,
-    /// `sha_check_error = Some(_)`). Both surface as
-    /// `sha_matches = false` so [`ensure`] treats either as "cache
-    /// entry unusable, replace it"; the distinction is captured here
-    /// so callers that want a precise diagnostic (the offline-gate
-    /// bail, the CLI `model status` readout) can name the underlying
-    /// failure rather than defaulting to "bytes don't match."
-    pub sha_check_error: Option<String>,
+    pub sha_verdict: ShaVerdict,
 }
 
 /// Resolve the cache root, creating it lazily when a writer needs it.
@@ -561,48 +621,42 @@ pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
         .join("models"))
 }
 
-/// Return the on-disk path the spec would occupy and whether a
-/// checked copy is already present. Used by both the CLI's
-/// `model status` subcommand and the eager prefetch fast-path.
+/// Return the on-disk path the spec would occupy and the outcome
+/// of the SHA-256 integrity check as a [`ShaVerdict`]. Used by both
+/// the CLI's `model status` subcommand and the eager prefetch
+/// fast-path.
 pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
     let root = resolve_cache_root()?;
     let path = root.join(spec.file_name);
-    let (cached, sha_matches, sha_check_error) = match std::fs::metadata(&path) {
-        Ok(meta) if meta.is_file() => {
-            // A cached file is considered "matched" only when the
-            // SHA agrees with the pin. Distinguish the two Err
-            // sources from check_sha256: a malformed pin is a
-            // ModelSpec programmer error that MUST surface (hiding
-            // it as "doesn't match" misroutes callers into a
-            // pointless re-download branch), while an I/O failure
-            // on the cached file (open/read error) means the file
-            // is unusable — surface that as `sha_matches = false`
-            // with the underlying error captured in
-            // `sha_check_error`, so ensure() replaces the cache
-            // entry and the CLI / offline-gate bail can name the
-            // specific reason rather than the generic "doesn't
-            // match" default.
-            let (matches, check_err) = match check_sha256(&path, spec.sha256_hex) {
-                Ok(m) => (m, None),
-                Err(e) => {
-                    if !is_valid_sha256_hex(spec.sha256_hex) {
-                        return Err(e).with_context(|| {
-                            format!("check SHA-256 pin for cached model '{}'", spec.file_name,)
-                        });
-                    }
-                    (false, Some(format!("{e:#}")))
+    // A cached file is considered "matched" only when the SHA agrees
+    // with the pin. Distinguish the two Err sources from
+    // `check_sha256`: a malformed pin is a `ModelSpec` programmer
+    // error that MUST surface (hiding it as "doesn't match" misroutes
+    // callers into a pointless re-download branch), while an I/O
+    // failure on the cached file (open/read error) means the file is
+    // unusable — surface that as `ShaVerdict::CheckFailed` so
+    // [`ensure`] replaces the cache entry and the CLI /
+    // offline-gate bail can name the specific reason rather than the
+    // generic "doesn't match" default.
+    let sha_verdict = match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => match check_sha256(&path, spec.sha256_hex) {
+            Ok(true) => ShaVerdict::Matches,
+            Ok(false) => ShaVerdict::Mismatches,
+            Err(e) => {
+                if !is_valid_sha256_hex(spec.sha256_hex) {
+                    return Err(e).with_context(|| {
+                        format!("check SHA-256 pin for cached model '{}'", spec.file_name,)
+                    });
                 }
-            };
-            (true, matches, check_err)
-        }
-        _ => (false, false, None),
+                ShaVerdict::CheckFailed(format!("{e:#}"))
+            }
+        },
+        _ => ShaVerdict::NotCached,
     };
     Ok(ModelStatus {
         spec: *spec,
         path,
-        cached,
-        sha_matches,
-        sha_check_error,
+        sha_verdict,
     })
 }
 
@@ -619,7 +673,7 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
 /// falling through to an online fetch.
 pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     let st = status(spec)?;
-    if st.cached && st.sha_matches {
+    if st.sha_verdict.is_match() {
         return Ok(st.path);
     }
     // SHA-pin shape check runs before the offline-gate check. A
@@ -660,33 +714,39 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
         // entry's filesystem state (permissions, truncation,
         // missing extents). Collapsing these into a single generic
         // message misroutes the user.
-        if st.cached {
-            if let Some(err) = st.sha_check_error.as_deref() {
-                anyhow::bail!(
-                    "{OFFLINE_ENV}={v_safe} set but model '{}' is cached at {} \
-                     and the SHA-256 check could not complete ({}); \
-                     inspect the cache entry (permissions, truncation, \
-                     filesystem errors) or unset {OFFLINE_ENV} to re-fetch.",
-                    spec.file_name,
-                    st.path.display(),
-                    err,
-                );
-            }
-            anyhow::bail!(
+        match &st.sha_verdict {
+            ShaVerdict::CheckFailed(err) => anyhow::bail!(
+                "{OFFLINE_ENV}={v_safe} set but model '{}' is cached at {} \
+                 and the SHA-256 check could not complete ({}); \
+                 inspect the cache entry (permissions, truncation, \
+                 filesystem errors) or unset {OFFLINE_ENV} to re-fetch.",
+                spec.file_name,
+                st.path.display(),
+                err,
+            ),
+            ShaVerdict::Mismatches => anyhow::bail!(
                 "{OFFLINE_ENV}={v_safe} set but model '{}' is cached at {} \
                  with bytes that do not match the declared SHA-256 pin; \
                  replace the cache entry with bytes matching the pin (or \
                  unset {OFFLINE_ENV} to re-fetch).",
                 spec.file_name,
                 st.path.display(),
-            );
+            ),
+            ShaVerdict::NotCached => anyhow::bail!(
+                "{OFFLINE_ENV}={v_safe} set but model '{}' is not cached at {}; \
+                 pre-seed the cache or unset {OFFLINE_ENV} to fetch.",
+                spec.file_name,
+                st.path.display(),
+            ),
+            // `ShaVerdict::Matches` is the fast-path return at the
+            // top of `ensure`; reaching the offline-gate with a
+            // matching verdict would be a logic bug in `ensure`
+            // itself, not a user-facing condition to diagnose.
+            ShaVerdict::Matches => unreachable!(
+                "fast path returned on Matches; reaching the \
+                 offline-gate match with Matches is a logic bug"
+            ),
         }
-        anyhow::bail!(
-            "{OFFLINE_ENV}={v_safe} set but model '{}' is not cached at {}; \
-             pre-seed the cache or unset {OFFLINE_ENV} to fetch.",
-            spec.file_name,
-            st.path.display(),
-        );
     }
     fetch(spec, &st.path)
 }
@@ -1069,16 +1129,17 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     // of feedback instead of staring at a silent stall. Any status
     // error here is non-fatal — we fall through to `ensure`, which
     // surfaces the real failure with full context. On an already-
-    // populated cache both probes succeed with `cached && sha_matches`
-    // and we skip the announcement entirely, matching the existing
-    // "zero noise on cache hit" semantics.
+    // populated cache both probes succeed with
+    // `s.sha_verdict.is_match()` and we skip the announcement
+    // entirely, matching the existing "zero noise on cache hit"
+    // semantics.
     let model_missing = matches!(
         status(&DEFAULT_MODEL),
-        Ok(s) if !s.cached || !s.sha_matches,
+        Ok(s) if !s.sha_verdict.is_match(),
     );
     let tokenizer_missing = matches!(
         status(&DEFAULT_TOKENIZER),
-        Ok(s) if !s.cached || !s.sha_matches,
+        Ok(s) if !s.sha_verdict.is_match(),
     );
     let announced = model_missing || tokenizer_missing;
     if announced {
@@ -1949,11 +2010,12 @@ mod tests {
         let rendered = format!("{err:#}");
         assert!(rendered.contains(OFFLINE_ENV), "err: {rendered}");
         // Pin the not-cached branch wording: the file does not exist
-        // on disk, so ensure() must take the `!st.cached` path of the
-        // offline bail and produce "is not cached at {path}". A
-        // regression that routed this case through the stale-cache
-        // branch (or collapsed the two messages into one generic
-        // wording) would mask the distinction from the user.
+        // on disk, so ensure() must take the `ShaVerdict::NotCached`
+        // arm of the offline-gate match and produce "is not cached
+        // at {path}". A regression that routed this case through
+        // the stale-cache branch (or collapsed the two messages into
+        // one generic wording) would mask the distinction from the
+        // user.
         assert!(
             rendered.contains("is not cached"),
             "expected not-cached branch wording, got: {rendered}"
@@ -1994,12 +2056,193 @@ mod tests {
         );
     }
 
-    /// status() on a file that exists but whose SHA does not
-    /// match must report `cached = true, sha_matches = false`. That
-    /// is the branch ensure() consults to decide between "reuse
-    /// cached copy" and "re-download"; a regression that lost the
-    /// mismatch would silently re-validate any garbage bytes sitting
-    /// at the expected path.
+    /// status() on a file whose bytes DO hash to the declared pin
+    /// must report `ShaVerdict::Matches`. Complements the three
+    /// failure-path tests
+    /// (`status_reports_cached_but_sha_mismatch_for_garbage_bytes`,
+    /// `status_captures_io_error_for_unreadable_cached_file`,
+    /// `status_surfaces_malformed_pin_error_for_cached_file`) by
+    /// pinning the success path — without this, a regression that
+    /// silently returned `Mismatches` on a good cache would break
+    /// [`ensure`]'s fast-path (every call would re-download) but
+    /// still pass every other test since they assert non-`Matches`
+    /// variants. The pin is computed in-process from the bytes
+    /// written so the assertion does not hard-code a magic digest
+    /// against a specific byte sequence.
+    #[test]
+    fn status_reports_matches_for_correctly_pinned_file() {
+        use sha2::{Digest, Sha256};
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
+        let bytes: &[u8] = b"model body pinned by its own hash";
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let digest = hex::encode(hasher.finalize());
+        // Leak the digest to 'static so it lives inside the
+        // `ModelSpec` (which holds `&'static str` for sha256_hex
+        // to stay copyable). Test-only allocation, bounded by
+        // the digest length (64 hex chars).
+        let pin: &'static str = Box::leak(digest.into_boxed_str());
+        let spec = ModelSpec {
+            file_name: "pinned.gguf",
+            url: "https://placeholder.example/pinned.gguf",
+            sha256_hex: pin,
+            size_bytes: bytes.len() as u64,
+        };
+        let on_disk = cache.path().join(spec.file_name);
+        std::fs::write(&on_disk, bytes).unwrap();
+        let st = status(&spec).expect("status on well-pinned file must not error");
+        assert_eq!(st.path, on_disk);
+        assert!(
+            matches!(st.sha_verdict, ShaVerdict::Matches),
+            "bytes hash to their declared pin — verdict must be \
+             ShaVerdict::Matches (fast path in ensure() depends on \
+             this); got: {:?}",
+            st.sha_verdict,
+        );
+        // Defensive: the helper path `ensure()` / `prefetch` relies
+        // on should line up with the variant. If the helper ever
+        // drifts from the variant (e.g. is_match() returns false on
+        // Matches), `sha_verdict_helpers_match_variant_semantics`
+        // catches it — this assertion here catches the
+        // complementary drift where `status()` constructs a Matches
+        // but `is_match()` returns false.
+        assert!(
+            st.sha_verdict.is_match(),
+            "Matches variant must answer true to .is_match(); if \
+             this fails but the variant is Matches, the helper is \
+             broken — see sha_verdict_helpers_match_variant_semantics",
+        );
+    }
+
+    /// status() on a path where no file exists must report
+    /// `ShaVerdict::NotCached`. Complements the three cached-file
+    /// tests (`status_reports_cached_but_sha_mismatch_for_garbage_bytes`,
+    /// `status_captures_io_error_for_unreadable_cached_file`,
+    /// `status_surfaces_malformed_pin_error_for_cached_file`) so all
+    /// four `ShaVerdict` variants are pinned on the production path.
+    /// A regression that folded the no-file branch into a different
+    /// variant (e.g. `Mismatches` via a "nothing to match" read)
+    /// would break downstream dispatch — `ensure()` expects
+    /// `NotCached` to trigger a fetch, `prefetch_if_required`
+    /// expects it to announce a download, and the CLI readout
+    /// expects it to print the "no cached copy" hint.
+    #[test]
+    fn status_reports_not_cached_when_file_absent() {
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
+        let spec = ModelSpec {
+            // File is not written to disk — `metadata()` returns
+            // Err(NotFound) and status() lands on the `_ => ...`
+            // arm that produces `ShaVerdict::NotCached`.
+            file_name: "absent.gguf",
+            url: "https://placeholder.example/absent.gguf",
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let st = status(&spec).expect("status on absent file must not error");
+        assert_eq!(st.path, cache.path().join(spec.file_name));
+        assert!(
+            matches!(st.sha_verdict, ShaVerdict::NotCached),
+            "absent file must produce ShaVerdict::NotCached (no \
+             check performed); got: {:?}",
+            st.sha_verdict,
+        );
+    }
+
+    /// Exercises every [`ShaVerdict`] variant's helper methods
+    /// (`is_cached`, `is_match`, `check_error`) against a
+    /// hand-constructed instance of that variant. This guards the
+    /// helper contract independently of [`status`]'s construction
+    /// path: a regression that left the enum fine but broke a
+    /// helper (e.g. `is_match()` returning true on `Mismatches`, or
+    /// `is_cached()` returning true on `NotCached`) would pass the
+    /// construction tests above — those only look at the variant
+    /// the path produced — but fail here. The helpers are relied on
+    /// by `ensure()` fast path, `prefetch_if_required`, the CLI
+    /// readout, and the `model status` integration test; a silent
+    /// helper regression would cascade into all of them.
+    #[test]
+    fn sha_verdict_helpers_match_variant_semantics() {
+        // NotCached: no file present → is_cached=false, is_match=false, check_error=None.
+        let v = ShaVerdict::NotCached;
+        assert!(
+            !v.is_cached(),
+            "NotCached.is_cached() must be false; got true for {v:?}",
+        );
+        assert!(
+            !v.is_match(),
+            "NotCached.is_match() must be false; got true for {v:?}",
+        );
+        assert_eq!(
+            v.check_error(),
+            None,
+            "NotCached.check_error() must be None; got Some for {v:?}",
+        );
+
+        // Matches: file present, SHA equals pin → is_cached=true, is_match=true, check_error=None.
+        let v = ShaVerdict::Matches;
+        assert!(
+            v.is_cached(),
+            "Matches.is_cached() must be true; got false for {v:?}",
+        );
+        assert!(
+            v.is_match(),
+            "Matches.is_match() must be true; got false for {v:?}",
+        );
+        assert_eq!(
+            v.check_error(),
+            None,
+            "Matches.check_error() must be None; got Some for {v:?}",
+        );
+
+        // Mismatches: file present, SHA differs → is_cached=true, is_match=false, check_error=None.
+        let v = ShaVerdict::Mismatches;
+        assert!(
+            v.is_cached(),
+            "Mismatches.is_cached() must be true; got false for {v:?}",
+        );
+        assert!(
+            !v.is_match(),
+            "Mismatches.is_match() must be false; got true for {v:?}",
+        );
+        assert_eq!(
+            v.check_error(),
+            None,
+            "Mismatches.check_error() must be None (the check ran \
+             to completion); got Some for {v:?}",
+        );
+
+        // CheckFailed: file present, check errored → is_cached=true,
+        // is_match=false, check_error=Some(the carried string).
+        let err = "open /tmp/x: Permission denied (os error 13)";
+        let v = ShaVerdict::CheckFailed(err.to_string());
+        assert!(
+            v.is_cached(),
+            "CheckFailed.is_cached() must be true (file exists, \
+             couldn't check it); got false for {v:?}",
+        );
+        assert!(
+            !v.is_match(),
+            "CheckFailed.is_match() must be false (check didn't \
+             complete successfully); got true for {v:?}",
+        );
+        assert_eq!(
+            v.check_error(),
+            Some(err),
+            "CheckFailed.check_error() must surface the carried \
+             string verbatim so the CLI readout and the offline \
+             bail can name the underlying failure; got: {:?}",
+            v.check_error(),
+        );
+    }
+
+    /// status() on a file that exists but whose SHA does not match
+    /// must report `ShaVerdict::Mismatches` (cached, checked,
+    /// didn't match). That is the branch ensure() consults to
+    /// decide between "reuse cached copy" and "re-download"; a
+    /// regression that lost the mismatch would silently re-validate
+    /// any garbage bytes sitting at the expected path.
     #[test]
     fn status_reports_cached_but_sha_mismatch_for_garbage_bytes() {
         let _lock = lock_env();
@@ -2014,36 +2257,33 @@ mod tests {
         let on_disk = cache.path().join(spec.file_name);
         std::fs::write(&on_disk, b"definitely-not-zero-sha").unwrap();
         let st = status(&spec).unwrap();
-        assert!(st.cached, "file exists, status must report cached=true");
-        assert!(
-            !st.sha_matches,
-            "SHA is a fixed zero pin — garbage bytes must not match",
-        );
         assert_eq!(st.path, on_disk);
-        // Pin the distinction between "SHA computed, did not match"
-        // and "SHA check failed with I/O error": garbage bytes hash
-        // cleanly to some non-zero digest, so check_sha256 returns
-        // Ok(false) and `sha_check_error` stays None. The
-        // complementary I/O-error case populates this field; ensure()
-        // and the CLI `model status` readout branch on it to name
-        // the specific remediation.
+        // Pin the exact variant: garbage bytes hash cleanly to some
+        // non-zero digest, so `check_sha256` returns `Ok(false)` and
+        // the verdict is `Mismatches`. The complementary I/O-error
+        // case produces `CheckFailed(_)`; ensure() and the CLI
+        // `model status` readout branch on the variant to name the
+        // specific remediation. Asserting the exact variant catches
+        // a regression that might fold Mismatches into CheckFailed
+        // or NotCached.
         assert!(
-            st.sha_check_error.is_none(),
-            "SHA check completed (mismatch, not I/O error); \
-             sha_check_error must be None, got: {:?}",
-            st.sha_check_error
+            matches!(st.sha_verdict, ShaVerdict::Mismatches),
+            "SHA is a fixed zero pin — garbage bytes must hash to a \
+             non-matching digest, producing ShaVerdict::Mismatches \
+             (not CheckFailed, not NotCached); got: {:?}",
+            st.sha_verdict,
         );
     }
 
     /// Complement of [`status_reports_cached_but_sha_mismatch_for_garbage_bytes`]:
     /// when the cached file exists (so `metadata().is_file()` passes)
     /// but `File::open()` fails with a permission error, status()
-    /// must report `sha_matches = false` AND populate
-    /// `sha_check_error` with the rendered I/O-error chain — NOT
-    /// silently collapse into the bytes-mismatch branch. Exercises
-    /// the I/O-error arm of the `check_sha256` match in status()
-    /// that the structural change capturing I/O failures into
-    /// `sha_check_error` wired up.
+    /// must report `ShaVerdict::CheckFailed(err)` carrying the
+    /// rendered I/O-error chain — NOT silently collapse into the
+    /// bytes-mismatch (`Mismatches`) branch. Exercises the
+    /// I/O-error arm of the `check_sha256` match in status() that
+    /// the structural change capturing I/O failures into the
+    /// `CheckFailed` variant wired up.
     ///
     /// Unix-only: relies on POSIX permission semantics (mode 0o000
     /// blocks reads). Skipped under any environment that bypasses
@@ -2110,19 +2350,14 @@ mod tests {
         // defensively.
         std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        assert!(
-            st.cached,
-            "metadata().is_file() passed despite 0o000 — status must report cached=true"
-        );
-        assert!(
-            !st.sha_matches,
-            "check_sha256 hit an I/O error, could not compute a hash; \
-             sha_matches must be false"
-        );
-        let err = st
-            .sha_check_error
-            .as_deref()
-            .expect("I/O error path must populate sha_check_error with Some(_)");
+        let err = match &st.sha_verdict {
+            ShaVerdict::CheckFailed(e) => e.as_str(),
+            other => panic!(
+                "metadata().is_file() passed despite 0o000 and \
+                 check_sha256 hit EACCES — status must report \
+                 ShaVerdict::CheckFailed(_); got: {other:?}",
+            ),
+        };
         // `{e:#}` on a File::open failure at permission-denied yields
         // something like "open /tmp/.../unreadable.gguf: Permission
         // denied (os error 13)". The exact phrasing of std's
@@ -2139,8 +2374,8 @@ mod tests {
 
     /// status() on a file that exists but whose SHA pin is malformed
     /// (non-hex chars) must surface the check_sha256 error instead
-    /// of coercing it into `sha_matches = false`. A malformed pin is
-    /// a programmer error in the ModelSpec — silently reporting
+    /// of coercing it into `ShaVerdict::Mismatches`. A malformed pin
+    /// is a programmer error in the ModelSpec — silently reporting
     /// "SHA doesn't match" hides the defect and misroutes downstream
     /// logic into a pointless re-download branch.
     #[test]
@@ -3567,15 +3802,16 @@ mod tests {
         );
     }
 
-    /// Under OFFLINE=1 with a cached file whose bytes do NOT match the
-    /// declared SHA pin, status() returns `cached=true, sha_matches=false`
-    /// and ensure() must bail with the offline-gate error — NOT attempt
-    /// a re-download. Pins two invariants: (1) status() correctly
-    /// classifies a stale cache (bytes present, hash wrong), and (2)
-    /// ensure() prefers "offline, refuse network" over "stale cache,
-    /// re-download silently" when OFFLINE is set. A regression that
-    /// tried to re-fetch under offline would surface as reqwest-side
-    /// error rather than the clear OFFLINE_ENV message.
+    /// Under OFFLINE=1 with a cached file whose bytes do NOT match
+    /// the declared SHA pin, status() returns
+    /// `ShaVerdict::Mismatches` and ensure() must bail with the
+    /// offline-gate error — NOT attempt a re-download. Pins two
+    /// invariants: (1) status() correctly classifies a stale cache
+    /// (bytes present, hash wrong), and (2) ensure() prefers
+    /// "offline, refuse network" over "stale cache, re-download
+    /// silently" when OFFLINE is set. A regression that tried to
+    /// re-fetch under offline would surface as reqwest-side error
+    /// rather than the clear OFFLINE_ENV message.
     #[test]
     fn ensure_under_offline_bails_on_stale_cache_sha_mismatch() {
         let _lock = lock_env();
@@ -3593,10 +3829,12 @@ mod tests {
         std::fs::write(&on_disk, b"wrong bytes for pin").unwrap();
         // Check status() classifies correctly before running ensure.
         let st = status(&spec).expect("status should not error on valid-shape pin");
-        assert!(st.cached, "file exists, status must report cached=true");
         assert!(
-            !st.sha_matches,
-            "bytes don't match zero-pin; sha_matches must be false"
+            matches!(st.sha_verdict, ShaVerdict::Mismatches),
+            "file exists with bytes that don't hash to zero-pin; \
+             verdict must be ShaVerdict::Mismatches (cached + \
+             checked + didn't match); got: {:?}",
+            st.sha_verdict,
         );
         // Now ensure() should bail with the offline-gate error, not
         // attempt to re-fetch.
@@ -3610,17 +3848,135 @@ mod tests {
             !rendered.contains("non-HTTPS"),
             "expected offline-path bail, not the URL-scheme path: {rendered}"
         );
-        // Pin the stale-cache branch wording. The
-        // file exists on disk but its bytes do not hash to the pin, so
-        // ensure() must take the `st.cached` path of the offline bail
-        // and produce a "do not match" message — distinct from the
-        // not-cached branch's "is not cached" wording. A regression
-        // that collapsed the two branches into a single "not cached"
-        // message would misroute the user toward a pre-seed step when
-        // they actually need to replace the stale cache entry.
+        // Pin the stale-cache branch wording. The file exists on
+        // disk but its bytes do not hash to the pin, so ensure()
+        // must take the `ShaVerdict::Mismatches` arm of the
+        // offline-gate match and produce a "do not match" message —
+        // distinct from the not-cached branch's "is not cached"
+        // wording. A regression that collapsed the two branches
+        // into a single "not cached" message would misroute the
+        // user toward a pre-seed step when they actually need to
+        // replace the stale cache entry.
         assert!(
             rendered.contains("do not match"),
             "expected stale-cache branch wording, got: {rendered}"
+        );
+    }
+
+    /// Under OFFLINE=1 with a cached file whose SHA-256 check
+    /// cannot complete (0o000 permissions → EACCES on open),
+    /// status() must return `ShaVerdict::CheckFailed(err)` and
+    /// ensure() must bail with the offline-gate error pointing at
+    /// the I/O failure — NOT the stale-cache or not-cached
+    /// wordings, and NOT attempt a re-download. Complements
+    /// `ensure_under_offline_bails_on_stale_cache_sha_mismatch`
+    /// (Mismatches arm) and
+    /// `ensure_in_offline_mode_fails_loudly_when_uncached` (NotCached arm) so
+    /// all three remediation branches of the offline-gate `match`
+    /// at model.rs:ensure are pinned. A regression that folded
+    /// CheckFailed into the stale-cache branch would surface the
+    /// bytes-mismatch diagnostic ("do not match") and hide the
+    /// filesystem-level failure ("could not complete").
+    ///
+    /// Unix-only, same DAC-bypass probe as
+    /// `status_captures_io_error_for_unreadable_cached_file` —
+    /// self-skips under root / CAP_DAC_OVERRIDE /
+    /// CAP_DAC_READ_SEARCH / rootless-container harnesses where
+    /// open(0o000) succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_under_offline_bails_on_check_failed_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
+        let spec = ModelSpec {
+            file_name: "unreadable-offline.gguf",
+            url: "https://placeholder.example/unreadable-offline.gguf",
+            // Valid-shape pin so check_sha256 clears its shape gate
+            // and the only way to fail is the open/read path.
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let on_disk = cache.path().join(spec.file_name);
+        std::fs::write(&on_disk, b"any content").unwrap();
+        // Strip read bits so File::open inside check_sha256 hits
+        // EACCES; metadata.is_file() still passes so status() enters
+        // the is_file arm and produces CheckFailed (not NotCached).
+        std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // DAC-bypass probe mirrors the sibling I/O-error test; the
+        // restore-first pattern is required because skip! early-
+        // returns so permissions must be readable before the skip
+        // fires (otherwise the tempdir cleanup chokes on some
+        // filesystems).
+        if std::fs::File::open(&on_disk).is_ok() {
+            std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            skip!(
+                "open(0o000) succeeded — process has a DAC bypass (root, \
+                 CAP_DAC_OVERRIDE, or equivalent); offline-gate CheckFailed \
+                 arm cannot be exercised here"
+            );
+        }
+
+        // Classify before running ensure(): status() must produce
+        // CheckFailed here, NOT Mismatches (no hash computed) or
+        // NotCached (file exists).
+        let st = status(&spec).expect("valid-shape pin; status must not error");
+        let underlying_err = match &st.sha_verdict {
+            ShaVerdict::CheckFailed(e) => e.clone(),
+            other => {
+                std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+                panic!(
+                    "0o000 on a readable-shape pin must yield \
+                     ShaVerdict::CheckFailed; got: {other:?}",
+                );
+            }
+        };
+
+        let err = ensure(&spec).unwrap_err();
+        // Restore readable permissions before the tempdir Drop —
+        // same rationale as the sibling I/O-error test.
+        std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(OFFLINE_ENV),
+            "expected offline-gate bail on CheckFailed cache, got: {rendered}"
+        );
+        // The CheckFailed arm's bail wording is the discriminator.
+        // Matches model.rs:ensure:"SHA-256 check could not complete".
+        assert!(
+            rendered.contains("SHA-256 check could not complete"),
+            "expected CheckFailed branch wording \
+             (\"SHA-256 check could not complete\"), got: {rendered}"
+        );
+        // The underlying I/O error chain must be surfaced verbatim
+        // inside the bail message so an operator can name the
+        // filesystem failure without re-running diagnostics.
+        assert!(
+            rendered.contains(&underlying_err),
+            "expected the underlying I/O error {underlying_err:?} \
+             to appear verbatim in the offline-gate bail; got: \
+             {rendered}"
+        );
+        // Negative: must NOT be the stale-cache wording (which
+        // would misdiagnose the failure as a bytes-mismatch and
+        // route the operator toward re-fetching rather than
+        // inspecting the cache entry).
+        assert!(
+            !rendered.contains("do not match"),
+            "CheckFailed bail must not emit the stale-cache \
+             \"do not match\" wording, got: {rendered}"
+        );
+        // Negative: must NOT be the not-cached wording (the file
+        // exists; claiming otherwise misroutes toward pre-seeding).
+        assert!(
+            !rendered.contains("is not cached"),
+            "CheckFailed bail must not emit the not-cached \
+             \"is not cached\" wording, got: {rendered}"
         );
     }
 
