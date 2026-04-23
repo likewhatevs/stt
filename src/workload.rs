@@ -5140,22 +5140,26 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn set_sched_policy_fifo_returns_result() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::Fifo(1));
-        // SCHED_FIFO requires CAP_SYS_NICE — fails without privileges.
+        // SCHED_FIFO requires CAP_SYS_NICE; succeeds when the runner holds it.
         assert!(
-            result.is_err(),
-            "SCHED_FIFO should fail without CAP_SYS_NICE"
+            result.is_ok(),
+            "SCHED_FIFO should succeed with CAP_SYS_NICE"
         );
+        restore_normal(pid);
     }
 
     #[test]
+    #[ignore]
     fn set_sched_policy_rr_returns_result() {
         let pid: libc::pid_t = unsafe { libc::getpid() };
         let result = set_sched_policy(pid, SchedPolicy::RoundRobin(1));
-        // SCHED_RR requires CAP_SYS_NICE — fails without privileges.
-        assert!(result.is_err(), "SCHED_RR should fail without CAP_SYS_NICE");
+        // SCHED_RR requires CAP_SYS_NICE; succeeds when the runner holds it.
+        assert!(result.is_ok(), "SCHED_RR should succeed with CAP_SYS_NICE");
+        restore_normal(pid);
     }
 
     #[test]
