@@ -130,101 +130,27 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+//
+// Flat-metric scanning primitives (`ThreadLookup`, `lookup_thread`,
+// `snapshot_worker_allocated`, `thread_count`, `snapshot_count`)
+// live in `ktstr::test_support::probe_metrics` so they're
+// reachable from lib-crate unit tests. Only the tiny
+// file-local `metric_u64` wrapper stays here — it's used once in
+// this file and doesn't warrant promotion.
 
-/// Outcome of scanning the flat metric list for a tid-keyed thread
-/// entry. Distinguishes "tid not present" from "tid present but
-/// `allocated_bytes` missing" so the caller can issue a precise
-/// diagnostic instead of a blanket "not found".
-enum ThreadLookup {
-    /// `snapshots.0.threads.N.tid == worker_tid` and
-    /// `snapshots.0.threads.N.allocated_bytes` are both present.
-    /// Returns the observed counter plus the companion
-    /// `deallocated_bytes` (if emitted).
-    Found {
-        allocated_bytes: u64,
-        deallocated_bytes: Option<u64>,
-    },
-    /// Probe emitted a `snapshots.0.threads.N.tid` matching
-    /// `worker_tid`, but no `snapshots.0.threads.N.allocated_bytes`
-    /// sibling. The probe hit an error on that thread — typically
-    /// an `error` entry replaces the counter fields.
-    MissingAllocatedBytes,
-    /// No `snapshots.0.threads.N.tid == worker_tid` entry in the
-    /// flat metric list. Probe did not visit the worker at all.
-    TidAbsent,
-}
-
-/// Extract the `allocated_bytes` / `deallocated_bytes` values for
-/// `worker_tid` from snapshot 0 in the flat metric list produced by
-/// `walk_json_leaves` over the probe's JSON output.
-///
-/// The probe emits
-/// `{"pid":P,"snapshots":[{"timestamp_unix_sec":T,"threads":[{"tid":T,"allocated_bytes":A,"deallocated_bytes":D,...}, ...]}, ...]}`
-/// which `walk_json_leaves` flattens per array index into contiguous
-/// keys `snapshots.0.threads.0.tid`, `snapshots.0.threads.1.tid`, …
-/// with no gaps. The scan below stops at the first
-/// `snapshots.0.threads.N.tid` miss, which is the natural array
-/// terminator. The 1024 cap is a belt-and-suspenders safety bound —
-/// realistic probe runs see at most a few dozen threads in a
-/// single-allocator worker process.
-fn lookup_thread(metrics: &PayloadMetrics, worker_tid: i32) -> ThreadLookup {
-    let worker_tid_f64 = worker_tid as f64;
-    for i in 0..1024 {
-        let tid_key = format!("snapshots.0.threads.{i}.tid");
-        let tid_m = match metrics.metrics.iter().find(|m| m.name == tid_key) {
-            Some(m) => m,
-            None => return ThreadLookup::TidAbsent,
-        };
-        if tid_m.value == worker_tid_f64 {
-            let alloc_key = format!("snapshots.0.threads.{i}.allocated_bytes");
-            let dealloc_key = format!("snapshots.0.threads.{i}.deallocated_bytes");
-            let allocated_bytes = match metrics
-                .metrics
-                .iter()
-                .find(|m| m.name == alloc_key)
-                .map(|m| m.value as u64)
-            {
-                Some(v) => v,
-                None => return ThreadLookup::MissingAllocatedBytes,
-            };
-            let deallocated_bytes = metrics
-                .metrics
-                .iter()
-                .find(|m| m.name == dealloc_key)
-                .map(|m| m.value as u64);
-            return ThreadLookup::Found {
-                allocated_bytes,
-                deallocated_bytes,
-            };
-        }
-    }
-    ThreadLookup::TidAbsent
-}
-
-/// Count the number of `snapshots.0.threads.N.tid` entries in the
-/// flat metric list. Walk uses the same contiguous-index property
-/// documented on [`lookup_thread`]: array flattening yields indices
-/// 0..N without gaps, so scanning stops at the first miss.
-fn thread_count(metrics: &PayloadMetrics) -> usize {
-    let mut n = 0;
-    for i in 0..1024 {
-        let tid_key = format!("snapshots.0.threads.{i}.tid");
-        if metrics.metrics.iter().any(|m| m.name == tid_key) {
-            n += 1;
-        } else {
-            break;
-        }
-    }
-    n
-}
+use ktstr::test_support::{
+    MAX_SCAN_INDEX, ThreadLookup, find_metric, lookup_thread, snapshot_count,
+    snapshot_worker_allocated, thread_count,
+};
 
 /// Look up a flat metric by exact key. Returns `None` if absent.
 fn metric_u64(metrics: &PayloadMetrics, key: &str) -> Option<u64> {
-    metrics
-        .metrics
-        .iter()
-        .find(|m| m.name == key)
-        .map(|m| m.value as u64)
+    find_metric(metrics, key).map(|m| m.value as u64)
+}
+
+/// Does the flat metric list contain a metric with this exact name?
+fn has_metric(metrics: &PayloadMetrics, key: &str) -> bool {
+    find_metric(metrics, key).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +285,16 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
                     .iter()
                     .map(|m| (m.name.as_str(), m.value))
                     .collect::<Vec<_>>(),
+            ));
+        }
+        ThreadLookup::ExceedsCap => {
+            return Err(anyhow!(
+                "probe JSON emitted at least {cap} contiguous snapshots.0.threads.N.tid \
+                 entries without matching tid={worker_tid}; scan hit the safety cap before \
+                 reaching the array terminator. n_threads={n_threads}. Either the target \
+                 is unexpectedly wide (raise the cap if legitimate) or the flat-metric \
+                 schema changed and the terminator convention no longer holds.",
+                cap = MAX_SCAN_INDEX,
             ));
         }
     };
@@ -581,13 +517,11 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
         // `allocated_bytes` sibling (the `error` string is flattened-
         // away by walk_json_leaves). Any such pair is evidence the
         // ESRCH race actually fired on this invocation.
-        for j in 0..1024 {
-            let tid_key = format!("snapshots.0.threads.{j}.tid");
-            if !metrics.metrics.iter().any(|m| m.name == tid_key) {
+        for j in 0..MAX_SCAN_INDEX {
+            if !has_metric(&metrics, &format!("snapshots.0.threads.{j}.tid")) {
                 break;
             }
-            let alloc_key = format!("snapshots.0.threads.{j}.allocated_bytes");
-            if !metrics.metrics.iter().any(|m| m.name == alloc_key) {
+            if !has_metric(&metrics, &format!("snapshots.0.threads.{j}.allocated_bytes")) {
                 error_invocations += 1;
                 break;
             }
@@ -630,57 +564,10 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
     Ok(result)
 }
 
-/// Count the number of `snapshots.N.timestamp_unix_sec` entries in
-/// the flat metric list. Same contiguous-index contract as
-/// [`thread_count`]; scans from 0 and stops at the first miss.
-fn snapshot_count(metrics: &PayloadMetrics) -> usize {
-    let mut n = 0;
-    for i in 0..1024 {
-        let key = format!("snapshots.{i}.timestamp_unix_sec");
-        if metrics.metrics.iter().any(|m| m.name == key) {
-            n += 1;
-        } else {
-            break;
-        }
-    }
-    n
-}
-
-/// Extract `snapshots.{snap_idx}.threads[*].allocated_bytes` for the
-/// thread whose tid matches `worker_tid`. Returns `None` if the
-/// tid is not present (e.g. probe emitted an Err arm for that
-/// snapshot) or if the `allocated_bytes` sibling is missing.
-fn snapshot_worker_allocated(
-    metrics: &PayloadMetrics,
-    snap_idx: usize,
-    worker_tid: i32,
-) -> Option<u64> {
-    let worker_tid_f64 = worker_tid as f64;
-    for j in 0..1024 {
-        let tid_key = format!("snapshots.{snap_idx}.threads.{j}.tid");
-        let tid_m = metrics.metrics.iter().find(|m| m.name == tid_key)?;
-        if tid_m.value == worker_tid_f64 {
-            let alloc_key =
-                format!("snapshots.{snap_idx}.threads.{j}.allocated_bytes");
-            return metrics
-                .metrics
-                .iter()
-                .find(|m| m.name == alloc_key)
-                .map(|m| m.value as u64);
-        }
-    }
-    None
-}
-
 /// Extract `snapshots.{snap_idx}.timestamp_unix_sec` for the given
 /// snapshot index.
 fn snapshot_timestamp(metrics: &PayloadMetrics, snap_idx: usize) -> Option<u64> {
-    let key = format!("snapshots.{snap_idx}.timestamp_unix_sec");
-    metrics
-        .metrics
-        .iter()
-        .find(|m| m.name == key)
-        .map(|m| m.value as u64)
+    metric_u64(metrics, &format!("snapshots.{snap_idx}.timestamp_unix_sec"))
 }
 
 /// Multi-snapshot sampling mode: run the probe with `--snapshots 3
@@ -761,17 +648,36 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
             anyhow!("snapshots.{i}.timestamp_unix_sec missing from probe output")
         })?;
         timestamps.push(ts);
-        let alloc = snapshot_worker_allocated(&metrics, i, worker_tid).ok_or_else(|| {
-            anyhow!(
-                "worker tid {worker_tid} not found (or no allocated_bytes) in \
-                 snapshots.{i}; flat metrics: {:?}",
-                metrics
-                    .metrics
-                    .iter()
-                    .map(|m| (m.name.as_str(), m.value))
-                    .collect::<Vec<_>>(),
-            )
-        })?;
+        let alloc = match snapshot_worker_allocated(&metrics, i, worker_tid) {
+            ThreadLookup::Found { allocated_bytes, .. } => allocated_bytes,
+            ThreadLookup::MissingAllocatedBytes => {
+                return Err(anyhow!(
+                    "worker tid {worker_tid} present in snapshots.{i} but no \
+                     allocated_bytes sibling — probe emitted an error record \
+                     in place of the counter for this snapshot"
+                ));
+            }
+            ThreadLookup::TidAbsent => {
+                return Err(anyhow!(
+                    "worker tid {worker_tid} absent from snapshots.{i}; flat \
+                     metrics: {:?}",
+                    metrics
+                        .metrics
+                        .iter()
+                        .map(|m| (m.name.as_str(), m.value))
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            ThreadLookup::ExceedsCap => {
+                return Err(anyhow!(
+                    "snapshots.{i} emitted at least {cap} contiguous tid \
+                     entries without matching tid={worker_tid}; scan hit cap \
+                     before terminator. Raise MAX_SCAN_INDEX if the \
+                     target is legitimately this wide.",
+                    cap = MAX_SCAN_INDEX,
+                ));
+            }
+        };
         allocations.push(alloc);
     }
 

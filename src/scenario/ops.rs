@@ -2137,21 +2137,18 @@ fn build_stimulus(
 /// # Why this is a scenario-intent check, not a kernel guard
 ///
 /// ktstr only writes `cpuset.cpus` on each cgroup; it never writes
-/// `cpuset.mems`, so `cpuset.mems` inherits its parent's permissive
-/// "all nodes" default. Under that layout the kernel's
-/// `set_mempolicy(2)` path does NOT silently intersect the nodemask
-/// with the cpuset — the cpuset's `mems_allowed` covers every node,
-/// so the policy's explicit nodemask is used as-written.
-///
-/// This holds when ktstr is the cgroup root (typical: PID 1 in a
-/// guest VM, the default deployment shape). Under a nested-cgroup
-/// layout with a narrowed parent `cpuset.mems` — container-in-
-/// container, systemd slices with `AllowedMemoryNodes=` — the
-/// inherited `mems_allowed` IS restricted, and the kernel DOES
-/// intersect `set_mempolicy`'s nodemask with it. In that shape the
-/// validator additionally functions as a kernel guard: it catches
-/// policy nodes the kernel would silently drop before they reach
-/// the syscall.
+/// `cpuset.mems`, so `cpuset.mems` inherits its parent's default.
+/// In every ktstr deployment shape — PID 1 in the guest VM, the
+/// cgroup root on the host — that default is the permissive
+/// "all nodes" set. Under that layout the kernel's
+/// `set_mempolicy(2)` path does NOT intersect the nodemask with
+/// the cpuset: `mems_allowed` covers every node, so the policy's
+/// explicit nodemask is used as-written and the kernel will not
+/// reject or silently trim it. The validator is therefore the
+/// **only** layer that rejects a mismatched policy — if it does
+/// not bail here, the policy lands on the syscall unchanged and
+/// `run_steps` commits to running the worker with a misconfigured
+/// allocation target.
 ///
 /// What the validator catches is a **scenario-design mismatch**:
 /// you pinned CPUs on NUMA node X (via `CpusetSpec::Numa(X)`) but
@@ -4616,15 +4613,38 @@ mod tests {
         // both appear so the reader sees the exact disjoint pair.
         assert!(err.contains("[1]"), "bail must name uncovered node 1: {err}");
         assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
-        // Both escape hatches must surface: STATIC_NODES opt-in
-        // AND cpuset widening.
+        // Both escape hatches must surface — pin the enumerated
+        // `(a)` / `(b)` markers so a regression that collapses them
+        // into one option trips this test before a user sees a
+        // vague diagnostic.
         assert!(
-            err.contains("STATIC_NODES"),
-            "bail must name STATIC_NODES escape hatch: {err}",
+            err.contains("(a) add .mpol_flags(MpolFlags::STATIC_NODES)"),
+            "bail must call out hatch (a) STATIC_NODES opt-in by name: {err}",
+        );
+        assert!(
+            err.contains("(b) widen the cpuset"),
+            "bail must call out hatch (b) cpuset widening: {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Numa(N)"),
+            "bail must name CpusetSpec::Numa(N) as a widening example: {err}",
         );
         assert!(
             err.contains("CpusetSpec::Exact"),
             "bail must name the CpusetSpec::Exact cpuset-widening escape hatch: {err}",
+        );
+        // The mismatch framing ("cross-socket allocation traffic
+        // that is almost certainly unintended") must survive doc
+        // edits — it's what makes the bail actionable for an
+        // author who wrote the policy assuming the kernel would
+        // silently intersect.
+        assert!(
+            err.contains("cross-socket allocation traffic"),
+            "bail must name the cross-socket framing: {err}",
+        );
+        assert!(
+            err.contains("almost certainly unintended"),
+            "bail must frame the mismatch as unintended: {err}",
         );
     }
 
@@ -4664,8 +4684,26 @@ mod tests {
         assert!(err.contains("cg_preferred_test"), "bail must name cgroup: {err}");
         assert!(err.contains("[1]"), "bail must name uncovered node 1: {err}");
         assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
-        assert!(err.contains("STATIC_NODES"), "bail must name STATIC_NODES: {err}");
-        assert!(err.contains("CpusetSpec::Exact"), "bail must name CpusetSpec::Exact widening: {err}");
+        assert!(
+            err.contains("(a) add .mpol_flags(MpolFlags::STATIC_NODES)"),
+            "bail must enumerate hatch (a): {err}",
+        );
+        assert!(
+            err.contains("(b) widen the cpuset"),
+            "bail must enumerate hatch (b): {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Numa(N)"),
+            "bail must cite CpusetSpec::Numa(N) example: {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Exact"),
+            "bail must name CpusetSpec::Exact widening: {err}",
+        );
+        assert!(
+            err.contains("almost certainly unintended"),
+            "bail must frame mismatch as unintended: {err}",
+        );
     }
 
     #[test]
@@ -4688,8 +4726,22 @@ mod tests {
         // bail should not list node 0 in the uncovered set.
         assert!(err.contains("[1]"), "bail must name uncovered node 1: {err}");
         assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
-        assert!(err.contains("STATIC_NODES"), "bail must name STATIC_NODES: {err}");
-        assert!(err.contains("CpusetSpec::Exact"), "bail must name CpusetSpec::Exact widening: {err}");
+        assert!(
+            err.contains("(a) add .mpol_flags(MpolFlags::STATIC_NODES)"),
+            "bail must enumerate hatch (a): {err}",
+        );
+        assert!(
+            err.contains("(b) widen the cpuset"),
+            "bail must enumerate hatch (b): {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Numa(N)"),
+            "bail must cite CpusetSpec::Numa(N) example: {err}",
+        );
+        assert!(
+            err.contains("CpusetSpec::Exact"),
+            "bail must name CpusetSpec::Exact widening: {err}",
+        );
     }
 
     /// `MPOL_F_STATIC_NODES` is the kernel's explicit opt-in for

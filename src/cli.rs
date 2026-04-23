@@ -2907,17 +2907,25 @@ mod tests {
         let missing = tmp.path().join("nonexistent_child");
         let _ = run_make_with_output(&missing, &["foo"], None);
         let before = count_fds();
-        // Run the failing path several times — a per-call leak of
-        // even one fd would compound here and surface as a clear
-        // delta. A single-call measurement could miss small leaks
-        // masked by transient fd churn from the test runtime.
-        for _ in 0..16 {
+        // Run the failing path 128 times — a per-call leak of even
+        // one fd would compound into a 128-fd delta, far above any
+        // realistic transient-churn noise. Scaled up from the
+        // previous 16-iteration loop because a 16-fd growth was
+        // still in the range where process-wide churn (background
+        // tempfile cleanup, tracing subscriber sinks, log rotators)
+        // could mask a small per-call leak under a tolerant `<=`
+        // comparison. 128 keeps the test under ~1s on a warm cache
+        // while giving the signal-to-noise margin a genuine leak
+        // needs to surface.
+        const FD_LEAK_ITERATIONS: u32 = 128;
+        for _ in 0..FD_LEAK_ITERATIONS {
             let _ = run_make_with_output(&missing, &["foo"], None);
         }
         let after = count_fds();
         assert!(
             after <= before,
-            "fd leak on spawn failure: {before} -> {after} (16 calls, expected no growth)"
+            "fd leak on spawn failure: {before} -> {after} \
+             ({FD_LEAK_ITERATIONS} calls, expected no growth)"
         );
     }
 

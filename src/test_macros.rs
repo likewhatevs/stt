@@ -139,7 +139,14 @@ mod tests {
             // Helper fn returning `()` so `skip!` can emit its
             // `return;` tail. The AtomicBool is set only if the
             // line AFTER `skip!` executes — a regression that
-            // dropped the `return;` tail would trip it.
+            // dropped the `return;` tail would trip it. The two
+            // `#[allow(...)]` attributes are load-bearing: when
+            // `skip!` correctly returns, `reached.store` is dead
+            // code AND `reached` falls out of the live set —
+            // which is exactly what this test is designed to
+            // pin. Without the allows, compilation warns about
+            // the very invariant the test verifies.
+            #[allow(unused_variables, unreachable_code)]
             fn helper(reached: &AtomicBool) {
                 skip!("macro-level reason with {} substitution", "format-args");
                 reached.store(true, Ordering::SeqCst);

@@ -980,17 +980,37 @@ fn run_model_status() -> Result<(), String> {
     // all-clear case (no annotation needed). An I/O failure points
     // at the filesystem entry (permissions, truncation); a mismatch
     // points at the bytes themselves.
+    // "Re-fetch to replace it" is the shared remediation tail for
+    // every non-Matches cached-file branch (both CheckFailed and
+    // Mismatches land on the same operator action — the cause
+    // differs but the fix does not). Factoring the tail into one
+    // string keeps the two arms in lock-step so a wording change
+    // lands in both places by construction.
+    const RE_FETCH_TAIL: &str = "re-fetch to replace it";
     match &status.sha_verdict {
         ktstr::test_support::ShaVerdict::NotCached => println!(
             "(no cached copy — run `cargo ktstr model fetch` to download {} MiB)",
             status.spec.size_bytes / 1024 / 1024,
         ),
-        ktstr::test_support::ShaVerdict::CheckFailed(err) => println!(
-            "(cached file could not be checked: {err}; inspect the cache entry \
-             or re-fetch to replace it)",
-        ),
+        ktstr::test_support::ShaVerdict::CheckFailed(err) => {
+            // Collapse multi-line anyhow chains into a single
+            // semicolon-separated line for the CLI readout.
+            // `{err:#}` rendering of an anyhow error can span
+            // multiple lines (source chain, backtrace), which
+            // breaks the "(single parenthesized note)" wrapper
+            // format used by the other arms. Replacing `\n` with
+            // `; ` preserves every cause while keeping the output
+            // on one line.
+            let single_line = err.replace('\n', "; ");
+            println!(
+                "(cached file could not be checked: {single_line}; \
+                 inspect the cache entry or {RE_FETCH_TAIL})",
+            );
+        }
         ktstr::test_support::ShaVerdict::Mismatches => {
-            println!("(cached file failed SHA-256 check; re-fetch to replace it)");
+            println!(
+                "(cached file failed SHA-256 check; {RE_FETCH_TAIL})",
+            );
         }
         ktstr::test_support::ShaVerdict::Matches => {}
     }

@@ -878,6 +878,17 @@ pub fn build_nodemask(nodes: &BTreeSet<usize>) -> (Vec<libc::c_ulong>, libc::c_u
 const MPOL_PREFERRED_MANY: i32 = 5;
 const MPOL_WEIGHTED_INTERLEAVE: i32 = 6;
 
+/// Worker-side `futex_wait` timeout for STOP-signal polling across
+/// every blocking workload primitive (FutexPingPong, FutexFanOut,
+/// FanOutCompute, MutexContention). Workers block inside the
+/// per-variant futex with this timespec; on wake (or timeout) they
+/// re-check [`STOP`] and either continue working or exit cleanly.
+/// At 100ms the worst-case shutdown latency a `stop_and_collect`
+/// caller must budget for is ~100ms above the flush/IO cost; see
+/// [`WorkloadHandle::stop_and_collect`]'s "Shutdown latency"
+/// paragraph for the caller-facing contract.
+const WORKER_STOP_POLL_NS: libc::c_long = 100_000_000;
+
 /// Call `set_mempolicy(2)` for the current process with mode flags.
 ///
 /// No-op for `MemPolicy::Default`. Logs a warning on syscall failure.
@@ -2046,6 +2057,22 @@ impl WorkloadHandle {
     /// This ensures `assert_not_starved` catches dead workers as starvation
     /// failures.
     ///
+    /// # Shutdown latency
+    ///
+    /// Workers spend their steady-state time blocked inside a
+    /// `futex_wait` with timeout [`WORKER_STOP_POLL_NS`] (~100 ms).
+    /// On SIGUSR1 the signal handler sets [`STOP`] to `true`, but
+    /// the worker only observes the flag on the NEXT wake of that
+    /// futex — whenever the partner writes its futex word OR the
+    /// 100 ms timeout fires, whichever comes first. Callers that
+    /// budget a graceful-shutdown window against `stop_and_collect`
+    /// should allow at least one [`WORKER_STOP_POLL_NS`] tick
+    /// (~100 ms) between the SIGUSR1 delivery and the final collect
+    /// step, over and above any report-flush / IO latency. Tighter
+    /// windows can race the worker's pre-STOP iteration and surface
+    /// as a missing report, which is then mapped to the sentinel
+    /// path above.
+    ///
     /// # Exit-shape invariance
     ///
     /// Collection discriminates purely on the presence and validity of
@@ -2586,7 +2613,7 @@ fn worker_main(
                 let before_block = Instant::now();
                 let ts = libc::timespec {
                     tv_sec: 0,
-                    tv_nsec: 100_000_000, // 100ms
+                    tv_nsec: WORKER_STOP_POLL_NS,
                 };
                 loop {
                     if STOP.load(Ordering::Relaxed) {
@@ -2682,7 +2709,7 @@ fn worker_main(
                     let before_block = Instant::now();
                     let ts = libc::timespec {
                         tv_sec: 0,
-                        tv_nsec: 100_000_000, // 100ms
+                        tv_nsec: WORKER_STOP_POLL_NS,
                     };
                     loop {
                         if STOP.load(Ordering::Relaxed) {
@@ -3023,7 +3050,7 @@ fn worker_main(
                     let expected_low = expected as u32;
                     let ts = libc::timespec {
                         tv_sec: 0,
-                        tv_nsec: 100_000_000, // 100ms timeout
+                        tv_nsec: WORKER_STOP_POLL_NS,
                     };
                     loop {
                         if STOP.load(Ordering::Relaxed) {
@@ -3103,7 +3130,18 @@ fn worker_main(
                         (ptr, region_size)
                     }
                 };
-                let page_count = region_size / 4096;
+                // region_kb < 4 produces region_size < 4096, so
+                // `region_size / 4096` truncates to zero and the
+                // `% page_count` below would panic (or UB in release
+                // with panic=abort). mmap rounds up to a whole page
+                // internally regardless of the requested length, so
+                // the kernel actually handed us at least one page
+                // of mapped memory even for a sub-page `region_kb`.
+                // Clamping `page_count` to at least 1 matches that
+                // physical reality: the single page gets touched
+                // every iteration, preserving the churn intent
+                // without introducing a panic edge.
+                let page_count = (region_size / 4096).max(1);
                 let xorshift64 = |state: &mut u64| -> u64 {
                     let mut x = *state;
                     x ^= x << 13;
@@ -3150,7 +3188,7 @@ fn worker_main(
                     let before_block = Instant::now();
                     let ts = libc::timespec {
                         tv_sec: 0,
-                        tv_nsec: 100_000_000, // 100ms
+                        tv_nsec: WORKER_STOP_POLL_NS,
                     };
                     unsafe {
                         futex_wait(futex_ptr, 1u32 /* expected value (locked) */, &ts)

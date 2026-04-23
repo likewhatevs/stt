@@ -163,6 +163,35 @@ pub(crate) fn build_vm_builder_base(
     // base initramfs; the init binary stays stripped because the
     // paired alloc-worker carries DWARF. Absent env var = existing
     // behavior (no probe).
+    //
+    // Required ctor shape in a new test file that needs the probe
+    // in the guest — paste verbatim, adjust the two binary names:
+    //
+    // ```ignore
+    // #[::ktstr::__private::ctor::ctor(crate_path = ::ktstr::__private::ctor)]
+    // fn set_probe_binary_env_var() {
+    //     // SAFETY: ctor runs before any `#[ktstr_test]` thread or
+    //     // probe thread spawns; glibc's `__environ` mutation is
+    //     // single-threaded here.
+    //     unsafe {
+    //         std::env::set_var(
+    //             "KTSTR_JEMALLOC_PROBE_BINARY",
+    //             env!("CARGO_BIN_EXE_ktstr-jemalloc-probe"),
+    //         );
+    //         std::env::set_var(
+    //             "KTSTR_JEMALLOC_ALLOC_WORKER_BINARY",
+    //             env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker"),
+    //         );
+    //     }
+    // }
+    // ```
+    //
+    // The `crate_path = ::ktstr::__private::ctor` argument is
+    // non-negotiable: `#[ctor::ctor]` without the re-export path
+    // panics at compile time because the `ctor` crate is not
+    // listed in the test crate's direct deps. ktstr re-exports
+    // `ctor` under `__private::ctor` exactly so test authors do
+    // not need to add it themselves.
     if let Ok(probe_path) = std::env::var("KTSTR_JEMALLOC_PROBE_BINARY")
         && !probe_path.is_empty()
     {

@@ -71,6 +71,15 @@ goblin = { version = "0.10.5", features = ["elf64"] }
 # path doesn't depend on blazesym's re-export surface.
 gimli = "0.32"
 rayon = "1"
+# ELF reader/writer. `features = ["build"]` pulls in the full
+# `object::build::elf::Builder` surface used by `elf_strip.rs` and
+# `cache.rs` for SHT_NOBITS rewriting. `cargo tree --duplicates` also
+# lists `object v0.37.3` reached via `ar_archive_writer` (build-dep of
+# `psm` / `stacker` / `polars`) with only the `memchr` feature — that
+# second instance is a build-script compilation artifact and does not
+# link into any shipped binary. The dupe is an artifact of resolver v3
+# keeping build-dep and regular-dep feature graphs separate; unifying
+# would require dropping `polars`, which is not a proportionate fix.
 object = { version = "0.37", default-features = false, features = ["build"] }
 walkdir = "2"
 indicatif = "0.18"

@@ -10,19 +10,28 @@
 //! Entry point: `--pid <PID>`. Attaches to every thread in the
 //! target process via ptrace, reads each thread's TSD counters
 //! through `process_vm_readv`, detaches. DWARF is resolved against
-//! the target's `/proc/<pid>/exe`, so the target ELF must ship with
-//! debuginfo. End-to-end validation runs via the `#[ktstr_test]`
-//! integration tests in `tests/jemalloc_probe_tests.rs`, which boot
-//! a VM, spawn a jemalloc-linked allocator worker, and run the probe
-//! against the worker's live pid.
+//! the target's `/proc/<pid>/exe` when that ELF carries
+//! `.debug_info`; if the target is stripped, the probe walks
+//! `.gnu_debuglink` + `NT_GNU_BUILD_ID` to locate external
+//! debuginfo (paired `.debug` file or a distro `-dbg` /
+//! `-debuginfo` package under `/usr/lib/debug`) — see
+//! [`resolve_field_offsets`]. End-to-end validation runs via the
+//! `#[ktstr_test]` integration tests in
+//! `tests/jemalloc_probe_tests.rs`, which boot a VM, spawn a
+//! jemalloc-linked allocator worker, and run the probe against
+//! the worker's live pid.
 //!
 //! Scope:
 //! - Linux, x86_64 and aarch64. Same-arch only (a probe binary built
 //!   for x86_64 only handles x86_64 targets; ptrace is same-arch).
 //! - Static-linked jemalloc only (symbol lives in the main
 //!   executable's static TLS image).
-//! - Requires DWARF debuginfo on the target ELF and CAP_SYS_PTRACE /
-//!   root / same-uid-as-target.
+//! - Requires DWARF debuginfo reachable from the target ELF —
+//!   either inline `.debug_info` on the target itself OR a paired
+//!   external debug file discovered via `.gnu_debuglink` /
+//!   `NT_GNU_BUILD_ID` — plus CAP_SYS_PTRACE / root / same-uid or
+//!   descendant relationship under YAMA (see "Security posture"
+//!   below).
 //!
 //! # Security posture
 //!
@@ -34,22 +43,37 @@
 //! `/proc/<pid>/exe`, `process_vm_readv`) rides on the same access
 //! check.
 //!
-//! On a stock Linux host with `kernel.yama.ptrace_scope=1` (the
-//! Debian/Ubuntu default), that means one of:
-//! - **Same-uid-as-target**: run the probe under the uid that owns
-//!   the target process. This is the intended path for the ktstr
-//!   integration tests, which spawn both the alloc-worker and the
-//!   probe under the same test-process uid inside the VM.
-//! - **CAP_SYS_PTRACE**: grant the probe the `ptrace` capability for
-//!   one invocation (`sudo setcap cap_sys_ptrace+eip ktstr-jemalloc-probe`
-//!   on a release binary, or `sudo -E` for an ad-hoc run).
-//! - **root**: run under uid 0. Not recommended outside CI / VM
-//!   environments where the blast radius is already contained.
+//! The exact privilege story depends on the host's
+//! `kernel.yama.ptrace_scope` setting (see
+//! `Documentation/admin-guide/LSM/Yama.rst` in the kernel tree):
 //!
-//! Under YAMA `ptrace_scope=2` (admin-only) or `=3` (disabled),
-//! only root + CAP_SYS_PTRACE, or root with YAMA disabled, can
-//! attach. The probe will report a clear ENOSYS-like failure from
-//! `PTRACE_SEIZE` in those cases rather than silently degrading.
+//! - **`ptrace_scope=0` (no restriction)**: any process sharing the
+//!   target's uid can attach. This is the layout the ktstr
+//!   integration tests run under — the guest VM boots with the
+//!   default kernel sysctls, and both the alloc-worker and the
+//!   probe live under the same uid inside that VM. No extra
+//!   capability is needed.
+//! - **`ptrace_scope=1` (restricted; Debian/Ubuntu default on
+//!   bare-metal hosts)**: same-uid alone is NOT sufficient. The
+//!   tracer must additionally be an ancestor of the target, OR the
+//!   target must have called `prctl(PR_SET_PTRACER, tracer_pid)` /
+//!   `PR_SET_PTRACER_ANY` to opt the tracer in, OR the tracer must
+//!   carry `CAP_SYS_PTRACE`. For a probe binary running outside
+//!   the target's process tree, the practical options on a
+//!   scope=1 host are: `sudo setcap cap_sys_ptrace+eip
+//!   ktstr-jemalloc-probe` on the release binary (one-time), or
+//!   invoke via `sudo -E` so the probe inherits uid 0.
+//! - **`ptrace_scope=2` (admin-only)**: only `CAP_SYS_PTRACE` or
+//!   uid 0 attaches; user-level opt-in via `PR_SET_PTRACER` is
+//!   refused.
+//! - **`ptrace_scope=3` (disabled)**: no process may attach to any
+//!   other, regardless of capability. The probe cannot function
+//!   and `PTRACE_SEIZE` returns `EPERM`.
+//!
+//! In every scope above, `PTRACE_SEIZE` surfaces a clear `EPERM` /
+//! `ESRCH` failure rather than silently degrading — `resolve_*`
+//! paths propagate the errno through anyhow context, so operators
+//! see the exact syscall that was refused.
 //!
 //! The probe does not open network sockets, does not write outside
 //! its explicit `--sidecar` path (when provided), and does not
@@ -322,13 +346,32 @@ const DEALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_deallocate
     name = "ktstr-jemalloc-probe",
     version = env!("CARGO_PKG_VERSION"),
     about = "Read per-thread jemalloc allocated/deallocated byte counters from a running process",
+    after_help = "\
+EXAMPLES:
+  Single snapshot against a running pid:
+    ktstr-jemalloc-probe --pid 12345 --json
+
+  Multi-snapshot sampling — 5 snapshots at 200ms each (= 1s total):
+    ktstr-jemalloc-probe --pid 12345 --snapshots 5 --interval-ms 200 --json
+
+  Time-bounded run — take up to 10 snapshots at 500ms, self-abort after 3s:
+    ktstr-jemalloc-probe --pid 12345 --snapshots 10 --interval-ms 500 \\
+                         --abort-after-ms 3000 --json
+
+  Enrich an existing ktstr sidecar with probe metrics:
+    ktstr-jemalloc-probe --pid 12345 --sidecar \\
+      target/ktstr/{kernel}-{git}/{test}-{hash}.ktstr.json\
+",
     long_about = "Reads jemalloc's per-thread `thread_allocated` / `thread_deallocated` TLS \
                   counters out of a running process via ptrace + process_vm_readv. Counters are \
                   cumulative from thread creation — attaching late does not miss prior \
-                  allocations. Requires CAP_SYS_PTRACE, root, or same-uid-as-target. Supports \
-                  Linux x86_64 and aarch64 (same-arch only) targets with a statically-linked \
-                  jemalloc and DWARF debuginfo on the binary carrying the jemalloc TLS \
-                  symbol.\n\n\
+                  allocations. Requires CAP_SYS_PTRACE, root, or same-uid / descendant \
+                  relationship under YAMA (kernel.yama.ptrace_scope). Supports Linux x86_64 \
+                  and aarch64 (same-arch only) targets with a statically-linked jemalloc and \
+                  DWARF debuginfo reachable from the target ELF — either inline on the binary \
+                  carrying the jemalloc TLS symbol or as a paired external debug file \
+                  discovered via .gnu_debuglink / NT_GNU_BUILD_ID (distro -dbg / -debuginfo \
+                  packages under /usr/lib/debug).\n\n\
                   The `--enable-stats` jemalloc build flag is NOT required: `thread.allocated` / \
                   `thread.deallocated` use jemalloc's `CTL_RO_NL_GEN` (ungated) and the fast/slow \
                   path writes are unconditional.\n\n\
@@ -604,7 +647,23 @@ struct Snapshot {
     /// Unix-epoch seconds at the start of this snapshot's per-tid
     /// attach/read/detach loop. Same clock-source semantics as
     /// [`ProbeOutput::started_at_unix_sec`].
+    ///
+    /// **Second-granularity is insufficient for tight sampling.**
+    /// Multi-snapshot runs with `--interval-ms` under 1000 produce
+    /// adjacent snapshots with identical `timestamp_unix_sec`
+    /// values, collapsing the inter-snapshot delta to zero seconds
+    /// and hiding sub-second allocation rate. For finer-grained
+    /// correlation, use [`Self::elapsed_since_start_ns`] below.
     timestamp_unix_sec: u64,
+    /// Nanoseconds since [`ProbeOutput::started_at_unix_sec`], as
+    /// measured by `CLOCK_MONOTONIC` at the start of this
+    /// snapshot's per-tid loop. Populated unconditionally in every
+    /// snapshot (single- and multi-snapshot runs alike) so
+    /// downstream consumers can subtract adjacent values to get
+    /// sub-second inter-snapshot gaps. Immune to wall-clock jumps
+    /// (NTP step, manual date set) that can perturb
+    /// `timestamp_unix_sec` on long runs.
+    elapsed_since_start_ns: u64,
     threads: Vec<ThreadResult>,
 }
 
@@ -904,14 +963,17 @@ impl CounterOffsets {
         })
     }
 
-    /// Byte range covering both counters plus the
-    /// `thread_allocated_next_event_fast` u64 between them. Used as the
-    /// remote iov for a single `process_vm_readv` while the target
-    /// thread is stopped.
-    pub fn combined_read_span(&self) -> (u64, u64) {
-        let start = self.thread_allocated;
-        let end = self.thread_deallocated + 8;
-        (start, end - start)
+    /// Byte span covering both counters plus the
+    /// `thread_allocated_next_event_fast` u64 between them. Used as
+    /// the length of the remote iov for a single `process_vm_readv`
+    /// while the target thread is stopped.
+    ///
+    /// The read's BASE address is `self.thread_allocated` (plus
+    /// whatever per-thread TLS base the caller computed) — it is
+    /// redundant with this struct's field and every caller already
+    /// has it, so this helper only returns the span.
+    pub fn combined_read_span(&self) -> u64 {
+        self.thread_deallocated + 8 - self.thread_allocated
     }
 }
 
@@ -1678,7 +1740,7 @@ fn probe_single_thread(
     )
     .map_err(ThreadProbeError::tls_arithmetic)?;
 
-    let (_base, span) = offsets.combined_read_span();
+    let span = offsets.combined_read_span();
     let mut buf = vec![0u8; span as usize];
     let remote = RemoteIoVec {
         base: addr as usize,
@@ -1830,12 +1892,17 @@ fn take_snapshot(
     symbol: &TsdTlsSymbol,
     offsets: &CounterOffsets,
     tids: &[i32],
+    run_start: std::time::Instant,
 ) -> (Snapshot, bool) {
-    // Capture timestamp BEFORE iterating threads so the field
-    // represents "start of this snapshot" — a post-loop capture
+    // Capture both timestamps BEFORE iterating threads so the fields
+    // represent "start of this snapshot" — a post-loop capture
     // would tail the variable-length per-thread ptrace work and
-    // drift as the snapshot progresses.
+    // drift as the snapshot progresses. `elapsed_since_start_ns`
+    // uses CLOCK_MONOTONIC via Instant so sub-second inter-snapshot
+    // gaps are measurable (timestamp_unix_sec only resolves to the
+    // second) and immune to wall-clock jumps.
     let timestamp_unix_sec = now_unix_sec();
+    let elapsed_since_start_ns = run_start.elapsed().as_nanos() as u64;
     let mut threads: Vec<ThreadResult> = Vec::with_capacity(tids.len());
     let mut interrupted = false;
     for &tid in tids {
@@ -1867,6 +1934,7 @@ fn take_snapshot(
     (
         Snapshot {
             timestamp_unix_sec,
+            elapsed_since_start_ns,
             threads,
         },
         interrupted,
@@ -1879,6 +1947,44 @@ fn take_snapshot(
 /// (collectively across all snapshots) for multi-snapshot runs.
 fn all_failed(threads: &[ThreadResult]) -> bool {
     threads.is_empty() || threads.iter().all(|t| matches!(t, ThreadResult::Err { .. }))
+}
+
+/// Re-stat the target's `/proc/<pid>/exe` and bail fatal if the
+/// identity (dev, inode) differs from the captured baseline.
+///
+/// Shared between two invariant points in [`run`]:
+/// - Between ELF/DWARF parse completion and the snapshot loop —
+///   `context` is `"during ELF/DWARF parse"`.
+/// - Between consecutive snapshots (iterations 1..N) — `context`
+///   is `"between snapshots"`.
+///
+/// A mismatch means the target `execve`'d mid-run (new inode,
+/// possibly same pid) or the pid was recycled. Either way the
+/// cached symbol address + TLS offsets point into a different
+/// binary, so continuing would read garbage counters; the probe
+/// must bail before any per-tid ptrace work.
+///
+/// Returns `Ok(())` on an unchanged identity, `Err(Fatal)` on a
+/// mismatch or a stat failure. The two outcomes funnel through
+/// [`RunOutcome::Fatal`] in the caller.
+fn ensure_exe_identity_unchanged(
+    pid: i32,
+    baseline: &ExeIdentity,
+    context: &'static str,
+) -> std::result::Result<(), anyhow::Error> {
+    match ExeIdentity::capture(pid) {
+        Ok(current) if current != *baseline => Err(anyhow!(
+            "target pid {pid} /proc/<pid>/exe changed {context} \
+             (captured dev={:#x} ino={}, now dev={:#x} ino={}); \
+             target execve'd or pid recycled, TLS offsets invalid",
+            baseline.dev,
+            baseline.ino,
+            current.dev,
+            current.ino,
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Stable identity of the target's on-disk executable, captured by
@@ -1912,6 +2018,13 @@ fn run(cli: &Cli) -> RunOutcome {
     // `started_at_unix_sec`. Taking it inside each arm would drift
     // with the variable pre-probe setup latency.
     let started_at_unix_sec = now_unix_sec();
+    // Monotonic anchor captured alongside the wall-clock timestamp so
+    // every `Snapshot::elapsed_since_start_ns` is measured from the
+    // same origin. Wall clock can jump (NTP, manual date set) —
+    // Instant does not, so this gives stable per-snapshot sub-second
+    // offsets regardless of what `clock_gettime(CLOCK_REALTIME)`
+    // reports later.
+    let run_start = std::time::Instant::now();
     let pid = cli.pid;
     // Self-probe reject: PTRACE_SEIZE refuses a tracer's own tgid —
     // ptrace semantics say a process cannot attach to itself. Catching
@@ -1956,20 +2069,8 @@ fn run(cli: &Cli) -> RunOutcome {
     // /proc/<pid>/exe, and subsequent snapshots would read TLS
     // offsets from a DIFFERENT binary. Bail before any per-tid
     // ptrace work runs.
-    match ExeIdentity::capture(pid) {
-        Ok(current) if current != exe_identity => {
-            return RunOutcome::Fatal(anyhow!(
-                "target pid {pid} /proc/<pid>/exe changed during ELF/DWARF parse \
-                 (captured dev={:#x} ino={}, now dev={:#x} ino={}); \
-                 target execve'd mid-parse or pid recycled, TLS offsets invalid",
-                exe_identity.dev,
-                exe_identity.ino,
-                current.dev,
-                current.ino,
-            ));
-        }
-        Ok(_) => {}
-        Err(e) => return RunOutcome::Fatal(e),
+    if let Err(e) = ensure_exe_identity_unchanged(pid, &exe_identity, "during ELF/DWARF parse") {
+        return RunOutcome::Fatal(e);
     }
 
     let tids = match iter_task_ids(pid) {
@@ -1995,23 +2096,13 @@ fn run(cli: &Cli) -> RunOutcome {
         // Skip on iteration 0 because `exe_identity` was just
         // captured before the loop.
         if i > 0 {
-            match ExeIdentity::capture(pid) {
-                Ok(current) if current != exe_identity => {
-                    return RunOutcome::Fatal(anyhow!(
-                        "target pid {pid} /proc/<pid>/exe changed between snapshots \
-                         (captured dev={:#x} ino={}, now dev={:#x} ino={}); \
-                         target execve'd mid-run or pid recycled, TLS offsets invalid",
-                        exe_identity.dev,
-                        exe_identity.ino,
-                        current.dev,
-                        current.ino,
-                    ));
-                }
-                Ok(_) => {}
-                Err(e) => return RunOutcome::Fatal(e),
+            if let Err(e) = ensure_exe_identity_unchanged(pid, &exe_identity, "between snapshots")
+            {
+                return RunOutcome::Fatal(e);
             }
         }
-        let (snap, snap_interrupted) = take_snapshot(pid, &symbol, &offsets, &tids);
+        let (snap, snap_interrupted) =
+            take_snapshot(pid, &symbol, &offsets, &tids, run_start);
         snapshots.push(snap);
         if snap_interrupted {
             interrupted = true;
@@ -2655,8 +2746,7 @@ mod tests {
     #[test]
     fn counter_offsets_combined_span_covers_both() {
         let o = CounterOffsets::new(264, 280).unwrap();
-        let (start, span) = o.combined_read_span();
-        assert_eq!(start, 264);
+        let span = o.combined_read_span();
         assert_eq!(span, 24, "8 (allocated) + 8 (fast_event) + 8 (deallocated)");
     }
 
@@ -2667,7 +2757,7 @@ mod tests {
     #[test]
     fn counter_offsets_combined_span_adjacent() {
         let o = CounterOffsets::new(100, 108).unwrap();
-        let (_start, span) = o.combined_read_span();
+        let span = o.combined_read_span();
         assert_eq!(span, 16);
     }
 
@@ -2779,6 +2869,7 @@ mod tests {
             interrupted: false,
             snapshots: vec![Snapshot {
                 timestamp_unix_sec: 1_700_000_000,
+                elapsed_since_start_ns: 0,
                 threads: vec![ok, ok_no_comm, err],
             }],
         };
@@ -3550,6 +3641,7 @@ mod tests {
             snapshots: vec![
                 Snapshot {
                     timestamp_unix_sec: 1_700_000_000,
+                elapsed_since_start_ns: 0,
                     threads: vec![ThreadResult::Ok {
                         tid: 42,
                         comm: Some("worker".to_string()),
@@ -3559,6 +3651,7 @@ mod tests {
                 },
                 Snapshot {
                     timestamp_unix_sec: 1_700_000_001,
+                elapsed_since_start_ns: 0,
                     threads: vec![ThreadResult::Ok {
                         tid: 42,
                         comm: Some("worker".to_string()),
@@ -3611,6 +3704,7 @@ mod tests {
             interrupted: false,
             snapshots: vec![Snapshot {
                 timestamp_unix_sec: 1_700_000_000,
+                elapsed_since_start_ns: 0,
                 threads: vec![ThreadResult::Ok {
                     tid: 99,
                     comm: None,
@@ -3640,6 +3734,167 @@ mod tests {
         assert_eq!(a, b, "ExeIdentity must be stable across back-to-back captures");
     }
 
+    /// `take_snapshot` polls `CLEANUP_REQUESTED` at the TOP of the
+    /// per-tid loop, so if the flag is already set on entry — the
+    /// "SIGTERM fired between snapshots" shape — the loop breaks
+    /// immediately, no ptrace work runs, and the returned snapshot
+    /// carries `interrupted = true` with an EMPTY `threads` vec.
+    /// The caller (run) then stops iterating further snapshots and
+    /// the final ProbeOutput carries `interrupted: true` with a
+    /// truncated `snapshots` array.
+    ///
+    /// This test pins the SIGTERM-mid-snapshot contract without
+    /// needing a subprocess or a live ptrace target: synthesize
+    /// non-empty tids, flip the flag before calling, and assert the
+    /// truncation. Uses dummy `TsdTlsSymbol` / `CounterOffsets`
+    /// because the ptrace path is never reached under the flag.
+    #[test]
+    fn take_snapshot_interrupted_flag_truncates_threads_vec() {
+        // Reset then flip BEFORE entry — real SIGTERM between
+        // snapshots produces this same observable pre-state.
+        CLEANUP_REQUESTED.store(false, Ordering::SeqCst);
+        CLEANUP_REQUESTED.store(true, Ordering::SeqCst);
+        // Dummy symbol + offsets — unused under the interrupted
+        // path (probe_single_thread is gated behind the flag
+        // check). Any valid construction works.
+        let symbol = TsdTlsSymbol {
+            elf_path: std::path::PathBuf::from("/dummy"),
+            st_value: 0,
+            tls_image_aligned_size: 0,
+            p_align: 8,
+            e_machine: arch::EXPECTED_E_MACHINE,
+        };
+        let offsets = CounterOffsets::new(0, 8).expect("0 < 8 satisfies layout invariant");
+        let tids = vec![1, 2, 3];
+        let run_start = std::time::Instant::now();
+        let (snap, interrupted) =
+            take_snapshot(self_pid(), &symbol, &offsets, &tids, run_start);
+        // Reset for other tests.
+        CLEANUP_REQUESTED.store(false, Ordering::SeqCst);
+
+        assert!(interrupted, "pre-set flag must surface interrupted=true");
+        assert!(
+            snap.threads.is_empty(),
+            "truncated snapshot must carry no thread entries when flag is set \
+             before the first per-tid iteration; got {} entries",
+            snap.threads.len(),
+        );
+        assert!(
+            snap.elapsed_since_start_ns < 1_000_000_000,
+            "elapsed_since_start_ns must be populated sub-second on an \
+             immediately-interrupted snapshot; got {} ns",
+            snap.elapsed_since_start_ns,
+        );
+    }
+
+    /// Companion: when the flag is set MID-iteration (after some
+    /// tids have been processed), the threads vec is partially
+    /// populated and `interrupted = true`. This test flips the flag
+    /// from a spawned thread between the loop's atomic polls,
+    /// mirroring the SIGTERM-during-probe shape.
+    ///
+    /// Because `take_snapshot`'s per-tid body runs synchronously
+    /// before the next atomic poll, we cannot deterministically
+    /// schedule the flip "between iteration N and N+1" from a
+    /// separate thread without ptrace running real work. Instead
+    /// this test exercises the NORMAL completion path with the flag
+    /// clear — confirming `interrupted = false` when no signal
+    /// arrives. The truncation guarantee is covered by the pre-set
+    /// test above.
+    #[test]
+    fn take_snapshot_flag_clear_completes_normally() {
+        CLEANUP_REQUESTED.store(false, Ordering::SeqCst);
+        let symbol = TsdTlsSymbol {
+            elf_path: std::path::PathBuf::from("/dummy"),
+            st_value: 0,
+            tls_image_aligned_size: 0,
+            p_align: 8,
+            e_machine: arch::EXPECTED_E_MACHINE,
+        };
+        let offsets = CounterOffsets::new(0, 8).expect("0 < 8 satisfies layout invariant");
+        // Empty tids list — the loop body never runs. `interrupted`
+        // stays false because the only write is inside the flag-poll
+        // branch which requires the loop to iterate at least once.
+        let tids: Vec<i32> = vec![];
+        let run_start = std::time::Instant::now();
+        let (snap, interrupted) =
+            take_snapshot(self_pid(), &symbol, &offsets, &tids, run_start);
+        assert!(!interrupted, "clear flag + empty tids must not mark interrupted");
+        assert!(snap.threads.is_empty());
+    }
+
+    /// `ensure_exe_identity_unchanged` passes when the re-captured
+    /// identity matches the baseline, matching the hot path taken
+    /// after a normal ELF/DWARF parse against a non-exec'ing target.
+    #[test]
+    fn ensure_exe_identity_unchanged_ok_on_match() {
+        let pid = self_pid();
+        let baseline = ExeIdentity::capture(pid).expect("stat /proc/self/exe");
+        ensure_exe_identity_unchanged(pid, &baseline, "test context")
+            .expect("identical baseline must pass");
+    }
+
+    /// `ensure_exe_identity_unchanged` bails with an actionable error
+    /// when the re-captured identity differs from the baseline. A
+    /// real execve mid-probe is a live-target operation; to exercise
+    /// the mismatch path deterministically this test synthesizes a
+    /// baseline with a deliberately-unreachable (dev, ino) pair, so
+    /// the re-stat against `/proc/self/exe` will produce a concrete
+    /// (dev, ino) that cannot equal the synthetic baseline. Pins the
+    /// Fatal-path failure shape: the error message carries both the
+    /// baseline values and the current values in hex/decimal and the
+    /// caller-supplied context fragment.
+    #[test]
+    fn ensure_exe_identity_unchanged_errs_on_mismatch() {
+        let pid = self_pid();
+        let baseline = ExeIdentity {
+            dev: 0xDEAD_BEEF_DEAD_BEEF,
+            ino: 0xCAFE_BABE_CAFE_BABE,
+        };
+        let err = ensure_exe_identity_unchanged(pid, &baseline, "in unit test")
+            .expect_err("synthetic mismatch must produce Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("changed in unit test"),
+            "error must carry the context string; got: {msg}",
+        );
+        assert!(
+            msg.contains("dev=0xdeadbeefdeadbeef") || msg.contains("dev=0xdeadbeefDEADBEEF"),
+            "error must carry the baseline dev in hex; got: {msg}",
+        );
+        assert!(
+            msg.contains("TLS offsets invalid"),
+            "error must carry the downstream consequence so operators \
+             know the probe is bailing before reading garbage; got: {msg}",
+        );
+    }
+
+    /// Helper integrates with the `RunOutcome::Fatal` error surface:
+    /// an `Err` from the helper is cast to `RunOutcome::Fatal(e)` by
+    /// the two call sites inside `run()`. This test confirms the
+    /// shape end-to-end — an `anyhow::Error` from the helper is
+    /// wrappable in `RunOutcome::Fatal` without loss of the error
+    /// message.
+    #[test]
+    fn ensure_exe_identity_unchanged_error_wraps_into_run_outcome_fatal() {
+        let pid = self_pid();
+        let baseline = ExeIdentity {
+            dev: 0,
+            ino: 0,
+        };
+        let err = ensure_exe_identity_unchanged(pid, &baseline, "between snapshots")
+            .expect_err("synthetic mismatch");
+        // Simulate the `run()` call-site: wrap in RunOutcome::Fatal.
+        let outcome = RunOutcome::Fatal(err);
+        match outcome {
+            RunOutcome::Fatal(e) => {
+                let msg = format!("{e}");
+                assert!(msg.contains("between snapshots"));
+            }
+            _ => panic!("expected RunOutcome::Fatal"),
+        }
+    }
+
     /// `interrupted: true` round-trips through serde. Pins the JSON
     /// literal so downstream consumers keying on `"interrupted":true`
     /// to distinguish partial from complete runs see a stable token.
@@ -3656,6 +3911,7 @@ mod tests {
             interrupted: true,
             snapshots: vec![Snapshot {
                 timestamp_unix_sec: 1_700_000_000,
+                elapsed_since_start_ns: 0,
                 threads: Vec::new(),
             }],
         };
@@ -3715,6 +3971,7 @@ mod tests {
             interrupted: false,
             snapshots: vec![Snapshot {
                 timestamp_unix_sec: 1_700_000_000,
+                elapsed_since_start_ns: 0,
                 threads: vec![ThreadResult::Ok {
                     tid: 42,
                     comm: Some("worker".to_string()),
@@ -4070,6 +4327,7 @@ mod tests {
             interrupted: false,
             snapshots: vec![Snapshot {
                 timestamp_unix_sec: 1_700_000_000,
+                elapsed_since_start_ns: 0,
                 threads: vec![
                     ThreadResult::Ok {
                         tid: 42,

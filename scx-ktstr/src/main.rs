@@ -36,30 +36,21 @@ fn has_flag(flag: &str) -> bool {
     std::env::args().any(|a| a == flag)
 }
 
+/// Main-loop poll cadence. Delay flags (`--stall-after`,
+/// `--degrade-after`) are checked inline at each tick, so a trigger
+/// fires at the NEXT poll after `elapsed >= delay`. At 100ms the
+/// worst-case jitter between "delay elapsed" and "trigger fires"
+/// is bounded by this constant, well within the resolution of even
+/// the smallest non-zero delay the CLI accepts (1s) — a requested
+/// 1s stall fires between 1.0s and 1.1s of wall clock, not 1.0s
+/// to 2.0s as under the prior 1s cadence. Shorter still would add
+/// wakeup cost with no observable benefit; 100ms is the smallest
+/// value that reliably keeps a test's timing annotation meaningful.
+const POLL_CADENCE: Duration = Duration::from_millis(100);
+
 fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
     let stall_after = parse_delay_flag("--stall-after");
     let degrade_after = parse_delay_flag("--degrade-after");
-    // The main poll cadence is `thread::sleep(Duration::from_secs(1))`
-    // (see the loop below). Delay flags are checked inline at each tick,
-    // so the trigger fires at the NEXT poll after `elapsed >= delay` —
-    // i.e. the actual trigger can land up to 1s after the requested
-    // delay. Values of 0 fire immediately before the loop (see below)
-    // and are unaffected. Warn the operator on `1..=4` so short-delay
-    // scenarios do not attribute a late trigger to scheduler behavior.
-    for (name, maybe) in [
-        ("--stall-after", stall_after),
-        ("--degrade-after", degrade_after),
-    ] {
-        if let Some(delay_s) = maybe
-            && (1..5).contains(&delay_s)
-        {
-            eprintln!(
-                "scx-ktstr: WARNING: {name}={delay_s}s can exhibit up to 1s \
-                 poll-granularity jitter under load. Delays of 5s or greater \
-                 keep the jitter well within the intended delay.",
-            );
-        }
-    }
     let degrade = has_flag("--degrade");
     let fail_verify = has_flag("--fail-verify");
     let scattershot = has_flag("--scattershot");
@@ -118,12 +109,13 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
     // are never joined, and the `BpfSkel<'_>` stack local (plus its
     // owned libbpf `Object`, `BpfLink`, and mmap'd `bss`/`rodata`
     // regions) drops when `run` returns on shutdown or `uei_exited`.
-    // Folding the triggers into the existing 1-second poll cadence
-    // eliminates the aliasing, removes the `unsafe` cast, and bounds
-    // the wake latency to the same granularity the file-triggered
-    // path already has. Delay precision is `Duration::from_secs(delay_s)`
-    // with 1 s poll granularity — adequate for the test durations
-    // these flags are used with (tens of seconds and up).
+    // Folding the triggers into the main poll loop eliminates the
+    // aliasing, removes the `unsafe` cast, and bounds the wake
+    // latency to the same granularity the file-triggered path
+    // already has. Delay precision is `Duration::from_secs(delay_s)`
+    // bounded by [`POLL_CADENCE`] (100ms) — adequate for every
+    // non-zero `--stall-after` / `--degrade-after` value the CLI
+    // surface accepts.
     //
     // Gating change vs the old timer-thread design: triggers become
     // inert once `uei_exited!(&skel, uei)` fires. A dead scheduler
@@ -134,10 +126,10 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
     // regression in practice.
     //
     // Zero-delay handling: `stall_after=0` / `degrade_after=0` would
-    // otherwise wait for the first `thread::sleep(1s)` before the
-    // elapsed check fired. Fire those immediately before entering
-    // the loop so the semantics match the old "spawn + sleep(0)"
-    // path (which fired essentially instantly).
+    // otherwise wait for the first `thread::sleep(POLL_CADENCE)`
+    // before the elapsed check fired. Fire those immediately before
+    // entering the loop so the semantics match the old "spawn +
+    // sleep(0)" path (which fired essentially instantly).
     if let Some(bss) = skel.maps.bss_data.as_mut() {
         if stall_after == Some(0) && bss.stall == 0 {
             bss.stall = 1;
@@ -150,7 +142,7 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
     }
     let start = Instant::now();
     while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&skel, uei) {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(POLL_CADENCE);
         let elapsed = start.elapsed();
         if let Some(bss) = skel.maps.bss_data.as_mut() {
             if let Some(delay_s) = stall_after

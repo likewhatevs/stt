@@ -52,6 +52,7 @@ mod model;
 mod output;
 mod payload;
 mod probe;
+mod probe_metrics;
 mod profraw;
 mod runtime;
 mod sidecar;
@@ -101,6 +102,10 @@ pub(crate) use probe::maybe_dispatch_vm_test;
 pub(crate) use probe::{
     PipelineDiagnostics, format_probe_diagnostics, maybe_dispatch_vm_test_with_args,
     maybe_dispatch_vm_test_with_phase_a, propagate_rust_env_from_cmdline, start_probe_phase_a,
+};
+pub use probe_metrics::{
+    MAX_SCAN_INDEX, ThreadLookup, count_indexed_metrics, find_metric, lookup_thread,
+    snapshot_count, snapshot_worker_allocated, thread_count,
 };
 pub(crate) use profraw::try_flush_profraw;
 pub(crate) use timefmt::now_iso8601;
