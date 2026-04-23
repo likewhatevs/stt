@@ -5943,18 +5943,32 @@ mod tests {
             unsafe { libc::_exit(127); }
         }
         if gpid == 0 {
-            // Close every inherited fd above stdio BEFORE exec so the
-            // grandchild does not keep the parent-worker's pipes open.
-            // The worker's report-pipe write end is especially
-            // load-bearing: if the grandchild inherits it, the test's
-            // parent-side `read_to_end` in `stop_and_collect` blocks on
-            // EOF until the grandchild itself dies, turning a fast
-            // graceful-exit test into a /bin/sleep-wall-clock-long run
-            // (observed: 60s). 3..256 covers any reasonable test
-            // configuration without requiring /proc/self/fd iteration
-            // post-fork. EBADF on a closed fd is silently ignored.
-            for fd in 3..256 {
-                unsafe { libc::close(fd); }
+            // Close every inherited fd above stdio BEFORE exec so
+            // the grandchild does not keep the parent-worker's
+            // pipes open. The worker's report-pipe write end is
+            // especially load-bearing: if the grandchild inherits
+            // it, the test's parent-side `read_to_end` in
+            // `stop_and_collect` blocks on EOF until the
+            // grandchild itself dies, turning a fast graceful-exit
+            // test into a /bin/sleep-wall-clock-long run
+            // (observed: 60s).
+            //
+            // `close_range(3, u32::MAX, 0)` is the one-syscall form
+            // (Linux 5.9+) and is the fast path. BUT this code
+            // runs on the HOST, not inside the ktstr guest VM —
+            // ktstr's 6.16+ kernel floor applies to the sched_ext
+            // guest kernel, not to the host running the tests. A
+            // host kernel predating 5.9 returns ENOSYS from
+            // `close_range`, leaving every inherited fd open and
+            // re-introducing the 60s hang. Fall back to the
+            // bounded `3..=256` close loop on any non-zero return
+            // so pre-5.9 hosts still close the load-bearing
+            // report-pipe write end.
+            let rc = unsafe { libc::close_range(3, u32::MAX, 0) };
+            if rc != 0 {
+                for fd in 3..=256 {
+                    unsafe { libc::close(fd); }
+                }
             }
             // Grandchild: exec immediately. `execv` returns only on
             // failure; any return is a setup error → _exit(127).

@@ -362,40 +362,11 @@ pub trait CgroupOps {
     fn cleanup_all(&self) -> Result<()>;
 }
 
-// The impl below is a thin forwarding layer from the `CgroupOps`
-// trait to the inherent `CgroupManager` methods. The duplication is
-// intentional: the inherent impl carries the real bodies (and the
-// fast-path monomorphic calls compile against it directly), while
-// this trait impl exists so the scenario layer can hold a
-// `&dyn CgroupOps` for test-double injection without a generic
-// parameter threaded through every caller. `CgroupOps` methods
-// cannot provide default bodies that access `CgroupManager`'s
-// private fields, so the forwarding cannot be collapsed via
-// trait-default-methods without exposing the internals. A
-// macro-generated delegation would cut the line count but lose the
-// method-by-method per-callsite `Go To Definition` discoverability;
-// the explicit forwarding is the cheaper trade. If a future refactor
-// shrinks `CgroupOps` toward just the methods the trait object
-// consumers actually use, the inherent methods that lose trait-level
-// callers can be deleted outright.
-//
-// Caller audit: `move_task` is not test-only. Outside the test
-// module there is one production caller at `move_task_with_retry`
-// (above), which is in turn called from `move_tasks` in the same
-// file. That call site — `self.move_task(name, pid)` — resolves
-// to the INHERENT `CgroupManager::move_task`, NOT the trait
-// method below, because `move_task_with_retry` is defined in the
-// `impl CgroupManager` block where inherent methods win over
-// trait methods of the same name. The trait method in this `impl
-// CgroupOps for CgroupManager` block is reached only via
-// dynamic dispatch through `&dyn CgroupOps`, which today has no
-// production callers of `move_task` — the trait method exists
-// solely so the shape is complete for the test-double. Removing
-// the inherent `move_task` would force inlining its body into
-// `move_task_with_retry` and dropping the retry-free fast path
-// that the test at the bottom of this file pins; removing the
-// trait method would shrink the test-double surface but leave
-// inherent callers untouched.
+// Thin forwarding trait impl: inherent `CgroupManager` methods hold the
+// real bodies; this trait impl exists so scenario code can hold
+// `&dyn CgroupOps` for test-double injection without threading a generic
+// through every caller. Trait default methods cannot access the private
+// fields, and macro-generated delegation would lose Go-To-Definition.
 impl CgroupOps for CgroupManager {
     fn parent_path(&self) -> &Path {
         CgroupManager::parent_path(self)
