@@ -47,23 +47,22 @@ use std::sync::OnceLock;
 /// # Constructing instances in tests
 ///
 /// `HostContext` is `#[non_exhaustive]`: downstream consumers
-/// cannot build one with a bare struct literal (`HostContext { ... }`)
-/// and must combine [`Default`] with Rust's struct-update syntax so
-/// a future field addition doesn't break the call site. The standard
-/// idiom is:
+/// cannot build one with any struct expression form (neither a
+/// bare struct literal `HostContext { ... }` nor a
+/// functional-update `HostContext { ..Default::default() }` — both
+/// are rejected cross-crate by E0639). The correct pattern is to
+/// start from a [`Default`] instance and mutate fields:
 ///
 /// ```
 /// use ktstr::prelude::HostContext;
-/// let ctx = HostContext {
-///     cpu_model: Some("Test CPU".to_string()),
-///     numa_nodes: Some(2),
-///     ..HostContext::default()
-/// };
+/// let mut ctx = HostContext::default();
+/// ctx.cpu_model = Some("Test CPU".to_string());
+/// ctx.numa_nodes = Some(2);
 /// ```
 ///
 /// For tests that want a populated baseline (non-trivial defaults
-/// for every field) instead of `Default`'s all-`None` minimum, use
-/// [`HostContext::test_fixture`].
+/// for every field) instead of `Default`'s all-`None` minimum, start
+/// from [`HostContext::test_fixture`] and mutate from there.
 ///
 /// # Error-free deserialization under field drift
 ///
@@ -208,14 +207,14 @@ pub struct HostContext {
 impl HostContext {
     /// Populated [`HostContext`] for unit tests. Every field carries
     /// a reasonable non-trivial value so call sites only spell out
-    /// what they want to vary via struct-update syntax:
+    /// what they want to vary via post-hoc field assignment
+    /// (`#[non_exhaustive]` rejects all StructExpression forms
+    /// cross-crate, including functional update):
     ///
     /// ```
     /// use ktstr::prelude::HostContext;
-    /// let ctx = HostContext {
-    ///     numa_nodes: Some(4),
-    ///     ..HostContext::test_fixture()
-    /// };
+    /// let mut ctx = HostContext::test_fixture();
+    /// ctx.numa_nodes = Some(4);
     /// ```
     ///
     /// Defaults model a plausible 2-node x86_64 Linux host: Intel

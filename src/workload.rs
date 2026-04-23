@@ -6207,12 +6207,43 @@ mod tests {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(gpid), None).is_ok(),
             "grandchild {gpid} must be alive before stop_and_collect",
         );
-        let _reports = h.stop_and_collect();
+        let reports = h.stop_and_collect();
         assert_grandchild_reaped_within(
             gpid,
             Duration::from_secs(5),
             "stop_and_collect (panic-path)",
         );
+        // Sentinel-mapping audit: the panicking worker cannot
+        // serialize a WorkerReport to the pipe, so
+        // `stop_and_collect`'s JSON-parse branch must fall into
+        // the sentinel path. The `exit_info` carried on the
+        // sentinel depends on the compile-time panic strategy:
+        //   - Under `panic = "abort"` (release profile), the
+        //     panic raises SIGABRT before the worker's
+        //     `catch_unwind` can run → `Signaled(SIGABRT)`.
+        //   - Under `panic = "unwind"` (dev/test profile, which
+        //     this test runs under), the worker's `catch_unwind`
+        //     intercepts the panic and calls `libc::_exit(1)` →
+        //     `Exited(1)`.
+        // Both paths produce a sentinel with `work_units == 0`;
+        // the match below accepts either.
+        assert_eq!(reports.len(), 1, "one worker spawned");
+        let r = &reports[0];
+        assert_eq!(
+            r.work_units, 0,
+            "sentinel must be zeroed; non-zero work_units would mean \
+             a worker-authored report leaked through the JSON-parse \
+             branch despite the panic",
+        );
+        match &r.exit_info {
+            Some(WorkerExitInfo::Signaled(sig)) if *sig == libc::SIGABRT => {}
+            Some(WorkerExitInfo::Exited(1)) => {}
+            other => panic!(
+                "expected sentinel with Signaled(SIGABRT) (panic=abort) \
+                 or Exited(1) (panic=unwind + catch_unwind) for a \
+                 panicking Custom closure; got {other:?}",
+            ),
+        }
     }
 
     /// Drop-path variant: the caller drops the handle WITHOUT calling

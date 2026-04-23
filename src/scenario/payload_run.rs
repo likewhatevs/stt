@@ -602,6 +602,19 @@ fn already_consumed(payload: &'static Payload) -> anyhow::Error {
     )
 }
 
+/// Drop-safety net for handles that fall out of scope without
+/// going through [`PayloadHandle::wait`], [`PayloadHandle::kill`],
+/// or [`PayloadHandle::try_wait`] (the three paths that
+/// `.take()` the child normally). Drop routes the process group
+/// through `kill_payload_process_group` — the SAME kill path the
+/// explicit `kill()` method uses — so there is no redundant
+/// `child.kill()` call: the killpg + single-pid SIGKILL inside
+/// `kill_payload_process_group` is belt-and-suspenders-by-design
+/// (see its doc for the pre-exec ESRCH race rationale), not
+/// two independent kills stacked. `child.wait()` reaps the
+/// zombie so the pid slot is freed even on the "dropped without
+/// consume" path, and the one-shot eprintln tells the operator
+/// metrics were lost.
 impl Drop for PayloadHandle {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -1173,10 +1186,15 @@ fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
 /// "uninitialized" (no SigchldScope has been constructed yet in
 /// this process).
 ///
-/// Zero is a safe sentinel: `std::thread::ThreadId` is guaranteed
-/// non-zero by the standard library (ThreadId bottoms out on
-/// NonZeroU64), so an unset AtomicUsize cannot collide with any
-/// legitimate thread ID.
+/// Zero is a safe sentinel: `current_thread_id_nonzero()` (the
+/// function that writes into this AtomicUsize) explicitly
+/// squashes a hash result of 0 to 1 before returning — so no
+/// legitimate thread-identity value written here is ever zero,
+/// and the uninitialized AtomicUsize is unambiguous. (The hash
+/// is produced via `DefaultHasher` on `ThreadId`, not via
+/// `ThreadId::as_u64()` which is nightly-only; the squash-to-1
+/// is what guarantees the non-zero invariant, not any property
+/// of `ThreadId` / `NonZeroU64`.)
 ///
 /// Multiple concurrent `SigchldScope` instances ARE allowed on
 /// the same thread — each `PayloadHandle` carries one, and a
@@ -3141,6 +3159,90 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 panic!("process group {pgid} still alive after kill+reap");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Timeout branch of [`wait_with_deadline`]: when the deadline
+    /// elapses without the child exiting, the function must
+    /// `kill_payload_process_group` the whole group (killpg plus a
+    /// direct single-pid SIGKILL) before draining output.
+    /// Without the killpg, a multi-process payload like
+    /// `sh -c 'sleep 60 & exec sleep 60'` would leave the
+    /// backgrounded sleeper alive after timeout. This test spawns
+    /// that shape directly (bypassing `PayloadRun` so the
+    /// `wait_with_deadline` fn can be driven with a tight 500 ms
+    /// budget without standing up a whole scenario) and probes the
+    /// pgid with `killpg(pgid, 0)` after the deadline fires —
+    /// ESRCH proves the sweep reached every member.
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_deadline_timeout_kills_process_group() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60 & exec sleep 60"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn multi-sleeper");
+        let pgid = libc::pid_t::try_from(child.id())
+            .expect("child pid fits in pid_t");
+        let start = std::time::Instant::now();
+        let out = wait_with_deadline(
+            &mut child,
+            std::time::Duration::from_millis(500),
+            "multi_sleeper_timeout",
+        )
+        .expect("wait_with_deadline returns Ok on timeout");
+        let elapsed = start.elapsed();
+        // Timeout must actually have elapsed — if the function
+        // returns almost instantly, the pidfd/epoll loop is
+        // short-circuiting on an unrelated signal rather than
+        // waiting for the 500 ms deadline.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(400),
+            "wait_with_deadline returned after only {elapsed:?}; \
+             deadline was 500 ms — check the epoll loop is honoring \
+             the timeout rather than unblocking on an unrelated event",
+        );
+        // The drain result must be captured even on timeout.
+        // After SIGKILL the child's std::process::ExitStatus has
+        // no numeric code (killed by signal, `status.code()`
+        // returns None), so `wait_and_capture` defaults to -1 at
+        // src/scenario/payload_run.rs per the `unwrap_or(-1)`
+        // fallback in its status-code read. Pin that contract —
+        // a future refactor that surfaces the signal number as
+        // the exit_code would regress this.
+        assert_eq!(out.exit_code, -1);
+        // After timeout-driven kill+reap, the whole process group
+        // must be gone. Poll `killpg(pgid, 0)` (existence probe)
+        // until ESRCH — SIGKILL delivery + reap of the backgrounded
+        // sleeper can lag the caller, so allow up to 30 s (matches
+        // kill_reaps_fork_descendants_via_process_group's budget).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            // SAFETY: killpg with signal 0 is a pure existence
+            // query with no side effects beyond errno.
+            let rc = unsafe { libc::killpg(pgid, 0) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(libc::ESRCH),
+                    "unexpected errno from killpg probe after \
+                     timeout: {err}",
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "process group {pgid} still alive 30 s after \
+                     wait_with_deadline timeout fired — killpg sweep \
+                     in the timeout branch failed to reach every \
+                     member",
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
