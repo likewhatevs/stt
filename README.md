@@ -110,15 +110,10 @@ sudo apt install clang pkg-config make gcc autoconf autopoint flex bison gawk
 sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 ```
 
-**liblzma (xz-utils) build note:** ktstr depends on `xz2` with the
-`static` feature, which builds `liblzma` from bundled C source
-during `cargo build`. The C compiler and autotools already listed
-above are sufficient — no separate `liblzma-dev` / `xz-devel`
-package is required. If you modify the workspace to drop the
-`static` feature on `xz2`, switch to the dynamic path by
-installing your distro's `liblzma-dev` (Debian) / `xz-devel`
-(Fedora) package and ensure `pkg-config` can find it. The default
-static build keeps CI builds reproducible across host distros.
+**liblzma note:** ktstr links `xz2` with the `static` feature — no
+separate `liblzma-dev` / `xz-devel` package is needed. See
+[CONTRIBUTING.md](CONTRIBUTING.md#liblzma-build-configuration)
+for the dynamic-link path if you're modifying the workspace.
 
 **Test files** go in `tests/` as standard Rust integration tests. Use `#[ktstr_test]` from `ktstr::prelude::*`.
 

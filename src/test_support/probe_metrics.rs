@@ -73,13 +73,45 @@ pub fn has_metric(metrics: &PayloadMetrics, key: &str) -> bool {
 }
 
 /// Fetch a metric by exact name and return its numeric value as a
-/// `u64`. Returns `None` if the metric is absent. Thin wrapper around
-/// [`find_metric`] + `value as u64` for the common numeric-lookup
-/// shape. Integer metrics that originated as JSON numbers round-trip
-/// through `f64` without loss up to 2^53 — every counter in the
-/// probe's output sits well below that bound.
-pub fn metric_u64(metrics: &PayloadMetrics, key: &str) -> Option<u64> {
-    find_metric(metrics, key).map(|m| m.value as u64)
+/// `u64`. Returns `None` if the metric is absent. Thin wrapper
+/// around [`find_metric`] + `value as u64` for the common
+/// numeric-lookup shape.
+///
+/// # `f64` → `u64` precision
+///
+/// JSON numbers parse into the probe's flat-metric list as `f64`
+/// (serde_json's number type). Integer values round-trip through
+/// `f64` without precision loss only up to `2^53`
+/// (`9_007_199_254_740_992`); above that bound, adjacent `u64`
+/// values collapse onto the same `f64` and `value as u64` loses
+/// the low-order bits. The probe's emitted counters
+/// (`allocated_bytes`, `deallocated_bytes`, tid numbers, snapshot
+/// timestamps in seconds) are in practice far below this
+/// threshold on realistic workloads: a 64-bit byte counter would
+/// require >8 PiB of total-allocated memory, and Linux pids are
+/// capped at `2^22`. The bound is therefore a soft invariant —
+/// consumers should NOT feed arbitrary externally-controlled
+/// values through this helper without a prior range check.
+///
+/// A `debug_assert!` on the same bound catches the invariant
+/// locally so a future metric that genuinely exceeds `2^53` lights
+/// up in a debug build before the truncation silently corrupts a
+/// downstream comparison; release builds trust the soft invariant
+/// and perform the `as u64` cast unconditionally.
+pub fn find_metric_u64(metrics: &PayloadMetrics, key: &str) -> Option<u64> {
+    find_metric(metrics, key).map(|m| {
+        debug_assert!(
+            m.value.is_finite() && m.value >= 0.0 && m.value <= (1u64 << 53) as f64,
+            "metric {:?} value {} outside the f64→u64 lossless range \
+             [0, 2^53]; the `as u64` cast will truncate silently. \
+             Either range-check externally-sourced input before \
+             landing it in the flat metrics list, or consume the \
+             metric via `.value` (f64) instead of this u64 helper.",
+            m.name,
+            m.value,
+        );
+        m.value as u64
+    })
 }
 
 /// Walk `0..cap` applying `key_fn(i)` to form a metric name and
@@ -209,7 +241,7 @@ pub fn snapshot_count(metrics: &PayloadMetrics) -> usize {
 ///
 /// Intended for "probe returned nothing we expected" error paths —
 /// when a lookup helper ([`lookup_thread`], [`snapshot_worker_allocated`],
-/// [`metric_u64`]) returns a miss, dumping the observed flat metric
+/// [`find_metric_u64`]) returns a miss, dumping the observed flat metric
 /// list into the failure message is usually the fastest triage step.
 pub fn flat_metrics_dump(metrics: &PayloadMetrics) -> Vec<(&str, f64)> {
     metrics

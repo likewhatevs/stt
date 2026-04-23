@@ -829,10 +829,35 @@ impl CacheDir {
 /// (it was created by the prior dead process), so
 /// `remove_dir_all` operates on paths that no live process is
 /// reading or writing. The reuse does not cross into the cleanup
-/// target's data. Linux `pid_max` caps at 2^22
-/// (`include/linux/threads.h::PID_MAX_LIMIT`), so reuse is rare
-/// on a host with moderate fork rate but not vanishingly so on
-/// CI runners that recycle pids quickly.
+/// target's data. The pid-reuse wraparound distance is the
+/// runtime `/proc/sys/kernel/pid_max` sysctl (the default on
+/// modern Linux is `2^22` == `4_194_304`, matching the
+/// compile-time ceiling `include/linux/threads.h::PID_MAX_LIMIT`;
+/// administrators can lower it via `sysctl kernel.pid_max=<N>`
+/// to shrink the wraparound surface, or — less commonly — raise
+/// it on 64-bit hosts where the 32-bit pid_t carries the higher
+/// bound). So reuse is rare on a host with moderate fork rate
+/// but not vanishingly so on CI runners that recycle pids
+/// quickly, especially if the runner's base image has lowered
+/// `pid_max` to fit a container namespace.
+///
+/// # TOCTOU: concurrent ktstr processes cannot collide on the
+///   same `.tmp-` directory
+///
+/// Two ktstr processes running against the same cache root
+/// cannot create conflicting `.tmp-{key}-{pid}` entries because
+/// the path embeds the CREATOR's pid. Process A with pid=100
+/// creates `.tmp-foo-100`; process B with pid=200 creates
+/// `.tmp-foo-200`. The scan here classifies both entries
+/// independently via the `kill(pid, None)` probe on the EMBEDDED
+/// pid, so a live sibling's debris is never misclassified as
+/// the scanner's own orphan — the scanner never writes a path
+/// embedding its own pid AND holding liveness for a foreign pid
+/// at the same time. A live ktstr whose pid happens to be
+/// reused after death falls under the pid-reuse case above, not
+/// this concurrent-process case, because the embedded pid
+/// refers to the DEAD creator, not the current live process
+/// occupying the same pid slot.
 ///
 /// We accept the race rather than serialize behind an additional
 /// lock because (a) the damage model is "delete a dead process's

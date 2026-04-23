@@ -24,11 +24,42 @@ These variables are only consulted by integration tests that boot a
 jemalloc-linked allocator worker inside the VM and attach the
 `ktstr-jemalloc-probe` to it (see `tests/jemalloc_probe_tests.rs`).
 Both are set from a `#[ctor]` in the test binary so they land before
-the test harness dispatches; the ctor hook runs under the `ctor`
-crate re-exported at `ktstr::__private::ctor`, so a new test crate
-does not need to add `ctor` to its own dependencies. Leaving either
-variable unset is the normal case — the VM launcher skips probe
-wiring entirely, and no initramfs entry is added.
+the test harness dispatches.
+
+### What `#[ctor]` is and why these variables need it
+
+`#[ctor]` is a Rust attribute (provided by the
+[`ctor` crate](https://crates.io/crates/ctor)) that marks a
+function to run automatically at binary initialization — after the
+dynamic linker sets up the process but before `main()` is called.
+Linux implements this via the `.init_array` ELF section; the
+attribute's generated code registers the function there. A function
+under `#[ctor]` therefore runs exactly once per process, on the
+main thread, before any code inside `main()` executes.
+
+The two environment variables above are consulted by ktstr's
+nextest pre-dispatch path (`ktstr_test_early_dispatch`), which
+itself runs under a ktstr-owned `#[ctor]` that intercepts the
+nextest protocol args (`--list`, `--exact`) before the standard
+Rust test harness sees them. The probe-wiring variables must
+already be populated when that early dispatch fires, so setting
+them from plain test-body code is too late — the sidecar
+enumeration and initramfs packing decisions have already run.
+Tests needing probe integration install their own `#[ctor]` that
+writes the two variables via `std::env::set_var`, ensuring both
+ktstr's early dispatch and the VM launch path downstream see the
+populated values.
+
+The ctor hook runs under the `ctor` crate re-exported at
+`ktstr::__private::ctor`, so a new test crate does not need to
+add `ctor` to its own dependencies — it can use the re-export
+via `ktstr::__private::ctor::ctor` and stay in sync with the
+version ktstr itself depends on, avoiding the "two ctor
+crates, two `.init_array` entries, ordering undefined" pitfall.
+
+Leaving either variable unset is the normal case — the VM
+launcher skips probe wiring entirely, and no initramfs entry is
+added.
 
 | Variable | Description | Default |
 |---|---|---|

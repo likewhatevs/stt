@@ -290,7 +290,7 @@ pub(crate) fn untracked_legend_if_any(any_untracked: bool) -> Option<&'static st
 /// so existing operators see no behavioural change.
 pub const STALE_KCONFIG_EXPLANATION: &str =
     "warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. \
-     Rebuild with: kernel build --force VERSION";
+     Rebuild with: kernel build --force <entry version>";
 
 /// Decide whether to emit the `(stale kconfig)` legend under the
 /// `kernel list` table. Mirrors [`eol_legend_if_any`] and
@@ -481,8 +481,9 @@ pub(crate) fn fetch_active_prefixes() -> anyhow::Result<Vec<String>> {
     Ok(active_prefixes_from_releases(&releases))
 }
 
-/// Reduce `(moniker, version)` pairs to the deduplicated list of
-/// major.minor prefixes the `(EOL)` annotation compares against.
+/// Reduce [`Release`](crate::fetch::Release) rows to the deduplicated
+/// list of major.minor prefixes the `(EOL)` annotation compares
+/// against.
 ///
 /// Separated from [`fetch_active_prefixes`] so the normalization path
 /// — `linux-next` skip, RC-suffix collapse via [`version_prefix`], and
@@ -490,13 +491,13 @@ pub(crate) fn fetch_active_prefixes() -> anyhow::Result<Vec<String>> {
 /// hitting the network. The on-network wrapper is a one-line adapter
 /// over this helper, so any future change to the normalization lands
 /// here once and both call sites consume it.
-fn active_prefixes_from_releases(releases: &[(String, String)]) -> Vec<String> {
+fn active_prefixes_from_releases(releases: &[crate::fetch::Release]) -> Vec<String> {
     let mut prefixes = Vec::new();
-    for (moniker, version) in releases {
-        if crate::fetch::is_skippable_release_moniker(moniker) {
+    for r in releases {
+        if crate::fetch::is_skippable_release_moniker(&r.moniker) {
             continue;
         }
-        if let Some(prefix) = version_prefix(version)
+        if let Some(prefix) = version_prefix(&r.version)
             && !prefixes.contains(&prefix)
         {
             prefixes.push(prefix);
@@ -2199,6 +2200,23 @@ static SPINNER_SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
 /// The hook delegates to the default `take_hook()` output after
 /// restoring, preserving the full panic-message contract (message,
 /// location, backtrace under `RUST_BACKTRACE`).
+///
+/// # Panic-hook stacking convention
+///
+/// ktstr installs hooks in two places: this spinner-termios restorer
+/// and the vCPU classifier (`crate::vmm::vcpu_panic::install_once`).
+/// `std::panic::set_hook` is process-wide — whichever site installs
+/// LAST wins, and earlier hooks are reached only via the previous-
+/// hook chain each site captures at install time. Every ktstr-side
+/// installer MUST follow the stacking pattern used here: call
+/// `std::panic::take_hook()` to capture the current hook, then
+/// `set_hook` a closure that runs its own work AND calls the
+/// captured `prev(info)` at the end. Skipping the delegation
+/// breaks the chain and silently drops every earlier-installed
+/// hook. See the module-level doc on `src/vmm/vcpu_panic.rs` for
+/// the full rationale (limitations section) and an alternative
+/// `make_hook(prev)` factoring; the pattern is identical, just
+/// packaged differently.
 fn install_spinner_termios_panic_hook() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
@@ -3858,10 +3876,13 @@ mod tests {
     // isolation: RC-suffix normalization, `linux-next` skip, and
     // first-seen dedup with input order preserved.
 
-    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn owned(pairs: &[(&str, &str)]) -> Vec<crate::fetch::Release> {
         pairs
             .iter()
-            .map(|(m, v)| ((*m).to_string(), (*v).to_string()))
+            .map(|(m, v)| crate::fetch::Release {
+                moniker: (*m).to_string(),
+                version: (*v).to_string(),
+            })
             .collect()
     }
 
@@ -4319,9 +4340,13 @@ mod tests {
     /// elements its inline-eprintln predecessor did: the warning
     /// preamble, the tag word `(stale kconfig)`, the cause
     /// (different ktstr.kconfig fragment), and the
-    /// `kernel build --force VERSION` remediation. A reword that
-    /// drops any of them silently degrades operator guidance —
-    /// pinning each piece catches the regression here.
+    /// `kernel build --force <entry version>` remediation. A reword
+    /// that drops any of them silently degrades operator guidance
+    /// — pinning each piece catches the regression here. The
+    /// `<entry version>` placeholder (angle brackets, lowercase)
+    /// is the convention ktstr uses to mark operator-substituted
+    /// tokens; a regression to a bare all-caps `VERSION` would
+    /// let a reader mistake it for a literal shell token.
     #[test]
     fn stale_kconfig_explanation_shape() {
         assert!(
@@ -4337,8 +4362,9 @@ mod tests {
             "stale legend must name the cause: {STALE_KCONFIG_EXPLANATION}",
         );
         assert!(
-            STALE_KCONFIG_EXPLANATION.contains("kernel build --force VERSION"),
-            "stale legend must name the rebuild remediation: {STALE_KCONFIG_EXPLANATION}",
+            STALE_KCONFIG_EXPLANATION.contains("kernel build --force <entry version>"),
+            "stale legend must name the rebuild remediation with the \
+             `<entry version>` placeholder: {STALE_KCONFIG_EXPLANATION}",
         );
     }
 

@@ -38,11 +38,13 @@
 //!   the default mode parks forever (`sleep(3600s)` loop) and the
 //!   `--churn` mode spins a `loop { spawn+join }` with no break —
 //!   so `0` in practice means a refactor silently dropped the
-//!   terminal-loop black-boxing and let the optimizer fold it away,
-//!   or the park loop returned Ok on a deliberate shutdown path.
-//!   Listed for grep-friendliness: a reader sweeping the legend for
-//!   "exit code 0" finds the row here rather than wondering whether
-//!   it was intentionally undocumented.
+//!   terminal-loop black-boxing and let the optimizer fold it away
+//!   (the `loop { … }` bodies have no `break` and no `Result`
+//!   return, so there is no legitimate "clean shutdown" code path
+//!   into `exit(0)`). Listed for grep-friendliness: a reader
+//!   sweeping the legend for "exit code 0" finds the row here
+//!   rather than wondering whether it was intentionally
+//!   undocumented.
 //! - `2`: `bytes == 0` (caller bug — zero-size alloc would panic in `touch`).
 //! - `3`: default-mode `/proc/self/task` self-check saw a thread count != 1.
 //! - `4`: ready-marker write failed.
@@ -84,7 +86,10 @@ use std::time::Duration;
 // single-source-of-truth behavior.
 #[path = "../worker_ready.rs"]
 mod worker_ready;
-use worker_ready::{WORKER_READY_MARKER_OVERRIDE_ENV, WORKER_STDERR_PREFIX, worker_ready_marker_path};
+use worker_ready::{
+    WORKER_READY_MARKER_OVERRIDE_ENV, WORKER_STDERR_PREFIX, WORKER_STDOUT_READY_PREFIX,
+    worker_ready_marker_path,
+};
 
 /// Force jemalloc to observe the heap buffer by reading through it.
 ///
@@ -246,7 +251,11 @@ fn main() {
     // The stdout line is a human-useful breadcrumb if the test
     // fails and the log is inspected; the test body does not parse
     // it (readiness is communicated via the marker file above).
-    println!("jemalloc-alloc-worker ready pid={pid} bytes={bytes}");
+    // The prefix literal lives in `worker_ready.rs` as
+    // `WORKER_STDOUT_READY_PREFIX` so a rename updates one place
+    // and any future test-side assertion can match against the
+    // same const rather than duplicating the string.
+    println!("{WORKER_STDOUT_READY_PREFIX} pid={pid} bytes={bytes}");
     let _ = std::io::stdout().flush();
 
     if churn {

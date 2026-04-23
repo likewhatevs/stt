@@ -64,12 +64,16 @@
 //! - **No `crate::…` paths**, no `use crate::…` statements.
 //!   `crate` resolves to two different crates (ktstr vs.
 //!   the bin) on the two compilation paths; anything that names the
-//!   other crate's types breaks one of the two builds. `super::*`
-//!   inside a nested `#[cfg(test)] mod tests { … }` block is the one
-//!   carve-out: `super::` from a child `mod tests` resolves to items
-//!   defined in this file itself, not to the enclosing crate, and
-//!   those items exist identically under both compilation paths — no
-//!   lib-vs-bin divergence.
+//!   other crate's types breaks one of the two builds. A future
+//!   nested `#[cfg(test)] mod tests { … }` block is safe to add at
+//!   the bottom of this file using `super::` to reach items defined
+//!   here — `super::` from a child `mod tests` resolves to this
+//!   file's own items, which exist identically under both
+//!   compilation paths, so the tests would not divide lib vs. bin.
+//!   None currently exists; the pin-tests for the path format live
+//!   in `tests/jemalloc_alloc_worker_exit_codes.rs` and
+//!   `tests/jemalloc_probe_signals_test.rs`, which reach the items
+//!   through the `ktstr::worker_ready::…` public surface.
 //! - **No ktstr-library types or modules.** Only `std` items,
 //!   language primitives, and `core` types are safe. Anything that
 //!   depends on `PayloadHandle`, scenario `Ctx`, `anyhow`, or any
@@ -125,20 +129,19 @@
 /// Prefix for the pid-scoped ready-marker path. The final segment is
 /// the worker's pid rendered as a decimal ASCII integer.
 ///
-/// Visibility: `pub(crate)` — the prefix is an internal
-/// implementation detail of the worker-ready-marker convention.
-/// Downstream callers (the worker binary's ready-path write and
-/// the host-side poll in `wait_for_worker_ready`) always go through
-/// [`worker_ready_marker_path`] / [`WORKER_READY_MARKER_OVERRIDE_ENV`]
-/// and never see the literal; the pin-tests that assert on the
-/// prefix value live in this module's own `#[cfg(test)]` block and
-/// reach the const via `super::`, which stays in lock-step with the
-/// definition by construction. External `/tmp/ktstr-worker-ready-`
-/// string literals elsewhere in the tree would be a drift bug —
-/// the prefix is kept `pub(crate)` so a rename updates one place
-/// and the compiler catches any new literal introduced outside
-/// this module.
-pub(crate) const WORKER_READY_MARKER_PREFIX: &str = "/tmp/ktstr-worker-ready-";
+/// Exported as a `pub const` for symmetry with the other items in
+/// this module ([`WORKER_READY_MARKER_OVERRIDE_ENV`],
+/// [`worker_ready_marker_path`], [`WORKER_STDERR_PREFIX`]) — every
+/// symbol that represents a piece of the worker-ready / worker-
+/// stderr wire contract is `pub` so host-side integration tests in
+/// `tests/` can assert on the exact literal the worker and the
+/// probe depend on, without the test file having to duplicate the
+/// string. Downstream callers (the worker binary's ready-path
+/// write, the host-side poll in `wait_for_worker_ready`) normally
+/// route through [`worker_ready_marker_path`] rather than
+/// concatenating this prefix themselves; the prefix is exposed for
+/// assertion use, not as the preferred construction path.
+pub const WORKER_READY_MARKER_PREFIX: &str = "/tmp/ktstr-worker-ready-";
 
 /// Name of the test-only env var that overrides the pid-scoped
 /// default path. When set and non-empty, the worker writes the
@@ -178,4 +181,29 @@ pub fn worker_ready_marker_path(pid: u32) -> String {
 /// prefix alone regardless of the specific separator the worker
 /// chooses.
 pub const WORKER_STDERR_PREFIX: &str = "jemalloc-alloc-worker:";
+
+/// Stdout "ready" breadcrumb the `ktstr-jemalloc-alloc-worker`
+/// binary prints once, immediately before parking on `pause()`,
+/// after its allocation + `black_box` triple has materialised.
+/// The full emitted line is
+/// `{WORKER_STDOUT_READY_PREFIX} pid={pid} bytes={bytes}`; this
+/// const carries only the prefix so host-side consumers that want
+/// to grep the worker's captured stdout (or that fold worker
+/// stdout into a larger test log) can match against a single
+/// authoritative literal.
+///
+/// Exported as `pub const` for the same reason as
+/// [`WORKER_STDERR_PREFIX`]: a rename or a typo on either side
+/// shows up in one place instead of silently desynchronising the
+/// worker and any test-side assertion. The breadcrumb is
+/// currently not parsed by any automated consumer — readiness is
+/// signalled via the marker file ([`worker_ready_marker_path`]),
+/// NOT via stdout — but pinning the literal here means a future
+/// test that wants to correlate "worker log says ready" with
+/// "marker file appeared" has a stable hook.
+///
+/// The trailing space separating the prefix from the
+/// `pid=` / `bytes=` tail is NOT part of the constant, matching
+/// the [`WORKER_STDERR_PREFIX`] convention.
+pub const WORKER_STDOUT_READY_PREFIX: &str = "jemalloc-alloc-worker ready";
 

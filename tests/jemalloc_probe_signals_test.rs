@@ -11,8 +11,16 @@
 //! The alloc-worker is spawned as the probe's target. YAMA
 //! `kernel.yama.ptrace_scope` > 0 rejects attach even under same-uid
 //! when the target is not a descendant of the probe; this test
-//! SKIPs cleanly on the EPERM/permission error path so CI hosts with
-//! YAMA pinned do not flake.
+//! SKIPs cleanly so CI hosts with YAMA pinned do not flake. The
+//! skip is gated both ways: pre-emptively on a readable
+//! `/proc/sys/kernel/yama/ptrace_scope > 0` (so the probe is never
+//! spawned on a host that would reject it), and reactively on the
+//! EPERM / permission stderr substrings (belt and suspenders for
+//! hosts where `/proc/sys/kernel/yama` is restricted-read). Both
+//! skip paths print a loud multi-line `SKIP:` marker to stderr so
+//! the outcome is visible in CI logs; nextest has no runtime skip
+//! facility, so the test still exits `success()` — the marker is
+//! the explicit signal.
 //!
 //! Same clean-slate-file rationale as
 //! `jemalloc_alloc_worker_exit_codes.rs`: no `#[ktstr_test]` entries
@@ -63,7 +71,9 @@ fn wait_for_worker_ready(pid: i32, timeout: Duration) -> Result<(), String> {
 /// 1. Spawn the alloc-worker with 16 MiB, waits for ready marker.
 /// 2. Spawn the probe with `--snapshots 20 --interval-ms 300 --json`
 ///    so the run takes ~6s of wall-clock.
-/// 3. Sleep 500ms — roughly one snapshot + start of a sleep.
+/// 3. Sleep `2 * interval_ms + 400ms` — guaranteed to cover at
+///    least one full snapshot plus buffer for probe spawn/attach,
+///    even on a CPU-saturated CI runner.
 /// 4. Send SIGINT to the probe. The probe's signal handler sets
 ///    `CLEANUP_REQUESTED` and `sleep_with_cancel` returns within
 ///    one poll tick (10ms).
@@ -72,10 +82,58 @@ fn wait_for_worker_ready(pid: i32, timeout: Duration) -> Result<(), String> {
 ///    - `interrupted: true`
 ///    - `snapshots.len() < 20` (interrupt landed before completion)
 ///    - at least one snapshot emitted (interrupt landed AFTER first)
+/// Pre-check YAMA `ptrace_scope`. Returns `true` when the test
+/// should skip — i.e. the file is readable and its value is > 0
+/// AND the caller is not privileged (`geteuid() != 0` stands in
+/// for "no CAP_SYS_PTRACE"; a root test would have the
+/// capability by default and can attach anyway). If the file is
+/// unreadable (sysfs restricted, namespace shenanigans) the
+/// function returns `false` so the reactive stderr-substring
+/// skip path stays in force.
+fn yama_blocks_cross_descendant_attach() -> bool {
+    let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") else {
+        return false;
+    };
+    let scope: i32 = match s.trim().parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if scope <= 0 {
+        return false;
+    }
+    // euid 0 bypasses YAMA via CAP_SYS_PTRACE (cap_to_mask default
+    // set on UID 0). Non-root hits YAMA for this test because the
+    // probe and worker are siblings, not parent/child.
+    let euid = unsafe { libc::geteuid() };
+    euid != 0
+}
+
+/// Emit a loud multi-line `SKIP:` marker and return. Nextest has
+/// no runtime skip facility; this is the explicit signal.
+fn skip_with_reason(reason: &str) {
+    eprintln!("================================================================");
+    eprintln!("SKIP: probe_sigint_mid_multi_snapshot_produces_partial_output");
+    eprintln!("SKIP reason: {reason}");
+    eprintln!("================================================================");
+}
+
 #[test]
 fn probe_sigint_mid_multi_snapshot_produces_partial_output() {
     let worker_bin = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
     let probe_bin = env!("CARGO_BIN_EXE_ktstr-jemalloc-probe");
+
+    // Pre-emptive skip: if YAMA will obviously block the attach,
+    // don't even spawn the worker. The reactive stderr-substring
+    // check below is kept as a fallback for hosts where YAMA's
+    // sysctl is unreadable (restricted sysfs, unusual namespace
+    // configs) — belt and suspenders.
+    if yama_blocks_cross_descendant_attach() {
+        skip_with_reason(
+            "kernel.yama.ptrace_scope > 0 and caller lacks CAP_SYS_PTRACE — \
+             probe cannot attach to a sibling worker under this YAMA policy",
+        );
+        return;
+    }
 
     let worker = Command::new(worker_bin)
         .arg(format!("{}", 16 * 1024 * 1024))
@@ -108,11 +166,37 @@ fn probe_sigint_mid_multi_snapshot_produces_partial_output() {
         .expect("spawn probe");
     let probe_pid = probe.id() as i32;
 
-    // Give the probe time to complete 1-2 snapshots and enter an
-    // inter-snapshot sleep. Sending SIGINT before the first snapshot
-    // would produce snapshots-empty output; this test specifically
-    // pins the "interrupt between snapshots" behavior.
-    std::thread::sleep(Duration::from_millis(500));
+    // Give the probe time to complete at least one snapshot and
+    // enter an inter-snapshot sleep. Sending SIGINT before the
+    // first snapshot would produce an empty snapshots array and
+    // fail the `!snapshots.is_empty()` assertion below, so the
+    // wait must exceed one full snapshot cycle (ptrace attach +
+    // per-thread read + interval sleep).
+    //
+    // Prior sleep of 500ms was flaky on loaded CI runners: the
+    // probe's first-snapshot critical path (PTRACE_SEIZE + per-tid
+    // PTRACE_INTERRUPT + process_vm_readv over the jemalloc arena
+    // stats struct) can exceed 500ms when the runner is
+    // CPU-saturated, especially on single-vCPU VMs where the probe
+    // and worker time-share one core. The current bound is sized
+    // so that even with the per-snapshot work taking the entire
+    // `--interval-ms 300` tick, at least one full snapshot lands
+    // before SIGINT:
+    //
+    //   - `interval_ms` (300ms) covers the inter-snapshot sleep
+    //   - `interval_ms` again (300ms) covers the first snapshot's
+    //     own ptrace + read work on a worst-case loaded runner
+    //   - `+ 400ms` buffer for spawn/exec latency of the probe
+    //     binary itself and the one-shot attach setup that runs
+    //     BEFORE the first snapshot loop iteration
+    //
+    // A pure polling approach (watching probe stderr for a
+    // per-snapshot breadcrumb) would tighten the bound further but
+    // the probe does not currently emit a per-snapshot progress
+    // marker, so the arithmetic bound is the reliable option.
+    const INTERVAL_MS: u64 = 300;
+    let sleep_before_sigint = Duration::from_millis(2 * INTERVAL_MS + 400);
+    std::thread::sleep(sleep_before_sigint);
 
     // Send SIGINT. The probe's handler sets CLEANUP_REQUESTED and
     // sleep_with_cancel observes the flag within its 10ms poll tick.
@@ -150,10 +234,12 @@ fn probe_sigint_mid_multi_snapshot_produces_partial_output() {
             || stderr_buf.contains("ptrace")
             || stderr_buf.contains("PTRACE_SEIZE"))
     {
-        eprintln!(
-            "SKIP: probe could not attach to worker — likely YAMA \
-             ptrace_scope > 0 or missing CAP_SYS_PTRACE. stderr:\n{stderr_buf}"
-        );
+        skip_with_reason(&format!(
+            "probe could not attach to worker — likely YAMA ptrace_scope > 0 \
+             or missing CAP_SYS_PTRACE (pre-check did not detect it, \
+             /proc/sys/kernel/yama/ptrace_scope may be unreadable). \
+             probe stderr:\n{stderr_buf}"
+        ));
         return;
     }
 
@@ -183,13 +269,15 @@ fn probe_sigint_mid_multi_snapshot_produces_partial_output() {
         .unwrap_or_else(|| panic!("probe output missing snapshots array: {stdout_buf}"));
     assert!(
         !snapshots.is_empty(),
-        "at least one snapshot must land before the 500ms SIGINT; got zero. \
-         stdout:\n{stdout_buf}",
+        "at least one snapshot must land before the SIGINT (sent after \
+         {sleep_ms}ms); got zero. stdout:\n{stdout_buf}",
+        sleep_ms = sleep_before_sigint.as_millis(),
     );
     assert!(
         snapshots.len() < 20,
-        "SIGINT at 500ms into a 6s run must produce fewer than the \
-         requested 20 snapshots; got {}. stdout:\n{stdout_buf}",
+        "SIGINT at {sleep_ms}ms into a 6s run must produce fewer than \
+         the requested 20 snapshots; got {}. stdout:\n{stdout_buf}",
         snapshots.len(),
+        sleep_ms = sleep_before_sigint.as_millis(),
     );
 }

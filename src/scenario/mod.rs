@@ -732,10 +732,13 @@ pub struct Ctx<'a> {
     /// 0-sentinel — `run_scenario` and step-level liveness probes
     /// destructure via `if let Some(pid)` instead of `!= 0` guards.
     ///
-    /// Note: the workload-side thread-local (`workload::SCHED_PID`,
-    /// an `AtomicI32`) keeps its 0-sentinel form because `AtomicOption`
-    /// is expensive; the sentinel is contained there and documented at
-    /// the `set_sched_pid` call site.
+    /// Note: the `workload` module keeps a module-private
+    /// `AtomicI32` scheduler-pid slot that uses a 0-sentinel form
+    /// (wrapping it in an `AtomicOption` would cost an allocation
+    /// on the polling hot path). That sentinel never leaks across
+    /// module boundaries — this `Option<pid_t>` is the only
+    /// crate-visible shape. The internal 0-sentinel convention is
+    /// documented at the workload-side `set_sched_pid` call site.
     pub sched_pid: Option<libc::pid_t>,
     /// Time to wait after cgroup creation for scheduler stabilization.
     pub settle: Duration,
@@ -781,8 +784,11 @@ impl Ctx<'_> {
     /// configured" state, and the liveness sites destructure with
     /// `if let Some(pid)`. Nothing in the builder, however, prevents
     /// a caller from passing `Some(0)` or a negative pid — an easy
-    /// mistake for callers used to the workload-side `0` sentinel
-    /// (`workload::SCHED_PID`). A bare `Some(0)` would reach
+    /// mistake for callers used to the workload module's internal
+    /// 0-sentinel pid slot (see the note on `sched_pid` above — the
+    /// sentinel lives on a module-private `AtomicI32` in
+    /// `src/workload.rs`, not on this `Option<pid_t>`). A bare
+    /// `Some(0)` would reach
     /// `process_alive`, which returns `false` for any pid `<= 0`,
     /// and the liveness sites would then bail with `scheduler died`
     /// even though no scheduler was ever running — a false
@@ -1940,12 +1946,51 @@ mod tests {
             "negative pid must be treated as unconfigured",
         );
 
+        // `pid_t::MIN` — the most-negative representable value.
+        // Pin the lower boundary explicitly so a future filter
+        // change that accidentally uses `p >= 0` (a common mis-read
+        // of "non-negative") keeps treating the edge as
+        // unconfigured. `Some(0)` above covers the `p > 0` vs
+        // `p >= 0` distinction; `pid_t::MIN` covers "does the
+        // `p > 0` predicate survive an overflow-adjacent input?"
+        let ctx_min = Ctx::builder(&cg, &topo)
+            .sched_pid(Some(libc::pid_t::MIN))
+            .build();
+        assert_eq!(
+            ctx_min.active_sched_pid(),
+            None,
+            "pid_t::MIN must be treated as unconfigured — the filter \
+             is `p > 0`, and the most-negative pid_t stays unconfigured \
+             under that predicate by construction",
+        );
+
         // Sanity: a positive pid survives the filter.
         let ctx_pos = Ctx::builder(&cg, &topo).sched_pid(Some(1234)).build();
         assert_eq!(
             ctx_pos.active_sched_pid(),
             Some(1234),
             "positive pid must pass through unchanged",
+        );
+
+        // `pid_t::MAX` — the most-positive representable value.
+        // Linux caps live pids at PID_MAX_LIMIT (2^22) so
+        // `pid_t::MAX` (2^31 - 1) cannot be allocated, but the
+        // filter operates on pure value-polarity rather than
+        // kernel allocability. A positive value — even one
+        // guaranteed not to exist — must pass through unchanged,
+        // because the liveness callsites downstream
+        // (`process_alive`) are what will see the pid and report
+        // it as dead; the `active_sched_pid` filter is a
+        // configured-vs-unconfigured gate, not a liveness gate.
+        let ctx_max = Ctx::builder(&cg, &topo)
+            .sched_pid(Some(libc::pid_t::MAX))
+            .build();
+        assert_eq!(
+            ctx_max.active_sched_pid(),
+            Some(libc::pid_t::MAX),
+            "pid_t::MAX must pass the filter — `p > 0` accepts it. \
+             Liveness determination is the responsibility of the \
+             downstream `process_alive` call, not this accessor.",
         );
 
         // Sanity: None stays None.

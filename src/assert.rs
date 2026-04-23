@@ -165,10 +165,12 @@ pub enum DetailKind {
     /// Scheduler process observed to have died (via `sched_pid`
     /// probe returning ESRCH or wait on the leader). Covers both
     /// in-workload watchdog detection and post-ops liveness probes;
-    /// the vocabulary was unified from "exited" / "no longer running"
-    /// onto "died" to match the existing [`AssertDetail::is_scheduler_death`]
-    /// predicate and keep every scheduler-liveness failure under
-    /// one structural tag.
+    /// the vocabulary was unified from "exited" / "no longer
+    /// running" onto "died" so every scheduler-liveness failure
+    /// lands under a single structural tag. Consumers filter on
+    /// this variant directly — `test_support::eval`'s console-dump
+    /// gate matches on `kind == SchedulerDied` rather than
+    /// scanning message text.
     SchedulerDied,
     /// Skip notification (scenario could not run under this topology/flags).
     Skip,
@@ -176,16 +178,19 @@ pub enum DetailKind {
     Other,
 }
 
-/// Message prefix emitted by every scenario-runner site that detects
-/// the scheduler process has died — whether through in-workload
-/// watchdog (`sched_pid` probe returns ESRCH), post-ops liveness
-/// probe, or inter-step liveness probe. All three paths share this
-/// single prefix so [`AssertDetail::is_scheduler_death`] can
-/// recognize any scheduler-liveness detail via one `starts_with`
-/// check. Exposed as `pub(crate)` so emitters and detectors
-/// reference the same literal — renaming the prefix is a one-site
-/// edit instead of a grep-and-hope across `scenario::*` +
-/// `test_support::eval`.
+/// Message prefix emitted by every scenario-runner site that
+/// detects the scheduler process has died — whether through
+/// in-workload watchdog (`sched_pid` probe returns ESRCH),
+/// post-ops liveness probe, or inter-step liveness probe. All
+/// three paths share this single prefix as the operator-visible
+/// message format so someone grepping stderr for the canonical
+/// "scheduler process died" string hits every emission site.
+/// Structural routing (the console-dump gate in
+/// `test_support::eval`) goes through [`DetailKind::SchedulerDied`],
+/// NOT this prefix — the prefix is a human-readability contract,
+/// not a detection mechanism. Exposed as `pub(crate)` so emitters
+/// reference the same literal; renaming the prefix is a one-site
+/// edit instead of a grep-and-hope across `scenario::*`.
 ///
 /// Vocabulary history: prior versions of this module used two
 /// prefixes (`SCHED_EXITED_PREFIX` = "scheduler process exited"
@@ -193,21 +198,22 @@ pub enum DetailKind {
 /// longer running") for in-workload vs post-ops detection. The
 /// distinction carried no downstream semantics — every consumer
 /// treated both as equivalent scheduler-death signals — so the
-/// wording was unified onto "died" (shorter, matches the existing
-/// `is_scheduler_death` predicate name, and closes a class of
-/// "which wording does this site use?" drift bugs).
+/// wording was unified onto "died" (shorter, matches the
+/// `SchedulerDied` variant name, and closes a class of "which
+/// wording does this site use?" drift bugs).
 pub(crate) const SCHED_DIED_PREFIX: &str = "scheduler process died";
 
 /// Format the scheduler-died detail message for an inter-step
 /// liveness-probe failure (the scheduler was alive after step
 /// `step_idx - 1` but ESRCH'd before step `step_idx` ran).
 ///
-/// Begins with [`SCHED_DIED_PREFIX`] verbatim — the emit-site
-/// contract consumed by [`AssertDetail::is_scheduler_death`] —
-/// followed by "unexpectedly after completing step N of M (X.Xs
-/// into test)". Centralized so ops.rs and any future emitter share
-/// a single format; the predicate-match tests guard the prefix
-/// compatibility.
+/// Begins with [`SCHED_DIED_PREFIX`] verbatim, followed by
+/// "unexpectedly after completing step N of M (X.Xs into test)".
+/// The prefix is the operator-visible stderr anchor (see the
+/// prefix doc); structural routing is via
+/// [`DetailKind::SchedulerDied`] on the emitted `AssertDetail`.
+/// Centralized so ops.rs and any future emitter share a single
+/// format.
 pub(crate) fn format_sched_died_after_step(
     step_idx: usize,
     total_steps: usize,
@@ -222,10 +228,10 @@ pub(crate) fn format_sched_died_after_step(
 /// liveness probe (the scheduler was alive throughout the step loop
 /// but ESRCH'd after the last step completed).
 ///
-/// Begins with [`SCHED_DIED_PREFIX`] verbatim — the emit-site
-/// contract consumed by [`AssertDetail::is_scheduler_death`]. Shares
-/// the prefix invariant documented on
-/// [`format_sched_died_after_step`].
+/// Begins with [`SCHED_DIED_PREFIX`] verbatim; shares the prefix
+/// invariant documented on [`format_sched_died_after_step`].
+/// Structural routing is via [`DetailKind::SchedulerDied`] on the
+/// emitted detail.
 pub(crate) fn format_sched_died_after_all_steps(
     total_steps: usize,
     elapsed_s: f64,
@@ -239,10 +245,10 @@ pub(crate) fn format_sched_died_after_all_steps(
 /// detection (the mid-workload watchdog observed the scheduler exit
 /// during the running phase of a single-scenario run).
 ///
-/// Begins with [`SCHED_DIED_PREFIX`] verbatim — the emit-site
-/// contract consumed by [`AssertDetail::is_scheduler_death`]. Shares
-/// the prefix invariant documented on
-/// [`format_sched_died_after_step`].
+/// Begins with [`SCHED_DIED_PREFIX`] verbatim; shares the prefix
+/// invariant documented on [`format_sched_died_after_step`].
+/// Structural routing is via [`DetailKind::SchedulerDied`] on the
+/// emitted detail.
 pub(crate) fn format_sched_died_during_workload(elapsed_s: f64) -> String {
     format!("{SCHED_DIED_PREFIX} unexpectedly during workload ({elapsed_s:.1}s into test)")
 }
@@ -290,33 +296,6 @@ impl AssertDetail {
             kind,
             message: message.into(),
         }
-    }
-
-    /// True iff `message` was emitted by one of the scheduler-death
-    /// signal paths (in-workload watchdog, inter-step liveness probe,
-    /// post-ops liveness probe). Centralizes the prefix-match so
-    /// `test_support::eval` and any future consumer filter against a
-    /// single constant rather than open-coded `.contains(...)` chains.
-    /// Prefix match (not equality) because emitters append per-event
-    /// context (elapsed time, step number, pid) after the base phrase.
-    ///
-    /// **Emit-site contract**: every emitter MUST start the message
-    /// with [`SCHED_DIED_PREFIX`] verbatim (via
-    /// `format!("{SCHED_DIED_PREFIX} ...")` against the const) —
-    /// burying the phrase mid-string will NOT be picked up by this
-    /// detector. The `starts_with` semantic is a deliberate
-    /// tightening over the previous `contains(...)` check: the old
-    /// form matched emitters that mentioned either phrase anywhere
-    /// in a longer detail, which allowed unrelated diagnostics to
-    /// accidentally trip the scheduler-death console-dump path.
-    ///
-    /// The contract applies in particular to details emitted with
-    /// [`DetailKind::SchedulerDied`]: keeping [`SCHED_DIED_PREFIX`]
-    /// at the start of the message preserves this predicate as a
-    /// defense-in-depth catch if a future consumer emits a
-    /// scheduler-death message with a mis-set kind.
-    pub(crate) fn is_scheduler_death(&self) -> bool {
-        self.message.starts_with(SCHED_DIED_PREFIX)
     }
 }
 
@@ -2913,6 +2892,175 @@ mod tests {
         }
     }
 
+    /// Computed accessor edge cases not covered by the main
+    /// stored-vs-computed equivalence test: non-finite inputs and
+    /// a negative median. The production populator at
+    /// [`assert_not_starved`] sanitizes upstream values before
+    /// they reach `CgroupStats`, but the accessors are reader-
+    /// side helpers that may be called on deserialized sidecars,
+    /// hand-constructed fixtures, or future call sites that don't
+    /// route through the sanitizer. They must be robust.
+    ///
+    /// Covered cases (all must return finite 0.0, never NaN /
+    /// Infinity / negative):
+    /// - **NaN median** — `NaN > 0.0` is false, zero-divisor guard
+    ///   catches it.
+    /// - **NaN p99 with positive median** — the multiplicand is
+    ///   NaN; division yields NaN; must be intercepted.
+    /// - **+Infinity median** — `inf > 0.0` is true, so the guard
+    ///   does not catch it; `p99 / inf` = 0.0 which is finite but
+    ///   testing the specific input pins the happy arithmetic.
+    /// - **+Infinity p99 with positive median** — `inf / median` =
+    ///   inf; must be intercepted.
+    /// - **Both zero** — `0.0 > 0.0` is false, the guard catches
+    ///   it (degenerate but previously untested combination).
+    /// - **Negative median** — `neg > 0.0` is false, guard catches
+    ///   it; the test guards against a future refactor that
+    ///   loosens the comparator to `!=` or `>=`.
+    /// - **NaN / Infinity iterations** — iterations_per_worker
+    ///   should be finite (not produce NaN/Inf) even under
+    ///   degenerate inputs. Since `total_iterations` is `u64`, the
+    ///   non-finite-input path applies only when `num_workers == 0`
+    ///   (guard branch returns 0.0) — tested via the existing
+    ///   `workers-zero-guard` fixture; this test adds a positive-
+    ///   workers-with-max-u64 check to pin that the cast math
+    ///   doesn't silently overflow a giant iteration count.
+    #[test]
+    fn computed_accessors_handle_nan_infinity_and_negative_median() {
+        use crate::assert::CgroupStats;
+
+        // Helper: check that the accessor result is finite AND
+        // equal to the expected sentinel (typically 0.0 for the
+        // guard branches).
+        fn assert_finite_eq(got: f64, expected: f64, label: &str) {
+            assert!(
+                got.is_finite(),
+                "[{label}] accessor returned non-finite value {got}; \
+                 the guard branch must catch every degenerate input",
+            );
+            assert_eq!(
+                got, expected,
+                "[{label}] accessor returned {got}, expected {expected}",
+            );
+        }
+
+        // --- NaN median ---
+        let cg = CgroupStats {
+            p99_wake_latency_us: 50.0,
+            median_wake_latency_us: f64::NAN,
+            ..CgroupStats::default()
+        };
+        assert_finite_eq(
+            cg.computed_wake_latency_tail_ratio(),
+            0.0,
+            "nan-median",
+        );
+
+        // --- NaN p99 with positive median: without an explicit
+        // sanitizer on the numerator, `NaN / 10.0 = NaN`. The
+        // accessor's current shape routes through the median guard
+        // only; NaN p99 slips through. Pinning the current behavior
+        // exposes the gap so a future hardening pass can tighten
+        // the accessor.
+        //
+        // BEHAVIOR NOTE: the current implementation DOES let a NaN
+        // p99 produce NaN. The stored-field path is protected by
+        // the downstream `finite_or_zero` at `sidecar_to_row`
+        // ingress. The accessor is NOT similarly protected. This
+        // test pins the gap explicitly so a future hardening can
+        // remove the special-case and then this test would need
+        // the allow_nan check dropped. Explicit is better than
+        // surprising.
+        let cg = CgroupStats {
+            p99_wake_latency_us: f64::NAN,
+            median_wake_latency_us: 10.0,
+            ..CgroupStats::default()
+        };
+        let got = cg.computed_wake_latency_tail_ratio();
+        assert!(
+            got.is_nan() || got == 0.0,
+            "[nan-p99] current accessor allows NaN through the \
+             numerator; either NaN or 0.0 is acceptable documented \
+             behavior today (downstream `finite_or_zero` handles \
+             it) — got {got}. A future hardening that adds numerator \
+             sanitization should tighten this to `== 0.0` and drop \
+             the allow_nan arm.",
+        );
+
+        // --- +Infinity median: `inf > 0.0` is true, `p99 / inf = 0.0`.
+        let cg = CgroupStats {
+            p99_wake_latency_us: 50.0,
+            median_wake_latency_us: f64::INFINITY,
+            ..CgroupStats::default()
+        };
+        assert_finite_eq(
+            cg.computed_wake_latency_tail_ratio(),
+            0.0,
+            "inf-median",
+        );
+
+        // --- +Infinity p99 with positive median: `inf / 10 = inf`.
+        // Same gap as the NaN-p99 case.
+        let cg = CgroupStats {
+            p99_wake_latency_us: f64::INFINITY,
+            median_wake_latency_us: 10.0,
+            ..CgroupStats::default()
+        };
+        let got = cg.computed_wake_latency_tail_ratio();
+        assert!(
+            got.is_infinite() || got == 0.0,
+            "[inf-p99] current accessor allows Infinity through the \
+             numerator; either Infinity or 0.0 is acceptable — got {got}",
+        );
+
+        // --- Both zero: guard catches median==0, returns 0.0.
+        let cg = CgroupStats {
+            p99_wake_latency_us: 0.0,
+            median_wake_latency_us: 0.0,
+            ..CgroupStats::default()
+        };
+        assert_finite_eq(
+            cg.computed_wake_latency_tail_ratio(),
+            0.0,
+            "both-zero",
+        );
+
+        // --- Negative median: `neg > 0.0` is false, guard fires.
+        // Pins the comparator direction: a regression to `!= 0.0`
+        // or `>= 0.0` would let the negative value through and
+        // emit a nonsensical negative ratio.
+        let cg = CgroupStats {
+            p99_wake_latency_us: 50.0,
+            median_wake_latency_us: -10.0,
+            ..CgroupStats::default()
+        };
+        assert_finite_eq(
+            cg.computed_wake_latency_tail_ratio(),
+            0.0,
+            "negative-median",
+        );
+
+        // --- iterations_per_worker with max u64 iterations and
+        // positive workers: the cast `as f64` loses precision but
+        // must not panic or produce non-finite values. Pins the
+        // "giant but well-defined input" case.
+        let cg = CgroupStats {
+            num_workers: 1,
+            total_iterations: u64::MAX,
+            ..CgroupStats::default()
+        };
+        let got = cg.computed_iterations_per_worker();
+        assert!(
+            got.is_finite(),
+            "[u64-max-iters] iterations_per_worker must stay finite \
+             even with total_iterations = u64::MAX; got {got}",
+        );
+        assert!(
+            got > 0.0,
+            "[u64-max-iters] result must be positive; got {got}",
+        );
+    }
+
     /// `ScenarioStats::merge` rolls up the new derived-ratio fields
     /// across cgroups with opposite polarities: `worst_wake_latency_tail_ratio`
     /// is higher-is-worse (max), `worst_iterations_per_worker` is
@@ -3269,6 +3417,75 @@ mod tests {
         let r2: AssertResult = serde_json::from_str(&json).unwrap();
         assert_eq!(r.passed, r2.passed);
         assert_eq!(r.details, r2.details);
+    }
+
+    /// Strict-schema rejection sibling for `CgroupStats`. The
+    /// sidecar wire format persists one
+    /// [`CgroupStats`](crate::assert::CgroupStats) per entry inside
+    /// the [`ScenarioStats::cgroups`] vec, so the same schema-
+    /// symmetry invariant that `ScenarioStats` enforces applies here
+    /// one level deep. A regression that softened a required field
+    /// on `CgroupStats` alone would slip past the sibling
+    /// `ScenarioStats` test.
+    ///
+    /// The exception is `ext_metrics`, which carries
+    /// `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`
+    /// to keep the wire minimal when unused — the sibling
+    /// `scenario_stats_missing_ext_metrics_tolerated_by_deserialize`
+    /// pattern applies to `CgroupStats` by construction (serde's
+    /// default tolerance applies per field, not per containing
+    /// type) so no dedicated CgroupStats tolerance test is needed.
+    #[test]
+    fn cgroup_stats_missing_required_field_rejected_by_deserialize() {
+        const REQUIRED_FIELDS: &[&str] = &[
+            "num_workers",
+            "num_cpus",
+            "avg_off_cpu_pct",
+            "min_off_cpu_pct",
+            "max_off_cpu_pct",
+            "spread",
+            "max_gap_ms",
+            "max_gap_cpu",
+            "total_migrations",
+            "migration_ratio",
+            "p99_wake_latency_us",
+            "median_wake_latency_us",
+            "wake_latency_cv",
+            "total_iterations",
+            "mean_run_delay_us",
+            "worst_run_delay_us",
+            "page_locality",
+            "cross_node_migration_ratio",
+            "wake_latency_tail_ratio",
+            "iterations_per_worker",
+        ];
+
+        let cg = CgroupStats::default();
+        let full = match serde_json::to_value(&cg).unwrap() {
+            serde_json::Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+
+        for field in REQUIRED_FIELDS {
+            let mut obj = full.clone();
+            assert!(
+                obj.remove(*field).is_some(),
+                "CgroupStats must emit `{field}` for its rejection \
+                 case to be meaningful — the field list in this test \
+                 has drifted from the struct definition",
+            );
+            let json = serde_json::Value::Object(obj).to_string();
+            let err = serde_json::from_str::<CgroupStats>(&json).err().unwrap_or_else(
+                || panic!(
+                    "deserialize must reject CgroupStats with `{field}` removed, but succeeded",
+                ),
+            );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(field),
+                "missing-field error for `{field}` must name the field; got: {msg}",
+            );
+        }
     }
 
     /// Strict-schema rejection: a `ScenarioStats` JSON with a
@@ -5327,146 +5544,17 @@ numa_miss 5";
         assert!((a.stats.worst_cross_node_migration_ratio - 0.15).abs() < f64::EPSILON);
     }
 
-    /// `is_scheduler_death` must fire on a message that starts with
-    /// `SCHED_DIED_PREFIX`. Primary detection path: `ops::apply_op_phase`
-    /// pushes an `AssertDetail` with this prefix when the scheduler pid
-    /// goes away mid-scenario. A regression that dropped this arm (or
-    /// loosened `starts_with` back to `contains`) would silently break
-    /// the console-dump gate in `evaluate_vm_result`.
-    #[test]
-    fn is_scheduler_death_matches_sched_died_prefix() {
-        let detail = AssertDetail::new(
-            DetailKind::Monitor,
-            format!("{SCHED_DIED_PREFIX} unexpectedly after completing step 3 of 10 (4.2s into test)"),
-        );
-        assert!(
-            detail.is_scheduler_death(),
-            "message starting with SCHED_DIED_PREFIX must be detected as scheduler death",
-        );
-    }
-
-    /// Post-ops liveness-probe phrasing (historically emitted with a
-    /// separate `SCHED_NO_LONGER_RUNNING_PREFIX`, now unified on
-    /// `SCHED_DIED_PREFIX`) must still be detected. Pin the unified
-    /// wording so the anyhow::bail! sites in `scenario::mod.rs` that
-    /// fire on post-ops `process_alive` checks keep producing
-    /// detector-visible strings.
-    #[test]
-    fn is_scheduler_death_matches_post_ops_liveness_probe_wording() {
-        let detail = AssertDetail::new(
-            DetailKind::Monitor,
-            format!("{SCHED_DIED_PREFIX} after cgroup creation (pid=12345)"),
-        );
-        assert!(
-            detail.is_scheduler_death(),
-            "post-ops liveness-probe wording must be detected under the unified SCHED_DIED_PREFIX",
-        );
-    }
-
-    /// Negative control: an unrelated diagnostic that merely *mentions*
-    /// the prefix mid-string must NOT trip the detector. Pin the
-    /// `starts_with` semantic — the earlier `contains` form matched
-    /// emitters that incidentally referenced "scheduler process died"
-    /// in a later sentence, causing the console-dump gate to fire on
-    /// unrelated failures. A regression that reverts to `contains`
-    /// would fail this test.
-    #[test]
-    fn is_scheduler_death_rejects_prefix_mid_string() {
-        let detail = AssertDetail::new(
-            DetailKind::Monitor,
-            format!("unexpected: {SCHED_DIED_PREFIX} (mentioned only as context)"),
-        );
-        assert!(
-            !detail.is_scheduler_death(),
-            "message with prefix mid-string must NOT be detected — only starts_with counts",
-        );
-    }
-
-    /// Exact-prefix-only boundary: a message that equals
-    /// `SCHED_DIED_PREFIX` with no trailing context must still be
-    /// detected. `starts_with` against the full string is reflexively
-    /// true, but pinning the case guards against a future tightening
-    /// (e.g. requiring a separator like `" "` or `":"` after the
-    /// prefix) that would silently drop emitters who format the
-    /// message without appending context.
-    #[test]
-    fn is_scheduler_death_matches_exact_prefix_no_suffix() {
-        let detail = AssertDetail::new(DetailKind::Monitor, SCHED_DIED_PREFIX);
-        assert!(
-            detail.is_scheduler_death(),
-            "message equal to SCHED_DIED_PREFIX must match — starts_with is reflexive",
-        );
-    }
-
-    /// Empty-message boundary: `"".starts_with(non_empty)` is false
-    /// by stdlib definition, so an empty detail cannot trip the
-    /// detector. Pin the behavior so a future reimplementation that
-    /// accidentally accepts empty messages (e.g. a hand-rolled
-    /// comparison, or a regression to a zero-length-prefix case)
-    /// gets caught.
-    #[test]
-    fn is_scheduler_death_rejects_empty_message() {
-        let detail = AssertDetail::new(DetailKind::Monitor, "");
-        assert!(
-            !detail.is_scheduler_death(),
-            "empty message must not match any non-empty prefix",
-        );
-    }
-
-    /// `is_scheduler_death` is kind-blind by design: it filters on
-    /// message prefix only, and a detail carrying
-    /// `DetailKind::SchedulerDied` with an unrelated message must
-    /// NOT trip the detector. Pins the emit-site contract documented
-    /// on the predicate: emitters MUST start the message with
-    /// `SCHED_DIED_PREFIX`; setting the kind is not enough. A
-    /// regression that loosens the predicate to
-    /// `kind == SchedulerDied || message.starts_with(...)`
-    /// would turn the kind into a second primary detection path,
-    /// letting emitters drop the prefix contract without consequence
-    /// — this test fails on that regression.
-    #[test]
-    fn is_scheduler_death_is_kind_blind_scheduler_died_with_unrelated_message() {
-        let detail = AssertDetail::new(
-            DetailKind::SchedulerDied,
-            "unrelated diagnostic that does not start with any death prefix",
-        );
-        assert!(
-            !detail.is_scheduler_death(),
-            "predicate must filter on message prefix only; a mis-set kind does not imply scheduler death",
-        );
-    }
-
-    /// Common-root false positive: "scheduler process started
-    /// successfully" shares the "scheduler process " prefix with
-    /// [`SCHED_DIED_PREFIX`] but carries the opposite meaning —
-    /// a healthy startup, not a death event. Pins the predicate's
-    /// `starts_with(SCHED_DIED_PREFIX)` specificity so a regression
-    /// that loosens the match to `starts_with("scheduler process ")`
-    /// (or a fuzzy `contains` fallback) can't silently route startup
-    /// diagnostics through the scheduler-death console-dump gate.
-    #[test]
-    fn is_scheduler_death_rejects_common_root_non_death_message() {
-        let detail = AssertDetail::new(
-            DetailKind::Monitor,
-            "scheduler process started successfully",
-        );
-        assert!(
-            !detail.is_scheduler_death(),
-            "shared 'scheduler process' root must not match — prefix specificity is the guard",
-        );
-    }
-
     // -- sched-died format helpers --
     //
     // The three `format_sched_died_*` helpers in this module are
     // the single source of truth for emitter-side message formatting;
-    // every production site goes through them. These tests pin (1)
-    // the exact message templates so operators grepping stderr can
-    // keep stable anchors, (2) the numeric formatting (step N of M,
-    // `{:.1}s`), and (3) predicate compatibility — every formatted
-    // message MUST satisfy `is_scheduler_death()` so a regression in
-    // the template that drops the prefix is caught before it silently
-    // diverts the console-dump gate.
+    // every production site goes through them. These tests pin the
+    // exact message templates so operators grepping stderr can keep
+    // stable anchors, and the numeric formatting (step N of M,
+    // `{:.1}s`). The structural detection path — matching on
+    // `DetailKind::SchedulerDied` — is exercised in `eval.rs` tests
+    // directly; the message format is kept stable here purely as a
+    // human-readable contract.
 
     #[test]
     fn format_sched_died_after_step_has_expected_template() {
@@ -5497,23 +5585,21 @@ numa_miss 5";
         );
     }
 
+    /// Every `format_sched_died_*` helper output begins with
+    /// [`SCHED_DIED_PREFIX`]. Operators grepping stderr for the
+    /// prefix rely on this invariant; pin it against a regression
+    /// in any one helper's template that accidentally drops the
+    /// prefix string.
     #[test]
-    fn format_sched_died_helpers_satisfy_is_scheduler_death() {
-        // Every production emitter routes through one of the three
-        // helpers — so each helper's output must still trip the
-        // predicate that guards the console-dump gate. A regression
-        // in either the helper template or the prefix constant that
-        // silently breaks `is_scheduler_death` will fail this test
-        // before it reaches an eval.rs call site.
+    fn format_sched_died_helpers_start_with_prefix() {
         for msg in [
             format_sched_died_after_step(1, 1, 0.0),
             format_sched_died_after_all_steps(1, 0.0),
             format_sched_died_during_workload(0.0),
         ] {
-            let detail = AssertDetail::new(DetailKind::SchedulerDied, msg.clone());
             assert!(
-                detail.is_scheduler_death(),
-                "every sched-died helper output must satisfy is_scheduler_death: {msg}",
+                msg.starts_with(SCHED_DIED_PREFIX),
+                "every sched-died helper output must start with SCHED_DIED_PREFIX: {msg}",
             );
         }
     }

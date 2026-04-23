@@ -84,10 +84,10 @@ pub use entry::{
 };
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
 pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
-pub use metrics::{extract_metrics, walk_json_leaves};
-pub(crate) use metrics::is_truncation_sentinel_name;
-#[cfg(test)]
-pub(crate) use metrics::WALK_TRUNCATION_SENTINEL_NAME;
+pub use metrics::{
+    MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
+    walk_json_leaves,
+};
 pub use model::{
     DEFAULT_MODEL, LLM_DEBUG_RESPONSES_ENV, ModelSpec, ModelStatus, OFFLINE_ENV, ShaVerdict,
     any_test_requires_model, ensure, prefetch_if_required, status,
@@ -106,8 +106,8 @@ pub(crate) use probe::{
     maybe_dispatch_vm_test_with_phase_a, propagate_rust_env_from_cmdline, start_probe_phase_a,
 };
 pub use probe_metrics::{
-    MAX_SCAN_INDEX, ThreadLookup, count_indexed_metrics, find_metric, flat_metrics_dump,
-    has_metric, lookup_thread, metric_u64, snapshot_count, snapshot_worker_allocated,
+    MAX_SCAN_INDEX, ThreadLookup, count_indexed_metrics, find_metric, find_metric_u64,
+    flat_metrics_dump, has_metric, lookup_thread, snapshot_count, snapshot_worker_allocated,
     thread_count,
 };
 pub(crate) use profraw::try_flush_profraw;

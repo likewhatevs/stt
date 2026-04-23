@@ -183,6 +183,17 @@ fn worker_exits_4_on_ready_marker_write_fail() {
 #[test]
 fn worker_exits_3_on_thread_count_not_one() {
     let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
+    // MALLOC_CONF is LOAD-BEARING here: the `background_thread:true`
+    // setting is the only reason the worker ever reaches the exit-3
+    // branch. Without this env, jemalloc starts in single-thread
+    // mode, `/proc/self/task` has exactly one entry, and the
+    // self-check passes — the test would then fail because the
+    // worker proceeded past the guard we are trying to exercise.
+    // Contrast with `worker_exits_4_on_ready_marker_write_fail` and
+    // `worker_stderr_lines_share_centralized_prefix`, which set
+    // `background_thread:false` as BELT-AND-SUSPENDERS — defensive
+    // pins against a leaking env var from an operator's shell or a
+    // sibling test, not a prerequisite for the branch under test.
     let output = std::process::Command::new(worker)
         .arg("1024")
         .env("MALLOC_CONF", "background_thread:true")

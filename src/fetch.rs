@@ -115,6 +115,36 @@ fn is_rc(version: &str) -> bool {
     version.contains("-rc")
 }
 
+/// One (`moniker`, `version`) row from kernel.org's `releases.json`.
+///
+/// A named struct instead of a bare `(String, String)` tuple so every
+/// call site reads its field by name (`r.moniker`, `r.version`) rather
+/// than positional destructuring — the two strings are trivially
+/// swappable at a tuple-destructure call site, and a silent swap
+/// would mis-drive `is_skippable_release_moniker` while the
+/// now-misnamed "moniker" string flows into `version_prefix`
+/// downstream. Naming the fields removes that class of bug at the
+/// type-checker level and shows up in IDE hints on every iteration
+/// site.
+///
+/// Both fields are owned `String` (not `&str`) because the values are
+/// parsed out of a `reqwest::Response` body whose lifetime ends when
+/// `fetch_releases` returns; downstream callers iterate the vector
+/// long after that borrow would dangle.
+#[derive(Clone, Debug)]
+pub(crate) struct Release {
+    /// releases.json `moniker` field — stable / longterm / mainline /
+    /// linux-next / etc. Consumed by
+    /// [`is_skippable_release_moniker`] and by
+    /// [`fetch_latest_stable_version`]'s stable/longterm filter.
+    pub moniker: String,
+    /// releases.json `version` field — e.g. `"6.14.2"`, `"6.15-rc3"`,
+    /// `"6.16-rc2-next-20260420"`. Consumed by
+    /// [`version_tuple`], [`patch_level`], and
+    /// `cli::version_prefix`.
+    pub version: String,
+}
+
 /// Is this releases.json moniker one that the version-resolution
 /// pipeline should skip?
 ///
@@ -145,20 +175,20 @@ fn latest_in_series(client: &Client, version: &str) -> Option<String> {
 
     let releases = fetch_releases(client).ok()?;
     let mut best: Option<(String, (u32, u32, u32))> = None;
-    for (moniker, ver) in &releases {
-        if is_skippable_release_moniker(moniker) {
+    for r in &releases {
+        if is_skippable_release_moniker(&r.moniker) {
             continue;
         }
-        if !ver.starts_with(&prefix) {
+        if !r.version.starts_with(&prefix) {
             continue;
         }
-        if ver.len() != prefix.len() && ver.as_bytes()[prefix.len()] != b'.' {
+        if r.version.len() != prefix.len() && r.version.as_bytes()[prefix.len()] != b'.' {
             continue;
         }
-        if let Some(tuple) = version_tuple(ver)
+        if let Some(tuple) = version_tuple(&r.version)
             && (best.is_none() || tuple > best.as_ref().unwrap().1)
         {
-            best = Some((ver.clone(), tuple));
+            best = Some((r.version.clone(), tuple));
         }
     }
     best.map(|(v, _)| v)
@@ -325,7 +355,8 @@ fn patch_level(version: &str) -> Option<u32> {
     }
 }
 
-/// Fetch releases.json from kernel.org and return (moniker, version) pairs.
+/// Fetch releases.json from kernel.org and return a vector of
+/// [`Release`] records.
 ///
 /// `client` is the HTTP client to use. Top-level CLI entries pass
 /// [`shared_client`] to reuse the process-wide singleton so connection
@@ -335,7 +366,7 @@ fn patch_level(version: &str) -> Option<u32> {
 /// run re-handshake anyway. Tests pass a locally-constructed `Client`
 /// for fault injection (e.g. point the client at an httpmock-style
 /// local mock server).
-pub(crate) fn fetch_releases(client: &Client) -> Result<Vec<(String, String)>> {
+pub(crate) fn fetch_releases(client: &Client) -> Result<Vec<Release>> {
     let url = "https://www.kernel.org/releases.json";
     let response = client
         .get(url)
@@ -358,7 +389,10 @@ pub(crate) fn fetch_releases(client: &Client) -> Result<Vec<(String, String)>> {
         .filter_map(|r| {
             let moniker = r.get("moniker")?.as_str()?;
             let version = r.get("version")?.as_str()?;
-            Some((moniker.to_string(), version.to_string()))
+            Some(Release {
+                moniker: moniker.to_string(),
+                version: version.to_string(),
+            })
         })
         .collect())
 }
@@ -376,16 +410,16 @@ pub fn fetch_latest_stable_version(client: &Client, cli_label: &str) -> Result<S
     let releases = fetch_releases(client)?;
 
     let mut best: Option<&str> = None;
-    for (moniker, version) in &releases {
-        if moniker != "stable" && moniker != "longterm" {
+    for r in &releases {
+        if r.moniker != "stable" && r.moniker != "longterm" {
             continue;
         }
-        if patch_level(version).unwrap_or(0) < 8 {
+        if patch_level(&r.version).unwrap_or(0) < 8 {
             continue;
         }
         // Pick the first matching release — releases.json is ordered
         // newest first, so the first stable with patch >= 8 is the best.
-        best = Some(version.as_str());
+        best = Some(r.version.as_str());
         break;
     }
 
@@ -443,21 +477,21 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
     let releases = fetch_releases(client)?;
 
     let mut best: Option<(&str, (u32, u32, u32))> = None;
-    for (moniker, version) in &releases {
-        if is_skippable_release_moniker(moniker) {
+    for r in &releases {
+        if is_skippable_release_moniker(&r.moniker) {
             continue;
         }
-        if !version.starts_with(prefix) {
+        if !r.version.starts_with(prefix) {
             continue;
         }
-        if version.len() != prefix.len() && version.as_bytes()[prefix.len()] != b'.' {
+        if r.version.len() != prefix.len() && r.version.as_bytes()[prefix.len()] != b'.' {
             continue;
         }
-        let Some(tuple) = version_tuple(version) else {
+        let Some(tuple) = version_tuple(&r.version) else {
             continue;
         };
         if best.is_none() || tuple > best.unwrap().1 {
-            best = Some((version.as_str(), tuple));
+            best = Some((r.version.as_str(), tuple));
         }
     }
 

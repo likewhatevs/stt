@@ -1645,6 +1645,29 @@ pub(crate) struct ThreadCounters {
 /// thread and the signal handler, and the handler runs on SIGINT
 /// only.
 static ATTACHED: OnceLock<Mutex<BTreeSet<i32>>> = OnceLock::new();
+
+/// Cleanup-requested flag, flipped by the SIGINT / SIGTERM handler
+/// (in-band) and by the `--abort-after-ms` deadline timer thread
+/// (out-of-band) and polled by the probe's main loop + retry
+/// bodies.
+///
+/// Ordering invariant: every load AND every store uses
+/// [`Ordering::SeqCst`]. The flag has one writer at a time in
+/// practice but is read from multiple call sites across the
+/// sampling loop + sidecar flock retry + sleep_with_cancel, and
+/// the deadline timer thread pairs its store with a subsequent
+/// `tgkill(SIGALRM)` on the main thread — the SeqCst store must
+/// happen-before the signal delivery so the main thread's
+/// post-EINTR reload observes `true`. SeqCst is the strongest
+/// cross-thread ordering, covers every existing call site
+/// uniformly, and avoids the need to reason about whether a
+/// future reader / writer needs Acquire/Release; the performance
+/// cost is negligible because the flag is touched at poll
+/// boundaries (10 ms cadence in sleep_with_cancel, once per tid
+/// iteration) rather than on any hot path. A future contributor
+/// adding a new load / store site MUST keep SeqCst — mixing
+/// orderings here would silently break the deadline timer's
+/// "flag then signal" happens-before chain.
 static CLEANUP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn attached() -> &'static Mutex<BTreeSet<i32>> {
@@ -1847,10 +1870,20 @@ impl ThreadProbeError {
 /// [`take_snapshot`]) limits the stale window but does not detect
 /// mid-lifetime TLS relocation. Trade-off: the `process_vm_readv`
 /// on the fast path races the target's ongoing counter updates —
-/// each u64 load is naturally atomic on x86_64/aarch64, so
-/// `allocated_bytes` and `deallocated_bytes` individually remain
-/// consistent, but the pair may be sampled a few instructions
-/// apart. Cumulative monotonic counters tolerate that skew.
+/// each naturally-aligned u64 load is torn-read-free on
+/// x86_64/aarch64, so `allocated_bytes` and `deallocated_bytes`
+/// individually remain consistent, but the pair is sampled in a
+/// single remote read of the 24-byte span that the target can
+/// continue to mutate between their two sub-loads. The observed
+/// skew between the two values is bounded by how much the target
+/// mutates during the `process_vm_readv` itself — not "a few
+/// instructions" (the prior doc wording was wrong: the target is
+/// not stopped on the fast path, so it may execute an unbounded
+/// number of allocator calls during the read, and on a
+/// contended / preempted reader the window can span many
+/// microseconds). Cumulative monotonic counters tolerate that
+/// skew — no invariant like `allocated >= deallocated` is
+/// load-bearing on the pair snapshot.
 ///
 /// Returns the counter pair plus the observed thread pointer so the
 /// caller can populate the cache entry for this tid on the
@@ -1908,6 +1941,22 @@ fn probe_single_thread(
     .map_err(ThreadProbeError::tls_arithmetic)?;
 
     let span = offsets.combined_read_span();
+    // The remote read pulls two u64 counters (plus one intervening
+    // u64 we discard). Their natural alignment is 8 bytes — a
+    // misaligned `addr` would mean the TLS-image / symbol / field
+    // offset math produced a value that cannot be a valid
+    // `thread_allocated` counter slot. Surface the invariant in
+    // debug builds so a future refactor that breaks the alignment
+    // contract trips immediately; release builds let
+    // `process_vm_readv` do the read anyway — Linux accepts
+    // unaligned remote bases and the u64-from-le-bytes decode
+    // below doesn't require alignment — but the resulting value
+    // would be meaningless, so the assert is the sharp diagnostic.
+    debug_assert!(
+        addr % 8 == 0,
+        "process_vm_readv remote base must be 8-byte aligned (jemalloc \
+         tsd_s.thread_allocated is a u64); got addr={addr:#x}",
+    );
     let mut buf = vec![0u8; span as usize];
     let remote = RemoteIoVec {
         base: addr as usize,
@@ -5086,6 +5135,72 @@ mod tests {
         );
         assert_eq!(FatalKind::NotJemalloc.tag(), "not-jemalloc");
         assert_eq!(FatalKind::Other.tag(), "other");
+    }
+
+    /// [`probe_single_thread`] fast-path routing pin: when
+    /// `cached_thread_pointer = Some(_)` is passed, the function
+    /// MUST skip the ptrace seize/interrupt/wait/getregset dance
+    /// and go straight to `process_vm_readv`. A dead tid +
+    /// `Some(tp)` therefore surfaces as
+    /// [`ThreadErrorKind::ProcessVmReadv`] (the `process_vm_readv`
+    /// call itself returns an error), NOT
+    /// [`ThreadErrorKind::PtraceSeize`] (which would prove ptrace
+    /// still ran). Pins the behavioral difference between the slow
+    /// and fast paths so a future refactor that accidentally
+    /// re-issues seize on the cached-tp arm trips this test.
+    ///
+    /// Mechanism: spawn `/bin/true`, reap it so its pid is dead
+    /// (or recycled by some other process, which is even better
+    /// because `process_vm_readv` still fails against it for our
+    /// probe), then call `probe_single_thread` with a fake `tp`
+    /// and minimal TLS/DWARF fixtures. The call is expected to
+    /// fail; the assertion is on the `kind` field.
+    #[test]
+    fn probe_single_thread_fast_path_skips_ptrace() {
+        use std::process::Command;
+        // Spawn `/bin/true` and reap it — pid is now dead. Using
+        // a spawned-and-reaped pid guarantees the kernel no
+        // longer has a task_struct for it, so every subsequent
+        // syscall against it returns ESRCH regardless of which
+        // path we're on.
+        let mut child = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let dead_tid = child.id() as i32;
+        let _ = child.wait();
+
+        // Minimal TLS / offset fixture. Values don't have to be
+        // valid for a real allocator — the test only needs
+        // `process_vm_readv` to be reached, not to succeed, and
+        // it always fails against a dead pid before it can read
+        // any bytes.
+        let symbol = TsdTlsSymbol {
+            elf_path: std::path::PathBuf::from("/nonexistent"),
+            st_value: 0,
+            tls_image_aligned_size: 4096,
+            p_align: 8,
+            e_machine: arch::EXPECTED_E_MACHINE,
+        };
+        let offsets = CounterOffsets::new(0, 8).expect("valid offset pair");
+        // Fake thread-pointer that the fast path uses verbatim —
+        // the whole point of Some(tp) is "don't ask ptrace". Use
+        // a page-aligned kernel-space address so the
+        // `debug_assert!(addr % 8 == 0)` inside
+        // `probe_single_thread` holds even in debug builds; the
+        // value is never dereferenced by the probe (only passed
+        // to `process_vm_readv` which the kernel rejects against
+        // a dead pid before touching the address).
+        let fake_tp: u64 = 0x1000;
+        let result = probe_single_thread(dead_tid, &symbol, &offsets, Some(fake_tp));
+        let err = result.expect_err("dead pid + Some(tp) must fail");
+        assert_eq!(
+            err.kind,
+            ThreadErrorKind::ProcessVmReadv,
+            "fast path must reach process_vm_readv, not bail at ptrace \
+             — seeing {kind:?} means the cached-tp arm is issuing ptrace \
+             when it shouldn't",
+            kind = err.kind,
+        );
     }
 
     /// [`read_thread_start_time`] parser pin: exercise the

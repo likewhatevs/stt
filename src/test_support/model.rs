@@ -446,6 +446,32 @@ const _: () = assert!(
     "DEFAULT_TOKENIZER.size_bytes must stay under 50 MiB — unexpected artifact shape",
 );
 
+// Every registered ModelSpec must declare a POSITIVE size_bytes. A
+// zero byte count degenerates the free-space gate (`needed == 0`
+// lets any available-space value pass even under full-disk
+// conditions) and the fetch-timeout computation (`size_bytes / 3MBps
+// == 0` collapses to the 60s floor, hiding the relationship between
+// size and timeout). Rejecting at `ModelSpec` declaration time means
+// [`compute_margin`]'s `max(1)` floor is belt-and-braces rather than
+// load-bearing for any production pin — the floor only ever matters
+// for the unit-test fixtures that explicitly exercise boundary
+// inputs to the helper. Applied per-spec via `ALL_MODEL_SPECS` so
+// future `ModelSpec` additions cannot slip past the check by
+// forgetting a hand-rolled assertion.
+const _: () = {
+    let mut i = 0;
+    while i < ALL_MODEL_SPECS.len() {
+        assert!(
+            ALL_MODEL_SPECS[i].size_bytes > 0,
+            "ModelSpec.size_bytes must be positive — a zero-size pin \
+             degenerates the free-space gate and fetch-timeout \
+             computation; see ALL_MODEL_SPECS, add a registration \
+             line there when declaring a new ModelSpec const",
+        );
+        i += 1;
+    }
+};
+
 /// Environment variable that opts out of the eager prefetch.
 /// `KTSTR_MODEL_OFFLINE=1` (or any non-empty value) leaves the cache
 /// untouched; `LlmExtract` tests then surface missing-model errors
@@ -678,58 +704,53 @@ pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
         .join("models"))
 }
 
-/// Return the on-disk path the spec would occupy and the outcome
-/// of the SHA-256 integrity check as a [`ShaVerdict`]. Used by both
-/// the CLI's `model status` subcommand and the eager prefetch
-/// fast-path.
-pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
-    let root = resolve_cache_root()?;
-    let path = root.join(spec.file_name);
-    // A cached file is considered "matched" only when the SHA agrees
-    // with the pin. Distinguish the two Err sources from
-    // `check_sha256`: a malformed pin is a `ModelSpec` programmer
-    // error that MUST surface (hiding it as "doesn't match" misroutes
-    // callers into a pointless re-download branch), while an I/O
-    // failure on the cached file (open/read error) means the file is
-    // unusable — surface that as `ShaVerdict::CheckFailed` so
-    // [`ensure`] replaces the cache entry and the CLI /
-    // offline-gate bail can name the specific reason rather than the
-    // generic "doesn't match" default.
-    //
-    // Warm-cache fast path: before the ~10s full-file SHA-256 walk,
-    // consult a `{artifact}.mtime-size` sidecar. If the sidecar
-    // exists and both the recorded mtime AND size equal the current
-    // on-disk values, trust the prior SHA verification and skip the
-    // re-hash. The sidecar is written at fetch-success and after a
-    // slow-path verification, so every subsequent nextest run on
-    // the same cache entry hits the fast path.
-    //
-    // The sidecar is a performance optimization, not a security
-    // boundary. mtime-preserving operations (`rsync -t`,
-    // `tar -xp`, `touch -r`, coarse-mtime filesystems that round
-    // to second or coarser granularity) can produce a sidecar
-    // match after the file content has changed. A sidecar
-    // false-positive propagates through both `status()` and
-    // `ensure()` — callers receive the cached artifact without a
-    // SHA re-check, because `ensure()` short-circuits on
-    // `ShaVerdict::Matches` and does not re-run `check_sha256`.
-    // The sidecar trades strict integrity verification on
-    // `status()` / `ensure()` for faster warm-cache revalidation.
-    // The SHA-256 pin remains the ground truth at fetch time; the
-    // sidecar only skips re-verification on subsequent runs.
-    let sha_verdict = match std::fs::metadata(&path) {
+/// Compute the [`ShaVerdict`] for the cached artifact at `path`
+/// against the pin recorded in `spec`. Shared between [`status`]
+/// (which passes `use_sidecar_fastpath = true` for the quick
+/// "cache health" read) and [`ensure`] (which passes `false` to
+/// force a full re-hash so the integrity-gate answer does not
+/// inherit any warm-cache sidecar false-positive).
+///
+/// The sidecar fast path is a performance optimization, not a
+/// security boundary. mtime-preserving operations (`rsync -t`,
+/// `tar -xp`, `touch -r`, coarse-mtime filesystems that round to
+/// second or coarser granularity) can produce a sidecar match
+/// after the file content has changed. Callers that gate
+/// downstream code on byte-exact integrity (LlmExtract expecting
+/// the pinned model, test harnesses that compare outputs across
+/// runs) must pass `use_sidecar_fastpath = false` so an mtime
+/// spoof cannot slip past the SHA check. A cached file that was
+/// just downloaded by this process is indistinguishable on the
+/// fast path from one touched externally minutes ago, so
+/// callers that want true integrity cannot rely on the sidecar
+/// alone.
+///
+/// Error handling mirrors the prior inline implementation:
+/// a malformed SHA pin is a `ModelSpec` programmer error and
+/// bubbles out as `Err`, while a transient I/O failure on the
+/// cached file maps to `ShaVerdict::CheckFailed` so the
+/// downstream offline-gate bail can name the specific reason.
+/// On `Ok(true)` the sidecar is refreshed (best-effort); on
+/// `Ok(false)` the stale sidecar is removed so a future verify
+/// cannot short-circuit against rejected bytes.
+fn compute_sha_verdict(
+    path: &std::path::Path,
+    spec: &ModelSpec,
+    use_sidecar_fastpath: bool,
+) -> Result<ShaVerdict> {
+    Ok(match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => {
-            if sidecar_confirms_prior_sha_match(&path, &meta) {
+            if use_sidecar_fastpath && sidecar_confirms_prior_sha_match(path, &meta) {
                 ShaVerdict::Matches
             } else {
-                match check_sha256(&path, spec.sha256_hex) {
+                match check_sha256(path, spec.sha256_hex) {
                     Ok(true) => {
-                        // Best-effort sidecar refresh so the next
-                        // status() call short-circuits. Write
-                        // failures are logged and swallowed — the
-                        // fast path is an optimization, not
-                        // correctness.
-                        if let Err(e) = write_mtime_size_sidecar(&path) {
+                        // Best-effort sidecar refresh so the
+                        // next status() call short-circuits.
+                        // Write failures are logged and
+                        // swallowed — the fast path is an
+                        // optimization, not correctness.
+                        if let Err(e) = write_mtime_size_sidecar(path) {
                             tracing::debug!(
                                 artifact = %path.display(),
                                 %e,
@@ -738,7 +759,24 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
                         }
                         ShaVerdict::Matches
                     }
-                    Ok(false) => ShaVerdict::Mismatches,
+                    Ok(false) => {
+                        // Drop the stale warm-cache sidecar:
+                        // its recorded (mtime, size) now
+                        // describes bytes that the pin
+                        // explicitly rejects. Leaving it on
+                        // disk risks a future status() call
+                        // short-circuiting against those bad
+                        // bytes if an operator repairs the
+                        // cache WITHOUT the mtime or size
+                        // changing (touch-replace, rsync -t,
+                        // coarse-mtime fs rounding). Removing
+                        // the sidecar forces the next call to
+                        // re-hash and rewrite, ensuring
+                        // sidecar state tracks the artifact's
+                        // true integrity.
+                        remove_mtime_size_sidecar(path);
+                        ShaVerdict::Mismatches
+                    }
                     Err(e) => {
                         if !is_valid_sha256_hex(spec.sha256_hex) {
                             return Err(e).with_context(|| {
@@ -754,13 +792,46 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
             }
         }
         _ => ShaVerdict::NotCached,
-    };
+    })
+}
+
+/// Return the on-disk path the spec would occupy and the outcome
+/// of the SHA-256 integrity check as a [`ShaVerdict`]. Used by both
+/// the CLI's `model status` subcommand and the eager prefetch
+/// fast-path. Uses the warm-cache sidecar short-circuit for
+/// responsiveness; see [`compute_sha_verdict`] for the strict-
+/// integrity alternative consumed by [`ensure`].
+pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
+    let root = resolve_cache_root()?;
+    let path = root.join(spec.file_name);
+    // `status()` uses the warm-cache sidecar fast path because its
+    // caller (the CLI `model status` subcommand, the eager
+    // prefetch, and operators running `cargo ktstr model status`)
+    // want an inexpensive "is the cache healthy enough to skip
+    // re-fetching" answer. `ensure()`, the integrity gate that
+    // hands out the cached path to downstream LlmExtract, calls
+    // [`compute_sha_verdict`] with `use_sidecar_fastpath = false`
+    // to bypass the sidecar and re-hash, trading the ~10s SHA
+    // walk for strict integrity.
+    let sha_verdict = compute_sha_verdict(&path, spec, true)?;
     Ok(ModelStatus {
         spec: *spec,
         path,
         sha_verdict,
     })
 }
+
+/// Magic header line prefixing every
+/// `{artifact}.mtime-size` warm-cache sidecar. A sidecar whose
+/// first line does not match this literal is rejected as
+/// truncated, corrupted, or written by an incompatible schema
+/// version — [`read_mtime_size_sidecar`] treats any such file as
+/// absent and drops through to the slow SHA-256 walk. The
+/// explicit `_V1` suffix lets a future rewrite that carries
+/// additional fields (e.g. a file inode) bump to `_V2` and have
+/// older sidecars deserialize as "absent" rather than as
+/// accidental matches against the new layout.
+const MTIME_SIZE_SIDECAR_MAGIC: &str = "KTSTR_SHA_MTIME_SIZE_V1";
 
 /// Path of the warm-cache revalidation sidecar alongside
 /// `artifact`. Named with a `.mtime-size` suffix so operators
@@ -788,11 +859,36 @@ fn sidecar_confirms_prior_sha_match(artifact: &std::path::Path, meta: &std::fs::
 }
 
 /// Read a previously-written (mtime_ns, size_bytes) pair from the
-/// sidecar, or `None` on any error (sidecar missing, malformed
-/// contents, unreadable).
+/// sidecar, or `None` on any error (sidecar missing, missing or
+/// mismatching magic header, truncated, malformed contents,
+/// unreadable).
+///
+/// Format: two lines.
+///   1. Exactly the [`MTIME_SIZE_SIDECAR_MAGIC`] literal.
+///   2. Whitespace-separated `{mtime_ns} {size_bytes}`.
+///
+/// A partial write (power loss or process kill between the
+/// `std::fs::write` syscall and fs writeback flushing the full
+/// payload) typically surfaces as a zero-length file or a file
+/// carrying only the magic line; the tokeniser below then fails
+/// to find the second field and returns `None`. The `None`
+/// routes the caller to the slow-path re-hash, and a subsequent
+/// successful verify rewrites the sidecar to a valid state.
+/// This turns "truncated sidecar" from a silent cache-poisoning
+/// risk (reading corrupted mtime/size and matching it spuriously
+/// against current metadata) into a reliable fall-through.
 fn read_mtime_size_sidecar(artifact: &std::path::Path) -> Option<(u128, u64)> {
     let contents = std::fs::read_to_string(mtime_size_sidecar_path(artifact)).ok()?;
-    let mut toks = contents.split_whitespace();
+    let mut lines = contents.lines();
+    // Magic-header gate: reject anything whose first line is not
+    // exactly the versioned literal. An absent line (empty file),
+    // a truncated line, or an older-schema sidecar all fail this
+    // check and fall through to the slow path.
+    if lines.next()? != MTIME_SIZE_SIDECAR_MAGIC {
+        return None;
+    }
+    let payload = lines.next()?;
+    let mut toks = payload.split_whitespace();
     let mtime: u128 = toks.next()?.parse().ok()?;
     let size: u64 = toks.next()?.parse().ok()?;
     Some((mtime, size))
@@ -801,6 +897,10 @@ fn read_mtime_size_sidecar(artifact: &std::path::Path) -> Option<(u128, u64)> {
 /// Write the current mtime+size of `artifact` to its sidecar. The
 /// sidecar's existence plus matching contents tells a future
 /// [`status`] call it can skip the SHA-256 walk.
+///
+/// Writes the two-line format documented on
+/// [`read_mtime_size_sidecar`]: magic header line + `{mtime}
+/// {size}` payload line.
 fn write_mtime_size_sidecar(artifact: &std::path::Path) -> std::io::Result<()> {
     let meta = std::fs::metadata(artifact)?;
     let (mtime, size) = mtime_size_from_metadata(&meta).ok_or_else(|| {
@@ -808,8 +908,43 @@ fn write_mtime_size_sidecar(artifact: &std::path::Path) -> std::io::Result<()> {
     })?;
     std::fs::write(
         mtime_size_sidecar_path(artifact),
-        format!("{mtime} {size}\n"),
+        format!("{MTIME_SIZE_SIDECAR_MAGIC}\n{mtime} {size}\n"),
     )
+}
+
+/// Best-effort removal of the `{artifact}.mtime-size` sidecar.
+/// Called when the SHA-256 check against the artifact has
+/// definitively rejected the cached bytes
+/// ([`ShaVerdict::Mismatches`]): the sidecar's recorded
+/// (mtime_ns, size_bytes) now describes bytes that the pin no
+/// longer accepts, so leaving it on disk risks a future
+/// fast-path short-circuit against bad bytes if the cache is
+/// repaired WITHOUT the mtime/size changing (e.g. a rebuild that
+/// preserves timestamps, or a touch-replace under coarse-mtime).
+/// Unlink fails are logged — worst case, the next verify
+/// recomputes the SHA and rewrites the sidecar with the correct
+/// metadata, which is the desired end state anyway.
+fn remove_mtime_size_sidecar(artifact: &std::path::Path) {
+    let sidecar = mtime_size_sidecar_path(artifact);
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => tracing::debug!(
+            sidecar = %sidecar.display(),
+            artifact = %artifact.display(),
+            "removed stale mtime-size sidecar after SHA mismatch",
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No sidecar to remove — legitimate when the verify
+            // ran on a freshly-downloaded entry that never
+            // reached the write step, or when cleanup already
+            // ran for this mismatch.
+        }
+        Err(e) => tracing::warn!(
+            sidecar = %sidecar.display(),
+            err = %format!("{e:#}"),
+            "failed to remove stale mtime-size sidecar; next successful \
+             verify will overwrite it",
+        ),
+    }
 }
 
 /// Pull mtime (as UNIX-epoch nanoseconds) and size from `meta`.
@@ -838,7 +973,30 @@ fn mtime_size_from_metadata(meta: &std::fs::Metadata) -> Option<(u128, u64)> {
 /// pre-seed mechanism skipped an artifact, rather than silently
 /// falling through to an online fetch.
 pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
-    let st = status(spec)?;
+    // BYPASS the warm-cache mtime/size sidecar: callers of
+    // `ensure()` (LlmExtract, test harnesses handing the cached
+    // path to the llama.cpp loader, anyone pinning a specific
+    // model-weights commit) expect byte-exact integrity against
+    // the declared SHA-256 pin. The sidecar fast path lets
+    // mtime-preserving tampering (`rsync -t`, `touch -r`,
+    // coarse-mtime fs rounding to 1 s or worse) produce a cached
+    // artifact whose `{mtime, size}` matches the sidecar record
+    // but whose BYTES do not match the pin. `status()` accepts
+    // that trade-off for responsiveness, but `ensure()` is the
+    // integrity gate. The cost is one full SHA-256 walk per
+    // `ensure()` call against an existing cache entry (~10 s for
+    // the 2.44 GiB Qwen3-4B pin); the prefetch at nextest
+    // bootstrap amortises this over every test in the binary, and
+    // the in-test cache reuses the post-ensure `ModelStatus` so
+    // the walk fires at most once per process run.
+    let root = resolve_cache_root()?;
+    let path = root.join(spec.file_name);
+    let verdict = compute_sha_verdict(&path, spec, false)?;
+    let st = ModelStatus {
+        spec: *spec,
+        path,
+        sha_verdict: verdict,
+    };
     if st.sha_verdict.is_match() {
         return Ok(st.path);
     }
@@ -1042,13 +1200,22 @@ fn filesystem_available_bytes(dir: &std::path::Path) -> Result<u64> {
 /// Integer division by 10 collapses to 0 for any
 /// `size_bytes < 10`, which contradicts the "10% safety buffer"
 /// claim in [`ensure_free_space`]'s doc. Clamping at `max(1)`
-/// keeps the buffer > 0 for micro-specs (test fixtures; a
-/// hypothetical 9-byte marker file). Real `ModelSpec` pins are
-/// multi-megabyte or larger (DEFAULT_TOKENIZER ≈ 11 MiB,
-/// DEFAULT_MODEL ≈ 2.5 GiB) so the `/ 10` branch dominates and
-/// the `max(1)` is a no-op in production — the floor only
-/// matters for test-fixture sizes. Extracted for direct unit
-/// testing of the boundary cases (5 → 1, 10 → 1, 100 → 10).
+/// keeps the buffer > 0 for micro-specs — a defense-in-depth
+/// floor that is redundant under the module-scope
+/// `ALL_MODEL_SPECS[i].size_bytes > 0` + ballpark-size guards
+/// above, which pin every production `ModelSpec` safely above
+/// the `size_bytes < 10` regime. The floor stays so the helper
+/// remains well-behaved under direct unit-test inputs that
+/// explicitly exercise the `size_bytes < 10` boundary (see the
+/// `compute_margin_respects_floor_*` family) without relying on
+/// callers to pre-validate.
+///
+/// Specific size constants are NOT quoted in this doc so a
+/// pin rotation that changes a ballpark does not drift this
+/// comment. The module-scope `const _: () = assert!(...)` blocks
+/// at the head of this file are the single authority for
+/// production ballpark bounds; this helper's doc is intentionally
+/// agnostic to them.
 fn compute_margin(size_bytes: u64) -> u64 {
     (size_bytes / 10).max(1)
 }
@@ -1070,7 +1237,13 @@ fn format_free_space_error(needed: u64, parent: &std::path::Path, available: u64
         " (blocks_available reported 0 — if this is a FUSE \
          or quota-enforced mount, the free-space report may \
          be a filesystem-side misreport rather than a real \
-         out-of-space condition)"
+         out-of-space condition; confirm with `df -h <mount>` \
+         or `stat -f <mount>` to see the raw fs_bavail value, \
+         then re-run with `XDG_CACHE_HOME` pointing at a \
+         directory on a mount without the overlay — e.g. \
+         `XDG_CACHE_HOME=/var/tmp/ktstr-cache` — so ktstr's \
+         model cache lands on a filesystem the kernel reports \
+         normally)"
     } else {
         ""
     };
@@ -1376,7 +1549,7 @@ fn reject_insecure_url(url: &str) -> Result<()> {
 /// `any_test_requires_model()` return `true`; a scheduler-only
 /// binary (e.g. `tests/eevdf_tests.rs`) leaves it at `false`.
 pub fn any_test_requires_model() -> bool {
-    inventory_requires_model(KTSTR_TESTS.iter())
+    entries_require_model(KTSTR_TESTS.iter())
 }
 
 /// Predicate core for [`any_test_requires_model`]. Extracted so unit
@@ -1386,7 +1559,7 @@ pub fn any_test_requires_model() -> bool {
 /// slice for the lib-crate test binary carries only the
 /// `__unit_test_dummy__` sentinel, so without this seam the
 /// `returns true` arm would have no in-tree test able to reach it.
-fn inventory_requires_model<'a, I>(entries: I) -> bool
+fn entries_require_model<'a, I>(entries: I) -> bool
 where
     I: Iterator<Item = &'a super::KtstrTestEntry>,
 {
@@ -1454,7 +1627,7 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
         // in lockstep with `ModelSpec::size_bytes`; a hardcoded
         // "~2.4 GiB" literal drifted every time the pin rotated.
         eprintln!(
-            "ktstr_test: downloading LlmExtract model (~{}; first run only) …",
+            "ktstr_test: downloading LlmExtract model + tokenizer (~{}; first run only) …",
             indicatif::HumanBytes(expected_total),
         );
         tracing::info!(
@@ -4071,16 +4244,16 @@ mod tests {
     /// binary like `jemalloc_alloc_worker_exit_codes.rs`) must not
     /// drag its process into a model prefetch.
     #[test]
-    fn inventory_requires_model_empty_iter_returns_false() {
+    fn entries_require_model_empty_iter_returns_false() {
         let entries: [&KtstrTestEntry; 0] = [];
-        assert!(!inventory_requires_model(entries.iter().copied()));
+        assert!(!entries_require_model(entries.iter().copied()));
     }
 
     /// A non-LlmExtract inventory returns false even when non-empty.
     /// Pins the "scheduler-only / binary-with-json-output inventories
     /// stay out of the prefetch path" contract.
     #[test]
-    fn inventory_requires_model_no_llm_extract_returns_false() {
+    fn entries_require_model_no_llm_extract_returns_false() {
         let entry = KtstrTestEntry {
             name: "scheduler_only",
             payload: None,
@@ -4088,19 +4261,19 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         let entries = [&entry];
-        assert!(!inventory_requires_model(entries.iter().copied()));
+        assert!(!entries_require_model(entries.iter().copied()));
     }
 
     /// The positive case under the primary-payload slot: an integration-
     /// test binary like `tests/llm_extract_e2e_test.rs` declares a
     /// `Payload` with `OutputFormat::LlmExtract` via its `#[ktstr_test]`
     /// entry's `payload = SOME_LLM_FIXTURE` attribute, which materializes
-    /// into the entry's `payload: Some(&…)` slot. `inventory_requires_model`
+    /// into the entry's `payload: Some(&…)` slot. `entries_require_model`
     /// must return `true` for that shape — without the pin here the
     /// primary-slot branch has no in-tree test that reaches it (the lib
     /// crate's `KTSTR_TESTS` only has `__unit_test_dummy__`).
     #[test]
-    fn inventory_requires_model_primary_payload_llm_extract_returns_true() {
+    fn entries_require_model_primary_payload_llm_extract_returns_true() {
         let entry = KtstrTestEntry {
             name: "llm_primary",
             payload: Some(&LLM_EXTRACT_BINARY_PAYLOAD),
@@ -4108,7 +4281,7 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         let entries = [&entry];
-        assert!(inventory_requires_model(entries.iter().copied()));
+        assert!(entries_require_model(entries.iter().copied()));
     }
 
     /// Positive case via the `workloads` slot: a test declaring
@@ -4116,7 +4289,7 @@ mod tests {
     /// fixture carries `OutputFormat::LlmExtract` must also trip the
     /// predicate. Guards the `.any()` over `entry.workloads` arm.
     #[test]
-    fn inventory_requires_model_workload_llm_extract_returns_true() {
+    fn entries_require_model_workload_llm_extract_returns_true() {
         let workloads: &[&Payload] = &[&LLM_EXTRACT_BINARY_PAYLOAD];
         let entry = KtstrTestEntry {
             name: "llm_workload",
@@ -4125,7 +4298,7 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         let entries = [&entry];
-        assert!(inventory_requires_model(entries.iter().copied()));
+        assert!(entries_require_model(entries.iter().copied()));
     }
 
     /// A model response with no JSON region at all (plain prose)
@@ -4186,9 +4359,25 @@ mod tests {
             r#"{"latency_ms": 42, "rps": 1000}"#,
             crate::test_support::MetricStream::Stdout,
         );
+        // Non-empty is the first invariant. The second is that the
+        // walker emits EACH numeric leaf as a distinct Metric — the
+        // input carries two numeric keys (`latency_ms`, `rps`), so
+        // the output must surface at least two metrics. An `>= 2`
+        // pin (rather than an exact `== 2` match) accommodates a
+        // future walker that derives additional metrics from
+        // structured shapes without tightening this test against
+        // that enhancement; a regression that collapsed the walker
+        // to "first leaf wins" would still fail here.
         assert!(
             !got.is_empty(),
             "JSON response with numeric leaves must produce a non-empty Metric list",
+        );
+        assert!(
+            got.len() >= 2,
+            "JSON response with TWO numeric leaves must produce at \
+             least 2 metrics; got {} — regression that collapsed \
+             the walker to a single-leaf extract?; metrics: {got:?}",
+            got.len(),
         );
         assert!(
             got.iter().all(|m| matches!(m.source, crate::test_support::MetricSource::LlmExtract)),
@@ -4201,7 +4390,7 @@ mod tests {
     /// against a regression that accidentally required every entry
     /// to match.
     #[test]
-    fn inventory_requires_model_mixed_inventory_returns_true() {
+    fn entries_require_model_mixed_inventory_returns_true() {
         let llm_entry = KtstrTestEntry {
             name: "llm_mixed",
             payload: Some(&LLM_EXTRACT_BINARY_PAYLOAD),
@@ -4218,7 +4407,7 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         let entries = [&plain_a, &llm_entry, &plain_b];
-        assert!(inventory_requires_model(entries.iter().copied()));
+        assert!(entries_require_model(entries.iter().copied()));
     }
 
     // -- strip_think_block --
@@ -4938,6 +5127,48 @@ mod tests {
         );
     }
 
+    /// Pin the ceiling-crossover boundary: at exactly `1800 s × 3
+    /// MB/s = 5_400_000_000` bytes the proportional term equals
+    /// the ceiling, one byte below would still fall under the
+    /// ceiling (same 1800 s due to integer division rounding down),
+    /// and one byte above also clamps to the ceiling. The three
+    /// inputs are adjacent and asymmetric around the crossover so
+    /// a regression that swapped `<=` for `<` in the clamp (or
+    /// introduced an off-by-one in the ceiling comparison) would
+    /// land one of the three outside the expected 1800 s envelope.
+    ///
+    /// Separately pin that 5.4 GB + 3_000_000 bytes stays clamped
+    /// (one body-second past the ceiling in the underlying formula
+    /// but still at the 1800 s cap) — this is the "small overage
+    /// clamps correctly" case that the existing 20 / 40 GiB test
+    /// doesn't exercise because both inputs are orders of magnitude
+    /// past the crossover.
+    #[test]
+    fn fetch_timeout_for_size_ceiling_crossover_at_5_4gb() {
+        const CROSSOVER_BYTES: u64 = 1800 * 3_000_000;
+        // Exactly at the crossover: body_secs = 1800, clamped to 1800.
+        assert_eq!(
+            fetch_timeout_for_size(CROSSOVER_BYTES),
+            std::time::Duration::from_secs(1800),
+            "exactly 5.4 GB must sit right at the ceiling",
+        );
+        // One body-second below: body_secs = 1799, the `.min(1800)`
+        // is a no-op, result is 1799 s — below the ceiling.
+        assert_eq!(
+            fetch_timeout_for_size(CROSSOVER_BYTES - 3_000_000),
+            std::time::Duration::from_secs(1799),
+            "one body-second below the crossover must return 1799 s, \
+             proving the ceiling clamp hasn't moved",
+        );
+        // One body-second past: body_secs = 1801, clamped to 1800.
+        assert_eq!(
+            fetch_timeout_for_size(CROSSOVER_BYTES + 3_000_000),
+            std::time::Duration::from_secs(1800),
+            "one body-second above the crossover must clamp to the \
+             ceiling (1800 s), not return 1801",
+        );
+    }
+
     /// `filesystem_available_bytes` on a real tempdir must return a
     /// positive byte count: any working test environment has at least
     /// some free space on the filesystem hosting `/tmp` (or wherever
@@ -4999,6 +5230,22 @@ mod tests {
     /// (the original `size_bytes / 10` without `max(1)`).
     #[test]
     fn compute_margin_respects_floor_and_scales_linearly() {
+        // 0-boundary: (0/10).max(1) = 1. The module-scope
+        // ALL_MODEL_SPECS size_bytes>0 guard means production pins
+        // never hit this input, but the helper must still emit a
+        // positive margin for any direct caller — a 0 return here
+        // would make `ensure_free_space` accept `needed == size + 0
+        // = 0` bytes of headroom, trivially passing on a full disk.
+        // Pin both the value (1) and the "floor is load-bearing at
+        // this input" semantic.
+        assert_eq!(
+            compute_margin(0),
+            1,
+            "compute_margin(0): `/ 10` = 0, the max(1) floor MUST \
+             win so the free-space gate retains positive headroom \
+             even when called with a degenerate zero input",
+        );
+
         for size in [1u64, 5, 9] {
             assert_eq!(
                 compute_margin(size),
@@ -5162,5 +5409,228 @@ mod tests {
             format!("{}", indicatif::HumanBytes(size_plus_margin)),
             "2.69 GiB"
         );
+    }
+
+    // -- mtime-size warm-cache sidecar helpers --
+
+    /// `sidecar_lock_path_appends_lock_extension` in sidecar.rs
+    /// pins the `.lock` suffix derivation; this test pins the
+    /// analogous `.mtime-size` suffix for the warm-cache sidecar
+    /// path. A future reshape of the naming scheme breaks caches
+    /// symmetrically across every ktstr invocation, so the path
+    /// is a hard-coded contract the test captures verbatim.
+    #[test]
+    fn mtime_size_sidecar_path_appends_suffix() {
+        let artifact = std::path::Path::new("/tmp/model.gguf");
+        assert_eq!(
+            mtime_size_sidecar_path(artifact),
+            std::path::PathBuf::from("/tmp/model.gguf.mtime-size"),
+        );
+        // No artifact extension — suffix appends to the bare name.
+        let bare = std::path::Path::new("/tmp/model");
+        assert_eq!(
+            mtime_size_sidecar_path(bare),
+            std::path::PathBuf::from("/tmp/model.mtime-size"),
+        );
+    }
+
+    /// Round-trip: write the sidecar for an artifact, read it
+    /// back, get the same `(mtime_ns, size_bytes)` tuple that
+    /// metadata reports for the live file. Covers the happy path
+    /// that the warm-cache fast path relies on.
+    #[test]
+    fn write_then_read_mtime_size_sidecar_roundtrips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let artifact = tmp.path().join("artifact.bin");
+        std::fs::write(&artifact, b"hello world").unwrap();
+
+        write_mtime_size_sidecar(&artifact).expect("write must succeed");
+        let meta = std::fs::metadata(&artifact).unwrap();
+        let expected = mtime_size_from_metadata(&meta).unwrap();
+        let read_back =
+            read_mtime_size_sidecar(&artifact).expect("sidecar must read back");
+        assert_eq!(
+            read_back, expected,
+            "round-trip must recover the (mtime, size) tuple written",
+        );
+    }
+
+    /// `sidecar_confirms_prior_sha_match` returns `true` only
+    /// when the on-disk metadata matches the sidecar record. A
+    /// post-write touch that changes mtime must break the match
+    /// — this is the core semantic the fast path depends on.
+    #[test]
+    fn sidecar_confirms_match_tracks_mtime_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let artifact = tmp.path().join("artifact.bin");
+        std::fs::write(&artifact, b"contents").unwrap();
+        write_mtime_size_sidecar(&artifact).expect("write must succeed");
+        let meta = std::fs::metadata(&artifact).unwrap();
+        assert!(
+            sidecar_confirms_prior_sha_match(&artifact, &meta),
+            "fresh sidecar must confirm match for unchanged file",
+        );
+
+        // Advance mtime by 2 seconds — enough to cross even the
+        // coarsest filesystem's mtime granularity (most are
+        // nanosecond, some tmpfs / older FAT are second).
+        let meta_before = std::fs::metadata(&artifact).unwrap();
+        let now = meta_before.modified().unwrap() + std::time::Duration::from_secs(2);
+        filetime_set(&artifact, now);
+        let meta_after = std::fs::metadata(&artifact).unwrap();
+        assert!(
+            !sidecar_confirms_prior_sha_match(&artifact, &meta_after),
+            "mtime bump must invalidate the sidecar match so the \
+             slow SHA path re-runs",
+        );
+    }
+
+    /// Fallback path 1: missing sidecar → `None`. The fast path
+    /// must not trust absent state as a match; the slow path
+    /// re-runs SHA-256.
+    #[test]
+    fn read_mtime_size_sidecar_missing_file_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let artifact = tmp.path().join("artifact-never-had-sidecar.bin");
+        std::fs::write(&artifact, b"x").unwrap();
+        // No write_mtime_size_sidecar call — sidecar never created.
+        assert!(
+            read_mtime_size_sidecar(&artifact).is_none(),
+            "absent sidecar must return None, not silently default",
+        );
+    }
+
+    /// Fallback path 2: sidecar file exists but is empty. A
+    /// zero-length file typically surfaces after a crash during
+    /// write — the kernel created the inode but the `write(2)`
+    /// payload never flushed. The magic-header gate rejects it.
+    #[test]
+    fn read_mtime_size_sidecar_empty_file_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let artifact = tmp.path().join("artifact.bin");
+        std::fs::write(&artifact, b"x").unwrap();
+        // Plant an empty sidecar: simulates the zero-length
+        // crash-truncation failure mode.
+        std::fs::write(mtime_size_sidecar_path(&artifact), b"").unwrap();
+        assert!(
+            read_mtime_size_sidecar(&artifact).is_none(),
+            "empty sidecar must fail the magic-header gate",
+        );
+    }
+
+    /// Fallback path 3: sidecar carries only the magic line
+    /// (payload truncated mid-write). The second `lines.next()`
+    /// returns `None` and the helper falls through to None.
+    #[test]
+    fn read_mtime_size_sidecar_magic_only_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let artifact = tmp.path().join("artifact.bin");
+        std::fs::write(&artifact, b"x").unwrap();
+        std::fs::write(
+            mtime_size_sidecar_path(&artifact),
+            format!("{MTIME_SIZE_SIDECAR_MAGIC}\n"),
+        )
+        .unwrap();
+        assert!(
+            read_mtime_size_sidecar(&artifact).is_none(),
+            "sidecar missing the mtime/size payload must fail parse",
+        );
+    }
+
+    /// Fallback path 4: wrong / older magic header. A v0 sidecar
+    /// that happened to carry a valid-looking `{mtime} {size}`
+    /// pair without a magic header must NOT deserialize as a v1
+    /// match; otherwise a schema bump would silently accept stale
+    /// data as fresh.
+    #[test]
+    fn read_mtime_size_sidecar_wrong_magic_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let artifact = tmp.path().join("artifact.bin");
+        std::fs::write(&artifact, b"x").unwrap();
+        // Older-schema shape: `{mtime} {size}` on line 1, no magic.
+        std::fs::write(
+            mtime_size_sidecar_path(&artifact),
+            b"12345 100\n",
+        )
+        .unwrap();
+        assert!(
+            read_mtime_size_sidecar(&artifact).is_none(),
+            "sidecar missing the magic header must fail the version gate",
+        );
+
+        // A different magic (future v2) must also be rejected by
+        // this v1 reader.
+        std::fs::write(
+            mtime_size_sidecar_path(&artifact),
+            b"KTSTR_SHA_MTIME_SIZE_V2\n12345 100\n",
+        )
+        .unwrap();
+        assert!(
+            read_mtime_size_sidecar(&artifact).is_none(),
+            "sidecar with a newer magic must fail the v1 gate",
+        );
+    }
+
+    /// Fallback path 5: malformed payload line. Non-numeric
+    /// tokens or a single-token line fail the `.parse()` chain
+    /// and return None.
+    #[test]
+    fn read_mtime_size_sidecar_malformed_payload_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let artifact = tmp.path().join("artifact.bin");
+        std::fs::write(&artifact, b"x").unwrap();
+        // Magic + non-numeric mtime.
+        std::fs::write(
+            mtime_size_sidecar_path(&artifact),
+            format!("{MTIME_SIZE_SIDECAR_MAGIC}\nnot-a-number 100\n"),
+        )
+        .unwrap();
+        assert!(read_mtime_size_sidecar(&artifact).is_none());
+        // Magic + single token (size missing).
+        std::fs::write(
+            mtime_size_sidecar_path(&artifact),
+            format!("{MTIME_SIZE_SIDECAR_MAGIC}\n12345\n"),
+        )
+        .unwrap();
+        assert!(read_mtime_size_sidecar(&artifact).is_none());
+    }
+
+    /// `remove_mtime_size_sidecar` unlinks an existing sidecar
+    /// and is silent when none exists — the post-mismatch
+    /// cleanup path must not error on a double-call or on a
+    /// cache entry that never wrote a sidecar (e.g. a
+    /// freshly-downloaded file that bailed before the
+    /// write-sidecar step).
+    #[test]
+    fn remove_mtime_size_sidecar_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let artifact = tmp.path().join("artifact.bin");
+        std::fs::write(&artifact, b"x").unwrap();
+        write_mtime_size_sidecar(&artifact).unwrap();
+        assert!(mtime_size_sidecar_path(&artifact).exists());
+        remove_mtime_size_sidecar(&artifact);
+        assert!(!mtime_size_sidecar_path(&artifact).exists());
+        // Double-call: no-op, no panic.
+        remove_mtime_size_sidecar(&artifact);
+    }
+
+    /// Set `path`'s mtime directly via libc — tmpfs / nextest
+    /// parallelism would make `std::thread::sleep(2s)` a flake
+    /// magnet, so use `utimes` to jump mtime forward without
+    /// wall-clock waits. Test-only; mirrors the similar helper in
+    /// sidecar.rs.
+    fn filetime_set(path: &std::path::Path, new_mtime: std::time::SystemTime) {
+        use std::os::unix::ffi::OsStrExt;
+        let secs = new_mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime before UNIX_EPOCH")
+            .as_secs() as i64;
+        let times = [
+            libc::timeval { tv_sec: secs, tv_usec: 0 },
+            libc::timeval { tv_sec: secs, tv_usec: 0 },
+        ];
+        let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::utimes(cstr.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes must succeed for the test helper");
     }
 }

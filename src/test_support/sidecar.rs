@@ -867,6 +867,42 @@ where
             p.st_dev == fd_ident.st_dev && p.st_ino == fd_ident.st_ino
         });
         if matches {
+            // Refresh the lock file's mtime to NOW before we start
+            // holding it for the mutate cycle. Without this touch,
+            // a lock file created long ago and re-acquired today
+            // would carry its stale mtime, and a concurrent
+            // `clean_orphaned_sidecar_locks` sweep that ran
+            // between our flock acquire and our rename could see
+            // the stale mtime (> SIDECAR_LOCK_ORPHAN_AGE), unlink
+            // the file, and produce exactly the inode-flip race
+            // we just resolved above. Touching mtime moves the
+            // file out of the cleanup's age-gate window for the
+            // duration of our critical section; the orphan
+            // cleaner's own mtime check then correctly classifies
+            // this file as "active" and skips it. Failure here is
+            // best-effort — the inode-verify loop would re-detect
+            // and retry if an orphan sweep truly replaced the
+            // inode mid-run — so we do not fail the mutate on a
+            // utimensat error.
+            let _ = rustix::fs::utimensat(
+                rustix::fs::CWD,
+                &lock_path,
+                &rustix::fs::Timestamps {
+                    // UTIME_NOW on both atime and mtime: the
+                    // kernel stamps the current clock. No manual
+                    // SystemTime::now() conversion means no
+                    // clock-skew / conversion errors creep in.
+                    last_access: rustix::fs::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: libc::UTIME_NOW,
+                    },
+                    last_modification: rustix::fs::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: libc::UTIME_NOW,
+                    },
+                },
+                rustix::fs::AtFlags::empty(),
+            );
             break candidate_fd;
         }
 
@@ -1052,8 +1088,23 @@ pub(crate) fn clean_orphaned_sidecar_locks(dir: &std::path::Path) -> usize {
         if age < SIDECAR_LOCK_ORPHAN_AGE {
             continue;
         }
-        if std::fs::remove_file(&path).is_ok() {
-            removed += 1;
+        // Log-and-continue on removal failure: another writer may be
+        // racing us to unlink the same orphan, or the file may be on
+        // a filesystem that rejected the unlink (readonly remount,
+        // permission flip under our pid). Silent-skip would hide
+        // that the sweep isn't actually cleaning up — a warn lets
+        // operators tailing logs notice a cleanup regression without
+        // the error propagating up as a hard failure from the
+        // janitor path.
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                err = %format!("{e:#}"),
+                age_secs = age.as_secs(),
+                "clean_orphaned_sidecar_locks: failed to unlink orphan \
+                 .lock file; will retry on next sweep",
+            ),
         }
     }
     removed
@@ -1591,29 +1642,55 @@ mod tests {
             test_name,
             topology,
             scheduler,
-            scheduler_commit: _,
-            payload: _,
-            metrics: _,
+            scheduler_commit,
+            payload,
+            metrics,
             passed,
-            skipped: _,
+            skipped,
             stats,
             monitor,
             stimulus_events,
-            work_type: _,
-            active_flags: _,
-            verifier_stats: _,
-            kvm_stats: _,
-            sysctls: _,
-            kargs: _,
-            kernel_version: _,
-            timestamp: _,
-            run_id: _,
-            host: _,
+            work_type,
+            active_flags,
+            verifier_stats,
+            kvm_stats,
+            sysctls,
+            kargs,
+            kernel_version,
+            timestamp,
+            run_id,
+            host,
         } = loaded;
+        // Hash-participating string fields round-trip verbatim.
         assert_eq!(test_name, "my_test");
         assert_eq!(topology, "1n2l4c2t");
         assert_eq!(scheduler, "scx_mitosis");
+        assert_eq!(work_type, "CpuSpin");
+        // Nullable string metadata fields.
+        assert_eq!(scheduler_commit.as_deref(), Some("abc123"));
+        assert_eq!(payload, None, "fixture declared no payload");
+        assert_eq!(kvm_stats, None, "fixture declared no kvm_stats");
+        assert_eq!(kernel_version, None, "fixture declared no kernel_version");
+        assert_eq!(host, None, "fixture declared no host context");
+        assert_eq!(timestamp, "", "fixture used empty-string timestamp");
+        assert_eq!(run_id, "", "fixture used empty-string run_id");
+        // Verdict bits — passed true + skipped false pinned.
         assert!(passed);
+        assert!(!skipped, "fixture declared skipped=false");
+        // Empty-Vec collections — regression guard against a serde
+        // regression that dropped `[]` on round-trip.
+        assert!(metrics.is_empty(), "fixture declared empty metrics");
+        assert!(
+            active_flags.is_empty(),
+            "fixture declared empty active_flags",
+        );
+        assert!(
+            verifier_stats.is_empty(),
+            "fixture declared empty verifier_stats",
+        );
+        assert!(sysctls.is_empty(), "fixture declared empty sysctls");
+        assert!(kargs.is_empty(), "fixture declared empty kargs");
+        // Populated nested structs.
         assert_eq!(stats.total_workers, 4);
         assert_eq!(stats.cgroups.len(), 1);
         assert_eq!(stats.cgroups[0].num_workers, 4);

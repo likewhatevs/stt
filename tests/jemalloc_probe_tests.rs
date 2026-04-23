@@ -135,11 +135,11 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload {
 // `snapshot_worker_allocated`, `thread_count`, `snapshot_count`)
 // live in `ktstr::test_support::probe_metrics` so they're
 // reachable from lib-crate unit tests. Only the tiny
-// file-local `metric_u64` wrapper stays here — it's used once in
+// file-local `find_metric_u64` wrapper stays here — it's used once in
 // this file and doesn't warrant promotion.
 
 use ktstr::test_support::{
-    MAX_SCAN_INDEX, ThreadLookup, flat_metrics_dump, has_metric, lookup_thread, metric_u64,
+    MAX_SCAN_INDEX, ThreadLookup, find_metric_u64, flat_metrics_dump, has_metric, lookup_thread,
     snapshot_count, snapshot_worker_allocated, thread_count,
 };
 
@@ -553,7 +553,7 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
 /// Extract `snapshots.{snap_idx}.timestamp_unix_sec` for the given
 /// snapshot index.
 fn snapshot_timestamp(metrics: &PayloadMetrics, snap_idx: usize) -> Option<u64> {
-    metric_u64(metrics, &format!("snapshots.{snap_idx}.timestamp_unix_sec"))
+    find_metric_u64(metrics, &format!("snapshots.{snap_idx}.timestamp_unix_sec"))
 }
 
 /// Multi-snapshot sampling mode: run the probe with `--snapshots 3
@@ -722,7 +722,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
     // must not precede it. Enforces the contract documented on
     // `ProbeOutput::started_at_unix_sec` ("start of the probe run
     // (before any per-tid work, before the first snapshot)").
-    let started_at = metric_u64(&metrics, "started_at_unix_sec").ok_or_else(|| {
+    let started_at = find_metric_u64(&metrics, "started_at_unix_sec").ok_or_else(|| {
         anyhow!(
             "top-level started_at_unix_sec missing from probe output; \
              flat metrics: {:?}",

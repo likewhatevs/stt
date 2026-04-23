@@ -176,6 +176,36 @@ fn extract_json_region(s: &str) -> Option<&str> {
 /// unit; the caller resolves these against the payload's declared
 /// [`MetricHint`](crate::test_support::MetricHint)s to upgrade
 /// polarity.
+///
+/// # Stability contract (pre-1.0)
+///
+/// This function, [`MAX_WALK_DEPTH`], [`WALK_TRUNCATION_SENTINEL_NAME`],
+/// and [`is_truncation_sentinel_name`] together form the public
+/// numeric-JSON-extraction surface ktstr offers to in-tree sibling
+/// binaries (`ktstr-jemalloc-probe` is the one current external
+/// consumer — see `src/bin/jemalloc_probe.rs`). Their visibility
+/// is aligned at `pub` so an external consumer that wants to
+/// distinguish "no deep metrics present" from "deep metrics
+/// dropped by the depth cap" can reach every piece of the
+/// contract from outside the crate.
+///
+/// ktstr is pre-1.0: the four items above are free to change in
+/// signature or behaviour without a compat shim. A caller depending
+/// on them must vendor the ktstr version at a known commit, not
+/// track `main`. Concretely:
+///
+/// - Path format (`key.subkey` / `key.0`): may grow a shape
+///   option to prefer arrays-by-key over positional index.
+/// - Depth cap ([`MAX_WALK_DEPTH`]): may raise or lower as
+///   pathological inputs are observed; consumers must not hard-code
+///   the literal value.
+/// - Sentinel shape: may migrate to a typed return
+///   (`WalkResult { metrics, truncated: Option<u64> }`) per the
+///   note on [`WALK_TRUNCATION_SENTINEL_NAME`]. Consumers that
+///   need zero-collision certainty should gate on
+///   [`is_truncation_sentinel_name`] (the predicate, not the
+///   literal string) so a sentinel-name rewording lands in one
+///   place.
 pub fn walk_json_leaves(
     value: &serde_json::Value,
     source: MetricSource,
@@ -197,7 +227,10 @@ pub fn walk_json_leaves(
 /// `serde_json::Value` that bypasses the parser can still reach
 /// arbitrary depth, so an explicit walker guard is the last line of
 /// defence against a stack overflow.
-pub(crate) const MAX_WALK_DEPTH: usize = 64;
+///
+/// See [`walk_json_leaves`]'s stability contract — the concrete
+/// value may change across ktstr pre-1.0 versions.
+pub const MAX_WALK_DEPTH: usize = 64;
 
 /// Sentinel metric name emitted when [`walk`] hits
 /// [`MAX_WALK_DEPTH`] and skips a subtree. Callers of
@@ -226,7 +259,15 @@ pub(crate) const MAX_WALK_DEPTH: usize = 64;
 /// from the metric stream. Held off pending a consumer that
 /// materially benefits from zero-collision certainty; the current
 /// advisory contract is sufficient for every in-crate consumer.
-pub(crate) const WALK_TRUNCATION_SENTINEL_NAME: &str = "__walk_json_leaves_truncated";
+///
+/// Exported `pub` so sibling binaries that embed ktstr as a
+/// library (e.g. `ktstr-jemalloc-probe`) can gate on the
+/// sentinel from their own consumer code. See
+/// [`walk_json_leaves`]'s stability contract — consumers
+/// comparing against the sentinel should prefer
+/// [`is_truncation_sentinel_name`] over the literal string so a
+/// future rewording lands in one place.
+pub const WALK_TRUNCATION_SENTINEL_NAME: &str = "__walk_json_leaves_truncated";
 
 /// Predicate for "this metric name / map key is the
 /// walk-truncation sentinel." Centralises the literal-equality
@@ -234,7 +275,11 @@ pub(crate) const WALK_TRUNCATION_SENTINEL_NAME: &str = "__walk_json_leaves_trunc
 /// changes, and so future sentinel variants (e.g. a
 /// parser-rejection sentinel) can be threaded through one
 /// predicate instead of scattered string literals.
-pub(crate) fn is_truncation_sentinel_name(name: &str) -> bool {
+///
+/// Visibility aligned with [`walk_json_leaves`] and
+/// [`WALK_TRUNCATION_SENTINEL_NAME`] so external consumers have a
+/// complete sentinel-discrimination API.
+pub fn is_truncation_sentinel_name(name: &str) -> bool {
     name == WALK_TRUNCATION_SENTINEL_NAME
 }
 

@@ -118,6 +118,10 @@ the same key out of a sidecar via `jq '.host.<field>'`.
   when CFS was replaced by EEVDF in Linux 6.6+, so a run on an
   EEVDF kernel will simply not have those keys in the map —
   their absence is a kernel-version fact, not a capture failure.
+  EEVDF's own latency-floor knob is exposed as
+  `sched_tunables.sched_base_slice_ns` on 6.6+ kernels (the
+  replacement for the dropped CFS latency / granularity triple);
+  check for its presence to confirm an EEVDF-era capture.
   What you get in practice is whatever `/proc/sys/kernel/sched_*`
   exposes on the running kernel.
 - `cmdline` diverges → `isolcpus=` / `nohz_full=` / `mitigations=`

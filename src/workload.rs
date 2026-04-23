@@ -1594,19 +1594,7 @@ impl WorkloadHandle {
                 };
                 if ptr == libc::MAP_FAILED {
                     let errno = std::io::Error::last_os_error();
-                    let hint = match errno.raw_os_error() {
-                        Some(libc::ENOMEM) => " (ENOMEM: host is out of memory \
-                             or /proc/sys/vm/max_map_count is too low — \
-                             check `sysctl vm.max_map_count` and `free -h`)",
-                        Some(libc::EPERM) => " (EPERM: the caller is not \
-                             permitted to create this mapping — check \
-                             MAP_SHARED restrictions on the mount or \
-                             memory cgroup limits)",
-                        Some(libc::EINVAL) => " (EINVAL: invalid length or \
-                             flag combination — likely a future caller \
-                             passed a zero or misaligned region size)",
-                        _ => "",
-                    };
+                    let hint = mmap_shared_anon_errno_hint(errno.raw_os_error());
                     anyhow::bail!(
                         "mmap(MAP_SHARED|MAP_ANONYMOUS, {futex_region_size} bytes) \
                          for a futex shared-memory region failed: {errno}{hint}; \
@@ -1651,27 +1639,18 @@ impl WorkloadHandle {
             };
             if ptr == libc::MAP_FAILED {
                 let errno = std::io::Error::last_os_error();
-                let hint = match errno.raw_os_error() {
-                    Some(libc::ENOMEM) => " (ENOMEM: host is out of memory \
-                         or /proc/sys/vm/max_map_count is too low — check \
-                         `sysctl vm.max_map_count` and `free -h`)",
-                    Some(libc::EPERM) => " (EPERM: MAP_SHARED|MAP_ANONYMOUS \
-                         rejected by the kernel — check memory cgroup \
-                         limits and container seccomp policy)",
-                    Some(libc::EINVAL) => " (EINVAL: invalid length or \
-                         flag combination — iter_counter_len may have \
-                         produced a zero or overflowing size)",
-                    _ => "",
-                };
+                let hint = mmap_shared_anon_errno_hint(errno.raw_os_error());
                 anyhow::bail!(
                     "mmap(MAP_SHARED|MAP_ANONYMOUS, {size} bytes) for the \
-                     per-worker iter_counters region failed: {errno}{hint}; \
-                     this region holds one AtomicU64 per worker \
-                     ({iter_counter_len} slots) so the parent can snapshot \
-                     iteration counts via `snapshot_iterations()`. \
-                     Remediation: reduce num_workers (each worker consumes \
-                     8 bytes of this region, rounded up to a page) or raise \
+                     {work_type:?} worker-group's per-worker iter_counters \
+                     region failed: {errno}{hint}; this region holds one \
+                     AtomicU64 per worker ({iter_counter_len} slots) so \
+                     the parent can snapshot iteration counts via \
+                     `snapshot_iterations()`. Remediation: reduce \
+                     num_workers (each worker consumes 8 bytes of this \
+                     region, rounded up to a page) or raise \
                      `vm.max_map_count` / the memory cgroup limit.",
+                    work_type = config.work_type.name(),
                 );
             }
             guard.iter_counters = ptr as *mut AtomicU64;
@@ -2392,6 +2371,36 @@ static STOP: AtomicBool = AtomicBool::new(false);
 #[inline]
 fn clamp_futex_wake_n(n: usize) -> i32 {
     n.min(i32::MAX as usize) as i32
+}
+
+/// Render an actionable hint for a failed
+/// `mmap(MAP_SHARED | MAP_ANONYMOUS)` call based on the observed
+/// `errno`. Shared between the futex-region mmap and the
+/// iter_counters mmap in [`WorkloadHandle::spawn`] so the two
+/// sites emit identical hint text per errno — a drift would mean
+/// two related failures produce inconsistent remediation advice.
+///
+/// Takes `Option<i32>` (the output of `std::io::Error::raw_os_error`)
+/// so an unrecognised errno folds cleanly through the `_ => ""`
+/// arm without forcing callers to `unwrap`.
+///
+/// The leading space on every non-empty arm lets callers format
+/// as `"...failed: {errno}{hint};"` without having to add a
+/// conditional separator — an empty hint disappears cleanly.
+fn mmap_shared_anon_errno_hint(errno: Option<i32>) -> &'static str {
+    match errno {
+        Some(libc::ENOMEM) => " (ENOMEM: host is out of memory \
+             or /proc/sys/vm/max_map_count is too low — \
+             check `sysctl vm.max_map_count` and `free -h`)",
+        Some(libc::EPERM) => " (EPERM: MAP_SHARED|MAP_ANONYMOUS \
+             rejected by the kernel — check memory cgroup \
+             limits and container seccomp policy)",
+        Some(libc::EINVAL) => " (EINVAL: invalid length or \
+             flag combination — verify num_workers > 0 so the \
+             region size is non-zero, and that the total size \
+             does not overflow usize)",
+        _ => "",
+    }
 }
 
 /// `futex_ptr` must point to a live `u32` reachable by every thread
@@ -3172,11 +3181,25 @@ fn worker_main(
                         // `region_kb * 1024` overflows usize on 32-bit
                         // targets for region_kb >= 4 MiB-equivalent;
                         // `checked_mul` returns None there and the
-                        // workload silently finishes this iteration
-                        // rather than wrapping to a tiny region.
+                        // workload exits this iteration rather than
+                        // wrapping to a tiny region. Previously
+                        // silent — a test author who typo'd a huge
+                        // `region_kb` would see a zero-iteration
+                        // worker report with no diagnostic. Surface
+                        // the overflow via `tracing::warn!` with the
+                        // offending `region_kb` so the configuration
+                        // bug is visible in the test log; the early
+                        // `break` still keeps the process honest.
                         let region_size = match region_kb.checked_mul(1024) {
                             Some(v) => v,
-                            None => break,
+                            None => {
+                                tracing::warn!(
+                                    tid,
+                                    region_kb,
+                                    "PageFaultChurn region_kb * 1024 overflowed usize — worker exiting outer loop without doing page-fault work"
+                                );
+                                break;
+                            }
                         };
                         let ptr = unsafe {
                             libc::mmap(
@@ -3817,6 +3840,70 @@ mod tests {
         h.stop_and_collect()
     }
 
+    /// `mmap_shared_anon_errno_hint` must produce distinct,
+    /// grep-friendly text for each of the three expected errnos
+    /// (ENOMEM, EPERM, EINVAL) and the empty-string fallback for
+    /// anything else. Pins the wire contract the two call sites
+    /// in `WorkloadHandle::spawn` share so an errno that drifts
+    /// between arms silently would trip the test here rather than
+    /// in production diagnostics. Every expected arm checks the
+    /// leading space (caller formats as `"{errno}{hint}"` and
+    /// relies on the hint providing its own separator) plus a
+    /// distinctive substring unique to that arm.
+    #[test]
+    fn mmap_shared_anon_errno_hint_variants() {
+        let enomem = mmap_shared_anon_errno_hint(Some(libc::ENOMEM));
+        assert!(
+            enomem.starts_with(' '),
+            "non-empty hint must begin with a space so \"{{errno}}{{hint}}\" has its separator; got {enomem:?}",
+        );
+        assert!(
+            enomem.contains("ENOMEM"),
+            "ENOMEM arm must name the errno in the hint; got {enomem:?}",
+        );
+        assert!(
+            enomem.contains("vm.max_map_count"),
+            "ENOMEM arm must mention the remediation sysctl; got {enomem:?}",
+        );
+
+        let eperm = mmap_shared_anon_errno_hint(Some(libc::EPERM));
+        assert!(eperm.starts_with(' '), "EPERM hint must start with a space");
+        assert!(
+            eperm.contains("EPERM"),
+            "EPERM arm must name the errno; got {eperm:?}",
+        );
+        assert!(
+            eperm.contains("cgroup"),
+            "EPERM arm must mention memory cgroup as a remediation path; got {eperm:?}",
+        );
+
+        let einval = mmap_shared_anon_errno_hint(Some(libc::EINVAL));
+        assert!(einval.starts_with(' '), "EINVAL hint must start with a space");
+        assert!(
+            einval.contains("EINVAL"),
+            "EINVAL arm must name the errno; got {einval:?}",
+        );
+        assert!(
+            einval.contains("num_workers > 0"),
+            "EINVAL arm must give the concrete `num_workers > 0` remediation \
+             (the older 'zero or misaligned' wording was too vague); got {einval:?}",
+        );
+
+        // Fallback arm: every unrecognised errno (EACCES, EBUSY,
+        // EEXIST, random positive integers) must produce the empty
+        // string so the caller's format produces no trailing noise.
+        assert_eq!(
+            mmap_shared_anon_errno_hint(Some(libc::EACCES)),
+            "",
+            "unrecognised errno must fold to empty-string hint",
+        );
+        assert_eq!(
+            mmap_shared_anon_errno_hint(None),
+            "",
+            "None errno (io::Error without raw_os_error) must fold to empty-string",
+        );
+    }
+
     /// `clock_gettime_ns(CLOCK_MONOTONIC)` must never observe time
     /// moving backwards between two sequential calls on the same
     /// thread. Pins the non-decreasing contract the wake-latency
@@ -3825,16 +3912,40 @@ mod tests {
     /// `now_ns - wake_ns`; a backward step would saturate to zero
     /// in the subtractor and silently discard a valid sample, or
     /// (without the saturator) wrap to `u64::MAX`.
+    ///
+    /// A 2-sample test would miss a backward step that only
+    /// appears under load; the 1000-sample tight loop here burns
+    /// a few microseconds of CPU and catches any regression that
+    /// makes the clock non-monotonic under reasonable contention
+    /// (timer drift on a virtualised guest, or a helper swap
+    /// from `CLOCK_MONOTONIC` to `CLOCK_REALTIME` which is NOT
+    /// monotonic). Every adjacent pair in the 999-element diff
+    /// list is checked for non-decreasing order so a mid-run
+    /// regression is localised to the offending index, not just
+    /// "some pair somewhere".
     #[test]
     fn clock_gettime_ns_monotonic_non_decreasing() {
-        let first = clock_gettime_ns(libc::CLOCK_MONOTONIC)
-            .expect("CLOCK_MONOTONIC must be readable on any Linux host");
-        let second = clock_gettime_ns(libc::CLOCK_MONOTONIC)
-            .expect("CLOCK_MONOTONIC must be readable on any Linux host");
-        assert!(
-            second >= first,
-            "CLOCK_MONOTONIC went backwards: first={first} second={second}",
-        );
+        const N: usize = 1000;
+        let samples: Vec<u64> = (0..N)
+            .map(|i| {
+                clock_gettime_ns(libc::CLOCK_MONOTONIC).unwrap_or_else(|| {
+                    panic!(
+                        "CLOCK_MONOTONIC must be readable on any Linux host; \
+                         sample {i}/{N} returned None"
+                    )
+                })
+            })
+            .collect();
+        for i in 1..N {
+            assert!(
+                samples[i] >= samples[i - 1],
+                "CLOCK_MONOTONIC went backwards at sample {i}: \
+                 prev={prev} curr={curr} (delta={delta})",
+                prev = samples[i - 1],
+                curr = samples[i],
+                delta = samples[i - 1] - samples[i],
+            );
+        }
     }
 
     // ---- classify_wait_outcome variant coverage ------------------------

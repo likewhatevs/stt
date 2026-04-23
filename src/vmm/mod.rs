@@ -731,7 +731,7 @@ impl VmResult {
 
 /// Per-vCPU KVM stats read after VM exit. Each map holds cumulative
 /// counter values from the VM's lifetime.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KvmStatsTotals {
     /// Per-vCPU stat maps. Index is vCPU id.
     pub per_vcpu: Vec<HashMap<String, u64>>,

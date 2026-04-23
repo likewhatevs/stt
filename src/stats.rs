@@ -221,7 +221,12 @@ pub static METRICS: &[MetricDef] = &[
         polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 5.0,
         default_rel: 0.30,
-        display_unit: "/s",
+        // Integer event count, not a rate — the source field on
+        // `MonitorSummary::event_deltas.total_fallback` is a cumulative
+        // delta across the run, not per-second. Empty unit matches the
+        // other counter metrics (`stall_count`, `total_iterations`,
+        // `total_migrations`).
+        display_unit: "",
         accessor: |r| Some(r.fallback_count as f64),
     },
     MetricDef {
@@ -229,7 +234,10 @@ pub static METRICS: &[MetricDef] = &[
         polarity: crate::test_support::Polarity::LowerBetter,
         default_abs: 5.0,
         default_rel: 0.30,
-        display_unit: "/s",
+        // Integer event count, not a rate — see `total_fallback`
+        // rationale above. Source field is
+        // `MonitorSummary::event_deltas.total_dispatch_keep_last`.
+        display_unit: "",
         accessor: |r| Some(r.keep_last_count as f64),
     },
     MetricDef {
@@ -512,15 +520,19 @@ pub struct GauntletRow {
     /// `stalls`; see the triples table on [`METRICS`] for the
     /// column-level rename rationale.
     pub stall_count: usize,
-    /// Fallback-dispatch rate-per-second. Surfaced in [`METRICS`]
-    /// under registry name `total_fallback` (DataFrame column
-    /// `fallback`); see the triples table on [`METRICS`] for the
-    /// registry/field/column rationale.
+    /// Fallback-dispatch count across the run. Carried as-is from
+    /// `MonitorSummary::event_deltas.total_fallback` — an integer
+    /// event count, NOT a rate. Surfaced in [`METRICS`] under
+    /// registry name `total_fallback` (DataFrame column `fallback`);
+    /// see the triples table on [`METRICS`] for the registry / field /
+    /// column rationale.
     pub fallback_count: i64,
-    /// Keep-last dispatch rate-per-second. Surfaced in [`METRICS`]
-    /// under registry name `total_keep_last` (DataFrame column
-    /// `keep_last`); see the triples table on [`METRICS`] for the
-    /// registry/field/column rationale.
+    /// Keep-last dispatch count across the run. Carried as-is from
+    /// `MonitorSummary::event_deltas.total_dispatch_keep_last` — an
+    /// integer event count, NOT a rate. Surfaced in [`METRICS`] under
+    /// registry name `total_keep_last` (DataFrame column `keep_last`);
+    /// see the triples table on [`METRICS`] for the registry / field /
+    /// column rationale.
     pub keep_last_count: i64,
     // Benchmarking fields.
     pub worst_p99_wake_latency_us: f64,
@@ -541,6 +553,29 @@ pub struct GauntletRow {
     /// across cgroups — lower is worse). Registry name matches the
     /// field name; see the triples table on [`METRICS`] for the
     /// field / registry / DataFrame-column mapping.
+    ///
+    /// # `worst_` vs `lowest_` naming evaluation
+    ///
+    /// A `lowest_iterations_per_worker` rename was considered — it
+    /// would describe the merge direction (min across cgroups) more
+    /// literally than `worst_`, which semantically maps "worst" to
+    /// different merge operations depending on polarity (max for
+    /// lower-better metrics, min for higher-better). Rejected
+    /// because `worst_` is the codebase-wide prefix for
+    /// cross-cgroup roll-ups regardless of polarity — see
+    /// `worst_page_locality` (`HigherBetter` → the merge takes the
+    /// LOWEST non-zero value) and `worst_spread` (`LowerBetter` →
+    /// the merge takes the HIGHEST). Breaking that convention for
+    /// one metric would require either (a) renaming every existing
+    /// `HigherBetter` worst_* metric to `lowest_*` for consistency,
+    /// or (b) accepting a mixed naming scheme where readers have to
+    /// cross-reference each metric's polarity to understand the
+    /// prefix. Option (a) is a high-churn rename across
+    /// sidecars / DataFrames / CI gates; option (b) degrades
+    /// readability. The current convention — `worst_` = "the
+    /// cross-cgroup roll-up that surfaces the most problematic
+    /// cgroup, direction determined by the metric's polarity" —
+    /// is documented on [`METRICS`] and applies here.
     pub worst_iterations_per_worker: f64,
     // NUMA fields.
     /// Worst-case per-cgroup NUMA page-locality fraction (lowest
@@ -2676,6 +2711,86 @@ mod tests {
             above.regressions, 1,
             "at-floor comparison with a 10x tail blow-up must surface \
              as a regression; threshold wiring has a gap otherwise",
+        );
+    }
+
+    /// Explicit None-branch pin on the compare_rows accessor contract.
+    ///
+    /// `compare_rows` calls `m.read(row)` for every metric and
+    /// falls through `unwrap_or(0.0)` to the EPSILON-guard when the
+    /// accessor returns `None`. The `wake_latency_tail_ratio_is_suppressed_below_*`
+    /// sibling exercises this path EMBEDDED in the full comparison
+    /// flow (via the tail-ratio accessor's iteration-count gate),
+    /// but does NOT directly prove that `compare_rows` handles a
+    /// None result; a regression that removed the `unwrap_or(0.0)`
+    /// and panicked on None would fail the sibling only through
+    /// the indirect "compare_rows panicked" route, which could be
+    /// mistaken for a test infrastructure problem.
+    ///
+    /// This test synthesizes the None condition explicitly — a
+    /// below-floor iterations count with distinctly-different
+    /// stored `worst_wake_latency_tail_ratio` values on each side
+    /// — and asserts the three observable consequences:
+    /// 1. `metric.read(&row)` returns `None` on both sides.
+    /// 2. `compare_rows` does NOT panic.
+    /// 3. The resulting `CompareReport` classifies the pair as
+    ///    `unchanged` (EPSILON guard swallowed the 0.0/0.0 delta).
+    ///
+    /// A panic or a regression/improvement count > 0 here would
+    /// indicate the `unwrap_or(0.0)` in `compare_rows` has drifted.
+    #[test]
+    fn compare_rows_handles_none_from_accessor_as_zero() {
+        use crate::stats::WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS as MIN;
+        let metric = metric_def("worst_wake_latency_tail_ratio")
+            .expect("tail ratio metric must be registered");
+
+        let mut row_a = make_row("none_branch", "tiny-1llc", true, 0.0);
+        let mut row_b = make_row("none_branch", "tiny-1llc", true, 0.0);
+        row_a.total_iterations = MIN - 1;
+        row_b.total_iterations = MIN - 1;
+        // Stored fields are distinctly non-zero so a regression that
+        // short-circuited the accessor (returned the stored value
+        // directly) would produce a 1000x delta that would fail
+        // both the "unchanged" classification AND the regression
+        // count assertion.
+        row_a.worst_wake_latency_tail_ratio = 1.0;
+        row_b.worst_wake_latency_tail_ratio = 1000.0;
+
+        assert!(
+            metric.read(&row_a).is_none(),
+            "accessor must return None for below-floor A input — \
+             otherwise this test is not actually exercising the \
+             None branch of compare_rows",
+        );
+        assert!(
+            metric.read(&row_b).is_none(),
+            "accessor must return None for below-floor B input",
+        );
+
+        // The call must not panic (a regression that dropped the
+        // `unwrap_or` would trip here), and the result must
+        // classify the pair as unchanged — both sides collapse to
+        // 0.0 via unwrap_or, then the `abs() < EPSILON` guard
+        // short-circuits without producing a finding.
+        let report = compare_rows(
+            std::slice::from_ref(&row_a),
+            std::slice::from_ref(&row_b),
+            None,
+            &ComparisonPolicy::default(),
+        );
+        assert_eq!(
+            report.regressions, 0,
+            "None accessor result must land as unchanged, not a regression",
+        );
+        assert_eq!(
+            report.improvements, 0,
+            "None accessor result must land as unchanged, not an improvement",
+        );
+        assert!(
+            report.findings.is_empty(),
+            "no findings must be emitted when the accessor returns None; \
+             got: {:?}",
+            report.findings,
         );
     }
 

@@ -87,7 +87,24 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// visibility.
 pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String]) {
     if let Err(e) = write_skip_sidecar(entry, active_flags) {
-        eprintln!("ktstr_test: {e:#}");
+        // Dual-emit at warn level: an unwritten skip sidecar costs
+        // the run no correctness — the test still skipped — but
+        // silently drops post-run stats tooling's visibility into
+        // the skip, so operators debugging a missing row in a
+        // gauntlet report need a loud-enough log to notice. The
+        // eprintln surfaces under direct nextest / cargo-ktstr
+        // invocations where no tracing subscriber is installed;
+        // the tracing::warn lands in every structured-log consumer
+        // (cargo-ktstr, downstream pipelines) at warn level rather
+        // than the previous implicit debug visibility.
+        let entry_name = entry.name;
+        let rendered = format!("{e:#}");
+        eprintln!("ktstr_test: warn: skip-sidecar write failed for {entry_name}: {rendered}");
+        tracing::warn!(
+            test = %entry_name,
+            err = %rendered,
+            "skip-sidecar write failed — stats tooling will not see this skip",
+        );
     }
 }
 
@@ -563,19 +580,21 @@ fn evaluate_vm_result(
             } else {
                 String::new()
             };
-            // Dual filter for the console-dump gate:
-            //   Primary: structured `DetailKind::SchedulerDied` tag —
-            //     every current scheduler-exit emitter sets it, and
-            //     the enum variant is cheap to match.
-            //   Fallback: `is_scheduler_death` prefix-match on the
-            //     message — catches any future detail that carries
-            //     the scheduler-exit wording but a mis-set kind, so
-            //     a regression in one emit site still surfaces the
-            //     console section instead of silently dropping it.
-            let console_section = if check_result.details.iter().any(|d| {
-                d.kind == crate::assert::DetailKind::SchedulerDied
-                    || d.is_scheduler_death()
-            }) || verbose()
+            // Structural filter for the console-dump gate: match on
+            // `DetailKind::SchedulerDied` only. Every scheduler-exit
+            // emit site in this crate tags its `AssertDetail` with
+            // that variant (see the ops.rs / scenario/mod.rs call
+            // sites plus the `format_sched_died_*` helpers in
+            // `assert.rs`), so filtering by kind is sufficient — the
+            // prior `is_scheduler_death()` prefix-match fallback was
+            // removed once every production emitter was audited as
+            // kind-tagging its details. `verbose()` forces the
+            // section on for operator debugging runs.
+            let console_section = if check_result
+                .details
+                .iter()
+                .any(|d| d.kind == crate::assert::DetailKind::SchedulerDied)
+                || verbose()
             {
                 let init_stage = classify_init_stage(output);
                 format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
