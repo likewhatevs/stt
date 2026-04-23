@@ -72,6 +72,17 @@ so most tests do not need to set `numa_nodes`. See
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
 | `watchdog_timeout_s` | 4 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 
+### Payloads
+
+| Attribute | Default | Description |
+|---|---|---|
+| `payload = CONST` | `None` | Rust const path to a binary-kind `Payload` (`PayloadKind::Binary`). Populates `KtstrTestEntry::payload`; the test body can run it via `ctx.payload(&CONST)`. Scheduler-kind payloads are rejected at compile time — use the `scheduler = …` slot for those. |
+| `workloads = [CONST, …]` | `[]` | Array of binary-kind `Payload` const paths composed alongside the primary `payload`. Each entry is runnable from the test body via `ctx.payload(&CONST)`; the include-file pipeline packages every referenced binary into the guest automatically. |
+
+See [Payload Definitions](scheduler-definitions.md#derive-payload) for
+authoring new `Payload` fixtures; `tests/common/fixtures.rs` carries
+reusable examples (`SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON`).
+
 ### Checking
 
 | Attribute | Default | Description |

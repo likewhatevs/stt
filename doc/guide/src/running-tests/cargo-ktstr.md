@@ -2,7 +2,8 @@
 
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test`, `coverage`,
-`stats`, `kernel`, `verifier`, `completions`, `shell`.
+`stats`, `kernel`, `model`, `verifier`, `completions`,
+`show-host`, `show-thresholds`, `cleanup`, `shell`.
 
 ## test
 
@@ -270,6 +271,27 @@ Print a table of run directories under
 `{CARGO_TARGET_DIR or "target"}/ktstr/` with run key, test count,
 and date.
 
+### show-host
+
+Print the archived `HostContext` for a specific run: CPU identity,
+memory/hugepage config, transparent-hugepage policy, NUMA node
+count, kernel uname triple, kernel cmdline, and every
+`/proc/sys/kernel/sched_*` tunable captured at archive time. Useful
+for inspecting the same fingerprint `compare`'s host-delta section
+uses, available on a single run.
+
+The command scans sidecars in the run directory in iteration order
+and prints the FIRST sidecar that carries a populated host field —
+older pre-enrichment sidecars may have `host: None`, and the
+forward scan tolerates those. If no sidecar has a populated host
+field the command fails with an actionable error rather than
+returning empty output.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--run ID` | required | Run key (from `cargo ktstr stats list`). |
+| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`: useful for archived sidecar trees copied off a CI host. |
+
 ### compare
 
 Load two run directories, join on (scenario, topology, work_type),
@@ -280,7 +302,9 @@ thresholds from the unified metric registry, and print colored output
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-E FILTER` | -- | Substring filter applied to `scenario topology scheduler work_type`. The scheduler is searchable via the filter but is not part of the pairing key, so the same `(scenario, topology, work_type)` pair still compares across different scheduler binaries when the filter does not constrain it. |
-| `--threshold PCT` | per-metric `default_rel` | Relative significance threshold in percent. The comparison is dual-gated: a delta must exceed both `--threshold` (relative gate) and the metric's `default_abs` (absolute gate) to count as a regression or improvement. `--threshold` overrides the per-metric `default_rel` only; the absolute gate is always per-metric and cannot be tuned from the CLI. When omitted, each metric's built-in `default_rel` applies (0.10 fallback for unknown metrics). |
+| `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy` — use `--threshold` for a uniform bound, `--policy` when per-metric overrides are needed. |
+| `--policy FILE` | -- | Path to a JSON `ComparisonPolicy` file with per-metric thresholds. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }`. Priority is per-metric override → `default_percent` → each metric's registry `default_rel`. Per-metric keys are rejected at load time if they do not match a metric in the `METRICS` registry (catches typos). Mutually exclusive with `--threshold`. |
+| `--dir DIR` | `target/ktstr/` | Alternate run root to resolve `a` / `b` against. Defaults to `test_support::runs_root()` (typically `target/ktstr/`). Useful when comparing archived sidecar trees copied off a CI host. |
 
 ### Prerequisites
 

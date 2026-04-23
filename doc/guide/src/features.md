@@ -107,9 +107,12 @@ Scenarios are composable sequences of
 [steps and ops](concepts/ops.md). You declare intent as data —
 the framework creates cgroups, assigns cpusets, spawns workers,
 sets scheduling policies, and manages affinity. 60+
-[canned scenarios](concepts/scenarios.md) across 10 submodules
-cover basic, cpuset, dynamic, stress, interaction, affinity,
-nested, ops, performance, and scenarios patterns.
+[canned scenarios](concepts/scenarios.md) across 8 scenario
+submodules cover basic, cpuset, dynamic, stress, interaction,
+affinity, nested, and performance patterns. (The `ops` module
+is the underlying DSL that every scenario is expressed in, not
+a scenario category; the `scenarios` module is the top-level
+catalog aggregator.)
 
 **API types:**
 - `CgroupDef` — declarative cgroup: name + cpuset + workload(s)
@@ -321,7 +324,8 @@ guest and host coverage for unified `cargo llvm-cov` reports.
 
 Wraps `cargo nextest run` with automatic kernel resolution.
 Subcommands (in `--help` order): `test`, `coverage`, `stats`,
-`kernel`, `verifier`, `completions`, `shell`.
+`kernel`, `model`, `verifier`, `completions`, `show-host`,
+`show-thresholds`, `cleanup`, `shell`.
 See [`cargo-ktstr`](running-tests/cargo-ktstr.md).
 
 </details>

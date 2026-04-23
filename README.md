@@ -270,8 +270,14 @@ cargo ktstr kernel build --source ~/linux                  # build from local so
 cargo ktstr kernel build --git URL --ref v6.14             # shallow-clone a git tree
 cargo ktstr kernel list                                    # list cached kernels (shows (EOL) tags)
 cargo ktstr kernel clean --keep 3                          # keep 3 most recent
+cargo ktstr model fetch                                    # prefetch the LlmExtract model + tokenizer
+cargo ktstr model status                                   # report whether a SHA-checked model is cached
 cargo ktstr verifier --scheduler scx_my_sched              # BPF verifier stats
 cargo ktstr stats                                          # aggregate gauntlet sidecars
+cargo ktstr stats show-host --run <key>                    # print archived HostContext for a run
+cargo ktstr show-host                                      # print current host context
+cargo ktstr show-thresholds my_test                        # print resolved Assert thresholds for a test
+cargo ktstr cleanup                                        # remove leftover ktstr cgroups
 cargo ktstr shell --kernel 6.14.2                          # interactive VM shell
 cargo ktstr completions bash                               # shell completions
 ```
@@ -298,6 +304,8 @@ ktstr kernel build 6.14.2
 ktstr kernel build --source ../linux
 ktstr kernel build --git URL --ref v6.14
 ktstr kernel clean --keep 3
+ktstr host-state capture --output baseline.hst.zst         # snapshot every live thread's counters
+ktstr host-state compare baseline.hst.zst candidate.hst.zst # diff two snapshots on (pcomm, comm)
 ktstr completions bash
 ```
 

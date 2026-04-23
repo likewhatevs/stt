@@ -75,7 +75,7 @@ details on how profiles are generated.
 ## The Scenario struct (internal catalog)
 
 `Scenario` is ktstr's internal catalog format. All catalog entries are
-registered in `all_scenarios()` across 11 categories.
+registered in `all_scenarios()` across 10 categories.
 
 ```rust,ignore
 pub struct Scenario {

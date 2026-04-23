@@ -20,6 +20,9 @@ An `Op` is an atomic operation on the cgroup topology:
 | `SetAffinity` | Set worker affinity via `AffinityKind` |
 | `SpawnHost` | Spawn workers in the parent cgroup |
 | `MoveAllTasks` | Move all tasks from one cgroup to another |
+| `RunPayload` | Spawn a binary-kind `Payload` in the background and track its `PayloadHandle` under the step's payload set. Subsequent `WaitPayload` / `KillPayload` address it by `(payload.name, cgroup)`. Scheduler-kind payloads are rejected at apply time. |
+| `WaitPayload` | Block until the named payload exits naturally, evaluate its checks, and record metrics to the per-test sidecar. Target lookup is by `(name, cgroup)` composite key; `cgroup: None` resolves to the unique live copy. No timeout — pair with a bounded `HoldSpec` or the payload's own `--runtime` for time-boxed runs. |
+| `KillPayload` | SIGKILL the named payload, reap the child, evaluate checks, and record metrics. Same `(name, cgroup)` lookup rules as `WaitPayload`. Mirrors step-teardown drain for an explicitly-targeted payload. |
 
 Op constructors accept string literals directly (no `.into()` needed):
 
