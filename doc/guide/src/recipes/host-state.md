@@ -95,18 +95,55 @@ any host field differs. A CI job can:
 
 ## Typical hits
 
-- `thp_enabled` changed between runs → explains latency-sensitive
-  regressions that vanish when you pin THP via `transparent_hugepage=`
-  on the kernel cmdline.
-- `sched_migration_cost_ns` differs → fair scheduler migrated the
-  run onto different CPUs, which changes the idle-steal pressure
-  on `scx_*` schedulers that depend on it.
+Each bullet names the `show-host` field that carries the signal so
+you can `cargo ktstr show-host | grep <field>` directly, or pluck
+the same key out of a sidecar via `jq '.host.<field>'`.
+
+- `thp_enabled` (and its companion `thp_defrag`) changed between
+  runs → explains latency-sensitive regressions that vanish when
+  you pin THP via `transparent_hugepage=` on the kernel cmdline.
+  The bracketed selection inside the value is the active setting;
+  compare the bracket position, not just the full string.
+- `sched_tunables.sched_migration_cost_ns` differs (look for it
+  inside the `sched_*` block printed by `show-host`) → fair
+  scheduler migrated the run onto different CPUs, which changes
+  the idle-steal pressure on `scx_*` schedulers that depend on
+  it. Other `sched_tunables.*` keys
+  (`sched_wakeup_granularity_ns`, `sched_min_granularity_ns`,
+  `sched_latency_ns`, `sched_rt_runtime_us`, etc.) have the same
+  shape — the full set is whatever `/proc/sys/kernel/sched_*`
+  lists at capture time.
 - `cmdline` diverges → `isolcpus=` / `nohz_full=` / `mitigations=`
-  are all boot-time and change the whole scheduling surface.
-  Rebooting the host to match is the correct remediation when
-  you need the comparison to hold.
-- `kernel_release` differs → the kernel itself changed; every
-  other host dimension is suspect under cross-kernel comparison.
+  / `transparent_hugepage=` / `numa_balancing=` are all boot-time
+  and change the whole scheduling surface. Rebooting the host to
+  match is the correct remediation when you need the comparison
+  to hold.
+- `kernel_release` differs (also check the companion
+  `kernel_name` and `arch` fields) → the kernel itself changed;
+  every other host dimension is suspect under cross-kernel
+  comparison. A `kernel_name` change (`uname -s` reporting a
+  different OS family — `Linux` vs `FreeBSD`, say) is a harder
+  stop than a same-family version bump and usually means the
+  two sidecars were produced on entirely different systems.
+- `hugepages_total` / `hugepages_free` / `hugepages_size_kb`
+  deltas → benchmark throughput that depends on 2 MiB pages
+  (performance_mode tests) flips outcome when the pool shrinks
+  or the page size changes. All three are reported by `show-host`
+  in the meminfo-derived block.
+- `numa_nodes` differs → cpusets and cross-node migration signals
+  only make sense within the CPU→node mapping captured at
+  sidecar-write time; a host reconfigured to expose or hide
+  nodes changes what `cpus_used` and `numa_pages` mean across
+  the two runs. See the
+  [capture caveat](#capture-show-host) — `numa_nodes` counts
+  only nodes that host at least one CPU (memory-only nodes are
+  not counted), so a delta here can reflect either a hardware /
+  firmware change or a topology reconfiguration that left the
+  memory-only nodes untouched.
+- CPU-level skew (`cpu_model` / `cpu_vendor`) → microarchitectural
+  differences affect cache-sensitive benchmarks. Always inspect
+  alongside `cmdline` because a different CPU usually comes with
+  a different bootloader.
 
 ## Seeing the raw sidecar field
 

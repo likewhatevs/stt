@@ -12,18 +12,28 @@
 //!
 //! ## Static-cache staleness under hotplug
 //!
-//! The static-field cache assumes hotplug-invariant topology. CPU
-//! / NUMA / memory hotplug between the first collect call and a
-//! later one will leave [`STATIC_HOST_INFO`] pinned to the
-//! pre-hotplug values — `total_memory_kb` stays at the original
-//! snapshot, `numa_nodes` does not reflect an added/removed node,
-//! and `arch` (which cannot change without a reboot) is
-//! the only field genuinely immune. Tests that run on a hotplug-
-//! live host must either (a) avoid reading HostContext after the
-//! hotplug event, or (b) restart the process to invalidate the
-//! cache. No `reset` hook is exposed in production; the
-//! `#[cfg(test)]`-only reset machinery is for unit tests, not
-//! runtime recapture.
+//! The static-field cache pins the first snapshot it observes for
+//! the life of the process. This is OUR invariant, not the
+//! kernel's: `/proc/meminfo`'s `MemTotal`,
+//! `/sys/devices/system/node/*`, and the `uname()` return all
+//! update live when memory or NUMA hotplug fires, and a freshly-
+//! started process would pick up the new values on its next
+//! collect call. It is [`STATIC_HOST_INFO`]'s `OnceLock` that
+//! binds a single read for the process lifetime — not any
+//! kernel-side caching.
+//!
+//! So on a host where CPU / NUMA / memory hotplug fires between
+//! two collect calls in the same process, `HostContext` continues
+//! to report the pre-hotplug values — `total_memory_kb` stays at
+//! the original snapshot, `numa_nodes` does not reflect an
+//! added/removed node. `arch` is the only field genuinely immune
+//! (a reboot is required to change architecture).
+//!
+//! Tests that need live-updated values must either (a) avoid
+//! reading HostContext after the hotplug event, or (b) restart
+//! the process to force a fresh `OnceLock` population. No
+//! `reset` hook is exposed in production; the `#[cfg(test)]`-only
+//! reset machinery is for unit tests, not runtime recapture.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;

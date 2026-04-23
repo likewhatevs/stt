@@ -1557,11 +1557,15 @@ fn memoized_inference() -> Arc<CachedInference> {
         return Arc::clone(arc);
     }
     #[cfg(test)]
-    // Relaxed is sufficient: the outer MODEL_CACHE mutex already
-    // establishes the happens-before edge between the load-count
-    // increment and the slot write. No thread reads the counter
-    // without holding the same lock, so no additional ordering on
-    // the atomic is needed.
+    // Relaxed is sufficient: the test helper `lock_env` serializes
+    // every test that reads MODEL_CACHE_LOAD_COUNT against every
+    // test that drives the slow path here, and that mutex
+    // provides the real happens-before edge between the increment
+    // and the read. The MODEL_CACHE lock covers the write side
+    // only — counter reads in
+    // `model_cache_loads_at_most_once_per_populated_slot` happen
+    // outside MODEL_CACHE, so the MODEL_CACHE lock is not a
+    // read-side gate.
     MODEL_CACHE_LOAD_COUNT.fetch_add(1, Ordering::Relaxed);
     let result = load_inference()
         .map(Mutex::new)

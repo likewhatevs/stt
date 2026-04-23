@@ -139,11 +139,56 @@ Payloads that need host binaries or fixtures in the guest initramfs
 can declare them on the `Payload` itself instead of relying on the
 CLI `-i` / `--include-files` flag at every invocation. The specs
 are resolved at `run_ktstr_test` time through the same
-include-file pipeline the CLI uses — bare names are
-searched in the host's `PATH`, explicit paths must exist, and
-directories are walked recursively.
+include-file pipeline the CLI uses.
 
-Declare per-Payload via the `#[include_files(...)]` attribute on
+### Spec shapes
+
+Three shapes are accepted; which branch fires is decided by the
+shape of the path:
+
+- **Bare name** (single-component, no `/`, no `./`, no `../`) —
+  looked up first in the harness's current working directory
+  (`path.exists()` is tried before the `PATH` walk), then in the
+  host's `PATH` if the cwd lookup misses. The resolved absolute
+  path is packed as `include-files/<filename>`.
+  Example: `"fio"` → host `/usr/bin/fio` → archive
+  `include-files/fio`.
+- **Relative or absolute path** (starts with `/`, `./`, `../`, or
+  contains more than one component) — used verbatim and must
+  exist. Relative paths are interpreted against the current
+  working directory at the time the test harness runs (for
+  `cargo nextest run` that is the workspace root or the
+  individual crate root, depending on how the binary is
+  invoked). A single-file path is packed as
+  `include-files/<filename>`.
+  Example: `"./test-fixtures/workload.json"` → archive
+  `include-files/workload.json`.
+- **Directory** (any path whose resolution is a directory) —
+  walked recursively (symlinks followed, non-regular files
+  skipped) and the directory's basename becomes the root under
+  `include-files/`.
+  Example: `"./helpers"` containing `a.sh` and `sub/b.sh` →
+  archive entries `include-files/helpers/a.sh` and
+  `include-files/helpers/sub/b.sh`.
+
+### Base directory for `extra_include_files`
+
+Strings in `extra_include_files` follow the same three shapes as
+the `#[include_files(...)]` attribute. They are NOT anchored to
+`CARGO_MANIFEST_DIR` or to the crate source tree — they are
+resolved against the harness's current working directory at test
+time, plus the host `PATH` for bare names. The attribute parser
+accepts string literals only, so paths must be plain quoted
+strings rather than compile-time expressions like
+`concat!(env!("CARGO_MANIFEST_DIR"), …)`. For test fixtures
+shipped alongside the test source, the reliable options are
+either a bare name that a build script or test-setup stage has
+placed on `PATH`, or a relative path rooted at the directory
+from which the test is invoked.
+
+### Per-Payload declaration
+
+Declare via the `#[include_files(...)]` attribute on
 `#[derive(Payload)]`:
 
 ```rust,ignore
@@ -152,14 +197,59 @@ use ktstr::prelude::*;
 #[derive(Payload)]
 #[payload(binary = "fio")]
 #[include_files("fio", "bench-helper")]
-#[metric(name = "iops", polarity = "higher_is_better", unit = "ops/s")]
+#[metric(name = "iops", polarity = HigherBetter, unit = "ops/s")]
 struct FioPayload;
 ```
 
 The generated `FIO` const carries `include_files: &["fio",
-"bench-helper"]`. When any `#[ktstr_test]` uses `FIO` as a payload
-or workload, those files get resolved and packed into the initramfs
-automatically — no `-i` flag needed on the CLI.
+"bench-helper"]`. The macro generates a const named by converting
+the struct name to SCREAMING_SNAKE_CASE (stripping any `Payload`
+suffix), so `FioPayload` → `FIO` and `BenchDriver` → `BENCH_DRIVER`.
+When any `#[ktstr_test]` uses `FIO` as a payload or workload, those
+files get resolved and packed into the initramfs automatically —
+no `-i` flag needed on the CLI.
+
+### Fully worked declarative test
+
+Complete end-to-end example of a `#[ktstr_test]` that relies on
+declarative include_files only (no CLI `-i` flag at runtime). The
+fixture binary ships on `PATH` under a project-controlled bin
+directory; the payload declares its own dependency:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+const MY_SCHED: Scheduler = Scheduler::new("my_sched")
+    .binary(SchedulerSpec::Discover("scx_my_sched"))
+    .topology(1, 1, 2, 1);
+
+#[derive(Payload)]
+#[payload(binary = "bench-driver")]
+#[include_files("bench-driver", "bench-helper")]
+#[metric(name = "ops_per_sec", polarity = HigherBetter, unit = "ops/s")]
+struct BenchDriver;
+
+#[ktstr_test(
+    scheduler = MY_SCHED,
+    payload = BENCH_DRIVER,
+    duration_s = 5,
+)]
+fn bench_driver_runs_with_declared_helpers(ctx: &Ctx) -> Result<AssertResult> {
+    // Harness resolves the payload's `include_files` before boot:
+    //   bench-driver  → `include-files/bench-driver`  (from $PATH)
+    //   bench-helper  → `include-files/bench-helper`  (from $PATH)
+    // Both land in the guest initramfs at `/include-files/` and are
+    // on the worker's `PATH` during execution. The test body itself
+    // does not touch the include set — it runs through `ctx.payload`.
+    ctx.payload(&BENCH_DRIVER).run().map(|(a, _)| a)
+}
+```
+
+No `-i` / `--include-files` flag is needed on any host-side
+invocation; the packaging happens automatically as part of
+`run_ktstr_test`.
+
+### Test-level extras
 
 Test-level extras that don't belong on any specific payload go on
 the `#[ktstr_test]` attribute directly:

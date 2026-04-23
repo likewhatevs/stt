@@ -42,6 +42,7 @@
 use std::borrow::Cow;
 use std::ffi::CString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::time::Duration;
 
@@ -365,18 +366,13 @@ fn evaluate(
         // set on the payload — exit code is orthogonal to the
         // metric pipeline and may still be meaningful (e.g. the
         // payload itself crashed before the model-load cache check
-        // returned Err, so the user wants both signals). Reuse
-        // `format_exit_mismatch` + `DetailKind::Other` for shape
-        // parity with `evaluate_checks`'s own exit-code branch.
-        for check in checks {
-            if let Check::ExitCodeEq(expected) = check
-                && output.exit_code != *expected
-            {
-                result.details.push(crate::assert::AssertDetail::new(
-                    crate::assert::DetailKind::Other,
-                    format_exit_mismatch(output.exit_code, *expected, &output.stderr),
-                ));
-            }
+        // returned Err, so the user wants both signals). Delegated
+        // to `exit_code_mismatch_detail` so this branch and
+        // `evaluate_checks`'s pre-pass produce bit-identical
+        // AssertDetails for the same (expected, actual, stderr)
+        // inputs — no drift between the two call sites.
+        if let Some(detail) = exit_code_mismatch_detail(checks, output.exit_code, &output.stderr) {
+            result.details.push(detail);
         }
         return (result, payload_metrics);
     }
@@ -698,9 +694,31 @@ impl Drop for PayloadHandle {
 /// the call site, or extend an enclosing type with a
 /// `_sigchld: SigchldScope` field, before landing.
 fn kill_payload_process_group(child: &std::process::Child, payload_name: &str) {
-    let pgid = libc::pid_t::try_from(child.id())
-        .expect("child pid fits in pid_t (Linux pid_max <= 2^22)");
-    debug_assert!(pgid > 0, "child pid must be positive, got {pgid}");
+    let raw_pid = child.id();
+    let pgid = match libc::pid_t::try_from(raw_pid) {
+        Ok(p) if p > 0 => p,
+        Ok(p) => {
+            tracing::error!(
+                payload = payload_name,
+                pid = p,
+                "child pid is non-positive — cannot kill process group; \
+                 skipping kill (kernel's pid_max invariant violated, \
+                 no safe target)"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::error!(
+                payload = payload_name,
+                pid = raw_pid,
+                "child pid exceeds pid_t range — cannot kill process group; \
+                 skipping kill (Linux pid_max is 2^22 so this is only \
+                 reachable on a non-Linux target or a kernel with an \
+                 extended pid space)"
+            );
+            return;
+        }
+    };
     let pid = nix::unistd::Pid::from_raw(pgid);
     match nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) => {}
@@ -775,19 +793,14 @@ fn resolve_polarities(metrics: &mut [Metric], payload: &Payload) {
 /// instead of silently passing.
 fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> AssertResult {
     let mut result = AssertResult::pass();
-    // Pre-pass: exit-code checks first.
-    for check in checks {
-        if let Check::ExitCodeEq(expected) = check
-            && pm.exit_code != *expected
-        {
-            result.merge(AssertResult::fail(AssertDetail {
-                kind: DetailKind::Other,
-                message: format_exit_mismatch(pm.exit_code, *expected, stderr),
-            }));
-            // Short-circuit metric checks: a bad exit probably means
-            // the metric extraction found nothing useful.
-            return result;
-        }
+    // Pre-pass: exit-code checks first. Delegates to
+    // `exit_code_mismatch_detail` so the detail's kind + message
+    // stay in lockstep with the LlmExtract-failure branch in
+    // `evaluate`. Short-circuit on mismatch — a bad exit probably
+    // means the metric extraction found nothing useful.
+    if let Some(detail) = exit_code_mismatch_detail(checks, pm.exit_code, stderr) {
+        result.merge(AssertResult::fail(detail));
+        return result;
     }
     // Metric-path pass.
     for check in checks {
@@ -834,6 +847,31 @@ fn missing_metric(metric: &str) -> AssertDetail {
         kind: DetailKind::Other,
         message: format!("metric '{metric}' not found in payload output"),
     }
+}
+
+/// Scan `checks` for the first `Check::ExitCodeEq` whose expected
+/// value differs from `actual_exit_code` and return a matching
+/// diagnostic [`AssertDetail`]. Returns `None` when no
+/// `ExitCodeEq` check is declared, or when every declared one
+/// matches the observed exit code.
+///
+/// Shared between [`evaluate`]'s LlmExtract-load-failure branch
+/// and [`evaluate_checks`]'s pre-pass so both sites produce
+/// bit-identical details for the same inputs — without this
+/// helper the two branches drift on kind, message format, or
+/// the "which Check wins" order.
+fn exit_code_mismatch_detail(
+    checks: &[Check],
+    actual_exit_code: i32,
+    stderr: &str,
+) -> Option<AssertDetail> {
+    checks.iter().find_map(|c| match c {
+        Check::ExitCodeEq(expected) if actual_exit_code != *expected => Some(AssertDetail {
+            kind: DetailKind::Other,
+            message: format_exit_mismatch(actual_exit_code, *expected, stderr),
+        }),
+        _ => None,
+    })
 }
 
 /// Render an exit-code mismatch with a trailing stderr tail when
@@ -1126,6 +1164,48 @@ fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
 /// between spawn and final disposition. Foreground spawns
 /// (`spawn_and_wait`) scope the guard to the `.output()` call —
 /// the child is reaped inline, no lingering state.
+/// Pins the thread ID of the first `SigchldScope` constructed in
+/// this process. Every subsequent construction must come from the
+/// same thread: `libc::signal` is not thread-safe, and concurrent
+/// installs from distinct threads would race on the process-wide
+/// `SIGCHLD` disposition. The field is `AtomicUsize` carrying a
+/// `ThreadId::as_u64()`-style encoding, with `0` meaning
+/// "uninitialized" (no SigchldScope has been constructed yet in
+/// this process).
+///
+/// Zero is a safe sentinel: `std::thread::ThreadId` is guaranteed
+/// non-zero by the standard library (ThreadId bottoms out on
+/// NonZeroU64), so an unset AtomicUsize cannot collide with any
+/// legitimate thread ID.
+///
+/// Multiple concurrent `SigchldScope` instances ARE allowed on
+/// the same thread — each `PayloadHandle` carries one, and a
+/// single-threaded caller can hold many handles simultaneously
+/// without racing the libc::signal install. Drop order must
+/// remain LIFO for the handler-restore chain to leave the
+/// original disposition intact; this is the caller's obligation
+/// (handles dropped in reverse creation order, which is the
+/// default when locals go out of scope).
+static SIGCHLD_SCOPE_OWNER_THREAD: AtomicUsize = AtomicUsize::new(0);
+
+fn current_thread_id_nonzero() -> usize {
+    // `ThreadId::as_u64()` is nightly-only; stable gives no public
+    // integer accessor. We hash the ThreadId instead — collisions
+    // across threads are astronomically unlikely within a single
+    // process, and the check is a debug / soundness guard, not a
+    // cryptographic boundary.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    // Squash zero to 1 so the sentinel stays reserved for
+    // "uninitialized". Collision with thread 1's legitimate hash
+    // is acceptable — it only means the check is slightly weaker
+    // for that single thread, never falsely-positive.
+    let id = h.finish() as usize;
+    if id == 0 { 1 } else { id }
+}
+
 struct SigchldScope {
     prev: libc::sighandler_t,
 }
@@ -1136,13 +1216,45 @@ impl SigchldScope {
     /// `prev` equals `SIG_DFL` and Drop is a no-op mathematically
     /// — the extra syscall is cheap and keeps behavior uniform
     /// between host and guest.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from a thread different from the one that
+    /// constructed the first `SigchldScope` in this process.
+    /// `libc::signal` is not thread-safe and cross-thread installs
+    /// would race on the process-wide SIGCHLD disposition.
     fn new() -> Self {
-        // SAFETY: `libc::signal` is thread-unsafe in the sense that
-        // concurrent installs race. Payload spawn runs on the test
-        // body's main thread, which is the only spawner; worker
-        // threads a test body creates do not install signal
-        // handlers. The guard is scoped to a single spawn +
-        // optional wait pairing, not nested within itself.
+        let tid = current_thread_id_nonzero();
+        // Pin the first thread that ever constructs a SigchldScope
+        // in this process. Subsequent threads are rejected.
+        match SIGCHLD_SCOPE_OWNER_THREAD.compare_exchange(
+            0,
+            tid,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                // We are the first — thread pinned.
+            }
+            Err(pinned) if pinned == tid => {
+                // Same thread as the first construction — OK.
+            }
+            Err(pinned) => {
+                panic!(
+                    "SigchldScope constructed on a different thread than the first \
+                     owner (pinned thread id hash={pinned}, this thread's hash={tid}). \
+                     libc::signal is not thread-safe; cross-thread installs race on \
+                     the process-wide SIGCHLD disposition."
+                );
+            }
+        }
+        // SAFETY: SIGCHLD_SCOPE_OWNER_THREAD pins construction to
+        // a single thread across the whole process, so no other
+        // thread is concurrently installing a SIGCHLD handler.
+        // Drop must run on the same thread (Rust's dropping
+        // invariants hold if the handle stays !Send, which it is
+        // by default since libc::sighandler_t contains a raw
+        // pointer).
         let prev = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
         SigchldScope { prev }
     }
@@ -1150,11 +1262,11 @@ impl SigchldScope {
 
 impl Drop for SigchldScope {
     fn drop(&mut self) {
-        // SAFETY: same rationale as `new` — single-threaded signal
-        // install, no concurrent racers. Restore whatever was
-        // installed before we entered the scope so we leave the
-        // process back in its original disposition (SIG_IGN under
-        // the guest init, typically SIG_DFL elsewhere).
+        // SAFETY: same rationale as `new` — the owner-thread pin
+        // guarantees no concurrent installer on another thread.
+        // Restoring in LIFO order across nested scopes unwinds
+        // back to the original disposition; drop-order is the
+        // caller's obligation.
         unsafe {
             libc::signal(libc::SIGCHLD, self.prev);
         }

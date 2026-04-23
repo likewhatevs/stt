@@ -22,6 +22,7 @@ use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::payload_run::PayloadHandle;
 use ktstr::test_support::{Check, OutputFormat, Payload, PayloadKind, PayloadMetrics};
+use ktstr::worker_ready::worker_ready_marker_path;
 
 // ---------------------------------------------------------------------------
 // Probe-binary env var setup
@@ -138,20 +139,6 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Build a failing `AssertResult` from a message. Kept local to
-/// this file because `AssertResult` exposes `pass` / `skip`
-/// constructors but not a generic fail constructor — tests that
-/// want to return a diagnostic-only failure assemble the struct by
-/// hand.
-fn fail_result(msg: impl Into<String>) -> AssertResult {
-    AssertResult {
-        passed: false,
-        skipped: false,
-        details: vec![AssertDetail::new(DetailKind::Other, msg)],
-        stats: Default::default(),
-    }
-}
 
 /// Outcome of scanning the flat metric list for a tid-keyed thread
 /// entry. Distinguishes "tid not present" from "tid present but
@@ -294,14 +281,18 @@ fn jemalloc_probe_single_worker_observes_known_allocation(ctx: &Ctx) -> Result<A
         )
     })?;
     if observed < KNOWN_BYTES {
-        return Ok(fail_result(format!(
-            "self-test observed_bytes={observed}, expected >= {KNOWN_BYTES}"
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!("self-test observed_bytes={observed}, expected >= {KNOWN_BYTES}"),
         )));
     }
     if observed > KNOWN_BYTES + MAX_SLOP {
-        return Ok(fail_result(format!(
-            "self-test observed_bytes={observed} exceeds known={KNOWN_BYTES} + slop={MAX_SLOP}; \
-             probe may be reading the wrong address or a shared counter"
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "self-test observed_bytes={observed} exceeds known={KNOWN_BYTES} + slop={MAX_SLOP}; \
+                 probe may be reading the wrong address or a shared counter"
+            ),
         )));
     }
     Ok(AssertResult::pass())
@@ -355,15 +346,16 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     // the marker (e.g. the single-thread self-check failed, or
     // allocation OOM'd) is detected immediately instead of waiting
     // the full 5s deadline with stale pid-scoped path polling.
-    let ready_path = format!("/tmp/ktstr-worker-ready-{worker_pid}");
+    let ready_path = worker_ready_marker_path(worker_pid);
     let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !std::path::Path::new(&ready_path).exists() {
-        if worker.try_wait()?.is_some() {
+        if let Some((_, metrics)) = worker.try_wait()? {
             return Err(anyhow!(
                 "worker pid={worker_pid} exited before creating ready marker {ready_path} \
-                 — check stderr for the exit reason (typical causes: \
-                 /proc/self/task self-check failed, allocation OOM, \
-                 bytes=0 argument)"
+                 (exit_code={} — see stderr; worker exit codes: 2=bytes==0, \
+                 3=/proc/self/task self-check failed, 4=ready-marker write failed, \
+                 5=argument parse failed, 101=Rust panic, negative=killed by signal)",
+                metrics.exit_code,
             ));
         }
         if std::time::Instant::now() >= ready_deadline {
@@ -382,10 +374,11 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     // One more try_wait surfaces that case with an actionable
     // error instead of letting the probe waste its wall time on a
     // dead pid.
-    if worker.try_wait()?.is_some() {
+    if let Some((_, metrics)) = worker.try_wait()? {
         return Err(anyhow!(
             "worker pid={worker_pid} exited after writing ready marker but \
-             before probe dispatch — check stderr for the exit reason"
+             before probe dispatch (exit_code={} — see stderr)",
+            metrics.exit_code,
         ));
     }
 
@@ -408,9 +401,12 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     // `worker_pid == worker_tid` identity).
     let n_threads = thread_count(&metrics);
     if n_threads != 1 {
-        return Ok(fail_result(format!(
-            "probe saw {n_threads} thread entries for single-threaded worker pid={worker_pid}; \
-             expected exactly 1"
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "probe saw {n_threads} thread entries for single-threaded worker pid={worker_pid}; \
+                 expected exactly 1"
+            ),
         )));
     }
 
@@ -439,21 +435,30 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
         }
     };
     if allocated < KNOWN_BYTES {
-        return Ok(fail_result(format!(
-            "worker (tid={worker_tid}) allocated_bytes={allocated}, expected >= {KNOWN_BYTES}"
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "worker (tid={worker_tid}) allocated_bytes={allocated}, expected >= {KNOWN_BYTES}"
+            ),
         )));
     }
     if allocated > KNOWN_BYTES + MAX_SLOP {
-        return Ok(fail_result(format!(
-            "worker (tid={worker_tid}) allocated_bytes={allocated} exceeds known={KNOWN_BYTES} \
-             + slop={MAX_SLOP}; probe may be reading the wrong address"
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "worker (tid={worker_tid}) allocated_bytes={allocated} exceeds known={KNOWN_BYTES} \
+                 + slop={MAX_SLOP}; probe may be reading the wrong address"
+            ),
         )));
     }
     match deallocated {
         Some(d) if d >= DEALLOC_CAP => {
-            return Ok(fail_result(format!(
-                "worker (tid={worker_tid}) deallocated_bytes={d} exceeds cap={DEALLOC_CAP}; \
-                 worker should hold its Vec until kill — unexpected free implied"
+            return Ok(AssertResult::fail(AssertDetail::new(
+                DetailKind::Other,
+                format!(
+                    "worker (tid={worker_tid}) deallocated_bytes={d} exceeds cap={DEALLOC_CAP}; \
+                     worker should hold its Vec until kill — unexpected free implied"
+                ),
             )));
         }
         _ => {}
@@ -490,10 +495,47 @@ fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
         .arg("--json")
         .run()?;
 
-    if metrics.exit_code == 0 {
-        return Ok(fail_result(format!(
-            "probe exit_code=0 against nonexistent pid {fake_pid}; \
-             probe must fail with non-zero exit on an invalid target"
+    // The probe's `run()` pipeline returns `RunOutcome::Fatal` on a
+    // missing `/proc/<pid>`, which `main` maps to a stderr
+    // "error: {e}" line and `std::process::exit(1)`. No ProbeOutput
+    // JSON is emitted on the Fatal arm — only the `Ok` / `AllFailed`
+    // arms go through `print_output()`. The assertions here pin
+    // that exact shape:
+    //   1. `exit_code == 1` — the Fatal exit code. A negative value
+    //      means signal-kill (probe crashed, which is the
+    //      regression), `0` means unexpected success, anything else
+    //      means a different non-zero exit path we have not
+    //      enumerated.
+    //   2. No ProbeOutput JSON fields (`pid`, `schema_version`,
+    //      `threads.N.*`) in the flat metric list. Their presence
+    //      would indicate the probe ran past `find_jemalloc_via_maps`
+    //      and into the per-thread loop, which a nonexistent pid
+    //      must never reach.
+    if metrics.exit_code != 1 {
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "probe exit_code={} against nonexistent pid {fake_pid}; \
+                 expected 1 (RunOutcome::Fatal arm). Negative = signal-kill \
+                 crash; 0 = unexpected success; other = unknown failure mode",
+                metrics.exit_code,
+            ),
+        )));
+    }
+    let structured_fields: Vec<&str> = metrics
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .filter(|n| *n == "pid" || *n == "schema_version" || n.starts_with("threads."))
+        .collect();
+    if !structured_fields.is_empty() {
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "probe against nonexistent pid {fake_pid} emitted ProbeOutput JSON \
+                 fields {structured_fields:?}; Fatal arm should exit via stderr \
+                 before print_output() populates ProbeOutput"
+            ),
         )));
     }
     Ok(AssertResult::pass())
@@ -532,7 +574,7 @@ fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
 #[ktstr_test(llcs = 1, cores = 2, threads = 2)]
 fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
     const KNOWN_BYTES: u64 = 1024 * 1024;
-    const INVOCATIONS: u32 = 10;
+    const INVOCATIONS: usize = 10;
     let mut worker: PayloadHandle = ctx
         .payload(&JEMALLOC_ALLOC_WORKER_CHURN)
         .arg(KNOWN_BYTES.to_string())
@@ -543,12 +585,16 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
     // Wait for the same pid-scoped ready marker the non-churn path
     // writes — identical handshake shape, simpler reuse than a
     // separate /tmp path for the churn variant.
-    let ready_path = format!("/tmp/ktstr-worker-ready-{worker_pid}");
+    let ready_path = worker_ready_marker_path(worker_pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !std::path::Path::new(&ready_path).exists() {
-        if worker.try_wait()?.is_some() {
+        if let Some((_, metrics)) = worker.try_wait()? {
             return Err(anyhow!(
-                "churn worker pid={worker_pid} exited before ready marker"
+                "churn worker pid={worker_pid} exited before ready marker \
+                 (exit_code={} — see stderr; worker exit codes: 2=bytes==0, \
+                 4=ready-marker write failed, 5=argument parse failed, \
+                 101=Rust panic, negative=killed by signal)",
+                metrics.exit_code,
             ));
         }
         if std::time::Instant::now() >= deadline {
@@ -567,10 +613,11 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
     // still fire). A try_wait here surfaces that case with an
     // actionable error instead of letting 10 probe invocations
     // silently hit a dead pid.
-    if worker.try_wait()?.is_some() {
+    if let Some((_, metrics)) = worker.try_wait()? {
         return Err(anyhow!(
             "churn worker pid={worker_pid} exited after writing ready marker but \
-             before probe dispatch — check stderr for the exit reason"
+             before probe dispatch (exit_code={} — see stderr)",
+            metrics.exit_code,
         ));
     }
 
@@ -598,10 +645,13 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
             .run()?;
         if metrics.exit_code < 0 {
             let _ = worker.kill();
-            return Ok(fail_result(format!(
-                "invocation {i}: probe died by signal (exit_code={}); \
-                 ESRCH race should surface as ThreadResult::Err, not crash",
-                metrics.exit_code
+            return Ok(AssertResult::fail(AssertDetail::new(
+                DetailKind::Other,
+                format!(
+                    "invocation {i}: probe died by signal (exit_code={}); \
+                     ESRCH race should surface as ThreadResult::Err, not crash",
+                    metrics.exit_code
+                ),
             )));
         }
         // Non-zero (non-signal) exit would mean a fatal probe-side
@@ -610,10 +660,13 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
         // reach the per-thread path and at least attempt some tids.
         if metrics.exit_code != 0 {
             let _ = worker.kill();
-            return Ok(fail_result(format!(
-                "invocation {i}: probe exit_code={} — fatal error before per-thread loop; \
-                 ESRCH stress test requires the probe to enter the tid iteration",
-                metrics.exit_code,
+            return Ok(AssertResult::fail(AssertDetail::new(
+                DetailKind::Other,
+                format!(
+                    "invocation {i}: probe exit_code={} — fatal error before per-thread loop; \
+                     ESRCH stress test requires the probe to enter the tid iteration",
+                    metrics.exit_code,
+                ),
             )));
         }
         if thread_count(&metrics) > 1 {
@@ -639,10 +692,13 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
     let _ = worker.kill();
 
     if !any_multi_thread_seen {
-        return Ok(fail_result(format!(
-            "none of {INVOCATIONS} probe invocations saw more than one thread — \
-             churn worker may not be producing tids fast enough to race the probe, \
-             or readdir(/proc/<pid>/task) is not observing the churn"
+        return Ok(AssertResult::fail(AssertDetail::new(
+            DetailKind::Other,
+            format!(
+                "none of {INVOCATIONS} probe invocations saw more than one thread — \
+                 churn worker may not be producing tids fast enough to race the probe, \
+                 or readdir(/proc/<pid>/task) is not observing the churn"
+            ),
         )));
     }
     // Both pass paths attach a DetailKind::Other diagnostic so

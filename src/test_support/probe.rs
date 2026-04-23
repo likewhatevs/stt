@@ -1733,9 +1733,15 @@ mod tests {
         assert_eq!(status, "repro VM: scheduler crashed — exited cleanly");
     }
 
-    /// Negative exit_code on the crash branch = qemu killed by
-    /// signal (std::process::ExitStatus maps signal-kill to a
-    /// negative i32 here). Clause format: "killed by signal (N)".
+    /// Negative exit_code on the crash branch exercises the
+    /// `<0` arm. The sign convention is the VMM's, not
+    /// `std::process::ExitStatus`: `VmResult::exit_code`
+    /// (vmm::mod.rs) is seeded to `-1` in the BSP run loop and
+    /// left negative on watchdog-fire / non-normal exits, so
+    /// negatives that reach `classify_repro_vm_status` are VMM
+    /// sentinels rather than OS-reported signal codes
+    /// (`ExitStatus::code()` returns `None`, never a negative
+    /// i32, on signal-kill). Clause format: "killed by signal (N)".
     #[test]
     fn classify_repro_vm_status_crashed_from_sentinel_killed_by_signal() {
         let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", -9);

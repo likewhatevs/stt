@@ -690,6 +690,10 @@ impl KtstrTestEntry {
     /// Rules:
     /// - `name` must be non-empty (empty names collapse into each
     ///   other in nextest output and in sidecar lookups).
+    /// - `name` must not contain `/` or `\` (path separators embed in
+    ///   sidecar filenames and nextest test IDs; a separator would
+    ///   create a synthetic subdirectory in sidecar output and
+    ///   mangle `cargo nextest run -E 'test(name)'` filtering).
     /// - `memory_mb` must be `> 0` (a VM with zero memory cannot boot).
     /// - `duration` must be `> 0` (a zero-duration run never exercises
     ///   the scheduler and produces no telemetry).
@@ -700,6 +704,16 @@ impl KtstrTestEntry {
             anyhow::bail!(
                 "KtstrTestEntry.name must be non-empty (empty names \
                  collide in nextest output and sidecar lookups)"
+            );
+        }
+        if self.name.contains('/') || self.name.contains('\\') {
+            anyhow::bail!(
+                "KtstrTestEntry '{}' name must not contain path \
+                 separators ('/' or '\\') — they embed in sidecar \
+                 filenames and nextest test IDs, creating synthetic \
+                 subdirectories in sidecar output and mangling \
+                 nextest -E 'test(name)' filtering",
+                self.name,
             );
         }
         if self.memory_mb == 0 {

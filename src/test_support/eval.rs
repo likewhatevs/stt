@@ -95,17 +95,40 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 /// Dedupe a resolved include-file list produced by unioning the
 /// per-payload `include_files` specs through
 /// [`crate::cli::resolve_include_files`] and appending the scheduler
-/// config file entry. Policy:
+/// config file entry. Each input tuple carries an `origin` label
+/// (e.g. `"declarative"`, `"scheduler config_file"`) that is
+/// surfaced in conflict diagnostics so the operator can trace which
+/// declaration contributed each side of a collision.
+///
+/// Policy:
 ///
 /// - Identical `(archive_path, host_path)` pairs collapse silently
-///   (the same host file declared twice is harmless).
+///   (the same host file declared twice is harmless). Comparison
+///   uses [`Path::canonicalize`] so two spellings of the same real
+///   file (e.g. `./fio` vs `/usr/bin/fio` when `./fio` is a
+///   symlink) are treated as equal. Canonicalization failure
+///   (missing path, permission denied) falls back to byte-for-byte
+///   PathBuf comparison; literal duplicates still collapse, and a
+///   genuine conflict still surfaces.
 /// - Two entries sharing an `archive_path` but resolving to
-///   different `host_path`s are a genuine ambiguity — a scheduler's
-///   and a payload's `include_files` both claiming
+///   different canonical `host_path`s are a genuine ambiguity — a
+///   scheduler's and a payload's `include_files` both claiming
 ///   `include-files/config.json` but pointing at different host
 ///   paths means one of the two would silently overwrite the other
 ///   in the initramfs. Bail with a diagnostic naming both host
-///   paths so the author can rename one archive slot.
+///   paths AND their origin labels so the author can rename one
+///   archive slot.
+///
+/// Case-sensitivity: `archive_path` keys are compared
+/// byte-for-byte (via `BTreeMap<String, _>`), so on a case-
+/// insensitive host filesystem (macOS HFS+, NTFS with the
+/// `case-insensitive` mount flag) two archive paths spelled
+/// `include-files/Helper` and `include-files/helper` are treated
+/// as distinct here even though the host filesystem would
+/// conflate them. This is intentional: `archive_path` is the
+/// path inside the guest initramfs, which is tmpfs / ext4-
+/// equivalent (always case-sensitive), so the guest-side
+/// identity is what governs.
 ///
 /// Order is stabilized via `BTreeMap`'s sorted iteration so the
 /// emitted slice is deterministic regardless of which caller
@@ -113,26 +136,37 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 /// policy can be unit-tested without constructing a whole
 /// KtstrTestEntry + VmBuilder.
 fn dedupe_include_files(
-    resolved: &[(String, std::path::PathBuf)],
+    resolved: &[(String, std::path::PathBuf, &'static str)],
 ) -> Result<Vec<(String, std::path::PathBuf)>> {
-    let mut seen: std::collections::BTreeMap<String, std::path::PathBuf> =
+    let mut seen: std::collections::BTreeMap<String, (std::path::PathBuf, &'static str)> =
         std::collections::BTreeMap::new();
-    for (archive, host) in resolved {
-        if let Some(existing) = seen.get(archive) {
-            if existing != host {
+    for (archive, host, origin) in resolved {
+        if let Some((existing, existing_origin)) = seen.get(archive) {
+            // Canonicalize both sides before comparing so
+            // symlink-equivalent spellings collapse. A failed
+            // canonicalize (missing path, permission denied) falls
+            // back to the uncanonicalized value so the structural
+            // compare still runs — literal duplicates still collapse
+            // and genuine conflicts still surface.
+            let existing_canon = existing.canonicalize().unwrap_or_else(|_| existing.clone());
+            let host_canon = host.canonicalize().unwrap_or_else(|_| host.clone());
+            if existing_canon != host_canon {
                 anyhow::bail!(
-                    "include_files conflict for archive path '{archive}': two declarative \
-                     sources resolved to different host paths ({} vs {}). Remove the \
-                     duplicate declaration or rename one of the archive entries.",
+                    "include_files conflict for archive path '{archive}': sources disagree \
+                     on host path ({} [origin: {existing_origin}] vs {} [origin: {origin}]). \
+                     Remove the duplicate declaration or rename one of the archive entries.",
                     existing.display(),
                     host.display(),
                 );
             }
         } else {
-            seen.insert(archive.clone(), host.clone());
+            seen.insert(archive.clone(), (host.clone(), origin));
         }
     }
-    Ok(seen.into_iter().collect())
+    Ok(seen
+        .into_iter()
+        .map(|(archive, (host, _origin))| (archive, host))
+        .collect())
 }
 
 pub(crate) fn run_ktstr_test_inner(
@@ -221,15 +255,18 @@ pub(crate) fn run_ktstr_test_inner(
         .into_iter()
         .map(std::path::PathBuf::from)
         .collect();
-    let mut resolved_includes: Vec<(String, std::path::PathBuf)> = if declarative_specs.is_empty()
-    {
-        Vec::new()
-    } else {
-        crate::cli::resolve_include_files(&declarative_specs)
-            .context("resolving declarative include_files from Payload definitions")?
-    };
+    let mut resolved_includes: Vec<(String, std::path::PathBuf, &'static str)> =
+        if declarative_specs.is_empty() {
+            Vec::new()
+        } else {
+            crate::cli::resolve_include_files(&declarative_specs)
+                .context("resolving declarative include_files from Payload definitions")?
+                .into_iter()
+                .map(|(a, h)| (a, h, "declarative"))
+                .collect()
+        };
     if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
-        resolved_includes.push((archive_path, host_path));
+        resolved_includes.push((archive_path, host_path, "scheduler config_file"));
         sched_args.push("--config".to_string());
         sched_args.push(guest_path);
     }
@@ -1062,10 +1099,12 @@ mod tests {
             (
                 "include-files/helper".to_string(),
                 std::path::PathBuf::from("/usr/bin/helper"),
+                "declarative",
             ),
             (
                 "include-files/helper".to_string(),
                 std::path::PathBuf::from("/usr/bin/helper"),
+                "scheduler config_file",
             ),
         ];
         let out = dedupe_include_files(&input).unwrap();
@@ -1085,10 +1124,12 @@ mod tests {
             (
                 "include-files/config.json".to_string(),
                 std::path::PathBuf::from("/tmp/sched/config.json"),
+                "scheduler config_file",
             ),
             (
                 "include-files/config.json".to_string(),
                 std::path::PathBuf::from("/tmp/payload/config.json"),
+                "declarative",
             ),
         ];
         let err = dedupe_include_files(&input).unwrap_err();
@@ -1101,6 +1142,10 @@ mod tests {
             msg.contains("/tmp/sched/config.json") && msg.contains("/tmp/payload/config.json"),
             "diagnostic must name both host paths: {msg}",
         );
+        assert!(
+            msg.contains("origin: scheduler config_file") && msg.contains("origin: declarative"),
+            "diagnostic must name both origin labels: {msg}",
+        );
     }
 
     /// Multiple distinct archive_paths pass through unchanged. Verifies
@@ -1112,14 +1157,17 @@ mod tests {
             (
                 "include-files/a".to_string(),
                 std::path::PathBuf::from("/usr/bin/a"),
+                "declarative",
             ),
             (
                 "include-files/b".to_string(),
                 std::path::PathBuf::from("/usr/bin/b"),
+                "declarative",
             ),
             (
                 "include-files/c".to_string(),
                 std::path::PathBuf::from("/usr/bin/c"),
+                "scheduler config_file",
             ),
         ];
         let out = dedupe_include_files(&input).unwrap();

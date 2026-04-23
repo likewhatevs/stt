@@ -63,17 +63,61 @@ pub struct WorkerReport {
     pub schedstat_cpu_time_ns: u64,
     pub numa_pages: BTreeMap<usize, u64>,
     pub vmstat_numa_pages_migrated: u64,
+    pub exit_info: Option<WorkerExitInfo>,
 }
 ```
 
 - `off_cpu_ns = wall_time_ns - cpu_time_ns`
-- Migrations are tracked every 1024 work units
-  (`work_units.is_multiple_of(1024)`). How often this fires depends
-  on the work type: every outer iteration for CpuSpin/Mixed (1024
-  units each), every 1024th yield for YieldHeavy (1 unit each),
-  every 64th write-then-sleep cycle for IoSync (16 units each), after each
-  inner spin batch for Bursty (1024 units per batch), and after each
-  burst for PipeIo (`burst_iters` units per batch, 1024 by default)
+- `exit_info` is `None` on every live-worker-authored report.
+  `stop_and_collect` synthesises a sentinel `WorkerReport` with
+  `Some(_)` when the worker handed back no (or unparseable) JSON,
+  using the `WorkerExitInfo` enum
+  (`Exited(code)` / `Signaled(signum)` / `TimedOut` / `WaitFailed`)
+  to preserve the reap shape for post-mortem.
+- Migrations are tracked every 1024 work units: after each outer
+  iteration the worker checks `work_units.is_multiple_of(1024)`
+  and runs the migration-detect body iff that is true. The check
+  runs exactly once per outer iteration, so the effective period
+  in outer iterations is
+  `1024 / gcd(units_per_iter, 1024)`. Default parameters assumed
+  unless noted:
+  - **Every outer iteration (period = 1 iter)**: CpuSpin (1024),
+    Mixed (1024), Bursty (each outer iter runs `spin_burst(1024)`
+    some number of times inside the `burst_ms` loop — always a
+    multiple of 1024), PipeIo (`burst_iters`=1024), FutexPingPong
+    (`spin_iters`=1024), CachePressure (1024 strided RMW steps),
+    CacheYield (1024 strided RMW steps), CachePipe
+    (`burst_iters`=1024), FutexFanOut messenger AND receiver
+    (both call `spin_burst(spin_iters)` before splitting roles;
+    default 1024), AffinityChurn (`spin_iters`=1024), PolicyChurn
+    (`spin_iters`=1024).
+  - **Every 2 iterations**: NiceSweep (`spin_burst(512)` per iter
+    → `gcd(512, 1024) = 512`).
+  - **Every 4 iterations**: MutexContention
+    (`work_iters`=1024 + `hold_iters`=256 = 1280 per acquire+
+    release → `gcd(1280, 1024) = 256`, period = 4 iters).
+    FanOutCompute messenger (`spin_burst(256)` per wake cycle
+    → same 256-unit gcd).
+  - **Every 16 iterations**: PageFaultChurn
+    (`touches_per_cycle`=256 faults + `spin_iters`=64 = 320 per
+    iter → `gcd(320, 1024) = 64`).
+  - **Every 64 iterations**: IoSync (16 4-KiB writes per
+    write-then-sleep pair → `gcd(16, 1024) = 16`).
+  - **Every 1024 iterations**: YieldHeavy (1 unit per yield),
+    ForkExit (1 unit per fork+wait), FanOutCompute worker
+    (`operations`=5 matrix multiplies per wake, one `work_units`
+    tick per multiply → `gcd(5, 1024) = 1`).
+  - **Phase-inherited**: Sequence inherits the unit cadence of
+    whichever phase is currently active — `Phase::Spin` runs
+    `spin_burst(1024)` inside its own deadline loop (multiple-of-
+    1024 units per phase tick), `Phase::Yield` adds 1 unit per
+    yield, `Phase::Io` matches IoSync's 16-per-cycle rate,
+    `Phase::Sleep` contributes no `work_units` and so blocks
+    migration checks while it runs.
+  - **Not tracked by the framework**: Custom workers do not
+    contribute to `work_units` on the framework's behalf —
+    migration tracking fires only if the user's `run` function
+    increments `work_units` and emits migrations directly.
 - Scheduling gaps are the longest intervals between iterations
 
 ### Benchmarking fields
@@ -86,22 +130,39 @@ blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
 (futex wait), FutexFanOut (futex wait, receivers only), FanOutCompute
 (futex wait, workers only — measured as `CLOCK_MONOTONIC` delta from
 messenger's shared timestamp), CacheYield (yield), CachePipe (pipe
-read), IoSync (sleep), NiceSweep (yield), AffinityChurn (yield), and
-Sequence when its phases include Sleep, Yield, or Io. Each sample is
-in nanoseconds; most work types use `Instant::elapsed()` across the
-blocking call, while FanOutCompute uses `clock_gettime(CLOCK_MONOTONIC)`
-to measure against the messenger's pre-wake timestamp.
+read), IoSync (sleep), NiceSweep (yield), AffinityChurn (yield),
+PolicyChurn (yield), MutexContention (futex wait on contended
+acquire), and Sequence when its phases include Sleep, Yield, or Io.
+Each sample is in nanoseconds; most work types use
+`Instant::elapsed()` across the blocking call, while FanOutCompute
+uses `clock_gettime(CLOCK_MONOTONIC)` to measure against the
+messenger's pre-wake timestamp.
 
 **schedstat deltas**: read from `/proc/self/schedstat` at work-loop
 start and end. Three fields:
 - `schedstat_cpu_time_ns` -- delta of field 1 (on-CPU time)
 - `schedstat_run_delay_ns` -- delta of field 2 (time spent waiting
   for a CPU)
-- `schedstat_run_count` -- delta of field 3 (pcount — times the
-  task was scheduled in over the work loop). This is NOT a
-  context-switch count; `/proc/<pid>/status`'s
-  `voluntary_ctxt_switches` / `nonvoluntary_ctxt_switches` are the
-  true context-switch counters and are not read here.
+- `schedstat_run_count` -- delta of field 3 (**pcount** — the
+  scheduler-in count, incremented each time the scheduler picks
+  this task to execute). pcount is scheduling-class-agnostic: it
+  increments under fair (CFS/EEVDF), realtime (FIFO/RR), and
+  sched_ext alike, because it is recorded in the core
+  scheduler's enqueue path rather than a class-specific one.
+  pcount is NOT a context-switch count: one schedule-in event
+  increments pcount, while a context switch is the switch-OUT
+  event. In steady state every schedule-in is eventually paired
+  with a schedule-out so the counts track each other, but the
+  semantics differ: pcount rises whenever the scheduler re-picks
+  this task after a preemption or a voluntary block (the
+  increment is on schedule-in, NOT per tick — a task that keeps
+  running on the same CPU without ever leaving the runqueue will
+  not see pcount advance while it runs). The canonical
+  context-switch counters are `/proc/<pid>/status`'s
+  `voluntary_ctxt_switches` and `nonvoluntary_ctxt_switches`;
+  the worker does not read those because schedstat already
+  delivers pcount alongside `run_delay` / `cpu_time` in a single
+  file read.
 
 `iterations` counts outer-loop iterations.
 

@@ -195,12 +195,15 @@ because they carry no captured state across the fork boundary. Closures
 are not supported. Cannot be constructed via `WorkType::from_name()`.
 
 ```rust,ignore
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use ktstr::workload::{WorkType, WorkerReport};
 
 fn my_workload(stop: &AtomicBool) -> WorkerReport {
-    let tid: libc::pid_t = unsafe { libc::getpid() };
+    // `tid` in `WorkerReport` is an `i32` (libc::pid_t). Using
+    // `std::process::id() as i32` avoids a direct `libc` dependency in
+    // the consumer crate; inside ktstr the two produce the same value
+    // because one worker = one process (no threads).
+    let tid: i32 = std::process::id() as i32;
     let start = std::time::Instant::now();
     let mut work_units = 0u64;
     while !stop.load(Ordering::Relaxed) {
@@ -208,25 +211,17 @@ fn my_workload(stop: &AtomicBool) -> WorkerReport {
         work_units += 1;
     }
     let wall_time_ns = start.elapsed().as_nanos() as u64;
+    // Start from `WorkerReport::default()` so the fields you don't
+    // populate take their zero / empty values automatically and new
+    // fields added to `WorkerReport` in the future do not require an
+    // edit here. Only populate the telemetry your custom workload
+    // actually produces.
     WorkerReport {
         tid,
         work_units,
-        cpu_time_ns: 0,
         wall_time_ns,
-        off_cpu_ns: 0,
-        migration_count: 0,
-        cpus_used: BTreeSet::new(),
-        migrations: vec![],
-        max_gap_ms: 0,
-        max_gap_cpu: 0,
-        max_gap_at_ms: 0,
-        resume_latencies_ns: vec![],
         iterations: work_units,
-        schedstat_run_delay_ns: 0,
-        schedstat_run_count: 0,
-        schedstat_cpu_time_ns: 0,
-        numa_pages: BTreeMap::new(),
-        vmstat_numa_pages_migrated: 0,
+        ..WorkerReport::default()
     }
 }
 
