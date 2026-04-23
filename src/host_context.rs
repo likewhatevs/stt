@@ -565,17 +565,22 @@ static MEMINFO_READ_CALLS: std::sync::atomic::AtomicUsize =
 /// `test_support::sidecar::write_sidecar` and `write_skip_sidecar`),
 /// which runs AFTER the VM finishes. The returned snapshot
 /// therefore reflects post-run host state, not the pre-run
-/// environment the scheduler booted into. For most fields the
-/// distinction does not matter because they do not change during
-/// a test (static barring hotplug): the uname triple,
-/// `cpu_model` / `cpu_vendor`, `total_memory_kb`,
-/// `hugepages_size_kb`, `online_cpus`, and `numa_nodes` shift
-/// only under CPU, memory, or NUMA hotplug (which the
-/// [`STATIC_HOST_INFO`] cache pins for the process lifetime
-/// anyway — see module docs for staleness-under-hotplug
-/// semantics), and `kernel_cmdline` changes only across reboot.
+/// environment the scheduler booted into.
 ///
-/// The fields that CAN drift between pre-run and post-run:
+/// Fields fall into two groups by how they are read:
+///
+/// Static subset (memoised in [`STATIC_HOST_INFO`], identical
+/// across every call in the process, shift only under CPU /
+/// memory / NUMA hotplug): the uname triple, CPU identity
+/// (`cpu_model` + `cpu_vendor`), `total_memory_kb`,
+/// `hugepages_size_kb`, `online_cpus`, and `numa_nodes`.
+///
+/// Dynamic subset (re-read on every call): `kernel_cmdline`,
+/// `hugepages_total`, `hugepages_free`, `thp_enabled`,
+/// `thp_defrag`, `sched_tunables`. `kernel_cmdline` is
+/// mechanically dynamic (re-read each call) but effectively
+/// static for the process (changes only across reboot). The
+/// others can genuinely drift between pre-run and post-run:
 ///
 /// - `sched_tunables`: a test that writes to `/proc/sys/kernel/sched_*`
 ///   and does not restore the previous value will be observed
@@ -933,13 +938,16 @@ mod tests {
         assert_eq!(cmdline, cmdline.trim());
     }
 
-    /// Stability regression — repeated calls return equal
-    /// `HostContext` values. Proves stability across calls:
-    /// static fields come from the cache, dynamic fields match
-    /// between back-to-back reads on a quiescent host.
+    /// Stability regression for the STATIC subset: uname triple,
+    /// CPU identity, total_memory_kb, hugepages_size_kb,
+    /// online_cpus, numa_nodes. These fields are memoised in
+    /// [`STATIC_HOST_INFO`] and therefore return identical values
+    /// across back-to-back calls regardless of what other tests
+    /// run concurrently — they are safe to assert equality on
+    /// under nextest's parallel-test model.
     #[cfg(target_os = "linux")]
     #[test]
-    fn collect_host_context_is_stable_across_calls() {
+    fn collect_host_context_static_subset_is_stable_across_calls() {
         let a = collect_host_context();
         let b = collect_host_context();
         assert_eq!(a.kernel_name, b.kernel_name);
@@ -947,13 +955,48 @@ mod tests {
         assert_eq!(a.arch, b.arch);
         assert_eq!(a.cpu_model, b.cpu_model);
         assert_eq!(a.cpu_vendor, b.cpu_vendor);
+        assert_eq!(a.total_memory_kb, b.total_memory_kb);
+        assert_eq!(a.hugepages_size_kb, b.hugepages_size_kb);
+        assert_eq!(a.online_cpus, b.online_cpus);
+        assert_eq!(a.numa_nodes, b.numa_nodes);
+    }
+
+    /// Stability regression for the DYNAMIC subset: kernel_cmdline,
+    /// hugepages_{total,free}, thp_enabled / thp_defrag, and
+    /// sched_tunables. These fields are re-read on every
+    /// [`collect_host_context`] call by design — a concurrent test
+    /// that reserves hugepages, flips a THP policy, or writes a
+    /// `/proc/sys/kernel/sched_*` tunable would cause back-to-back
+    /// reads to diverge under nextest's parallel-test model. The
+    /// in-tree tests do not touch these knobs, so on a quiescent
+    /// host the fields match; the assertion is relaxed to "both
+    /// Some or both None" rather than full equality so a concurrent
+    /// hugepage reservation in a theoretical future test does not
+    /// flake this regression guard. `kernel_cmdline` is effectively
+    /// static (changes only across reboot), so it asserts equality.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn collect_host_context_dynamic_subset_is_stable_across_calls() {
+        let a = collect_host_context();
+        let b = collect_host_context();
+        // kernel_cmdline changes only across reboot — safe to pin.
         assert_eq!(a.kernel_cmdline, b.kernel_cmdline);
+        // For the remaining dynamic fields, assert presence parity
+        // only: a concurrent sysctl/THP/hugepage twiddle would
+        // break equality but must not break the "collector keeps
+        // producing readable values" contract.
+        assert_eq!(a.hugepages_total.is_some(), b.hugepages_total.is_some());
+        assert_eq!(a.hugepages_free.is_some(), b.hugepages_free.is_some());
+        assert_eq!(a.thp_enabled.is_some(), b.thp_enabled.is_some());
+        assert_eq!(a.thp_defrag.is_some(), b.thp_defrag.is_some());
+        assert_eq!(a.sched_tunables.is_some(), b.sched_tunables.is_some());
     }
 
     /// Direct OnceLock caching test for `STATIC_HOST_INFO`. The
-    /// sibling `collect_host_context_is_stable_across_calls` proves
-    /// static fields match between calls but does not verify the
-    /// cache mechanism itself — the two reads could both hit
+    /// sibling `collect_host_context_static_subset_is_stable_across_calls`
+    /// proves static fields match between calls but does not
+    /// verify the cache mechanism itself — the two reads could
+    /// both hit
     /// `compute_static_host_info` and still match on a quiescent
     /// host. This test pins the caching contract directly: after
     /// the first call populates `STATIC_HOST_INFO`, the stored

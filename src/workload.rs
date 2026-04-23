@@ -3282,6 +3282,19 @@ fn read_schedstat() -> Option<(u64, u64, u64)> {
             return None;
         }
     };
+    parse_schedstat_line(&data)
+}
+
+/// Pure parser split from [`read_schedstat`] for unit testability.
+/// Parses the first three whitespace-separated fields of a
+/// `/proc/self/schedstat` line as `(cpu_time_ns, run_delay_ns,
+/// timeslices)`. Returns `None` when any of the three tokens is
+/// missing or not parseable as `u64` — matches the silent-failure
+/// contract described on `read_schedstat`. Synthetic fixtures can
+/// exercise the parse-failure branches (truncated line, non-u64
+/// token, empty input, trailing garbage) without standing up a
+/// real `/proc/self/schedstat`.
+fn parse_schedstat_line(data: &str) -> Option<(u64, u64, u64)> {
     let mut parts = data.split_whitespace();
     let cpu_time = parts.next()?.parse::<u64>().ok()?;
     let run_delay = parts.next()?.parse::<u64>().ok()?;
@@ -5080,6 +5093,62 @@ mod tests {
         };
         assert!(cpu_time > 0);
         assert!(timeslices > 0);
+    }
+
+    #[test]
+    fn parse_schedstat_line_happy_path() {
+        // A well-formed line has at least three whitespace-separated
+        // u64 fields; extra trailing fields are ignored.
+        let (cpu_time, run_delay, timeslices) =
+            parse_schedstat_line("100 200 300 999 extra").unwrap();
+        assert_eq!(cpu_time, 100);
+        assert_eq!(run_delay, 200);
+        assert_eq!(timeslices, 300);
+    }
+
+    #[test]
+    fn parse_schedstat_line_tab_and_newline_separators() {
+        // `split_whitespace` treats any run of whitespace as one
+        // separator, so tabs and trailing newlines must parse.
+        let parsed = parse_schedstat_line("1\t2\t3\n").unwrap();
+        assert_eq!(parsed, (1, 2, 3));
+    }
+
+    #[test]
+    fn parse_schedstat_line_missing_field_returns_none() {
+        // Two fields is one short — the third `?` bails.
+        assert!(parse_schedstat_line("100 200").is_none());
+        // One field short of two.
+        assert!(parse_schedstat_line("100").is_none());
+        // Empty input — zero fields.
+        assert!(parse_schedstat_line("").is_none());
+        // Whitespace-only input — zero tokens after split.
+        assert!(parse_schedstat_line("   \t\n  ").is_none());
+    }
+
+    #[test]
+    fn parse_schedstat_line_non_u64_token_returns_none() {
+        // Any non-u64 token fails the `.parse::<u64>().ok()?` chain.
+        assert!(parse_schedstat_line("not-a-number 200 300").is_none());
+        assert!(parse_schedstat_line("100 abc 300").is_none());
+        assert!(parse_schedstat_line("100 200 nan").is_none());
+        // Negative numbers parse to u64 as an error.
+        assert!(parse_schedstat_line("-1 200 300").is_none());
+        // Overflow beyond u64::MAX.
+        assert!(parse_schedstat_line("99999999999999999999 2 3").is_none());
+    }
+
+    #[test]
+    fn warn_schedstat_unavailable_once_does_not_panic_on_repeat() {
+        // `std::sync::Once::call_once` guarantees at most one
+        // eprintln regardless of how many times the gate fires.
+        // Smoke-check that repeated calls don't panic — direct
+        // stderr-emission assertions require a process-global
+        // capture gate (`#[test]` threads share fd 2), which is
+        // out of scope for this unit test.
+        for _ in 0..10 {
+            warn_schedstat_unavailable_once();
+        }
     }
 
     // -- FutexFanOut tests --
