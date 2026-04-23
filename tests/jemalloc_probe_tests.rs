@@ -321,7 +321,7 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     // when jemalloc runs its own helper thread.
     let n_threads = thread_count(&metrics);
     if n_threads < 1 {
-        return Ok(AssertResult::fail_other(format!(
+        return Ok(AssertResult::fail_msg(format!(
                 "probe saw n_threads={n_threads} for worker pid={worker_pid}; \
                  probe must emit at least one thread entry — bailed before \
                  per-thread iteration or filtered out every tid"
@@ -355,19 +355,19 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
         }
     };
     if allocated < KNOWN_BYTES {
-        return Ok(AssertResult::fail_other(format!(
+        return Ok(AssertResult::fail_msg(format!(
                 "worker (tid={worker_tid}) allocated_bytes={allocated}, expected >= {KNOWN_BYTES}"
             )));
     }
     if allocated > KNOWN_BYTES + MAX_SLOP {
-        return Ok(AssertResult::fail_other(format!(
+        return Ok(AssertResult::fail_msg(format!(
                 "worker (tid={worker_tid}) allocated_bytes={allocated} exceeds known={KNOWN_BYTES} \
                  + slop={MAX_SLOP}; probe may be reading the wrong address"
             )));
     }
     match deallocated {
         Some(d) if d >= DEALLOC_CAP => {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                     "worker (tid={worker_tid}) deallocated_bytes={d} exceeds cap={DEALLOC_CAP}; \
                      worker should hold its Vec until kill — unexpected free implied"
                 )));
@@ -448,7 +448,7 @@ fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
     //      field names) keeps the test agnostic to future
     //      ProbeOutput field additions.
     if metrics.exit_code != 1 {
-        return Ok(AssertResult::fail_other(format!(
+        return Ok(AssertResult::fail_msg(format!(
                 "probe exit_code={} against nonexistent pid {fake_pid}; \
                  expected 1 (RunOutcome::Fatal arm). Negative = signal-kill \
                  crash; 0 = unexpected success; other = unknown failure mode",
@@ -457,7 +457,7 @@ fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
     }
     if !metrics.metrics.is_empty() {
         let names: Vec<&str> = metrics.metrics.iter().map(|m| m.name.as_str()).collect();
-        return Ok(AssertResult::fail_other(format!(
+        return Ok(AssertResult::fail_msg(format!(
                 "probe against nonexistent pid {fake_pid} emitted {} metric(s) \
                  {names:?}; Fatal arm should exit via stderr before \
                  print_output() populates ProbeOutput, leaving the metric \
@@ -547,7 +547,7 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
             .run()?;
         if metrics.exit_code < 0 {
             let _ = worker.kill();
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                     "invocation {i}: probe died by signal (exit_code={}); \
                      ESRCH race should surface as ThreadResult::Err, not crash",
                     metrics.exit_code
@@ -559,7 +559,7 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
         // reach the per-thread path and at least attempt some tids.
         if metrics.exit_code != 0 {
             let _ = worker.kill();
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                     "invocation {i}: probe exit_code={} — fatal error before per-thread loop; \
                      ESRCH stress test requires the probe to enter the tid iteration",
                     metrics.exit_code,
@@ -588,7 +588,7 @@ fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
     let _ = worker.kill();
 
     if !any_multi_thread_seen {
-        return Ok(AssertResult::fail_other(format!(
+        return Ok(AssertResult::fail_msg(format!(
                 "none of {INVOCATIONS} probe invocations saw more than one thread — \
                  churn worker may not be producing tids fast enough to race the probe, \
                  or readdir(/proc/<pid>/task) is not observing the churn"
@@ -734,7 +734,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
 
     let n_snaps = snapshot_count(&metrics);
     if n_snaps != SNAPSHOTS {
-        return Ok(AssertResult::fail_other(format!(
+        return Ok(AssertResult::fail_msg(format!(
             "multi-snapshot probe emitted {n_snaps} snapshots, expected {SNAPSHOTS}; \
              flat metrics: {:?}",
             metrics
@@ -774,7 +774,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
     // would also be a test failure mode worth surfacing).
     for i in 1..SNAPSHOTS {
         if timestamps[i] < timestamps[i - 1] {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                 "snapshot {i} timestamp {} is less than snapshot {} timestamp {}; \
                  CLOCK_REALTIME went backwards across snapshots",
                 timestamps[i],
@@ -791,7 +791,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
     // address) on one of the iterations.
     for i in 1..SNAPSHOTS {
         if allocations[i] < allocations[i - 1] {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                 "snapshot {i} allocated_bytes={} < snapshot {} allocated_bytes={}; \
                  jemalloc cumulative counter must not decrease for a parked worker \
                  that holds its Vec",
@@ -810,14 +810,14 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
     // wrong address.
     for (i, a) in allocations.iter().enumerate() {
         if *a < KNOWN_BYTES {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                 "snapshot {i} allocated_bytes={a} is below known {KNOWN_BYTES} — \
                  probe may be reading the wrong address or the counter was not \
                  yet propagated to the TSD slot",
             )));
         }
         if *a > KNOWN_BYTES + MAX_SLOP {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                 "snapshot {i} allocated_bytes={a} exceeds known={KNOWN_BYTES} \
                  + slop={MAX_SLOP}; probe may be reading the wrong address \
                  or the worker leaked extra allocations between snapshots",
@@ -842,7 +842,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
         )
     })?;
     if timestamps[0] < started_at {
-        return Ok(AssertResult::fail_other(format!(
+        return Ok(AssertResult::fail_msg(format!(
             "snapshots.0.timestamp_unix_sec={} < top-level started_at_unix_sec={}; \
              started_at must precede every snapshot timestamp",
             timestamps[0],

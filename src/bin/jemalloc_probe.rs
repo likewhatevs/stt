@@ -307,7 +307,10 @@ const DEALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_deallocate
                   is an array of length 1.\n\n\
                   Sidecar enrichment: pass `--sidecar PATH` to append probe metrics into an \
                   existing ktstr sidecar file. The file MUST exist — run the test first to \
-                  generate it, then re-invoke with `--sidecar`."
+                  generate it, then re-invoke with `--sidecar`.\n\n\
+                  CI deadline: pass `--abort-after-ms MS` to self-abort after MS \
+                  milliseconds, producing a partial ProbeOutput with interrupted: true \
+                  instead of hanging indefinitely on a wedged snapshot loop."
 )]
 struct Cli {
     /// Target process id. Required. Must be a positive integer; pid
@@ -403,6 +406,60 @@ struct Cli {
         value_name = "MS",
     )]
     interval_ms: Option<u64>,
+    /// Self-abort deadline in milliseconds. When set, a dedicated
+    /// timer thread sleeps the deadline then flips
+    /// [`CLEANUP_REQUESTED`], the same atomic the SIGINT /
+    /// SIGTERM handler uses. The snapshot loop polls the flag
+    /// between tids (and `sleep_with_cancel` polls it at
+    /// [`CANCEL_POLL_TICK_MS`] granularity during inter-snapshot
+    /// waits), producing a partial `ProbeOutput` with
+    /// `interrupted: true` instead of hanging.
+    ///
+    /// **Scope**: the deadline bounds the time between per-tid
+    /// probes and inter-snapshot sleeps. Individual blocking
+    /// syscalls that the probe makes (`waitpid` after
+    /// `PTRACE_INTERRUPT`, `flock(LOCK_EX)` inside the
+    /// `--sidecar` path) are NOT interrupted by the deadline —
+    /// they run to completion, and the flag is observed on the
+    /// next poll boundary. Interrupting those blocking calls
+    /// requires signal delivery to the probe thread, which is
+    /// out of scope for this flag.
+    ///
+    /// **Interaction with `--snapshots` / `--interval-ms`**: if
+    /// `interval_ms * (snapshots - 1)` exceeds the deadline, the
+    /// probe will emit fewer than `snapshots` entries with
+    /// `interrupted: true`. Size the deadline to accommodate at
+    /// least one full snapshot's worth of per-tid work plus the
+    /// N-1 inter-snapshot sleeps, or accept partial results.
+    ///
+    /// **Reference point**: the deadline is measured from the
+    /// timer-thread spawn (immediately after CLI validation in
+    /// `main`), NOT from process invocation — clap parsing and
+    /// pre-flight checks run before the timer starts.
+    ///
+    /// **Sidecar scope**: the deadline covers the probe run
+    /// itself. Post-run sidecar append (`--sidecar`) uses
+    /// `flock(LOCK_EX)` on a separate path that is NOT bounded
+    /// by this deadline; a wedged sidecar lock can still block
+    /// indefinitely.
+    ///
+    /// **Response-latency floor**: the probe observes the flag
+    /// on the next poll boundary, so the effective response
+    /// latency is bounded by [`CANCEL_POLL_TICK_MS`] (10 ms)
+    /// plus the current per-tid probe's completion time.
+    ///
+    /// Range is 1..=3_600_000 (1 ms to 1 hour), matching
+    /// `--interval-ms`. A probe with no `--abort-after-ms` has
+    /// no self-imposed deadline — SIGINT / SIGTERM are still
+    /// honored. CI runs that can't tolerate indefinite blocks
+    /// should pass `--abort-after-ms` matching the test's
+    /// wall-clock budget.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..=3_600_000),
+        value_name = "MS",
+    )]
+    abort_after_ms: Option<u64>,
 }
 
 impl Cli {
@@ -487,14 +544,17 @@ struct ProbeOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     interval_ms: Option<u64>,
     /// `true` iff the run ended early because a SIGINT / SIGTERM
-    /// arrived during the snapshot loop or inter-snapshot sleep.
-    /// The `snapshots` array carries every snapshot started before
-    /// the signal landed, INCLUDING a partial final snapshot whose
-    /// per-tid loop was interrupted mid-iteration: its `threads`
-    /// array is truncated to the tids that completed before the
-    /// signal. Callers observing `interrupted: true` must expect
-    /// the last entry in `snapshots` to potentially cover fewer
-    /// tids than earlier entries.
+    /// arrived during the snapshot loop or inter-snapshot sleep,
+    /// or a configured `--abort-after-ms` deadline fired. All
+    /// three paths flip the same `CLEANUP_REQUESTED` atomic and
+    /// surface identically on the wire. The `snapshots` array
+    /// carries every snapshot started before the flag was
+    /// observed, INCLUDING a partial final snapshot whose per-tid
+    /// loop was interrupted mid-iteration: its `threads` array is
+    /// truncated to the tids that completed before the flag.
+    /// Callers observing `interrupted: true` must expect the last
+    /// entry in `snapshots` to potentially cover fewer tids than
+    /// earlier entries.
     ///
     /// `false` on a normal completion.
     interrupted: bool,
@@ -2027,6 +2087,31 @@ fn main() {
         );
         std::process::exit(2);
     }
+    // `--abort-after-ms MS`: spawn a detached timer thread that
+    // flips `CLEANUP_REQUESTED` after MS milliseconds, reusing
+    // the existing SIGINT cleanup path (detach-all + partial
+    // snapshot with `interrupted: true`). The thread holds no
+    // references and leaks on a fast-probe exit — `process::exit`
+    // reaps it unconditionally, and a probe that exits before the
+    // deadline simply never observes the flag flip. No
+    // synchronization with `main` is required; the atomic store
+    // is the full handoff.
+    //
+    // The `ktstr-probe-deadline:` stderr line mirrors the
+    // `ktstr-probe-fatal:` / `ktstr-probe-all-failed:` tag
+    // convention so operators grepping stderr can distinguish a
+    // deadline-driven interrupt from an operator SIGINT even
+    // though both produce the same on-wire `interrupted: true`.
+    // Emitted BEFORE the atomic store so any downstream consumer
+    // reading interleaved stderr + stdout sees the tag ahead of
+    // the partial JSON.
+    if let Some(ms) = cli.abort_after_ms {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            eprintln!("ktstr-probe-deadline: abort after {ms}ms");
+            CLEANUP_REQUESTED.store(true, Ordering::SeqCst);
+        });
+    }
     match run(&cli) {
         RunOutcome::Ok(out) => {
             if let Err(e) = print_output(&cli, &out) {
@@ -2601,6 +2686,7 @@ mod tests {
             snapshots: 1,
             interval_ms: None,
             sidecar: None,
+            abort_after_ms: None,
         };
         match run(&cli) {
             RunOutcome::Fatal(err) => {
@@ -2657,6 +2743,7 @@ mod tests {
             snapshots: 1,
             interval_ms: None,
             sidecar: None,
+            abort_after_ms: None,
         };
         let outcome = run(&cli);
         let _ = child.kill();
@@ -2900,6 +2987,161 @@ mod tests {
         assert!(
             msg.contains("0 is not in") || msg.contains("invalid value"),
             "expected clap range-rejection message, got: {msg}",
+        );
+    }
+
+    /// `--abort-after-ms` defaults to None (no self-imposed
+    /// deadline) when omitted. Pins the opt-in semantics so a
+    /// future `default_value_t` addition would fail this test
+    /// rather than silently impose a CI-breaking default.
+    #[test]
+    fn cli_abort_after_ms_defaults_none() {
+        let cli = Cli::try_parse_from(["ktstr-jemalloc-probe", "--pid", "42"]).unwrap();
+        assert!(cli.abort_after_ms.is_none());
+    }
+
+    /// `--abort-after-ms` accepts a positive integer within the
+    /// range matching `--interval-ms`, 1..=3_600_000 ms.
+    #[test]
+    fn cli_abort_after_ms_accepts_positive_value() {
+        let cli = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--abort-after-ms",
+            "500",
+        ])
+        .unwrap();
+        assert_eq!(cli.abort_after_ms, Some(500));
+    }
+
+    /// `--abort-after-ms 1` (lower boundary) is accepted. Pairs
+    /// with `cli_abort_after_ms_zero_rejected`: together they pin
+    /// the inclusive-1 lower bound so a future shift of the
+    /// `range(1..=..)` to `range(0..=..)` would regress one of
+    /// the two, and a shift to `range(2..=..)` would regress this
+    /// one.
+    #[test]
+    fn cli_abort_after_ms_lower_boundary_accepted() {
+        let cli = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--abort-after-ms",
+            "1",
+        ])
+        .unwrap();
+        assert_eq!(cli.abort_after_ms, Some(1));
+    }
+
+    /// `--abort-after-ms 3_600_000` (upper boundary, 1 hour) is
+    /// accepted. Pairs with `cli_abort_after_ms_upper_bound_rejected`
+    /// at 3_600_001: together they pin the inclusive upper bound
+    /// so the 1-hour ceiling cannot silently drift.
+    #[test]
+    fn cli_abort_after_ms_upper_boundary_accepted() {
+        let cli = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--abort-after-ms",
+            "3600000",
+        ])
+        .unwrap();
+        assert_eq!(cli.abort_after_ms, Some(3_600_000));
+    }
+
+    /// `--abort-after-ms 0` is rejected at parse time: a zero-ms
+    /// deadline would fire before any probe work runs, producing
+    /// a useless empty `ProbeOutput`. Pinning the 1-ms lower
+    /// bound forces the operator to pick a sensible deadline.
+    #[test]
+    fn cli_abort_after_ms_zero_rejected() {
+        let err = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--abort-after-ms",
+            "0",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0 is not in") || msg.contains("invalid value"),
+            "expected clap range-rejection message, got: {msg}",
+        );
+    }
+
+    /// `--abort-after-ms 3_600_001` (> 1 hour) is rejected by the
+    /// upper bound, matching the `--interval-ms` ceiling. A probe
+    /// run past 1 hour is an infrastructure problem the deadline
+    /// is supposed to catch, not a deadline configuration.
+    #[test]
+    fn cli_abort_after_ms_upper_bound_rejected() {
+        let err = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--pid",
+            "42",
+            "--abort-after-ms",
+            "3600001",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not in") || msg.contains("invalid value"),
+            "expected clap range-rejection message, got: {msg}",
+        );
+    }
+
+    /// Deadline-thread cancellation: spawning a thread that flips
+    /// `CLEANUP_REQUESTED` after a short delay unblocks
+    /// `sleep_with_cancel` within one poll tick of the flip, even
+    /// when the sleep's configured total is orders of magnitude
+    /// larger. This is the in-process analog of the production
+    /// `main()` timer-thread path (see `--abort-after-ms` CLI
+    /// wiring): a detached thread sleeps the deadline, sets the
+    /// atomic, and the existing cancellation path handles the
+    /// rest. Pins the deadline → flag → cancel handoff without
+    /// needing to spawn a subprocess.
+    #[test]
+    fn sleep_with_cancel_observes_deadline_thread_flip() {
+        // Ensure a clean slate — other tests touch the atomic.
+        CLEANUP_REQUESTED.store(false, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let flipper = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            CLEANUP_REQUESTED.store(true, Ordering::SeqCst);
+        });
+        // Ask for 10 seconds of sleep; the deadline thread should
+        // end the sleep within ~50ms + one poll tick + scheduling
+        // slop. 500ms is a generous ceiling — a regression that
+        // broke the handoff would show as a full 10s sleep.
+        let cancelled = sleep_with_cancel(10_000);
+        let elapsed = start.elapsed();
+        // Reset for other tests running in parallel.
+        CLEANUP_REQUESTED.store(false, Ordering::SeqCst);
+        let _ = flipper.join();
+        assert!(
+            cancelled,
+            "deadline thread set the flag at 50ms; sleep must report cancelled",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "sleep should return within a poll tick of the flag flip; got {elapsed:?}",
+        );
+        // Lower bound: we DID observe the flag, not a spurious
+        // early return — the sleep had to progress past the
+        // flipper's 50ms sleep. The 30ms floor is slackened
+        // from the naive 40ms (= ~50ms - sched slop) to absorb
+        // the extra jitter observed on loaded CI runners where
+        // the flipper thread can wake early under nanos-drift
+        // or where the main thread's first poll-tick observation
+        // catches the atomic before the flipper's sleep fully
+        // completes. A return before 30ms still indicates the
+        // deadline-thread mechanism short-circuited.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "sleep returned before the deadline thread could flip the flag; got {elapsed:?}",
         );
     }
 

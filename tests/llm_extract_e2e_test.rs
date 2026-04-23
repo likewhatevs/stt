@@ -107,7 +107,7 @@ fn llm_extract_schbench_surfaces_sane_metrics(ctx: &Ctx) -> Result<AssertResult>
     // single hallucinated scalar.
     const MIN_METRICS: usize = 5;
     if metrics.metrics.len() < MIN_METRICS {
-        return Ok(AssertResult::fail_other(format!(
+        return Ok(AssertResult::fail_msg(format!(
             "LlmExtract produced {} metric(s), expected >= {MIN_METRICS}. \
              Schbench's latency tables + summary emit dozens of numeric \
              leaves; a short extraction indicates the model truncated \
@@ -131,7 +131,7 @@ fn llm_extract_schbench_surfaces_sane_metrics(ctx: &Ctx) -> Result<AssertResult>
         use std::collections::HashSet;
         let names: HashSet<&str> = metrics.metrics.iter().map(|m| m.name.as_str()).collect();
         if names.len() != metrics.metrics.len() {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                 "LlmExtract produced {} metric(s) but only {} unique name(s); \
                  duplicate metric names indicate the model emitted the same \
                  dotted path twice or a walker aggregation bug",
@@ -160,7 +160,7 @@ fn llm_extract_schbench_surfaces_sane_metrics(ctx: &Ctx) -> Result<AssertResult>
         // tag-propagation bug) would surface here before it
         // poisoned downstream stats aggregation.
         if m.source != MetricSource::LlmExtract {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                 "metric '{}' has source {:?}, expected MetricSource::LlmExtract",
                 m.name, m.source,
             )));
@@ -172,7 +172,7 @@ fn llm_extract_schbench_surfaces_sane_metrics(ctx: &Ctx) -> Result<AssertResult>
         // the walker — NaN / ±inf propagating into PayloadMetrics
         // poisons percentile comparisons downstream.
         if !m.value.is_finite() {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                 "metric '{}' has non-finite value {} — LlmExtract must \
                  not propagate NaN / ±inf",
                 m.name, m.value,
@@ -185,7 +185,7 @@ fn llm_extract_schbench_surfaces_sane_metrics(ctx: &Ctx) -> Result<AssertResult>
         // Either way, non-negative is a hard schbench-semantic
         // invariant that the test should pin.
         if m.value < 0.0 {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                 "metric '{}' has negative value {} — schbench emits \
                  latencies / percentiles / RPS, all non-negative",
                 m.name, m.value,
@@ -197,7 +197,7 @@ fn llm_extract_schbench_surfaces_sane_metrics(ctx: &Ctx) -> Result<AssertResult>
         // 1e20 throughput fail here before they reach stats
         // comparison.
         if m.value > MAX_VALUE {
-            return Ok(AssertResult::fail_other(format!(
+            return Ok(AssertResult::fail_msg(format!(
                 "metric '{}' has value {} > {MAX_VALUE:e} — exceeds the \
                  loose ceiling for realistic schbench output; likely an \
                  LLM hallucination",
