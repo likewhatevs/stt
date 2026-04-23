@@ -261,14 +261,49 @@ enum StatsCommand {
         /// scheduler, work_type.
         #[arg(short = 'E', long)]
         filter: Option<String>,
-        /// Relative significance threshold in percent (e.g. 10 for
-        /// 10%). When set, overrides the per-metric default
-        /// threshold for ALL metrics — intentionally, so callers
-        /// can loosen a tight default or tighten a loose one from
-        /// the CLI without per-metric knobs. Omit to use each
-        /// metric's built-in default.
-        #[arg(long)]
+        /// Uniform relative significance threshold in percent
+        /// (e.g. 10 for 10%). When set, overrides the per-metric
+        /// default threshold for ALL metrics — intentionally, so
+        /// callers can loosen a tight default or tighten a loose
+        /// one from the CLI without per-metric knobs. Omit to use
+        /// each metric's built-in default.
+        ///
+        /// Sugar for `--policy` with `{default_percent: N}` and an
+        /// empty per-metric map. Mutually exclusive with `--policy`
+        /// — if you need per-metric overrides, spell them out in a
+        /// policy file and pass `--policy`.
+        #[arg(long, conflicts_with = "policy")]
         threshold: Option<f64>,
+        /// Path to a JSON-persisted `ktstr::cli::ComparisonPolicy`
+        /// file with per-metric thresholds. Mutually exclusive
+        /// with `--threshold`. Use `--threshold` as sugar for a
+        /// uniform default; use `--policy` for the per-metric
+        /// override map.
+        ///
+        /// Priority: per-metric override → `default_percent` →
+        /// each metric's registry `default_rel`.
+        ///
+        /// Schema (every field optional; empty object produces
+        /// the "registry defaults everywhere" policy):
+        ///
+        ///   {
+        ///     "default_percent": 10.0,
+        ///     "per_metric_percent": {
+        ///       "worst_spread": 5.0,
+        ///       "worst_p99_wake_latency_us": 20.0,
+        ///       "worst_mean_run_delay_us": 15.0
+        ///     }
+        ///   }
+        ///
+        /// Values are PERCENT (e.g. `10.0` → 10%). Negative
+        /// values are rejected. Per-metric keys must match a
+        /// metric name in the `METRICS` registry — a typo
+        /// (e.g. `wrost_spread`) is rejected at load time so it
+        /// does not silently fall through to `default_percent`.
+        /// Use `cargo ktstr stats` to discover available metric
+        /// names.
+        #[arg(long, conflicts_with = "threshold")]
+        policy: Option<std::path::PathBuf>,
         /// Alternate run root to resolve `a` / `b` against. Defaults
         /// to `test_support::runs_root()` (typically `target/ktstr/`).
         /// Useful when comparing archived sidecar trees copied off a
@@ -411,10 +446,46 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             b,
             filter,
             threshold,
+            policy,
             dir,
         }) => {
-            let exit = cli::compare_runs(a, b, filter.as_deref(), *threshold, dir.as_deref())
-                .map_err(|e| format!("{e:#}"))?;
+            // Resolve `--threshold N` / `--policy PATH` / neither
+            // into a single `ComparisonPolicy`. Clap's
+            // `conflicts_with` guarantees at most one of
+            // (threshold, policy) is set, so the three branches
+            // are exhaustive on user-visible input.
+            let resolved_policy = match (threshold, policy.as_ref()) {
+                (Some(t), None) => {
+                    let p = ktstr::cli::ComparisonPolicy::uniform(*t);
+                    // `uniform` is infallible, but the user-supplied
+                    // percent still needs a sign check. `validate`
+                    // rejects negatives before they reach
+                    // `compare_rows`' dual-gate math.
+                    p.validate().map_err(|e| format!("{e:#}"))?;
+                    p
+                }
+                (None, Some(path)) => ktstr::cli::ComparisonPolicy::load_json(path)
+                    .map_err(|e| format!("{e:#}"))?,
+                (None, None) => ktstr::cli::ComparisonPolicy::default(),
+                (Some(_), Some(_)) => {
+                    // Defence-in-depth: clap's `conflicts_with` is
+                    // load-bearing here, but a regression that
+                    // dropped either attribute would silently pick
+                    // one path and ignore the other. Panic loudly.
+                    unreachable!(
+                        "clap `conflicts_with` on --threshold / --policy \
+                         must enforce mutual exclusion at parse time",
+                    );
+                }
+            };
+            let exit = cli::compare_runs(
+                a,
+                b,
+                filter.as_deref(),
+                &resolved_policy,
+                dir.as_deref(),
+            )
+            .map_err(|e| format!("{e:#}"))?;
             if exit != 0 {
                 std::process::exit(exit);
             }
@@ -1212,6 +1283,7 @@ mod tests {
                         b,
                         filter,
                         threshold,
+                        policy,
                         dir,
                     }),
                 ..
@@ -1220,6 +1292,7 @@ mod tests {
                 assert_eq!(b, "b");
                 assert_eq!(filter.as_deref(), Some("cgroup_steady"));
                 assert!(threshold.is_none());
+                assert!(policy.is_none());
                 assert!(dir.is_none());
             }
             _ => panic!("expected Stats Compare"),
@@ -1291,6 +1364,7 @@ mod tests {
                         b,
                         filter,
                         threshold,
+                        policy,
                         dir,
                     }),
                 ..
@@ -1312,9 +1386,103 @@ mod tests {
                     threshold.is_none(),
                     "bare --dir must not spuriously populate threshold",
                 );
+                assert!(
+                    policy.is_none(),
+                    "bare --dir must not spuriously populate policy",
+                );
             }
             _ => panic!("expected Stats Compare"),
         }
+    }
+
+    /// Positive parse pin: `--policy PATH` round-trips to
+    /// `StatsCommand::Compare { policy: Some(PathBuf(PATH)),
+    /// threshold: None, ... }`. Mirrors `parse_stats_compare_with_dir`
+    /// for the `dir` field. Uses an obviously-synthetic path that
+    /// does not need to exist — the parse path never touches the
+    /// filesystem; policy loading happens downstream in the
+    /// dispatch.
+    #[test]
+    fn parse_stats_compare_with_policy() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "a",
+            "b",
+            "--policy",
+            "/tmp/policy.json",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command:
+                    Some(StatsCommand::Compare {
+                        threshold,
+                        policy,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(
+                    policy.as_deref(),
+                    Some(std::path::Path::new("/tmp/policy.json")),
+                    "--policy must round-trip to Some(PathBuf); got {policy:?}",
+                );
+                assert!(
+                    threshold.is_none(),
+                    "bare --policy must not populate --threshold",
+                );
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    /// `--threshold` and `--policy` are mutually exclusive via
+    /// clap `conflicts_with`. Passing both must be rejected at
+    /// parse time, NOT reach the dispatch-level `unreachable!()`
+    /// branch. A regression that dropped the `conflicts_with`
+    /// attribute on either field would turn the `unreachable!()`
+    /// into a panic at runtime instead of a parse error at parse
+    /// time — this test catches that at compile-time parse
+    /// behaviour.
+    #[test]
+    fn parse_stats_compare_rejects_both_threshold_and_policy() {
+        // Avoid `expect_err` / `unwrap_err` because they require
+        // the `Ok` type (`Cargo`) to implement `Debug`, which the
+        // clap `Parser` derive does not add. A direct `match`
+        // sidesteps the bound and keeps the test compiling
+        // independently of whether `Cargo` gains `#[derive(Debug)]`
+        // elsewhere.
+        let result = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "a",
+            "b",
+            "--threshold",
+            "5.0",
+            "--policy",
+            "/tmp/policy.json",
+        ]);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "clap conflicts_with must reject both --threshold \
+                 and --policy being set together"
+            ),
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.to_ascii_lowercase().contains("cannot be used with")
+                || rendered.to_ascii_lowercase().contains("conflict"),
+            "clap error must surface the conflict between \
+             --threshold and --policy; got: {rendered}",
+        );
     }
 
     /// `cargo ktstr stats show-host --run X` parses to
@@ -1990,7 +2158,7 @@ mod tests {
             KtstrCommand::ShowThresholds { test } => {
                 assert_eq!(test, "my_test_fn");
             }
-            other => panic!("expected ShowThresholds, got {other:?}"),
+            _ => panic!("expected ShowThresholds"),
         }
     }
 

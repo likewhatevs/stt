@@ -1409,11 +1409,20 @@ pub fn compare_runs(
     a: &str,
     b: &str,
     filter: Option<&str>,
-    threshold: Option<f64>,
+    policy: &ComparisonPolicy,
     dir: Option<&Path>,
 ) -> Result<i32> {
-    crate::stats::compare_runs(a, b, filter, threshold, dir)
+    crate::stats::compare_runs(a, b, filter, policy, dir)
 }
+
+/// Re-export the comparison-policy type so downstream crates using
+/// `ktstr::cli` as their public surface don't need to reach into
+/// the internal `ktstr::stats` module (which is `pub(crate)` —
+/// see `lib.rs` — and therefore not a stable public path). The
+/// policy is the only item in `stats` that a CLI or external
+/// consumer constructs directly; every other item is internal
+/// plumbing reached via `cli::compare_runs`.
+pub use crate::stats::ComparisonPolicy;
 
 /// Collect the current host context via
 /// [`crate::host_context::collect_host_context`] and render it as

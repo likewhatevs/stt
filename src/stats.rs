@@ -1007,6 +1007,165 @@ pub(crate) struct CompareReport {
     pub findings: Vec<Finding>,
 }
 
+/// Per-metric threshold policy driving [`compare_rows`] /
+/// [`compare_runs`].
+///
+/// Resolution priority for a given metric's relative significance
+/// threshold, highest first:
+///
+/// 1. `per_metric_percent[metric_name]` — explicit override for
+///    this metric.
+/// 2. `default_percent` — uniform override across every metric
+///    not listed in the map (equivalent to the old `--threshold N`
+///    CLI flag).
+/// 3. The metric's built-in `default_rel` from the [`METRICS`]
+///    registry — the "no policy" fallback.
+///
+/// Values in the struct are stored as PERCENT (e.g. `10.0` meaning
+/// 10%), NOT fractions. [`Self::rel_threshold`] does the `/100.0`
+/// conversion so every caller inside `compare_rows` reads a
+/// fraction without re-deriving the division.
+///
+/// Note on the registry-fallback branch: the `default_rel` field
+/// on `MetricDef` is already a FRACTION (e.g. `0.25` for 25%),
+/// not a percent. `rel_threshold` returns it verbatim — it
+/// does NOT divide by 100. Only the override branches
+/// (per-metric map, `default_percent`) do the percent-to-fraction
+/// conversion because their inputs are percents. This asymmetry
+/// is deliberate so callers supplying CLI/file-based overrides
+/// work in human-intuitive percent units while the registry
+/// defaults (which already ship in fraction form) pass through
+/// unchanged.
+///
+/// The struct is `serde::Serialize` / `serde::Deserialize` so
+/// `cargo ktstr stats compare --policy <path>` can load a
+/// JSON-persisted policy file. Default construction produces an
+/// empty policy that uses every registry default; [`Self::uniform`]
+/// reproduces the old `--threshold N` behaviour without any
+/// per-metric override plumbing at the call site.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComparisonPolicy {
+    /// Uniform override: when `Some(p)`, every metric whose name is
+    /// NOT in [`Self::per_metric_percent`] uses `p / 100.0` as its
+    /// relative threshold. `None` falls through to the registry
+    /// `default_rel`. Stored as percent (e.g. `10.0` for 10%).
+    pub default_percent: Option<f64>,
+    /// Per-metric overrides keyed by metric name. Each value is a
+    /// percent (e.g. `15.0` → 15%). An entry here takes precedence
+    /// over both [`Self::default_percent`] and the registry
+    /// `default_rel`.
+    pub per_metric_percent: BTreeMap<String, f64>,
+}
+
+impl ComparisonPolicy {
+    /// Empty policy — every metric uses its [`METRICS`] registry
+    /// default. Equivalent to the old `--threshold None` CLI path.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Uniform override: every metric uses `percent / 100.0`.
+    /// Mirrors the old `--threshold N` CLI behaviour; the CLI
+    /// dispatch at `cargo-ktstr stats compare --threshold N`
+    /// constructs a policy via this constructor.
+    pub fn uniform(percent: f64) -> Self {
+        Self {
+            default_percent: Some(percent),
+            per_metric_percent: BTreeMap::new(),
+        }
+    }
+
+    /// Load a JSON-persisted policy from a file. Errors propagate
+    /// the read / parse reason as an `anyhow::Error` with the file
+    /// path in the context chain so a malformed `--policy path.json`
+    /// surfaces an actionable message rather than a generic
+    /// "invalid JSON."
+    ///
+    /// Validates after parsing via [`Self::validate`]: rejects
+    /// negative thresholds (a misconfigured 10 vs -10 would
+    /// invert the dual-gate logic at the `.abs() >= rel_thresh`
+    /// check and silently classify every metric as significant)
+    /// and rejects per-metric keys not registered in [`METRICS`]
+    /// (a typo like `"wrost_spread"` would otherwise be silently
+    /// ignored — the key simply never matches during resolution
+    /// and the metric falls through to `default_percent`).
+    pub fn load_json(path: &std::path::Path) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let data = std::fs::read_to_string(path)
+            .with_context(|| format!("read comparison policy from {}", path.display()))?;
+        let policy: ComparisonPolicy = serde_json::from_str(&data)
+            .with_context(|| format!("parse comparison policy from {}", path.display()))?;
+        policy
+            .validate()
+            .with_context(|| format!("validate comparison policy from {}", path.display()))?;
+        Ok(policy)
+    }
+
+    /// Structural validation separate from parsing so both the
+    /// `load_json` path and programmatic constructors (after
+    /// [`Self::uniform`] with a user-supplied percent) can share
+    /// one set of invariants without re-implementing checks at
+    /// each call site. Called automatically by [`Self::load_json`];
+    /// CLI dispatch should call it after constructing via
+    /// [`Self::uniform`] to catch `--threshold -10` at the
+    /// entry point rather than deep inside `compare_rows` where
+    /// the dual-gate math silently misbehaves.
+    ///
+    /// Rejects:
+    /// - Negative `default_percent` (nonsensical — thresholds are
+    ///   absolute-value comparisons).
+    /// - Negative entries in `per_metric_percent`.
+    /// - Per-metric keys not in the [`METRICS`] registry (silent
+    ///   typos would otherwise fall through to `default_percent`
+    ///   unnoticed).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(p) = self.default_percent
+            && p < 0.0
+        {
+            anyhow::bail!(
+                "ComparisonPolicy: default_percent must be non-negative; got {p}. \
+                 Thresholds are absolute-value comparisons — a negative value \
+                 would invert the dual-gate logic and silently classify every \
+                 delta as significant."
+            );
+        }
+        for (name, p) in &self.per_metric_percent {
+            if !METRICS.iter().any(|m| m.name == name) {
+                let known: Vec<&str> = METRICS.iter().map(|m| m.name).collect();
+                anyhow::bail!(
+                    "ComparisonPolicy: per_metric_percent contains unknown \
+                     metric `{name}`. A typo in the key would silently fall \
+                     through to default_percent. Registered metrics: {}",
+                    known.join(", "),
+                );
+            }
+            if *p < 0.0 {
+                anyhow::bail!(
+                    "ComparisonPolicy: per_metric_percent[{name:?}] must be \
+                     non-negative; got {p}",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the relative threshold (as a fraction, e.g. `0.10`
+    /// for 10%) for `metric_name` with `default_rel` as the
+    /// registry-level fallback. Handles the percent→fraction
+    /// conversion so [`compare_rows`] does not need to re-derive
+    /// `p / 100.0` at every call site.
+    pub fn rel_threshold(&self, metric_name: &str, default_rel: f64) -> f64 {
+        if let Some(p) = self.per_metric_percent.get(metric_name) {
+            p / 100.0
+        } else if let Some(p) = self.default_percent {
+            p / 100.0
+        } else {
+            default_rel
+        }
+    }
+}
+
 /// Compare two row sets metric-by-metric.
 ///
 /// Pure function: no I/O, no globals. Pairs `rows_a` and `rows_b` by
@@ -1031,17 +1190,16 @@ pub(crate) struct CompareReport {
 /// The filter (when set) applies to every counter -- excluded rows
 /// never reach the matching, pass, or metric stages.
 ///
-/// `threshold` is a relative percentage (e.g. `Some(10.0)` for 10%).
-/// Deltas whose relative magnitude is below `threshold / 100.0` are
-/// treated as unchanged. When `None`, each metric's built-in
-/// `default_rel` is used. The absolute gate always uses the metric's
-/// `default_abs`. A delta must clear both gates to count as
-/// significant.
+/// `policy` carries the comparison thresholds. See
+/// [`ComparisonPolicy`] for the resolution rules — per-metric
+/// override → `default_percent` → registry `default_rel`. The
+/// absolute gate always uses the metric's `default_abs`. A delta
+/// must clear both gates to count as significant.
 pub(crate) fn compare_rows(
     rows_a: &[GauntletRow],
     rows_b: &[GauntletRow],
     filter: Option<&str>,
-    threshold: Option<f64>,
+    policy: &ComparisonPolicy,
 ) -> CompareReport {
     let mut report = CompareReport::default();
 
@@ -1101,10 +1259,7 @@ pub(crate) fn compare_rows(
                 continue;
             }
 
-            let rel_thresh = match threshold {
-                Some(t) => t / 100.0,
-                None => m.default_rel,
-            };
+            let rel_thresh = policy.rel_threshold(m.name, m.default_rel);
 
             let delta = val_b - val_a;
             let rel_delta = if val_a.abs() > f64::EPSILON {
@@ -1190,7 +1345,7 @@ pub fn compare_runs(
     a: &str,
     b: &str,
     filter: Option<&str>,
-    threshold: Option<f64>,
+    policy: &ComparisonPolicy,
     dir: Option<&std::path::Path>,
 ) -> anyhow::Result<i32> {
     // `--dir` overrides the default runs root. Earlier versions of
@@ -1225,7 +1380,7 @@ pub fn compare_runs(
     let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
     let rows_b: Vec<GauntletRow> = sidecars_b.iter().map(sidecar_to_row).collect();
 
-    let report = compare_rows(&rows_a, &rows_b, filter, threshold);
+    let report = compare_rows(&rows_a, &rows_b, filter, policy);
 
     use comfy_table::{Cell, Color};
     let mut table = crate::cli::new_table();
@@ -1984,7 +2139,7 @@ mod tests {
         // unchanged for worst_spread.
         let rows_a = vec![cmp_row("test_a", "tiny-1llc", true, 10.0, 0)];
         let rows_b = vec![cmp_row("test_a", "tiny-1llc", true, 12.0, 0)];
-        let res = compare_rows(&rows_a, &rows_b, None, None);
+        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
         assert_eq!(res.regressions, 0, "abs gate must block 2.0 < 5.0");
         assert_eq!(res.improvements, 0);
         assert_eq!(
@@ -1996,7 +2151,7 @@ mod tests {
         // Confirm the rel gate alone is not enough: spread 10 -> 14 has
         // rel 0.40 (>= 0.25) but abs delta 4.0 (< 5.0), still unchanged.
         let rows_b2 = vec![cmp_row("test_a", "tiny-1llc", true, 14.0, 0)];
-        let res2 = compare_rows(&rows_a, &rows_b2, None, None);
+        let res2 = compare_rows(&rows_a, &rows_b2, None, &ComparisonPolicy::default());
         assert_eq!(
             res2.regressions, 0,
             "rel-only is insufficient: abs gate must also fire"
@@ -2014,7 +2169,7 @@ mod tests {
         // significant metric.
         let rows_a = vec![cmp_row("test1", "tiny-1llc", true, 10.0, 1000)];
         let rows_b = vec![cmp_row("test1", "tiny-1llc", true, 30.0, 500)];
-        let res = compare_rows(&rows_a, &rows_b, None, Some(10.0));
+        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::uniform(10.0));
         assert_eq!(
             res.regressions, 2,
             "spread up + iterations down both regress"
@@ -2031,7 +2186,7 @@ mod tests {
         }
 
         // Reverse direction: improvements should also surface.
-        let res_imp = compare_rows(&rows_b, &rows_a, None, Some(10.0));
+        let res_imp = compare_rows(&rows_b, &rows_a, None, &ComparisonPolicy::uniform(10.0));
         assert_eq!(res_imp.regressions, 0);
         assert_eq!(res_imp.improvements, 2);
         for d in &res_imp.findings {
@@ -2045,7 +2200,7 @@ mod tests {
         // 500 must be reported as a regression, not an improvement.
         let rows_a = vec![cmp_row("t", "tiny-1llc", true, 0.0, 1000)];
         let rows_b = vec![cmp_row("t", "tiny-1llc", true, 0.0, 500)];
-        let res = compare_rows(&rows_a, &rows_b, None, None);
+        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
         let iters_delta = res
             .findings
             .iter()
@@ -2063,7 +2218,7 @@ mod tests {
         // regression; a decrease must be an improvement.
         let rows_a2 = vec![cmp_row("t", "tiny-1llc", true, 10.0, 0)];
         let rows_b2 = vec![cmp_row("t", "tiny-1llc", true, 30.0, 0)];
-        let res_up = compare_rows(&rows_a2, &rows_b2, None, None);
+        let res_up = compare_rows(&rows_a2, &rows_b2, None, &ComparisonPolicy::default());
         let spread_up = res_up
             .findings
             .iter()
@@ -2072,7 +2227,7 @@ mod tests {
         assert!(spread_up.is_regression, "spread increase is a regression");
         assert_eq!(spread_up.delta, 20.0);
 
-        let res_down = compare_rows(&rows_b2, &rows_a2, None, None);
+        let res_down = compare_rows(&rows_b2, &rows_a2, None, &ComparisonPolicy::default());
         let spread_down = res_down
             .findings
             .iter()
@@ -2096,7 +2251,7 @@ mod tests {
         let mut row_a = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         let mut row_b = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         row_a.skipped = true; // A side was skipped
-        let res = compare_rows(&[row_a.clone()], &[row_b.clone()], None, None);
+        let res = compare_rows(&[row_a.clone()], &[row_b.clone()], None, &ComparisonPolicy::default());
         assert_eq!(res.regressions, 0);
         assert_eq!(res.improvements, 0);
         assert_eq!(
@@ -2107,7 +2262,7 @@ mod tests {
         // Symmetrically on the B side.
         row_a.skipped = false;
         row_b.skipped = true;
-        let res = compare_rows(&[row_a], &[row_b], None, None);
+        let res = compare_rows(&[row_a], &[row_b], None, &ComparisonPolicy::default());
         assert_eq!(res.regressions, 0);
         assert_eq!(res.improvements, 0);
         assert_eq!(res.skipped_failed, 1);
@@ -2132,7 +2287,7 @@ mod tests {
             cmp_row("test_failed_b", "tiny-1llc", false, 30.0, 500),
             cmp_row("test_failed_a", "tiny-1llc", true, 30.0, 500),
         ];
-        let res = compare_rows(&rows_a, &rows_b, None, Some(10.0));
+        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::uniform(10.0));
         assert_eq!(
             res.skipped_failed, 2,
             "test_failed_a and test_failed_b skip"
@@ -2158,7 +2313,7 @@ mod tests {
             cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
             cmp_row("beta", "tiny-1llc", true, 30.0, 0),
         ];
-        let res = compare_rows(&rows_a, &rows_b, Some("alpha"), None);
+        let res = compare_rows(&rows_a, &rows_b, Some("alpha"), &ComparisonPolicy::default());
         assert_eq!(res.regressions, 1, "only alpha row should compare");
         assert_eq!(res.findings.len(), 1);
         assert_eq!(res.findings[0].scenario, "alpha");
@@ -2171,12 +2326,12 @@ mod tests {
         // share the "tiny-1llc" topology and only worst_spread crosses
         // both gates (10 -> 30 with default_abs=5.0, default_rel=0.25),
         // so each row contributes exactly one finding.
-        let res_topo = compare_rows(&rows_a, &rows_b, Some("tiny"), None);
+        let res_topo = compare_rows(&rows_a, &rows_b, Some("tiny"), &ComparisonPolicy::default());
         assert_eq!(res_topo.regressions, 2, "both rows match 'tiny' topology");
         assert_eq!(res_topo.findings.len(), 2);
 
         // Non-matching filter yields no comparisons at all.
-        let res_none = compare_rows(&rows_a, &rows_b, Some("nomatch"), None);
+        let res_none = compare_rows(&rows_a, &rows_b, Some("nomatch"), &ComparisonPolicy::default());
         assert_eq!(res_none.regressions, 0);
         assert_eq!(res_none.improvements, 0);
         assert_eq!(res_none.unchanged, 0);
@@ -2190,7 +2345,7 @@ mod tests {
         // (default rel fails) → unchanged with default thresholds.
         let rows_a = vec![cmp_row("t", "tiny-1llc", true, 100.0, 0)];
         let rows_b = vec![cmp_row("t", "tiny-1llc", true, 106.0, 0)];
-        let res_default = compare_rows(&rows_a, &rows_b, None, None);
+        let res_default = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
         let spread_default = res_default
             .findings
             .iter()
@@ -2202,7 +2357,7 @@ mod tests {
 
         // Override threshold to 5% (Some(5.0) → rel_thresh 0.05). Now
         // rel 0.06 >= 0.05, both gates fire → regression.
-        let res_override = compare_rows(&rows_a, &rows_b, None, Some(5.0));
+        let res_override = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::uniform(5.0));
         let spread_override = res_override
             .findings
             .iter()
@@ -2216,13 +2371,387 @@ mod tests {
         // can't promote it to significant.
         let rows_a_small = vec![cmp_row("t", "tiny-1llc", true, 1.0, 0)];
         let rows_b_small = vec![cmp_row("t", "tiny-1llc", true, 1.5, 0)];
-        let res_small = compare_rows(&rows_a_small, &rows_b_small, None, Some(1.0));
+        let res_small = compare_rows(&rows_a_small, &rows_b_small, None, &ComparisonPolicy::uniform(1.0));
         assert!(
             !res_small
                 .findings
                 .iter()
                 .any(|d| d.metric.name == "worst_spread"),
             "abs gate must still block tiny absolute moves"
+        );
+    }
+
+    /// `ComparisonPolicy::rel_threshold` resolution priority pinned
+    /// by exhaustive enumeration: per-metric override wins over
+    /// `default_percent`, which wins over the registry fallback.
+    /// A regression that inverted the priority or shortcut the
+    /// fallback (e.g. always returning `default_percent` even when
+    /// a per-metric override exists) surfaces here, not as subtly-
+    /// wrong thresholds inside `compare_rows`.
+    #[test]
+    fn comparison_policy_rel_threshold_resolution_priority() {
+        // Empty policy → registry fallback. `default_rel` is
+        // passed by the caller (compare_rows supplies it from
+        // `m.default_rel`), so we pick an arbitrary fallback here
+        // and check it's returned verbatim.
+        let empty = ComparisonPolicy::default();
+        assert_eq!(
+            empty.rel_threshold("worst_spread", 0.25),
+            0.25,
+            "empty policy must fall through to the registry default_rel",
+        );
+
+        // Uniform override → default_percent / 100 wins over
+        // the registry default.
+        let uniform = ComparisonPolicy::uniform(10.0);
+        assert_eq!(
+            uniform.rel_threshold("worst_spread", 0.25),
+            0.10,
+            "uniform(10.0) must override the registry default_rel \
+             with 10.0 / 100.0 = 0.10",
+        );
+
+        // Per-metric override wins over both `default_percent` and
+        // the registry default. Use two metric names so the test
+        // also proves other metrics still see `default_percent`
+        // when no per-metric entry matches.
+        let mut per_metric = ComparisonPolicy::uniform(10.0);
+        per_metric
+            .per_metric_percent
+            .insert("worst_spread".to_string(), 5.0);
+        assert_eq!(
+            per_metric.rel_threshold("worst_spread", 0.25),
+            0.05,
+            "per-metric override (5.0) must win over default_percent \
+             (10.0) and the registry default (0.25)",
+        );
+        assert_eq!(
+            per_metric.rel_threshold("worst_gap_ms", 0.25),
+            0.10,
+            "metrics not in the per-metric map must still see the \
+             default_percent (10.0 → 0.10), not the registry default",
+        );
+    }
+
+    /// `ComparisonPolicy::load_json` round-trips a policy file: a
+    /// policy constructed in memory, serialized, and reloaded must
+    /// yield the same thresholds end-to-end. Pins the wire format
+    /// for the `--policy <path>` CLI flag.
+    #[test]
+    fn comparison_policy_load_json_round_trip() {
+        let mut original = ComparisonPolicy::uniform(10.0);
+        original
+            .per_metric_percent
+            .insert("worst_spread".to_string(), 5.0);
+        original
+            .per_metric_percent
+            .insert("worst_p99_wake_latency_us".to_string(), 20.0);
+
+        let json = serde_json::to_string(&original).expect("serialize policy");
+
+        let tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+        std::fs::write(tmp.path(), json).expect("write policy file");
+
+        let loaded = ComparisonPolicy::load_json(tmp.path()).expect("load policy");
+
+        assert_eq!(
+            loaded.default_percent,
+            Some(10.0),
+            "default_percent must round-trip",
+        );
+        assert_eq!(
+            loaded.per_metric_percent.get("worst_spread"),
+            Some(&5.0),
+            "per-metric worst_spread override must round-trip",
+        );
+        assert_eq!(
+            loaded.per_metric_percent.get("worst_p99_wake_latency_us"),
+            Some(&20.0),
+            "per-metric worst_p99 override must round-trip",
+        );
+        // Resolution-path equivalence: the loaded policy resolves
+        // every metric identically to the original.
+        for metric_name in ["worst_spread", "worst_p99_wake_latency_us", "worst_gap_ms"] {
+            assert_eq!(
+                loaded.rel_threshold(metric_name, 0.25),
+                original.rel_threshold(metric_name, 0.25),
+                "load_json round-trip must preserve threshold \
+                 resolution for {metric_name}",
+            );
+        }
+    }
+
+    /// `ComparisonPolicy::load_json` on a nonexistent path must
+    /// surface an actionable error naming the path (not a generic
+    /// "no such file"). Pins the `with_context` chain — a
+    /// regression that dropped the context would collapse a
+    /// user-facing `--policy missing.json` invocation into a
+    /// bare `No such file or directory` with no clue about where
+    /// the missing file was expected.
+    #[test]
+    fn comparison_policy_load_json_nonexistent_path_surfaces_path() {
+        let path = std::path::Path::new("/nonexistent/ktstr/policy-DOES-NOT-EXIST.json");
+        let err = ComparisonPolicy::load_json(path)
+            .expect_err("nonexistent path must fail");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&path.display().to_string()),
+            "error must name the missing path so a user can see \
+             which file was expected; got: {rendered}",
+        );
+        assert!(
+            rendered.to_ascii_lowercase().contains("read")
+                || rendered.to_ascii_lowercase().contains("no such"),
+            "error must describe the read failure (either the \
+             `with_context` \"read comparison policy from ...\" \
+             prefix or std's underlying \"No such file...\" \
+             reason); got: {rendered}",
+        );
+    }
+
+    /// `ComparisonPolicy::load_json` on a malformed JSON body
+    /// must include both the path (for locating) AND the parse
+    /// context (for understanding the failure shape). A
+    /// `serde_json::Error` on its own gives line/column but no
+    /// file identity; the `with_context` adds the path. Pins
+    /// both halves.
+    #[test]
+    fn comparison_policy_load_json_malformed_json_surfaces_path_and_parse_context() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        // Not JSON — clearly malformed.
+        std::fs::write(tmp.path(), "this is not json at all {{{").expect("write");
+        let err = ComparisonPolicy::load_json(tmp.path())
+            .expect_err("malformed JSON must fail");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(&tmp.path().display().to_string()),
+            "malformed-JSON error must name the path; got: {rendered}",
+        );
+        assert!(
+            rendered.to_ascii_lowercase().contains("parse")
+                || rendered.to_ascii_lowercase().contains("expected"),
+            "malformed-JSON error must include a parse-context \
+             hint (either the `with_context` \"parse comparison \
+             policy from ...\" prefix, or serde_json's \"expected \
+             ...\" reason); got: {rendered}",
+        );
+    }
+
+    /// `load_json` rejects unknown top-level fields per
+    /// `deny_unknown_fields`. A misspelled field (e.g.
+    /// `default_percentage` vs `default_percent`) must surface as
+    /// a parse error, not silently drop the value and fall back
+    /// to the default.
+    #[test]
+    fn comparison_policy_load_json_rejects_unknown_fields() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            tmp.path(),
+            r#"{"default_percentage": 10.0}"#,
+        )
+        .expect("write");
+        let err = ComparisonPolicy::load_json(tmp.path())
+            .expect_err("unknown field must fail");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("default_percentage")
+                || rendered.to_ascii_lowercase().contains("unknown"),
+            "unknown-field error must name the typo so a user \
+             can fix the policy file; got: {rendered}",
+        );
+    }
+
+    /// `validate` rejects negative `default_percent`. A regression
+    /// that lost the sign check would let `--threshold -10`
+    /// through to `compare_rows`' dual-gate `.abs()` comparison,
+    /// where a negative `rel_thresh` makes every delta (including
+    /// zero) significant — silently inverting the comparison.
+    #[test]
+    fn comparison_policy_validate_rejects_negative_default_percent() {
+        let policy = ComparisonPolicy::uniform(-10.0);
+        let err = policy
+            .validate()
+            .expect_err("negative default_percent must fail validation");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("default_percent"),
+            "validation error must name the field; got: {rendered}",
+        );
+        assert!(
+            rendered.contains("-10"),
+            "validation error must echo the rejected value; got: {rendered}",
+        );
+    }
+
+    /// `validate` rejects unknown per-metric keys. A typo in the
+    /// policy file would otherwise silently fall through to
+    /// `default_percent` — a user debugging a regression with
+    /// `--policy typo.json` would see the uniform threshold
+    /// applied instead of the expected override and have no way
+    /// to know why.
+    #[test]
+    fn comparison_policy_validate_rejects_unknown_per_metric_keys() {
+        let mut policy = ComparisonPolicy::default();
+        policy
+            .per_metric_percent
+            .insert("wrost_spread".to_string(), 5.0); // typo
+        let err = policy
+            .validate()
+            .expect_err("unknown per-metric key must fail validation");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("wrost_spread"),
+            "validation error must echo the unknown key so a user \
+             can see the typo; got: {rendered}",
+        );
+        // Known-metric list should appear so the user can pick the
+        // right spelling. Registered metric names include
+        // `worst_spread` — a hint toward the correct key.
+        assert!(
+            rendered.contains("worst_spread"),
+            "validation error should include the registered \
+             metric list so users can find the right spelling; \
+             got: {rendered}",
+        );
+    }
+
+    /// `validate` rejects negative per-metric overrides. Covers
+    /// the sibling case of the default_percent sign check above.
+    #[test]
+    fn comparison_policy_validate_rejects_negative_per_metric_value() {
+        let mut policy = ComparisonPolicy::default();
+        policy
+            .per_metric_percent
+            .insert("worst_spread".to_string(), -5.0);
+        let err = policy
+            .validate()
+            .expect_err("negative per-metric percent must fail");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("worst_spread") && rendered.contains("-5"),
+            "validation error must name both the key and the \
+             rejected value; got: {rendered}",
+        );
+    }
+
+    /// Defence-in-depth against an on-disk policy missing fields
+    /// (e.g. older wire format, hand-edited JSON). The struct uses
+    /// `#[serde(default)]` on every field so a partial JSON
+    /// (`{}`, `{"default_percent": 5}`) deserializes to a policy
+    /// with the missing field at its `Default` value. A regression
+    /// that dropped the `#[serde(default)]` attribute would make
+    /// `load_json` reject otherwise-valid partial policies.
+    #[test]
+    fn comparison_policy_load_json_accepts_partial_fields() {
+        let tmp = tempfile::NamedTempFile::new().expect("create tempfile");
+        // Empty object → policy with every default.
+        std::fs::write(tmp.path(), "{}").expect("write empty policy");
+        let loaded = ComparisonPolicy::load_json(tmp.path()).expect("load empty policy");
+        assert_eq!(loaded.default_percent, None);
+        assert!(loaded.per_metric_percent.is_empty());
+
+        // Only default_percent set → empty per_metric.
+        std::fs::write(tmp.path(), r#"{"default_percent": 7.5}"#)
+            .expect("write partial policy");
+        let loaded = ComparisonPolicy::load_json(tmp.path()).expect("load partial policy");
+        assert_eq!(loaded.default_percent, Some(7.5));
+        assert!(loaded.per_metric_percent.is_empty());
+
+        // Only per_metric_percent set → default_percent None.
+        std::fs::write(
+            tmp.path(),
+            r#"{"per_metric_percent": {"worst_spread": 3.0}}"#,
+        )
+        .expect("write per-metric-only policy");
+        let loaded =
+            ComparisonPolicy::load_json(tmp.path()).expect("load per-metric-only policy");
+        assert_eq!(loaded.default_percent, None);
+        assert_eq!(
+            loaded.per_metric_percent.get("worst_spread"),
+            Some(&3.0),
+        );
+    }
+
+    /// End-to-end pin: `compare_rows` with a per-metric policy
+    /// must apply the override for the matching metric AND fall
+    /// through to `default_percent` for every other metric. The
+    /// unit-level `comparison_policy_rel_threshold_resolution_priority`
+    /// test above pins the resolution function in isolation; this
+    /// test runs it through the actual compare_rows pipeline with
+    /// rows that trigger distinct deltas on two metrics, proving
+    /// that `compare_rows` reads `m.name` correctly and hands it
+    /// to `policy.rel_threshold`. A regression that hard-coded a
+    /// single metric name, or passed the wrong name to the
+    /// resolver, would surface here as the wrong regression count.
+    ///
+    /// Fixture:
+    /// - A: `worst_spread = 100`, `worst_median_wake_latency_us = 100`
+    /// - B: `worst_spread = 106` (6% delta, passes the abs gate
+    ///   at 5.0), `worst_median_wake_latency_us = 110` (10%
+    ///   delta).
+    /// - Policy: `default_percent = 20%`, per_metric
+    ///   `worst_spread = 5%`.
+    ///
+    /// Expected: `worst_spread`'s 6% delta beats the 5%
+    /// per-metric override → regression. `worst_median_wake_latency_us`'s
+    /// 10% delta falls under the 20% default → unchanged. Total
+    /// regressions = 1.
+    #[test]
+    fn compare_rows_per_metric_policy_resolves_each_metric_independently() {
+        // Construct rows with both metrics non-default so we can
+        // trigger per-metric and default_percent branches in one
+        // row pair.
+        let mut row_a = cmp_row("t", "tiny-1llc", true, 100.0, 0);
+        row_a.worst_median_wake_latency_us = 100.0;
+        let mut row_b = cmp_row("t", "tiny-1llc", true, 106.0, 0);
+        row_b.worst_median_wake_latency_us = 110.0;
+
+        let mut policy = ComparisonPolicy::uniform(20.0);
+        policy
+            .per_metric_percent
+            .insert("worst_spread".to_string(), 5.0);
+
+        let res = compare_rows(&[row_a], &[row_b], None, &policy);
+
+        let spread_finding = res
+            .findings
+            .iter()
+            .find(|f| f.metric.name == "worst_spread");
+        assert!(
+            spread_finding.is_some(),
+            "worst_spread per-metric override (5%) must fire on 6% \
+             delta; got findings: {:?}",
+            res.findings
+                .iter()
+                .map(|f| f.metric.name)
+                .collect::<Vec<_>>(),
+        );
+        let spread_finding = spread_finding.unwrap();
+        assert!(spread_finding.is_regression, "6% > 5% → regression");
+
+        // worst_median_wake_latency_us has a 10% delta; under
+        // default_percent = 20%, it must be unchanged (not in
+        // findings).
+        let wake_finding = res
+            .findings
+            .iter()
+            .find(|f| f.metric.name == "worst_median_wake_latency_us");
+        assert!(
+            wake_finding.is_none(),
+            "worst_median_wake_latency_us 10% delta must fall \
+             under default_percent 20% and be unchanged. The \
+             regression would indicate `compare_rows` ignored \
+             default_percent for non-per-metric entries; got \
+             finding: {wake_finding:?}",
+        );
+
+        assert_eq!(
+            res.regressions, 1,
+            "exactly one regression expected — the per-metric \
+             spread override should win on spread, and the \
+             default_percent should suppress wake latency. Got: \
+             regressions={}, improvements={}, unchanged={}",
+            res.regressions, res.improvements, res.unchanged,
         );
     }
 
@@ -2242,7 +2771,7 @@ mod tests {
             cmp_row("t", "tiny-1llc", true, 29.0, 0),
         ];
         let rows_b = vec![cmp_row("t", "tiny-1llc", true, 30.0, 0)];
-        let res = compare_rows(&rows_a, &rows_b, None, None);
+        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
         assert_eq!(res.regressions, 1, "first match (spread=10) must win");
         let spread = res
             .findings
@@ -2285,7 +2814,7 @@ mod tests {
 
         let rows_a = vec![a_llc, a_borrow];
         let rows_b = vec![b_borrow, b_llc];
-        let res = compare_rows(&rows_a, &rows_b, None, None);
+        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
 
         // Each flag profile's spread moved by 90 → one regression
         // (llc 10→100) and one improvement (borrow 100→10).
@@ -2319,14 +2848,14 @@ mod tests {
         ];
         // Without a filter, beta's failed row contributes
         // skipped_failed=1.
-        let unfiltered = compare_rows(&rows_a, &rows_b, None, None);
+        let unfiltered = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
         assert_eq!(unfiltered.skipped_failed, 1);
         assert_eq!(unfiltered.regressions, 1, "alpha still regresses");
 
         // Filtering to "alpha" excludes beta entirely; the failed row
         // is filtered out before the passed gate runs, so
         // skipped_failed=0.
-        let filtered = compare_rows(&rows_a, &rows_b, Some("alpha"), None);
+        let filtered = compare_rows(&rows_a, &rows_b, Some("alpha"), &ComparisonPolicy::default());
         assert_eq!(filtered.skipped_failed, 0);
         assert_eq!(filtered.regressions, 1);
         assert_eq!(filtered.findings.len(), 1);
@@ -2349,7 +2878,7 @@ mod tests {
         let mut b2 = cmp_row("test2", "tiny-1llc", true, 30.0, 0);
         b2.scheduler = "scx_beta".into();
 
-        let res = compare_rows(&[a1, a2], &[b1, b2], Some("scx_alpha"), None);
+        let res = compare_rows(&[a1, a2], &[b1, b2], Some("scx_alpha"), &ComparisonPolicy::default());
         assert_eq!(res.regressions, 1, "only the scx_alpha row compares");
         assert_eq!(res.findings.len(), 1);
         assert_eq!(res.findings[0].scenario, "test1");
@@ -2376,7 +2905,7 @@ mod tests {
             cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
             cmp_row("beta", "tiny-1llc", true, 30.0, 0),
         ];
-        let res = compare_rows(&rows_a, &rows_b, None, None);
+        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
         assert_eq!(res.regressions, 1, "alpha regresses on worst_spread");
         assert_eq!(res.new_in_b, 1, "beta is new on B side");
         assert_eq!(res.removed_from_a, 1, "gamma is removed on B side");
@@ -2399,7 +2928,7 @@ mod tests {
 
         // Filter to "alpha" -- beta and gamma are excluded by the
         // substring filter on both passes.
-        let res = compare_rows(&rows_a, &rows_b, Some("alpha"), None);
+        let res = compare_rows(&rows_a, &rows_b, Some("alpha"), &ComparisonPolicy::default());
         assert_eq!(res.regressions, 1);
         assert_eq!(res.new_in_b, 0, "beta is filtered out, not new");
         assert_eq!(res.removed_from_a, 0, "gamma is filtered out, not removed");
@@ -2646,8 +3175,14 @@ mod tests {
         // find the fixtures we just laid down and return Ok. A
         // broken threading would fall back to `runs_root()`, fail
         // to find `runs_root()/__dir_thread_a__`, and bail.
-        let exit = compare_runs(run_a, run_b, None, None, Some(alt_root.path()))
-            .expect("compare_runs must resolve runs under the dir arg");
+        let exit = compare_runs(
+            run_a,
+            run_b,
+            None,
+            &ComparisonPolicy::default(),
+            Some(alt_root.path()),
+        )
+        .expect("compare_runs must resolve runs under the dir arg");
         assert_eq!(
             exit, 0,
             "both fixtures are byte-identical copies of \
@@ -2667,7 +3202,7 @@ mod tests {
         // above actually went through the Some(d) arm rather than
         // happening to work because runs_root() also had these
         // names.
-        let err = compare_runs(run_a, run_b, None, None, None)
+        let err = compare_runs(run_a, run_b, None, &ComparisonPolicy::default(), None)
             .expect_err("compare_runs without --dir must fail on missing unique fixtures");
         let rendered = format!("{err:#}");
         assert!(
