@@ -1508,12 +1508,28 @@ impl WorkloadHandle {
                     // with EBUSY. SIGKILL is the only safe choice: it
                     // cannot be masked and runs before any of this child's
                     // destructors execute (good — those destructors still
-                    // reference the parent's guard). The call is
-                    // async-signal-safe (in the post-fork AS-safe list per
-                    // signal-safety(7)) so running it here before STOP's
-                    // atomic store and the sigaction install is fine.
+                    // reference the parent's guard). prctl is NOT listed
+                    // as async-signal-safe by signal-safety(7); safe to
+                    // call here because this is a single-threaded
+                    // post-fork child before any signal handlers are
+                    // installed, so no interleaving can observe partial
+                    // state.
                     unsafe {
                         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    }
+                    // Fork-race close: if the parent died between fork()
+                    // return and the prctl above, this child was already
+                    // reparented (typically to pid 1) before PDEATHSIG
+                    // was armed — the death signal is keyed on the CURRENT
+                    // parent, not the parent-at-fork-time, so the signal
+                    // will never fire. getppid() == 1 means we are already
+                    // orphaned; exit now instead of running the full
+                    // worker loop only to leak into init. Using `_exit`
+                    // (async-signal-safe) rather than `exit` so Rust
+                    // destructors that reference the parent's now-dead
+                    // guard don't run on the fork stack.
+                    if unsafe { libc::getppid() } == 1 {
+                        unsafe { libc::_exit(0); }
                     }
                     // Make this worker its own process-group leader so
                     // any descendants it spawns inherit `pgid == worker_pid`.
@@ -1872,19 +1888,27 @@ impl WorkloadHandle {
             // `WorkerExitInfo::TimedOut` without retaining the final
             // status (the reap itself is the diagnostic — the child
             // was past its deadline).
+            //
+            // Unconditional killpg: BOTH branches sweep the worker's
+            // process group so descendants forked by a
+            // [`WorkType::Custom`] body (or any future work type that
+            // spawns helpers) die with the worker. A graceful-exit
+            // worker that forked a long-running grandchild would
+            // otherwise leave the grandchild alive — setpgid(0, 0) at
+            // fork time gives us pgid == worker pid, and killpg is a
+            // no-op (ESRCH) once all members have exited. The
+            // StillAlive branch additionally direct-kills + blocking-
+            // waits the leader; the graceful branch keeps `waited`
+            // because the leader's exit status is already known and
+            // is what classify_wait_outcome should see.
+            let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
             let exit_info_source: Result<nix::sys::wait::WaitStatus, nix::errno::Errno> =
                 if still_running {
-                    // killpg reaches any descendants the worker forked
-                    // (Custom closures, ForkExit grandchildren caught
-                    // mid-fork) — the worker set up its own pgid at
-                    // spawn, so pgid == worker pid. Issue killpg BEFORE
-                    // the direct kill so descendants start dying in
-                    // parallel with the leader; the follow-up `kill`
-                    // is the single-process fallback when the worker's
+                    // Leader still up: direct-kill + blocking reap. The
+                    // killpg above has already started dying descendants
+                    // in parallel; the follow-up `kill` is the single-
+                    // process fallback when the worker's
                     // `setpgid(0, 0)` at fork time somehow failed.
-                    // ESRCH is expected if the group no longer exists
-                    // (all members, including the leader, already exited).
-                    let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::wait::waitpid(npid, None);
                     Ok(nix::sys::wait::WaitStatus::StillAlive)
@@ -3337,6 +3361,40 @@ mod tests {
         // shorten to "CpuSpin". The helper pins exact case-insensitive
         // equality, not prefix or substring semantics.
         assert!(WorkType::suggest("cpu").is_none());
+    }
+
+    /// Surrounding / embedded whitespace must NOT silently resolve
+    /// to a canonical name. The helper's doc commits to strict
+    /// (non-trimming) matching so a caller that passes unsanitized
+    /// user input like `" CpuSpin"` or `"CpuSpin\n"` sees `None` —
+    /// callers are expected to `s.trim()` first (same convention
+    /// [`WorkType::from_name`] follows). If this test ever starts
+    /// failing because [`suggest`] returns `Some(_)` for a whitespace-
+    /// padded input, the helper's behavior has drifted away from its
+    /// documented contract.
+    #[test]
+    fn suggest_rejects_whitespace_padded_inputs() {
+        // Leading / trailing ASCII space.
+        assert!(WorkType::suggest(" CpuSpin").is_none());
+        assert!(WorkType::suggest("CpuSpin ").is_none());
+        assert!(WorkType::suggest(" CpuSpin ").is_none());
+        // Trailing newline (typical for unsanitized fgets / read_line
+        // output).
+        assert!(WorkType::suggest("CpuSpin\n").is_none());
+        // Tab separators on either side.
+        assert!(WorkType::suggest("\tCpuSpin").is_none());
+        assert!(WorkType::suggest("CpuSpin\t").is_none());
+        // Embedded whitespace inside an otherwise-known name also
+        // fails — the helper is NOT doing fuzzy tokenization.
+        assert!(WorkType::suggest("Cpu Spin").is_none());
+        // Pure whitespace input returns None (parallels the empty-
+        // string case pinned in `suggest_is_case_insensitive_and_canonical`).
+        assert!(WorkType::suggest(" ").is_none());
+        assert!(WorkType::suggest("\n").is_none());
+        // Sanity check: the same input without whitespace does
+        // resolve, confirming the rejection is specifically about
+        // the whitespace and not an unrelated regression.
+        assert_eq!(WorkType::suggest("CpuSpin"), Some("CpuSpin"));
     }
 
     #[test]
@@ -5319,6 +5377,35 @@ mod tests {
         std::env::temp_dir().join(format!("ktstr-sigusr1-ignore-ready-{pid}"))
     }
 
+    /// Shared post-fork prologue for test WorkType closures: installs
+    /// `SIG_IGN` for SIGUSR1 so stop_and_collect cannot flip STOP via
+    /// the signal path, then returns the current pid (which doubles as
+    /// the worker's tid on Linux because [`WorkloadHandle::spawn`]
+    /// forks one process per worker). Factored out of the two custom
+    /// closures that share this opening; both forks land in a
+    /// single-threaded child where `libc::signal` is safe.
+    fn ignore_sigusr1_and_get_pid() -> libc::pid_t {
+        unsafe {
+            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+        }
+        unsafe { libc::getpid() }
+    }
+
+    /// Sleep-based deadline loop shared by the SIGUSR1-ignoring test
+    /// closures. Returns when either `stop` flips (SIGUSR1 handler
+    /// path, never fires under SIG_IGN — kept honest) or
+    /// `secs` elapse. Uses `thread::sleep(10ms)` rather than
+    /// `spin_loop()`: the closures' purpose is to outlive
+    /// stop_and_collect's 5s collection deadline, not to respond to
+    /// cache-coherent store visibility at CPU speed, so a ~100x lower
+    /// CPU footprint is strictly better under CI contention.
+    fn wait_for_deadline(stop: &AtomicBool, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Poll for `path`'s appearance with a deadline, aborting early if
     /// `liveness_pid` dies before the file is written. `kill(pid, 0)` is
     /// the POSIX existence probe — Err means the pid is gone (or the
@@ -5360,10 +5447,7 @@ mod tests {
     /// true via the handler, and even code that checks STOP spins
     /// past the deadline.
     fn ignores_sigusr1_fn(stop: &AtomicBool) -> WorkerReport {
-        unsafe {
-            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
-        }
-        let tid: libc::pid_t = unsafe { libc::getpid() };
+        let tid = ignore_sigusr1_and_get_pid();
         // Readiness handshake: after SIG_IGN is installed, write a
         // zero-byte ready file so the parent can proceed without
         // waiting on a fixed-duration sleep. Without the handshake
@@ -5375,14 +5459,12 @@ mod tests {
         // below for the reader side.
         let ready_path = ready_file_path(tid);
         let _ = std::fs::write(&ready_path, []);
-        // Spin for 7s — well past stop_and_collect's 5s shared
-        // deadline. The `!stop.load` check is kept honest (no infinite
-        // loop) but is only observed via the fallback timeout: with
-        // SIG_IGN in place, the parent's SIGUSR1 doesn't flip STOP.
-        let deadline = Instant::now() + Duration::from_secs(7);
-        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-            std::hint::spin_loop();
-        }
+        // Wait 7s — well past stop_and_collect's 5s shared deadline.
+        // The `!stop.load` check is kept honest inside
+        // `wait_for_deadline` (no infinite loop) but is only
+        // observed via the fallback timeout: with SIG_IGN in place,
+        // the parent's SIGUSR1 doesn't flip STOP.
+        wait_for_deadline(stop, 7);
         // Report body is never observed — the parent SIGKILLs the
         // worker before any `f.write_all(&json)` could run. Per the
         // `WorkerReport` doc, sentinel-shape constructions use
@@ -5495,10 +5577,10 @@ mod tests {
     /// Custom WorkType closure that forks a long-running grandchild
     /// (`/bin/sleep 60` via `execv`) and ignores `SIGUSR1` on the
     /// parent-worker side so stop_and_collect is forced into its
-    /// StillAlive escalation branch — the only stop_and_collect
-    /// branch that invokes killpg (Drop also issues killpg on handle
-    /// teardown). Pairs with the
-    /// `stop_and_collect_reaps_custom_grandchild_via_process_group`
+    /// StillAlive escalation branch. Both stop_and_collect branches
+    /// (StillAlive and graceful-exit) now issue killpg unconditionally,
+    /// and Drop issues a third killpg on handle teardown. Pairs with
+    /// the `stop_and_collect_reaps_custom_grandchild_via_process_group`
     /// test below.
     ///
     /// The `execv` after fork is deliberate: spawning `/bin/sleep` as
@@ -5508,10 +5590,7 @@ mod tests {
     fn forks_grandchild_sleep_fn(stop: &AtomicBool) -> WorkerReport {
         // Ignore SIGUSR1 so stop_and_collect escalates — matches
         // ignores_sigusr1_fn's rationale.
-        unsafe {
-            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
-        }
-        let worker_pid: libc::pid_t = unsafe { libc::getpid() };
+        let worker_pid = ignore_sigusr1_and_get_pid();
         // Fork a grandchild; the parent-worker keeps spinning.
         let gpid = unsafe { libc::fork() };
         if gpid < 0 {
@@ -5562,14 +5641,12 @@ mod tests {
             );
             unsafe { libc::_exit(127); }
         }
-        // Spin past the 5s collection deadline so stop_and_collect
+        // Wait past the 5s collection deadline so stop_and_collect
         // escalates to SIGKILL → killpg. The `!stop.load` check is
-        // kept honest even though SIG_IGN prevents SIGUSR1 from
-        // flipping it; the 7s deadline is the real terminator.
-        let deadline = Instant::now() + Duration::from_secs(7);
-        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-            std::hint::spin_loop();
-        }
+        // kept honest inside `wait_for_deadline` even though SIG_IGN
+        // prevents SIGUSR1 from flipping STOP; the 7s deadline is
+        // the real terminator.
+        wait_for_deadline(stop, 7);
         WorkerReport {
             tid: worker_pid,
             ..WorkerReport::default()
@@ -5584,11 +5661,12 @@ mod tests {
     /// ESRCH after collection.
     ///
     /// The SIGUSR1 ignore forces stop_and_collect into its StillAlive
-    /// escalation branch. This test covers only the stop_and_collect
-    /// StillAlive path; the graceful-exit and Drop paths are separate
-    /// code paths (Drop issues its own killpg on handle teardown;
-    /// graceful-exit in stop_and_collect does not currently sweep the
-    /// process group).
+    /// escalation branch. This test pins the StillAlive path. The
+    /// graceful-exit and Drop paths sweep the group via their own
+    /// killpg invocations (now unconditional in both stop_and_collect
+    /// branches; Drop additionally sweeps on handle teardown), but
+    /// dedicated coverage for those paths is not yet exercised by any
+    /// test.
     #[test]
     fn stop_and_collect_reaps_custom_grandchild_via_process_group() {
         let config = WorkloadConfig {
@@ -5679,7 +5757,13 @@ mod tests {
         loop {
             match nix::sys::signal::kill(nix::unistd::Pid::from_raw(gpid), None) {
                 Err(nix::errno::Errno::ESRCH) => break,
-                Err(e) => panic!("unexpected errno from existence probe: {e}"),
+                Err(e) => panic!(
+                    "unexpected errno from existence probe: {e} \
+                     (common non-ESRCH errnos: EPERM = caller may not \
+                     signal this process despite it existing; EINVAL = \
+                     invalid signal number, which cannot happen here \
+                     since we pass None / signal 0)",
+                ),
                 Ok(()) => {
                     match nix::sys::wait::waitpid(
                         nix::unistd::Pid::from_raw(gpid),
