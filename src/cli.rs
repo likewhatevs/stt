@@ -3588,7 +3588,25 @@ mod tests {
     /// empty and unparseable `active_prefixes` branches are pinned by
     /// sibling `is_eol_` tests. A 7th case fixes the `version == "-"`
     /// short-circuit at cli.rs where a missing version skips the EOL
-    /// tag even under a non-empty active list.
+    /// tag even under a non-empty active list. A 10th case (c10) pins
+    /// the end-to-end RC-version render: an entry whose version
+    /// carries an `-rc` suffix must have that suffix stripped by
+    /// [`version_prefix`] before the active-prefix compare, so an RC
+    /// whose stripped series IS active emits no `(EOL)` tag. Sibling
+    /// unit tests (`version_prefix_strips_rc_suffix`,
+    /// `is_eol_rc_suffix_mismatch_does_not_flag`) pin the pieces; c10
+    /// pins the assembled behavior through `format_entry_row` itself
+    /// so a regression that bypasses `is_eol` in the render path is
+    /// still caught. An 11th case (c11) pins the complementary
+    /// negative: an RC whose stripped series is NOT in the active
+    /// list must emit `(EOL)`, catching a regression that skips
+    /// the active-list compare entirely for RC versions (e.g. an
+    /// early `if has_rc(v) { return false }` short-circuit).
+    /// c10 and c11 guard different regressions: c10 catches
+    /// "suffix left attached to the compare key" (6.14-rc2 would
+    /// miss the 6.14 prefix), c11 catches "RC compare skipped"
+    /// (since 7.0 is absent from the active list either way, only
+    /// a skipped compare suppresses its EOL tag).
     ///
     /// Inline snapshot captures exact padding and tag ordering so any
     /// drift — column width change, tag reorder, `(EOL)` string
@@ -3598,9 +3616,13 @@ mod tests {
     /// payload fields for every variant, so source choice only
     /// affects the rendered column when the Display impl changes.
     /// Fixed `built_at` timestamp keeps the snapshot date-stable.
-    /// Key lengths vary (12-20 chars) but all fit within the 48-char
-    /// column, so padding drift surfaces at multiple pad counts
-    /// across c1-c7.
+    /// Key lengths vary (10-20 chars) across c1-c7, c10, and c11;
+    /// all fit within the 48-char column, so padding drift surfaces
+    /// at multiple pad counts. c8 and c9 pin column-boundary
+    /// behavior: c8 is exactly 48 chars to verify the `:<48` pad
+    /// emits no truncation at the column edge, and c9 is 59 chars
+    /// so the key overflows the nominal column to stress the
+    /// min-width (not fixed-width) semantics.
     #[test]
     fn format_entry_row_renders_eol_kconfig_matrix() {
         use crate::cache::{CacheArtifacts, CacheDir, KernelMetadata, KernelSource};
@@ -3660,6 +3682,24 @@ mod tests {
             build_row("c7-active-no-version", None, Some(current_hash)),
             build_row(c8_key, Some("6.14.2"), Some(current_hash)),
             build_row(c9_key, Some("6.14.2"), Some(current_hash)),
+            // c10: RC version whose stripped series (`6.14`) is in
+            // `active_prefixes` — must render the raw `6.14-rc2`
+            // string in the version column with NO `(EOL)` tag.
+            // Proves `version_prefix` strips the `-rc2` suffix inside
+            // `format_entry_row`'s `entry_is_eol` call, not only in
+            // the unit-tested helper.
+            build_row("c10-active-rc", Some("6.14-rc2"), Some(current_hash)),
+            // c11: RC version whose stripped series (`7.0`) is NOT
+            // in `active_prefixes` — must render the raw `7.0-rc1`
+            // string AND carry the `(EOL)` tag. Guards specifically
+            // against a regression that skips the active-list
+            // compare for RC versions (e.g. an early-return
+            // `if has_rc(v) { return false }` in the EOL path).
+            // "Suffix left attached" regressions are c10's job —
+            // c11 does not detect them because `7.0` is absent
+            // from the active list regardless of whether the
+            // compare key is `7.0` or `7.0-rc1`.
+            build_row("c11-eol-rc", Some("7.0-rc1"), Some(current_hash)),
         ];
         let joined = rows.join("\n");
         insta::assert_snapshot!(joined, @r"
@@ -3672,6 +3712,8 @@ mod tests {
           c7-active-no-version                             -            tarball  x86_64  2026-04-12T10:00:00Z
           c8-long-key-exactly-forty-eight-chars-xxxxxxxxxx 6.14.2       tarball  x86_64  2026-04-12T10:00:00Z
           c9-key-longer-than-forty-eight-chars-by-twelve-xxxxxxxxxxxx 6.14.2       tarball  x86_64  2026-04-12T10:00:00Z
+          c10-active-rc                                    6.14-rc2     tarball  x86_64  2026-04-12T10:00:00Z
+          c11-eol-rc                                       7.0-rc1      tarball  x86_64  2026-04-12T10:00:00Z (EOL)
         ");
     }
 
