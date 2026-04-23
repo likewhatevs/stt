@@ -86,6 +86,51 @@ impl SchedulerSpec {
             SchedulerSpec::KernelBuiltin { .. } => "kernel",
         }
     }
+
+    /// Best-effort git commit of the scheduler binary used for this
+    /// run, or `None` when the commit cannot be determined honestly.
+    ///
+    /// Currently ALWAYS returns `None`. The field is reserved on the
+    /// sidecar schema so stats tooling can enrich it once a reliable
+    /// source exists, but no variant today has one:
+    ///
+    /// - `Eevdf` — no userspace scheduler binary at all. Kernel
+    ///   default; the running kernel's identity belongs in
+    ///   `host.kernel_release`, not here.
+    /// - `Discover(_)` — `resolve_scheduler` has a 5-path cascade
+    ///   (`KTSTR_SCHEDULER` env override → sibling of the ktstr
+    ///   binary → `target/debug/` → `target/release/` → cargo
+    ///   rebuild fallback). Only the rebuild path guarantees the
+    ///   resulting binary was built from the current tree; the
+    ///   four pre-built discovery paths can point at a binary
+    ///   whose commit does NOT match `crate::GIT_HASH`. Returning
+    ///   `Some(GIT_HASH)` would be a lie in 4 of 5 cases and would
+    ///   silently attribute regressions to the wrong commit. A
+    ///   future enhancement can probe the binary itself (e.g.
+    ///   `--version` output, an ELF note) and return `Some(..)`
+    ///   ONLY when the actual commit is introspected; until then,
+    ///   `None` is the only honest answer.
+    /// - `Path(p)` — arbitrary externally-built binary. No
+    ///   reliable introspection path (no shared ABI, no required
+    ///   `--version` format).
+    /// - `KernelBuiltin` — in-kernel scheduler, no userspace
+    ///   binary commit to record.
+    ///
+    /// Returning `None` rather than `Some("unknown")` keeps the
+    /// sidecar schema's nullable semantics honest: `stats compare`
+    /// distinguishes "unset" from "set to a sentinel" without a
+    /// magic string, and a future enhancement that learns to
+    /// introspect a scheduler binary can flip a single arm to
+    /// `Some(..)` without retrofitting consumers to strip a
+    /// sentinel.
+    pub const fn scheduler_commit(&self) -> Option<&'static str> {
+        match self {
+            SchedulerSpec::Eevdf
+            | SchedulerSpec::Discover(_)
+            | SchedulerSpec::Path(_)
+            | SchedulerSpec::KernelBuiltin { .. } => None,
+        }
+    }
 }
 
 /// A `key=value` sysctl applied to the guest before the scheduler
@@ -964,6 +1009,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let entry = KtstrTestEntry {
             name: "payload_entry",
@@ -986,6 +1033,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         // stress-ng emits progress / metrics / summaries to stderr; stdout
         // is blank. `OutputFormat::Json` yields zero metrics — stdout has
@@ -1004,6 +1053,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let entry = KtstrTestEntry {
             name: "multi_workload",
@@ -1031,6 +1082,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1069,6 +1122,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         // stress-ng emits progress / metrics / summaries to stderr; stdout
         // is blank. `OutputFormat::Json` yields zero metrics — stdout has
@@ -1087,6 +1142,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1546,6 +1603,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let entry = KtstrTestEntry {
             name: "bad_required",
@@ -1568,6 +1627,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let entry = KtstrTestEntry {
             name: "bad_both",
@@ -1614,6 +1675,83 @@ mod tests {
         );
     }
 
+    // -- SchedulerSpec::scheduler_commit --
+    //
+    // Conservative by design: only `Discover(_)` returns Some
+    // (workspace-built via `cargo build` → `crate::GIT_HASH`
+    // is authoritative). Every other variant returns None — the
+    // sidecar's nullable semantics distinguish "unset" from a
+    // sentinel so consumers can tell "no userspace binary" from
+    // "external binary, commit unknown." See the method doc for
+    // the full rationale.
+
+    #[test]
+    fn scheduler_commit_eevdf_returns_none() {
+        assert!(
+            SchedulerSpec::Eevdf.scheduler_commit().is_none(),
+            "Eevdf has no userspace binary — scheduler_commit must \
+             be None so the sidecar field distinguishes this case \
+             from `Path(_)` (external, unknown commit). Got: {:?}",
+            SchedulerSpec::Eevdf.scheduler_commit(),
+        );
+    }
+
+    #[test]
+    fn scheduler_commit_discover_returns_none() {
+        // `Discover` is resolved by `resolve_scheduler`'s 5-path
+        // cascade. Only the rebuild fallback guarantees the binary
+        // matches the current tree; the four pre-built discovery
+        // paths (KTSTR_SCHEDULER env, ktstr-binary sibling dir,
+        // target/debug/, target/release/) can pick up a binary
+        // whose commit does NOT match `crate::GIT_HASH`. Returning
+        // `Some(GIT_HASH)` would be a lie in 4 of 5 cases — so the
+        // honest answer today is `None`. A future enhancement that
+        // probes the binary (e.g. `--version`, ELF note) can flip
+        // this to `Some(..)` when an authoritative commit is
+        // available; until then, `None` keeps consumers from
+        // attributing regressions to the wrong commit.
+        assert!(
+            SchedulerSpec::Discover("scx_mitosis")
+                .scheduler_commit()
+                .is_none(),
+            "Discover(_) must return None — resolve_scheduler's \
+             cascade can pick up a binary whose commit doesn't \
+             match the workspace. Got: {:?}",
+            SchedulerSpec::Discover("scx_mitosis").scheduler_commit(),
+        );
+    }
+
+    #[test]
+    fn scheduler_commit_path_returns_none() {
+        // External binaries have no reliable introspection path;
+        // returning Some(GIT_HASH) here would be a lie when the
+        // binary was built from a different tree.
+        assert!(
+            SchedulerSpec::Path("/usr/bin/scx_external").scheduler_commit().is_none(),
+            "Path(_) points at an externally-built binary — \
+             scheduler_commit must be None so consumers don't treat \
+             a fabricated commit as authoritative. Got: {:?}",
+            SchedulerSpec::Path("/usr/bin/scx_external").scheduler_commit(),
+        );
+    }
+
+    #[test]
+    fn scheduler_commit_kernel_builtin_returns_none() {
+        // In-kernel schedulers have no userspace binary. The
+        // running kernel's identity belongs in
+        // `host.kernel_release`, not here.
+        let spec = SchedulerSpec::KernelBuiltin {
+            enable: &[],
+            disable: &[],
+        };
+        assert!(
+            spec.scheduler_commit().is_none(),
+            "KernelBuiltin has no userspace binary — \
+             scheduler_commit must be None. Got: {:?}",
+            spec.scheduler_commit(),
+        );
+    }
+
     // -- all_include_files aggregation tests --
     //
     // Pins the scheduler → payload → workloads → extras order. The
@@ -1650,6 +1788,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &["sched-helper"],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         static PRIMARY: crate::test_support::Payload = crate::test_support::Payload {
             name: "primary",
@@ -1659,6 +1799,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &["fio"],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         static WL_A: crate::test_support::Payload = crate::test_support::Payload {
             name: "wl_a",
@@ -1668,6 +1810,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &["stress-ng"],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         static WL_B: crate::test_support::Payload = crate::test_support::Payload {
             name: "wl_b",
@@ -1677,6 +1821,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &["schbench"],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         static WORKLOADS: &[&crate::test_support::Payload] = &[&WL_A, &WL_B];
         let entry = KtstrTestEntry {
@@ -1716,6 +1862,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &["sched-helper"],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let entry = KtstrTestEntry {
             name: "t",

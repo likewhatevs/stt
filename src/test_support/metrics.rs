@@ -502,6 +502,158 @@ mod tests {
         assert!(extract_json_region("incomplete {").is_none());
     }
 
+    /// Interaction coverage for the realistic payload scenario:
+    /// the captured stream carries stderr-style bracket noise
+    /// (dmesg-like `[ TIME] message` lines, stress-ng status,
+    /// kernel stacktraces printed with `[...]` prefixes, etc.)
+    /// BEFORE the actual stdout JSON document. The region finder
+    /// scans left-to-right and returns the FIRST balanced
+    /// `{...}` or `[...]` region regardless of what the outer
+    /// content looks like, so a leading `[   0.001234]`-shaped
+    /// token can in fact parse as a valid one-element JSON array
+    /// and masquerade as the payload's data.
+    ///
+    /// Three scenarios pinned here:
+    ///
+    /// 1. `[   0.001234] kernel boot banner {"iops": 100}` —
+    ///    leading bracket parses as a JSON array (`[0.001234]`).
+    ///    `extract_metrics` on this input returns a metric for
+    ///    the array's single element (`0`) keyed by its
+    ///    positional path, NOT the stdout `{"iops": 100}`. This
+    ///    documents the known-limitation behaviour: callers that
+    ///    need robust stderr-noise rejection must pre-strip
+    ///    timestamped brackets before handing the blob to
+    ///    `extract_metrics`. The comment on the Metric-source
+    ///    paths should make this contract explicit.
+    ///
+    /// 2. Stderr noise that is NOT self-balancing (an open
+    ///    bracket without its closer: `[FAIL stress-ng ...`) —
+    ///    the finder commits to the first opener and returns
+    ///    `None` rather than retrying past its failure point.
+    ///    Stdout JSON that follows the unbalanced prefix is LOST,
+    ///    not recovered. Documents a known limitation: the finder
+    ///    has no fallback-search after a failed region.
+    ///
+    /// 3. Stderr noise with BALANCED brackets containing
+    ///    non-numeric content (`[stderr] message`) — JSON parse
+    ///    on the bracket slice fails (not a number/bool/null/etc.
+    ///    inside), `find_and_parse_json` falls back from its
+    ///    region to `None` since `extract_json_region` only
+    ///    returns the first region it finds. This also documents
+    ///    a known-limitation: the finder stops at the first
+    ///    balanced region even if it's unparseable, so the
+    ///    following valid JSON is lost. Callers handle this by
+    ///    ensuring the payload doesn't co-mingle streams.
+    ///
+    /// Each scenario documents expected behaviour, not desired
+    /// behaviour. If a future change adds a "skip unparseable
+    /// regions and keep scanning" rule, scenario (3) here will
+    /// flip — the `[stderr bracket message]` region fails to
+    /// parse as JSON, so a richer extractor would advance past
+    /// it to the stdout `{..}`. Scenario (1) would NOT flip
+    /// under that rule alone: `[   0.001234]` IS valid JSON (a
+    /// single-element array), so an "unparseable-skip" heuristic
+    /// never triggers on it. Correcting scenario (1) requires a
+    /// stronger rule — e.g. prefer regions whose shape matches
+    /// the payload's expected metric keys, or reject numeric-
+    /// leaf-only regions that lack object wrappers. Scenario
+    /// (1)'s flip is therefore the correct signal that
+    /// `extract_metrics` gained shape-aware selection, not just
+    /// unparseable-skip.
+    #[test]
+    fn extract_json_region_stdout_json_after_stderr_bracket_noise() {
+        // Scenario 1: dmesg-style timestamp prefix `[  0.123]`
+        // parses as a one-element JSON array.
+        let scenario_1 = "[   0.001234] kernel boot banner\n{\"iops\": 100}";
+        let first_region = extract_json_region(scenario_1)
+            .expect("dmesg-style prefix starts with `[` — finder must return SOME region");
+        assert_eq!(
+            first_region, "[   0.001234]",
+            "left-to-right scan picks the FIRST balanced region; \
+             the dmesg prefix is self-balancing and wins over the \
+             stdout JSON that follows",
+        );
+        // End-to-end: `extract_metrics` on the same input should
+        // emit a metric derived from the leading array, not from
+        // the stdout `{"iops": 100}`. This pins that payloads
+        // needing stderr-noise tolerance must pre-strip
+        // timestamps rather than relying on the extractor.
+        let m1 = extract_metrics(scenario_1, &OutputFormat::Json).unwrap();
+        let names_1: Vec<&str> = m1.iter().map(|x| x.name.as_str()).collect();
+        assert!(
+            !names_1.iter().any(|n| *n == "iops"),
+            "regression check: the finder picking up the dmesg \
+             timestamp array means the real stdout `iops` metric \
+             is NOT extracted; if this ever starts containing \
+             `iops`, the finder must have gained smarter \
+             noise-skipping (update this test and the \
+             documented contract); got: {names_1:?}",
+        );
+
+        // Scenario 2: unbalanced stderr prefix (open without
+        // close).
+        //
+        // Note: the current finder terminates on the first opener
+        // and returns None if unbalanced, so this scenario is
+        // documented as EXPECTED behavior: unbalanced stderr
+        // noise causes extraction to fail (return None), even
+        // though stdout JSON is present. The finder does not
+        // implement fallback-search after a failed region.
+        let scenario_2 = "[FAIL stress-ng: worker timed out\n{\"iops\": 200}";
+        let r2 = extract_json_region(scenario_2);
+        assert!(
+            r2.is_none(),
+            "unbalanced leading `[` makes the finder return \
+             None even though valid stdout JSON follows — the \
+             finder commits to the first opener and does not \
+             retry past its failure point. Known limitation; \
+             callers pre-strip stderr noise. Got: {r2:?}",
+        );
+
+        // Scenario 3: balanced stderr region with non-numeric
+        // content (`[stderr message]`). The region PARSES as a
+        // JSON array of... wait, `[stderr message]` without
+        // quotes is not valid JSON. `find_and_parse_json` falls
+        // back when the region doesn't parse. But the extractor
+        // only tries the FIRST region — so the stdout JSON that
+        // follows is lost.
+        let scenario_3 = "[stderr bracket message]\n{\"iops\": 300}";
+        let first_region_3 = extract_json_region(scenario_3).expect(
+            "leading `[stderr bracket message]` is a balanced region \
+             at the byte level (ignoring JSON validity); finder must \
+             return it",
+        );
+        assert_eq!(
+            first_region_3, "[stderr bracket message]",
+            "balanced-but-invalid-JSON regions still win the \
+             first-region scan; the following valid `{{..}}` is \
+             never inspected by the finder",
+        );
+        let m3 = extract_metrics(scenario_3, &OutputFormat::Json).unwrap();
+        assert!(
+            m3.is_empty(),
+            "region parses unsuccessfully as JSON → fallback \
+             yields no metrics. The stdout `iops` metric is lost. \
+             Documents the known limitation: mixed-stream \
+             captures lose valid JSON when a preceding balanced \
+             region fails to parse; got: {m3:?}",
+        );
+
+        // Positive control: the same stdout JSON with NO
+        // preceding noise extracts cleanly, so the failures
+        // above are specifically due to the preceding bracket
+        // noise, not the JSON itself.
+        let m_clean = extract_metrics(r#"{"iops": 400}"#, &OutputFormat::Json).unwrap();
+        let clean_names: Vec<&str> = m_clean.iter().map(|x| x.name.as_str()).collect();
+        assert!(
+            clean_names.iter().any(|n| *n == "iops"),
+            "control: stdout JSON in isolation must extract the \
+             `iops` metric so the preceding assertions above are \
+             isolating the noise-interaction behaviour, not \
+             hiding a broken extractor; got: {clean_names:?}",
+        );
+    }
+
     #[test]
     fn walk_json_leaves_polarity_is_unknown_before_hint_resolution() {
         let v: serde_json::Value = serde_json::from_str(r#"{"a": 1}"#).unwrap();
@@ -1002,6 +1154,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let stdout = r#"{"throughput": 42.5}"#;
         let m = extract_metrics(stdout, &EXAMPLE_PAYLOAD.output).unwrap();

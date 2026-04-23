@@ -52,6 +52,20 @@ pub struct SidecarResult {
     /// Scheduler name (matches `Scheduler::name`); `"eevdf"` for
     /// tests run without an scx scheduler.
     pub scheduler: String,
+    /// Best-effort git commit of the scheduler binary used for this
+    /// run. Currently ALWAYS `None` for every `SchedulerSpec`
+    /// variant — no variant today has a reliable commit source.
+    /// The field is reserved on the schema so stats tooling can
+    /// enrich it once a reliable source exists (e.g. a
+    /// `--version` probe or ELF-note read on the resolved
+    /// scheduler binary). See
+    /// [`crate::test_support::SchedulerSpec::scheduler_commit`]
+    /// for the full per-variant rationale.
+    ///
+    /// Always emitted (`"scheduler_commit": null` on absence);
+    /// required on deserialize — matches every other nullable on
+    /// this struct.
+    pub scheduler_commit: Option<String>,
     /// Binary payload name (matches `Payload::name` when
     /// `entry.payload` is set). `None` when the test declared no
     /// binary payload. Serialized as `"payload": null` in that case;
@@ -182,6 +196,7 @@ impl SidecarResult {
             test_name: "t".to_string(),
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
+            scheduler_commit: None,
             payload: None,
             metrics: Vec::new(),
             passed: true,
@@ -569,8 +584,21 @@ pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
 /// this exact triple; keeping the derivation in one place means a
 /// change to the sidecar schema (e.g. a new scheduler-level field)
 /// shows up in all writers automatically.
-fn scheduler_fingerprint(entry: &KtstrTestEntry) -> (String, Vec<String>, Vec<String>) {
+fn scheduler_fingerprint(
+    entry: &KtstrTestEntry,
+) -> (String, Option<String>, Vec<String>, Vec<String>) {
     let sched_name = entry.scheduler.scheduler_name().to_string();
+    // `entry.scheduler` is a `&Payload` wrapper, not a `&Scheduler`
+    // directly — routing through `scheduler_binary()` returns the
+    // underlying `Option<&SchedulerSpec>` (None for binary-kind
+    // payloads). Flatten with `and_then` so a binary-kind payload
+    // naturally yields `None` without duplicating the
+    // binary-vs-scheduler dispatch logic here.
+    let sched_commit = entry
+        .scheduler
+        .scheduler_binary()
+        .and_then(|s| s.scheduler_commit())
+        .map(|s| s.to_string());
     let sysctls: Vec<String> = entry
         .scheduler
         .sysctls()
@@ -583,7 +611,7 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> (String, Vec<String>, Vec<St
         .iter()
         .map(|s| s.to_string())
         .collect();
-    (sched_name, sysctls, kargs)
+    (sched_name, sched_commit, sysctls, kargs)
 }
 
 /// Compute the per-variant sidecar path and serialize + write the
@@ -720,11 +748,12 @@ pub(crate) fn write_skip_sidecar(
     entry: &KtstrTestEntry,
     active_flags: &[String],
 ) -> anyhow::Result<()> {
-    let (scheduler, sysctls, kargs) = scheduler_fingerprint(entry);
+    let (scheduler, scheduler_commit, sysctls, kargs) = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
         topology: entry.topology.to_string(),
         scheduler,
+        scheduler_commit,
         // A skip never runs the payload. Still record the declared
         // payload name so stats tooling can attribute the skip to
         // the payload-gauntlet variant rather than losing the
@@ -777,11 +806,12 @@ pub(crate) fn write_sidecar(
     active_flags: &[String],
     payload_metrics: &[PayloadMetrics],
 ) -> anyhow::Result<()> {
-    let (scheduler, sysctls, kargs) = scheduler_fingerprint(entry);
+    let (scheduler, scheduler_commit, sysctls, kargs) = scheduler_fingerprint(entry);
     let sidecar = SidecarResult {
         test_name: entry.name.to_string(),
         topology: entry.topology.to_string(),
         scheduler,
+        scheduler_commit,
         payload: entry.payload.map(|p| p.name.to_string()),
         metrics: payload_metrics.to_vec(),
         passed: check_result.passed,
@@ -1065,6 +1095,7 @@ mod tests {
             test_name: "my_test".to_string(),
             topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
+            scheduler_commit: Some("abc123".to_string()),
             payload: None,
             metrics: vec![],
             passed: true,
@@ -1203,6 +1234,7 @@ mod tests {
             test_name: "audit".to_string(),
             topology: "8n8l16c2t".to_string(),
             scheduler: "scx_audit".to_string(),
+            scheduler_commit: Some("deadbeef1234567890abcdef".to_string()),
             payload: Some("audit_payload".to_string()),
             metrics: vec![PayloadMetrics {
                 metrics: vec![Metric {
@@ -1260,6 +1292,13 @@ mod tests {
         assert_eq!(loaded.test_name, "audit");
         assert_eq!(loaded.topology, "8n8l16c2t");
         assert_eq!(loaded.scheduler, "scx_audit");
+        assert_eq!(
+            loaded.scheduler_commit.as_deref(),
+            Some("deadbeef1234567890abcdef"),
+            "scheduler_commit must round-trip the literal string \
+             populated on the write side — not collapse to None via \
+             a missing serde attribute or default fallback",
+        );
         assert_eq!(loaded.payload.as_deref(), Some("audit_payload"));
         assert_eq!(loaded.metrics.len(), 1);
         assert_eq!(loaded.metrics[0].exit_code, 7);
@@ -2201,8 +2240,13 @@ mod tests {
             name: "eevdf_test",
             ..KtstrTestEntry::DEFAULT
         };
-        let (name, sysctls, kargs) = scheduler_fingerprint(&entry);
+        let (name, commit, sysctls, kargs) = scheduler_fingerprint(&entry);
         assert_eq!(name, "eevdf");
+        assert!(
+            commit.is_none(),
+            "Eevdf variant has no userspace binary; \
+             scheduler_commit must be None. Got: {commit:?}",
+        );
         assert!(sysctls.is_empty());
         assert!(kargs.is_empty());
     }
@@ -2223,7 +2267,7 @@ mod tests {
             scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
-        let (name, sysctls, kargs) = scheduler_fingerprint(&entry);
+        let (name, _commit, sysctls, kargs) = scheduler_fingerprint(&entry);
         assert_eq!(name, "s");
         assert_eq!(
             sysctls,
@@ -2246,7 +2290,7 @@ mod tests {
             scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
-        let (_name, sysctls, kargs) = scheduler_fingerprint(&entry);
+        let (_name, _commit, sysctls, kargs) = scheduler_fingerprint(&entry);
         assert_eq!(kargs, vec!["quiet".to_string(), "splash".to_string()]);
         assert!(sysctls.is_empty());
     }
@@ -2263,8 +2307,70 @@ mod tests {
             scheduler: &SCHED_PAYLOAD,
             ..KtstrTestEntry::DEFAULT
         };
-        let (name, _, _) = scheduler_fingerprint(&entry);
+        let (name, commit, _, _) = scheduler_fingerprint(&entry);
         assert_eq!(name, "s");
+        assert!(
+            commit.is_none(),
+            "Discover variant currently returns None via \
+             `SchedulerSpec::scheduler_commit` — \
+             `resolve_scheduler`'s cascade does not guarantee a \
+             fresh build, so `crate::GIT_HASH` is not authoritative \
+             and `scheduler_commit` reports None honestly. Got: \
+             {commit:?}",
+        );
+    }
+
+    /// `scheduler_fingerprint` on a binary-kind `Payload`
+    /// (constructed via `Payload::binary`) must produce
+    /// `commit: None`. The `and_then` chain in `scheduler_fingerprint`
+    /// (`entry.scheduler.scheduler_binary().and_then(|s|
+    /// s.scheduler_commit())`) relies on `Payload::scheduler_binary`
+    /// returning `None` for `PayloadKind::Binary` to short-circuit
+    /// the commit lookup — a regression that accidentally returned
+    /// `Some(&some_default)` from `scheduler_binary` for
+    /// binary-kind payloads would skip this short-circuit and
+    /// populate `scheduler_commit` with a value that has nothing
+    /// to do with a scheduler. This test pins that short-circuit
+    /// end-to-end.
+    ///
+    /// Complements the `scheduler_commit_*` variant tests on
+    /// `SchedulerSpec` itself (which cover the scheduler-kind
+    /// branches) by exercising the binary-kind fallthrough that
+    /// never touches `SchedulerSpec` at all.
+    #[test]
+    fn scheduler_fingerprint_binary_payload_has_no_commit() {
+        static BINARY_PAYLOAD: super::super::payload::Payload =
+            super::super::payload::Payload::binary("bin_test", "some_binary");
+        let entry = KtstrTestEntry {
+            name: "bin_test",
+            scheduler: &BINARY_PAYLOAD,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let (name, commit, sysctls, kargs) = scheduler_fingerprint(&entry);
+        // Per `Payload::scheduler_name`, binary-kind payloads
+        // carry the intent-level label `"kernel_default"` — pinning
+        // this alongside the None-commit keeps the binary-kind
+        // contract visible in one place.
+        assert_eq!(
+            name, "kernel_default",
+            "binary-kind payload must report the intent-level \
+             scheduler label; got: {name:?}",
+        );
+        assert!(
+            commit.is_none(),
+            "binary-kind payload has no scheduler binary at all — \
+             scheduler_commit must be None via the `and_then` \
+             short-circuit on `scheduler_binary() == None`. Got: \
+             {commit:?}",
+        );
+        assert!(
+            sysctls.is_empty(),
+            "binary-kind payload reports no sysctls; got: {sysctls:?}",
+        );
+        assert!(
+            kargs.is_empty(),
+            "binary-kind payload reports no kargs; got: {kargs:?}",
+        );
     }
 
     // -- write_skip_sidecar --
@@ -2466,6 +2572,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -2596,6 +2704,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -2663,6 +2773,39 @@ mod tests {
             sidecar_variant_hash(&without_host),
             sidecar_variant_hash(&with_host),
             "host context must not influence variant hash",
+        );
+    }
+
+    /// `scheduler_commit` is metadata, not a variant discriminator:
+    /// two gauntlet runs differing only in the recorded scheduler
+    /// commit (e.g. same variant re-run after a scheduler rebuild)
+    /// must share one hash bucket so `stats compare` treats them as
+    /// the same semantic variant. If a future change folds
+    /// `scheduler_commit` into `sidecar_variant_hash`, this test
+    /// catches it before the run-key split reaches on-disk sidecars
+    /// and splits previously-comparable runs. Mirrors
+    /// `sidecar_variant_hash_excludes_host_context`.
+    #[test]
+    fn sidecar_variant_hash_excludes_scheduler_commit() {
+        let without_commit = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            scheduler_commit: None,
+            ..SidecarResult::test_fixture()
+        };
+        let with_commit = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            scheduler_commit: Some(
+                "0000000000000000000000000000000000000000".to_string(),
+            ),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&without_commit),
+            sidecar_variant_hash(&with_commit),
+            "scheduler_commit must not influence variant hash — \
+             runs of the same semantic variant on different \
+             scheduler-binary builds must remain comparable by \
+             `stats compare`",
         );
     }
 
