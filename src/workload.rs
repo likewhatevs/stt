@@ -1329,14 +1329,21 @@ impl Drop for SpawnGuard {
 // SAFETY: futex_ptrs and iter_counters are MAP_SHARED anonymous pages
 // created before fork, so every forked child inherits a pointer copy
 // of the same underlying kernel object. Children read/write their own
-// futex word (via `std::ptr::read_volatile`/`write_volatile`) and
-// atomically store into their dedicated iter_counters slot (via
-// `AtomicU64::from_ptr`); the parent reads all slots via
-// `snapshot_iterations` and is the sole process that munmaps the
-// region, on WorkloadHandle::drop after every child has been reaped.
-// No Rust reference is ever shared across processes — only raw
-// pointers into a MAP_SHARED region — so the inherited alias is not
-// an aliasing-rule violation.
+// futex word — via `std::ptr::read_volatile`/`write_volatile` for
+// most WorkType variants, or via `AtomicU32`/`AtomicU64` references
+// re-derived from the raw pointer for FanOutCompute, which needs
+// release-acquire ordering to publish `wake_ns` alongside the
+// generation advance — and atomically store into their dedicated
+// iter_counters slot (via `AtomicU64::from_ptr`); the parent reads
+// all slots via `snapshot_iterations` and is the sole process that
+// munmaps the region, on WorkloadHandle::drop after every child has
+// been reaped. Each process constructs its own process-local
+// `&AtomicU32`/`&AtomicU64` shared reference into the MAP_SHARED
+// page from the inherited raw pointer; no reference ever crosses
+// a process boundary. Interior mutation through a shared atomic
+// reference is permitted by Rust's aliasing model because
+// AtomicU32/AtomicU64 wrap an UnsafeCell, so the inherited alias
+// is not an aliasing-rule violation.
 unsafe impl Send for WorkloadHandle {}
 unsafe impl Sync for WorkloadHandle {}
 
@@ -2653,8 +2660,35 @@ fn worker_main(
                     Some(f) => f,
                     None => break,
                 };
-                // Shared memory layout: [u32 generation @ offset 0] [u64 wake_ns @ offset 8]
+                // Shared memory layout: [u32 generation @ offset 0]
+                // [u64 wake_ns @ offset 8]. The mmap base is
+                // page-aligned (see MAP_ANONYMOUS region allocated
+                // at src/workload.rs:1414), so offset 8 is 8-byte
+                // aligned, which AtomicU64 requires.
                 let wake_ts_ptr = unsafe { (futex_ptr as *mut u8).add(8) as *mut u64 };
+                // Use Release/Acquire ordering so that when workers
+                // observe the generation advance, the matching
+                // wake_ns store is already visible to them.
+                // `read_volatile`/`write_volatile` only defeat
+                // compiler reordering; on aarch64's weak memory
+                // model two independent hazards remain:
+                //   (a) the messenger's two stores (wake_ns, then
+                //       generation) can be reordered by the CPU so
+                //       the generation advance becomes globally
+                //       visible before the new wake_ns; and/or
+                //   (b) the worker's wake_ns load can be
+                //       speculatively issued before its generation
+                //       load and satisfied from a stale cache line.
+                // Either path yields a fresh generation paired with
+                // a stale wake_ns and contaminates the resume-latency
+                // histogram. The futex syscalls operate on the raw
+                // u32 at futex_ptr; AtomicU32 has the same in-memory
+                // representation, so futex_wake/futex_wait keep
+                // working unchanged.
+                let gen_atom =
+                    unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
+                let wake_atom =
+                    unsafe { &*(wake_ts_ptr as *const std::sync::atomic::AtomicU64) };
                 if is_messenger {
                     // Messenger: stamp wake time, advance generation, wake workers.
                     // Advance the generation and wake the workers
@@ -2673,17 +2707,32 @@ fn worker_main(
                     // thread so the messenger keeps producing
                     // work_units.
                     if let Some(wake_ns) = clock_gettime_ns(libc::CLOCK_MONOTONIC) {
-                        unsafe { std::ptr::write_volatile(wake_ts_ptr, wake_ns) };
-                        let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
-                        unsafe {
-                            std::ptr::write_volatile(futex_ptr, next);
-                            futex_wake(futex_ptr, fan_out as i32);
-                        }
+                        // Relaxed wake_ns store is fine; the subsequent
+                        // Release RMW on the generation synchronises
+                        // it with the worker's Acquire load.
+                        wake_atom.store(wake_ns, Ordering::Relaxed);
+                        // fetch_add wraps on u32 overflow and is
+                        // sole-writer here, so one Release RMW beats
+                        // load-Relaxed + store-Release. On aarch64,
+                        // AtomicU32 Release ordering is guaranteed
+                        // by LLVM to lower to a release-ordered
+                        // instruction — LDADDL on LSE-capable cores
+                        // (Armv8.1+), or an LDXR/STLXR retry loop
+                        // on pre-LSE cores where STLXR supplies the
+                        // release barrier. Either way the store-
+                        // release half pairs with the worker's
+                        // Acquire load below.
+                        gen_atom.fetch_add(1, Ordering::Release);
+                        unsafe { futex_wake(futex_ptr, fan_out as i32) };
                     }
                     spin_burst(&mut work_units, 256);
                 } else {
                     // Worker: wait for generation advance, then do work.
-                    let expected = unsafe { std::ptr::read_volatile(futex_ptr) };
+                    // Initial snapshot can be Relaxed — it only feeds
+                    // `futex_wait`'s expected-value check; the real
+                    // happens-before edge is established by the
+                    // Acquire load below once the generation differs.
+                    let expected = gen_atom.load(Ordering::Relaxed);
                     let ts = libc::timespec {
                         tv_sec: 0,
                         tv_nsec: 100_000_000, // 100ms timeout
@@ -2692,7 +2741,7 @@ fn worker_main(
                         if STOP.load(Ordering::Relaxed) {
                             break;
                         }
-                        let cur = unsafe { std::ptr::read_volatile(futex_ptr) };
+                        let cur = gen_atom.load(Ordering::Acquire);
                         if cur != expected {
                             // Skip the reservoir push entirely on
                             // `clock_gettime` failure — previously
@@ -2702,8 +2751,11 @@ fn worker_main(
                             // the resume-latency histogram with values
                             // dominated by wake_ns itself.
                             if let Some(now_ns) = clock_gettime_ns(libc::CLOCK_MONOTONIC) {
-                                let wake_ns =
-                                    unsafe { std::ptr::read_volatile(wake_ts_ptr) };
+                                // Acquire load above synchronises-with
+                                // the messenger's Release store, so
+                                // this wake_ns load sees the value
+                                // paired with `cur`.
+                                let wake_ns = wake_atom.load(Ordering::Relaxed);
                                 let latency = now_ns.saturating_sub(wake_ns);
                                 reservoir_push(
                                     &mut resume_latencies_ns,
@@ -6382,6 +6434,30 @@ mod tests {
         assert!(WorkType::fan_out_compute(4, 256, 5, 100).needs_cache_buf());
     }
 
+    /// Guards two invariants of [`WorkType::FanOutCompute`]:
+    ///
+    /// 1. Every spawned worker produces non-zero `work_units`, and at
+    ///    least one records a wake latency into `resume_latencies_ns`.
+    /// 2. The Release/Acquire ordering between the messenger's
+    ///    `wake_ns` store and its generation advance prevents workers
+    ///    from pairing a fresh generation with a stale or zero-init
+    ///    `wake_ns` — the 10 s latency bound below detects only the
+    ///    zero-init arm of that failure mode (see comment on the
+    ///    bound).
+    ///
+    /// Platform coverage: x86-64 is TSO (store-store and load-load
+    /// reordering are hardware-prohibited), so on x86 CI this test
+    /// cannot reproduce a weak-memory regression of the messenger-
+    /// side store reorder or the worker-side load speculation that
+    /// the Release/Acquire on aarch64 guards against — the hardware
+    /// masks the bug. It still catches implementation bugs that
+    /// surface on any platform, most notably a missing or
+    /// misordered `wake_ns` store that leaves workers reading
+    /// zero-init memory (the 10 s bound trips on `now_ns - 0`).
+    /// Round-over-round reordering cannot be detected by this
+    /// assertion on any platform. Meaningful weak-memory
+    /// regression protection requires running this test on an
+    /// aarch64 runner in CI.
     #[test]
     fn spawn_fan_out_compute_produces_work() {
         let config = WorkloadConfig {
@@ -6410,6 +6486,31 @@ mod tests {
         }
         let has_latencies = reports.iter().any(|r| !r.resume_latencies_ns.is_empty());
         assert!(has_latencies, "workers should record wake latencies");
+        // The 10 s bound catches the zero-init arm of a missing
+        // Release/Acquire pairing: a worker that reads `wake_ns`
+        // before the messenger's first store sees 0, so
+        // `now_ns.saturating_sub(0)` surfaces `CLOCK_MONOTONIC`
+        // (seconds-to-days of monotonic uptime) >> 10 s on any
+        // live machine. It does NOT catch round-over-round
+        // mispairing — a fresh generation paired with the
+        // immediately-prior round's `wake_ns` yields a sub-second
+        // delta that is indistinguishable from a correctly-paired
+        // fast wake. This is a coarse guard against the easy
+        // failure mode, not a full verification of the ordering.
+        const MAX_PLAUSIBLE_LATENCY_NS: u64 = 10_000_000_000;
+        for r in &reports {
+            for &lat in &r.resume_latencies_ns {
+                assert!(
+                    lat < MAX_PLAUSIBLE_LATENCY_NS,
+                    "worker {} recorded implausible wake latency {} ns \
+                     (expected < {} ns); indicates wake_ns/generation \
+                     ordering race",
+                    r.tid,
+                    lat,
+                    MAX_PLAUSIBLE_LATENCY_NS
+                );
+            }
+        }
     }
 
     #[test]
@@ -6435,6 +6536,10 @@ mod tests {
         );
     }
 
+    /// Two-messenger-group variant of the invariants guarded by
+    /// [`spawn_fan_out_compute_produces_work`] — see that test's
+    /// doc for the full Release/Acquire rationale and platform
+    /// coverage notes.
     #[test]
     fn spawn_fan_out_compute_two_groups() {
         let config = WorkloadConfig {
@@ -6461,6 +6566,27 @@ mod tests {
                 "FanOutCompute worker {} did no work",
                 r.tid
             );
+        }
+        // Mirror of the single-group test's latency sanity check —
+        // see `spawn_fan_out_compute_produces_work` for rationale.
+        // The 10 s bound catches the zero-init arm of a missing
+        // Release/Acquire pairing but not round-over-round
+        // mispairing; with two messenger groups running
+        // independently it still provides a coarse smoke test per
+        // group.
+        const MAX_PLAUSIBLE_LATENCY_NS: u64 = 10_000_000_000;
+        for r in &reports {
+            for &lat in &r.resume_latencies_ns {
+                assert!(
+                    lat < MAX_PLAUSIBLE_LATENCY_NS,
+                    "worker {} recorded implausible wake latency {} ns \
+                     (expected < {} ns); indicates wake_ns/generation \
+                     ordering race",
+                    r.tid,
+                    lat,
+                    MAX_PLAUSIBLE_LATENCY_NS
+                );
+            }
         }
     }
 
