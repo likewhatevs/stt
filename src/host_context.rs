@@ -221,6 +221,15 @@ pub struct HostContext {
     /// systems.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_cmdline: Option<String>,
+    /// Running process's jemalloc heap state — active / allocated /
+    /// resident / mapped bytes and arena count. Populated on
+    /// jemalloc-linked builds (every ktstr binary), `None` on
+    /// downstream consumers that use the library without
+    /// installing `tikv_jemallocator` as `#[global_allocator]`. See
+    /// [`HostHeapState`](crate::host_heap::HostHeapState) for the
+    /// field-level documentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heap_state: Option<crate::host_heap::HostHeapState>,
 }
 
 /// Extract the bracketed active policy from a kernel mm
@@ -316,6 +325,7 @@ impl HostContext {
             kernel_cmdline: Some(
                 "BOOT_IMAGE=/boot/vmlinuz-test root=/dev/sda1".to_string(),
             ),
+            heap_state: Some(crate::host_heap::HostHeapState::test_fixture()),
         }
     }
 
@@ -369,6 +379,7 @@ impl HostContext {
             kernel_release,
             arch,
             kernel_cmdline,
+            heap_state,
         } = self;
         fn row<T: std::fmt::Display>(out: &mut String, key: &str, value: Option<&T>) {
             match value {
@@ -412,6 +423,15 @@ impl HostContext {
             }
             Some(_) => out.push_str("sched_tunables: (empty)\n"),
             None => out.push_str("sched_tunables: (unknown)\n"),
+        }
+        match heap_state {
+            Some(h) => {
+                out.push_str("heap_state:\n");
+                for line in h.format_human().lines() {
+                    let _ = writeln!(&mut out, "  {line}");
+                }
+            }
+            None => out.push_str("heap_state: (unknown)\n"),
         }
         out
     }
@@ -479,6 +499,7 @@ impl HostContext {
             kernel_release: a_kernel_release,
             arch: a_arch,
             kernel_cmdline: a_kernel_cmdline,
+            heap_state: a_heap_state,
         } = self;
         let HostContext {
             cpu_model: b_cpu_model,
@@ -497,6 +518,7 @@ impl HostContext {
             kernel_release: b_kernel_release,
             arch: b_arch,
             kernel_cmdline: b_kernel_cmdline,
+            heap_state: b_heap_state,
         } = other;
         fn fmt_opt<T: std::fmt::Display>(v: Option<&T>) -> String {
             match v {
@@ -600,6 +622,26 @@ impl HostContext {
                     "  sched_tunables: {} → {}",
                     summarize_tunables(am),
                     summarize_tunables(bm),
+                );
+            }
+            _ => {}
+        }
+        match (a_heap_state.as_ref(), b_heap_state.as_ref()) {
+            (Some(ah), Some(bh)) => {
+                let inner = ah.diff(bh);
+                if !inner.is_empty() {
+                    out.push_str("  heap_state:\n");
+                    for line in inner.lines() {
+                        let _ = writeln!(&mut out, "    {line}");
+                    }
+                }
+            }
+            (a, b) if a != b => {
+                let _ = writeln!(
+                    &mut out,
+                    "  heap_state: {} → {}",
+                    if a.is_some() { "(present)" } else { "(unknown)" },
+                    if b.is_some() { "(present)" } else { "(unknown)" },
                 );
             }
             _ => {}
@@ -731,6 +773,29 @@ pub fn collect_host_context() -> HostContext {
         kernel_release: static_info.kernel_release,
         arch: static_info.arch,
         kernel_cmdline: read_trimmed_sysfs("/proc/cmdline"),
+        // `heap_state` is a post-run snapshot of the running ktstr
+        // process's jemalloc footprint. Captured here alongside the
+        // other dynamic fields so sidecar consumers can correlate
+        // test outcomes with runner memory pressure. libjemalloc is
+        // linked into every binary in this workspace (hard dep of
+        // `tikv-jemalloc-ctl`), so `collect()` always returns a
+        // populated struct when `#[global_allocator]` is jemalloc.
+        // Downstream consumers using ktstr without jemallocator
+        // installed see `allocated_bytes == Some(0)` and
+        // `active_bytes == Some(0)` because libjemalloc is linked
+        // but unused — collapse that shape to `None` so the sidecar
+        // does not carry a misleading empty row. `arenas.narenas` is
+        // still populated in the collapsed shape but alone carries
+        // no runner-pressure information, so it travels with the
+        // stats that give it meaning.
+        heap_state: {
+            let h = crate::host_heap::collect();
+            if h.allocated_bytes == Some(0) && h.active_bytes == Some(0) {
+                None
+            } else {
+                Some(h)
+            }
+        },
     }
 }
 
@@ -1217,6 +1282,7 @@ mod tests {
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
             kernel_cmdline: Some("preempt=lazy transparent_hugepage=madvise".to_string()),
+            heap_state: Some(crate::host_heap::HostHeapState::test_fixture()),
         };
         let json = serde_json::to_string(&ctx).expect("serialize");
         let decoded: HostContext = serde_json::from_str(&json).expect("deserialize");
@@ -1261,6 +1327,7 @@ mod tests {
             numa_nodes: None,
             cpufreq_governor: BTreeMap::new(),
             kernel_cmdline: None,
+            heap_state: None,
         };
         let json = serde_json::to_string(&ctx).expect("serialize");
         let decoded: HostContext = serde_json::from_str(&json).expect("deserialize");
@@ -1597,7 +1664,7 @@ Hugepagesize:       2048 kB
     /// operator-eye scanning depend on a stable top-to-bottom field
     /// ordering (uname → CPU → memory → hugepages → online_cpus →
     /// NUMA → THP → kernel_cmdline → cpufreq_governor →
-    /// sched_tunables). A silent
+    /// sched_tunables → heap_state). A silent
     /// reorder from a future edit that shuffles the `row(...)`
     /// calls would slip past the existing `.contains(...)` checks,
     /// which are order-blind. This test fails the moment the
@@ -1631,6 +1698,7 @@ Hugepagesize:       2048 kB
                 "kernel_cmdline",
                 "cpufreq_governor",
                 "sched_tunables",
+                "heap_state",
             ],
             "format_human field order drifted — if intentional, update \
              the expected vector and audit downstream diff/scan consumers",
@@ -1664,6 +1732,7 @@ Hugepagesize:       2048 kB
             "thp_defrag",
             "kernel_cmdline",
             "sched_tunables",
+            "heap_state",
         ] {
             assert!(
                 out.contains(&format!("{key}: (unknown)")),

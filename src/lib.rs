@@ -250,6 +250,7 @@ pub mod cli;
 pub(crate) mod elf_strip;
 pub mod fetch;
 pub mod host_context;
+pub mod host_heap;
 pub mod kernel_path;
 pub(crate) mod monitor;
 pub(crate) mod probe;
@@ -351,6 +352,7 @@ pub mod prelude {
     pub use crate::assert::{Assert, AssertResult};
     pub use crate::cgroup::CgroupManager;
     pub use crate::host_context::HostContext;
+    pub use crate::host_heap::HostHeapState;
     pub use crate::ktstr_test;
     pub use crate::scenario::backdrop::Backdrop;
     pub use crate::scenario::flags::FlagDecl;

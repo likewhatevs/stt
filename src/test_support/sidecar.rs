@@ -1227,7 +1227,7 @@ mod tests {
         use crate::host_context::HostContext;
         use crate::monitor::MonitorSummary;
         use crate::monitor::bpf_prog::ProgVerifierStats;
-        use crate::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
+        use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
         use crate::timeline::StimulusEvent;
 
         let sc = SidecarResult {
@@ -1243,6 +1243,7 @@ mod tests {
                     polarity: Polarity::HigherBetter,
                     unit: "audits".to_string(),
                     source: MetricSource::Json,
+                    stream: MetricStream::Stdout,
                 }],
                 exit_code: 7,
             }],
@@ -2517,7 +2518,7 @@ mod tests {
     /// would lose the per-payload provenance the design requires).
     #[test]
     fn sidecar_payload_and_metrics_roundtrip_populated() {
-        use crate::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
+        use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
         let pm = PayloadMetrics {
             metrics: vec![Metric {
                 name: "iops".to_string(),
@@ -2525,6 +2526,7 @@ mod tests {
                 polarity: Polarity::HigherBetter,
                 unit: "iops".to_string(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -2621,7 +2623,7 @@ mod tests {
     /// every `ctx.payload(X).run()` invocation's output in order.
     #[test]
     fn write_sidecar_forwards_payload_metrics_slice() {
-        use crate::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
+        use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
 
         let _lock = lock_env();
         let tmp = std::env::temp_dir().join("ktstr-sidecar-metrics-slice-test");
@@ -2660,6 +2662,7 @@ mod tests {
                     polarity: Polarity::HigherBetter,
                     unit: "iops".to_string(),
                     source: MetricSource::Json,
+                    stream: MetricStream::Stdout,
                 }],
                 exit_code: 0,
             },
@@ -2759,6 +2762,7 @@ mod tests {
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
             kernel_cmdline: Some("preempt=lazy".to_string()),
+            heap_state: None,
         };
         let without_host = SidecarResult {
             topology: "1n1l2c1t".to_string(),
@@ -2841,6 +2845,7 @@ mod tests {
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
             kernel_cmdline: Some("preempt=lazy isolcpus=1-3".to_string()),
+            heap_state: Some(crate::host_heap::HostHeapState::test_fixture()),
         };
         let sc = SidecarResult {
             topology: "1n1l2c1t".to_string(),

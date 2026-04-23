@@ -104,8 +104,22 @@ rustix = { version = "1", features = ["fs", "shm", "system"] }
 strum = { version = "0.27", features = ["derive"] }
 # jemalloc as global allocator for the ktstr/cargo-ktstr binaries.
 # binary-only — the library stays allocator-agnostic so downstream
-# consumers pick their own allocator.
-tikv-jemallocator = { version = "0.6" }
+# consumers pick their own allocator. `stats` feature compiles
+# jemalloc with internal per-allocation bookkeeping so
+# `tikv-jemalloc-ctl`'s `stats.{allocated,active,resident,mapped}`
+# mallctl reads return populated values instead of failing with
+# EPERM; `host_heap::collect` depends on this.
+tikv-jemallocator = { version = "0.6", features = ["stats"] }
+# Safe wrappers for the jemalloc mallctl introspection surface. Used
+# by `host_heap` to capture the running binary's heap footprint
+# (active / allocated / resident / mapped bytes, arena count) as part
+# of the sidecar's HostContext. Reads return `Err` when the linked
+# allocator is not jemalloc, so downstream consumers that do NOT
+# enable `tikv-jemallocator` land the heap state as `None` cleanly.
+# `stats` feature gates the `stats::*` submodule (allocated/active/
+# resident/mapped); without it the submodule is absent at compile
+# time. `arenas::narenas` is exposed unconditionally.
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # SHA-256 for verifying downloaded model-cache artifacts. `gix` pulls
 # in sha1 only; sha2 is a fresh dep and only the model-cache code
 # path needs it, so keep the feature surface minimal.
