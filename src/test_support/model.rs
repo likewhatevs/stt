@@ -686,7 +686,7 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // `status()` already propagates a malformed-pin Err for the
     // cached-file branch (so ensure() never reaches this check with
     // a cached file + malformed pin). This explicit check covers the
-    // no-cache case: status() returned `cached = false` without
+    // no-cache case: status() returned `ShaVerdict::NotCached` without
     // calling `check_sha256`, so without this gate a placeholder
     // (all-`?`) pin would drop through to `fetch` and waste a
     // 2.44 GiB download before the post-download `check_sha256`
@@ -970,10 +970,18 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     Ok(final_path.to_path_buf())
 }
 
+/// Canonical length of a SHA-256 digest rendered as ASCII hex:
+/// 32 bytes × 2 hex chars per byte. Named constant so the length
+/// gate in [`is_valid_sha256_hex`] and the matching diagnostic in
+/// [`validate_sha256_hex`] share one source of truth.
+const SHA256_HEX_LEN: usize = 64;
+
 /// True iff `s` contains only ASCII hex digits (`0-9a-fA-F`).
-/// Length is not checked. Split from [`is_valid_sha256_hex`] so
-/// [`check_sha256`] can pick a non-hex-specific diagnostic without
-/// re-running the length check that the caller already evaluated.
+/// Length is not checked. Shared between [`is_valid_sha256_hex`]
+/// (the const-context bool predicate) and [`validate_sha256_hex`]
+/// (the runtime diagnostic-producing validator); centralizing the
+/// hex check in one const helper prevents drift between the two
+/// surfaces.
 const fn is_all_hex_ascii(s: &str) -> bool {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -987,19 +995,60 @@ const fn is_all_hex_ascii(s: &str) -> bool {
 }
 
 /// Canonical predicate for a well-formed SHA-256 hex pin: exactly
-/// 64 ASCII characters, each a hex digit (`0-9a-fA-F`). Shared by
-/// [`ensure`] (pre-fetch shape check on [`ModelSpec::sha256_hex`])
-/// and [`check_sha256`] (post-read validation of the expected pin);
-/// centralizing the rule prevents drift between the call sites.
-/// Composed from a length gate and [`is_all_hex_ascii`] so callers
-/// that need to distinguish "wrong length" from "non-hex" for
-/// diagnostics can call the sub-predicate directly rather than
-/// re-deriving the length check (see [`check_sha256`]).
+/// [`SHA256_HEX_LEN`] ASCII characters, each a hex digit
+/// (`0-9a-fA-F`). `const fn` so module-scope compile-time asserts
+/// on [`DEFAULT_MODEL`] / [`DEFAULT_TOKENIZER`] pins fold to a
+/// no-op at build time, and so [`status`] / [`ensure`] can gate on
+/// it without runtime diagnostic construction (they produce
+/// context-specific error messages themselves).
+///
+/// Runtime callers that want the "wrong length" vs "non-hex" kind
+/// distinction in the error string use [`validate_sha256_hex`]
+/// instead, which returns `Result<()>` with a pre-formatted
+/// diagnostic. The two surfaces share [`SHA256_HEX_LEN`] and
+/// [`is_all_hex_ascii`] so a change to either constraint updates
+/// both call sites by construction.
 const fn is_valid_sha256_hex(s: &str) -> bool {
     // `const fn` requires byte-level iteration — `.chars().all(...)`
     // depends on non-const iterator adapters. `u8::is_ascii_hexdigit`
     // has been `const fn` since Rust 1.47.
-    s.len() == 64 && is_all_hex_ascii(s)
+    s.len() == SHA256_HEX_LEN && is_all_hex_ascii(s)
+}
+
+/// Runtime validator for a SHA-256 hex pin that produces a
+/// kind-specific diagnostic on failure. Length failure and non-hex
+/// failure surface as distinct bail messages so a caller (CLI
+/// readout, I/O-error wrapper, test assertion) can name the
+/// underlying problem rather than defaulting to a generic "SHA
+/// check failed."
+///
+/// Previously [`check_sha256`] open-coded the length+hex checks
+/// inline to produce these two distinct diagnostics while the
+/// const bool [`is_valid_sha256_hex`] sat alongside doing the
+/// same check without the diagnostic — two representations of
+/// the same predicate that could drift if edited independently.
+/// Pushing the diagnostic into this sibling Result-returning
+/// validator collapses that duplication: both surfaces now share
+/// [`SHA256_HEX_LEN`] and [`is_all_hex_ascii`] and the wording
+/// lives in one place.
+///
+/// Substrings pinned by the call-site tests
+/// (`check_sha256_rejects_malformed_hex_length`,
+/// `check_sha256_rejects_non_hex_chars`): `"64 chars"` for the
+/// length kind and `"non-hex"` for the character kind. Any
+/// rewording must preserve those substrings.
+fn validate_sha256_hex(s: &str) -> Result<()> {
+    if s.len() != SHA256_HEX_LEN {
+        anyhow::bail!(
+            "expected SHA-256 hex must be {SHA256_HEX_LEN} chars, got {} ({:?})",
+            s.len(),
+            s,
+        );
+    }
+    if !is_all_hex_ascii(s) {
+        anyhow::bail!("expected SHA-256 hex contains non-hex chars: {:?}", s);
+    }
+    Ok(())
 }
 
 /// Return `Ok(true)` when the file's SHA-256 matches the expected
@@ -1012,25 +1061,12 @@ fn check_sha256(path: &std::path::Path, expected_hex: &str) -> Result<bool> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
-    // Branch on the two sub-predicates directly rather than
-    // re-deriving a length check after asking `is_valid_sha256_hex`:
-    // length first so a non-64 string of all hex digits surfaces as
-    // a length error, then `is_all_hex_ascii` for the non-hex case.
-    // The wording matches `check_sha256_rejects_malformed_hex_length`
-    // and `check_sha256_rejects_non_hex_chars`.
-    if expected_hex.len() != 64 {
-        anyhow::bail!(
-            "expected SHA-256 hex must be 64 chars, got {} ({:?})",
-            expected_hex.len(),
-            expected_hex,
-        );
-    }
-    if !is_all_hex_ascii(expected_hex) {
-        anyhow::bail!(
-            "expected SHA-256 hex contains non-hex chars: {:?}",
-            expected_hex,
-        );
-    }
+    // Delegate shape validation to `validate_sha256_hex` so the
+    // length-vs-hex diagnostic lives in one place. Previously this
+    // function open-coded the same length+hex check inline,
+    // duplicating what the const bool `is_valid_sha256_hex`
+    // expressed without diagnostics.
+    validate_sha256_hex(expected_hex)?;
 
     let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -1871,6 +1907,59 @@ mod tests {
         let bad = "????????????????????????????????????????????????????????????????";
         let err = check_sha256(tmp.path(), bad).unwrap_err();
         assert!(format!("{err:#}").contains("non-hex"), "err: {err:#}");
+    }
+
+    /// Direct coverage for `validate_sha256_hex` independent of
+    /// `check_sha256`'s caller path. `check_sha256_rejects_*` above
+    /// already exercise the two Err kinds by way of a full file-read
+    /// call; these direct tests guard the same two Err kinds PLUS
+    /// the Ok(()) branch, so a regression that broke validate's
+    /// happy path (e.g. an accidental inversion of the length check)
+    /// surfaces here instead of silently letting valid pins fall
+    /// through to a wasted download or a false I/O-error diagnosis.
+    /// Failure-substring assertions (`"64 chars"`, `"non-hex"`)
+    /// mirror the wording pinned by the `check_sha256_rejects_*`
+    /// siblings so the diagnostic is anchored at both layers.
+    #[test]
+    fn validate_sha256_hex_flags_empty_as_length_error() {
+        let err = validate_sha256_hex("").unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("64 chars"),
+            "empty string must surface the length-kind diagnostic \
+             (substring \"64 chars\"); got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn validate_sha256_hex_flags_nonhex_chars_at_correct_length() {
+        // 64 chars so the length gate passes; every char is `?` so
+        // the hex gate trips and the non-hex diagnostic fires.
+        let sixty_four_nonhex = "?".repeat(64);
+        let err = validate_sha256_hex(&sixty_four_nonhex).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("non-hex"),
+            "64-char non-hex string must surface the hex-kind \
+             diagnostic (substring \"non-hex\"); got: {rendered}",
+        );
+        assert!(
+            !rendered.contains("64 chars"),
+            "length gate passed on a 64-char input — diagnostic \
+             must NOT mention \"64 chars\"; got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn validate_sha256_hex_accepts_well_formed_pin() {
+        // 64 ASCII hex chars → Ok(()). Mixing case to also exercise
+        // the is_ascii_hexdigit path through both the 0-9 and
+        // a-f/A-F sub-ranges in one input.
+        let pin = "0".repeat(64);
+        validate_sha256_hex(&pin).unwrap();
+        let mixed = "0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789ABCDEF";
+        assert_eq!(mixed.len(), 64);
+        validate_sha256_hex(mixed).unwrap();
     }
 
     /// Non-empty short file — SHA-256 of ASCII "abc" is a
