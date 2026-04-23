@@ -1186,6 +1186,67 @@ mod tests {
         }
     }
 
+    /// Proves the `dir: Option<PathBuf>` field is wired on
+    /// `StatsCommand::Compare` and round-trips through clap's arg
+    /// parser. A regression that removed the struct field would
+    /// fail this test at compile time; a regression that dropped
+    /// the dispatch wiring (cargo-ktstr.rs → cli.rs → stats.rs) is
+    /// outside parse-scope and covered by the resolver's own
+    /// tests. The sibling `*_with_filter` test pins the
+    /// `dir.is_none()` default; this one pins the `Some(PathBuf)`
+    /// branch byte-exactly. Uses an absolute `/tmp/...` path
+    /// (synthetic, not required to exist) because the parse path
+    /// does not touch the filesystem — clap produces the `PathBuf`
+    /// from the raw argument, full stop.
+    #[test]
+    fn parse_stats_compare_with_dir() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "a",
+            "b",
+            "--dir",
+            "/tmp/archived-runs",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command:
+                    Some(StatsCommand::Compare {
+                        a,
+                        b,
+                        filter,
+                        threshold,
+                        dir,
+                    }),
+                ..
+            } => {
+                assert_eq!(a, "a");
+                assert_eq!(b, "b");
+                assert_eq!(
+                    dir.as_deref(),
+                    Some(std::path::Path::new("/tmp/archived-runs")),
+                    "--dir must round-trip to Some(PathBuf); \
+                     parse-scope only — resolver coverage lives \
+                     with stats::compare_runs' own tests",
+                );
+                assert!(
+                    filter.is_none(),
+                    "bare --dir must not spuriously populate filter",
+                );
+                assert!(
+                    threshold.is_none(),
+                    "bare --dir must not spuriously populate threshold",
+                );
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
     // -- try_get_matches_from: kernel list --
 
     #[test]
