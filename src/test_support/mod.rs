@@ -106,8 +106,9 @@ pub(crate) use probe::{
     maybe_dispatch_vm_test_with_phase_a, propagate_rust_env_from_cmdline, start_probe_phase_a,
 };
 pub use probe_metrics::{
-    MAX_SCAN_INDEX, ThreadLookup, count_indexed_metrics, find_metric, has_metric, lookup_thread,
-    metric_u64, snapshot_count, snapshot_worker_allocated, thread_count,
+    MAX_SCAN_INDEX, ThreadLookup, count_indexed_metrics, find_metric, flat_metrics_dump,
+    has_metric, lookup_thread, metric_u64, snapshot_count, snapshot_worker_allocated,
+    thread_count,
 };
 pub(crate) use profraw::try_flush_profraw;
 pub(crate) use timefmt::now_iso8601;
@@ -143,12 +144,12 @@ pub(crate) fn require_kernel() -> std::path::PathBuf {
     match crate::find_kernel() {
         Ok(Some(p)) => p,
         Ok(None) => panic!(
-            "ktstr: test requires a kernel but none was found. \
+            "ktstr_test: test requires a kernel but none was found. \
              Set KTSTR_KERNEL to a kernel source dir / version / cache key, \
              place a built kernel under ./linux or ../linux, or run \
              `cargo ktstr kernel build` to populate the cache."
         ),
-        Err(e) => panic!("ktstr: kernel resolution failed: {e:#}"),
+        Err(e) => panic!("ktstr_test: kernel resolution failed: {e:#}"),
     }
 }
 
@@ -163,7 +164,7 @@ pub(crate) fn require_kernel() -> std::path::PathBuf {
 pub(crate) fn require_vmlinux(kernel_path: &std::path::Path) -> std::path::PathBuf {
     crate::vmm::find_vmlinux(kernel_path).unwrap_or_else(|| {
         panic!(
-            "ktstr: no vmlinux found alongside {}. The cache entry or \
+            "ktstr_test: no vmlinux found alongside {}. The cache entry or \
              kernel build is incomplete. Rebuild with `cargo ktstr kernel \
              build --force` or point KTSTR_KERNEL at a directory that \
              contains both the kernel image and `vmlinux`.",
@@ -181,7 +182,7 @@ pub(crate) fn require_vmlinux(kernel_path: &std::path::Path) -> std::path::PathB
 pub(crate) fn require_binary(package: &str) -> std::path::PathBuf {
     crate::build_and_find_binary(package).unwrap_or_else(|e| {
         panic!(
-            "ktstr: build of `{package}` failed: {e:#}. \
+            "ktstr_test: build of `{package}` failed: {e:#}. \
              Run `cargo build -p {package}` to reproduce and diagnose."
         )
     })
@@ -196,7 +197,7 @@ pub(crate) fn require_kernel_symbols(
 ) -> crate::monitor::symbols::KernelSymbols {
     crate::monitor::symbols::KernelSymbols::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
         panic!(
-            "ktstr: kernel symbol resolution from {} failed: {e:#}",
+            "ktstr_test: kernel symbol resolution from {} failed: {e:#}",
             vmlinux_path.display(),
         )
     })
@@ -212,7 +213,7 @@ pub(crate) fn require_kernel_offsets(
 ) -> crate::monitor::btf_offsets::KernelOffsets {
     crate::monitor::btf_offsets::KernelOffsets::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
         panic!(
-            "ktstr: kernel BTF resolution from {} failed: {e:#}. \
+            "ktstr_test: kernel BTF resolution from {} failed: {e:#}. \
              The kernel must be built with CONFIG_DEBUG_INFO_BTF=y; \
              rebuild with `cargo ktstr kernel build --force` if the \
              cache entry was produced without BTF.",
@@ -230,7 +231,7 @@ pub(crate) fn require_bpf_map_offsets(
 ) -> crate::monitor::btf_offsets::BpfMapOffsets {
     crate::monitor::btf_offsets::BpfMapOffsets::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
         panic!(
-            "ktstr: BpfMapOffsets resolution from {} failed: {e:#}. \
+            "ktstr_test: BpfMapOffsets resolution from {} failed: {e:#}. \
              The kernel must be built with CONFIG_DEBUG_INFO_BTF=y; \
              rebuild with `cargo ktstr kernel build --force` if the \
              cache entry was produced without BTF.",
@@ -248,7 +249,7 @@ pub(crate) fn require_bpf_prog_offsets(
 ) -> crate::monitor::btf_offsets::BpfProgOffsets {
     crate::monitor::btf_offsets::BpfProgOffsets::from_vmlinux(vmlinux_path).unwrap_or_else(|e| {
         panic!(
-            "ktstr: BpfProgOffsets resolution from {} failed: {e:#}. \
+            "ktstr_test: BpfProgOffsets resolution from {} failed: {e:#}. \
              The kernel must be built with CONFIG_DEBUG_INFO_BTF=y; \
              rebuild with `cargo ktstr kernel build --force` if the \
              cache entry was produced without BTF.",

@@ -438,7 +438,17 @@ impl ListedEntry {
 /// All operations are local filesystem operations via `std::fs`.
 /// Thread safety: individual operations are atomic (rename-based
 /// writes), but concurrent callers must coordinate externally.
+///
+/// `#[non_exhaustive]` matches the sibling pub types in this module
+/// ([`KernelMetadata`], [`KernelSource`], [`CacheArtifacts`],
+/// [`KconfigStatus`], [`CacheEntry`], [`ListedEntry`]). Every field
+/// today is private, so external struct-literal construction is
+/// already impossible; the attribute is kept for consistency and to
+/// pin the "no cross-crate struct-literal" contract against a future
+/// change that promotes a field to `pub`. Use [`Self::new`] or
+/// [`Self::with_root`] to construct.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CacheDir {
     root: PathBuf,
 }
@@ -804,6 +814,37 @@ impl CacheDir {
 /// live pid whose debris we leave alone. A pid recycled between
 /// orphan creation and this scan is treated as alive — false
 /// negative, preserves debris — but never false positive.
+///
+/// # TOCTOU: pid reuse between the `kill(pid, None)` probe and
+///   `remove_dir_all(path)`
+///
+/// There is an inherent race between the liveness probe above and
+/// the filesystem unlink below: the kernel is free to reap the
+/// embedded pid (actually dead → probe returns `ESRCH`), allocate
+/// it to a fresh unrelated process, and schedule that process
+/// before `remove_dir_all` starts. The cleanup then proceeds
+/// because the probe snapshot said "dead" — it cannot observe the
+/// subsequent reuse. The consequence is bounded and harmless: the
+/// new pid-holder does NOT own the `.tmp-{key}-{pid}` directory
+/// (it was created by the prior dead process), so
+/// `remove_dir_all` operates on paths that no live process is
+/// reading or writing. The reuse does not cross into the cleanup
+/// target's data. Linux `pid_max` caps at 2^22
+/// (`include/linux/threads.h::PID_MAX_LIMIT`), so reuse is rare
+/// on a host with moderate fork rate but not vanishingly so on
+/// CI runners that recycle pids quickly.
+///
+/// We accept the race rather than serialize behind an additional
+/// lock because (a) the damage model is "delete a dead process's
+/// leftover tempdir"— exactly the scan's intent — regardless of
+/// what happens to the pid slot AFTER the probe, and (b) the only
+/// alternative that closes the race (an exclusive `flock` on each
+/// tempdir before remove) would compound its own failure modes in
+/// exchange for eliminating an effectively-benign race. The
+/// reverse race (pid reuse BEFORE the probe, producing a false
+/// "alive" verdict) is already covered by the "false negative,
+/// preserves debris" bullet above — debris staying one extra cycle
+/// is acceptable; deleting a live process's state would not be.
 ///
 /// Errors during individual entry walks are swallowed and logged
 /// (each one would prevent a store that otherwise has nothing to
@@ -2389,6 +2430,175 @@ mod tests {
         );
     }
 
+    // -- clean_orphaned_tmp_dirs unit tests --
+    //
+    // Parser/dispatcher coverage: the scan must remove directories
+    // under `.tmp-{key}-{pid}` whose `{pid}` is verifiably dead,
+    // must LEAVE malformed entries and non-`.tmp-` entries alone,
+    // and must tolerate a nonexistent cache root.
+
+    /// A `.tmp-{key}-{pid}` directory whose pid refers to a dead
+    /// process is removed. Uses `libc::pid_t::MAX` — above
+    /// `PID_MAX_LIMIT` (2^22), so no live process can ever claim it
+    /// (same technique as `process_alive_nonexistent_pid` in
+    /// scenario tests, removes the pid-reuse race from the test).
+    #[test]
+    fn clean_orphaned_tmp_dirs_removes_dead_pid_tempdir() {
+        let tmp = TempDir::new().unwrap();
+        let dead_pid = libc::pid_t::MAX;
+        let orphan = tmp
+            .path()
+            .join(format!("{TMP_DIR_PREFIX}somekey-{dead_pid}"));
+        std::fs::create_dir_all(&orphan).unwrap();
+        // Plant a nested file so a regression that hand-rolled
+        // `remove_dir` (non-recursive) instead of `remove_dir_all`
+        // would fail with ENOTEMPTY and the dir would survive.
+        std::fs::write(orphan.join("inner.txt"), b"data").unwrap();
+
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+        assert!(
+            !orphan.exists(),
+            "dead-pid tempdir must be removed by clean_orphaned_tmp_dirs",
+        );
+    }
+
+    /// A `.tmp-{key}-{pid}` directory whose pid is LIVE (the test
+    /// process itself) must be preserved. `kill(getpid(), None)`
+    /// returns `Ok(())` inside `clean_orphaned_tmp_dirs`'s liveness
+    /// probe, which routes to the `!dead` continue branch.
+    #[test]
+    fn clean_orphaned_tmp_dirs_preserves_live_pid_tempdir() {
+        let tmp = TempDir::new().unwrap();
+        let live_pid = unsafe { libc::getpid() };
+        let keeper = tmp
+            .path()
+            .join(format!("{TMP_DIR_PREFIX}somekey-{live_pid}"));
+        std::fs::create_dir_all(&keeper).unwrap();
+
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+        assert!(
+            keeper.exists(),
+            "live-pid tempdir must NOT be removed — its owner is still running",
+        );
+    }
+
+    /// Entries whose suffix cannot be parsed as a pid (non-numeric
+    /// or empty after the trailing `-`) must be left alone — they
+    /// do not match our format and may belong to an unrelated
+    /// tool. Covers the `rsplit_once` / `parse::<i32>` continue
+    /// branches.
+    #[test]
+    fn clean_orphaned_tmp_dirs_leaves_malformed_suffix_alone() {
+        let tmp = TempDir::new().unwrap();
+        // Case A: non-numeric suffix.
+        let nonnum = tmp
+            .path()
+            .join(format!("{TMP_DIR_PREFIX}somekey-notapid"));
+        std::fs::create_dir_all(&nonnum).unwrap();
+        // Case B: empty suffix (name ends with `-`).
+        let empty_suf = tmp.path().join(format!("{TMP_DIR_PREFIX}somekey-"));
+        std::fs::create_dir_all(&empty_suf).unwrap();
+        // Case C: no `-` at all after the prefix (rsplit_once
+        // still finds the `-` inside the prefix itself, but
+        // `.tmp` parses as non-numeric → continue).
+        let no_dash = tmp.path().join(format!("{TMP_DIR_PREFIX}nokeyhere"));
+        std::fs::create_dir_all(&no_dash).unwrap();
+
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+        assert!(nonnum.exists(), "non-numeric pid suffix must be left alone");
+        assert!(empty_suf.exists(), "empty pid suffix must be left alone");
+        assert!(no_dash.exists(), "no-pid-suffix entry must be left alone");
+    }
+
+    /// Directories that do not begin with [`TMP_DIR_PREFIX`] must
+    /// never be touched. The cache root also holds real cache
+    /// entries (hash-keyed directories), and an overbroad scan
+    /// would wipe them out.
+    #[test]
+    fn clean_orphaned_tmp_dirs_leaves_unrelated_entries_alone() {
+        let tmp = TempDir::new().unwrap();
+        let real_entry = tmp.path().join("real-cache-entry");
+        std::fs::create_dir_all(&real_entry).unwrap();
+        let other = tmp.path().join("not-a-tempdir");
+        std::fs::create_dir_all(&other).unwrap();
+
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+        assert!(real_entry.exists(), "unrelated cache entry must be preserved");
+        assert!(other.exists(), "unrelated directory must be preserved");
+    }
+
+    /// Non-UTF-8 filenames in the cache root must be skipped
+    /// silently — they cannot be a `.tmp-{key}-{pid}` directory
+    /// this module created (all our names are ASCII), and bailing
+    /// on every stray non-UTF-8 entry would fail the whole cleanup
+    /// pass.
+    ///
+    /// Unix-only because the byte-level name construction uses
+    /// `OsStr::from_bytes`, which is Unix-only. Other platforms
+    /// cannot produce a non-UTF-8 filesystem name from this test
+    /// code.
+    #[test]
+    #[cfg(unix)]
+    fn clean_orphaned_tmp_dirs_skips_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TempDir::new().unwrap();
+        // Name that looks like a tempdir prefix but has a non-UTF-8
+        // byte after. `into_string()` in the scan returns Err(_)
+        // and the continue branch skips it.
+        let mut bytes: Vec<u8> = b".tmp-".to_vec();
+        bytes.push(0xFF);
+        bytes.extend_from_slice(b"-123");
+        let bad_name = OsStr::from_bytes(&bytes);
+        let bad_path = tmp.path().join(bad_name);
+        std::fs::create_dir(&bad_path).unwrap();
+
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+        assert!(
+            bad_path.exists(),
+            "non-UTF-8 entry must be left alone — the scan cannot \
+             confirm it matches our format, so safe-default is skip",
+        );
+    }
+
+    /// A nonexistent cache root returns `Ok(())` without error —
+    /// called from the `store()` prologue, which may execute
+    /// before any cache operation has created the directory.
+    #[test]
+    fn clean_orphaned_tmp_dirs_handles_missing_cache_root() {
+        let tmp = TempDir::new().unwrap();
+        let never_created = tmp.path().join("never-created");
+        // `is_dir()` short-circuits to Ok(()) without read_dir.
+        clean_orphaned_tmp_dirs(&never_created).unwrap();
+    }
+
+    /// Multi-entry mix: a DEAD-pid orphan and a LIVE-pid tempdir
+    /// side by side — only the dead one is removed. Pins the
+    /// per-entry classification logic against a regression that
+    /// bailed on the first entry's liveness-probe error or
+    /// short-circuited after the first successful remove.
+    #[test]
+    fn clean_orphaned_tmp_dirs_mixed_entries() {
+        let tmp = TempDir::new().unwrap();
+        let dead_pid = libc::pid_t::MAX;
+        let live_pid = unsafe { libc::getpid() };
+        let dead = tmp
+            .path()
+            .join(format!("{TMP_DIR_PREFIX}a-{dead_pid}"));
+        let live = tmp
+            .path()
+            .join(format!("{TMP_DIR_PREFIX}b-{live_pid}"));
+        let unrelated = tmp.path().join("c-regular-entry");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+        assert!(!dead.exists(), "dead orphan must be removed");
+        assert!(live.exists(), "live-pid entry must survive");
+        assert!(unrelated.exists(), "unrelated entry must survive");
+    }
+
     // -- validate_cache_key unit tests --
 
     #[test]
@@ -3267,6 +3477,100 @@ mod tests {
         // a cache entry): return None, caller keeps its existing path.
         let tmp = TempDir::new().unwrap();
         assert_eq!(prefer_source_tree_for_dwarf(tmp.path()), None);
+    }
+
+    /// Malformed `metadata.json` — present on disk but not valid
+    /// [`KernelMetadata`] — must short-circuit to `None`. The
+    /// `read_metadata(..).ok()?` guard in
+    /// [`prefer_source_tree_for_dwarf`] converts the parse failure
+    /// into `None` without bailing, so callers fall back to the
+    /// cache directory for symbol-only lookup rather than having
+    /// the DWARF path blow up on a corrupted entry.
+    ///
+    /// A regression that replaced the `.ok()?` with `.unwrap()`,
+    /// `.expect(..)`, or an `anyhow::Result` propagation would
+    /// break this test — preserving the "silent fallback" contract
+    /// documented on the function.
+    #[test]
+    fn prefer_source_tree_metadata_parse_failure_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        fs::create_dir_all(&cache_entry).unwrap();
+        // Valid JSON shape but NOT a `KernelMetadata` — missing
+        // every required field. serde_json::from_str errors with
+        // "missing field", which `read_metadata` maps to
+        // `Err(String)`, which `prefer_source_tree_for_dwarf`'s
+        // `.ok()?` turns into `None`.
+        fs::write(cache_entry.join("metadata.json"), br#"{"not_kernel_metadata": true}"#)
+            .unwrap();
+
+        assert_eq!(
+            prefer_source_tree_for_dwarf(&cache_entry),
+            None,
+            "malformed metadata.json must short-circuit to None, not bail",
+        );
+
+        // Completely invalid JSON (not parseable at the token level)
+        // must also short-circuit. Covers serde's two distinct
+        // error classes — tokenizer failure vs shape mismatch —
+        // both of which map to `Err(String)` inside `read_metadata`.
+        let other_entry = tmp.path().join("other");
+        fs::create_dir_all(&other_entry).unwrap();
+        fs::write(other_entry.join("metadata.json"), b"not json at all {{{")
+            .unwrap();
+        assert_eq!(
+            prefer_source_tree_for_dwarf(&other_entry),
+            None,
+            "unparseable metadata.json must short-circuit to None, not bail",
+        );
+    }
+
+    /// Local-source cache entry whose `source_tree_path` is
+    /// explicitly `None` short-circuits at the `let src_path =
+    /// source_tree_path?;` line — no filesystem probe runs for the
+    /// missing path. Pins the "tree location not recorded" branch
+    /// documented on [`prefer_source_tree_for_dwarf`].
+    ///
+    /// Distinct from `prefer_source_tree_local_without_vmlinux_in_tree`:
+    /// that test has `source_tree_path = Some(...)` but the
+    /// filesystem lacks `vmlinux`, so the function reaches the
+    /// `src_path.join("vmlinux").is_file()` check before returning
+    /// None. This test short-circuits one step earlier, before any
+    /// filesystem inspection — a regression that replaced the `?`
+    /// with a `.unwrap_or_else(|| default_path)` or a fallback
+    /// would break it.
+    #[test]
+    fn prefer_source_tree_local_with_none_source_tree_path_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        fs::create_dir_all(&cache_entry).unwrap();
+
+        let meta = KernelMetadata {
+            version: Some("6.14.2".to_string()),
+            source: KernelSource::Local {
+                source_tree_path: None,
+                git_hash: Some("abc123".to_string()),
+            },
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            has_vmlinux: true,
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prefer_source_tree_for_dwarf(&cache_entry),
+            None,
+            "Local entry with source_tree_path=None must short-circuit \
+             to None at the `let src_path = source_tree_path?;` line \
+             — no filesystem probe must run",
+        );
     }
 
     // -- strip_vmlinux_debug --

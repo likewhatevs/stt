@@ -138,18 +138,22 @@ fn classify_repro_vm_status(
         // Describe qemu's exit disposition precisely: a crash sentinel
         // in `output` can coincide with qemu itself exiting 0 (guest
         // panic handler + orderly reboot), >0 (propagated non-zero),
-        // -1 (VMM internal sentinel — the BSP run loop seeds
+        // -1 (VMM internal sentinel — the boot CPU's run loop seeds
         // `VmResult::exit_code = -1` and leaves it at -1 on error
-        // paths that did not emit `MSG_TYPE_EXIT`; watchdog-fire is
-        // caught earlier via `timed_out`, so a -1 reaching THIS
-        // branch indicates a code-unsetting error path, not a
-        // signal-kill), or <-1 (signal-kill / other VMM convention).
-        // Labeling all four as "crashed (exit N)" conflates the
-        // guest-scheduler failure with qemu's own exit, making the
-        // qemu-clean and VMM-sentinel cases especially misleading.
+        // paths that did not deliver the guest's final exit message;
+        // watchdog-fire is caught earlier via `timed_out`, so a -1
+        // reaching THIS branch indicates a code-unsetting error
+        // path, not a signal-kill), or <-1 (signal-kill / other VMM
+        // convention). Labeling all four as "crashed (exit N)"
+        // conflates the guest-scheduler failure with qemu's own
+        // exit, making the qemu-clean and VMM-sentinel cases
+        // especially misleading. The -1 clause is phrased in
+        // end-user terms: the internals (boot-CPU run loop,
+        // scheduler-exit IPC message) belong in the code comment,
+        // not in the output a test operator reads at the console.
         let exit_clause = if exit_code == -1 {
-            "VMM exit-code sentinel (BSP run loop left VmResult::exit_code \
-             at its -1 seed — scheduler did not emit MSG_TYPE_EXIT)"
+            "VM host reported no final exit status (the scheduler did not \
+             deliver an exit signal before the VM ended)"
                 .to_string()
         } else if exit_code < 0 {
             format!("killed by signal ({exit_code})")
@@ -1761,20 +1765,40 @@ mod tests {
     }
 
     /// `exit_code == -1` on the crash branch is the VMM sentinel —
-    /// `VmResult::exit_code` is seeded to `-1` at the top of the BSP
-    /// run loop and left there when the scheduler did not emit
-    /// `MSG_TYPE_EXIT`. Watchdog-fire is caught earlier via the
-    /// `timed_out` branch, so a `-1` here means the BSP ran a
-    /// code-unsetting error path — not a signal-kill. Distinct
-    /// clause so users don't misread this as "signal 1" (SIGHUP).
+    /// `VmResult::exit_code` is seeded to `-1` at the top of the
+    /// boot-CPU run loop and left there when the scheduler did not
+    /// deliver its final exit message. Watchdog-fire is caught
+    /// earlier via the `timed_out` branch, so a `-1` here means the
+    /// boot-CPU ran a code-unsetting error path — not a signal-kill.
+    /// Distinct clause so users don't misread this as "signal 1"
+    /// (SIGHUP). The asserted string is phrased in end-user terms —
+    /// the internals are in the implementation comment so the
+    /// console output stays operator-readable without cross-
+    /// referencing VMM source. A regression that swapped the clause
+    /// back to "VMM exit-code sentinel" or any `BSP` /
+    /// `VmResult::exit_code` / `MSG_TYPE_EXIT` phrasing would fail
+    /// here.
     #[test]
     fn classify_repro_vm_status_crashed_from_sentinel_vmm_exit_code_unset() {
         let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", -1);
         assert_eq!(
             status,
-            "repro VM: scheduler crashed — VMM exit-code sentinel \
-             (BSP run loop left VmResult::exit_code at its -1 seed — \
-             scheduler did not emit MSG_TYPE_EXIT)",
+            "repro VM: scheduler crashed — VM host reported no final exit \
+             status (the scheduler did not deliver an exit signal before \
+             the VM ended)",
+        );
+        // Negative assertions: none of the internal vocabulary may
+        // leak into the user-facing status — each term was flagged
+        // as a usability bug in  and must stay out of the
+        // rendered string.
+        assert!(!status.contains("BSP"), "user-facing status leaks BSP: {status}");
+        assert!(
+            !status.contains("VmResult::exit_code"),
+            "user-facing status leaks VmResult::exit_code: {status}",
+        );
+        assert!(
+            !status.contains("MSG_TYPE_EXIT"),
+            "user-facing status leaks MSG_TYPE_EXIT: {status}",
         );
     }
 

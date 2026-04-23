@@ -237,9 +237,12 @@ pub const DIRTY_TREE_CACHE_SKIP_HINT: &str =
 /// wording drift is caught in unit tests.
 pub const NON_GIT_TREE_CACHE_SKIP_HINT: &str =
     "skipping cache — source tree is not a git repository so dirty \
-     state cannot be detected; put the source under git (or use a \
-     kernel fetch mode that produces a git-tracked tree) to enable \
-     caching";
+     state cannot be detected; put the source under git, or replace \
+     `--source` with one of the content-keyed fetch modes that does \
+     not need dirty-state detection — `kernel build VERSION` \
+     (downloads the tarball from kernel.org) or \
+     `kernel build --git URL --ref REF` (shallow-clones the given \
+     ref) — to enable caching";
 
 /// Decide whether to emit the `(EOL)` legend under the `kernel list`
 /// table. Returns `Some(EOL_EXPLANATION)` iff at least one rendered
@@ -257,10 +260,8 @@ pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
 /// Explanation of the `(untracked kconfig)` tag. Consumer-facing
 /// wording mirrors `EOL_EXPLANATION`'s "one-const, one-surface"
 /// pattern so a doc-drift between the tag word and the legend
-/// cannot silently slip. The `(stale kconfig)` tag already has a
-/// warning line wired below the table; `(untracked kconfig)` had
-/// no such legend before this, so a reader inspecting the tag had
-/// to dig through source to learn what it meant.
+/// cannot silently slip. Mirrors [`STALE_KCONFIG_EXPLANATION`] so
+/// the kconfig tag pair shares one shape.
 ///
 /// The `(corrupt)` tag is deliberately not in this legend family —
 /// its remediation is operational, not informational. See
@@ -280,6 +281,30 @@ pub(crate) fn untracked_legend_if_any(any_untracked: bool) -> Option<&'static st
     }
 }
 
+/// Explanation of the `(stale kconfig)` tag. Mirrors
+/// [`UNTRACKED_KCONFIG_EXPLANATION`] so the kconfig tag pair
+/// shares one shape — every kconfig-status legend in the
+/// informational trio (EOL / UNTRACKED / STALE) is now a const
+/// surfaced via a `*_legend_if_any` helper. Verbatim wording
+/// preserved from the prior inline `eprintln!` in `kernel_list`
+/// so existing operators see no behavioural change.
+pub const STALE_KCONFIG_EXPLANATION: &str =
+    "warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. \
+     Rebuild with: kernel build --force VERSION";
+
+/// Decide whether to emit the `(stale kconfig)` legend under the
+/// `kernel list` table. Mirrors [`eol_legend_if_any`] and
+/// [`untracked_legend_if_any`] so all three informational legends
+/// share one shape (boolean in, `Option<&'static str>` out) and
+/// every branch is unit-testable without stderr capture.
+pub(crate) fn stale_legend_if_any(any_stale: bool) -> Option<&'static str> {
+    if any_stale {
+        Some(STALE_KCONFIG_EXPLANATION)
+    } else {
+        None
+    }
+}
+
 /// Footer emitted by `kernel_list` when at least one entry is
 /// corrupt. Pure function of the cache-root path so tests pin the
 /// exact same string the production path prints — not a hand-copied
@@ -291,14 +316,16 @@ pub(crate) fn untracked_legend_if_any(any_untracked: bool) -> Option<&'static st
 /// Scope-safe wording: callers inspecting the footer in isolation
 /// must not be able to misread `kernel clean --force` as surgical.
 /// The text explicitly spells out "ALL cached entries" and
-/// surfaces `--keep N --force` for partial cleanup so an operator
-/// with valid alongside corrupt entries does not blow them all
-/// away in a single command.
+/// surfaces `--corrupt-only --force` (the surgical form that leaves
+/// valid entries intact) ahead of the broader `--force` and
+/// `--keep N --force` escalation paths, so an operator with valid
+/// alongside corrupt entries reaches for the safe option first
+/// rather than blowing them all away in a single command.
 ///
 /// Design decision: `(corrupt)` is deliberately NOT promoted to a
 /// one-line tag-explanation const in the [`EOL_EXPLANATION`] /
-/// [`UNTRACKED_KCONFIG_EXPLANATION`] legend family. Two constraints
-/// drive the decision:
+/// [`UNTRACKED_KCONFIG_EXPLANATION`] / [`STALE_KCONFIG_EXPLANATION`]
+/// legend family. Two constraints drive the decision:
 ///
 /// 1. **Runtime cache-root path.** The remediation must surface
 ///    the actual cache-root directory so operators know where to
@@ -321,15 +348,11 @@ pub(crate) fn untracked_legend_if_any(any_untracked: bool) -> Option<&'static st
 ///    already hits the definition in the first line. Test
 ///    `corrupt_footer_is_self_documenting` pins that invariant.
 ///
-/// Consistency note: the legend family as currently constituted is
-/// not uniform. `(stale kconfig)` is also handled outside this
-/// pattern — inlined directly in `kernel_list` rather than
-/// extracted to a const + helper pair like EOL and UNTRACKED.
-/// Extracting `stale_kconfig` into the const+helper shape is a
-/// pending follow-up so the informational trio (EOL / UNTRACKED /
-/// STALE) share one pattern; `(corrupt)` remains the sole tag
-/// whose remediation requires runtime state, so even after that
-/// cleanup it stays in the footer family.
+/// Consistency note: the informational trio (EOL / UNTRACKED /
+/// STALE) all share the const + `*_legend_if_any` shape;
+/// `(corrupt)` is the sole tag whose remediation requires runtime
+/// state (the cache-root path), which is why it stays in the
+/// footer family rather than joining the informational trio.
 ///
 /// Command ordering inside the footer: `--corrupt-only --force`
 /// is listed FIRST because it is the zero-risk surgical option
@@ -687,21 +710,47 @@ pub fn kernel_list(json: bool) -> Result<()> {
             }
         }
     }
-    // Legend surfaces only when a tag was actually rendered, so the
-    // normal (no-EOL) case stays noise-free. Mirrors the any_stale
-    // pattern below. Decision routed through `eol_legend_if_any` so
-    // both branches are unit-testable.
+    // Annotation footers. The emission order is fixed and load-bearing
+    // — `kernel_list_footer_ordering_pin` below pins the sequence
+    // against regressions:
+    //
+    //   1. EOL        (informational, inherent-to-upstream-release)
+    //   2. untracked  (informational, actionable with a rebuild)
+    //   3. stale      (informational, actionable with a rebuild)
+    //   4. corrupt    (operational, requires manual inspection + clean)
+    //
+    // Rationale: informational legends come first because they do
+    // not demand operator action to resolve — an EOL tag is a state
+    // of the world, not a cache pathology. The `untracked` and
+    // `stale` legends share a remediation shape (`kernel build
+    // --force VERSION`) and are grouped adjacent so an operator who
+    // needs to batch-rebuild sees the two one-line recipes together.
+    // The corrupt footer comes last because its remediation is the
+    // most disruptive (`kernel clean`), runs against a separate
+    // command, and interpolates a runtime cache-root path that is
+    // irrelevant to the preceding tags; surfacing it last keeps the
+    // informational/operational distinction visually obvious in the
+    // output stream.
+    //
+    // Each legend surfaces only when a tag was actually rendered, so
+    // the normal no-tag case stays noise-free. Decisions are routed
+    // through the `*_legend_if_any` / `*_footer_if_any` helpers so
+    // both branches per legend are unit-testable.
+    //
+    // Channel: stderr (diagnostic). The rendered entry rows above
+    // flow to stdout so `kernel list | awk` / `kernel list >
+    // kernels.txt` downstream scripts receive table data without
+    // legend text mixed in; the legends only become visible on an
+    // interactive terminal where both channels are typically
+    // displayed. Pinned by `eol_legend_emits_via_eprintln` below.
     if let Some(legend) = eol_legend_if_any(any_eol) {
         eprintln!("{legend}");
     }
     if let Some(legend) = untracked_legend_if_any(any_untracked) {
         eprintln!("{legend}");
     }
-    if any_stale {
-        eprintln!(
-            "warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. \
-             Rebuild with: kernel build --force VERSION"
-        );
+    if let Some(legend) = stale_legend_if_any(any_stale) {
+        eprintln!("{legend}");
     }
     if let Some(footer) = corrupt_footer_if_any(any_corrupt, cache.root()) {
         eprintln!("{footer}");
@@ -4225,6 +4274,48 @@ mod tests {
         assert_eq!(untracked_legend_if_any(false), None);
     }
 
+    /// `stale_legend_if_any` completes the kconfig legend pair —
+    /// every kconfig-status legend (UNTRACKED, STALE) now flows
+    /// through one `*_legend_if_any` shape. True branch returns the
+    /// `STALE_KCONFIG_EXPLANATION` const verbatim (no per-call
+    /// formatting), false branch returns `None` so the noise-free
+    /// invariant on clean runs is enforced by the gate.
+    #[test]
+    fn stale_legend_if_any_branches() {
+        assert_eq!(
+            stale_legend_if_any(true),
+            Some(STALE_KCONFIG_EXPLANATION),
+        );
+        assert_eq!(stale_legend_if_any(false), None);
+    }
+
+    /// `STALE_KCONFIG_EXPLANATION` carries the four actionable
+    /// elements its inline-eprintln predecessor did: the warning
+    /// preamble, the tag word `(stale kconfig)`, the cause
+    /// (different ktstr.kconfig fragment), and the
+    /// `kernel build --force VERSION` remediation. A reword that
+    /// drops any of them silently degrades operator guidance —
+    /// pinning each piece catches the regression here.
+    #[test]
+    fn stale_kconfig_explanation_shape() {
+        assert!(
+            STALE_KCONFIG_EXPLANATION.starts_with("warning"),
+            "stale legend must keep the warning preamble: {STALE_KCONFIG_EXPLANATION}",
+        );
+        assert!(
+            STALE_KCONFIG_EXPLANATION.contains("(stale kconfig)"),
+            "stale legend must name the tag verbatim: {STALE_KCONFIG_EXPLANATION}",
+        );
+        assert!(
+            STALE_KCONFIG_EXPLANATION.contains("different ktstr.kconfig"),
+            "stale legend must name the cause: {STALE_KCONFIG_EXPLANATION}",
+        );
+        assert!(
+            STALE_KCONFIG_EXPLANATION.contains("kernel build --force VERSION"),
+            "stale legend must name the rebuild remediation: {STALE_KCONFIG_EXPLANATION}",
+        );
+    }
+
     /// `corrupt_footer_if_any` completes the trio of `*_if_any`
     /// tag-gate helpers. True branch must carry the same
     /// `format_corrupt_footer` content the production path would
@@ -4358,6 +4449,39 @@ mod tests {
              (removes ALL) and `--keep N --force` (preserves N \
              newest); got: {footer:?}",
         );
+
+        // Command ordering: `--corrupt-only --force` must appear
+        // FIRST so an operator scanning top-to-bottom reaches the
+        // zero-risk surgical option before the escalation paths.
+        // Doc on `format_corrupt_footer` calls this out explicitly;
+        // pin it here so a future reword that re-orders the three
+        // commands trips before landing. Each assertion uses
+        // `<` rather than `<=` to require strict precedence —
+        // identical positions are impossible (the substrings
+        // differ) but the strict form makes the intent obvious to
+        // a reader.
+        let pos_corrupt_only = footer
+            .find("kernel clean --corrupt-only --force")
+            .expect("`--corrupt-only --force` must appear in footer");
+        let pos_force = footer
+            .find("kernel clean --force")
+            .expect("`--force` must appear in footer");
+        let pos_keep = footer
+            .find("kernel clean --keep N --force")
+            .expect("`--keep N --force` must appear in footer");
+        assert!(
+            pos_corrupt_only < pos_force,
+            "`--corrupt-only --force` must precede `--force` in the footer \
+             (surgical option goes before escalation); got positions \
+             corrupt_only={pos_corrupt_only}, force={pos_force} in: {footer:?}",
+        );
+        assert!(
+            pos_force < pos_keep,
+            "`--force` must precede `--keep N --force` in the footer so the \
+             escalation path reads in widening order (surgical → broadest \
+             → preserve-N); got positions force={pos_force}, keep={pos_keep} \
+             in: {footer:?}",
+        );
     }
 
     /// `DIRTY_TREE_CACHE_SKIP_HINT` is the exact text the
@@ -4389,12 +4513,16 @@ mod tests {
     /// `NON_GIT_TREE_CACHE_SKIP_HINT` is the hint fired when the
     /// local source tree is not a git repository — `commit` / `stash`
     /// do not apply, so the wording must avoid them and instead
-    /// point to the two actionable remediations: put the source
-    /// under git, or pick a fetch mode that produces a git-tracked
-    /// tree. Pinning the shape catches a reword that (a) drops the
+    /// point to the actionable remediations: put the source under
+    /// git, OR switch to a content-keyed fetch mode (`kernel build
+    /// VERSION` for tarball, `kernel build --git URL --ref REF` for
+    /// shallow clone) that does not need dirty-state detection.
+    /// Pinning the shape catches a reword that (a) drops the
     /// "skipping cache" preamble, (b) invents a commit/stash
-    /// remediation that's not actionable, or (c) loses the
-    /// actionable remediation pointer.
+    /// remediation that's not actionable, or (c) regresses to a
+    /// vague "use a kernel fetch mode that produces a git-tracked
+    /// tree" pointer that leaves the operator guessing which CLI
+    /// invocation actually fixes it.
     #[test]
     fn non_git_tree_cache_skip_hint_shape() {
         assert!(
@@ -4410,12 +4538,20 @@ mod tests {
             "non-git hint must name the actionable remediation: {NON_GIT_TREE_CACHE_SKIP_HINT}",
         );
         assert!(
+            NON_GIT_TREE_CACHE_SKIP_HINT.contains("kernel build VERSION"),
+            "non-git hint must name the concrete tarball-fetch alternative: {NON_GIT_TREE_CACHE_SKIP_HINT}",
+        );
+        assert!(
+            NON_GIT_TREE_CACHE_SKIP_HINT.contains("kernel build --git URL --ref REF"),
+            "non-git hint must name the concrete git-clone alternative: {NON_GIT_TREE_CACHE_SKIP_HINT}",
+        );
+        assert!(
             !NON_GIT_TREE_CACHE_SKIP_HINT.contains("stash"),
             "non-git hint must NOT suggest stash (no git = no stash): {NON_GIT_TREE_CACHE_SKIP_HINT}",
         );
         assert!(
             !NON_GIT_TREE_CACHE_SKIP_HINT.contains("commit"),
-            "non-git hint must NOT suggest commit (no git = no commit): {NON_GIT_TREE_CACHE_SKIP_HINT}",
+            "non-git hint must NOT suggest committing existing tree changes (no git = no commit): {NON_GIT_TREE_CACHE_SKIP_HINT}",
         );
     }
 
@@ -4858,5 +4994,143 @@ mod tests {
             }
             other => panic!("expected KernelCommand::Clean, got {other:?}"),
         }
+    }
+
+    /// Pin that the EOL legend is emitted on stderr (via
+    /// `eprintln!`), not stdout (via `println!`). The rendered
+    /// entry rows go to stdout so `kernel list | awk` /
+    /// `kernel list > kernels.txt` downstream scripts receive
+    /// table data without legend text mixed in. A regression
+    /// that swapped `eprintln!` for `println!` at the legend
+    /// emission site would silently start polluting the data
+    /// channel with human-readable prose — no compile error,
+    /// no visible diff in interactive use (both channels land
+    /// on the same terminal), and failures only showing up
+    /// downstream when scripted consumers hit unexpected bytes.
+    ///
+    /// Rust's stable test harness does not expose per-test stderr
+    /// capture hooks (`std::io::set_output_capture` is unstable,
+    /// and wiring a writer through `kernel_list` would expand the
+    /// public surface). The cheap, stable alternative is a source-
+    /// level pattern match: each `*_legend_if_any` / `*_footer_if_any`
+    /// helper's gated block in `kernel_list` must emit via
+    /// `eprintln!`, never `println!`. The gated blocks are all
+    /// in a narrow window of `kernel_list`; scanning the full source
+    /// for a `println!` immediately adjacent to a legend helper call
+    /// catches the regression regardless of which helper the drift
+    /// landed on.
+    #[test]
+    fn eol_legend_emits_via_eprintln() {
+        let src = include_str!("cli.rs");
+        for helper in [
+            "eol_legend_if_any",
+            "untracked_legend_if_any",
+            "stale_legend_if_any",
+            "corrupt_footer_if_any",
+        ] {
+            // `if let Some(...) = <helper>(...)` pattern at the
+            // call site — look for the *call*, not the definition,
+            // by requiring the full `if let Some(...) = <helper>(`
+            // prefix. Definition lines read `pub(crate) fn <helper>(`,
+            // so the filter leaves only real call sites.
+            let needle_call = format!("= {helper}(");
+            let call_pos = src
+                .find(&needle_call)
+                .unwrap_or_else(|| panic!("helper call site for {helper} must exist in cli.rs"));
+            // Look at the ~120 bytes following the call for the
+            // eprintln!; the block body is short and contiguous.
+            let end = (call_pos + 200).min(src.len());
+            let window = &src[call_pos..end];
+            assert!(
+                window.contains("eprintln!"),
+                "{helper} call site must be followed by `eprintln!` \
+                 (stderr); legend text belongs on the diagnostic \
+                 channel. Window: {window:?}",
+            );
+            // Raw substring match for "println!" is not good enough —
+            // `eprintln!` CONTAINS "println!" starting at byte 1. Look
+            // for a bare `println!` not preceded by an `e`; that is
+            // the real stdout emission we want to reject. `idx == 0`
+            // (or `idx.wrapping_sub(1)` missing) also counts as "not
+            // preceded by e", which correctly flags a `println!` that
+            // opens the window.
+            let has_stdout_emit = window.match_indices("println!").any(|(idx, _)| {
+                let prev = idx.checked_sub(1).and_then(|p| window.as_bytes().get(p));
+                prev != Some(&b'e')
+            });
+            assert!(
+                !has_stdout_emit,
+                "{helper} call site must NOT emit via `println!` \
+                 (stdout); scripted consumers reading stdout would \
+                 receive legend prose mixed into data rows. Window: \
+                 {window:?}",
+            );
+        }
+    }
+
+    /// Pin the annotation-footer emission order in `kernel_list`:
+    /// EOL → untracked → stale → corrupt. The ordering is
+    /// informational-first, operational-last (see the block comment
+    /// at the emission site for the rationale). A regression that
+    /// reshuffled the block order — e.g. hoisting the corrupt footer
+    /// to the top because it felt "louder" — would change the
+    /// human-readable output in a way that is invisible under a
+    /// normal no-tag test run (all four Options are `None`) and only
+    /// surfaces in a tag-heavy run, long after the refactor commit.
+    ///
+    /// Uses the source-pattern approach so the test can pin the
+    /// order WITHOUT building a fixture cache with four simultaneously-
+    /// tagged entries (which would require network fetch of the
+    /// active-prefixes list, real on-disk cache metadata, and a
+    /// corrupt entry — all to prove a four-line ordering).
+    #[test]
+    fn kernel_list_footer_ordering_pin() {
+        let src = include_str!("cli.rs");
+        // Only consider call sites inside `kernel_list`. Locate
+        // the fn by its public signature; slice from there to
+        // the next `^}` at the top level.
+        let kernel_list_start = src
+            .find("pub fn kernel_list(json: bool)")
+            .expect("kernel_list fn must exist");
+        // The next top-level `\n}\n` closes the fn. Scanning
+        // forward for that boundary is sufficient because
+        // `kernel_list` has no nested fn definitions.
+        let tail = &src[kernel_list_start..];
+        let body_end_rel = tail
+            .find("\n}\n")
+            .expect("kernel_list body must close with a top-level `}`");
+        let body = &tail[..body_end_rel];
+
+        let i_eol = body
+            .find("eol_legend_if_any")
+            .expect("EOL helper call missing from kernel_list");
+        let i_untracked = body
+            .find("untracked_legend_if_any")
+            .expect("untracked helper call missing from kernel_list");
+        let i_stale = body
+            .find("stale_legend_if_any")
+            .expect("stale helper call missing from kernel_list");
+        let i_corrupt = body
+            .find("corrupt_footer_if_any")
+            .expect("corrupt helper call missing from kernel_list");
+
+        assert!(
+            i_eol < i_untracked,
+            "EOL legend must precede untracked legend in kernel_list — \
+             informational-first ordering (EOL is upstream-state, \
+             untracked is a rebuild-actionable kconfig tag)",
+        );
+        assert!(
+            i_untracked < i_stale,
+            "untracked legend must precede stale legend — both are \
+             kconfig-tag rebuild recipes and are kept adjacent so \
+             operators see the pair together",
+        );
+        assert!(
+            i_stale < i_corrupt,
+            "stale legend must precede corrupt footer — the corrupt \
+             footer is the operationally-disruptive entry and belongs \
+             last so informational/operational stays visually distinct",
+        );
     }
 }

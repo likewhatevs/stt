@@ -208,9 +208,39 @@ pub enum Op {
 ///
 /// # `#[non_exhaustive]` migration note
 ///
-/// Pattern matches over `CpusetSpec` must include a wildcard
-/// `_ =>` arm so future cpuset-derivation strategies can land
-/// without breaking existing matchers.
+/// **Pattern-match side.** Matches over `CpusetSpec` must include a
+/// wildcard `_ =>` arm so future cpuset-derivation strategies can
+/// land without breaking existing matchers.
+///
+/// **Construction side.** Prefer the associated constructor
+/// functions —
+/// [`Self::llc`], [`Self::numa`], [`Self::range`], [`Self::disjoint`],
+/// [`Self::overlap`], and [`Self::exact`] — over literal variant
+/// expressions like `CpusetSpec::Llc(0)` or `CpusetSpec::Range {
+/// start_frac, end_frac }`. Two reasons:
+///
+/// 1. **Stability across variant reshaping.** A future commit that
+///    adds a field to `Range` (e.g. a stride parameter) breaks every
+///    caller that spelled out `CpusetSpec::Range { start_frac,
+///    end_frac }`; the `Self::range(..)` constructor absorbs the
+///    new field behind a defaulted parameter. The `#[non_exhaustive]`
+///    attribute is what reserves that freedom for the enum; the
+///    constructor convention is how callers opt into benefiting from
+///    it.
+/// 2. **Semantic consistency with [`Self::exact`].** The `exact`
+///    constructor accepts any `IntoIterator<Item = usize>` (arrays,
+///    ranges, `Vec`, `BTreeSet`) and converts to `BTreeSet<usize>`
+///    internally; callers that bypass it and write
+///    `CpusetSpec::Exact(set)` directly must hand-build the
+///    `BTreeSet` — duplicate bookkeeping a future-proofed constructor
+///    erases.
+///
+/// Test code that needs to *inspect* a variant via pattern match
+/// necessarily references the variant literal (the name is load-
+/// bearing for the match), so the construction-side rule is a
+/// convention for *production* call sites, not a hard constraint.
+/// Inside this crate, matchers obey the pattern-side rule above;
+/// constructors obey this rule.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum CpusetSpec {

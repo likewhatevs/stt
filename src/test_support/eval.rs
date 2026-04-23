@@ -928,7 +928,7 @@ pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<(
         }
         Ok(None) => {}
         Err(e) => {
-            eprintln!("ktstr: model prefetch failed; LlmExtract tests may fail: {e:#}");
+            eprintln!("ktstr_test: model prefetch failed; LlmExtract tests may fail: {e:#}");
             tracing::warn!(
                 err = %format!("{e:#}"),
                 "model prefetch failed; LlmExtract tests may fail",
@@ -1016,7 +1016,7 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<Option<PathBuf>> {
             // 5. Build the scheduler package on demand.
             match crate::build_and_find_binary(name) {
                 Ok(path) => return Ok(Some(path)),
-                Err(e) => eprintln!("ktstr: auto-build scheduler '{name}' failed: {e:#}"),
+                Err(e) => eprintln!("ktstr_test: auto-build scheduler '{name}' failed: {e:#}"),
             }
 
             anyhow::bail!(

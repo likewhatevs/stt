@@ -1341,8 +1341,30 @@ fn reject_insecure_url(url: &str) -> Result<()> {
 /// workload. The prefetcher uses this to decide whether the fetch is
 /// worth attempting — a scheduler-only or binary-only test run does
 /// not need the model.
+///
+/// Per-binary scope: each integration-test binary links its own
+/// `KTSTR_TESTS` distributed slice, so this predicate answers the
+/// question for the calling binary's inventory, not for the project
+/// as a whole. An integration test that declares `LlmExtract`
+/// (e.g. `tests/llm_extract_e2e_test.rs`) makes its binary's
+/// `any_test_requires_model()` return `true`; a scheduler-only
+/// binary (e.g. `tests/eevdf_tests.rs`) leaves it at `false`.
 pub fn any_test_requires_model() -> bool {
-    KTSTR_TESTS.iter().any(|entry| {
+    inventory_requires_model(KTSTR_TESTS.iter())
+}
+
+/// Predicate core for [`any_test_requires_model`]. Extracted so unit
+/// tests can exercise both the positive (LlmExtract entry present)
+/// and negative (empty / non-LlmExtract inventory) arms against
+/// synthetic `KtstrTestEntry` lists — the real [`KTSTR_TESTS`]
+/// slice for the lib-crate test binary carries only the
+/// `__unit_test_dummy__` sentinel, so without this seam the
+/// `returns true` arm would have no in-tree test able to reach it.
+fn inventory_requires_model<'a, I>(entries: I) -> bool
+where
+    I: Iterator<Item = &'a super::KtstrTestEntry>,
+{
+    entries.into_iter().any(|entry| {
         let primary_needs = entry
             .payload
             .is_some_and(|p| matches!(p.output, OutputFormat::LlmExtract(_)));
@@ -1379,7 +1401,7 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
         // test-support dispatch path), tracing for structured-log
         // consumers (cargo-ktstr, downstream pipelines).
         eprintln!(
-            "ktstr: LlmExtract offline gate set ({OFFLINE_ENV}={v_safe}); skipping model prefetch"
+            "ktstr_test: LlmExtract offline gate set ({OFFLINE_ENV}={v_safe}); skipping model prefetch"
         );
         tracing::warn!(
             env_var = OFFLINE_ENV,
@@ -1406,7 +1428,7 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
         // in lockstep with `ModelSpec::size_bytes`; a hardcoded
         // "~2.4 GiB" literal drifted every time the pin rotated.
         eprintln!(
-            "ktstr: downloading LlmExtract model (~{}; first run only) …",
+            "ktstr_test: downloading LlmExtract model (~{}; first run only) …",
             indicatif::HumanBytes(expected_total),
         );
         tracing::info!(
@@ -1428,7 +1450,7 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
         // start and end of the prefetch phase — symmetric with
         // the `tracing::info!` at the download-announcement site
         // above.
-        eprintln!("ktstr: model cache ready");
+        eprintln!("ktstr_test: model cache ready");
         tracing::info!(
             model_path = %model_path.display(),
             expected_total_bytes = expected_total,
@@ -2052,12 +2074,30 @@ pub(crate) fn extract_via_llm(
             "LlmExtract raw response (debug env enabled)",
         );
     }
-    match super::metrics::find_and_parse_json(&response) {
-        Some(json) => Ok(super::metrics::walk_json_leaves(
+    Ok(parse_llm_response(&response, stream))
+}
+
+/// Parse a model-emitted response into the Metric list for the
+/// `LlmExtract` pipeline. Returns an empty vector when the response
+/// contains no JSON region the
+/// [`find_and_parse_json`](super::metrics::find_and_parse_json)
+/// recovery walker can lift out — a non-JSON response is a recoverable
+/// "no metrics this time" outcome, not an error, because LLM output
+/// is inherently stochastic and a single failed inference should not
+/// fail the whole test run.
+///
+/// Extracted from [`extract_via_llm`] so the response-to-metrics step
+/// is unit-testable without standing up the model backend: the caller
+/// injects any response string it likes and asserts on the result.
+/// `extract_via_llm` owns the model load and the `invoke_with_model`
+/// round-trip; this helper owns the parse contract alone.
+fn parse_llm_response(response: &str, stream: super::MetricStream) -> Vec<super::Metric> {
+    match super::metrics::find_and_parse_json(response) {
+        Some(json) => super::metrics::walk_json_leaves(
             &json,
             super::MetricSource::LlmExtract,
             stream,
-        )),
+        ),
         None => {
             // Intentionally log only `response.len()` (byte count), not
             // the body. The response can run up to SAMPLE_LEN tokens —
@@ -2071,7 +2111,7 @@ pub(crate) fn extract_via_llm(
                 response_bytes = response.len(),
                 "LlmExtract response was not parseable JSON; returning empty metric set",
             );
-            Ok(Vec::new())
+            Vec::new()
         }
     }
 }
@@ -3599,6 +3639,114 @@ mod tests {
         );
     }
 
+    /// `is_all_hex_ascii` on the empty string is vacuously true —
+    /// no byte fails the `is_ascii_hexdigit` check because no byte
+    /// is inspected. Pins the empty-iteration contract so a
+    /// regression that flipped the default return (e.g. `return
+    /// false` at loop start) would surface here. `is_valid_sha256_hex`
+    /// still rejects the empty string via the length check; this
+    /// test exercises the hex predicate in isolation.
+    #[test]
+    fn is_all_hex_ascii_empty_string_returns_true() {
+        assert!(
+            is_all_hex_ascii(""),
+            "empty string must return true — no byte fails the hex check",
+        );
+    }
+
+    /// Every ASCII hex-digit boundary character is accepted. Covers
+    /// the six documented acceptance ranges (`0-9`, `a-f`, `A-F`)
+    /// plus the boundary characters at each end: `0` / `9` for
+    /// decimals, `a` / `f` for lowercase, `A` / `F` for uppercase.
+    /// A regression that narrowed the predicate (e.g. hardcoded
+    /// `0-9a-f` only, missing uppercase) would fail here on the
+    /// uppercase boundary cases.
+    #[test]
+    fn is_all_hex_ascii_boundary_chars_all_accepted() {
+        for s in &["0", "9", "a", "f", "A", "F", "0123456789", "abcdefABCDEF"] {
+            assert!(
+                is_all_hex_ascii(s),
+                "boundary input {s:?} must be accepted by is_all_hex_ascii",
+            );
+        }
+    }
+
+    /// Every character immediately adjacent to an ASCII hex-digit
+    /// range is rejected. The byte values used are, in order: `/`
+    /// (0x2F, one below `0` at 0x30), `:` (0x3A, one above `9` at
+    /// 0x39), `@` (0x40, one below `A` at 0x41), `G` (0x47, one
+    /// above `F` at 0x46), `` ` `` (0x60, one below `a` at 0x61),
+    /// and `g` (0x67, one above `f` at 0x66). Pinning these six
+    /// catches any off-by-one widening of the predicate (e.g. a
+    /// typo that accepted `g-z` or `G-Z` would flip one of these
+    /// assertions).
+    #[test]
+    fn is_all_hex_ascii_adjacent_non_hex_chars_rejected() {
+        for s in &["/", ":", "@", "G", "`", "g"] {
+            assert!(
+                !is_all_hex_ascii(s),
+                "adjacent-to-hex input {s:?} (hex byte {:#x}) must be rejected",
+                s.as_bytes()[0],
+            );
+        }
+    }
+
+    /// A multi-byte UTF-8 character (every byte has the high bit
+    /// set, so none is an ASCII hex digit) is rejected. Complements
+    /// the existing `is_valid_sha256_hex_rejects_non_canonical_inputs`
+    /// which covers the same failure mode under the 64-byte length
+    /// constraint; this test exercises the hex predicate alone at
+    /// arbitrary length so the byte-level iteration is the only
+    /// thing being pinned. Uses an emoji ("🦀", 4 bytes) rather
+    /// than the Arabic-Indic digit so the test name plausibly
+    /// maps to "non-ASCII bytes" rather than "Unicode digits
+    /// specifically".
+    #[test]
+    fn is_all_hex_ascii_multibyte_utf8_rejected() {
+        let s = "🦀";
+        assert_eq!(s.len(), 4, "setup: emoji must be 4 UTF-8 bytes");
+        assert!(
+            !is_all_hex_ascii(s),
+            "multi-byte UTF-8 input {s:?} must be rejected — every byte has the high bit set",
+        );
+    }
+
+    /// Mixed input: a hex prefix followed by a non-hex byte is
+    /// rejected. Pins the early-return contract: the iteration
+    /// must visit bytes until a non-hex byte appears and return
+    /// `false` immediately rather than accidentally short-
+    /// circuiting to `true` on a partial match. The opposite
+    /// ordering (non-hex byte first) also rejects, proving the
+    /// predicate is position-independent within the iteration.
+    #[test]
+    fn is_all_hex_ascii_mixed_hex_and_non_hex_rejected() {
+        assert!(
+            !is_all_hex_ascii("0123g"),
+            "hex prefix + non-hex byte must fail — iteration must reach the non-hex byte",
+        );
+        assert!(
+            !is_all_hex_ascii("g0123"),
+            "non-hex prefix + hex suffix must fail — iteration must fail at the first non-hex byte",
+        );
+    }
+
+    /// Whitespace and common control bytes that fall OUTSIDE the
+    /// ASCII hex ranges are rejected. Pins the "strict: no
+    /// whitespace tolerance" contract — `check_sha256` consumers
+    /// who pass a pin trimmed from a file-read with trailing
+    /// newlines get a clean diagnostic rather than a silent pass
+    /// on the stripped form. Covers: space (0x20), tab (0x09),
+    /// newline (0x0A), NUL (0x00).
+    #[test]
+    fn is_all_hex_ascii_whitespace_and_nul_rejected() {
+        for s in &[" ", "\t", "\n", "\0", "abc\n", "\0abc"] {
+            assert!(
+                !is_all_hex_ascii(s),
+                "whitespace/NUL input {s:?} must be rejected",
+            );
+        }
+    }
+
     /// `is_valid_sha256_hex` rejects any input that is not exactly
     /// 64 ASCII hex digits. Covers the three rejection classes the
     /// helper guards against: too-short (63 bytes), too-long (65),
@@ -3857,6 +4005,194 @@ mod tests {
              any_test_requires_model() must return false. If this assertion fails, a new test \
              entry was added with OutputFormat::LlmExtract — update this pin accordingly."
         );
+    }
+
+    // Synthetic `Payload` values pinned to `'static` lifetimes so they
+    // can be assigned into `KtstrTestEntry`'s scheduler / payload /
+    // workloads slots (each requires `&'static Payload`). Kept local
+    // to the test module — production consumers build payloads via
+    // `#[derive(Payload)]` or use the curated fixtures in
+    // `tests/common/fixtures.rs`.
+    use super::super::{KtstrTestEntry, OutputFormat, Payload, PayloadKind};
+
+    const LLM_EXTRACT_BINARY_PAYLOAD: Payload = Payload {
+        name: "llm_extract_stub",
+        kind: PayloadKind::Binary("schbench-stub"),
+        output: OutputFormat::LlmExtract(None),
+        default_args: &[],
+        default_checks: &[],
+        metrics: &[],
+        include_files: &[],
+        uses_parent_pgrp: false,
+        known_flags: None,
+    };
+
+    const EXIT_CODE_BINARY_PAYLOAD: Payload = Payload {
+        name: "exit_code_stub",
+        kind: PayloadKind::Binary("some-bin"),
+        output: OutputFormat::ExitCode,
+        default_args: &[],
+        default_checks: &[],
+        metrics: &[],
+        include_files: &[],
+        uses_parent_pgrp: false,
+        known_flags: None,
+    };
+
+    /// Empty inventory must return false. Pins the "no iteration, no
+    /// result" boundary — an integration-test binary that registers
+    /// zero `#[ktstr_test]` entries (e.g. a pure `#[test]`-only
+    /// binary like `jemalloc_alloc_worker_exit_codes.rs`) must not
+    /// drag its process into a model prefetch.
+    #[test]
+    fn inventory_requires_model_empty_iter_returns_false() {
+        let entries: [&KtstrTestEntry; 0] = [];
+        assert!(!inventory_requires_model(entries.iter().copied()));
+    }
+
+    /// A non-LlmExtract inventory returns false even when non-empty.
+    /// Pins the "scheduler-only / binary-with-json-output inventories
+    /// stay out of the prefetch path" contract.
+    #[test]
+    fn inventory_requires_model_no_llm_extract_returns_false() {
+        let entry = KtstrTestEntry {
+            name: "scheduler_only",
+            payload: None,
+            workloads: &[],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let entries = [&entry];
+        assert!(!inventory_requires_model(entries.iter().copied()));
+    }
+
+    /// The positive case under the primary-payload slot: an integration-
+    /// test binary like `tests/llm_extract_e2e_test.rs` declares a
+    /// `Payload` with `OutputFormat::LlmExtract` via its `#[ktstr_test]`
+    /// entry's `payload = SOME_LLM_FIXTURE` attribute, which materializes
+    /// into the entry's `payload: Some(&…)` slot. `inventory_requires_model`
+    /// must return `true` for that shape — without the pin here the
+    /// primary-slot branch has no in-tree test that reaches it (the lib
+    /// crate's `KTSTR_TESTS` only has `__unit_test_dummy__`).
+    #[test]
+    fn inventory_requires_model_primary_payload_llm_extract_returns_true() {
+        let entry = KtstrTestEntry {
+            name: "llm_primary",
+            payload: Some(&LLM_EXTRACT_BINARY_PAYLOAD),
+            workloads: &[],
+            ..KtstrTestEntry::DEFAULT
+        };
+        let entries = [&entry];
+        assert!(inventory_requires_model(entries.iter().copied()));
+    }
+
+    /// Positive case via the `workloads` slot: a test declaring
+    /// `#[ktstr_test(workloads = [FIXTURE])]` where the workload
+    /// fixture carries `OutputFormat::LlmExtract` must also trip the
+    /// predicate. Guards the `.any()` over `entry.workloads` arm.
+    #[test]
+    fn inventory_requires_model_workload_llm_extract_returns_true() {
+        let workloads: &[&Payload] = &[&LLM_EXTRACT_BINARY_PAYLOAD];
+        let entry = KtstrTestEntry {
+            name: "llm_workload",
+            payload: Some(&EXIT_CODE_BINARY_PAYLOAD),
+            workloads,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let entries = [&entry];
+        assert!(inventory_requires_model(entries.iter().copied()));
+    }
+
+    /// A model response with no JSON region at all (plain prose)
+    /// must route through the `Ok(Vec::new())` branch — the fallback
+    /// for stochastic "model output was not parseable" runs. Pins
+    /// the non-error recovery contract directly against
+    /// `parse_llm_response`; the full `extract_via_llm` wrapper
+    /// needs a loaded model to reach this branch, so the helper
+    /// is the seam where the non-JSON path is exercisable without
+    /// the ~2.44 GiB weights load.
+    #[test]
+    fn parse_llm_response_non_json_returns_empty_metrics() {
+        let got = parse_llm_response(
+            "model said: no numbers today, just prose",
+            crate::test_support::MetricStream::Stdout,
+        );
+        assert!(
+            got.is_empty(),
+            "non-JSON response must produce an empty Metric list, got: {got:?}",
+        );
+    }
+
+    /// Empty model response — degenerate pathological case
+    /// (inference truncated before the first token). Same contract:
+    /// empty Metric list, no error.
+    #[test]
+    fn parse_llm_response_empty_returns_empty_metrics() {
+        let got = parse_llm_response("", crate::test_support::MetricStream::Stdout);
+        assert!(
+            got.is_empty(),
+            "empty response must produce an empty Metric list, got: {got:?}",
+        );
+    }
+
+    /// Response with a trailing `</think>`-style prose tail and
+    /// no JSON region — representative of a "model refused to emit
+    /// JSON" outcome. Must still route through the non-JSON branch.
+    #[test]
+    fn parse_llm_response_think_block_only_returns_empty_metrics() {
+        let got = parse_llm_response(
+            "<think>reasoning trace with numbers like 42 and 1337</think>",
+            crate::test_support::MetricStream::Stdout,
+        );
+        assert!(
+            got.is_empty(),
+            "think-block-only response must produce an empty Metric list, got: {got:?}",
+        );
+    }
+
+    /// A valid JSON response with numeric leaves must NOT be routed
+    /// through the empty-fallback branch — it exercises the
+    /// `Some(json) → walk_json_leaves` arm. Asymmetric guard against
+    /// a regression that accidentally returned `Vec::new()` for every
+    /// response shape.
+    #[test]
+    fn parse_llm_response_valid_json_produces_metrics() {
+        let got = parse_llm_response(
+            r#"{"latency_ms": 42, "rps": 1000}"#,
+            crate::test_support::MetricStream::Stdout,
+        );
+        assert!(
+            !got.is_empty(),
+            "JSON response with numeric leaves must produce a non-empty Metric list",
+        );
+        assert!(
+            got.iter().all(|m| matches!(m.source, crate::test_support::MetricSource::LlmExtract)),
+            "every metric from parse_llm_response must carry MetricSource::LlmExtract; got: {got:?}",
+        );
+    }
+
+    /// Mixed inventory: one LlmExtract entry alongside many non-LLM
+    /// entries still returns `true`. Pins the `.any()` short-circuit
+    /// against a regression that accidentally required every entry
+    /// to match.
+    #[test]
+    fn inventory_requires_model_mixed_inventory_returns_true() {
+        let llm_entry = KtstrTestEntry {
+            name: "llm_mixed",
+            payload: Some(&LLM_EXTRACT_BINARY_PAYLOAD),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let plain_a = KtstrTestEntry {
+            name: "plain_a",
+            payload: None,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let plain_b = KtstrTestEntry {
+            name: "plain_b",
+            payload: Some(&EXIT_CODE_BINARY_PAYLOAD),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let entries = [&plain_a, &llm_entry, &plain_b];
+        assert!(inventory_requires_model(entries.iter().copied()));
     }
 
     // -- strip_think_block --

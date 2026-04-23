@@ -340,22 +340,24 @@ impl Scheduler {
     /// launched. Useful as a baseline and for tests that exercise
     /// framework behavior independent of any scx scheduler.
     ///
-    /// The `.name` is the compile-time-fixed string `"eevdf"`. It is
-    /// NOT runtime-derived from the live kernel: a sidecar written
-    /// on a kernel that replaces EEVDF with a successor scheduling
-    /// class still records `"eevdf"` here as long as the test
-    /// attributes this `Scheduler` to a run. The pairing with
-    /// [`Payload::KERNEL_DEFAULT.name`](crate::test_support::Payload::KERNEL_DEFAULT)
-    /// (`"kernel_default"`, also compile-time-fixed) gives consumers
-    /// two static labels per sidecar: `"kernel_default"` captures
-    /// the test author's intent (use whatever scheduler the kernel
-    /// hands us); `"eevdf"` captures the scheduling class this
-    /// placeholder was authored against. Neither label observes the
-    /// running kernel's actual scheduler; for that, consumers must
-    /// cross-reference the sidecar's host block (e.g.
-    /// `host.kernel_release`) with kernel-version-to-scheduler
-    /// knowledge. See the docs on `Payload::KERNEL_DEFAULT` for why
-    /// both labels are carried in the sidecar.
+    /// The `.name` is the compile-time-fixed string `"eevdf"` — NOT
+    /// runtime-derived from the live kernel. A sidecar written on a
+    /// kernel whose default is a successor scheduling class still
+    /// records `"eevdf"` here as long as the test attributes this
+    /// `Scheduler` to a run.
+    ///
+    /// The pairing with
+    /// [`Payload::KERNEL_DEFAULT`](crate::test_support::Payload::KERNEL_DEFAULT)
+    /// (`"kernel_default"`) makes two static labels available at
+    /// runtime — `"kernel_default"` (author intent) and `"eevdf"`
+    /// (scheduling class the placeholder was authored against) —
+    /// but only one of them, `"eevdf"`, reaches the sidecar's
+    /// `scheduler` field via `scheduler_name()`; `"kernel_default"`
+    /// stays in-memory only. See the canonical explanation on
+    /// [`Payload::KERNEL_DEFAULT`](crate::test_support::Payload::KERNEL_DEFAULT)
+    /// for which question each label answers, the sidecar-
+    /// serialization split, and how to filter by author intent vs.
+    /// by scheduling class.
     pub const EEVDF: Scheduler = Scheduler {
         name: "eevdf",
         binary: SchedulerSpec::Eevdf,

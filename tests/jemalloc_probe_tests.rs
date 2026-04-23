@@ -139,8 +139,8 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload {
 // this file and doesn't warrant promotion.
 
 use ktstr::test_support::{
-    MAX_SCAN_INDEX, ThreadLookup, has_metric, lookup_thread, metric_u64, snapshot_count,
-    snapshot_worker_allocated, thread_count,
+    MAX_SCAN_INDEX, ThreadLookup, flat_metrics_dump, has_metric, lookup_thread, metric_u64,
+    snapshot_count, snapshot_worker_allocated, thread_count,
 };
 
 // ---------------------------------------------------------------------------
@@ -270,11 +270,7 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
                 "probe JSON has no snapshots.0.threads.N.tid == {worker_tid} entry despite \
                  n_threads={n_threads} — the probe emitted some tids but none \
                  matched worker_pid, tid-identity is broken. Flat metrics: {:?}",
-                metrics
-                    .metrics
-                    .iter()
-                    .map(|m| (m.name.as_str(), m.value))
-                    .collect::<Vec<_>>(),
+                flat_metrics_dump(&metrics),
             ));
         }
         ThreadLookup::ExceedsCap => {
@@ -622,11 +618,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
         return Ok(AssertResult::fail_msg(format!(
             "multi-snapshot probe emitted {n_snaps} snapshots, expected {SNAPSHOTS}; \
              flat metrics: {:?}",
-            metrics
-                .metrics
-                .iter()
-                .map(|m| (m.name.as_str(), m.value))
-                .collect::<Vec<_>>(),
+            flat_metrics_dump(&metrics),
         )));
     }
 
@@ -651,11 +643,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
                 return Err(anyhow!(
                     "worker tid {worker_tid} absent from snapshots.{i}; flat \
                      metrics: {:?}",
-                    metrics
-                        .metrics
-                        .iter()
-                        .map(|m| (m.name.as_str(), m.value))
-                        .collect::<Vec<_>>(),
+                    flat_metrics_dump(&metrics),
                 ));
             }
             ThreadLookup::ExceedsCap => {
@@ -738,11 +726,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
         anyhow!(
             "top-level started_at_unix_sec missing from probe output; \
              flat metrics: {:?}",
-            metrics
-                .metrics
-                .iter()
-                .map(|m| (m.name.as_str(), m.value))
-                .collect::<Vec<_>>(),
+            flat_metrics_dump(&metrics),
         )
     })?;
     if timestamps[0] < started_at {

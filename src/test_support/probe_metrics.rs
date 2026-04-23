@@ -201,6 +201,24 @@ pub fn snapshot_count(metrics: &PayloadMetrics) -> usize {
     })
 }
 
+/// Flatten the full `(name, value)` pair list for diagnostic
+/// rendering inside error messages. Returned as an owned
+/// `Vec<(&str, f64)>` so call sites spell the diagnostic as a single
+/// `{:?}` formatter argument instead of re-typing the
+/// `.iter().map(...).collect()` chain at every site.
+///
+/// Intended for "probe returned nothing we expected" error paths —
+/// when a lookup helper ([`lookup_thread`], [`snapshot_worker_allocated`],
+/// [`metric_u64`]) returns a miss, dumping the observed flat metric
+/// list into the failure message is usually the fastest triage step.
+pub fn flat_metrics_dump(metrics: &PayloadMetrics) -> Vec<(&str, f64)> {
+    metrics
+        .metrics
+        .iter()
+        .map(|m| (m.name.as_str(), m.value))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -720,16 +720,30 @@ impl Drop for PayloadHandle {
 /// returns. Without `SIG_DFL` for `SIGCHLD`, the guest init's
 /// `SIG_IGN` default causes `wait` to block until the child is
 /// re-reaped by init or to return `ECHILD` on an already-ignored
-/// SIGCHLD. The current caller set is:
+/// SIGCHLD. Audited caller set — every invocation of this function:
 ///
-/// - `PayloadHandle::wait` / `::kill` / `::try_wait` / `::drop` — all
-///   hold `self._sigchld` (field declaration order places it last,
-///   so the scope is live for every method body's duration).
-/// - `wait_with_deadline` — runs under its caller `spawn_and_wait`'s
-///   `SigchldScope` (opened at the top of `spawn_and_wait`). The
-///   scope is alive for the full `wait_with_deadline` call because
-///   `spawn_and_wait` holds it as a local `_sigchld` across the
-///   callee.
+/// - `PayloadHandle::wait` (one site: error arm after a
+///   `wait_and_capture` failure) — holds `self._sigchld`.
+/// - `PayloadHandle::kill` (one site: top of the method, before
+///   drain) — holds `self._sigchld`.
+/// - `PayloadHandle::try_wait` (one site: error arm after a
+///   terminal `try_wait` when drain fails) — holds `self._sigchld`.
+/// - `impl Drop for PayloadHandle` (one site: handle dropped without
+///   an explicit `wait`/`kill`/`try_wait` consume) — holds
+///   `self._sigchld` for the full Drop body.
+/// - `spawn_and_wait` (one site: error arm when `wait_and_capture`
+///   fails on a timeout-less foreground spawn) — opens a local
+///   `let _sigchld = SigchldScope::new()` at the top of the
+///   function.
+/// - `wait_with_deadline` (two sites: deadline-miss kill on expiry,
+///   and error arm for drain failure on natural child exit) — runs
+///   inside `spawn_and_wait`'s `_sigchld` scope, which is held
+///   across the callee as a local binding.
+///
+/// Every `PayloadHandle` method is safe because `_sigchld` is
+/// declared after `child` in the struct body; Rust drops fields in
+/// declaration order so `_sigchld` lives longer than the child
+/// `Option`, keeping the scope live for the full method body.
 ///
 /// A future caller that skips either pattern will see
 /// `waitpid` hang on some guest runtimes — add a `SigchldScope` at
@@ -1191,6 +1205,21 @@ fn render_pid(pid: libc::pid_t, buf: &mut [u8]) -> usize {
 /// entries (which cannot pass `-i`). Other errors keep the minimal
 /// `"spawn '<binary>'"` context so the underlying io::Error chain
 /// surfaces unchanged.
+///
+/// **Shebang interpreter case.** `execve(2)` ALSO returns ENOENT
+/// when `binary` is itself present but is a script whose `#!`
+/// shebang names an interpreter that is missing in the guest
+/// (e.g. `#!/usr/bin/python3` when python3 is absent from
+/// initramfs). The kernel surfaces ENOENT with the script's path
+/// even though the missing file is the interpreter — there is no
+/// userspace signal that distinguishes "binary missing" from
+/// "interpreter missing". The wrapped message therefore names
+/// both the binary and the interpreter as candidate missing
+/// artifacts and tells the operator to package both with `-i`
+/// (CLI) or pre-install both in the initramfs
+/// (`#[ktstr_test]`); the production message body carries this
+/// guidance verbatim, the test
+/// `spawn_error_context_enoent_attaches_remediation` pins it.
 fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
     if err.kind() == std::io::ErrorKind::NotFound {
         anyhow::Error::new(err).context(format!(

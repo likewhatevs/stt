@@ -18,7 +18,7 @@
 //! returns false, the intercept is skipped, and the standard
 //! rustc test harness picks up the `#[test]` functions below.
 
-use ktstr::worker_ready::WORKER_READY_MARKER_OVERRIDE_ENV;
+use ktstr::worker_ready::{WORKER_READY_MARKER_OVERRIDE_ENV, WORKER_STDERR_PREFIX};
 
 /// Render a `std::process::ExitStatus` as a human-actionable string
 /// for assertion-failure diagnostics.
@@ -129,6 +129,21 @@ fn worker_exits_4_on_ready_marker_write_fail() {
             WORKER_READY_MARKER_OVERRIDE_ENV,
             "/nonexistent-ktstr-test-dir/marker",
         )
+        // Pin MALLOC_CONF to background_thread:false so that an
+        // operator with the opposite setting in their shell (or a
+        // sibling test that set it on its own invocation and had the
+        // state leak through an inheritance path we haven't caught)
+        // cannot race the worker into exiting 3 (thread count != 1)
+        // before it reaches the ready-marker branch we're trying to
+        // assert. Without this pin, a stray MALLOC_CONF would make
+        // this test flaky in exactly the conditions that
+        // `worker_exits_3_on_thread_count_not_one` deliberately
+        // exercises. Setting both the generic and tikv-jemallocator
+        // prefixed forms mirrors worker_exits_3's rationale (the
+        // `_rjem_` symbol prefix gates which variant the in-process
+        // allocator reads).
+        .env("MALLOC_CONF", "background_thread:false")
+        .env("_RJEM_MALLOC_CONF", "background_thread:false")
         .output()
         .expect("spawn worker");
     assert_eq!(
@@ -186,5 +201,61 @@ fn worker_exits_3_on_thread_count_not_one() {
     assert!(
         stderr.contains("/proc/self/task has"),
         "stderr must name the self-check that fired; got: {stderr}",
+    );
+}
+
+/// Every fail-fast stderr line the worker emits must start with the
+/// shared [`WORKER_STDERR_PREFIX`]. Pins the "one source of truth
+/// for the worker's stderr prefix" contract: a literal-vs-const
+/// drift — someone retypes `"jemalloc-alloc-worker:"` with a typo,
+/// or omits it on a new eprintln! — would have this assertion
+/// trip on the specific failure path. Drives one failure mode per
+/// exit code the binary can produce from the host side (missing
+/// argv → 5, bytes=0 → 2, bad marker path → 4) so every stderr-
+/// emitting branch is sampled at least once.
+#[test]
+fn worker_stderr_lines_share_centralized_prefix() {
+    let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
+    // Exit 5: missing BYTES.
+    let output = std::process::Command::new(worker)
+        .output()
+        .expect("spawn worker (missing-bytes case)");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with(WORKER_STDERR_PREFIX),
+        "missing-BYTES stderr must start with WORKER_STDERR_PREFIX ({WORKER_STDERR_PREFIX:?}); \
+         got: {stderr}",
+    );
+    // Exit 2: bytes=0.
+    let output = std::process::Command::new(worker)
+        .arg("0")
+        .output()
+        .expect("spawn worker (bytes=0 case)");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with(WORKER_STDERR_PREFIX),
+        "bytes=0 stderr must start with WORKER_STDERR_PREFIX ({WORKER_STDERR_PREFIX:?}); \
+         got: {stderr}",
+    );
+    // Exit 4: marker-write failure via the override env var.
+    // Pin MALLOC_CONF to background_thread:false for the same
+    // reason `worker_exits_4_on_ready_marker_write_fail` does — a
+    // leaking background_thread:true setting would race this case
+    // into exit 3 before the marker write is attempted.
+    let output = std::process::Command::new(worker)
+        .arg("1024")
+        .env(
+            WORKER_READY_MARKER_OVERRIDE_ENV,
+            "/nonexistent-ktstr-test-dir/marker",
+        )
+        .env("MALLOC_CONF", "background_thread:false")
+        .env("_RJEM_MALLOC_CONF", "background_thread:false")
+        .output()
+        .expect("spawn worker (marker-write case)");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with(WORKER_STDERR_PREFIX),
+        "marker-write stderr must start with WORKER_STDERR_PREFIX ({WORKER_STDERR_PREFIX:?}); \
+         got: {stderr}",
     );
 }

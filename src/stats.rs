@@ -137,7 +137,7 @@ impl MetricDef {
 /// | `worst_page_locality` | `page_locality` | `page_locality` |
 /// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
-/// The remaining six metrics in [`METRICS`] have matching
+/// The remaining eight metrics in [`METRICS`] have matching
 /// registry / field / DataFrame column names and are not listed —
 /// no translation to document. Quoting a count instead of each
 /// metric name keeps this doc from silently drifting when a
@@ -281,6 +281,55 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.worst_run_delay_us),
     },
     MetricDef {
+        // Ratio of p99 / median wake latency, worst-case across
+        // cgroups. `LowerBetter` because a higher ratio signals a
+        // stretched long tail. Unitless; baseline is 1.0 (p99 == median
+        // is the perfect-uniform floor set by order-statistic
+        // ordering). `default_abs = 0.5` guards against trivially
+        // small deltas that percent-only gates would flag; `default_rel
+        // = 0.25` matches the wake-latency metrics' percent gate.
+        //
+        // Samples-required noise gate: the accessor returns `None` when
+        // the run completed fewer than
+        // [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] iterations; with
+        // few samples the p99 estimate is effectively the observed
+        // maximum and the tail ratio is dominated by a single
+        // outlier rather than a distributional signal. Routing
+        // through `None` lets `compare_rows` fall through to the
+        // `ext_metrics` lookup (which is also empty for a sub-
+        // threshold run), then to the `unwrap_or(0.0)` default, so
+        // both A- and B-side rows collapse to 0.0 and the subsequent
+        // `abs() < EPSILON` short-circuit silently skips the metric
+        // for that row. See [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`]
+        // for the threshold-value rationale.
+        name: "worst_wake_latency_tail_ratio",
+        polarity: crate::test_support::Polarity::LowerBetter,
+        default_abs: 0.5,
+        default_rel: 0.25,
+        display_unit: "x",
+        accessor: |r| {
+            if r.total_iterations < WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS {
+                None
+            } else {
+                Some(r.worst_wake_latency_tail_ratio)
+            }
+        },
+    },
+    MetricDef {
+        // Per-worker iteration throughput, worst (lowest) cgroup.
+        // `HigherBetter` mirrors [`total_iterations`]: a cgroup that
+        // fell behind regresses this downward, and a cross-variant
+        // improvement raises it. `default_abs = 10.0` is the absolute
+        // iteration-count floor below which deltas are noise;
+        // `default_rel = 0.10` mirrors the `total_iterations` gate.
+        name: "worst_iterations_per_worker",
+        polarity: crate::test_support::Polarity::HigherBetter,
+        default_abs: 10.0,
+        default_rel: 0.10,
+        display_unit: "",
+        accessor: |r| Some(r.worst_iterations_per_worker),
+    },
+    MetricDef {
         name: "worst_page_locality",
         polarity: crate::test_support::Polarity::HigherBetter,
         default_abs: 0.05,
@@ -297,6 +346,46 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.cross_node_migration_ratio),
     },
 ];
+
+/// Minimum total iterations a run must have accumulated before the
+/// `worst_wake_latency_tail_ratio` metric participates in regression
+/// math.
+///
+/// Below this threshold the p99 / median ratio is dominated by a
+/// handful of outlier samples rather than a distributional signal:
+/// p99 on an N-sample set where `N < 100` collapses to approximately
+/// `samples.max()` (the empirical p99 sits at the Nth item of a
+/// sorted set, rounded down, so with N=10 every "p99" is in fact the
+/// maximum), and the ratio `max/median` swings by order of magnitude
+/// across runs that differ only in which worker happened to hit a
+/// scheduling stall. `compare_rows` would report those swings as
+/// regressions / improvements, burying real signal under low-N noise.
+///
+/// 100 is the threshold of interest because percentile estimation
+/// stabilizes when the sample count crosses `1 / (1 - target_p)` —
+/// i.e. 100 samples for a p99 — which is the point at which at least
+/// one sample is expected in the 99th-percentile tail by pigeonhole.
+/// Below this floor the p99 estimator degenerates to the observed
+/// maximum (`samples[99]` when N is exactly 100, and a still-sparse
+/// tail at N just above 100). Above 100 the ratio begins to reflect
+/// actual tail behavior rather than single-sample extrema.
+///
+/// The gate uses `total_iterations` (scenario-wide sum across every
+/// cgroup in the run) as a coarse floor, not an exact per-cgroup
+/// sample count. That sum OVERESTIMATES the per-cgroup iteration
+/// count when the scenario has multiple cgroups sharing load, so a
+/// scenario whose total just clears the floor may still have
+/// individual cgroups with fewer than 100 iterations and therefore
+/// noisy per-cgroup tail ratios. The floor is a minimum-viable
+/// filter against the lowest-N degeneracy, not a guarantee that
+/// every cgroup in a passing row has a stable p99.
+///
+/// The gate is applied in the metric's accessor closure in [`METRICS`]:
+/// a row with `total_iterations < WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`
+/// returns `None`, which `compare_rows` short-circuits to 0.0 against
+/// both A- and B-side rows, which then falls under the
+/// `abs() < EPSILON` "unchanged" guard and emits no finding.
+pub const WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS: u64 = 100;
 
 /// Look up a metric definition by name.
 pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
@@ -322,8 +411,14 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
 /// warns on every non-finite it rewrites to zero, so the log
 /// timeline tells you which run's zeroes were real. Consumers that
 /// cannot accept the ambiguity should prefer metric paths that
-/// flow through `ext_metrics` (which keep non-finite values as
-/// explicit `Option::None` rather than collapsing to zero).
+/// flow through `ext_metrics` (a `BTreeMap<String, f64>` — see the
+/// field definition below): non-finite entries are DROPPED at
+/// [`sidecar_to_row`] ingress rather than stored. A subsequent
+/// `ext_metrics.get(name)` returns `None` because the key is
+/// absent, not because an `Option::None` sentinel is stored — the
+/// map's value type is `f64`, which cannot represent "missing".
+/// Absent-key and zero-valued metrics therefore remain distinguishable
+/// for downstream consumers.
 ///
 /// # `#[non_exhaustive]` migration note
 ///
@@ -385,14 +480,47 @@ pub struct GauntletRow {
     /// the registry / DataFrame boundary translate via
     /// [`MetricDef::read`] rather than by string comparison.
     pub spread: f64,
+    /// Worst-case per-cgroup scheduling gap (ms). Surfaced in
+    /// [`METRICS`] under registry name `worst_gap_ms`; the
+    /// field / registry / DataFrame-column divergence is catalogued
+    /// in the triples table on [`METRICS`].
     pub gap_ms: u64,
+    /// Total CPU migrations across the run. Surfaced in [`METRICS`]
+    /// under registry name `total_migrations`; see the triples
+    /// table on [`METRICS`] for the rationale behind the
+    /// field / registry / DataFrame-column divergence.
     pub migrations: u64,
+    /// Worst-case per-cgroup migrations-per-iteration ratio.
+    /// Surfaced in [`METRICS`] under registry name
+    /// `worst_migration_ratio`; see the triples table on
+    /// [`METRICS`] for the field / registry / DataFrame-column
+    /// divergence.
     pub migration_ratio: f64,
     // Monitor fields (host-side telemetry from guest memory reads).
+    /// Worst per-sample cgroup imbalance ratio. Surfaced in
+    /// [`METRICS`] under registry name `max_imbalance_ratio`
+    /// (DataFrame column `imbalance`); see the triples table on
+    /// [`METRICS`] for the registry/field/column rationale.
     pub imbalance_ratio: f64,
+    /// Worst observed DSQ queue depth. Registry and field names
+    /// match (`max_dsq_depth`) but the DataFrame column is
+    /// `dsq_depth`; see the triples table on [`METRICS`] for the
+    /// column-level rename rationale.
     pub max_dsq_depth: u32,
+    /// Stalled-sample count across the run. Registry and field
+    /// names match (`stall_count`) but the DataFrame column is
+    /// `stalls`; see the triples table on [`METRICS`] for the
+    /// column-level rename rationale.
     pub stall_count: usize,
+    /// Fallback-dispatch rate-per-second. Surfaced in [`METRICS`]
+    /// under registry name `total_fallback` (DataFrame column
+    /// `fallback`); see the triples table on [`METRICS`] for the
+    /// registry/field/column rationale.
     pub fallback_count: i64,
+    /// Keep-last dispatch rate-per-second. Surfaced in [`METRICS`]
+    /// under registry name `total_keep_last` (DataFrame column
+    /// `keep_last`); see the triples table on [`METRICS`] for the
+    /// registry/field/column rationale.
     pub keep_last_count: i64,
     // Benchmarking fields.
     pub worst_p99_wake_latency_us: f64,
@@ -401,8 +529,29 @@ pub struct GauntletRow {
     pub total_iterations: u64,
     pub worst_mean_run_delay_us: f64,
     pub worst_run_delay_us: f64,
+    /// Worst-case ratio of p99 / median wake latency across cgroups.
+    /// Higher values indicate a stretched long tail. Registry name
+    /// matches the field name; see the triples table on [`METRICS`]
+    /// for the full registry / field / DataFrame-column mapping.
+    /// Noise-suppressed when the scenario produced fewer than
+    /// [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] iterations — see
+    /// the constant's doc for the rationale.
+    pub worst_wake_latency_tail_ratio: f64,
+    /// Worst-case per-worker iteration count across cgroups (LOWEST
+    /// across cgroups — lower is worse). Registry name matches the
+    /// field name; see the triples table on [`METRICS`] for the
+    /// field / registry / DataFrame-column mapping.
+    pub worst_iterations_per_worker: f64,
     // NUMA fields.
+    /// Worst-case per-cgroup NUMA page-locality fraction (lowest
+    /// non-zero). Surfaced in [`METRICS`] under registry name
+    /// `worst_page_locality`; see the triples table on
+    /// [`METRICS`] for the registry/field/column rationale.
     pub page_locality: f64,
+    /// Worst-case cross-node migration ratio. Surfaced in
+    /// [`METRICS`] under registry name
+    /// `worst_cross_node_migration_ratio`; see the triples table
+    /// on [`METRICS`] for the registry/field/column rationale.
     pub cross_node_migration_ratio: f64,
     /// Extensible metrics populated by scenarios and processed by the
     /// comparison pipeline. Keyed by metric name; looked up via
@@ -526,6 +675,14 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             sc.stats.worst_mean_run_delay_us,
         ),
         worst_run_delay_us: finite_or_zero("worst_run_delay_us", sc.stats.worst_run_delay_us),
+        worst_wake_latency_tail_ratio: finite_or_zero(
+            "worst_wake_latency_tail_ratio",
+            sc.stats.worst_wake_latency_tail_ratio,
+        ),
+        worst_iterations_per_worker: finite_or_zero(
+            "worst_iterations_per_worker",
+            sc.stats.worst_iterations_per_worker,
+        ),
         page_locality: finite_or_zero("page_locality", sc.stats.worst_page_locality),
         cross_node_migration_ratio: finite_or_zero(
             "cross_node_migration_ratio",
@@ -1535,6 +1692,8 @@ mod tests {
             total_iterations: 0,
             worst_mean_run_delay_us: 0.0,
             worst_run_delay_us: 0.0,
+            worst_wake_latency_tail_ratio: 0.0,
+            worst_iterations_per_worker: 0.0,
             page_locality: 0.0,
             cross_node_migration_ratio: 0.0,
             ext_metrics: BTreeMap::new(),
@@ -1724,8 +1883,8 @@ mod tests {
     /// `finite_or_zero` with `non_finite` planted in the source
     /// [`SidecarResult`], then assert each lands as 0.0 on the row.
     ///
-    /// Covers all ten `finite_or_zero` call sites in `sidecar_to_row`:
-    /// nine fields drawn from [`ScenarioStats`] plus `imbalance_ratio`
+    /// Covers all twelve `finite_or_zero` call sites in `sidecar_to_row`:
+    /// eleven fields drawn from [`ScenarioStats`] plus `imbalance_ratio`
     /// which is read from [`MonitorSummary`]. A missed call site would
     /// leave one of the asserts comparing the non-finite input to 0.0
     /// (NaN != 0.0, ±Infinity != 0.0) and fail the test.
@@ -1742,6 +1901,8 @@ mod tests {
                 worst_wake_latency_cv: non_finite,
                 worst_mean_run_delay_us: non_finite,
                 worst_run_delay_us: non_finite,
+                worst_wake_latency_tail_ratio: non_finite,
+                worst_iterations_per_worker: non_finite,
                 worst_page_locality: non_finite,
                 worst_cross_node_migration_ratio: non_finite,
                 ..Default::default()
@@ -1765,6 +1926,14 @@ mod tests {
             ("worst_wake_latency_cv", row.worst_wake_latency_cv),
             ("worst_mean_run_delay_us", row.worst_mean_run_delay_us),
             ("worst_run_delay_us", row.worst_run_delay_us),
+            (
+                "worst_wake_latency_tail_ratio",
+                row.worst_wake_latency_tail_ratio,
+            ),
+            (
+                "worst_iterations_per_worker",
+                row.worst_iterations_per_worker,
+            ),
             ("page_locality", row.page_locality),
             ("cross_node_migration_ratio", row.cross_node_migration_ratio),
         ] {
@@ -2430,6 +2599,83 @@ mod tests {
             0.10,
             "metrics not in the per-metric map must still see the \
              default_percent (10.0 → 0.10), not the registry default",
+        );
+    }
+
+    /// `worst_wake_latency_tail_ratio` must be suppressed below the
+    /// [`WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS`] sample floor. Low-N
+    /// runs produce p99/median ratios dominated by a single outlier;
+    /// the metric accessor must return `None` in that regime so
+    /// [`compare_rows`] short-circuits and emits no finding.
+    ///
+    /// Positive side: above the floor, the same delta that was
+    /// suppressed below must produce a finding. This proves the
+    /// None-vs-Some branching is the gate that's firing — not an
+    /// unrelated threshold somewhere else in the comparison math.
+    #[test]
+    fn wake_latency_tail_ratio_is_suppressed_below_min_iteration_floor() {
+        use crate::stats::WAKE_LATENCY_TAIL_RATIO_MIN_ITERATIONS as MIN;
+        let metric = metric_def("worst_wake_latency_tail_ratio")
+            .expect("worst_wake_latency_tail_ratio must be registered in METRICS");
+
+        // Below the floor: accessor returns None. Both sides collapse
+        // to 0.0 via unwrap_or(0.0); the EPSILON-guard then classifies
+        // the delta as unchanged.
+        let mut low_a = make_row("tail_low", "tiny-1llc", true, 0.0);
+        let mut low_b = make_row("tail_low", "tiny-1llc", true, 0.0);
+        low_a.total_iterations = MIN - 1;
+        low_b.total_iterations = MIN - 1;
+        low_a.worst_wake_latency_tail_ratio = 2.0;
+        low_b.worst_wake_latency_tail_ratio = 20.0;
+        assert!(
+            metric.read(&low_a).is_none(),
+            "below-floor A accessor must return None so the regression \
+             math cannot see a value",
+        );
+        assert!(
+            metric.read(&low_b).is_none(),
+            "below-floor B accessor must return None even when the \
+             raw field would have carried a suspicious value",
+        );
+        let below = compare_rows(
+            std::slice::from_ref(&low_a),
+            std::slice::from_ref(&low_b),
+            None,
+            &ComparisonPolicy::default(),
+        );
+        assert_eq!(
+            below.regressions, 0,
+            "below-floor comparison must not surface a regression — \
+             low-N ratios are noise, not signal",
+        );
+        assert!(
+            below.findings.is_empty(),
+            "below-floor comparison must emit no findings",
+        );
+
+        // At and above the floor: accessor returns Some and the same
+        // delta now produces a finding.
+        let mut hi_a = make_row("tail_hi", "tiny-1llc", true, 0.0);
+        let mut hi_b = make_row("tail_hi", "tiny-1llc", true, 0.0);
+        hi_a.total_iterations = MIN;
+        hi_b.total_iterations = MIN;
+        hi_a.worst_wake_latency_tail_ratio = 2.0;
+        hi_b.worst_wake_latency_tail_ratio = 20.0;
+        assert_eq!(
+            metric.read(&hi_a),
+            Some(2.0),
+            "at-floor accessor must return Some",
+        );
+        let above = compare_rows(
+            std::slice::from_ref(&hi_a),
+            std::slice::from_ref(&hi_b),
+            None,
+            &ComparisonPolicy::default(),
+        );
+        assert_eq!(
+            above.regressions, 1,
+            "at-floor comparison with a 10x tail blow-up must surface \
+             as a regression; threshold wiring has a gap otherwise",
         );
     }
 

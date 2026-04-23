@@ -2531,11 +2531,60 @@ fn append_probe_output_to_sidecar(
         Mode::from_raw_mode(0o600),
     )
     .with_context(|| format!("open lock file {}", lock_path.display()))?;
-    // LOCK_EX (blocking). Concurrent `--sidecar` callers queue on
-    // the same lock file rather than corrupting each other. The
-    // lock is released when `lock_fd` drops at end-of-function.
-    flock(&lock_fd, FlockOperation::LockExclusive)
-        .with_context(|| format!("flock(LOCK_EX) on {}", lock_path.display()))?;
+    // Non-blocking LOCK_EX with a bounded retry budget instead of
+    // a bare blocking `LockExclusive`. A stuck holder (CI runner
+    // wedged under a zombie probe, an operator who `kill -STOP`'d
+    // a sibling) would otherwise park this call indefinitely —
+    // CI jobs have no upstream deadline and a hung `--sidecar`
+    // write can wedge an entire gauntlet run past the queue's
+    // wall-clock budget. The retry loop tries non-blocking first
+    // (instant success on an uncontended lock) and sleeps briefly
+    // between attempts so concurrent writers still serialize
+    // without busy-looping.
+    //
+    // Budget: 30 seconds — generous for a legitimate contention
+    // scenario (concurrent --sidecar calls on the same file,
+    // which never block more than the time to read+parse+write
+    // a single small JSON document under the lock) but short
+    // enough to fail fast on a truly stuck holder. Operator fix:
+    // identify the advisory-lock holder via `lslocks | grep
+    // <lock_path>` (enumerates every flock / fcntl holder in the
+    // kernel's lock table) or `fuser <lock_path>` (pids with the
+    // file open, a superset) and kill the zombie, then re-run.
+    // `lsof` is the wrong tool here — it enumerates open files,
+    // not advisory lock holders, and a process that opened the
+    // `.lock` file and released its flock would still appear in
+    // `lsof` output without actually holding the lock.
+    const FLOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    const FLOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + FLOCK_BUDGET;
+    loop {
+        match flock(&lock_fd, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => break,
+            Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(FLOCK_RETRY_INTERVAL);
+                continue;
+            }
+            Err(rustix::io::Errno::WOULDBLOCK) => bail!(
+                "flock(LOCK_EX) on {} timed out after {:?} — another \
+                 --sidecar writer holds the lock. Run `lslocks | grep {}` \
+                 or `fuser {}` to identify the flock holder; if it is a \
+                 wedged probe, kill it and re-run. This bounded wait \
+                 replaces the old unbounded LOCK_EX that could hang CI \
+                 indefinitely.",
+                lock_path.display(),
+                FLOCK_BUDGET,
+                lock_path.display(),
+                lock_path.display(),
+            ),
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "flock(LOCK_EX, non-blocking) on {}",
+                    lock_path.display(),
+                )));
+            }
+        }
+    }
 
     // Read INSIDE the flock window — no separate `exists()` call.
     // `fs::read_to_string` itself reports `ErrorKind::NotFound` if
@@ -2578,8 +2627,44 @@ fn append_probe_output_to_sidecar(
         .with_context(|| format!("create staging file in {}", dir.display()))?;
     std::io::Write::write_all(tmp.as_file_mut(), serialized.as_bytes())
         .with_context(|| format!("write staging file in {}", dir.display()))?;
+    // fsync BEFORE rename for powerloss durability. Without this
+    // call, a crash between write(2) and rename(2) can leave the
+    // target file visible (the rename succeeded in the VFS
+    // journal) but with zero-length or partial content on disk —
+    // the staging file's data blocks were not yet flushed when the
+    // rename metadata update beat them to durable storage. POSIX
+    // allows this reordering; ext4 with `data=ordered` (the
+    // default) mitigates it for most cases but does not fully
+    // prevent it across reboots, and tmpfs / XFS give no such
+    // guarantee. Explicit `sync_all` forces the data blocks out
+    // before the rename commits, so a reader post-crash either
+    // sees the OLD sidecar (rename didn't commit) or the FULL
+    // NEW sidecar — never a truncated mix.
+    //
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("fsync staging file in {}", dir.display()))?;
     tmp.persist(path)
         .with_context(|| format!("atomic rename staging file into {}", path.display()))?;
+
+    // Parent-directory fsync AFTER the rename commits the directory
+    // entry to durable storage. Without this call, a post-rename
+    // crash within the fs writeback window can lose both the OLD
+    // and NEW sidecar: the old inode's directory entry was removed,
+    // the new inode's directory entry was not yet flushed, and the
+    // post-crash readdir sees neither. Best-effort — a parent-dir
+    // open/fsync failure is a durability regression, not a
+    // correctness failure (the rename itself already landed in the
+    // VFS), and bubbling the error up would convert an extant-but-
+    // not-yet-flushed sidecar into a hard failure for the caller.
+    // The `unwrap_or(Path::new("."))` guard handles the degenerate
+    // "sidecar has no parent" shape, which the rename path above
+    // would have bailed on before we reach here — kept as
+    // defense-in-depth against a future refactor that loosens the
+    // parent-check.
+    if let Ok(parent) = std::fs::File::open(path.parent().unwrap_or(Path::new("."))) {
+        let _ = parent.sync_all();
+    }
 
     // `lock_fd` drops here; flock is released. Drop order: the
     // rename completed with the lock held, so any concurrent

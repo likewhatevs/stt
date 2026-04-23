@@ -899,6 +899,17 @@ const FUTEX_WAIT_TIMEOUT: libc::timespec = libc::timespec {
     tv_nsec: WORKER_STOP_POLL_NS,
 };
 
+/// Post-wake spin count used by the fan-out messenger variants
+/// ([`WorkType::FutexFanOut`] and [`WorkType::FanOutCompute`]) AFTER
+/// each broadcast wake. Gives receivers a short uncontended window
+/// to run to their reservoir-push before the next wake cycle
+/// arrives. Threaded through [`spin_burst`] rather than a raw
+/// `std::hint::spin_loop` so the messenger also contributes to
+/// `work_units` — matching FanOutCompute's existing pattern so
+/// both variants' messengers report comparable throughput to
+/// downstream assertions.
+const FAN_OUT_POST_WAKE_SPIN_ITERS: u64 = 256;
+
 /// Call `set_mempolicy(2)` for the current process with mode flags.
 ///
 /// No-op for `MemPolicy::Default`. Logs a warning on syscall failure.
@@ -2754,10 +2765,13 @@ fn worker_main(
                     let wake_n = clamp_futex_wake_n(fan_out);
                     atom.store(next, Ordering::Relaxed);
                     unsafe { futex_wake(futex_ptr, wake_n) };
-                    // Short spin to let receivers run before next wake cycle.
-                    for _ in 0..256 {
-                        std::hint::spin_loop();
-                    }
+                    // Short post-wake spin to let receivers run
+                    // before the next wake cycle. Routes through
+                    // `spin_burst` for consistency with
+                    // `WorkType::FanOutCompute`'s messenger (both
+                    // use `FAN_OUT_POST_WAKE_SPIN_ITERS`) so the
+                    // messenger also advances `work_units`.
+                    spin_burst(&mut work_units, FAN_OUT_POST_WAKE_SPIN_ITERS);
                 } else {
                     // Receiver: wait for the generation counter to advance.
                     let expected = atom.load(Ordering::Relaxed);
@@ -3081,7 +3095,7 @@ fn worker_main(
                         gen_atom.fetch_add(1, Ordering::Release);
                         unsafe { futex_wake(futex_ptr, clamp_futex_wake_n(fan_out)) };
                     }
-                    spin_burst(&mut work_units, 256);
+                    spin_burst(&mut work_units, FAN_OUT_POST_WAKE_SPIN_ITERS);
                 } else {
                     // Worker: wait for generation advance, then do work.
                     // Initial snapshot can be Relaxed — it only feeds
@@ -6586,11 +6600,24 @@ mod tests {
     ///
     /// The SIGUSR1 ignore forces stop_and_collect into its StillAlive
     /// escalation branch. This test pins the StillAlive path. The
-    /// graceful-exit branch is pinned by
-    /// [`stop_and_collect_reaps_grandchild_from_panicking_custom_closure`]
-    /// (worker panics → process dies before stop_and_collect runs →
-    /// graceful branch's unconditional killpg reaches the grandchild),
-    /// and the Drop branch is pinned by
+    /// graceful-exit branch (stop_and_collect's `waited` arm where the
+    /// worker exits before the 5s deadline) is pinned by TWO variants
+    /// covering the disjoint shapes a worker can die in before the
+    /// parent reaps it:
+    ///   - [`stop_and_collect_reaps_grandchild_from_panicking_custom_closure`]
+    ///     — worker panics → process dies via `_exit(1)` (under
+    ///     `panic = "unwind"`) or SIGABRT (under `panic = "abort"`)
+    ///     BEFORE stop_and_collect even signals it. The graceful
+    ///     branch's `waited` result is `Exited(1)` / `Signaled(SIGABRT)`
+    ///     on that path; the unconditional killpg must still reach
+    ///     the grandchild.
+    ///   - [`stop_and_collect_reaps_grandchild_from_graceful_custom_closure`]
+    ///     — worker's inherited SIGUSR1 handler fires and flips STOP,
+    ///     the closure returns a clean WorkerReport, the worker
+    ///     `_exit(0)`s WITHIN the deadline. The graceful branch's
+    ///     `waited` is `Exited(0)`; the same unconditional killpg
+    ///     must still reap the grandchild.
+    /// The Drop branch is pinned by
     /// [`drop_reaps_custom_grandchild_via_process_group`] (handle is
     /// dropped with no stop_and_collect call → `impl Drop`'s killpg
     /// sweeps). The multi-worker variant is
@@ -6875,7 +6902,28 @@ mod tests {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(gpid), None).is_ok(),
             "grandchild {gpid} must be alive before stop_and_collect",
         );
+        // Pin which `stop_and_collect` branch fires. The graceful path
+        // — worker's SIGUSR1 handler flips STOP, the closure returns
+        // cleanly via `wait_for_deadline`'s stop-observed early-exit,
+        // the worker `_exit(0)`s well within the 5s collection
+        // deadline — completes in a few hundred milliseconds
+        // (500ms auto-start sleep + SIGUSR1 + 10ms wait_for_deadline
+        // poll + worker serialize/_exit + WNOHANG reap). The
+        // StillAlive escalation branch, by contrast, waits the full
+        // 5s deadline before SIGKILL. A <2s ceiling rules out
+        // StillAlive escalation (~5s+) while leaving generous slack
+        // for CI contention on the graceful path.
+        let t0 = Instant::now();
         let _reports = h.stop_and_collect();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stop_and_collect must hit the graceful-exit branch \
+             (<2s), not StillAlive escalation (~5s). elapsed={elapsed:?} \
+             — a value near the 5s deadline means SIGUSR1 failed to \
+             reach the worker or wait_for_deadline did not observe \
+             STOP in time",
+        );
         assert_grandchild_reaped_within(
             gpid,
             Duration::from_secs(5),
@@ -6981,9 +7029,9 @@ mod tests {
     }
 
     /// Deadline-elapse path: `stop` stays `false`, so
-    /// [`wait_for_deadline`] runs until `secs` elapse. Uses a 1-second
-    /// deadline; asserts the call returned no earlier than ~900ms
-    /// (granularity slop from the 10ms sleep cadence).
+    /// [`wait_for_deadline`] runs until `timeout` elapses. Uses a
+    /// 1-second deadline; asserts the call returned no earlier than
+    /// ~900ms (granularity slop from the 10ms sleep cadence).
     #[test]
     fn wait_for_deadline_waits_full_duration_when_stop_stays_false() {
         let stop = AtomicBool::new(false);

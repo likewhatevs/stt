@@ -240,7 +240,37 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
         };
         match serde_json::from_str::<SidecarResult>(&data) {
             Ok(sc) => out.push(sc),
-            Err(e) => eprintln!("ktstr: skipping {}: {e}", path.display()),
+            Err(e) => {
+                // Enrich the diagnostic when a serde "missing field"
+                // error mentions `host` (the most common miss after
+                // the host-context landing) — point the operator at
+                // the fix that pre-1.0 disposable-sidecar policy
+                // calls for: re-run the test to regenerate the
+                // sidecar under the current schema. Generic errors
+                // fall through to the unadorned message so the
+                // original serde line number / column remain visible.
+                //
+                // Matching on the Display text is deliberate: serde's
+                // typed-error surface for `missing field "X"` is not
+                // stable across serde_json versions, but the rendered
+                // message is — a forward-compat regression-resilient
+                // check costs one string search.
+                let msg = e.to_string();
+                let is_missing_host = msg.contains("missing field")
+                    && msg.contains("`host`");
+                if is_missing_host {
+                    eprintln!(
+                        "ktstr_test: skipping {}: {e} — the `host` field was \
+                         added to SidecarResult; pre-1.0 policy is \
+                         disposable-sidecar: re-run the test to \
+                         regenerate this file under the current schema \
+                         (no migration shim exists)",
+                        path.display(),
+                    );
+                } else {
+                    eprintln!("ktstr_test: skipping {}: {e}", path.display());
+                }
+            }
         }
     };
     for entry in entries.flatten() {
@@ -1161,15 +1191,47 @@ mod tests {
         };
         let json = serde_json::to_string_pretty(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.test_name, "my_test");
-        assert_eq!(loaded.topology, "1n2l4c2t");
-        assert_eq!(loaded.scheduler, "scx_mitosis");
-        assert!(loaded.passed);
-        assert_eq!(loaded.stats.total_workers, 4);
-        assert_eq!(loaded.stats.cgroups.len(), 1);
-        assert_eq!(loaded.stats.cgroups[0].num_workers, 4);
-        assert_eq!(loaded.stats.worst_spread, 20.0);
-        let mon = loaded.monitor.unwrap();
+        // Exhaustive destructure — `SidecarResult` is `non_exhaustive`
+        // only across crates, but in-crate destructure still requires
+        // every field to appear by name. Adding a field to
+        // `SidecarResult` without extending this pattern fails to
+        // compile here, forcing the author to make an explicit
+        // roundtrip-coverage decision at the same time they introduce
+        // the field. See sibling
+        // [`sidecar_payload_and_metrics_always_emit_when_empty`] for
+        // the empty-collection variant of this pin.
+        let SidecarResult {
+            test_name,
+            topology,
+            scheduler,
+            scheduler_commit: _,
+            payload: _,
+            metrics: _,
+            passed,
+            skipped: _,
+            stats,
+            monitor,
+            stimulus_events,
+            work_type: _,
+            active_flags: _,
+            verifier_stats: _,
+            kvm_stats: _,
+            sysctls: _,
+            kargs: _,
+            kernel_version: _,
+            timestamp: _,
+            run_id: _,
+            host: _,
+        } = loaded;
+        assert_eq!(test_name, "my_test");
+        assert_eq!(topology, "1n2l4c2t");
+        assert_eq!(scheduler, "scx_mitosis");
+        assert!(passed);
+        assert_eq!(stats.total_workers, 4);
+        assert_eq!(stats.cgroups.len(), 1);
+        assert_eq!(stats.cgroups[0].num_workers, 4);
+        assert_eq!(stats.worst_spread, 20.0);
+        let mon = monitor.unwrap();
         assert_eq!(mon.total_samples, 10);
         assert_eq!(mon.max_imbalance_ratio, 1.5);
         assert_eq!(mon.max_local_dsq_depth, 3);
@@ -1177,8 +1239,8 @@ mod tests {
         let deltas = mon.event_deltas.unwrap();
         assert_eq!(deltas.total_fallback, 7);
         assert_eq!(deltas.total_dispatch_keep_last, 3);
-        assert_eq!(loaded.stimulus_events.len(), 1);
-        assert_eq!(loaded.stimulus_events[0].label, "StepStart[0]");
+        assert_eq!(stimulus_events.len(), 1);
+        assert_eq!(stimulus_events[0].label, "StepStart[0]");
     }
 
     /// Exhaustive schema-audit gate for `SidecarResult`'s serde
@@ -1612,7 +1674,28 @@ mod tests {
         // `dir` itself is shared with any other test that runs
         // without `KTSTR_SIDECAR_DIR` set, so leave it in place;
         // only this test's own files are removed.
-        for p in find_sidecars_by_prefix(&dir, "__sidecar_default_dir__-") {
+        let paths = find_sidecars_by_prefix(&dir, "__sidecar_default_dir__-");
+        // One call to `write_sidecar` above must produce exactly
+        // one sidecar under this test's unique prefix. A count
+        // above 1 exposes a variant-hash collision (two distinct
+        // test_name + variant-hash pairs hashing to the same
+        // filename suffix) or a stale file lingering from a
+        // previous crashed run sharing this exact test_name — the
+        // latter would hide a real collision today. Making the
+        // check loud here (rather than silently wiping every
+        // matching file) surfaces both regressions.
+        assert_eq!(
+            paths.len(),
+            1,
+            "single `write_sidecar` call against prefix \
+             `__sidecar_default_dir__-` must produce exactly one \
+             file; got {} ({paths:?}). If >1, either the variant \
+             hash collided for this test's variant-field tuple or \
+             a prior crashed run left a stale sidecar under the \
+             same prefix — investigate before re-running the test.",
+            paths.len(),
+        );
+        for p in paths {
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -2506,8 +2589,51 @@ mod tests {
             "empty metrics must emit as `\"metrics\":[]`: {json}",
         );
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
-        assert!(loaded.payload.is_none());
-        assert!(loaded.metrics.is_empty());
+        // Exhaustive destructure so a new `Option<_>` / `Vec<_>`
+        // field on `SidecarResult` that defaults to `None` / empty
+        // forces this test to spell it out and make an
+        // always-emit-vs-skip decision at the same time. See
+        // [`sidecar_result_roundtrip`] for the same pattern on the
+        // populated side — the two together pin the wire contract
+        // at both extremes of the default distribution.
+        let SidecarResult {
+            test_name: _,
+            topology: _,
+            scheduler: _,
+            scheduler_commit,
+            payload,
+            metrics,
+            passed: _,
+            skipped: _,
+            stats: _,
+            monitor,
+            stimulus_events,
+            work_type: _,
+            active_flags,
+            verifier_stats,
+            kvm_stats,
+            sysctls,
+            kargs,
+            kernel_version,
+            timestamp: _,
+            run_id: _,
+            host,
+        } = loaded;
+        assert!(payload.is_none());
+        assert!(metrics.is_empty());
+        // The sibling-field defaults on the empty fixture — every
+        // nullable must be None and every Vec empty, matching the
+        // always-emit invariants that the JSON shape above pins.
+        assert!(scheduler_commit.is_none());
+        assert!(monitor.is_none());
+        assert!(stimulus_events.is_empty());
+        assert!(active_flags.is_empty());
+        assert!(verifier_stats.is_empty());
+        assert!(kvm_stats.is_none());
+        assert!(sysctls.is_empty());
+        assert!(kargs.is_empty());
+        assert!(kernel_version.is_none());
+        assert!(host.is_none());
     }
 
     /// Populated `payload` + `metrics` survive round-trip with the

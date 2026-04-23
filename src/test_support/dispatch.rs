@@ -112,12 +112,18 @@ pub fn ktstr_test_early_dispatch() {
         // test binary per crate; the ctor runs exactly once per
         // test binary) so there is no need to gate with a
         // std::sync::Once.
-        let has_real_tests = KTSTR_TESTS.iter().any(|e| !is_test_sentinel(e.name));
-        if has_real_tests {
+        let total = KTSTR_TESTS.len();
+        let real = KTSTR_TESTS
+            .iter()
+            .filter(|e| !is_test_sentinel(e.name))
+            .count();
+        if real > 0 {
             eprintln!(
-                "warning: ktstr test entries detected but NEXTEST env var is not set; \
-                 flag-profile / topology-preset variants will not run under `cargo test`. \
-                 Use `cargo nextest run` (or `cargo ktstr test`) to exercise the full gauntlet.",
+                "warning: {real} of {total} ktstr test entries registered in this binary \
+                 will not generate their flag-profile / topology-preset gauntlet variants — \
+                 NEXTEST env var is not set and the standard rustc harness does not expand \
+                 them. Use `cargo nextest run` (or `cargo ktstr test`) to exercise the full \
+                 gauntlet.",
             );
         }
     }
@@ -303,11 +309,11 @@ fn list_tests(ignored_only: bool) {
     let budget_secs: Option<f64> = raw.as_deref().and_then(|s| match s.parse::<f64>() {
         Ok(v) if v > 0.0 => Some(v),
         Ok(v) => {
-            eprintln!("ktstr: KTSTR_BUDGET_SECS={v}: must be positive, ignoring");
+            eprintln!("ktstr_test: KTSTR_BUDGET_SECS={v}: must be positive, ignoring");
             None
         }
         Err(e) => {
-            eprintln!("ktstr: KTSTR_BUDGET_SECS={s:?}: {e}, ignoring");
+            eprintln!("ktstr_test: KTSTR_BUDGET_SECS={s:?}: {e}, ignoring");
             None
         }
     });

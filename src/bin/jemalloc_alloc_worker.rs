@@ -84,7 +84,7 @@ use std::time::Duration;
 // single-source-of-truth behavior.
 #[path = "../worker_ready.rs"]
 mod worker_ready;
-use worker_ready::{WORKER_READY_MARKER_OVERRIDE_ENV, worker_ready_marker_path};
+use worker_ready::{WORKER_READY_MARKER_OVERRIDE_ENV, WORKER_STDERR_PREFIX, worker_ready_marker_path};
 
 /// Force jemalloc to observe the heap buffer by reading through it.
 ///
@@ -126,7 +126,7 @@ fn main() {
             Ok(n) => n,
             Err(e) => {
                 eprintln!(
-                    "jemalloc-alloc-worker: failed to parse BYTES argument {raw:?} as usize: {e}; \
+                    "{WORKER_STDERR_PREFIX} failed to parse BYTES argument {raw:?} as usize: {e}; \
                      usage: jemalloc-alloc-worker [--churn] <BYTES>"
                 );
                 std::process::exit(5);
@@ -134,7 +134,7 @@ fn main() {
         },
         None => {
             eprintln!(
-                "jemalloc-alloc-worker: missing required positional <BYTES>; \
+                "{WORKER_STDERR_PREFIX} missing required positional <BYTES>; \
                  usage: jemalloc-alloc-worker [--churn] <BYTES>"
             );
             std::process::exit(5);
@@ -147,7 +147,7 @@ fn main() {
     // See module doc's "Exit codes" section for the full enumeration.
     if bytes == 0 {
         eprintln!(
-            "jemalloc-alloc-worker: bytes=0 is not a valid allocation size; \
+            "{WORKER_STDERR_PREFIX} bytes=0 is not a valid allocation size; \
              caller must pass a positive byte count"
         );
         std::process::exit(2);
@@ -173,7 +173,7 @@ fn main() {
                 let n = iter.filter(|e| e.is_ok()).count();
                 if n != 1 {
                     eprintln!(
-                        "jemalloc-alloc-worker: /proc/self/task has {n} entries, expected 1; \
+                        "{WORKER_STDERR_PREFIX} /proc/self/task has {n} entries, expected 1; \
                          extra threads break the tid==pid identity"
                     );
                     // Exit code 3: self-check saw >1 TID. The test
@@ -187,7 +187,7 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("jemalloc-alloc-worker: read_dir(/proc/self/task) failed: {e}");
+                eprintln!("{WORKER_STDERR_PREFIX} read_dir(/proc/self/task) failed: {e}");
                 // Exit code 6: procfs itself was unreadable. Distinct
                 // from exit 3 (threads!=1) because the failure class
                 // is different — 3 points at the worker build, 6
@@ -220,16 +220,26 @@ fn main() {
     // at a deliberately-unwritable path (e.g. a non-existent parent
     // directory) so the exit-4 branch fires deterministically instead
     // of racing a pre-mkdir against the worker's own `fs::write`.
-    // Production callers never set this env var. The env-var name
-    // lives in `worker_ready.rs` as a `pub const` so worker and test
-    // cannot drift on spelling.
+    //
+    // This override exists for integration-test determinism; the
+    // worker binary is a test fixture, not a production artifact.
+    // The env lookup is unconditional (no `cfg(debug_assertions)`
+    // gate) so `cargo nextest run --release` and any other release-
+    // profile integration-test invocation still exercise the
+    // exit-4 branch — gating on debug_assertions silently broke
+    // the test in the release profile because the override became
+    // inert and the worker fell through to writing the pid-scoped
+    // default path (which the `/nonexistent-ktstr-test-dir/marker`
+    // test case never reaches). The env-var name lives in
+    // `worker_ready.rs` as a `pub const` so worker and test cannot
+    // drift on spelling.
     let ready_path = match std::env::var(WORKER_READY_MARKER_OVERRIDE_ENV) {
         Ok(p) if !p.is_empty() => p,
         _ => worker_ready_marker_path(pid),
     };
     if let Err(e) = std::fs::write(&ready_path, b"ready\n") {
         eprintln!(
-            "jemalloc-alloc-worker: failed to write ready marker {ready_path}: {e}"
+            "{WORKER_STDERR_PREFIX} failed to write ready marker {ready_path}: {e}"
         );
         std::process::exit(4);
     }

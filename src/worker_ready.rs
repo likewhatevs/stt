@@ -155,3 +155,19 @@ pub fn worker_ready_marker_path(pid: u32) -> String {
     format!("{WORKER_READY_MARKER_PREFIX}{pid}")
 }
 
+/// Stderr line prefix the `ktstr-jemalloc-alloc-worker` binary
+/// prepends to every fail-fast diagnostic it emits (missing argv,
+/// bytes=0, thread self-check, procfs unreadable, ready-marker
+/// write fail). Exported as a `pub const` so host-side integration
+/// tests can assert against the binary's emitted literal without
+/// duplicating it — a rename or a typo on either side shows up
+/// here in one place instead of silently desynchronizing.
+///
+/// The trailing space that separates the prefix from the message
+/// body is NOT part of this constant: call sites write
+/// `{WORKER_STDERR_PREFIX} …` so the space remains a formatting
+/// concern, and test-side substring checks can match on the
+/// prefix alone regardless of the specific separator the worker
+/// chooses.
+pub const WORKER_STDERR_PREFIX: &str = "jemalloc-alloc-worker:";
+
