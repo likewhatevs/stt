@@ -1505,12 +1505,19 @@ pub fn show_host() -> String {
 /// POSIX "process terminates on SIGPIPE" convention that Unix
 /// CLI tools rely on.
 ///
-/// Call this at the TOP of every `ktstr*` binary's `main` —
+/// Call this at the TOP of each of the three user-facing CLIs'
+/// `main` — `ktstr`, `cargo-ktstr`, and `ktstr-jemalloc-probe` —
 /// before the tracing subscriber installs its stderr handler and
 /// before any stdout write. Shared across `src/bin/ktstr.rs`,
 /// `src/bin/cargo-ktstr.rs`, and `src/bin/jemalloc_probe.rs` so
 /// the three CLIs behave identically under `|` pipelines and a
-/// future reword of the SAFETY rationale lands in one place.
+/// future reword of the SAFETY rationale lands in one place. The
+/// `ktstr-jemalloc-alloc-worker` binary does NOT call this — it
+/// is a test-fixture target spawned by the probe's closed-loop
+/// integration tests, never piped by a human operator, and its
+/// stdout emission path prints a single "ready" breadcrumb that
+/// the test body ignores, so SIGPIPE restoration there would
+/// add noise without benefit.
 ///
 /// No return value; the call is effectively infallible (libc's
 /// `signal(2)` can't fail for a standard signal + SIG_DFL

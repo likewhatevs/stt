@@ -25,7 +25,11 @@
 //!   `Vec<SidecarResult>` for CLI output.
 //! - [`detect_kernel_version`]: read the kernel version from
 //!   `KTSTR_KERNEL` cache metadata for sidecar-dir naming and the
-//!   `kernel_version` field.
+//!   `kernel_version` field, with fallback to
+//!   `include/config/kernel.release` in the kernel source tree
+//!   when the cache metadata is absent or does not carry a
+//!   version (e.g. a raw source-tree path set in `KTSTR_KERNEL`
+//!   rather than a cache key).
 
 use std::path::PathBuf;
 
@@ -124,12 +128,15 @@ pub struct SidecarResult {
     /// deserialize.
     pub kargs: Vec<String>,
     /// Kernel version of the VM under test (from cache metadata,
-    /// e.g. `"6.14.2"`). Populated from the VM's `/proc/version` or
-    /// the cache entry metadata; `None` for host-only tests or when
-    /// the version could not be determined. The host's running
-    /// kernel release is carried separately in `host.kernel_release`.
-    /// Always emitted (`"kernel_version": null` on absence); required
-    /// on deserialize.
+    /// e.g. `"6.14.2"`). Populated from the cache entry's
+    /// `metadata.json` version field, with fallback to the kernel
+    /// source tree's `include/config/kernel.release` when
+    /// `KTSTR_KERNEL` points at a raw source path rather than a
+    /// cache key; `None` for host-only tests or when neither
+    /// source yields a version string. The host's running kernel
+    /// release is carried separately in `host.kernel_release`.
+    /// Always emitted (`"kernel_version": null` on absence);
+    /// required on deserialize.
     pub kernel_version: Option<String>,
     /// ISO 8601 timestamp of when this test run started.
     pub timestamp: String,

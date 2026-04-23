@@ -1,7 +1,7 @@
 //! Join, aggregate, and render the comparison between two
 //! [`HostStateSnapshot`]s.
 //!
-//! Design summary (backlog ): the per-thread profiler emits
+//! Design summary: the per-thread profiler emits
 //! one snapshot per run. Comparison groups threads within each
 //! snapshot by `(pcomm, comm)` (or by cgroup / comm, see
 //! [`GroupBy`]), aggregates every metric per the rule on its

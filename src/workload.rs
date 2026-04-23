@@ -1090,8 +1090,14 @@ pub struct Migration {
 
 /// Telemetry collected from a worker process after it stops.
 ///
-/// Each field is populated by the worker itself (inside the VM) and
-/// serialized via a pipe to the parent process.
+/// Normal reports: each field is populated by the worker itself
+/// (inside the VM) and serialized via a pipe to the parent process.
+/// Sentinel reports: sentinel reports synthesized by
+/// [`WorkloadHandle::stop_and_collect`] on worker-exit carry
+/// parent-populated `exit_info` with the remaining fields at their
+/// [`Default`] values (the worker never emitted on the pipe, so
+/// the parent is the sole source of truth for the surfaced
+/// outcome).
 ///
 /// # Default trade-off
 ///

@@ -3,15 +3,14 @@
 //! [`HostStateSnapshot`] is the serialized container for a single
 //! host-wide per-thread profile. Capture produces one via the
 //! `ktstr host-state -o snapshot.hst.zst` subcommand; comparison
-//! reads two and joins them on `(pcomm, comm)` per the design in
-//! session backlog item .
+//! reads two and joins them on `(pcomm, comm)`.
 //!
 //! Every field is cumulative-from-birth so probe timing does not
 //! alter the output: the design principle is that a thread sampled
 //! twice at different wall-clock instants produces the same numbers
 //! so long as its cumulative counters have not rolled over. Metrics
 //! that reset on attachment (perf_event_open counters, etc.) are
-//! intentionally absent — see the backlog entry for the parked set.
+//! intentionally absent from this capture layer.
 //!
 //! # Capture model
 //!
@@ -132,16 +131,21 @@ pub struct ThreadState {
     pub cgroup: String,
     /// `/proc/<tid>/stat` field 22 (`start_time`) in USER_HZ
     /// clock ticks since system boot. The kernel exports this
-    /// field in USER_HZ units (constant 100 across every in-tree
-    /// Linux build regardless of CONFIG_HZ, via
-    /// `kernel/sys.c::USER_HZ` and `fs/proc/array.c::do_task_stat`)
-    /// — NOT raw internal jiffies, which scale with CONFIG_HZ.
-    /// The name corrects a prior misnaming: cross-host comparison
-    /// IS meaningful because USER_HZ does not vary, so a diff
-    /// between two hosts on different CONFIG_HZ settings still
-    /// compares correctly. Seconds-since-boot is simply
-    /// `start_time_clock_ticks / 100` on every Linux the capture
-    /// layer targets.
+    /// field in USER_HZ units (defined in
+    /// `include/asm-generic/param.h` as `USER_HZ == 100` on
+    /// every architecture the capture layer targets — x86_64
+    /// and aarch64) — NOT raw internal jiffies, which scale
+    /// with CONFIG_HZ. The name corrects a prior misnaming:
+    /// cross-host comparison between x86_64 and aarch64 IS
+    /// meaningful because USER_HZ is the same 100 on both, so
+    /// a diff between two hosts on different CONFIG_HZ
+    /// settings still compares correctly. Seconds-since-boot
+    /// is simply `start_time_clock_ticks / 100` on those
+    /// architectures. Other in-tree architectures carry
+    /// different USER_HZ (alpha defines 1024, for instance);
+    /// a future port must either restate the divisor or
+    /// normalise at capture time. `fs/proc/array.c::do_task_stat`
+    /// is where the kernel writes the field to procfs.
     pub start_time_clock_ticks: u64,
     /// Scheduling policy (SCHED_OTHER, SCHED_FIFO, SCHED_RR,
     /// SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT). Stored
@@ -149,9 +153,11 @@ pub struct ThreadState {
     /// integer so comparison output is human-readable without a
     /// reverse-lookup table.
     pub policy: String,
-    /// Nice value in the standard [-20, 19] range. Stored as
-    /// i32 to accommodate SCHED_DEADLINE's negative-runtime
-    /// encoding should that ever flow through this field.
+    /// Nice value in the standard [-20, 19] range. Signed i32
+    /// because the range includes negative values and
+    /// [`parse_stat`] extracts the field via `get_i32` on
+    /// procfs's decimal text — the type matches the extraction
+    /// path and the kernel-visible range without coercion.
     pub nice: i32,
     /// Allowed CPU set from `sched_getaffinity`. Sorted ascending.
     /// Comparison aggregates via union across the group and
@@ -184,14 +190,23 @@ pub struct ThreadState {
     /// separately from `nr_wakeups`, which already covers the
     /// wake-side tally).
     pub sleep_sum: u64,
-    /// Total time blocked on involuntary I/O — includes swap-in,
-    /// page fault resolution, and any kernel path that blocks the
-    /// task on a disk or compressed-pool read. `block_sum - iowait_sum`
-    /// approximates swap/zswap decompression delay specifically.
+    /// Total time blocked in the scheduler — every path that
+    /// puts the task into `TASK_UNINTERRUPTIBLE` contributes:
+    /// swap-in, page-fault resolution, disk I/O, plus
+    /// mutex/rwsem/completion waits inside kernel code that
+    /// hold the task off the runqueue. `block_sum - iowait_sum`
+    /// is therefore an UPPER BOUND on non-iowait
+    /// involuntary-block time — swap/zswap decompression
+    /// contributes, but so do the lock-family waits, so the
+    /// delta cannot be read as swap latency without further
+    /// attribution.
     pub block_sum: u64,
     pub block_count: u64,
-    /// Total time in I/O wait specifically (subset of block_sum).
-    /// Distinguishes disk-backed I/O delay from swap/zswap delay.
+    /// Total time in I/O wait specifically (subset of
+    /// `block_sum`). Distinguishes disk-backed I/O delay from
+    /// the full involuntary-block total — callers that want
+    /// disk latency alone read this field, callers that want
+    /// every blocked window read `block_sum`.
     pub iowait_sum: u64,
     pub iowait_count: u64,
 
@@ -642,12 +657,14 @@ pub fn parse_cpu_list(s: &str) -> Option<Vec<u32>> {
 /// # CPU-count cap
 ///
 /// Uses libc's fixed-size `cpu_set_t` whose capacity is
-/// `CPU_SETSIZE` — `1024` on glibc, matching the kernel's
-/// compile-time `CONFIG_NR_CPUS` default. On hosts that were
-/// built with `CONFIG_NR_CPUS > 1024` (large NUMA servers,
-/// partitioning hardware), the syscall returns `EINVAL` on the
-/// 128-byte buffer above because the kernel cannot encode the
-/// full mask into that size. The caller at
+/// `CPU_SETSIZE` — `1024` on glibc. That cap is independent of
+/// the kernel's `CONFIG_NR_CPUS`, which on x86_64 defaults to
+/// 8192 and can be raised further; the glibc struct size is
+/// the binding constraint, not the kernel's allocation. On
+/// hosts that were built with `CONFIG_NR_CPUS > 1024` (large
+/// NUMA servers, partitioning hardware), the syscall returns
+/// `EINVAL` on the 128-byte buffer above because the kernel
+/// cannot encode the full mask into that size. The caller at
 /// [`capture_thread_at`] falls back to parsing
 /// `Cpus_allowed_list:` out of `/proc/<tid>/status`, which
 /// handles arbitrary CPU counts via its string form — so the

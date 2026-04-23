@@ -137,12 +137,29 @@ impl MetricDef {
 /// | `worst_page_locality` | `page_locality` | `page_locality` |
 /// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
-/// The remaining eight metrics in [`METRICS`] have matching
-/// registry / field / DataFrame column names and are not listed —
-/// no translation to document. Quoting a count instead of each
-/// metric name keeps this doc from silently drifting when a
-/// matching-name metric is renamed without the divergence
-/// classification changing.
+/// Six of the remaining metrics in [`METRICS`] have matching
+/// registry / field / DataFrame column names (`worst_p99_wake_latency_us`,
+/// `worst_median_wake_latency_us`, `worst_wake_latency_cv`,
+/// `total_iterations`, `worst_mean_run_delay_us`,
+/// `worst_run_delay_us`) and are not listed — no translation
+/// to document.
+///
+/// Two further entries in [`METRICS`] —
+/// `worst_wake_latency_tail_ratio` and
+/// `worst_iterations_per_worker` — are registered and
+/// populated on [`GauntletRow`] but have NO DataFrame column
+/// in [`build_dataframe`]. Consumers that reach for them via
+/// polars receive "column not found" — go through the
+/// registry accessor closure instead. A follow-up task (see
+/// comments on the two [`GauntletRow`] fields) wires them into
+/// the DataFrame once the comparison pipeline accounts for the
+/// two new dimensions.
+///
+/// Quoting the matching list instead of a bare count avoids
+/// the prior silent-drift failure mode: the old "remaining
+/// eight metrics" sentence was wrong (two of the eight have
+/// no DataFrame column) and it would have stayed wrong on any
+/// future matching-name rename.
 ///
 /// Consumers that cross the registry / DataFrame boundary should
 /// go through [`MetricDef::read`] / the accessor closure rather

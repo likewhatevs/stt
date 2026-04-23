@@ -497,11 +497,8 @@ pub struct CgroupStats {
     /// lock-step, tail ratio stays put) or by stretching just
     /// the tail (only p99 climbs, ratio balloons).
     ///
-    /// Persisted on the sidecar for future `stats compare`
-    /// wiring; not yet routed through `GauntletRow` / the
-    /// `METRICS` registry, so `stats compare` output does not
-    /// surface this axis today. A follow-up task wires the
-    /// sidecar field into the comparison row schema.
+    /// Routed through `GauntletRow` and the `METRICS` registry;
+    /// `stats compare` surfaces this axis in its comparison rows.
     ///
     /// `0.0` when `median_wake_latency_us` is `0.0` to avoid
     /// producing `NaN` / `Infinity` that would trip the
@@ -527,9 +524,8 @@ pub struct CgroupStats {
     /// topology, and work_type constant before reading this
     /// field.
     ///
-    /// Persisted on the sidecar for future `stats compare`
-    /// wiring; not yet routed through `GauntletRow` / the
-    /// `METRICS` registry. A follow-up task wires it in.
+    /// Routed through `GauntletRow` and the `METRICS` registry;
+    /// `stats compare` surfaces this axis in its comparison rows.
     ///
     /// `0.0` when `num_workers` is zero (empty cgroup — a
     /// constructed edge case, not expected in production runs).
@@ -642,9 +638,8 @@ pub struct ScenarioStats {
     /// [`CgroupStats::wake_latency_tail_ratio`] — see that field
     /// for the unit/semantics rationale.
     ///
-    /// Persisted on the sidecar for future `stats compare`
-    /// wiring; not yet routed through `GauntletRow` / the
-    /// `METRICS` registry.
+    /// Routed through `GauntletRow` and the `METRICS` registry;
+    /// `stats compare` surfaces this axis in its comparison rows.
     pub worst_wake_latency_tail_ratio: f64,
     /// Worst per-worker iteration count across cgroups (LOWEST).
     ///
@@ -658,9 +653,9 @@ pub struct ScenarioStats {
     ///
     /// Only meaningful across runs of the SAME variant — see
     /// [`CgroupStats::iterations_per_worker`] for the cross-
-    /// variant caveat. Persisted on the sidecar for future
-    /// `stats compare` wiring; not yet routed through
-    /// `GauntletRow` / the `METRICS` registry.
+    /// variant caveat. Routed through `GauntletRow` and the
+    /// `METRICS` registry; `stats compare` surfaces this axis
+    /// in its comparison rows.
     pub worst_iterations_per_worker: f64,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).

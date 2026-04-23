@@ -158,10 +158,17 @@ pub const WORKER_READY_MARKER_OVERRIDE_ENV: &str = "KTSTR_WORKER_READY_MARKER_OV
 
 /// Construct the ready-marker path for a worker with the given pid.
 ///
-/// The worker uses [`std::process::id()`] (`u32`) as the pid source;
-/// the test reads the pid via `PayloadHandle::pid()` which also returns
-/// `u32`. The shared `u32` parameter matches both call sites without
-/// per-caller casts.
+/// The worker uses [`std::process::id()`] (`u32`) as the pid source
+/// inside its own process. The host-side test reads the worker's
+/// pid via `PayloadHandle::pid()`, which returns `Option<u32>` —
+/// `Some(pid)` once the child has been spawned and `None` before
+/// (or after a kill that tore the child down). Callers must
+/// unwrap (or propagate) the `Option` at the call site; this
+/// helper takes a bare `u32` so the unwrap decision stays visible
+/// to the caller instead of being swallowed inside the formatter.
+/// The `u32` parameter matches both the worker's
+/// `std::process::id()` return type and the unwrapped payload of
+/// `PayloadHandle::pid()` without per-caller casts.
 pub fn worker_ready_marker_path(pid: u32) -> String {
     format!("{WORKER_READY_MARKER_PREFIX}{pid}")
 }

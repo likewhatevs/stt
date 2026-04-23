@@ -82,14 +82,26 @@
 //! exactly one target and exits when that target is detached.
 //!
 //! Mechanism (per target thread):
-//! 1. `ptrace(PTRACE_SEIZE)` + `ptrace(PTRACE_INTERRUPT)` to stop.
-//! 2. Read the thread pointer via `ptrace(PTRACE_GETREGSET, ...)`:
+//! 1. `ptrace(PTRACE_SEIZE)` + `ptrace(PTRACE_INTERRUPT)` to stop
+//!    (cache miss only — on cache hit the thread pointer is
+//!    served from the per-tid TP cache without a ptrace stop).
+//! 2. Read the thread pointer via `ptrace(PTRACE_GETREGSET, ...)`
+//!    on cache miss; on cache hit the cached TP is reused:
 //!    - x86_64 uses `NT_PRSTATUS` to get `user_regs_struct.fs_base`.
 //!    - aarch64 uses `NT_ARM_TLS` (regset 0x401) to get `TPIDR_EL0`.
-//! 3. `process_vm_readv` 24 bytes at the computed TLS address to read
-//!    `thread_allocated` + `thread_allocated_next_event_fast` +
-//!    `thread_deallocated` in one syscall while the thread is stopped.
-//! 4. `ptrace(PTRACE_DETACH)`.
+//! 3. `process_vm_readv` 24 bytes at the computed TLS address to
+//!    read `thread_allocated` +
+//!    `thread_allocated_next_event_fast` + `thread_deallocated`
+//!    in one syscall — stopping the thread via the ptrace
+//!    sequence above on cache miss, reading without stopping on
+//!    cache hit (snapshots 2+ against the same tid go through the
+//!    fast path, which skips PTRACE_SEIZE / PTRACE_INTERRUPT
+//!    entirely). `process_vm_readv` is atomic at page granularity
+//!    on the kernel side, so the 24-byte read returns a
+//!    consistent snapshot of the three counters even against a
+//!    running thread.
+//! 4. `ptrace(PTRACE_DETACH)` (cache miss only; the fast path
+//!    has no ptrace session to detach).
 //!
 //! Address math:
 //! - Variant II (x86_64): TP points to END of TLS block.

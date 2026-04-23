@@ -1099,8 +1099,11 @@ impl KtstrVm {
         }
 
         // Set host terminal to raw mode. TerminalRawGuard restores on drop
-        // and installs signal handlers for SIGINT/SIGTERM/SIGQUIT.
-        // Skip for exec mode — no interactive terminal needed.
+        // and installs signal handlers for SIGINT, SIGTERM, SIGQUIT,
+        // SIGABRT, and SIGFPE so every terminating signal routes through
+        // the terminal-restore path before the process exits (see
+        // `src/terminal.rs`). Skip for exec mode — no interactive
+        // terminal needed.
         let _raw_guard = if exec_mode {
             None
         } else {
