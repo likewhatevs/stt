@@ -139,19 +139,9 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload {
 // this file and doesn't warrant promotion.
 
 use ktstr::test_support::{
-    MAX_SCAN_INDEX, ThreadLookup, find_metric, lookup_thread, snapshot_count,
+    MAX_SCAN_INDEX, ThreadLookup, has_metric, lookup_thread, metric_u64, snapshot_count,
     snapshot_worker_allocated, thread_count,
 };
-
-/// Look up a flat metric by exact key. Returns `None` if absent.
-fn metric_u64(metrics: &PayloadMetrics, key: &str) -> Option<u64> {
-    find_metric(metrics, key).map(|m| m.value as u64)
-}
-
-/// Does the flat metric list contain a metric with this exact name?
-fn has_metric(metrics: &PayloadMetrics, key: &str) -> bool {
-    find_metric(metrics, key).is_some()
-}
 
 // ---------------------------------------------------------------------------
 // Tests

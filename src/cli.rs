@@ -2098,6 +2098,53 @@ fn warn(msg: &str) {
     }
 }
 
+/// Stash of the pre-spinner termios for the panic hook's restore
+/// path. Populated by [`Spinner::disable_echo`] before the ECHO flag
+/// is cleared, and cleared by [`Spinner::teardown`] on normal exit.
+/// The panic hook reads this mutex — when populated, it replays the
+/// stashed termios to the terminal BEFORE the default panic handler
+/// emits its message. Under `panic = "abort"`, `Spinner::Drop` never
+/// runs, so without the hook the terminal stays in echo-disabled /
+/// non-canonical mode and the multi-line panic message staircases
+/// (LF without CR) before SIGABRT kills the process.
+static SPINNER_SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
+    std::sync::Mutex::new(None);
+
+/// Install a panic hook that restores stdin termios from
+/// [`SPINNER_SAVED_TERMIOS`] before the default panic handler prints.
+/// Called via [`std::sync::Once`] from [`Spinner::disable_echo`], so
+/// every Spinner that actually mutates termios triggers the install
+/// exactly once per process. Idempotent — subsequent calls hit the
+/// `Once` guard and no-op.
+///
+/// The hook delegates to the default `take_hook()` output after
+/// restoring, preserving the full panic-message contract (message,
+/// location, backtrace under `RUST_BACKTRACE`).
+fn install_spinner_termios_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // try_lock, not lock: if the panicking thread is the
+            // one mid-mutation inside Spinner::disable_echo (holds
+            // the mutex across its own libc::tcsetattr call), a
+            // blocking lock would deadlock the hook. try_lock
+            // failure ≈ "mutex held by someone mid-mutation" — the
+            // terminal state is indeterminate and the hook
+            // cannot safely restore, so we fall through to the
+            // default handler unchanged.
+            if let Ok(guard) = SPINNER_SAVED_TERMIOS.try_lock() {
+                if let Some(termios) = *guard {
+                    unsafe {
+                        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios);
+                    }
+                }
+            }
+            default(info);
+        }));
+    });
+}
+
 /// Progress spinner for long-running CLI operations.
 ///
 /// When stderr is a TTY, draws an animated spinner via indicatif,
@@ -2107,9 +2154,13 @@ fn warn(msg: &str) {
 /// Call `finish` with a completion message to replace it with a
 /// final line, or let it drop to remove it silently; [`Drop`] also
 /// restores echo and clears the bar so a panic or early `?`
-/// propagation leaves the terminal in a usable state. Note: Drop
-/// does NOT run on SIGINT/SIGTERM kill; if the spinner is
-/// interrupted mid-operation, run `stty sane` to restore echo.
+/// propagation leaves the terminal in a usable state. Under
+/// `panic = "abort"`, Drop does NOT run on a panic — the panic hook
+/// installed by [`install_spinner_termios_panic_hook`] restores
+/// termios instead, so the panic message renders cleanly before
+/// SIGABRT kills the process. Note: Drop also does NOT run on
+/// SIGINT/SIGTERM kill; if the spinner is interrupted mid-operation,
+/// run `stty sane` to restore echo.
 pub struct Spinner {
     /// None when stderr is not a TTY — no indicatif overhead.
     pb: Option<indicatif::ProgressBar>,
@@ -2170,6 +2221,16 @@ impl Spinner {
                 return None;
             }
             let saved = termios;
+            // Stash the pre-mutation termios for the panic hook's
+            // restore path. Under `panic=abort` the Spinner's Drop
+            // never runs, so if a panic fires while the spinner is
+            // active the terminal stays in echo-disabled mode and
+            // the panic message renders with a "staircase" effect
+            // (LF without CR). The hook replays the saved termios
+            // before the default panic handler prints, producing a
+            // readable diagnostic on the way to SIGABRT.
+            install_spinner_termios_panic_hook();
+            *SPINNER_SAVED_TERMIOS.lock().unwrap() = Some(saved);
             termios.c_lflag &= !libc::ECHO;
             libc::tcsetattr(fd, libc::TCSANOW, &termios);
             Some(saved)
@@ -2186,6 +2247,10 @@ impl Spinner {
             unsafe {
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios);
             }
+            // Clear the panic-hook stash — further panics without a
+            // live Spinner should NOT try to restore a termios we
+            // already restored via the normal path.
+            *SPINNER_SAVED_TERMIOS.lock().unwrap() = None;
         }
     }
 

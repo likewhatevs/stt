@@ -574,15 +574,19 @@ impl Cli {
 /// of length 1 with `interval_ms` absent. Consumers distinguish the
 /// two modes by `interval_ms` presence or `snapshots.len()`.
 ///
-/// **Tid enumeration is frozen at run start.** `iter_task_ids` runs
-/// once before the first snapshot and the same tid list is reused
-/// for every subsequent snapshot. Threads spawned AFTER the initial
-/// enumeration are invisible to the probe — they will not appear
-/// in any snapshot even if they outlive the run. Threads that exit
-/// between snapshots produce [`ThreadResult::Err`] entries (typically
-/// `PtraceSeize` with ESRCH) on subsequent snapshots rather than
-/// disappearing, so index-wise diffing across `snapshots[*].threads`
-/// is stable.
+/// **Tid enumeration runs per snapshot.** `iter_task_ids` fires at
+/// the start of EVERY snapshot iteration so threads spawned between
+/// the probe's start and a given snapshot appear from the snapshot
+/// forward. Threads that have exited produce [`ThreadResult::Err`]
+/// entries (typically `PtraceSeize` with ESRCH) on the snapshots
+/// where they're still in the tid list but the ptrace attach fails,
+/// then fall out of subsequent enumerations entirely as the kernel
+/// reaps them. Downstream consumers doing index-wise diffing across
+/// `snapshots[*].threads` must key on `tid` (present on every entry,
+/// Ok and Err alike), not array index, because the tid list can
+/// grow or shrink between snapshots. Index-wise diffing across a
+/// long multi-snapshot run would silently misalign the moment the
+/// thread-set changes.
 #[derive(Debug, Serialize)]
 struct ProbeOutput {
     schema_version: u32,
@@ -2073,11 +2077,6 @@ fn run(cli: &Cli) -> RunOutcome {
         return RunOutcome::Fatal(e);
     }
 
-    let tids = match iter_task_ids(pid) {
-        Ok(v) => v,
-        Err(e) => return RunOutcome::Fatal(e),
-    };
-
     // `validate_sampling_flags` enforced that `interval_ms` is Some
     // exactly when `snapshots > 1`; unwrap is guarded by that check
     // in the multi-snapshot branch below.
@@ -2101,6 +2100,20 @@ fn run(cli: &Cli) -> RunOutcome {
                 return RunOutcome::Fatal(e);
             }
         }
+        // Re-enumerate /proc/<pid>/task per snapshot so threads
+        // spawned AFTER the previous enumeration are visible in this
+        // snapshot forward. Freezing the list at run start missed
+        // late-created threads entirely; for long multi-snapshot
+        // runs against a growing thread pool that is the common
+        // shape. Per-snapshot enumeration is
+        // cheap (single `readdir` of /proc/<pid>/task, no ptrace
+        // work) and catches the "new tid" case; exits still surface
+        // as ThreadResult::Err on snapshots where the tid hasn't
+        // been reaped yet, then drop out of subsequent enumerations.
+        let tids = match iter_task_ids(pid) {
+            Ok(v) => v,
+            Err(e) => return RunOutcome::Fatal(e),
+        };
         let (snap, snap_interrupted) =
             take_snapshot(pid, &symbol, &offsets, &tids, run_start);
         snapshots.push(snap);
@@ -2134,15 +2147,43 @@ fn run(cli: &Cli) -> RunOutcome {
         interrupted,
         snapshots,
     };
-    let all_err = out
-        .snapshots
-        .iter()
-        .all(|s| all_failed(&s.threads));
-    if all_err {
+    // An interrupt that lands before the first snapshot completes
+    // produces an empty `snapshots` vec. `multi_snapshot_all_failed`
+    // returns `true` vacuously on that input, but there is no
+    // observation data to classify as "all failed" — the run simply
+    // collected nothing. Surface it as `Ok(out)` with
+    // `interrupted: true` preserved so callers see a truncated (but
+    // not failed) run; `AllFailed` is reserved for the case where
+    // we DID observe threads and every one of them errored.
+    if out.snapshots.is_empty() {
+        RunOutcome::Ok(out)
+    } else if multi_snapshot_all_failed(&out.snapshots) {
         RunOutcome::AllFailed(out)
     } else {
         RunOutcome::Ok(out)
     }
+}
+
+/// True iff every snapshot in `snapshots` is itself all-failed (via
+/// [`all_failed`]). The classification criterion for multi-snapshot
+/// `RunOutcome::AllFailed`: a single Ok thread result anywhere in
+/// any snapshot disqualifies the run from AllFailed and it surfaces
+/// as `Ok` with `interrupted` mirroring whatever the sampling loop
+/// observed.
+///
+/// An empty `snapshots` slice satisfies `.iter().all(...)` vacuously
+/// and therefore returns `true` here. This can occur if the probe
+/// is interrupted (SIGINT) before the first snapshot completes —
+/// the sampling loop breaks out on the cancel flag without pushing
+/// anything into `snapshots`. Callers MUST handle the empty case
+/// explicitly: classifying an empty run as "all failed" conflates
+/// "observed zero threads" with "observed N threads, all errored",
+/// which are semantically distinct. `run()` guards the empty case
+/// separately and surfaces it as `RunOutcome::Ok` (truncated, not
+/// failed). This helper's vacuous-truth behavior is preserved for
+/// the test fixture that pins the empty-input contract.
+fn multi_snapshot_all_failed(snapshots: &[Snapshot]) -> bool {
+    snapshots.iter().all(|s| all_failed(&s.threads))
 }
 
 /// Render one `ThreadResult` to stdout (Ok path) or stderr (Err
@@ -3591,6 +3632,75 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "cancel path should return within a poll tick, got: {elapsed:?}",
         );
+    }
+
+    /// Multi-snapshot all-failed classification: when EVERY snapshot
+    /// is itself all_failed, the run is MultiAllFailed (surfaced as
+    /// `RunOutcome::AllFailed` at the classification boundary).
+    /// Pins the three shapes: every-snapshot-failed (→ true),
+    /// mixed-snapshot (one has an Ok → false), and the unreachable-
+    /// in-production empty-snapshots case (→ vacuously true). The
+    /// empty case is documented on `multi_snapshot_all_failed` and
+    /// this test guards its stability so a future refactor does not
+    /// silently flip the classification on an empty input.
+    #[test]
+    fn multi_snapshot_all_failed_classification() {
+        let err_thread = || ThreadResult::Err {
+            tid: 1,
+            comm: None,
+            error: "e".into(),
+            error_kind: ThreadErrorKind::PtraceSeize,
+        };
+        let ok_thread = || ThreadResult::Ok {
+            tid: 2,
+            comm: None,
+            allocated_bytes: 10,
+            deallocated_bytes: 0,
+        };
+        let snap = |threads: Vec<ThreadResult>| Snapshot {
+            timestamp_unix_sec: 1_700_000_000,
+            elapsed_since_start_ns: 0,
+            threads,
+        };
+
+        // Every snapshot's threads vec is all-Err → MultiAllFailed.
+        let all_err = vec![
+            snap(vec![err_thread(), err_thread()]),
+            snap(vec![err_thread()]),
+            snap(vec![err_thread(), err_thread(), err_thread()]),
+        ];
+        assert!(
+            multi_snapshot_all_failed(&all_err),
+            "every snapshot all-Err must classify as MultiAllFailed",
+        );
+
+        // Mixed: second snapshot carries one Ok → NOT MultiAllFailed.
+        // Caller produces `RunOutcome::Ok` with partial data.
+        let mixed = vec![
+            snap(vec![err_thread()]),
+            snap(vec![err_thread(), ok_thread()]),
+            snap(vec![err_thread()]),
+        ];
+        assert!(
+            !multi_snapshot_all_failed(&mixed),
+            "a single Ok in any snapshot must disqualify MultiAllFailed",
+        );
+
+        // Empty-threads snapshot counts as all-failed per
+        // `all_failed([])`, so a run of empty-threads snapshots is
+        // also MultiAllFailed. Exercises the all_failed-empty-vec
+        // convention at the multi-snapshot layer.
+        let empty_threads = vec![snap(vec![]), snap(vec![])];
+        assert!(
+            multi_snapshot_all_failed(&empty_threads),
+            "every snapshot's threads empty must classify as MultiAllFailed",
+        );
+
+        // Vacuously true on an empty snapshots slice — documented
+        // unreachable in production but a test guard keeps the
+        // semantics stable under future refactors.
+        let empty_snapshots: &[Snapshot] = &[];
+        assert!(multi_snapshot_all_failed(empty_snapshots));
     }
 
     /// `all_failed` semantics: empty vec is "all failed" (no live

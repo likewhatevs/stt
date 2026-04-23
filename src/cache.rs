@@ -574,11 +574,31 @@ impl CacheDir {
                         });
                     }
                 }
-                Err(reason) => entries.push(ListedEntry::Corrupt {
-                    key: name,
-                    path,
-                    reason,
-                }),
+                Err(reason) => {
+                    // Emit a `tracing::info` so operators
+                    // reviewing logs can distinguish a schema-drift
+                    // corruption (metadata.json parse failure —
+                    // typical cause: older sidecar format, a
+                    // partially-written metadata, or a field rename
+                    // in `KernelMetadata`) from other
+                    // corruption modes (missing image file, path
+                    // access errors). The on-disk
+                    // `ListedEntry::Corrupt` record carries `reason`
+                    // for the CLI table; the tracing event adds a
+                    // per-entry log line that CI / monitoring can
+                    // aggregate without scraping table output.
+                    tracing::info!(
+                        entry = %name,
+                        path = %path.display(),
+                        %reason,
+                        "cache entry corrupt at list-time (likely schema drift)",
+                    );
+                    entries.push(ListedEntry::Corrupt {
+                        key: name,
+                        path,
+                        reason,
+                    });
+                }
             }
         }
         // Sort by built_at descending (newest first). Corrupt entries

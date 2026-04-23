@@ -65,6 +65,23 @@ pub fn find_metric<'a>(metrics: &'a PayloadMetrics, key: &str) -> Option<&'a Met
     metrics.metrics.iter().find(|m| m.name == key)
 }
 
+/// Does the flat metric list contain a metric with this exact name?
+/// Thin wrapper around [`find_metric`] for the common existence
+/// check — avoids forcing every call site to spell `.is_some()`.
+pub fn has_metric(metrics: &PayloadMetrics, key: &str) -> bool {
+    find_metric(metrics, key).is_some()
+}
+
+/// Fetch a metric by exact name and return its numeric value as a
+/// `u64`. Returns `None` if the metric is absent. Thin wrapper around
+/// [`find_metric`] + `value as u64` for the common numeric-lookup
+/// shape. Integer metrics that originated as JSON numbers round-trip
+/// through `f64` without loss up to 2^53 — every counter in the
+/// probe's output sits well below that bound.
+pub fn metric_u64(metrics: &PayloadMetrics, key: &str) -> Option<u64> {
+    find_metric(metrics, key).map(|m| m.value as u64)
+}
+
 /// Walk `0..cap` applying `key_fn(i)` to form a metric name and
 /// count how many consecutive indices yield a present metric.
 /// Stops at the first miss — the probe's `walk_json_leaves`

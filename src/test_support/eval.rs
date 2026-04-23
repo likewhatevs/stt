@@ -179,18 +179,21 @@ pub(crate) fn run_ktstr_test_inner(
         t.validate().context("TopoOverride validation")?;
     }
     if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
-        crate::report::test_skip(format_args!(
-            "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
-            entry.name,
-        ));
+        // One canonical reason string for both the stderr banner
+        // (prefixed with the entry name for multi-test context)
+        // and the structured AssertResult::skip payload (test-name
+        // is carried on the surrounding entry). Prior code
+        // duplicated the body verbatim across both sites, inviting
+        // drift; the shared const keeps them in lockstep.
+        const REASON: &str =
+            "test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active";
+        crate::report::test_skip(format_args!("{}: {REASON}", entry.name));
         // Record the skip so stats tooling sees every skipped run,
         // not just the ones that made it to the VM-run site. A sidecar
         // write failure is logged but not propagated: the skip itself
         // is still valid — only post-run stats tooling loses visibility.
         record_skip_sidecar(entry, active_flags);
-        return Ok(AssertResult::skip(
-            "test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
-        ));
+        return Ok(AssertResult::skip(REASON));
     }
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;

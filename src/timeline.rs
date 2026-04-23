@@ -667,33 +667,12 @@ mod tests {
         assert!(t.phases[1].metrics.sample_count > 0);
     }
 
-    #[test]
-    fn degradation_detected() {
-        // Phase 0: balanced (imbalance ~1.0)
-        // Phase 1: imbalanced (imbalance ~5.0)
-        let events = vec![stimulus(0, "ScenarioStart"), stimulus(1000, "StepStart[0]")];
-        let mut samples = Vec::new();
-        // Phase 0 samples: balanced
-        for i in 5..15 {
-            samples.push(sample(
-                i * 100,
-                vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)],
-            ));
-        }
-        // Phase 1 samples: imbalanced
-        for i in 15..25 {
-            samples.push(sample(
-                i * 100,
-                vec![(1, 1, i * 1000), (5, 1, i * 1000 + 100)],
-            ));
-        }
-        let t = Timeline::build(&events, &samples);
-        assert!(!t.degradations().is_empty());
-        let degradations = t.degradations();
-        assert!(!degradations.is_empty());
-        assert_eq!(degradations[0].1.direction, ChangeDirection::Degraded);
-        assert_eq!(degradations[0].1.metric, "imbalance");
-    }
+    // `degradation_detected` smoke test deleted — subsumed by
+    // `neg_timeline_detects_imbalance_degradation` below, which
+    // covers the same imbalance-degradation path with additional
+    // pins on phase count, per-phase metric shape, delta sign,
+    // threshold crossing, and format-output contents. Keeping both
+    // duplicated coverage without adding signal.
 
     #[test]
     fn improvement_detected() {
@@ -723,18 +702,10 @@ mod tests {
         assert!(!improvements.is_empty());
     }
 
-    #[test]
-    fn stable_no_changes() {
-        let events = vec![stimulus(0, "ScenarioStart"), stimulus(1000, "StepStart[0]")];
-        let samples: Vec<MonitorSample> = (5..25)
-            .map(|i| sample(i * 100, vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)]))
-            .collect();
-        let t = Timeline::build(&events, &samples);
-        assert!(t.degradations().is_empty());
-        for phase in &t.phases {
-            assert!(phase.changes.is_empty());
-        }
-    }
+    // `stable_no_changes` smoke test deleted — subsumed by
+    // `neg_timeline_no_degradation_when_stable` below, which
+    // covers the same stable-phase-no-degradation path with
+    // richer assertions on phase metrics and change-list shape.
 
     #[test]
     fn format_non_empty() {
@@ -772,32 +743,11 @@ mod tests {
         assert_eq!(t.phases[0].metrics.stall_count, 1);
     }
 
-    #[test]
-    fn dsq_degradation_detected() {
-        let events = vec![stimulus(0, "ScenarioStart"), stimulus(1000, "StepStart[0]")];
-        let mut samples = Vec::new();
-        // Phase 0: low DSQ
-        for i in 5..15 {
-            samples.push(sample(
-                i * 100,
-                vec![(2, 1, i * 1000), (2, 1, i * 1000 + 100)],
-            ));
-        }
-        // Phase 1: high DSQ
-        for i in 15..25 {
-            samples.push(sample(
-                i * 100,
-                vec![(2, 20, i * 1000), (2, 20, i * 1000 + 100)],
-            ));
-        }
-        let t = Timeline::build(&events, &samples);
-        let dsq_degs: Vec<_> = t
-            .degradations()
-            .into_iter()
-            .filter(|(_, c)| c.metric == "dsq_depth")
-            .collect();
-        assert!(!dsq_degs.is_empty());
-    }
+    // `dsq_degradation_detected` smoke test deleted — subsumed by
+    // `neg_timeline_detects_dsq_depth_degradation` below, which
+    // covers the same dsq_depth degradation path with additional
+    // pins on the detected change's direction, delta sign,
+    // threshold crossing, and per-phase metric shape.
 
     #[test]
     fn compute_metrics_empty() {

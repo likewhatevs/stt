@@ -993,14 +993,18 @@ fn run_model_status() -> Result<(), String> {
             status.spec.size_bytes / 1024 / 1024,
         ),
         ktstr::test_support::ShaVerdict::CheckFailed(err) => {
-            // Collapse multi-line anyhow chains into a single
-            // semicolon-separated line for the CLI readout.
-            // `{err:#}` rendering of an anyhow error can span
-            // multiple lines (source chain, backtrace), which
-            // breaks the "(single parenthesized note)" wrapper
-            // format used by the other arms. Replacing `\n` with
-            // `; ` preserves every cause while keeping the output
-            // on one line.
+            // Defensively collapse any embedded `\n` into `; `
+            // before placing `err` inside the "(single
+            // parenthesized note)" wrapper. The alternate
+            // anyhow format (`{e:#}`) that produced `err` joins
+            // causes with `: ` and is single-line in practice;
+            // this replace is a guard against a future error
+            // source whose Display impl injects its own
+            // newlines (std::io errors wrapping mutli-line OS
+            // messages, third-party crates formatting
+            // call-chain trees). Keeping the output on one
+            // line preserves the visual grouping the other
+            // match arms use.
             let single_line = err.replace('\n', "; ");
             println!(
                 "(cached file could not be checked: {single_line}; \

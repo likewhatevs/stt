@@ -459,6 +459,37 @@ pub const OFFLINE_ENV: &str = "KTSTR_MODEL_OFFLINE";
 /// CI transcripts.
 pub const LLM_DEBUG_RESPONSES_ENV: &str = "KTSTR_LLM_DEBUG_RESPONSES";
 
+/// Shared non-trim "env var is opt-in" predicate for boolean gates
+/// like [`LLM_DEBUG_RESPONSES_ENV`]. Returns `true` iff `val` is
+/// `Some` and non-empty; `None` and `Some("")` both map to `false`.
+///
+/// Callers pass `std::env::var(NAME).ok().as_deref()`; the pure
+/// signature lets the predicate be unit-tested without touching the
+/// process environment (which would require the
+/// `ENV_LOCK`-serialised env-mutation dance).
+fn env_value_is_opt_in(val: Option<&str>) -> bool {
+    matches!(val, Some(s) if !s.is_empty())
+}
+
+/// "Does this status probe say the cache needs fetching?" —
+/// extracted from [`prefetch_if_required`] so the
+/// error-resilience contract is unit-testable without touching
+/// the real cache directory.
+///
+/// The contract:
+/// - `Ok(Matches)` → `false` (cache is valid, no fetch)
+/// - `Ok(Mismatches)` / `Ok(NotCached)` / `Ok(CheckFailed)` → `true`
+/// - `Err(_)` → `false` — a status probe error is **non-fatal**.
+///   Prefetch skips the announcement for this artifact and falls
+///   through to [`ensure`], which surfaces the real error with
+///   full context (see the doc block at the probe site in
+///   `prefetch_if_required`). Treating `Err` as "fetch needed"
+///   would double-announce (probe-side false positive + ensure
+///   re-surface) and obscure the true failure.
+fn status_indicates_fetch_needed(st: &Result<ModelStatus>) -> bool {
+    matches!(st, Ok(s) if !s.sha_verdict.is_match())
+}
+
 /// Read [`OFFLINE_ENV`] and return the trimmed value IFF it is set
 /// to a non-empty string. Centralizes the "non-empty env-var means
 /// opt-in" predicate used by [`ensure`] and [`prefetch_if_required`]
@@ -638,19 +669,64 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
     // [`ensure`] replaces the cache entry and the CLI /
     // offline-gate bail can name the specific reason rather than the
     // generic "doesn't match" default.
+    //
+    // Warm-cache fast path: before the ~10s full-file SHA-256 walk,
+    // consult a `{artifact}.mtime-size` sidecar. If the sidecar
+    // exists and both the recorded mtime AND size equal the current
+    // on-disk values, trust the prior SHA verification and skip the
+    // re-hash. The sidecar is written at fetch-success and after a
+    // slow-path verification, so every subsequent nextest run on
+    // the same cache entry hits the fast path.
+    //
+    // The sidecar is a performance optimization, not a security
+    // boundary. mtime-preserving operations (`rsync -t`,
+    // `tar -xp`, `touch -r`, coarse-mtime filesystems that round
+    // to second or coarser granularity) can produce a sidecar
+    // match after the file content has changed. A sidecar
+    // false-positive propagates through both `status()` and
+    // `ensure()` — callers receive the cached artifact without a
+    // SHA re-check, because `ensure()` short-circuits on
+    // `ShaVerdict::Matches` and does not re-run `check_sha256`.
+    // The sidecar trades strict integrity verification on
+    // `status()` / `ensure()` for faster warm-cache revalidation.
+    // The SHA-256 pin remains the ground truth at fetch time; the
+    // sidecar only skips re-verification on subsequent runs.
     let sha_verdict = match std::fs::metadata(&path) {
-        Ok(meta) if meta.is_file() => match check_sha256(&path, spec.sha256_hex) {
-            Ok(true) => ShaVerdict::Matches,
-            Ok(false) => ShaVerdict::Mismatches,
-            Err(e) => {
-                if !is_valid_sha256_hex(spec.sha256_hex) {
-                    return Err(e).with_context(|| {
-                        format!("check SHA-256 pin for cached model '{}'", spec.file_name,)
-                    });
+        Ok(meta) if meta.is_file() => {
+            if sidecar_confirms_prior_sha_match(&path, &meta) {
+                ShaVerdict::Matches
+            } else {
+                match check_sha256(&path, spec.sha256_hex) {
+                    Ok(true) => {
+                        // Best-effort sidecar refresh so the next
+                        // status() call short-circuits. Write
+                        // failures are logged and swallowed — the
+                        // fast path is an optimization, not
+                        // correctness.
+                        if let Err(e) = write_mtime_size_sidecar(&path) {
+                            tracing::debug!(
+                                artifact = %path.display(),
+                                %e,
+                                "mtime-size sidecar write failed; next status() will re-hash",
+                            );
+                        }
+                        ShaVerdict::Matches
+                    }
+                    Ok(false) => ShaVerdict::Mismatches,
+                    Err(e) => {
+                        if !is_valid_sha256_hex(spec.sha256_hex) {
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "check SHA-256 pin for cached model '{}'",
+                                    spec.file_name,
+                                )
+                            });
+                        }
+                        ShaVerdict::CheckFailed(format!("{e:#}"))
+                    }
                 }
-                ShaVerdict::CheckFailed(format!("{e:#}"))
             }
-        },
+        }
         _ => ShaVerdict::NotCached,
     };
     Ok(ModelStatus {
@@ -658,6 +734,70 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
         path,
         sha_verdict,
     })
+}
+
+/// Path of the warm-cache revalidation sidecar alongside
+/// `artifact`. Named with a `.mtime-size` suffix so operators
+/// inspecting the cache directory can identify it without
+/// guessing.
+fn mtime_size_sidecar_path(artifact: &std::path::Path) -> PathBuf {
+    let mut s = artifact.as_os_str().to_owned();
+    s.push(".mtime-size");
+    PathBuf::from(s)
+}
+
+/// Return `true` iff a `{artifact}.mtime-size` sidecar exists and
+/// records the same (mtime_ns, size_bytes) as `meta`. Any I/O error
+/// or parse failure returns `false` — callers fall back to the
+/// slow path.
+fn sidecar_confirms_prior_sha_match(artifact: &std::path::Path, meta: &std::fs::Metadata) -> bool {
+    let current = match mtime_size_from_metadata(meta) {
+        Some(v) => v,
+        None => return false,
+    };
+    match read_mtime_size_sidecar(artifact) {
+        Some(stored) => stored == current,
+        None => false,
+    }
+}
+
+/// Read a previously-written (mtime_ns, size_bytes) pair from the
+/// sidecar, or `None` on any error (sidecar missing, malformed
+/// contents, unreadable).
+fn read_mtime_size_sidecar(artifact: &std::path::Path) -> Option<(u128, u64)> {
+    let contents = std::fs::read_to_string(mtime_size_sidecar_path(artifact)).ok()?;
+    let mut toks = contents.split_whitespace();
+    let mtime: u128 = toks.next()?.parse().ok()?;
+    let size: u64 = toks.next()?.parse().ok()?;
+    Some((mtime, size))
+}
+
+/// Write the current mtime+size of `artifact` to its sidecar. The
+/// sidecar's existence plus matching contents tells a future
+/// [`status`] call it can skip the SHA-256 walk.
+fn write_mtime_size_sidecar(artifact: &std::path::Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(artifact)?;
+    let (mtime, size) = mtime_size_from_metadata(&meta).ok_or_else(|| {
+        std::io::Error::other("cannot capture mtime/size for revalidation sidecar")
+    })?;
+    std::fs::write(
+        mtime_size_sidecar_path(artifact),
+        format!("{mtime} {size}\n"),
+    )
+}
+
+/// Pull mtime (as UNIX-epoch nanoseconds) and size from `meta`.
+/// Returns `None` if the platform's mtime clock is unsupported or
+/// predates the epoch; callers treat None as "fast path
+/// unavailable, fall back to SHA".
+fn mtime_size_from_metadata(meta: &std::fs::Metadata) -> Option<(u128, u64)> {
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((mtime, meta.len()))
 }
 
 /// Ensure the model artifact described by `spec` is present and
@@ -857,17 +997,58 @@ fn filesystem_available_bytes(dir: &std::path::Path) -> Result<u64> {
 /// gate pre-empts). The gate catches the common "cache filesystem
 /// nearly full" case before the HTTP request runs — it does not
 /// claim reservation semantics.
+/// The 10% safety buffer over a spec's declared size, floored
+/// at 1 byte.
+///
+/// Integer division by 10 collapses to 0 for any
+/// `size_bytes < 10`, which contradicts the "10% safety buffer"
+/// claim in [`ensure_free_space`]'s doc. Clamping at `max(1)`
+/// keeps the buffer > 0 for micro-specs (test fixtures; a
+/// hypothetical 9-byte marker file). Real `ModelSpec` pins are
+/// multi-megabyte or larger (DEFAULT_TOKENIZER ≈ 11 MiB,
+/// DEFAULT_MODEL ≈ 2.5 GiB) so the `/ 10` branch dominates and
+/// the `max(1)` is a no-op in production — the floor only
+/// matters for test-fixture sizes. Extracted for direct unit
+/// testing of the boundary cases (5 → 1, 10 → 1, 100 → 10).
+fn compute_margin(size_bytes: u64) -> u64 {
+    (size_bytes / 10).max(1)
+}
+
+/// Render the free-space bail message, with an optional
+/// FUSE/quota hint when `available == 0`.
+///
+/// Extracted from [`ensure_free_space`] so the message shape is
+/// unit-testable without calling `statvfs` — the inputs
+/// `needed`, `parent`, and `available` are pure values the caller
+/// supplies. FUSE filesystems, quota-enforced mounts, and some
+/// container overlays can report `blocks_available == 0` when no
+/// user-visible free-space quota applies — the number reflects
+/// the quota/overlay's view, not the underlying backing store.
+/// Surfacing the hint only when `available == 0` keeps the
+/// "normal" full-disk case's message un-cluttered.
+fn format_free_space_error(needed: u64, parent: &std::path::Path, available: u64) -> String {
+    let hint = if available == 0 {
+        " (blocks_available reported 0 — if this is a FUSE \
+         or quota-enforced mount, the free-space report may \
+         be a filesystem-side misreport rather than a real \
+         out-of-space condition)"
+    } else {
+        ""
+    };
+    format!(
+        "Need {} free at {}; have {}{hint}",
+        indicatif::HumanBytes(needed),
+        parent.display(),
+        indicatif::HumanBytes(available),
+    )
+}
+
 fn ensure_free_space(parent: &std::path::Path, spec: &ModelSpec) -> Result<()> {
     let available = filesystem_available_bytes(parent)?;
-    let margin = spec.size_bytes / 10;
+    let margin = compute_margin(spec.size_bytes);
     let needed = spec.size_bytes.saturating_add(margin);
     if available < needed {
-        anyhow::bail!(
-            "Need {} free at {}; have {}",
-            indicatif::HumanBytes(needed),
-            parent.display(),
-            indicatif::HumanBytes(available),
-        );
+        anyhow::bail!("{}", format_free_space_error(needed, parent, available));
     }
     Ok(())
 }
@@ -937,16 +1118,39 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     // `response` implements `std::io::Read`; the tempfile handle
     // from `NamedTempFile` implements `Write`. A buffer-then-write
     // approach would hold the full body in memory.
+    //
+    // TTY-aware progress bar: when stderr is a terminal, wrap the
+    // reader with [`indicatif::ProgressBar`] so the user sees a
+    // live "N/total MiB — ETA" readout during the multi-minute
+    // download. indicatif auto-detects whether stderr is a
+    // terminal and hides the bar (silently no-ops all draw calls)
+    // when it is not — so CI captures, redirected stderr, and
+    // nohup'd invocations get zero noise while interactive runs
+    // get the progress UI for free. No explicit draw-target
+    // override is needed; the default stderr target does the
+    // right thing.
+    let total_bytes = response.content_length().unwrap_or(spec.size_bytes);
+    let progress = indicatif::ProgressBar::new(total_bytes);
+    progress.set_style(
+        indicatif::ProgressStyle::with_template(
+            "  {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta})",
+        )
+        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+        .progress_chars("=>-"),
+    );
+    progress.set_message(spec.file_name);
     {
         use std::io::Write;
         let file = tmp.as_file_mut();
         let mut writer = std::io::BufWriter::new(file);
-        std::io::copy(&mut response, &mut writer)
+        let mut reader = progress.wrap_read(&mut response);
+        std::io::copy(&mut reader, &mut writer)
             .with_context(|| format!("stream body from {} to {}", spec.url, tmp_path.display()))?;
         writer
             .flush()
             .with_context(|| format!("flush {} after body stream", tmp_path.display()))?;
     }
+    progress.finish_and_clear();
 
     if !check_sha256(&tmp_path, spec.sha256_hex)? {
         anyhow::bail!(
@@ -967,6 +1171,17 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
             e.error,
         )
     })?;
+    // Seed the revalidation sidecar so the next `status()` hits the
+    // warm-cache fast path instead of re-hashing the full artifact.
+    // Write failure is non-fatal — the next status() simply falls
+    // back to the SHA walk and tries again.
+    if let Err(e) = write_mtime_size_sidecar(final_path) {
+        tracing::debug!(
+            artifact = %final_path.display(),
+            %e,
+            "mtime-size sidecar write failed post-fetch; next status() will re-hash",
+        );
+    }
     Ok(final_path.to_path_buf())
 }
 
@@ -1169,22 +1384,22 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     // `s.sha_verdict.is_match()` and we skip the announcement
     // entirely, matching the existing "zero noise on cache hit"
     // semantics.
-    let model_missing = matches!(
-        status(&DEFAULT_MODEL),
-        Ok(s) if !s.sha_verdict.is_match(),
-    );
-    let tokenizer_missing = matches!(
-        status(&DEFAULT_TOKENIZER),
-        Ok(s) if !s.sha_verdict.is_match(),
-    );
+    let model_missing = status_indicates_fetch_needed(&status(&DEFAULT_MODEL));
+    let tokenizer_missing = status_indicates_fetch_needed(&status(&DEFAULT_TOKENIZER));
     let announced = model_missing || tokenizer_missing;
+    let expected_total = DEFAULT_MODEL.size_bytes + DEFAULT_TOKENIZER.size_bytes;
     if announced {
+        // Render size via indicatif::HumanBytes so the value stays
+        // in lockstep with `ModelSpec::size_bytes`; a hardcoded
+        // "~2.4 GiB" literal drifted every time the pin rotated.
         eprintln!(
-            "ktstr: downloading LlmExtract model (~2.4 GiB; first run only) …"
+            "ktstr: downloading LlmExtract model (~{}; first run only) …",
+            indicatif::HumanBytes(expected_total),
         );
         tracing::info!(
             model_missing,
             tokenizer_missing,
+            expected_total_bytes = expected_total,
             "downloading LlmExtract model on first run",
         );
     }
@@ -1195,7 +1410,17 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     // (tempfile persist) and the fast-path reader.
     PREFETCH_CHECKED.store(true, Ordering::Release);
     if announced {
+        // Dual-emit the completion signal so structured-log
+        // consumers (cargo-ktstr, downstream pipelines) see both
+        // start and end of the prefetch phase — symmetric with
+        // the `tracing::info!` at the download-announcement site
+        // above.
         eprintln!("ktstr: model cache ready");
+        tracing::info!(
+            model_path = %model_path.display(),
+            expected_total_bytes = expected_total,
+            "LlmExtract model cache ready",
+        );
     }
     Ok(Some(model_path))
 }
@@ -1807,11 +2032,7 @@ pub(crate) fn extract_via_llm(
     // the full model output through `tracing::debug!` so users
     // debugging a "response was not parseable JSON" warn can see
     // exactly what the model emitted without patching the source.
-    if std::env::var(LLM_DEBUG_RESPONSES_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .is_some()
-    {
+    if env_value_is_opt_in(std::env::var(LLM_DEBUG_RESPONSES_ENV).ok().as_deref()) {
         tracing::debug!(
             response_bytes = response.len(),
             response = %response,
@@ -1862,6 +2083,93 @@ mod tests {
             EnvVarGuard::set("KTSTR_CACHE_DIR", "/explicit/override");
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, PathBuf::from("/explicit/override"));
+    }
+
+    /// `env_value_is_opt_in(None)` models an unset env var; the
+    /// predicate must be `false` so the gated code path (debug-
+    /// response tracing, etc.) stays dormant by default. A
+    /// regression that treated `None` as opt-in would spam
+    /// `tracing::debug!` for every user on every run.
+    #[test]
+    fn env_value_is_opt_in_unset_is_false() {
+        assert!(!env_value_is_opt_in(None));
+    }
+
+    /// `Some("")` models an env var that is set-but-empty
+    /// (`KTSTR_LLM_DEBUG_RESPONSES=`). Shell-level "unset by
+    /// setting to empty" is a common idiom, so the predicate must
+    /// collapse empty and absent to the same `false` verdict.
+    #[test]
+    fn env_value_is_opt_in_empty_is_false() {
+        assert!(!env_value_is_opt_in(Some("")));
+    }
+
+    /// Any non-empty value opts in — `1`, `true`, `yes`, or
+    /// garbage all flip the gate. The predicate intentionally
+    /// does NOT interpret values (no `"false"`-is-false parse);
+    /// once the user sets the var, they've signalled intent.
+    #[test]
+    fn env_value_is_opt_in_nonempty_is_true() {
+        assert!(env_value_is_opt_in(Some("1")));
+        assert!(env_value_is_opt_in(Some("true")));
+        assert!(env_value_is_opt_in(Some("0"))); // deliberately opt-in: non-empty is the rule
+        assert!(env_value_is_opt_in(Some("anything at all")));
+    }
+
+    /// Fabricate a `ModelStatus` with a chosen verdict — used by
+    /// the status-resilience tests below. Uses DEFAULT_MODEL's
+    /// static spec so `ModelSpec: Copy` is honoured and no real
+    /// filesystem access happens.
+    fn mock_status(verdict: ShaVerdict) -> ModelStatus {
+        ModelStatus {
+            spec: DEFAULT_MODEL,
+            path: PathBuf::from("/tmp/mock"),
+            sha_verdict: verdict,
+        }
+    }
+
+    /// `Ok(Matches)` must signal "no fetch needed" — this is the
+    /// warm-cache happy path. A regression that flipped the
+    /// polarity would re-download the model on every run.
+    #[test]
+    fn status_indicates_fetch_needed_ok_matches_false() {
+        assert!(!status_indicates_fetch_needed(&Ok(mock_status(
+            ShaVerdict::Matches
+        ))));
+    }
+
+    /// Every non-matching `Ok` verdict (Mismatches, NotCached,
+    /// CheckFailed) must return `true` so the prefetch announcer
+    /// fires. A regression that collapsed any of these into
+    /// "not needed" would silence the first-run download banner.
+    #[test]
+    fn status_indicates_fetch_needed_ok_non_matching_true() {
+        assert!(status_indicates_fetch_needed(&Ok(mock_status(
+            ShaVerdict::Mismatches
+        ))));
+        assert!(status_indicates_fetch_needed(&Ok(mock_status(
+            ShaVerdict::NotCached
+        ))));
+        assert!(status_indicates_fetch_needed(&Ok(mock_status(
+            ShaVerdict::CheckFailed("io error".into()),
+        ))));
+    }
+
+    /// A status probe error (`resolve_cache_root` fail, malformed
+    /// pin, etc.) must NOT cause prefetch_if_required to report
+    /// "fetch needed" — the error path is non-fatal and the
+    /// downstream `ensure()` call re-surfaces the real failure
+    /// with richer context. Returning `true` here would
+    /// double-announce and obscure the true error. Pins the
+    /// error-resilience contract documented at the probe call
+    /// site.
+    #[test]
+    fn status_indicates_fetch_needed_err_is_false() {
+        let err: Result<ModelStatus> = Err(anyhow::anyhow!("simulated probe failure"));
+        assert!(
+            !status_indicates_fetch_needed(&err),
+            "status probe error must be non-fatal (return false); instead it reported fetch-needed",
+        );
     }
 
     #[test]
@@ -4276,6 +4584,89 @@ mod tests {
     /// branch against a regression that flipped the comparator
     /// direction (which would cause every fetch to bail regardless
     /// of real free-space state).
+    ///
+    /// `compute_margin` enforces the "10% safety buffer, floored
+    /// at 1 byte" contract. Pins the boundary cases where the
+    /// `/ 10` branch is zero and the `max(1)` floor is
+    /// load-bearing: sizes in `[1, 5, 9]` → 1 (integer division
+    /// yields 0 → floor kicks in). Size 10 → 1 (integer division
+    /// yields 1, floor is a no-op). Size 100 → 10 (normal 10%
+    /// path). A regression that lost the floor would fail the
+    /// sub-10-byte cases and pass the ≥10 cases, surfacing the
+    /// exact class this extraction was meant to guard against
+    /// (the original `size_bytes / 10` without `max(1)`).
+    #[test]
+    fn compute_margin_respects_floor_and_scales_linearly() {
+        for size in [1u64, 5, 9] {
+            assert_eq!(
+                compute_margin(size),
+                1,
+                "compute_margin({size}): floor at 1 must beat the \
+                 zero produced by integer `/ 10`",
+            );
+        }
+        assert_eq!(
+            compute_margin(10),
+            1,
+            "compute_margin(10): 10/10 = 1 — the `/ 10` branch \
+             wins, floor is a no-op",
+        );
+        assert_eq!(
+            compute_margin(100),
+            10,
+            "compute_margin(100): 10% = 10, `/ 10` dominates",
+        );
+        assert_eq!(
+            compute_margin(u64::MAX),
+            u64::MAX / 10,
+            "compute_margin(u64::MAX): integer division, no \
+             overflow; floor is a no-op",
+        );
+    }
+
+    /// `format_free_space_error` includes the FUSE/quota hint
+    /// iff `available == 0`. Pins both branches so a regression
+    /// that inverted the condition or always appended the hint
+    /// fails here. Also pins that both messages include the
+    /// "Need N free at PATH" skeleton — the hint is ADDITIONAL
+    /// context, not a replacement.
+    #[test]
+    fn format_free_space_error_includes_fuse_hint_iff_available_is_zero() {
+        let parent = std::path::Path::new("/tmp/ktstr-fuse-test");
+
+        let with_hint = format_free_space_error(1_000_000, parent, 0);
+        assert!(
+            with_hint.contains("Need") && with_hint.contains("/tmp/ktstr-fuse-test"),
+            "base message shape must survive the hint append; \
+             got: {with_hint}",
+        );
+        assert!(
+            with_hint.contains("FUSE") && with_hint.contains("quota"),
+            "available == 0 must append the FUSE/quota hint; \
+             got: {with_hint}",
+        );
+        assert!(
+            with_hint.contains("blocks_available reported 0"),
+            "hint must name the specific value (0) so a user \
+             sees the trigger; got: {with_hint}",
+        );
+
+        // Non-zero `available` → no hint. Use a realistic gap
+        // (needed > available > 0) to confirm the hint does NOT
+        // fire for the normal full-disk case.
+        let without_hint = format_free_space_error(1_000_000, parent, 500_000);
+        assert!(
+            without_hint.contains("Need") && without_hint.contains("/tmp/ktstr-fuse-test"),
+            "base message shape unchanged; got: {without_hint}",
+        );
+        assert!(
+            !without_hint.contains("FUSE") && !without_hint.contains("blocks_available"),
+            "available > 0 must NOT append the FUSE hint (would \
+             clutter normal full-disk bails with irrelevant \
+             quota speculation); got: {without_hint}",
+        );
+    }
+
     #[test]
     fn ensure_free_space_ok_when_space_sufficient() {
         let tmp = tempfile::tempdir().expect("create tempdir");
