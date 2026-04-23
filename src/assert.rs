@@ -479,9 +479,86 @@ pub struct CgroupStats {
     /// Cross-node page migration ratio from `/proc/vmstat`
     /// `numa_pages_migrated` delta divided by total allocated pages.
     pub cross_node_migration_ratio: f64,
+    /// Wake-latency tail amplification:
+    /// `p99_wake_latency_us / median_wake_latency_us`.
+    ///
+    /// Unitless; ≥1.0 by definition of order statistics (p99
+    /// cannot undershoot the median on the same sample set).
+    /// Values far above 1.0 signal a long tail — the scheduler
+    /// wakes most workers promptly but occasionally stalls some,
+    /// a regression axis that neither `median_*` nor `p99_*`
+    /// exposes in isolation: a scenario can regress either by
+    /// lifting the whole distribution (both fields climb in
+    /// lock-step, tail ratio stays put) or by stretching just
+    /// the tail (only p99 climbs, ratio balloons).
+    ///
+    /// Persisted on the sidecar for future `stats compare`
+    /// wiring; not yet routed through `GauntletRow` / the
+    /// `METRICS` registry, so `stats compare` output does not
+    /// surface this axis today. A follow-up task wires the
+    /// sidecar field into the comparison row schema.
+    ///
+    /// `0.0` when `median_wake_latency_us` is `0.0` to avoid
+    /// producing `NaN` / `Infinity` that would trip the
+    /// `finite_or_zero` downstream filter. Callers that need to
+    /// distinguish "no samples" from "zero-latency case" consult
+    /// the raw fields directly.
+    pub wake_latency_tail_ratio: f64,
+    /// Throughput per parallel degree:
+    /// `total_iterations / num_workers`. Units: iterations per
+    /// worker over the scenario's wall time.
+    ///
+    /// Normalizes raw iteration counts against the cgroup's
+    /// worker count so a run that achieves the same total work
+    /// with more workers (lower per-worker throughput, possibly
+    /// from CPU contention) surfaces as a regression.
+    ///
+    /// Only meaningful across runs of the SAME variant (equal
+    /// scenario duration): cross-variant comparison is
+    /// misleading because this metric is NOT rate-normalized —
+    /// a longer-running scenario racks up more iterations per
+    /// worker even if the scheduler is identical. `stats
+    /// compare`-style comparisons should hold scenario,
+    /// topology, and work_type constant before reading this
+    /// field.
+    ///
+    /// Persisted on the sidecar for future `stats compare`
+    /// wiring; not yet routed through `GauntletRow` / the
+    /// `METRICS` registry. A follow-up task wires it in.
+    ///
+    /// `0.0` when `num_workers` is zero (empty cgroup — a
+    /// constructed edge case, not expected in production runs).
+    pub iterations_per_worker: f64,
     /// Extensible metrics for the generic comparison pipeline.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ext_metrics: BTreeMap<String, f64>,
+}
+
+impl CgroupStats {
+    /// Compute the two derived metrics
+    /// ([`Self::wake_latency_tail_ratio`],
+    /// [`Self::iterations_per_worker`]) from the already-populated
+    /// raw fields (`p99_wake_latency_us`, `median_wake_latency_us`,
+    /// `total_iterations`, `num_workers`).
+    ///
+    /// Both derived fields divide raw values and must guard the
+    /// zero-divisor case; centralizing the guards here means the
+    /// production populator at [`assert_not_starved`] and any
+    /// future call site share one definition of "no samples yet"
+    /// (both yield `0.0`, which survives the downstream
+    /// `finite_or_zero` filter).
+    pub fn derive_ratios(&mut self) {
+        self.wake_latency_tail_ratio = if self.median_wake_latency_us > 0.0 {
+            self.p99_wake_latency_us / self.median_wake_latency_us
+        } else {
+            0.0
+        };
+        self.iterations_per_worker = if self.num_workers > 0 {
+            self.total_iterations as f64 / self.num_workers as f64
+        } else {
+            0.0
+        };
+    }
 }
 
 /// Aggregated statistics across all cgroups in a scenario.
@@ -521,6 +598,34 @@ pub struct ScenarioStats {
     pub worst_page_locality: f64,
     /// Worst cross-node migration ratio across cgroups (highest).
     pub worst_cross_node_migration_ratio: f64,
+    /// Worst wake-latency tail amplification across cgroups
+    /// (highest). Higher is worse — it is the ratio of p99 to
+    /// median, so a cgroup with a severe long tail drives this up.
+    /// Zero when every cgroup has `median_wake_latency_us == 0.0`
+    /// (no samples). Pairs with
+    /// [`CgroupStats::wake_latency_tail_ratio`] — see that field
+    /// for the unit/semantics rationale.
+    ///
+    /// Persisted on the sidecar for future `stats compare`
+    /// wiring; not yet routed through `GauntletRow` / the
+    /// `METRICS` registry.
+    pub worst_wake_latency_tail_ratio: f64,
+    /// Worst per-worker iteration count across cgroups (LOWEST).
+    ///
+    /// Per-cgroup [`CgroupStats::iterations_per_worker`] is a
+    /// throughput metric; the worst-case (regression-detecting)
+    /// roll-up across cgroups is the MINIMUM, not the maximum —
+    /// a cgroup that fell behind surfaces as the lowest per-worker
+    /// throughput. Mirrors the "lowest non-zero" convention of
+    /// [`Self::worst_page_locality`]. Zero when every cgroup has
+    /// `num_workers == 0`.
+    ///
+    /// Only meaningful across runs of the SAME variant — see
+    /// [`CgroupStats::iterations_per_worker`] for the cross-
+    /// variant caveat. Persisted on the sidecar for future
+    /// `stats compare` wiring; not yet routed through
+    /// `GauntletRow` / the `METRICS` registry.
+    pub worst_iterations_per_worker: f64,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -586,6 +691,27 @@ impl AssertResult {
     /// worst-case value per dimension so the merged result represents
     /// the union of all checks applied.
     pub fn merge(&mut self, other: AssertResult) {
+        /// Lowest-non-zero fold: `*self_field` becomes `other_field`
+        /// when `other_field` is strictly positive AND either
+        /// `*self_field` is zero (uninitialized sentinel) or
+        /// `other_field` is strictly smaller than `*self_field`.
+        ///
+        /// This is NOT `f64::min` — a plain min would let an
+        /// unreported cgroup (`0.0` sentinel) clobber a real
+        /// reading from another cgroup, treating "no data yet" as
+        /// "worst possible." Shared by every lower-is-worse
+        /// aggregate that uses zero as a "not reported" marker
+        /// (currently `worst_page_locality` and
+        /// `worst_iterations_per_worker`). Any future
+        /// lower-is-worse field with the same sentinel convention
+        /// calls this rather than re-open-coding the five-line
+        /// guard.
+        fn fold_lowest_nonzero(self_field: &mut f64, other_field: f64) {
+            if other_field > 0.0 && (*self_field == 0.0 || other_field < *self_field) {
+                *self_field = other_field;
+            }
+        }
+
         if !other.passed {
             self.passed = false;
         }
@@ -613,21 +739,28 @@ impl AssertResult {
         s.worst_cross_node_migration_ratio = s
             .worst_cross_node_migration_ratio
             .max(o.worst_cross_node_migration_ratio);
+        // Tail ratio is higher-is-worse: max across cgroups surfaces
+        // the worst long-tail amplification.
+        s.worst_wake_latency_tail_ratio = s
+            .worst_wake_latency_tail_ratio
+            .max(o.worst_wake_latency_tail_ratio);
+        // Per-worker throughput is lower-is-worse: take the min
+        // across cgroups so a cgroup falling behind wins the
+        // "worst" bucket. Shared lowest-non-zero convention with
+        // `worst_page_locality` — see `fold_lowest_nonzero` above.
+        fold_lowest_nonzero(
+            &mut s.worst_iterations_per_worker,
+            o.worst_iterations_per_worker,
+        );
         // Coupled fields: `worst_gap_cpu` must come from the same
         // cgroup that posted the new worst `worst_gap_ms`.
         if o.worst_gap_ms > s.worst_gap_ms {
             s.worst_gap_ms = o.worst_gap_ms;
             s.worst_gap_cpu = o.worst_gap_cpu;
         }
-        // NUMA page locality: lowest non-zero value wins. Plain `min`
-        // would let an unreported cgroup (0.0 sentinel) clobber a
-        // real reading from another cgroup.
-        if o.worst_page_locality > 0.0
-            && (s.worst_page_locality == 0.0
-                || o.worst_page_locality < s.worst_page_locality)
-        {
-            s.worst_page_locality = o.worst_page_locality;
-        }
+        // NUMA page locality: lowest-non-zero fold — see
+        // `fold_lowest_nonzero` above for the sentinel convention.
+        fold_lowest_nonzero(&mut s.worst_page_locality, o.worst_page_locality);
         // Merge extensible metrics: take worst per key according to
         // each metric's polarity in the MetricDef registry. For
         // `higher_is_worse: true` the worst is max; for
@@ -1667,7 +1800,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         0.0
     };
 
-    let cg = CgroupStats {
+    let mut cg = CgroupStats {
         num_workers: reports.len(),
         num_cpus: cpus.len(),
         avg_off_cpu_pct: avg,
@@ -1686,8 +1819,15 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         worst_run_delay_us: worst_run_delay,
         page_locality: 0.0,
         cross_node_migration_ratio: 0.0,
+        wake_latency_tail_ratio: 0.0,
+        iterations_per_worker: 0.0,
         ext_metrics: BTreeMap::new(),
     };
+    // Centralize derived-ratio computation so both production and
+    // future test-fixture construction paths share one definition
+    // of "no samples yet" vs "zero latency" (the divide-by-zero
+    // guard lives in `derive_ratios`).
+    cg.derive_ratios();
 
     // Per-cgroup fairness: spread above threshold means unequal scheduling within a cgroup
     let spread_limit = spread_threshold_pct();
@@ -1738,6 +1878,8 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
         worst_run_delay_us: cg.worst_run_delay_us,
         worst_page_locality: 0.0,
         worst_cross_node_migration_ratio: 0.0,
+        worst_wake_latency_tail_ratio: cg.wake_latency_tail_ratio,
+        worst_iterations_per_worker: cg.iterations_per_worker,
         ext_metrics: cg.ext_metrics.clone(),
         cgroups: vec![cg],
     };
@@ -2380,6 +2522,201 @@ mod tests {
         assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.25);
     }
 
+    /// `CgroupStats::derive_ratios` computes the two derived fields
+    /// from the already-populated raw fields. Pins both the happy
+    /// path (non-zero divisors) and the zero-divisor guards — if
+    /// either guard regressed, the derived fields would produce
+    /// `NaN` / `Infinity` that the downstream `finite_or_zero`
+    /// filter in `stats::sidecar_to_row` would have to mop up.
+    /// Keeping the zero cases pinned at the source means the
+    /// finite_or_zero layer is belt-and-braces, not load-bearing.
+    #[test]
+    fn derive_ratios_computes_tail_and_throughput() {
+        use crate::assert::CgroupStats;
+
+        // Happy path: non-zero divisors, both ratios land.
+        let mut cg = CgroupStats {
+            num_workers: 4,
+            total_iterations: 800,
+            p99_wake_latency_us: 50.0,
+            median_wake_latency_us: 10.0,
+            ..CgroupStats::default()
+        };
+        cg.derive_ratios();
+        assert_eq!(
+            cg.wake_latency_tail_ratio, 5.0,
+            "p99 / median = 50 / 10; got {}",
+            cg.wake_latency_tail_ratio,
+        );
+        assert_eq!(
+            cg.iterations_per_worker, 200.0,
+            "total_iterations / num_workers = 800 / 4; got {}",
+            cg.iterations_per_worker,
+        );
+
+        // Zero-divisor: median == 0 → tail_ratio stays at 0.0, no NaN/Inf.
+        // Cross-check: the OTHER derived field (iterations_per_worker)
+        // must still land at its non-guard value — the median guard
+        // must not accidentally zero out an unrelated derived field.
+        let mut cg = CgroupStats {
+            num_workers: 2,
+            total_iterations: 100,
+            p99_wake_latency_us: 50.0,
+            median_wake_latency_us: 0.0,
+            ..CgroupStats::default()
+        };
+        cg.derive_ratios();
+        assert_eq!(
+            cg.wake_latency_tail_ratio, 0.0,
+            "divide-by-zero guard on median must yield 0.0, not NaN; got {}",
+            cg.wake_latency_tail_ratio,
+        );
+        assert!(
+            cg.wake_latency_tail_ratio.is_finite(),
+            "tail_ratio must be finite so `finite_or_zero` downstream \
+             is not load-bearing; got {}",
+            cg.wake_latency_tail_ratio,
+        );
+        assert_eq!(
+            cg.iterations_per_worker, 50.0,
+            "cross-check: median-guard branch must not zero out the \
+             independent iterations_per_worker (100 / 2 = 50); got {}",
+            cg.iterations_per_worker,
+        );
+
+        // Zero-divisor: num_workers == 0 → iterations_per_worker stays at 0.0.
+        // Cross-check: tail_ratio lands at its non-guard value — the
+        // num_workers guard must not bleed into the latency branch.
+        let mut cg = CgroupStats {
+            num_workers: 0,
+            total_iterations: 100,
+            p99_wake_latency_us: 50.0,
+            median_wake_latency_us: 10.0,
+            ..CgroupStats::default()
+        };
+        cg.derive_ratios();
+        assert_eq!(
+            cg.iterations_per_worker, 0.0,
+            "divide-by-zero guard on num_workers must yield 0.0, \
+             not NaN; got {}",
+            cg.iterations_per_worker,
+        );
+        assert!(
+            cg.iterations_per_worker.is_finite(),
+            "iterations_per_worker must be finite; got {}",
+            cg.iterations_per_worker,
+        );
+        assert_eq!(
+            cg.wake_latency_tail_ratio, 5.0,
+            "cross-check: num_workers-guard branch must not zero out \
+             the independent tail_ratio (50 / 10 = 5); got {}",
+            cg.wake_latency_tail_ratio,
+        );
+    }
+
+    /// `ScenarioStats::merge` rolls up the new derived-ratio fields
+    /// across cgroups with opposite polarities: `worst_wake_latency_tail_ratio`
+    /// is higher-is-worse (max), `worst_iterations_per_worker` is
+    /// lower-is-worse (min with lowest-non-zero convention matching
+    /// `worst_page_locality`). A regression that merged either with
+    /// the wrong polarity would surface a regression as an
+    /// improvement or vice versa — exactly the kind of sign-flip
+    /// that would silently break `stats compare`.
+    #[test]
+    fn merge_derived_ratios_use_correct_polarities() {
+        let mut a = AssertResult::pass();
+        a.stats.worst_wake_latency_tail_ratio = 2.0;
+        a.stats.worst_iterations_per_worker = 500.0;
+
+        let mut b = AssertResult::pass();
+        b.stats.worst_wake_latency_tail_ratio = 8.0;
+        b.stats.worst_iterations_per_worker = 100.0;
+
+        a.merge(b);
+
+        assert_eq!(
+            a.stats.worst_wake_latency_tail_ratio, 8.0,
+            "tail ratio uses max — 8.0 is worse than 2.0 (more \
+             amplification); got {}",
+            a.stats.worst_wake_latency_tail_ratio,
+        );
+        assert_eq!(
+            a.stats.worst_iterations_per_worker, 100.0,
+            "iterations_per_worker uses min — 100.0 is worse than \
+             500.0 (less throughput per worker); got {}",
+            a.stats.worst_iterations_per_worker,
+        );
+
+        // Lowest-non-zero convention, direction 1: a 0.0 sentinel
+        // on `other` must NOT clobber a real reading on `self`.
+        let mut c = AssertResult::pass();
+        c.stats.worst_iterations_per_worker = 300.0;
+        let mut empty = AssertResult::pass();
+        empty.stats.worst_iterations_per_worker = 0.0;
+        c.merge(empty);
+        assert_eq!(
+            c.stats.worst_iterations_per_worker, 300.0,
+            "unreported (0.0) cgroup on `other` must not clobber \
+             a real reading on `self` — lowest-non-zero, not \
+             plain-min; got {}",
+            c.stats.worst_iterations_per_worker,
+        );
+
+        // Lowest-non-zero convention, direction 2: the symmetric
+        // case where `self` starts at the 0.0 sentinel and a
+        // real reading on `other` must ADOPT. A plain-min would
+        // leave self at 0.0 (since min(0.0, 300.0) = 0.0),
+        // swallowing the real reading. The lowest-non-zero fold
+        // must recognise 0.0 as "unreported" and prefer the
+        // positive `other`.
+        let mut d = AssertResult::pass();
+        d.stats.worst_iterations_per_worker = 0.0;
+        let mut real = AssertResult::pass();
+        real.stats.worst_iterations_per_worker = 300.0;
+        d.merge(real);
+        assert_eq!(
+            d.stats.worst_iterations_per_worker, 300.0,
+            "unreported (0.0) `self` must adopt a real reading \
+             from `other` — otherwise the first-merged cgroup \
+             is silently lost; got {}",
+            d.stats.worst_iterations_per_worker,
+        );
+
+        // Both-zero: no real reading on either side stays 0.0
+        // rather than flipping to some sentinel.
+        let mut e = AssertResult::pass();
+        e.stats.worst_iterations_per_worker = 0.0;
+        let mut f = AssertResult::pass();
+        f.stats.worst_iterations_per_worker = 0.0;
+        e.merge(f);
+        assert_eq!(
+            e.stats.worst_iterations_per_worker, 0.0,
+            "both-zero must stay zero — no reading on either \
+             side, no fold; got {}",
+            e.stats.worst_iterations_per_worker,
+        );
+
+        // Tail-ratio polarity, reverse direction: when `self`
+        // starts at the higher value and `other` is smaller,
+        // `self` must retain its larger worst. Pair with the
+        // forward direction above (self=2, other=8 → 8) so both
+        // branches of the `.max()` are pinned — otherwise a
+        // regression that silently flipped to `.min()` would
+        // pass the forward-direction assertion and surface
+        // only here.
+        let mut g = AssertResult::pass();
+        g.stats.worst_wake_latency_tail_ratio = 8.0;
+        let mut h = AssertResult::pass();
+        h.stats.worst_wake_latency_tail_ratio = 2.0;
+        g.merge(h);
+        assert_eq!(
+            g.stats.worst_wake_latency_tail_ratio, 8.0,
+            "tail_ratio uses max: self=8.0, other=2.0 → self \
+             retains 8.0 (higher is worse); got {}",
+            g.stats.worst_wake_latency_tail_ratio,
+        );
+    }
+
     #[test]
     fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
         // Symmetric case: when `other` reports smaller values, `self`
@@ -2686,6 +3023,8 @@ mod tests {
             "worst_run_delay_us",
             "worst_page_locality",
             "worst_cross_node_migration_ratio",
+            "worst_wake_latency_tail_ratio",
+            "worst_iterations_per_worker",
         ];
 
         let s = ScenarioStats::default();
