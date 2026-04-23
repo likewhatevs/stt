@@ -3135,7 +3135,7 @@ mod tests {
             .spawn()
             .expect("spawn multi-sleeper");
         // The pgid equals the head child's pid. Capture it via the
-        // #[cfg(test)] accessor so the test does not reach into the
+        // public `pid()` accessor so the test does not reach into the
         // private `child` field.
         let pgid = libc::pid_t::try_from(handle.pid().expect("child still present"))
             .expect("child pid fits in pid_t");
@@ -3159,6 +3159,71 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 panic!("process group {pgid} still alive after kill+reap");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Drop path of [`PayloadHandle`]: a handle that falls out of
+    /// scope WITHOUT any consuming call (no `wait`, no `kill`, no
+    /// `try_wait`) must still SIGKILL the whole process group via
+    /// `kill_payload_process_group`. Without the Drop sweep,
+    /// multi-process payloads whose head exits while descendants
+    /// linger would leak their leader pid and keep descendants
+    /// alive on init, polluting later tests with stray children
+    /// holding file descriptors.
+    ///
+    /// Mirrors `kill_reaps_fork_descendants_via_process_group`
+    /// (the explicit-`kill()` counterpart) but drops the handle
+    /// instead of calling kill — pins the Drop implementation's
+    /// killpg route against the same backgrounded-sleeper shape.
+    #[cfg(unix)]
+    #[test]
+    fn drop_kills_fork_descendants_via_process_group() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        const MULTI_SLEEPER: Payload = Payload {
+            name: "multi_sleeper_drop",
+            kind: PayloadKind::Binary("/bin/sh"),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &["-c", "sleep 60 & exec sleep 60"],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+        };
+        let handle = PayloadRun::new(&ctx, &MULTI_SLEEPER)
+            .spawn()
+            .expect("spawn multi-sleeper");
+        // Capture the pgid via the public `pid()` accessor before
+        // dropping, so we can probe the group after the handle
+        // goes out of scope.
+        let pgid = libc::pid_t::try_from(handle.pid().expect("child still present"))
+            .expect("child pid fits in pid_t");
+        // Drop (no wait/kill/try_wait). The Drop impl at
+        // src/scenario/payload_run.rs routes through
+        // `kill_payload_process_group` + `child.wait()`.
+        drop(handle);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            // SAFETY: killpg with signal 0 is a pure existence
+            // query with no side effects beyond errno.
+            let rc = unsafe { libc::killpg(pgid, 0) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(libc::ESRCH),
+                    "unexpected errno from killpg probe after drop: {err}",
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "process group {pgid} still alive 30 s after \
+                     PayloadHandle drop — Drop-path killpg sweep \
+                     failed to reach every member",
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }

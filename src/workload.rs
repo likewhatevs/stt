@@ -266,6 +266,52 @@ pub enum WorkType {
     },
 }
 
+/// Named defaults for the parametric [`WorkType`] variants, used by
+/// [`WorkType::from_name`]. Extracting the magic numbers here
+/// provides a named home for the default values so tests and docs
+/// (e.g. `doc/guide/src/architecture/workers.md`) can cite them by
+/// constant name instead of each tracking a scattered integer
+/// literal. Every value carries a single-line comment naming the
+/// knob and its unit; the const names mirror the
+/// `{variant_snake}_{field}` convention so renames show up as
+/// compile errors in both sites.
+pub mod defaults {
+    // Bursty
+    pub const BURSTY_BURST_MS: u64 = 50;
+    pub const BURSTY_SLEEP_MS: u64 = 100;
+    // PipeIo
+    pub const PIPE_IO_BURST_ITERS: u64 = 1024;
+    // FutexPingPong
+    pub const FUTEX_PING_PONG_SPIN_ITERS: u64 = 1024;
+    // CachePressure / CacheYield / CachePipe share buffer shape
+    pub const CACHE_PRESSURE_SIZE_KB: usize = 32;
+    pub const CACHE_PRESSURE_STRIDE: usize = 64;
+    pub const CACHE_YIELD_SIZE_KB: usize = 32;
+    pub const CACHE_YIELD_STRIDE: usize = 64;
+    pub const CACHE_PIPE_SIZE_KB: usize = 32;
+    pub const CACHE_PIPE_BURST_ITERS: u64 = 1024;
+    // FutexFanOut
+    pub const FUTEX_FAN_OUT_FAN_OUT: usize = 4;
+    pub const FUTEX_FAN_OUT_SPIN_ITERS: u64 = 1024;
+    // AffinityChurn
+    pub const AFFINITY_CHURN_SPIN_ITERS: u64 = 1024;
+    // PolicyChurn
+    pub const POLICY_CHURN_SPIN_ITERS: u64 = 1024;
+    // FanOutCompute
+    pub const FAN_OUT_COMPUTE_FAN_OUT: usize = 4;
+    pub const FAN_OUT_COMPUTE_CACHE_FOOTPRINT_KB: usize = 256;
+    pub const FAN_OUT_COMPUTE_OPERATIONS: usize = 5;
+    pub const FAN_OUT_COMPUTE_SLEEP_USEC: u64 = 100;
+    // PageFaultChurn
+    pub const PAGE_FAULT_CHURN_REGION_KB: usize = 4096;
+    pub const PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE: usize = 256;
+    pub const PAGE_FAULT_CHURN_SPIN_ITERS: u64 = 64;
+    // MutexContention
+    pub const MUTEX_CONTENTION_CONTENDERS: usize = 4;
+    pub const MUTEX_CONTENTION_HOLD_ITERS: u64 = 256;
+    pub const MUTEX_CONTENTION_WORK_ITERS: u64 = 1024;
+}
+
 impl WorkType {
     /// PascalCase names for all built-in variants, matching the enum arm names.
     ///
@@ -315,46 +361,54 @@ impl WorkType {
             "Mixed" => Some(WorkType::Mixed),
             "IoSync" => Some(WorkType::IoSync),
             "Bursty" => Some(WorkType::Bursty {
-                burst_ms: 50,
-                sleep_ms: 100,
+                burst_ms: defaults::BURSTY_BURST_MS,
+                sleep_ms: defaults::BURSTY_SLEEP_MS,
             }),
-            "PipeIo" => Some(WorkType::PipeIo { burst_iters: 1024 }),
-            "FutexPingPong" => Some(WorkType::FutexPingPong { spin_iters: 1024 }),
+            "PipeIo" => Some(WorkType::PipeIo {
+                burst_iters: defaults::PIPE_IO_BURST_ITERS,
+            }),
+            "FutexPingPong" => Some(WorkType::FutexPingPong {
+                spin_iters: defaults::FUTEX_PING_PONG_SPIN_ITERS,
+            }),
             "CachePressure" => Some(WorkType::CachePressure {
-                size_kb: 32,
-                stride: 64,
+                size_kb: defaults::CACHE_PRESSURE_SIZE_KB,
+                stride: defaults::CACHE_PRESSURE_STRIDE,
             }),
             "CacheYield" => Some(WorkType::CacheYield {
-                size_kb: 32,
-                stride: 64,
+                size_kb: defaults::CACHE_YIELD_SIZE_KB,
+                stride: defaults::CACHE_YIELD_STRIDE,
             }),
             "CachePipe" => Some(WorkType::CachePipe {
-                size_kb: 32,
-                burst_iters: 1024,
+                size_kb: defaults::CACHE_PIPE_SIZE_KB,
+                burst_iters: defaults::CACHE_PIPE_BURST_ITERS,
             }),
             "FutexFanOut" => Some(WorkType::FutexFanOut {
-                fan_out: 4,
-                spin_iters: 1024,
+                fan_out: defaults::FUTEX_FAN_OUT_FAN_OUT,
+                spin_iters: defaults::FUTEX_FAN_OUT_SPIN_ITERS,
             }),
             "ForkExit" => Some(WorkType::ForkExit),
             "NiceSweep" => Some(WorkType::NiceSweep),
-            "AffinityChurn" => Some(WorkType::AffinityChurn { spin_iters: 1024 }),
-            "PolicyChurn" => Some(WorkType::PolicyChurn { spin_iters: 1024 }),
+            "AffinityChurn" => Some(WorkType::AffinityChurn {
+                spin_iters: defaults::AFFINITY_CHURN_SPIN_ITERS,
+            }),
+            "PolicyChurn" => Some(WorkType::PolicyChurn {
+                spin_iters: defaults::POLICY_CHURN_SPIN_ITERS,
+            }),
             "FanOutCompute" => Some(WorkType::FanOutCompute {
-                fan_out: 4,
-                cache_footprint_kb: 256,
-                operations: 5,
-                sleep_usec: 100,
+                fan_out: defaults::FAN_OUT_COMPUTE_FAN_OUT,
+                cache_footprint_kb: defaults::FAN_OUT_COMPUTE_CACHE_FOOTPRINT_KB,
+                operations: defaults::FAN_OUT_COMPUTE_OPERATIONS,
+                sleep_usec: defaults::FAN_OUT_COMPUTE_SLEEP_USEC,
             }),
             "PageFaultChurn" => Some(WorkType::PageFaultChurn {
-                region_kb: 4096,
-                touches_per_cycle: 256,
-                spin_iters: 64,
+                region_kb: defaults::PAGE_FAULT_CHURN_REGION_KB,
+                touches_per_cycle: defaults::PAGE_FAULT_CHURN_TOUCHES_PER_CYCLE,
+                spin_iters: defaults::PAGE_FAULT_CHURN_SPIN_ITERS,
             }),
             "MutexContention" => Some(WorkType::MutexContention {
-                contenders: 4,
-                hold_iters: 256,
-                work_iters: 1024,
+                contenders: defaults::MUTEX_CONTENTION_CONTENDERS,
+                hold_iters: defaults::MUTEX_CONTENTION_HOLD_ITERS,
+                work_iters: defaults::MUTEX_CONTENTION_WORK_ITERS,
             }),
             // Sequence requires explicit phases; no default from_name.
             _ => None,
@@ -1042,6 +1096,16 @@ pub struct WorkerReport {
     /// AffinityChurn, PolicyChurn, MutexContention, Sequence with
     /// Sleep/Yield/Io phases.
     pub resume_latencies_ns: Vec<u64>,
+    /// Total number of wake-latency observations the worker
+    /// recorded, INCLUDING any that were dropped by the reservoir
+    /// sampler. `resume_latencies_ns` is reservoir-clamped to at
+    /// most `MAX_WAKE_SAMPLES` (100_000) entries; on a long run
+    /// that accumulates more than that many wake events, the
+    /// vector stays at its cap while this counter keeps climbing.
+    /// Host-side consumers that want to report "total wakeups
+    /// observed" (vs. "entries in the sample") read this field;
+    /// percentile / CV computations read `resume_latencies_ns`.
+    pub wake_sample_total: u64,
     /// Outer-loop iteration count.
     pub iterations: u64,
     /// Delta of /proc/self/schedstat field 2 (run_delay) over the work loop.
@@ -3039,6 +3103,7 @@ fn worker_main(
         max_gap_cpu,
         max_gap_at_ms: max_gap_at_ns / 1_000_000,
         resume_latencies_ns,
+        wake_sample_total: wake_sample_count,
         iterations,
         schedstat_run_delay_ns: ss_delay_delta,
         schedstat_run_count: ss_ts_delta,
@@ -3726,6 +3791,7 @@ mod tests {
             max_gap_cpu: 1,
             max_gap_at_ms: 500,
             resume_latencies_ns: vec![1000, 2000],
+            wake_sample_total: 2,
             iterations: 10,
             schedstat_run_delay_ns: 500_000,
             schedstat_run_count: 20,
@@ -3741,6 +3807,7 @@ mod tests {
         assert_eq!(r.migration_count, r2.migration_count);
         assert_eq!(r.cpus_used, r2.cpus_used);
         assert_eq!(r.max_gap_ms, r2.max_gap_ms);
+        assert_eq!(r.wake_sample_total, r2.wake_sample_total);
     }
 
     #[test]
@@ -4376,6 +4443,7 @@ mod tests {
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
             resume_latencies_ns: vec![],
+            wake_sample_total: 0,
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
@@ -4404,6 +4472,7 @@ mod tests {
             max_gap_cpu: usize::MAX,
             max_gap_at_ms: u64::MAX,
             resume_latencies_ns: vec![],
+            wake_sample_total: u64::MAX,
             iterations: u64::MAX,
             schedstat_run_delay_ns: u64::MAX,
             schedstat_run_count: u64::MAX,
@@ -4771,6 +4840,7 @@ mod tests {
             max_gap_cpu: 5,
             max_gap_at_ms: 500,
             resume_latencies_ns: vec![],
+            wake_sample_total: 0,
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
@@ -4824,6 +4894,7 @@ mod tests {
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
             resume_latencies_ns: vec![],
+            wake_sample_total: 0,
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
@@ -5469,6 +5540,7 @@ mod tests {
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
             resume_latencies_ns: vec![],
+            wake_sample_total: 0,
             iterations: 0,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
@@ -5513,6 +5585,7 @@ mod tests {
             max_gap_cpu: 0,
             max_gap_at_ms: 0,
             resume_latencies_ns: vec![],
+            wake_sample_total: 0,
             iterations: work_units,
             schedstat_run_delay_ns: 0,
             schedstat_run_count: 0,
