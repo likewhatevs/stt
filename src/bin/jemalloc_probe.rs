@@ -21,29 +21,39 @@
 //!   resolved against the probe's own ELF (which is never stripped),
 //!   so external targets' debuginfo state is irrelevant in this mode.
 //!
-//! Scope for v1:
-//! - Linux x86_64 only.
-//! - Static-linked jemalloc only (symbol lives in the main executable's
-//!   static TLS image).
+//! Scope:
+//! - Linux, x86_64 and aarch64. Same-arch only (a probe binary built
+//!   for x86_64 only handles x86_64 targets; ptrace is same-arch).
+//! - Static-linked jemalloc only (symbol lives in the main
+//!   executable's static TLS image).
 //! - External-pid mode requires DWARF debuginfo on the target ELF and
 //!   CAP_SYS_PTRACE / root / same-uid-as-target; self-test mode
 //!   requires neither (DWARF is on the probe; the target is self).
 //!
 //! Mechanism (external-pid, per target thread):
 //! 1. `ptrace(PTRACE_SEIZE)` + `ptrace(PTRACE_INTERRUPT)` to stop.
-//! 2. `ptrace(PTRACE_GETREGSET, NT_PRSTATUS)` to read `fs_base`.
+//! 2. Read the thread pointer via `ptrace(PTRACE_GETREGSET, ...)`:
+//!    - x86_64 uses `NT_PRSTATUS` to get `user_regs_struct.fs_base`.
+//!    - aarch64 uses `NT_ARM_TLS` (regset 0x401) to get `TPIDR_EL0`.
 //! 3. `process_vm_readv` 24 bytes at the computed TLS address to read
 //!    `thread_allocated` + `thread_allocated_next_event_fast` +
 //!    `thread_deallocated` in one syscall while the thread is stopped.
 //! 4. `ptrace(PTRACE_DETACH)`.
 //!
-//! Mechanism (self-test): arch_prctl(ARCH_GET_FS) in the allocator
-//! thread instead of PTRACE_GETREGSET; `process_vm_readv` against
+//! Mechanism (self-test): same-thread TP read instead of
+//! PTRACE_GETREGSET (`arch_prctl(ARCH_GET_FS)` on x86_64, `mrs {},
+//! tpidr_el0` inline-asm on aarch64); `process_vm_readv` against
 //! self_pid; no ptrace attach/detach.
 //!
-//! Address math (Variant II TLS, x86_64):
-//!   addr(tsd_tls) = fs_base - round_up(PT_TLS.p_memsz, PT_TLS.p_align) + st_value
-//!   addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
+//! Address math:
+//! - Variant II (x86_64): TP points to END of TLS block.
+//!     addr(tsd_tls) = fs_base - round_up(PT_TLS.p_memsz, PT_TLS.p_align) + st_value
+//!     addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
+//! - Variant I (aarch64): TP points to start of the 16-byte TCB
+//!   header; TLS block starts after the header, aligned up to
+//!   PT_TLS.p_align (AArch64 ELF ABI, IHI 0056D §4.1).
+//!     addr(tsd_tls) = TPIDR_EL0 + round_up(16, PT_TLS.p_align) + st_value
+//!     addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
 
 // Link jemalloc as the global allocator so the probe binary itself
 // carries the `tsd_tls` symbol. Required by the `--self-test` mode
@@ -70,6 +80,7 @@ use gimli::{AttributeValue, EndianSlice, LittleEndian, Reader, Unit};
 use goblin::elf::Elf;
 use nix::sys::ptrace;
 use nix::sys::ptrace::Options;
+#[cfg(target_arch = "x86_64")]
 use nix::sys::ptrace::regset::NT_PRSTATUS;
 use nix::sys::signal::{SigHandler, Signal, signal};
 use nix::sys::uio::{RemoteIoVec, process_vm_readv};
@@ -125,6 +136,142 @@ fn self_pid() -> i32 {
 /// chain duplicated at every call site.
 fn format_comm_suffix(comm: Option<&str>) -> String {
     comm.map(|c| format!(" comm={c}")).unwrap_or_default()
+}
+
+/// Per-target-arch primitives: thread pointer read (via ptrace on an
+/// external target, via a same-thread inline-asm / syscall in the
+/// self-test path), the expected ELF `e_machine`, and a human-readable
+/// arch name. Gated on `target_arch` — a probe binary built for
+/// x86_64 only handles x86_64 targets (ptrace is same-arch). Both
+/// Variants are exposed as pure arithmetic (see
+/// [`compute_tls_address_variant_i`] / [`compute_tls_address_variant_ii`])
+/// so unit tests for either can run on any host regardless of
+/// `target_arch`.
+mod arch {
+    use super::*;
+
+    /// ELF `e_machine` value the probe is willing to probe. Matches
+    /// `target_arch`: a probe built for x86_64 rejects aarch64 targets
+    /// and vice versa. The check lives in [`find_jemalloc_via_maps`]
+    /// upstream of the DWARF walk so arch mismatches fail fast.
+    #[cfg(target_arch = "x86_64")]
+    pub const EXPECTED_E_MACHINE: u16 = goblin::elf::header::EM_X86_64;
+    #[cfg(target_arch = "aarch64")]
+    pub const EXPECTED_E_MACHINE: u16 = goblin::elf::header::EM_AARCH64;
+
+    /// Human-readable name of the arch this probe build targets.
+    /// Used only in diagnostic messages — the JSON schema carries the
+    /// target ELF's `e_machine` as a hex value elsewhere.
+    #[cfg(target_arch = "x86_64")]
+    pub const ARCH_NAME: &str = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    pub const ARCH_NAME: &str = "aarch64";
+
+    /// Name of the regset this build passes to PTRACE_GETREGSET when
+    /// reading the target thread's TP. Surfaced in the
+    /// [`ThreadErrorKind::GetRegset`] error message so an operator
+    /// grepping `warning: tid X [get_regset]` sees the arch-correct
+    /// register name — `NT_PRSTATUS` on x86_64 (for `fs_base` inside
+    /// `user_regs_struct`), `NT_ARM_TLS` on aarch64 (for
+    /// `tpidr_el0`).
+    #[cfg(target_arch = "x86_64")]
+    pub const REGSET_NAME: &str = "NT_PRSTATUS";
+    #[cfg(target_arch = "aarch64")]
+    pub const REGSET_NAME: &str = "NT_ARM_TLS";
+
+    /// `NT_ARM_TLS` regset number, from
+    /// `linux/include/uapi/linux/elf.h`. `nix` does not expose this
+    /// regset (its `RegisterSetValue` enum is closed and only carries
+    /// NT_PRSTATUS / NT_PRFPREG / NT_PRPSINFO / NT_TASKSTRUCT /
+    /// NT_AUXV), so the aarch64 read path calls `libc::ptrace`
+    /// directly with the raw regset value.
+    #[cfg(target_arch = "aarch64")]
+    pub const NT_ARM_TLS: libc::c_int = 0x401;
+
+    /// Read the stopped target thread's TP via ptrace.
+    ///
+    /// - x86_64: `ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, ...)`
+    ///   returns `user_regs_struct.fs_base`.
+    /// - aarch64: `ptrace(PTRACE_GETREGSET, pid, NT_ARM_TLS, ...)`
+    ///   returns `[tpidr_el0, tpidr2_el0]` on kernels with TPIDR2
+    ///   support, or a single `tpidr_el0` on older kernels. We
+    ///   request only the first 8 bytes (tpidr_el0) via the iovec's
+    ///   `iov_len`, so the read is version-stable across both.
+    #[cfg(target_arch = "x86_64")]
+    pub fn read_thread_pointer_ptrace(pid: Pid) -> std::result::Result<u64, nix::errno::Errno> {
+        let regs = ptrace::getregset::<NT_PRSTATUS>(pid)?;
+        Ok(regs.fs_base)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn read_thread_pointer_ptrace(pid: Pid) -> std::result::Result<u64, nix::errno::Errno> {
+        let mut tpidr: u64 = 0;
+        let mut iov = libc::iovec {
+            iov_base: (&mut tpidr as *mut u64).cast::<libc::c_void>(),
+            iov_len: std::mem::size_of::<u64>(),
+        };
+        // SAFETY: `libc::ptrace` is variadic; the addresses passed
+        // must be valid for the duration of the call. `iov.iov_base`
+        // points at a stack u64 and `&mut iov` points at a stack
+        // iovec — both live for the entire call.
+        let res = unsafe {
+            libc::ptrace(
+                libc::PTRACE_GETREGSET,
+                pid.as_raw(),
+                NT_ARM_TLS as libc::c_long,
+                &mut iov as *mut libc::iovec,
+            )
+        };
+        if res == -1 {
+            return Err(nix::errno::Errno::last());
+        }
+        Ok(tpidr)
+    }
+
+    /// Read the CURRENT thread's TP without ptrace. Used by
+    /// `--self-test` mode (same-process reads, no ptrace).
+    ///
+    /// - x86_64: `arch_prctl(ARCH_GET_FS, &fs)` — `arch_prctl` is
+    ///   x86-specific.
+    /// - aarch64: `mrs x0, tpidr_el0` — system register read is
+    ///   unprivileged in EL0.
+    #[cfg(target_arch = "x86_64")]
+    pub fn read_thread_pointer_self() -> Result<u64> {
+        const ARCH_GET_FS: libc::c_int = 0x1003;
+        let mut fs_base: u64 = 0;
+        // SAFETY: `arch_prctl` writes a single u64 into the buffer;
+        // the buffer is live for the syscall's duration.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_arch_prctl,
+                ARCH_GET_FS as libc::c_ulong,
+                &mut fs_base as *mut u64,
+            )
+        };
+        if r != 0 {
+            return Err(anyhow!(
+                "arch_prctl(ARCH_GET_FS) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(fs_base)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn read_thread_pointer_self() -> Result<u64> {
+        let tpidr: u64;
+        // SAFETY: `mrs` on `tpidr_el0` is unprivileged on AArch64
+        // EL0 (userspace). Reads the TLS register into `tpidr`; no
+        // memory touched.
+        unsafe {
+            std::arch::asm!(
+                "mrs {0}, tpidr_el0",
+                out(reg) tpidr,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        Ok(tpidr)
+    }
 }
 
 /// Candidate symbol names for jemalloc's per-thread state.
@@ -200,9 +347,10 @@ const DEALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_deallocate
     long_about = "Reads jemalloc's per-thread `thread_allocated` / `thread_deallocated` TLS \
                   counters out of a running process via ptrace + process_vm_readv. Counters are \
                   cumulative from thread creation — attaching late does not miss prior \
-                  allocations. Requires CAP_SYS_PTRACE, root, or same-uid-as-target. V1 supports \
-                  x86_64 targets with a statically-linked jemalloc and DWARF debuginfo on the \
-                  binary carrying the jemalloc TLS symbol.\n\n\
+                  allocations. Requires CAP_SYS_PTRACE, root, or same-uid-as-target. Supports \
+                  Linux x86_64 and aarch64 (same-arch only) targets with a statically-linked \
+                  jemalloc and DWARF debuginfo on the binary carrying the jemalloc TLS \
+                  symbol.\n\n\
                   The `--enable-stats` jemalloc build flag is NOT required: `thread.allocated` / \
                   `thread.deallocated` use jemalloc's `CTL_RO_NL_GEN` (ungated) and the fast/slow \
                   path writes are unconditional.\n\n\
@@ -546,11 +694,11 @@ enum ThreadErrorKind {
     /// kernel reports either `Err(ECHILD)` or a non-Stopped wait
     /// status.
     Waitpid,
-    /// `ptrace(PTRACE_GETREGSET, NT_PRSTATUS)` failed — the target
+    /// `ptrace(PTRACE_GETREGSET, <regset>)` failed — the target
     /// tid exited between attach and register fetch, or the target
-    /// is not an x86_64 thread (the probe refuses non-x86_64
-    /// upstream of this path, but this variant is held as
-    /// belt-and-braces).
+    /// is not the expected arch for this probe build (the arch
+    /// check refuses cross-arch targets upstream of this path, but
+    /// this variant is held as belt-and-braces).
     GetRegset,
     /// `process_vm_readv` against the computed TLS address failed or
     /// returned a short read. The address may be unmapped or the tid
@@ -602,10 +750,21 @@ pub(crate) struct TsdTlsSymbol {
     pub st_value: u64,
     /// Aligned size of the PT_TLS program header:
     /// `round_up(p_memsz, p_align)`. Added as a negative offset to TP
-    /// to reach the start of the TLS image (Variant II).
+    /// to reach the start of the TLS image under the Variant II
+    /// model (x86_64). Not used by Variant I (aarch64), which only
+    /// needs [`TsdTlsSymbol::p_align`].
     pub tls_image_aligned_size: u64,
-    /// ELF architecture e_machine value — used to refuse non-x86_64
-    /// targets with a clear error.
+    /// Raw `PT_TLS.p_align` value. Variant I (aarch64) needs this
+    /// to compute `round_up(TCB_SIZE_AARCH64, p_align)` — the offset
+    /// from TP to the TLS image base. Retained alongside
+    /// `tls_image_aligned_size` for Variant II back-compat rather
+    /// than collapsing into the aligned value, because the two
+    /// formulas diverge on the arg they need.
+    pub p_align: u64,
+    /// ELF architecture e_machine value — matched against the probe's
+    /// compile-time [`arch::EXPECTED_E_MACHINE`] so a probe built for
+    /// x86_64 refuses an aarch64 target (and vice versa) with a clear
+    /// error upstream of the ptrace dance.
     pub e_machine: u16,
 }
 
@@ -622,7 +781,7 @@ pub(crate) struct TsdTlsSymbol {
 ///    ktstr's own binaries keep `.symtab`.
 pub(crate) fn find_tsd_tls(elf: &Elf<'_>, elf_path: &Path) -> Result<TsdTlsSymbol> {
     let e_machine = elf.header.e_machine;
-    let tls_image_aligned_size = extract_pt_tls_size(elf)?;
+    let (tls_image_aligned_size, p_align) = extract_pt_tls_layout(elf)?;
 
     // Order-preserving name search across symbol tables.
     let finders: [(&str, &dyn Fn(&str) -> Option<u64>); 2] = [
@@ -642,6 +801,7 @@ pub(crate) fn find_tsd_tls(elf: &Elf<'_>, elf_path: &Path) -> Result<TsdTlsSymbo
                     elf_path: elf_path.to_path_buf(),
                     st_value,
                     tls_image_aligned_size,
+                    p_align,
                     e_machine,
                 });
             }
@@ -670,19 +830,36 @@ fn find_symbol_by_name(
     None
 }
 
-fn extract_pt_tls_size(elf: &Elf<'_>) -> Result<u64> {
+/// Extract both `round_up(p_memsz, p_align)` and the raw `p_align`
+/// from the ELF's `PT_TLS` program header. The first is Variant II's
+/// TP-to-TLS-image delta (subtracted); the second feeds Variant I's
+/// `round_up(TCB_SIZE_AARCH64, p_align)`. Returning both keeps the
+/// ELF parse a single pass.
+fn extract_pt_tls_layout(elf: &Elf<'_>) -> Result<(u64, u64)> {
     let tls_hdr = elf
         .program_headers
         .iter()
         .find(|ph| ph.p_type == goblin::elf::program_header::PT_TLS)
         .ok_or_else(|| anyhow!("ELF has no PT_TLS segment — target does not use static TLS"))?;
+    // PT_TLS.p_align is a power of two (or zero) per the ELF spec
+    // (and in practice for every Linux toolchain). The `& !(align - 1)`
+    // round-up trick below assumes this invariant; `debug_assert!`
+    // surfaces a non-power-of-two in debug builds before the silent
+    // miscomputation reaches the probe's address arithmetic. Release
+    // builds accept the ELF as-is — a malicious target isn't the
+    // threat model.
+    debug_assert!(
+        tls_hdr.p_align == 0 || tls_hdr.p_align.is_power_of_two(),
+        "PT_TLS.p_align must be 0 or a power of two, got {}",
+        tls_hdr.p_align,
+    );
     let align = tls_hdr.p_align.max(1);
     let rounded = tls_hdr
         .p_memsz
         .checked_add(align - 1)
         .map(|v| v & !(align - 1))
         .ok_or_else(|| anyhow!("PT_TLS size arithmetic overflow"))?;
-    Ok(rounded)
+    Ok((rounded, align))
 }
 
 /// Offsets of the two counters inside `struct tsd_s`, resolved from
@@ -874,19 +1051,27 @@ fn member_offset<R: Reader>(attr: Option<AttributeValue<R>>) -> Result<Option<u6
     }
 }
 
-/// Compute the absolute address of a TLS variable's field in the target.
+/// Reserved-area size at the low end of AArch64's Variant I thread-
+/// control block — 2 words before the TLS image, per the AArch64 ELF
+/// Linux ABI (IHI 0056D §4.1). The TLS image base is
+/// `TP + round_up(TCB_SIZE_AARCH64, p_align)`; every TLS variable
+/// sits at `tls_image_base + st_value + field_offset`.
+#[allow(dead_code)] // used by the aarch64 dispatcher + Variant I unit tests
+pub(crate) const TCB_SIZE_AARCH64: u64 = 16;
+
+/// Variant II TLS address (x86_64).
 ///
-/// Variant II (x86_64): the thread pointer (`fs_base`) points to the
-/// end of the static TLS block; the executable's TLS image sits at
+/// The thread pointer (`fs_base`) points to the END of the static
+/// TLS block; the executable's TLS image sits at
 /// `fs_base - tls_image_aligned_size`. The symbol lives at
-/// `st_value` bytes within that image; the field lives `field_offset`
-/// bytes inside the symbol.
+/// `st_value` bytes within that image; the field lives
+/// `field_offset` bytes inside the symbol.
 ///
 /// Returns `Err` on `fs_base < tls_image_aligned_size` — that would
 /// indicate the target has not initialized TLS or the ELF layout is
 /// malformed; silently wrapping into the top of the address space
 /// would produce a read from kernel-space and confuse the error path.
-pub(crate) fn compute_tls_address(
+pub(crate) fn compute_tls_address_variant_ii(
     fs_base: u64,
     tls_image_aligned_size: u64,
     st_value: u64,
@@ -903,6 +1088,70 @@ pub(crate) fn compute_tls_address(
         .checked_add(st_value)
         .and_then(|v| v.checked_add(field_offset))
         .ok_or_else(|| anyhow!("TLS address arithmetic overflow"))
+}
+
+/// Variant I TLS address (aarch64).
+///
+/// `TPIDR_EL0` (the thread pointer) points to the BEGINNING of the
+/// thread-control block; the executable's TLS image sits at
+/// `TP + round_up(TCB_SIZE_AARCH64, p_align)`. The symbol lives at
+/// `st_value` within that image; the field lives `field_offset`
+/// bytes inside the symbol.
+///
+/// Every `checked_*` guard exists to catch an overflow that would
+/// silently wrap into the high part of the address space and confuse
+/// the error path — same rationale as
+/// [`compute_tls_address_variant_ii`].
+#[allow(dead_code)] // used by the aarch64 dispatcher + Variant I unit tests
+pub(crate) fn compute_tls_address_variant_i(
+    tpidr_el0: u64,
+    p_align: u64,
+    st_value: u64,
+    field_offset: u64,
+) -> Result<u64> {
+    // Round the TCB reserved area up to the TLS block's alignment.
+    // Rust's integer arithmetic traps on underflow in debug builds;
+    // the `.max(1)` guards against p_align=0 in a degenerate ELF.
+    let align = p_align.max(1);
+    let image_offset = TCB_SIZE_AARCH64
+        .checked_add(align - 1)
+        .map(|v| v & !(align - 1))
+        .ok_or_else(|| {
+            anyhow!(
+                "TLS image offset overflow: tcb={} align={align:#x}",
+                TCB_SIZE_AARCH64,
+            )
+        })?;
+    tpidr_el0
+        .checked_add(image_offset)
+        .and_then(|v| v.checked_add(st_value))
+        .and_then(|v| v.checked_add(field_offset))
+        .ok_or_else(|| anyhow!("TLS address arithmetic overflow"))
+}
+
+/// Arch-dispatched TLS address compute. Routes to Variant II on
+/// x86_64 and Variant I on aarch64 via `cfg(target_arch)`. Keeps
+/// call sites (`probe_single_thread`, `run_self_test`) arch-neutral.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn compute_tls_address(
+    tp: u64,
+    tls_image_aligned_size: u64,
+    _p_align: u64,
+    st_value: u64,
+    field_offset: u64,
+) -> Result<u64> {
+    compute_tls_address_variant_ii(tp, tls_image_aligned_size, st_value, field_offset)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn compute_tls_address(
+    tp: u64,
+    _tls_image_aligned_size: u64,
+    p_align: u64,
+    st_value: u64,
+    field_offset: u64,
+) -> Result<u64> {
+    compute_tls_address_variant_i(tp, p_align, st_value, field_offset)
 }
 
 // ---------------------------------------------------------------------
@@ -983,12 +1232,19 @@ pub(crate) fn find_jemalloc_via_maps(
                 exe_path.display(),
             );
         }
-        // Arch check runs before the (slow) DWARF walk so an aarch64
-        // target fails fast with the right message instead of running
-        // gimli over unsupported debug info.
-        if symbol.e_machine != goblin::elf::header::EM_X86_64 {
+        // Arch check runs before the (slow) DWARF walk so a
+        // cross-arch target fails fast with the right message instead
+        // of running gimli over unsupported debug info. The probe is
+        // same-arch only: a probe binary built for x86_64 only probes
+        // x86_64 targets; aarch64 build only probes aarch64. Cross-
+        // arch ptrace is not supported.
+        if symbol.e_machine != arch::EXPECTED_E_MACHINE {
             bail!(
-                "probe is x86_64-only; target ELF {} is {} (e_machine={:#x})",
+                "probe is {}-only; target ELF {} is {} (e_machine={:#x}). \
+                 Obtain or build a probe matching the target's architecture \
+                 (ptrace is same-arch only — the probe and its target must \
+                 share the same machine type).",
+                arch::ARCH_NAME,
                 symbol.elf_path.display(),
                 e_machine_name(symbol.e_machine),
                 symbol.e_machine,
@@ -1161,7 +1417,10 @@ impl ThreadProbeError {
     fn getregset(tid: i32, e: nix::errno::Errno) -> Self {
         Self::new(
             ThreadErrorKind::GetRegset,
-            anyhow!("ptrace(PTRACE_GETREGSET, NT_PRSTATUS) on tid {tid}: {e}"),
+            anyhow!(
+                "ptrace(PTRACE_GETREGSET, {}) on tid {tid}: {e}",
+                arch::REGSET_NAME,
+            ),
         )
     }
 
@@ -1214,13 +1473,13 @@ fn probe_single_thread(
         Err(e) => return Err(ThreadProbeError::waitpid_err(tid, e)),
     }
 
-    let regs = ptrace::getregset::<NT_PRSTATUS>(pid)
+    let thread_pointer = arch::read_thread_pointer_ptrace(pid)
         .map_err(|e| ThreadProbeError::getregset(tid, e))?;
-    let fs_base = regs.fs_base;
 
     let addr = compute_tls_address(
-        fs_base,
+        thread_pointer,
         symbol.tls_image_aligned_size,
+        symbol.p_align,
         symbol.st_value,
         offsets.thread_allocated,
     )
@@ -1689,9 +1948,10 @@ struct SelfTestOutput {
 /// No ptrace: the target thread is in the same process, so
 /// `process_vm_readv(self_pid, ...)` succeeds under the same-uid
 /// kernel check without CAP_SYS_PTRACE. The worker self-reports
-/// its FS base via `arch_prctl(ARCH_GET_FS)` instead of the
-/// ptrace GETREGSET path used for external probes, again because
-/// we can't ptrace our own threads.
+/// its thread pointer via [`arch::read_thread_pointer_self`]
+/// (`arch_prctl(ARCH_GET_FS)` on x86_64, `mrs tpidr_el0` on
+/// aarch64) instead of the ptrace GETREGSET path used for external
+/// probes, again because we can't ptrace our own threads.
 ///
 /// The probe binary ships with DWARF (not stripped), so
 /// `find_jemalloc_via_maps(self_pid)` resolves `tsd_s`'s field
@@ -1700,28 +1960,6 @@ struct SelfTestOutput {
 fn run_self_test(bytes: u64) -> RunOutcome {
     use std::sync::atomic::AtomicI32;
     use std::sync::{Arc, mpsc};
-
-    // Load CURRENT thread's arch_prctl(ARCH_GET_FS) to learn its
-    // FS base. x86_64-only — aarch64 uses a different TLS model
-    // and the probe already bails on non-x86_64 elsewhere.
-    fn arch_get_fs() -> Result<u64> {
-        const ARCH_GET_FS: libc::c_int = 0x1003;
-        let mut fs_base: u64 = 0;
-        let r = unsafe {
-            libc::syscall(
-                libc::SYS_arch_prctl,
-                ARCH_GET_FS as libc::c_ulong,
-                &mut fs_base as *mut u64,
-            )
-        };
-        if r != 0 {
-            return Err(anyhow!(
-                "arch_prctl(ARCH_GET_FS) failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(fs_base)
-    }
 
     /// RAII guard that signals the self-test worker to exit
     /// (`stop_tx.send(())`) and joins it on scope exit. Previously
@@ -1756,25 +1994,35 @@ fn run_self_test(bytes: u64) -> RunOutcome {
     // scheduling latency.
     let timestamp_unix_sec = now_unix_sec();
     let worker_tid = Arc::new(AtomicI32::new(0));
-    let worker_fs_base = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Holds the worker's thread pointer: fs_base on x86_64 (from
+    // arch_prctl(ARCH_GET_FS)), tpidr_el0 on aarch64 (from `mrs`).
+    // Same atomic u64 shape, arch-specific semantics resolved by
+    // `arch::read_thread_pointer_self`.
+    let worker_tp = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let tid_clone = worker_tid.clone();
-    let fs_clone = worker_fs_base.clone();
+    let tp_clone = worker_tp.clone();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let bytes_usize = bytes as usize;
 
     let worker = std::thread::spawn(move || {
+        // SAFETY: `SYS_gettid` takes no arguments and returns the
+        // caller's kernel tid. It cannot fail, has no memory effects,
+        // and is safe to call on any Linux thread. The `libc::syscall`
+        // variadic wrapper is marked unsafe because OTHER syscalls
+        // have trailing-arg requirements; for a zero-arg syscall the
+        // unsafe is just the FFI boundary.
         let tid = libc::pid_t::try_from(unsafe { libc::syscall(libc::SYS_gettid) })
             .expect("Linux pid_max <= 2^22 so tid fits in pid_t");
-        let fs_base = match arch_get_fs() {
+        let tp = match arch::read_thread_pointer_self() {
             Ok(v) => v,
             Err(e) => {
-                let _ = ready_tx.send(Err(format!("arch_get_fs: {e:#}")));
+                let _ = ready_tx.send(Err(format!("read_thread_pointer_self: {e:#}")));
                 return;
             }
         };
         tid_clone.store(tid, Ordering::Release);
-        fs_clone.store(fs_base, Ordering::Release);
+        tp_clone.store(tp, Ordering::Release);
         // Alloc AFTER registering tid/fs so a main-thread read
         // before the alloc completes only misses the counter
         // update, not identity metadata.
@@ -1798,7 +2046,7 @@ fn run_self_test(bytes: u64) -> RunOutcome {
     }
 
     let tid = worker_tid.load(Ordering::Acquire);
-    let fs_base = worker_fs_base.load(Ordering::Acquire);
+    let tp = worker_tp.load(Ordering::Acquire);
 
     // Resolve jemalloc symbols + offsets against the probe's own
     // ELF (via `/proc/self/maps`). DWARF comes from the probe
@@ -1809,8 +2057,9 @@ fn run_self_test(bytes: u64) -> RunOutcome {
     };
 
     let addr = match compute_tls_address(
-        fs_base,
+        tp,
         symbol.tls_image_aligned_size,
+        symbol.p_align,
         symbol.st_value,
         offsets.thread_allocated,
     ) {
@@ -2201,7 +2450,7 @@ mod tests {
         let aligned = 512; // round_up(memsz=500, align=16)
         let st_value = 0x100; // symbol is at byte 256 of the TLS image
         let field = 264; // offsetof(tsd_s, thread_allocated) example
-        let addr = compute_tls_address(fs_base, aligned, st_value, field).unwrap();
+        let addr = compute_tls_address_variant_ii(fs_base, aligned, st_value, field).unwrap();
         // 0x7f1234567000 - 0x200 + 0x100 + 264
         // = 0x7f1234566f00 + 264
         // = 0x7f1234567008
@@ -2214,7 +2463,8 @@ mod tests {
     /// test).
     #[test]
     fn compute_tls_address_boundary_tp_equals_image_size() {
-        let addr = compute_tls_address(/*fs_base*/ 4096, /*aligned*/ 4096, 0, 0).unwrap();
+        let addr =
+            compute_tls_address_variant_ii(/*fs_base*/ 4096, /*aligned*/ 4096, 0, 0).unwrap();
         assert_eq!(addr, 0);
     }
 
@@ -2222,10 +2472,174 @@ mod tests {
     /// the math must NOT wrap into the top of the u64 address space.
     #[test]
     fn compute_tls_address_underflow_errors() {
-        let err = compute_tls_address(4096, 8192, 0, 0).unwrap_err();
+        let err = compute_tls_address_variant_ii(4096, 8192, 0, 0).unwrap_err();
         assert!(
             format!("{err}").contains("below the aligned TLS image size"),
             "got: {err}",
+        );
+    }
+
+    /// Variant I (aarch64) worked example pinning the hand-checked
+    /// arithmetic: `TP + round_up(TCB_SIZE=16, p_align) + st_value +
+    /// field_offset`.
+    ///
+    /// With `p_align = 16`, `round_up(16, 16) = 16`, so the image
+    /// base sits at `TP + 16`. Adding `st_value = 0x100` and
+    /// `field = 264` gives `TP + 0x10 + 0x100 + 264`.
+    #[test]
+    fn compute_tls_address_variant_i_example() {
+        let tpidr = 0x7f12_3456_7000;
+        let p_align = 16;
+        let st_value = 0x100;
+        let field = 264;
+        let addr = compute_tls_address_variant_i(tpidr, p_align, st_value, field).unwrap();
+        // 0x7f1234567000 + 0x10 + 0x100 + 264
+        // = 0x7f1234567110 + 264
+        // = 0x7f1234567218
+        assert_eq!(addr, 0x7f12_3456_7218);
+    }
+
+    /// Variant I with `p_align > TCB_SIZE_AARCH64`: the TLS image
+    /// base is rounded up to `p_align`, not pinned at 16. Pins the
+    /// `round_up(16, p_align)` calculation for a common high-align
+    /// case (`p_align = 64`, which jemalloc's tsd_s uses to hit
+    /// cache-line alignment).
+    #[test]
+    fn compute_tls_address_variant_i_high_alignment() {
+        // TP + round_up(16, 64) + 0 + 0 = TP + 64
+        let addr = compute_tls_address_variant_i(0x1000, 64, 0, 0).unwrap();
+        assert_eq!(addr, 0x1040);
+    }
+
+    /// Variant I `p_align == TCB_SIZE_AARCH64`: exact fit, no
+    /// padding past the reserved TCB words.
+    #[test]
+    fn compute_tls_address_variant_i_tcb_sized_alignment() {
+        let addr = compute_tls_address_variant_i(0x1000, TCB_SIZE_AARCH64, 0, 0).unwrap();
+        assert_eq!(addr, 0x1010);
+    }
+
+    /// Variant I with `p_align < TCB_SIZE_AARCH64`: `round_up(16, 8)
+    /// = 16`. The reserved TCB size is the minimum — sub-TCB
+    /// alignments do NOT shrink the image-base offset.
+    #[test]
+    fn compute_tls_address_variant_i_sub_tcb_alignment() {
+        let addr = compute_tls_address_variant_i(0x1000, 8, 0, 0).unwrap();
+        assert_eq!(addr, 0x1010);
+    }
+
+    /// Variant I degenerate-align fallback: `p_align = 0` in a
+    /// malformed ELF must not divide-by-zero. The implementation's
+    /// `.max(1)` coerces to `align = 1`, giving
+    /// `round_up(16, 1) = 16`.
+    #[test]
+    fn compute_tls_address_variant_i_zero_align_clamped() {
+        let addr = compute_tls_address_variant_i(0x1000, 0, 0, 0).unwrap();
+        assert_eq!(addr, 0x1010);
+    }
+
+    /// Variant I overflow: `TP + image_offset + st_value +
+    /// field_offset` near `u64::MAX` must error rather than wrap
+    /// into the low address space.
+    #[test]
+    fn compute_tls_address_variant_i_overflow_errors() {
+        let err = compute_tls_address_variant_i(u64::MAX - 10, 16, 0x100, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("TLS address arithmetic overflow"),
+            "got: {err}",
+        );
+    }
+
+    /// Variant I image-offset overflow: a malformed ELF with
+    /// `p_align` near `u64::MAX` would make `round_up(TCB_SIZE,
+    /// p_align)` overflow the `checked_add` in
+    /// `compute_tls_address_variant_i` BEFORE the TP addition runs.
+    /// The error must be the image-offset variant, not the address-
+    /// arithmetic variant — distinguishing the two helps the
+    /// operator know which input is malformed.
+    #[test]
+    fn compute_tls_address_variant_i_image_offset_overflow_errors() {
+        // `p_align = u64::MAX` is non-power-of-two, but the overflow
+        // guard fires regardless (release builds don't hit the
+        // debug_assert). `TCB_SIZE_AARCH64 + (u64::MAX - 1)`
+        // overflows u64, so `checked_add` returns None and the
+        // image-offset bail fires.
+        let err = compute_tls_address_variant_i(0x1000, u64::MAX, 0, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("TLS image offset overflow"),
+            "expected image-offset overflow, got: {err}",
+        );
+    }
+
+    /// Arch dispatcher routes to the right Variant based on
+    /// `target_arch`. On x86_64 build the result matches Variant II;
+    /// on aarch64 build it matches Variant I. The test picks inputs
+    /// that produce distinct answers under each formula so a
+    /// cfg-dispatch regression would produce the wrong output.
+    #[test]
+    fn compute_tls_address_dispatches_by_target_arch() {
+        // TP=4096, aligned=4096, p_align=16, st_value=0, field=0.
+        // Variant II: 4096 - 4096 + 0 + 0 = 0
+        // Variant I:  4096 + round_up(16, 16) + 0 + 0 = 4096 + 16 = 4112
+        let got = compute_tls_address(4096, 4096, 16, 0, 0).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(got, 0, "x86_64 must dispatch to Variant II");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(got, 4112, "aarch64 must dispatch to Variant I");
+    }
+
+    /// Positionally-distinct dispatcher test with non-zero primes
+    /// for every argument. A regression that swapped argument
+    /// positions (e.g. passed `p_align` where Variant II expects
+    /// `aligned_size`, or vice versa) would produce a wrong answer
+    /// for ONE variant but the test that uses zeros for most args
+    /// cannot detect that class of drift. Each input is a distinct
+    /// prime so a position swap shifts the result by an identifiable
+    /// amount.
+    ///
+    /// Inputs: TP=13_000_009 (prime-ish), aligned=1009 (prime),
+    /// p_align=64 (power of 2, used only by Variant I),
+    /// st_value=307 (prime), field=83 (prime).
+    ///
+    /// Variant II: 13_000_009 - 1009 + 307 + 83 = 12_999_390
+    /// Variant I:  13_000_009 + round_up(16, 64) + 307 + 83
+    ///           = 13_000_009 + 64 + 307 + 83
+    ///           = 13_000_463
+    #[test]
+    fn compute_tls_address_dispatches_positionally_distinct() {
+        let got = compute_tls_address(13_000_009, 1009, 64, 307, 83).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(got, 12_999_390, "x86_64 Variant II formula");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(got, 13_000_463, "aarch64 Variant I formula");
+    }
+
+    /// `extract_pt_tls_layout` on the test binary's own ELF (the
+    /// bin's `#[cfg(test)]` executable). The probe binary links
+    /// `tikv_jemallocator` as the global allocator (see the
+    /// `#[global_allocator]` declaration at the top of the file), so
+    /// the compiled test binary carries jemalloc's `tsd_tls` in a
+    /// real `PT_TLS` segment. Parsing it exercises the ACTUAL
+    /// extraction function end-to-end and proves that the tuple
+    /// invariants (`p_align` power-of-two, `aligned_size >=
+    /// p_align`, `aligned_size % p_align == 0`) hold against a real
+    /// toolchain-emitted program header, not a local mirror of the
+    /// round-up math.
+    #[test]
+    fn extract_pt_tls_layout_on_real_elf() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let data = std::fs::read(&exe).expect("read current_exe");
+        let elf = goblin::elf::Elf::parse(&data).expect("parse current_exe");
+        let (rounded, align) =
+            extract_pt_tls_layout(&elf).expect("probe test binary must carry PT_TLS");
+        assert!(
+            align.is_power_of_two(),
+            "p_align {align} must be a power of two",
+        );
+        assert!(rounded >= align, "aligned_size {rounded} must be >= align {align}");
+        assert!(
+            rounded % align == 0,
+            "aligned_size {rounded} must be a multiple of align {align}",
         );
     }
 
@@ -2637,7 +3051,14 @@ mod tests {
         assert_eq!(err.kind, ThreadErrorKind::GetRegset);
         let msg = format!("{}", err.source);
         assert!(msg.contains("PTRACE_GETREGSET"), "got: {msg}");
-        assert!(msg.contains("NT_PRSTATUS"), "got: {msg}");
+        // Match the arch-correct regset name — NT_PRSTATUS on x86_64
+        // (where fs_base lives in user_regs_struct), NT_ARM_TLS on
+        // aarch64 (where tpidr_el0 is reached via regset 0x401).
+        assert!(
+            msg.contains(arch::REGSET_NAME),
+            "expected regset name {}, got: {msg}",
+            arch::REGSET_NAME,
+        );
         assert!(msg.contains("tid 88"), "got: {msg}");
     }
 
