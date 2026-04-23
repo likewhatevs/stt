@@ -2577,7 +2577,7 @@ mod tests {
     /// resolves `a` / `b` against `alt_root`, not the default
     /// [`crate::test_support::runs_root`].
     ///
-    /// Sibling [`crate::bin::cargo_ktstr::tests::parse_stats_compare_with_dir`]
+    /// Sibling `parse_stats_compare_with_dir`
     /// (src/bin/cargo-ktstr.rs) pins the clap-binding half of the
     /// `--dir` wiring: a CLI invocation `stats compare a b --dir
     /// PATH` parses into `StatsCommand::Compare { dir: Some(PATH),
@@ -2648,10 +2648,15 @@ mod tests {
         // to find `runs_root()/__dir_thread_a__`, and bail.
         let exit = compare_runs(run_a, run_b, None, None, Some(alt_root.path()))
             .expect("compare_runs must resolve runs under the dir arg");
-        assert!(
-            exit == 0 || exit == 1,
-            "compare_runs must return a standard exit code (0 no \
-             regressions, 1 regressions); got {exit}",
+        assert_eq!(
+            exit, 0,
+            "both fixtures are byte-identical copies of \
+             SidecarResult::test_fixture() modulo test_name — \
+             comparing them against each other must yield zero \
+             regressions (exit 0). A non-zero exit here means \
+             either compare_rows regressed on identical inputs \
+             or the resolver loaded different data than the \
+             fixtures written above.",
         );
 
         // Companion: without `--dir`, the same unique names cannot

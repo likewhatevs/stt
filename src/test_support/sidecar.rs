@@ -614,7 +614,57 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
     Ok(())
 }
 
-/// Emit a minimal sidecar for an early-skip path.
+/// Return `active_flags` sorted into canonical
+/// [`crate::scenario::flags::ALL`] order. Both sidecar writers
+/// pipe their caller-supplied flag slice through this helper so
+/// the persisted ordering is a pure function of the flag SET,
+/// not the order the caller happened to accumulate them in.
+///
+/// Why this matters: [`sidecar_variant_hash`] walks
+/// `active_flags` in-order and folds each byte into a SipHasher
+/// state (see sibling site that hashes `for f in
+/// &sidecar.active_flags`). Two runs of the same semantic variant
+/// that differ only in flag accumulation order — e.g. a gauntlet
+/// path that inserts `llc` then `steal` versus one that inserts
+/// `steal` then `llc` — would otherwise produce distinct hashes,
+/// distinct sidecar filenames, and end up as two separate rows in
+/// `compare_runs` even though they describe the same variant. By
+/// canonicalizing at write time against the canonical
+/// [`crate::scenario::flags::ALL`] positional ordering (shared
+/// with `compute_flag_profiles` at scenario/mod.rs, which sorts
+/// the same way), the on-disk representation is
+/// order-insensitive by construction.
+///
+/// Flags not found in [`crate::scenario::flags::ALL`] are kept
+/// and sorted to the end in lexical order. Sort key is composite:
+/// positional for known flags (so the canonical ALL order leads),
+/// then `&str` comparison as a tiebreaker. The lexical secondary
+/// matters because two unknown flags both collide on the fallback
+/// `usize::MAX` positional key — without the tiebreak, a caller
+/// that supplies `["zzz_unknown", "aaa_unknown"]` versus the
+/// reverse would share identical positional keys yet produce
+/// different on-disk orderings under a stable sort, once again
+/// breaking the "variant hash is a pure function of the flag
+/// SET" invariant. The lexical secondary collapses them to one
+/// canonical order so future or ad-hoc flag names are handled
+/// without data loss AND without order sensitivity.
+fn canonicalize_active_flags(flags: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = flags.to_vec();
+    v.sort_by(|a, b| {
+        let ka = crate::scenario::flags::ALL
+            .iter()
+            .position(|x| *x == a.as_str())
+            .unwrap_or(usize::MAX);
+        let kb = crate::scenario::flags::ALL
+            .iter()
+            .position(|x| *x == b.as_str())
+            .unwrap_or(usize::MAX);
+        ka.cmp(&kb).then_with(|| a.as_str().cmp(b.as_str()))
+    });
+    v
+}
+
+/// Emit a minimal sidecar for a PRE-VM-BOOT skip path.
 ///
 /// Stats tooling enumerates sidecars to compute pass/skip/fail
 /// rates; when a test bails before `run_ktstr_test_inner` reaches
@@ -627,6 +677,40 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
 /// verifier stats, no kvm stats, no payload metrics). Stats tooling
 /// that subtracts skipped runs from the pass count treats the entry
 /// correctly.
+///
+/// # Distinction from in-VM `AssertResult::skip` paths
+///
+/// There are TWO classes of skip, each with its own sidecar writer:
+///
+/// 1. **Pre-VM-boot skips** route through this helper
+///    (`write_skip_sidecar`). Examples:
+///    - `performance_mode` gated off via `KTSTR_NO_PERF_MODE`
+///      (see `run_ktstr_test_inner`),
+///    - `ResourceContention` at `builder.build()` or `vm.run()`
+///      (topology-level unavailability — the VM never booted).
+///    These paths write a MINIMAL sidecar: empty VM telemetry,
+///    `work_type = "skipped"`, and `payload` pinned to the entry's
+///    declared payload so stats can still attribute the skip to
+///    the correct gauntlet variant. There is no VmResult to drain
+///    because the VM didn't boot.
+///
+/// 2. **In-VM `AssertResult::skip` returns** — e.g. the
+///    empty-cpuset skip in `scenario::run_scenario`
+///    (`AssertResult::skip("not enough CPUs/LLCs")`), or the
+///    `need >= 4 CPUs` checks in `scenario::dynamic::*` — route
+///    through [`write_sidecar`] at `run_ktstr_test_inner`'s end.
+///    The guest VM fully booted, ran through scenario setup,
+///    discovered the topology couldn't accommodate the test, and
+///    returned early. The resulting sidecar carries REAL VM
+///    telemetry (monitor, kvm_stats, verifier_stats) alongside
+///    `skipped: true` — not a blind spot, just a richer record
+///    than what this helper emits.
+///
+/// The asymmetry is intentional: pre-VM-boot skips have no
+/// telemetry to record, while in-VM skips do. Stats tooling that
+/// wants to uniformly discount skipped runs filters on
+/// [`SidecarResult::skipped == true`] regardless of which writer
+/// produced the entry — both set the field identically.
 ///
 /// Returns `Err` when the sidecar directory cannot be created, the
 /// JSON cannot be serialized, or the file write fails. Callers that
@@ -656,7 +740,7 @@ pub(crate) fn write_skip_sidecar(
         // so stats tooling that groups by work_type puts these in a
         // distinguishable bucket.
         work_type: "skipped".to_string(),
-        active_flags: active_flags.to_vec(),
+        active_flags: canonicalize_active_flags(active_flags),
         verifier_stats: Vec::new(),
         kvm_stats: None,
         sysctls,
@@ -706,7 +790,7 @@ pub(crate) fn write_sidecar(
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
         stimulus_events: stimulus_events.to_vec(),
         work_type: work_type.to_string(),
-        active_flags: active_flags.to_vec(),
+        active_flags: canonicalize_active_flags(active_flags),
         verifier_stats: vm_result.verifier_stats.clone(),
         kvm_stats: vm_result.kvm_stats.clone(),
         sysctls,
@@ -1627,6 +1711,229 @@ mod tests {
         );
     }
 
+    /// Two `write_sidecar` calls differing ONLY in the ORDER their
+    /// caller accumulated `active_flags` — same semantic variant,
+    /// same flag SET — must produce identical sidecar filenames.
+    /// Filenames are keyed on [`sidecar_variant_hash`], which walks
+    /// `active_flags` in-order and folds each byte into the hash
+    /// state. Without canonicalization at the write site, a caller
+    /// that happened to collect `["steal", "llc"]` would hash to
+    /// a different bucket than one that collected `["llc",
+    /// "steal"]` for the same run — `stats compare` would then see
+    /// two rows for one semantic variant and mark one as "new" or
+    /// "removed" on a re-run that only changed flag accumulation
+    /// order.
+    ///
+    /// This test pins the canonicalization done by
+    /// `canonicalize_active_flags` (applied in both
+    /// `write_sidecar` and `write_skip_sidecar`): two writes with
+    /// reversed flag order collapse to a single file via normal
+    /// overwrite. A regression that dropped the sort (reverting to
+    /// `active_flags.to_vec()`) would make the second write land
+    /// at a different hash → two files, caught here. Pair with
+    /// `write_sidecar_variant_hash_distinguishes_active_flags`
+    /// above, which pins the complementary property: different
+    /// flag SETS must still hash distinctly.
+    #[test]
+    fn write_sidecar_variant_hash_is_order_invariant_for_active_flags() {
+        let _lock = lock_env();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__flagorder_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult {
+            success: true,
+            exit_code: 0,
+            duration: std::time::Duration::from_secs(1),
+            timed_out: false,
+            output: String::new(),
+            stderr: String::new(),
+            monitor: None,
+            shm_data: None,
+            stimulus_events: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            crash_message: None,
+        };
+        let ok = AssertResult::pass();
+        // Same set of flags in reversed accumulation order. `llc` is
+        // `ALL_DECLS[0].name` and `steal` is `ALL_DECLS[2].name`, so
+        // the canonical order is ["llc","steal"] regardless of
+        // which order the caller supplied them.
+        let forward = vec!["llc".to_string(), "steal".to_string()];
+        let reversed = vec!["steal".to_string(), "llc".to_string()];
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &forward, &[]).unwrap();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &reversed, &[]).unwrap();
+
+        let paths = find_sidecars_by_prefix(tmp, "__flagorder_test__-");
+        assert_eq!(
+            paths.len(),
+            1,
+            "reversed-order writes of the same flag SET must \
+             collapse to a single canonical sidecar filename \
+             (overwrite); got {paths:?}. If this fails with \
+             `paths.len() == 2`, the write path has regressed to \
+             hashing caller-order flags — re-sort via \
+             `canonicalize_active_flags` in both write_sidecar \
+             and write_skip_sidecar.",
+        );
+
+        // Defensive: the single surviving file must carry the
+        // canonical order on disk, not whichever order the last
+        // caller passed. Deserialize and check.
+        let path = &paths[0];
+        let data = std::fs::read_to_string(path).expect("read canonical sidecar");
+        let loaded: SidecarResult =
+            serde_json::from_str(&data).expect("deserialize canonical sidecar");
+        assert_eq!(
+            loaded.active_flags,
+            vec!["llc".to_string(), "steal".to_string()],
+            "on-disk active_flags must be sorted in \
+             `scenario::flags::ALL` positional order; got: {:?}",
+            loaded.active_flags,
+        );
+    }
+
+    /// `write_skip_sidecar` sibling of
+    /// `write_sidecar_variant_hash_is_order_invariant_for_active_flags`.
+    /// The canonicalization path is applied at BOTH write sites
+    /// (`write_sidecar` for run-to-completion results,
+    /// `write_skip_sidecar` for pre-VM-boot skips), so both need
+    /// order-invariance coverage — a partial revert that dropped
+    /// `canonicalize_active_flags` in just the skip path would
+    /// leave the run path covered by the sibling test yet leave
+    /// skip-variant hashes order-sensitive, producing duplicate
+    /// skip-sidecar files for the same semantic variant under
+    /// `stats list` / `stats compare`.
+    ///
+    /// Pins the same two invariants as the sibling: (1) reversed
+    /// flag-order inputs collapse to a single file via normal
+    /// overwrite, (2) the surviving on-disk `active_flags` is in
+    /// canonical `scenario::flags::ALL` order. Uses a distinct
+    /// entry-name prefix (`__skipflagorder_test__`) so the
+    /// `find_sidecars_by_prefix` scan doesn't overlap with the
+    /// run-path test's fixtures.
+    #[test]
+    fn write_skip_sidecar_variant_hash_is_order_invariant_for_active_flags() {
+        let _lock = lock_env();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__skipflagorder_test__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+
+        // Same flag SET, reversed accumulation order. Mirrors the
+        // `llc` / `steal` choice from the run-path sibling so the
+        // canonical order (index 0, index 2 in `ALL_DECLS`) is
+        // unambiguous.
+        let forward = vec!["llc".to_string(), "steal".to_string()];
+        let reversed = vec!["steal".to_string(), "llc".to_string()];
+        write_skip_sidecar(&entry, &forward).unwrap();
+        write_skip_sidecar(&entry, &reversed).unwrap();
+
+        let paths = find_sidecars_by_prefix(tmp, "__skipflagorder_test__-");
+        assert_eq!(
+            paths.len(),
+            1,
+            "reversed-order skip-sidecar writes of the same flag \
+             SET must collapse to a single canonical filename \
+             (overwrite); got {paths:?}. If this fails with \
+             `paths.len() == 2`, canonicalization was removed from \
+             `write_skip_sidecar` even if the run-path test above \
+             still passes — apply `canonicalize_active_flags` in \
+             both write sites, not just one.",
+        );
+
+        let path = &paths[0];
+        let data = std::fs::read_to_string(path).expect("read canonical skip sidecar");
+        let loaded: SidecarResult =
+            serde_json::from_str(&data).expect("deserialize canonical skip sidecar");
+        assert_eq!(
+            loaded.active_flags,
+            vec!["llc".to_string(), "steal".to_string()],
+            "on-disk active_flags of a skip sidecar must be sorted \
+             in `scenario::flags::ALL` positional order; got: {:?}",
+            loaded.active_flags,
+        );
+    }
+
+    /// Directly exercises `canonicalize_active_flags` on a mixed
+    /// input: known canonical flags AND ad-hoc unknown flags. The
+    /// sibling
+    /// `write_sidecar_variant_hash_is_order_invariant_for_active_flags`
+    /// test pins the known-flag-only case through the full
+    /// write-and-read round trip; this unit-level test pins the
+    /// composite sort-key contract in isolation so a regression in
+    /// the tiebreaker (e.g. dropping the secondary lexical
+    /// comparator, reverting to `sort_by_key` with a bare
+    /// positional key) fails here with a precise diagnostic,
+    /// rather than going undetected until a user trips it with
+    /// ad-hoc flags.
+    ///
+    /// Invariants pinned:
+    /// 1. Known flags (members of `scenario::flags::ALL`) always
+    ///    appear before unknown flags, regardless of input order.
+    /// 2. Known flags are ordered by their position in ALL
+    ///    (positional key as primary sort).
+    /// 3. Unknown flags are ordered lexically among themselves
+    ///    (secondary `&str` comparator). Without the secondary,
+    ///    two unknown flags share `usize::MAX` as their positional
+    ///    key and stable-sort preserves input order — so reversed
+    ///    unknown-flag input would produce reversed output and
+    ///    the variant hash would still depend on caller order.
+    #[test]
+    fn canonicalize_active_flags_orders_unknown_lexically_after_known() {
+        // `llc` is `ALL[0]`, so it always wins against unknown
+        // flags on the positional key. The two `*_unknown` flags
+        // collide at `usize::MAX` and must then be ordered
+        // lexically (`aaa_` < `zzz_`).
+        let input = vec![
+            "zzz_unknown".to_string(),
+            "llc".to_string(),
+            "aaa_unknown".to_string(),
+        ];
+        let got = canonicalize_active_flags(&input);
+        assert_eq!(
+            got,
+            vec![
+                "llc".to_string(),
+                "aaa_unknown".to_string(),
+                "zzz_unknown".to_string(),
+            ],
+            "known flags must sort first by ALL position, unknown \
+             flags must sort lexically after; got: {got:?}",
+        );
+
+        // Invariance check: reversing the input must produce the
+        // same output. Without the lexical secondary the two
+        // unknowns would swap, breaking the set-determines-hash
+        // property for any variant carrying ad-hoc flags.
+        let reversed: Vec<String> = input.into_iter().rev().collect();
+        let got_rev = canonicalize_active_flags(&reversed);
+        assert_eq!(
+            got_rev, got,
+            "reversed input must canonicalize to the same output; \
+             got: {got_rev:?}, expected: {got:?}",
+        );
+    }
+
     #[test]
     fn write_sidecar_variant_hash_distinguishes_work_types() {
         // Two gauntlet variants differing only in work_type must
@@ -2337,6 +2644,7 @@ mod tests {
             sched_tunables: None,
             online_cpus: Some(8),
             numa_nodes: Some(2),
+            cpufreq_governor: std::collections::BTreeMap::new(),
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
@@ -2385,6 +2693,7 @@ mod tests {
             sched_tunables: Some(tunables),
             online_cpus: Some(8),
             numa_nodes: Some(2),
+            cpufreq_governor: std::collections::BTreeMap::new(),
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some("6.11.0".to_string()),
             arch: Some("x86_64".to_string()),
