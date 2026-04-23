@@ -172,7 +172,7 @@ fn extract_json_region(s: &str) -> Option<&str> {
 /// unit; the caller resolves these against the payload's declared
 /// [`MetricHint`](crate::test_support::MetricHint)s to upgrade
 /// polarity.
-pub(crate) fn walk_json_leaves(value: &serde_json::Value, source: MetricSource) -> Vec<Metric> {
+pub fn walk_json_leaves(value: &serde_json::Value, source: MetricSource) -> Vec<Metric> {
     let mut out = Vec::new();
     // Single reusable path buffer: children push their segment,
     // recurse, then truncate back. O(total_path_chars) work across

@@ -211,7 +211,10 @@ const DEALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_deallocate
                   enumeration run once; each snapshot attach/detaches per tid and threads are \
                   released during the inter-snapshot sleep so the workload is not held stopped \
                   across the run. The JSON output always carries a `snapshots` array — single \
-                  snapshot is an array of length 1."
+                  snapshot is an array of length 1.\n\n\
+                  Sidecar enrichment: pass `--sidecar PATH` to append probe metrics into an \
+                  existing ktstr sidecar file. The file MUST exist — run the test first to \
+                  generate it, then re-invoke with `--sidecar`."
 )]
 struct Cli {
     /// Target process id. Required unless `--self-test` is set.
@@ -239,10 +242,54 @@ struct Cli {
     /// validation.
     #[arg(
         long,
-        conflicts_with_all = ["pid", "snapshots", "interval_ms"],
+        conflicts_with_all = ["pid", "snapshots", "interval_ms", "sidecar"],
         value_name = "BYTES",
     )]
     self_test: Option<u64>,
+    /// Append probe output to an existing ktstr sidecar JSON file
+    /// (`target/ktstr/{kernel}-{git}/{test_name}-{hash}.ktstr.json`).
+    /// The probe reads the existing [`SidecarResult`], synthesizes a
+    /// [`PayloadMetrics`] entry from its own output (walking
+    /// numeric JSON leaves into `name: value` [`Metric`] records),
+    /// appends it to `sidecar.metrics`, and writes the result back
+    /// atomically (tempfile + rename) under an exclusive advisory
+    /// lock (`flock(LOCK_EX)`) so concurrent `--sidecar` calls
+    /// serialize.
+    ///
+    /// The sidecar file MUST already exist — the probe will not
+    /// synthesize a fresh `SidecarResult`, since most fields
+    /// (monitor, stimulus_events, verifier_stats, host context)
+    /// cannot be honestly populated from a standalone probe run.
+    /// Run the target test first so the harness writes the
+    /// sidecar, then invoke the probe with `--sidecar` to enrich
+    /// it post-hoc. The path is pre-flight-validated immediately
+    /// after `Cli::parse()` so a typo fails fast instead of after
+    /// the full ptrace run.
+    ///
+    /// **Multi-snapshot runs**: produce one `PayloadMetrics` entry
+    /// containing all snapshots' flattened leaves —
+    /// `snapshots.0.threads.N.allocated_bytes`,
+    /// `snapshots.1.threads.N.allocated_bytes`, etc. — not one
+    /// entry per snapshot. Downstream stats tooling diffing across
+    /// snapshots keys on the snapshot index in the metric name.
+    ///
+    /// **Fatal errors do NOT modify the sidecar** — a `Fatal`
+    /// outcome (pid missing, exe-identity-changed, not-jemalloc)
+    /// never produces a usable `ProbeOutput` to flatten.
+    /// `AllFailed` DOES append with `exit_code: 1` so consumers
+    /// keying on `ExitCodeEq(0)`-equivalents see the failure.
+    ///
+    /// **Metric namespace**: appended metrics use the
+    /// `jemalloc_probe.*` prefix so downstream aggregators walking
+    /// the full `Vec<PayloadMetrics>` can discriminate probe-
+    /// sourced leaves from the test's primary payload metrics.
+    ///
+    /// External-pid only; conflicts with `--self-test`. Orthogonal
+    /// to `--json` — the stdout emission is independent of the
+    /// sidecar write, so `--sidecar` invocations remain debuggable
+    /// without re-reading the sidecar.
+    #[arg(long, value_name = "PATH")]
+    sidecar: Option<PathBuf>,
     /// Number of snapshots to take. Defaults to 1 (single-snapshot
     /// mode). Values > 1 engage multi-snapshot mode and require
     /// `--interval-ms`. Range is 1..=100_000; the upper cap bounds
@@ -1826,11 +1873,194 @@ fn run_self_test(bytes: u64) -> RunOutcome {
     }
 }
 
+/// Payload name recorded as an identifying metric when the probe
+/// appends to a sidecar. Not an existing `Payload` fixture — the
+/// probe enters the sidecar out-of-band, not through the
+/// `ctx.payload()` pipeline, so there is no `Payload::name` to
+/// reuse. The prefix on every metric lets downstream stats tooling
+/// distinguish probe-sourced metrics from the test's primary
+/// payload metrics when iterating `SidecarResult::metrics`.
+const SIDECAR_METRIC_PREFIX: &str = "jemalloc_probe";
+
+/// Upgrade a [`Metric`]'s unit + polarity based on its flat-path
+/// name. Names ending in `.allocated_bytes` or `.deallocated_bytes`
+/// become `(Polarity::LowerBetter, "bytes")` — memory usage is a
+/// cost, a regression is an increase. Every other name is left at
+/// the walker's default `(Polarity::Unknown, "")`. Stats tooling
+/// normally applies hints from [`Payload::metrics`] during in-
+/// harness runs; the probe has no `Payload` fixture in the sidecar
+/// path, so hints are applied here directly.
+fn apply_probe_metric_hints(m: &mut ktstr::test_support::Metric) {
+    use ktstr::test_support::Polarity;
+    // Match on suffixes to stay robust to the snapshot-index prefix
+    // (`snapshots.0.threads.3.allocated_bytes` ends in
+    // `allocated_bytes` just like the top-level `allocated_bytes` in
+    // a hypothetical future schema).
+    if m.name.ends_with(".allocated_bytes") || m.name.ends_with(".deallocated_bytes") {
+        m.polarity = Polarity::LowerBetter;
+        m.unit = "bytes".to_string();
+    }
+}
+
+/// Synthesize a [`PayloadMetrics`] from a [`ProbeOutput`] so the
+/// result can land in a [`SidecarResult::metrics`] vec. The probe's
+/// JSON is passed through [`walk_json_leaves`] with
+/// `MetricSource::Json` — same walker the in-harness payload
+/// pipeline uses, re-exported from the ktstr lib so the probe and
+/// the test harness share a single flattening contract. Every
+/// resulting [`Metric::name`] is prefixed with
+/// [`SIDECAR_METRIC_PREFIX`] + `.` so downstream consumers can
+/// discriminate probe-sourced leaves from the test's primary payload
+/// metrics when walking `SidecarResult::metrics` end-to-end.
+fn synthesize_payload_metrics(
+    out: &ProbeOutput,
+    exit_code: i32,
+) -> Result<ktstr::test_support::PayloadMetrics> {
+    use ktstr::test_support::{MetricSource, PayloadMetrics, walk_json_leaves};
+    let value = serde_json::to_value(out)
+        .context("serialize ProbeOutput to serde_json::Value for sidecar append")?;
+    let mut metrics = walk_json_leaves(&value, MetricSource::Json);
+    for m in &mut metrics {
+        // Prefix in place to avoid allocating a second Vec; the
+        // capacity is exactly `metrics.len()` already.
+        m.name = format!("{SIDECAR_METRIC_PREFIX}.{}", m.name);
+        apply_probe_metric_hints(m);
+    }
+    Ok(PayloadMetrics { metrics, exit_code })
+}
+
+/// Append a synthesized [`PayloadMetrics`] to the
+/// [`SidecarResult::metrics`] vec of the sidecar file at `path`.
+/// The file is read, parsed, mutated, and written back atomically
+/// via tempfile + rename under an exclusive advisory lock
+/// (`flock(LOCK_EX)`) so concurrent `--sidecar` invocations against
+/// the same file serialize rather than interleave.
+///
+/// Missing file is a hard error with an operator-actionable message:
+/// the probe will not synthesize a fresh `SidecarResult`, since most
+/// fields (monitor, stimulus_events, verifier_stats, host context)
+/// cannot be honestly populated from a standalone probe run.
+///
+/// Malformed JSON is a hard error — the pre-1.0 sidecar policy is
+/// "regenerate, don't migrate", so a parse failure points at an
+/// out-of-sync schema rather than something the probe should paper
+/// over.
+fn append_probe_output_to_sidecar(
+    path: &Path,
+    out: &ProbeOutput,
+    exit_code: i32,
+) -> Result<()> {
+    use ktstr::test_support::SidecarResult;
+    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+
+    // Flock on a SIBLING lock file, not on the sidecar itself. The
+    // atomic rename() below replaces the sidecar's inode, which
+    // would invalidate any lock held on the old inode — a second
+    // concurrent invocation would open the new inode and see no
+    // lock. A fixed `<sidecar>.lock` path keeps every writer
+    // agreeing on the same lock object regardless of how many
+    // rename cycles the sidecar has been through.
+    let lock_path = path.with_extension({
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.is_empty() {
+            "lock".to_string()
+        } else {
+            format!("{ext}.lock")
+        }
+    });
+    // `CLOEXEC` so a fork/exec later in the process (e.g. the probe
+    // spawning a child for some future reason, or stdlib helpers
+    // that internally fork) does not leak the lock to the child —
+    // a leaked lock-holding FD would deadlock any subsequent
+    // `--sidecar` call that waits on the same path.
+    let lock_fd = open(
+        &lock_path,
+        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .with_context(|| format!("open lock file {}", lock_path.display()))?;
+    // LOCK_EX (blocking). Concurrent `--sidecar` callers queue on
+    // the same lock file rather than corrupting each other. The
+    // lock is released when `lock_fd` drops at end-of-function.
+    flock(&lock_fd, FlockOperation::LockExclusive)
+        .with_context(|| format!("flock(LOCK_EX) on {}", lock_path.display()))?;
+
+    // Read INSIDE the flock window — no separate `exists()` call.
+    // `fs::read_to_string` itself reports `ErrorKind::NotFound` if
+    // the file is absent, so we rewrite that one kind into the
+    // operator-actionable message and let every other I/O error
+    // propagate with the raw cause. One fewer syscall, no TOCTOU
+    // between `exists()` and `open()`.
+    let existing = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+            "sidecar file not found at {}; run the test first to \
+             generate it, then re-invoke with --sidecar",
+            path.display(),
+        ),
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("read {}", path.display()))),
+    };
+    let mut sidecar: SidecarResult = serde_json::from_str(&existing).with_context(|| {
+        format!(
+            "parse {} as SidecarResult — sidecar may be from an incompatible \
+             schema version (pre-1.0 policy: regenerate, do not migrate)",
+            path.display(),
+        )
+    })?;
+
+    let payload_metrics = synthesize_payload_metrics(out, exit_code)?;
+    sidecar.metrics.push(payload_metrics);
+
+    let serialized = serde_json::to_string_pretty(&sidecar)
+        .context("re-serialize SidecarResult after appending probe metrics")?;
+
+    // Atomic write via `tempfile::NamedTempFile::new_in` in the
+    // SAME directory as the target (same filesystem, so
+    // `.persist()` is a rename(2), not a copy). NamedTempFile's
+    // Drop impl removes the tempfile on panic or early return, so
+    // no hand-rolled cleanup needed. Collision-free by construction.
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("sidecar path {} has no parent directory", path.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("create staging file in {}", dir.display()))?;
+    std::io::Write::write_all(tmp.as_file_mut(), serialized.as_bytes())
+        .with_context(|| format!("write staging file in {}", dir.display()))?;
+    tmp.persist(path)
+        .with_context(|| format!("atomic rename staging file into {}", path.display()))?;
+
+    // `lock_fd` drops here; flock is released. Drop order: the
+    // rename completed with the lock held, so any concurrent
+    // `--sidecar` caller blocked on `flock(LOCK_EX)` will acquire
+    // and see the new sidecar contents on its next read.
+    drop(lock_fd);
+    Ok(())
+}
+
 fn main() {
     install_cleanup_handler();
     let cli = Cli::parse();
     if let Err(e) = cli.validate_sampling_flags() {
         eprintln!("error: {e:#}");
+        std::process::exit(2);
+    }
+    // Pre-flight `--sidecar` path validation so a typo (or a
+    // user who forgot to run the test first) fails within tens of
+    // milliseconds of invocation instead of after a multi-second
+    // probe run. This is a UX fast-fail, NOT the correctness gate:
+    // the real missing-file check lives inside
+    // `append_probe_output_to_sidecar` INSIDE the flock window,
+    // where TOCTOU cannot introduce a false positive. A file that
+    // exists here and vanishes before the append fires surfaces as
+    // the normal inside-flock error.
+    if let Some(path) = cli.sidecar.as_deref()
+        && !path.exists()
+    {
+        eprintln!(
+            "error: sidecar file not found at {}; run the test \
+             first to generate it, then re-invoke with --sidecar",
+            path.display(),
+        );
         std::process::exit(2);
     }
     // `--self-test` is an alternative entry point; its JSON shape
@@ -1859,6 +2089,12 @@ fn main() {
                 eprintln!("error writing output: {e:#}");
                 std::process::exit(1);
             }
+            if let Some(path) = cli.sidecar.as_deref()
+                && let Err(e) = append_probe_output_to_sidecar(path, &out, 0)
+            {
+                eprintln!("error appending to sidecar {}: {e:#}", path.display());
+                std::process::exit(1);
+            }
         }
         RunOutcome::AllFailed(out) => {
             // Emit the structured output anyway so callers have the
@@ -1877,6 +2113,18 @@ fn main() {
             let marker = if is_multi { "multi" } else { "single" };
             if let Err(e) = print_output(&cli, &out) {
                 eprintln!("error writing output: {e:#}");
+            }
+            // Record the all-failed outcome in the sidecar BEFORE the
+            // final exit so downstream stats tooling sees the probe's
+            // per-tid error records (via the flattened `metrics`
+            // leaves) even when every tid was an Err arm. The probe
+            // exits 1 on this branch, so the appended PayloadMetrics
+            // carries `exit_code: 1` — consumers keying on
+            // `Check::ExitCodeEq(0)`-equivalents see the failure.
+            if let Some(path) = cli.sidecar.as_deref()
+                && let Err(e) = append_probe_output_to_sidecar(path, &out, 1)
+            {
+                eprintln!("error appending to sidecar {}: {e:#}", path.display());
             }
             eprintln!("ktstr-probe-all-failed: {marker}");
             eprintln!(
@@ -2246,6 +2494,7 @@ mod tests {
             self_test: None,
             snapshots: 1,
             interval_ms: None,
+            sidecar: None,
         };
         match run(&cli) {
             RunOutcome::Fatal(err) => {
@@ -2302,6 +2551,7 @@ mod tests {
             self_test: None,
             snapshots: 1,
             interval_ms: None,
+            sidecar: None,
         };
         let outcome = run(&cli);
         let _ = child.kill();
@@ -2666,6 +2916,28 @@ mod tests {
         );
     }
 
+    /// `--self-test` conflicts with `--sidecar` at the clap layer —
+    /// the self-test path emits `SelfTestOutput`, not `ProbeOutput`,
+    /// so there is no ProbeOutput to append. The conflict is pinned
+    /// here to catch a future `conflicts_with_all` change that
+    /// accidentally drops `sidecar`.
+    #[test]
+    fn cli_self_test_conflicts_with_sidecar() {
+        let err = Cli::try_parse_from([
+            "ktstr-jemalloc-probe",
+            "--self-test",
+            "1024",
+            "--sidecar",
+            "/tmp/does-not-matter.ktstr.json",
+        ])
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflicts"),
+            "expected clap conflict message, got: {msg}",
+        );
+    }
+
     /// `--self-test` with default `--snapshots 1` (implicit) is
     /// accepted — clap's `conflicts_with` only fires on explicit
     /// presence, so the defaulted value does not trigger a conflict.
@@ -2886,5 +3158,468 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v.get("interrupted").and_then(|b| b.as_bool()), Some(true));
+    }
+
+    // ---- --sidecar integration ----
+
+    /// Build a minimal [`SidecarResult`] JSON string for sidecar-path
+    /// tests. Populates every field required on deserialize — any
+    /// schema change that adds a field surfaces as a compile error
+    /// at this call site, prompting the test fixture to stay in sync.
+    fn minimal_sidecar_json() -> String {
+        let sc = ktstr::test_support::SidecarResult {
+            test_name: "t".to_string(),
+            topology: "1n1l1c1t".to_string(),
+            scheduler: "eevdf".to_string(),
+            payload: None,
+            metrics: Vec::new(),
+            passed: true,
+            skipped: false,
+            stats: ktstr::assert::ScenarioStats::default(),
+            monitor: None,
+            stimulus_events: Vec::new(),
+            work_type: "CpuSpin".to_string(),
+            active_flags: Vec::new(),
+            verifier_stats: Vec::new(),
+            kvm_stats: None,
+            sysctls: Vec::new(),
+            kargs: Vec::new(),
+            kernel_version: None,
+            timestamp: String::new(),
+            run_id: String::new(),
+            host: None,
+        };
+        serde_json::to_string_pretty(&sc).unwrap()
+    }
+
+    /// Build a `ProbeOutput` fixture with one Ok thread so
+    /// `walk_json_leaves` produces a deterministic set of numeric
+    /// leaves. Used across the `append_probe_output_to_sidecar`
+    /// tests.
+    fn probe_output_fixture() -> ProbeOutput {
+        ProbeOutput {
+            schema_version: SCHEMA_VERSION,
+            pid: 42,
+            tool_version: "0.0.0",
+            started_at_unix_sec: 1_700_000_000,
+            interval_ms: None,
+            interrupted: false,
+            snapshots: vec![Snapshot {
+                timestamp_unix_sec: 1_700_000_000,
+                threads: vec![ThreadResult::Ok {
+                    tid: 42,
+                    comm: Some("worker".to_string()),
+                    allocated_bytes: 1024,
+                    deallocated_bytes: 512,
+                }],
+            }],
+        }
+    }
+
+    /// Happy path: append a synthesized `PayloadMetrics` to a
+    /// pre-existing sidecar JSON file. Verifies (1) the file parses
+    /// back to a valid `SidecarResult`, (2) the appended
+    /// `PayloadMetrics` is the last entry, (3) its `metrics` contain
+    /// the `jemalloc_probe.*`-prefixed leaves walked out of the
+    /// probe's output, and (4) the `allocated_bytes` leaf got the
+    /// `LowerBetter` polarity + `bytes` unit hint from
+    /// `apply_probe_metric_hints`.
+    #[test]
+    fn sidecar_append_happy_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t-0000000000000000.ktstr.json");
+        std::fs::write(&path, minimal_sidecar_json()).unwrap();
+
+        let out = probe_output_fixture();
+        append_probe_output_to_sidecar(&path, &out, 0)
+            .expect("append happy path");
+
+        let re_read = std::fs::read_to_string(&path).unwrap();
+        let sc: ktstr::test_support::SidecarResult =
+            serde_json::from_str(&re_read).expect("sidecar re-parse");
+        // Pre-existing top-level fields must survive the append
+        // unchanged — the probe only touches `metrics`. A regression
+        // that rewrote scheduler/topology/etc. would show up here.
+        assert_eq!(sc.test_name, "t");
+        assert_eq!(sc.topology, "1n1l1c1t");
+        assert_eq!(sc.scheduler, "eevdf");
+        assert!(sc.passed);
+        assert!(!sc.skipped);
+        assert_eq!(sc.metrics.len(), 1, "one appended PayloadMetrics");
+        let pm = &sc.metrics[0];
+        assert_eq!(pm.exit_code, 0);
+        // Every metric name carries the probe prefix so downstream
+        // aggregators can discriminate probe-sourced leaves.
+        for m in &pm.metrics {
+            assert!(
+                m.name.starts_with(&format!("{SIDECAR_METRIC_PREFIX}.")),
+                "metric name {} missing probe prefix",
+                m.name,
+            );
+        }
+        let alloc = pm
+            .metrics
+            .iter()
+            .find(|m| m.name.ends_with(".allocated_bytes"))
+            .expect("allocated_bytes metric in appended entry");
+        assert_eq!(alloc.value, 1024.0);
+        assert_eq!(alloc.unit, "bytes");
+        assert!(matches!(
+            alloc.polarity,
+            ktstr::test_support::Polarity::LowerBetter,
+        ));
+        // Identity leaves (tid, schema_version) retain Unknown
+        // polarity — the hints only fire for the named byte counters.
+        let tid = pm
+            .metrics
+            .iter()
+            .find(|m| m.name.ends_with(".tid"))
+            .expect("tid metric in appended entry");
+        assert!(matches!(
+            tid.polarity,
+            ktstr::test_support::Polarity::Unknown,
+        ));
+        assert_eq!(tid.unit, "");
+
+        // Lock-file convention: `<sidecar>.<ext>.lock` sits alongside
+        // the sidecar. Pins the naming contract so a future refactor
+        // that relocates or renames the lock surfaces as a test
+        // failure. `.ktstr.json` path extension is `json`, so the
+        // lock file is `<...>.json.lock`.
+        let lock_path = path.with_extension("json.lock");
+        assert!(
+            lock_path.exists(),
+            "expected lock file at {}",
+            lock_path.display(),
+        );
+
+        // No orphan staging files must remain after a successful
+        // append — `append_probe_output_to_sidecar` renames its
+        // `*.tmp` over the sidecar on success, so none should be
+        // visible in the parent dir.
+        let orphans: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("tmp")
+                    || p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains(".tmp"))
+            })
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "expected no staging tmp files after successful append, got: {orphans:?}",
+        );
+    }
+
+    /// Two back-to-back appends stack — the second `PayloadMetrics`
+    /// lands after the first. Proves the helper is repeatable and
+    /// does not clobber earlier appends (regression guard against a
+    /// `vec![new]` overwrite).
+    #[test]
+    fn sidecar_append_stacks_across_invocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.ktstr.json");
+        std::fs::write(&path, minimal_sidecar_json()).unwrap();
+
+        let out = probe_output_fixture();
+        append_probe_output_to_sidecar(&path, &out, 0).unwrap();
+        append_probe_output_to_sidecar(&path, &out, 1).unwrap();
+
+        let sc: ktstr::test_support::SidecarResult =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(sc.metrics.len(), 2, "both appends retained");
+        assert_eq!(sc.metrics[0].exit_code, 0);
+        assert_eq!(sc.metrics[1].exit_code, 1);
+        // Both appends must carry the probe prefix on every metric —
+        // a regression that prefixed only the first invocation's
+        // metrics (e.g. a stale `SIDECAR_METRIC_PREFIX` constant
+        // captured once at module init) would be caught here.
+        for (i, pm) in sc.metrics.iter().enumerate() {
+            for m in &pm.metrics {
+                assert!(
+                    m.name.starts_with(&format!("{SIDECAR_METRIC_PREFIX}.")),
+                    "append {i} metric {} missing probe prefix",
+                    m.name,
+                );
+            }
+        }
+    }
+
+    /// Starting from a sidecar that already has pre-existing
+    /// `metrics` entries (e.g. the test harness recorded its primary
+    /// payload invocation), the probe's append must preserve those
+    /// entries in order and land its own entry at the end. Guards
+    /// against a `sidecar.metrics = vec![new]` regression.
+    #[test]
+    fn sidecar_append_preserves_prepopulated_metrics() {
+        use ktstr::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.ktstr.json");
+
+        // Build a sidecar that already carries two PayloadMetrics
+        // entries (e.g. the test harness recorded both a primary
+        // payload and a secondary workload).
+        let mut sc: ktstr::test_support::SidecarResult =
+            serde_json::from_str(&minimal_sidecar_json()).unwrap();
+        sc.metrics.push(PayloadMetrics {
+            metrics: vec![Metric {
+                name: "primary.bogo_ops".to_string(),
+                value: 12345.0,
+                polarity: Polarity::HigherBetter,
+                unit: "ops".to_string(),
+                source: MetricSource::Json,
+            }],
+            exit_code: 0,
+        });
+        sc.metrics.push(PayloadMetrics {
+            metrics: vec![Metric {
+                name: "secondary.latency_us".to_string(),
+                value: 42.0,
+                polarity: Polarity::LowerBetter,
+                unit: "us".to_string(),
+                source: MetricSource::Json,
+            }],
+            exit_code: 0,
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&sc).unwrap()).unwrap();
+
+        let out = probe_output_fixture();
+        append_probe_output_to_sidecar(&path, &out, 0).unwrap();
+
+        let after: ktstr::test_support::SidecarResult =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after.metrics.len(), 3, "expected 2 pre-existing + 1 appended");
+        // Pre-existing entries unchanged in order and content.
+        assert_eq!(after.metrics[0].metrics[0].name, "primary.bogo_ops");
+        assert_eq!(after.metrics[0].metrics[0].value, 12345.0);
+        assert_eq!(after.metrics[1].metrics[0].name, "secondary.latency_us");
+        assert_eq!(after.metrics[1].metrics[0].value, 42.0);
+        // Probe's append is the LAST entry.
+        for m in &after.metrics[2].metrics {
+            assert!(
+                m.name.starts_with(&format!("{SIDECAR_METRIC_PREFIX}.")),
+                "last entry's metric {} missing probe prefix",
+                m.name,
+            );
+        }
+    }
+
+    /// Missing file is a hard error with the operator-actionable
+    /// "run the test first" wording. Pins the phrasing so a consumer
+    /// grepping stderr for `sidecar file not found` keeps working.
+    #[test]
+    fn sidecar_append_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.ktstr.json");
+        let out = probe_output_fixture();
+        let err = append_probe_output_to_sidecar(&missing, &out, 0).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sidecar file not found"),
+            "expected missing-file wording, got: {msg}",
+        );
+        assert!(
+            msg.contains("run the test first"),
+            "expected operator-actionable hint, got: {msg}",
+        );
+        // The flag name (`--sidecar`) MUST appear in the hint so
+        // operators who `man`-read the error know which invocation
+        // produced it — `jemalloc-probe`'s CLI surface has grown
+        // several file-path flags and the fix-it hint has to be
+        // specific.
+        assert!(
+            msg.contains("--sidecar"),
+            "expected flag name in hint, got: {msg}",
+        );
+    }
+
+    /// Malformed JSON in the sidecar file is a hard error with a
+    /// parse-failure hint pointing at the pre-1.0 regenerate policy.
+    /// Covers the "sidecar from an incompatible schema version"
+    /// path in `append_probe_output_to_sidecar`.
+    #[test]
+    fn sidecar_append_malformed_json_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.ktstr.json");
+        std::fs::write(&path, "{ this is not valid json }").unwrap();
+        let out = probe_output_fixture();
+        let err = append_probe_output_to_sidecar(&path, &out, 0).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parse"),
+            "expected parse-failure context, got: {msg}",
+        );
+        // Pre-1.0 policy hint: the operator's remediation is to
+        // regenerate the sidecar, not to patch the JSON by hand.
+        // Pinning the substring keeps the hint on-message.
+        assert!(
+            msg.contains("regenerate"),
+            "expected pre-1.0 regenerate-policy hint, got: {msg}",
+        );
+    }
+
+    /// Probe-specific polarity / unit hints: byte-counter metrics get
+    /// `LowerBetter` + `bytes`; everything else keeps the walker's
+    /// `Unknown` + empty-unit defaults. Pins the hint surface so a
+    /// future rename of `allocated_bytes` in the probe schema forces
+    /// a matching update here.
+    #[test]
+    fn apply_probe_metric_hints_classifies_byte_counters() {
+        use ktstr::test_support::{Metric, MetricSource, Polarity};
+        let mut alloc = Metric {
+            name: "jemalloc_probe.snapshots.0.threads.0.allocated_bytes".to_string(),
+            value: 1024.0,
+            polarity: Polarity::Unknown,
+            unit: String::new(),
+            source: MetricSource::Json,
+        };
+        apply_probe_metric_hints(&mut alloc);
+        assert!(matches!(alloc.polarity, Polarity::LowerBetter));
+        assert_eq!(alloc.unit, "bytes");
+
+        let mut dealloc = Metric {
+            name: "jemalloc_probe.snapshots.0.threads.0.deallocated_bytes".to_string(),
+            value: 512.0,
+            polarity: Polarity::Unknown,
+            unit: String::new(),
+            source: MetricSource::Json,
+        };
+        apply_probe_metric_hints(&mut dealloc);
+        assert!(matches!(dealloc.polarity, Polarity::LowerBetter));
+        assert_eq!(dealloc.unit, "bytes");
+
+        let mut tid = Metric {
+            name: "jemalloc_probe.snapshots.0.threads.0.tid".to_string(),
+            value: 42.0,
+            polarity: Polarity::Unknown,
+            unit: String::new(),
+            source: MetricSource::Json,
+        };
+        apply_probe_metric_hints(&mut tid);
+        assert!(matches!(tid.polarity, Polarity::Unknown));
+        assert_eq!(tid.unit, "");
+
+        // Negative match: the hint uses `ends_with(".allocated_bytes")`,
+        // not `contains`. A metric whose name ends with
+        // `allocated_bytes_extra` (or any suffix beyond the exact
+        // counter name) must NOT pick up the LowerBetter/bytes hint —
+        // substring matching would misclassify arbitrary future
+        // metrics. Pins the ends-with contract.
+        let mut extra = Metric {
+            name: "jemalloc_probe.snapshots.0.threads.0.allocated_bytes_extra".to_string(),
+            value: 999.0,
+            polarity: Polarity::Unknown,
+            unit: String::new(),
+            source: MetricSource::Json,
+        };
+        apply_probe_metric_hints(&mut extra);
+        assert!(
+            matches!(extra.polarity, Polarity::Unknown),
+            "name ending in _extra must not match the byte-counter hint",
+        );
+        assert_eq!(extra.unit, "");
+        // Same check for deallocated.
+        let mut dextra = Metric {
+            name: "jemalloc_probe.deallocated_bytes_something".to_string(),
+            value: 0.0,
+            polarity: Polarity::Unknown,
+            unit: String::new(),
+            source: MetricSource::Json,
+        };
+        apply_probe_metric_hints(&mut dextra);
+        assert!(matches!(dextra.polarity, Polarity::Unknown));
+        assert_eq!(dextra.unit, "");
+    }
+
+    /// Direct [`synthesize_payload_metrics`] test that bypasses the
+    /// sidecar file. Constructs a `ProbeOutput` carrying both Ok and
+    /// Err per-thread results and asserts (1) every emitted `Metric`
+    /// carries the `jemalloc_probe.` prefix, (2) only numeric leaves
+    /// surface (Err's `error` string is dropped by `walk_json_leaves`,
+    /// `error_kind` is a string-enum so also dropped), (3) the
+    /// `exit_code` parameter flows through to the `PayloadMetrics`,
+    /// and (4) numeric leaves from both Ok and Err arms (tid from
+    /// both) are present.
+    #[test]
+    fn synthesize_payload_metrics_handles_ok_and_err_threads() {
+        let out = ProbeOutput {
+            schema_version: SCHEMA_VERSION,
+            pid: 1234,
+            tool_version: "0.0.0",
+            started_at_unix_sec: 1_700_000_000,
+            interval_ms: None,
+            interrupted: false,
+            snapshots: vec![Snapshot {
+                timestamp_unix_sec: 1_700_000_000,
+                threads: vec![
+                    ThreadResult::Ok {
+                        tid: 42,
+                        comm: Some("ok-worker".to_string()),
+                        allocated_bytes: 2048,
+                        deallocated_bytes: 128,
+                    },
+                    ThreadResult::Err {
+                        tid: 99,
+                        comm: Some("err-worker".to_string()),
+                        error: "ptrace(PTRACE_SEIZE): ESRCH".to_string(),
+                        error_kind: ThreadErrorKind::PtraceSeize,
+                    },
+                ],
+            }],
+        };
+        let pm = synthesize_payload_metrics(&out, 7).expect("synthesize");
+        assert_eq!(pm.exit_code, 7, "exit_code flows through");
+
+        // All prefixed.
+        for m in &pm.metrics {
+            assert!(
+                m.name.starts_with(&format!("{SIDECAR_METRIC_PREFIX}.")),
+                "metric {} missing probe prefix",
+                m.name,
+            );
+        }
+        // No string leaves surface — the walker drops non-numeric
+        // leaves. `error` and `error_kind` are strings; their
+        // metric-ified names must not appear.
+        for m in &pm.metrics {
+            assert!(
+                !m.name.ends_with(".error"),
+                "string `error` leaf must not surface, got: {}",
+                m.name,
+            );
+            assert!(
+                !m.name.ends_with(".error_kind"),
+                "string `error_kind` leaf must not surface, got: {}",
+                m.name,
+            );
+        }
+        // Numeric leaves from BOTH Ok and Err arms surface: tid
+        // value 42 (Ok) and tid value 99 (Err).
+        let tid_values: Vec<f64> = pm
+            .metrics
+            .iter()
+            .filter(|m| m.name.ends_with(".tid"))
+            .map(|m| m.value)
+            .collect();
+        assert!(
+            tid_values.contains(&42.0),
+            "Ok thread's tid=42 must surface, got: {tid_values:?}",
+        );
+        assert!(
+            tid_values.contains(&99.0),
+            "Err thread's tid=99 must surface, got: {tid_values:?}",
+        );
+        // Only the Ok thread has byte counters — the Err variant
+        // has no `allocated_bytes` / `deallocated_bytes` fields, so
+        // exactly one of each should appear.
+        let alloc_count = pm
+            .metrics
+            .iter()
+            .filter(|m| m.name.ends_with(".allocated_bytes"))
+            .count();
+        assert_eq!(alloc_count, 1, "one Ok thread emits one allocated_bytes");
     }
 }
