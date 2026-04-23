@@ -259,7 +259,14 @@ impl BaseKey {
             let mut entries: Vec<_> = result.found.iter().map(|(_, p)| p.clone()).collect();
             entries.sort();
             for p in &entries {
-                p.to_str().unwrap_or("").hash(hasher);
+                // `to_str()` loses every non-UTF-8 path (Linux
+                // paths are arbitrary byte sequences, not UTF-8)
+                // and the `unwrap_or("")` collapse would hash
+                // every such path to the SAME empty string,
+                // silently gluing distinct libraries together in
+                // the cache key. `as_encoded_bytes()` hashes the
+                // raw OS bytes verbatim.
+                p.as_os_str().as_encoded_bytes().hash(hasher);
                 if let Ok(sample) = hash_file(p) {
                     sample.hash(hasher);
                 }
@@ -3618,9 +3625,11 @@ impl KtstrVmBuilder {
     /// `ctx.payload(&PROBE)` invocation must set this to the host
     /// path obtained via `env!("CARGO_BIN_EXE_ktstr-jemalloc-probe")`.
     ///
-    /// The probe binary carries its own DWARF (never stripped) and
-    /// runs in `--self-test` mode against its own `/proc/self/mem`,
-    /// so the init binary does NOT need to retain DWARF. An earlier
+    /// The probe attaches to a separately-spawned
+    /// `ktstr-jemalloc-alloc-worker` via `--pid <worker_pid>`; the
+    /// worker ships with DWARF, which is what the probe resolves
+    /// offsets against, so the init binary does NOT need to retain
+    /// DWARF. An earlier
     /// design attempted to preserve DWARF on the init binary so the
     /// probe could resolve offsets against the running init; that
     /// inflated the initramfs past practical VM memory budgets (the

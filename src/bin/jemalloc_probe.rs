@@ -7,30 +7,24 @@
 //! thread_event.h:117-119), so attaching late does not miss prior
 //! allocations — the reading is cumulative from thread creation.
 //!
-//! Two entry points:
-//! - `--pid <PID>`: external-pid mode. Attaches to every thread in
-//!   the target process via ptrace, reads each thread's TSD counters
-//!   through `process_vm_readv`, detaches. DWARF is resolved against
-//!   the target's `/proc/<pid>/exe`, so the target ELF must ship
-//!   with debuginfo.
-//! - `--self-test <BYTES>`: same-process closed-loop mode. Spawns an
-//!   allocator thread inside the probe itself, reads its TSD counter
-//!   via `process_vm_readv` on the probe's own pid (no ptrace needed
-//!   for same-process reads under the same-uid kernel check), and
-//!   exits 0 iff the observed counter is at least `BYTES`. DWARF is
-//!   resolved against the probe's own ELF (which is never stripped),
-//!   so external targets' debuginfo state is irrelevant in this mode.
+//! Entry point: `--pid <PID>`. Attaches to every thread in the
+//! target process via ptrace, reads each thread's TSD counters
+//! through `process_vm_readv`, detaches. DWARF is resolved against
+//! the target's `/proc/<pid>/exe`, so the target ELF must ship with
+//! debuginfo. End-to-end validation runs via the `#[ktstr_test]`
+//! integration tests in `tests/jemalloc_probe_tests.rs`, which boot
+//! a VM, spawn a jemalloc-linked allocator worker, and run the probe
+//! against the worker's live pid.
 //!
 //! Scope:
 //! - Linux, x86_64 and aarch64. Same-arch only (a probe binary built
 //!   for x86_64 only handles x86_64 targets; ptrace is same-arch).
 //! - Static-linked jemalloc only (symbol lives in the main
 //!   executable's static TLS image).
-//! - External-pid mode requires DWARF debuginfo on the target ELF and
-//!   CAP_SYS_PTRACE / root / same-uid-as-target; self-test mode
-//!   requires neither (DWARF is on the probe; the target is self).
+//! - Requires DWARF debuginfo on the target ELF and CAP_SYS_PTRACE /
+//!   root / same-uid-as-target.
 //!
-//! Mechanism (external-pid, per target thread):
+//! Mechanism (per target thread):
 //! 1. `ptrace(PTRACE_SEIZE)` + `ptrace(PTRACE_INTERRUPT)` to stop.
 //! 2. Read the thread pointer via `ptrace(PTRACE_GETREGSET, ...)`:
 //!    - x86_64 uses `NT_PRSTATUS` to get `user_regs_struct.fs_base`.
@@ -39,11 +33,6 @@
 //!    `thread_allocated` + `thread_allocated_next_event_fast` +
 //!    `thread_deallocated` in one syscall while the thread is stopped.
 //! 4. `ptrace(PTRACE_DETACH)`.
-//!
-//! Mechanism (self-test): same-thread TP read instead of
-//! PTRACE_GETREGSET (`arch_prctl(ARCH_GET_FS)` on x86_64, `mrs {},
-//! tpidr_el0` inline-asm on aarch64); `process_vm_readv` against
-//! self_pid; no ptrace attach/detach.
 //!
 //! Address math:
 //! - Variant II (x86_64): TP points to END of TLS block.
@@ -55,13 +44,14 @@
 //!     addr(tsd_tls) = TPIDR_EL0 + round_up(16, PT_TLS.p_align) + st_value
 //!     addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
 
-// Link jemalloc as the global allocator so the probe binary itself
-// carries the `tsd_tls` symbol. Required by the `--self-test` mode
-// which resolves tsd_s field offsets against `/proc/self/maps` /
-// `/proc/self/exe` — without this, the probe uses glibc malloc and
-// has no jemalloc TLS to probe (self-test fails with "ELF has no
-// PT_TLS segment"). Matches the global-allocator declaration in
-// src/bin/ktstr.rs and src/bin/cargo-ktstr.rs.
+// Link jemalloc as the global allocator for binary-homogeneity
+// across ktstr bins — the probe does NOT read its own TSD, so the
+// choice here is not a correctness requirement. Matching the
+// `#[global_allocator]` declaration in src/bin/ktstr.rs and
+// src/bin/cargo-ktstr.rs keeps allocator policy uniform across the
+// workspace's shipped binaries: the same allocator runs when a user
+// invokes any ktstr tool, and future cross-binary comparisons stay
+// apples-to-apples.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -105,8 +95,8 @@ const SCHEMA_VERSION: u32 = 2;
 /// handles the impossible pre-epoch-clock case defensively — KVM
 /// guests under kvm-clock or NTP always resolve post-1970, so the
 /// zero is a never-fires safety net rather than a real fallback.
-/// Factored so `run()`, `run_self_test()`, and any future probe-
-/// output site reach for the same helper instead of re-typing the
+/// Factored so `run()` and any future probe-output site reach for
+/// the same helper instead of re-typing the
 /// `SystemTime::now().duration_since(UNIX_EPOCH)...` chain.
 fn now_unix_sec() -> u64 {
     std::time::SystemTime::now()
@@ -118,9 +108,8 @@ fn now_unix_sec() -> u64 {
 /// The probe's own pid as an `i32`. Linux enforces `pid_max <= 2^22`
 /// (kernel/pid.c), so the `u32 → i32` conversion is infallible in
 /// practice; the `expect` documents that invariant. Used in the
-/// self-probe guard, `--self-test` worker wiring, and test bodies —
-/// centralized so a future platform constraint change lands in one
-/// place.
+/// self-probe guard and test bodies — centralized so a future
+/// platform constraint change lands in one place.
 fn self_pid() -> i32 {
     libc::pid_t::try_from(std::process::id())
         .expect("Linux pid_max <= 2^22 so pid fits in pid_t")
@@ -138,11 +127,11 @@ fn format_comm_suffix(comm: Option<&str>) -> String {
     comm.map(|c| format!(" comm={c}")).unwrap_or_default()
 }
 
-/// Per-target-arch primitives: thread pointer read (via ptrace on an
-/// external target, via a same-thread inline-asm / syscall in the
-/// self-test path), the expected ELF `e_machine`, and a human-readable
-/// arch name. Gated on `target_arch` — a probe binary built for
-/// x86_64 only handles x86_64 targets (ptrace is same-arch). Both
+/// Per-target-arch primitives: thread pointer read via ptrace on the
+/// stopped target, the expected ELF `e_machine`, the regset name for
+/// error messages, and a human-readable arch name. Gated on
+/// `target_arch` — a probe binary built for x86_64 only handles
+/// x86_64 targets (ptrace is same-arch). Both
 /// Variants are exposed as pure arithmetic (see
 /// [`compute_tls_address_variant_i`] / [`compute_tls_address_variant_ii`])
 /// so unit tests for either can run on any host regardless of
@@ -228,50 +217,6 @@ mod arch {
         Ok(tpidr)
     }
 
-    /// Read the CURRENT thread's TP without ptrace. Used by
-    /// `--self-test` mode (same-process reads, no ptrace).
-    ///
-    /// - x86_64: `arch_prctl(ARCH_GET_FS, &fs)` — `arch_prctl` is
-    ///   x86-specific.
-    /// - aarch64: `mrs x0, tpidr_el0` — system register read is
-    ///   unprivileged in EL0.
-    #[cfg(target_arch = "x86_64")]
-    pub fn read_thread_pointer_self() -> Result<u64> {
-        const ARCH_GET_FS: libc::c_int = 0x1003;
-        let mut fs_base: u64 = 0;
-        // SAFETY: `arch_prctl` writes a single u64 into the buffer;
-        // the buffer is live for the syscall's duration.
-        let r = unsafe {
-            libc::syscall(
-                libc::SYS_arch_prctl,
-                ARCH_GET_FS as libc::c_ulong,
-                &mut fs_base as *mut u64,
-            )
-        };
-        if r != 0 {
-            return Err(anyhow!(
-                "arch_prctl(ARCH_GET_FS) failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(fs_base)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    pub fn read_thread_pointer_self() -> Result<u64> {
-        let tpidr: u64;
-        // SAFETY: `mrs` on `tpidr_el0` is unprivileged on AArch64
-        // EL0 (userspace). Reads the TLS register into `tpidr`; no
-        // memory touched.
-        unsafe {
-            std::arch::asm!(
-                "mrs {0}, tpidr_el0",
-                out(reg) tpidr,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        Ok(tpidr)
-    }
 }
 
 /// Candidate symbol names for jemalloc's per-thread state.
@@ -354,46 +299,25 @@ const DEALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_deallocate
                   The `--enable-stats` jemalloc build flag is NOT required: `thread.allocated` / \
                   `thread.deallocated` use jemalloc's `CTL_RO_NL_GEN` (ungated) and the fast/slow \
                   path writes are unconditional.\n\n\
-                  Sampling mode (external-pid only): pass `--snapshots N --interval-ms MS` to \
-                  take N snapshots separated by MS milliseconds. Symbol resolution and tid \
-                  enumeration run once; each snapshot attach/detaches per tid and threads are \
-                  released during the inter-snapshot sleep so the workload is not held stopped \
-                  across the run. The JSON output always carries a `snapshots` array — single \
-                  snapshot is an array of length 1.\n\n\
+                  Sampling mode: pass `--snapshots N --interval-ms MS` to take N snapshots \
+                  separated by MS milliseconds. Symbol resolution and tid enumeration run \
+                  once; each snapshot attach/detaches per tid and threads are released during \
+                  the inter-snapshot sleep so the workload is not held stopped across the \
+                  run. The JSON output always carries a `snapshots` array — single snapshot \
+                  is an array of length 1.\n\n\
                   Sidecar enrichment: pass `--sidecar PATH` to append probe metrics into an \
                   existing ktstr sidecar file. The file MUST exist — run the test first to \
                   generate it, then re-invoke with `--sidecar`."
 )]
 struct Cli {
-    /// Target process id. Required unless `--self-test` is set.
-    /// Must be a positive integer; pid 0 and negative values are
-    /// rejected at parse time since Linux tgids start at 1.
-    #[arg(
-        long,
-        required_unless_present = "self_test",
-        value_parser = clap::value_parser!(i32).range(1..),
-    )]
-    pid: Option<i32>,
+    /// Target process id. Required. Must be a positive integer; pid
+    /// 0 and negative values are rejected at parse time since Linux
+    /// tgids start at 1.
+    #[arg(long, value_parser = clap::value_parser!(i32).range(1..))]
+    pid: i32,
     /// Emit JSON on stdout instead of a human-readable table.
     #[arg(long)]
     json: bool,
-    /// Self-test mode: spawn a worker thread that allocates the
-    /// given number of bytes, read the worker's jemalloc TSD
-    /// counters via `/proc/self/mem`, and exit 0 iff the probe
-    /// observes at least that many `thread_allocated` bytes on
-    /// the worker's thread.
-    ///
-    /// The probe binary ships with its own DWARF debuginfo so the
-    /// TSD offset resolution succeeds even when used against a
-    /// stripped external target would fail. Used by
-    /// `tests/jemalloc_probe_tests.rs` for the closed-loop VM
-    /// validation.
-    #[arg(
-        long,
-        conflicts_with_all = ["pid", "snapshots", "interval_ms", "sidecar"],
-        value_name = "BYTES",
-    )]
-    self_test: Option<u64>,
     /// Append probe output to an existing ktstr sidecar JSON file
     /// (`target/ktstr/{kernel}-{git}/{test_name}-{hash}.ktstr.json`).
     /// The probe reads the existing [`SidecarResult`], synthesizes a
@@ -432,10 +356,9 @@ struct Cli {
     /// the full `Vec<PayloadMetrics>` can discriminate probe-
     /// sourced leaves from the test's primary payload metrics.
     ///
-    /// External-pid only; conflicts with `--self-test`. Orthogonal
-    /// to `--json` — the stdout emission is independent of the
-    /// sidecar write, so `--sidecar` invocations remain debuggable
-    /// without re-reading the sidecar.
+    /// Orthogonal to `--json` — the stdout emission is independent
+    /// of the sidecar write, so `--sidecar` invocations remain
+    /// debuggable without re-reading the sidecar.
     #[arg(long, value_name = "PATH")]
     sidecar: Option<PathBuf>,
     /// Number of snapshots to take. Defaults to 1 (single-snapshot
@@ -444,8 +367,6 @@ struct Cli {
     /// the pre-allocated snapshot vector so a runaway `--snapshots`
     /// cannot request a multi-GiB allocation before any ptrace work
     /// runs.
-    ///
-    /// External-pid only; conflicts with `--self-test`.
     #[arg(
         long,
         default_value_t = 1,
@@ -476,8 +397,6 @@ struct Cli {
     /// sleep equals the configured interval, so latency degrades
     /// gracefully. Upper bound is always 10 ms, independent of how
     /// large the configured interval is.
-    ///
-    /// External-pid only; conflicts with `--self-test`.
     #[arg(
         long,
         value_parser = clap::value_parser!(u64).range(1..=3_600_000),
@@ -1131,7 +1050,7 @@ pub(crate) fn compute_tls_address_variant_i(
 
 /// Arch-dispatched TLS address compute. Routes to Variant II on
 /// x86_64 and Variant I on aarch64 via `cfg(target_arch)`. Keeps
-/// call sites (`probe_single_thread`, `run_self_test`) arch-neutral.
+/// call site (`probe_single_thread`) arch-neutral.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn compute_tls_address(
     tp: u64,
@@ -1719,16 +1638,7 @@ fn run(cli: &Cli) -> RunOutcome {
     // `started_at_unix_sec`. Taking it inside each arm would drift
     // with the variable pre-probe setup latency.
     let started_at_unix_sec = now_unix_sec();
-    // `required_unless_present = "self_test"` in the Cli derive
-    // guarantees `pid` is Some whenever we reach this path.
-    let pid = match cli.pid {
-        Some(p) => p,
-        None => {
-            return RunOutcome::Fatal(anyhow!(
-                "BUG: run() called without --pid set and without --self-test"
-            ));
-        }
-    };
+    let pid = cli.pid;
     // Self-probe reject: PTRACE_SEIZE refuses a tracer's own tgid —
     // ptrace semantics say a process cannot attach to itself. Catching
     // this at the CLI boundary produces an actionable error instead of
@@ -1927,201 +1837,6 @@ fn print_output(cli: &Cli, out: &ProbeOutput) -> Result<()> {
     Ok(())
 }
 
-/// Result emitted by `--self-test` mode. Probe JSON for external
-/// pids goes through [`ProbeOutput`]; self-test surfaces a simpler
-/// pass/fail shape because the caller (the VM integration test)
-/// only needs the one observation + verdict.
-#[derive(Debug, Serialize)]
-struct SelfTestOutput {
-    schema_version: u32,
-    tid: i32,
-    known_bytes: u64,
-    observed_bytes: u64,
-    passed: bool,
-}
-
-/// `--self-test <BYTES>`: spawn an allocator worker in this
-/// process, wait for it to finish allocating, read its
-/// `thread_allocated` TSD counter via `process_vm_readv` on our
-/// own pid, compare against `bytes`, and exit accordingly.
-///
-/// No ptrace: the target thread is in the same process, so
-/// `process_vm_readv(self_pid, ...)` succeeds under the same-uid
-/// kernel check without CAP_SYS_PTRACE. The worker self-reports
-/// its thread pointer via [`arch::read_thread_pointer_self`]
-/// (`arch_prctl(ARCH_GET_FS)` on x86_64, `mrs tpidr_el0` on
-/// aarch64) instead of the ptrace GETREGSET path used for external
-/// probes, again because we can't ptrace our own threads.
-///
-/// The probe binary ships with DWARF (not stripped), so
-/// `find_jemalloc_via_maps(self_pid)` resolves `tsd_s`'s field
-/// layout against the probe's own executable — the external-pid
-/// DWARF-requirement does not apply here.
-fn run_self_test(bytes: u64) -> RunOutcome {
-    use std::sync::atomic::AtomicI32;
-    use std::sync::{Arc, mpsc};
-
-    /// RAII guard that signals the self-test worker to exit
-    /// (`stop_tx.send(())`) and joins it on scope exit. Previously
-    /// every error path in `run_self_test` open-coded
-    /// `let _ = stop_tx.send(()); let _ = worker.join();` before
-    /// returning `RunOutcome::Fatal(...)`; missing the pair on any
-    /// new early return would leak the worker thread holding its
-    /// 16 MiB buffer. The guard ensures cleanup runs exactly once
-    /// regardless of return path — including the happy path, which
-    /// formerly open-coded the same sequence after the successful
-    /// read. `Option<JoinHandle<()>>` lets Drop take the handle
-    /// without requiring `worker` to be Copy.
-    struct WorkerGuard {
-        stop_tx: Option<mpsc::Sender<()>>,
-        worker: Option<std::thread::JoinHandle<()>>,
-    }
-    impl Drop for WorkerGuard {
-        fn drop(&mut self) {
-            if let Some(tx) = self.stop_tx.take() {
-                let _ = tx.send(());
-            }
-            if let Some(handle) = self.worker.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    let self_pid: i32 = self_pid();
-    // Capture timestamp BEFORE spawning the self-test worker so the
-    // field represents "start of probe run" per its doc, not the
-    // post-join point that would slide with `bytes` or worker
-    // scheduling latency.
-    let timestamp_unix_sec = now_unix_sec();
-    let worker_tid = Arc::new(AtomicI32::new(0));
-    // Holds the worker's thread pointer: fs_base on x86_64 (from
-    // arch_prctl(ARCH_GET_FS)), tpidr_el0 on aarch64 (from `mrs`).
-    // Same atomic u64 shape, arch-specific semantics resolved by
-    // `arch::read_thread_pointer_self`.
-    let worker_tp = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let tid_clone = worker_tid.clone();
-    let tp_clone = worker_tp.clone();
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let bytes_usize = bytes as usize;
-
-    let worker = std::thread::spawn(move || {
-        // SAFETY: `SYS_gettid` takes no arguments and returns the
-        // caller's kernel tid. It cannot fail, has no memory effects,
-        // and is safe to call on any Linux thread. The `libc::syscall`
-        // variadic wrapper is marked unsafe because OTHER syscalls
-        // have trailing-arg requirements; for a zero-arg syscall the
-        // unsafe is just the FFI boundary.
-        let tid = libc::pid_t::try_from(unsafe { libc::syscall(libc::SYS_gettid) })
-            .expect("Linux pid_max <= 2^22 so tid fits in pid_t");
-        let tp = match arch::read_thread_pointer_self() {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("read_thread_pointer_self: {e:#}")));
-                return;
-            }
-        };
-        tid_clone.store(tid, Ordering::Release);
-        tp_clone.store(tp, Ordering::Release);
-        // Alloc AFTER registering tid/fs so a main-thread read
-        // before the alloc completes only misses the counter
-        // update, not identity metadata.
-        let known: Vec<u8> = vec![0u8; bytes_usize];
-        std::hint::black_box(&known);
-        let _ = ready_tx.send(Ok(()));
-        let _ = stop_rx.recv();
-        drop(known);
-    });
-    let _guard = WorkerGuard {
-        stop_tx: Some(stop_tx),
-        worker: Some(worker),
-    };
-
-    let ready = match ready_rx.recv() {
-        Ok(r) => r,
-        Err(e) => return RunOutcome::Fatal(anyhow!("self-test ready recv: {e}")),
-    };
-    if let Err(msg) = ready {
-        return RunOutcome::Fatal(anyhow!("self-test worker: {msg}"));
-    }
-
-    let tid = worker_tid.load(Ordering::Acquire);
-    let tp = worker_tp.load(Ordering::Acquire);
-
-    // Resolve jemalloc symbols + offsets against the probe's own
-    // ELF (via `/proc/self/maps`). DWARF comes from the probe
-    // binary, not the target of an external probe.
-    let (symbol, offsets) = match find_jemalloc_via_maps(self_pid) {
-        Ok(v) => v,
-        Err(e) => return RunOutcome::Fatal(e),
-    };
-
-    let addr = match compute_tls_address(
-        tp,
-        symbol.tls_image_aligned_size,
-        symbol.p_align,
-        symbol.st_value,
-        offsets.thread_allocated,
-    ) {
-        Ok(a) => a,
-        Err(e) => return RunOutcome::Fatal(e),
-    };
-
-    let mut buf = [0u8; 8];
-    let remote = RemoteIoVec {
-        base: addr as usize,
-        len: 8,
-    };
-    let mut local = [IoSliceMut::new(&mut buf)];
-    let n = match process_vm_readv(Pid::from_raw(self_pid), &mut local, &[remote]) {
-        Ok(n) => n,
-        Err(e) => {
-            return RunOutcome::Fatal(anyhow!(
-                "process_vm_readv(self_pid={self_pid}, addr={addr:#x}): {e}"
-            ));
-        }
-    };
-    if n != 8 {
-        return RunOutcome::Fatal(anyhow!(
-            "short process_vm_readv: got {n} bytes, expected 8"
-        ));
-    }
-    let observed = u64::from_le_bytes(buf);
-
-    let out = SelfTestOutput {
-        schema_version: SCHEMA_VERSION,
-        tid,
-        known_bytes: bytes,
-        observed_bytes: observed,
-        passed: observed >= bytes,
-    };
-    match serde_json::to_string_pretty(&out) {
-        Ok(s) => println!("{s}"),
-        Err(e) => {
-            return RunOutcome::Fatal(anyhow!("serialize self-test output: {e}"));
-        }
-    }
-    // Stub ProbeOutput carries the self-test run's started-at
-    // timestamp and no snapshots. `run_self_test` owns its own JSON
-    // emission (SelfTestOutput above), so this value only feeds
-    // `main`'s exit-code translation — the empty `snapshots` never
-    // reach print_output.
-    let stub = ProbeOutput {
-        schema_version: SCHEMA_VERSION,
-        pid: self_pid,
-        tool_version: env!("CARGO_PKG_VERSION"),
-        started_at_unix_sec: timestamp_unix_sec,
-        interval_ms: None,
-        interrupted: false,
-        snapshots: Vec::new(),
-    };
-    if out.passed {
-        RunOutcome::Ok(stub)
-    } else {
-        RunOutcome::AllFailed(stub)
-    }
-}
-
 /// Payload name recorded as an identifying metric when the probe
 /// appends to a sidecar. Not an existing `Payload` fixture — the
 /// probe enters the sidecar out-of-band, not through the
@@ -2312,26 +2027,6 @@ fn main() {
         );
         std::process::exit(2);
     }
-    // `--self-test` is an alternative entry point; its JSON shape
-    // is `SelfTestOutput`, not `ProbeOutput`. Emission happens
-    // inside `run_self_test`, so main only needs to translate
-    // the `RunOutcome` to an exit code. `validate_sampling_flags`
-    // above plus the clap `conflicts_with_all` on `--self-test`
-    // combine to rule out any snapshots/interval-ms input reaching
-    // this arm.
-    if let Some(bytes) = cli.self_test {
-        match run_self_test(bytes) {
-            RunOutcome::Ok(_) => return,
-            RunOutcome::AllFailed(_) => {
-                eprintln!("error: self-test failed (observed < known)");
-                std::process::exit(1);
-            }
-            RunOutcome::Fatal(e) => {
-                eprintln!("error: {e:#}");
-                std::process::exit(1);
-            }
-        }
-    }
     match run(&cli) {
         RunOutcome::Ok(out) => {
             if let Err(e) = print_output(&cli, &out) {
@@ -2426,8 +2121,6 @@ fn classify_fatal(e: &anyhow::Error) -> &'static str {
         "exe-identity-changed"
     } else if msg.contains("jemalloc") && msg.contains("not") {
         "not-jemalloc"
-    } else if msg.contains("self-test") {
-        "self-test"
     } else {
         "other"
     }
@@ -2903,9 +2596,8 @@ mod tests {
     #[test]
     fn run_rejects_self_probe() {
         let cli = Cli {
-            pid: Some(self_pid()),
+            pid: self_pid(),
             json: false,
-            self_test: None,
             snapshots: 1,
             interval_ms: None,
             sidecar: None,
@@ -2960,9 +2652,8 @@ mod tests {
             "spawned child pid must differ from parent for this test to be meaningful",
         );
         let cli = Cli {
-            pid: Some(child_pid),
+            pid: child_pid,
             json: false,
-            self_test: None,
             snapshots: 1,
             interval_ms: None,
             sidecar: None,
@@ -3298,80 +2989,6 @@ mod tests {
             msg.contains("only meaningful with --snapshots > 1"),
             "got: {msg}",
         );
-    }
-
-    /// `--self-test` conflicts with `--snapshots` at the clap layer —
-    /// clap emits an error before `validate_sampling_flags` runs.
-    #[test]
-    fn cli_self_test_conflicts_with_count() {
-        let err = Cli::try_parse_from([
-            "ktstr-jemalloc-probe",
-            "--self-test",
-            "1024",
-            "--snapshots",
-            "2",
-        ])
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("cannot be used with") || msg.contains("conflicts"),
-            "expected clap conflict message, got: {msg}",
-        );
-    }
-
-    /// `--self-test` conflicts with `--interval-ms` at the clap layer.
-    #[test]
-    fn cli_self_test_conflicts_with_interval() {
-        let err = Cli::try_parse_from([
-            "ktstr-jemalloc-probe",
-            "--self-test",
-            "1024",
-            "--interval-ms",
-            "100",
-        ])
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("cannot be used with") || msg.contains("conflicts"),
-            "expected clap conflict message, got: {msg}",
-        );
-    }
-
-    /// `--self-test` conflicts with `--sidecar` at the clap layer —
-    /// the self-test path emits `SelfTestOutput`, not `ProbeOutput`,
-    /// so there is no ProbeOutput to append. The conflict is pinned
-    /// here to catch a future `conflicts_with_all` change that
-    /// accidentally drops `sidecar`.
-    #[test]
-    fn cli_self_test_conflicts_with_sidecar() {
-        let err = Cli::try_parse_from([
-            "ktstr-jemalloc-probe",
-            "--self-test",
-            "1024",
-            "--sidecar",
-            "/tmp/does-not-matter.ktstr.json",
-        ])
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("cannot be used with") || msg.contains("conflicts"),
-            "expected clap conflict message, got: {msg}",
-        );
-    }
-
-    /// `--self-test` with default `--snapshots 1` (implicit) is
-    /// accepted — clap's `conflicts_with` only fires on explicit
-    /// presence, so the defaulted value does not trigger a conflict.
-    /// Mirrors the real CLI: `ktstr-jemalloc-probe --self-test 1024`
-    /// must parse.
-    #[test]
-    fn cli_self_test_with_default_count_parses() {
-        let cli =
-            Cli::try_parse_from(["ktstr-jemalloc-probe", "--self-test", "1024"]).unwrap();
-        assert_eq!(cli.self_test, Some(1024));
-        assert_eq!(cli.snapshots, 1);
-        assert!(cli.interval_ms.is_none());
-        assert!(cli.validate_sampling_flags().is_ok());
     }
 
     // ---- take_snapshot / sleep_with_cancel helpers ----

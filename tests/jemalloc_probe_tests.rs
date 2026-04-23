@@ -1,20 +1,17 @@
 //! Closed-loop validation of the jemalloc TLS probe
 //! (`src/bin/jemalloc_probe.rs`) inside a ktstr VM.
 //!
-//! The probe's `--self-test <BYTES>` mode spawns an allocator
-//! thread inside the probe process, reads the worker's
-//! `thread_allocated` counter via `process_vm_readv` on its own
-//! pid (no ptrace needed for same-process reads), and exits 0 iff
-//! the observed counter is at least the known allocation size.
-//! This approach keeps DWARF inside the probe binary — which is
-//! never stripped — and avoids needing DWARF on the much larger
-//! ktstr-init binary that runs as PID 1 inside the VM.
+//! Every test boots a ktstr VM, spawns
+//! `ktstr-jemalloc-alloc-worker` as a background allocator target
+//! with a known byte count, waits for the worker's ready marker,
+//! then runs the probe against the worker's live pid via `--pid`. The probe's JSON output is parsed back through the
+//! framework's flat-metric pipeline and asserted against the
+//! known allocation. DWARF lives on the alloc-worker binary (not
+//! stripped in the test build); the init binary is unchanged.
 //!
 //! The probe binary reaches the guest via the initramfs wiring
 //! activated by the `KTSTR_JEMALLOC_PROBE_BINARY` env var, set by
-//! [`set_probe_binary_env_var`] at static init time. The init
-//! binary stays stripped; the probe carries its own DWARF and
-//! self-probes.
+//! [`set_probe_binary_env_var`] at static init time.
 
 use anyhow::{Result, anyhow};
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
@@ -58,12 +55,11 @@ fn set_probe_binary_env_var() {
 // Payload fixtures
 // ---------------------------------------------------------------------------
 
-/// Self-test probe invocation. `Check::ExitCodeEq(0)` gates a
-/// non-zero probe exit as a failing AssertResult; the probe's
-/// `--self-test` mode exits 0 iff the observed `thread_allocated`
-/// counter is at least the known allocation size.
-static JEMALLOC_PROBE_SELFTEST: Payload = Payload {
-    name: "jemalloc_probe_selftest",
+/// Probe invocation with exit-code gating. Used by tests that read
+/// the probe's JSON output directly to find a specific thread's
+/// `allocated_bytes`.
+static JEMALLOC_PROBE: Payload = Payload {
+    name: "jemalloc_probe",
     kind: PayloadKind::Binary("ktstr-jemalloc-probe"),
     output: OutputFormat::Json,
     default_args: &[],
@@ -72,22 +68,9 @@ static JEMALLOC_PROBE_SELFTEST: Payload = Payload {
     include_files: &[],
 };
 
-/// External-pid probe invocation. Used by the cross-process
-/// closed-loop test which reads the JSON output directly to find
-/// a specific thread's `allocated_bytes`.
-static JEMALLOC_PROBE_EXTERNAL: Payload = Payload {
-    name: "jemalloc_probe_external",
-    kind: PayloadKind::Binary("ktstr-jemalloc-probe"),
-    output: OutputFormat::Json,
-    default_args: &[],
-    default_checks: &[Check::ExitCodeEq(0)],
-    metrics: &[],
-    include_files: &[],
-};
-
-/// External-pid probe invocation without exit-code gating. Used by
-/// the error-path test that deliberately probes a non-jemalloc
-/// target and reads `metrics.exit_code` directly.
+/// Probe invocation without exit-code gating. Used by the error-
+/// path test that deliberately probes a non-jemalloc target and
+/// reads `metrics.exit_code` directly.
 static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload {
     name: "jemalloc_probe_no_exit_check",
     kind: PayloadKind::Binary("ktstr-jemalloc-probe"),
@@ -240,63 +223,9 @@ fn metric_u64(metrics: &PayloadMetrics, key: &str) -> Option<u64> {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Single-worker closed loop via the probe's `--self-test` mode.
-/// 16 MiB is large enough that jemalloc routes the allocation
-/// through the huge-size path, which unconditionally updates
-/// `thread_allocated` on every alloc regardless of tcache state.
-/// The probe observes its own process memory (no ptrace required
-/// for same-process `process_vm_readv`) and exits 0 iff the
-/// observed counter is at least 16 MiB.
-///
-/// The assertion here does not rely solely on the probe's exit
-/// code (already gated by `Check::ExitCodeEq(0)` on
-/// `JEMALLOC_PROBE_SELFTEST`). It re-reads the JSON output via
-/// the framework's flat-metric pipeline so a future probe change
-/// that leaks a false-positive exit (e.g. `passed: true` with
-/// `observed_bytes: 0`) still fails the test.
-#[ktstr_test(llcs = 1, cores = 1, threads = 1)]
-fn jemalloc_probe_single_worker_observes_known_allocation(ctx: &Ctx) -> Result<AssertResult> {
-    const KNOWN_BYTES: u64 = 16 * 1024 * 1024;
-    // Upper bound on post-allocation slop: kernel + jemalloc
-    // startup noise (metadata arenas, tsd init, small bookkeeping
-    // vectors) on the worker thread. 4 MiB covers observed
-    // overhead with slack; a much larger observed value would
-    // indicate either a test leak or a probe reading the wrong
-    // address.
-    const MAX_SLOP: u64 = 4 * 1024 * 1024;
-    let (assert_result, metrics) = ctx
-        .payload(&JEMALLOC_PROBE_SELFTEST)
-        .arg("--self-test")
-        .arg(KNOWN_BYTES.to_string())
-        .run()?;
-    if !assert_result.passed {
-        return Ok(assert_result);
-    }
-    let observed = metric_u64(&metrics, "observed_bytes").ok_or_else(|| {
-        anyhow!(
-            "self-test metrics missing observed_bytes; flat metrics: {:?}",
-            metrics
-                .metrics
-                .iter()
-                .map(|m| (m.name.as_str(), m.value))
-                .collect::<Vec<_>>(),
-        )
-    })?;
-    if observed < KNOWN_BYTES {
-        return Ok(AssertResult::fail_other(format!("self-test observed_bytes={observed}, expected >= {KNOWN_BYTES}")));
-    }
-    if observed > KNOWN_BYTES + MAX_SLOP {
-        return Ok(AssertResult::fail_other(format!(
-                "self-test observed_bytes={observed} exceeds known={KNOWN_BYTES} + slop={MAX_SLOP}; \
-                 probe may be reading the wrong address or a shared counter"
-            )));
-    }
-    Ok(AssertResult::pass())
-}
-
 /// Cross-process closed loop. Spawns the jemalloc-alloc-worker
 /// as a background payload with a known allocation size, runs
-/// the probe in external-pid mode against the worker's pid,
+/// the probe against the worker's pid via `--pid`,
 /// parses the probe's JSON output, and asserts that the worker's
 /// thread reports `allocated_bytes` inside a tight band around
 /// the known size with `deallocated_bytes` near zero, and that
@@ -315,8 +244,11 @@ fn jemalloc_probe_single_worker_observes_known_allocation(ctx: &Ctx) -> Result<A
 #[ktstr_test(llcs = 1, cores = 1, threads = 1)]
 fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result<AssertResult> {
     const KNOWN_BYTES: u64 = 16 * 1024 * 1024;
-    // See `jemalloc_probe_single_worker_observes_known_allocation`
-    // for the rationale behind this bound.
+    // Upper bound on post-allocation slop: kernel + jemalloc startup
+    // noise (metadata arenas, tsd init, small bookkeeping vectors) on
+    // the worker thread. 4 MiB covers observed overhead with slack; a
+    // much larger observed value would indicate either a test leak or
+    // the probe reading the wrong address.
     const MAX_SLOP: u64 = 4 * 1024 * 1024;
     // Worker allocates once and parks — `deallocated_bytes`
     // should be dominated by jemalloc's own bookkeeping + Rust's
@@ -354,7 +286,7 @@ fn jemalloc_probe_external_target_observes_known_allocation(ctx: &Ctx) -> Result
     )?;
 
     let run_outcome = ctx
-        .payload(&JEMALLOC_PROBE_EXTERNAL)
+        .payload(&JEMALLOC_PROBE)
         .arg("--pid")
         .arg(worker_pid.to_string())
         .arg("--json")
@@ -762,7 +694,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
     const KNOWN_BYTES: u64 = 16 * 1024 * 1024;
     const SNAPSHOTS: usize = 3;
     const INTERVAL_MS: u64 = 50;
-    // Same slop rationale as `jemalloc_probe_single_worker_*`: 4 MiB
+    // Same slop rationale as the single-snapshot external test: 4 MiB
     // covers kernel + jemalloc startup noise with slack. A larger
     // per-snapshot `allocated_bytes` would indicate a leak or the
     // probe reading the wrong address.
@@ -787,7 +719,7 @@ fn jemalloc_probe_multi_snapshot_monotone(ctx: &Ctx) -> Result<AssertResult> {
     )?;
 
     let run_outcome = ctx
-        .payload(&JEMALLOC_PROBE_EXTERNAL)
+        .payload(&JEMALLOC_PROBE)
         .arg("--pid")
         .arg(worker_pid.to_string())
         .arg("--json")

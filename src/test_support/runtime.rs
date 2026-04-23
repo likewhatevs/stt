@@ -161,17 +161,16 @@ pub(crate) fn build_vm_builder_base(
     // `ktstr-jemalloc-probe` via `#[ctor]` before the test harness
     // dispatches. When set, the probe is packed into every VM's
     // base initramfs; the init binary stays stripped because the
-    // probe carries its own DWARF. Absent env var = existing
+    // paired alloc-worker carries DWARF. Absent env var = existing
     // behavior (no probe).
     if let Ok(probe_path) = std::env::var("KTSTR_JEMALLOC_PROBE_BINARY")
         && !probe_path.is_empty()
     {
         // Pack the probe binary into the guest initramfs at
-        // `/bin/ktstr-jemalloc-probe`. Closed-loop probe tests use
-        // either the probe's `--self-test` mode (same-process read)
-        // or the paired `ktstr-jemalloc-alloc-worker` target
-        // (external-pid read); both rely on DWARF in the probe's
-        // own ELF, not the init's.
+        // `/bin/ktstr-jemalloc-probe`. Closed-loop probe tests run
+        // the probe via `--pid <alloc_worker_pid>` against the
+        // paired `ktstr-jemalloc-alloc-worker` target; DWARF comes
+        // from the worker's own ELF, not the init's.
         builder = builder.jemalloc_probe_binary(std::path::PathBuf::from(probe_path));
     }
     if let Ok(worker_path) = std::env::var("KTSTR_JEMALLOC_ALLOC_WORKER_BINARY")
