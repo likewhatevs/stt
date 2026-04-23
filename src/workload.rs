@@ -6164,7 +6164,6 @@ mod tests {
     #[test]
     fn stop_and_collect_reaps_grandchild_from_graceful_custom_closure() {
         require_grandchild_sleep_binary();
-        let test_start = Instant::now();
         let config = WorkloadConfig {
             num_workers: 1,
             affinity: AffinityMode::None,
@@ -6175,30 +6174,23 @@ mod tests {
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
-        eprintln!("T+{:?}: spawning", test_start.elapsed());
         let mut h = WorkloadHandle::spawn(&config).unwrap();
         let worker_pid = h.worker_pids()[0];
         let pidfile = grandchild_pidfile_path(worker_pid);
         let _ = std::fs::remove_file(&pidfile);
         let _pidfile_cleanup = PidfileCleanup(vec![pidfile.clone()]);
-        eprintln!("T+{:?}: starting", test_start.elapsed());
         h.start();
-        eprintln!("T+{:?}: reading gpid", test_start.elapsed());
         let gpid = read_grandchild_gpid_from_pidfile(worker_pid, &pidfile);
-        eprintln!("T+{:?}: gpid={gpid}", test_start.elapsed());
         assert!(
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(gpid), None).is_ok(),
             "grandchild {gpid} must be alive before stop_and_collect",
         );
-        eprintln!("T+{:?}: calling stop_and_collect", test_start.elapsed());
         let _reports = h.stop_and_collect();
-        eprintln!("T+{:?}: stop_and_collect returned", test_start.elapsed());
         assert_grandchild_reaped_within(
             gpid,
             Duration::from_secs(5),
             "stop_and_collect (graceful-exit)",
         );
-        eprintln!("T+{:?}: assert completed", test_start.elapsed());
     }
 
     // -- Test-helper unit tests --

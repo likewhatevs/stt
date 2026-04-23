@@ -121,7 +121,7 @@ impl MetricDef {
 /// match each other, but diverge from the registry name where
 /// the domain-level wording adds context (`worst_*`, `total_*`,
 /// `max_*`) that would be noise on an already-qualified field.
-/// Nine divergent triples:
+/// Eleven divergent triples:
 ///
 /// | Registry (`MetricDef.name`) | `GauntletRow` field | DataFrame column |
 /// |---|---|---|
@@ -134,14 +134,15 @@ impl MetricDef {
 /// | `stall_count` | `stall_count` | `stalls` |
 /// | `total_fallback` | `fallback_count` | `fallback` |
 /// | `total_keep_last` | `keep_last_count` | `keep_last` |
+/// | `worst_page_locality` | `page_locality` | `page_locality` |
+/// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
 /// Metrics with matching names (`worst_p99_wake_latency_us`,
 /// `worst_median_wake_latency_us`, `worst_wake_latency_cv`,
 /// `total_iterations`, `worst_mean_run_delay_us`,
-/// `worst_run_delay_us`, `worst_page_locality`,
-/// `worst_cross_node_migration_ratio`) are not listed — the
-/// registry name, field, and DataFrame column are all identical,
-/// so there is no translation to document.
+/// `worst_run_delay_us`) are not listed — the registry name,
+/// field, and DataFrame column are all identical, so there is no
+/// translation to document.
 ///
 /// Consumers that cross the registry / DataFrame boundary should
 /// go through [`MetricDef::read`] / the accessor closure rather

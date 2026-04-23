@@ -279,11 +279,10 @@ fn fio_with_fixture(ctx: &Ctx) -> Result<AssertResult> {
 The declarative set (scheduler's `include_files` + payload's +
 workloads' + `extra_include_files`) is aggregated at test time
 and resolved through the same include-file pipeline the CLI's
-`-i` / `--include-files` flag uses (exposed on both
-`cargo ktstr test` / `cargo ktstr shell` and the standalone
-`ktstr` entry point — `#[ktstr_test]` resolution and the CLI
-share the same resolver, just fed from different sources). The
-union is deduped on identical
+`-i` / `--include-files` flag uses (exposed on `ktstr shell` and
+`cargo ktstr shell`; `#[ktstr_test]` resolution and the shell
+CLIs share the same `resolve_include_files` resolver, just fed
+from different sources). The union is deduped on identical
 `(archive_path, host_path)` pairs. Two declarations that resolve
 to the same archive slot with different host paths surface as a
 hard error with both host paths in the diagnostic, rather than one
