@@ -24,7 +24,7 @@ use crate::workload::WorkType;
 #[derive(Subcommand, Debug)]
 pub enum KernelCommand {
     /// List cached kernel images.
-    #[command(long_about = EOL_EXPLANATION)]
+    #[command(long_about = KERNEL_LIST_LONG_ABOUT)]
     List {
         /// Output in JSON format for CI scripting.
         #[arg(long)]
@@ -120,17 +120,99 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
      on cache miss. When absent, resolves via cache then filesystem, \
      falling back to downloading the latest stable kernel.";
 
+/// Literal text of the `(EOL)` tag explanation. Lives inside a macro
+/// (instead of a `pub const`) so that downstream `concat!` callers
+/// — specifically [`KERNEL_LIST_LONG_ABOUT`] — can embed the bytes at
+/// compile time without duplicating the string. `concat!` requires
+/// each argument to be a string literal at expansion, and a macro
+/// call that expands to a literal satisfies that requirement while
+/// a `&'static str` reference does not. Expansion order: the inner
+/// macro is expanded first, `concat!` then sees a literal.
+macro_rules! eol_explanation_literal {
+    () => {
+        "(EOL) marks entries whose major.minor series is absent from \
+         kernel.org's current active releases. Suppressed when the \
+         active-release list cannot be fetched."
+    };
+}
+
 /// Explanation of the `(EOL)` tag, shared between the text-output
 /// legend printed after `kernel list` and the `kernel list --help`
-/// long description. One const → one source of truth, so a wording
-/// drift cannot put the two surfaces out of sync. `pub` matches the
-/// visibility of the sibling `KERNEL_HELP_*` constants so downstream
-/// consumers (e.g. documentation generators) can reference the exact
-/// text the CLI prints.
-pub const EOL_EXPLANATION: &str =
-    "(EOL) marks entries whose major.minor series is absent from \
-     kernel.org's current active releases. Suppressed when the \
-     active-release list cannot be fetched.";
+/// long description (via [`KERNEL_LIST_LONG_ABOUT`], which embeds this
+/// exact byte sequence at its head through the shared
+/// `eol_explanation_literal!` macro). One literal → one source of
+/// truth, so a wording drift cannot put the two surfaces out of
+/// sync. `pub` matches the visibility of the sibling
+/// `KERNEL_HELP_*` constants so downstream consumers (e.g.
+/// documentation generators) can reference the exact text the CLI
+/// prints.
+pub const EOL_EXPLANATION: &str = eol_explanation_literal!();
+
+/// `long_about` for `kernel list --help`. Embeds [`EOL_EXPLANATION`]
+/// verbatim (via `eol_explanation_literal!`) so the tag legend
+/// cannot drift between the post-table output and the help copy,
+/// then appends a plain-text rendering of the `--json` output
+/// schema so scripted consumers can discover the contract from the
+/// terminal without running `cargo doc`. The schema wording
+/// mirrors the Rust-doc schema on [`kernel_list`]; keeping both
+/// surfaces terse makes a drift obvious on review. A plain-text
+/// (not JSON/markdown) rendering is used because clap applies no
+/// JSON/markdown formatting pass, so the schema reads as plain
+/// text. Clap does apply terminal-width wrapping, so the embedded
+/// EOL sentence re-flows to the width of the host terminal; the
+/// schema block's explicit `\n` line breaks survive wrapping and
+/// preserve the column-aligned field table.
+pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
+    eol_explanation_literal!(),
+    "\n\n",
+    "--json emits one JSON object with three top-level fields:\n",
+    "\n",
+    "  current_ktstr_kconfig_hash   hex digest of the kconfig fragment the\n",
+    "                               running binary was built with, for\n",
+    "                               stale-entry detection.\n",
+    "  active_prefixes_fetch_error  null on success; error string on\n",
+    "                               active-series fetch failure. When\n",
+    "                               non-null, every entry's `eol` is false\n",
+    "                               regardless of actual support status —\n",
+    "                               check this field before trusting `eol`.\n",
+    "  entries                      array of per-entry objects. Each\n",
+    "                               element is either a VALID entry (full\n",
+    "                               field set) or a CORRUPT entry (only\n",
+    "                               `key`, `path`, `error`). Detect\n",
+    "                               corruption by the presence of `error`.\n",
+    "\n",
+    "Valid entry fields: key, path, version (nullable), source, arch,\n",
+    "built_at, ktstr_kconfig_hash (nullable), kconfig_status, eol,\n",
+    "config_hash (nullable), image_name, image_path, has_vmlinux.\n",
+    "\n",
+    "  path             absolute path to the cache entry DIRECTORY.\n",
+    "  image_path       absolute path to the boot image file INSIDE\n",
+    "                   that directory. `path` points at the dir, not\n",
+    "                   the image — scripts that want the kernel\n",
+    "                   artifact to pass to qemu/vm-loaders should\n",
+    "                   read `image_path`, not join `path` with a\n",
+    "                   hardcoded filename.\n",
+    "  kconfig_status   one of \"matches\", \"stale\", \"untracked\"\n",
+    "                   (Display form of cache::KconfigStatus).\n",
+    "  source           internally-tagged on \"type\":\n",
+    "                     {\"type\": \"tarball\"}\n",
+    "                     {\"type\": \"git\",   \"git_hash\": ?, \"ref\": ?}\n",
+    "                     {\"type\": \"local\", \"source_tree_path\": ?,\n",
+    "                                       \"git_hash\": ?}\n",
+    "                   Dispatch on \"type\" before reading variant\n",
+    "                   fields.\n",
+    "  eol              true iff the entry's major.minor series is absent\n",
+    "                   from the active-prefix list. Meaningful only when\n",
+    "                   active_prefixes_fetch_error is null. Also false\n",
+    "                   whenever version is null (the missing-version\n",
+    "                   short-circuit in `entry_is_eol`).\n",
+    "  has_vmlinux      true iff the uncompressed vmlinux is cached\n",
+    "                   alongside the compressed image (required for\n",
+    "                   DWARF-driven probes).\n",
+    "  config_hash      CRC32 of the final merged .config; distinct\n",
+    "                   from ktstr_kconfig_hash which covers only the\n",
+    "                   ktstr fragment."
+);
 
 /// Emitted by `kernel build` when a local source tree has
 /// uncommitted index/worktree changes. Caching would key the built
@@ -3501,13 +3583,194 @@ mod tests {
     /// both branches avoids a regression that would print the legend
     /// on clean no-EOL runs (noise) or suppress it on EOL runs
     /// (users cannot interpret the tag). The returned `&'static str`
-    /// is the same `EOL_EXPLANATION` shown by `--json --help`, so
-    /// drift between legend and help copy is impossible by
-    /// construction.
+    /// is the same `EOL_EXPLANATION` literal embedded at the head of
+    /// `KERNEL_LIST_LONG_ABOUT` (which drives `kernel list --help`) via the
+    /// shared `eol_explanation_literal!` macro, so drift between the
+    /// legend and the help copy is impossible by construction.
     #[test]
     fn eol_legend_if_any_branches() {
         assert_eq!(eol_legend_if_any(true), Some(EOL_EXPLANATION));
         assert_eq!(eol_legend_if_any(false), None);
+    }
+
+    /// `KERNEL_LIST_LONG_ABOUT` drives `kernel list --help` and must expose
+    /// the `--json` output contract so scripted consumers can
+    /// discover the schema from the terminal alone. Pins:
+    /// 1. the `(EOL)` legend text appears verbatim at the head
+    ///    (enforced at compile time by the shared
+    ///    `eol_explanation_literal!` macro; the runtime assert here
+    ///    catches any future edit that causes `EOL_EXPLANATION` and
+    ///    `KERNEL_LIST_LONG_ABOUT`'s head to diverge in content);
+    /// 2. every top-level wrapper field (`current_ktstr_kconfig_hash`,
+    ///    `active_prefixes_fetch_error`, `entries`) appears, so a
+    ///    scripted consumer finds them without reading source;
+    /// 3. every field listed in the test array is present in
+    ///    `KERNEL_LIST_LONG_ABOUT`; the test array is maintained in
+    ///    lockstep with the JSON emitter by code-review discipline,
+    ///    not at compile time (a new field added to the emitter
+    ///    without touching this test array will not trip the
+    ///    assertion);
+    /// 4. each field declared `Option<T>` in `cache::KernelMetadata`
+    ///    is annotated `(nullable)` in the help copy, so consumers
+    ///    know to handle `null` without reading source;
+    /// 5. the corrupt-entry `error` marker appears so the two
+    ///    entry shapes (valid vs corrupt) are both documented.
+    /// Not pinning the entire byte sequence because a small
+    /// wording tweak should not require a snapshot update — the
+    /// discoverability contract is the invariant.
+    #[test]
+    fn kernel_list_long_about_exposes_json_schema() {
+        assert!(
+            KERNEL_LIST_LONG_ABOUT.starts_with(EOL_EXPLANATION),
+            "KERNEL_LIST_LONG_ABOUT must embed EOL_EXPLANATION verbatim at its \
+             head so the --help and post-table legend share one source of \
+             truth; got: {KERNEL_LIST_LONG_ABOUT:?}",
+        );
+
+        for wrapper_field in [
+            "current_ktstr_kconfig_hash",
+            "active_prefixes_fetch_error",
+            "entries",
+        ] {
+            assert!(
+                KERNEL_LIST_LONG_ABOUT.contains(wrapper_field),
+                "KERNEL_LIST_LONG_ABOUT must mention top-level wrapper field \
+                 `{wrapper_field}` so scripted consumers discover the \
+                 schema without `cargo doc`; got: {KERNEL_LIST_LONG_ABOUT:?}",
+            );
+        }
+
+        for valid_entry_field in [
+            "key",
+            "path",
+            "version",
+            "source",
+            "arch",
+            "built_at",
+            "ktstr_kconfig_hash",
+            "kconfig_status",
+            "eol",
+            "config_hash",
+            "image_name",
+            "image_path",
+            "has_vmlinux",
+            // Source-variant payload fields (internally-tagged
+            // `source` object). `"ref"` is asserted in its quoted
+            // JSON-field form to avoid matching substrings like
+            // "prefixes" / "reference" elsewhere in the help copy;
+            // the bare token would produce a false-positive pass
+            // even if the field were removed. Without these, a
+            // `KernelSource` variant that adds, removes, or
+            // renames a payload field could ship without a
+            // matching help update — silently breaking scripted
+            // consumers that dispatch on `source.type`.
+            "git_hash",
+            "\"ref\"",
+            "source_tree_path",
+        ] {
+            assert!(
+                KERNEL_LIST_LONG_ABOUT.contains(valid_entry_field),
+                "KERNEL_LIST_LONG_ABOUT must mention valid-entry JSON \
+                 field `{valid_entry_field}`; a JSON emitter that adds \
+                 a field without updating the help copy silently \
+                 breaks the discoverability contract; got: \
+                 {KERNEL_LIST_LONG_ABOUT:?}",
+            );
+        }
+
+        // Corrupt-entry shape: `ListedEntry::Corrupt` emits a
+        // structurally different object with only `key`, `path`,
+        // `error`. `key` and `path` overlap with valid-entry fields
+        // and are covered above. `error` is corrupt-only — asserted
+        // separately so the failure message does not mislead a
+        // future reader into grepping the valid-entry code path.
+        for corrupt_entry_field in ["error"] {
+            assert!(
+                KERNEL_LIST_LONG_ABOUT.contains(corrupt_entry_field),
+                "KERNEL_LIST_LONG_ABOUT must mention corrupt-entry JSON \
+                 field `{corrupt_entry_field}` so consumers know the \
+                 corrupt-entry shape and can branch on its presence; \
+                 got: {KERNEL_LIST_LONG_ABOUT:?}",
+            );
+        }
+
+        // Nullable markers: every `Option<T>` field declared in
+        // `cache::KernelMetadata` must carry a `(nullable)` tag in
+        // the help copy so scripted consumers handle `null` without
+        // reading source. Sourced from cache.rs: `version`,
+        // `ktstr_kconfig_hash`, `config_hash` are the three
+        // `Option<String>` fields flowing into the JSON emitter.
+        for nullable_field in ["version", "ktstr_kconfig_hash", "config_hash"] {
+            let marker = format!("{nullable_field} (nullable)");
+            assert!(
+                KERNEL_LIST_LONG_ABOUT.contains(&marker),
+                "KERNEL_LIST_LONG_ABOUT must mark `{nullable_field}` \
+                 as `(nullable)` (expected substring `{marker}`) so \
+                 consumers know to handle `null`; got: \
+                 {KERNEL_LIST_LONG_ABOUT:?}",
+            );
+        }
+
+        for source_variant_tag in ["\"tarball\"", "\"git\"", "\"local\""] {
+            assert!(
+                KERNEL_LIST_LONG_ABOUT.contains(source_variant_tag),
+                "KERNEL_LIST_LONG_ABOUT must list source variant tag \
+                 `{source_variant_tag}` so consumers can dispatch on \
+                 the internally-tagged `source.type` field; got: \
+                 {KERNEL_LIST_LONG_ABOUT:?}",
+            );
+        }
+
+        for status_variant in ["\"matches\"", "\"stale\"", "\"untracked\""] {
+            assert!(
+                KERNEL_LIST_LONG_ABOUT.contains(status_variant),
+                "KERNEL_LIST_LONG_ABOUT must list kconfig_status variant \
+                 `{status_variant}` so consumers can branch on the \
+                 three-value enum without reading source; got: \
+                 {KERNEL_LIST_LONG_ABOUT:?}",
+            );
+        }
+    }
+
+    /// Pins that the `#[command(long_about = KERNEL_LIST_LONG_ABOUT)]`
+    /// attribute on `KernelCommand::List` is actually wired through
+    /// clap's registered metadata — i.e. the bytes that reach a
+    /// terminal user via `kernel list --help` equal
+    /// `KERNEL_LIST_LONG_ABOUT` byte-for-byte. Complements the
+    /// content-discovery test above: that test guards the string's
+    /// shape; this test guards the wiring. A regression that drops
+    /// the attribute, points it at a different const, or leaves the
+    /// attribute pointing at stale text would pass the shape test
+    /// (the const is still well-formed) but fail here. Follows the
+    /// `TestCli` pattern used by `kernel_clean_rejects_corrupt_only_
+    /// with_keep` at cli.rs below.
+    #[test]
+    fn kernel_list_long_about_wired_via_clap() {
+        use clap::CommandFactory as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let cmd = TestCli::command();
+        let list = cmd
+            .find_subcommand("list")
+            .expect("clap must register a `list` subcommand on KernelCommand");
+        let long_about = list
+            .get_long_about()
+            .expect(
+                "`list` subcommand must have a long_about set (drives \
+                 `kernel list --help`)",
+            )
+            .to_string();
+        assert_eq!(
+            long_about, KERNEL_LIST_LONG_ABOUT,
+            "clap's registered long_about for `list` must equal \
+             KERNEL_LIST_LONG_ABOUT byte-for-byte; a mismatch means \
+             the `#[command(long_about = ...)]` attribute is missing, \
+             pointing at a different const, or clap mutated the \
+             content on its way into the registry",
+        );
     }
 
     /// `untracked_legend_if_any` mirrors `eol_legend_if_any`'s
