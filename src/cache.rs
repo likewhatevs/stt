@@ -2624,6 +2624,192 @@ mod tests {
         assert!(unrelated.exists(), "unrelated entry must survive");
     }
 
+    /// `pid == 0` suffix: `nix::sys::signal::kill(Pid::from_raw(0),
+    /// None)` broadcasts a signal probe to the process group of the
+    /// CURRENT process (POSIX semantics: signal pid 0 = self's
+    /// pgrp). Under a running test process, that check almost
+    /// always returns `Ok(())`, which the scan classifies as
+    /// "alive" and LEAVES the entry in place. Pins the
+    /// safe-default behavior: a `.tmp-key-0` orphan is not touched,
+    /// even though "pid 0" is not a real process — because the
+    /// liveness probe's answer is not specific enough to justify
+    /// removal.
+    #[test]
+    fn clean_orphaned_tmp_dirs_preserves_pid_zero_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let entry = tmp.path().join(format!("{TMP_DIR_PREFIX}somekey-0"));
+        std::fs::create_dir_all(&entry).unwrap();
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+        assert!(
+            entry.exists(),
+            "pid=0 suffix must be preserved — kill(0, None) reports \
+             the current process group as alive, safe-default is \
+             skip rather than remove",
+        );
+    }
+
+    /// "Negative pid suffix" unreachability pin. The parser uses
+    /// `rsplit_once('-')` to extract the suffix AFTER the last `-`,
+    /// which by construction never contains a `-` — so
+    /// `parse::<i32>()` on the suffix can only produce a
+    /// non-negative integer (or fail to parse). A filename like
+    /// `.tmp-key--12345` rsplits into `(".tmp-key-", "12345")`:
+    /// the suffix `"12345"` parses to pid 12345 (POSITIVE).
+    ///
+    /// This test documents the invariant and pins the observable
+    /// behavior: under `.tmp-key--12345`, the pid parses as a
+    /// real positive integer (12345), `kill(12345, None)` likely
+    /// returns `Err(ESRCH)` on a fresh pid space, and the entry
+    /// is REMOVED (not preserved). The test verifies the REMOVAL
+    /// path under this input so a future refactor that changed
+    /// `rsplit_once('-')` to `splitn(3, '-')` or a regex — which
+    /// COULD emit a `-12345` suffix and open the negative-pid
+    /// door — would change the observable behavior and trip this
+    /// test's "entry must be gone" assertion.
+    ///
+    /// Note: the test's observable outcome depends on pid 12345
+    /// NOT being alive on the host. If a coincidental live
+    /// process happens to hold pid 12345, the entry would be
+    /// preserved instead; accept the ≈1-in-N-pids risk
+    /// (empirically negligible in CI / dev environments) rather
+    /// than contort the test to force a guaranteed-dead pid (the
+    /// existing `dead_pid = libc::pid_t::MAX` technique produces
+    /// a suffix too large to demonstrate the `--` splitting
+    /// behavior).
+    #[test]
+    fn clean_orphaned_tmp_dirs_double_dash_parses_as_positive_pid() {
+        let tmp = TempDir::new().unwrap();
+        // Name with a double-dash so the rsplit-once path produces
+        // the suffix "12345" (no leading dash — rsplit_once
+        // guarantees no delimiter in the suffix). A future regex
+        // that emitted "-12345" would behave differently here.
+        let entry = tmp.path().join(format!("{TMP_DIR_PREFIX}somekey--12345"));
+        std::fs::create_dir_all(&entry).unwrap();
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+
+        // Whether the entry is removed depends on whether pid
+        // 12345 is alive at test time. The invariant being pinned
+        // is the parse direction (positive, not negative), which
+        // is a prerequisite for either the remove or preserve
+        // branch — a refactor to a negative-suffix parser would
+        // land in the `kill(-12345, None)` broadcast probe
+        // instead, which returns `Ok(())` and preserves
+        // unconditionally. Testing both "parses as positive" AND
+        // "either removed or preserved based on liveness" together
+        // requires nothing stronger than a liveness check here.
+        //
+        // The TEST IS PRIMARILY A DOC — the comment above explains
+        // the negative-pid unreachability. The assertion below
+        // guards against the most likely concrete regression: a
+        // regex that emits a `-N` suffix and thereby lands in the
+        // broadcast-probe branch. Under that regression, `kill(-N,
+        // None)` returns Ok and the entry is ALWAYS preserved;
+        // this assertion is satisfied only if the current parse
+        // direction (positive pid, real liveness probe) holds.
+        //
+        // Use `kill(12345, None)` here to decide what we expect:
+        // if the pid is live, the entry is preserved; if dead,
+        // removed. Either result confirms positive-pid parse.
+        let pid_alive = matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(12345), None),
+            Ok(()),
+        );
+        if pid_alive {
+            assert!(
+                entry.exists(),
+                "pid 12345 was alive at probe time → entry must be \
+                 preserved; got: entry removed (regression?)",
+            );
+        } else {
+            assert!(
+                !entry.exists(),
+                "pid 12345 was dead at probe time → entry must be \
+                 removed (proves positive-pid parse). A regression to \
+                 negative-pid parse would preserve unconditionally; \
+                 entry still exists.",
+            );
+        }
+    }
+
+    /// Regular file entry (not a directory) whose name MATCHES the
+    /// `.tmp-{key}-{pid}` pattern with a dead pid. `fs::remove_dir_all`
+    /// on a regular file returns `ENOTDIR` / `NotADirectory`; the
+    /// scan catches the error in its match arm, logs + continues,
+    /// and the file stays in place. Pins that the scan does NOT
+    /// fall through to `fs::remove_file` on type mismatch —
+    /// quietly removing a file with a tempdir-shaped name could
+    /// destroy state belonging to an unrelated tool that happened
+    /// to pick a colliding name.
+    #[test]
+    fn clean_orphaned_tmp_dirs_leaves_regular_file_entry() {
+        let tmp = TempDir::new().unwrap();
+        let dead_pid = libc::pid_t::MAX;
+        let file_entry = tmp
+            .path()
+            .join(format!("{TMP_DIR_PREFIX}fileshaped-{dead_pid}"));
+        std::fs::write(&file_entry, b"not a directory").unwrap();
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+        assert!(
+            file_entry.exists(),
+            "regular file with tempdir-shaped name + dead pid must \
+             NOT be removed — `remove_dir_all` errors on a file, \
+             and the scan's error-tolerance contract leaves it",
+        );
+    }
+
+    /// Symlink entry whose NAME matches the tempdir pattern but
+    /// whose TARGET is an unrelated path outside the cache. The
+    /// scan must not follow the symlink — following would risk
+    /// `remove_dir_all` deleting the target's contents (the very
+    /// bug that a production cache cleaner must never commit).
+    ///
+    /// Rust's `std::fs::remove_dir_all` on modern platforms uses
+    /// `openat` + symlink-aware checks to refuse to follow
+    /// symlinks; this test pins that guarantee against a regression
+    /// that reached for `fs::remove_dir` (which follows) or hand-
+    /// rolled a recursive walk that followed links.
+    #[test]
+    #[cfg(unix)]
+    fn clean_orphaned_tmp_dirs_leaves_symlink_entry() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create the real target directory OUTSIDE the cache root
+        // — the test asserts the target's contents survive even
+        // though the symlink shares the tempdir-like name + dead
+        // pid.
+        let target_root = TempDir::new().unwrap();
+        let target_file = target_root.path().join("sentinel.txt");
+        std::fs::write(&target_file, b"must-not-be-deleted").unwrap();
+
+        let dead_pid = libc::pid_t::MAX;
+        let symlink = tmp
+            .path()
+            .join(format!("{TMP_DIR_PREFIX}symkey-{dead_pid}"));
+        std::os::unix::fs::symlink(target_root.path(), &symlink).unwrap();
+
+        clean_orphaned_tmp_dirs(tmp.path()).unwrap();
+
+        // Either the symlink itself was removed (modern
+        // `remove_dir_all` removes the link without following) OR
+        // the symlink stayed (older `remove_dir_all` that errored
+        // on symlinks). The LOAD-BEARING invariant is that the
+        // TARGET's contents survive — the test's safety guarantee
+        // is "data outside the cache root is untouched", not
+        // "the symlink entry itself must survive".
+        assert!(
+            target_file.exists(),
+            "symlink target's contents must survive the scan — \
+             following symlinks would delete unrelated state \
+             outside the cache root, a critical security / data- \
+             safety regression",
+        );
+        assert_eq!(
+            std::fs::read(&target_file).unwrap(),
+            b"must-not-be-deleted",
+            "target file content must be unchanged",
+        );
+    }
+
     // -- validate_cache_key unit tests --
 
     #[test]

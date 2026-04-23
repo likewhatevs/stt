@@ -373,6 +373,28 @@ pub enum FlockMode {
 /// Returns the OwnedFd on success, None on EWOULDBLOCK, or
 /// propagates other errors. Uses rustix so file descriptor ownership
 /// and errno handling are not open-coded per call.
+///
+/// # NFS limitation
+///
+/// `path` is expected to resolve to a LOCAL filesystem (ext4, xfs,
+/// btrfs, tmpfs, …). `flock(2)` on an NFS mount is advisory-only
+/// under older NFS server configurations and, depending on the
+/// Linux-kernel version + server combination, can silently succeed
+/// without actually serializing peers — two concurrent runs both
+/// get `OwnedFd` back and both believe they own the lock. The
+/// default path prefix `/tmp/ktstr-*.lock` is tmpfs on typical
+/// distros, which is always local. Operators who mount `/tmp`
+/// over NFS (a setup ktstr does not support) get an unreliable
+/// serialization contract; this function does not detect that
+/// case.
+///
+/// A more defensive implementation could `statfs(path)` and bail
+/// with `NFS_SUPER_MAGIC == 0x6969` before even opening the
+/// file. That change is intentionally deferred — the extra syscall
+/// per lock acquisition pays a constant-time cost for every ktstr
+/// run to defend against an uncommon misconfiguration. If this
+/// limitation bites a real deployment, the check lives in one
+/// place (here) and can land as a one-liner.
 fn try_flock(path: &str, mode: FlockMode) -> Result<Option<std::os::fd::OwnedFd>> {
     use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
 

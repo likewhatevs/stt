@@ -4301,6 +4301,63 @@ mod tests {
         assert!(entries_require_model(entries.iter().copied()));
     }
 
+    /// LlmExtract workload in NON-first position within a
+    /// multi-workload slice. The sibling
+    /// `entries_require_model_workload_llm_extract_returns_true`
+    /// exercises a single-element workloads array — a regression
+    /// that short-circuited on `workloads[0]` alone (instead of
+    /// `.any()`) would still pass that test. This test
+    /// configures the LlmExtract workload at index 1, preceded by
+    /// a non-LLM exit-code workload, so a first-only scan returns
+    /// `false` and trips the assertion.
+    #[test]
+    fn entries_require_model_workload_llm_extract_non_first_position() {
+        let workloads: &[&Payload] = &[
+            &EXIT_CODE_BINARY_PAYLOAD,
+            &LLM_EXTRACT_BINARY_PAYLOAD,
+        ];
+        let entry = KtstrTestEntry {
+            name: "llm_workload_non_first",
+            payload: Some(&EXIT_CODE_BINARY_PAYLOAD),
+            workloads,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let entries = [&entry];
+        assert!(
+            entries_require_model(entries.iter().copied()),
+            "LlmExtract workload at NON-first position must still \
+             trip the predicate. A regression that short-circuited \
+             on workloads[0] alone instead of `.any()` over the \
+             full slice would fail here.",
+        );
+    }
+
+    /// Three workloads, LlmExtract at the TAIL. Belt-and-suspenders
+    /// variant of the non-first-position test: exercises the
+    /// "must scan all the way to the end" path, catching a
+    /// regression that bounded the scan to a fixed prefix (e.g.
+    /// `workloads.iter().take(2).any(...)`).
+    #[test]
+    fn entries_require_model_workload_llm_extract_tail_position() {
+        let workloads: &[&Payload] = &[
+            &EXIT_CODE_BINARY_PAYLOAD,
+            &EXIT_CODE_BINARY_PAYLOAD,
+            &LLM_EXTRACT_BINARY_PAYLOAD,
+        ];
+        let entry = KtstrTestEntry {
+            name: "llm_workload_tail",
+            payload: Some(&EXIT_CODE_BINARY_PAYLOAD),
+            workloads,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let entries = [&entry];
+        assert!(
+            entries_require_model(entries.iter().copied()),
+            "LlmExtract workload at the TAIL must trip the predicate; \
+             a regression that bounded the scan to a prefix would fail here",
+        );
+    }
+
     /// A model response with no JSON region at all (plain prose)
     /// must route through the `Ok(Vec::new())` branch — the fallback
     /// for stochastic "model output was not parseable" runs. Pins
@@ -4330,6 +4387,100 @@ mod tests {
         assert!(
             got.is_empty(),
             "empty response must produce an empty Metric list, got: {got:?}",
+        );
+    }
+
+    /// Valid JSON but NO numeric leaves — every value is a string,
+    /// bool, or null. The walker skips non-numeric leaves, so the
+    /// returned Vec is empty even though the `Some(json)` arm
+    /// fires. Pins the distinction between "couldn't find JSON"
+    /// (empty via the fallback branch) and "found JSON but nothing
+    /// to extract" (empty via the walker's filter) — both paths
+    /// end at an empty Vec but are DIFFERENT in tracing and future-
+    /// diagnostic surfaces. A regression that cast strings to 0.0
+    /// or stamped a sentinel on boolean leaves would fail here.
+    #[test]
+    fn parse_llm_response_valid_json_non_numeric_leaves_returns_empty() {
+        let got = parse_llm_response(
+            r#"{"status": "ok", "ready": true, "note": null, "label": "p99_latency"}"#,
+            crate::test_support::MetricStream::Stdout,
+        );
+        assert!(
+            got.is_empty(),
+            "valid JSON with only non-numeric leaves (strings / \
+             bools / nulls) must produce an empty Metric list — \
+             the walker's numeric filter is the gate; got: {got:?}",
+        );
+    }
+
+    /// Root JSON array rather than the expected object. The
+    /// walker's leaf traversal must still surface every numeric
+    /// element by its array-index path (`[0]`, `[1]`, …) — pins
+    /// that the walker does not hard-code "root must be object".
+    /// A regression that required `Value::Object` at the top would
+    /// return empty on this input.
+    #[test]
+    fn parse_llm_response_root_array_with_numeric_elements() {
+        let got = parse_llm_response(
+            r#"[1, 2.5, "label", 3]"#,
+            crate::test_support::MetricStream::Stdout,
+        );
+        // Three numeric elements ("label" is filtered). The exact
+        // metric names depend on the walker's dotted-path
+        // convention, so pin the COUNT (>= 3) rather than the
+        // names — a dotted-path rename is a non-regression; a
+        // root-object hardcode would drop to 0 here.
+        assert!(
+            got.len() >= 3,
+            "root-array JSON with 3 numeric elements must produce \
+             at least 3 metrics; got {} — is the walker requiring \
+             a root object?; metrics: {got:?}",
+            got.len(),
+        );
+    }
+
+    /// Multiple JSON regions in one response (e.g. a preamble
+    /// object followed by a conversational tail and then another
+    /// object). The current contract uses
+    /// `find_and_parse_json` which scans for the FIRST valid
+    /// JSON region and returns it; subsequent regions are
+    /// ignored. This test pins that "first JSON wins" invariant so
+    /// a future refactor that tried to merge / concatenate
+    /// multiple regions would have to update this pin explicitly —
+    /// a silent merge could produce nonsensical metric overlaps
+    /// from a model that emits an outline followed by the real
+    /// payload.
+    #[test]
+    fn parse_llm_response_multiple_json_regions_first_wins() {
+        let got = parse_llm_response(
+            r#"prose preamble {"iops": 100} middle prose {"iops": 999, "latency": 5}"#,
+            crate::test_support::MetricStream::Stdout,
+        );
+        assert!(
+            !got.is_empty(),
+            "must find at least the first JSON region; got empty",
+        );
+        // The first region has ONE numeric leaf (iops=100). The
+        // second region has TWO (iops=999, latency=5). If the
+        // walker merged, we'd see 2+ metrics and `iops` would
+        // either be 100 (first wins) or 999 (last wins) depending
+        // on merge order. First-JSON-wins means exactly one metric
+        // with value 100.
+        let iops = got.iter().find(|m| m.name == "iops");
+        assert!(iops.is_some(), "iops metric must be present; got: {got:?}");
+        assert_eq!(
+            iops.unwrap().value,
+            100.0,
+            "first-JSON-wins: iops must come from the first region (100), \
+             not the second (999). A regression that merged regions or \
+             switched to last-wins would surface here.",
+        );
+        // The second region's `latency` must NOT appear — confirmation
+        // that the second region was not parsed.
+        assert!(
+            got.iter().all(|m| m.name != "latency"),
+            "latency metric must NOT be present — it lives in the \
+             second JSON region, which first-wins ignores; got: {got:?}",
         );
     }
 

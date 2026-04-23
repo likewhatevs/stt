@@ -86,6 +86,59 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
+// Host-to-guest observable-action integration test.
+//
+// Exercises the full loop:
+//   1. HOST writes into the guest's BPF `.bss` map via the KVM
+//      memslot path (`BpfMapAccessor::write_value_u32` dispatched
+//      from `vmm::bpf_map_write_thread`).
+//   2. GUEST scheduler's BPF dispatcher reads the new `stall` value
+//      from its `.bss` section on the next dispatch entry (line 93
+//      of main.bpf.c: `if (stall) return;`).
+//   3. GUEST ACTS: the scheduler stops inserting tasks into DSQs,
+//      every CPU sits idle, the scx watchdog observes no progress
+//      within its budget and tears the scheduler down (emitted
+//      via the `SchedulerDied` assert detail the runtime records).
+//   4. HOST CONFIRMS: the scenario returns a failing AssertResult
+//      carrying the scheduler-died signal; `expect_err: true`
+//      inverts the verdict so "fails as expected" is the PASS
+//      state.
+//
+// Differs from the existing BPF-NOOP test (value=0 over a field
+// already 0) — that proves the API pipeline LINKS, this proves
+// the pipeline's WRITE is OBSERVED by the guest and produces
+// distinct guest behaviour. Differs from `cover_watchdog_forced_stall`
+// which achieves the same stall via the scheduler's
+// `--stall-after` CLI flag (a scheduler-internal timer, no host
+// write): that path tests the scheduler's self-stall plumbing,
+// this path tests the host→guest map-write plumbing.
+//
+// `watchdog_timeout` is set short (2 s) so the stall-detection
+// fires quickly; `duration` is longer so the watchdog has room
+// to fire inside the scenario window rather than racing the
+// natural scenario end.
+static BPF_STALL_HOST_WRITE: BpfMapWrite = BpfMapWrite {
+    map_name_suffix: ".bss",
+    offset: 0, // stall @ main.bpf.c line 14
+    value: 1,
+};
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_BPF_HOST_WRITE_STALLS: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "sched_host_bpf_map_write_stalls_scheduler",
+        func: scenario_bpf_api,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        auto_repro: false,
+        bpf_map_write: &[&BPF_STALL_HOST_WRITE],
+        watchdog_timeout: std::time::Duration::from_secs(2),
+        duration: std::time::Duration::from_secs(10),
+        performance_mode: true,
+        expect_err: true,
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
+
 /// Positive benchmarking test: scx-ktstr under performance_mode passes
 /// min_iteration_rate and max_gap_ms gates.
 #[ktstr_test(

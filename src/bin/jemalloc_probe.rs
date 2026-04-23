@@ -755,6 +755,17 @@ enum ThreadResult {
         /// as `comm`. Additive-safe per the `SCHEMA_VERSION`
         /// contract: a consumer that ignores the field keeps its
         /// tid-only keying.
+        ///
+        /// Capture-timing on the `Ok` arm: the value observed
+        /// here was read from `/proc/<pid>/task/<tid>/stat`
+        /// BEFORE `process_vm_readv` succeeded. Because the probe
+        /// reached a usable counter-read, the tid was demonstrably
+        /// alive for at least the interval spanning the stat
+        /// read, the ptrace attach (slow path) or direct
+        /// `process_vm_readv` (fast path), and the counter read
+        /// itself. A `Some(starttime)` on the Ok arm therefore
+        /// reliably identifies the thread that owns the observed
+        /// counters — the composite key is trustworthy.
         #[serde(skip_serializing_if = "Option::is_none")]
         start_time_jiffies: Option<u64>,
         allocated_bytes: u64,
@@ -775,6 +786,26 @@ enum ThreadResult {
         /// reuse, so diff tooling keying on `(tid, start_time)`
         /// distinguishes a racing re-spawn from a persistent
         /// failure.
+        ///
+        /// Capture-timing on the `Err` arm — the subtle
+        /// difference from the `Ok` arm: the stat read ran
+        /// identically (pre-probe), but the probe itself
+        /// FAILED. That means the tid was alive at the stat
+        /// read, then something went wrong — EPERM (permission
+        /// denied), ESRCH (tid exited mid-probe), etc. On a
+        /// race-exit path the `start_time_jiffies` captured here
+        /// is the starttime of the thread that WAS alive at the
+        /// stat read but is NO LONGER alive at the probe; a
+        /// future probe run against the same pid may observe the
+        /// same tid with a DIFFERENT starttime (pid recycled)
+        /// and keying on `(tid, start_time)` will correctly
+        /// distinguish the two lifetimes. In other words: Ok's
+        /// starttime identifies "the thread we measured"; Err's
+        /// starttime identifies "the thread we TRIED to measure,
+        /// and may or may not still exist at the time of
+        /// downstream consumption." Both are useful for diff
+        /// tooling, but the Err arm's identity is inherently
+        /// more volatile.
         #[serde(skip_serializing_if = "Option::is_none")]
         start_time_jiffies: Option<u64>,
         /// Human-readable error rendering for log / stderr paths.
@@ -2048,6 +2079,37 @@ fn read_thread_start_time(pid: i32, tid: i32) -> Option<u64> {
 /// trailing newline or appended content cannot let `rfind(')')`
 /// latch onto a `)` past the single `stat` record and misalign the
 /// field index.
+///
+/// Concrete multi-line edge cases this guard covers:
+///   - **Trailing `\n`**: `read_to_string` returns `"PID (comm)
+///     S … starttime …\n"`. `lines().next()` strips the newline
+///     and `rfind(')')` still lands on the comm close-paren.
+///     Without `lines().next()` the `rfind` would skip over
+///     nothing new (the newline has no `)` after it) and be
+///     harmless in practice, but keeps the contract explicit.
+///   - **CRLF line endings**: unlikely in `/proc` but possible
+///     if a test fixture writes CRLF text. `str::lines()`
+///     handles both `\n` and `\r\n`; taking `.next()` strips
+///     the carriage return too.
+///   - **Appended content with embedded `)`**: if a future
+///     kernel (or a reader that concatenates multiple stat
+///     records) emits `"PID (comm) … starttime\nother record
+///     with )"`, the naive `rfind(')')` on the full buffer
+///     would latch onto the `)` in the second line and
+///     mis-index field 22. `lines().next()` pins us to the
+///     first line so the second line's `)` is invisible.
+///   - **Fixture that pads with whitespace lines**:
+///     `"PID (comm) …\n  \n"` — `lines().next()` returns the
+///     first non-empty line (actually the first `\n`-delimited
+///     line, which may itself be the empty string if the input
+///     starts with a newline — `rfind(')')` then returns `None`
+///     and the parser safely yields `None`).
+///   - **Single-line input with no trailing newline**: the
+///     common `/proc` shape. `lines().next()` returns the whole
+///     buffer and the parser runs unchanged.
+/// Each edge case either produces the correct `starttime` value
+/// or a safe `None` return, never a latent misalignment that
+/// yields a plausible-looking wrong integer.
 fn parse_start_time_from_stat(raw: &str) -> Option<u64> {
     let line = raw.lines().next()?;
     let last_close = line.rfind(')')?;
@@ -2112,7 +2174,7 @@ enum RunOutcome {
 /// `anyhow::Error`. Adding a new kind is always safe; removing or
 /// renaming one breaks downstream test consumers that pin the
 /// substring, so [`FatalKind::tag`] is the wire contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 enum FatalKind {
     /// `/proc/<pid>` does not exist at run start — the target pid
     /// was never live, or exited before the probe opened it.
@@ -2248,6 +2310,28 @@ fn take_snapshot(
     // second) and immune to wall-clock jumps.
     let timestamp_unix_sec = now_unix_sec();
     let elapsed_since_start_ns = run_start.elapsed().as_nanos() as u64;
+    // Empty-`threads` contract: if every tid exited between
+    // `iter_task_ids` upstream (which fed this `tids` slice) and
+    // the first `probe_single_thread` call here, the loop below
+    // still runs zero iterations and the emitted `Snapshot`
+    // carries `threads: vec![]`. That is NOT an error — it is
+    // the legitimate "all observations raced the reap" outcome.
+    // Downstream classification distinguishes it from per-tid
+    // errors: `all_failed` returns `true` on an empty slice
+    // (vacuous truth), which funnels into
+    // `multi_snapshot_all_failed` → `RunOutcome::AllFailed` /
+    // exit code 1 only when EVERY snapshot in the run is empty
+    // or all-Err. A single empty snapshot in the middle of an
+    // otherwise-populated run surfaces as `RunOutcome::Ok` with
+    // the empty entry preserved — consumers key on the empty
+    // `threads` vec to detect "snapshot covered zero threads"
+    // as distinct from "snapshot covered N threads, all
+    // errored". The tid list itself can grow or shrink between
+    // snapshots, so consumers doing index-wise diffing across
+    // `snapshots[*].threads` must NOT assume a constant
+    // cardinality; see the `ProbeOutput` doc for the
+    // per-snapshot enumeration contract.
+    //
     // Evict cache entries for tids that are no longer in the live
     // enumeration BEFORE any lookups this snapshot. An exited tid
     // eventually drops out of `/proc/<pid>/task/`; the kernel may
@@ -3017,12 +3101,7 @@ fn main() {
             if let Some(path) = cli.sidecar.as_deref()
                 && let Err(e) = append_probe_output_to_sidecar(path, &out, 0)
             {
-                eprintln!(
-                    "error appending to sidecar {} (probe output already \
-                     printed to stdout; exit 3 distinguishes \
-                     sidecar-append failure from probe failure): {e:#}",
-                    path.display(),
-                );
+                eprintln!("sidecar append failed (exit 3): {}: {e:#}", path.display());
                 std::process::exit(3);
             }
         }
@@ -4919,6 +4998,73 @@ mod tests {
         );
     }
 
+    /// Pre-flock CLEANUP_REQUESTED gate: if the deadline / SIGINT /
+    /// SIGTERM flag was already flipped before
+    /// [`append_probe_output_to_sidecar`] enters its flock retry
+    /// loop, the loop body's first iteration observes the flag and
+    /// bails with the deadline-abort error message — no flock
+    /// syscall fires, no 30s wait, no partial sidecar write.
+    ///
+    /// This pins the flock-loop's cleanup-gate check that the
+    /// SIGALRM deadline mechanism depends on: setting
+    /// CLEANUP_REQUESTED from a parallel thread (or, as here, from
+    /// the same thread before entering) must produce a deterministic
+    /// bail regardless of whether the lock is currently contended.
+    ///
+    /// Uses an isolated tempdir so the lock file is uncontested —
+    /// the gate must fire BEFORE the flock call, not instead of it
+    /// on a contended path. Resets the flag in a RAII guard so this
+    /// test is reentrant with the rest of the suite (nextest
+    /// forks a fresh process per test by default, so in practice
+    /// the global state is already isolated — but the guard is
+    /// belt-and-braces against a future harness flip that shares
+    /// state across tests in the same binary).
+    #[test]
+    fn sidecar_append_bails_when_cleanup_requested_preflock() {
+        struct FlagGuard;
+        impl Drop for FlagGuard {
+            fn drop(&mut self) {
+                CLEANUP_REQUESTED.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = FlagGuard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-flock-bail.ktstr.json");
+        std::fs::write(&path, minimal_sidecar_json()).unwrap();
+        let out = probe_output_fixture();
+
+        // Flip the flag BEFORE calling append — the retry loop's
+        // first iteration must observe it and bail.
+        CLEANUP_REQUESTED.store(true, Ordering::SeqCst);
+        let err = append_probe_output_to_sidecar(&path, &out, 0)
+            .expect_err("flock retry loop must bail when CLEANUP_REQUESTED is set");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("aborted by probe deadline"),
+            "expected deadline-abort bail message, got: {msg}",
+        );
+        assert!(
+            msg.contains("flock(LOCK_EX)"),
+            "bail message must name the flock phase so operators know which \
+             retry loop fired; got: {msg}",
+        );
+
+        // Lock file must NOT have been created — the `open`
+        // happens before the loop, but the actual `flock` syscall
+        // never ran. Well — `open(CREATE | RDWR | CLOEXEC)` did
+        // create the file before the gate fires (per the
+        // `flock` API shape, we need a fd to lock), so the file
+        // existing is fine; the important invariant is that the
+        // SIDECAR itself was NOT modified.
+        let re_read = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            re_read,
+            minimal_sidecar_json(),
+            "sidecar contents must be unchanged when the flock gate fires",
+        );
+    }
+
     /// Probe-specific polarity / unit hints: byte-counter metrics get
     /// `LowerBetter` + `bytes`; everything else keeps the walker's
     /// `Unknown` + empty-unit defaults. Pins the hint surface so a
@@ -5137,6 +5283,60 @@ mod tests {
         assert_eq!(FatalKind::Other.tag(), "other");
     }
 
+    /// Compile-time exhaustiveness guard: every [`FatalKind`]
+    /// variant must be covered by [`FatalKind::tag`] and must
+    /// return a non-empty, lowercase-kebab-case token.
+    ///
+    /// The `match` inside `tag()` is already exhaustive without
+    /// a `_` arm, so adding a new variant without a matching arm
+    /// is a build-time error. This test piles on TWO additional
+    /// guards on top:
+    ///
+    /// 1. Via `strum::EnumIter`, iterate every variant and call
+    ///    `.tag()`. Asserts non-empty + all ASCII lowercase /
+    ///    digits / hyphens (the wire shape downstream consumers
+    ///    rely on). A future variant whose `tag()` returns `""`
+    ///    or `"SomeCamelCase"` trips this assertion at runtime,
+    ///    before external consumers see the drift.
+    /// 2. A `match` in this test body, also exhaustive without
+    ///    `_`, mirrors the `tag()` match structurally. Adding a
+    ///    new variant forces an update HERE too — two
+    ///    independent compile-time requirements catch a drift
+    ///    that a reviewer might fix in one site but forget the
+    ///    other.
+    #[test]
+    fn fatal_kind_exhaustiveness_compile_time_guard() {
+        use strum::IntoEnumIterator;
+
+        let mut count = 0;
+        for kind in FatalKind::iter() {
+            let tag = kind.tag();
+            assert!(!tag.is_empty(), "FatalKind::{kind:?}.tag() returned empty string");
+            assert!(
+                tag.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "FatalKind::{kind:?}.tag() = {tag:?} must be lowercase-kebab-case \
+                 (only [a-z0-9-]) per the ktstr-probe-fatal: wire contract",
+            );
+            // Second compile-time guard: this match is exhaustive
+            // without `_`. Adding a new FatalKind variant fails
+            // compilation here, forcing the author to update the
+            // test in lockstep with the enum.
+            match kind {
+                FatalKind::PidMissing
+                | FatalKind::ExeIdentityChanged
+                | FatalKind::NotJemalloc
+                | FatalKind::Other => {}
+            }
+            count += 1;
+        }
+        assert!(
+            count >= 4,
+            "FatalKind::iter() produced fewer variants than the four pinned in \
+             `fatal_kind_tag_strings_pinned`; strum::EnumIter drift suspected"
+        );
+    }
+
     /// [`probe_single_thread`] fast-path routing pin: when
     /// `cached_thread_pointer = Some(_)` is passed, the function
     /// MUST skip the ptrace seize/interrupt/wait/getregset dance
@@ -5224,6 +5424,77 @@ mod tests {
         }
         s.push_str(" 987654321 rest of line ignored");
         assert_eq!(parse_start_time_from_stat(&s), Some(987654321));
+    }
+
+    /// Empty input: no bytes at all. `lines().next()` returns
+    /// either `None` (truly empty) or `Some("")` (input is just
+    /// the empty string) — either way `rfind(')')` on the empty
+    /// line yields `None` and the parser returns `None` without
+    /// panicking or reading past the end of the slice.
+    #[test]
+    fn start_time_parser_empty_input_returns_none() {
+        assert_eq!(parse_start_time_from_stat(""), None);
+    }
+
+    /// No `)` anywhere in the first line: either the comm field
+    /// was somehow emitted without its wrapping parens (malformed
+    /// /proc output) or the input is not a /proc/stat record.
+    /// `rfind(')')` returns `None`; parser safely returns `None`.
+    /// Guards against a future `String::rfind` that might be
+    /// refactored into a different search primitive with
+    /// different failure semantics.
+    #[test]
+    fn start_time_parser_no_close_paren_returns_none() {
+        assert_eq!(
+            parse_start_time_from_stat("1234 comm_without_parens S 0 0 0 0"),
+            None,
+        );
+    }
+
+    /// `)` exists but is followed by nothing (no state, no
+    /// numeric fields). The tail past the last `)` is an empty
+    /// string, the field iterator returns `None` on its first
+    /// `fields.next()?`, and the parser returns `None`.
+    #[test]
+    fn start_time_parser_nothing_after_close_paren_returns_none() {
+        assert_eq!(parse_start_time_from_stat("1234 (comm)"), None);
+    }
+
+    /// Fewer than 20 whitespace-separated tokens after the last
+    /// `)`: the field-skip loop hits `fields.next()? → None`
+    /// before reaching offset 19. Parser returns `None` safely
+    /// instead of silently returning whichever token DID land at
+    /// `nth(N < 19)` — a prior implementation that did not use
+    /// `?` would have silently misaligned.
+    #[test]
+    fn start_time_parser_too_few_fields_returns_none() {
+        // Only 10 tokens after `)` — half of what we need.
+        assert_eq!(
+            parse_start_time_from_stat("1234 (comm) S 1 2 3 4 5 6 7 8 9"),
+            None,
+        );
+    }
+
+    /// Field 22 exists but is not a valid `u64` (non-digit
+    /// contents, e.g. a placeholder token, a negative number,
+    /// or a garbage string). `parse::<u64>()` returns `Err` and
+    /// the parser returns `None` via the `.ok()` fold. Critical
+    /// — without this, a hypothetical future change to the
+    /// field semantics (say, field 22 flipped to a float or a
+    /// signed integer) would silently produce wrong starttime
+    /// values; `None` here forces the caller's Option-aware
+    /// consumption path instead of feeding garbage downstream.
+    #[test]
+    fn start_time_parser_non_numeric_field_22_returns_none() {
+        // Fields 4..21 are placeholders; field 22 is
+        // intentionally not a parseable u64.
+        let mut s = String::from("1234 (comm) S");
+        for i in 0..18 {
+            s.push(' ');
+            s.push_str(&i.to_string());
+        }
+        s.push_str(" not_a_number trailing garbage");
+        assert_eq!(parse_start_time_from_stat(&s), None);
     }
 
     // -- debuginfo discovery helpers (read_gnu_debuglink,

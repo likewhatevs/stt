@@ -180,6 +180,37 @@ fn worker_exits_4_on_ready_marker_write_fail() {
 /// stanza), so the generic `MALLOC_CONF` is not read by the
 /// in-process jemalloc copy. Setting both variants keeps the test
 /// robust against a future feature flip that unprefixes the symbols.
+///
+/// # Dependency on jemalloc-init-via-`std::env::args()`
+///
+/// This test's correctness rests on an implicit invariant in the
+/// worker binary's `main`: the FIRST call into any jemalloc-backed
+/// code path must occur AFTER the process's environment is
+/// readable. In the current worker, that first call is implicit —
+/// `std::env::args().skip(1).collect::<Vec<String>>()` at the top
+/// of `main` allocates a `Vec<String>`, which goes through
+/// `tikv_jemallocator::Jemalloc` (the `#[global_allocator]`) and
+/// forces jemalloc to initialize on the spot. The initializer
+/// reads `MALLOC_CONF` / `_RJEM_MALLOC_CONF` via
+/// `getenv()` / `__environ` exactly once during that first
+/// allocation, sees `background_thread:true`, and spawns the
+/// helper thread as part of init. By the time the worker reaches
+/// the `/proc/self/task` self-check, the helper is live, the
+/// thread count is ≥ 2, and the exit-3 branch fires.
+///
+/// A future refactor that (a) marks the env read as pre-main via
+/// a `ctor::ctor` constructor, (b) moves argv parsing into a
+/// no-alloc path (e.g. `argv.iter()` on a raw `&[&str]` provided
+/// by a shim), or (c) adds an `unsafe extern "C" fn main` that
+/// bypasses the Rust runtime's env initialization would BREAK this
+/// test in a subtle way: jemalloc would still initialize on some
+/// later allocation, but by then the env read could race the
+/// `/proc/self/task` scan and produce a flaky exit 3 ↔ exit 0
+/// result depending on thread scheduling. If you are the author of
+/// such a refactor, update this test to force the first allocation
+/// explicitly (e.g. via a `let _ = Vec::<u8>::with_capacity(1)` at
+/// the top of `main` under a `// jemalloc-init probe` comment) or
+/// switch to a more robust forcing mechanism.
 #[test]
 fn worker_exits_3_on_thread_count_not_one() {
     let worker = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");

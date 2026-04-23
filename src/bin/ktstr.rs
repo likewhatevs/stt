@@ -9,6 +9,8 @@ use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use ktstr::cgroup::CgroupManager;
 use ktstr::cli;
 use ktstr::cli::KernelCommand;
+use ktstr::host_state;
+use ktstr::host_state_compare;
 use ktstr::runner::Runner;
 use ktstr::scenario;
 use ktstr::topology::TestTopology;
@@ -177,6 +179,21 @@ enum Command {
         #[arg(long)]
         exec: Option<String>,
     },
+    /// Capture or compare a host-wide per-thread state snapshot.
+    ///
+    /// `capture` walks `/proc` at capture time and writes every
+    /// visible thread's cumulative scheduling, memory, and I/O
+    /// counters as zstd-compressed JSON (`.hst.zst`). Every
+    /// field is cumulative-from-birth so probe attachment time
+    /// does not bias the reading — a diff between two captures
+    /// measures exactly the activity over the window.
+    ///
+    /// `compare` joins two snapshots on `(pcomm, comm)` and
+    /// renders a per-metric baseline/candidate/delta table.
+    HostState {
+        #[command(subcommand)]
+        command: HostStateCommand,
+    },
     /// Generate shell completions for ktstr.
     Completions {
         /// Shell to generate completions for.
@@ -187,6 +204,23 @@ enum Command {
         #[arg(long, default_value = "ktstr")]
         binary: String,
     },
+}
+
+#[derive(Subcommand)]
+enum HostStateCommand {
+    /// Capture a host-wide per-thread snapshot to `<output>` as
+    /// zstd-compressed JSON. Walks `/proc` for every live tgid,
+    /// enumerates threads, records schedstat / sched / status
+    /// CSW / page faults / io bytes / affinity / cgroup / identity.
+    /// Per-cgroup aggregates (cpu.stat, memory.current) are
+    /// captured once per distinct path.
+    Capture {
+        /// Destination path (convention: `.hst.zst`).
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Compare two snapshots and render a per-metric diff table.
+    Compare(host_state_compare::HostStateCompareArgs),
 }
 
 /// RAII guard that cleans up an auto-generated cgroup directory on drop.
@@ -487,6 +521,19 @@ fn main() -> Result<()> {
                 exec.as_deref(),
             )?;
         }
+
+        Command::HostState { command } => match command {
+            HostStateCommand::Capture { output } => {
+                host_state::capture_to(&output)?;
+                eprintln!("ktstr: wrote host-state snapshot to {}", output.display());
+            }
+            HostStateCommand::Compare(args) => {
+                let code = host_state_compare::run_compare(&args)?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
+        },
 
         Command::Completions { shell, binary } => {
             run_completions(shell, &binary);

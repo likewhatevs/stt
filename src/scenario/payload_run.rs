@@ -1224,18 +1224,18 @@ fn spawn_error_context(err: std::io::Error, binary: &str) -> anyhow::Error {
     if err.kind() == std::io::ErrorKind::NotFound {
         anyhow::Error::new(err).context(format!(
             "spawn '{binary}': binary not found on guest PATH. \
-             Note: ENOENT on execve also fires when `{binary}` is a \
-             script whose `#!` shebang points at an interpreter that \
-             is missing in the guest (per execve(2)); in that case \
-             the error names the script but the missing file is the \
-             interpreter. Remediation: for CLI invocations (ktstr / \
-             cargo-ktstr shell, run, …), package every missing \
-             artifact with `-i {binary}` / `--include-files {binary}` \
-             (and `-i <interpreter>` if the script names one) so each \
-             lands on the guest PATH under `/include-files/`. For \
-             `#[ktstr_test]` entries, pre-install the binary AND its \
-             shebang interpreter in the base initramfs — the macro \
-             surface does not expose `-i`."
+             Remediation: for CLI invocations (ktstr / cargo-ktstr \
+             shell, run, …), package the binary with `-i {binary}` \
+             / `--include-files {binary}` so it lands on the guest \
+             PATH under `/include-files/`. For `#[ktstr_test]` \
+             entries, pre-install the binary in the base initramfs \
+             — the macro surface does not expose `-i`. If `{binary}` \
+             is a script, execve(2) ALSO returns ENOENT when the \
+             `#!` shebang names an interpreter missing from the \
+             guest (the error names the script but the missing \
+             file is the interpreter); package the interpreter \
+             the same way — `-i <interpreter>` for CLI, pre-install \
+             for `#[ktstr_test]`."
         ))
     } else {
         anyhow::Error::new(err).context(format!("spawn '{binary}'"))
@@ -3165,6 +3165,84 @@ mod tests {
     /// stdout attempt), so their attribution invariant is identical;
     /// one test exercises all three to close the fallback-shape
     /// coverage gap for the stream field specifically.
+    /// Positive control for the stream-attribution pin: when
+    /// stdout carries valid JSON that extracts cleanly, every
+    /// emitted metric's `stream` must tag `MetricStream::Stdout`
+    /// — NOT `Stderr`. The sibling
+    /// `stderr_fallback_tags_metrics_with_metric_stream_stderr`
+    /// covers the fallback (negative) side; this test closes the
+    /// symmetry gap. A regression that unconditionally stamped
+    /// `Stderr` on every Metric (or swapped the two
+    /// unconditionally) would trip the fallback test's value-
+    /// agnostic `== Stderr` assertion OR this test's inverse
+    /// `== Stdout` assertion — at least one of the two paths
+    /// has to change its stream tag direction to hide the bug.
+    ///
+    /// Exercises the happy path with both a minimal JSON object
+    /// and a multi-key JSON object, proving the attribution is
+    /// per-metric rather than per-document. A regression that
+    /// attributed based on document-level shape (e.g. "stream =
+    /// Stderr if multi-key") would fail on the second fixture.
+    #[test]
+    fn stdout_primary_tags_metrics_with_metric_stream_stdout() {
+        use crate::test_support::MetricStream;
+
+        for (label, stdout) in [
+            ("single-key", r#"{"iops": 4242}"#.to_string()),
+            (
+                "multi-key",
+                r#"{"iops": 1000, "latency_us": 42, "runs": 3}"#.to_string(),
+            ),
+        ] {
+            let output = SpawnOutput {
+                stdout,
+                // stderr carries a distinct value so a regression
+                // that merged the streams (or used stderr despite
+                // stdout winning) would surface a wrong-valued
+                // metric here alongside the wrong stream tag.
+                stderr: r#"{"iops": 9999999}"#.to_string(),
+                exit_code: 0,
+            };
+            let (_, pm) = evaluate(&JSON_PAYLOAD, &[], output);
+            assert!(
+                !pm.metrics.is_empty(),
+                "[{label}] stdout-primary must produce metrics",
+            );
+            for m in &pm.metrics {
+                assert_eq!(
+                    m.stream,
+                    MetricStream::Stdout,
+                    "[{label}] stdout-extracted metric `{name}` must \
+                     carry MetricStream::Stdout; got stream={stream:?}. \
+                     A regression that mis-tagged stdout-sourced \
+                     metrics as Stderr (or merged the streams) would \
+                     trip here — the stderr-fallback sibling test \
+                     covers the inverse direction.",
+                    name = m.name,
+                    stream = m.stream,
+                );
+            }
+            // Stream-independence: the `iops` value MUST come from
+            // stdout (4242 / 1000), not stderr (9999999). A
+            // regression that pulled from the wrong stream would
+            // both mis-tag AND mis-value, but the value check is
+            // the ground-truth that the stream tag then describes.
+            let iops = pm
+                .metrics
+                .iter()
+                .find(|m| m.name == "iops")
+                .expect("iops metric must be present");
+            assert!(
+                iops.value < 9_000_000.0,
+                "[{label}] iops value {val} must come from stdout \
+                 (< 9M) not stderr (9999999); a value from stderr \
+                 would prove the test's stream tag is accidentally \
+                 correct because the merge went the wrong way",
+                val = iops.value,
+            );
+        }
+    }
+
     #[test]
     fn stderr_fallback_tags_metrics_with_metric_stream_stderr() {
         use crate::test_support::MetricStream;

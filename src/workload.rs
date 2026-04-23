@@ -7660,6 +7660,77 @@ mod tests {
         assert!(!WorkType::page_fault_churn(4096, 256, 64).needs_cache_buf());
     }
 
+    /// Overflow-path pin: when `region_kb * 1024` overflows `usize`
+    /// (the configured value is so large that the page-fault region
+    /// size cannot be represented), the worker's outer loop hits
+    /// the `checked_mul` None arm, emits the `tracing::warn!`, and
+    /// `break`s without doing any page-fault work. The worker
+    /// still terminates cleanly and reports 0 iterations — no
+    /// mmap, no segfault, no hang.
+    ///
+    /// Spawns a single worker with `region_kb = usize::MAX` so the
+    /// multiplication overflows on every pointer width we support
+    /// (32-bit: MAX*1024 overflows immediately; 64-bit: MAX*1024
+    /// also overflows). Runs briefly, asserts the worker's
+    /// `iterations` is 0 — proof the outer loop broke out before
+    /// the first page-fault cycle ran. The worker report still
+    /// arrives (proving `stop_and_collect` sees a graceful exit
+    /// on this path, not a signal kill).
+    ///
+    /// Pairs with [`page_fault_churn_from_name_defaults`] which
+    /// pins the happy path — together they pin both ends of the
+    /// region_size validity domain.
+    #[test]
+    fn page_fault_churn_region_kb_overflow_worker_exits_cleanly() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            affinity: AffinityMode::None,
+            // `region_kb = usize::MAX` — `usize::MAX * 1024`
+            // overflows on both 32-bit and 64-bit usize, so
+            // `checked_mul` returns None and the outer loop
+            // `break`s immediately. `touches_per_cycle` and
+            // `spin_iters` are ignored by that path.
+            work_type: WorkType::PageFaultChurn {
+                region_kb: usize::MAX,
+                touches_per_cycle: 16,
+                spin_iters: 32,
+            },
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        h.start();
+        // Give the worker a short window to spin through its
+        // spawn handshake + outer-loop entry + break. 100 ms is
+        // comfortably more than the sub-millisecond path the
+        // overflow arm runs, while keeping the test fast.
+        std::thread::sleep(Duration::from_millis(100));
+        let reports = h.stop_and_collect();
+        assert_eq!(reports.len(), 1, "exactly one worker was spawned");
+        let r = &reports[0];
+        // `iterations` is the outer-loop counter: 0 means the
+        // worker hit the `break` BEFORE any page-fault cycle
+        // completed, which is the overflow path.
+        assert_eq!(
+            r.iterations, 0,
+            "worker with overflowing region_kb must break out of the outer loop \
+             without completing any page-fault cycle; got iterations={}",
+            r.iterations,
+        );
+        // `work_units` may be 0 (spin_burst inside the overflow
+        // arm never ran) OR a tiny positive value if the worker
+        // took an unrelated iteration through the outer loop —
+        // but under this config only PageFaultChurn is selected
+        // so spin_burst before the overflow break is not
+        // reachable. Assert exact zero to pin the overflow path's
+        // no-op guarantee.
+        assert_eq!(
+            r.work_units, 0,
+            "overflow path must not increment work_units; got {}",
+            r.work_units,
+        );
+    }
+
     /// Guards three invariants of [`WorkType::PageFaultChurn`]:
     ///
     /// 1. Every spawned worker produces non-zero `work_units` and

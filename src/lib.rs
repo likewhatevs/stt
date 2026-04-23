@@ -313,6 +313,8 @@ pub(crate) mod elf_strip;
 pub mod fetch;
 pub mod host_context;
 pub mod host_heap;
+pub mod host_state;
+pub mod host_state_compare;
 pub mod kernel_path;
 pub(crate) mod monitor;
 pub(crate) mod probe;

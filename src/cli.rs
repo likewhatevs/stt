@@ -2190,6 +2190,20 @@ fn warn(msg: &str) {
 static SPINNER_SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
     std::sync::Mutex::new(None);
 
+/// Tracks whether a [`Spinner`] is currently alive. `Spinner::start`
+/// flips this from `false` to `true`; `Drop` flips it back. A
+/// `debug_assert!` at start-time fires when the previous value was
+/// already `true`, catching nested `Spinner::start()` calls that
+/// would clobber [`SPINNER_SAVED_TERMIOS`]: the second `start` saves
+/// the outer spinner's ALREADY-ECHO-disabled termios, and the outer
+/// teardown then restores to the disabled state instead of the
+/// original. Release builds skip the check (the assertion compiles
+/// away) rather than panic in production; the flag is still
+/// maintained so a future `debug_assert` → `assert` upgrade would
+/// not need a second seam.
+static SPINNER_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Install a panic hook that restores stdin termios from
 /// [`SPINNER_SAVED_TERMIOS`] before the default panic handler prints.
 /// Called via [`std::sync::Once`] from [`Spinner::disable_echo`], so
@@ -2273,6 +2287,37 @@ impl Spinner {
     /// When stderr is not a TTY, no ProgressBar or ticker thread is
     /// created — all output methods fall back to plain `eprintln!`.
     pub fn start(msg: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        // Nesting rejection: a second `Spinner::start()` while
+        // another Spinner is still live would overwrite
+        // SPINNER_SAVED_TERMIOS with the ALREADY-ECHO-disabled
+        // termios that the outer spinner installed; the outer's
+        // Drop / teardown would then restore the disabled state
+        // instead of the pre-spinner state, leaving the terminal
+        // broken after both exit. `debug_assert!` catches the
+        // misuse under `cargo test` / `cargo nextest` without
+        // paying a release-mode cost. Release builds allow the
+        // nesting and accept the terminal-leakage risk (the
+        // alternative — panicking release binaries — would be
+        // worse than a terminal that needs `reset` after a crash
+        // path that was never exercised in testing). If nesting
+        // is genuinely needed in the future, flip this guard and
+        // add depth-aware save/restore logic to `teardown()`.
+        //
+        // The flag is swapped unconditionally at start (before the
+        // TTY-absence short-circuit) AND cleared in both Drop and
+        // the `is_hidden()` early-return below, so the invariant
+        // `SPINNER_ACTIVE == true iff a Spinner exists` holds
+        // across every exit path.
+        debug_assert!(
+            !SPINNER_ACTIVE.swap(true, std::sync::atomic::Ordering::SeqCst),
+            "Spinner::start called while another Spinner is already \
+             active. Nested spinners clobber SPINNER_SAVED_TERMIOS — \
+             the outer spinner's restore path would reset to the \
+             already-modified termios state instead of the original. \
+             If nesting is genuinely needed, refactor the save/restore \
+             path to depth-count before lifting this assertion.",
+        );
+
         if !stderr_color() {
             return Spinner {
                 pb: None,
@@ -2433,6 +2478,15 @@ impl Drop for Spinner {
         if let Some(pb) = self.pb.take() {
             pb.finish_and_clear();
         }
+        // Release the nesting guard. Paired with the `swap(true)` in
+        // `Spinner::start`: Drop fires exactly once per Spinner
+        // (owned value), so the flag returns to `false` and the
+        // next call to `start` can succeed. Unconditional store
+        // rather than a swap — a nested misuse already panicked
+        // under `debug_assert`, so the ordering of the counter
+        // value on the first observer side is less important than
+        // releasing the guard for the next legitimate caller.
+        SPINNER_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2628,6 +2682,123 @@ mod tests {
         // exercises that lifecycle end-to-end.
         let sp = Spinner::start("test");
         sp.finish("done");
+    }
+
+    /// Bootstrap gate for the source-form tests further down this
+    /// module (`eol_legend_emits_via_eprintln`,
+    /// `kernel_list_footer_ordering_pin`). Those tests use
+    /// `include_str!("cli.rs")` to scan the source for specific
+    /// function names — if the names are renamed and the tests
+    /// aren't updated, the source-pattern match silently shifts
+    /// semantics (a rename from `eol_legend_if_any` to
+    /// `eol_legend` would make the old `.find()` return `None`,
+    /// tripping an `.expect()` inside the dependent tests with a
+    /// message that doesn't clearly identify the rename as the
+    /// root cause).
+    ///
+    /// This test runs FIRST in the module (alphabetical / order
+    /// doesn't matter for nextest, but the test-name prefix
+    /// `_bootstrap_` reads well in failure output) and panics with
+    /// a loud, specific message if any of the expected function /
+    /// constant names is absent from the included source. A
+    /// rename that breaks the source-form tests fails here first,
+    /// with a message that tells the maintainer exactly which
+    /// source-form test needs updating.
+    ///
+    /// Also validates that the file LOADS — a nonexistent
+    /// `cli.rs` or a build-time `include_str!` path regression
+    /// would fail at compile time, but an empty file or one
+    /// without a newline could technically compile and then
+    /// break the `.find()` scans in unexpected ways.
+    #[test]
+    fn _bootstrap_source_form_tests_can_find_expected_identifiers() {
+        let src = include_str!("cli.rs");
+        assert!(
+            !src.is_empty(),
+            "include_str!(\"cli.rs\") yielded empty bytes — source-form \
+             tests downstream would silently match against an empty \
+             string and produce false-pass results",
+        );
+
+        // Every identifier the source-form tests reference. Grouped
+        // by which test depends on which name so a failure points
+        // directly at the affected downstream test.
+        //
+        // Format: (test_name_that_needs_this, identifier).
+        const REQUIRED: &[(&str, &str)] = &[
+            // `eol_legend_emits_via_eprintln` scans for each of the
+            // four *_if_any helpers' call sites.
+            ("eol_legend_emits_via_eprintln", "eol_legend_if_any"),
+            ("eol_legend_emits_via_eprintln", "untracked_legend_if_any"),
+            ("eol_legend_emits_via_eprintln", "stale_legend_if_any"),
+            ("eol_legend_emits_via_eprintln", "corrupt_footer_if_any"),
+            // `kernel_list_footer_ordering_pin` locates the fn body
+            // via the signature string.
+            (
+                "kernel_list_footer_ordering_pin",
+                "pub fn kernel_list(json: bool)",
+            ),
+        ];
+
+        let mut missing: Vec<(&str, &str)> = Vec::new();
+        for (dependent_test, needle) in REQUIRED {
+            if !src.contains(needle) {
+                missing.push((*dependent_test, *needle));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "source-form tests reference identifiers that are no \
+             longer present in cli.rs. Update each listed test to \
+             match the current source OR restore the missing name \
+             to cli.rs:\n{}",
+            missing
+                .iter()
+                .map(|(t, n)| format!("  - test `{t}` needs `{n}`"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    /// Nesting guard pin: starting a second Spinner while another is
+    /// live must panic under `debug_assert!`. Exercises the
+    /// SPINNER_ACTIVE swap — without the guard, the inner spinner
+    /// would stash the outer's already-ECHO-disabled termios into
+    /// SPINNER_SAVED_TERMIOS, and the outer's teardown would restore
+    /// to that broken state instead of the pre-spinner original.
+    ///
+    /// `#[should_panic]` is gated on `debug_assertions` because the
+    /// assertion compiles away in release builds; running the test
+    /// without the debug gate under a release harness would make
+    /// the test fail when the expected panic doesn't fire. The
+    /// sibling `spinner_start_releases_guard_on_drop` test covers
+    /// the happy path (non-nested sequential spinners) and runs
+    /// under both profiles.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Spinner::start called while another Spinner is already active")]
+    fn spinner_nested_start_panics_under_debug_assertions() {
+        let _outer = Spinner::start("outer");
+        // This call must fire the debug_assert! — the outer is
+        // still live in scope. The test framework captures the
+        // panic via `#[should_panic]`.
+        let _inner = Spinner::start("inner");
+    }
+
+    /// Happy path paired with the nesting-panic test: starting two
+    /// spinners SEQUENTIALLY (with the first dropped before the
+    /// second starts) must succeed. Guards against a regression that
+    /// forgot to clear SPINNER_ACTIVE in Drop and would one-shot the
+    /// guard after a single use.
+    #[test]
+    fn spinner_start_releases_guard_on_drop() {
+        {
+            let _sp = Spinner::start("first");
+            // Drop at end of block.
+        }
+        // After the first Spinner is dropped, the guard must be
+        // cleared so a fresh start succeeds without panicking.
+        let _sp = Spinner::start("second");
     }
 
     // -- drain_lines_lossy --
@@ -5241,6 +5412,62 @@ mod tests {
             .find("\n}\n")
             .expect("kernel_list body must close with a top-level `}`");
         let body = &tail[..body_end_rel];
+
+        // Bootstrap assert: validate the slice really is the full
+        // `kernel_list` body, not a truncation at the first inner
+        // `\n}\n` match. Three checks catch the ways this can go
+        // wrong:
+        //
+        // 1. The body must start with the signature we scanned
+        //    for — a null-match above would leave `body` pointing
+        //    inside some unrelated function.
+        // 2. Braces must balance. An inner `}` followed by `\n`
+        //    inside an `if`/`match`/loop closes a nested scope,
+        //    not the fn — if the scanner stopped there, the
+        //    counted opens will exceed the counted closes by at
+        //    least one.
+        // 3. The slice must NOT contain `\nfn ` or `\npub fn ` at
+        //    a top-level column — any of those would mean the
+        //    scanner walked past `kernel_list`'s end and swallowed
+        //    a sibling fn, which would let unrelated helpers leak
+        //    into the four-ordering check below.
+        assert!(
+            body.starts_with("pub fn kernel_list(json: bool)"),
+            "bootstrap: body must start with the scanned signature; \
+             got prefix: {:?}",
+            &body[..body.len().min(64)],
+        );
+        let opens = body.bytes().filter(|&b| b == b'{').count();
+        let closes = body.bytes().filter(|&b| b == b'}').count();
+        assert_eq!(
+            opens,
+            closes + 1,
+            "bootstrap: kernel_list body must have exactly one \
+             unmatched `{{` (the one closed by the trailing `}}` at \
+             `body_end_rel`); got opens={opens}, closes={closes}. \
+             A mismatch means the `\\n}}\\n` scanner either stopped \
+             inside a nested block (closes+1 > opens) or walked \
+             past kernel_list's closing brace (opens > closes+1, \
+             swallowing a sibling fn's opener).",
+        );
+        // Nested-`fn` guard: `kernel_list` currently has no inner
+        // fn, closure, or impl definition. A line starting with
+        // `fn ` or `pub fn ` at column 4 or 0 inside `body` means
+        // a refactor introduced one, and the brace-balance check
+        // above is no longer a sufficient bootstrap — the scanner
+        // could stop at the NESTED fn's closing brace and still
+        // show a balanced inner slice. Trip loudly so the author
+        // updates the test to either skip nested scopes or scan
+        // to the outermost `\n}\n` explicitly.
+        assert!(
+            !body.contains("\n    fn ") && !body.contains("\nfn "),
+            "bootstrap: a new nested / sibling `fn` definition \
+             appeared in the scanned slice. The `\\n}}\\n` scanner \
+             cannot distinguish the nested fn's close from \
+             kernel_list's own close — update this test to use a \
+             brace-balance walker before landing the refactor. \
+             body: {body:?}",
+        );
 
         let i_eol = body
             .find("eol_legend_if_any")

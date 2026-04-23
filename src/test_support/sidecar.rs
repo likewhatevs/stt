@@ -3461,17 +3461,21 @@ mod tests {
     ///     test-isolation bug — every in-tree test treats host
     ///     tunables as read-only.
     ///
-    /// This "property test" samples the contract across N
-    /// back-to-back sidecar writes (simulating the per-test
-    /// sidecar drumbeat of a gauntlet run): every resulting `host`
-    /// field must compare equal. The sibling
-    /// [`crate::host_context`] tests already pin `collect_host_context`
-    /// internal stability; this test pins the SIDECAR surface so a
-    /// regression that threaded a partial context through
-    /// `write_sidecar` / `write_skip_sidecar` would fail here even
-    /// if `collect_host_context` itself stayed stable.
+    /// This test runs a deterministic N-iteration loop (NOT a
+    /// proptest-style property sampler — there is no input-space
+    /// shrinker and no random seed; the same N calls with the same
+    /// ordering produce the same comparisons every run) of
+    /// back-to-back `collect_host_context()` calls simulating the
+    /// per-test sidecar drumbeat of a gauntlet run. Every resulting
+    /// `host` field must compare equal across all N samples. The
+    /// sibling [`crate::host_context`] tests already pin
+    /// `collect_host_context` internal stability; this test pins
+    /// the SIDECAR surface so a regression that threaded a partial
+    /// context through `write_sidecar` / `write_skip_sidecar`
+    /// would fail here even if `collect_host_context` itself
+    /// stayed stable.
     ///
-    /// Bounded N=8: enough samples to catch intermittent drift
+    /// Bounded N=8: enough iterations to catch intermittent drift
     /// without bloating the test runtime — `collect_host_context`
     /// does ~20 sysfs/procfs reads per call, so the cost scales
     /// linearly and must stay modest.

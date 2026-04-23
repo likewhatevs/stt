@@ -409,6 +409,32 @@ pub struct AssertResult {
 /// each worker on its own is tight. Tests comparing single-worker
 /// behavior should scope their assertions to per-worker data
 /// rather than this aggregate.
+///
+/// # Stored-vs-computed ratio drift
+///
+/// Two fields are DERIVED rather than measured:
+/// [`Self::wake_latency_tail_ratio`] and
+/// [`Self::iterations_per_worker`]. Both are stored on the struct
+/// AND available through computed accessors
+/// ([`Self::computed_wake_latency_tail_ratio`],
+/// [`Self::computed_iterations_per_worker`]). The two sources can
+/// drift:
+///
+/// - Producers (`assert_not_starved` et al.) populate the raw
+///   fields, then call [`Self::derive_ratios`] to stamp the
+///   stored values.
+/// - `serde::Deserialize` restores whatever the on-disk sidecar
+///   recorded — potentially stale values from an older ktstr
+///   build whose `derive_ratios` convention differed.
+/// - Test fixtures that construct `CgroupStats { .. }` literals
+///   typically skip the `derive_ratios` call.
+///
+/// Read rule: consumers holding a `CgroupStats` from an uncertain
+/// origin (deserialized sidecar, hand-built fixture) MUST prefer
+/// the `computed_*` accessors. Consumers that populate via
+/// `assert_not_starved` → `derive_ratios` can read the stored
+/// field directly. The stored values exist for sidecar wire
+/// format compatibility, not as the canonical read path.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CgroupStats {
     /// Number of workers in this cgroup.
@@ -514,57 +540,17 @@ pub struct CgroupStats {
 }
 
 impl CgroupStats {
-    /// Compute the two derived metrics
-    /// ([`Self::wake_latency_tail_ratio`],
-    /// [`Self::iterations_per_worker`]) from the already-populated
-    /// raw fields (`p99_wake_latency_us`, `median_wake_latency_us`,
-    /// `total_iterations`, `num_workers`).
-    ///
-    /// Both derived fields divide raw values and must guard the
-    /// zero-divisor case; centralizing the guards here means the
-    /// production populator at [`assert_not_starved`] and any
-    /// future call site share one definition of "no samples yet"
-    /// (both yield `0.0`, which survives the downstream
-    /// `finite_or_zero` filter).
-    ///
-    /// # Compile-time enforcement evaluation
-    ///
-    /// Two alternatives to the current populate-then-stamp
-    /// convention were considered and rejected:
-    ///
-    /// 1. **Finalize / typestate**: `CgroupStatsRaw::finalize()
-    ///    -> CgroupStats`, with only `CgroupStatsRaw` constructible
-    ///    externally and `CgroupStats` carrying the derive-completed
-    ///    invariant in its type. Rejected because `CgroupStats` is
-    ///    serialized on the sidecar wire format — splitting it into
-    ///    two types would force a schema decision (do sidecars
-    ///    carry the raw or finalized struct? both? neither?) that
-    ///    the "evaluate" scope cannot resolve. The invariant would
-    ///    be compile-time enforced only at construction; any
-    ///    deserialization path would need to re-run derive_ratios
-    ///    anyway, so the type-state guarantee dilutes at the wire
-    ///    boundary.
-    ///
-    /// 2. **Pure computed accessors, no stored fields**: drop
-    ///    `wake_latency_tail_ratio` / `iterations_per_worker` from
-    ///    the struct entirely and expose them only as methods.
-    ///    Rejected because `serde::Deserialize` + the
-    ///    `ScenarioStats` merge path both read the fields directly
-    ///    today, and the sidecar wire format already persists them
-    ///    — removing the fields would be a breaking schema change
-    ///    for an invariant that is trivially restored by the merge-
-    ///    time `derive_ratios` call.
-    ///
-    /// **Chosen middle ground**: `derive_ratios` remains the
-    /// populator, AND [`Self::computed_wake_latency_tail_ratio`] /
-    /// [`Self::computed_iterations_per_worker`] exist as reader-side
-    /// accessors that compute the ratios on demand from the raw
-    /// fields. Consumers that have a `CgroupStats` in hand but are
-    /// uncertain whether `derive_ratios` has fired (e.g. a
-    /// deserialized value from an older sidecar or a hand-
-    /// constructed test fixture) can call the computed accessors
-    /// and get the correct value without mutating the struct. The
-    /// stored fields remain the sidecar wire format.
+    /// Stamp the two derived ratios ([`Self::wake_latency_tail_ratio`],
+    /// [`Self::iterations_per_worker`]) into the struct so the sidecar
+    /// wire format carries them without every reader re-running the
+    /// divide. Kept as a method (rather than typestate or
+    /// computed-only accessors) because the struct is the sidecar
+    /// serde format — splitting into raw/finalized types would
+    /// break wire compat, and dropping the fields would make every
+    /// downstream `GauntletRow` / stats reader recompute. See the
+    /// sibling [`Self::computed_wake_latency_tail_ratio`] /
+    /// [`Self::computed_iterations_per_worker`] accessors for the
+    /// drift-safe reader path.
     pub fn derive_ratios(&mut self) {
         self.wake_latency_tail_ratio = self.computed_wake_latency_tail_ratio();
         self.iterations_per_worker = self.computed_iterations_per_worker();
