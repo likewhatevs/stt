@@ -40,10 +40,19 @@ use std::io::Write;
 use std::time::Duration;
 
 fn main() {
-    let bytes: usize = std::env::args()
-        .nth(1)
+    // Parse args: first non-flag positional is bytes; `--churn`
+    // anywhere on the line enables the thread-churn mode used by the
+    // probe ESRCH stress test. Churn mode relaxes the single-thread
+    // contract below and, after the main-thread allocation + ready
+    // marker, enters a tight spawn+join loop to maximize the number
+    // of thread lifetimes the probe races against.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let churn = args.iter().any(|a| a == "--churn");
+    let bytes: usize = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
         .and_then(|s| s.parse().ok())
-        .expect("usage: jemalloc-alloc-worker <BYTES>");
+        .expect("usage: jemalloc-alloc-worker [--churn] <BYTES>");
 
     // A zero-length allocation would indexing-panic on `known[0]`
     // in the black_box triple below (both post-alloc and park-loop
@@ -68,20 +77,28 @@ fn main() {
     // tests/jemalloc_probe_tests.rs is the authoritative guard — this
     // check only exits early with an actionable diagnostic instead of
     // letting the probe observe a silently-broken worker.
-    match std::fs::read_dir("/proc/self/task") {
-        Ok(iter) => {
-            let n = iter.filter(|e| e.is_ok()).count();
-            if n != 1 {
-                eprintln!(
-                    "jemalloc-alloc-worker: /proc/self/task has {n} entries, expected 1; \
-                     extra threads break the tid==pid identity"
-                );
+    //
+    // Skipped under `--churn`: churn mode intentionally runs many
+    // short-lived helper threads, breaking the tid==pid invariant on
+    // purpose. The ESRCH-stress test does NOT rely on that invariant
+    // — it asserts the probe survives rapid thread exit races
+    // without crashing, using ThreadResult shape in probe JSON.
+    if !churn {
+        match std::fs::read_dir("/proc/self/task") {
+            Ok(iter) => {
+                let n = iter.filter(|e| e.is_ok()).count();
+                if n != 1 {
+                    eprintln!(
+                        "jemalloc-alloc-worker: /proc/self/task has {n} entries, expected 1; \
+                         extra threads break the tid==pid identity"
+                    );
+                    std::process::exit(2);
+                }
+            }
+            Err(e) => {
+                eprintln!("jemalloc-alloc-worker: read_dir(/proc/self/task) failed: {e}");
                 std::process::exit(2);
             }
-        }
-        Err(e) => {
-            eprintln!("jemalloc-alloc-worker: read_dir(/proc/self/task) failed: {e}");
-            std::process::exit(2);
         }
     }
 
@@ -124,16 +141,48 @@ fn main() {
     println!("jemalloc-alloc-worker ready pid={pid} bytes={bytes}");
     let _ = std::io::stdout().flush();
 
-    // Park forever, re-touching the allocation each tick so the
-    // optimizer cannot move the free before the park. The test
-    // body's `PayloadHandle::kill` delivers SIGKILL via `killpg`
-    // on the child's process group, reaching us without further
-    // cooperation. Mirrors the strong black_box pattern above:
-    // a heap read through `[0]` plus a pointer/len materialize.
-    loop {
-        let _ = std::hint::black_box(known[0]);
-        std::hint::black_box(known.as_ptr());
-        std::hint::black_box(known.len());
-        std::thread::sleep(Duration::from_secs(3600));
+    if churn {
+        // Thread-churn mode: in a tight loop, spawn a short-lived
+        // helper thread that returns immediately, and join it. Each
+        // iteration opens and closes a TID — the probe's external-pid
+        // path iterates `/proc/<pid>/task`, issues PTRACE_SEIZE /
+        // PTRACE_INTERRUPT per tid, and races thread exit:
+        // a tid that dies between the readdir and the ptrace syscall
+        // returns ESRCH, which the probe's PtraceSeize /
+        // PtraceInterrupt error variants (see
+        // src/bin/jemalloc_probe.rs:310-319) must surface as
+        // `ThreadResult::Err` entries rather than panic or abort.
+        //
+        // No upper bound on iterations: the test body's
+        // `PayloadHandle::kill` reaps the worker when probe runs are
+        // done. Tiny sleep inside the helper so the tid is live for
+        // ~100µs, maximizing the fraction of probe attempts that see
+        // a live tid on readdir and a dead tid on ptrace.
+        loop {
+            let _ = std::hint::black_box(known[0]);
+            std::hint::black_box(known.as_ptr());
+            std::hint::black_box(known.len());
+            let handle = std::thread::spawn(|| {
+                // Micro-nap — keeps the tid alive for ~100µs so the
+                // probe's readdir(/proc/pid/task) has a non-trivial
+                // chance of listing it before PTRACE_SEIZE races
+                // thread exit.
+                std::thread::sleep(Duration::from_micros(100));
+            });
+            let _ = handle.join();
+        }
+    } else {
+        // Park forever, re-touching the allocation each tick so the
+        // optimizer cannot move the free before the park. The test
+        // body's `PayloadHandle::kill` delivers SIGKILL via `killpg`
+        // on the child's process group, reaching us without further
+        // cooperation. Mirrors the strong black_box pattern above:
+        // a heap read through `[0]` plus a pointer/len materialize.
+        loop {
+            let _ = std::hint::black_box(known[0]);
+            std::hint::black_box(known.as_ptr());
+            std::hint::black_box(known.len());
+            std::thread::sleep(Duration::from_secs(3600));
+        }
     }
 }

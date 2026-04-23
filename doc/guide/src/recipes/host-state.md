@@ -22,14 +22,27 @@ Prints a `key: value` report covering:
 - Transparent hugepage policy (`thp_enabled`, `thp_defrag`) with
   the bracketed selection preserved verbatim.
 - Every `/proc/sys/kernel/sched_*` tunable, one entry per line.
-- NUMA node count (from `/sys/devices/system/node`).
-- `uname` sysname / release / machine.
+- NUMA node count (from CPU→node mapping; memory-only nodes
+  without CPUs are not counted).
+- `kernel_name` / `kernel_release` / `arch` (from the `uname()`
+  syscall).
 - `/proc/cmdline` verbatim.
 
 Absent fields render as `(unknown)` — an empty `sched_*` map
 renders as `(empty)` and a missing map renders as `(unknown)`.
 The distinction matters when you want to know whether a
 dimension was inspected but absent, vs failed to populate.
+
+Sidecars written before the `uname_sysname` / `uname_release` /
+`uname_machine` → `kernel_name` / `kernel_release` / `arch`
+rename render the renamed fields as `(unknown)` in `show-host`
+and in `stats compare`'s host-delta section, and re-running the
+test against the current binary regenerates the sidecar with
+the new field names populated. Mechanically: the old sidecar
+still deserializes cleanly (deserialization is forward-compatible
+in the "does-not-error" sense), but the renamed fields land as
+`None` on the new struct because the old-name data does not
+migrate to the new field names.
 
 This output is human-oriented. For programmatic access, read
 the `host` field of any sidecar JSON (same schema, identical
@@ -105,8 +118,4 @@ the sidecar's host block directly:
 jq '.host' path/to/sidecar.ktstr.json
 ```
 
-The field is emitted on every gauntlet run (populated by
-production paths) and `null` on the `test_fixture` path used by
-sidecar unit tests — round-trip tests pin the `null`-on-fixture
-vs `Some`-on-production split so a silently-missing host block
-in a real run surfaces at commit time.
+The field is emitted on every gauntlet run.

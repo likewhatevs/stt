@@ -763,14 +763,17 @@ impl KtstrTestEntry {
     /// [`Payload::include_files`](crate::test_support::Payload::include_files),
     /// each entry in [`workloads`](Self::workloads) contributes its
     /// own, and [`extra_include_files`](Self::extra_include_files)
-    /// contributes test-level extras. Order: scheduler → payload →
-    /// workloads (in declaration order) → extras. Duplicate spec
-    /// strings at this layer are NOT deduped — the downstream
-    /// [`crate::cli::resolve_include_files`] + union pass at
-    /// `run_ktstr_test` resolves each entry to a `(archive_path,
-    /// host_path)` pair and dedupes on identical pairs while
-    /// erroring on archive_path collisions with conflicting
-    /// host_paths.
+    /// contributes test-level extras. Pre-dedupe aggregation order:
+    /// scheduler → payload → workloads (in declaration order) →
+    /// extras. Duplicate spec strings at this layer are NOT deduped
+    /// — the framework's include-file pipeline at `run_ktstr_test`
+    /// resolves each entry to a `(archive_path, host_path)` pair
+    /// and dedupes on identical pairs while erroring on
+    /// archive_path collisions with conflicting host_paths. This
+    /// aggregation order does NOT survive downstream: the final
+    /// resolved list is sorted alphabetically by archive_path after
+    /// deduplication. Alphabetical ordering ensures deterministic
+    /// initramfs layout regardless of declaration order.
     pub fn all_include_files(&self) -> Vec<&'static str> {
         let mut out: Vec<&'static str> = Vec::new();
         out.extend(self.scheduler.include_files.iter().copied());

@@ -2,14 +2,9 @@
 //!
 //! Used by [`KtstrVm::run_interactive`](super::KtstrVm::run_interactive)
 //! to put stdin into raw mode for the lifetime of the shell session,
-//! restoring the original termios on every catchable signal we
-//! subscribe to (SIGINT/SIGTERM/SIGQUIT/SIGABRT) plus the normal
-//! Drop path. SIGKILL and SIGSEGV are intentionally out of scope:
-//! the first cannot be caught; the second fires from corrupted
-//! state where tcsetattr is unsafe. SIGABRT is included so a
-//! `panic = "abort"` release build (see `[profile.release]` in
-//! Cargo.toml) still restores the terminal before process death:
-//! an unwind-less panic calls `abort(3)`, which raises SIGABRT.
+//! restoring the original termios on Drop and on a SA_RESETHAND
+//! signal-handler chain. See [`TerminalRawGuard`] for the full catch
+//! list, bypass list, and per-signal rationale.
 
 use anyhow::{Context, Result};
 
@@ -90,19 +85,25 @@ extern "C" fn terminal_restore_signal_handler(sig: libc::c_int) {
 
 /// Sets stdin to raw mode on creation, restores original termios on drop.
 /// Handles panic paths via Drop. Installs signal handlers for SIGINT,
-/// SIGTERM, SIGQUIT, and SIGABRT with SA_RESETHAND that restore
-/// termios via raw libc::tcsetattr (async-signal-safe) before the
-/// default handler runs. SIGABRT catches the `panic = "abort"`
+/// SIGTERM, SIGQUIT, SIGABRT, and SIGFPE with SA_RESETHAND that
+/// restore termios via raw libc::tcsetattr (async-signal-safe) before
+/// the default handler runs. SIGABRT catches the `panic = "abort"`
 /// release-build path where an unwind-less panic calls `abort(3)`
-/// instead of unwinding Drop.
+/// instead of unwinding Drop. SIGFPE catches a synchronous integer
+/// divide-by-zero / invalid FP operation: the process memory state
+/// is still coherent (unlike SIGSEGV/SIGBUS/SIGILL), so the tcsetattr
+/// from the handler is safe; the re-raised default handler then runs
+/// the core dump with the terminal already back in cooked mode.
 ///
 /// # Guard bypass paths
 ///
 /// Neither the Drop path nor the SA_RESETHAND handler fires in these
 /// cases, leaving the terminal in raw mode after process exit:
-/// - **SIGSEGV / SIGBUS / SIGILL**: not in the guard's handler list
-///   and the kernel's default action produces a core dump without
-///   running userspace recovery.
+/// - **SIGSEGV / SIGBUS / SIGILL**: synchronous hardware-fault
+///   signals that fire from corrupted process state where
+///   `tcsetattr` is unsafe; deliberately left uncaught. The kernel's
+///   default action produces a core dump without running userspace
+///   recovery.
 /// - **`std::process::exit` / `libc::_exit`**: skip Drop entirely.
 /// - **SIGKILL**: uncatchable by design, no handler runs.
 ///
@@ -117,6 +118,7 @@ pub(crate) struct TerminalRawGuard {
     prev_sigterm: libc::sigaction,
     prev_sigquit: libc::sigaction,
     prev_sigabrt: libc::sigaction,
+    prev_sigfpe: libc::sigaction,
 }
 
 impl TerminalRawGuard {
@@ -181,6 +183,7 @@ impl TerminalRawGuard {
         let mut prev_sigterm: libc::sigaction = unsafe { std::mem::zeroed() };
         let mut prev_sigquit: libc::sigaction = unsafe { std::mem::zeroed() };
         let mut prev_sigabrt: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut prev_sigfpe: libc::sigaction = unsafe { std::mem::zeroed() };
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = terminal_restore_signal_handler as *const () as usize;
@@ -196,6 +199,12 @@ impl TerminalRawGuard {
             // the termios is restored before the default SIGABRT
             // handler generates the core dump / exits the process.
             libc::sigaction(libc::SIGABRT, &sa, &mut prev_sigabrt);
+            // SIGFPE fires on integer divide-by-zero or invalid FP
+            // operation. Unlike SIGSEGV/SIGBUS/SIGILL the process
+            // memory state is coherent, so tcsetattr from the handler
+            // is safe; the re-raised SIGFPE then runs the default
+            // core dump with the terminal already restored.
+            libc::sigaction(libc::SIGFPE, &sa, &mut prev_sigfpe);
         }
 
         Ok(Self {
@@ -205,6 +214,7 @@ impl TerminalRawGuard {
             prev_sigterm,
             prev_sigquit,
             prev_sigabrt,
+            prev_sigfpe,
         })
     }
 }
@@ -242,6 +252,7 @@ impl Drop for TerminalRawGuard {
             libc::sigaction(libc::SIGTERM, &self.prev_sigterm, std::ptr::null_mut());
             libc::sigaction(libc::SIGQUIT, &self.prev_sigquit, std::ptr::null_mut());
             libc::sigaction(libc::SIGABRT, &self.prev_sigabrt, std::ptr::null_mut());
+            libc::sigaction(libc::SIGFPE, &self.prev_sigfpe, std::ptr::null_mut());
         }
     }
 }
@@ -426,6 +437,81 @@ mod tests {
         // the original tty.
         unsafe {
             libc::sigaction(libc::SIGABRT, &pre_test, std::ptr::null_mut());
+            libc::dup2(saved_stdin, 0);
+            libc::close(saved_stdin);
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
+    /// Regression pin for the SIGFPE arm of the signal-handler set.
+    /// Mirrors `terminal_raw_guard_installs_and_restores_sigabrt_handler`
+    /// for the SIGFPE handler added so a synchronous FP trap (integer
+    /// divide-by-zero, invalid FP op) restores cooked mode before the
+    /// kernel's default core dump runs. Install `SIG_IGN` as a
+    /// sentinel, verify `enter()` overwrites it with
+    /// [`terminal_restore_signal_handler`], then verify `drop(guard)`
+    /// restores the sentinel verbatim.
+    #[test]
+    fn terminal_raw_guard_installs_and_restores_sigfpe_handler() {
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+        let saved_stdin = unsafe { libc::dup(0) };
+        assert!(saved_stdin >= 0);
+        assert_eq!(unsafe { libc::dup2(slave, 0) }, 0);
+
+        let mut pre_test: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut ign: libc::sigaction = unsafe { std::mem::zeroed() };
+        ign.sa_sigaction = libc::SIG_IGN;
+        unsafe {
+            libc::sigemptyset(&mut ign.sa_mask);
+            libc::sigaction(libc::SIGFPE, &ign, &mut pre_test);
+        }
+
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigaction(libc::SIGFPE, std::ptr::null(), &mut current);
+        }
+        assert_eq!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "test setup: SIG_IGN sentinel must be installed before enter()",
+        );
+
+        let guard = TerminalRawGuard::enter().expect("enter must succeed");
+
+        unsafe {
+            libc::sigaction(libc::SIGFPE, std::ptr::null(), &mut current);
+        }
+        let expected = terminal_restore_signal_handler as *const () as usize;
+        assert_eq!(
+            current.sa_sigaction, expected,
+            "enter() must point SIGFPE at terminal_restore_signal_handler",
+        );
+
+        drop(guard);
+
+        unsafe {
+            libc::sigaction(libc::SIGFPE, std::ptr::null(), &mut current);
+        }
+        assert_eq!(
+            current.sa_sigaction,
+            libc::SIG_IGN,
+            "Drop must restore the previous SIGFPE SIG_IGN sentinel",
+        );
+
+        unsafe {
+            libc::sigaction(libc::SIGFPE, &pre_test, std::ptr::null_mut());
             libc::dup2(saved_stdin, 0);
             libc::close(saved_stdin);
             libc::close(slave);

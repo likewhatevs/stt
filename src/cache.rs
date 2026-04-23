@@ -1354,7 +1354,9 @@ mod tests {
         let sym_size = match arch {
             object::Architecture::X86_64 => 8,
             object::Architecture::I386 => 4,
-            _ => 8,
+            other => panic!(
+                "build_base_elf_with_text_symbol: unsupported arch {other:?}; supported: X86_64, I386",
+            ),
         };
         let mut obj = write::Object::new(
             object::BinaryFormat::Elf,
@@ -1374,6 +1376,20 @@ mod tests {
             flags: object::SymbolFlags::None,
         });
         obj
+    }
+
+    /// Regression pin for the explicit `other =>` arm in
+    /// [`build_base_elf_with_text_symbol`]. Before the guard, an
+    /// unsupported architecture silently fell through to `sym_size = 8`
+    /// which is wrong for any future 32-bit arch (or any arch whose
+    /// address width isn't 8 bytes). `Aarch64` is a supported object
+    /// crate architecture that isn't on the helper's allow-list, so
+    /// passing it triggers the panic and the `#[should_panic]`
+    /// assertion confirms the guard fires.
+    #[test]
+    #[should_panic(expected = "unsupported arch")]
+    fn build_base_elf_with_text_symbol_panics_on_unsupported_arch() {
+        let _ = build_base_elf_with_text_symbol(object::Architecture::Aarch64);
     }
 
     // -- keep-list source disjointness --

@@ -59,7 +59,7 @@ pub struct WorkerReport {
     pub resume_latencies_ns: Vec<u64>,
     pub iterations: u64,
     pub schedstat_run_delay_ns: u64,
-    pub schedstat_ctx_switches: u64,
+    pub schedstat_run_count: u64,
     pub schedstat_cpu_time_ns: u64,
     pub numa_pages: BTreeMap<usize, u64>,
     pub vmstat_numa_pages_migrated: u64,
@@ -97,7 +97,11 @@ start and end. Three fields:
 - `schedstat_cpu_time_ns` -- delta of field 1 (on-CPU time)
 - `schedstat_run_delay_ns` -- delta of field 2 (time spent waiting
   for a CPU)
-- `schedstat_ctx_switches` -- delta of field 3 (timeslice count)
+- `schedstat_run_count` -- delta of field 3 (pcount — times the
+  task was scheduled in over the work loop). This is NOT a
+  context-switch count; `/proc/<pid>/status`'s
+  `voluntary_ctxt_switches` / `nonvoluntary_ctxt_switches` are the
+  true context-switch counters and are not read here.
 
 `iterations` counts outer-loop iterations.
 

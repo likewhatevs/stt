@@ -301,38 +301,12 @@ impl CgroupManager {
         if !self.parent.exists() {
             return Ok(());
         }
-        let entries = match fs::read_dir(&self.parent) {
-            Ok(entries) => entries,
-            Err(err) => {
-                tracing::warn!(
-                    parent = %self.parent.display(),
-                    err = %err,
-                    "cleanup_all: read_dir failed; child cgroups may remain under parent",
-                );
-                return Ok(());
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(err) => {
-                    tracing::warn!(
-                        parent = %self.parent.display(),
-                        err = %err,
-                        "cleanup_all: dir entry read failed; skipping",
-                    );
-                    continue;
-                }
-            };
-            match entry.file_type() {
-                Ok(t) if t.is_dir() => cleanup_recursive(&entry.path()),
-                Ok(_) => {}
-                Err(err) => tracing::warn!(
-                    path = %entry.path().display(),
-                    err = %err,
-                    "cleanup_all: file_type read failed; skipping entry",
-                ),
-            }
+        if let Err(err) = for_each_child_dir(&self.parent, "cleanup_all", cleanup_recursive) {
+            tracing::warn!(
+                parent = %self.parent.display(),
+                err = %err,
+                "cleanup_all: read_dir failed; child cgroups may remain under parent",
+            );
         }
         Ok(())
     }
@@ -474,38 +448,61 @@ fn drain_pids_to_root(procs_path: &Path, context: &str) {
     }
 }
 
+/// Iterate the direct child directories of `path`, calling `f` on each.
+///
+/// `context` is a short caller name (e.g. `"cleanup_all"`,
+/// `"cleanup_recursive"`) that is prefixed into every per-entry
+/// `tracing::warn!` message so operators grepping logs for
+/// `"cleanup_all: "` still see both the outer read_dir failure (which
+/// stays with the caller) and the per-entry `DirEntry` / `file_type`
+/// warnings emitted here.
+///
+/// `read_dir` failure is surfaced to the caller via `Err`; the caller
+/// owns the top-level warn message. Non-directory entries are skipped.
+/// Per-entry errors are logged and the iteration continues.
+///
+/// The structured log field key is normalized to `path =` at this
+/// boundary; `cleanup_all`'s outer warn still uses `parent =` for the
+/// top-level read_dir failure since that warn is emitted by the
+/// caller, not here.
+fn for_each_child_dir(
+    path: &Path,
+    context: &str,
+    mut f: impl FnMut(&Path),
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    err = %err,
+                    "{context}: dir entry read failed; skipping",
+                );
+                continue;
+            }
+        };
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => f(&entry.path()),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                path = %entry.path().display(),
+                err = %err,
+                "{context}: file_type read failed; skipping entry",
+            ),
+        }
+    }
+    Ok(())
+}
+
 fn cleanup_recursive(path: &std::path::Path) {
     // Depth-first: clean children before parent
-    match fs::read_dir(path) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(err) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            err = %err,
-                            "cleanup_recursive: dir entry read failed; skipping",
-                        );
-                        continue;
-                    }
-                };
-                match entry.file_type() {
-                    Ok(t) if t.is_dir() => cleanup_recursive(&entry.path()),
-                    Ok(_) => {}
-                    Err(err) => tracing::warn!(
-                        path = %entry.path().display(),
-                        err = %err,
-                        "cleanup_recursive: file_type read failed; skipping entry",
-                    ),
-                }
-            }
-        }
-        Err(err) => tracing::warn!(
+    if let Err(err) = for_each_child_dir(path, "cleanup_recursive", cleanup_recursive) {
+        tracing::warn!(
             path = %path.display(),
             err = %err,
             "cleanup_recursive: read_dir failed; child cgroups may remain",
-        ),
+        );
     }
     drain_pids_to_root(&path.join("cgroup.procs"), &path.display().to_string());
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -588,6 +585,61 @@ mod tests {
     fn drain_tasks_nonexistent_source() {
         let cg = CgroupManager::new("/nonexistent/ktstr-drain-test");
         assert!(cg.drain_tasks("missing_cgroup").is_ok());
+    }
+
+    /// `cleanup_all` must skip non-directory entries rather than
+    /// recurse into them. Plants a regular file alongside a child
+    /// cgroup directory and verifies: (a) the child dir is removed,
+    /// (b) the file is left in place. Pins the `Ok(t) if t.is_dir()`
+    /// branch in [`for_each_child_dir`] so a future refactor that
+    /// drops the `is_dir` guard fails this test instead of silently
+    /// deleting arbitrary files under the cgroup parent.
+    #[test]
+    fn cleanup_all_skips_non_dir_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-cg-nondir-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        cg.create_cgroup("cg_child").unwrap();
+        let stray_file = dir.join("stray.txt");
+        fs::write(&stray_file, b"do not descend").unwrap();
+        assert!(dir.join("cg_child").exists());
+        assert!(stray_file.exists());
+        cg.cleanup_all().unwrap();
+        assert!(
+            !dir.join("cg_child").exists(),
+            "cleanup_all should remove the child directory",
+        );
+        assert!(
+            stray_file.exists(),
+            "cleanup_all must not descend into or remove regular files",
+        );
+        assert_eq!(fs::read_to_string(&stray_file).unwrap(), "do not descend");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `cleanup_recursive` on a 2-level nested directory structure must
+    /// remove leaves before their parents (depth-first). Plants
+    /// `root/mid/leaf/` plus `root/sibling/`, invokes
+    /// [`cleanup_recursive`] directly on `root`, and verifies every
+    /// directory is gone. Exercises the recursive call inside
+    /// [`for_each_child_dir`] that item 7's `cleanup_recursive`
+    /// function-pointer arg drives.
+    #[test]
+    fn cleanup_recursive_removes_nested_dirs_depth_first() {
+        let base =
+            std::env::temp_dir().join(format!("ktstr-cg-nested-{}", std::process::id()));
+        let root = base.join("root");
+        fs::create_dir_all(root.join("mid").join("leaf")).unwrap();
+        fs::create_dir_all(root.join("sibling")).unwrap();
+        assert!(root.join("mid/leaf").exists());
+        assert!(root.join("sibling").exists());
+        cleanup_recursive(&root);
+        assert!(
+            !root.exists(),
+            "cleanup_recursive should remove root and every descendant",
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

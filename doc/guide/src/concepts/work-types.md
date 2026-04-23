@@ -223,7 +223,7 @@ fn my_workload(stop: &AtomicBool) -> WorkerReport {
         resume_latencies_ns: vec![],
         iterations: work_units,
         schedstat_run_delay_ns: 0,
-        schedstat_ctx_switches: 0,
+        schedstat_run_count: 0,
         schedstat_cpu_time_ns: 0,
         numa_pages: BTreeMap::new(),
         vmstat_numa_pages_migrated: 0,

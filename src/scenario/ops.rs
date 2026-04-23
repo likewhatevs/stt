@@ -2073,7 +2073,7 @@ fn build_stimulus(
 
     StimulusPayload {
         elapsed_ms: to_u32("elapsed_ms", scenario_start.elapsed().as_millis()),
-        step_index: step_idx as u16,
+        step_index: to_u16("step_index", step_idx),
         op_count: to_u16("op_count", ops.len()),
         op_kinds,
         cgroup_count: to_u16("cgroup_count", cgroup_count),

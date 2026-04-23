@@ -55,7 +55,7 @@ use std::sync::OnceLock;
 /// for every field) instead of `Default`'s all-`None` minimum, use
 /// [`HostContext::test_fixture`].
 ///
-/// # Forward-compatible deserialization
+/// # Error-free deserialization under field drift
 ///
 /// The `Deserialize` impl is derived WITHOUT
 /// `#[serde(deny_unknown_fields)]`. An older binary reading a
@@ -70,6 +70,17 @@ use std::sync::OnceLock;
 /// that lacks a newly-added field gets `None` rather than a
 /// deserialize error. Both directions of the version skew are
 /// covered by this policy.
+///
+/// "Forward-compat" here means only that deserialization does
+/// not error — it does NOT mean data is preserved across field
+/// renames. If a field is renamed (e.g. `uname_sysname` →
+/// `kernel_name`), a sidecar written under the old name
+/// deserializes cleanly but the renamed field lands as `None` on
+/// the new struct, because `#[serde(default)]` supplies the
+/// absent-field default and there is no alias mapping. This is
+/// by design: sidecar data is disposable (re-running the test
+/// regenerates it with the current schema), so rename migrations
+/// do not carry alias shims.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct HostContext {
@@ -503,8 +514,9 @@ static MEMINFO_READ_CALLS: std::sync::atomic::AtomicUsize =
 /// Every sub-read is fallible; individual failures leave the
 /// corresponding field `None` and the rest of the context
 /// proceeds. Even on a host where every `/proc` and `/sys` read
-/// fails, the three `uname_*` fields still populate because they
-/// come from the `uname()` syscall — filesystem-independent. An
+/// fails, the three uname-derived fields (`kernel_name`,
+/// `kernel_release`, `arch`) still populate because they come from
+/// the `uname()` syscall — filesystem-independent. An
 /// otherwise-empty `HostContext` serializes to a near-empty JSON
 /// object and distinguishes "collection attempted, nothing known"
 /// from "collection not attempted" (represented at the enclosing

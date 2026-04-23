@@ -291,6 +291,37 @@ pub struct GauntletRow {
 /// non-finite, so a single poisoned metric would otherwise halt every
 /// downstream JSON write. Sanitizing at the ingress boundary keeps the
 /// serializer happy without silencing the upstream data quality issue.
+///
+/// # NaN → 0.0 ambiguity for zero-meaningful metrics
+///
+/// The 0.0 substitution is indistinguishable from a legitimate 0.0
+/// measurement for metrics whose natural zero carries its own signal.
+/// Three fields are especially affected — note in-tree producers
+/// already guard the typical divide-by-zero path (`assert.rs` emits
+/// `0.0` for migration_ratio when `total_iters == 0` and `1.0` for
+/// page_locality when `total == 0`), so a NaN reaching this boundary
+/// indicates an upstream producer outside those guards (e.g. an
+/// external `ext_metrics` contributor, or a schedstat arithmetic
+/// edge that slipped past a guard):
+///
+/// - `migration_ratio`: lower-better. A real 0.0 means "no task was
+///   migrated" (ideal locality). A sanitized NaN collapses to the
+///   same value and reads as *falsely good* — a downstream regression
+///   gate sees "perfect locality" where the truth is "no data".
+/// - `page_locality`: higher-better. A real 0.0 means "no local-node
+///   accesses". A sanitized NaN collapses to the same value and
+///   reads as *falsely bad* — a downstream regression gate sees
+///   "everything cross-node" where the truth is "no data". The
+///   polarity is opposite to `migration_ratio`: the two failure
+///   modes push the comparison in opposite directions.
+/// - `worst_wake_latency_cv`: lower-better. A real 0.0 means
+///   "wake-latency samples were perfectly uniform" (ideal jitter).
+///   A sanitized NaN collapses to the same value and reads as
+///   *falsely good* — same direction as `migration_ratio`.
+///
+/// The accompanying `tracing::warn!` is the only signal that
+/// separates a sanitized NaN from a real 0.0; downstream aggregation
+/// by value alone cannot distinguish them.
 pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
     // Local closure so the warn can carry the scenario name as
     // context — keyed by field so the operator can pinpoint which
@@ -1407,41 +1438,91 @@ mod tests {
         assert_eq!(row.keep_last_count, 0);
     }
 
-    /// `sidecar_to_row` must sanitize non-finite f64 in the row's
-    /// direct fields (not just `ext_metrics`) — same `serde_json`
-    /// rejects-NaN motivation. Unlike `ext_metrics`, direct fields
-    /// can't be dropped (the row schema is fixed), so non-finite
-    /// collapses to 0.0 with a warn. Pins all 10 direct f64 field
-    /// assignments behind the `finite_or_zero` helper via spread =
-    /// NaN (one representative); if the helper ever gets removed
-    /// from one of its call sites, extending this test to cover the
-    /// other 9 is a single-line edit.
-    #[test]
-    fn sidecar_to_row_zeros_non_finite_direct_f64_fields() {
+    /// Drive every direct f64 field on [`GauntletRow`] through
+    /// `finite_or_zero` with `non_finite` planted in the source
+    /// [`SidecarResult`], then assert each lands as 0.0 on the row.
+    ///
+    /// Covers all ten `finite_or_zero` call sites in `sidecar_to_row`:
+    /// nine fields drawn from [`ScenarioStats`] plus `imbalance_ratio`
+    /// which is read from [`MonitorSummary`]. A missed call site would
+    /// leave one of the asserts comparing the non-finite input to 0.0
+    /// (NaN != 0.0, ±Infinity != 0.0) and fail the test.
+    fn assert_all_direct_f64_fields_sanitized(non_finite: f64) {
         use crate::assert::ScenarioStats;
+        use crate::monitor::MonitorSummary;
         use crate::test_support;
         let sc = test_support::SidecarResult {
             stats: ScenarioStats {
-                worst_spread: f64::NAN,
-                worst_migration_ratio: f64::INFINITY,
-                worst_p99_wake_latency_us: f64::NEG_INFINITY,
-                worst_page_locality: f64::NAN,
+                worst_spread: non_finite,
+                worst_migration_ratio: non_finite,
+                worst_p99_wake_latency_us: non_finite,
+                worst_median_wake_latency_us: non_finite,
+                worst_wake_latency_cv: non_finite,
+                worst_mean_run_delay_us: non_finite,
+                worst_run_delay_us: non_finite,
+                worst_page_locality: non_finite,
+                worst_cross_node_migration_ratio: non_finite,
                 ..Default::default()
             },
+            monitor: Some(MonitorSummary {
+                max_imbalance_ratio: non_finite,
+                ..Default::default()
+            }),
             ..test_support::SidecarResult::test_fixture()
         };
         let row = sidecar_to_row(&sc);
-        assert_eq!(row.spread, 0.0, "NaN must collapse to 0.0");
-        assert_eq!(row.migration_ratio, 0.0, "+Infinity must collapse to 0.0");
-        assert_eq!(
-            row.worst_p99_wake_latency_us, 0.0,
-            "-Infinity must collapse to 0.0"
-        );
-        assert_eq!(row.page_locality, 0.0, "NaN must collapse to 0.0");
+        for (name, val) in [
+            ("spread", row.spread),
+            ("migration_ratio", row.migration_ratio),
+            ("imbalance_ratio", row.imbalance_ratio),
+            ("worst_p99_wake_latency_us", row.worst_p99_wake_latency_us),
+            (
+                "worst_median_wake_latency_us",
+                row.worst_median_wake_latency_us,
+            ),
+            ("worst_wake_latency_cv", row.worst_wake_latency_cv),
+            ("worst_mean_run_delay_us", row.worst_mean_run_delay_us),
+            ("worst_run_delay_us", row.worst_run_delay_us),
+            ("page_locality", row.page_locality),
+            ("cross_node_migration_ratio", row.cross_node_migration_ratio),
+        ] {
+            assert_eq!(
+                val, 0.0,
+                "{name} must collapse to 0.0 for non-finite input {non_finite:?}",
+            );
+        }
         // Motivation check: the sanitized row serializes. Without the
         // `finite_or_zero` wraps, serde_json::to_string would return
         // Err because NaN / Infinity have no JSON representation.
         serde_json::to_string(&row).expect("sanitized row must serialize cleanly");
+    }
+
+    /// `sidecar_to_row` must sanitize NaN in every direct f64 field
+    /// (both [`ScenarioStats`]-sourced and the
+    /// [`MonitorSummary`]-sourced `imbalance_ratio`), not just a
+    /// representative sample — same `serde_json` rejects-NaN
+    /// motivation. Unlike `ext_metrics`, direct fields can't be
+    /// dropped (the row schema is fixed), so non-finite collapses to
+    /// 0.0 with a warn.
+    #[test]
+    fn sidecar_to_row_zeros_nan_in_every_direct_f64_field() {
+        assert_all_direct_f64_fields_sanitized(f64::NAN);
+    }
+
+    /// Companion to `sidecar_to_row_zeros_nan_in_every_direct_f64_field`
+    /// pinning the `+Infinity` branch of `finite_or_zero` for every
+    /// direct f64 field on the row.
+    #[test]
+    fn sidecar_to_row_zeros_pos_infinity_in_every_direct_f64_field() {
+        assert_all_direct_f64_fields_sanitized(f64::INFINITY);
+    }
+
+    /// Companion to `sidecar_to_row_zeros_nan_in_every_direct_f64_field`
+    /// pinning the `-Infinity` branch of `finite_or_zero` for every
+    /// direct f64 field on the row.
+    #[test]
+    fn sidecar_to_row_zeros_neg_infinity_in_every_direct_f64_field() {
+        assert_all_direct_f64_fields_sanitized(f64::NEG_INFINITY);
     }
 
     /// `sidecar_to_row` must drop NaN / +Infinity / -Infinity from

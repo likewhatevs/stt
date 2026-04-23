@@ -139,7 +139,7 @@ Payloads that need host binaries or fixtures in the guest initramfs
 can declare them on the `Payload` itself instead of relying on the
 CLI `-i` / `--include-files` flag at every invocation. The specs
 are resolved at `run_ktstr_test` time through the same
-`resolve_include_files` pipeline the CLI uses — bare names are
+include-file pipeline the CLI uses — bare names are
 searched in the host's `PATH`, explicit paths must exist, and
 directories are walked recursively.
 
@@ -177,11 +177,10 @@ fn fio_with_fixture(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 The declarative set (scheduler's `include_files` + payload's +
-workloads' + `extra_include_files`) is additive with the CLI
-`-i` flag — it does NOT replace CLI input. Running
-`ktstr exec --test fio_with_fixture -i extra-binary` packs
-`extra-binary` alongside the declaratively-declared files; the
-union is deduped on identical `(archive_path, host_path)` pairs.
-Two declarations that resolve to the same archive slot with
-different host paths surface as a hard error with both host paths
-in the diagnostic, rather than one silently overwriting the other.
+workloads' + `extra_include_files`) is aggregated at test time
+and resolved through the same include-file pipeline
+the `ktstr shell -i` path uses. The union is deduped on identical
+`(archive_path, host_path)` pairs. Two declarations that resolve
+to the same archive slot with different host paths surface as a
+hard error with both host paths in the diagnostic, rather than one
+silently overwriting the other.

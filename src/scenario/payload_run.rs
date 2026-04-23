@@ -665,9 +665,9 @@ impl Drop for PayloadHandle {
 /// `setsid(2)` between fork and exit leaves the leader's process
 /// group and becomes invisible to this helper — the escaping
 /// descendant keeps running after SIGKILL and may continue holding
-/// pipe fds that stall `wait_and_capture`. None of the payloads this
-/// crate ships today (stress-ng, schbench, fio) call those syscalls
-/// on their workers, and `build_command` does not place an exec'd
+/// pipe fds that stall `wait_and_capture`. The bundled payloads
+/// (stress-ng, schbench, fio) have not been audited for these
+/// syscalls. `build_command` does not place an exec'd
 /// child into any other group; this limitation applies only to
 /// third-party payloads that deliberately re-parent themselves. The
 /// mitigation path is the caller's: wrap the misbehaving payload in

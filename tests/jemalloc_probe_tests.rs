@@ -103,11 +103,33 @@ static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload {
 /// single-threaded (`tid == pid`) so the test can match on
 /// `threads[N].tid == worker_pid` in the probe's flat metric
 /// output without an extra TID handshake.
+///
+/// See [`JEMALLOC_ALLOC_WORKER_CHURN`] for the thread-churn variant
+/// used by the ESRCH stress test — same binary, `--churn` flag,
+/// disables the single-thread self-check.
 static JEMALLOC_ALLOC_WORKER: Payload = Payload {
     name: "jemalloc_alloc_worker",
     kind: PayloadKind::Binary("ktstr-jemalloc-alloc-worker"),
     output: OutputFormat::ExitCode,
     default_args: &[],
+    default_checks: &[],
+    metrics: &[],
+    include_files: &[],
+};
+
+/// Churn-mode allocator worker. Same binary as
+/// [`JEMALLOC_ALLOC_WORKER`] but invoked with `--churn`, which
+/// disables the single-thread self-check and enters a tight
+/// spawn+join loop after the main-thread allocation completes.
+/// Used by `jemalloc_probe_survives_thread_churn` to stress the
+/// probe's ESRCH handling: the probe races rapidly-exiting helper
+/// tids and every seized tid that dies before PTRACE_INTERRUPT
+/// surfaces as a `ThreadResult::Err` rather than a crash.
+static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload {
+    name: "jemalloc_alloc_worker_churn",
+    kind: PayloadKind::Binary("ktstr-jemalloc-alloc-worker"),
+    output: OutputFormat::ExitCode,
+    default_args: &["--churn"],
     default_checks: &[],
     metrics: &[],
     include_files: &[],
@@ -475,4 +497,178 @@ fn jemalloc_probe_fatal_on_nonexistent_pid(ctx: &Ctx) -> Result<AssertResult> {
         )));
     }
     Ok(AssertResult::pass())
+}
+
+/// ESRCH-handling stress test. The churn-mode worker spawns and
+/// joins short-lived helper threads in a tight loop. The probe is
+/// invoked against the worker's pid multiple times; its
+/// `readdir(/proc/<pid>/task)` enumerates tids that may die before
+/// the subsequent `PTRACE_SEIZE` / `PTRACE_INTERRUPT` lands,
+/// returning `ESRCH`. The probe must survive every invocation
+/// without panicking or exiting by signal — ESRCH errors must
+/// surface as `ThreadResult::Err { kind: PtraceSeize |
+/// PtraceInterrupt }` entries in the JSON output, not crashes.
+///
+/// The assertion is deliberately coarse: `probe exit_code == 0`
+/// and at least one invocation saw more than one thread in the
+/// probe JSON (confirms churn is actually producing tids for the
+/// probe to race). We do NOT assert a specific count of
+/// `ThreadResult::Err` entries: whether any given invocation wins
+/// every race or loses every race is inherently timing-dependent
+/// and would produce a flaky test if pinned.
+///
+/// N=10 invocations: the churn loop is strictly sequential
+/// (spawn → join → respawn), so 1-2 tids visible per readdir;
+/// main continuously re-spawns to maximize the number of seize-race
+/// opportunities across probe iterations. 10 invocations is
+/// empirically enough to land at least one PTRACE_SEIZE /
+/// PTRACE_INTERRUPT against a tid that dies mid-probe on an idle
+/// guest. Keeping N low bounds the test's wall-time ceiling — each
+/// probe invocation costs ~20-40ms.
+// Topology: `llcs = 1, cores = 2, threads = 2` — ≥2 CPUs ensure the
+// probe process and the churn worker's main thread run concurrently,
+// maximizing the window where a just-spawned helper tid is visible
+// to readdir before join completes.
+#[ktstr_test(llcs = 1, cores = 2, threads = 2)]
+fn jemalloc_probe_survives_thread_churn(ctx: &Ctx) -> Result<AssertResult> {
+    const KNOWN_BYTES: u64 = 1024 * 1024;
+    const INVOCATIONS: u32 = 10;
+    let mut worker: PayloadHandle = ctx
+        .payload(&JEMALLOC_ALLOC_WORKER_CHURN)
+        .arg(KNOWN_BYTES.to_string())
+        .spawn()?;
+    let worker_pid = worker
+        .pid()
+        .ok_or_else(|| anyhow!("churn worker handle has no pid"))?;
+    // Wait for the same pid-scoped ready marker the non-churn path
+    // writes — identical handshake shape, simpler reuse than a
+    // separate /tmp path for the churn variant.
+    let ready_path = format!("/tmp/ktstr-worker-ready-{worker_pid}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !std::path::Path::new(&ready_path).exists() {
+        if worker.try_wait()?.is_some() {
+            return Err(anyhow!(
+                "churn worker pid={worker_pid} exited before ready marker"
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = worker.kill();
+            return Err(anyhow!(
+                "churn worker pid={worker_pid} did not create ready marker within 5s"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Narrow-race close mirroring the external-target test: the
+    // worker may have written the ready marker then died before the
+    // first probe invocation (unusual — the churn loop is supposed
+    // to run forever — but a fatal Drop or kernel SIGKILL could
+    // still fire). A try_wait here surfaces that case with an
+    // actionable error instead of letting 10 probe invocations
+    // silently hit a dead pid.
+    if worker.try_wait()?.is_some() {
+        return Err(anyhow!(
+            "churn worker pid={worker_pid} exited after writing ready marker but \
+             before probe dispatch — check stderr for the exit reason"
+        ));
+    }
+
+    let mut any_multi_thread_seen = false;
+    // A `threads.N.tid` entry without the sibling
+    // `threads.N.allocated_bytes` numeric is the probe emitting an
+    // Err arm — `walk_json_leaves` drops the string-valued `error`
+    // field, so the absence of `allocated_bytes` is the only signal
+    // for an ESRCH / PtraceSeize error surfaced through the flat
+    // metric layout. Counted per-invocation so the returned
+    // AssertResult can carry the observed count as a diagnostic
+    // detail even on the pass paths.
+    let mut error_invocations: u32 = 0;
+    for i in 0..INVOCATIONS {
+        // Every iteration spawns a fresh probe subprocess against
+        // the live churn worker. A signal-death exit (negative
+        // exit_code per PayloadMetrics convention) means the probe
+        // panicked or SIGABORT'd on an ESRCH race — the regression
+        // this test exists to prevent.
+        let (_assert, metrics) = ctx
+            .payload(&JEMALLOC_PROBE_NO_EXIT_CHECK)
+            .arg("--pid")
+            .arg(worker_pid.to_string())
+            .arg("--json")
+            .run()?;
+        if metrics.exit_code < 0 {
+            let _ = worker.kill();
+            return Ok(fail_result(format!(
+                "invocation {i}: probe died by signal (exit_code={}); \
+                 ESRCH race should surface as ThreadResult::Err, not crash",
+                metrics.exit_code
+            )));
+        }
+        // Non-zero (non-signal) exit would mean a fatal probe-side
+        // error OUTSIDE the per-thread loop (e.g. find_jemalloc_via_maps
+        // failure). That's not what this test exercises — it should
+        // reach the per-thread path and at least attempt some tids.
+        if metrics.exit_code != 0 {
+            let _ = worker.kill();
+            return Ok(fail_result(format!(
+                "invocation {i}: probe exit_code={} — fatal error before per-thread loop; \
+                 ESRCH stress test requires the probe to enter the tid iteration",
+                metrics.exit_code,
+            )));
+        }
+        if thread_count(&metrics) > 1 {
+            any_multi_thread_seen = true;
+        }
+        // Scan for an error entry on this invocation: the probe's Err
+        // arm emits `threads.N.tid` without an `allocated_bytes`
+        // sibling (the `error` string is flattened-away by
+        // walk_json_leaves). Any such pair is evidence the ESRCH race
+        // actually fired on this invocation.
+        for j in 0..1024 {
+            let tid_key = format!("threads.{j}.tid");
+            if !metrics.metrics.iter().any(|m| m.name == tid_key) {
+                break;
+            }
+            let alloc_key = format!("threads.{j}.allocated_bytes");
+            if !metrics.metrics.iter().any(|m| m.name == alloc_key) {
+                error_invocations += 1;
+                break;
+            }
+        }
+    }
+    let _ = worker.kill();
+
+    if !any_multi_thread_seen {
+        return Ok(fail_result(format!(
+            "none of {INVOCATIONS} probe invocations saw more than one thread — \
+             churn worker may not be producing tids fast enough to race the probe, \
+             or readdir(/proc/<pid>/task) is not observing the churn"
+        )));
+    }
+    // Both pass paths attach a DetailKind::Other diagnostic so
+    // `error_invocations` is observable in the test report (JSON /
+    // stdout). No dedicated `Info` variant exists in DetailKind — the
+    // kind is advisory here since the result passes either way; the
+    // message is the payload. Hard pass = saw the race at least once;
+    // soft pass = race window present (multi-thread view) but never
+    // lost. Whether a given invocation wins or loses every race is
+    // inherently timing-dependent, so this test does not pin a
+    // specific error count.
+    let mut result = AssertResult::pass();
+    let message = if error_invocations > 0 {
+        format!(
+            "{error_invocations} of {INVOCATIONS} probe invocations observed \
+             ThreadResult::Err entries — ESRCH race window confirmed exercised"
+        )
+    } else {
+        format!(
+            "0 of {INVOCATIONS} invocations observed ThreadResult::Err entries — \
+             race window may not have been exercised (multi-thread view was \
+             visible, but no tid died mid-probe)"
+        )
+    };
+    result
+        .details
+        .push(AssertDetail::new(DetailKind::Other, message));
+    Ok(result)
 }

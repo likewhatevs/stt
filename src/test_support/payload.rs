@@ -72,18 +72,19 @@ pub struct Payload {
     /// extracted from output land as [`Polarity::Unknown`].
     pub metrics: &'static [MetricHint],
     /// Host-side file specs resolved at runtime. Each entry is
-    /// passed through the same resolver as CLI `-i` /
-    /// `--include-files` arguments (see
-    /// [`crate::cli::resolve_include_files`]): bare names are
-    /// searched in the host's `PATH`, explicit paths (absolute,
-    /// relative, or containing `/`) must exist on the host, and
-    /// directories are walked recursively. Resolved entries
-    /// union-merge with whatever the CLI passed via `-i` —
-    /// declarative dependencies NEVER replace CLI input; the two
-    /// sources concatenate and dedupe on identical host_path.
-    /// Populate via the `#[include_files("helper", ...)]`
-    /// attribute on `#[derive(Payload)]` or by spelling the array
-    /// in the struct literal.
+    /// resolved through the framework's include-file pipeline — the
+    /// same resolver used by CLI `-i` / `--include-files` arguments:
+    /// bare names are searched in the host's `PATH`, explicit paths
+    /// (absolute, relative, or containing `/`) must exist on the
+    /// host, and directories are walked recursively. The entry's
+    /// scheduler / payload / workloads / extra_include_files are
+    /// aggregated at test time via
+    /// [`KtstrTestEntry::all_include_files`](crate::test_support::KtstrTestEntry::all_include_files)
+    /// and resolved through the same pipeline the `ktstr shell -i`
+    /// path uses. Populate via the
+    /// `#[include_files("helper", ...)]` attribute on
+    /// `#[derive(Payload)]` or by spelling the array in the struct
+    /// literal.
     pub include_files: &'static [&'static str],
 }
 
@@ -127,12 +128,12 @@ pub enum PayloadKind {
     /// `std::process::Command::new` inside the guest (see
     /// [`PayloadRun::run`](crate::scenario::payload_run::PayloadRun::run)),
     /// which resolves it against the guest's `PATH`. The framework
-    /// does NOT package the binary into the initramfs automatically —
-    /// the test author must supply it via the `-i` / `--include-files`
-    /// resolver on the launching CLI.
+    /// resolves binaries through the include-file pipeline — for
+    /// `#[ktstr_test]` entries via declarative `include_files` /
+    /// `extra_include_files`, or via `-i` on `ktstr shell`.
     ///
-    /// Supply a binary via the [`resolve_include_files`](crate::cli::resolve_include_files)
-    /// resolver. The resolver is wired up to the `shell` subcommand
+    /// Supply a binary through the framework's include-file
+    /// pipeline. The pipeline is wired up to the `shell` subcommand
     /// of both `ktstr` and `cargo ktstr` through the repeatable
     /// `-i` / `--include-files` flag. Each `-i` argument accepts:
     ///
@@ -161,24 +162,19 @@ pub enum PayloadKind {
     ///
     /// # `#[ktstr_test]` entries
     ///
-    /// The `#[ktstr_test]` harness (invoked via `cargo nextest run`)
-    /// does NOT expose `-i` on its surface: the VM-boot path includes
-    /// only the scheduler's config file (see the
-    /// [`Scheduler`](crate::test_support::Scheduler) `config_file`
-    /// field). For a `#[ktstr_test]` that declares
-    /// `PayloadKind::Binary("fio")`, the `fio` binary must already be
-    /// present on the guest `PATH` — either pre-installed in the base
-    /// initramfs or made available via a bespoke test harness that
-    /// wires `resolve_include_files` through its own builder chain.
+    /// Declarative `include_files` on `#[derive(Payload)]` and
+    /// `extra_include_files` on `#[ktstr_test]` handle binary
+    /// packaging automatically — no CLI `-i` and no bespoke harness
+    /// needed.
     ///
     /// # Scheduler config files
     ///
     /// Scheduler-kind payloads that set
     /// [`Scheduler`](crate::test_support::Scheduler)'s `config_file`
-    /// field are the one case the framework packages automatically:
-    /// the config file is placed at `/include-files/{filename}`
-    /// without a `-i` flag. Binary-kind payloads have no equivalent
-    /// shortcut — `-i` is the sole entry point.
+    /// field get automatic packaging: the config file is placed at
+    /// `/include-files/{filename}` without a `-i` flag. Binary-kind
+    /// payloads get the same auto-packaging through declarative
+    /// `include_files` / `extra_include_files` (see above).
     ///
     /// # Fork / kill semantics
     ///

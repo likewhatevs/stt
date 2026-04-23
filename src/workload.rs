@@ -1882,8 +1882,8 @@ impl WorkloadHandle {
                     // parallel with the leader; the follow-up `kill`
                     // is the single-process fallback when the worker's
                     // `setpgid(0, 0)` at fork time somehow failed.
-                    // ESRCH is the expected return when the group has
-                    // no non-leader members.
+                    // ESRCH is expected if the group no longer exists
+                    // (all members, including the leader, already exited).
                     let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::wait::waitpid(npid, None);
@@ -5319,6 +5319,36 @@ mod tests {
         std::env::temp_dir().join(format!("ktstr-sigusr1-ignore-ready-{pid}"))
     }
 
+    /// Poll for `path`'s appearance with a deadline, aborting early if
+    /// `liveness_pid` dies before the file is written. `kill(pid, 0)` is
+    /// the POSIX existence probe — Err means the pid is gone (or the
+    /// caller is not permitted to signal it, which for a pid owned by
+    /// this test process implies the pid has already been reaped).
+    /// Panics with an actionable message on either early-death or
+    /// deadline. `context` is appended to the panic text so the caller
+    /// can pin the failure to a specific test scenario.
+    fn wait_for_file_or_panic(
+        path: &std::path::Path,
+        timeout: Duration,
+        liveness_pid: libc::pid_t,
+        context: &str,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while !path.exists() {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(liveness_pid), None).is_err() {
+                panic!(
+                    "pid {liveness_pid} exited before writing ready file {path:?} — {context}",
+                );
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "pid {liveness_pid} did not write ready file {path:?} within {timeout:?} — {context}",
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Worker function that installs `SIG_IGN` for SIGUSR1 — overriding
     /// the `sigusr1_handler` the child set up post-fork — and spins
     /// for long enough to outlive the parent's 5s collection deadline.
@@ -5412,30 +5442,13 @@ mod tests {
         // unlink a live handshake and wedge the poll loop.
         let _ = std::fs::remove_file(&ready_path);
         h.start();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !ready_path.exists() {
-            // Liveness probe: if the worker died before it could write
-            // the ready file, no amount of further polling will produce
-            // it. `kill(pid, 0)` is the POSIX "does this process
-            // exist?" probe — Err(ESRCH) is the definitive
-            // negative. Break immediately instead of burning the full
-            // 2s deadline on a child that is already reaped.
-            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(worker_pid), None).is_err() {
-                panic!(
-                    "worker at pid {worker_pid} exited before writing ready file \
-                     {ready_path:?} — the child crashed or was reaped before it \
-                     could reach `ignores_sigusr1_fn`'s ready-file write",
-                );
-            }
-            if Instant::now() >= deadline {
-                panic!(
-                    "worker at pid {worker_pid} never wrote ready file {ready_path:?} \
-                     — SIG_IGN install may have failed or child never reached \
-                     `ignores_sigusr1_fn`",
-                );
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_file_or_panic(
+            &ready_path,
+            Duration::from_secs(2),
+            worker_pid,
+            "SIG_IGN install may have failed or child never reached \
+             ignores_sigusr1_fn's ready-file write",
+        );
         let reports = h.stop_and_collect();
         // Ready file outlives the worker (written early, never
         // cleaned up by the child because the parent SIGKILLs it
@@ -5469,6 +5482,231 @@ mod tests {
                 "expected TimedOut or Signaled(SIGKILL), got {other:?}",
             ),
         }
+    }
+
+    /// Shared path helper for [`forks_grandchild_sleep_fn`] and
+    /// [`stop_and_collect_reaps_custom_grandchild_via_process_group`].
+    /// Workers write their forked-grandchild pid here so the test
+    /// can observe it without fragile pipe-based IPC.
+    fn grandchild_pidfile_path(worker_pid: libc::pid_t) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ktstr-grandchild-pid-{worker_pid}"))
+    }
+
+    /// Custom WorkType closure that forks a long-running grandchild
+    /// (`/bin/sleep 60` via `execv`) and ignores `SIGUSR1` on the
+    /// parent-worker side so stop_and_collect is forced into its
+    /// StillAlive escalation branch — the only stop_and_collect
+    /// branch that invokes killpg (Drop also issues killpg on handle
+    /// teardown). Pairs with the
+    /// `stop_and_collect_reaps_custom_grandchild_via_process_group`
+    /// test below.
+    ///
+    /// The `execv` after fork is deliberate: spawning `/bin/sleep` as
+    /// a separate binary avoids running non-async-signal-safe Rust in
+    /// the forked child. Post-exec, the grandchild's address space is
+    /// completely replaced by sleep's.
+    fn forks_grandchild_sleep_fn(stop: &AtomicBool) -> WorkerReport {
+        // Ignore SIGUSR1 so stop_and_collect escalates — matches
+        // ignores_sigusr1_fn's rationale.
+        unsafe {
+            libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+        }
+        let worker_pid: libc::pid_t = unsafe { libc::getpid() };
+        // Fork a grandchild; the parent-worker keeps spinning.
+        let gpid = unsafe { libc::fork() };
+        if gpid < 0 {
+            // Fork failed — the test has no way to observe a
+            // never-created grandchild, so surface the errno and
+            // abort with a diagnostic exit code. _exit is
+            // async-signal-safe; eprintln writes to stderr which the
+            // harness captures for the test log.
+            eprintln!("fork failed: {}", std::io::Error::last_os_error());
+            unsafe { libc::_exit(127); }
+        }
+        if gpid == 0 {
+            // Grandchild: exec /bin/sleep 60 immediately. argv is
+            // NUL-terminated C strings. `execv` returns only on
+            // failure; any return is a setup error → _exit(127).
+            let prog = b"/bin/sleep\0".as_ptr() as *const libc::c_char;
+            let arg = b"60\0".as_ptr() as *const libc::c_char;
+            let argv: [*const libc::c_char; 3] = [prog, arg, std::ptr::null()];
+            unsafe {
+                libc::execv(prog, argv.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        // Parent-worker: publish the grandchild pid through a pidfile
+        // (matches the ready-file pattern elsewhere in these tests)
+        // so the test can look it up without fragile IPC. A write
+        // failure leaves the test waiting on a file that will never
+        // appear — surface the errno and exit so the test gets an
+        // actionable diagnostic instead of a poll-timeout panic.
+        //
+        // Write atomically via tempfile + rename to close the
+        // `exists() → read_to_string()` race: `std::fs::write` does
+        // open(O_CREAT|O_TRUNC) + write + close, so a reader that
+        // catches the file between truncate and write sees an empty
+        // buffer and panics on parse. rename(2) on the same
+        // filesystem is atomic — the test's `exists()` check sees
+        // either no file or a fully-populated one.
+        let pidfile = grandchild_pidfile_path(worker_pid);
+        let pidfile_tmp =
+            std::env::temp_dir().join(format!("ktstr-grandchild-pid-{worker_pid}.tmp"));
+        if let Err(e) = std::fs::write(&pidfile_tmp, gpid.to_string()) {
+            eprintln!("failed to write grandchild pidfile tmp {pidfile_tmp:?}: {e}");
+            unsafe { libc::_exit(127); }
+        }
+        if let Err(e) = std::fs::rename(&pidfile_tmp, &pidfile) {
+            eprintln!(
+                "failed to rename grandchild pidfile {pidfile_tmp:?} → {pidfile:?}: {e}"
+            );
+            unsafe { libc::_exit(127); }
+        }
+        // Spin past the 5s collection deadline so stop_and_collect
+        // escalates to SIGKILL → killpg. The `!stop.load` check is
+        // kept honest even though SIG_IGN prevents SIGUSR1 from
+        // flipping it; the 7s deadline is the real terminator.
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+        WorkerReport {
+            tid: worker_pid,
+            ..WorkerReport::default()
+        }
+    }
+
+    /// Proves the `setpgid(0, 0)` + `killpg` path works end-to-end:
+    /// a long-running grandchild forked from a Custom worker's
+    /// closure dies when stop_and_collect runs. Without setpgid +
+    /// killpg, the grandchild would orphan onto init and survive the
+    /// test — which this test catches via `kill(gpid, 0)` returning
+    /// ESRCH after collection.
+    ///
+    /// The SIGUSR1 ignore forces stop_and_collect into its StillAlive
+    /// escalation branch. This test covers only the stop_and_collect
+    /// StillAlive path; the graceful-exit and Drop paths are separate
+    /// code paths (Drop issues its own killpg on handle teardown;
+    /// graceful-exit in stop_and_collect does not currently sweep the
+    /// process group).
+    #[test]
+    fn stop_and_collect_reaps_custom_grandchild_via_process_group() {
+        let config = WorkloadConfig {
+            num_workers: 1,
+            affinity: AffinityMode::None,
+            work_type: WorkType::custom("grandchild_sleep", forks_grandchild_sleep_fn),
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        let worker_pid = h.worker_pids()[0];
+        let pidfile = grandchild_pidfile_path(worker_pid);
+        let _ = std::fs::remove_file(&pidfile);
+        // Ensure the pidfile is removed on every exit path, including
+        // panics from the assertions below. Manual Drop wrapper keeps
+        // scopeguard out of the dep graph — the crate is only a
+        // transitive dep today.
+        struct PidfileCleanup(std::path::PathBuf);
+        impl Drop for PidfileCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _pidfile_cleanup = PidfileCleanup(pidfile.clone());
+        h.start();
+        // Wait for the worker to publish its grandchild pid. Uses the
+        // shared helper so a worker that dies before publishing (fork
+        // failure, pidfile-write failure, execv error on /bin/sleep)
+        // surfaces immediately instead of waiting the full deadline.
+        wait_for_file_or_panic(
+            &pidfile,
+            Duration::from_secs(3),
+            worker_pid,
+            "fork+exec path likely broken — check /bin/sleep exists and is executable",
+        );
+        // Reader-side retry-on-empty: the worker side writes via
+        // tempfile + rename so the reader should always see a
+        // fully-populated file, but retry here as defence-in-depth
+        // against any remaining exists()-vs-write races (future
+        // refactor removing the atomic rename, filesystems where
+        // rename isn't strictly atomic, or a sibling test using the
+        // non-atomic pattern). 2s cap covers ~200 retries at 10ms;
+        // well over any plausible write latency.
+        let read_deadline = Instant::now() + Duration::from_secs(2);
+        let gpid_str = loop {
+            let s = std::fs::read_to_string(&pidfile)
+                .expect("pidfile readable once exists");
+            if !s.trim().is_empty() {
+                break s;
+            }
+            if Instant::now() >= read_deadline {
+                panic!(
+                    "pidfile {pidfile:?} stayed empty for 2s after exists() \
+                     returned true — writer may have crashed between O_TRUNC \
+                     and write",
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let gpid: libc::pid_t = gpid_str
+            .trim()
+            .parse()
+            .expect("pidfile holds a valid pid_t");
+        assert!(gpid > 0, "grandchild pid must be positive: {gpid}");
+        // Confirm grandchild is alive before stop_and_collect.
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(gpid), None).is_ok(),
+            "grandchild {gpid} must be alive before stop_and_collect",
+        );
+        // Trigger the teardown that should also reap the grandchild.
+        let _reports = h.stop_and_collect();
+        // Poll for grandchild death: killpg delivery + SIGKILL reap
+        // can lag the caller by tens of ms, especially under CI load.
+        //
+        // Zombie hazard: `kill(pid, 0)` returns Ok for zombies too —
+        // "process exists" includes "has exited but not yet reaped."
+        // Under normal conditions, pid 1 (or the nearest subreaper)
+        // reaps the grandchild shortly after its parent worker dies,
+        // flipping kill() to ESRCH. Under PR_SET_CHILD_SUBREAPER
+        // (systemd-run scopes, some CI runners) the test binary
+        // itself becomes the reaper — no reap happens unless we
+        // issue waitpid. Try a non-blocking waitpid on each Ok
+        // observation: ECHILD means we are not its parent (common
+        // case, init reaps) and we fall through to wait for the kill
+        // flip; a successful waitpid means we inherited the zombie
+        // and just cleared it, so we break.
+        let die_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match nix::sys::signal::kill(nix::unistd::Pid::from_raw(gpid), None) {
+                Err(nix::errno::Errno::ESRCH) => break,
+                Err(e) => panic!("unexpected errno from existence probe: {e}"),
+                Ok(()) => {
+                    match nix::sys::wait::waitpid(
+                        nix::unistd::Pid::from_raw(gpid),
+                        Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                    ) {
+                        Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+                        | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                        _ => {}
+                    }
+                    if Instant::now() >= die_deadline {
+                        // Last-resort cleanup so a test failure doesn't
+                        // leak a live grandchild into the host.
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(gpid),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        panic!(
+                            "grandchild {gpid} still alive 5s after \
+                             stop_and_collect — setpgid/killpg path broken",
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        // Pidfile cleanup runs via PidfileCleanup's Drop above (fires
+        // on both the happy path and any panic).
     }
 
     // -- FanOutCompute tests --
