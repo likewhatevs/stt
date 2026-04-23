@@ -248,6 +248,10 @@ pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
 /// warning line wired below the table; `(untracked kconfig)` had
 /// no such legend before this, so a reader inspecting the tag had
 /// to dig through source to learn what it meant.
+///
+/// The `(corrupt)` tag is deliberately not in this legend family —
+/// its remediation is operational, not informational. See
+/// [`format_corrupt_footer`] for the full rationale.
 pub const UNTRACKED_KCONFIG_EXPLANATION: &str =
     "(untracked kconfig) marks entries with no recorded ktstr.kconfig hash \
      (pre-dates kconfig hash tracking). Rebuild with: kernel build --force VERSION";
@@ -277,14 +281,60 @@ pub(crate) fn untracked_legend_if_any(any_untracked: bool) -> Option<&'static st
 /// surfaces `--keep N --force` for partial cleanup so an operator
 /// with valid alongside corrupt entries does not blow them all
 /// away in a single command.
+///
+/// Design decision: `(corrupt)` is deliberately NOT promoted to a
+/// one-line tag-explanation const in the [`EOL_EXPLANATION`] /
+/// [`UNTRACKED_KCONFIG_EXPLANATION`] legend family. Two constraints
+/// drive the decision:
+///
+/// 1. **Runtime cache-root path.** The remediation must surface
+///    the actual cache-root directory so operators know where to
+///    inspect, and a `&'static str` cannot interpolate a runtime
+///    value. [`UNTRACKED_KCONFIG_EXPLANATION`] fits on one line
+///    precisely because its remediation (`kernel build --force
+///    VERSION`) is a literal string with no runtime context;
+///    corrupt's is not, and splitting definition from remediation
+///    is only a fallback — not a solution — since the runtime
+///    path still has to land somewhere adjacent to the tag.
+///
+/// 2. **Duplication avoidance.** The footer's first sentence
+///    already IS the legend — it names the tag, states the
+///    unusable meaning, and enumerates the three corruption modes
+///    (missing metadata, malformed metadata, missing image). A
+///    separate `CORRUPT_EXPLANATION` const would duplicate that
+///    content at two surfaces (const + footer), create drift risk
+///    as either wording is edited, and pay for nothing: a reader
+///    who sees `(corrupt)` in a row and scrolls to the footer
+///    already hits the definition in the first line. Test
+///    `corrupt_footer_is_self_documenting` pins that invariant.
+///
+/// Consistency note: the legend family as currently constituted is
+/// not uniform. `(stale kconfig)` is also handled outside this
+/// pattern — inlined directly in `kernel_list` rather than
+/// extracted to a const + helper pair like EOL and UNTRACKED.
+/// Extracting `stale_kconfig` into the const+helper shape is a
+/// pending follow-up so the informational trio (EOL / UNTRACKED /
+/// STALE) share one pattern; `(corrupt)` remains the sole tag
+/// whose remediation requires runtime state, so even after that
+/// cleanup it stays in the footer family.
+///
+/// Command ordering inside the footer: `--corrupt-only --force`
+/// is listed FIRST because it is the zero-risk surgical option
+/// for the common case (a cache with both valid and corrupt
+/// entries — leaves valid alone). The broader `--force` (removes
+/// ALL) and `--keep N --force` (preserves N newest) variants
+/// follow as escalation paths for operators who want to expand
+/// scope beyond corrupt entries alone.
 pub(crate) fn format_corrupt_footer(cache_root: &Path) -> String {
     format!(
         "warning: entries marked (corrupt) cannot be used — cached metadata is \
          missing, malformed, or references a missing image. Inspect the entry \
          directory under {} to remove it manually, or run \
-         `kernel clean --force` which removes ALL cached entries (valid and \
-         corrupt alike). Use `kernel clean --keep N --force` to preserve the \
-         N newest cached entries while removing the rest.",
+         `kernel clean --corrupt-only --force` which removes ONLY corrupt \
+         entries and leaves valid ones intact. For broader cleanup, \
+         `kernel clean --force` removes ALL cached entries (valid and corrupt \
+         alike); `kernel clean --keep N --force` preserves the N newest \
+         cached entries while removing the rest.",
         cache_root.display(),
     )
 }
@@ -3803,6 +3853,123 @@ mod tests {
             Some(format_corrupt_footer(root)),
         );
         assert_eq!(corrupt_footer_if_any(false, root), None);
+    }
+
+    /// Pins the design decision that `(corrupt)` is NOT in the
+    /// one-line legend family — the footer carries the
+    /// legend-equivalent first sentence AND the operational
+    /// remediation block. Positive content assertions only; this
+    /// test cannot (and does not try to) enforce the absence of a
+    /// future `CORRUPT_EXPLANATION` const.
+    ///
+    /// The invariant the test pins: the footer's FIRST SENTENCE
+    /// names the tag, states the unusable meaning, and enumerates
+    /// the three corruption modes — so a reader who sees
+    /// `(corrupt)` in a row finds the definition in the first line
+    /// of the footer, not buried after the remediation block. A
+    /// future reword that moves the legend content elsewhere (e.g.
+    /// appends it after the command list) would force readers to
+    /// scan past operational guidance to find the meaning — this
+    /// test catches that.
+    ///
+    /// The remediation elements that justify the footer format
+    /// over a one-line legend const are also pinned: the cache-root
+    /// path (the runtime-interpolation constraint that actually
+    /// forces the footer) and all three `kernel clean` command
+    /// variants — the surgical `--corrupt-only --force` (leaves
+    /// valid entries alone) and the two escalation paths `--force`
+    /// (removes ALL) and `--keep N --force` (preserves N newest).
+    /// A regression that dropped any of them invalidates the
+    /// rationale for keeping corrupt out of the legend family and
+    /// trips here.
+    #[test]
+    fn corrupt_footer_is_self_documenting() {
+        let root = std::path::Path::new("/tmp/ktstr-cache-test-root");
+        let footer = format_corrupt_footer(root);
+        // First sentence = legend. A sentence boundary is the
+        // period followed by a space; split once so a future
+        // multi-paragraph footer still pins the first sentence
+        // against the same invariants. Use `.expect()` — a footer
+        // that fails to end its first sentence with `". "` breaks
+        // the invariant (the legend would no longer be separable),
+        // so failing loudly at this split is the right default;
+        // a silent `unwrap_or(&footer)` would let the whole footer
+        // satisfy the downstream assertions and hide the
+        // regression.
+        let first_sentence = footer
+            .split_once(". ")
+            .map(|(head, _)| head)
+            .expect("footer must terminate legend sentence with period-space");
+        assert!(
+            first_sentence.contains("(corrupt)"),
+            "first sentence must name the tag so a reader who sees \
+             `(corrupt)` in a row finds the definition in the \
+             first line of the footer, not buried after the \
+             remediation block; got: {first_sentence:?}",
+        );
+        assert!(
+            first_sentence.contains("cannot be used"),
+            "first sentence must carry the definitional meaning \
+             (legend-equivalent wording); got: {first_sentence:?}",
+        );
+        // Reasons a cache entry is corrupt — the three the JSON
+        // schema (kernel_list corrupt-entry shape) enumerates:
+        // metadata-missing, metadata-malformed, image-missing.
+        // Tokens chosen to be distinct substrings of the actual
+        // legend wording so each mode is independently guarded:
+        // "metadata is missing" anchors to the
+        // "cached metadata is missing" clause, "malformed"
+        // stands alone, and "missing image" anchors to the
+        // "references a missing image" tail. A bare `"missing"`
+        // would match two clauses simultaneously and mask a
+        // regression that dropped one of them.
+        for reason_token in ["metadata is missing", "malformed", "missing image"] {
+            assert!(
+                first_sentence.contains(reason_token),
+                "legend sentence must enumerate corruption modes; \
+                 expected `{reason_token}`, got: {first_sentence:?}",
+            );
+        }
+        // Operational elements that justify the footer format
+        // over a one-line legend const. If any of these disappear,
+        // the design decision (exclude from legend family) loses
+        // its rationale and the task should be revisited.
+        assert!(
+            footer.contains(&root.display().to_string()),
+            "footer must surface the cache-root path verbatim so \
+             operators know which directory to inspect; got: \
+             {footer:?}",
+        );
+        assert!(
+            footer.contains("kernel clean --corrupt-only --force"),
+            "footer must name the `kernel clean --corrupt-only \
+             --force` surgical variant — the zero-risk option for \
+             operators with valid alongside corrupt entries; got: \
+             {footer:?}",
+        );
+        assert!(
+            footer.contains("kernel clean --force"),
+            "footer must name the `kernel clean --force` escalation \
+             variant (removes ALL entries, valid and corrupt); \
+             got: {footer:?}",
+        );
+        assert!(
+            footer.contains("kernel clean --keep N --force"),
+            "footer must name the `kernel clean --keep N --force` \
+             escalation variant (preserves the N newest entries) \
+             alongside the surgical `--corrupt-only --force` and \
+             the broader `--force`, so every operator position \
+             (corrupt-only, preserve-N-newest, everything) has a \
+             documented command; got: {footer:?}",
+        );
+        assert!(
+            footer.contains("ALL cached entries"),
+            "footer must carry the safety wording that distinguishes \
+             the surgical `--corrupt-only --force` (leaves valid \
+             entries alone) from its escalation paths `--force` \
+             (removes ALL) and `--keep N --force` (preserves N \
+             newest); got: {footer:?}",
+        );
     }
 
     /// `DIRTY_TREE_CACHE_SKIP_HINT` is the exact text the
