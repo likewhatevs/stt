@@ -220,6 +220,16 @@ pub(crate) const MAX_WALK_DEPTH: usize = 64;
 /// advisory contract is sufficient for every in-crate consumer.
 pub(crate) const WALK_TRUNCATION_SENTINEL_NAME: &str = "__walk_json_leaves_truncated";
 
+/// Predicate for "this metric name / map key is the
+/// walk-truncation sentinel." Centralises the literal-equality
+/// check so every consumer stays in sync when the sentinel name
+/// changes, and so future sentinel variants (e.g. a
+/// parser-rejection sentinel) can be threaded through one
+/// predicate instead of scattered string literals.
+pub(crate) fn is_truncation_sentinel_name(name: &str) -> bool {
+    name == WALK_TRUNCATION_SENTINEL_NAME
+}
+
 fn walk(
     value: &serde_json::Value,
     path: &mut String,
@@ -303,6 +313,19 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_truncation_sentinel_name_matches_the_constant() {
+        assert!(is_truncation_sentinel_name(WALK_TRUNCATION_SENTINEL_NAME));
+    }
+
+    #[test]
+    fn is_truncation_sentinel_name_rejects_other_names() {
+        assert!(!is_truncation_sentinel_name("foo"));
+        assert!(!is_truncation_sentinel_name(""));
+        // Near-miss: same prefix but not the full sentinel name.
+        assert!(!is_truncation_sentinel_name("__walk_json_leaves"));
+    }
 
     #[test]
     fn exit_code_returns_empty() {

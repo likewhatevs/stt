@@ -1093,8 +1093,8 @@ pub struct WorkerReport {
     /// wakeup that resumes execution; not a yield-specific measure.
     /// Populated for blocking work types: Bursty, PipeIo, FutexPingPong,
     /// FutexFanOut, FanOutCompute, CacheYield, CachePipe, IoSync, NiceSweep,
-    /// AffinityChurn, PolicyChurn, MutexContention, Sequence with
-    /// Sleep/Yield/Io phases.
+    /// AffinityChurn, PolicyChurn, MutexContention, ForkExit (parent's
+    /// waitpid wait), Sequence with Sleep/Yield/Io phases.
     pub resume_latencies_ns: Vec<u64>,
     /// Total number of wake-latency observations the worker
     /// recorded, INCLUDING any that were dropped by the reservoir
@@ -1580,7 +1580,7 @@ impl WorkloadHandle {
             if unsafe { libc::pipe(report_fds.as_mut_ptr()) } != 0 {
                 anyhow::bail!(
                     "worker {}/{}: report pipe failed: {}",
-                    i,
+                    i + 1,
                     config.num_workers,
                     std::io::Error::last_os_error(),
                 );
@@ -1593,7 +1593,7 @@ impl WorkloadHandle {
                 }
                 anyhow::bail!(
                     "worker {}/{}: start pipe failed: {}",
-                    i,
+                    i + 1,
                     config.num_workers,
                     std::io::Error::last_os_error(),
                 );
@@ -1613,7 +1613,7 @@ impl WorkloadHandle {
                     }
                     anyhow::bail!(
                         "worker {}/{}: fork failed: {}",
-                        i,
+                        i + 1,
                         config.num_workers,
                         std::io::Error::last_os_error(),
                     );
@@ -1789,6 +1789,29 @@ impl WorkloadHandle {
                     //    cargo nextest run — dev profile inherits
                     //    default unwind semantics) still get a real
                     //    `catch_unwind` Err → `_exit(1)` fast-path.
+                    //
+                    //    Global-state safety under unwind: the
+                    //    globals reachable from `worker_main`'s
+                    //    code path are atomic primitives
+                    //    (`STOP`: AtomicBool, `SCHED_PID`:
+                    //    AtomicI32, `REPRO_MODE`: AtomicBool) and
+                    //    `OnceLock` (`STATIC_HOST_INFO`). Other
+                    //    crate-wide statics (fetch, probe, vmm)
+                    //    exist but are not touched by the worker
+                    //    path. None of the worker-path globals
+                    //    carry Drop
+                    //    logic that touches the inherited MAP_SHARED
+                    //    regions or the parent-owned pipe fds.
+                    //    Under a hypothetical unwind that escaped
+                    //    `catch_unwind` (e.g. a double-panic that
+                    //    bypasses the landing pad), the only
+                    //    fork-child Drops that matter are on the
+                    //    guard (severed by `mem::forget` above) and
+                    //    on `resume_latencies_ns` / `migrations`
+                    //    (child-local Vec<T>, no cross-process
+                    //    impact). `STATIC_HOST_INFO`'s inner Drop
+                    //    frees a handful of Option<String>s; safe
+                    //    to run in either parent or child.
                     //
                     // 4. `_exit(1)` on catch_unwind Err, `_exit(0)`
                     //    on Ok — bypasses Rust's global static
@@ -2663,7 +2686,21 @@ fn worker_main(
                     }
                     child => {
                         let mut status = 0i32;
+                        // `waitpid` is a blocking primitive: the
+                        // parent sleeps until the child's exit is
+                        // reaped. Measuring the interval is the same
+                        // "resume latency" signal the other blocking
+                        // work types record (pipe read, futex wait,
+                        // yield_now, nanosleep), so feed it into the
+                        // reservoir on the same contract.
+                        let before_wait = Instant::now();
                         unsafe { libc::waitpid(child, &mut status, 0) };
+                        reservoir_push(
+                            &mut resume_latencies_ns,
+                            &mut wake_sample_count,
+                            before_wait.elapsed().as_nanos() as u64,
+                            MAX_WAKE_SAMPLES,
+                        );
                         work_units = work_units.wrapping_add(1);
                         iterations += 1;
                     }
@@ -4421,6 +4458,51 @@ mod tests {
         assert!(h.worker_pids().is_empty());
         let reports = h.stop_and_collect();
         assert!(reports.is_empty());
+    }
+
+    /// Zombie-tolerance on the Drop path: a caller drops a live
+    /// `WorkloadHandle` after external code has SIGKILLed one of
+    /// its workers. Between the signal delivery and the parent's
+    /// `waitpid`, the killed worker sits as a zombie — its pid
+    /// is still owned by this parent (only `waitpid` consumes
+    /// the zombie state; an external signal does not), so Drop's
+    /// follow-up `kill(pid, SIGKILL)` is a no-op against the
+    /// zombie and Drop's `waitpid` reaps the exit status
+    /// normally.
+    ///
+    /// Pins that Drop survives this realistic failure mode — an
+    /// external operator (a CI runner's OOM killer, a stray
+    /// `killall <name>`, a test-harness teardown signal)
+    /// signals one worker before the handle's owning code
+    /// finishes. Drop must leave the surviving siblings alone
+    /// and reap the zombie without panicking.
+    #[test]
+    fn workload_handle_drop_tolerates_externally_killed_child() {
+        let config = WorkloadConfig {
+            num_workers: 2,
+            affinity: AffinityMode::None,
+            work_type: WorkType::CpuSpin,
+            sched_policy: SchedPolicy::Normal,
+            ..Default::default()
+        };
+        let mut h = WorkloadHandle::spawn(&config).unwrap();
+        let pids = h.worker_pids();
+        assert_eq!(pids.len(), 2);
+        h.start();
+        // Externally SIGKILL one worker. The handle still owns
+        // the pid; on Drop it will try to signal + reap it.
+        unsafe { libc::kill(pids[0], libc::SIGKILL) };
+        // A brief sleep covers SIGKILL delivery latency. The
+        // killed worker becomes a zombie rather than ESRCH (only
+        // `waitpid` can clear it), so probing `kill(pid, 0)`
+        // would spin forever — 50 ms is more than enough for
+        // the kernel to deliver the signal and transition the
+        // target to zombie state.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // The assertion is implicit: this drop must not panic.
+        // A panic inside Drop under panic=abort aborts the test
+        // process, which nextest reports as an abnormal failure.
+        drop(h);
     }
 
     #[test]
@@ -6742,7 +6824,15 @@ mod tests {
                     lat < MAX_PLAUSIBLE_LATENCY_NS,
                     "worker {} recorded implausible wake latency {} ns \
                      (expected < {} ns); indicates wake_ns/generation \
-                     ordering race",
+                     ordering race. NB: lat==0 is LEGITIMATE under \
+                     correct ordering — a Relaxed `wake_atom.load` \
+                     paired with an Acquire gen load can see a wake_ns \
+                     from a LATER round (gen+1's store becomes visible \
+                     ahead of gen+1's wake_ns re-load), making \
+                     now_ns < wake_ns and `saturating_sub` = 0. The \
+                     reservoir-sampling of real latencies is dominated \
+                     by positive values; a stray zero from this race \
+                     is not a bug, so no lower bound is asserted.",
                     r.tid,
                     lat,
                     MAX_PLAUSIBLE_LATENCY_NS
@@ -6819,7 +6909,15 @@ mod tests {
                     lat < MAX_PLAUSIBLE_LATENCY_NS,
                     "worker {} recorded implausible wake latency {} ns \
                      (expected < {} ns); indicates wake_ns/generation \
-                     ordering race",
+                     ordering race. NB: lat==0 is LEGITIMATE under \
+                     correct ordering — a Relaxed `wake_atom.load` \
+                     paired with an Acquire gen load can see a wake_ns \
+                     from a LATER round (gen+1's store becomes visible \
+                     ahead of gen+1's wake_ns re-load), making \
+                     now_ns < wake_ns and `saturating_sub` = 0. The \
+                     reservoir-sampling of real latencies is dominated \
+                     by positive values; a stray zero from this race \
+                     is not a bug, so no lower bound is asserted.",
                     r.tid,
                     lat,
                     MAX_PLAUSIBLE_LATENCY_NS

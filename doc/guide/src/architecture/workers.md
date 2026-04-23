@@ -138,7 +138,8 @@ blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
 messenger's shared timestamp), CacheYield (yield), CachePipe (pipe
 read), IoSync (sleep), NiceSweep (yield), AffinityChurn (yield),
 PolicyChurn (yield), MutexContention (futex wait on contended
-acquire), and Sequence when its phases include Sleep, Yield, or Io.
+acquire), ForkExit (parent's waitpid wait), and Sequence when its
+phases include Sleep, Yield, or Io.
 Each sample is in nanoseconds; most work types use
 `Instant::elapsed()` across the blocking call, while FanOutCompute
 uses `clock_gettime(CLOCK_MONOTONIC)` to measure against the

@@ -86,7 +86,7 @@ pub fn ktstr_test_early_dispatch() {
     // skip interception so the standard harness discovers #[cfg(test)]
     // module #[test] functions (unit tests).
     if std::env::var_os("NEXTEST").is_some() {
-        let has_real_tests = KTSTR_TESTS.iter().any(|e| e.name != "__unit_test_dummy__");
+        let has_real_tests = KTSTR_TESTS.iter().any(|e| !is_test_sentinel(e.name));
         if has_real_tests {
             let args: Vec<String> = std::env::args().collect();
             if args.iter().any(|a| a == "--list" || a == "--exact") {
@@ -112,7 +112,7 @@ pub fn ktstr_test_early_dispatch() {
         // test binary per crate; the ctor runs exactly once per
         // test binary) so there is no need to gate with a
         // std::sync::Once.
-        let has_real_tests = KTSTR_TESTS.iter().any(|e| e.name != "__unit_test_dummy__");
+        let has_real_tests = KTSTR_TESTS.iter().any(|e| !is_test_sentinel(e.name));
         if has_real_tests {
             eprintln!(
                 "warning: ktstr test entries detected but NEXTEST env var is not set; \
@@ -121,6 +121,36 @@ pub fn ktstr_test_early_dispatch() {
             );
         }
     }
+}
+
+/// Predicate for "this entry is a unit-test sentinel, not a real
+/// `#[ktstr_test]` user entry." The lib-test binary registers a
+/// single sentinel entry (currently `"__unit_test_dummy__"`) so
+/// the dispatch + gauntlet plumbing has something to exercise
+/// under `cargo test --lib`; real user entries look like
+/// `"module::test_name"` or similar PascalCase-with-dots names.
+///
+/// Matching the sentinel by convention (`__` prefix + `__`
+/// suffix + `_test_` or `_dummy_` infix) rather than by literal
+/// equality keeps the filter robust when the sentinel is
+/// renamed, or when future scaffolding adds additional
+/// sentinel-shaped entries (e.g. `__unit_test_panics__`,
+/// `__unit_test_timeout__`). The literal-equality form would
+/// silently admit those future sentinels into the real-entry
+/// population and double-fire the "NEXTEST env var not set"
+/// warning or spuriously enable --list interception.
+fn is_test_sentinel(name: &str) -> bool {
+    // Real user-authored `#[ktstr_test]` entry names
+    // conventionally do not match the `__unit_test_*__` pattern
+    // (Rust's reserved-identifier convention for
+    // language-implementation and framework-internal names).
+    // The `#[ktstr_test]` proc macro does not validate this, so
+    // the predicate admits a real user entry in the unlikely
+    // case someone names one with the `__unit_test_*__` shape —
+    // collision would double-fire the "NEXTEST env var not set"
+    // warning / spuriously enable --list interception, but
+    // that's a diagnostic glitch, not a correctness failure.
+    name.starts_with("__unit_test_") && name.ends_with("__")
 }
 
 /// Host-side dispatch: if both `--ktstr-test-fn` and `--ktstr-topo` are
@@ -705,6 +735,40 @@ pub fn ktstr_main() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // is_test_sentinel — convention-based sentinel-name predicate
+    // ---------------------------------------------------------------
+
+    /// Accepted shapes: `__unit_test_*__` (the established
+    /// sentinel convention — double-underscore prefix with
+    /// `unit_test_` tag, arbitrary inner suffix, double-underscore
+    /// suffix).
+    #[test]
+    fn is_test_sentinel_accepts_convention_shaped_names() {
+        assert!(is_test_sentinel("__unit_test_dummy__"));
+        assert!(is_test_sentinel("__unit_test_panics__"));
+        // Any inner body after the prefix is accepted, as long as
+        // the `__` suffix is also present.
+        assert!(is_test_sentinel("__unit_test_foo_bar_baz__"));
+    }
+
+    /// Rejected shapes: real user names, unrelated
+    /// double-underscore names, and partial matches.
+    #[test]
+    fn is_test_sentinel_rejects_non_convention_names() {
+        // Real user-authored name.
+        assert!(!is_test_sentinel("my_test"));
+        // Double-underscore wrapping but not the `__unit_test_` tag.
+        assert!(!is_test_sentinel("__foo__"));
+        // Empty string.
+        assert!(!is_test_sentinel(""));
+        // Has the prefix but no `__` suffix (ends with just `_`).
+        assert!(!is_test_sentinel("__unit_test_"));
+        // Has the prefix, has `__` suffix, but the prefix itself
+        // is truncated — missing the trailing `_` of `__unit_test_`.
+        assert!(!is_test_sentinel("__unit__"));
+    }
 
     // ---------------------------------------------------------------
     // run_named_test / run_gauntlet_test — nextest dispatch routing

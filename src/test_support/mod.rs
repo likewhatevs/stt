@@ -84,7 +84,7 @@ pub use entry::{
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
 pub use eval::{nextest_setup, resolve_scheduler, resolve_test_kernel};
 pub use metrics::{extract_metrics, walk_json_leaves};
-pub(crate) use metrics::WALK_TRUNCATION_SENTINEL_NAME;
+pub(crate) use metrics::{WALK_TRUNCATION_SENTINEL_NAME, is_truncation_sentinel_name};
 pub use model::{
     DEFAULT_MODEL, LLM_DEBUG_RESPONSES_ENV, ModelSpec, ModelStatus, OFFLINE_ENV, ShaVerdict,
     any_test_requires_model, ensure, prefetch_if_required, status,

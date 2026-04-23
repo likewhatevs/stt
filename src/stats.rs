@@ -547,7 +547,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .ext_metrics
             .iter()
             .filter_map(|(k, &v)| {
-                if k == crate::test_support::WALK_TRUNCATION_SENTINEL_NAME {
+                if crate::test_support::is_truncation_sentinel_name(k) {
                     return None;
                 }
                 if v.is_finite() {
@@ -2571,5 +2571,125 @@ mod tests {
         let json = serde_json::to_string(&row).unwrap();
         let back: GauntletRow = serde_json::from_str(&json).unwrap();
         assert_eq!(back, row);
+    }
+
+    /// Pins that `compare_runs(..., dir = Some(alt_root))` actually
+    /// resolves `a` / `b` against `alt_root`, not the default
+    /// [`crate::test_support::runs_root`].
+    ///
+    /// Sibling [`crate::bin::cargo_ktstr::tests::parse_stats_compare_with_dir`]
+    /// (src/bin/cargo-ktstr.rs) pins the clap-binding half of the
+    /// `--dir` wiring: a CLI invocation `stats compare a b --dir
+    /// PATH` parses into `StatsCommand::Compare { dir: Some(PATH),
+    /// ... }`. That test stops at the parsed struct — it cannot
+    /// prove that the resolved `Option<&Path>` is then threaded
+    /// through to `compare_runs`'s root-resolution site
+    /// (stats.rs:`let root = match dir { Some(d) => ..., None =>
+    /// runs_root() }`). A regression that re-parsed `--dir`
+    /// correctly but dropped the field on the way to
+    /// `compare_runs` would pass the parse test yet silently read
+    /// from `runs_root()` — exactly the bug a reader of the
+    /// existing comment at the top of [`compare_runs`] is warned
+    /// about as "earlier versions."
+    ///
+    /// Fixture shape: two unique-named run subdirectories under a
+    /// freshly-created tempdir, each containing one valid
+    /// `*.ktstr.json` sidecar (built from
+    /// [`SidecarResult::test_fixture`] with a distinct run-specific
+    /// test_name). Calling `compare_runs` with `dir =
+    /// Some(alt_root.path())` reads those sidecars and returns
+    /// `Ok(exit_code)`. The unique-name choice (`__dir_thread_a__`
+    /// / `__dir_thread_b__`) insulates the test from any ambient
+    /// sidecar tree under `runs_root()`: if `--dir` threading
+    /// silently broke and the function fell back to `runs_root()`,
+    /// it would bail with "run '__dir_thread_a__' not found under
+    /// {runs_root}" rather than succeed. Success therefore
+    /// implies the alt-root path was honoured.
+    ///
+    /// Companion assertion: calling `compare_runs` WITHOUT `--dir`
+    /// (dir = None) against the same unique names must produce an
+    /// error whose message names `runs_root()` — proving the
+    /// fallback path points where we expect and reinforcing that
+    /// the success above used `alt_root`. Ensures a broken
+    /// threading regression cannot pass this test by "sort of
+    /// working" (e.g. some parent-directory bug that happens to
+    /// include our tempdir).
+    #[test]
+    fn compare_runs_threads_dir_through_to_sidecar_resolution() {
+        use crate::test_support::SidecarResult;
+
+        let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
+        // Distinctive test-only names that must not collide with
+        // any pre-existing run directory under the ambient
+        // `runs_root()`.
+        let run_a = "__dir_thread_a__";
+        let run_b = "__dir_thread_b__";
+
+        // Set up two run directories each with one valid sidecar.
+        // Using `test_fixture()` keeps the fields defaulted;
+        // overriding `test_name` per run gives the two runs
+        // distinct rows so compare_runs has something to report
+        // without tripping the empty-sidecars bail.
+        for (name, run_key) in [("dir_thread_fixture_a", run_a), ("dir_thread_fixture_b", run_b)] {
+            let run_dir = alt_root.path().join(run_key);
+            std::fs::create_dir_all(&run_dir).expect("create run dir");
+            let sidecar = SidecarResult {
+                test_name: name.to_string(),
+                ..SidecarResult::test_fixture()
+            };
+            let json = serde_json::to_string(&sidecar).expect("serialize fixture sidecar");
+            let sidecar_path = run_dir.join(format!("{name}.ktstr.json"));
+            std::fs::write(&sidecar_path, json).expect("write fixture sidecar");
+        }
+
+        // Positive: with `dir = Some(alt_root)` the resolver must
+        // find the fixtures we just laid down and return Ok. A
+        // broken threading would fall back to `runs_root()`, fail
+        // to find `runs_root()/__dir_thread_a__`, and bail.
+        let exit = compare_runs(run_a, run_b, None, None, Some(alt_root.path()))
+            .expect("compare_runs must resolve runs under the dir arg");
+        assert!(
+            exit == 0 || exit == 1,
+            "compare_runs must return a standard exit code (0 no \
+             regressions, 1 regressions); got {exit}",
+        );
+
+        // Companion: without `--dir`, the same unique names cannot
+        // exist under the ambient `runs_root()` (they're
+        // test-private fixtures we just created under a tempdir),
+        // so compare_runs must Err with a message that names the
+        // fallback root. This proves the dir-resolution branch
+        // above actually went through the Some(d) arm rather than
+        // happening to work because runs_root() also had these
+        // names.
+        let err = compare_runs(run_a, run_b, None, None, None)
+            .expect_err("compare_runs without --dir must fail on missing unique fixtures");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(run_a),
+            "fallback error must name the missing run; got: {rendered}",
+        );
+        let fallback_root = crate::test_support::runs_root();
+        let fallback_display = fallback_root.display().to_string();
+        assert!(
+            rendered.contains(&fallback_display),
+            "fallback error must name runs_root() ({fallback_display:?}) so the \
+             dir=None branch is proven to resolve against the fallback; got: \
+             {rendered}",
+        );
+        // Defensive: the fallback root must NOT equal our alt
+        // root. If it did, the positive assertion above is
+        // circular (alt_root ≡ runs_root()) and proves nothing
+        // about threading. Tempdir names are randomized per run,
+        // so this is effectively always true, but assert anyway
+        // to rule out a regression that changed `runs_root()` to
+        // return the first-argument dir.
+        assert_ne!(
+            fallback_root.as_path(),
+            alt_root.path(),
+            "runs_root() must differ from the alt-root tempdir, \
+             otherwise this test cannot distinguish threading \
+             from fallback",
+        );
     }
 }
