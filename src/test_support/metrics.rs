@@ -24,7 +24,7 @@
 //! [`MetricSource::LlmExtract`]. One extraction walker, two
 //! acquisition paths.
 
-use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
+use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Polarity};
 
 /// Extract metrics from a payload's captured output per its declared
 /// [`OutputFormat`].
@@ -65,13 +65,17 @@ use crate::test_support::{Metric, MetricSource, OutputFormat, Polarity};
 /// below serde_json's default parse recursion limit (128) and
 /// covers every realistic payload schema observed in the crate
 /// (fio maxes out around depth 8, schbench around depth 3).
-pub fn extract_metrics(output: &str, format: &OutputFormat) -> Result<Vec<Metric>, String> {
+pub fn extract_metrics(
+    output: &str,
+    format: &OutputFormat,
+    stream: MetricStream,
+) -> Result<Vec<Metric>, String> {
     match format {
         OutputFormat::ExitCode => Ok(Vec::new()),
         OutputFormat::Json => Ok(find_and_parse_json(output)
-            .map(|v| walk_json_leaves(&v, MetricSource::Json))
+            .map(|v| walk_json_leaves(&v, MetricSource::Json, stream))
             .unwrap_or_default()),
-        OutputFormat::LlmExtract(hint) => super::model::extract_via_llm(output, *hint),
+        OutputFormat::LlmExtract(hint) => super::model::extract_via_llm(output, *hint, stream),
     }
 }
 
@@ -172,13 +176,17 @@ fn extract_json_region(s: &str) -> Option<&str> {
 /// unit; the caller resolves these against the payload's declared
 /// [`MetricHint`](crate::test_support::MetricHint)s to upgrade
 /// polarity.
-pub fn walk_json_leaves(value: &serde_json::Value, source: MetricSource) -> Vec<Metric> {
+pub fn walk_json_leaves(
+    value: &serde_json::Value,
+    source: MetricSource,
+    stream: MetricStream,
+) -> Vec<Metric> {
     let mut out = Vec::new();
     // Single reusable path buffer: children push their segment,
     // recurse, then truncate back. O(total_path_chars) work across
     // the whole walk instead of O(depth × path_chars) per leaf.
     let mut path = String::new();
-    walk(value, &mut path, 0, source, &mut out);
+    walk(value, &mut path, 0, source, stream, &mut out);
     out
 }
 
@@ -235,6 +243,7 @@ fn walk(
     path: &mut String,
     depth: usize,
     source: MetricSource,
+    stream: MetricStream,
     out: &mut Vec<Metric>,
 ) {
     if depth > MAX_WALK_DEPTH {
@@ -256,6 +265,7 @@ fn walk(
             polarity: Polarity::Unknown,
             unit: String::new(),
             source,
+            stream,
         });
         return;
     }
@@ -267,7 +277,7 @@ fn walk(
                     path.push('.');
                 }
                 path.push_str(k);
-                walk(v, path, depth + 1, source, out);
+                walk(v, path, depth + 1, source, stream, out);
                 path.truncate(saved_len);
             }
         }
@@ -282,7 +292,7 @@ fn walk(
                 // fmt::Write impl (infallible for String).
                 use std::fmt::Write;
                 let _ = write!(path, "{i}");
-                walk(v, path, depth + 1, source, out);
+                walk(v, path, depth + 1, source, stream, out);
                 path.truncate(saved_len);
             }
         }
@@ -300,6 +310,7 @@ fn walk(
                     polarity: Polarity::Unknown,
                     unit: String::new(),
                     source,
+                    stream,
                 });
             }
         }
@@ -329,14 +340,14 @@ mod tests {
 
     #[test]
     fn exit_code_returns_empty() {
-        let m = extract_metrics("whatever", &OutputFormat::ExitCode).unwrap();
+        let m = extract_metrics("whatever", &OutputFormat::ExitCode, MetricStream::Stdout).unwrap();
         assert!(m.is_empty());
     }
 
     #[test]
     fn json_full_document_extracts_numeric_leaves() {
         let s = r#"{"iops": 10000, "lat_ns": 500}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 2);
         let names: Vec<_> = m.iter().map(|x| x.name.as_str()).collect();
         assert!(names.contains(&"iops"));
@@ -352,7 +363,7 @@ mod tests {
     fn json_with_banner_prefix_extracts_region() {
         // Fio-style: banner line then JSON body.
         let s = "fio-3.36 starting up\n{\"iops\": 500}";
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "iops");
         assert_eq!(m[0].value, 500.0);
@@ -361,7 +372,7 @@ mod tests {
     #[test]
     fn json_nested_objects_use_dotted_paths() {
         let s = r#"{"jobs": {"0": {"read": {"iops": 123}}}}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "jobs.0.read.iops");
         assert_eq!(m[0].value, 123.0);
@@ -370,7 +381,7 @@ mod tests {
     #[test]
     fn json_arrays_use_numeric_index_paths() {
         let s = r#"{"samples": [100, 200, 300]}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 3);
         let mut actual: Vec<(&str, f64)> = m.iter().map(|x| (x.name.as_str(), x.value)).collect();
         actual.sort_by_key(|(n, _)| n.to_string());
@@ -386,20 +397,20 @@ mod tests {
 
     #[test]
     fn json_malformed_returns_empty() {
-        let m = extract_metrics("garbage not json", &OutputFormat::Json).unwrap();
+        let m = extract_metrics("garbage not json", &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert!(m.is_empty());
     }
 
     #[test]
     fn json_empty_stdout_returns_empty() {
-        let m = extract_metrics("", &OutputFormat::Json).unwrap();
+        let m = extract_metrics("", &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert!(m.is_empty());
     }
 
     #[test]
     fn json_skips_string_and_bool_leaves() {
         let s = r#"{"name": "fio", "ok": true, "iops": 42}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         // Only iops is numeric.
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "iops");
@@ -408,7 +419,7 @@ mod tests {
     #[test]
     fn json_top_level_array_extracts_entries() {
         let s = "[1, 2, 3]";
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 3);
     }
 
@@ -437,7 +448,7 @@ mod tests {
         // surfaced as a threaded reason string so the Check
         // evaluator can attach it to the AssertResult. The exact
         // reason message includes the offline-gate env-var name.
-        let err = extract_metrics("anything", &OutputFormat::LlmExtract(None))
+        let err = extract_metrics("anything", &OutputFormat::LlmExtract(None), MetricStream::Stdout)
             .expect_err("offline gate must produce Err from extract_metrics");
         assert!(
             err.contains(super::super::model::OFFLINE_ENV),
@@ -460,6 +471,7 @@ mod tests {
         let err = extract_metrics(
             "anything",
             &OutputFormat::LlmExtract(Some("focus on latency")),
+            MetricStream::Stdout,
         )
         .expect_err("offline gate must produce Err from extract_metrics");
         assert!(
@@ -578,7 +590,7 @@ mod tests {
         // the stdout `{"iops": 100}`. This pins that payloads
         // needing stderr-noise tolerance must pre-strip
         // timestamps rather than relying on the extractor.
-        let m1 = extract_metrics(scenario_1, &OutputFormat::Json).unwrap();
+        let m1 = extract_metrics(scenario_1, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         let names_1: Vec<&str> = m1.iter().map(|x| x.name.as_str()).collect();
         assert!(
             !names_1.iter().any(|n| *n == "iops"),
@@ -629,7 +641,7 @@ mod tests {
              first-region scan; the following valid `{{..}}` is \
              never inspected by the finder",
         );
-        let m3 = extract_metrics(scenario_3, &OutputFormat::Json).unwrap();
+        let m3 = extract_metrics(scenario_3, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert!(
             m3.is_empty(),
             "region parses unsuccessfully as JSON → fallback \
@@ -643,7 +655,7 @@ mod tests {
         // preceding noise extracts cleanly, so the failures
         // above are specifically due to the preceding bracket
         // noise, not the JSON itself.
-        let m_clean = extract_metrics(r#"{"iops": 400}"#, &OutputFormat::Json).unwrap();
+        let m_clean = extract_metrics(r#"{"iops": 400}"#, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         let clean_names: Vec<&str> = m_clean.iter().map(|x| x.name.as_str()).collect();
         assert!(
             clean_names.iter().any(|n| *n == "iops"),
@@ -657,17 +669,106 @@ mod tests {
     #[test]
     fn walk_json_leaves_polarity_is_unknown_before_hint_resolution() {
         let v: serde_json::Value = serde_json::from_str(r#"{"a": 1}"#).unwrap();
-        let m = walk_json_leaves(&v, MetricSource::Json);
+        let m = walk_json_leaves(&v, MetricSource::Json, MetricStream::Stdout);
         assert_eq!(m[0].polarity, Polarity::Unknown);
     }
 
     #[test]
     fn walk_json_leaves_tags_source() {
         let v: serde_json::Value = serde_json::from_str(r#"{"a": 1}"#).unwrap();
-        let json_tagged = walk_json_leaves(&v, MetricSource::Json);
+        let json_tagged = walk_json_leaves(&v, MetricSource::Json, MetricStream::Stdout);
         assert_eq!(json_tagged[0].source, MetricSource::Json);
-        let llm_tagged = walk_json_leaves(&v, MetricSource::LlmExtract);
+        let llm_tagged = walk_json_leaves(&v, MetricSource::LlmExtract, MetricStream::Stdout);
         assert_eq!(llm_tagged[0].source, MetricSource::LlmExtract);
+    }
+
+    /// `stream` attribution is orthogonal to `source`: every cross
+    /// product of (`Json`/`LlmExtract`) × (`Stdout`/`Stderr`) must
+    /// round-trip through the walker, and the stream field on the
+    /// emitted `Metric` must match the argument. Pins the
+    /// orthogonality contract asserted in the [`MetricStream`]
+    /// docstring so a regression that silently coupled the two
+    /// axes (e.g. forced `LlmExtract` to always stamp `Stdout`)
+    /// fails here.
+    ///
+    /// Exercises BOTH walker branches: the object-recurse branch
+    /// (via `{"a": 1}`) AND the array-recurse branch (via
+    /// `[{"a": 1}, {"b": 2}]`) — a regression that stamped the
+    /// stream only on one branch's emitted metrics would pass the
+    /// object fixture but fail the array leaves. The array
+    /// fixture also doubles coverage (two leaves per call) so the
+    /// cross-product's 4 stream×source combos each produce 2
+    /// assertions, catching any leaf-specific drift.
+    #[test]
+    fn walk_json_leaves_tags_stream_orthogonally_to_source() {
+        let obj: serde_json::Value = serde_json::from_str(r#"{"a": 1}"#).unwrap();
+        let arr: serde_json::Value =
+            serde_json::from_str(r#"[{"a": 1}, {"b": 2}]"#).unwrap();
+        for (fixture_label, value, expected_len) in [
+            ("object", &obj, 1_usize),
+            ("array", &arr, 2_usize),
+        ] {
+            for (src, stream) in [
+                (MetricSource::Json, MetricStream::Stdout),
+                (MetricSource::Json, MetricStream::Stderr),
+                (MetricSource::LlmExtract, MetricStream::Stdout),
+                (MetricSource::LlmExtract, MetricStream::Stderr),
+            ] {
+                let tagged = walk_json_leaves(value, src, stream);
+                assert_eq!(
+                    tagged.len(),
+                    expected_len,
+                    "walker on {fixture_label} fixture must produce \
+                     exactly {expected_len} leaf(s); got {}",
+                    tagged.len(),
+                );
+                for (i, m) in tagged.iter().enumerate() {
+                    assert_eq!(
+                        m.source, src,
+                        "{fixture_label} leaf {i}: source tag must \
+                         match the argument ({src:?}); got {:?}",
+                        m.source,
+                    );
+                    assert_eq!(
+                        m.stream, stream,
+                        "{fixture_label} leaf {i}: stream tag must \
+                         match the argument ({stream:?}); got {:?}. \
+                         A regression that stamped the stream only \
+                         on the object-recurse branch would pass \
+                         the object fixture but fail here.",
+                        m.stream,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `extract_metrics` on the `Json` format threads the `stream`
+    /// argument through to every emitted `Metric.stream`. Pins the
+    /// wire between `extract_metrics` (caller-facing API) and the
+    /// walker that actually stamps the field — a regression that
+    /// dropped the `stream` parameter on the way in, or hardcoded
+    /// `Stdout` inside the `Json` arm, silently drops the stderr
+    /// attribution and breaks the `PayloadRun` stderr-fallback
+    /// labelling. Mirrors the `walk_json_leaves_tags_stream_...`
+    /// test one layer up.
+    #[test]
+    fn extract_metrics_threads_stream_from_argument_to_emitted_metric() {
+        let json = r#"{"iops": 100}"#;
+        for stream in [MetricStream::Stdout, MetricStream::Stderr] {
+            let metrics = extract_metrics(json, &OutputFormat::Json, stream).unwrap();
+            assert_eq!(
+                metrics.len(),
+                1,
+                "one leaf expected from {{\"iops\": 100}}",
+            );
+            assert_eq!(
+                metrics[0].stream, stream,
+                "extract_metrics must thread stream={stream:?} to the \
+                 emitted Metric; got {:?}",
+                metrics[0].stream,
+            );
+        }
     }
 
     // Additional edge-case coverage for walk_json_leaves paths.
@@ -677,7 +778,7 @@ mod tests {
         // Edge case: array of objects. Each object's field should
         // emit `samples.N.field` paths.
         let s = r#"{"samples": [{"iops": 100}, {"iops": 200}, {"iops": 300}]}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 3);
         let names: Vec<&str> = m.iter().map(|x| x.name.as_str()).collect();
         assert!(names.contains(&"samples.0.iops"));
@@ -691,7 +792,7 @@ mod tests {
         // Number::as_f64 lossily converts any JSON number to f64;
         // values below 2^53 are exact.
         let s = r#"{"big_iops": 1000000000000}"#; // 1e12 = 2^40
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].value, 1_000_000_000_000.0);
     }
@@ -707,7 +808,7 @@ mod tests {
                  \n\
                  {\"jobs\": [{\"jobname\": \"test\", \"read\": {\"iops\": 12345, \"bw_bytes\": 50593792}}], \
                  \"disk_util\": [{\"util\": 99.5}]}";
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         // Extracted: jobs.0.read.iops, jobs.0.read.bw_bytes, disk_util.0.util.
         // jobname is a string, skipped.
         assert_eq!(m.len(), 3);
@@ -750,7 +851,7 @@ mod tests {
         // 2^53+1 would itself round at parse time, obscuring what
         // the walker did.
         let s = r#"{"huge": 9007199254740993}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 1);
         // The emitted f64 IS the nearest representable value —
         // which is 2^53, not 2^53+1. Both literals happen to print
@@ -777,7 +878,7 @@ mod tests {
     #[test]
     fn json_integer_at_2_pow_53_is_exact() {
         let s = r#"{"exact": 9007199254740992}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].value, 9_007_199_254_740_992.0_f64);
     }
@@ -855,7 +956,7 @@ mod tests {
     #[test]
     fn json_negative_numbers_extract_preserving_sign() {
         let s = r#"{"delta_ns": -500.5, "underflow": -1000000}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         let by_name: std::collections::BTreeMap<&str, f64> =
             m.iter().map(|x| (x.name.as_str(), x.value)).collect();
         assert_eq!(by_name.get("delta_ns"), Some(&-500.5));
@@ -871,7 +972,7 @@ mod tests {
     #[test]
     fn json_zero_values_are_emitted_not_filtered() {
         let s = r#"{"errors": 0, "cpu_idle_pct": 0.0, "count": -0.0}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         let by_name: std::collections::BTreeMap<&str, f64> =
             m.iter().map(|x| (x.name.as_str(), x.value)).collect();
         assert_eq!(by_name.len(), 3, "all three zeros must extract: {m:?}");
@@ -886,7 +987,7 @@ mod tests {
     #[test]
     fn json_mixed_signs_and_zero_all_extract() {
         let s = r#"{"pos": 10.0, "neg": -10.0, "zero": 0.0}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 3);
     }
 
@@ -896,7 +997,7 @@ mod tests {
     /// empty Vec. No `None` return, no panic.
     #[test]
     fn json_empty_object_yields_no_metrics() {
-        let m = extract_metrics("{}", &OutputFormat::Json).unwrap();
+        let m = extract_metrics("{}", &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert!(m.is_empty(), "empty object has no leaves: {m:?}");
     }
 
@@ -904,7 +1005,7 @@ mod tests {
     /// metrics.
     #[test]
     fn json_empty_array_yields_no_metrics() {
-        let m = extract_metrics("[]", &OutputFormat::Json).unwrap();
+        let m = extract_metrics("[]", &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert!(m.is_empty(), "empty array has no leaves: {m:?}");
     }
 
@@ -915,7 +1016,7 @@ mod tests {
     #[test]
     fn json_nested_empty_containers_yield_no_metrics() {
         let s = r#"{"outer": {"inner": {}, "also": []}}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert!(m.is_empty(), "nested empties emit nothing: {m:?}");
     }
 
@@ -924,7 +1025,7 @@ mod tests {
     #[test]
     fn json_empty_container_mixed_with_real_metrics() {
         let s = r#"{"iops": 100.0, "meta": {}, "samples": []}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "iops");
         assert_eq!(m[0].value, 100.0);
@@ -939,7 +1040,7 @@ mod tests {
     fn walk_json_leaves_deep_nesting_paths_are_correct() {
         // 6 levels deep → one leaf at a.b.c.d.e.f.
         let s = r#"{"a":{"b":{"c":{"d":{"e":{"f": 42.0}}}}}}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "a.b.c.d.e.f");
         assert_eq!(m[0].value, 42.0);
@@ -953,7 +1054,7 @@ mod tests {
     #[test]
     fn walk_json_leaves_siblings_do_not_accumulate_path() {
         let s = r#"{"root":{"a": 1, "b": 2, "c": 3}}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 3);
         let names: std::collections::BTreeSet<&str> = m.iter().map(|x| x.name.as_str()).collect();
         let expected: std::collections::BTreeSet<&str> =
@@ -967,7 +1068,7 @@ mod tests {
     #[test]
     fn walk_json_leaves_deep_array_object_interleaving() {
         let s = r#"{"data":[{"vals":[10.0, 20.0]},{"vals":[30.0]}]}"#;
-        let m = extract_metrics(s, &OutputFormat::Json).unwrap();
+        let m = extract_metrics(s, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         let by_name: std::collections::BTreeMap<&str, f64> =
             m.iter().map(|x| (x.name.as_str(), x.value)).collect();
         assert_eq!(by_name.get("data.0.vals.0"), Some(&10.0));
@@ -998,7 +1099,7 @@ mod tests {
             m.insert("x".to_string(), value);
             value = serde_json::Value::Object(m);
         }
-        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
         let real_leaves: Vec<_> = metrics
             .iter()
             .filter(|m| m.name != WALK_TRUNCATION_SENTINEL_NAME)
@@ -1037,7 +1138,7 @@ mod tests {
             m.insert("x".to_string(), value);
             value = serde_json::Value::Object(m);
         }
-        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
         assert_eq!(metrics.len(), 1, "boundary leaf must be preserved");
         assert_eq!(metrics[0].value, 42.0);
     }
@@ -1066,7 +1167,7 @@ mod tests {
                 "only_child": 5.0
             }
         });
-        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
         let by_name: std::collections::BTreeMap<&str, f64> =
             metrics.iter().map(|m| (m.name.as_str(), m.value)).collect();
         assert_eq!(by_name.get("shallow"), Some(&1.0));
@@ -1093,7 +1194,7 @@ mod tests {
                 [[5.0, 6.0], [7.0, 8.0]]
             ]
         });
-        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
         let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
         // 8 leaves in lexicographic index order.
         assert_eq!(names.len(), 8);
@@ -1134,7 +1235,7 @@ mod tests {
             m.insert("a".to_string(), value);
             value = serde_json::Value::Object(m);
         }
-        let metrics = walk_json_leaves(&value, MetricSource::Json);
+        let metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
         assert!(
             metrics.is_empty(),
             "Null leaves must produce no metrics (and no truncation sentinel), \
@@ -1158,7 +1259,7 @@ mod tests {
             known_flags: None,
         };
         let stdout = r#"{"throughput": 42.5}"#;
-        let m = extract_metrics(stdout, &EXAMPLE_PAYLOAD.output).unwrap();
+        let m = extract_metrics(stdout, &EXAMPLE_PAYLOAD.output, MetricStream::Stdout).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "throughput");
         assert_eq!(m[0].value, 42.5);

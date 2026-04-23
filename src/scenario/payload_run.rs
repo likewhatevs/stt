@@ -301,7 +301,11 @@ fn evaluate(
     // the AssertResult rather than collapse into a vague
     // "metric 'X' not found" downstream. Non-LlmExtract formats are
     // infallible and always Ok.
-    let stdout_result = extract_metrics(&output.stdout, &payload.output);
+    let stdout_result = extract_metrics(
+        &output.stdout,
+        &payload.output,
+        crate::test_support::MetricStream::Stdout,
+    );
     let (mut metrics, mut extract_err) = match stdout_result {
         Ok(m) => (m, None::<String>),
         Err(msg) => (Vec::new(), Some(msg)),
@@ -342,7 +346,11 @@ fn evaluate(
         // which matches the "well-behaved binaries keep stdout
         // canonical" language on the `OutputFormat` doc.
         if extract_err.is_none() {
-            match extract_metrics(&output.stderr, &payload.output) {
+            match extract_metrics(
+                &output.stderr,
+                &payload.output,
+                crate::test_support::MetricStream::Stderr,
+            ) {
                 Ok(m) => metrics = m,
                 Err(msg) => extract_err = Some(msg),
             }
@@ -1638,7 +1646,7 @@ fn drain_capped(
 mod tests {
     use super::*;
     use crate::cgroup::CgroupManager;
-    use crate::test_support::{MetricSource, OutputFormat, Polarity, Scheduler};
+    use crate::test_support::{MetricSource, MetricStream, OutputFormat, Polarity, Scheduler};
     use crate::topology::TestTopology;
 
     // Minimal Ctx builder fixture for tests — no VM boot.
@@ -1931,7 +1939,7 @@ mod tests {
     /// changing the failure mode.
     #[test]
     fn evaluate_checks_range_reversed_bounds_fails_every_finite_value() {
-        use crate::test_support::{Metric, MetricSource, Polarity};
+        use crate::test_support::{Metric, MetricSource, MetricStream, Polarity};
         let reversed = Check::range("iops", 100.0, 50.0);
         for actual in &[0.0, 50.0, 75.0, 100.0, 200.0, -1000.0, 1e9] {
             let pm = PayloadMetrics {
@@ -1941,6 +1949,7 @@ mod tests {
                     polarity: Polarity::HigherBetter,
                     unit: String::new(),
                     source: MetricSource::Json,
+                    stream: MetricStream::Stdout,
                 }],
                 exit_code: 0,
             };
@@ -2121,6 +2130,7 @@ mod tests {
                 polarity: Polarity::HigherBetter,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -2138,6 +2148,7 @@ mod tests {
                 polarity: Polarity::LowerBetter,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -2155,6 +2166,7 @@ mod tests {
                 polarity: Polarity::Unknown,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -2182,6 +2194,7 @@ mod tests {
                 polarity: Polarity::HigherBetter,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -2215,6 +2228,7 @@ mod tests {
                 polarity: Polarity::HigherBetter,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -2248,6 +2262,7 @@ mod tests {
                 polarity: Polarity::HigherBetter,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -2283,6 +2298,7 @@ mod tests {
                 polarity: Polarity::LowerBetter,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -2307,6 +2323,7 @@ mod tests {
                 polarity: Polarity::Unknown,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -2371,6 +2388,7 @@ mod tests {
             polarity: Polarity::Unknown,
             unit: String::new(),
             source: MetricSource::Json,
+            stream: MetricStream::Stdout,
         }];
         const HINTED: Payload = Payload {
             name: "p",
@@ -2516,6 +2534,7 @@ mod tests {
             polarity: Polarity::Unknown,
             unit: String::new(),
             source: MetricSource::Json,
+            stream: MetricStream::Stdout,
         }];
         resolve_polarities(&mut metrics, &FIO_BINARY);
         assert_eq!(metrics[0].polarity, Polarity::Unknown);
@@ -2538,6 +2557,7 @@ mod tests {
                     polarity: Polarity::HigherBetter,
                     unit: String::new(),
                     source: MetricSource::Json,
+                    stream: MetricStream::Stdout,
                 },
                 Metric {
                     name: "lat".to_string(),
@@ -2545,6 +2565,7 @@ mod tests {
                     polarity: Polarity::LowerBetter,
                     unit: String::new(),
                     source: MetricSource::Json,
+                    stream: MetricStream::Stdout,
                 },
                 Metric {
                     name: "cpu".to_string(),
@@ -2552,6 +2573,7 @@ mod tests {
                     polarity: Polarity::Unknown,
                     unit: String::new(),
                     source: MetricSource::Json,
+                    stream: MetricStream::Stdout,
                 },
             ],
             exit_code: 0,
@@ -2710,6 +2732,7 @@ mod tests {
                     polarity: Polarity::HigherBetter,
                     unit: "iops".to_string(),
                     source: MetricSource::Json,
+                    stream: MetricStream::Stdout,
                 },
                 Metric {
                     name: "lat_ns".to_string(),
@@ -2717,6 +2740,7 @@ mod tests {
                     polarity: Polarity::LowerBetter,
                     unit: "ns".to_string(),
                     source: MetricSource::LlmExtract,
+                    stream: MetricStream::Stdout,
                 },
             ],
             exit_code: 0,
@@ -2742,7 +2766,7 @@ mod tests {
     /// invariant the prior linear scan had.
     #[test]
     fn resolve_polarities_applies_hints_by_name_lookup() {
-        use crate::test_support::{Metric, MetricHint, MetricSource, Polarity};
+        use crate::test_support::{Metric, MetricHint, MetricSource, MetricStream, Polarity};
         static PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
             name: "hinted",
             kind: crate::test_support::PayloadKind::Binary("x"),
@@ -2774,6 +2798,7 @@ mod tests {
                 polarity: Polarity::Unknown,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             },
             Metric {
                 name: "unhinted".into(),
@@ -2781,6 +2806,7 @@ mod tests {
                 polarity: Polarity::Unknown,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             },
             Metric {
                 name: "lat_ns".into(),
@@ -2788,6 +2814,7 @@ mod tests {
                 polarity: Polarity::Unknown,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             },
         ];
         resolve_polarities(&mut ms, &PAYLOAD);
@@ -2814,7 +2841,7 @@ mod tests {
     /// the new value.
     #[test]
     fn resolve_polarities_duplicate_hint_names_last_wins() {
-        use crate::test_support::{Metric, MetricHint, MetricSource, Polarity};
+        use crate::test_support::{Metric, MetricHint, MetricSource, MetricStream, Polarity};
         static PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
             name: "dup_hints",
             kind: crate::test_support::PayloadKind::Binary("x"),
@@ -2843,6 +2870,7 @@ mod tests {
             polarity: Polarity::Unknown,
             unit: String::new(),
             source: MetricSource::Json,
+            stream: MetricStream::Stdout,
         }];
         resolve_polarities(&mut ms, &PAYLOAD);
         // Second declaration wins (HashMap last-insertion semantics).
@@ -2857,7 +2885,7 @@ mod tests {
     /// unit so downstream regression reports are consistent.
     #[test]
     fn resolve_polarities_duplicate_metric_names_each_gets_hint() {
-        use crate::test_support::{Metric, MetricHint, MetricSource, Polarity};
+        use crate::test_support::{Metric, MetricHint, MetricSource, MetricStream, Polarity};
         static PAYLOAD: crate::test_support::Payload = crate::test_support::Payload {
             name: "dup_metrics",
             kind: crate::test_support::PayloadKind::Binary("x"),
@@ -2880,6 +2908,7 @@ mod tests {
                 polarity: Polarity::Unknown,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             },
             Metric {
                 name: "iops".into(),
@@ -2887,6 +2916,7 @@ mod tests {
                 polarity: Polarity::Unknown,
                 unit: String::new(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             },
         ];
         resolve_polarities(&mut ms, &PAYLOAD);
@@ -2898,7 +2928,7 @@ mod tests {
 
     #[test]
     fn resolve_polarities_empty_inputs_are_noop() {
-        use crate::test_support::{Metric, MetricSource, Polarity};
+        use crate::test_support::{Metric, MetricSource, MetricStream, Polarity};
         static NO_HINTS: crate::test_support::Payload = crate::test_support::Payload {
             name: "no_hints",
             kind: crate::test_support::PayloadKind::Binary("x"),
@@ -2916,6 +2946,7 @@ mod tests {
             polarity: Polarity::Unknown,
             unit: String::new(),
             source: MetricSource::Json,
+            stream: MetricStream::Stdout,
         }];
         resolve_polarities(&mut ms, &NO_HINTS);
         assert_eq!(ms[0].polarity, Polarity::Unknown);

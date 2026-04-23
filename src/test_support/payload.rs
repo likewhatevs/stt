@@ -802,6 +802,48 @@ pub enum MetricSource {
     LlmExtract,
 }
 
+/// Which of the payload's output streams a [`Metric`] was extracted
+/// from.
+///
+/// Orthogonal to [`MetricSource`]: `source` captures HOW the metric
+/// was produced (structured JSON parse vs LLM-driven extraction);
+/// `stream` captures WHERE the bytes came from (payload stdout vs
+/// stderr). Both axes matter for diagnosing "surprise metrics" in
+/// post-run analysis: a metric tagged [`Self::Stderr`] signals a
+/// payload whose structured output landed on the diagnostic stream
+/// — well-behaved payloads keep stdout canonical per the
+/// [`OutputFormat`] doc contract, so a stderr tag is a review hint
+/// ("is this payload misconfigured, or did the fallback
+/// intentionally pick it up?") even when `source` says the parse
+/// itself succeeded.
+///
+/// Populated by the extraction pipeline in
+/// [`crate::scenario::payload_run`]: the stdout-primary branch
+/// stamps [`Stdout`](Self::Stdout), the stderr-fallback branch
+/// stamps [`Stderr`](Self::Stderr). The streams are never merged;
+/// one or the other produces the metric set, and that identity
+/// propagates through [`Metric::stream`].
+///
+/// Status: persisted on the sidecar for future review-tooling
+/// (CI dashboards, `cargo ktstr stats`-style filters); not yet
+/// consumed by `stats compare` or any automated pipeline. The
+/// field is wired end-to-end from the payload-pipeline to the
+/// sidecar JSON today so that downstream review tools can start
+/// filtering on it without a schema change — but no production
+/// consumer reads it yet. A follow-up task wires filtering into
+/// `stats compare` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MetricStream {
+    /// Extracted from the payload's stdout (the happy path for
+    /// fio / stress-ng / most benchmark tools).
+    Stdout,
+    /// Extracted from the payload's stderr via the stderr-fallback
+    /// contract (for payloads that emit structured summaries to
+    /// stderr — e.g. schbench's `show_latencies` →
+    /// `fprintf(stderr, ...)`).
+    Stderr,
+}
+
 /// A single extracted metric from a payload's output.
 ///
 /// Populated by the extraction pipeline after the payload exits.
@@ -821,6 +863,12 @@ pub struct Metric {
     pub unit: String,
     /// Where this metric came from — JSON parse or LLM extraction.
     pub source: MetricSource,
+    /// Which of the payload's output streams the metric was read
+    /// from — stdout on the happy path, stderr under the
+    /// stderr-fallback contract. See [`MetricStream`] for the
+    /// orthogonality with `source` and the "well-behaved
+    /// payloads keep stdout canonical" review hint.
+    pub stream: MetricStream,
 }
 
 /// All metrics extracted from a single payload run plus the process
@@ -915,6 +963,7 @@ mod tests {
                 polarity: Polarity::HigherBetter,
                 unit: "iops".to_string(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         };
@@ -947,6 +996,28 @@ mod tests {
         let js = serde_json::to_string(&MetricSource::LlmExtract).unwrap();
         let de: MetricSource = serde_json::from_str(&js).unwrap();
         assert_eq!(de, MetricSource::LlmExtract);
+    }
+
+    /// Wire-format round-trip for every [`MetricStream`] variant.
+    /// Pins the serde representation so a sidecar written by one
+    /// version of ktstr deserializes under another — a silent wire
+    /// change (rename, internal tag, numeric encoding) would
+    /// surface here, not as a missing-field error on every
+    /// existing sidecar. Mirrors
+    /// [`metric_source_serde_round_trip`] so the two metric-tag
+    /// enums share one pinning convention.
+    #[test]
+    fn metric_stream_serde_round_trip() {
+        for s in [MetricStream::Stdout, MetricStream::Stderr] {
+            let js = serde_json::to_string(&s).expect("serialize");
+            let de: MetricStream = serde_json::from_str(&js).expect("deserialize");
+            assert_eq!(
+                de, s,
+                "MetricStream::{s:?} wire format must round-trip \
+                 identically; serialized as {js}, deserialized to \
+                 {de:?}",
+            );
+        }
     }
 
     #[test]

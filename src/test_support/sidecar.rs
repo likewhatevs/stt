@@ -2548,6 +2548,14 @@ mod tests {
         assert_eq!(loaded.metrics[0].metrics.len(), 1);
         assert_eq!(loaded.metrics[0].metrics[0].name, "iops");
         assert_eq!(loaded.metrics[0].metrics[0].value, 5000.0);
+        assert_eq!(
+            loaded.metrics[0].metrics[0].stream,
+            MetricStream::Stdout,
+            "metric stream tag must round-trip through sidecar \
+             serde; a regression that lost `stream` serialization \
+             or deserialized it to a different variant would break \
+             review-tooling's stdout-vs-stderr attribution",
+        );
     }
 
     /// `write_sidecar` must populate `payload` from `entry.payload`

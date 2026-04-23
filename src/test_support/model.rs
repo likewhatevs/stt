@@ -1776,6 +1776,7 @@ pub(crate) fn reset() {
 pub(crate) fn extract_via_llm(
     output: &str,
     hint: Option<&str>,
+    stream: super::MetricStream,
 ) -> Result<Vec<super::Metric>, String> {
     let prompt = compose_prompt(output, hint);
 
@@ -1821,6 +1822,7 @@ pub(crate) fn extract_via_llm(
         Some(json) => Ok(super::metrics::walk_json_leaves(
             &json,
             super::MetricSource::LlmExtract,
+            stream,
         )),
         None => {
             // Intentionally log only `response.len()` (byte count), not
@@ -3358,13 +3360,13 @@ mod tests {
         // the Check evaluator can thread the reason into the
         // AssertResult. The "returns empty" test-name predates the
         // signature change — kept for git blame continuity.
-        let err = extract_via_llm("arbitrary stdout", None)
+        let err = extract_via_llm("arbitrary stdout", None, crate::test_support::MetricStream::Stdout)
             .expect_err("offline gate must produce Err");
         assert!(
             err.contains(OFFLINE_ENV),
             "reason should name the offline env var, got: {err}"
         );
-        let err = extract_via_llm("stdout with hint", Some("focus"))
+        let err = extract_via_llm("stdout with hint", Some("focus"), crate::test_support::MetricStream::Stdout)
             .expect_err("offline gate must produce Err with hint variant");
         assert!(err.contains(OFFLINE_ENV));
     }
@@ -3401,7 +3403,7 @@ mod tests {
         let _cache = isolated_cache_dir();
         let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
         // First call — populates MODEL_CACHE with Err(<offline gate>).
-        let _ = extract_via_llm("seed call", None);
+        let _ = extract_via_llm("seed call", None, crate::test_support::MetricStream::Stdout);
         {
             let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             assert!(
@@ -3427,7 +3429,7 @@ mod tests {
         );
         // Subsequent extract_via_llm under the same offline gate must
         // re-trip ensure() rather than reading a stale cached entry.
-        let _ = extract_via_llm("post-reset call", None);
+        let _ = extract_via_llm("post-reset call", None, crate::test_support::MetricStream::Stdout);
         let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let cached = guard
             .as_ref()
@@ -3480,9 +3482,9 @@ mod tests {
             "reset() must zero the load counter",
         );
 
-        let _ = extract_via_llm("first", None);
-        let _ = extract_via_llm("second", None);
-        let _ = extract_via_llm("third", None);
+        let _ = extract_via_llm("first", None, crate::test_support::MetricStream::Stdout);
+        let _ = extract_via_llm("second", None, crate::test_support::MetricStream::Stdout);
+        let _ = extract_via_llm("third", None, crate::test_support::MetricStream::Stdout);
         assert_eq!(
             MODEL_CACHE_LOAD_COUNT.load(Ordering::Relaxed),
             1,
@@ -3497,7 +3499,7 @@ mod tests {
             0,
             "reset() must zero the load counter on every call",
         );
-        let _ = extract_via_llm("post-reset", None);
+        let _ = extract_via_llm("post-reset", None, crate::test_support::MetricStream::Stdout);
         assert_eq!(
             MODEL_CACHE_LOAD_COUNT.load(Ordering::Relaxed),
             1,

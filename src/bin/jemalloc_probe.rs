@@ -24,6 +24,39 @@
 //! - Requires DWARF debuginfo on the target ELF and CAP_SYS_PTRACE /
 //!   root / same-uid-as-target.
 //!
+//! # Security posture
+//!
+//! The probe is distributed as a normal user binary — **no setuid,
+//! no setgid, no file capabilities, no suid-helper**. It carries no
+//! privileged bits on disk and does not request any at runtime. The
+//! only privilege needed is whatever `ptrace(PTRACE_SEIZE)` demands
+//! against the target process; everything else (DWARF read via
+//! `/proc/<pid>/exe`, `process_vm_readv`) rides on the same access
+//! check.
+//!
+//! On a stock Linux host with `kernel.yama.ptrace_scope=1` (the
+//! Debian/Ubuntu default), that means one of:
+//! - **Same-uid-as-target**: run the probe under the uid that owns
+//!   the target process. This is the intended path for the ktstr
+//!   integration tests, which spawn both the alloc-worker and the
+//!   probe under the same test-process uid inside the VM.
+//! - **CAP_SYS_PTRACE**: grant the probe the `ptrace` capability for
+//!   one invocation (`sudo setcap cap_sys_ptrace+eip ktstr-jemalloc-probe`
+//!   on a release binary, or `sudo -E` for an ad-hoc run).
+//! - **root**: run under uid 0. Not recommended outside CI / VM
+//!   environments where the blast radius is already contained.
+//!
+//! Under YAMA `ptrace_scope=2` (admin-only) or `=3` (disabled),
+//! only root + CAP_SYS_PTRACE, or root with YAMA disabled, can
+//! attach. The probe will report a clear ENOSYS-like failure from
+//! `PTRACE_SEIZE` in those cases rather than silently degrading.
+//!
+//! The probe does not open network sockets, does not write outside
+//! its explicit `--sidecar` path (when provided), and does not
+//! inspect anything beyond the single target pid named on `--pid`.
+//! It cannot escalate to adjacent processes — each invocation names
+//! exactly one target and exits when that target is detached.
+//!
 //! Mechanism (per target thread):
 //! 1. `ptrace(PTRACE_SEIZE)` + `ptrace(PTRACE_INTERRUPT)` to stop.
 //! 2. Read the thread pointer via `ptrace(PTRACE_GETREGSET, ...)`:
@@ -883,13 +916,95 @@ impl CounterOffsets {
 }
 
 /// Resolve the byte offsets of `thread_allocated` and
-/// `thread_deallocated` inside `struct tsd_s` by walking DWARF on the
-/// ELF. Returns `Err` with actionable text when the ELF has no
-/// `.debug_info` or the struct/fields are not found.
+/// `thread_deallocated` inside `struct tsd_s` by walking DWARF on
+/// the target ELF, or on an external debuginfo file discovered via
+/// `.gnu_debuglink` / `NT_GNU_BUILD_ID` when the target is stripped.
+///
+/// External-debuginfo discovery path (fires only when the target
+/// has no populated `.debug_info`):
+/// 1. If the target carries a `NT_GNU_BUILD_ID` note, consult
+///    `/usr/lib/debug/.build-id/<xx>/<rest>.debug` — the standard
+///    distro layout used by `-dbg` / `-debuginfo` packages.
+/// 2. If the target carries a `.gnu_debuglink` section, consult
+///    (in order) `{target_dir}/{name}`, `{target_dir}/.debug/{name}`,
+///    and `/usr/lib/debug/{abs_target_dir}/{name}`. When the section
+///    also carries a CRC32, candidate files whose CRC does not
+///    match are rejected.
+///
+/// Returns `Err` with actionable text when the ELF has no
+/// `.debug_info`, no discoverable external debuginfo, or the
+/// struct/fields are not found in the DWARF.
 pub(crate) fn resolve_field_offsets(elf_path: &Path) -> Result<CounterOffsets> {
     let data = fs::read(elf_path)
         .with_context(|| format!("re-read {} for DWARF inspection", elf_path.display()))?;
     let elf = Elf::parse(&data).with_context(|| format!("parse ELF {}", elf_path.display()))?;
+
+    if section_is_populated(&elf, &data, ".debug_info") {
+        return resolve_field_offsets_from_bytes(&data, elf_path);
+    }
+
+    // Stripped target — look for external debuginfo.
+    let debuglink = read_gnu_debuglink(&elf, &data);
+    let build_id = read_build_id(&elf, &data);
+    let debuglink_name = debuglink.as_ref().map(|(n, _)| n.as_str());
+    let build_id_hex = build_id.as_deref();
+
+    let candidates = candidate_debuginfo_paths(elf_path, debuglink_name, build_id_hex);
+    if candidates.is_empty() {
+        anyhow::bail!(
+            "{} has no populated .debug_info and carries neither a \
+             .gnu_debuglink section nor an NT_GNU_BUILD_ID note — there \
+             is no pointer to external debuginfo. Rebuild the target \
+             with `-g`, ship a paired `.debug` file, or install the \
+             distro's -dbg / -debuginfo package.",
+            elf_path.display(),
+        );
+    }
+
+    let mut tried: Vec<String> = Vec::new();
+    for candidate in &candidates {
+        let debug_data = match fs::read(candidate) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tried.push(format!("{} (not found)", candidate.display()));
+                continue;
+            }
+            Err(e) => {
+                tried.push(format!("{}: {e}", candidate.display()));
+                continue;
+            }
+        };
+        if let Some((_, expected_crc)) = debuglink.as_ref() {
+            let actual = crc32fast::hash(&debug_data);
+            if actual != *expected_crc {
+                tried.push(format!(
+                    "{} (CRC mismatch: expected {:#010x}, got {:#010x})",
+                    candidate.display(),
+                    expected_crc,
+                    actual,
+                ));
+                continue;
+            }
+        }
+        return resolve_field_offsets_from_bytes(&debug_data, candidate);
+    }
+    anyhow::bail!(
+        "{} is stripped; searched for external debuginfo via \
+         debuglink={debuglink_name:?} build_id={build_id_hex:?} but \
+         no candidate was readable or CRC-matched. Tried: {}",
+        elf_path.display(),
+        tried.join("; "),
+    );
+}
+
+/// Core DWARF walk — parses `data` as ELF, locates `struct tsd_s`,
+/// and returns the byte offsets of its `thread_allocated` and
+/// `thread_deallocated` members. `source_path` is used only for
+/// error diagnostics (it names whichever file the bytes came from
+/// — either the target ELF or an external debuginfo file).
+fn resolve_field_offsets_from_bytes(data: &[u8], source_path: &Path) -> Result<CounterOffsets> {
+    let elf = Elf::parse(data)
+        .with_context(|| format!("parse ELF {}", source_path.display()))?;
 
     let load_section = |id: gimli::SectionId| -> Result<Cow<'_, [u8]>> {
         let name = id.name();
@@ -931,7 +1046,7 @@ pub(crate) fn resolve_field_offsets(elf_path: &Path) -> Result<CounterOffsets> {
             "DWARF walk of {} did not find field '{}' in struct '{}' — \
              target was built without -g, the jemalloc version renamed the field, \
              or the TSD_MANGLE prefix ('{}') drifted",
-            elf_path.display(),
+            source_path.display(),
             ALLOCATED_FIELD,
             TSD_STRUCT_NAME,
             TSD_MANGLE_PREFIX,
@@ -940,12 +1055,111 @@ pub(crate) fn resolve_field_offsets(elf_path: &Path) -> Result<CounterOffsets> {
     let deallocated = deallocated.ok_or_else(|| {
         anyhow!(
             "DWARF walk of {} did not find field '{}' in struct '{}'",
-            elf_path.display(),
+            source_path.display(),
             DEALLOCATED_FIELD,
             TSD_STRUCT_NAME,
         )
     })?;
     CounterOffsets::new(allocated, deallocated)
+}
+
+/// Returns `true` iff `elf` has a section named `name` whose file
+/// contents are non-empty. A stripped binary retains the
+/// `.debug_info` section header with `sh_size == 0` (or lacks it
+/// entirely), so this cleanly distinguishes "has DWARF" from "is
+/// stripped".
+fn section_is_populated(elf: &Elf, data: &[u8], name: &str) -> bool {
+    for sh in &elf.section_headers {
+        if let Some(n) = elf.shdr_strtab.get_at(sh.sh_name)
+            && n == name
+        {
+            let range = sh.file_range().unwrap_or(0..0);
+            let len = data.get(range).map(<[u8]>::len).unwrap_or(0);
+            return len > 0;
+        }
+    }
+    false
+}
+
+/// Parse a `.gnu_debuglink` section. Layout (see binutils
+/// `bfd/opncls.c:bfd_fill_in_gnu_debuglink_section`):
+///
+/// ```text
+/// [NUL-terminated filename][0-3 pad bytes to 4-byte align][u32 CRC32 LE]
+/// ```
+///
+/// Returns `None` if the section is absent, its filename is not
+/// valid UTF-8, or the CRC word is truncated.
+fn read_gnu_debuglink(elf: &Elf, data: &[u8]) -> Option<(String, u32)> {
+    let section = find_section_slice(elf, data, ".gnu_debuglink")?;
+    let nul = section.iter().position(|&b| b == 0)?;
+    let name = std::str::from_utf8(&section[..nul]).ok()?.to_owned();
+    let crc_offset = (nul + 1 + 3) & !3;
+    let crc_bytes = section.get(crc_offset..crc_offset + 4)?;
+    let crc = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+    Some((name, crc))
+}
+
+/// Read the `NT_GNU_BUILD_ID` note descriptor and render it as a
+/// lowercase hex string. Returns `None` when no such note is
+/// present.
+fn read_build_id(elf: &Elf, data: &[u8]) -> Option<String> {
+    let iter = elf.iter_note_sections(data, Some("GNU"))?;
+    for note in iter.flatten() {
+        if note.n_type == goblin::elf::note::NT_GNU_BUILD_ID {
+            let mut hex = String::with_capacity(note.desc.len() * 2);
+            for b in note.desc {
+                use std::fmt::Write as _;
+                let _ = write!(&mut hex, "{b:02x}");
+            }
+            return Some(hex);
+        }
+    }
+    None
+}
+
+/// Candidate filesystem paths to search for external debuginfo,
+/// ordered most-to-least-likely-to-hit. Build-id comes first because
+/// it uniquely identifies the exact ELF; debuglink-based paths are
+/// CRC-checked by the caller when a CRC is available.
+fn candidate_debuginfo_paths(
+    target_path: &Path,
+    debuglink_name: Option<&str>,
+    build_id_hex: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(hex) = build_id_hex
+        && hex.len() >= 2
+    {
+        let (prefix, rest) = hex.split_at(2);
+        out.push(PathBuf::from(format!(
+            "/usr/lib/debug/.build-id/{prefix}/{rest}.debug"
+        )));
+    }
+    if let (Some(name), Some(parent)) = (debuglink_name, target_path.parent()) {
+        out.push(parent.join(name));
+        out.push(parent.join(".debug").join(name));
+        if parent.is_absolute() {
+            let rel = parent.strip_prefix("/").unwrap_or(parent);
+            out.push(Path::new("/usr/lib/debug").join(rel).join(name));
+        }
+    }
+    out
+}
+
+/// Return the raw file bytes of a named section, or `None` if the
+/// section is absent or its `sh_offset`/`sh_size` land outside the
+/// ELF data buffer.
+fn find_section_slice<'a>(elf: &Elf, data: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    for sh in &elf.section_headers {
+        if let Some(n) = elf.shdr_strtab.get_at(sh.sh_name)
+            && n == name
+        {
+            let range = sh.file_range().unwrap_or(0..0);
+            return data.get(range);
+        }
+    }
+    None
 }
 
 #[allow(clippy::type_complexity)]
@@ -1940,10 +2154,19 @@ fn synthesize_payload_metrics(
     out: &ProbeOutput,
     exit_code: i32,
 ) -> Result<ktstr::test_support::PayloadMetrics> {
-    use ktstr::test_support::{MetricSource, PayloadMetrics, walk_json_leaves};
+    use ktstr::test_support::{MetricSource, MetricStream, PayloadMetrics, walk_json_leaves};
     let value = serde_json::to_value(out)
         .context("serialize ProbeOutput to serde_json::Value for sidecar append")?;
-    let mut metrics = walk_json_leaves(&value, MetricSource::Json);
+    // Probe-synthesized metrics have no stream origin — the probe
+    // assembles a `ProbeOutput` struct in-process and serializes it
+    // directly; nothing was read from a payload's stdout or stderr.
+    // `Stdout` is the null-object default here, not a true origin
+    // claim. See the `MetricStream` doc for the orthogonality
+    // contract; review-tooling that filters on `stream` should
+    // treat probe-prefixed metric names (see `SIDECAR_METRIC_PREFIX`
+    // below) as a separate category rather than trusting the
+    // stream tag.
+    let mut metrics = walk_json_leaves(&value, MetricSource::Json, MetricStream::Stdout);
     for m in &mut metrics {
         // Prefix in place to avoid allocating a second Vec; the
         // capacity is exactly `metrics.len()` already.
@@ -3640,7 +3863,7 @@ mod tests {
     /// against a `sidecar.metrics = vec![new]` regression.
     #[test]
     fn sidecar_append_preserves_prepopulated_metrics() {
-        use ktstr::test_support::{Metric, MetricSource, PayloadMetrics, Polarity};
+        use ktstr::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.ktstr.json");
@@ -3657,6 +3880,7 @@ mod tests {
                 polarity: Polarity::HigherBetter,
                 unit: "ops".to_string(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         });
@@ -3667,6 +3891,7 @@ mod tests {
                 polarity: Polarity::LowerBetter,
                 unit: "us".to_string(),
                 source: MetricSource::Json,
+                stream: MetricStream::Stdout,
             }],
             exit_code: 0,
         });
@@ -3754,13 +3979,14 @@ mod tests {
     /// a matching update here.
     #[test]
     fn apply_probe_metric_hints_classifies_byte_counters() {
-        use ktstr::test_support::{Metric, MetricSource, Polarity};
+        use ktstr::test_support::{Metric, MetricSource, MetricStream, Polarity};
         let mut alloc = Metric {
             name: "jemalloc_probe.snapshots.0.threads.0.allocated_bytes".to_string(),
             value: 1024.0,
             polarity: Polarity::Unknown,
             unit: String::new(),
             source: MetricSource::Json,
+            stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut alloc);
         assert!(matches!(alloc.polarity, Polarity::LowerBetter));
@@ -3772,6 +3998,7 @@ mod tests {
             polarity: Polarity::Unknown,
             unit: String::new(),
             source: MetricSource::Json,
+            stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut dealloc);
         assert!(matches!(dealloc.polarity, Polarity::LowerBetter));
@@ -3783,6 +4010,7 @@ mod tests {
             polarity: Polarity::Unknown,
             unit: String::new(),
             source: MetricSource::Json,
+            stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut tid);
         assert!(matches!(tid.polarity, Polarity::Unknown));
@@ -3800,6 +4028,7 @@ mod tests {
             polarity: Polarity::Unknown,
             unit: String::new(),
             source: MetricSource::Json,
+            stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut extra);
         assert!(
@@ -3814,6 +4043,7 @@ mod tests {
             polarity: Polarity::Unknown,
             unit: String::new(),
             source: MetricSource::Json,
+            stream: MetricStream::Stdout,
         };
         apply_probe_metric_hints(&mut dextra);
         assert!(matches!(dextra.polarity, Polarity::Unknown));
