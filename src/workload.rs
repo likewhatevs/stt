@@ -23,6 +23,25 @@ use std::io::{Read, Seek, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+// `FanOutCompute` stores its u64 generation counter at offset 0 of
+// a 16-byte shared region and relies on the low 4 bytes of that
+// counter living at offset 0 so the futex syscall (which reads the
+// raw u32 at `futex_ptr`) sees the low u32 of the u64. That layout
+// assumption holds on little-endian targets (x86_64, aarch64) and
+// flips on big-endian — the futex would read the high 32 bits
+// instead, and an increment of the u64 would leave the low 4 bytes
+// unchanged until the 2^32-th advance. Reject the big-endian build
+// at compile time rather than shipping a silently-broken binary.
+#[cfg(not(target_endian = "little"))]
+compile_error!(
+    "ktstr's FanOutCompute generation-counter layout assumes a \
+     little-endian target — the u64 counter at offset 0 of the \
+     shared futex region must expose its low 32 bits to the \
+     futex syscall at that same offset. Porting to a big-endian \
+     target requires reworking the layout so futex_wait sees the \
+     incrementing low 4 bytes."
+);
+
 /// Scenario-level affinity intent for a group of workers.
 ///
 /// Resolved to a concrete [`AffinityMode`] at runtime based on the
@@ -543,6 +562,16 @@ impl WorkType {
     }
 
     /// Messenger/worker fan-out with compute work using the given parameters.
+    ///
+    /// `fan_out` is passed to `futex_wake(ptr, N)` where `N: i32` is
+    /// the number of waiters to wake. Realistic values are tens of
+    /// workers; sched-test topologies that need more than `i32::MAX`
+    /// (~2.1B) receivers per messenger are not expressible.
+    /// [`WorkloadHandle::spawn`] clamps the cast to `i32::MAX` so a
+    /// pathological `usize` input wakes all-available instead of
+    /// wrapping to a negative (FUTEX_WAKE broadcasts when passed a
+    /// negative N on some kernels, which would wake every waiter on
+    /// the futex rather than just this messenger's receivers).
     pub fn fan_out_compute(
         fan_out: usize,
         cache_footprint_kb: usize,
@@ -1169,6 +1198,29 @@ pub struct WorkerReport {
     /// sidecar.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_info: Option<WorkerExitInfo>,
+    /// `true` when this worker served as the messenger for a
+    /// wake-fanout work type ([`WorkType::FutexFanOut`] or
+    /// [`WorkType::FanOutCompute`]) — the single writer that
+    /// advances the shared generation and issues `futex_wake` for
+    /// its group. `false` for receivers and for every non-fanout
+    /// work type.
+    ///
+    /// Populated from the `is_messenger` flag on the
+    /// `futex: Option<(*mut u32, bool)>` parameter threaded into
+    /// `worker_main`. A sentinel report synthesized by the
+    /// JSON-parse fallback in
+    /// [`WorkloadHandle::stop_and_collect`] carries `false` via
+    /// [`Default`], matching its `completed: false` shape.
+    ///
+    /// Enables per-worker latency-participation assertions in
+    /// tests — a receiver worker produces `resume_latencies_ns`
+    /// entries while its messenger pair records wake-side work but
+    /// no resume latency. Without this field, tests had to
+    /// cross-reference per-group indexing or guess from the empty
+    /// vector — ambiguous on groups where the messenger legitimately
+    /// exits before producing a report.
+    #[serde(default)]
+    pub is_messenger: bool,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to
@@ -1283,7 +1335,7 @@ pub struct WorkloadHandle {
     started: bool,
     /// Shared mmap regions for futex-based work types (one per worker group). Unmapped on drop.
     futex_ptrs: Vec<*mut u32>,
-    /// Size of each futex mmap region (4 for FutexPingPong/FutexFanOut/MutexContention, 16 for FanOutCompute).
+    /// Size of each futex mmap region (4 for FutexPingPong/FutexFanOut/MutexContention, 16 for FanOutCompute: u64 generation @ 0 + u64 wake_ns @ 8).
     futex_region_size: usize,
     /// MAP_SHARED region of per-worker iteration counters. Workers
     /// atomically store their iteration count; parent reads via
@@ -1944,6 +1996,29 @@ impl WorkloadHandle {
     /// Each element is the monotonically increasing iteration count for
     /// that worker, read with Relaxed ordering. Returns an empty vec
     /// if no workers were spawned.
+    ///
+    /// # Ordering rationale — why Relaxed is sound
+    ///
+    /// Every producer (the worker-side store at the
+    /// `worker_main` publish sites) writes its slot with Relaxed
+    /// ordering, and this reader loads with Relaxed too. No
+    /// happens-before edge is needed because no host-side consumer
+    /// pairs the iteration count with OTHER shared state: the
+    /// parent samples these counters to answer "is this worker
+    /// still making progress?" and feeds deltas into gap
+    /// detection, not into any data-dependent follow-up read from
+    /// a different shared memory location. A stale value on one
+    /// sample is self-correcting — the next snapshot picks up the
+    /// newer count without any cross-field invariant to break.
+    ///
+    /// The per-slot single-producer / multi-sampler shape is
+    /// inherently non-tearing on every supported target
+    /// (AtomicU64 is architecture-primitive on x86_64 and aarch64
+    /// LSE with 8-byte alignment enforced by the type). The only
+    /// question is ordering, and the audit above concludes Relaxed
+    /// is load-bearingly correct — promoting either side to
+    /// Acquire/Release would add a barrier with no corresponding
+    /// paired operation to synchronise with.
     pub fn snapshot_iterations(&self) -> Vec<u64> {
         if self.iter_counters.is_null() || self.iter_counter_len == 0 {
             return Vec::new();
@@ -1953,7 +2028,8 @@ impl WorkloadHandle {
                 // SAFETY: alignment + atomic-only-access invariant
                 // established at the iter_counters mmap site in
                 // `WorkloadHandle::spawn` and carried by the
-                // `*mut AtomicU64` type.
+                // `*mut AtomicU64` type. Relaxed ordering: see the
+                // rationale in the outer doc comment.
                 unsafe { &*self.iter_counters.add(i) }.load(Ordering::Relaxed)
             })
             .collect()
@@ -2206,6 +2282,25 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// wake path duplicate the 7-arg layout in every spot otherwise.
 ///
 /// # Safety
+/// Clamp a `usize` wake-count to the positive `i32` range before
+/// passing to `futex_wake`.
+///
+/// `FUTEX_WAKE`'s `val` argument is `i32`. A naked `usize → i32`
+/// cast wraps to a negative value when the input exceeds `i32::MAX`
+/// (~2.1B), and some kernels interpret a negative `val` as "wake
+/// every waiter on this futex" — a silent scope explosion from a
+/// numeric-overflow bug. The clamp pins the syscall to wake at most
+/// `i32::MAX` waiters, which exceeds any realistic topology by
+/// orders of magnitude.
+///
+/// `#[inline]` because the call site is a single cast + `min` and
+/// inlining lets the compiler fold the clamp into the surrounding
+/// futex_wake syscall setup.
+#[inline]
+fn clamp_futex_wake_n(n: usize) -> i32 {
+    n.min(i32::MAX as usize) as i32
+}
+
 /// `futex_ptr` must point to a live `u32` reachable by every thread
 /// that might block on this futex word.
 unsafe fn futex_wake(futex_ptr: *mut u32, n_waiters: i32) {
@@ -2572,9 +2667,10 @@ fn worker_main(
                 if is_messenger {
                     // Increment generation counter and wake all receivers.
                     let next = unsafe { std::ptr::read_volatile(futex_ptr) }.wrapping_add(1);
+                    let wake_n = clamp_futex_wake_n(fan_out);
                     unsafe {
                         std::ptr::write_volatile(futex_ptr, next);
-                        futex_wake(futex_ptr, fan_out as i32);
+                        futex_wake(futex_ptr, wake_n);
                     }
                     // Short spin to let receivers run before next wake cycle.
                     for _ in 0..256 {
@@ -2815,12 +2911,41 @@ fn worker_main(
                     Some(f) => f,
                     None => break,
                 };
-                // Shared memory layout: [u32 generation @ offset 0]
+                // Shared memory layout: [u64 generation @ offset 0]
                 // [u64 wake_ns @ offset 8]. The mmap base is
                 // page-aligned (see the futex-region MAP_ANONYMOUS
-                // allocation in `WorkloadHandle::spawn`), so offset 8
-                // is 8-byte aligned, which AtomicU64 requires.
-                let wake_ts_ptr = unsafe { (futex_ptr as *mut u8).add(8) as *mut u64 };
+                // allocation in `WorkloadHandle::spawn`), so both
+                // offsets are 8-byte aligned.
+                //
+                // The generation counter is u64 (not u32) to prevent
+                // a wraparound-ABA bug in USER-SPACE: with a u32
+                // counter the worker's snapshot `expected` could
+                // match `cur` again after exactly 2^32 messenger
+                // advances, causing the worker's user-space
+                // `cur != expected` compare to miss the wake. u64
+                // comparisons push that user-space wraparound out
+                // to ~585 years at one advance per nanosecond —
+                // effectively unreachable.
+                //
+                // The KERNEL-SIDE futex_wait still compares the low
+                // 32 bits at `futex_ptr` to the `expected` u32
+                // argument passed into the syscall, so a full
+                // 2^32-advance race inside a single futex_wait's
+                // microsecond syscall window would still cause a
+                // kernel-side EAGAIN miss. That is empirically
+                // unreachable (2^32 atomic RMWs in microseconds
+                // requires >10^15 advances/sec — orders of
+                // magnitude above any realistic sequencer rate),
+                // and the 100 ms futex_wait timeout self-heals any
+                // hypothetical occurrence: on timeout the outer
+                // loop re-reads `cur` as u64 and the mismatch is
+                // visible in user space even if the kernel missed
+                // the advance. Little-endian x86_64 / aarch64
+                // targets guarantee the low 4 bytes of the u64
+                // live at offset 0 (enforced by a compile_error!
+                // elsewhere in this file); big-endian would flip
+                // the layout and is rejected at build time.
+                //
                 // Use Release/Acquire ordering so that when workers
                 // observe the generation advance, the matching
                 // wake_ns store is already visible to them.
@@ -2836,12 +2961,10 @@ fn worker_main(
                 //       load and satisfied from a stale cache line.
                 // Either path yields a fresh generation paired with
                 // a stale wake_ns and contaminates the resume-latency
-                // histogram. The futex syscalls operate on the raw
-                // u32 at futex_ptr; AtomicU32 has the same in-memory
-                // representation, so futex_wake/futex_wait keep
-                // working unchanged.
+                // histogram.
+                let wake_ts_ptr = unsafe { (futex_ptr as *mut u8).add(8) as *mut u64 };
                 let gen_atom =
-                    unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU32) };
+                    unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU64) };
                 let wake_atom =
                     unsafe { &*(wake_ts_ptr as *const std::sync::atomic::AtomicU64) };
                 if is_messenger {
@@ -2866,10 +2989,10 @@ fn worker_main(
                         // Release RMW on the generation synchronises
                         // it with the worker's Acquire load.
                         wake_atom.store(wake_ns, Ordering::Relaxed);
-                        // fetch_add wraps on u32 overflow and is
+                        // fetch_add on u64 wraps at 2^64 and is
                         // sole-writer here, so one Release RMW beats
                         // load-Relaxed + store-Release. On aarch64,
-                        // AtomicU32 Release ordering is guaranteed
+                        // AtomicU64 Release ordering is guaranteed
                         // by LLVM to lower to a release-ordered
                         // instruction — LDADDL on LSE-capable cores
                         // (Armv8.1+), or an LDXR/STLXR retry loop
@@ -2878,7 +3001,7 @@ fn worker_main(
                         // release half pairs with the worker's
                         // Acquire load below.
                         gen_atom.fetch_add(1, Ordering::Release);
-                        unsafe { futex_wake(futex_ptr, fan_out as i32) };
+                        unsafe { futex_wake(futex_ptr, clamp_futex_wake_n(fan_out)) };
                     }
                     spin_burst(&mut work_units, 256);
                 } else {
@@ -2887,7 +3010,17 @@ fn worker_main(
                     // `futex_wait`'s expected-value check; the real
                     // happens-before edge is established by the
                     // Acquire load below once the generation differs.
+                    // u64 snapshot compared against u64 cur so
+                    // wraparound cannot create a false-negative
+                    // (see region-layout comment above). futex_wait
+                    // takes a u32 expected, so the low 32 bits of
+                    // the u64 snapshot get truncated for the syscall
+                    // only — the messenger's fetch_add changes those
+                    // low bits on every increment, so futex_wait's
+                    // kernel-side expected-check still fires
+                    // correctly on every advance.
                     let expected = gen_atom.load(Ordering::Relaxed);
+                    let expected_low = expected as u32;
                     let ts = libc::timespec {
                         tv_sec: 0,
                         tv_nsec: 100_000_000, // 100ms timeout
@@ -2921,7 +3054,7 @@ fn worker_main(
                             }
                             break;
                         }
-                        unsafe { futex_wait(futex_ptr, expected, &ts) };
+                        unsafe { futex_wait(futex_ptr, expected_low, &ts) };
                     }
                     if sleep_usec > 0 && !STOP.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_micros(sleep_usec));
@@ -3047,6 +3180,10 @@ fn worker_main(
         // `WorkloadHandle::spawn` and carried by the
         // `*mut AtomicU64` type.
         if !iter_slot.is_null() {
+            // Relaxed store: the parent reads this counter via
+            // `snapshot_iterations()` with Relaxed ordering only for
+            // progress-sampling — no cross-field happens-before edge
+            // is required (see that function's ordering rationale).
             unsafe { &*iter_slot }.store(iterations, Ordering::Relaxed);
         }
 
@@ -3166,6 +3303,22 @@ fn worker_main(
         // `None` — the child reached the `f.write_all(&json)` site
         // and handed a complete report back to the parent.
         exit_info: None,
+        // `futex` is `Some((ptr, bool))` for several work types but
+        // the BOOL HAS DIFFERENT MEANINGS:
+        //   - FutexFanOut / FanOutCompute: `is_messenger` — one
+        //     worker per group advances the generation and fans out
+        //     wakes. Exactly the shape the WorkerReport doc pins.
+        //   - FutexPingPong: `is_first` — a pair-position flag.
+        //     Both workers write+wake symmetrically; neither is a
+        //     messenger.
+        //   - MutexContention: unused (the bool is ignored).
+        // Gate on the WorkType so only the fanout variants propagate
+        // the bool — every other work type lands `false` as the
+        // field doc contract requires.
+        is_messenger: matches!(
+            work_type,
+            WorkType::FutexFanOut { .. } | WorkType::FanOutCompute { .. }
+        ) && futex.map(|(_, b)| b).unwrap_or(false),
     }
 }
 
@@ -3864,6 +4017,10 @@ mod tests {
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
+            // Non-default so the serde roundtrip proves the field
+            // survives, not just that Default's value matches on
+            // both sides.
+            is_messenger: true,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -3874,6 +4031,7 @@ mod tests {
         assert_eq!(r.max_gap_ms, r2.max_gap_ms);
         assert_eq!(r.wake_sample_total, r2.wake_sample_total);
         assert_eq!(r.completed, r2.completed);
+        assert_eq!(r.is_messenger, r2.is_messenger);
     }
 
     #[test]
@@ -4563,6 +4721,7 @@ mod tests {
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
+            is_messenger: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -4593,6 +4752,7 @@ mod tests {
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
+            is_messenger: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         let r2: WorkerReport = serde_json::from_str(&json).unwrap();
@@ -4962,6 +5122,7 @@ mod tests {
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
+            is_messenger: false,
         };
         let s = format!("{:?}", r);
         assert!(s.contains("42"), "must show tid value");
@@ -5017,6 +5178,7 @@ mod tests {
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
+            is_messenger: false,
         };
         assert_eq!(r.off_cpu_ns, r.wall_time_ns - r.cpu_time_ns);
     }
@@ -5720,6 +5882,7 @@ mod tests {
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
+            is_messenger: false,
         }
     }
 
@@ -5766,6 +5929,7 @@ mod tests {
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
+            is_messenger: false,
         }
     }
 
@@ -6172,8 +6336,10 @@ mod tests {
     /// reaping test closure. In the parent-worker: forks a
     /// [`GRANDCHILD_SLEEP_BINARY`] 60 grandchild via `execv`, publishes
     /// the gpid atomically via tempfile + rename, and returns the
-    /// worker's own pid. In the child: `execv(prog, ["60", NULL])`
-    /// followed by `_exit(127)` on exec failure. Never returns on the
+    /// worker's own pid. In the child: `execv(prog, [prog, "60", NULL])`
+    /// followed by `_exit(127)` on exec failure — `execv` requires
+    /// `argv[0]` to carry the program name by convention so the
+    /// exec'd `/bin/sleep` sees its usual `argv[0]`. Never returns on the
     /// child side.
     ///
     /// Does NOT install any SIGUSR1 disposition — callers pick the
@@ -6843,8 +7009,25 @@ mod tests {
                 r.tid
             );
         }
-        let has_latencies = reports.iter().any(|r| !r.resume_latencies_ns.is_empty());
-        assert!(has_latencies, "workers should record wake latencies");
+        // Every non-messenger worker (receiver) must record at
+        // least one wake-latency sample — the messenger advances
+        // the generation and never waits, so its latency vec is
+        // legitimately empty. Asserting the stronger per-receiver
+        // contract (previously `reports.iter().any(...)`) catches
+        // a regression that leaves one group of receivers parked
+        // on futex_wait without ever seeing the generation advance.
+        assert!(
+            reports
+                .iter()
+                .filter(|r| !r.is_messenger)
+                .all(|r| !r.resume_latencies_ns.is_empty()),
+            "every FanOutCompute receiver must record at least one \
+             wake latency sample; got {:?}",
+            reports
+                .iter()
+                .map(|r| (r.tid, r.is_messenger, r.resume_latencies_ns.len()))
+                .collect::<Vec<_>>(),
+        );
         // The 10 s bound catches the zero-init arm of a missing
         // Release/Acquire pairing: a worker that reads `wake_ns`
         // before the messenger's first store sees 0, so
@@ -6934,6 +7117,24 @@ mod tests {
                 r.tid
             );
         }
+        // Every non-messenger worker (receiver) in each group must
+        // record at least one wake-latency sample — mirror of the
+        // per-receiver contract asserted in the single-group test
+        // at `spawn_fan_out_compute_produces_work`. With 10 workers
+        // and 2 groups (1 messenger + 4 receivers each), this means
+        // 8 receivers must all report non-empty latency vectors.
+        assert!(
+            reports
+                .iter()
+                .filter(|r| !r.is_messenger)
+                .all(|r| !r.resume_latencies_ns.is_empty()),
+            "every FanOutCompute receiver in both groups must record \
+             at least one wake latency sample; got {:?}",
+            reports
+                .iter()
+                .map(|r| (r.tid, r.is_messenger, r.resume_latencies_ns.len()))
+                .collect::<Vec<_>>(),
+        );
         // Mirror of the single-group test's latency sanity check —
         // see `spawn_fan_out_compute_produces_work` for rationale.
         // The 10 s bound catches the zero-init arm of a missing

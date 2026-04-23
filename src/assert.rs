@@ -1653,6 +1653,7 @@ impl Assert {
 /// #     numa_pages: std::collections::BTreeMap::new(),
 /// #     vmstat_numa_pages_migrated: 0,
 /// #     exit_info: None,
+/// #     is_messenger: false,
 /// # };
 /// let expected: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
 /// assert!(assert_isolation(&[report], &expected).passed);
@@ -1689,6 +1690,7 @@ pub fn assert_isolation(reports: &[WorkerReport], expected: &BTreeSet<usize>) ->
 /// #     numa_pages: std::collections::BTreeMap::new(),
 /// #     vmstat_numa_pages_migrated: 0,
 /// #     exit_info: None,
+/// #     is_messenger: false,
 /// # };
 /// let r = assert_not_starved(&[report]);
 /// assert!(r.passed);
@@ -1910,6 +1912,7 @@ pub fn assert_not_starved(reports: &[WorkerReport]) -> AssertResult {
 /// #     numa_pages: std::collections::BTreeMap::new(),
 /// #     vmstat_numa_pages_migrated: 0,
 /// #     exit_info: None,
+/// #     is_messenger: false,
 /// # };
 /// // Equal throughput -> low CV -> passes.
 /// let reports = [mk(1000, 1_000_000_000), mk(1000, 1_000_000_000)];
@@ -1997,6 +2000,7 @@ pub fn assert_throughput_parity(
 /// #     numa_pages: std::collections::BTreeMap::new(),
 /// #     vmstat_numa_pages_migrated: 0,
 /// #     exit_info: None,
+/// #     is_messenger: false,
 /// # };
 /// // p99 = 500ns, well under 10000ns limit.
 /// assert!(assert_benchmarks(&[report], Some(10000), None, None).passed);
@@ -2122,6 +2126,7 @@ mod tests {
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
+            is_messenger: false,
         }
     }
 
@@ -4079,6 +4084,7 @@ mod tests {
             numa_pages: BTreeMap::new(),
             vmstat_numa_pages_migrated: 0,
             exit_info: None,
+            is_messenger: false,
         }
     }
 

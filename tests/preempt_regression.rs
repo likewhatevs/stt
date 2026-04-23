@@ -176,6 +176,7 @@ fn fault_under_lock(stop: &AtomicBool) -> WorkerReport {
         numa_pages: BTreeMap::new(),
         vmstat_numa_pages_migrated: 0,
         exit_info: None,
+        is_messenger: false,
     }
 }
 
@@ -202,6 +203,7 @@ fn zeroed_report(tid: libc::pid_t, start: Instant) -> WorkerReport {
         numa_pages: BTreeMap::new(),
         vmstat_numa_pages_migrated: 0,
         exit_info: None,
+        is_messenger: false,
     }
 }
 
