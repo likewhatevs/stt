@@ -66,6 +66,8 @@ static JEMALLOC_PROBE: Payload = Payload {
     default_checks: &[Check::ExitCodeEq(0)],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 /// Probe invocation without exit-code gating. Used by the error-
@@ -79,6 +81,8 @@ static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 /// Allocator worker target. Spawned as a background payload; the
@@ -99,6 +103,8 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 /// Churn-mode allocator worker. Same binary as
@@ -117,6 +123,8 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 // ---------------------------------------------------------------------------

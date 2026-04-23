@@ -10,6 +10,8 @@ const FIO: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 #[ktstr_test(workloads = [FIO, FIO])]

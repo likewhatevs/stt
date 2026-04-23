@@ -1659,6 +1659,8 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
                 default_checks: &[],
                 metrics: &[],
                 include_files: &[],
+                uses_parent_pgrp: false,
+                known_flags: None,
             };
 
         impl #enum_name {
@@ -1937,6 +1939,8 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
             default_checks: &[#(#default_checks),*],
             metrics: &[#(#metrics),*],
             include_files: &[#(#include_files),*],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
     };
 

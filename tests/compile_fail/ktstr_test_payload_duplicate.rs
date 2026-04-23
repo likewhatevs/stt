@@ -10,6 +10,8 @@ const FIO: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 #[allow(dead_code)]
@@ -21,6 +23,8 @@ const STRESS: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 #[ktstr_test(payload = FIO, payload = STRESS)]

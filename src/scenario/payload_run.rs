@@ -213,8 +213,14 @@ impl<'a> PayloadRun<'a> {
     pub fn run(self) -> Result<(AssertResult, PayloadMetrics)> {
         let binary = payload_binary(self.payload)?;
         let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref())?;
-        let output = spawn_and_wait(binary, &self.args, cgroup_path.as_deref(), self.timeout)
-            .with_context(|| format!("spawn payload '{}'", self.payload.name))?;
+        let output = spawn_and_wait(
+            binary,
+            &self.args,
+            cgroup_path.as_deref(),
+            self.timeout,
+            self.payload.uses_parent_pgrp,
+        )
+        .with_context(|| format!("spawn payload '{}'", self.payload.name))?;
         Ok(evaluate(self.payload, &self.checks, output))
     }
 
@@ -235,8 +241,13 @@ impl<'a> PayloadRun<'a> {
     pub fn spawn(self) -> Result<PayloadHandle> {
         let binary = payload_binary(self.payload)?;
         let cgroup_path = resolve_cgroup_path(self.ctx, self.cgroup.as_deref())?;
-        let (child, sigchld) = spawn_child(binary, &self.args, cgroup_path.as_deref())
-            .with_context(|| format!("spawn payload '{}'", self.payload.name))?;
+        let (child, sigchld) = spawn_child(
+            binary,
+            &self.args,
+            cgroup_path.as_deref(),
+            self.payload.uses_parent_pgrp,
+        )
+        .with_context(|| format!("spawn payload '{}'", self.payload.name))?;
         Ok(PayloadHandle {
             child: Some(child),
             payload: self.payload,
@@ -509,7 +520,7 @@ impl PayloadHandle {
                 // sends killpg + single-pid SIGKILL to close the
                 // pipes and guarantee the leader exits; the
                 // trailing `wait` reaps it so the pid slot is freed.
-                kill_payload_process_group(&child, self.payload.name);
+                kill_payload_process_group(&child, self.payload.name, self.payload.uses_parent_pgrp);
                 let _ = child.wait();
                 Err(e).with_context(|| format!("wait payload '{}'", self.payload.name))
             }
@@ -536,7 +547,7 @@ impl PayloadHandle {
             .child
             .take()
             .ok_or_else(|| already_consumed(self.payload))?;
-        kill_payload_process_group(&child, self.payload.name);
+        kill_payload_process_group(&child, self.payload.name, self.payload.uses_parent_pgrp);
         match wait_and_capture(&mut child) {
             Ok(output) => Ok(evaluate(self.payload, &self.checks, output)),
             Err(e) => {
@@ -578,7 +589,7 @@ impl PayloadHandle {
                         // pipe drain failed — descendants may still
                         // hold the pipes. Kill the group to release
                         // them, then reap the leader zombie.
-                        kill_payload_process_group(&child, self.payload.name);
+                        kill_payload_process_group(&child, self.payload.name, self.payload.uses_parent_pgrp);
                         let _ = child.wait();
                         Err(e).with_context(|| format!("reap payload '{}'", self.payload.name))
                     }
@@ -618,7 +629,7 @@ fn already_consumed(payload: &'static Payload) -> anyhow::Error {
 impl Drop for PayloadHandle {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            kill_payload_process_group(&child, self.payload.name);
+            kill_payload_process_group(&child, self.payload.name, self.payload.uses_parent_pgrp);
             let _ = child.wait();
             eprintln!(
                 "ktstr: PayloadHandle for '{}' dropped without wait/kill — \
@@ -632,14 +643,24 @@ impl Drop for PayloadHandle {
 /// Send `SIGKILL` to the process group headed by `child` AND to the
 /// leader pid directly.
 ///
-/// `build_command` requests `CommandExt::process_group(0)` so the
-/// child's pid becomes its own process-group leader, coordinated
+/// `build_command` requests `CommandExt::process_group(0)` by default
+/// so the child's pid becomes its own process-group leader, coordinated
 /// with exec setup by the standard library. `killpg(pgid, SIGKILL)`
 /// on the child's pid therefore reaches every fork descendant in
 /// one shot — a single `child.kill()` would otherwise miss
 /// grandchildren of multi-process payloads (stress-ng, schbench
 /// worker mode, fio --numjobs) and those orphans would keep the
 /// stdout/stderr pipes open, hanging `wait_and_capture` forever.
+///
+/// When `uses_parent_pgrp` is `true`, the child shares its parent's
+/// pgrp ([`Payload::uses_parent_pgrp`] opted out of the fresh
+/// process group for tty-dependent binaries). The `killpg` call is
+/// skipped entirely in that case — issuing it would either hit
+/// `ESRCH` (child is not a pgrp leader) in the common case or, worse,
+/// target an unrelated group if the pgrp id happened to match a stale
+/// value. Only the direct `kill(pid)` on the leader runs; opt-out
+/// payloads accept responsibility for cleaning up their own
+/// descendants.
 ///
 /// The follow-up `kill(pid, SIGKILL)` on the leader pid is
 /// belt-and-suspenders coverage for the edge case where `killpg`
@@ -706,7 +727,11 @@ impl Drop for PayloadHandle {
 /// `waitpid` hang on some guest runtimes — add a `SigchldScope` at
 /// the call site, or extend an enclosing type with a
 /// `_sigchld: SigchldScope` field, before landing.
-fn kill_payload_process_group(child: &std::process::Child, payload_name: &str) {
+fn kill_payload_process_group(
+    child: &std::process::Child,
+    payload_name: &str,
+    uses_parent_pgrp: bool,
+) {
     let raw_pid = child.id();
     let pgid = match libc::pid_t::try_from(raw_pid) {
         Ok(p) if p > 0 => p,
@@ -733,17 +758,28 @@ fn kill_payload_process_group(child: &std::process::Child, payload_name: &str) {
         }
     };
     let pid = nix::unistd::Pid::from_raw(pgid);
-    match nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL) {
-        Ok(()) => {}
-        Err(nix::errno::Errno::ESRCH) => {
-            tracing::debug!(
-                payload = payload_name,
-                pgid,
-                "ESRCH — payload process group already reaped",
-            );
-        }
-        Err(e) => {
-            tracing::warn!(payload = payload_name, pgid, %e, "killpg failed for payload process group");
+    // `uses_parent_pgrp=true` means `build_command` did NOT request
+    // `process_group(0)`, so the child shares its parent's process
+    // group. A `killpg(pgid=child_pid, …)` call would target a group
+    // the child does not lead — `ESRCH` in the common case, or (worse)
+    // reach the ktstr process itself if a stale pid matches. Skip the
+    // group kill entirely and rely on the direct `kill(pid)` below to
+    // reap the leader. Multi-process tty-dependent payloads that
+    // opt out of the fresh pgrp accept responsibility for their own
+    // descendant cleanup (see `Payload::uses_parent_pgrp` doc).
+    if !uses_parent_pgrp {
+        match nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ESRCH) => {
+                tracing::debug!(
+                    payload = payload_name,
+                    pgid,
+                    "ESRCH — payload process group already reaped",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(payload = payload_name, pgid, %e, "killpg failed for payload process group");
+            }
         }
     }
     match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL) {
@@ -979,40 +1015,54 @@ fn build_command(
     binary: &str,
     args: &[String],
     cgroup_path: Option<&std::path::Path>,
+    uses_parent_pgrp: bool,
 ) -> Result<std::process::Command> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     let mut cmd = Command::new(binary);
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // `process_group(0)` requests a fresh process group with the
-        // child as leader (pgid == child's pid). `killpg` on the
-        // child's pid then reaches every fork descendant in one
-        // signal — a single `child.kill()` would otherwise miss
-        // grandchildren of multi-process payloads (stress-ng,
-        // schbench worker mode, fio with multiple jobs), and those
-        // orphans keep the stdout/stderr pipes open, hanging
-        // `wait_and_capture` and discarding the metrics.
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if !uses_parent_pgrp {
+        // `process_group(0)` requests a fresh process group with
+        // the child as leader (pgid == child's pid). `killpg` on
+        // the child's pid then reaches every fork descendant in
+        // one signal — a single `child.kill()` would otherwise
+        // miss grandchildren of multi-process payloads (stress-ng,
+        // schbench worker mode, fio with multiple jobs), and
+        // those orphans keep the stdout/stderr pipes open,
+        // hanging `wait_and_capture` and discarding the metrics.
         //
         // Previously a hand-rolled `pre_exec(setpgid(0, 0))` hook
-        // did the same job, but a `killpg` issued between `fork(2)`
-        // and the child's `setpgid` completion could return `ESRCH`
-        // (no such group) while the child and its descendants
-        // survived. `CommandExt::process_group` NARROWS that
-        // window: on `posix_spawn`-capable platforms (and futures
-        // where `process_group` dispatches to it) the pgid
-        // transition is kernel-sequenced with exec and the race is
-        // eliminated. When the standard library has to fall through
-        // to the fork+exec path — which it does whenever a cgroup
-        // placement `pre_exec` hook is also registered below, as
-        // `process_group(0)` and any `pre_exec` together force the
-        // legacy path — the remaining window is covered by the
-        // direct `kill(pid, SIGKILL)` follow-up in
+        // did the same job, but a `killpg` issued between
+        // `fork(2)` and the child's `setpgid` completion could
+        // return `ESRCH` (no such group) while the child and its
+        // descendants survived. `CommandExt::process_group`
+        // NARROWS that window: on `posix_spawn`-capable
+        // platforms (and futures where `process_group` dispatches
+        // to it) the pgid transition is kernel-sequenced with
+        // exec and the race is eliminated. When the standard
+        // library has to fall through to the fork+exec path —
+        // which it does whenever a cgroup placement `pre_exec`
+        // hook is also registered below, as `process_group(0)`
+        // and any `pre_exec` together force the legacy path —
+        // the remaining window is covered by the direct
+        // `kill(pid, SIGKILL)` follow-up in
         // `kill_payload_process_group`.
-        .process_group(0);
+        //
+        // The `uses_parent_pgrp == true` branch SKIPS this call
+        // so the child inherits the parent ktstr process's pgid.
+        // Opt-in for tty-dependent payloads (shells, `less`,
+        // anything that reads controlling-terminal foreground-
+        // pgrp for job-control signalling) — a fresh pgrp reads
+        // as "no job control" and breaks their signal
+        // behaviour. The cost is that `killpg(child_pid, ...)`
+        // no longer reaches descendants (the child isn't a
+        // pgrp leader), so multi-process tty-dependent payloads
+        // must react to SIGHUP / pipe close on their own or
+        // risk orphaning — see the doc on `Payload::uses_parent_pgrp`.
+        cmd.process_group(0);
+    }
 
     if let Some(cg) = cgroup_path {
         // Precompute the full `.../cgroup.procs` CString on the
@@ -1310,17 +1360,18 @@ fn spawn_and_wait(
     args: &[String],
     cgroup_path: Option<&std::path::Path>,
     timeout: Option<Duration>,
+    uses_parent_pgrp: bool,
 ) -> Result<SpawnOutput> {
     let _sigchld = SigchldScope::new();
-    let mut child = build_command(binary, args, cgroup_path)?
+    let mut child = build_command(binary, args, cgroup_path, uses_parent_pgrp)?
         .spawn()
         .map_err(|e| spawn_error_context(e, binary))?;
     match timeout {
-        Some(deadline) => wait_with_deadline(&mut child, deadline, binary),
+        Some(deadline) => wait_with_deadline(&mut child, deadline, binary, uses_parent_pgrp),
         None => match wait_and_capture(&mut child) {
             Ok(out) => Ok(out),
             Err(e) => {
-                kill_payload_process_group(&child, binary);
+                kill_payload_process_group(&child, binary, uses_parent_pgrp);
                 let _ = child.wait();
                 Err(e)
             }
@@ -1347,6 +1398,7 @@ fn wait_with_deadline(
     child: &mut std::process::Child,
     timeout: Duration,
     payload_name: &str,
+    uses_parent_pgrp: bool,
 ) -> Result<SpawnOutput> {
     use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
@@ -1388,7 +1440,7 @@ fn wait_with_deadline(
             return match wait_and_capture(child) {
                 Ok(out) => Ok(out),
                 Err(e) => {
-                    kill_payload_process_group(child, payload_name);
+                    kill_payload_process_group(child, payload_name, uses_parent_pgrp);
                     let _ = child.wait();
                     Err(e)
                 }
@@ -1397,7 +1449,7 @@ fn wait_with_deadline(
 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            kill_payload_process_group(child, payload_name);
+            kill_payload_process_group(child, payload_name, uses_parent_pgrp);
             return match wait_and_capture(child) {
                 Ok(out) => Ok(out),
                 Err(e) => {
@@ -1445,9 +1497,10 @@ fn spawn_child(
     binary: &str,
     args: &[String],
     cgroup_path: Option<&std::path::Path>,
+    uses_parent_pgrp: bool,
 ) -> Result<(std::process::Child, SigchldScope)> {
     let sigchld = SigchldScope::new();
-    let child = build_command(binary, args, cgroup_path)?
+    let child = build_command(binary, args, cgroup_path, uses_parent_pgrp)?
         .spawn()
         .map_err(|e| spawn_error_context(e, binary))?;
     Ok((child, sigchld))
@@ -1604,6 +1657,8 @@ mod tests {
         default_checks: &[],
         metrics: &[],
         include_files: &[],
+        uses_parent_pgrp: false,
+        known_flags: None,
     };
 
     const EEVDF_SCHED_PAYLOAD: Payload = Payload {
@@ -1614,6 +1669,8 @@ mod tests {
         default_checks: &[],
         metrics: &[],
         include_files: &[],
+        uses_parent_pgrp: false,
+        known_flags: None,
     };
 
     #[test]
@@ -2327,6 +2384,8 @@ mod tests {
                 unit: "iops",
             }],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         resolve_polarities(&mut metrics, &HINTED);
         assert_eq!(metrics[0].polarity, Polarity::HigherBetter);
@@ -2378,6 +2437,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let handle = PayloadRun::new(&ctx, &SLEEPER)
             .spawn()
@@ -2401,6 +2462,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mut handle = PayloadRun::new(&ctx, &SLEEPER)
             .spawn()
@@ -2544,6 +2607,8 @@ mod tests {
             default_checks: &[Check::exit_code_eq(0), Check::min("iops", 500.0)],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let cgroups = CgroupManager::new("/nonexistent");
         let topo = TestTopology::synthetic(4, 1);
@@ -2699,6 +2764,8 @@ mod tests {
                 },
             ],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mut ms = vec![
             Metric {
@@ -2767,6 +2834,8 @@ mod tests {
                 },
             ],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mut ms = vec![Metric {
             name: "iops".into(),
@@ -2801,6 +2870,8 @@ mod tests {
                 unit: "iops",
             }],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mut ms = vec![
             Metric {
@@ -2836,6 +2907,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let mut ms = vec![Metric {
             name: "anything".into(),
@@ -2964,6 +3037,8 @@ mod tests {
         default_checks: &[],
         metrics: &[],
         include_files: &[],
+        uses_parent_pgrp: false,
+        known_flags: None,
     };
 
     /// Well-behaved case: stdout carries the JSON document; stderr
@@ -3130,6 +3205,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let handle = PayloadRun::new(&ctx, &MULTI_SLEEPER)
             .spawn()
@@ -3191,6 +3268,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         let handle = PayloadRun::new(&ctx, &MULTI_SLEEPER)
             .spawn()
@@ -3229,15 +3308,64 @@ mod tests {
         }
     }
 
-    /// Timeout branch of [`wait_with_deadline`]: when the deadline
-    /// elapses without the child exiting, the function must
-    /// `kill_payload_process_group` the whole group (killpg plus a
-    /// direct single-pid SIGKILL) before draining output.
-    /// Without the killpg, a multi-process payload like
-    /// `sh -c 'sleep 60 & exec sleep 60'` would leave the
-    /// backgrounded sleeper alive after timeout. This test spawns
-    /// that shape directly (bypassing `PayloadRun` so the
-    /// `wait_with_deadline` fn can be driven with a tight 500 ms
+    /// `uses_parent_pgrp = true` SKIPS the `process_group(0)` call
+    /// in `build_command`, so the child inherits the test
+    /// process's pgid instead of becoming its own pgrp leader.
+    /// Spawn a sleeping binary via a Payload with the flag set,
+    /// `getpgid` the child's pid, and assert it equals the
+    /// parent's pgid — that pairs the "opt-out" directive with
+    /// the observable behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn payload_uses_parent_pgrp_opts_out_of_process_group() {
+        let cgroups = CgroupManager::new("/nonexistent");
+        let topo = TestTopology::synthetic(4, 1);
+        let ctx = make_ctx(&cgroups, &topo);
+        const PARENT_PGRP_SLEEPER: Payload = Payload {
+            name: "parent_pgrp_sleeper",
+            kind: PayloadKind::Binary("/bin/sleep"),
+            output: crate::test_support::OutputFormat::ExitCode,
+            default_args: &["60"],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: true,
+            known_flags: None,
+        };
+        let handle = PayloadRun::new(&ctx, &PARENT_PGRP_SLEEPER)
+            .spawn()
+            .expect("spawn opt-out sleeper");
+        let child_pid = libc::pid_t::try_from(handle.pid().expect("child alive"))
+            .expect("child pid fits in pid_t");
+        // SAFETY: getpgid(pid) is a pure lookup with no side
+        // effects beyond returning the queried pid's pgid (or -1
+        // + errno on failure).
+        let child_pgid = unsafe { libc::getpgid(child_pid) };
+        // SAFETY: getpgid(0) returns the CURRENT process's pgid
+        // and cannot fail.
+        let parent_pgid = unsafe { libc::getpgid(0) };
+        assert!(child_pgid > 0, "getpgid(child) failed: {child_pgid}");
+        assert_eq!(
+            child_pgid, parent_pgid,
+            "uses_parent_pgrp=true payload must inherit the \
+             parent's pgid (child_pgid={child_pgid}, \
+             parent_pgid={parent_pgid}); a mismatch means \
+             `build_command` still called `process_group(0)` \
+             despite the opt-out",
+        );
+        // kill() on a handle whose child is not a pgrp leader
+        // still reaps normally — kill_payload_process_group
+        // falls back to single-pid SIGKILL. Consume the handle
+        // so the sleeper doesn't outlive the test; a silent
+        // failure here would mask the test's own regression
+        // (e.g. a broken kill path that leaks sleepers).
+        let _ = handle.kill().expect("kill opt-out sleeper");
+    }
+
+    /// `wait_with_deadline` timeout kills the whole process group
+    /// via killpg + single-pid SIGKILL. Spawn a multi-process
+    /// shell, drive `wait_with_deadline` with a 500 ms budget
+    /// (so the whole test fits inside the 30s-slack nextest
     /// budget without standing up a whole scenario) and probes the
     /// pgid with `killpg(pgid, 0)` after the deadline fires —
     /// ESRCH proves the sweep reached every member.
@@ -3259,6 +3387,7 @@ mod tests {
             &mut child,
             std::time::Duration::from_millis(500),
             "multi_sleeper_timeout",
+            false,
         )
         .expect("wait_with_deadline returns Ok on timeout");
         let elapsed = start.elapsed();

@@ -10,6 +10,8 @@ const FIO: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 // `workloads` must be an array literal `[FIO]`, not a bare path.

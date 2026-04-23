@@ -321,6 +321,8 @@ impl CpusetSpec {
 /// #     default_checks: &[],
 /// #     metrics: &[],
 /// #     include_files: &[],
+/// #     uses_parent_pgrp: false,
+/// #     known_flags: None,
 /// # };
 /// let def = CgroupDef::named("io_and_spin")
 ///     .with_cpuset(CpusetSpec::disjoint(0, 2))
@@ -2192,6 +2194,63 @@ fn build_stimulus(
 ///   every policy node must appear in the cpuset's covered NUMA
 ///   nodes. Bail naming the uncovered nodes AND both escape
 ///   hatches (STATIC_NODES opt-in; widening the cpuset).
+/// Reject `--flag` args whose bare name is not in the payload's
+/// `known_flags` allowlist. Returns `Ok(())` when the payload
+/// declared no allowlist (`known_flags: None`) — the opt-in
+/// contract defaults to "permissive" so payloads wrapping
+/// open-ended binaries (stress-ng, fio, schbench) aren't forced
+/// to enumerate every flag their upstream tool accepts.
+///
+/// Recognises two flag shapes: `--foo` (flag-only) and
+/// `--foo=value` (flag-with-attached-value). Non-flag args
+/// (positional, `-short`, everything else) are passed through
+/// without inspection — the allowlist scopes to long flags only.
+///
+/// Extracted out of `apply_ops`'s `Op::RunPayload` arm so the
+/// validation is unit-testable without standing up a full Ctx
+/// / scenario state. See the caller for how the allowlist is
+/// threaded through Op::RunPayload execution.
+fn validate_known_flags(
+    payload: &crate::test_support::Payload,
+    args: &[String],
+) -> Result<()> {
+    let Some(allowlist) = payload.known_flags else {
+        return Ok(());
+    };
+    for arg in args {
+        let Some(flag_body) = arg.strip_prefix("--") else {
+            continue;
+        };
+        // `split('=').next()` is infallible: `str::split` always
+        // yields at least one element (the full string when no
+        // separator is present). The prior `unwrap_or("")` fallback
+        // was dead code — the empty-name branch below never fired
+        // via this path since `flag_body` had already passed the
+        // `strip_prefix("--")` filter above (leaving at least one
+        // character). Kept the `name.is_empty()` guard in place
+        // only to handle the degenerate `"--"` bare-dashes case,
+        // which produces `flag_body = ""` → `name = ""`.
+        let name = flag_body
+            .split('=')
+            .next()
+            .expect("str::split always yields at least one element");
+        if name.is_empty() {
+            continue;
+        }
+        if !allowlist.contains(&name) {
+            anyhow::bail!(
+                "Op::RunPayload: payload '{}' received unknown flag \
+                 '--{name}' — not in its known_flags allowlist \
+                 {allowlist:?}. Check the spelling against the \
+                 payload's declared flags; if '--{name}' is a new \
+                 legitimate flag, add it to `Payload::known_flags`.",
+                payload.name,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_mempolicy_cpuset(
     policy: &MemPolicy,
     flags: crate::workload::MpolFlags,
@@ -2749,6 +2808,11 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                         payload.name,
                     );
                 }
+                // Known-flags allowlist: if the Payload declared
+                // one, surface typos as scenario-execution-time
+                // errors instead of silent no-ops at payload
+                // runtime.
+                validate_known_flags(payload, args)?;
                 // Compute the cgroup key now so the composite-key
                 // dedup sees the same `(name, cgroup)` pair the
                 // spawn is about to record.
@@ -3147,6 +3211,139 @@ mod tests {
     fn seeded_rng(seed: u64) -> rand::rngs::StdRng {
         use rand::SeedableRng;
         rand::rngs::StdRng::seed_from_u64(seed)
+    }
+
+    // -- validate_known_flags tests --
+
+    /// Declared allowlist, every `--flag` in args is on the
+    /// allowlist → `Ok(())`. Covers both `--foo` and
+    /// `--foo=value` shapes to pin the flag-body split.
+    #[test]
+    fn validate_known_flags_accepts_listed_long_flags() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static WITH_ALLOWLIST: Payload = Payload {
+            name: "with_allowlist",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: Some(&["runtime", "threads", "verbose"]),
+        };
+        let args: Vec<String> = vec![
+            "--runtime=30".into(),
+            "--threads".into(),
+            "4".into(),
+            "--verbose".into(),
+            "positional_arg".into(),
+            "-s".into(), // short flags aren't inspected
+            // Degenerate forms: the bare `--` (end-of-flags
+            // marker used by many CLIs) and `--=value` (empty
+            // name before `=`) both skip the allowlist check
+            // because the extracted flag name is empty. Pin the
+            // empty-name skip path so a future refactor can't
+            // accidentally treat them as unknown long flags.
+            "--".into(),
+            "--=value".into(),
+        ];
+        validate_known_flags(&WITH_ALLOWLIST, &args)
+            .expect("all long flags in allowlist must pass");
+    }
+
+    /// Fail-fast ordering: when args contain a known flag, a
+    /// typo, then another known flag, the error must name ONLY
+    /// the typo — the validator bails on the first unknown flag
+    /// without continuing to inspect later args.
+    #[test]
+    fn validate_known_flags_fails_fast_on_first_unknown() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static WITH_ALLOWLIST: Payload = Payload {
+            name: "with_allowlist",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: Some(&["runtime", "threads", "verbose"]),
+        };
+        let args = vec![
+            "--runtime=30".into(),
+            "--threds".into(),
+            "--verbose".into(),
+        ];
+        let err = validate_known_flags(&WITH_ALLOWLIST, &args)
+            .expect_err("typo between two known flags must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--threds"), "error must name the typo: {msg}");
+        assert!(
+            !msg.contains("--verbose"),
+            "error must not mention the later known flag '--verbose' \
+             — fail-fast broke: {msg}",
+        );
+    }
+
+    /// A `--flag` whose bare name is not on the allowlist bails
+    /// with a message naming both the offending flag and the
+    /// allowlist — the loud-typo-detection contract.
+    #[test]
+    fn validate_known_flags_rejects_unknown_long_flag() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static WITH_ALLOWLIST: Payload = Payload {
+            name: "with_allowlist",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: Some(&["runtime", "threads"]),
+        };
+        // "threds" is a typo for "threads" — the exact failure
+        // the allowlist exists to catch.
+        let args = vec!["--threds".to_string(), "4".to_string()];
+        let err = validate_known_flags(&WITH_ALLOWLIST, &args)
+            .expect_err("typo must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--threds"),
+            "error must name the offending flag: {msg}",
+        );
+        assert!(
+            msg.contains("known_flags allowlist"),
+            "error must mention the allowlist surface: {msg}",
+        );
+    }
+
+    /// `known_flags: None` (the default on every Payload that
+    /// doesn't opt in) lets every `--flag` through without
+    /// inspection. Required for payloads that wrap binaries with
+    /// open-ended flag surfaces (stress-ng, fio, schbench).
+    #[test]
+    fn validate_known_flags_none_is_permissive() {
+        use crate::test_support::{OutputFormat, Payload, PayloadKind};
+        static NO_ALLOWLIST: Payload = Payload {
+            name: "no_allowlist",
+            kind: PayloadKind::Binary("/bin/true"),
+            output: OutputFormat::ExitCode,
+            default_args: &[],
+            default_checks: &[],
+            metrics: &[],
+            include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
+        };
+        let args: Vec<String> = vec![
+            "--anything".into(),
+            "--whatever=x".into(),
+            "--threds".into(),
+        ];
+        validate_known_flags(&NO_ALLOWLIST, &args)
+            .expect("None allowlist must pass any flag");
     }
 
     // -- Op discriminant tests --

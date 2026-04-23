@@ -86,6 +86,56 @@ pub struct Payload {
     /// `#[derive(Payload)]` or by spelling the array in the struct
     /// literal.
     pub include_files: &'static [&'static str],
+    /// When `true`, the payload's spawn path does NOT place the
+    /// child into its own process group via
+    /// `CommandExt::process_group(0)`. The child inherits the
+    /// parent ktstr process's pgid. Default (`false`) keeps the
+    /// existing "fresh pgrp → killpg-reaches-descendants" model
+    /// — see `src/scenario/payload_run.rs::build_command`.
+    ///
+    /// Opt-in for tty-dependent binaries: a shell-like tool that
+    /// uses the controlling terminal's foreground process group
+    /// for signal delivery (job-control signals, SIGHUP on tty
+    /// close) reads a fresh pgrp as "no job control", which
+    /// breaks interactive shells and `less`-style readers.
+    /// Payloads that need tty job-control semantics set this
+    /// true so they stay in the parent's pgrp and keep the
+    /// inherited controlling-terminal association.
+    ///
+    /// Trade-off on the `true` branch: multi-process payloads
+    /// can no longer be killed via `killpg(child_pid, SIGKILL)`
+    /// because the child is not a pgrp leader; the kill path
+    /// falls back to single-pid `kill(pid, SIGKILL)` and any
+    /// descendants that the payload forks must either react to
+    /// SIGHUP / pipe close or run the risk of orphaning. Most
+    /// payloads should leave this `false`.
+    pub uses_parent_pgrp: bool,
+    /// When `Some`, the listed flag names form an allowlist that
+    /// `Op::RunPayload` validation checks against at scenario-
+    /// execution time (inside `apply_ops`, before the payload
+    /// spawn) — any user-supplied `--flag` whose name is not in
+    /// the allowlist produces an error surfaced through the step
+    /// executor, surfacing typos as loud errors instead of silent
+    /// no-ops that only manifest as "feature didn't activate" in
+    /// the test output.
+    ///
+    /// `None` (default) disables validation — the payload accepts
+    /// arbitrary flag sets. Use `None` for payloads that wrap
+    /// binaries with open-ended flag surfaces (stress-ng, fio,
+    /// schbench) where enumerating every accepted flag is either
+    /// impossible or high-churn.
+    ///
+    /// `Some(&[])` is legal but rarely intended: it rejects EVERY
+    /// long flag, including ones the wrapped binary legitimately
+    /// accepts. Use `None` for "no validation" and a non-empty
+    /// slice for "validate against this allowlist" — an empty
+    /// slice means "only positional args and short flags are
+    /// acceptable", which is almost never what a Payload author
+    /// wants.
+    ///
+    /// Flag names in the slice are bare (no leading `--`) and
+    /// match the syntax of `Op::RunPayload`'s per-flag slot.
+    pub known_flags: Option<&'static [&'static str]>,
 }
 
 impl std::fmt::Debug for Payload {
@@ -284,6 +334,8 @@ impl Payload {
         default_checks: &[],
         metrics: &[],
         include_files: &[],
+        uses_parent_pgrp: false,
+        known_flags: None,
     };
 
     /// Short, human-readable name for logging and sidecar output.
@@ -321,6 +373,8 @@ impl Payload {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         }
     }
 
@@ -348,6 +402,8 @@ impl Payload {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         }
     }
 
@@ -918,6 +974,8 @@ mod tests {
             default_checks: &[],
             metrics: &[],
             include_files: &[],
+            uses_parent_pgrp: false,
+            known_flags: None,
         };
         match FIO.kind {
             PayloadKind::Binary(name) => assert_eq!(name, "fio"),
@@ -952,6 +1010,8 @@ mod tests {
             unit: "iops",
         }],
         include_files: &[],
+        uses_parent_pgrp: false,
+        known_flags: None,
     };
 
     #[test]

@@ -1,5 +1,5 @@
 error: duplicate `workloads = [...]` — combine all entries into a single array
-  --> tests/compile_fail/ktstr_test_workloads_duplicate.rs:26:33
+  --> tests/compile_fail/ktstr_test_workloads_duplicate.rs:30:33
    |
-26 | #[ktstr_test(workloads = [FIO], workloads = [STRESS])]
+30 | #[ktstr_test(workloads = [FIO], workloads = [STRESS])]
    |                                 ^^^^^^^^^

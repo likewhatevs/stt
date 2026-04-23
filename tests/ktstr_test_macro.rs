@@ -747,6 +747,8 @@ const PAYLOAD_A: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 #[allow(dead_code)]
@@ -758,6 +760,8 @@ const PAYLOAD_B: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 #[allow(dead_code)]
@@ -769,6 +773,8 @@ const PAYLOAD_C: Payload = Payload {
     default_checks: &[],
     metrics: &[],
     include_files: &[],
+    uses_parent_pgrp: false,
+    known_flags: None,
 };
 
 /// `payload = PATH` wires `entry.payload = Some(&PATH)`. Assertions
