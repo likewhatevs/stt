@@ -77,6 +77,41 @@ affects where new sidecars are written and what bare
    prints gauntlet analysis, BPF verifier stats, callback profile,
    and KVM stats.
 
+6. **Inspect the archived host context** for a specific run:
+
+   ```sh
+   cargo ktstr stats show-host --run 6.14-20260424T014200Z
+   cargo ktstr stats show-host --run archive-2024-01-15 --dir /tmp/archived-runs
+   ```
+
+   Resolves `--run` against `target/ktstr/` (or `--dir` when set),
+   scans the run's sidecars in order, and renders the first populated
+   host-context field via `HostContext::format_human`: CPU model,
+   memory config, transparent-hugepage policy, NUMA node count, uname
+   triple, kernel cmdline, and every `/proc/sys/kernel/sched_*`
+   tunable. Same fingerprint `stats compare` uses for its host-delta
+   section, but available on a single run. Fails with an actionable
+   error when no sidecar carries a host field (pre-enrichment run).
+
+## Metric registry discovery
+
+Before configuring per-metric `ComparisonPolicy` overrides, enumerate
+the available metric names:
+
+```sh
+cargo ktstr stats list-metrics
+cargo ktstr stats list-metrics --json
+```
+
+Prints the `ktstr::stats::METRICS` registry: metric name, polarity
+(higher / lower better), `default_abs` and `default_rel` gate
+thresholds, and display unit. Use the metric names from this list as
+keys in `ComparisonPolicy.per_metric_percent`; unknown names are
+rejected at `--policy` load time so typos surface loudly. `--json`
+emits the same data as a serde array — the row accessor function is
+omitted (`#[serde(skip)]`) so the wire surface carries only
+wire-stable fields.
+
 ## Sidecar format
 
 Each test writes a `SidecarResult` JSON file containing the test name,

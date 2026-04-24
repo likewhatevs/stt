@@ -546,6 +546,48 @@ pub fn acquire_cpu_locks(
     }))
 }
 
+/// Acquire `LOCK_SH` on `/tmp/ktstr-llc-*.lock` for EVERY LLC on the
+/// host. Used by callers that cannot promise their workload stays
+/// within a specific LLC window — no-perf-mode VMs (unpinned vCPUs;
+/// the host kernel places them on any online CPU) and kernel builds
+/// (`make -j$(nproc)` fans gcc children across every core).
+///
+/// `LOCK_SH` is reentrant, so two such callers coexist cheaply. The
+/// contract is intentionally asymmetric against the existing perf-
+/// mode `LOCK_EX` acquisition at [`acquire_resource_locks`]: while
+/// any unpinned ktstr workload holds host-wide `LOCK_SH`, a
+/// perf-mode VM cannot acquire its required `LOCK_EX` on any of the
+/// shared LLCs, so perf-mode correctly fails over (or nextest-retries)
+/// until the unpinned workload finishes. This serializes perf-mode
+/// measurement campaigns against any concurrent noise source without
+/// requiring the kernel scheduler to know about the flock files.
+///
+/// Non-blocking: returns `ResourceContention` when any LLC is
+/// currently held `LOCK_EX` by a perf-mode peer. Callers rely on
+/// nextest retry backoff (for tests) or an explicit retry loop
+/// (for kernel builds) to resolve contention.
+pub fn acquire_all_llc_shared_locks(topo: &HostTopology) -> Result<Vec<std::os::fd::OwnedFd>> {
+    let mut locks = Vec::with_capacity(topo.llc_groups.len());
+    for llc_idx in 0..topo.llc_groups.len() {
+        let path = format!("/tmp/ktstr-llc-{llc_idx}.lock");
+        match try_flock(&path, FlockMode::Shared) {
+            Ok(Some(fd)) => locks.push(fd),
+            Ok(None) => {
+                return Err(anyhow::Error::new(ResourceContention {
+                    reason: format!(
+                        "LLC {llc_idx} exclusively held by a perf-mode peer\n  \
+                         hint: wait for the peer to finish, or export \
+                         KTSTR_BYPASS_LLC_LOCKS=1 to acquire without coordination \
+                         (accept perf-mode measurement noise)"
+                    ),
+                }));
+            }
+            Err(e) => return Err(e.context(format!("acquire LOCK_SH on LLC {llc_idx}"))),
+        }
+    }
+    Ok(locks)
+}
+
 /// Acquire `LOCK_SH` on LLC lock files for the LLCs containing `cpus`.
 fn acquire_llc_shared_locks(
     topo: &HostTopology,
@@ -2227,5 +2269,147 @@ mod tests {
         drop(shared2);
         drop(llc_locks);
         cleanup_lock("/tmp/ktstr-llc-92100.lock");
+    }
+
+    /// `acquire_all_llc_shared_locks` returns one fd per LLC group,
+    /// all in shared mode. A synthetic 3-LLC topology must produce
+    /// 3 fds on a clean lock pool. Each acquired fd must pair with
+    /// the literal `/tmp/ktstr-llc-{idx}.lock` path so a concurrent
+    /// reader can locate them by index.
+    ///
+    /// Uses offsets well above any real host's LLC count (93000+) so
+    /// a concurrent ktstr run on the test host cannot race this test
+    /// on the same lock files.
+    #[test]
+    fn acquire_all_llc_shared_locks_returns_one_fd_per_group() {
+        // Build a topology that LOOKS like 3 groups at offsets 93000-93002.
+        // `llc_groups.len()` drives the iteration in
+        // `acquire_all_llc_shared_locks`, so we need the vec to be
+        // exactly that long — pad with empty groups up to the 93002
+        // slot.
+        let mut llc_groups: Vec<LlcGroup> = (0..93003)
+            .map(|_| LlcGroup { cpus: Vec::new() })
+            .collect();
+        // Mark the last three as the "real" LLCs this fake host has —
+        // cpus content doesn't matter to the helper, only the index
+        // range 0..llc_groups.len() does.
+        llc_groups[93000].cpus = vec![99000];
+        llc_groups[93001].cpus = vec![99001];
+        llc_groups[93002].cpus = vec![99002];
+        let topo = HostTopology {
+            llc_groups,
+            online_cpus: vec![99000, 99001, 99002],
+            cpu_to_node: std::collections::HashMap::new(),
+        };
+        // Clean every lock file the helper will touch (0..93003)
+        // before the test. In practice only the last three matter
+        // for assertions, but leaving stale EX locks at low indices
+        // from prior failed runs would short-circuit the acquisition
+        // before it reaches our target range.
+        for llc_idx in 93000..93003 {
+            cleanup_lock(&format!("/tmp/ktstr-llc-{llc_idx}.lock"));
+        }
+
+        let locks = acquire_all_llc_shared_locks(&topo)
+            .expect("clean pool must allow SH on every LLC");
+        assert_eq!(
+            locks.len(),
+            topo.llc_groups.len(),
+            "one held fd per LLC group — see acquire_all_llc_shared_locks doc",
+        );
+
+        drop(locks);
+        for llc_idx in 93000..93003 {
+            cleanup_lock(&format!("/tmp/ktstr-llc-{llc_idx}.lock"));
+        }
+    }
+
+    /// `acquire_all_llc_shared_locks` bails with `ResourceContention`
+    /// when ANY LLC is held `LOCK_EX` by a peer (the path a perf-mode
+    /// VM takes via `acquire_resource_locks`). The reason string
+    /// must name the busy LLC index so an operator running
+    /// `fuser /tmp/ktstr-llc-N.lock` can trace the holder.
+    ///
+    /// Pins the Tier-1 / Tier-2 coordination contract: no-perf-mode
+    /// VMs and kernel builds correctly fail closed against a
+    /// perf-mode peer, rather than silently racing.
+    #[test]
+    fn acquire_all_llc_shared_locks_bails_on_exclusive_peer() {
+        // Single-LLC synthetic host so one held EX lock is enough to
+        // make the helper bail.
+        let mut llc_groups: Vec<LlcGroup> = (0..93101)
+            .map(|_| LlcGroup { cpus: Vec::new() })
+            .collect();
+        llc_groups[93100].cpus = vec![99100];
+        let topo = HostTopology {
+            llc_groups,
+            online_cpus: vec![99100],
+            cpu_to_node: std::collections::HashMap::new(),
+        };
+        let busy_path = "/tmp/ktstr-llc-93100.lock";
+        cleanup_lock(busy_path);
+
+        // Peer takes EX on the one LLC the helper will try to SH on.
+        // Holding the fd in scope keeps the lock alive through the
+        // call site below.
+        let _peer_ex = try_flock(busy_path, FlockMode::Exclusive)
+            .unwrap()
+            .expect("peer EX must acquire on clean pool");
+
+        let err = acquire_all_llc_shared_locks(&topo)
+            .expect_err("EX peer must block all-LLC SH acquisition");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("93100"),
+            "error must name the busy LLC index so fuser can trace: {rendered}",
+        );
+        // Verify the ResourceContention tag survives so callers
+        // pattern-matching on the error type (for nextest-retry
+        // routing) see it correctly.
+        assert!(
+            err.downcast_ref::<ResourceContention>().is_some(),
+            "error must downcast to ResourceContention for retry routing: {rendered}",
+        );
+
+        drop(_peer_ex);
+        cleanup_lock(busy_path);
+    }
+
+    /// Two no-perf-mode peers coexist: both acquire
+    /// `acquire_all_llc_shared_locks` successfully because `LOCK_SH`
+    /// is reentrant. The contract says "shared holders coexist;
+    /// exclusive blocks" — this pins the shared-coexistence half
+    /// of that contract, complementing the EX-blocks-SH test above.
+    #[test]
+    fn acquire_all_llc_shared_locks_coexists_with_shared_peer() {
+        let mut llc_groups: Vec<LlcGroup> = (0..93201)
+            .map(|_| LlcGroup { cpus: Vec::new() })
+            .collect();
+        llc_groups[93200].cpus = vec![99200];
+        let topo = HostTopology {
+            llc_groups,
+            online_cpus: vec![99200],
+            cpu_to_node: std::collections::HashMap::new(),
+        };
+        let shared_path = "/tmp/ktstr-llc-93200.lock";
+        cleanup_lock(shared_path);
+
+        // First peer: SH. Simulates an already-running no-perf-mode VM.
+        let _peer_sh = try_flock(shared_path, FlockMode::Shared)
+            .unwrap()
+            .expect("peer SH must acquire on clean pool");
+
+        // Second caller: also SH via the helper — must coexist.
+        let locks = acquire_all_llc_shared_locks(&topo)
+            .expect("second SH caller must coexist with the first");
+        assert_eq!(
+            locks.len(),
+            topo.llc_groups.len(),
+            "second SH caller must acquire one fd per LLC group",
+        );
+
+        drop(locks);
+        drop(_peer_sh);
+        cleanup_lock(shared_path);
     }
 }

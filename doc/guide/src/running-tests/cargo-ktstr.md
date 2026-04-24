@@ -16,6 +16,7 @@ cargo ktstr test                                               # auto-discover k
 cargo ktstr test --kernel ../linux                             # local source tree
 cargo ktstr test --kernel 6.14.2                               # version (auto-downloads on miss)
 cargo ktstr test --kernel 6.14.2-tarball-x86_64-kc...          # cache key (from kernel list)
+cargo ktstr test --release                                     # release profile (stricter assertions)
 ```
 
 `--kernel` accepts a path, version string, or cache key. When absent,
@@ -32,6 +33,7 @@ Cache keys resolve from the cache only — they error if not cached
 |------|---------|-------------|
 | `--kernel ID` | auto | Kernel identifier: path, version, or cache key. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
+| `--release` | off | Build and run tests with the release profile (`--cargo-profile release` to nextest). Release mode applies **stricter assertion thresholds** (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct` 15% vs debug's 35%) — tests that barely pass in debug may fail under `--release`. `catch_unwind`-based tests and tests gated on `#[cfg(debug_assertions)]` are skipped. |
 
 ### What it does (path mode only)
 
@@ -71,6 +73,7 @@ Build the kernel (if needed) and run tests with coverage via
 cargo ktstr coverage                                               # auto-discover kernel
 cargo ktstr coverage --kernel ../linux                             # local source tree
 cargo ktstr coverage --kernel 6.14.2                               # version (auto-downloads on miss)
+cargo ktstr coverage --release                                     # release profile (stricter assertions)
 cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 ```
 
@@ -78,6 +81,7 @@ cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 |------|---------|-------------|
 | `--kernel ID` | auto | Kernel identifier: path, version, or cache key. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
+| `--release` | off | Collect coverage with the release profile (`--cargo-profile release` to llvm-cov nextest). Same stricter-threshold caveats as `test --release` — release mode applies `gap_threshold_ms=2000` / `spread_threshold_pct=15%`, and skips `catch_unwind`-based tests along with `#[cfg(debug_assertions)]`-gated tests. |
 
 Requires `cargo-llvm-cov` and the `llvm-tools-preview` rustup
 component:
@@ -278,6 +282,7 @@ Sidecar analysis and run-to-run comparison. See
 ```sh
 cargo ktstr stats                          # print analysis of newest run
 cargo ktstr stats list                     # list runs
+cargo ktstr stats list-metrics             # list registered regression metrics
 cargo ktstr stats compare <a> <b>          # compare two runs
 cargo ktstr stats compare <a> <b> -E filt  # compare with filter
 ```
@@ -303,6 +308,27 @@ source directly -- there is no newest-subdirectory walk under it:
 Print a table of run directories under
 `{CARGO_TARGET_DIR or "target"}/ktstr/` with run key, test count,
 and date.
+
+### list-metrics
+
+List the registered regression metrics and their default
+thresholds. Enumerates the `ktstr::stats::METRICS` registry: metric
+name, polarity (higher/lower better), default absolute-delta gate,
+default relative-delta gate, display unit, and a one-line
+description. Use this to see which metric names
+`ComparisonPolicy.per_metric_percent` keys can reference, and what
+each default absolute and relative gate starts at before an
+override. Default output is a human-readable table; `--json` emits
+a JSON array with the same fields.
+
+```sh
+cargo ktstr stats list-metrics              # table
+cargo ktstr stats list-metrics --json       # JSON array
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--json` | off | Emit JSON instead of a table. |
 
 ### show-host
 

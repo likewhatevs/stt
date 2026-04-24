@@ -3508,11 +3508,26 @@ fn spin_burst(work_units: &mut u64, count: u64) {
 }
 
 /// Strided read-modify-write over a cache buffer.
+///
+/// Both the per-byte RMW and the `work_units` bump route through
+/// `std::hint::black_box` so `-O2`/`-O3` cannot dead-code-eliminate
+/// the buffer traffic that is the POINT of `WorkType::CachePressure`
+/// / `CacheYield` / `CachePipe`. `buf` is a process-local `Vec<u8>`
+/// owned by the worker loop — no external observer reads it, so
+/// without an explicit barrier LLVM may prove every store dead and
+/// collapse the loop body to the `work_units` increment alone. The
+/// `work_units` bump flows into the shared iter-slot atomic store
+/// and the worker report, which keeps THAT dependency live, but
+/// that observable flow does not force the independent cache
+/// traffic to execute. Routing the loaded byte through `black_box`
+/// on read and the newly-written byte through `black_box` on write
+/// makes the cache-line traffic unelidable.
 fn cache_rmw_loop(buf: &mut [u8], stride: usize, iters: u64, work_units: &mut u64) {
     let len = buf.len();
     let mut idx = 0;
     for _ in 0..iters {
-        buf[idx] = buf[idx].wrapping_add(1);
+        let cur = std::hint::black_box(buf[idx]);
+        buf[idx] = std::hint::black_box(cur.wrapping_add(1));
         idx = (idx + stride) % len;
         *work_units = std::hint::black_box(work_units.wrapping_add(1));
     }

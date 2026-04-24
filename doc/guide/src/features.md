@@ -106,7 +106,7 @@ scheduler (EEVDF).
 Scenarios are composable sequences of
 [steps and ops](concepts/ops.md). You declare intent as data —
 the framework creates cgroups, assigns cpusets, spawns workers,
-sets scheduling policies, and manages affinity. 60+
+sets scheduling policies, and manages affinity. 50+
 [canned scenarios](concepts/scenarios.md) across 8 scenario
 submodules cover basic, cpuset, dynamic, stress, interaction,
 affinity, nested, and performance patterns. (The `ops` module
@@ -323,8 +323,8 @@ guest and host coverage for unified `cargo llvm-cov` reports.
 <summary><b>cargo-ktstr</b> — cargo subcommand for the full workflow, more introspection less shell scripts</summary>
 
 Wraps `cargo nextest run` with automatic kernel resolution.
-Subcommands (in `--help` order): `test`, `coverage`, `stats`,
-`kernel`, `model`, `verifier`, `completions`, `show-host`,
+Subcommands (in `--help` order): `test`, `coverage`, `llvm-cov`,
+`stats`, `kernel`, `model`, `verifier`, `completions`, `show-host`,
 `show-thresholds`, `cleanup`, `shell`.
 See [`cargo-ktstr`](running-tests/cargo-ktstr.md).
 

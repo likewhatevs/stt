@@ -65,7 +65,16 @@ mod tests {
     /// Regression for the error-chain fix: a ResourceContention wrapped
     /// in `.context(...)` must still be recognized by the macro and
     /// trigger the `skip!` branch instead of the `panic!` branch.
+    ///
+    /// `#[cfg(panic = "unwind")]`: this test uses `std::panic::catch_unwind`
+    /// to assert the macro does NOT panic. Under `panic = "abort"` (the
+    /// release profile's setting — see `Cargo.toml [profile.release]`)
+    /// panics cannot be caught; the panic aborts the whole test binary
+    /// instead of returning an `Err` from `catch_unwind`. Gating the
+    /// test on the panic strategy lets `cargo ktstr test --release`
+    /// skip it without false-failing the binary.
     #[test]
+    #[cfg(panic = "unwind")]
     fn skip_on_contention_walks_context_chain() {
         let result = std::panic::catch_unwind(|| {
             fn skip_fn() {
@@ -87,7 +96,12 @@ mod tests {
 
     /// Unwrapped ResourceContention keeps working (no regression on the
     /// simple path).
+    ///
+    /// `#[cfg(panic = "unwind")]`: same rationale as the sibling
+    /// context-chain test — `catch_unwind` is unusable under
+    /// `panic = "abort"`.
     #[test]
+    #[cfg(panic = "unwind")]
     fn skip_on_contention_recognizes_direct_error() {
         let result = std::panic::catch_unwind(|| {
             fn skip_fn() {

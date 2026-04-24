@@ -144,12 +144,11 @@ KVM enabled and the user must have read+write access to `/dev/kvm`.
 
 ```text
 no kernel found
-  hint: run `cargo ktstr kernel build` to download and build the latest stable kernel
-  hint: or set KTSTR_KERNEL=/path/to/linux
-  hint: or set KTSTR_TEST_KERNEL=/path/to/bzImage
+  hint: set KTSTR_KERNEL to a kernel source directory, a version (e.g. `6.14.2`), or a cache key (see `cargo ktstr kernel list`), or run `cargo ktstr kernel build` to populate the cache
+  hint: or set KTSTR_TEST_KERNEL=/path/to/bzImage to point at a pre-built bootable image directly (bypasses KTSTR_KERNEL resolution)
 ```
 
-On aarch64 the hint says `Image` instead of `bzImage`.
+On aarch64 the second hint says `Image` instead of `bzImage`.
 
 `ktstr shell` and `cargo ktstr shell` auto-download the latest
 stable kernel when no `--kernel` is specified and no kernel is found
@@ -180,13 +179,24 @@ When using `SchedulerSpec::Discover`, ktstr searches for the scheduler
 binary in:
 
 1. `KTSTR_SCHEDULER` environment variable.
-2. Same directory as the test binary.
+2. Sibling of the current executable (and, when the test binary
+   lives under `target/{debug,release}/deps/`, the parent of
+   `deps/` one level up — this covers the nextest / integration-
+   test layout where the scheduler binary sits next to the test
+   binary's parent).
 3. `target/debug/`.
 4. `target/release/`.
+5. On-demand build via `cargo build` against the scheduler's
+   package name — ktstr invokes the build itself when the
+   preceding four locations have no match, so a fresh checkout
+   with an unbuilt scheduler still produces a usable binary
+   without the caller pre-running `cargo build`.
 
 **Fixes:**
 
-- Build the scheduler first: `cargo build -p scx_mitosis`.
+- Build the scheduler first: `cargo build -p scx_mitosis` (skipped
+  automatically if step 5 above can build it on demand, but
+  pre-building makes the first test run faster).
 - Set `KTSTR_SCHEDULER=/path/to/binary`.
 - Use `SchedulerSpec::Path` for an explicit path in `#[ktstr_test]`.
 
@@ -325,22 +335,40 @@ group size. `WorkType::worker_group_size()` returns the divisor.
 ## Cache corruption
 
 ```text
-cached entry 6.14.2-tarball-x86_64-kc... has corrupt metadata
+  6.14.2-tarball-x86_64-kc...                 (corrupt: metadata.json malformed: ...)
+warning: entries marked (corrupt) cannot be used — cached metadata is missing, malformed, or references a missing image. Inspect the entry directory under ~/.cache/ktstr/kernels to remove it manually, or run `kernel clean --corrupt-only --force` which removes ONLY corrupt entries and leaves valid ones intact. ...
 ```
 
-A cached kernel entry has missing or unparseable `metadata.json`.
-This can happen after a partial write (e.g. disk full, killed process).
-`CacheDir::lookup` returns `None` for entries with corrupt metadata
-or a missing kernel image file.
+A cached kernel entry has missing, unparseable, or
+schema-drifted `metadata.json`, or metadata that references an
+image file that is no longer present. This can happen after a
+partial write (e.g. disk full, killed process), or after a ktstr
+release that evolved the metadata schema in a
+non-backward-compatible way. `cargo ktstr kernel list` surfaces
+these as `(corrupt: ...)` rows; the trailing footer on stderr
+summarizes the remediation options. `CacheDir::lookup` returns
+`None` for corrupt entries so test runs at a specific cache key
+fall through to the normal re-build path.
+
+The JSON form (`cargo ktstr kernel list --json`) emits an
+`error_kind` field on every corrupt entry — one of `"missing"`,
+`"unreadable"`, `"schema_drift"`, `"malformed"`, `"truncated"`,
+`"parse_error"`, `"image_missing"`, or `"unknown"` — so CI
+scripts can dispatch on a stable token without parsing the
+free-form `error` string.
 
 **Fixes:**
 
-- Remove the corrupt entry: `cargo ktstr kernel clean --force`
-- Rebuild: `cargo ktstr kernel build --force 6.14.2`
+- Remove ONLY corrupt entries (keeps valid ones intact):
+  `cargo ktstr kernel clean --corrupt-only --force`
+- Remove the corrupt entry along with everything else:
+  `cargo ktstr kernel clean --force`
+- Rebuild a specific version after cleanup: `cargo ktstr kernel build --force 6.14.2`
 - Override the cache directory via `KTSTR_CACHE_DIR` if the default
   location is on a problematic filesystem.
 - See [`cargo ktstr kernel clean`](running-tests/cargo-ktstr.md#kernel-clean)
-  for all cleanup options.
+  for all cleanup options, including `--keep N --force` to preserve
+  the N newest entries.
 
 ## Cache directory not found
 

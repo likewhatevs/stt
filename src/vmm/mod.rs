@@ -3738,7 +3738,39 @@ impl KtstrVmBuilder {
         }
 
         let (pinning_plan, mbind_node_map, cpu_locks) = if self.no_perf_mode {
-            (None, Vec::new(), Vec::new())
+            // No-perf-mode VMs have unrestricted vCPU affinity — the
+            // host kernel places their threads on any online CPU,
+            // including ones a perf-mode peer has flocked and bound
+            // its RT-FIFO vCPUs to. Injecting that thread competition
+            // destroys perf-mode's measurement contract. Acquire
+            // `LOCK_SH` on every host LLC so perf-mode's required
+            // `LOCK_EX` blocks on any of them and fails over cleanly.
+            // See `host_topology::acquire_all_llc_shared_locks` for
+            // the full rationale (and the `KTSTR_BYPASS_LLC_LOCKS`
+            // escape hatch for operators who accept noise).
+            //
+            // `from_sysfs` returning `Err` (non-Linux, sysfs absent)
+            // degenerates the lock set to empty; no coordination is
+            // possible, but the VM still runs. This preserves the
+            // legacy "no-perf-mode runs everywhere" behaviour on
+            // hosts that literally cannot enumerate LLCs, and the
+            // `tracing::warn!` below makes the fallback visible.
+            let locks = if std::env::var("KTSTR_BYPASS_LLC_LOCKS")
+                .ok()
+                .is_some_and(|v| !v.is_empty())
+            {
+                Vec::new()
+            } else if let Ok(host_topo) = host_topology::HostTopology::from_sysfs() {
+                host_topology::acquire_all_llc_shared_locks(&host_topo)?
+            } else {
+                tracing::warn!(
+                    "no-perf-mode: could not read host LLC topology from sysfs; \
+                     skipping all-LLC LOCK_SH acquisition. Concurrent perf-mode \
+                     runs on this host will NOT be serialized against this VM"
+                );
+                Vec::new()
+            };
+            (None, Vec::new(), locks)
         } else if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;
             let node_map = build_per_node_map(&plan, &host_topo, &self.topology);

@@ -325,7 +325,16 @@ mod panic_payload_tests {
 
     /// `panic!("str-literal")` panics with a `&'static str` payload.
     /// The helper must recover the literal exactly.
+    ///
+    /// `#[cfg(panic = "unwind")]`: the test deliberately panics
+    /// inside `std::panic::catch_unwind` to exercise the payload
+    /// recovery helper. Under `panic = "abort"` (release profile —
+    /// see `Cargo.toml [profile.release]`) panics cannot be caught;
+    /// the panic aborts the whole test binary instead of returning
+    /// an `Err` from `catch_unwind`. Gating the test on the panic
+    /// strategy lets `cargo ktstr test --release` skip it cleanly.
     #[test]
+    #[cfg(panic = "unwind")]
     fn panic_payload_str_literal_recovered() {
         let result = std::panic::catch_unwind(|| {
             panic!("a-string-literal");
@@ -337,7 +346,12 @@ mod panic_payload_tests {
     /// `panic!("{x}")` with a formatted arg panics with a `String`
     /// payload. The helper must preserve the FORMATTED text, not
     /// drop back to a `Box<dyn Any>` stringification.
+    ///
+    /// `#[cfg(panic = "unwind")]`: same rationale as the sibling
+    /// `panic_payload_str_literal_recovered` test — `catch_unwind`
+    /// is unusable under `panic = "abort"`.
     #[test]
+    #[cfg(panic = "unwind")]
     fn panic_payload_formatted_string_recovered() {
         let n: u32 = 42;
         let result = std::panic::catch_unwind(|| {
@@ -352,7 +366,12 @@ mod panic_payload_tests {
     /// helper itself. The exact rendering is not pinned beyond a
     /// non-empty string — the contract is "never panic, always
     /// return SOMETHING useful".
+    ///
+    /// `#[cfg(panic = "unwind")]`: same rationale as the sibling
+    /// `panic_payload_str_literal_recovered` test — `catch_unwind`
+    /// is unusable under `panic = "abort"`.
     #[test]
+    #[cfg(panic = "unwind")]
     fn panic_payload_non_string_falls_back_to_debug() {
         let result = std::panic::catch_unwind(|| {
             std::panic::panic_any(127i32);

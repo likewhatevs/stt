@@ -57,15 +57,42 @@ pub struct WorkerReport {
     pub max_gap_cpu: usize,
     pub max_gap_at_ms: u64,
     pub resume_latencies_ns: Vec<u64>,
+    pub wake_sample_total: u64,
     pub iterations: u64,
     pub schedstat_run_delay_ns: u64,
     pub schedstat_run_count: u64,
     pub schedstat_cpu_time_ns: u64,
+    pub completed: bool,
     pub numa_pages: BTreeMap<usize, u64>,
     pub vmstat_numa_pages_migrated: u64,
     pub exit_info: Option<WorkerExitInfo>,
+    pub is_messenger: bool,
 }
 ```
+
+Three fields worth calling out explicitly:
+
+- `wake_sample_total` — the TOTAL number of wake-latency
+  observations the worker saw, including samples the reservoir
+  sampler dropped. `resume_latencies_ns` is clamped to at most
+  100_000 entries (`MAX_WAKE_SAMPLES`); on a long run that
+  accumulates more wakes than the cap, the vector stays at the
+  cap while this counter keeps climbing. Host-side consumers
+  reporting "total wakeups observed" read `wake_sample_total`;
+  percentile / CV computations read `resume_latencies_ns`.
+- `completed` — `true` when the worker reached its natural end
+  (outer loop observed STOP and exited cleanly, or a custom-
+  closure payload returned from its `run`). Sentinel reports
+  synthesised by `stop_and_collect`'s JSON-parse fallback carry
+  `false`. Lets consumers distinguish "ran to completion, saw
+  zero iterations" from "died / timed out before recording
+  anything."
+- `is_messenger` — `true` only for the messenger worker in a
+  `FutexFanOut` / `FanOutCompute` group (the single writer that
+  advances the shared generation and issues `futex_wake`).
+  Enables per-worker latency-participation assertions —
+  receivers produce `resume_latencies_ns` entries, messengers
+  record wake-side work but no resume latency.
 
 - `off_cpu_ns = wall_time_ns - cpu_time_ns`
 - `exit_info` is `None` on every live-worker-authored report.
@@ -124,7 +151,16 @@ pub struct WorkerReport {
     contribute to `work_units` on the framework's behalf —
     migration tracking fires only if the user's `run` function
     increments `work_units` and emits migrations directly.
-- Scheduling gaps are the longest intervals between iterations
+- Scheduling gaps (`max_gap_ms`, `max_gap_cpu`, `max_gap_at_ms`)
+  record the longest wall-clock interval between consecutive
+  1024-work-unit migration-check points plus the CPU the gap
+  was observed on and its time from start. High values indicate
+  preemption or descheduling near a checkpoint boundary. The
+  checkpoint cadence — and therefore the gap-measurement
+  cadence — is governed by the same `work_units.is_multiple_of(1024)`
+  test that the migration tracker uses, so the effective
+  measurement period in outer iterations matches the per-WorkType
+  tables above.
 
 ### Benchmarking fields
 

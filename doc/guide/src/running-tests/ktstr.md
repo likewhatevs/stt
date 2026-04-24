@@ -143,6 +143,7 @@ on all exit paths.
 | `--memory-mb MB` | auto | Guest memory in MB (minimum 128). When absent, estimated from payload and include file sizes. |
 | `--dmesg` | off | Forward kernel console (COM1/dmesg) to stderr in real-time. Sets loglevel=7 for verbose kernel output. |
 | `--exec CMD` | -- | Run a command in the VM instead of an interactive shell. The VM exits after the command completes. |
+| `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 
 `cargo ktstr shell` runs the same VM boot flow and differs in one
 respect: it accepts raw image file paths for `--kernel` (e.g.

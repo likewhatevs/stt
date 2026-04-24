@@ -71,9 +71,14 @@ console, COM2 for application I/O) and a shared-memory ring buffer.
 
 **Direct access over tooling layers** -- the host-side monitor reads
 guest memory directly via BTF (BPF Type Format)-resolved struct
-offsets to observe scheduler state. No BPF instrumentation inside the guest, no observer
-effects on scheduling decisions. See [Monitor](architecture/monitor.md)
-for details on BTF resolution and guest memory introspection.
+offsets to observe scheduler state. The monitor runs entirely
+host-side — no BPF programs are injected into the guest to collect
+scheduler telemetry, so observations do not perturb scheduling
+decisions. (BPF programs loaded by the scheduler under test, the
+BPF verifier pipeline, and the auto-repro probe pipeline are
+separate concerns; those are the code under test, not the
+observation layer.) See [Monitor](architecture/monitor.md) for
+details on BTF resolution and guest memory introspection.
 
 ## BPF verifier analysis
 
@@ -95,7 +100,7 @@ scenario with BPF probes attached to the crash-path functions. See
 | `ktstr` (lib) | Core library |
 | `ktstr-macros` | `#[ktstr_test]` and `#[derive(Scheduler)]` proc macros |
 | `ktstr` (bin) | Host-side CLI |
-| `cargo-ktstr` (bin) | Dev workflow plugin: kernel build + nextest |
+| `cargo-ktstr` (bin) | Cargo-integrated workflow: test, coverage, llvm-cov, kernel mgmt, verifier analysis, stats, interactive shell |
 | `scx-ktstr` | Minimal BPF scheduler for testing |
 
 Both `ktstr` and `cargo-ktstr` are `[[bin]]` targets in the same

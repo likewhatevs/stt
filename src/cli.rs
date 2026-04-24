@@ -1444,6 +1444,55 @@ pub fn kernel_build_pipeline(
     let source_dir = &acquired.source_dir;
     let (arch, image_name) = crate::fetch::arch_info();
 
+    // Acquire `LOCK_SH` on every host LLC for the duration of the
+    // build. `make -j$(nproc)` fans gcc children across every online
+    // CPU with no flock awareness; without this coordination, a
+    // kernel build running concurrently with a perf-mode test run
+    // saturates the cores perf-mode is measuring on, producing
+    // noise that trips `max_gap_ms` / `max_p99_wake_latency_ns`
+    // thresholds for reasons unrelated to the scheduler under test.
+    // `LOCK_SH` is the same mode no-perf-mode VMs use (see
+    // `vmm::host_topology::acquire_all_llc_shared_locks`); a
+    // perf-mode peer requesting `LOCK_EX` on any one LLC blocks on
+    // the shared lock and correctly fails over to another LLC (or
+    // nextest-retries) until the build finishes.
+    //
+    // `_llc_locks` binds the held fds to a local so RAII drops them
+    // at function exit, covering every branch including early-
+    // return error paths. Name prefix `_` suppresses the
+    // unused-variable warning without `#[allow(unused_variables)]`.
+    //
+    // Escape hatches:
+    //   - `KTSTR_BYPASS_LLC_LOCKS=1`: skip the lock acquisition
+    //     entirely; the build proceeds immediately without
+    //     coordinating with any concurrent perf-mode run. Use when
+    //     the operator explicitly accepts measurement noise (one
+    //     shell doing unrelated work, an isolated developer
+    //     workstation, or a CI queue that already serializes jobs
+    //     at a higher layer).
+    //   - Sysfs-unreadable host (non-Linux, degraded container):
+    //     `HostTopology::from_sysfs()` returns `Err`, and the
+    //     fallback path emits a `tracing::warn!` and proceeds
+    //     without locks. This matches the no-perf-mode branch's
+    //     behaviour at `vmm::KtstrVmBuilder::build` so the two
+    //     surfaces degrade identically.
+    let _llc_locks: Vec<std::os::fd::OwnedFd> = if std::env::var("KTSTR_BYPASS_LLC_LOCKS")
+        .ok()
+        .is_some_and(|v| !v.is_empty())
+    {
+        Vec::new()
+    } else if let Ok(host_topo) = crate::vmm::host_topology::HostTopology::from_sysfs() {
+        crate::vmm::host_topology::acquire_all_llc_shared_locks(&host_topo)?
+    } else {
+        tracing::warn!(
+            "{cli_label}: could not read host LLC topology from sysfs; \
+             skipping kernel-build all-LLC LOCK_SH acquisition. \
+             Concurrent perf-mode runs on this host will NOT be serialized \
+             against this build"
+        );
+        Vec::new()
+    };
+
     if clean {
         if !is_local_source {
             eprintln!(

@@ -44,6 +44,18 @@ enum KtstrCommand {
         /// Also settable via KTSTR_NO_PERF_MODE env var.
         #[arg(long)]
         no_perf_mode: bool,
+        /// Build and run tests with the release profile
+        /// (`--cargo-profile release` to nextest).
+        ///
+        /// Release mode uses STRICTER assertion thresholds
+        /// (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct`
+        /// 15% vs debug's 35%) — tests that barely pass in debug may
+        /// fail under `--release`. `catch_unwind`-based tests are
+        /// skipped because release sets `panic = "abort"` (see
+        /// `Cargo.toml [profile.release]`). Tests gated on
+        /// `#[cfg(debug_assertions)]` also skip.
+        #[arg(long)]
+        release: bool,
         /// Arguments passed through to cargo nextest run.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -60,6 +72,16 @@ enum KtstrCommand {
         /// Also settable via KTSTR_NO_PERF_MODE env var.
         #[arg(long)]
         no_perf_mode: bool,
+        /// Build and collect coverage with the release profile
+        /// (`--cargo-profile release` to llvm-cov nextest).
+        ///
+        /// Release mode uses STRICTER assertion thresholds
+        /// (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct`
+        /// 15% vs debug's 35%) — tests that barely pass in debug may
+        /// fail under `--release`. `catch_unwind`-based tests are
+        /// skipped because release sets `panic = "abort"`.
+        #[arg(long)]
+        release: bool,
         /// Arguments passed through to cargo llvm-cov nextest.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -418,23 +440,41 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> anyhow::Result<()> {
 ///
 /// All three subcommands have the same plumbing: resolve `--kernel` to
 /// a cache entry or source-tree build, propagate `--no-perf-mode` via
-/// an env var, append the user's trailing args, and `exec` into the
-/// chosen cargo subcommand. The only differences are the cargo
-/// subcommand name (`["nextest","run"]` vs `["llvm-cov","nextest"]`
-/// vs `["llvm-cov"]`) and the log / error-message prefix.
-/// Consolidating here ensures all flows evolve together — a
-/// kernel-resolution fix in one used to drift against the others.
+/// an env var, optionally prepend `--cargo-profile release`, append
+/// the user's trailing args, and `exec` into the chosen cargo
+/// subcommand. The only differences are the cargo subcommand name
+/// (`["nextest","run"]` vs `["llvm-cov","nextest"]` vs `["llvm-cov"]`)
+/// and the log / error-message prefix. Consolidating here ensures all
+/// flows evolve together — a kernel-resolution fix in one used to
+/// drift against the others.
+///
+/// `release` is always `false` for the raw `llvm-cov` passthrough —
+/// that subcommand hands every argument to the user, so the profile
+/// is set via the user's trailing args (or not at all). `test` and
+/// `coverage` wire their `--release` flag through to this argument.
 fn run_cargo_sub(
     sub_argv: &[&str],
     label: &str,
     kernel: Option<String>,
     no_perf_mode: bool,
+    release: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     use ktstr::kernel_path::KernelId;
 
     let mut cmd = Command::new("cargo");
-    cmd.args(sub_argv).args(&args);
+    cmd.args(sub_argv);
+    if release {
+        // Prepend `--cargo-profile release` BEFORE the user's
+        // trailing args so the profile selection applies to the
+        // whole invocation. nextest reads `--cargo-profile` directly;
+        // `cargo llvm-cov nextest` forwards it to its inner nextest
+        // invocation. For `cargo llvm-cov <sub>` (the raw-passthrough
+        // binding), the release arg is never passed here — the raw
+        // path relies on user-supplied `--release` / `--profile`.
+        cmd.args(["--cargo-profile", "release"]);
+    }
+    cmd.args(&args);
 
     if no_perf_mode {
         cmd.env("KTSTR_NO_PERF_MODE", "1");
@@ -515,16 +555,29 @@ const COVERAGE_SUB_ARGV: &[&str] = &["llvm-cov", "nextest"];
 /// subcommand (`report`, `clean`, `show-env`, ...).
 const LLVM_COV_SUB_ARGV: &[&str] = &["llvm-cov"];
 
-fn run_test(kernel: Option<String>, no_perf_mode: bool, args: Vec<String>) -> Result<(), String> {
-    run_cargo_sub(TEST_SUB_ARGV, "tests", kernel, no_perf_mode, args)
+fn run_test(
+    kernel: Option<String>,
+    no_perf_mode: bool,
+    release: bool,
+    args: Vec<String>,
+) -> Result<(), String> {
+    run_cargo_sub(TEST_SUB_ARGV, "tests", kernel, no_perf_mode, release, args)
 }
 
 fn run_coverage(
     kernel: Option<String>,
     no_perf_mode: bool,
+    release: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
-    run_cargo_sub(COVERAGE_SUB_ARGV, "coverage", kernel, no_perf_mode, args)
+    run_cargo_sub(
+        COVERAGE_SUB_ARGV,
+        "coverage",
+        kernel,
+        no_perf_mode,
+        release,
+        args,
+    )
 }
 
 fn run_llvm_cov(
@@ -532,7 +585,18 @@ fn run_llvm_cov(
     no_perf_mode: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
-    run_cargo_sub(LLVM_COV_SUB_ARGV, "llvm-cov", kernel, no_perf_mode, args)
+    // `llvm-cov` is raw passthrough — the user supplies every
+    // argument after the subcommand name, including any profile
+    // selection. `release: false` here means "don't inject a profile
+    // ourselves"; the user decides.
+    run_cargo_sub(
+        LLVM_COV_SUB_ARGV,
+        "llvm-cov",
+        kernel,
+        no_perf_mode,
+        false,
+        args,
+    )
 }
 
 fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
@@ -1156,13 +1220,15 @@ fn main() {
         KtstrCommand::Test {
             kernel,
             no_perf_mode,
+            release,
             args,
-        } => run_test(kernel, no_perf_mode, args),
+        } => run_test(kernel, no_perf_mode, release, args),
         KtstrCommand::Coverage {
             kernel,
             no_perf_mode,
+            release,
             args,
-        } => run_coverage(kernel, no_perf_mode, args),
+        } => run_coverage(kernel, no_perf_mode, release, args),
         KtstrCommand::LlvmCov {
             kernel,
             no_perf_mode,
@@ -1274,6 +1340,26 @@ mod tests {
         assert!(m.is_ok(), "{}", m.err().unwrap());
     }
 
+    /// `--release` on `test` parses to `KtstrCommand::Test { release:
+    /// true, .. }` so `run_test` prepends `--cargo-profile release`
+    /// to the cargo nextest invocation. A clap regression that
+    /// dropped the flag would turn the user-visible `--release` into
+    /// either a silent no-op (default false) or a passthrough-arg
+    /// typo — this test pins the clap-level wiring.
+    #[test]
+    fn parse_test_with_release_flag() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "test", "--release"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Test { release, .. } => {
+                assert!(release, "`--release` must set `release=true`");
+            }
+            _ => panic!("expected Test"),
+        }
+    }
+
     #[test]
     fn parse_test_with_passthrough_args() {
         let Cargo {
@@ -1366,10 +1452,12 @@ mod tests {
             KtstrCommand::Test {
                 kernel,
                 no_perf_mode,
+                release,
                 args,
             } => {
                 assert_eq!(kernel.as_deref(), Some("6.14.2"));
                 assert!(no_perf_mode);
+                assert!(!release, "bare invocation must default --release to false");
                 assert!(args.is_empty());
             }
             _ => panic!("expected Test (via `nextest` alias)"),
@@ -1388,6 +1476,26 @@ mod tests {
     fn parse_coverage_with_kernel() {
         let m = Cargo::try_parse_from(["cargo", "ktstr", "coverage", "--kernel", "6.14.2"]);
         assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    /// `--release` on `coverage` parses to `KtstrCommand::Coverage
+    /// { release: true, .. }` so `run_coverage` prepends
+    /// `--cargo-profile release` to the cargo llvm-cov nextest
+    /// invocation. Same rationale as the sibling
+    /// `parse_test_with_release_flag` — pins the clap-level wiring
+    /// against a regression that turns the flag into a no-op.
+    #[test]
+    fn parse_coverage_with_release_flag() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "coverage", "--release"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Coverage { release, .. } => {
+                assert!(release, "`--release` must set `release=true`");
+            }
+            _ => panic!("expected Coverage"),
+        }
     }
 
     #[test]
@@ -1441,10 +1549,12 @@ mod tests {
             KtstrCommand::Coverage {
                 kernel,
                 no_perf_mode,
+                release,
                 args,
             } => {
                 assert_eq!(kernel.as_deref(), Some("6.14.2"));
                 assert!(no_perf_mode);
+                assert!(!release, "bare invocation must default --release to false");
                 assert_eq!(args, vec!["--workspace"]);
             }
             _ => panic!("expected Coverage"),

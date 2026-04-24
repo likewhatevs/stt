@@ -288,6 +288,74 @@ const RELAXED: Scheduler = Scheduler::new("relaxed")
     .assert(Assert::NO_OVERRIDES.max_imbalance_ratio(5.0));
 ```
 
+## Payload Definitions {#derive-payload}
+
+A `Payload` describes a binary workload that a test can run alongside
+(or in place of) its cgroup workers. The same struct encodes both
+`PayloadKind::Binary` (an external executable — `schbench`, `fio`,
+`stress-ng`) and `PayloadKind::Scheduler` (the scheduler under test,
+constructed via `Payload::from_scheduler`). Tests reference a
+`Payload` via `#[ktstr_test(payload = FIXTURE)]` (primary slot) or
+`#[ktstr_test(workloads = [FIXTURE_A, FIXTURE_B])]` (additional slots);
+the test body then runs it via `ctx.payload(&FIXTURE)`.
+
+### `#[non_exhaustive]` and construction rules
+
+`Payload` is `#[non_exhaustive]` (see [`crate::non_exhaustive`](https://likewhatevs.github.io/ktstr/api/ktstr/non_exhaustive/index.html)).
+Downstream crates **cannot** use struct-literal construction — a
+future ktstr bump can add fields without breaking callers only if
+everyone constructs through the provided associated functions:
+
+- [`Payload::binary(name, binary)`](https://likewhatevs.github.io/ktstr/api/ktstr/test_support/struct.Payload.html#method.binary)
+  — minimal binary-kind `Payload` with exit-code-only defaults (no
+  declared args, checks, metrics, or include files). Fills `name`,
+  sets `kind = PayloadKind::Binary(binary)`.
+- [`Payload::from_scheduler(&'static Scheduler)`](https://likewhatevs.github.io/ktstr/api/ktstr/test_support/struct.Payload.html#method.from_scheduler)
+  — wraps a `Scheduler` const into a `PayloadKind::Scheduler`
+  payload. Used internally by the scheduler slot plumbing; test
+  authors rarely call this directly.
+
+For richer binary payloads (custom default args, declared `Check`s,
+`MetricHint`s, `include_files`), use `#[derive(Payload)]` on a
+marker struct — the derive generates the matching `const` via the
+same non-exhaustive-preserving construction path. `tests/common/fixtures.rs`
+has worked examples — `SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON`
+— suitable as reference shapes to copy.
+
+### Quick reference: `Payload` fields
+
+The fields are listed here for readers tracing the fixture files,
+not as a license to hand-roll literals. Each is populated by
+`Payload::binary` + the derive's builder methods:
+
+- `name: &'static str` — display name that appears in sidecar JSON,
+  stats tables, and test filtering. Distinct from the binary name
+  (`kind`) so e.g. `SCHBENCH_HINTED` can run the same `schbench`
+  binary with a different label.
+- `kind: PayloadKind` — either `Binary(executable_name)` (for test
+  payloads like `schbench`) or `Scheduler(&'static Scheduler)` (for
+  the scheduler slot; constructed via `Payload::from_scheduler`).
+- `output: OutputFormat` — how to interpret the payload's stdout/stderr.
+  `ExitCode` (status code only), `Json` (parse numeric leaves), or
+  `LlmExtract(Option<&'static str>)` (route through a local LLM with
+  an optional hint — see [concepts/metrics](../concepts/work-types.md)).
+- `default_args: &'static [&'static str]` — CLI args prepended to
+  every invocation. Per-test `ctx.payload(...).args(...)` appends
+  after these.
+- `default_checks: &'static [Check]` — static assertions applied to
+  the payload's output/exit. Merged with per-test `.checks(...)`.
+- `metrics: &'static [MetricHint]` — declared metrics the payload
+  emits (name, unit, polarity). Drives `list-metrics` and
+  comparison thresholds.
+- `include_files: &'static [&'static str]` — extra files packaged
+  into the guest alongside the binary (config files, datasets).
+- `uses_parent_pgrp: bool` — when true, the payload child inherits
+  the test's process group so the teardown SIGKILL sweep reaches
+  it. Most binaries leave this `false` and are reaped explicitly.
+- `known_flags: Option<&'static [&'static str]>` — optional
+  allow-list of CLI flags the payload accepts; used by the
+  gauntlet-style flag expansion.
+
 ## Kernel-built scheduler example
 
 For schedulers compiled into the kernel (no userspace binary),

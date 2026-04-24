@@ -54,11 +54,11 @@ Custom scenarios receive a `Ctx` reference:
 
 ```rust,ignore
 pub struct Ctx<'a> {
-    pub cgroups: &'a CgroupManager,
+    pub cgroups: &'a dyn CgroupOps,
     pub topo: &'a TestTopology,
     pub duration: Duration,
     pub workers_per_cgroup: usize,
-    pub sched_pid: libc::pid_t,
+    pub sched_pid: Option<libc::pid_t>,
     pub settle: Duration,
     pub work_type_override: Option<WorkType>,
     pub assert: Assert,
@@ -66,17 +66,23 @@ pub struct Ctx<'a> {
 }
 ```
 
-**`cgroups`** -- create/remove cgroups, set cpusets, move tasks. See
-[CgroupManager](../architecture/cgroup-manager.md) for method details.
+**`cgroups`** -- create/remove cgroups, set cpusets, move tasks. The
+slot is a `&dyn CgroupOps` trait object, not a concrete
+[`CgroupManager`](../architecture/cgroup-manager.md), so tests can
+substitute a no-op double for host-only scenarios while production
+paths receive the real manager. Method signatures are defined on
+`CgroupOps`; see `CgroupManager` for the production implementation.
 
 **`topo`** -- query CPU topology (LLCs, NUMA nodes, memory info,
 distances). Provides CPU enumeration, LLC/NUMA partitioning, cpuset
 generation, and inter-node distance queries. See
 [TestTopology](../concepts/topology.md) for the full API reference.
 
-**`sched_pid`** -- scheduler process ID (`libc::pid_t`, the kernel's
-native type) for liveness checks. Pass it to `process_alive` or
-`kill(Pid::from_raw(pid), None)` without casting.
+**`sched_pid`** -- scheduler process ID (`Option<libc::pid_t>`) for
+liveness checks. `None` when the test runs without an scx scheduler
+(the EEVDF default path has no userspace scheduler binary). Unwrap
+or `is_some_and(...)` before passing to `process_alive` or
+`kill(Pid::from_raw(pid), None)`.
 
 **`settle`** -- time to wait after cgroup creation for the scheduler
 to stabilize.

@@ -124,11 +124,16 @@ the same key out of a sidecar via `jq '.host.<field>'`.
   check for its presence to confirm an EEVDF-era capture.
   What you get in practice is whatever `/proc/sys/kernel/sched_*`
   exposes on the running kernel.
-- `cmdline` diverges → `isolcpus=` / `nohz_full=` / `mitigations=`
-  / `transparent_hugepage=` / `numa_balancing=` are all boot-time
-  and change the whole scheduling surface. Rebooting the host to
-  match is the correct remediation when you need the comparison
-  to hold.
+- `kernel_cmdline` diverges → `isolcpus=` / `nohz_full=` /
+  `mitigations=` / `transparent_hugepage=` / `numa_balancing=`
+  are all boot-time and change the whole scheduling surface.
+  Rebooting the host to match is the correct remediation when
+  you need the comparison to hold. The field is named
+  `kernel_cmdline` (not `cmdline`) in both `show-host`'s printed
+  output and the sidecar JSON to disambiguate from
+  `SidecarResult.kargs`, which carries the extra kargs the ktstr
+  VMM appended when booting the guest rather than the running
+  host's boot line.
 - `kernel_release` differs (also check the companion
   `kernel_name` and `arch` fields) → the kernel itself changed;
   every other host dimension is suspect under cross-kernel

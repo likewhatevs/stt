@@ -6,7 +6,9 @@ dynamic scenarios.
 
 ## Op
 
-An `Op` is an atomic operation on the cgroup topology:
+An `Op` is an atomic operation on the cgroup topology. The enum is
+`#[non_exhaustive]`, so external pattern matches must end with `..` to
+stay compatible across ktstr version bumps that add new variants:
 
 | Op | Description |
 |---|---|
@@ -39,9 +41,30 @@ Op::spawn_host(Work::default().workers(4))
 cgroup. Use this to simulate host-level CPU contention alongside
 managed cgroups.
 
+## OpKind
+
+`OpKind` is a payload-free discriminant enum generated from `Op` via
+`#[strum_discriminants]`. It carries the same variant set as `Op`
+(`AddCgroup`, `RemoveCgroup`, ..., `RunPayload`, `WaitPayload`,
+`KillPayload`) with none of the inner fields, so it is cheap to copy
+and use as a map key. Framework code uses `OpKind` when it only cares
+WHICH operation ran (per-op statistics, stimulus-event tagging,
+verifier/monitor bookkeeping) without the payload. Test authors
+rarely spell `OpKind` directly — the `strum::EnumIter` derive also
+lets tooling enumerate every `OpKind` variant for coverage checks.
+
+`OpKind` shares `Op`'s `#[non_exhaustive]` attribute: external
+pattern matches over `OpKind` must end with `..`.
+
 ## CpusetSpec
 
-`CpusetSpec` computes a cpuset from the topology at runtime:
+`CpusetSpec` computes a cpuset from the topology at runtime. The enum
+is `#[non_exhaustive]`, so external callers should construct via the
+associated constructor functions (see the list below this snippet)
+rather than naming variant literals — a future field addition (e.g.
+a stride on `Range`) can land behind a defaulted parameter without
+breaking call sites. Pattern matches over `CpusetSpec` must also end
+with `..`:
 
 ```rust,ignore
 pub enum CpusetSpec {
