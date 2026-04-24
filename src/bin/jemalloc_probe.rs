@@ -1551,7 +1551,7 @@ pub(crate) fn find_jemalloc_via_maps(
 ) -> std::result::Result<(TsdTlsSymbol, CounterOffsets), FatalError> {
     let exe_link = format!("/proc/{pid}/exe");
     let exe_path = fs::read_link(&exe_link).map_err(|e| {
-        FatalError::other(
+        FatalError::readlink_failure(
             anyhow::Error::from(e)
                 .context(format!("readlink {exe_link} (need it to gate static-TLS match)")),
         )
@@ -1559,7 +1559,7 @@ pub(crate) fn find_jemalloc_via_maps(
 
     let maps_path = format!("/proc/{pid}/maps");
     let contents = fs::read_to_string(&maps_path).map_err(|e| {
-        FatalError::other(anyhow::Error::from(e).context(format!("read {maps_path}")))
+        FatalError::maps_read_failure(anyhow::Error::from(e).context(format!("read {maps_path}")))
     })?;
 
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
@@ -1610,7 +1610,7 @@ pub(crate) fn find_jemalloc_via_maps(
         // x86_64 targets; aarch64 build only probes aarch64. Cross-
         // arch ptrace is not supported.
         if symbol.e_machine != arch::EXPECTED_E_MACHINE {
-            return Err(FatalError::other(anyhow!(
+            return Err(FatalError::arch_mismatch(anyhow!(
                 "probe is {}-only; target ELF {} is {} (e_machine={:#x}). \
                  Obtain or build a probe matching the target's architecture \
                  (ptrace is same-arch only — the probe and its target must \
@@ -1621,7 +1621,7 @@ pub(crate) fn find_jemalloc_via_maps(
                 symbol.e_machine,
             )));
         }
-        let offsets = resolve_field_offsets(&path).map_err(FatalError::other)?;
+        let offsets = resolve_field_offsets(&path).map_err(FatalError::dwarf_parse_failure)?;
         return Ok((symbol, offsets));
     }
 
@@ -2241,9 +2241,61 @@ enum FatalKind {
     /// [`Self::JemallocNotFound`] — the symbol IS present, the
     /// probe just can't address it.
     JemallocInDso,
-    /// Anything else: readlink / maps read failures, architecture
-    /// mismatch, self-probe rejection, DWARF parse errors, tid
-    /// enumeration failures.
+    /// `readlink(/proc/<pid>/exe)` failed — typically ENOENT (target
+    /// exited in the narrow window between the existence check and
+    /// the readlink) or EACCES (the probe cannot resolve the target's
+    /// executable path under the current ptrace-scope policy).
+    /// Distinct from [`Self::PidMissing`] so consumers can
+    /// distinguish "target never existed" from "/proc entry exists
+    /// but its `exe` symlink cannot be resolved."
+    ReadlinkFailure,
+    /// Reading `/proc/<pid>/maps` failed — most commonly when the
+    /// target exits mid-read (the file becomes empty) or when the
+    /// probe's caller lacks `CAP_SYS_PTRACE` / `ptrace-scope`
+    /// clearance. Without the maps file the probe has no candidate
+    /// ELF list to walk, so this is always fatal.
+    MapsReadFailure,
+    /// DWARF field-offset resolution in the target ELF failed. The
+    /// jemalloc TLS symbol was located but the probe could not
+    /// extract the `struct tsd_s` counter offsets needed to read
+    /// per-thread state. Remediation: confirm the target was built
+    /// with debug info (the DWARF walker needs `.debug_info` +
+    /// `.debug_abbrev` + `.debug_str`), or rebuild with
+    /// `-g` / `debug = true` for jemalloc's translation units.
+    DwarfParseFailure,
+    /// The target's ELF architecture (`e_machine`) does not match
+    /// the probe binary's architecture. ptrace is same-arch only —
+    /// an x86_64 probe cannot probe an aarch64 target and vice
+    /// versa. Remediation: obtain or build a probe binary matching
+    /// the target's architecture.
+    ArchMismatch,
+    /// The probe was asked to attach to its own pid
+    /// (`--pid <ktstr-jemalloc-probe own pid>`). `PTRACE_SEIZE`
+    /// rejects self-attach, and catching it at the CLI boundary
+    /// produces one actionable error instead of a per-thread EPERM
+    /// cascade mid-run that looks like a permissions problem.
+    SelfProbeRejected,
+    /// Enumerating `/proc/<pid>/task` to get the live tid list
+    /// failed after the target's ELF/DWARF parse completed
+    /// successfully. The target was addressable at parse time but
+    /// the tid readdir errored — typically a mid-snapshot exit
+    /// or a procfs readdir transient. Distinct from
+    /// [`Self::PidMissing`] because the pid WAS live when the
+    /// probe started.
+    TidEnumerationFailure,
+    /// Anything else — kept as a catch-all for failure modes that
+    /// don't fit any of the specific variants above. Every current
+    /// fatal-error construction site has been audited and routed
+    /// to a specific variant, so in the current tree this arm is
+    /// unreachable via production paths. No dedicated
+    /// `FatalError::other` constructor exists; a future caller
+    /// that needs this bucket must use `FatalError::new(FatalKind::Other, err)`
+    /// explicitly — making the "still using the catch-all" case
+    /// visible at the call site instead of hiding it behind a
+    /// helper. The `Other` variant stays in the enum so a future
+    /// failure mode can surface under a typed bucket (emitted
+    /// with the `other` tag) rather than forcing a new variant
+    /// addition for every one-off error.
     Other,
 }
 
@@ -2257,6 +2309,12 @@ impl FatalKind {
             Self::ExeIdentityChanged => "exe-identity-changed",
             Self::JemallocNotFound => "jemalloc-not-found",
             Self::JemallocInDso => "jemalloc-in-dso",
+            Self::ReadlinkFailure => "readlink-failure",
+            Self::MapsReadFailure => "maps-read-failure",
+            Self::DwarfParseFailure => "dwarf-parse-failure",
+            Self::ArchMismatch => "arch-mismatch",
+            Self::SelfProbeRejected => "self-probe-rejected",
+            Self::TidEnumerationFailure => "tid-enumeration-failure",
             Self::Other => "other",
         }
     }
@@ -2291,8 +2349,28 @@ impl FatalError {
         Self::new(FatalKind::JemallocInDso, error)
     }
 
-    fn other(error: anyhow::Error) -> Self {
-        Self::new(FatalKind::Other, error)
+    fn readlink_failure(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::ReadlinkFailure, error)
+    }
+
+    fn maps_read_failure(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::MapsReadFailure, error)
+    }
+
+    fn dwarf_parse_failure(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::DwarfParseFailure, error)
+    }
+
+    fn arch_mismatch(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::ArchMismatch, error)
+    }
+
+    fn self_probe_rejected(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::SelfProbeRejected, error)
+    }
+
+    fn tid_enumeration_failure(error: anyhow::Error) -> Self {
+        Self::new(FatalKind::TidEnumerationFailure, error)
     }
 }
 
@@ -2545,7 +2623,7 @@ fn run(cli: &Cli) -> RunOutcome {
     // problem.
     let self_pid = self_pid();
     if pid == self_pid {
-        return RunOutcome::Fatal(FatalError::other(anyhow!(
+        return RunOutcome::Fatal(FatalError::self_probe_rejected(anyhow!(
             "refusing to probe self (pid {pid} == ktstr-jemalloc-probe's own pid). \
              ptrace(PTRACE_SEIZE) rejects self-attach — a process cannot trace \
              itself. Run the probe from a separate process against the target's pid."
@@ -2644,7 +2722,7 @@ fn run(cli: &Cli) -> RunOutcome {
         // been reaped yet, then drop out of subsequent enumerations.
         let tids = match iter_task_ids(pid) {
             Ok(v) => v,
-            Err(e) => return RunOutcome::Fatal(FatalError::other(e)),
+            Err(e) => return RunOutcome::Fatal(FatalError::tid_enumeration_failure(e)),
         };
         let (snap, snap_interrupted) =
             take_snapshot(pid, &symbol, &offsets, &tids, run_start, &mut tp_cache);
@@ -5394,6 +5472,15 @@ mod tests {
         );
         assert_eq!(FatalKind::JemallocNotFound.tag(), "jemalloc-not-found");
         assert_eq!(FatalKind::JemallocInDso.tag(), "jemalloc-in-dso");
+        assert_eq!(FatalKind::ReadlinkFailure.tag(), "readlink-failure");
+        assert_eq!(FatalKind::MapsReadFailure.tag(), "maps-read-failure");
+        assert_eq!(FatalKind::DwarfParseFailure.tag(), "dwarf-parse-failure");
+        assert_eq!(FatalKind::ArchMismatch.tag(), "arch-mismatch");
+        assert_eq!(FatalKind::SelfProbeRejected.tag(), "self-probe-rejected");
+        assert_eq!(
+            FatalKind::TidEnumerationFailure.tag(),
+            "tid-enumeration-failure",
+        );
         assert_eq!(FatalKind::Other.tag(), "other");
     }
 
@@ -5441,6 +5528,12 @@ mod tests {
                 | FatalKind::ExeIdentityChanged
                 | FatalKind::JemallocNotFound
                 | FatalKind::JemallocInDso
+                | FatalKind::ReadlinkFailure
+                | FatalKind::MapsReadFailure
+                | FatalKind::DwarfParseFailure
+                | FatalKind::ArchMismatch
+                | FatalKind::SelfProbeRejected
+                | FatalKind::TidEnumerationFailure
                 | FatalKind::Other => {}
             }
             count += 1;
@@ -5455,8 +5548,8 @@ mod tests {
         // a drift in the new variant's tag would go unnoticed by
         // downstream consumers that grep the stderr tag.
         assert_eq!(
-            count, 5,
-            "FatalKind::iter() must yield exactly the five variants pinned in \
+            count, 11,
+            "FatalKind::iter() must yield exactly the eleven variants pinned in \
              `fatal_kind_tag_strings_pinned`; drift means either strum::EnumIter \
              is broken or a new variant was added without updating the tag-string \
              pin — fix by adding the new tag literal to `fatal_kind_tag_strings_pinned` \

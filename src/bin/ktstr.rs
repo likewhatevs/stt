@@ -439,6 +439,22 @@ fn main() -> Result<()> {
                 }
                 println!("\n{} scenarios", filtered.len());
             }
+            // Typo-suggestion hint on an empty result with a
+            // user-supplied filter. Quiet when filter is None
+            // (intentional empty listing) or when the filter
+            // matched at least one scenario. Routed to stderr so
+            // JSON consumers that parse stdout remain unaffected —
+            // the JSON array is still the sole stdout payload, the
+            // hint is stderr-side operator UX only.
+            if filtered.is_empty()
+                && let Some(f) = filter.as_deref()
+                && let Some(hint) = cli::scenario_filter_hint(f)
+            {
+                eprintln!(
+                    "ktstr: no scenarios matched filter {f:?}.{hint} \
+                     Run 'ktstr list' (no --filter) to see every scenario.",
+                );
+            }
         }
 
         Command::Topo => {

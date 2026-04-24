@@ -1411,6 +1411,248 @@ mod tests {
     }
 
     // ------------------------------------------------------------
+    // Parser edge-case coverage expansion
+    //
+    // The existing parse_* tests above cover the documented happy
+    // paths plus the most-adversarial documented edge cases
+    // (paren-in-comm, huge ranges, fractional fields). The tests
+    // below cover MALFORMED, EMPTY, and BOUNDARY inputs that the
+    // parsers silently absorb — regressions in this family would
+    // land as stray data in the snapshot rather than loud failures,
+    // which is exactly the class of drift the capture contract
+    // ("absent = 0, best-effort, never-fail-the-snapshot") needs a
+    // test gate against.
+    // ------------------------------------------------------------
+
+    /// parse_io on empty input produces the default `IoFields`
+    /// (every field `None`). Empty input happens when `/proc/<tid>/io`
+    /// is present but the kernel was compiled without
+    /// `CONFIG_TASK_IO_ACCOUNTING` — the file exists with zero
+    /// bytes. Without this gate the parser would silently accept
+    /// the no-lines case by producing `IoFields::default()` anyway,
+    /// but a regression that inverted an `if`/ early-returned a
+    /// partial default would surface here.
+    #[test]
+    fn parse_io_empty_input_yields_all_none() {
+        let f = parse_io("");
+        assert_eq!(f, IoFields::default());
+    }
+
+    /// parse_io with a non-numeric value for a known key must drop
+    /// ONLY the offending field — other lines still populate. Proves
+    /// per-field `parse::<u64>().ok()` isolation rather than a
+    /// whole-file bail that would zero out unrelated counters.
+    #[test]
+    fn parse_io_malformed_value_drops_only_that_field() {
+        let raw = "rchar: 100\n\
+                   wchar: not-a-number\n\
+                   syscr: 3\n";
+        let f = parse_io(raw);
+        assert_eq!(f.rchar, Some(100));
+        assert_eq!(f.wchar, None, "malformed value drops to None");
+        assert_eq!(f.syscr, Some(3));
+    }
+
+    /// parse_cpu_list on a single-CPU range (`"5-5"`) must return
+    /// a 1-element vec. `lo == hi` is the boundary of the inclusive
+    /// range expansion — a regression that skipped the `lo == hi`
+    /// case (e.g. `lo < hi` instead of `lo <= hi` in the loop)
+    /// would drop the single element.
+    #[test]
+    fn parse_cpu_list_single_element_range_lo_equals_hi() {
+        assert_eq!(parse_cpu_list("5-5").unwrap(), vec![5]);
+        // Also pin at the cap boundary and bottom edge.
+        assert_eq!(parse_cpu_list("0-0").unwrap(), vec![0]);
+    }
+
+    /// parse_cpu_list with a trailing comma (`"0,1,"`) must succeed
+    /// and drop the empty token — the tokenizer has a dedicated
+    /// `if token.is_empty() { continue }` arm precisely for this
+    /// case. A user-pasted cpulist sometimes carries a stray comma
+    /// from copy+paste; rejecting it would be a usability
+    /// regression.
+    #[test]
+    fn parse_cpu_list_trailing_comma_accepted() {
+        assert_eq!(parse_cpu_list("0,1,").unwrap(), vec![0, 1]);
+        // Also the leading-comma case — same codepath.
+        assert_eq!(parse_cpu_list(",0,1").unwrap(), vec![0, 1]);
+    }
+
+    /// parse_stat on a line with NO `)` returns `Default` — the
+    /// `rfind(')')` guard in parse_stat short-circuits to
+    /// `StatFields::default()` without tripping on out-of-bounds.
+    /// A procfs file that got truncated mid-comm (impossible under
+    /// correct procfs but possible against a fuzzer / synthetic
+    /// tree) must not panic.
+    #[test]
+    fn parse_stat_empty_and_no_paren_return_default() {
+        assert_eq!(parse_stat(""), StatFields::default());
+        assert_eq!(
+            parse_stat("garbage line with no close paren 1 2 3"),
+            StatFields::default(),
+            "line without `)` must return Default, not panic on \
+             out-of-bounds indexing",
+        );
+        assert_eq!(
+            parse_stat("  \n"),
+            StatFields::default(),
+            "whitespace-only input must also land at Default",
+        );
+    }
+
+    /// parse_stat on multi-line input reads ONLY the first line.
+    /// Production procfs stat is single-line; a synthetic
+    /// multi-line file (e.g. a test fixture that appended extra
+    /// rows by mistake, or a fuzz input) must not mix field
+    /// positions across lines. Pins the `.lines().next()` behavior
+    /// so a future refactor that concatenated lines would surface
+    /// here.
+    #[test]
+    fn parse_stat_multi_line_input_uses_only_first_line() {
+        let mut first = String::from("1 (proc) ");
+        for i in 0..=38 {
+            first.push_str(&format!("{i} "));
+        }
+        // Second line carries clearly-different values — if the
+        // parser concatenated or mixed them, `nice` would change.
+        let second = "2 (other) 999 999 999 999 999 999 999 999 999 999 \
+                      999 999 999 999 999 999 999 999 999 999 999 999 999\n";
+        let raw = format!("{first}\n{second}");
+        let f = parse_stat(&raw);
+        // First-line values untouched.
+        assert_eq!(f.nice, Some(16));
+        assert_eq!(f.start_time_clock_ticks, Some(19));
+        assert_eq!(f.policy, Some(38));
+    }
+
+    /// parse_schedstat with more than three leading fields must
+    /// accept the first three and ignore the rest. Real procfs
+    /// stops at three, but a future kernel could append more or a
+    /// synthetic fixture could pad the line — the parser's
+    /// three-next-calls design already ignores tail tokens, and
+    /// this test pins that invariant.
+    ///
+    /// Also covers the "invalid u64 token" path — a non-numeric
+    /// token routes to None via `.parse::<u64>().ok()`.
+    #[test]
+    fn parse_schedstat_extra_fields_and_invalid_tokens() {
+        // Four fields — fourth ignored.
+        let (a, b, c) = parse_schedstat("1 2 3 4\n");
+        assert_eq!((a, b, c), (Some(1), Some(2), Some(3)));
+        // Invalid middle token drops only that slot.
+        let (a, b, c) = parse_schedstat("1 invalid 3\n");
+        assert_eq!(a, Some(1));
+        assert_eq!(b, None);
+        assert_eq!(c, Some(3));
+        // Empty input → all None.
+        let (a, b, c) = parse_schedstat("");
+        assert_eq!((a, b, c), (None, None, None));
+    }
+
+    /// policy_name on a NEGATIVE integer must format as
+    /// `"SCHED_UNKNOWN(-N)"` rather than panicking or producing an
+    /// unsigned-wrapped value. The kernel's `policy` field is
+    /// signed i32 (see `parse_stat::get_i32`), so a corrupt or
+    /// out-of-band synthetic fixture could carry a negative value;
+    /// the fallback branch must handle it cleanly.
+    #[test]
+    fn policy_name_negative_integer_renders_unknown() {
+        assert_eq!(policy_name(-1), "SCHED_UNKNOWN(-1)");
+        assert_eq!(policy_name(i32::MIN), format!("SCHED_UNKNOWN({})", i32::MIN));
+    }
+
+    /// parse_cpu_stat on empty input produces all-`None`. Same
+    /// shape as `parse_io_empty_input_yields_all_none`, but
+    /// exercises the space-separated key/value format rather than
+    /// the `key: value` colon format — they are distinct parsers.
+    #[test]
+    fn parse_cpu_stat_empty_and_keyonly_lines_yield_none() {
+        let (u, t, tu) = parse_cpu_stat("");
+        assert_eq!((u, t, tu), (None, None, None));
+        // Line with key but no value — dropped. The `parts.next()`
+        // for value returns None → `continue`.
+        let (u, t, tu) = parse_cpu_stat("usage_usec\n");
+        assert_eq!((u, t, tu), (None, None, None));
+    }
+
+    /// parse_status with ONLY `voluntary_ctxt_switches` present
+    /// populates only that field — the other two stay `None`. The
+    /// production capture path coerces these to `0`; pinning the
+    /// `None` at the parser layer proves the "absent vs. zero"
+    /// distinction survives through the pure parser even if a
+    /// future refactor separates the coercion.
+    #[test]
+    fn parse_status_partial_and_malformed_fields_isolate_correctly() {
+        // Only voluntary_csw → other two None.
+        let only_v = "Name:\tfoo\n\
+                      voluntary_ctxt_switches:\t9\n";
+        let f = parse_status(only_v);
+        assert_eq!(f.voluntary_csw, Some(9));
+        assert_eq!(f.nonvoluntary_csw, None);
+        assert_eq!(f.cpus_allowed, None);
+
+        // Malformed Cpus_allowed_list → cpus_allowed None (parse_cpu_list
+        // returns None on bad tokens). Other fields still populate.
+        let bad_cpu_list = "Cpus_allowed_list:\t5-3\n\
+                            voluntary_ctxt_switches:\t1\n";
+        let f = parse_status(bad_cpu_list);
+        assert_eq!(f.voluntary_csw, Some(1));
+        assert_eq!(
+            f.cpus_allowed, None,
+            "malformed cpulist must route parse_cpu_list's None \
+             into the StatusFields field — not collapse to empty vec",
+        );
+    }
+
+    /// parse_cgroup_v2 with an empty path (`"0::\n"`) returns None
+    /// because the `!trimmed.is_empty()` guard rejects the blank
+    /// path. A kernel bug or a synthetic fixture that emitted
+    /// `0::` without a path must not land an empty-string cgroup
+    /// in the ThreadState (which would then join against other
+    /// cgroup-less threads and produce noise).
+    ///
+    /// Also pins the first-wins behavior when multiple unified
+    /// lines appear — real procfs emits ONE v2 line per task, but
+    /// a fixture might pad with duplicates; the parser returns on
+    /// the first valid match.
+    #[test]
+    fn parse_cgroup_v2_empty_path_and_multiple_unified_lines() {
+        // Empty path after `0::` — the guard rejects.
+        assert_eq!(parse_cgroup_v2("0::\n"), None);
+        assert_eq!(parse_cgroup_v2("0::   \n"), None);
+
+        // First unified line wins when duplicates exist.
+        let raw = "0::/first\n0::/second\n";
+        assert_eq!(parse_cgroup_v2(raw), Some("/first".to_string()));
+    }
+
+    /// `read_thread_comm_at` returns `None` (not `Some("")`) when
+    /// the comm file exists but contains only whitespace. The
+    /// trim-then-is-empty guard is load-bearing: a `Some("")` in
+    /// ThreadState.comm would both (a) disable the empty-comm ghost
+    /// filter and (b) pollute comparison joins that key on comm.
+    /// Pins the explicit empty→None routing so a future refactor
+    /// that simplified the fn to `.ok().map(|s| s.trim().to_string())`
+    /// (losing the empty guard) would break this test.
+    #[test]
+    fn read_thread_comm_at_whitespace_only_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tgid = 1;
+        let tid = 1;
+        let task_dir = tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string());
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::write(task_dir.join("comm"), "   \n").unwrap();
+        assert_eq!(read_thread_comm_at(tmp.path(), tgid, tid), None);
+
+        // Also the missing-file branch (thread exited mid-read).
+        assert_eq!(read_thread_comm_at(tmp.path(), tgid, 9999), None);
+    }
+
+    // ------------------------------------------------------------
     // Synthetic-tree tests (H1-H5)
     //
     // Stage a tempdir shaped like `/proc/<tgid>/{comm,

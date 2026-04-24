@@ -1885,4 +1885,355 @@ mod tests {
         // SCHED_OTHER — non-numeric delta path exercised.
         assert!(out.contains("differs"));
     }
+
+    // -- Batch 17 coverage expansion --
+
+    /// Pin all four branches of `cgroup_cell` directly. Existing
+    /// tests only exercise the (Some, Some) path transitively via
+    /// `write_diff_cgroup_enrichment_section_for_cgroup_mode`; the
+    /// other three branches (baseline-only, candidate-only,
+    /// both-missing) are rendering-critical for the one-sided
+    /// enrichment row path (`all_keys` union at the enrichment
+    /// table site) and have no current pin.
+    #[test]
+    fn cgroup_cell_renders_all_four_branches() {
+        // (Some, Some) → "a → b (+d)" where d = b - a (signed).
+        assert_eq!(cgroup_cell(Some(10), Some(42)), "10 → 42 (+32)");
+        // Negative delta uses the signed formatter to keep the
+        // sign explicit.
+        assert_eq!(cgroup_cell(Some(50), Some(5)), "50 → 5 (-45)");
+        // (Some, None) → baseline value then en-dash placeholder.
+        assert_eq!(cgroup_cell(Some(7), None), "7 → -");
+        // (None, Some) → leading en-dash placeholder.
+        assert_eq!(cgroup_cell(None, Some(99)), "- → 99");
+        // (None, None) → single en-dash (both sides absent).
+        assert_eq!(cgroup_cell(None, None), "-");
+    }
+
+    /// Enrichment renderer must union `cgroup_stats_a` and
+    /// `cgroup_stats_b` keys so a cgroup that appeared in only one
+    /// run still surfaces a row. Drives the one-sided paths of
+    /// `cgroup_cell` through `write_diff` so the rendered output
+    /// carries the `"X → -"` / `"- → Y"` strings.
+    #[test]
+    fn write_diff_enrichment_handles_one_sided_cgroup_keys() {
+        let mut diff = HostStateDiff::default();
+        diff.cgroup_stats_a.insert(
+            "/only-baseline".into(),
+            CgroupStats {
+                cpu_usage_usec: 111,
+                ..CgroupStats::default()
+            },
+        );
+        diff.cgroup_stats_b.insert(
+            "/only-candidate".into(),
+            CgroupStats {
+                cpu_usage_usec: 222,
+                ..CgroupStats::default()
+            },
+        );
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Cgroup,
+        )
+        .unwrap();
+        // Both keys present.
+        assert!(
+            out.contains("/only-baseline"),
+            "baseline-only key missing:\n{out}",
+        );
+        assert!(
+            out.contains("/only-candidate"),
+            "candidate-only key missing:\n{out}",
+        );
+        // Each one-sided row emits the en-dash placeholder for
+        // the absent side (per `cgroup_cell`'s Some/None branch).
+        assert!(
+            out.contains("111 → -"),
+            "baseline-only row missing '111 → -' cell:\n{out}",
+        );
+        assert!(
+            out.contains("- → 222"),
+            "candidate-only row missing '- → 222' cell:\n{out}",
+        );
+    }
+
+    /// Rows with equal `sort_key()` break ties by ascending
+    /// `group_key`. Build two groups that move the same metric by
+    /// the same percentage (so their sort keys are identical) and
+    /// verify the output order is alphabetical.
+    #[test]
+    fn write_diff_stable_sort_tie_breaks_by_group_key_ascending() {
+        // Same percentage swing, distinct group keys "alpha" and
+        // "bravo". Both rise 1_000 → 2_000 (+100%).
+        let mut a1 = make_thread("alpha", "w");
+        a1.run_time_ns = 1_000;
+        let mut a2 = make_thread("bravo", "w");
+        a2.run_time_ns = 1_000;
+        let mut b1 = make_thread("alpha", "w");
+        b1.run_time_ns = 2_000;
+        let mut b2 = make_thread("bravo", "w");
+        b2.run_time_ns = 2_000;
+        let diff = compare(
+            &snap_with(vec![a1, a2]),
+            &snap_with(vec![b1, b2]),
+            &CompareOptions::default(),
+        );
+        // Filter to run_time_ns rows across the two groups; the
+        // tie-break must put "alpha" before "bravo".
+        let run_rows: Vec<&DiffRow> = diff
+            .rows
+            .iter()
+            .filter(|r| r.metric_name == "run_time_ns")
+            .collect();
+        assert_eq!(run_rows.len(), 2);
+        assert!(
+            (run_rows[0].delta_pct.unwrap() - 1.0).abs() < 1e-9
+                && (run_rows[1].delta_pct.unwrap() - 1.0).abs() < 1e-9,
+            "test fixture must produce identical delta_pct for both groups",
+        );
+        assert_eq!(
+            run_rows[0].group_key, "alpha",
+            "ascending group_key tie-break expected alpha first",
+        );
+        assert_eq!(run_rows[1].group_key, "bravo");
+    }
+
+    /// `sort_key` inflates the zero-baseline-nonzero-candidate
+    /// branch (delta=Some, delta_pct=None) by 1e9 so it sorts
+    /// above pure zero-delta rows but still below any nonzero
+    /// percentage row. Two rows: one zero-delta (delta_pct=0.0),
+    /// one zero-baseline (delta=100, delta_pct=None) — the zero-
+    /// baseline row must sort FIRST.
+    #[test]
+    fn sort_key_zero_delta_rows_sink_below_nonzero() {
+        // Group "calm": identical values → delta 0, pct 0.0.
+        let mut a1 = make_thread("calm", "w");
+        a1.run_time_ns = 500;
+        let mut b1 = make_thread("calm", "w");
+        b1.run_time_ns = 500;
+        // Group "birth": baseline 0 → candidate 100 → delta 100,
+        // pct undefined (None). sort_key inflates to 100 * 1e9.
+        let a2 = make_thread("birth", "w");
+        let mut b2 = make_thread("birth", "w");
+        b2.run_time_ns = 100;
+        let diff = compare(
+            &snap_with(vec![a1, a2]),
+            &snap_with(vec![b1, b2]),
+            &CompareOptions::default(),
+        );
+        let run_rows: Vec<&DiffRow> = diff
+            .rows
+            .iter()
+            .filter(|r| r.metric_name == "run_time_ns")
+            .collect();
+        // "birth" row (zero-baseline branch of sort_key) sorts
+        // ahead of "calm" (zero-delta branch).
+        assert_eq!(run_rows[0].group_key, "birth");
+        assert_eq!(run_rows[1].group_key, "calm");
+        // Pin the exact shape each branch is meant to carry, so a
+        // regression that swapped the inflation with the zero
+        // arm surfaces here with a precise diagnostic rather than
+        // just "wrong order".
+        assert_eq!(run_rows[0].delta, Some(100.0));
+        assert!(run_rows[0].delta_pct.is_none());
+        assert_eq!(run_rows[1].delta, Some(0.0));
+        assert_eq!(run_rows[1].delta_pct, Some(0.0));
+    }
+
+    /// Rows with no numeric delta (categorical Mode) sort to the
+    /// bottom via `sort_key`'s `f64::NEG_INFINITY` arm. Pin that a
+    /// nonzero numeric row sorts ahead of a Mode row whose inputs
+    /// differ, and that the Mode row still appears (sinks, not
+    /// dropped).
+    #[test]
+    fn sort_key_none_delta_rows_sink_to_bottom() {
+        let mut a = make_thread("app", "w");
+        a.run_time_ns = 100;
+        a.policy = "SCHED_OTHER".into();
+        let mut b = make_thread("app", "w");
+        b.run_time_ns = 200;
+        b.policy = "SCHED_FIFO".into();
+        let diff = compare(
+            &snap_with(vec![a]),
+            &snap_with(vec![b]),
+            &CompareOptions::default(),
+        );
+        // Locate the positions of run_time_ns (numeric) and
+        // policy (Mode, delta=None) in the sorted rows.
+        let run_idx = diff
+            .rows
+            .iter()
+            .position(|r| r.metric_name == "run_time_ns")
+            .expect("run_time_ns row");
+        let policy_idx = diff
+            .rows
+            .iter()
+            .position(|r| r.metric_name == "policy")
+            .expect("policy row");
+        assert!(
+            run_idx < policy_idx,
+            "numeric row at {run_idx} must sort above Mode row at {policy_idx}",
+        );
+        // Mode row really is None-delta — otherwise the ordering
+        // wouldn't prove the NEG_INFINITY branch.
+        assert!(diff.rows[policy_idx].delta.is_none());
+    }
+
+    /// `aggregate(OrdinalRange, &[])` returns `OrdinalRange {
+    /// min: 0, max: 0 }` via the `unwrap_or(0)` in the first-value
+    /// init. Sibling to the empty-affinity test.
+    #[test]
+    fn aggregate_ordinal_range_on_empty_threads_is_zero() {
+        let empty: Vec<&ThreadState> = vec![];
+        let v = aggregate(AggRule::OrdinalRange(|t| t.nice as i64), &empty);
+        match v {
+            Aggregated::OrdinalRange { min, max } => {
+                assert_eq!(min, 0);
+                assert_eq!(max, 0);
+            }
+            other => panic!("expected OrdinalRange, got {other:?}"),
+        }
+    }
+
+    /// `aggregate(Mode, &[])` returns `Mode { value: "", count:
+    /// 0, total: 0 }` via the `unwrap_or_else((String::new(), 0))`
+    /// tail.
+    #[test]
+    fn aggregate_mode_on_empty_threads_is_empty() {
+        let empty: Vec<&ThreadState> = vec![];
+        let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &empty);
+        match v {
+            Aggregated::Mode {
+                value,
+                count,
+                total,
+            } => {
+                assert!(value.is_empty());
+                assert_eq!(count, 0);
+                assert_eq!(total, 0);
+            }
+            other => panic!("expected Mode, got {other:?}"),
+        }
+    }
+
+    /// `aggregate(Sum, &[])` returns `Sum(0)` via the `fold(0u64,
+    /// ...)` accumulator. Completes empty-slice coverage across
+    /// all four AggRules.
+    #[test]
+    fn aggregate_sum_on_empty_threads_is_zero() {
+        let empty: Vec<&ThreadState> = vec![];
+        let v = aggregate(AggRule::Sum(|t| t.run_time_ns), &empty);
+        match v {
+            Aggregated::Sum(s) => assert_eq!(s, 0),
+            other => panic!("expected Sum, got {other:?}"),
+        }
+    }
+
+    /// `Aggregated::numeric` returns `None` for `Mode` — a
+    /// policy name has no scalar projection. Pin the contract
+    /// directly rather than via the diff pipeline because the
+    /// pipeline only reads numeric through `build_row`'s `(a.numeric(),
+    /// b.numeric())` pair and a regression could silently flip the
+    /// return to `Some(0.0)` without any currently-visible symptom.
+    #[test]
+    fn numeric_returns_none_for_mode() {
+        let m = Aggregated::Mode {
+            value: "SCHED_OTHER".into(),
+            count: 4,
+            total: 4,
+        };
+        assert!(m.numeric().is_none());
+    }
+
+    /// `Aggregated::numeric` for a heterogeneous `Affinity`
+    /// returns `(min_cpus + max_cpus) / 2.0` — the midpoint
+    /// projection. Existing affinity tests only exercise uniform
+    /// cpusets where `min == max`, so the arithmetic path is
+    /// unpinned.
+    #[test]
+    fn numeric_returns_midpoint_for_affinity_heterogeneous() {
+        let a = Aggregated::Affinity(AffinitySummary {
+            min_cpus: 2,
+            max_cpus: 8,
+            uniform: None,
+        });
+        assert_eq!(a.numeric(), Some(5.0));
+        // Single-element (uniform) heterogeneous check is the
+        // degenerate case where the midpoint equals either bound.
+        let b = Aggregated::Affinity(AffinitySummary {
+            min_cpus: 4,
+            max_cpus: 4,
+            uniform: None,
+        });
+        assert_eq!(b.numeric(), Some(4.0));
+    }
+
+    /// Uniform non-contiguous cpuset `[0, 2]` renders as
+    /// `"2 cpus (0,2)"` — exercises the comma-separated branch of
+    /// `format_cpu_range` from the Affinity display impl. Existing
+    /// uniform test uses `[0,1,2,3]` which collapses to a single
+    /// range token.
+    #[test]
+    fn affinity_display_uniform_noncontiguous_renders_comma_separated() {
+        let a = Aggregated::Affinity(AffinitySummary {
+            min_cpus: 2,
+            max_cpus: 2,
+            uniform: Some(vec![0, 2]),
+        });
+        assert_eq!(a.to_string(), "2 cpus (0,2)");
+    }
+
+    /// Heterogeneous affinity where `min_cpus == max_cpus` (every
+    /// thread has the same cpuset SIZE but different SETS) renders
+    /// as `"N cpus (mixed)"` — pins the specific branch in the
+    /// display impl. Current heterogeneous test has min != max so
+    /// this branch was unpinned.
+    #[test]
+    fn affinity_display_heterogeneous_same_count_renders_mixed() {
+        let a = Aggregated::Affinity(AffinitySummary {
+            min_cpus: 3,
+            max_cpus: 3,
+            uniform: None,
+        });
+        assert_eq!(a.to_string(), "3 cpus (mixed)");
+    }
+
+    /// `flatten_cgroup_stats` with zero patterns preserves the
+    /// input map verbatim — no entry merges, no key rewrites. A
+    /// regression that accidentally ran the aggregation step on
+    /// the empty-pattern path would collapse distinct cgroup paths
+    /// together.
+    #[test]
+    fn flatten_cgroup_stats_with_no_patterns_preserves_keys() {
+        let mut stats = BTreeMap::new();
+        stats.insert(
+            "/alpha".into(),
+            CgroupStats {
+                cpu_usage_usec: 10,
+                nr_throttled: 1,
+                throttled_usec: 5,
+                memory_current: 100,
+            },
+        );
+        stats.insert(
+            "/beta".into(),
+            CgroupStats {
+                cpu_usage_usec: 20,
+                nr_throttled: 2,
+                throttled_usec: 15,
+                memory_current: 200,
+            },
+        );
+        let out = flatten_cgroup_stats(&stats, &[]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out["/alpha"].cpu_usage_usec, 10);
+        assert_eq!(out["/alpha"].memory_current, 100);
+        assert_eq!(out["/beta"].cpu_usage_usec, 20);
+        assert_eq!(out["/beta"].memory_current, 200);
+    }
 }

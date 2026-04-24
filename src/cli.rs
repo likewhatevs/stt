@@ -1272,6 +1272,13 @@ pub fn parse_topology_string(topology: &str) -> Result<(u32, u32, u32, u32)> {
 }
 
 /// Filter scenarios by name substring.
+///
+/// When a non-None `filter` matches zero scenarios, the bail
+/// message appends a `Did you mean \`<name>\`?` hint sourced from
+/// [`suggest_closest_scenario_name`] — strsim Levenshtein match
+/// against the registry — so an operator typo surfaces a concrete
+/// correction candidate instead of the generic "run 'ktstr list'"
+/// redirect.
 pub fn filter_scenarios<'a>(
     scenarios: &'a [Scenario],
     filter: Option<&str>,
@@ -1281,7 +1288,13 @@ pub fn filter_scenarios<'a>(
         .filter(|s| filter.is_none_or(|f| s.name.contains(f)))
         .collect();
     if refs.is_empty() {
-        bail!("no scenarios matched filter. run 'ktstr list' to see available scenarios");
+        let hint = filter
+            .and_then(suggest_closest_scenario_name)
+            .map(|s| format!(" Did you mean `{s}`?"))
+            .unwrap_or_default();
+        bail!(
+            "no scenarios matched filter.{hint} Run 'ktstr list' to see available scenarios.",
+        );
     }
     Ok(refs)
 }
@@ -1754,6 +1767,55 @@ fn suggest_closest_test_name(query: &str) -> Option<&'static str> {
         }
     }
     best.map(|(_, name)| name)
+}
+
+/// Return the registered scenario name whose Levenshtein edit
+/// distance from `query` is smallest AND within the closeness
+/// threshold, or `None` if no candidate is close enough. Sibling
+/// of [`suggest_closest_test_name`] — same threshold shape
+/// (`max(3, query.len() / 3)`), same first-wins tie rule, same
+/// "no match" contract — but queries the scenario registry
+/// ([`crate::scenario::all_scenarios`]) instead of `KTSTR_TESTS`.
+///
+/// Used by [`filter_scenarios`] and the `ktstr list` empty-output
+/// surface to surface "Did you mean `<name>`?" hints when a
+/// `--filter` value produces zero matches (typo UX per dev-advocate
+/// finding 12.b).
+///
+/// The returned `&'static str` points into the scenario registry —
+/// `Scenario.name` is `&'static str` by construction, so the
+/// helper owns no allocations on the happy path.
+fn suggest_closest_scenario_name(query: &str) -> Option<&'static str> {
+    let threshold = std::cmp::max(3, query.len() / 3);
+    let mut best: Option<(usize, &'static str)> = None;
+    for s in crate::scenario::all_scenarios() {
+        let d = strsim::levenshtein(query, s.name);
+        if d > threshold {
+            continue;
+        }
+        match best {
+            Some((best_d, _)) if best_d <= d => continue,
+            _ => best = Some((d, s.name)),
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+/// Public "did you mean?" helper for callers that print a
+/// zero-match scenario-filter diagnostic without routing through
+/// [`filter_scenarios`]. Returns a formatted suffix like
+/// `" Did you mean \`steady_state\`?"` on a near match, or `None`
+/// when no scenario is close enough — callers concatenate the
+/// suffix onto their own error message.
+///
+/// Used by the `ktstr list` inline filter (which does not bail on
+/// zero matches, intentionally — an empty list is not an error)
+/// to enrich the trailing banner with a typo suggestion. The
+/// `filter_scenarios` error path uses [`suggest_closest_scenario_name`]
+/// directly rather than this wrapper because it owns its own
+/// message shape.
+pub fn scenario_filter_hint(filter: &str) -> Option<String> {
+    suggest_closest_scenario_name(filter).map(|s| format!(" Did you mean `{s}`?"))
 }
 
 /// Render the resolved, merged `Assert` thresholds for the named
@@ -5272,6 +5334,187 @@ mod tests {
         assert!(
             !suggestion.is_empty(),
             "boundary-distance query must yield a non-empty suggestion",
+        );
+    }
+
+    /// Sibling of `suggest_closest_test_name_finds_near_match` for
+    /// the scenario-registry helper. A single-byte typo of a
+    /// registered scenario name must round-trip to the exact
+    /// scenario name through the Levenshtein match. Uses
+    /// `all_scenarios()` so the test is data-driven against the
+    /// live registry rather than a hardcoded name that could drift.
+    #[test]
+    fn suggest_closest_scenario_name_finds_near_match() {
+        let scenarios = crate::scenario::all_scenarios();
+        let Some(s) = scenarios.iter().find(|s| s.name.len() >= 10) else {
+            skip!(
+                "no registered scenario with name >= 10 chars — cannot \
+                 construct a positive strsim probe"
+            );
+        };
+        // Flip one byte at position 0 to an ASCII letter different
+        // from the original. Guarantees distance 1, which is well
+        // inside `max(3, len/3)` for a ≥10-char name.
+        let mut mutated: Vec<u8> = s.name.bytes().collect();
+        mutated[0] = if mutated[0] == b'z' { b'a' } else { b'z' };
+        let query = std::str::from_utf8(&mutated).expect("ASCII mutation stays UTF-8");
+        let suggestion = suggest_closest_scenario_name(query)
+            .expect("distance-1 typo of a registered scenario must yield a suggestion");
+        assert_eq!(
+            suggestion, s.name,
+            "single-byte typo must resolve back to the exact scenario name",
+        );
+    }
+
+    /// Unrelated query → None. Parallel to the test-name sibling.
+    /// A 40-char uniform string exceeds `max(3, 40/3) == 13` edits
+    /// against every snake_case scenario name, so the helper
+    /// correctly declines to emit a suggestion instead of reaching
+    /// for the nearest-but-distant candidate.
+    #[test]
+    fn suggest_closest_scenario_name_returns_none_for_unrelated_query() {
+        let unrelated = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        assert_eq!(
+            suggest_closest_scenario_name(unrelated),
+            None,
+            "a query unrelated to every registered scenario must yield \
+             no suggestion (no over-reach)",
+        );
+    }
+
+    /// Empty registry edge case — if `all_scenarios()` is empty in
+    /// this build, the helper must return None cleanly rather than
+    /// panicking. The `all_scenarios` registry currently has many
+    /// entries, so this test is guarded to only assert the "no
+    /// panic" contract (any result is acceptable for the empty
+    /// path; the scenarios-present path is covered by the
+    /// near-match test above).
+    #[test]
+    fn suggest_closest_scenario_name_handles_any_registry_size() {
+        let _ = suggest_closest_scenario_name("arbitrary");
+    }
+
+    /// `scenario_filter_hint` wraps the suggestion in the ` Did you
+    /// mean \`<name>\`?` suffix shape that `filter_scenarios` and
+    /// the `ktstr list` empty-output path both consume. Pins the
+    /// format so a reword to `Perhaps you meant` or dropping the
+    /// leading space lands here first, before the CLI surfaces
+    /// drift away from each other.
+    #[test]
+    fn scenario_filter_hint_formats_suffix_on_near_match() {
+        let scenarios = crate::scenario::all_scenarios();
+        let Some(s) = scenarios.iter().find(|s| s.name.len() >= 10) else {
+            skip!("no registered scenario with name >= 10 chars");
+        };
+        let mut mutated: Vec<u8> = s.name.bytes().collect();
+        mutated[0] = if mutated[0] == b'z' { b'a' } else { b'z' };
+        let query = std::str::from_utf8(&mutated).unwrap();
+        let hint = scenario_filter_hint(query)
+            .expect("near match must produce a hint");
+        assert!(
+            hint.starts_with(" Did you mean `"),
+            "hint must start with ` Did you mean \\`` prefix: {hint}",
+        );
+        assert!(
+            hint.ends_with("`?"),
+            "hint must end with the backtick-close + question mark: {hint}",
+        );
+        assert!(
+            hint.contains(s.name),
+            "hint must embed the matched scenario name: {hint}",
+        );
+    }
+
+    /// Negative case for the public hint wrapper: an unrelated
+    /// query yields `None` rather than a blank suffix. The caller
+    /// in `ktstr list` conditions its whole eprintln line on this
+    /// `Option`, so a spurious `Some("")` would print a dangling
+    /// "Did you mean `?" line. Pin the None result explicitly.
+    #[test]
+    fn scenario_filter_hint_returns_none_on_unrelated_query() {
+        assert!(
+            scenario_filter_hint("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").is_none(),
+            "unrelated query must produce no hint, not a blank suffix",
+        );
+    }
+
+    /// End-to-end pin on the `filter_scenarios` error path: a
+    /// filter string that's a close typo of a registered scenario
+    /// must surface a "Did you mean `<name>`?" snippet embedded in
+    /// the anyhow bail message. Operator's first-line error text
+    /// goes from generic ("no scenarios matched filter") to
+    /// specific (names the likely intended scenario) without them
+    /// having to cross-reference `ktstr list`.
+    #[test]
+    fn filter_scenarios_empty_match_includes_did_you_mean_hint() {
+        let scenarios = crate::scenario::all_scenarios();
+        let Some(s) = scenarios.iter().find(|s| s.name.len() >= 10) else {
+            skip!("no registered scenario with name >= 10 chars");
+        };
+        // Build a query that's a single-byte typo — guaranteed
+        // inside the Levenshtein threshold — AND that doesn't
+        // substring-match any scenario name (so the filter path
+        // actually reaches the empty-match bail branch). The
+        // single-byte mutation at position 0 produces a string
+        // that cannot substring-match the source, since `contains`
+        // on the unmutated name would require the full original
+        // byte at position 0 to appear somewhere in the query.
+        let mut mutated: Vec<u8> = s.name.bytes().collect();
+        mutated[0] = if mutated[0] == b'z' { b'a' } else { b'z' };
+        let query = std::str::from_utf8(&mutated).unwrap().to_string();
+        // Sanity: no registered scenario contains the mutated
+        // query as a substring — otherwise the filter would pass
+        // through and we'd never see the bail message. A legitimate
+        // collision is possible in theory (another scenario shares
+        // a suffix with the mutated query) but exceedingly unlikely
+        // given the distinct snake_case prefixes in the catalog.
+        // Skip if we hit one so the test doesn't flake on a future
+        // catalog addition.
+        if scenarios.iter().any(|sc| sc.name.contains(&query)) {
+            skip!(
+                "mutated query accidentally substring-matches a \
+                 registered scenario; cannot exercise the bail branch"
+            );
+        }
+        let err = filter_scenarios(&scenarios, Some(&query))
+            .expect_err("non-matching filter must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no scenarios matched filter"),
+            "bail must name the condition: {msg}",
+        );
+        assert!(
+            msg.contains("Did you mean"),
+            "bail must include the strsim suggestion on a near match: {msg}",
+        );
+        assert!(
+            msg.contains(s.name),
+            "bail must name the suggested scenario: {msg}",
+        );
+    }
+
+    /// filter_scenarios with a totally-unrelated filter still
+    /// bails, but the Did-you-mean suffix is absent — the message
+    /// degrades back to the generic "run 'ktstr list'" redirect
+    /// rather than over-suggesting a distant candidate.
+    #[test]
+    fn filter_scenarios_unrelated_filter_bails_without_hint() {
+        let scenarios = crate::scenario::all_scenarios();
+        let err =
+            filter_scenarios(&scenarios, Some("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))
+                .expect_err("unrelated filter must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no scenarios matched filter"),
+            "bail must still name the condition: {msg}",
+        );
+        assert!(
+            !msg.contains("Did you mean"),
+            "unrelated filter must NOT over-suggest a distant match: {msg}",
+        );
+        assert!(
+            msg.contains("ktstr list"),
+            "bail must fall back to the generic 'ktstr list' pointer: {msg}",
         );
     }
 

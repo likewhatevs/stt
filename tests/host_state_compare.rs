@@ -21,7 +21,8 @@ use std::path::Path;
 
 use ktstr::host_state::{CgroupStats, HostStateSnapshot, ThreadState};
 use ktstr::host_state_compare::{
-    CompareOptions, GroupBy, HOST_STATE_METRICS, compare, write_diff,
+    CompareOptions, GroupBy, HOST_STATE_METRICS, HostStateCompareArgs, compare, run_compare,
+    write_diff,
 };
 
 fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
@@ -279,5 +280,54 @@ fn load_surfaces_error_on_malformed_snapshot() {
     assert!(
         msg.contains("host-state") || msg.contains("zstd"),
         "error context missing source hint:\n{msg}",
+    );
+}
+
+/// `run_compare` returns `Ok(0)` even when the comparison
+/// produces a non-empty diff. Pin the doc contract at the top
+/// of the function ("a non-empty diff is data, not a failure")
+/// — a silent regression that made `Ok(0)` / `Ok(1)` depend on
+/// whether `diff.rows.is_empty()` would turn routine comparison
+/// into a spurious CI failure.
+///
+/// Two distinct snapshots are written to disk, `run_compare` is
+/// driven through the full CLI surface (load → compare → print),
+/// and the exit code is asserted against the documented contract.
+/// Also covers the `--group-by=Pcomm` default path without
+/// flatten patterns, mirroring the typical invocation shape.
+#[test]
+fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let baseline_path = tmp.path().join("baseline.hst.zst");
+    let candidate_path = tmp.path().join("candidate.hst.zst");
+
+    let mut ta = make_thread("run_compare_proc", "w");
+    ta.run_time_ns = 10_000;
+    let mut tb = make_thread("run_compare_proc", "w");
+    tb.run_time_ns = 50_000;
+
+    snapshot(vec![ta], BTreeMap::new())
+        .write(&baseline_path)
+        .unwrap();
+    snapshot(vec![tb], BTreeMap::new())
+        .write(&candidate_path)
+        .unwrap();
+
+    let args = HostStateCompareArgs {
+        baseline: baseline_path,
+        candidate: candidate_path,
+        group_by: GroupBy::Pcomm,
+        cgroup_flatten: vec![],
+    };
+    // `run_compare` returns `anyhow::Result<i32>`. The contract
+    // says the `i32` is always 0 for a successful load+compare,
+    // regardless of whether any rows changed — interpretation is
+    // left to the caller.
+    let rc = run_compare(&args).expect("run_compare must succeed on valid snapshots");
+    assert_eq!(
+        rc, 0,
+        "run_compare must return Ok(0) on a non-empty diff \
+         (doc contract: 'a non-empty diff is data, not a failure'); \
+         got Ok({rc})",
     );
 }
