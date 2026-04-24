@@ -1436,6 +1436,7 @@ pub(crate) const TCB_SIZE_AARCH64: u64 = 16;
 /// indicate the target has not initialized TLS or the ELF layout is
 /// malformed; silently wrapping into the top of the address space
 /// would produce a read from kernel-space and confuse the error path.
+#[allow(dead_code)] // used by the x86_64 dispatcher + Variant II unit tests
 pub(crate) fn compute_tls_address_variant_ii(
     fs_base: u64,
     tls_image_aligned_size: u64,

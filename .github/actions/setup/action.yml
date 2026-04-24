@@ -65,8 +65,6 @@ runs:
     - name: Provision Rust toolchain from rust-toolchain.toml
       shell: bash
       run: |
-        /usr/bin/rustup-init -y --default-toolchain none
-        source "$HOME/.cargo/env"
         rustup show active-toolchain || rustup toolchain install
         rustup component add rustfmt clippy llvm-tools-preview
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
