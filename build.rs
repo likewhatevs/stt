@@ -15,30 +15,36 @@ fn main() {
 
     // Cache invalidation: track the env var that selects a kernel
     // and the build-script inputs (kernel_path resolver, C generator
-    // source). Deliberately NOT tracking `{kernel}/vmlinux` content:
+    // source). Deliberately NOT emitting a `rerun-if-changed` on the
+    // BTF source path itself:
     //
     //   1. `vmlinux` is consumed here only as the BTF source for
     //      `vmlinux.h` generation on the C side below, not as an
-    //      input that the Rust compiler reads. The generated
-    //      `vmlinux.h` is gated on `vmlinux_h.exists()`, so a
-    //      content change to the underlying vmlinux does not
-    //      actually re-run generation — only a missing output file
-    //      does. Cargo re-running build.rs on vmlinux change
-    //      therefore spins the BPF skeleton rebuild without any
-    //      upstream input actually differing.
-    //   2. BPF CO-RE (Compile Once Run Everywhere) relocates field
-    //      offsets at LOAD time against the runtime kernel's BTF,
-    //      so a field-layout drift between the compile-time
-    //      `vmlinux.h` and the runtime kernel is resolved by
-    //      libbpf on BPF object load — there is no compile-time
-    //      correctness dependency on the exact byte content of
-    //      the vmlinux used to generate `vmlinux.h`.
-    //   3. Operators who genuinely need a fresh `vmlinux.h` after a
-    //      kernel rebuild run `cargo clean`, which clears
-    //      `$OUT_DIR/vmlinux.h` and forces the generator on the
-    //      next build. `KTSTR_KERNEL` env changes (which point at
-    //      a DIFFERENT kernel) still trigger a rerun via the
-    //      `rerun-if-env-changed` line below.
+    //      input that the Rust compiler reads. BPF CO-RE (Compile
+    //      Once Run Everywhere) relocates field offsets at LOAD
+    //      time against the runtime kernel's BTF, so a field-layout
+    //      drift between the compile-time `vmlinux.h` and the
+    //      runtime kernel is resolved by libbpf on BPF object load
+    //      — there is no compile-time correctness dependency on
+    //      the exact byte content of the vmlinux used to generate
+    //      `vmlinux.h`.
+    //   2. `rerun-if-changed` on the BTF would force build.rs to
+    //      re-run on every kernel rebuild. That runs the BPF
+    //      skeleton generator unnecessarily when the drift (per
+    //      (1)) has no compile-time correctness impact.
+    //
+    // However, WHEN build.rs does run (triggered by a watched
+    // input — KTSTR_KERNEL change, kernel_path.rs edit, or a
+    // previously-absent `vmlinux.h`), it SHOULD detect a BTF
+    // content change and regenerate. The pre-hash design only
+    // regenerated when `vmlinux.h` was absent entirely, which
+    // meant a BTF-content change paired with an unrelated build-
+    // script trigger would leave stale `vmlinux.h` in place. The
+    // FNV-1a hash of the BTF bytes is written alongside
+    // `vmlinux.h` as `vmlinux.h.btf-hash`; regen fires when the
+    // file is absent OR the stored hash differs from the current
+    // BTF's hash. Operators who need to force regen unconditionally
+    // still have `cargo clean` as the escape hatch.
     println!("cargo:rerun-if-env-changed=KTSTR_KERNEL");
     println!("cargo:rerun-if-changed=src/kernel_path.rs");
     println!("cargo:rerun-if-changed=src/bpf/vmlinux_gen.c");
@@ -46,8 +52,51 @@ fn main() {
 
     // Generate vmlinux.h from kernel BTF.
     let vmlinux_h = out_dir.join("vmlinux.h");
-    if !vmlinux_h.exists() {
-        let btf_source = resolve_btf(ktstr_kernel.as_deref()).unwrap_or_else(|| {
+    let hash_path = out_dir.join("vmlinux.h.btf-hash");
+    // Resolve BTF + compute content hash eagerly. `resolve_btf`
+    // returns `Option` to degrade cleanly when no BTF is reachable
+    // (no KTSTR_KERNEL + no host BTF): if `vmlinux.h` is already in
+    // place from an earlier build, we keep it rather than panicking
+    // — matches the CO-RE design (runtime BTF fixes field drift
+    // anyway), so a disappearing source is not a build-blocking
+    // event. A MISSING `vmlinux.h` still panics below because we
+    // have nothing to fall back on.
+    let current_btf = resolve_btf(ktstr_kernel.as_deref());
+    // Hash the BTF source for drift detection. Fault-tolerant: a
+    // BTF path that resolved but whose bytes cannot be read (EACCES,
+    // or a race where the file vanished between resolve and read)
+    // downgrades to `None` instead of panicking, so we fall back to
+    // the existence-only gate for `vmlinux.h`. The eventual regen
+    // path below re-reads the bytes via `vmlinux_gen` and fails
+    // loudly there if the source is truly unusable.
+    let current_hash: Option<String> = current_btf.as_ref().and_then(|p| {
+        match std::fs::read(p) {
+            Ok(bytes) => Some(format!("{:016x}", fnv1a_64(&bytes))),
+            Err(e) => {
+                println!(
+                    "cargo:warning=BTF source {} present but unreadable \
+                     ({e}); skipping hash check, reusing existing vmlinux.h",
+                    p.display(),
+                );
+                None
+            }
+        }
+    });
+    let stored_hash: Option<String> = std::fs::read_to_string(&hash_path)
+        .ok()
+        .map(|s| s.trim().to_string());
+    // Regen fires on any of three conditions:
+    //   - `vmlinux.h` is absent (first build or post-`cargo clean`);
+    //   - the stored hash is absent but we have a current hash (the
+    //     vmlinux.h was generated by an older build.rs that didn't
+    //     track hashes — upgrade in place);
+    //   - current and stored hashes differ (real drift).
+    // An unreadable BTF with vmlinux.h already in place falls
+    // through to "no regen" per `current_hash.is_none()`.
+    let should_regen = !vmlinux_h.exists()
+        || (current_hash.is_some() && current_hash != stored_hash);
+    if should_regen {
+        let btf_source = current_btf.unwrap_or_else(|| {
             panic!(
                 "no BTF source found. Set KTSTR_KERNEL to a kernel build \
                  directory, or ensure /sys/kernel/btf/vmlinux exists."
@@ -107,6 +156,50 @@ int main(void) {{
             "vmlinux_gen failed — check BTF source: {}",
             btf_source.display()
         );
+
+        // Record the BTF content hash alongside `vmlinux.h`. A
+        // future build.rs invocation reads this file and compares
+        // against the freshly-hashed BTF; a mismatch triggers
+        // regeneration above.
+        //
+        // Normally `current_hash` was populated at the top of
+        // `main`. The one path that leaves it `None` while still
+        // reaching this regen branch is: `!vmlinux_h.exists()` AND
+        // `std::fs::read(&btf_source)` failed during the eager hash
+        // attempt. In that case, the generator above successfully
+        // invoked `vmlinux_gen` against `btf_source`, which means
+        // libbpf could read it — the earlier read failure was
+        // transient or the generator accessed the file via a path
+        // libbpf handles differently (e.g. sysfs BTF). Re-read and
+        // hash here so the sidecar is always populated alongside a
+        // successful regen; on a second-read failure, skip the
+        // sidecar (the generator already succeeded — the build is
+        // in a good state; a missing sidecar forces the next
+        // build.rs run to regenerate conservatively, which is
+        // correct).
+        let hash_opt: Option<String> = match current_hash.as_deref() {
+            Some(h) => Some(h.to_string()),
+            None => match std::fs::read(&btf_source) {
+                Ok(bytes) => Some(format!("{:016x}", fnv1a_64(&bytes))),
+                Err(e) => {
+                    println!(
+                        "cargo:warning=post-regen BTF re-read failed ({e}); \
+                         skipping hash sidecar — next build.rs run will \
+                         regenerate conservatively"
+                    );
+                    None
+                }
+            },
+        };
+        if let Some(hash) = hash_opt {
+            // Trailing newline so `cat` / editor-open produces a
+            // clean single-line display. The reader at the top of
+            // main uses `.trim()` on the stored value, so the
+            // newline round-trips.
+            std::fs::write(&hash_path, format!("{hash}\n")).unwrap_or_else(|e| {
+                panic!("write BTF hash sidecar {}: {e}", hash_path.display())
+            });
+        }
     }
 
     // arm64 bpf_tracing.h casts pt_regs through struct user_pt_regs,
@@ -305,4 +398,30 @@ int main(void) {{
         std::fs::copy(busybox_src.join("busybox"), &busybox_bin)
             .expect("copy busybox binary to OUT_DIR");
     }
+}
+
+/// 64-bit FNV-1a hash. Used to detect BTF content drift between
+/// `vmlinux.h` regenerations without adding a crate to
+/// `[build-dependencies]`.
+///
+/// FNV-1a is a non-cryptographic hash — collisions are
+/// astronomically unlikely for the drift-detection use case
+/// (a BTF change that collides on a 64-bit FNV-1a would have to
+/// hit a ~1-in-2^64 chance) but NOT adversarial-safe. The hash
+/// file is a build-artifact sidecar, not a signed manifest, so
+/// non-cryptographic is the right choice.
+///
+/// The constants are the canonical FNV-1a 64-bit offset basis
+/// (`0xcbf29ce484222325`) and prime (`0x100000001b3`); see the
+/// FNV reference page:
+/// <http://www.isthe.com/chongo/tech/comp/fnv/>.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
