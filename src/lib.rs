@@ -338,13 +338,6 @@ pub mod workload;
 /// Static busybox binary compiled in build.rs for guest shell mode.
 pub(crate) const BUSYBOX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/busybox"));
 
-/// Short git commit hash at ktstr build time, or "unknown" when
-/// built without `.git` in the manifest dir (see build.rs).
-pub const GIT_HASH: &str = env!("KTSTR_GIT_HASH");
-/// Full git commit hash at ktstr build time, or "unknown" when
-/// built without `.git` in the manifest dir (see build.rs).
-pub const GIT_FULL_HASH: &str = env!("KTSTR_GIT_FULL_HASH");
-
 /// Contents of `ktstr.kconfig` (the kernel-config fragment that
 /// enables sched_ext, BPF, kprobes, cgroups, and the other options
 /// ktstr requires) baked into the binary at build time via

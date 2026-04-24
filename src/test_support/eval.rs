@@ -991,15 +991,15 @@ fn scheduler_label(spec: &SchedulerSpec) -> String {
 /// lines) can distinguish "we found a pre-built binary in a target
 /// directory whose git hash we don't control" from "we just built
 /// this binary from HEAD in the current workspace and therefore know
-/// its git hash matches [`crate::GIT_HASH`]."
+/// its source commit is the workspace HEAD."
 ///
 /// Only the [`AutoBuilt`](Self::AutoBuilt) variant carries an honest
-/// git-hash guarantee: every other branch locates an *existing* file
-/// whose provenance is outside this process's knowledge. Callers that
-/// need to stamp a sidecar with a scheduler-specific commit must
-/// discard the hash for every non-`AutoBuilt` resolution — a stale
-/// `target/debug/` binary looks identical to a fresh `AutoBuilt` one
-/// but can be arbitrarily old.
+/// source-commit guarantee: every other branch locates an *existing*
+/// file whose provenance is outside this process's knowledge.
+/// Callers that need to stamp a sidecar with a scheduler-specific
+/// commit must discard the hash for every non-`AutoBuilt` resolution
+/// — a stale `target/debug/` binary looks identical to a fresh
+/// `AutoBuilt` one but can be arbitrarily old.
 ///
 /// `Eevdf` / `KernelBuiltin` / `Path` resolutions do not go through
 /// the discovery cascade; they map to [`EnvVar`](Self::EnvVar) style
@@ -1035,10 +1035,9 @@ pub enum ResolveSource {
     /// [`TargetDebug`](Self::TargetDebug).
     TargetRelease,
     /// Built on demand by [`crate::build_and_find_binary`] inside this
-    /// process. The build targets the current workspace's HEAD, so
-    /// the resulting binary's source matches [`crate::GIT_HASH`]
-    /// by construction — the ONLY variant where the git hash is
-    /// honest.
+    /// process. The build targets the current workspace's HEAD by
+    /// construction — the ONLY variant where the source commit is
+    /// known to match the workspace tree the tests run from.
     AutoBuilt,
     /// No user-space binary path was produced. Returned for
     /// `SchedulerSpec::Eevdf` and `SchedulerSpec::KernelBuiltin` (the
@@ -1053,9 +1052,8 @@ pub enum ResolveSource {
 /// [`ResolveSource`] naming the discovery branch that produced it.
 /// The source is load-bearing for downstream provenance: only
 /// [`ResolveSource::AutoBuilt`] guarantees the binary matches the
-/// current workspace's [`crate::GIT_HASH`]; every other variant
-/// locates a pre-existing file whose git hash is UNKNOWN to this
-/// process.
+/// current workspace tree; every other variant locates a
+/// pre-existing file whose git hash is UNKNOWN to this process.
 ///
 /// Variant mapping:
 /// - `Eevdf` / `KernelBuiltin { .. }` → `(None, NotFound)` (no

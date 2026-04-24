@@ -13,15 +13,36 @@ include!("src/kernel_path.rs");
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // Cache invalidation: always track env var and resolved kernel.
+    // Cache invalidation: track the env var that selects a kernel
+    // and the build-script inputs (kernel_path resolver, C generator
+    // source). Deliberately NOT tracking `{kernel}/vmlinux` content:
+    //
+    //   1. `vmlinux` is consumed here only as the BTF source for
+    //      `vmlinux.h` generation on the C side below, not as an
+    //      input that the Rust compiler reads. The generated
+    //      `vmlinux.h` is gated on `vmlinux_h.exists()`, so a
+    //      content change to the underlying vmlinux does not
+    //      actually re-run generation — only a missing output file
+    //      does. Cargo re-running build.rs on vmlinux change
+    //      therefore spins the BPF skeleton rebuild without any
+    //      upstream input actually differing.
+    //   2. BPF CO-RE (Compile Once Run Everywhere) relocates field
+    //      offsets at LOAD time against the runtime kernel's BTF,
+    //      so a field-layout drift between the compile-time
+    //      `vmlinux.h` and the runtime kernel is resolved by
+    //      libbpf on BPF object load — there is no compile-time
+    //      correctness dependency on the exact byte content of
+    //      the vmlinux used to generate `vmlinux.h`.
+    //   3. Operators who genuinely need a fresh `vmlinux.h` after a
+    //      kernel rebuild run `cargo clean`, which clears
+    //      `$OUT_DIR/vmlinux.h` and forces the generator on the
+    //      next build. `KTSTR_KERNEL` env changes (which point at
+    //      a DIFFERENT kernel) still trigger a rerun via the
+    //      `rerun-if-env-changed` line below.
     println!("cargo:rerun-if-env-changed=KTSTR_KERNEL");
     println!("cargo:rerun-if-changed=src/kernel_path.rs");
     println!("cargo:rerun-if-changed=src/bpf/vmlinux_gen.c");
     let ktstr_kernel = env::var("KTSTR_KERNEL").ok();
-    let kernel = resolve_kernel(ktstr_kernel.as_deref());
-    if let Some(ref path) = kernel {
-        println!("cargo:rerun-if-changed={}", path.join("vmlinux").display());
-    }
 
     // Generate vmlinux.h from kernel BTF.
     let vmlinux_h = out_dir.join("vmlinux.h");
@@ -141,25 +162,6 @@ int main(void) {{
     println!("cargo::rerun-if-changed=src/bpf/probe.bpf.c");
     println!("cargo::rerun-if-changed=src/bpf/fentry_probe.bpf.c");
     println!("cargo::rerun-if-changed=src/bpf/intf.h");
-
-    // Git info for output directory keying and display. Bounded to
-    // ktstr's own manifest dir — never walks upward into a consuming
-    // project's repository. When ktstr is consumed as a path-dep or
-    // registry crate without its own .git, both vars fall back
-    // to "unknown".
-    let mut short_hash = String::from("unknown");
-    let mut full_hash = String::from("unknown");
-    if let Ok(repo) = gix::open(env!("CARGO_MANIFEST_DIR"))
-        && let Ok(id) = repo.head_id()
-    {
-        let full = id.to_string();
-        short_hash = full[..full.len().min(7)].to_string();
-        full_hash = full;
-    }
-    println!("cargo:rustc-env=KTSTR_GIT_HASH={short_hash}");
-    println!("cargo:rustc-env=KTSTR_GIT_FULL_HASH={full_hash}");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
 
     // Build busybox from source for guest shell mode.
     // Cache: skip if $OUT_DIR/busybox exists. After build.rs config

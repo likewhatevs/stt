@@ -344,12 +344,12 @@ thresholds from the unified metric registry, and print colored output
 Run tests first to generate sidecar JSON files:
 
 ```sh
-cargo nextest run --workspace        # generates target/ktstr/{kernel}-{git_short}/*.json
+cargo nextest run --workspace        # generates target/ktstr/{kernel}-{timestamp}/*.json
 cargo ktstr stats                    # reads the newest run
 ```
 
 Set `KTSTR_SIDECAR_DIR` to override the sidecar directory; otherwise
-the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`.
+the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{timestamp}/`.
 
 ## Install
 

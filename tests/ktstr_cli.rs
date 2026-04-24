@@ -366,3 +366,210 @@ fn kernel_list_json() {
         .success()
         .stdout(predicate::str::contains("entries"));
 }
+
+// -- kernel list legend channel + ordering --
+//
+// Replaces two source-scanning tests (`eol_legend_emits_via_eprintln`
+// and `kernel_list_footer_ordering_pin`) that previously used
+// `include_str!("cli.rs")` + a hand-rolled brace-balanced matcher to
+// static-analyze the cli.rs source for legend emit sites. The new
+// tests exercise the real binary against a fixture cache and assert
+// against captured stdout/stderr — the actual behaviour operators
+// observe, not the source-form of the code that produces it.
+//
+// Fixture shape (shared between both tests):
+//
+//   <tmp_cache>/
+//     valid-untracked/           # metadata.json with ktstr_kconfig_hash: null
+//       metadata.json            # → KconfigStatus::Untracked → "(untracked kconfig)" tag
+//       Image                    # empty sentinel, just needs to exist per cache::list()
+//     valid-stale/               # metadata.json with wrong ktstr_kconfig_hash
+//       metadata.json            # → KconfigStatus::Stale → "(stale kconfig)" tag
+//       Image
+//     corrupt-malformed/         # metadata.json unparseable → ListedEntry::Corrupt
+//       metadata.json            # "{" — invalid JSON
+//
+// `cache::list` sorts Valid entries by built_at descending; Corrupt
+// entries sort last. Untracked and stale are both Valid, so they
+// render in the rows first; corrupt renders last. Legend footers
+// then emit in the documented order (untracked → stale → corrupt).
+// EOL coverage: not fixtured — the `(EOL)` tag requires a non-empty
+// active-prefixes list from kernel.org, which needs network access
+// and a version string that survives the active-prefixes filter. The
+// old source-pattern test pinned all four via static analysis; these
+// integration tests pin the three we can fixture deterministically
+// offline, and the in-source block comment + per-helper unit tests
+// in cli.rs continue to cover EOL's design.
+
+/// Helper: write a valid-shape metadata.json to `dir` with the given
+/// `ktstr_kconfig_hash` (None = untracked, Some(non-matching) = stale).
+/// Also creates an empty `Image` file so `cache::list()` classifies
+/// the directory as [`ListedEntry::Valid`] rather than
+/// image-missing-corrupt. Mirrors the on-disk shape
+/// `cache::CacheDir::store` writes, specified by JSON directly so
+/// the test stays at the CLI boundary (no dependency on the crate's
+/// internal constructors).
+fn write_valid_entry(dir: &std::path::Path, ktstr_kconfig_hash: Option<&str>) {
+    std::fs::create_dir_all(dir).expect("create fixture entry dir");
+    let kconfig = match ktstr_kconfig_hash {
+        Some(h) => format!("\"{h}\""),
+        None => "null".to_string(),
+    };
+    let metadata = format!(
+        "{{\
+         \"version\":\"6.99.0\",\
+         \"source\":{{\"type\":\"tarball\"}},\
+         \"arch\":\"x86_64\",\
+         \"image_name\":\"Image\",\
+         \"config_hash\":null,\
+         \"built_at\":\"2025-01-01T00:00:00Z\",\
+         \"ktstr_kconfig_hash\":{kconfig},\
+         \"has_vmlinux\":false\
+         }}",
+    );
+    std::fs::write(dir.join("metadata.json"), metadata.as_bytes())
+        .expect("write metadata.json");
+    std::fs::write(dir.join("Image"), b"").expect("write Image");
+}
+
+/// Helper: write a deliberately malformed metadata.json so
+/// `cache::list()` surfaces the directory as
+/// [`ListedEntry::Corrupt`]. The body is an incomplete JSON object;
+/// serde_json classifies it as `Category::Syntax`, which the list
+/// path wraps into a `"metadata.json malformed: ..."` reason
+/// string. The tag rendered in the row is `(corrupt)`.
+fn write_corrupt_entry(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("create fixture corrupt dir");
+    std::fs::write(dir.join("metadata.json"), b"{")
+        .expect("write malformed metadata.json");
+}
+
+/// Build the shared fixture cache for the legend tests. Returns the
+/// temp dir guard so the caller keeps it alive for the duration of
+/// the spawned binary — dropping it earlier would remove the cache
+/// while `ktstr` is mid-`list`.
+fn build_legend_fixture_cache() -> tempfile::TempDir {
+    let tmp = tempfile::TempDir::new().expect("tempdir for fixture cache");
+    let root = tmp.path();
+    write_valid_entry(&root.join("valid-untracked"), None);
+    // A 7-char hex-looking string that cannot collide with the
+    // real ktstr.kconfig hash — the CRC32 the cache uses is 8 hex
+    // chars; a 7-char literal guarantees mismatch without assuming
+    // any specific current hash value.
+    write_valid_entry(&root.join("valid-stale"), Some("deadbe7"));
+    write_corrupt_entry(&root.join("corrupt-malformed"));
+    tmp
+}
+
+/// Channel-routing pin: every legend / footer must land on STDERR,
+/// never STDOUT. Downstream scripts redirect stdout to machine-
+/// parseable data (`kernel list > kernels.txt`) and stderr to an
+/// interactive channel; a legend leaked onto stdout would corrupt
+/// the row data for those consumers. Previously pinned by a source-
+/// pattern test scanning cli.rs for `eprintln!`; now pinned by
+/// reading the real binary's streams.
+#[test]
+fn kernel_list_legends_emit_on_stderr() {
+    let cache = build_legend_fixture_cache();
+    let out = ktstr()
+        .env("KTSTR_CACHE_DIR", cache.path())
+        .args(["kernel", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf-8");
+
+    // Each of the three offline-fixturable legends must appear in
+    // stderr. The exact wording comes from the *_EXPLANATION consts
+    // / format_corrupt_footer body in cli.rs; pinning a stable
+    // substring from each catches a reword at the CLI boundary
+    // without over-specifying the full string.
+    for needle in [
+        "(untracked kconfig) marks entries",
+        "warning: entries marked (stale kconfig)",
+        "warning: entries marked (corrupt)",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "stderr must contain legend fragment {needle:?}; got:\n{stderr}",
+        );
+        // Same fragment must NOT leak to stdout — the row data
+        // channel stays legend-free for script consumers.
+        assert!(
+            !stdout.contains(needle),
+            "stdout must NOT contain legend fragment {needle:?}; got:\n{stdout}",
+        );
+    }
+}
+
+/// Ordering pin: the four annotation footers emit in a fixed order
+/// (EOL → untracked → stale → corrupt) documented in `kernel_list`'s
+/// emission block. Previously pinned by source-pattern scan of the
+/// function body; now pinned by checking byte offsets of each
+/// legend's fingerprint in captured stderr.
+///
+/// Offline guarantee: the three fixturable legends (untracked,
+/// stale, corrupt) are always present in the output from the
+/// fixture, so their relative ordering is always pinnable. EOL
+/// coverage is conditional — when the kernel.org active-prefixes
+/// fetch succeeds AND the fixture version "6.99.0" does not appear
+/// in the active list, EOL fires and must precede untracked. When
+/// the fetch fails (offline CI, DNS outage) `active_prefixes` is
+/// empty and EOL is silently disabled per `fetch_active_prefixes`'s
+/// error arm; the test still passes on the three we CAN guarantee.
+#[test]
+fn kernel_list_legend_ordering_pins_untracked_stale_corrupt() {
+    let cache = build_legend_fixture_cache();
+    let out = ktstr()
+        .env("KTSTR_CACHE_DIR", cache.path())
+        .args(["kernel", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf-8");
+
+    let i_untracked = stderr
+        .find("(untracked kconfig) marks entries")
+        .expect("untracked legend must appear in stderr");
+    let i_stale = stderr
+        .find("warning: entries marked (stale kconfig)")
+        .expect("stale legend must appear in stderr");
+    let i_corrupt = stderr
+        .find("warning: entries marked (corrupt)")
+        .expect("corrupt footer must appear in stderr");
+
+    assert!(
+        i_untracked < i_stale,
+        "untracked legend must precede stale legend in stderr — \
+         kconfig-tag rebuild recipes are kept adjacent so operators \
+         see both remediation shapes together. \
+         untracked at byte {i_untracked}, stale at {i_stale}:\n{stderr}",
+    );
+    assert!(
+        i_stale < i_corrupt,
+        "stale legend must precede corrupt footer — informational \
+         trio (EOL/untracked/stale) comes before the operationally-\
+         disruptive corrupt entry per the emission block comment in \
+         cli.rs. stale at byte {i_stale}, corrupt at {i_corrupt}:\n{stderr}",
+    );
+
+    // EOL ordering: only enforceable when the fixture's version
+    // was actually tagged EOL by the fetched active-prefixes list.
+    // When the fetch succeeds and classifies 6.99.0 as EOL, the
+    // legend appears in stderr and must precede untracked. When
+    // the fetch fails (offline runner) the legend is absent and
+    // the guard short-circuits to Ok — which is correct since
+    // there's nothing to order.
+    if let Some(i_eol) = stderr.find("(EOL) marks entries") {
+        assert!(
+            i_eol < i_untracked,
+            "EOL legend must precede untracked legend — EOL is \
+             informational-first (upstream-release state, not a \
+             cache pathology) per the emission block comment. \
+             eol at byte {i_eol}, untracked at {i_untracked}:\n{stderr}",
+        );
+    }
+}

@@ -10,20 +10,22 @@ record -- there is no separate "baselines" cache.
 ```
 target/
 └── ktstr/
-    ├── 6.14-abc1234/        # one run: kernel 6.14, repo commit abc1234
+    ├── 6.14-20260424T014200Z/   # one run: kernel 6.14, invoked 2026-04-24 01:42 UTC
     │   ├── test_a.ktstr.json
     │   └── test_b.ktstr.json
-    └── 7.0-def5678/         # another run: different kernel, different commit
+    └── 7.0-20260424T015830Z/    # another run: different kernel, different timestamp
         ├── test_a.ktstr.json
         └── test_b.ktstr.json
 ```
 
-Each subdirectory is keyed `{kernel}-{git_short}`, where `{kernel}`
+Each subdirectory is keyed `{kernel}-{timestamp}`, where `{kernel}`
 is the kernel version resolved from the directory `KTSTR_KERNEL`
 points at — first the `version` field in its `metadata.json`, else
 the content of `include/config/kernel.release`, else `unknown` (when
 `KTSTR_KERNEL` is unset or neither file yields a version) — and
-`{git_short}` is the short commit hash baked in by `build.rs`.
+`{timestamp}` is a compact `YYYYMMDDTHHMMSSZ` UTC stamp captured
+once per `cargo ktstr test` invocation. Successive runs always get
+distinct directories, so no run ever overwrites another.
 
 `KTSTR_SIDECAR_DIR` overrides the *sidecar* directory itself
 (used as-is, no key suffix), not the parent. The override only
@@ -56,8 +58,8 @@ affects where new sidecars are written and what bare
 4. **Compare** two runs:
 
    ```sh
-   cargo ktstr stats compare 6.14-abc1234 7.0-def5678
-   cargo ktstr stats compare 6.14-abc1234 7.0-def5678 -E cgroup_steady
+   cargo ktstr stats compare 6.14-20260424T014200Z 7.0-20260424T015830Z
+   cargo ktstr stats compare 6.14-20260424T014200Z 7.0-20260424T015830Z -E cgroup_steady
    ```
 
    Per-metric deltas are computed using the unified `MetricDef`

@@ -42,7 +42,7 @@ use crate::timeline::StimulusEvent;
 use crate::vmm;
 
 use super::entry::KtstrTestEntry;
-use super::timefmt::{generate_run_id, now_iso8601};
+use super::timefmt::{generate_run_id, now_iso8601, run_id_timestamp};
 
 /// Test result sidecar written to KTSTR_SIDECAR_DIR for post-run analysis.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -484,10 +484,15 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// Resolve the sidecar output directory for the current test process.
 ///
 /// Override: `KTSTR_SIDECAR_DIR` (used as-is when non-empty).
-/// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`,
+/// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{timestamp}/`,
 /// where `{kernel}` is the version detected from `KTSTR_KERNEL`'s
 /// metadata (or `"unknown"` when no kernel is set / detection fails)
-/// and `{git_short}` is the short commit hash baked in by `build.rs`.
+/// and `{timestamp}` is the compact `YYYYMMDDTHHMMSSZ` stamp captured
+/// once per process by [`run_id_timestamp`]. Every sidecar written
+/// from the same `cargo ktstr test` invocation lands in the same
+/// directory; successive invocations get distinct directories so the
+/// "runs ARE baselines" archival model retains all runs even when
+/// the same kernel is re-tested.
 pub(crate) fn sidecar_dir() -> PathBuf {
     if let Ok(d) = std::env::var("KTSTR_SIDECAR_DIR")
         && !d.is_empty()
@@ -495,7 +500,7 @@ pub(crate) fn sidecar_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     let kernel = detect_kernel_version().unwrap_or_else(|| "unknown".to_string());
-    runs_root().join(format!("{kernel}-{}", crate::GIT_HASH))
+    runs_root().join(format!("{kernel}-{}", run_id_timestamp()))
 }
 
 /// Resolve the parent directory that holds all test-run subdirectories.
@@ -515,8 +520,8 @@ pub fn runs_root() -> PathBuf {
 ///
 /// Used by bare `cargo ktstr stats` (no subcommand) when
 /// `KTSTR_SIDECAR_DIR` isn't set: the stats command doesn't itself
-/// run a kernel, so it can't reconstruct the `{kernel}-{git_short}` key
-/// that the test process used. Picking the newest subdirectory by
+/// run a kernel, so it can't reconstruct the `{kernel}-{timestamp}`
+/// key that the test process used. Picking the newest subdirectory by
 /// mtime mirrors "show me the report from my last test run."
 pub fn newest_run_dir() -> Option<PathBuf> {
     let root = runs_root();
@@ -925,7 +930,7 @@ pub(crate) fn write_skip_sidecar(
 ///
 /// Output goes to the current run's sidecar directory
 /// (`KTSTR_SIDECAR_DIR` override, or
-/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{git_short}/`).
+/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{timestamp}/`).
 ///
 /// `payload_metrics` is the accumulated per-invocation output from
 /// `ctx.payload(X).run()` / `.spawn().wait()` calls made in the
@@ -1777,7 +1782,7 @@ mod tests {
         let _env_target = EnvVarGuard::remove("CARGO_TARGET_DIR");
 
         let dir = sidecar_dir();
-        let expected = format!("target/ktstr/unknown-{}", crate::GIT_HASH);
+        let expected = format!("target/ktstr/unknown-{}", run_id_timestamp());
         assert_eq!(dir, PathBuf::from(&expected));
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -2571,9 +2576,9 @@ mod tests {
             "Discover variant currently returns None via \
              `SchedulerSpec::scheduler_commit` — \
              `resolve_scheduler`'s cascade does not guarantee a \
-             fresh build, so `crate::GIT_HASH` is not authoritative \
-             and `scheduler_commit` reports None honestly. Got: \
-             {commit:?}",
+             fresh build, so there is no authoritative source for \
+             the scheduler binary's commit and `scheduler_commit` \
+             reports None honestly. Got: {commit:?}",
         );
     }
 

@@ -775,8 +775,10 @@ pub fn kernel_list(json: bool) -> Result<()> {
         }
     }
     // Annotation footers. The emission order is fixed and load-bearing
-    // — `kernel_list_footer_ordering_pin` below pins the sequence
-    // against regressions:
+    // — the integration test
+    // `kernel_list_legend_ordering_pins_untracked_stale_corrupt` in
+    // `tests/ktstr_cli.rs` pins the sequence against regressions by
+    // running the real binary against a fixture cache:
     //
     //   1. EOL        (informational, inherent-to-upstream-release)
     //   2. untracked  (informational, actionable with a rebuild)
@@ -806,7 +808,8 @@ pub fn kernel_list(json: bool) -> Result<()> {
     // kernels.txt` downstream scripts receive table data without
     // legend text mixed in; the legends only become visible on an
     // interactive terminal where both channels are typically
-    // displayed. Pinned by `eol_legend_emits_via_eprintln` below.
+    // displayed. Pinned by `kernel_list_legends_emit_on_stderr` in
+    // `tests/ktstr_cli.rs`.
     if let Some(legend) = eol_legend_if_any(any_eol) {
         eprintln!("{legend}");
     }
@@ -1567,7 +1570,7 @@ fn build_make_args(nproc: usize) -> Vec<String> {
 ///   `{CARGO_TARGET_DIR or "target"}/ktstr/`.
 ///
 /// `cargo ktstr stats` doesn't itself run a kernel, so it can't
-/// reconstruct the `{kernel}-{git_short}` key the test process used; the
+/// reconstruct the `{kernel}-{timestamp}` key the test process used; the
 /// mtime fallback mirrors "show me the report from my last test run."
 ///
 /// Returns `None` with a warning on stderr when no sidecars are found.
@@ -3025,82 +3028,6 @@ mod tests {
         // exercises that lifecycle end-to-end.
         let sp = Spinner::start("test");
         sp.finish("done");
-    }
-
-    /// Bootstrap gate for the source-form tests further down this
-    /// module (`eol_legend_emits_via_eprintln`,
-    /// `kernel_list_footer_ordering_pin`). Those tests use
-    /// `include_str!("cli.rs")` to scan the source for specific
-    /// function names — if the names are renamed and the tests
-    /// aren't updated, the source-pattern match silently shifts
-    /// semantics (a rename from `eol_legend_if_any` to
-    /// `eol_legend` would make the old `.find()` return `None`,
-    /// tripping an `.expect()` inside the dependent tests with a
-    /// message that doesn't clearly identify the rename as the
-    /// root cause).
-    ///
-    /// This test runs FIRST in the module (alphabetical / order
-    /// doesn't matter for nextest, but the test-name prefix
-    /// `_bootstrap_` reads well in failure output) and panics with
-    /// a loud, specific message if any of the expected function /
-    /// constant names is absent from the included source. A
-    /// rename that breaks the source-form tests fails here first,
-    /// with a message that tells the maintainer exactly which
-    /// source-form test needs updating.
-    ///
-    /// Also validates that the file LOADS — a nonexistent
-    /// `cli.rs` or a build-time `include_str!` path regression
-    /// would fail at compile time, but an empty file or one
-    /// without a newline could technically compile and then
-    /// break the `.find()` scans in unexpected ways.
-    #[test]
-    fn _bootstrap_source_form_tests_can_find_expected_identifiers() {
-        let src = include_str!("cli.rs");
-        assert!(
-            !src.is_empty(),
-            "include_str!(\"cli.rs\") yielded empty bytes — source-form \
-             tests downstream would silently match against an empty \
-             string and produce false-pass results",
-        );
-
-        // Every identifier the source-form tests reference. Grouped
-        // by which test depends on which name so a failure points
-        // directly at the affected downstream test.
-        //
-        // Format: (test_name_that_needs_this, identifier).
-        const REQUIRED: &[(&str, &str)] = &[
-            // `eol_legend_emits_via_eprintln` scans for each of the
-            // four *_if_any helpers' call sites.
-            ("eol_legend_emits_via_eprintln", "eol_legend_if_any"),
-            ("eol_legend_emits_via_eprintln", "untracked_legend_if_any"),
-            ("eol_legend_emits_via_eprintln", "stale_legend_if_any"),
-            ("eol_legend_emits_via_eprintln", "corrupt_footer_if_any"),
-            // `kernel_list_footer_ordering_pin` locates the fn body
-            // via the signature string.
-            (
-                "kernel_list_footer_ordering_pin",
-                "pub fn kernel_list(json: bool)",
-            ),
-        ];
-
-        let mut missing: Vec<(&str, &str)> = Vec::new();
-        for (dependent_test, needle) in REQUIRED {
-            if !src.contains(needle) {
-                missing.push((*dependent_test, *needle));
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "source-form tests reference identifiers that are no \
-             longer present in cli.rs. Update each listed test to \
-             match the current source OR restore the missing name \
-             to cli.rs:\n{}",
-            missing
-                .iter()
-                .map(|(t, n)| format!("  - test `{t}` needs `{n}`"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
     }
 
     /// Nesting guard pin: starting a second Spinner while another is
@@ -5981,305 +5908,16 @@ mod tests {
         }
     }
 
-    /// Pin that the EOL legend is emitted on stderr (via
-    /// `eprintln!`), not stdout (via `println!`). The rendered
-    /// entry rows go to stdout so `kernel list | awk` /
-    /// `kernel list > kernels.txt` downstream scripts receive
-    /// table data without legend text mixed in. A regression
-    /// that swapped `eprintln!` for `println!` at the legend
-    /// emission site would silently start polluting the data
-    /// channel with human-readable prose — no compile error,
-    /// no visible diff in interactive use (both channels land
-    /// on the same terminal), and failures only showing up
-    /// downstream when scripted consumers hit unexpected bytes.
-    ///
-    /// Rust's stable test harness does not expose per-test stderr
-    /// capture hooks (`std::io::set_output_capture` is unstable,
-    /// and wiring a writer through `kernel_list` would expand the
-    /// public surface). The cheap, stable alternative is a source-
-    /// level pattern match: each `*_legend_if_any` / `*_footer_if_any`
-    /// helper's gated block in `kernel_list` must emit via
-    /// `eprintln!`, never `println!`. The gated blocks are all
-    /// in a narrow window of `kernel_list`; scanning the full source
-    /// for a `println!` immediately adjacent to a legend helper call
-    /// catches the regression regardless of which helper the drift
-    /// landed on.
-    #[test]
-    fn eol_legend_emits_via_eprintln() {
-        let src = include_str!("cli.rs");
-        for helper in [
-            "eol_legend_if_any",
-            "untracked_legend_if_any",
-            "stale_legend_if_any",
-            "corrupt_footer_if_any",
-        ] {
-            // `if let Some(...) = <helper>(...)` pattern at the
-            // call site — look for the *call*, not the definition,
-            // by requiring the full `if let Some(...) = <helper>(`
-            // prefix. Definition lines read `pub(crate) fn <helper>(`,
-            // so the filter leaves only real call sites.
-            let needle_call = format!("= {helper}(");
-            let call_pos = src
-                .find(&needle_call)
-                .unwrap_or_else(|| panic!("helper call site for {helper} must exist in cli.rs"));
-            // Expand the window to the FULL `if let Some(..) = helper(..)
-            // { .. }` body by finding the `{` that opens the if-body
-            // and scanning forward until the matching `}`. The old
-            // 200-byte fixed window was vulnerable to two silent
-            // failure modes: (a) a block that grows past 200 bytes
-            // leaves a regression at the tail invisible to this
-            // check; (b) a block that shrinks below 200 bytes pulls
-            // the scan into the NEXT if-let block, where a legitimate
-            // `eprintln!` in an unrelated handler falsely satisfies
-            // THIS helper's assertion.
-            //
-            // Scanner: once the opening `{` is found, count `{`/`}`
-            // balance with awareness of `"..."` string literals (so
-            // a format arg like `"{legend}"` doesn't disturb the
-            // count, even though in practice `{id}` is brace-
-            // balanced; the "..." skip is kept as a correctness
-            // guarantee against `"{"` / `"}"` literals a future
-            // edit might introduce). Raw strings, block comments,
-            // and char literals are not handled — the if-let
-            // bodies in kernel_list are one-liner `eprintln!`
-            // emitters that contain none of those, and a future
-            // addition would fail this scanner fast enough to
-            // surface the need rather than silently miscount.
-            let brace_open = src[call_pos..]
-                .find('{')
-                .map(|off| call_pos + off)
-                .unwrap_or_else(|| {
-                    panic!("no `{{` after `= {helper}(` — cli.rs structure changed")
-                });
-            let brace_close = matching_brace_end(src.as_bytes(), brace_open)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "unbalanced braces after `= {helper}(` starting at byte {brace_open} \
-                         — the if-let block boundary could not be resolved"
-                    )
-                });
-            // Include both the call prefix AND the full body in the
-            // window so diagnostics show the surrounding context.
-            let window = &src[call_pos..=brace_close];
-            assert!(
-                window.contains("eprintln!"),
-                "{helper} call site must be followed by `eprintln!` \
-                 (stderr); legend text belongs on the diagnostic \
-                 channel. Window: {window:?}",
-            );
-            // Raw substring match for "println!" is not good enough —
-            // `eprintln!` CONTAINS "println!" starting at byte 1. Look
-            // for a bare `println!` not preceded by an `e`; that is
-            // the real stdout emission we want to reject. `idx == 0`
-            // (or `idx.wrapping_sub(1)` missing) also counts as "not
-            // preceded by e", which correctly flags a `println!` that
-            // opens the window.
-            let has_stdout_emit = window.match_indices("println!").any(|(idx, _)| {
-                let prev = idx.checked_sub(1).and_then(|p| window.as_bytes().get(p));
-                prev != Some(&b'e')
-            });
-            assert!(
-                !has_stdout_emit,
-                "{helper} call site must NOT emit via `println!` \
-                 (stdout); scripted consumers reading stdout would \
-                 receive legend prose mixed into data rows. Window: \
-                 {window:?}",
-            );
-        }
-    }
-
-    /// Return the byte offset of the `}` that matches the `{` at
-    /// `bytes[start]`, scanning forward with `"..."` string-literal
-    /// awareness so format args and literal quotes don't disturb the
-    /// brace count. Returns `None` if no match is found before
-    /// end-of-input. The caller guarantees `bytes[start] == b'{'`;
-    /// a debug assert pins that precondition so a caller bug
-    /// surfaces at the call site rather than returning a nonsense
-    /// offset.
-    fn matching_brace_end(bytes: &[u8], start: usize) -> Option<usize> {
-        debug_assert_eq!(
-            bytes.get(start),
-            Some(&b'{'),
-            "matching_brace_end must be called with start pointing at `{{`",
-        );
-        let mut depth: i32 = 0;
-        let mut in_string = false;
-        let mut i = start;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if in_string {
-                match b {
-                    b'\\' => i += 1, // skip the escaped byte
-                    b'"' => in_string = false,
-                    _ => {}
-                }
-            } else {
-                match b {
-                    b'"' => in_string = true,
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(i);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            i += 1;
-        }
-        None
-    }
-
-    /// Exercise the scanner against a hand-built snippet so the
-    /// `eol_legend_emits_via_eprintln` test's correctness doesn't
-    /// ride on an invariant only observable on real cli.rs bytes.
-    /// Covers: nested braces, `"..."` string literals with embedded
-    /// braces (including escaped quotes), and the unbalanced-input
-    /// branch returning `None`.
-    #[test]
-    fn matching_brace_end_handles_strings_and_nesting() {
-        // Simple balanced block.
-        let src = br#"{ eprintln!("x"); }"#;
-        assert_eq!(matching_brace_end(src, 0), Some(src.len() - 1));
-
-        // Nested braces.
-        let src = br#"{ let x = { 1 + 2 }; }"#;
-        assert_eq!(matching_brace_end(src, 0), Some(src.len() - 1));
-
-        // String literal containing a lone `}` must NOT close the
-        // outer brace prematurely.
-        let src = br#"{ println!("a}b"); }"#;
-        assert_eq!(matching_brace_end(src, 0), Some(src.len() - 1));
-
-        // Escaped quote inside a string must NOT close the string.
-        let src = br#"{ println!("a\"}b"); }"#;
-        assert_eq!(matching_brace_end(src, 0), Some(src.len() - 1));
-
-        // Unbalanced: opening brace with no closer returns None.
-        let src = br#"{ unterminated"#;
-        assert_eq!(matching_brace_end(src, 0), None);
-    }
-
-    /// Pin the annotation-footer emission order in `kernel_list`:
-    /// EOL → untracked → stale → corrupt. The ordering is
-    /// informational-first, operational-last (see the block comment
-    /// at the emission site for the rationale). A regression that
-    /// reshuffled the block order — e.g. hoisting the corrupt footer
-    /// to the top because it felt "louder" — would change the
-    /// human-readable output in a way that is invisible under a
-    /// normal no-tag test run (all four Options are `None`) and only
-    /// surfaces in a tag-heavy run, long after the refactor commit.
-    ///
-    /// Uses the source-pattern approach so the test can pin the
-    /// order WITHOUT building a fixture cache with four simultaneously-
-    /// tagged entries (which would require network fetch of the
-    /// active-prefixes list, real on-disk cache metadata, and a
-    /// corrupt entry — all to prove a four-line ordering).
-    #[test]
-    fn kernel_list_footer_ordering_pin() {
-        let src = include_str!("cli.rs");
-        // Only consider call sites inside `kernel_list`. Locate
-        // the fn by its public signature; slice from there to
-        // the next `^}` at the top level.
-        let kernel_list_start = src
-            .find("pub fn kernel_list(json: bool)")
-            .expect("kernel_list fn must exist");
-        // The next top-level `\n}\n` closes the fn. Scanning
-        // forward for that boundary is sufficient because
-        // `kernel_list` has no nested fn definitions.
-        let tail = &src[kernel_list_start..];
-        let body_end_rel = tail
-            .find("\n}\n")
-            .expect("kernel_list body must close with a top-level `}`");
-        let body = &tail[..body_end_rel];
-
-        // Bootstrap assert: validate the slice really is the full
-        // `kernel_list` body, not a truncation at the first inner
-        // `\n}\n` match. Three checks catch the ways this can go
-        // wrong:
-        //
-        // 1. The body must start with the signature we scanned
-        //    for — a null-match above would leave `body` pointing
-        //    inside some unrelated function.
-        // 2. Braces must balance. An inner `}` followed by `\n`
-        //    inside an `if`/`match`/loop closes a nested scope,
-        //    not the fn — if the scanner stopped there, the
-        //    counted opens will exceed the counted closes by at
-        //    least one.
-        // 3. The slice must NOT contain `\nfn ` or `\npub fn ` at
-        //    a top-level column — any of those would mean the
-        //    scanner walked past `kernel_list`'s end and swallowed
-        //    a sibling fn, which would let unrelated helpers leak
-        //    into the four-ordering check below.
-        assert!(
-            body.starts_with("pub fn kernel_list(json: bool)"),
-            "bootstrap: body must start with the scanned signature; \
-             got prefix: {:?}",
-            &body[..body.len().min(64)],
-        );
-        let opens = body.bytes().filter(|&b| b == b'{').count();
-        let closes = body.bytes().filter(|&b| b == b'}').count();
-        assert_eq!(
-            opens,
-            closes + 1,
-            "bootstrap: kernel_list body must have exactly one \
-             unmatched `{{` (the one closed by the trailing `}}` at \
-             `body_end_rel`); got opens={opens}, closes={closes}. \
-             A mismatch means the `\\n}}\\n` scanner either stopped \
-             inside a nested block (closes+1 > opens) or walked \
-             past kernel_list's closing brace (opens > closes+1, \
-             swallowing a sibling fn's opener).",
-        );
-        // Nested-`fn` guard: `kernel_list` currently has no inner
-        // fn, closure, or impl definition. A line starting with
-        // `fn ` or `pub fn ` at column 4 or 0 inside `body` means
-        // a refactor introduced one, and the brace-balance check
-        // above is no longer a sufficient bootstrap — the scanner
-        // could stop at the NESTED fn's closing brace and still
-        // show a balanced inner slice. Trip loudly so the author
-        // updates the test to either skip nested scopes or scan
-        // to the outermost `\n}\n` explicitly.
-        assert!(
-            !body.contains("\n    fn ") && !body.contains("\nfn "),
-            "bootstrap: a new nested / sibling `fn` definition \
-             appeared in the scanned slice. The `\\n}}\\n` scanner \
-             cannot distinguish the nested fn's close from \
-             kernel_list's own close — update this test to use a \
-             brace-balance walker before landing the refactor. \
-             body: {body:?}",
-        );
-
-        let i_eol = body
-            .find("eol_legend_if_any")
-            .expect("EOL helper call missing from kernel_list");
-        let i_untracked = body
-            .find("untracked_legend_if_any")
-            .expect("untracked helper call missing from kernel_list");
-        let i_stale = body
-            .find("stale_legend_if_any")
-            .expect("stale helper call missing from kernel_list");
-        let i_corrupt = body
-            .find("corrupt_footer_if_any")
-            .expect("corrupt helper call missing from kernel_list");
-
-        assert!(
-            i_eol < i_untracked,
-            "EOL legend must precede untracked legend in kernel_list — \
-             informational-first ordering (EOL is upstream-state, \
-             untracked is a rebuild-actionable kconfig tag)",
-        );
-        assert!(
-            i_untracked < i_stale,
-            "untracked legend must precede stale legend — both are \
-             kconfig-tag rebuild recipes and are kept adjacent so \
-             operators see the pair together",
-        );
-        assert!(
-            i_stale < i_corrupt,
-            "stale legend must precede corrupt footer — the corrupt \
-             footer is the operationally-disruptive entry and belongs \
-             last so informational/operational stays visually distinct",
-        );
-    }
+    // Channel-routing and ordering pins previously lived here as
+    // `eol_legend_emits_via_eprintln` + `kernel_list_footer_ordering_pin`,
+    // scanning cli.rs via `include_str!` + a hand-rolled brace-
+    // balanced matcher. Both have moved to
+    // `tests/ktstr_cli.rs` as `kernel_list_legends_emit_on_stderr`
+    // and `kernel_list_legend_ordering_pins_untracked_stale_corrupt`,
+    // which exercise the real `ktstr kernel list` binary against a
+    // fixture cache and assert on captured stdout / stderr — the
+    // behaviour operators actually observe, not the source form of
+    // the code that produces it. The old source-scanning machinery
+    // (brace-balance walker, identifier-presence bootstrap) has
+    // been removed along with the two tests it supported.
 }

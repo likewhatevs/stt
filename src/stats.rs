@@ -1213,7 +1213,7 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
 /// List the test-run directories under
 /// `{CARGO_TARGET_DIR or "target"}/ktstr/`.
 ///
-/// Each subdirectory is one run keyed `{kernel}-{git_short}`. The
+/// Each subdirectory is one run keyed `{kernel}-{timestamp}`. The
 /// sidecar JSON files inside it are the run's results -- there is no
 /// separate "baselines" cache; runs ARE baselines.
 pub fn list_runs() -> anyhow::Result<()> {

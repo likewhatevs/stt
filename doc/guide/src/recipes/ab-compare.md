@@ -22,12 +22,12 @@ git worktree add ~/opensource/scx-main upstream/main
 ## Collect both runs into a shared run root
 
 Each `cargo nextest run --workspace` writes its sidecars into
-`target/ktstr/{kernel}-{ktstr_git_short}/`. The `{git_short}` half
-is baked in by ktstr's `build.rs` from ktstr's own repository, not
-the consumer's, so two worktrees of the same scheduler produce
-identical run keys and would overwrite each other in a shared
-`target/ktstr/`. Move each run out under a branch-tagged name
-before kicking off the next one.
+`target/ktstr/{kernel}-{timestamp}/`. The `{timestamp}` half is
+captured once per process at run start (compact
+`YYYYMMDDTHHMMSSZ` form), so successive runs always land in
+distinct directories — two back-to-back runs of the same kernel
+never overwrite each other. Rename each run to a branch-tagged
+name so `stats compare` can address them by memorable keys.
 
 Do **not** set `KTSTR_SIDECAR_DIR`: `cargo ktstr stats list` and
 `cargo ktstr stats compare` always enumerate
@@ -48,7 +48,7 @@ cargo nextest run --workspace
 mv target/ktstr/* ~/opensource/scx-runs/ktstr/current
 ```
 
-Each `mv` renames the just-produced `{kernel}-{ktstr_git_short}/`
+Each `mv` renames the just-produced `{kernel}-{timestamp}/`
 subdirectory to a branch-tagged name (`baseline`, `current`) so
 both runs coexist under one root.
 

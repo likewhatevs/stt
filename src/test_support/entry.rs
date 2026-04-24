@@ -103,10 +103,10 @@ impl SchedulerSpec {
     ///   rebuild fallback). Only the rebuild path guarantees the
     ///   resulting binary was built from the current tree; the
     ///   four pre-built discovery paths can point at a binary
-    ///   whose commit does NOT match `crate::GIT_HASH`. Returning
-    ///   `Some(GIT_HASH)` would be a lie in 4 of 5 cases and would
-    ///   silently attribute regressions to the wrong commit. A
-    ///   future enhancement can probe the binary itself (e.g.
+    ///   whose commit is unknown to this process. Synthesizing a
+    ///   commit would be a lie in 4 of 5 cases and would silently
+    ///   attribute regressions to the wrong commit. A future
+    ///   enhancement can probe the binary itself (e.g.
     ///   `--version` output, an ELF note) and return `Some(..)`
     ///   ONLY when the actual commit is introspected; until then,
     ///   `None` is the only honest answer.
@@ -1694,9 +1694,9 @@ mod tests {
     //
     // Conservative by design: EVERY variant currently returns
     // None, including `Discover(_)`. `resolve_scheduler`'s 5-path
-    // cascade can pick up a binary whose commit does not match
-    // `crate::GIT_HASH` in four of the five paths, so `Discover`
-    // returns None to avoid lying. The sidecar's nullable
+    // cascade can pick up a binary whose commit is unknown to this
+    // process in four of the five paths, so `Discover` returns
+    // None to avoid lying. The sidecar's nullable
     // semantics distinguish "unset" from a sentinel so consumers
     // can tell "no userspace binary" (Eevdf, KernelBuiltin) from
     // "external binary, commit unknown" (Path) and "discovered
@@ -1725,13 +1725,13 @@ mod tests {
         // matches the current tree; the four pre-built discovery
         // paths (KTSTR_SCHEDULER env, ktstr-binary sibling dir,
         // target/debug/, target/release/) can pick up a binary
-        // whose commit does NOT match `crate::GIT_HASH`. Returning
-        // `Some(GIT_HASH)` would be a lie in 4 of 5 cases — so the
-        // honest answer today is `None`. A future enhancement that
-        // probes the binary (e.g. `--version`, ELF note) can flip
-        // this to `Some(..)` when an authoritative commit is
-        // available; until then, `None` keeps consumers from
-        // attributing regressions to the wrong commit.
+        // whose commit is unknown to this process. Synthesizing a
+        // commit would be a lie in 4 of 5 cases — so the honest
+        // answer today is `None`. A future enhancement that probes
+        // the binary (e.g. `--version`, ELF note) can flip this to
+        // `Some(..)` when an authoritative commit is available;
+        // until then, `None` keeps consumers from attributing
+        // regressions to the wrong commit.
         assert!(
             SchedulerSpec::Discover("scx_mitosis")
                 .scheduler_commit()
@@ -1746,7 +1746,7 @@ mod tests {
     #[test]
     fn scheduler_commit_path_returns_none() {
         // External binaries have no reliable introspection path;
-        // returning Some(GIT_HASH) here would be a lie when the
+        // synthesizing a commit here would be a lie when the
         // binary was built from a different tree.
         assert!(
             SchedulerSpec::Path("/usr/bin/scx_external").scheduler_commit().is_none(),

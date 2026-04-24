@@ -93,7 +93,7 @@ enum KtstrCommand {
     /// `{CARGO_TARGET_DIR or "target"}/ktstr/` (overridable with
     /// `KTSTR_SIDECAR_DIR`) and prints gauntlet analysis, BPF
     /// verifier stats, callback profile, and KVM stats. Each test
-    /// run is its own subdirectory keyed `{kernel}-{git_short}`;
+    /// run is its own subdirectory keyed `{kernel}-{timestamp}`;
     /// the runs ARE the baselines.
     ///
     /// Use `list` to see runs; `compare <a> <b>` to diff two.
