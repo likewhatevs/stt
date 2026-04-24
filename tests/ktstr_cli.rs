@@ -424,7 +424,8 @@ fn write_valid_entry(dir: &std::path::Path, ktstr_kconfig_hash: Option<&str>) {
          \"config_hash\":null,\
          \"built_at\":\"2025-01-01T00:00:00Z\",\
          \"ktstr_kconfig_hash\":{kconfig},\
-         \"has_vmlinux\":false\
+         \"has_vmlinux\":false,\
+         \"vmlinux_stripped\":false\
          }}",
     );
     std::fs::write(dir.join("metadata.json"), metadata.as_bytes()).expect("write metadata.json");

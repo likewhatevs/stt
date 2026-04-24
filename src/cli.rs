@@ -234,7 +234,8 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
     "\n",
     "Valid entry fields: key, path, version (nullable), source, arch,\n",
     "built_at, ktstr_kconfig_hash (nullable), kconfig_status, eol,\n",
-    "config_hash (nullable), image_name, image_path, has_vmlinux.\n",
+    "config_hash (nullable), image_name, image_path, has_vmlinux,\n",
+    "vmlinux_stripped.\n",
     "\n",
     "  path             absolute path to the cache entry DIRECTORY.\n",
     "  image_path       absolute path to the boot image file INSIDE\n",
@@ -260,6 +261,13 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
     "  has_vmlinux      true iff the uncompressed vmlinux is cached\n",
     "                   alongside the compressed image (required for\n",
     "                   DWARF-driven probes).\n",
+    "  vmlinux_stripped true iff the cached vmlinux came from a\n",
+    "                   successful strip pass. false marks the\n",
+    "                   raw-fallback path — a larger on-disk payload\n",
+    "                   indicating the strip pipeline errored on this\n",
+    "                   kernel; the entry is still usable but the\n",
+    "                   fallback is a signal to investigate. Meaningful\n",
+    "                   only when has_vmlinux is true (false otherwise).\n",
     "  config_hash      CRC32 of the final merged .config; distinct\n",
     "                   from ktstr_kconfig_hash which covers only the\n",
     "                   ktstr fragment."
@@ -616,7 +624,8 @@ pub fn format_entry_row(
 ///       "config_hash": "def456...",
 ///       "image_name": "bzImage",
 ///       "image_path": "/path/to/cache/entry/bzImage",
-///       "has_vmlinux": true
+///       "has_vmlinux": true,
+///       "vmlinux_stripped": true
 ///     },
 ///     {
 ///       "key": "6.12.0-broken",
@@ -657,6 +666,13 @@ pub fn format_entry_row(
 /// - `has_vmlinux`: whether the cache entry includes the uncompressed
 ///   `vmlinux` (needed for DWARF-driven probes); when `false`, only
 ///   the compressed `image_path` is available.
+/// - `vmlinux_stripped`: whether the cached vmlinux came from a
+///   successful strip pass (`true`) or the raw-fallback path
+///   (`false`). A `false` here indicates the strip pipeline errored
+///   on this kernel and the unstripped bytes were copied instead —
+///   the entry still works but carries a large on-disk payload that
+///   signals a parseability regression worth investigating. Always
+///   `false` when `has_vmlinux` is `false`.
 /// - `source`: tagged object (serde internally tagged on `"type"`).
 ///   Variants: `{"type": "tarball"}`, `{"type": "git", "git_hash": ?,
 ///   "ref": ?}`, `{"type": "local", "source_tree_path": ?, "git_hash":
@@ -748,6 +764,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
                         "image_name": meta.image_name,
                         "image_path": entry.image_path().display().to_string(),
                         "has_vmlinux": meta.has_vmlinux(),
+                        "vmlinux_stripped": meta.vmlinux_stripped(),
                     })
                 }
                 crate::cache::ListedEntry::Corrupt { key, path, reason } => {
@@ -2358,6 +2375,13 @@ pub fn cache_lookup(
     cache_key: &str,
     cli_label: &str,
 ) -> Option<crate::cache::CacheEntry> {
+    // `CacheDir::lookup` emits the per-lookup "unstripped vmlinux"
+    // warning on any local hit whose entry was stored via the
+    // strip-fallback path. The remote-lookup path here funnels
+    // downloads through `CacheDir::store`, which runs its own strip
+    // pipeline and reports via eprintln at store time — so the
+    // warning coverage is uniform across local and remote cache
+    // hits without an additional check here.
     if let Some(entry) = cache.lookup(cache_key) {
         return Some(entry);
     }
@@ -5244,6 +5268,7 @@ mod tests {
             "image_name",
             "image_path",
             "has_vmlinux",
+            "vmlinux_stripped",
             // Source-variant payload fields (internally-tagged
             // `source` object). `"ref"` is asserted in its quoted
             // JSON-field form to avoid matching substrings like

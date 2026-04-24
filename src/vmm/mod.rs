@@ -137,13 +137,16 @@ impl BaseKey {
     /// the optional scheduler / probe / alloc-worker binary content
     /// and shared libs. Each optional input participates
     /// symmetrically because each changes the bytes written into
-    /// the initramfs. Even though probe + alloc-worker are
-    /// currently routed through `include_files` (so their content
-    /// also appears in the `new_shell` include-hash loop), an
-    /// explicit parameter keeps the cache key sensitive to those
-    /// inputs regardless of the routing choice — if a future change
-    /// moves them back to extras, the key stays correct without a
-    /// separate update.
+    /// the initramfs. Explicit parameters keep the cache key
+    /// sensitive to these inputs regardless of the routing choice —
+    /// the probe currently rides the extras path (stripped) while
+    /// the worker rides `include_files` (verbatim), but the hash
+    /// stays correct if a future change moves either between the
+    /// two paths (the `new_shell` include-hash loop also re-hashes
+    /// whatever ends up in `include_files`, so the double hash of a
+    /// worker-in-includes is tolerated; the explicit worker hash
+    /// covers the case where a future refactor moves the worker to
+    /// extras).
     pub(crate) fn new(
         payload: &Path,
         scheduler: Option<&Path>,
@@ -1592,34 +1595,40 @@ impl KtstrVm {
             .name("initramfs-resolve".into())
             .spawn(move || -> Result<(BaseRef, BaseKey)> {
                 // Extras are stripped by `build_initramfs_base`
-                // before write. The scheduler can lose its DWARF
-                // without functional impact, but the probe and
-                // worker MUST retain DWARF — the probe resolves
-                // `tsd_s.thread_allocated` field offsets against
-                // the running target's `/proc/<pid>/exe`, and a
-                // stripped target has no DWARF to walk. Route
-                // probe + worker through `include_files` instead,
-                // which copies files verbatim (no `strip_debug`).
+                // before write. The scheduler and probe can lose
+                // their DWARF without functional impact — the probe
+                // resolves `tsd_s.thread_allocated` offsets against
+                // the TARGET process's `/proc/<pid>/exe`, not against
+                // its own binary, so its own DWARF is dead weight.
+                // The worker (the probe's target) MUST retain DWARF:
+                // a stripped worker has no DWARF for the probe to
+                // walk. Route scheduler + probe through `extras`
+                // (stripped), worker through `include_files`
+                // (verbatim). Packing the probe unstripped inflated
+                // the initramfs by ~900MB per run in debug builds,
+                // which was enough to time out VM init before the
+                // test binary loaded.
                 let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
                 if let Some(s) = scheduler.as_deref() {
                     extras.push(("scheduler", s));
                 }
+                if let Some(p) = probe.as_deref() {
+                    extras.push(("bin/ktstr-jemalloc-probe", p));
+                }
                 // Shell-mode cache keying treats ANY include_files
-                // as shell-mode. `jemalloc_probe_binary` and `jemalloc_alloc_worker_binary`
-                // are real include_files at the cache-key layer —
-                // hash them accordingly so a binary-change
-                // invalidates the cache. The scheduler stays in
-                // the non-shell path.
+                // as shell-mode. `jemalloc_alloc_worker_binary` is
+                // still a real include_file at the cache-key layer —
+                // hash it accordingly so a binary-change invalidates
+                // the cache. The probe is hashed explicitly regardless
+                // of its routing (see `BaseKey::new_shell`). The
+                // scheduler stays in the non-shell path.
                 let has_jemalloc_extras = probe.as_deref().is_some() || worker.as_deref().is_some();
                 let shell_mode = busybox || !include_files.is_empty() || has_jemalloc_extras;
 
-                // Merge include_files with probe + worker so both
-                // the cache key and the actual archive build see
-                // the same input set.
+                // Merge include_files with worker so both the cache
+                // key and the actual archive build see the same
+                // worker entry; the probe is added to extras above.
                 let mut merged_includes: Vec<(String, PathBuf)> = include_files.clone();
-                if let Some(p) = probe.as_deref() {
-                    merged_includes.push(("bin/ktstr-jemalloc-probe".to_string(), p.to_path_buf()));
-                }
                 if let Some(w) = worker.as_deref() {
                     merged_includes.push((
                         "bin/ktstr-jemalloc-alloc-worker".to_string(),

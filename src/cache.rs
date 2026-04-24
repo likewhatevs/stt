@@ -161,14 +161,14 @@ impl fmt::Display for KernelSource {
 /// Metadata stored alongside a cached kernel image.
 ///
 /// Required fields (`source`, `arch`, `image_name`, `built_at`,
-/// `has_vmlinux`) must be present in `metadata.json` during
-/// deserialization; a truncated file that drops any of them surfaces
-/// the entry as [`ListedEntry::Corrupt`] via [`CacheDir::list`]
-/// rather than silently defaulting. Optional fields (`version`,
-/// `config_hash`, `ktstr_kconfig_hash`) and the `Option`-typed
-/// payloads inside [`KernelSource`] variants tolerate absent keys
-/// as `None` — they participate in the on-disk shape but do not
-/// gate cache integrity.
+/// `has_vmlinux`, `vmlinux_stripped`) must be present in
+/// `metadata.json` during deserialization; a truncated file that
+/// drops any of them surfaces the entry as [`ListedEntry::Corrupt`]
+/// via [`CacheDir::list`] rather than silently defaulting. Optional
+/// fields (`version`, `config_hash`, `ktstr_kconfig_hash`) and the
+/// `Option`-typed payloads inside [`KernelSource`] variants tolerate
+/// absent keys as `None` — they participate in the on-disk shape but
+/// do not gate cache integrity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct KernelMetadata {
@@ -187,9 +187,11 @@ pub struct KernelMetadata {
     pub built_at: String,
     /// CRC32 of ktstr.kconfig at build time.
     pub ktstr_kconfig_hash: Option<String>,
-    /// Whether a stripped vmlinux ELF was cached alongside the image.
-    /// When true, the entry directory contains a `vmlinux` file; see
-    /// [`strip_vmlinux_debug`] for the strip policy.
+    /// Whether a vmlinux ELF was cached alongside the image. When
+    /// true, the entry directory contains a `vmlinux` file; see
+    /// [`strip_vmlinux_debug`] for the strip policy and
+    /// [`KernelMetadata::vmlinux_stripped`] for whether the cached
+    /// bytes came from the strip pipeline or the raw fallback.
     ///
     /// Required in metadata.json — plain `bool` without
     /// `#[serde(default)]` must be present during deserialization, so
@@ -204,6 +206,27 @@ pub struct KernelMetadata {
     /// "don't set this directly" guidance purely advisory (see the
     /// note on `new()` below).
     has_vmlinux: bool,
+    /// Whether the cached vmlinux ELF came from a successful strip
+    /// pass (`true`) or the raw-fallback path (`false`) where both
+    /// the keep-list strip and the debug-prefix strip failed and
+    /// [`CacheDir::store`] copied the unstripped bytes.
+    ///
+    /// Meaningful only when [`has_vmlinux`](Self::has_vmlinux)
+    /// returns `true`. When `has_vmlinux` is `false`, this field is
+    /// always `false` and has no consumer (there is no vmlinux to
+    /// describe).
+    ///
+    /// Required in metadata.json — plain `bool` without
+    /// `#[serde(default)]` must be present during deserialization.
+    /// Old entries without this field surface as Corrupt and must be
+    /// regenerated (pre-1.0 policy: no serde compatibility shims —
+    /// re-running the test that populates the cache rebuilds the
+    /// entry with the new field).
+    ///
+    /// Visibility: private field with the same ownership rules as
+    /// [`has_vmlinux`](Self::has_vmlinux) — the authoritative writer
+    /// is [`CacheDir::store`].
+    vmlinux_stripped: bool,
 }
 
 impl KernelMetadata {
@@ -235,6 +258,7 @@ impl KernelMetadata {
             built_at,
             ktstr_kconfig_hash: None,
             has_vmlinux: false,
+            vmlinux_stripped: false,
         }
     }
 
@@ -256,7 +280,13 @@ impl KernelMetadata {
         self
     }
 
-    /// Whether a stripped vmlinux ELF was cached alongside the image.
+    /// Whether a vmlinux ELF was cached alongside the image.
+    ///
+    /// Returns `true` whether the cached vmlinux came from a
+    /// successful strip pass OR from the raw-fallback path (both
+    /// produce an entry-dir `vmlinux` file). Use
+    /// [`vmlinux_stripped`](Self::vmlinux_stripped) to distinguish
+    /// the two shapes.
     ///
     /// Public reader for the private `has_vmlinux` field; consumers
     /// outside this crate must use this method to observe the field
@@ -277,6 +307,30 @@ impl KernelMetadata {
     /// `store()` ownership is supposed to prevent.
     pub(crate) fn set_has_vmlinux(&mut self, value: bool) {
         self.has_vmlinux = value;
+    }
+
+    /// Whether the cached vmlinux came from a successful strip pass.
+    ///
+    /// Returns `true` when the cached bytes were produced by
+    /// [`strip_vmlinux_debug`] (either the keep-list strip or the
+    /// debug-prefix fallback inside it). Returns `false` when
+    /// [`strip_vmlinux_debug`] itself errored and [`CacheDir::store`]
+    /// fell back to copying the unstripped source — a much larger
+    /// on-disk payload that still exposes symbols / BTF but indicates
+    /// the strip pipeline hit a parse failure on this kernel.
+    ///
+    /// Meaningful only when [`has_vmlinux`](Self::has_vmlinux) is
+    /// `true`; returns `false` otherwise.
+    pub fn vmlinux_stripped(&self) -> bool {
+        self.vmlinux_stripped
+    }
+
+    /// Crate-only mutator for `vmlinux_stripped`.
+    ///
+    /// Authoritative writer is [`CacheDir::store`]; same ownership
+    /// discipline as [`set_has_vmlinux`](Self::set_has_vmlinux).
+    pub(crate) fn set_vmlinux_stripped(&mut self, value: bool) {
+        self.vmlinux_stripped = value;
     }
 }
 
@@ -543,6 +597,37 @@ pub struct CacheDir {
     root: PathBuf,
 }
 
+/// Emit a per-lookup warning when a cache entry was created with an
+/// unstripped vmlinux — i.e. a prior `CacheDir::store` call took the
+/// strip-fallback path. The entry is still usable (monitor and probe
+/// symbol lookup works on the raw ELF) but the on-disk payload is
+/// much larger than a successfully-stripped entry. Firing every
+/// lookup gives the operator a persistent reminder until the cache
+/// is rebuilt — complementing the one-shot eprintln at store time.
+fn warn_if_unstripped_vmlinux(entry: &CacheEntry) {
+    if should_warn_unstripped(entry) {
+        eprintln!(
+            "cache: using unstripped vmlinux for {} (strip failed on a prior build; \
+             re-run with a clean cache to retry)",
+            entry.key,
+        );
+    }
+}
+
+/// Pure decision logic for [`warn_if_unstripped_vmlinux`]: `true`
+/// iff the entry has a cached vmlinux AND that vmlinux came from
+/// the raw-fallback path (strip failure). Returns `false` when
+/// `has_vmlinux` is false (no vmlinux was cached; the
+/// `vmlinux_stripped` bit is meaningless in that shape and emitting
+/// a warning would be noise).
+///
+/// Separated from the eprintln so the `!has_vmlinux → no warning`
+/// and `has_vmlinux && vmlinux_stripped → no warning` branches can
+/// be unit-tested without capturing stderr.
+fn should_warn_unstripped(entry: &CacheEntry) -> bool {
+    entry.metadata.has_vmlinux() && !entry.metadata.vmlinux_stripped()
+}
+
 impl CacheDir {
     /// Open a cache directory at the resolved root path.
     ///
@@ -596,6 +681,13 @@ impl CacheDir {
     /// Returns the cache entry if it exists, has valid metadata, and
     /// contains the expected kernel image file. Returns `None` if the
     /// key is invalid, the entry does not exist, or is corrupted.
+    ///
+    /// On a successful lookup of an entry whose vmlinux came from the
+    /// raw-fallback path (`vmlinux_stripped == false` alongside
+    /// `has_vmlinux == true`), emits a per-lookup eprintln warning so
+    /// operators running with the default (no-tracing) subscriber see
+    /// the signal every time they hit a bloated entry — not just once
+    /// at store time when a prior build's strip pipeline failed.
     pub fn lookup(&self, cache_key: &str) -> Option<CacheEntry> {
         if let Err(e) = validate_cache_key(cache_key) {
             tracing::warn!("invalid cache key: {e}");
@@ -610,11 +702,13 @@ impl CacheDir {
         if !entry_dir.join(&metadata.image_name).exists() {
             return None;
         }
-        Some(CacheEntry {
+        let entry = CacheEntry {
             key: cache_key.to_string(),
             path: entry_dir,
             metadata,
-        })
+        };
+        warn_if_unstripped_vmlinux(&entry);
+        Some(entry)
     }
 
     /// List all cached kernel entries, sorted by build time (newest
@@ -741,9 +835,10 @@ impl CacheDir {
     /// `tracing::warn!`). See [`CacheArtifacts`].
     ///
     /// `metadata`: descriptor to serialize as `metadata.json`. The
-    /// `has_vmlinux` field is overwritten based on whether
-    /// `artifacts.vmlinux` is present, so callers do not need to
-    /// pre-populate it.
+    /// `has_vmlinux` and `vmlinux_stripped` fields are overwritten
+    /// based on what `store()` actually persisted (whether a vmlinux
+    /// was given, and whether the strip pipeline succeeded), so
+    /// callers do not need to pre-populate either.
     ///
     /// Files are copied (not moved) so the caller retains the
     /// originals. Writes atomically via a temporary directory that is
@@ -814,28 +909,54 @@ impl CacheDir {
         // the unstripped vmlinux so downstream callers still get
         // symbols and BTF — the size penalty is preferable to losing
         // the vmlinux entirely.
-        let has_vmlinux = if let Some(vmlinux) = artifacts.vmlinux {
+        //
+        // `vmlinux_stripped` distinguishes the two success shapes:
+        // `true` on the strip-ok path, `false` on the raw-fallback
+        // path. Consumers (e.g. `ktstr cache list --json`) surface
+        // this so operators notice when a newly-cached kernel hit
+        // the fallback — a silent size regression that used to only
+        // appear in tracing logs.
+        let (has_vmlinux, vmlinux_stripped) = if let Some(vmlinux) = artifacts.vmlinux {
             let vmlinux_dest = tmp_dir.join("vmlinux");
             match strip_vmlinux_debug(vmlinux) {
                 Ok(stripped) => {
                     fs::copy(stripped.path(), &vmlinux_dest)
                         .map_err(|e| anyhow::anyhow!("copy stripped vmlinux to cache: {e}"))?;
+                    (true, true)
                 }
                 Err(e) => {
-                    tracing::warn!("vmlinux strip failed ({e:#}), caching unstripped",);
+                    // eprintln in addition to tracing::warn so the
+                    // failure is visible to operators running with
+                    // the default (no-tracing) subscriber. Without
+                    // this, the only signal was a tracing::warn
+                    // swallowed by the default writer — the cached
+                    // entry grew unboundedly (the uncompressed
+                    // source vmlinux's full size) with no on-screen
+                    // explanation.
+                    eprintln!(
+                        "cache: vmlinux strip failed for {cache_key} ({e:#}); \
+                         caching unstripped (larger on-disk payload). \
+                         See `ktstr cache list --json` vmlinux_stripped field.",
+                    );
+                    tracing::warn!(
+                        cache_key = cache_key,
+                        err = %format!("{e:#}"),
+                        "vmlinux strip failed, caching unstripped",
+                    );
                     fs::copy(vmlinux, &vmlinux_dest)
                         .map_err(|e| anyhow::anyhow!("copy vmlinux to cache: {e}"))?;
+                    (true, false)
                 }
             }
-            true
         } else {
-            false
+            (false, false)
         };
 
-        // Write metadata. has_vmlinux reflects whether we actually
-        // stored a vmlinux sidecar, overriding whatever the caller set.
+        // Write metadata. has_vmlinux and vmlinux_stripped reflect
+        // what we actually stored, overriding whatever the caller set.
         let mut meta = metadata.clone();
         meta.set_has_vmlinux(has_vmlinux);
+        meta.set_vmlinux_stripped(vmlinux_stripped);
         let meta_json = serde_json::to_string_pretty(&meta)?;
         fs::write(tmp_dir.join("metadata.json"), meta_json)
             .map_err(|e| anyhow::anyhow!("write cache metadata: {e}"))?;
@@ -1590,8 +1711,8 @@ pub(crate) fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<Strippe
     let raw =
         fs::read(vmlinux_path).map_err(|e| anyhow::anyhow!("read vmlinux for stripping: {e}"))?;
     let original_size = raw.len();
-    let data = neutralize_alloc_relocs(&raw)
-        .map_err(|e| anyhow::anyhow!("preprocess vmlinux ELF: {e}"))?;
+    let data =
+        neutralize_relocs(&raw).map_err(|e| anyhow::anyhow!("preprocess vmlinux ELF: {e}"))?;
 
     let out = match strip_keep_list(&data) {
         Ok(buf) => buf,
@@ -1620,49 +1741,116 @@ pub(crate) fn strip_vmlinux_debug(vmlinux_path: &Path) -> anyhow::Result<Strippe
     })
 }
 
-/// Zero `sh_size` on every `SHT_REL`/`SHT_RELA` section that has the
-/// `SHF_ALLOC` flag set, returning a modified copy of the bytes.
+/// Rewrite every relocation section (`SHT_REL`, `SHT_RELA`, `SHT_RELR`,
+/// `SHT_CREL`) to `SHT_PROGBITS` with `sh_size = 0`, regardless of the
+/// `SHF_ALLOC` flag, returning a modified copy of the bytes.
 ///
-/// Workaround for `object::build::elf::Builder::read`: the Builder
-/// treats any `SHF_ALLOC` relocation section as a dynamic-relocation
-/// section and parses each entry against an empty (zero-length)
-/// dynamic symbol table. Any entry referencing a non-null symbol
-/// index then trips the bounds check at `read_relocations_impl` and
-/// the whole read fails with `Invalid symbol index N in relocation
-/// section at index M`. Kernels built with `CONFIG_RELOCATABLE` +
-/// `CONFIG_RANDOMIZE_BASE` (any x86_64 defconfig + kASLR build) emit
-/// such sections (e.g. `.rela.dyn`-style entries for kASLR /
-/// static-call patching) so the Builder cannot parse the vmlinux
-/// at all -- both the keep-list strip and the debug-only fallback
-/// fail at parse time, and `strip_vmlinux_debug` returns an error
-/// that the cache build path silently swallows (caching the
-/// unstripped vmlinux), and the test path bubbles up as a panic.
+/// Workaround for `object::build::elf::Builder::read`. The Builder
+/// routes sections by `sh_type` through two mechanisms that each pose
+/// failure modes on malformed reloc inputs.
 ///
-/// Zeroing `sh_size` makes the Builder see these sections as empty,
-/// so the relocation walk finds no entries and the parse succeeds.
-/// The keep-list pass then deletes the sections by name like any
-/// other non-kept section. The output is identical to what we would
-/// have written if these sections had never been parsed.
+/// **`SHT_REL` / `SHT_RELA`** go through `section.rel()` /
+/// `section.rela()` (object-0.37.3/src/build/elf.rs:187,198) which
+/// call `data_as_array::<Rel|Rela<Endianness>>` against the raw
+/// bytes. Four independent failure modes trip that call:
 ///
-/// No-op for ELFs that have no `SHF_ALLOC` relocation sections
-/// (returns the original bytes copied into a new `Vec`).
-fn neutralize_alloc_relocs(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// - `sh_offset + sh_size` byte range exceeds the file (arm64 kernel
+///   7.0's observed failure mode, matches `"Invalid ELF relocation
+///   section offset or size"`).
+/// - `sh_size` not divisible by the entry size (24 bytes for `Rela64`,
+///   16 for `Rel64`) — `slice_from_all_bytes` rejects the leftover
+///   tail.
+/// - Under ktstr's feature set (`default-features = false,
+///   features = ["build"]`) the runtime-endian `Rela<Endianness>`
+///   uses the non-`unaligned` `aligned` module in
+///   object-0.37.3/src/endian.rs with `align_of == 8`. Even with
+///   `sh_size == 0`, `read_bytes_at` returns a literal `Ok(&[])`
+///   whose dangling pointer (`0x1` on x86_64) is NOT 8-aligned, so
+///   `slice_from_all_bytes::<Rela64>` fails the alignment check.
+///   Zeroing `sh_size` alone is insufficient under this feature
+///   configuration.
+/// - For allocated relocs with `sh_link == 0`,
+///   `read_relocations_impl` bounds-checks each entry's `r_info`
+///   symbol index against an empty dynamic symtab
+///   (`symtab_len == 0`); any non-null index trips "Invalid symbol
+///   index N in relocation section at index M".
+///
+/// **`SHT_RELR` / `SHT_CREL`** short-circuit both `section.rel()`
+/// (returns `Ok(None)` because `sh_type != SHT_REL`) and
+/// `section.rela()` (`sh_type != SHT_RELA`) in the same
+/// `Builder::read` loop, then reach the sh_type match at
+/// build/elf.rs:221 which dispatches to `section.data()`
+/// (line 225-232) — the opaque-data path. Failure mode there is
+/// `sh_offset + sh_size` past the file end, surfacing as
+/// `"Invalid ELF section size or offset"`. Empty-slice alignment
+/// does not apply (opaque byte reads have no entry alignment
+/// requirement).
+///
+/// Rewriting `sh_type` to `SHT_PROGBITS` routes every matching section
+/// through the same opaque-data path regardless of its original type:
+/// `section.rel()` / `section.rela()` / `section.relr()` /
+/// `section.crel()` all return `Ok(None)` immediately at their
+/// respective sh_type mismatch guards (section.rs:829, 849, 867, 886),
+/// the sh_type match at build/elf.rs:221 falls through to the
+/// `SHT_PROGBITS` arm, and `section.data(endian, data)` returns
+/// `Ok(&[])` via the zero-size short-circuit in `read_bytes_at` (line
+/// 132) without any alignment check on the empty slice's pointer.
+/// Builder::read succeeds; Builder::write reserves 0 bytes for the
+/// opaque data and emits a well-formed section header.
+///
+/// Zeroing `sh_size` in the same pass ensures that if a downstream
+/// reader re-parses the output with a strict "sh_offset + sh_size <=
+/// file_len" check, the zero-length section passes trivially. The
+/// section still carries its original name and file offset so the
+/// keep-list or debug-prefix strip that runs next can delete it by
+/// name.
+///
+/// The output is indistinguishable from a file that never had the
+/// offending relocation sections: their bytes (pre-existing entries)
+/// are left in place but orphaned, and the strip passes that follow
+/// remove their headers by name. Neither monitor nor probe walks
+/// relocation entries — the output is semantically equivalent.
+///
+/// No-op for ELFs that have no matching relocation sections (returns
+/// the original bytes copied into a new `Vec`).
+fn neutralize_relocs(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // SHT_RELR and SHT_CREL are not exposed by goblin; use the
+    // object-crate constants (19 and 0x40000014 respectively, matching
+    // object-0.37.3/src/elf.rs).
+    const SHT_RELR: u32 = object::elf::SHT_RELR;
+    const SHT_CREL: u32 = object::elf::SHT_CREL;
+    // SHT_PROGBITS (value 1) is the "program data" section type —
+    // opaque bytes that the Builder reads as `SectionData::Data` and
+    // writes back verbatim. Rewriting reloc sections to this type
+    // routes them through the opaque path, avoiding the rel/rela/relr/
+    // crel parse branches that the empty-slice alignment pathology
+    // breaks.
+    const SHT_PROGBITS: u32 = goblin::elf::section_header::SHT_PROGBITS;
+
     let elf = goblin::elf::Elf::parse(data)
         .map_err(|e| anyhow::anyhow!("parse vmlinux ELF for preprocess: {e}"))?;
     let mut out = data.to_vec();
     let shoff = elf.header.e_shoff as usize;
     let shentsize = elf.header.e_shentsize as usize;
-    // sh_size byte offset and width within a section header entry.
-    // ELF64 section header layout: sh_name(4) sh_type(4) sh_flags(8)
-    // sh_addr(8) sh_offset(8) sh_size(8) ... -> sh_size at offset 32.
-    // ELF32 layout: sh_name(4) sh_type(4) sh_flags(4) sh_addr(4)
-    // sh_offset(4) sh_size(4) ... -> sh_size at offset 20.
+    // Section header field offsets (same order in ELF32 and ELF64, width
+    // differs on the 64-bit `sh_flags`/`sh_addr`/`sh_offset` path).
+    // ELF64: sh_name(4) sh_type(4) sh_flags(8) sh_addr(8) sh_offset(8)
+    //        sh_size(8) ... -> sh_size at offset 32.
+    // ELF32: sh_name(4) sh_type(4) sh_flags(4) sh_addr(4) sh_offset(4)
+    //        sh_size(4) ... -> sh_size at offset 20.
+    // sh_type is at offset 4 with width 4 in both layouts (the ELF
+    // spec fixes it at `Elf{32,64}_Word = u32`).
     let (sh_size_offset, sh_size_width) = if elf.is_64 { (32, 8) } else { (20, 4) };
-    use goblin::elf::section_header::{SHF_ALLOC, SHT_REL, SHT_RELA};
+    let sh_type_offset: usize = 4;
+    let sh_type_width: usize = 4;
+    // sh_type is stored little- or big-endian per the ELF header's
+    // e_ident[EI_DATA]. goblin::elf::Elf's `little_endian` field
+    // reports the observed endianness.
+    let le = elf.little_endian;
+    use goblin::elf::section_header::{SHT_REL, SHT_RELA};
     for (i, sh) in elf.section_headers.iter().enumerate() {
-        let is_rela = sh.sh_type == SHT_RELA || sh.sh_type == SHT_REL;
-        let is_alloc = sh.sh_flags & u64::from(SHF_ALLOC) != 0;
-        if !(is_rela && is_alloc) {
+        let is_reloc = matches!(sh.sh_type, SHT_REL | SHT_RELA | SHT_RELR | SHT_CREL);
+        if !is_reloc {
             continue;
         }
         let entry_offset = shoff
@@ -1671,16 +1859,30 @@ fn neutralize_alloc_relocs(data: &[u8]) -> anyhow::Result<Vec<u8>> {
                     .ok_or_else(|| anyhow::anyhow!("section header table overflow at index {i}"))?,
             )
             .ok_or_else(|| anyhow::anyhow!("section header offset overflow at index {i}"))?;
+        let type_offset = entry_offset
+            .checked_add(sh_type_offset)
+            .ok_or_else(|| anyhow::anyhow!("sh_type offset overflow at index {i}"))?;
+        let type_end = type_offset
+            .checked_add(sh_type_width)
+            .ok_or_else(|| anyhow::anyhow!("sh_type end overflow at index {i}"))?;
         let size_offset = entry_offset
             .checked_add(sh_size_offset)
             .ok_or_else(|| anyhow::anyhow!("sh_size offset overflow at index {i}"))?;
         let size_end = size_offset
             .checked_add(sh_size_width)
             .ok_or_else(|| anyhow::anyhow!("sh_size end overflow at index {i}"))?;
-        if size_end > out.len() {
-            anyhow::bail!("sh_size at section header {i} extends past file end");
+        if type_end > out.len() || size_end > out.len() {
+            anyhow::bail!("section header {i} sh_type or sh_size field extends past file end");
         }
-        // Zero is endian-agnostic.
+        // Write sh_type = SHT_PROGBITS (u32, per the ELF spec for
+        // Elf{32,64}_Word) in the file's endianness.
+        let type_bytes: [u8; 4] = if le {
+            SHT_PROGBITS.to_le_bytes()
+        } else {
+            SHT_PROGBITS.to_be_bytes()
+        };
+        out[type_offset..type_end].copy_from_slice(&type_bytes);
+        // Zero sh_size (endian-agnostic: all bytes are zero).
         out[size_offset..size_end].fill(0);
     }
     Ok(out)
@@ -1756,11 +1958,24 @@ fn strip_keep_list(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Fallback strip: remove only .debug_* and .comment sections. Uses
-/// the shared [`crate::elf_strip::rewrite`] primitive.
+/// Fallback strip: remove `.debug_*`, `.comment`, and neutralized
+/// relocation sections (`.rela.*`, `.rel.*`, `.relr.*`, `.crel.*`).
+/// Uses the shared [`crate::elf_strip::rewrite`] primitive.
+///
+/// The reloc-prefix arms delete the header entries that
+/// [`neutralize_relocs`] left behind with `sh_size = 0`. Without this
+/// pass the fallback output carries one zero-size ghost section
+/// header per reloc section — parseable but wasted section-header
+/// bytes that consumers never walk (neither monitor nor probe reads
+/// relocation entries).
 fn strip_debug_prefix(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     crate::elf_strip::rewrite(data, |name| {
-        name.starts_with(b".debug_") || name == b".comment"
+        name.starts_with(b".debug_")
+            || name == b".comment"
+            || name.starts_with(b".rela.")
+            || name.starts_with(b".rel.")
+            || name.starts_with(b".relr.")
+            || name.starts_with(b".crel.")
     })
     .map_err(|e| anyhow::anyhow!("rewrite stripped vmlinux (fallback): {e}"))
 }
@@ -1862,6 +2077,7 @@ mod tests {
             built_at: "2026-04-12T10:00:00Z".to_string(),
             ktstr_kconfig_hash: Some("def456".to_string()),
             has_vmlinux: false,
+            vmlinux_stripped: false,
         }
     }
 
@@ -1874,16 +2090,17 @@ mod tests {
     /// Build a minimal ELF object with a single `.text` section (64
     /// bytes of 0xCC) anchored by one symbol. The anchor symbol is
     /// what drives `object::write` to emit `.symtab`/`.strtab`, and
-    /// every `neutralize_alloc_relocs` test shares this base shape.
-    /// Callers that need SHF_ALLOC relocation sections add them on
-    /// top of the returned object before calling `.write()`.
+    /// every `neutralize_relocs` test shares this base shape.
+    /// Callers that need relocation sections (with or without
+    /// `SHF_ALLOC`) add them on top of the returned object before
+    /// calling `.write()`.
     ///
     /// `arch` selects the ELF class: `Architecture::X86_64` yields
     /// ELF64 (8-byte anchor symbol), `Architecture::I386` yields
     /// ELF32 (4-byte anchor symbol). The anchor-symbol size is the
     /// only shape difference between the two classes at this
     /// fixture level; everything downstream (section headers, the
-    /// `is_rela` predicate under test) is driven by the
+    /// `is_reloc` predicate under test) is driven by the
     /// ELF32/ELF64 split `object::write` performs based on `arch`.
     fn build_base_elf_with_text_symbol(
         arch: object::Architecture,
@@ -2008,6 +2225,7 @@ mod tests {
         assert_eq!(parsed.built_at, "2026-04-12T10:00:00Z");
         assert_eq!(parsed.ktstr_kconfig_hash.as_deref(), Some("def456"));
         assert!(!parsed.has_vmlinux);
+        assert!(!parsed.vmlinux_stripped);
     }
 
     #[test]
@@ -2024,6 +2242,7 @@ mod tests {
             built_at: "2026-04-12T12:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
             has_vmlinux: false,
+            vmlinux_stripped: false,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -2051,6 +2270,7 @@ mod tests {
             built_at: "2026-04-12T14:00:00Z".to_string(),
             ktstr_kconfig_hash: Some("aaa111".to_string()),
             has_vmlinux: true,
+            vmlinux_stripped: true,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -2063,6 +2283,7 @@ mod tests {
             if p == &PathBuf::from("/tmp/linux") && h == "deadbee"
         ));
         assert!(parsed.has_vmlinux);
+        assert!(parsed.vmlinux_stripped);
     }
 
     /// git_hash on KernelSource::Local is a plain Option<String> with
@@ -2575,16 +2796,18 @@ mod tests {
     fn cache_dir_list_classifies_incomplete_metadata_as_corrupt() {
         // metadata.json is valid JSON but omits fields the current
         // `KernelMetadata` schema requires: `source`, `arch`,
-        // `image_name`, `built_at`, and `has_vmlinux`. These are
-        // non-`Option`, non-`#[serde(default)]` fields, so
-        // `serde_json::from_str` fails with `Category::Data` when
-        // they are absent. Note `has_vmlinux: bool` is required even
-        // though it is not wrapped in `Option` — a plain `bool` with
-        // no `#[serde(default)]` attribute must still be present in
-        // the JSON payload. serde_json reports the first missing
-        // required field in declaration order (`source`), and
-        // `read_metadata` wraps it under the schema-drift prefix so
-        // the user sees both the classification ("schema drift") and
+        // `image_name`, `built_at`, `has_vmlinux`, and
+        // `vmlinux_stripped`. These are non-`Option`,
+        // non-`#[serde(default)]` fields, so `serde_json::from_str`
+        // fails with `Category::Data` when they are absent. Note
+        // `has_vmlinux: bool` and `vmlinux_stripped: bool` are
+        // required even though they are not wrapped in `Option` — a
+        // plain `bool` with no `#[serde(default)]` attribute must
+        // still be present in the JSON payload. serde_json reports
+        // the first missing required field in declaration order
+        // (`source`), and `read_metadata` wraps it under the
+        // schema-drift prefix so the user sees both the
+        // classification ("schema drift") and
         // the specific missing field.
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().to_path_buf());
@@ -3836,8 +4059,11 @@ mod tests {
         assert!(entry.path.join("bzImage").exists());
         assert!(!entry.path.join("vmlinux").exists());
         assert!(entry.path.join("metadata.json").exists());
-        // Metadata records absence of vmlinux.
+        // Metadata records absence of vmlinux; vmlinux_stripped is
+        // meaningless without a vmlinux but must still be false (the
+        // strip pipeline never ran).
         assert!(!entry.metadata.has_vmlinux);
+        assert!(!entry.metadata.vmlinux_stripped);
     }
 
     #[test]
@@ -3879,13 +4105,18 @@ mod tests {
             "internal strip should have removed .debug_info"
         );
         assert!(entry.metadata.has_vmlinux);
+        assert!(
+            entry.metadata.vmlinux_stripped,
+            "strip-succeeds path must set vmlinux_stripped = true"
+        );
     }
 
     #[test]
     fn cache_dir_store_falls_back_when_strip_fails() {
         // Unparseable vmlinux: strip errors, store() falls back to
-        // copying the raw bytes. has_vmlinux stays true so consumers
-        // still see it.
+        // copying the raw bytes. has_vmlinux stays true (so consumers
+        // still see the sidecar) but vmlinux_stripped is false (so
+        // consumers can tell the raw-fallback path ran).
         let tmp = TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
@@ -3905,6 +4136,76 @@ mod tests {
         let cached = fs::read(entry.path.join("vmlinux")).unwrap();
         assert_eq!(cached, raw, "fallback must copy raw bytes verbatim");
         assert!(entry.metadata.has_vmlinux);
+        assert!(
+            !entry.metadata.vmlinux_stripped,
+            "raw-fallback path must set vmlinux_stripped = false so \
+             `ktstr cache list --json` surfaces the strip failure"
+        );
+    }
+
+    // -- should_warn_unstripped (pure decision logic driving
+    //    `CacheDir::lookup`'s per-lookup "unstripped vmlinux" warning).
+
+    /// Helper for the three `should_warn_unstripped` tests below:
+    /// construct a synthetic [`CacheEntry`] with explicit
+    /// `has_vmlinux` / `vmlinux_stripped` bits and the rest of the
+    /// metadata filled in from [`KernelMetadata::new`]. The entry-dir
+    /// path is never touched (the decision logic only reads the
+    /// metadata bools), so a synthetic PathBuf is enough.
+    fn make_warn_test_entry(has_vmlinux: bool, vmlinux_stripped: bool) -> CacheEntry {
+        let mut meta = KernelMetadata::new(
+            KernelSource::Tarball,
+            "x86_64".to_string(),
+            "bzImage".to_string(),
+            "2026-04-24T12:00:00Z".to_string(),
+        );
+        meta.set_has_vmlinux(has_vmlinux);
+        meta.set_vmlinux_stripped(vmlinux_stripped);
+        CacheEntry {
+            key: "test-key".to_string(),
+            path: PathBuf::from("/nonexistent/entry"),
+            metadata: meta,
+        }
+    }
+
+    /// An entry with a vmlinux that came from the raw-fallback path
+    /// (strip failed at store time) MUST trigger the warning. The
+    /// per-lookup eprintln is the operator's persistent signal to
+    /// rebuild the cache.
+    #[test]
+    fn should_warn_unstripped_fires_when_vmlinux_present_and_unstripped() {
+        let entry = make_warn_test_entry(true, false);
+        assert!(
+            should_warn_unstripped(&entry),
+            "has_vmlinux=true + vmlinux_stripped=false must warn"
+        );
+    }
+
+    /// An entry with a successfully-stripped vmlinux MUST NOT warn.
+    /// This is the common case; warning here would be noise that
+    /// operators learn to ignore, defeating the signal on the
+    /// genuine failure case above.
+    #[test]
+    fn should_warn_unstripped_silent_when_vmlinux_stripped() {
+        let entry = make_warn_test_entry(true, true);
+        assert!(
+            !should_warn_unstripped(&entry),
+            "has_vmlinux=true + vmlinux_stripped=true must not warn"
+        );
+    }
+
+    /// An entry with no vmlinux at all MUST NOT warn. The
+    /// `vmlinux_stripped` bit is meaningless in that shape (always
+    /// `false` by construction in [`CacheDir::store`]'s no-vmlinux
+    /// branch) and warning would fire on every cache hit that simply
+    /// did not cache a vmlinux — pure noise.
+    #[test]
+    fn should_warn_unstripped_silent_when_no_vmlinux() {
+        let entry = make_warn_test_entry(false, false);
+        assert!(
+            !should_warn_unstripped(&entry),
+            "has_vmlinux=false must not warn (no vmlinux to worry about)"
+        );
     }
 
     #[test]
@@ -4102,6 +4403,7 @@ mod tests {
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
             has_vmlinux: true,
+            vmlinux_stripped: true,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -4135,6 +4437,7 @@ mod tests {
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
             has_vmlinux: false,
+            vmlinux_stripped: false,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -4163,6 +4466,7 @@ mod tests {
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
             has_vmlinux: true,
+            vmlinux_stripped: true,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -4261,6 +4565,7 @@ mod tests {
             built_at: "2026-04-18T10:00:00Z".to_string(),
             ktstr_kconfig_hash: None,
             has_vmlinux: true,
+            vmlinux_stripped: true,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -4636,7 +4941,7 @@ mod tests {
         let src = TempDir::new().unwrap();
         let vmlinux = create_strip_test_fixture(src.path());
         let raw = fs::read(&vmlinux).unwrap();
-        let processed = neutralize_alloc_relocs(&raw).unwrap();
+        let processed = neutralize_relocs(&raw).unwrap();
 
         let stripped = strip_debug_prefix(&processed).unwrap();
         let elf = goblin::elf::Elf::parse(&stripped).unwrap();
@@ -4669,14 +4974,18 @@ mod tests {
         }
     }
 
-    /// `strip_debug_prefix`'s delete filter matches on two distinct
-    /// predicates: `name.starts_with(b".debug_")` and
-    /// `name == b".comment"`. The `.debug_*` branch is exercised by
+    /// `strip_debug_prefix`'s delete filter matches on six predicates:
+    /// `name.starts_with(b".debug_")`, `name == b".comment"`,
+    /// `name.starts_with(b".rela.")`, `name.starts_with(b".rel.")`,
+    /// `name.starts_with(b".relr.")`, and `name.starts_with(b".crel.")`.
+    /// The `.debug_*` branch is exercised by
     /// `strip_debug_prefix_removes_debug_and_preserves_rest` against
-    /// the shared fixture. This test covers the `.comment` branch
-    /// against a focused fixture that specifically emits one — the
-    /// shared fixture deliberately does not, to keep the keep-list
-    /// assertions scoped.
+    /// the shared fixture; the four reloc-name prefix arms are
+    /// exercised by `strip_debug_prefix_removes_reloc_prefix_sections`.
+    /// This test covers the `.comment` branch against a focused
+    /// fixture that specifically emits one — the shared fixture
+    /// deliberately does not, to keep the keep-list assertions
+    /// scoped.
     #[test]
     fn strip_debug_prefix_removes_dot_comment() {
         use object::write;
@@ -4730,10 +5039,10 @@ mod tests {
             );
         }
 
-        // `neutralize_alloc_relocs` is a no-op on this fixture (no
+        // `neutralize_relocs` is a no-op on this fixture (no
         // SHF_ALLOC relocation sections) — run it anyway so the test
         // exercises the exact input pipeline `strip_vmlinux_debug` uses.
-        let processed = neutralize_alloc_relocs(&data).unwrap();
+        let processed = neutralize_relocs(&data).unwrap();
         let stripped = strip_debug_prefix(&processed).unwrap();
         let elf = goblin::elf::Elf::parse(&stripped).unwrap();
         let names: Vec<&str> = elf
@@ -4755,35 +5064,129 @@ mod tests {
         );
     }
 
-    /// `neutralize_alloc_relocs` rewrites the `sh_size` field to 0
-    /// in every section header whose `sh_type` is `SHT_REL` or
-    /// `SHT_RELA` AND whose `sh_flags` carries `SHF_ALLOC`. Pin the
-    /// four observable invariants against a focused fixture:
-    ///
-    /// 1a. SHF_ALLOC + SHT_RELA section has sh_size zeroed post-call.
-    /// 1b. SHF_ALLOC + SHT_REL section has sh_size zeroed post-call.
-    /// 2. Non-ALLOC SHT_RELA section has sh_size preserved (guards
-    ///    against over-matching — real kernel ELFs carry
-    ///    non-ALLOC RELA sections like `.rela.debug_info` that must
-    ///    survive untouched).
-    /// 3. Non-RELA section (e.g. `.text`) has sh_size preserved
-    ///    (guards against an accidentally-broader filter).
-    ///
-    /// Also pins content preservation: `neutralize_alloc_relocs`
-    /// only mutates the section HEADER's sh_size, not the section's
-    /// data bytes. Raw bytes at the original sh_offset must remain
-    /// bit-identical post-call.
+    /// `strip_debug_prefix` deletes reloc-named sections via the
+    /// `.rela.`, `.rel.`, `.relr.`, and `.crel.` prefix arms so the
+    /// fallback output doesn't carry the zero-size ghost headers that
+    /// `neutralize_relocs` left behind. Exercise each prefix on a
+    /// focused fixture — a real kernel vmlinux might carry only a
+    /// subset, so the synthetic shape pins every arm.
     #[test]
-    fn neutralize_alloc_relocs_zeros_only_sh_size_of_alloc_reloc_sections() {
-        use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
+    fn strip_debug_prefix_removes_reloc_prefix_sections() {
+        use object::elf::{SHT_REL, SHT_RELA, SHT_RELR};
+
+        // Base ELF with .text + anchor symbol so `.symtab`/`.strtab`
+        // are present.
+        let mut obj = build_base_elf_with_text_symbol(object::Architecture::X86_64);
+        // One section per reloc-prefix arm. `.crel.*` uses SHT_CREL
+        // below. Each carries a nonzero payload so `neutralize_relocs`
+        // has observable work to do before the fallback runs.
+        let rela_id = obj.add_section(
+            Vec::new(),
+            b".rela.text".to_vec(),
+            object::SectionKind::Elf(SHT_RELA),
+        );
+        obj.append_section_data(rela_id, &[0xA5; 24], 1);
+        let rel_id = obj.add_section(
+            Vec::new(),
+            b".rel.data".to_vec(),
+            object::SectionKind::Elf(SHT_REL),
+        );
+        obj.append_section_data(rel_id, &[0xC7; 16], 1);
+        let relr_id = obj.add_section(
+            Vec::new(),
+            b".relr.dyn".to_vec(),
+            object::SectionKind::Elf(SHT_RELR),
+        );
+        obj.append_section_data(relr_id, &[0xD3; 16], 1);
+        let crel_id = obj.add_section(
+            Vec::new(),
+            b".crel.text".to_vec(),
+            object::SectionKind::Elf(object::elf::SHT_CREL),
+        );
+        obj.append_section_data(crel_id, &[0xE4; 8], 1);
+        let data = obj.write().unwrap();
+
+        // Positive control: every reloc-named section must exist
+        // pre-strip; a silent rename by `object::write` would false-pass
+        // the post-strip absence assertions below.
+        let source_elf = goblin::elf::Elf::parse(&data).unwrap();
+        let source_names: Vec<&str> = source_elf
+            .section_headers
+            .iter()
+            .filter_map(|s| source_elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+        for name in [
+            ".rela.text",
+            ".rel.data",
+            ".relr.dyn",
+            ".crel.text",
+            ".text",
+        ] {
+            assert!(
+                source_names.contains(&name),
+                "fixture missing expected section {name}; got {source_names:?}"
+            );
+        }
+
+        let processed = neutralize_relocs(&data).unwrap();
+        let stripped = strip_debug_prefix(&processed).unwrap();
+        let elf = goblin::elf::Elf::parse(&stripped).unwrap();
+        let names: Vec<&str> = elf
+            .section_headers
+            .iter()
+            .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+
+        // All four reloc-prefix arms deleted.
+        for name in [".rela.text", ".rel.data", ".relr.dyn", ".crel.text"] {
+            assert!(
+                !names.contains(&name),
+                "fallback must delete {name} (prefix arm), got sections {names:?}"
+            );
+        }
+        // Non-reloc section survives — guards against an overly broad
+        // filter that would drop e.g. `.text` on an unrelated name prefix.
+        assert!(
+            names.contains(&".text"),
+            "fallback must preserve .text, got sections {names:?}"
+        );
+    }
+
+    /// `neutralize_relocs` rewrites two section-header fields on every
+    /// section whose `sh_type` is `SHT_REL`, `SHT_RELA`, `SHT_RELR`, or
+    /// `SHT_CREL`, regardless of the `SHF_ALLOC` flag: `sh_type`
+    /// becomes `SHT_PROGBITS` and `sh_size` becomes 0. Pin the
+    /// observable invariants against a focused fixture:
+    ///
+    /// 1a. SHF_ALLOC + SHT_RELA section has sh_type rewritten to
+    ///     SHT_PROGBITS and sh_size zeroed post-call.
+    /// 1b. SHF_ALLOC + SHT_REL section has sh_type rewritten to
+    ///     SHT_PROGBITS and sh_size zeroed post-call.
+    /// 1c. Non-ALLOC SHT_RELA section has sh_type rewritten to
+    ///     SHT_PROGBITS and sh_size zeroed post-call (the SHF_ALLOC
+    ///     gate was dropped — aarch64 kernels emit non-alloc rela
+    ///     sections whose byte ranges trip
+    ///     `object::build::elf::Builder::read`).
+    /// 1d. SHT_RELR section has sh_type rewritten to SHT_PROGBITS and
+    ///     sh_size zeroed post-call (defense-in-depth for arm64
+    ///     kernels with `CONFIG_PIE` + `CONFIG_RELR` that emit
+    ///     `.relr.dyn`).
+    /// 2. Non-RELA section (e.g. `.text`) has sh_type and sh_size
+    ///    preserved (guards against an accidentally-broader filter).
+    ///
+    /// Also pins content preservation: `neutralize_relocs` only
+    /// mutates the section HEADER's `sh_type` and `sh_size`, not the
+    /// section's data bytes. Raw bytes at the original sh_offset must
+    /// remain bit-identical post-call.
+    #[test]
+    fn neutralize_relocs_zeros_sh_size_of_every_reloc_section() {
+        use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA, SHT_RELR};
 
         // Base ELF with .text + anchor symbol (so object::write
         // emits .symtab/.strtab). Reloc sections are added below.
         let mut obj = build_base_elf_with_text_symbol(object::Architecture::X86_64);
         // .rela.kaslr — SHT_RELA + SHF_ALLOC. Shape matches what
-        // CONFIG_RELOCATABLE + CONFIG_RANDOMIZE_BASE kernels emit
-        // and motivates this pass per the fn docstring. sh_size
-        // must be zeroed.
+        // CONFIG_RELOCATABLE + CONFIG_RANDOMIZE_BASE kernels emit.
         let kaslr_id = obj.add_section(
             Vec::new(),
             b".rela.kaslr".to_vec(),
@@ -4805,26 +5208,39 @@ mod tests {
         obj.section_mut(rel_id).flags = object::SectionFlags::Elf {
             sh_flags: u64::from(SHF_ALLOC),
         };
-        // .rela.debug_info — SHT_RELA WITHOUT SHF_ALLOC. Negative
-        // control: must be left untouched by neutralize_alloc_relocs.
+        // .rela.debug_info — SHT_RELA WITHOUT SHF_ALLOC. After the
+        // SHF_ALLOC gate was dropped, this must also be zeroed — a
+        // regression that re-added the gate would preserve sh_size
+        // here and fail the new invariant 1c.
         let rdbg_id = obj.add_section(
             Vec::new(),
             b".rela.debug_info".to_vec(),
             object::SectionKind::Elf(SHT_RELA),
         );
         obj.append_section_data(rdbg_id, &[0xB6; 16], 1);
-        // flags left as SectionFlags::None — no SHF_ALLOC.
+        // .relr.dyn — SHT_RELR + SHF_ALLOC. Defense-in-depth for
+        // arm64 kernels that emit packed relative relocations.
+        let relr_id = obj.add_section(
+            Vec::new(),
+            b".relr.dyn".to_vec(),
+            object::SectionKind::Elf(SHT_RELR),
+        );
+        obj.append_section_data(relr_id, &[0xD3; 24], 1);
+        obj.section_mut(relr_id).flags = object::SectionFlags::Elf {
+            sh_flags: u64::from(SHF_ALLOC),
+        };
 
         let data = obj.write().unwrap();
 
-        // Positive-control the fixture: the four sections we assert
-        // on must actually exist in the produced ELF with the expected
+        // Positive-control the fixture: the five sections we assert on
+        // must actually exist in the produced ELF with the expected
         // sh_type/sh_flags/sh_size. If `object::write` renamed or
         // reshaped one, the post-call assertions would false-pass.
         let pre_elf = goblin::elf::Elf::parse(&data).unwrap();
         let mut pre_kaslr = None;
         let mut pre_rel = None;
         let mut pre_rdbg = None;
+        let mut pre_relr = None;
         let mut pre_text = None;
         for sh in pre_elf.section_headers.iter() {
             let name = pre_elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
@@ -4832,6 +5248,7 @@ mod tests {
                 ".rela.kaslr" => pre_kaslr = Some(sh.clone()),
                 ".rel.foo" => pre_rel = Some(sh.clone()),
                 ".rela.debug_info" => pre_rdbg = Some(sh.clone()),
+                ".relr.dyn" => pre_relr = Some(sh.clone()),
                 ".text" => pre_text = Some(sh.clone()),
                 _ => {}
             }
@@ -4839,6 +5256,7 @@ mod tests {
         let pre_kaslr = pre_kaslr.expect("fixture must carry .rela.kaslr");
         let pre_rel = pre_rel.expect("fixture must carry .rel.foo");
         let pre_rdbg = pre_rdbg.expect("fixture must carry .rela.debug_info");
+        let pre_relr = pre_relr.expect("fixture must carry .relr.dyn");
         let pre_text = pre_text.expect("fixture must carry .text");
         assert_eq!(
             pre_kaslr.sh_type,
@@ -4890,6 +5308,17 @@ mod tests {
             ".rela.debug_info sh_size must match 16-byte payload"
         );
         assert_eq!(
+            pre_relr.sh_type,
+            SHT_RELR,
+            ".relr.dyn sh_type must be SHT_RELR (19); got sh_type={} ({})",
+            pre_relr.sh_type,
+            sh_type_name(pre_relr.sh_type),
+        );
+        assert_eq!(
+            pre_relr.sh_size, 24,
+            ".relr.dyn sh_size must match 24-byte payload"
+        );
+        assert_eq!(
             pre_text.sh_size, 64,
             ".text sh_size must match 64-byte payload"
         );
@@ -4900,17 +5329,18 @@ mod tests {
         let kaslr_size = pre_kaslr.sh_size as usize;
         let kaslr_original_data = data[kaslr_offset..kaslr_offset + kaslr_size].to_vec();
 
-        let processed = neutralize_alloc_relocs(&data).unwrap();
+        let processed = neutralize_relocs(&data).unwrap();
         assert_eq!(
             processed.len(),
             data.len(),
-            "neutralize_alloc_relocs must not resize the ELF; only sh_size header fields are rewritten"
+            "neutralize_relocs must not resize the ELF; only sh_size header fields are rewritten"
         );
 
         let post_elf = goblin::elf::Elf::parse(&processed).unwrap();
         let mut post_kaslr = None;
         let mut post_rel = None;
         let mut post_rdbg = None;
+        let mut post_relr = None;
         let mut post_text = None;
         for sh in post_elf.section_headers.iter() {
             let name = post_elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
@@ -4918,6 +5348,7 @@ mod tests {
                 ".rela.kaslr" => post_kaslr = Some(sh.clone()),
                 ".rel.foo" => post_rel = Some(sh.clone()),
                 ".rela.debug_info" => post_rdbg = Some(sh.clone()),
+                ".relr.dyn" => post_relr = Some(sh.clone()),
                 ".text" => post_text = Some(sh.clone()),
                 _ => {}
             }
@@ -4925,6 +5356,7 @@ mod tests {
         let post_kaslr = post_kaslr.expect(".rela.kaslr must survive");
         let post_rel = post_rel.expect(".rel.foo must survive");
         let post_rdbg = post_rdbg.expect(".rela.debug_info must survive");
+        let post_relr = post_relr.expect(".relr.dyn must survive");
         let post_text = post_text.expect(".text must survive");
 
         // Invariant 1a: SHF_ALLOC + SHT_RELA section has sh_size zeroed.
@@ -4934,18 +5366,28 @@ mod tests {
             post_kaslr.sh_size
         );
         // Invariant 1b: SHF_ALLOC + SHT_REL section has sh_size zeroed
-        // (the `|| sh.sh_type == SHT_REL` branch in the filter).
+        // (the SHT_REL arm of the filter).
         assert_eq!(
             post_rel.sh_size, 0,
             ".rel.foo sh_size must be zeroed; got {}",
             post_rel.sh_size
         );
-        // Invariant 2: Non-ALLOC SHT_RELA preserved.
+        // Invariant 1c: Non-ALLOC SHT_RELA section ALSO zeroed (the
+        // SHF_ALLOC gate was dropped so aarch64 non-alloc rela
+        // sections get neutralized).
         assert_eq!(
-            post_rdbg.sh_size, pre_rdbg.sh_size,
-            ".rela.debug_info sh_size must be preserved (no SHF_ALLOC)"
+            post_rdbg.sh_size, 0,
+            ".rela.debug_info sh_size must be zeroed (SHF_ALLOC gate dropped); got {}",
+            post_rdbg.sh_size
         );
-        // Invariant 3: Non-RELA section preserved.
+        // Invariant 1d: SHT_RELR section zeroed (defense-in-depth
+        // for arm64 CONFIG_RELR kernels).
+        assert_eq!(
+            post_relr.sh_size, 0,
+            ".relr.dyn sh_size must be zeroed (SHT_RELR match arm); got {}",
+            post_relr.sh_size
+        );
+        // Invariant 2: Non-RELA section preserved.
         assert_eq!(
             post_text.sh_size, pre_text.sh_size,
             ".text sh_size must be preserved (not a relocation section)"
@@ -4960,19 +5402,18 @@ mod tests {
             ".rela.kaslr data bytes must be preserved; neutralize only rewrites sh_size"
         );
 
-        // sh_offset, sh_type, sh_flags of the neutralized section
-        // must also be preserved — the fn touches ONE field per
-        // matching section header.
+        // sh_offset and sh_flags are preserved; sh_type is rewritten
+        // to SHT_PROGBITS so the Builder reads the section via the
+        // opaque-data arm instead of the rel/rela parse arms that
+        // break on zero-length slices with align != 1.
         assert_eq!(
             post_kaslr.sh_offset, pre_kaslr.sh_offset,
             "sh_offset must be preserved"
         );
         assert_eq!(
             post_kaslr.sh_type,
-            pre_kaslr.sh_type,
-            "sh_type must be preserved; pre={} ({}) post={} ({})",
-            pre_kaslr.sh_type,
-            sh_type_name(pre_kaslr.sh_type),
+            object::elf::SHT_PROGBITS,
+            "sh_type must be rewritten to SHT_PROGBITS; got sh_type={} ({})",
             post_kaslr.sh_type,
             sh_type_name(post_kaslr.sh_type),
         );
@@ -4980,58 +5421,75 @@ mod tests {
             post_kaslr.sh_flags, pre_kaslr.sh_flags,
             "sh_flags must be preserved"
         );
+        // The sibling reloc sections should also be re-typed to
+        // SHT_PROGBITS (the fn applies sh_type rewrite to every
+        // matching section, not just the first).
+        assert_eq!(
+            post_rel.sh_type,
+            object::elf::SHT_PROGBITS,
+            ".rel.foo sh_type must be SHT_PROGBITS"
+        );
+        assert_eq!(
+            post_rdbg.sh_type,
+            object::elf::SHT_PROGBITS,
+            ".rela.debug_info sh_type must be SHT_PROGBITS"
+        );
+        assert_eq!(
+            post_relr.sh_type,
+            object::elf::SHT_PROGBITS,
+            ".relr.dyn sh_type must be SHT_PROGBITS"
+        );
     }
 
-    /// For ELFs that carry no SHF_ALLOC relocation sections,
-    /// `neutralize_alloc_relocs` returns an unchanged copy —
+    /// For ELFs that carry no relocation sections at all,
+    /// `neutralize_relocs` returns an unchanged copy —
     /// documented as the "no-op" branch in the fn docstring.
     #[test]
-    fn neutralize_alloc_relocs_noop_when_no_alloc_reloc_sections() {
+    fn neutralize_relocs_noop_when_no_reloc_sections() {
         // Base ELF carries only .text + anchor symbol — no reloc
         // sections at all, so the filter matches nothing.
         let data = build_base_elf_with_text_symbol(object::Architecture::X86_64)
             .write()
             .unwrap();
 
-        let processed = neutralize_alloc_relocs(&data).unwrap();
+        let processed = neutralize_relocs(&data).unwrap();
         assert_eq!(
             processed, data,
-            "neutralize_alloc_relocs must be a byte-identity no-op when no SHF_ALLOC reloc sections are present"
+            "neutralize_relocs must be a byte-identity no-op when no reloc sections are present"
         );
     }
 
-    /// `neutralize_alloc_relocs` must be byte-identity idempotent:
+    /// `neutralize_relocs` must be byte-identity idempotent:
     /// `f(f(x)) == f(x)`. The production filter inside
-    /// [`neutralize_alloc_relocs`] keys on `sh_type` and `sh_flags`
-    /// — neither of which the function ever writes, only `sh_size`
-    /// is rewritten. On the
-    /// second pass every matching section header is re-matched (same
-    /// sh_type and sh_flags) and `out[size_offset..size_end].fill(0)`
-    /// rewrites already-zero bytes; every other byte is left untouched
-    /// by `out = data.to_vec()`.
+    /// [`neutralize_relocs`] keys on `sh_type` — which IS rewritten
+    /// (to `SHT_PROGBITS`) on matching sections. Idempotence still
+    /// holds because after the first pass the neutralized sections
+    /// no longer match the `is_reloc` predicate (sh_type is now
+    /// `SHT_PROGBITS`, not one of `SHT_REL`/`SHT_RELA`/`SHT_RELR`/
+    /// `SHT_CREL`), so the second pass walks every section without
+    /// touching any header field and the output is byte-identical to
+    /// the first-pass output.
     ///
-    /// Guards against a future "skip already-zero" optimization that
-    /// drifts the filter predicate (e.g. stops matching headers whose
-    /// `sh_size` is already 0), and against a future mutation that
-    /// widens the rewrite to touch `sh_flags` or `sh_type` — which
-    /// would break idempotence by changing what the second pass
-    /// matches on.
+    /// Guards against a future mutation that rewrites sh_type to a
+    /// still-matched value (e.g. flipping `SHT_REL` to `SHT_RELA` —
+    /// both match `is_reloc`, which would make the second pass
+    /// re-neutralize to yet another sh_type value and break
+    /// idempotence).
     ///
-    /// Uses the same 4-section fixture as
-    /// `neutralize_alloc_relocs_zeros_only_sh_size_of_alloc_reloc_sections`
-    /// so both positive (SHT_RELA+ALLOC, SHT_REL+ALLOC) and negative
-    /// (SHT_RELA no-ALLOC, non-RELA .text) paths are re-walked on the
-    /// second pass.
+    /// Uses the same multi-section fixture as
+    /// `neutralize_relocs_zeros_sh_size_of_every_reloc_section`
+    /// so every reloc-type arm of the filter (SHT_RELA with and
+    /// without SHF_ALLOC, SHT_REL) and the non-RELA negative control
+    /// re-walk on the second pass.
     #[test]
-    fn neutralize_alloc_relocs_is_idempotent() {
+    fn neutralize_relocs_is_idempotent() {
         use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
 
         // Base .text + anchor symbol; the reloc sections added below
-        // intentionally mirror the sibling zeros_only test's fixture
-        // so both positive and negative filter paths re-walk on the
-        // second pass.
+        // intentionally mirror the sibling zeros-every-reloc test's
+        // fixture so the filter re-walks on the second pass.
         let mut obj = build_base_elf_with_text_symbol(object::Architecture::X86_64);
-        // .rela.kaslr — SHT_RELA + SHF_ALLOC. Primary positive case.
+        // .rela.kaslr — SHT_RELA + SHF_ALLOC.
         let kaslr_id = obj.add_section(
             Vec::new(),
             b".rela.kaslr".to_vec(),
@@ -5041,9 +5499,9 @@ mod tests {
         obj.section_mut(kaslr_id).flags = object::SectionFlags::Elf {
             sh_flags: u64::from(SHF_ALLOC),
         };
-        // .rel.foo — SHT_REL + SHF_ALLOC. Exercises the second arm of
-        // the `is_rela` predicate so a regression that special-cased
-        // only SHT_RELA on re-entry would surface here.
+        // .rel.foo — SHT_REL + SHF_ALLOC. Exercises the SHT_REL arm
+        // of the filter so a regression that special-cased only
+        // SHT_RELA on re-entry would surface here.
         let rel_id = obj.add_section(
             Vec::new(),
             b".rel.foo".to_vec(),
@@ -5053,8 +5511,10 @@ mod tests {
         obj.section_mut(rel_id).flags = object::SectionFlags::Elf {
             sh_flags: u64::from(SHF_ALLOC),
         };
-        // .rela.debug_info — SHT_RELA without SHF_ALLOC. Negative
-        // control on the second pass as well.
+        // .rela.debug_info — SHT_RELA without SHF_ALLOC. After the
+        // SHF_ALLOC gate was dropped, this gets neutralized too —
+        // but must re-neutralize to byte-identical bytes on the
+        // second pass.
         let rdbg_id = obj.add_section(
             Vec::new(),
             b".rela.debug_info".to_vec(),
@@ -5065,23 +5525,23 @@ mod tests {
 
         let data = obj.write().unwrap();
 
-        let first_pass = neutralize_alloc_relocs(&data).unwrap();
-        let second_pass = neutralize_alloc_relocs(&first_pass).unwrap();
+        let first_pass = neutralize_relocs(&data).unwrap();
+        let second_pass = neutralize_relocs(&first_pass).unwrap();
 
         // Non-vacuous guard: the first call must actually modify bytes
-        // on this fixture (which carries SHF_ALLOC reloc sections); a
-        // degenerate no-op implementation of `neutralize_alloc_relocs`
-        // would trivially satisfy idempotence and must not pass.
+        // on this fixture (which carries reloc sections); a degenerate
+        // no-op implementation of `neutralize_relocs` would
+        // trivially satisfy idempotence and must not pass.
         assert_ne!(
             first_pass, data,
-            "first call must modify bytes on a fixture with SHF_ALLOC reloc sections; \
-             if this fails, neutralize_alloc_relocs is a no-op"
+            "first call must modify bytes on a fixture with reloc sections; \
+             if this fails, neutralize_relocs is a no-op"
         );
 
         // Primary idempotence assertion: byte equality between passes.
         assert_eq!(
             second_pass, first_pass,
-            "neutralize_alloc_relocs must be idempotent: a second pass over its own output produces byte-identical bytes"
+            "neutralize_relocs must be idempotent: a second pass over its own output produces byte-identical bytes"
         );
 
         // Length preservation across both passes — the function only
@@ -5118,7 +5578,8 @@ mod tests {
         let post_rel = post_rel.expect(".rel.foo must survive second pass");
         let post_rdbg = post_rdbg.expect(".rela.debug_info must survive second pass");
 
-        // SHF_ALLOC+reloc sections stay zeroed on the second pass.
+        // All reloc sections stay zeroed on the second pass,
+        // regardless of SHF_ALLOC.
         assert_eq!(
             post_kaslr.sh_size, 0,
             ".rela.kaslr sh_size must remain zero after the second pass"
@@ -5127,9 +5588,15 @@ mod tests {
             post_rel.sh_size, 0,
             ".rel.foo sh_size must remain zero after the second pass"
         );
+        assert_eq!(
+            post_rdbg.sh_size, 0,
+            ".rela.debug_info sh_size must remain zero after the second pass (SHF_ALLOC gate dropped)"
+        );
 
-        // SHF_ALLOC flag must still be set on the zeroed sections —
-        // the function touches sh_size ONLY, never sh_flags.
+        // SHF_ALLOC flag must still be set on the ALLOC sections —
+        // the function touches sh_type and sh_size, never sh_flags.
+        // The non-ALLOC `.rela.debug_info` likewise retains its
+        // (cleared) SHF_ALLOC bit.
         assert!(
             post_kaslr.sh_flags & u64::from(SHF_ALLOC) != 0,
             ".rela.kaslr SHF_ALLOC flag must survive both passes; got sh_flags={:#x}",
@@ -5140,20 +5607,19 @@ mod tests {
             ".rel.foo SHF_ALLOC flag must survive both passes; got sh_flags={:#x}",
             post_rel.sh_flags
         );
-
-        // Negative control survives both passes untouched: non-ALLOC
-        // SHT_RELA section keeps its original sh_size.
         assert_eq!(
-            post_rdbg.sh_size, 16,
-            ".rela.debug_info sh_size must be preserved across both passes (no SHF_ALLOC)"
+            post_rdbg.sh_flags & u64::from(SHF_ALLOC),
+            0,
+            ".rela.debug_info must retain its (cleared) SHF_ALLOC flag across both passes; got sh_flags={:#x}",
+            post_rdbg.sh_flags
         );
     }
 
-    /// `neutralize_alloc_relocs` fails loudly when fed bytes that do
+    /// `neutralize_relocs` fails loudly when fed bytes that do
     /// not parse as an ELF — the goblin parse returns Err and the
     /// function wraps it in an `anyhow::anyhow!("parse vmlinux ELF
     /// for preprocess: {e}")`. Pin only the stable "parse vmlinux ELF
-    /// for preprocess" wrapper in `neutralize_alloc_relocs`; the
+    /// for preprocess" wrapper in `neutralize_relocs`; the
     /// goblin-side error text is version-dependent and not part of
     /// the contract.
     ///
@@ -5175,7 +5641,7 @@ mod tests {
     /// wrapper, so the test pins the wrapper string for each input
     /// without pinning the goblin-side sub-error wording.
     #[test]
-    fn neutralize_alloc_relocs_rejects_invalid_elf() {
+    fn neutralize_relocs_rejects_invalid_elf() {
         // Table-driven so a future goblin upgrade that changes either
         // sub-error's wording still surfaces both paths distinctly.
         let cases: &[(&str, &[u8])] = &[
@@ -5189,7 +5655,7 @@ mod tests {
             ),
         ];
         for (label, input) in cases {
-            let err = neutralize_alloc_relocs(input).unwrap_err();
+            let err = neutralize_relocs(input).unwrap_err();
             let rendered = format!("{err:#}");
             assert!(
                 rendered.contains("parse vmlinux ELF for preprocess"),
@@ -5199,9 +5665,9 @@ mod tests {
     }
 
     /// ELF32 counterpart of
-    /// [`neutralize_alloc_relocs_zeros_only_sh_size_of_alloc_reloc_sections`].
+    /// [`neutralize_relocs_zeros_sh_size_of_every_reloc_section`].
     ///
-    /// `neutralize_alloc_relocs` dispatches on `elf.is_64` at the
+    /// `neutralize_relocs` dispatches on `elf.is_64` at the
     /// `sh_size` offset/width pair — 32-byte offset + 8-byte field for
     /// ELF64, 20-byte offset + 4-byte field for ELF32 (per the
     /// ELF32/ELF64 section header layouts documented at the call site).
@@ -5213,7 +5679,7 @@ mod tests {
     /// Uses `Architecture::I386` which `object` maps to
     /// `address_size == U32` and therefore emits ELFCLASS32 via the
     /// writer's is_64=false path. goblin then parses the output with
-    /// `is_64 == false`, driving `neutralize_alloc_relocs` through the
+    /// `is_64 == false`, driving `neutralize_relocs` through the
     /// else `(20, 4)` branch.
     ///
     /// Exercises BOTH arms of the
@@ -5229,7 +5695,7 @@ mod tests {
     /// preserved (the fn only rewrites an in-place header field,
     /// never resizes).
     #[test]
-    fn neutralize_alloc_relocs_zeros_sh_size_in_elf32_fixture() {
+    fn neutralize_relocs_zeros_sh_size_in_elf32_fixture() {
         use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
 
         // Base shape — .text + test_text_symbol with ELF32-sized
@@ -5250,12 +5716,11 @@ mod tests {
         obj.section_mut(kaslr_id).flags = object::SectionFlags::Elf {
             sh_flags: u64::from(SHF_ALLOC),
         };
-        // .rel.foo — SHT_REL + SHF_ALLOC. Exercises the second arm
-        // of the `is_rela` predicate (`|| sh.sh_type == SHT_REL`) on
-        // the ELF32 code path. A regression that dropped SHT_REL
-        // from the filter on the 32-bit path would leave this
-        // section's sh_size unchanged and trip the post-call
-        // assertion below.
+        // .rel.foo — SHT_REL + SHF_ALLOC. Exercises the `SHT_REL` arm
+        // of the `is_reloc` match on the ELF32 code path. A regression
+        // that dropped SHT_REL from the filter on the 32-bit path
+        // would leave this section's sh_size unchanged and trip the
+        // post-call assertion below.
         let rel_id = obj.add_section(
             Vec::new(),
             b".rel.foo".to_vec(),
@@ -5324,11 +5789,11 @@ mod tests {
             ".rel.foo sh_size must match 12-byte payload pre-call"
         );
 
-        let processed = neutralize_alloc_relocs(&data).unwrap();
+        let processed = neutralize_relocs(&data).unwrap();
         assert_eq!(
             processed.len(),
             data.len(),
-            "neutralize_alloc_relocs must not resize the ELF32 buffer"
+            "neutralize_relocs must not resize the ELF32 buffer"
         );
 
         let post_elf = goblin::elf::Elf::parse(&processed).unwrap();
@@ -5364,18 +5829,17 @@ mod tests {
     }
 
     /// ELF32 counterpart of
-    /// [`neutralize_alloc_relocs_noop_when_no_alloc_reloc_sections`].
+    /// [`neutralize_relocs_noop_when_no_reloc_sections`].
     ///
-    /// When the input carries no SHF_ALLOC reloc sections, the ELF32
-    /// code path in `neutralize_alloc_relocs` must return a byte-
-    /// identity copy of the input — same invariant as ELF64, but
-    /// exercised through the `(20, 4)` offset/width branch. A
-    /// regression that filled zeros even on the "no match" path, or
-    /// mis-read the section header count / size on 32-bit inputs,
-    /// would break byte-identity here without tripping the ELF64
-    /// sibling test.
+    /// When the input carries no reloc sections, the ELF32 code path
+    /// in `neutralize_relocs` must return a byte-identity copy
+    /// of the input — same invariant as ELF64, but exercised through
+    /// the `(20, 4)` offset/width branch. A regression that filled
+    /// zeros even on the "no match" path, or mis-read the section
+    /// header count / size on 32-bit inputs, would break byte-identity
+    /// here without tripping the ELF64 sibling test.
     #[test]
-    fn neutralize_alloc_relocs_noop_when_no_alloc_reloc_sections_elf32() {
+    fn neutralize_relocs_noop_when_no_reloc_sections_elf32() {
         use object::write;
 
         let mut obj = write::Object::new(
@@ -5411,30 +5875,30 @@ mod tests {
             "fixture must produce ELF32 (is_64 == false) to exercise the (20, 4) branch",
         );
 
-        let processed = neutralize_alloc_relocs(&data).unwrap();
+        let processed = neutralize_relocs(&data).unwrap();
         assert_eq!(
             processed, data,
-            "neutralize_alloc_relocs must be byte-identity on ELF32 when no SHF_ALLOC reloc sections are present",
+            "neutralize_relocs must be byte-identity on ELF32 when no reloc sections are present",
         );
     }
 
     /// ELF32 counterpart of
-    /// [`neutralize_alloc_relocs_is_idempotent`].
+    /// [`neutralize_relocs_is_idempotent`].
     ///
     /// Idempotence (`f(f(x)) == f(x)`) must hold through the ELF32
-    /// `(20, 4)` branch of `neutralize_alloc_relocs`. The ELF64
+    /// `(20, 4)` branch of `neutralize_relocs`. The ELF64
     /// sibling covers the `(32, 8)` branch; pinning both prevents a
     /// future offset-width mismatch where e.g. the second pass on
     /// ELF32 reads sh_size through an ELF64 offset and silently
     /// tripped idempotence on 32-bit inputs.
     ///
     /// Uses the same SHT_RELA+ALLOC / SHT_REL+ALLOC / SHT_RELA-no-
-    /// ALLOC section mix as the ELF32 zeros fixture so both arms
-    /// of the `is_rela` predicate re-walk on the second pass, and
-    /// a no-match section is present to rule out a degenerate
-    /// "zero every sh_size" implementation.
+    /// ALLOC section mix as the ELF32 zeros fixture so the SHT_REL
+    /// and SHT_RELA arms of the `is_reloc` match re-walk on the
+    /// second pass. A no-match section is present to rule out a
+    /// degenerate "zero every sh_size" implementation.
     #[test]
-    fn neutralize_alloc_relocs_is_idempotent_elf32() {
+    fn neutralize_relocs_is_idempotent_elf32() {
         use object::elf::{SHF_ALLOC, SHT_REL, SHT_RELA};
         use object::write;
 
@@ -5475,8 +5939,12 @@ mod tests {
         obj.section_mut(rel_id).flags = object::SectionFlags::Elf {
             sh_flags: u64::from(SHF_ALLOC),
         };
-        // .rela.debug_info — SHT_RELA without SHF_ALLOC. Negative
-        // control — must re-match "no ALLOC flag" on the second pass.
+        // .rela.debug_info — SHT_RELA without SHF_ALLOC. The
+        // SHF_ALLOC gate was dropped, so this also gets neutralized
+        // on both passes — a regression that re-added the gate would
+        // leave sh_size preserved here but still satisfy idempotence,
+        // so the post-second-pass assertions below pin the neutralized
+        // value directly.
         let rdbg_id = obj.add_section(
             Vec::new(),
             b".rela.debug_info".to_vec(),
@@ -5494,8 +5962,8 @@ mod tests {
             "fixture must be ELF32 to exercise the (20, 4) idempotence path",
         );
 
-        let first_pass = neutralize_alloc_relocs(&data).unwrap();
-        let second_pass = neutralize_alloc_relocs(&first_pass).unwrap();
+        let first_pass = neutralize_relocs(&data).unwrap();
+        let second_pass = neutralize_relocs(&first_pass).unwrap();
 
         // Non-vacuous guard: first pass must actually rewrite bytes on
         // this fixture. Without this the test could false-pass on a
@@ -5503,12 +5971,29 @@ mod tests {
         // idempotence.
         assert_ne!(
             first_pass, data,
-            "first pass must rewrite sh_size on ELF32 SHF_ALLOC reloc sections",
+            "first pass must rewrite sh_size on ELF32 reloc sections",
         );
         assert_eq!(
             second_pass, first_pass,
-            "neutralize_alloc_relocs must be byte-identity idempotent on ELF32",
+            "neutralize_relocs must be byte-identity idempotent on ELF32",
         );
+
+        // Pin the post-second-pass sh_size values directly so a
+        // regression that re-added the SHF_ALLOC gate (leaving
+        // `.rela.debug_info` un-zeroed) surfaces even though
+        // idempotence alone would still hold.
+        let post_elf = goblin::elf::Elf::parse(&second_pass).unwrap();
+        for name in [".rela.kaslr", ".rel.foo", ".rela.debug_info"] {
+            let sh = post_elf
+                .section_headers
+                .iter()
+                .find(|sh| post_elf.shdr_strtab.get_at(sh.sh_name) == Some(name))
+                .unwrap_or_else(|| panic!("{name} must survive second pass"));
+            assert_eq!(
+                sh.sh_size, 0,
+                "ELF32 {name} sh_size must be zeroed after both passes (SHF_ALLOC gate dropped)"
+            );
+        }
     }
 
     #[test]
@@ -5524,6 +6009,377 @@ mod tests {
         fs::write(&path, b"not an ELF file").unwrap();
         let result = strip_vmlinux_debug(&path);
         assert!(result.is_err());
+    }
+
+    /// Build an ELF on disk matching `create_strip_test_fixture`'s
+    /// shape (keep-list sections, code, debug, data sidecars, and a
+    /// symtab anchor) plus one extra section provided by the caller.
+    /// Returns the path.
+    ///
+    /// The helper is generic over the per-test extra section so each
+    /// of the four end-to-end pipeline tests can focus on one failure
+    /// mode (non-alloc SHT_RELA with invalid entries, non-alloc
+    /// SHT_RELA with sh_size past EOF, SHT_RELR with sh_size past
+    /// EOF) while sharing the rest of the fixture shape.
+    ///
+    /// The `mutate_header` closure receives a goblin-parsed view of
+    /// the produced ELF plus a mutable byte buffer and can rewrite
+    /// the section header of the extra section in-place. Tests use it
+    /// to push `sh_size` or `sh_offset` past the file end — a direct
+    /// rewrite is safer than trying to coax `object::write` into
+    /// emitting malformed headers.
+    fn build_reloc_fixture(
+        dir: &Path,
+        extra_section_name: &[u8],
+        extra_section_sh_type: u32,
+        extra_section_data: &[u8],
+        mutate_header: impl FnOnce(&mut [u8]),
+    ) -> PathBuf {
+        use object::write;
+
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        // .text anchors the symtab.
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 16);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"pipeline_anchor".to_vec(),
+            value: 0x10,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        // .BTF — kept by probe BTF keep-list.
+        let btf_id = obj.add_section(Vec::new(), b".BTF".to_vec(), object::SectionKind::Other);
+        obj.append_section_data(btf_id, &[0x42; 128], 1);
+        // .rodata — kept by monitor CONFIG_IKCONFIG keep-list.
+        let rodata_id = obj.add_section(
+            Vec::new(),
+            b".rodata".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        obj.append_section_data(rodata_id, &[0xAA; 256], 1);
+        // Extra caller-provided section (a reloc section in the tests
+        // below). Flags left as SectionFlags::None so it is non-alloc
+        // — exercising the SHF_ALLOC-gate-drop path.
+        let extra_id = obj.add_section(
+            Vec::new(),
+            extra_section_name.to_vec(),
+            object::SectionKind::Elf(extra_section_sh_type),
+        );
+        obj.append_section_data(extra_id, extra_section_data, 1);
+
+        let mut bytes = obj.write().unwrap();
+        mutate_header(&mut bytes);
+        let path = dir.join("vmlinux");
+        fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    /// Assert a successful [`strip_vmlinux_debug`] run on the fixture
+    /// preserves the keep-list sections and deletes the extra
+    /// (reloc-name) section via `strip_keep_list`'s name-based policy.
+    ///
+    /// This is the shared oracle for the four end-to-end pipeline
+    /// tests: every variant that `strip_vmlinux_debug` accepts must
+    /// yield the same output shape — keep-list sections present,
+    /// reloc-name section absent.
+    fn assert_stripped_preserves_keep_list_and_deletes(stripped: &Path, reloc_name: &str) {
+        let data = fs::read(stripped).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let names: Vec<&str> = elf
+            .section_headers
+            .iter()
+            .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+        for name in [".symtab", ".strtab", ".BTF", ".rodata"] {
+            assert!(
+                names.contains(&name),
+                "keep-list section {name} must survive strip_vmlinux_debug; got {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&reloc_name),
+            "reloc section {reloc_name} must be deleted by strip_vmlinux_debug; got {names:?}"
+        );
+    }
+
+    /// Pipeline pin #1: strip_vmlinux_debug handles a non-ALLOC
+    /// `SHT_RELA` section with VALID byte range but entries whose
+    /// `r_info` symbol indices are garbage (`0xA5A5...`).
+    ///
+    /// Before the SHF_ALLOC gate was dropped from
+    /// [`neutralize_relocs`], non-ALLOC reloc sections were skipped,
+    /// and `object::build::elf::Builder::read` then called
+    /// `section.rela()` → `data_as_array` → `read_relocations_impl`
+    /// on the raw bytes. With `sh_link == 0` (no linked symbol
+    /// table) the impl uses `dynamic_symbols.len() == 0` for the
+    /// bounds check; any non-null symbol index fails with
+    /// `"Invalid symbol index N in relocation section at index M"`
+    /// and `strip_vmlinux_debug` bubbled the error up. This test
+    /// FAILS on that pre-fix codepath and PASSES after neutralize
+    /// rewrites `sh_type` to `SHT_PROGBITS` on every `SHT_REL`/
+    /// `SHT_RELA` section regardless of `SHF_ALLOC`.
+    #[test]
+    fn strip_vmlinux_debug_handles_nonalloc_rela_with_invalid_entries() {
+        let src = TempDir::new().unwrap();
+        let vmlinux = build_reloc_fixture(
+            src.path(),
+            b".rela.invalid",
+            object::elf::SHT_RELA,
+            // 24 bytes = one Elf64_Rela entry. 0xA5 bytes give
+            // r_info = 0xA5A5A5A5A5A5A5A5 — a non-null, out-of-range
+            // symbol index that `read_relocations_impl`'s bounds
+            // check rejects when sh_link=0 directs the parse to the
+            // empty dynamic symbol table.
+            &[0xA5; 24],
+            |_| {},
+        );
+        let stripped = strip_vmlinux_debug(&vmlinux).unwrap();
+        assert_stripped_preserves_keep_list_and_deletes(stripped.path(), ".rela.invalid");
+    }
+
+    /// Pipeline pin #2: strip_vmlinux_debug handles a non-ALLOC
+    /// `SHT_RELA` section whose `sh_size` is not a multiple of the
+    /// `Elf64_Rela` entry size (24 bytes) — a shape that passes
+    /// goblin's section-bounds check but fails object-crate's
+    /// `data_as_array` divisibility check with `"Invalid ELF
+    /// relocation section offset or size"`.
+    ///
+    /// This is the realistic arm64 kernel 7.0 failure mode: the
+    /// section's byte range fits inside the file (so goblin accepts
+    /// it) but doesn't represent a well-formed stream of `Elf64_Rela`
+    /// entries from `object::build::elf::Builder::read`'s
+    /// perspective.
+    ///
+    /// Before the fix, `Builder::read` failed at
+    /// `slice_from_all_bytes` (non-exact multiple of entry size ⇒
+    /// tail bytes remaining ⇒ Err). After the fix,
+    /// [`neutralize_relocs`] rewrites `sh_type` to `SHT_PROGBITS` on
+    /// every reloc section before `Builder::read` sees it; the sh_type
+    /// mismatch short-circuits `section.rel()`/`section.rela()` at
+    /// the type-check line (object-0.37.3/src/read/elf/section.rs:829,
+    /// 849) and `data_as_array` is never called.
+    #[test]
+    fn strip_vmlinux_debug_handles_nonalloc_rela_with_non_entsize_sh_size() {
+        let src = TempDir::new().unwrap();
+        let vmlinux = build_reloc_fixture(
+            src.path(),
+            b".rela.odd",
+            object::elf::SHT_RELA,
+            // 24 bytes = one valid Elf64_Rela. We'll rewrite sh_size
+            // to 17 below — fits inside the file's byte range (so
+            // goblin accepts it) but 17 % 24 != 0 so object-crate's
+            // `slice_from_all_bytes::<Rela64>` rejects the size.
+            &[0x11; 24],
+            |bytes| {
+                let elf = goblin::elf::Elf::parse(bytes).unwrap();
+                let shoff = elf.header.e_shoff as usize;
+                let shentsize = elf.header.e_shentsize as usize;
+                let idx = elf
+                    .section_headers
+                    .iter()
+                    .position(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".rela.odd"))
+                    .expect("fixture must carry .rela.odd");
+                drop(elf);
+                let sh_size_off = shoff + idx * shentsize + 32;
+                // sh_size = 17 bytes, not divisible by 24
+                // (sizeof(Elf64_Rela)). In-bounds (section payload is
+                // 24 bytes) so goblin accepts, but the Builder's
+                // `slice_from_all_bytes` check leaves a 17-byte tail
+                // that rejects — matching the arm64 kernel 7.0
+                // failure mode.
+                let bad_size: u64 = 17;
+                bytes[sh_size_off..sh_size_off + 8].copy_from_slice(&bad_size.to_le_bytes());
+            },
+        );
+        let stripped = strip_vmlinux_debug(&vmlinux).unwrap();
+        assert_stripped_preserves_keep_list_and_deletes(stripped.path(), ".rela.odd");
+    }
+
+    /// Pipeline pin #3: strip_vmlinux_debug handles `SHT_RELR`
+    /// sections — arm64 kernels with `CONFIG_PIE` + `CONFIG_RELR`
+    /// emit `.relr.dyn` with packed relative-relocation entries.
+    ///
+    /// This test locks in the SHT_RELR match arm in
+    /// [`neutralize_relocs`] by checking BOTH invariants:
+    ///
+    /// 1. **Neutralize reaches SHT_RELR**: after the first pass,
+    ///    the `.relr.dyn` section's `sh_type` is `SHT_PROGBITS`
+    ///    (not its original `SHT_RELR`) and `sh_size` is 0. A
+    ///    regression that drops SHT_RELR from the match arm leaves
+    ///    the section with `sh_type = SHT_RELR` (19) — this
+    ///    assertion fires.
+    ///
+    /// 2. **End-to-end strip succeeds**: `strip_vmlinux_debug` runs
+    ///    cleanly and the output has `.relr.dyn` removed by
+    ///    keep-list policy.
+    ///
+    /// Even on a well-formed `.relr.dyn` payload (Builder::read
+    /// handles SHT_RELR opaquely via `section.data()` with no
+    /// alignment check, so a "happy-path" SHT_RELR might pass
+    /// `strip_vmlinux_debug` even without neutralization), the
+    /// invariant-1 check locks in the neutralize reach to guard
+    /// against a future regression that silently stops rewriting
+    /// SHT_RELR sections.
+    #[test]
+    fn strip_vmlinux_debug_handles_relr_section() {
+        let src = TempDir::new().unwrap();
+        let vmlinux = build_reloc_fixture(
+            src.path(),
+            b".relr.dyn",
+            object::elf::SHT_RELR,
+            // 16 bytes = two packed RELR entries (each u64).
+            &[0x77; 16],
+            |_| {},
+        );
+
+        // Invariant 1: `neutralize_relocs` must rewrite the .relr.dyn
+        // section's sh_type to SHT_PROGBITS and zero its sh_size.
+        // Checking the function output directly locks in the
+        // SHT_RELR match arm — a regression that drops SHT_RELR
+        // from the arm would leave sh_type == SHT_RELR here.
+        let raw = fs::read(&vmlinux).unwrap();
+        let neutralized = neutralize_relocs(&raw).unwrap();
+        let neutralized_elf = goblin::elf::Elf::parse(&neutralized).unwrap();
+        let relr_sh = neutralized_elf
+            .section_headers
+            .iter()
+            .find(|sh| neutralized_elf.shdr_strtab.get_at(sh.sh_name) == Some(".relr.dyn"))
+            .expect(".relr.dyn must survive neutralize");
+        assert_eq!(
+            relr_sh.sh_type,
+            object::elf::SHT_PROGBITS,
+            ".relr.dyn sh_type must be rewritten to SHT_PROGBITS (SHT_RELR arm of the match); got sh_type={}",
+            relr_sh.sh_type,
+        );
+        assert_eq!(
+            relr_sh.sh_size, 0,
+            ".relr.dyn sh_size must be zeroed post-neutralize",
+        );
+
+        // Invariant 2: end-to-end strip succeeds and removes the
+        // reloc section.
+        let stripped = strip_vmlinux_debug(&vmlinux).unwrap();
+        assert_stripped_preserves_keep_list_and_deletes(stripped.path(), ".relr.dyn");
+    }
+
+    /// Pipeline pin #4: after strip_vmlinux_debug succeeds on an ELF
+    /// carrying BOTH a non-alloc `SHT_RELA` and a `SHT_RELR` section,
+    /// the output has every keep-list section (`.symtab`, `.strtab`,
+    /// `.BTF`, `.rodata`) present and every reloc-named section
+    /// deleted.
+    ///
+    /// Guards against a regression where the fix skipped one or the
+    /// other reloc type (e.g. a future refactor that splits
+    /// [`neutralize_relocs`]'s match arm and drops SHT_RELR). The
+    /// pipeline pins above each cover one reloc type in isolation;
+    /// this combined fixture ensures the fix holds when both types
+    /// appear in the same kernel image.
+    #[test]
+    fn strip_vmlinux_debug_deletes_reloc_sections_and_preserves_keep_list() {
+        use object::write;
+
+        let src = TempDir::new().unwrap();
+        let mut obj = write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        // .text anchors the symtab.
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        obj.append_section_data(text_id, &[0xCC; 64], 16);
+        let _ = obj.add_symbol(write::Symbol {
+            name: b"pipeline_anchor".to_vec(),
+            value: 0x10,
+            size: 8,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Compilation,
+            weak: false,
+            section: write::SymbolSection::Section(text_id),
+            flags: object::SymbolFlags::None,
+        });
+        let btf_id = obj.add_section(Vec::new(), b".BTF".to_vec(), object::SectionKind::Other);
+        obj.append_section_data(btf_id, &[0x42; 128], 1);
+        let rodata_id = obj.add_section(
+            Vec::new(),
+            b".rodata".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        obj.append_section_data(rodata_id, &[0xAA; 256], 1);
+        // Two reloc sections: .rela.dbg (non-alloc SHT_RELA with
+        // garbage entries) and .relr.dyn (SHT_RELR). Both must be
+        // deleted from the output and neither must break the strip.
+        let rela_id = obj.add_section(
+            Vec::new(),
+            b".rela.dbg".to_vec(),
+            object::SectionKind::Elf(object::elf::SHT_RELA),
+        );
+        obj.append_section_data(rela_id, &[0xA5; 24], 1);
+        let relr_id = obj.add_section(
+            Vec::new(),
+            b".relr.dyn".to_vec(),
+            object::SectionKind::Elf(object::elf::SHT_RELR),
+        );
+        obj.append_section_data(relr_id, &[0xD3; 24], 1);
+
+        let bytes = obj.write().unwrap();
+        let vmlinux = src.path().join("vmlinux");
+        fs::write(&vmlinux, &bytes).unwrap();
+
+        // Positive control: fixture must carry all sections the
+        // post-strip assertion inspects. A silent rename by
+        // object::write would false-pass the absence checks.
+        let source_elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let source_names: Vec<&str> = source_elf
+            .section_headers
+            .iter()
+            .filter_map(|s| source_elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+        for name in [
+            ".text",
+            ".BTF",
+            ".rodata",
+            ".rela.dbg",
+            ".relr.dyn",
+            ".symtab",
+            ".strtab",
+        ] {
+            assert!(
+                source_names.contains(&name),
+                "fixture missing expected section {name}; got {source_names:?}"
+            );
+        }
+
+        let stripped = strip_vmlinux_debug(&vmlinux).unwrap();
+        let data = fs::read(stripped.path()).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let names: Vec<&str> = elf
+            .section_headers
+            .iter()
+            .filter_map(|s| elf.shdr_strtab.get_at(s.sh_name))
+            .collect();
+
+        // Keep-list sections survive.
+        for name in [".symtab", ".strtab", ".BTF", ".rodata"] {
+            assert!(
+                names.contains(&name),
+                "keep-list section {name} must survive strip; got {names:?}"
+            );
+        }
+        // Both reloc sections deleted.
+        for name in [".rela.dbg", ".relr.dyn"] {
+            assert!(
+                !names.contains(&name),
+                "reloc section {name} must be deleted by strip; got {names:?}"
+            );
+        }
     }
 
     #[test]
