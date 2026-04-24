@@ -305,7 +305,7 @@ fn dispatch_io_in(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
 

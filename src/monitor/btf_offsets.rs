@@ -902,7 +902,7 @@ impl BpfMapOffsets {
     /// value KVA and never reads an offset from `self`. Production code
     /// must use [`from_vmlinux`](Self::from_vmlinux) or
     /// [`from_btf`](Self::from_btf).
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(crate) const EMPTY: Self = Self {
         map_name: 0,
         map_type: 0,

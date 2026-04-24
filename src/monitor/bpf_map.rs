@@ -754,6 +754,7 @@ mod tests {
     /// `&BpfMapOffsets` through, because `read_value` / `write_value`
     /// never touch one. Build the full [`AccessorCtx`] by borrowing
     /// [`BpfMapOffsets::EMPTY`] so those call sites stay terse.
+    #[cfg(target_arch = "x86_64")]
     fn value_ctx<'a>(mem: &'a GuestMem, cr3_pa: u64, l5: bool) -> AccessorCtx<'a> {
         AccessorCtx {
             mem,
