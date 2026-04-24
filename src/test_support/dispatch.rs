@@ -104,14 +104,14 @@ pub fn ktstr_test_early_dispatch() {
         // `crate::vm::gauntlet_presets()` regardless of whether the
         // scheduler declares flags — the flag set only determines
         // the profile half of the `presets × profiles` product).
-        // Without nextest those variants silently do not run —
-        // coverage loss with no error, no warning. Emit a one-shot
-        // stderr diagnostic when the binary carries any real entry
-        // so the user sees the gap instead of trusting a false
-        // green. Print once per process (cargo test invokes one
-        // test binary per crate; the ctor runs exactly once per
-        // test binary) so there is no need to gate with a
-        // std::sync::Once.
+        // Without nextest those variants would silently not run —
+        // coverage loss with no error. Emit a one-shot stderr
+        // `warning:` diagnostic (see the `eprintln!` below) when the
+        // binary carries any real entry so the user sees the gap
+        // instead of trusting a false green. Print once per process
+        // (cargo test invokes one test binary per crate; the ctor
+        // runs exactly once per test binary) so there is no need to
+        // gate with a std::sync::Once.
         let total = KTSTR_TESTS.len();
         let real = KTSTR_TESTS
             .iter()

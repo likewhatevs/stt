@@ -58,32 +58,32 @@ fn set_probe_binary_env_var() {
 /// Probe invocation with exit-code gating. Used by tests that read
 /// the probe's JSON output directly to find a specific thread's
 /// `allocated_bytes`.
-static JEMALLOC_PROBE: Payload = Payload {
-    name: "jemalloc_probe",
-    kind: PayloadKind::Binary("ktstr-jemalloc-probe"),
-    output: OutputFormat::Json,
-    default_args: &[],
-    default_checks: &[Check::ExitCodeEq(0)],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+static JEMALLOC_PROBE: Payload = Payload::new(
+    "jemalloc_probe",
+    PayloadKind::Binary("ktstr-jemalloc-probe"),
+    OutputFormat::Json,
+    &[],
+    &[Check::ExitCodeEq(0)],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 /// Probe invocation without exit-code gating. Used by the error-
 /// path test that deliberately probes a non-jemalloc target and
 /// reads `metrics.exit_code` directly.
-static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload {
-    name: "jemalloc_probe_no_exit_check",
-    kind: PayloadKind::Binary("ktstr-jemalloc-probe"),
-    output: OutputFormat::Json,
-    default_args: &[],
-    default_checks: &[],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload::new(
+    "jemalloc_probe_no_exit_check",
+    PayloadKind::Binary("ktstr-jemalloc-probe"),
+    OutputFormat::Json,
+    &[],
+    &[],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 /// Allocator worker target. Spawned as a background payload; the
 /// test body reads its pid from the `PayloadHandle`, then probes
@@ -95,17 +95,17 @@ static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload {
 /// See [`JEMALLOC_ALLOC_WORKER_CHURN`] for the thread-churn variant
 /// used by the ESRCH stress test — same binary, `--churn` flag,
 /// disables the single-thread self-check.
-static JEMALLOC_ALLOC_WORKER: Payload = Payload {
-    name: "jemalloc_alloc_worker",
-    kind: PayloadKind::Binary("ktstr-jemalloc-alloc-worker"),
-    output: OutputFormat::ExitCode,
-    default_args: &[],
-    default_checks: &[],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+static JEMALLOC_ALLOC_WORKER: Payload = Payload::new(
+    "jemalloc_alloc_worker",
+    PayloadKind::Binary("ktstr-jemalloc-alloc-worker"),
+    OutputFormat::ExitCode,
+    &[],
+    &[],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 /// Churn-mode allocator worker. Same binary as
 /// [`JEMALLOC_ALLOC_WORKER`] but invoked with `--churn`, which
@@ -115,17 +115,17 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload {
 /// probe's ESRCH handling: the probe races rapidly-exiting helper
 /// tids and every seized tid that dies before PTRACE_INTERRUPT
 /// surfaces as a `ThreadResult::Err` rather than a crash.
-static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload {
-    name: "jemalloc_alloc_worker_churn",
-    kind: PayloadKind::Binary("ktstr-jemalloc-alloc-worker"),
-    output: OutputFormat::ExitCode,
-    default_args: &["--churn"],
-    default_checks: &[],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload::new(
+    "jemalloc_alloc_worker_churn",
+    PayloadKind::Binary("ktstr-jemalloc-alloc-worker"),
+    OutputFormat::ExitCode,
+    &["--churn"],
+    &[],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 // ---------------------------------------------------------------------------
 // Helpers

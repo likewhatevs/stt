@@ -435,6 +435,64 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
     METRICS.iter().find(|m| m.name == name)
 }
 
+/// Render the [`METRICS`] registry for `cargo ktstr stats list-metrics`.
+///
+/// `json=false` renders a comfy-table with one row per registered
+/// metric and columns NAME / POLARITY / DEFAULT_ABS / DEFAULT_REL
+/// / UNIT / DESCRIPTION. `json=true` emits `serde_json::to_string_pretty`
+/// on the whole [`METRICS`] slice — the `accessor` fn-pointer is
+/// `#[serde(skip)]` so the array carries only wire-stable fields.
+///
+/// Iteration order equals [`METRICS`] declaration order (the
+/// canonical surface order for sidecar / CI-gate consumers).
+///
+/// The return is owned `String` rather than a print-direct helper so
+/// callers can pin output via `assert_eq!` in tests; the cargo-ktstr
+/// dispatch arm at `run_stats` writes it to stdout verbatim.
+pub fn list_metrics(json: bool) -> anyhow::Result<String> {
+    if json {
+        return serde_json::to_string_pretty(METRICS)
+            .map_err(|e| anyhow::anyhow!("serialize METRICS to JSON: {e}"));
+    }
+
+    let mut table = crate::cli::new_table();
+    table.set_header(vec![
+        "NAME",
+        "POLARITY",
+        "DEFAULT_ABS",
+        "DEFAULT_REL",
+        "UNIT",
+        "DESCRIPTION",
+    ]);
+    for m in METRICS {
+        table.add_row(vec![
+            m.name.to_string(),
+            polarity_label(m.polarity),
+            format!("{}", m.default_abs),
+            format!("{}", m.default_rel),
+            m.display_unit.to_string(),
+        ]);
+    }
+    Ok(format!("{table}\n"))
+}
+
+/// Short human label for a [`Polarity`](crate::test_support::Polarity)
+/// variant in the list-metrics table.
+///
+/// `HigherBetter` → `higher`, `LowerBetter` → `lower`,
+/// `TargetValue(t)` → `target(t)`, `Unknown` → `unknown`. Match is
+/// total; adding a new `Polarity` variant without extending this
+/// rendering surfaces as a compile error.
+fn polarity_label(p: crate::test_support::Polarity) -> String {
+    use crate::test_support::Polarity;
+    match p {
+        Polarity::HigherBetter => "higher".to_string(),
+        Polarity::LowerBetter => "lower".to_string(),
+        Polarity::TargetValue(t) => format!("target({t})"),
+        Polarity::Unknown => "unknown".to_string(),
+    }
+}
+
 /// Per-scenario result row for gauntlet analysis and run-to-run comparison.
 ///
 /// Populated by [`sidecar_to_row`] from on-disk `SidecarResult`s. The
@@ -2288,6 +2346,124 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), len);
+    }
+
+    // -- list_metrics tests --
+
+    /// Text-mode [`list_metrics`] emits a table that names every
+    /// registered metric at least once. Uses substring contains
+    /// rather than column-exact equality so a future comfy-table
+    /// preset rename (NOTHING → other) that rewraps whitespace
+    /// does not false-fail — the surface contract is "every metric
+    /// name appears somewhere in the rendered output", not a
+    /// column-width pin.
+    #[test]
+    fn list_metrics_text_names_every_metric() {
+        let out = list_metrics(false).expect("text render must succeed");
+        assert!(!out.is_empty(), "text output must be non-empty");
+        for m in METRICS {
+            assert!(
+                out.contains(m.name),
+                "list_metrics(false) output missing metric name {}: {out}",
+                m.name,
+            );
+        }
+    }
+
+    /// Text-mode [`list_metrics`] header row names every column. Pins
+    /// the header contract so a column rename in
+    /// `list_metrics` lands here instead of silently in downstream CI
+    /// scripts that grep the output.
+    #[test]
+    fn list_metrics_text_header_pins_column_names() {
+        let out = list_metrics(false).expect("text render must succeed");
+        for header in ["NAME", "POLARITY", "DEFAULT_ABS", "DEFAULT_REL", "UNIT", "DESCRIPTION"] {
+            assert!(
+                out.contains(header),
+                "list_metrics(false) output missing column header {header}: {out}",
+            );
+        }
+    }
+
+    /// JSON-mode [`list_metrics`] parses back to a `Vec<MetricDef>`-
+    /// shaped structure with one entry per registry member. `MetricDef`
+    /// itself does not derive `Deserialize` (the `accessor` fn-pointer
+    /// is unserializable), so we deserialize into a minimal struct
+    /// that captures the fields the wire contract promises.
+    #[test]
+    fn list_metrics_json_round_trips_via_minimal_schema() {
+        #[derive(serde::Deserialize)]
+        struct MetricEntry {
+            name: String,
+            default_abs: f64,
+            default_rel: f64,
+            display_unit: String,
+            // polarity is serialized as an enum tag string by serde
+            // (Polarity derives Serialize with the default
+            // externally-tagged representation). Deserialize into a
+            // serde_json::Value to avoid a cross-crate enum
+            // dependency in the test-private schema.
+            polarity: serde_json::Value,
+        }
+
+        let out = list_metrics(true).expect("json render must succeed");
+        let parsed: Vec<MetricEntry> =
+            serde_json::from_str(&out).expect("json output must parse");
+        assert_eq!(
+            parsed.len(),
+            METRICS.len(),
+            "json entry count must match METRICS.len()",
+        );
+        for (parsed_m, registry_m) in parsed.iter().zip(METRICS.iter()) {
+            assert_eq!(parsed_m.name, registry_m.name);
+            assert_eq!(parsed_m.default_abs, registry_m.default_abs);
+            assert_eq!(parsed_m.default_rel, registry_m.default_rel);
+            assert_eq!(parsed_m.display_unit, registry_m.display_unit);
+            assert!(
+                !parsed_m.polarity.is_null(),
+                "polarity for {} must serialize as a non-null value",
+                registry_m.name,
+            );
+        }
+    }
+
+    /// JSON-mode [`list_metrics`] must NOT expose the `accessor`
+    /// fn-pointer field. The `#[serde(skip)]` attribute on
+    /// `MetricDef::accessor` carries that contract; a regression that
+    /// dropped the attribute would surface here as the emitted JSON
+    /// gaining an "accessor" key. Pins the wire surface.
+    #[test]
+    fn list_metrics_json_omits_accessor_field() {
+        let out = list_metrics(true).expect("json render must succeed");
+        assert!(
+            !out.contains("\"accessor\""),
+            "list_metrics(true) must not emit the accessor field — \
+             fn-pointers are not serializable and the field carries \
+             #[serde(skip)]: {out}",
+        );
+    }
+
+    /// Iteration order of [`list_metrics`] matches [`METRICS`]
+    /// declaration order. Registry order is the canonical surface
+    /// order for sidecar / CI-gate consumers; a renderer that sorted
+    /// by name or polarity would silently break scripts that key on
+    /// the first row.
+    #[test]
+    fn list_metrics_text_preserves_registry_order() {
+        let out = list_metrics(false).expect("text render must succeed");
+        let mut last_pos = 0usize;
+        for m in METRICS {
+            let pos = out
+                .find(m.name)
+                .unwrap_or_else(|| panic!("metric {} must appear in text output", m.name));
+            assert!(
+                pos >= last_pos,
+                "metric {} appears before a prior metric — text output must \
+                 preserve METRICS declaration order",
+                m.name,
+            );
+            last_pos = pos;
+        }
     }
 
     // -- MetricDef::read tests --

@@ -2,30 +2,30 @@ use ktstr::ktstr_test;
 use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
 
 #[allow(dead_code)]
-const FIO: Payload = Payload {
-    name: "fio",
-    kind: PayloadKind::Binary("fio"),
-    output: OutputFormat::ExitCode,
-    default_args: &[],
-    default_checks: &[],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+const FIO: Payload = Payload::new(
+    "fio",
+    PayloadKind::Binary("fio"),
+    OutputFormat::ExitCode,
+    &[],
+    &[],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 #[allow(dead_code)]
-const STRESS: Payload = Payload {
-    name: "stress",
-    kind: PayloadKind::Binary("stress-ng"),
-    output: OutputFormat::ExitCode,
-    default_args: &[],
-    default_checks: &[],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+const STRESS: Payload = Payload::new(
+    "stress",
+    PayloadKind::Binary("stress-ng"),
+    OutputFormat::ExitCode,
+    &[],
+    &[],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 #[ktstr_test(payload = FIO, payload = STRESS)]
 fn bad(_ctx: &ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult> {

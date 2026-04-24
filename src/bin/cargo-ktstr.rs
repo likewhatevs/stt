@@ -262,6 +262,25 @@ enum ModelCommand {
 enum StatsCommand {
     /// List test runs under `{CARGO_TARGET_DIR or "target"}/ktstr/`.
     List,
+    /// List the registered regression metrics and their default
+    /// thresholds.
+    ///
+    /// Enumerates the `ktstr::stats::METRICS` registry: metric name,
+    /// polarity (higher/lower better), default absolute-delta gate,
+    /// default relative-delta gate, display unit, and a one-line
+    /// description. Use this to see which metric names
+    /// `ComparisonPolicy.per_metric_percent` keys can reference, and
+    /// what each default_abs / default_rel gate starts at before an
+    /// override.
+    ///
+    /// Default output is a human-readable table; `--json` emits a
+    /// JSON array with the same fields (the row accessor function is
+    /// omitted — `#[serde(skip)]` in the registry).
+    ListMetrics {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the archived host context for a specific run.
     ///
     /// Resolves `--run <id>` against `test_support::runs_root()`
@@ -342,8 +361,8 @@ enum StatsCommand {
         /// metric name in the `METRICS` registry — a typo
         /// (e.g. `wrost_spread`) is rejected at load time so it
         /// does not silently fall through to `default_percent`.
-        /// Use `cargo ktstr stats` to discover available metric
-        /// names.
+        /// Use `cargo ktstr stats list-metrics` to discover
+        /// available metric names and their default thresholds.
         #[arg(long, conflicts_with = "threshold")]
         policy: Option<std::path::PathBuf>,
         /// Alternate run root to resolve `a` / `b` against. Defaults
@@ -525,6 +544,13 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             Ok(())
         }
         Some(StatsCommand::List) => cli::list_runs().map_err(|e| format!("{e:#}")),
+        Some(StatsCommand::ListMetrics { json }) => match cli::list_metrics(*json) {
+            Ok(s) => {
+                print!("{s}");
+                Ok(())
+            }
+            Err(e) => Err(format!("{e:#}")),
+        },
         Some(StatsCommand::ShowHost { run, dir }) => {
             match cli::show_run_host(run, dir.as_deref()) {
                 Ok(s) => {
@@ -682,35 +708,14 @@ fn run_shell(
     no_perf_mode: bool,
 ) -> Result<(), String> {
     if no_perf_mode {
+        // SAFETY: single-threaded at this point — no concurrent env readers.
         unsafe { std::env::set_var("KTSTR_NO_PERF_MODE", "1") };
     }
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
 
-    // Parse topology "N,L,C,T" (numa_nodes,llcs,cores,threads).
-    let parts: Vec<&str> = topology.split(',').collect();
-    if parts.len() != 4 {
-        return Err(format!(
-            "invalid topology '{topology}': expected 'numa_nodes,llcs,cores,threads' (e.g. '1,2,4,1')"
-        ));
-    }
-    let numa_nodes: u32 = parts[0]
-        .parse()
-        .map_err(|_| format!("invalid numa_nodes value: '{}'", parts[0]))?;
-    let llcs: u32 = parts[1]
-        .parse()
-        .map_err(|_| format!("invalid llcs value: '{}'", parts[1]))?;
-    let cores: u32 = parts[2]
-        .parse()
-        .map_err(|_| format!("invalid cores value: '{}'", parts[2]))?;
-    let threads: u32 = parts[3]
-        .parse()
-        .map_err(|_| format!("invalid threads value: '{}'", parts[3]))?;
-    if numa_nodes == 0 || llcs == 0 || cores == 0 || threads == 0 {
-        return Err(format!(
-            "invalid topology '{topology}': all values must be >= 1"
-        ));
-    }
+    let (numa_nodes, llcs, cores, threads) =
+        cli::parse_topology_string(&topology).map_err(|e| format!("{e:#}"))?;
 
     let resolved_includes =
         cli::resolve_include_files(&include_files).map_err(|e| format!("{e:#}"))?;
@@ -1141,11 +1146,13 @@ fn main() {
         command: CargoSub::Ktstr(ktstr),
     } = Cargo::parse();
 
+    // Match-arm order mirrors the `KtstrCommand` enum declaration at
+    // the top of this file. Keeping the two orderings in lockstep lets
+    // a reviewer eyeball "every variant is dispatched" in one linear
+    // scan instead of cross-referencing two different orders; a future
+    // variant addition then lands in the matching enum position and
+    // here without requiring the reader to rebuild the mapping.
     let result = match ktstr.command {
-        KtstrCommand::Completions { shell, binary } => {
-            run_completions(shell, &binary);
-            Ok(())
-        }
         KtstrCommand::Test {
             kernel,
             no_perf_mode,
@@ -1161,39 +1168,7 @@ fn main() {
             no_perf_mode,
             args,
         } => run_llvm_cov(kernel, no_perf_mode, args),
-        KtstrCommand::Verifier {
-            scheduler,
-            scheduler_bin,
-            kernel,
-            raw,
-            all_profiles,
-            profiles,
-        } => run_verifier(
-            scheduler,
-            scheduler_bin,
-            kernel,
-            raw,
-            all_profiles,
-            profiles,
-        ),
         KtstrCommand::Stats { ref command } => run_stats(command),
-        KtstrCommand::Shell {
-            kernel,
-            topology,
-            include_files,
-            memory_mb,
-            dmesg,
-            exec,
-            no_perf_mode,
-        } => run_shell(
-            kernel,
-            topology,
-            include_files,
-            memory_mb,
-            dmesg,
-            exec,
-            no_perf_mode,
-        ),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json } => cli::kernel_list(json).map_err(|e| format!("{e:#}")),
             KernelCommand::Build {
@@ -1214,8 +1189,24 @@ fn main() {
             ModelCommand::Fetch => run_model_fetch(),
             ModelCommand::Status => run_model_status(),
         },
-        KtstrCommand::Cleanup { parent_cgroup } => {
-            cli::cleanup(parent_cgroup).map_err(|e| format!("{e:#}"))
+        KtstrCommand::Verifier {
+            scheduler,
+            scheduler_bin,
+            kernel,
+            raw,
+            all_profiles,
+            profiles,
+        } => run_verifier(
+            scheduler,
+            scheduler_bin,
+            kernel,
+            raw,
+            all_profiles,
+            profiles,
+        ),
+        KtstrCommand::Completions { shell, binary } => {
+            run_completions(shell, &binary);
+            Ok(())
         }
         KtstrCommand::ShowHost => {
             print!("{}", cli::show_host());
@@ -1228,6 +1219,26 @@ fn main() {
             }
             Err(e) => Err(format!("{e:#}")),
         },
+        KtstrCommand::Cleanup { parent_cgroup } => {
+            cli::cleanup(parent_cgroup).map_err(|e| format!("{e:#}"))
+        }
+        KtstrCommand::Shell {
+            kernel,
+            topology,
+            include_files,
+            memory_mb,
+            dmesg,
+            exec,
+            no_perf_mode,
+        } => run_shell(
+            kernel,
+            topology,
+            include_files,
+            memory_mb,
+            dmesg,
+            exec,
+            no_perf_mode,
+        ),
     };
 
     if let Err(e) = result {
@@ -1601,6 +1612,62 @@ mod tests {
     fn parse_stats_list() {
         let m = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list"]);
         assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    /// `cargo ktstr stats list-metrics` parses (no flags required)
+    /// and dispatches to the `ListMetrics` variant with `json=false`.
+    #[test]
+    fn parse_stats_list_metrics_bare() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-metrics"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::ListMetrics { json }),
+                ..
+            } => {
+                assert!(
+                    !json,
+                    "bare `list-metrics` must default to text mode (json=false)",
+                );
+            }
+            _ => panic!("expected Stats ListMetrics"),
+        }
+    }
+
+    /// `cargo ktstr stats list-metrics --json` sets `json=true`.
+    /// Pins the flag name so a clap-derive-default rename
+    /// (kebab-case) cannot drift — `--json` is the same flag name
+    /// other list-style subcommands use (e.g. `kernel list --json`).
+    #[test]
+    fn parse_stats_list_metrics_json() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-metrics", "--json"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::ListMetrics { json }),
+                ..
+            } => {
+                assert!(json, "--json must set the flag true");
+            }
+            _ => panic!("expected Stats ListMetrics"),
+        }
+    }
+
+    /// `list-metrics` takes no positional args — a stray positional
+    /// must be rejected by clap so a typo like `list-metrics
+    /// worst_spread` doesn't silently look like success.
+    #[test]
+    fn parse_stats_list_metrics_rejects_positional() {
+        let rejected =
+            Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-metrics", "worst_spread"]);
+        assert!(
+            rejected.is_err(),
+            "list-metrics must reject positional arguments",
+        );
     }
 
     #[test]

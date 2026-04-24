@@ -378,18 +378,31 @@ pub(crate) fn format_corrupt_footer(cache_root: &Path) -> String {
 /// Decide whether to emit the corrupt-entry footer under the
 /// `kernel list` table. Mirrors [`eol_legend_if_any`] and
 /// [`untracked_legend_if_any`] so the three "tag → footer" gates
-/// share one shape (boolean in, `Option<String>` out) and every
+/// share one shape (count in, `Option<String>` out) and every
 /// branch is unit-testable without stderr capture. The
 /// unconditional emission-only-when-tag-rendered invariant is the
 /// signal that keeps the normal no-corrupt case noise-free; a
 /// regression that unconditionally emitted the footer would show
-/// up as a red test on the `false` branch here.
-pub(crate) fn corrupt_footer_if_any(any_corrupt: bool, cache_root: &Path) -> Option<String> {
-    if any_corrupt {
-        Some(format_corrupt_footer(cache_root))
-    } else {
-        None
+/// up as a red test on the `corrupt_count == 0` branch here.
+///
+/// Prepends a `"N corrupt entr{y|ies}. Run `cargo ktstr kernel
+/// clean --corrupt-only` to remove.\n"` summary line before the
+/// full [`format_corrupt_footer`] body so an operator sees the
+/// count and the short remediation FIRST, with the multi-option
+/// escalation detail following. The pluralized form ("entry" vs
+/// "entries") matches the count, making the line read naturally
+/// at both the 1-entry and N>1-entry boundaries.
+pub(crate) fn corrupt_footer_if_any(corrupt_count: usize, cache_root: &Path) -> Option<String> {
+    if corrupt_count == 0 {
+        return None;
     }
+    let noun = if corrupt_count == 1 { "entry" } else { "entries" };
+    let summary = format!(
+        "{corrupt_count} corrupt {noun}. \
+         Run `cargo ktstr kernel clean --corrupt-only` to remove.",
+    );
+    let detail = format_corrupt_footer(cache_root);
+    Some(format!("{summary}\n{detail}"))
 }
 
 /// ktstr.kconfig embedded at compile time.
@@ -561,7 +574,8 @@ pub fn format_entry_row(
 ///     {
 ///       "key": "6.12.0-broken",
 ///       "path": "/path/to/cache/broken-entry",
-///       "error": "metadata.json schema drift: missing field `source` at line 1 column 21"
+///       "error": "metadata.json schema drift: missing field `source` at line 1 column 21",
+///       "error_kind": "schema_drift"
 ///     }
 ///   ]
 /// }
@@ -629,6 +643,16 @@ pub fn format_entry_row(
 ///   The example above shows the schema-drift case; consumers that
 ///   treat corrupt entries as a single category can key on the
 ///   `"error"` key alone.
+/// - `error_kind`: machine-readable classification of the failure
+///   mode — a stable snake_case identifier CI scripts can dispatch
+///   on without parsing the free-form `error`. Values:
+///   `"missing"`, `"unreadable"`, `"schema_drift"`, `"malformed"`,
+///   `"truncated"`, `"parse_error"`, `"image_missing"`, and
+///   `"unknown"` as a defensive fallback for a future producer
+///   prefix that has not yet been taught to the classifier. Always
+///   present on corrupt entries; always absent on valid entries.
+///   See [`crate::cache::ListedEntry::error_kind`] for the
+///   classifier contract.
 pub fn kernel_list(json: bool) -> Result<()> {
     let cache = CacheDir::new()?;
     let entries = cache.list()?;
@@ -678,11 +702,22 @@ pub fn kernel_list(json: bool) -> Result<()> {
                         "has_vmlinux": meta.has_vmlinux(),
                     })
                 }
-                crate::cache::ListedEntry::Corrupt { key, path, reason } => serde_json::json!({
-                    "key": key,
-                    "path": path.display().to_string(),
-                    "error": reason,
-                }),
+                crate::cache::ListedEntry::Corrupt { key, path, reason } => {
+                    // `error_kind` is the machine-readable classification
+                    // of the failure mode (snake_case identifier); `error`
+                    // keeps the human-readable reason. Both fields emit
+                    // on every corrupt entry so consumers that dispatch
+                    // on `error_kind` AND consumers that display `error`
+                    // work without a version gate. See
+                    // `ListedEntry::error_kind` for the classifier.
+                    let error_kind = e.error_kind().unwrap_or("unknown");
+                    serde_json::json!({
+                        "key": key,
+                        "path": path.display().to_string(),
+                        "error": reason,
+                        "error_kind": error_kind,
+                    })
+                }
             })
             .collect();
         // `active_prefixes_fetch_error` is `null` on success and a
@@ -714,7 +749,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
     let mut any_stale = false;
     let mut any_untracked = false;
     let mut any_eol = false;
-    let mut any_corrupt = false;
+    let mut corrupt_count: usize = 0;
     for listed in &entries {
         match listed {
             crate::cache::ListedEntry::Valid(entry) => {
@@ -734,7 +769,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
                 );
             }
             crate::cache::ListedEntry::Corrupt { key, reason, .. } => {
-                any_corrupt = true;
+                corrupt_count += 1;
                 println!("  {key:<48} (corrupt: {reason})");
             }
         }
@@ -781,7 +816,7 @@ pub fn kernel_list(json: bool) -> Result<()> {
     if let Some(legend) = stale_legend_if_any(any_stale) {
         eprintln!("{legend}");
     }
-    if let Some(footer) = corrupt_footer_if_any(any_corrupt, cache.root()) {
+    if let Some(footer) = corrupt_footer_if_any(corrupt_count, cache.root()) {
         eprintln!("{footer}");
     }
     Ok(())
@@ -1186,6 +1221,56 @@ pub fn parse_work_type(name: Option<&str>) -> Result<Option<WorkType>> {
     }
 }
 
+/// Parse a comma-separated topology string into its four dimensions:
+/// `(numa_nodes, llcs, cores, threads)`. The canonical format is
+/// `"numa_nodes,llcs,cores,threads"` — the same shape accepted by the
+/// `ktstr shell --topology` and `cargo ktstr shell --topology` flags.
+///
+/// Validation:
+/// - Exactly four comma-separated components are required.
+/// - Each component must parse as `u32`. A parse failure names the
+///   failing field explicitly (e.g. `"invalid llcs value: 'abc'"`)
+///   so the user can see which dimension they mistyped without
+///   counting commas.
+/// - Every dimension must be at least 1 — a zero in any position
+///   produces an unusable VM topology, so we reject it up front.
+///
+/// Consolidating the parse + validate in one helper eliminates the
+/// identical 4-arm `parts[i].parse().map_err(...)` block that the two
+/// binary entry points (`src/bin/ktstr.rs` Command::Shell and
+/// `src/bin/cargo-ktstr.rs` `run_shell`) would otherwise drift on.
+/// Error shape is `anyhow::Error`; callers that need a `String` (like
+/// cargo-ktstr's `Result<(), String>` surface) bridge via
+/// `.map_err(|e| format!("{e:#}"))` at the call site.
+pub fn parse_topology_string(topology: &str) -> Result<(u32, u32, u32, u32)> {
+    let parts: Vec<&str> = topology.split(',').collect();
+    if parts.len() != 4 {
+        bail!(
+            "invalid topology '{topology}': expected 'numa_nodes,llcs,cores,threads' \
+             (e.g. '1,2,4,1')"
+        );
+    }
+    // Stable field order mirrors the 4-tuple return so a future
+    // field-rename lands consistently in one place.
+    let fields: [(&str, &str); 4] = [
+        ("numa_nodes", parts[0]),
+        ("llcs", parts[1]),
+        ("cores", parts[2]),
+        ("threads", parts[3]),
+    ];
+    let mut vals: [u32; 4] = [0; 4];
+    for (i, (name, raw)) in fields.iter().enumerate() {
+        vals[i] = raw
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("invalid {name} value: '{raw}'"))?;
+    }
+    let [numa_nodes, llcs, cores, threads] = vals;
+    if numa_nodes == 0 || llcs == 0 || cores == 0 || threads == 0 {
+        bail!("invalid topology '{topology}': all values must be >= 1");
+    }
+    Ok((numa_nodes, llcs, cores, threads))
+}
+
 /// Filter scenarios by name substring.
 pub fn filter_scenarios<'a>(
     scenarios: &'a [Scenario],
@@ -1493,6 +1578,17 @@ pub fn print_stats_report() -> Option<String> {
 /// List test runs under `{CARGO_TARGET_DIR or "target"}/ktstr/`.
 pub fn list_runs() -> Result<()> {
     crate::stats::list_runs()
+}
+
+/// Render the metric registry for `cargo ktstr stats list-metrics`.
+///
+/// Thin wrapper over [`crate::stats::list_metrics`] — exposed through
+/// `cli::` to match the `list_runs` / `compare_runs` / `show_host`
+/// convention where every stats-subcommand dispatch arm lands on a
+/// `cli::*` helper before reaching the private `stats` module. The
+/// returned `String` is printed verbatim by the dispatch site.
+pub fn list_metrics(json: bool) -> Result<String> {
+    crate::stats::list_metrics(json)
 }
 
 /// Compare two test runs and report regressions.
@@ -2571,6 +2667,114 @@ impl Drop for Spinner {
 mod tests {
     use super::*;
     use crate::scenario;
+
+    // -- parse_topology_string --
+
+    /// Happy path: a canonical `"n,l,c,t"` string round-trips to the
+    /// four u32 dimensions in positional order. Pins the field order
+    /// so a future refactor that reshuffles (numa_nodes/llcs/cores/
+    /// threads) → something else can't silently swap one dimension
+    /// for another without flipping this pin.
+    #[test]
+    fn parse_topology_string_happy_path() {
+        let (n, l, c, t) = parse_topology_string("1,2,4,8").expect("valid");
+        assert_eq!((n, l, c, t), (1, 2, 4, 8));
+    }
+
+    /// Wrong component count: fewer than 4 parts names the expected
+    /// shape in the error so the user sees the canonical format.
+    #[test]
+    fn parse_topology_string_rejects_too_few_parts() {
+        let err = parse_topology_string("1,2,4").expect_err("3 parts must fail");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("invalid topology '1,2,4'"),
+            "error must echo the bad input: {rendered}",
+        );
+        assert!(
+            rendered.contains("numa_nodes,llcs,cores,threads"),
+            "error must name the expected shape: {rendered}",
+        );
+    }
+
+    /// Too MANY parts is rejected the same way. Pairs with the
+    /// too-few case so the guard is symmetric.
+    #[test]
+    fn parse_topology_string_rejects_too_many_parts() {
+        let err = parse_topology_string("1,2,4,8,16").expect_err("5 parts must fail");
+        assert!(format!("{err:#}").contains("invalid topology"));
+    }
+
+    /// A non-numeric component fails with a message that names the
+    /// offending FIELD, not just the bad token — a user who mistypes
+    /// the second dimension sees `"invalid llcs value: 'abc'"` and
+    /// knows immediately which dimension needs fixing. Pin all four
+    /// position-to-name mappings so a field-order refactor surfaces
+    /// here.
+    #[test]
+    fn parse_topology_string_names_failing_field() {
+        for (pos, field) in [
+            (0, "numa_nodes"),
+            (1, "llcs"),
+            (2, "cores"),
+            (3, "threads"),
+        ] {
+            let mut parts = vec!["1"; 4];
+            parts[pos] = "abc";
+            let input = parts.join(",");
+            let err = parse_topology_string(&input).expect_err("non-numeric must fail");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains(&format!("invalid {field} value: 'abc'")),
+                "pos {pos}: error must name the `{field}` field, got: {rendered}",
+            );
+        }
+    }
+
+    /// Zero in any position fails the `>= 1` guard with the
+    /// "all values must be >= 1" phrasing. A zero topology would
+    /// build a non-bootable VM, so rejecting it up-front is a
+    /// correctness requirement, not a style choice.
+    #[test]
+    fn parse_topology_string_rejects_zero_dimensions() {
+        for pos in 0..4 {
+            let mut parts = vec!["1"; 4];
+            parts[pos] = "0";
+            let input = parts.join(",");
+            let err = parse_topology_string(&input).expect_err("zero must fail");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains(">= 1"),
+                "pos {pos}: error must cite the >=1 rule: {rendered}",
+            );
+        }
+    }
+
+    /// Upper bound: u32::MAX in every position parses successfully.
+    /// Pins the return-type decision (u32, not u16 / usize) so a
+    /// future refactor that narrows the type surfaces here rather
+    /// than truncating large-host topology strings.
+    #[test]
+    fn parse_topology_string_accepts_u32_max() {
+        let big = u32::MAX;
+        let input = format!("{big},{big},{big},{big}");
+        let (n, l, c, t) = parse_topology_string(&input).expect("u32::MAX valid");
+        assert_eq!((n, l, c, t), (big, big, big, big));
+    }
+
+    /// u32 overflow (value above u32::MAX) fails with the field
+    /// name, not a generic parse error. Exercises the `parse::<u32>`
+    /// failure path rather than only the non-numeric path.
+    #[test]
+    fn parse_topology_string_rejects_u32_overflow() {
+        let too_big = (u32::MAX as u64) + 1;
+        let input = format!("1,{too_big},4,1");
+        let err = parse_topology_string(&input).expect_err("overflow must fail");
+        assert!(
+            format!("{err:#}").contains(&format!("invalid llcs value: '{too_big}'")),
+            "overflow must surface field + bad token: {err:#}",
+        );
+    }
 
     // -- show_host smoke --
 
@@ -4617,21 +4821,46 @@ mod tests {
     }
 
     /// `corrupt_footer_if_any` completes the trio of `*_if_any`
-    /// tag-gate helpers. True branch must carry the same
-    /// `format_corrupt_footer` content the production path would
-    /// print, and the cache_root path must appear verbatim so
-    /// operators know exactly which directory to inspect. False
-    /// branch must be `None` — a regression that unconditionally
-    /// emitted the footer would show here instead of shipping noise
-    /// to every clean `kernel list` run.
+    /// tag-gate helpers. A positive count must yield a footer that
+    /// carries the full `format_corrupt_footer` content (so
+    /// operators see the cache_root path and all three `kernel
+    /// clean` variants), prefixed with the count-summary sentence
+    /// a dev-advocate flagged as load-bearing (an operator looking
+    /// at `kernel list` should see HOW MANY entries are broken
+    /// without re-counting rows). A zero count must be `None` — a
+    /// regression that emitted the footer on every run would ship
+    /// a "0 corrupt entries" line to every clean invocation.
     #[test]
     fn corrupt_footer_if_any_branches() {
         let root = std::path::Path::new("/tmp/ktstr-cache-test-root");
-        assert_eq!(
-            corrupt_footer_if_any(true, root),
-            Some(format_corrupt_footer(root)),
+        // Zero → None.
+        assert_eq!(corrupt_footer_if_any(0, root), None);
+        // Positive count → Some, with the count-summary line AND the
+        // full format_corrupt_footer body.
+        let one = corrupt_footer_if_any(1, root)
+            .expect("positive count must yield Some(footer)");
+        assert!(
+            one.contains("1 corrupt entry."),
+            "singular form (count == 1) must render as `1 corrupt entry.`; got: {one}",
         );
-        assert_eq!(corrupt_footer_if_any(false, root), None);
+        assert!(
+            one.contains("cargo ktstr kernel clean --corrupt-only"),
+            "summary must name the surgical-cleanup command: {one}",
+        );
+        // Existing detail paragraph must still follow — same content
+        // as `format_corrupt_footer` on its own.
+        assert!(
+            one.contains(&format_corrupt_footer(root)),
+            "footer must embed the full format_corrupt_footer \
+             detail after the count summary: {one}",
+        );
+
+        let many = corrupt_footer_if_any(3, root)
+            .expect("positive count must yield Some(footer)");
+        assert!(
+            many.contains("3 corrupt entries."),
+            "plural form (count > 1) must render as `N corrupt entries.`; got: {many}",
+        );
     }
 
     /// Pins the design decision that `(corrupt)` is NOT in the

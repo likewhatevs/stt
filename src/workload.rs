@@ -993,6 +993,44 @@ impl Default for WorkloadConfig {
     }
 }
 
+impl WorkloadConfig {
+    /// Set the number of worker processes.
+    pub fn workers(mut self, n: usize) -> Self {
+        self.num_workers = n;
+        self
+    }
+
+    /// Set the resolved CPU affinity.
+    pub fn affinity(mut self, a: AffinityMode) -> Self {
+        self.affinity = a;
+        self
+    }
+
+    /// Set the work type.
+    pub fn work_type(mut self, wt: WorkType) -> Self {
+        self.work_type = wt;
+        self
+    }
+
+    /// Set the Linux scheduling policy.
+    pub fn sched_policy(mut self, p: SchedPolicy) -> Self {
+        self.sched_policy = p;
+        self
+    }
+
+    /// Set the NUMA memory placement policy.
+    pub fn mem_policy(mut self, p: MemPolicy) -> Self {
+        self.mem_policy = p;
+        self
+    }
+
+    /// Set the NUMA memory policy mode flags.
+    pub fn mpol_flags(mut self, f: MpolFlags) -> Self {
+        self.mpol_flags = f;
+        self
+    }
+}
+
 /// Workload definition for a single group of workers within a cgroup.
 ///
 /// Extracted from [`CgroupDef`](crate::scenario::ops::CgroupDef) to allow
@@ -4284,6 +4322,17 @@ mod tests {
     }
 
     #[test]
+    fn workload_config_builder_setters_chain() {
+        let cfg = WorkloadConfig::default()
+            .workers(7)
+            .work_type(WorkType::CpuSpin)
+            .sched_policy(SchedPolicy::Batch);
+        assert_eq!(cfg.num_workers, 7);
+        assert!(matches!(cfg.work_type, WorkType::CpuSpin));
+        assert!(matches!(cfg.sched_policy, SchedPolicy::Batch));
+    }
+
+    #[test]
     fn worker_report_serde_roundtrip() {
         let r = WorkerReport {
             tid: 42,
@@ -7080,11 +7129,7 @@ mod tests {
             );
         });
         let err = result.expect_err("must panic when liveness pid is dead");
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
-            .unwrap_or_default();
+        let msg = crate::test_support::test_helpers::panic_payload_to_string(err);
         assert!(
             msg.contains("exited before writing ready file"),
             "panic must name the early-exit path, got: {msg}"
@@ -7112,11 +7157,7 @@ mod tests {
             );
         });
         let err = result.expect_err("must panic when deadline expires");
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
-            .unwrap_or_default();
+        let msg = crate::test_support::test_helpers::panic_payload_to_string(err);
         assert!(
             msg.contains("did not write ready file"),
             "panic must name the deadline-miss path, got: {msg}"

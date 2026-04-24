@@ -343,6 +343,7 @@ fn main() -> Result<()> {
             no_perf_mode,
         } => {
             if no_perf_mode {
+                // SAFETY: single-threaded at this point — no concurrent env readers.
                 unsafe { std::env::set_var("KTSTR_NO_PERF_MODE", "1") };
             }
 
@@ -479,6 +480,7 @@ fn main() -> Result<()> {
             no_perf_mode,
         } => {
             if no_perf_mode {
+                // SAFETY: single-threaded at this point — no concurrent env readers.
                 unsafe { std::env::set_var("KTSTR_NO_PERF_MODE", "1") };
             }
             cli::check_kvm()?;
@@ -490,28 +492,7 @@ fn main() -> Result<()> {
                 },
             )?;
 
-            // Parse topology "N,L,C,T" (numa_nodes,llcs,cores,threads).
-            let parts: Vec<&str> = topology.split(',').collect();
-            anyhow::ensure!(
-                parts.len() == 4,
-                "invalid topology '{topology}': expected 'numa_nodes,llcs,cores,threads' (e.g. '1,2,4,1')"
-            );
-            let numa_nodes: u32 = parts[0]
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid numa_nodes value: '{}'", parts[0]))?;
-            let llcs: u32 = parts[1]
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid llcs value: '{}'", parts[1]))?;
-            let cores: u32 = parts[2]
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid cores value: '{}'", parts[2]))?;
-            let threads: u32 = parts[3]
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid threads value: '{}'", parts[3]))?;
-            anyhow::ensure!(
-                numa_nodes > 0 && llcs > 0 && cores > 0 && threads > 0,
-                "invalid topology '{topology}': all values must be >= 1"
-            );
+            let (numa_nodes, llcs, cores, threads) = cli::parse_topology_string(&topology)?;
 
             let resolved_includes = cli::resolve_include_files(&include_files)?;
 

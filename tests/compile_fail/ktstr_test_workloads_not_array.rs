@@ -2,17 +2,17 @@ use ktstr::ktstr_test;
 use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
 
 #[allow(dead_code)]
-const FIO: Payload = Payload {
-    name: "fio",
-    kind: PayloadKind::Binary("fio"),
-    output: OutputFormat::ExitCode,
-    default_args: &[],
-    default_checks: &[],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+const FIO: Payload = Payload::new(
+    "fio",
+    PayloadKind::Binary("fio"),
+    OutputFormat::ExitCode,
+    &[],
+    &[],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 // `workloads` must be an array literal `[FIO]`, not a bare path.
 #[ktstr_test(workloads = FIO)]

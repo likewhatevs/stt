@@ -739,43 +739,43 @@ fn topology_matches_vm_spec(ctx: &Ctx) -> Result<AssertResult> {
 use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
 
 #[allow(dead_code)]
-const PAYLOAD_A: Payload = Payload {
-    name: "payload_a",
-    kind: PayloadKind::Binary("/bin/true"),
-    output: OutputFormat::ExitCode,
-    default_args: &[],
-    default_checks: &[],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+const PAYLOAD_A: Payload = Payload::new(
+    "payload_a",
+    PayloadKind::Binary("/bin/true"),
+    OutputFormat::ExitCode,
+    &[],
+    &[],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 #[allow(dead_code)]
-const PAYLOAD_B: Payload = Payload {
-    name: "payload_b",
-    kind: PayloadKind::Binary("/bin/true"),
-    output: OutputFormat::ExitCode,
-    default_args: &[],
-    default_checks: &[],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+const PAYLOAD_B: Payload = Payload::new(
+    "payload_b",
+    PayloadKind::Binary("/bin/true"),
+    OutputFormat::ExitCode,
+    &[],
+    &[],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 #[allow(dead_code)]
-const PAYLOAD_C: Payload = Payload {
-    name: "payload_c",
-    kind: PayloadKind::Binary("/bin/true"),
-    output: OutputFormat::ExitCode,
-    default_args: &[],
-    default_checks: &[],
-    metrics: &[],
-    include_files: &[],
-    uses_parent_pgrp: false,
-    known_flags: None,
-};
+const PAYLOAD_C: Payload = Payload::new(
+    "payload_c",
+    PayloadKind::Binary("/bin/true"),
+    OutputFormat::ExitCode,
+    &[],
+    &[],
+    &[],
+    &[],
+    false,
+    None,
+);
 
 /// `payload = PATH` wires `entry.payload = Some(&PATH)`. Assertions
 /// are inline so the nextest-visible wrapper is the assertion site —

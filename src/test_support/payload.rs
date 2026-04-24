@@ -47,7 +47,15 @@ use crate::test_support::Scheduler;
 /// telemetry (per-payload metrics, exit codes, names) is serialized
 /// via [`PayloadMetrics`] and [`Metric`] instead; those own their
 /// data.
+///
+/// `#[non_exhaustive]` reserves the right to add fields without
+/// breaking downstream code. Out-of-crate callers cannot construct
+/// `Payload` via struct literal — use the const-fn constructors
+/// ([`Payload::new`], [`Payload::from_scheduler`], [`Payload::binary`])
+/// or the derive macros (`#[derive(Scheduler)]`, `#[derive(Payload)]`),
+/// which route through [`Payload::new`] under the hood.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct Payload {
     /// Short, stable name used in logs and sidecar records.
     pub name: &'static str,
@@ -330,17 +338,17 @@ impl Payload {
     /// author-intent filtering on `"kernel_default"` requires
     /// consulting the in-memory `Payload::name` directly, not the
     /// sidecar.
-    pub const KERNEL_DEFAULT: Payload = Payload {
-        name: "kernel_default",
-        kind: PayloadKind::Scheduler(&Scheduler::EEVDF),
-        output: OutputFormat::ExitCode,
-        default_args: &[],
-        default_checks: &[],
-        metrics: &[],
-        include_files: &[],
-        uses_parent_pgrp: false,
-        known_flags: None,
-    };
+    pub const KERNEL_DEFAULT: Payload = Payload::new(
+        "kernel_default",
+        PayloadKind::Scheduler(&Scheduler::EEVDF),
+        OutputFormat::ExitCode,
+        &[],
+        &[],
+        &[],
+        &[],
+        false,
+        None,
+    );
 
     /// Short, human-readable name for logging and sidecar output.
     pub const fn display_name(&self) -> &'static str {
@@ -362,6 +370,45 @@ impl Payload {
         matches!(self.kind, PayloadKind::Scheduler(_))
     }
 
+    /// Primary const constructor for a [`Payload`].
+    ///
+    /// Takes every field by position so the two derive macros
+    /// (`#[derive(Scheduler)]` / `#[derive(Payload)]`) can emit a
+    /// single call instead of a struct-literal. `#[non_exhaustive]`
+    /// on the struct prevents out-of-crate struct-literal
+    /// construction; this constructor — defined in the same crate
+    /// as `Payload` — is not subject to that restriction, so the
+    /// macro-expanded tokens that reach downstream crates compile
+    /// cleanly.
+    ///
+    /// For one-field constructions prefer [`Payload::from_scheduler`]
+    /// or [`Payload::binary`] — both call into this helper and pin
+    /// the non-identity fields to the exit-code-only defaults.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        name: &'static str,
+        kind: PayloadKind,
+        output: OutputFormat,
+        default_args: &'static [&'static str],
+        default_checks: &'static [Check],
+        metrics: &'static [MetricHint],
+        include_files: &'static [&'static str],
+        uses_parent_pgrp: bool,
+        known_flags: Option<&'static [&'static str]>,
+    ) -> Payload {
+        Payload {
+            name,
+            kind,
+            output,
+            default_args,
+            default_checks,
+            metrics,
+            include_files,
+            uses_parent_pgrp,
+            known_flags,
+        }
+    }
+
     /// Minimal const wrapper: build a `Payload` that references an
     /// existing `&'static Scheduler`. Used by unit tests and by the
     /// `#[derive(Scheduler)]` wrapper emission to produce the
@@ -369,17 +416,17 @@ impl Payload {
     /// the scheduler's `name` into the payload's `name` so the two
     /// surfaces render with matching identity.
     pub const fn from_scheduler(sched: &'static Scheduler) -> Payload {
-        Payload {
-            name: sched.name,
-            kind: PayloadKind::Scheduler(sched),
-            output: OutputFormat::ExitCode,
-            default_args: &[],
-            default_checks: &[],
-            metrics: &[],
-            include_files: &[],
-            uses_parent_pgrp: false,
-            known_flags: None,
-        }
+        Payload::new(
+            sched.name,
+            PayloadKind::Scheduler(sched),
+            OutputFormat::ExitCode,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+        )
     }
 
     /// Minimal const constructor for a binary-kind [`Payload`]. Fills
@@ -398,17 +445,17 @@ impl Payload {
     /// Pair with [`Payload::from_scheduler`] for the scheduler side
     /// of the same constructor surface.
     pub const fn binary(name: &'static str, binary: &'static str) -> Payload {
-        Payload {
+        Payload::new(
             name,
-            kind: PayloadKind::Binary(binary),
-            output: OutputFormat::ExitCode,
-            default_args: &[],
-            default_checks: &[],
-            metrics: &[],
-            include_files: &[],
-            uses_parent_pgrp: false,
-            known_flags: None,
-        }
+            PayloadKind::Binary(binary),
+            OutputFormat::ExitCode,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+        )
     }
 
     // -----------------------------------------------------------------

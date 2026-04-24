@@ -431,6 +431,61 @@ impl ListedEntry {
             ListedEntry::Corrupt { .. } => None,
         }
     }
+
+    /// Machine-readable classification of a corrupt entry's failure
+    /// mode, for consumers that need to branch without parsing the
+    /// free-form `reason`. Returns `None` on a `Valid` entry.
+    ///
+    /// Classifier keys the prefix the [`read_metadata`] and
+    /// [`CacheDir::list`] producers actually emit, so a downstream
+    /// consumer can switch on the returned `&str` instead of matching
+    /// human text. Values are stable identifiers (snake_case) the
+    /// `kernel list --json` schema surfaces as the `error_kind` field:
+    ///
+    /// | `error_kind`    | Producing prefix                        |
+    /// |-----------------|-----------------------------------------|
+    /// | `"missing"`     | `"metadata.json missing"`               |
+    /// | `"unreadable"`  | `"metadata.json unreadable: ..."`       |
+    /// | `"schema_drift"`| `"metadata.json schema drift: ..."`     |
+    /// | `"malformed"`   | `"metadata.json malformed: ..."`        |
+    /// | `"truncated"`   | `"metadata.json truncated: ..."`        |
+    /// | `"parse_error"` | `"metadata.json parse error: ..."` (Io fallback) |
+    /// | `"image_missing"` | `"image file <name> missing from entry directory"` |
+    /// | `"unknown"`     | Any reason that does not match the above prefixes. Surfaces here instead of panicking so a future prefix addition degrades to "unclassified" rather than bailing the whole list. |
+    ///
+    /// A regression that introduces a new prefix in the producer
+    /// without updating this classifier surfaces as `"unknown"` in
+    /// the JSON output — consumer-side alerts on that value give
+    /// maintainers a clear signal to extend the table.
+    pub fn error_kind(&self) -> Option<&'static str> {
+        match self {
+            ListedEntry::Valid(_) => None,
+            ListedEntry::Corrupt { reason, .. } => Some(classify_corrupt_reason(reason)),
+        }
+    }
+}
+
+/// Shared prefix → `error_kind` classifier. Public to the module so
+/// tests can pin each prefix routes to its documented value without
+/// constructing a whole `ListedEntry::Corrupt`.
+fn classify_corrupt_reason(reason: &str) -> &'static str {
+    if reason == "metadata.json missing" {
+        "missing"
+    } else if reason.starts_with("metadata.json unreadable: ") {
+        "unreadable"
+    } else if reason.starts_with("metadata.json schema drift: ") {
+        "schema_drift"
+    } else if reason.starts_with("metadata.json malformed: ") {
+        "malformed"
+    } else if reason.starts_with("metadata.json truncated: ") {
+        "truncated"
+    } else if reason.starts_with("metadata.json parse error: ") {
+        "parse_error"
+    } else if reason.starts_with("image file ") && reason.contains("missing") {
+        "image_missing"
+    } else {
+        "unknown"
+    }
 }
 
 /// Handle to the kernel image cache directory.
@@ -2295,6 +2350,95 @@ mod tests {
             reason.starts_with("metadata.json truncated: "),
             "truncated-JSON reason should carry the truncated prefix \
              (Category::Eof route), got: {reason}",
+        );
+    }
+
+    /// Table-drive every prefix → `error_kind` classifier mapping.
+    /// Pins each documented value independently so a regression in
+    /// one arm surfaces with the specific prefix cited in the
+    /// failure message, not as a blanket "classifier broken". The
+    /// "unknown" fallback row is the safety net: a future producer
+    /// prefix that falls through this table must surface as
+    /// `"unknown"` to consumers rather than panic.
+    #[test]
+    fn classify_corrupt_reason_covers_every_documented_prefix() {
+        let cases: &[(&str, &str)] = &[
+            ("metadata.json missing", "missing"),
+            ("metadata.json unreadable: Is a directory (os error 21)", "unreadable"),
+            (
+                "metadata.json schema drift: missing field `source` at line 1 column 21",
+                "schema_drift",
+            ),
+            (
+                "metadata.json malformed: expected value at line 1 column 1",
+                "malformed",
+            ),
+            (
+                "metadata.json truncated: EOF while parsing a value at line 1 column 10",
+                "truncated",
+            ),
+            (
+                "metadata.json parse error: something unexpected",
+                "parse_error",
+            ),
+            (
+                "image file bzImage missing from entry directory",
+                "image_missing",
+            ),
+            (
+                "some future prefix nobody wrote yet",
+                "unknown",
+            ),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(
+                classify_corrupt_reason(reason),
+                *expected,
+                "reason `{reason}` should classify as `{expected}`",
+            );
+        }
+    }
+
+    /// `ListedEntry::error_kind()` returns `None` on a Valid entry
+    /// and the classifier result on a Corrupt entry. Pins the
+    /// Valid → None contract so a consumer that dispatches on
+    /// `error_kind().is_some()` can safely gate on the corrupt
+    /// path.
+    #[test]
+    fn listed_entry_error_kind_dispatches_on_variant() {
+        // Construct a Valid entry via the normal store path.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        cache
+            .store("valid-ek", &CacheArtifacts::new(&image), &meta)
+            .unwrap();
+
+        // And a Corrupt entry via a missing-metadata directory.
+        let bad_dir = tmp.path().join("cache").join("corrupt-ek");
+        fs::create_dir_all(&bad_dir).unwrap();
+
+        let entries = cache.list().unwrap();
+        assert_eq!(entries.len(), 2);
+        let valid = entries
+            .iter()
+            .find(|e| e.key() == "valid-ek")
+            .expect("valid entry must be listed");
+        let corrupt = entries
+            .iter()
+            .find(|e| e.key() == "corrupt-ek")
+            .expect("corrupt entry must be listed");
+        assert_eq!(
+            valid.error_kind(),
+            None,
+            "Valid entries must report no error_kind",
+        );
+        assert_eq!(
+            corrupt.error_kind(),
+            Some("missing"),
+            "missing-metadata Corrupt entry must classify as `missing`",
         );
     }
 

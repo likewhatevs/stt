@@ -1651,17 +1651,17 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
         /// intentionally not meant for `workloads = [..]` (which is
         /// binary-only).
         const #payload_const_name: ::ktstr::test_support::Payload =
-            ::ktstr::test_support::Payload {
-                name: #sched_name_for_payload,
-                kind: ::ktstr::test_support::PayloadKind::Scheduler(&#const_name),
-                output: ::ktstr::test_support::OutputFormat::ExitCode,
-                default_args: &[],
-                default_checks: &[],
-                metrics: &[],
-                include_files: &[],
-                uses_parent_pgrp: false,
-                known_flags: None,
-            };
+            ::ktstr::test_support::Payload::new(
+                #sched_name_for_payload,
+                ::ktstr::test_support::PayloadKind::Scheduler(&#const_name),
+                ::ktstr::test_support::OutputFormat::ExitCode,
+                &[],
+                &[],
+                &[],
+                &[],
+                false,
+                None,
+            );
 
         impl #enum_name {
             #(#name_consts)*
@@ -1931,17 +1931,18 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
     let const_name = format_ident!("{}", camel_to_screaming_snake(base));
 
     let expanded = quote! {
-        #struct_vis const #const_name: ::ktstr::test_support::Payload = ::ktstr::test_support::Payload {
-            name: #payload_name,
-            kind: ::ktstr::test_support::PayloadKind::Binary(#binary),
-            output: #output_tokens,
-            default_args: &[#(#default_args),*],
-            default_checks: &[#(#default_checks),*],
-            metrics: &[#(#metrics),*],
-            include_files: &[#(#include_files),*],
-            uses_parent_pgrp: false,
-            known_flags: None,
-        };
+        #struct_vis const #const_name: ::ktstr::test_support::Payload =
+            ::ktstr::test_support::Payload::new(
+                #payload_name,
+                ::ktstr::test_support::PayloadKind::Binary(#binary),
+                #output_tokens,
+                &[#(#default_args),*],
+                &[#(#default_checks),*],
+                &[#(#metrics),*],
+                &[#(#include_files),*],
+                false,
+                None,
+            );
     };
 
     Ok(expanded)
