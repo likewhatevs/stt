@@ -44,6 +44,8 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           rustup show active-toolchain || rustup toolchain install
+          echo "/usr/bin" >> $GITHUB_PATH
+          echo "/usr/local/bin" >> $GITHUB_PATH
           echo "/usr/lib64/ccache" >> $GITHUB_PATH
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
@@ -80,6 +82,8 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           rustup show active-toolchain || rustup toolchain install
+          echo "/usr/bin" >> $GITHUB_PATH
+          echo "/usr/local/bin" >> $GITHUB_PATH
           echo "/usr/lib64/ccache" >> $GITHUB_PATH
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
@@ -112,6 +116,8 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           rustup show active-toolchain || rustup toolchain install
+          echo "/usr/bin" >> $GITHUB_PATH
+          echo "/usr/local/bin" >> $GITHUB_PATH
           echo "/usr/lib64/ccache" >> $GITHUB_PATH
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
@@ -140,6 +146,8 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           rustup show active-toolchain || rustup toolchain install
+          echo "/usr/bin" >> $GITHUB_PATH
+          echo "/usr/local/bin" >> $GITHUB_PATH
           echo "/usr/lib64/ccache" >> $GITHUB_PATH
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
