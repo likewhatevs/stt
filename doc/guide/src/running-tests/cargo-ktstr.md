@@ -380,7 +380,7 @@ the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{timestamp}/`.
 ## Install
 
 ```sh
-cargo install ktstr                   # installs both ktstr and cargo-ktstr
+cargo install --locked ktstr          # installs both ktstr and cargo-ktstr
 ```
 
 Or build from the workspace:

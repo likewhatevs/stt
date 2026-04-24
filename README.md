@@ -64,7 +64,7 @@ This is all test authors need -- run with
 The `anyhow::Result` referenced in examples below is re-exported
 through `ktstr::prelude`; no separate `anyhow` dev-dependency needed.
 
-**Optional CLI tools** (`cargo install ktstr`) installs two binaries:
+**Optional CLI tools** (`cargo install --locked ktstr`) installs two binaries:
 
 - `ktstr` -- host-side CLI for running scenarios outside VMs and
   managing cached kernel images
@@ -249,7 +249,7 @@ ktstr_test 'two_cgroups' [topo=1n1l2c1t] failed:
 
 ### Dev workflow
 
-These commands require `cargo install ktstr` (see [Installation](#installation)).
+These commands require `cargo install --locked ktstr` (see [Installation](#installation)).
 The frictionless loop is to build a cached kernel once and then run
 tests against the cache:
 

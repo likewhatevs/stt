@@ -36,11 +36,11 @@ sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 
 ```sh
 cargo install cargo-nextest           # recommended test runner (optional)
-cargo install ktstr                   # both binaries: ktstr + cargo-ktstr (optional)
+cargo install --locked ktstr          # both binaries: ktstr + cargo-ktstr (optional)
 ```
 
 `cargo-nextest` enables gauntlet expansion; `cargo test` works
-without it for base topology. `cargo install ktstr` installs
+without it for base topology. `cargo install --locked ktstr` installs
 both the host-side CLI (`ktstr`) and the dev workflow plugin
 (`cargo-ktstr`).
 

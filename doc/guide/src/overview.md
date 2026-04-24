@@ -104,7 +104,7 @@ scenario with BPF probes attached to the crash-path functions. See
 | `scx-ktstr` | Minimal BPF scheduler for testing |
 
 Both `ktstr` and `cargo-ktstr` are `[[bin]]` targets in the same
-crate, so `cargo install ktstr` installs both.
+crate, so `cargo install --locked ktstr` installs both.
 
 ## Kernel config
 
