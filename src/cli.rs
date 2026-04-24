@@ -15,6 +15,17 @@ use crate::runner::RunConfig;
 use crate::scenario::{Scenario, flags};
 use crate::workload::WorkType;
 
+/// Re-export of the internal `vmm::host_topology::LlcCap` type so
+/// the `ktstr` and `cargo-ktstr` CLI binaries (which import this
+/// module through the `pub mod cli` surface) can resolve
+/// `--llc-cap N` without depending on the `pub(crate)` `vmm`
+/// module. Keeping the canonical definition in `vmm::host_topology`
+/// (so the `acquire_llc_plan` internal call site consumes its own
+/// type without needing `cli`) and re-exporting here — versus
+/// inverting the dependency — avoids pulling the CLI module into
+/// the VMM internals.
+pub use crate::vmm::host_topology::LlcCap;
+
 /// Shared `kernel` subcommand tree used by both `ktstr` and
 /// `cargo ktstr`. The two binaries embed this as
 /// `ktstr kernel <subcmd>` / `cargo ktstr kernel <subcmd>` and
@@ -57,6 +68,8 @@ pub enum KernelCommand {
         /// and is ignored in those modes.
         #[arg(long)]
         clean: bool,
+        #[arg(long, help = LLC_CAP_HELP)]
+        llc_cap: Option<usize>,
     },
     /// Remove cached kernel images.
     Clean {
@@ -119,6 +132,37 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
      (can be slow on a fresh tree); versions auto-download from kernel.org \
      on cache miss. When absent, resolves via cache then filesystem, \
      falling back to downloading the latest stable kernel.";
+
+/// Help text for the `--llc-cap N` flag. Shared across `ktstr kernel build`,
+/// `cargo ktstr kernel build`, and `ktstr shell` so the operator-facing
+/// wording is identical regardless of entry point.
+///
+/// This flag is the resource-budget contract: the operator promises
+/// (and the framework enforces) that the build or no-perf-mode shell
+/// VM will stay within N LLCs' worth of CPU and the NUMA nodes hosting
+/// them. Setting `--llc-cap N` flips several internal defaults on this
+/// run: the LLC discovery uses a consolidation-aware, NUMA-aware plan
+/// instead of "lock every LLC"; make's `-jN` parallelism matches the
+/// reserved CPU count so gcc can't fan out beyond the budget; a cgroup
+/// v2 sandbox binds make + gcc's cpuset to the plan's CPUs and
+/// `cpuset.mems` to the plan's NUMA nodes, so any degradation is fatal
+/// under the flag rather than a silent warning.
+pub const LLC_CAP_HELP: &str = "Reserve only N host LLCs for the build or \
+     no-perf-mode shell. Integer ≥ 1; must be ≤ total host LLCs (see \
+     `ktstr topo`). When absent, every LLC on the host is reserved. \
+     The planner prefers LLCs on a single NUMA node and only spills \
+     across nodes when N exceeds the single-node capacity (run \
+     `ktstr locks --watch 1s` to observe NUMA placement live). Under \
+     --llc-cap, make's `-jN` parallelism matches the reserved CPU \
+     count and the kernel build runs inside a cgroup v2 sandbox that \
+     pins gcc/ld to the reserved CPUs + NUMA nodes; if the sandbox \
+     cannot be installed (missing cgroup v2, missing cpuset \
+     controller, permission denied), the build aborts rather than \
+     running without enforcement. Mutually exclusive with \
+     KTSTR_BYPASS_LLC_LOCKS=1. On `ktstr shell`, requires \
+     --no-perf-mode (perf-mode already holds every LLC exclusively). \
+     Also settable via KTSTR_LLC_CAP env var (CLI flag wins when both \
+     are present).";
 
 /// Literal text of the `(EOL)` tag explanation. Lives inside a macro
 /// (instead of a `pub const`) so that downstream `concat!` callers
@@ -1181,10 +1225,21 @@ pub fn run_make_with_output(
 }
 
 /// Build the kernel with output piped through a spinner.
-pub fn make_kernel_with_output(kernel_dir: &Path, spinner: Option<&Spinner>) -> Result<()> {
-    let nproc = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+///
+/// `jobs_override` supplies the `-jN` count when set (used by
+/// `kernel_build_pipeline` under `--llc-cap` to keep gcc's
+/// parallelism aligned with the reserved CPU count). `None`
+/// falls back to `std::thread::available_parallelism`.
+pub fn make_kernel_with_output(
+    kernel_dir: &Path,
+    spinner: Option<&Spinner>,
+    jobs_override: Option<usize>,
+) -> Result<()> {
+    let nproc = jobs_override.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
     let args = build_make_args(nproc);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     run_make_with_output(kernel_dir, &arg_refs, spinner)
@@ -1422,6 +1477,139 @@ pub struct KernelBuildResult {
     pub image_path: std::path::PathBuf,
 }
 
+/// Two-phase build reservation handles (LLC flock plan + cgroup v2
+/// sandbox + make -jN hint). Consumed by
+/// [`kernel_build_pipeline`]; the factored-out
+/// [`acquire_build_reservation`] builds it from `llc_cap` without
+/// depending on kernel source, enabling integration tests that
+/// exercise the reservation logic against synthetic topologies.
+///
+/// Drop order is load-bearing: `_sandbox` drops BEFORE `plan`
+/// because struct fields drop in declaration order and
+/// `_sandbox` is declared after `plan` (swapped relative to the
+/// prior inline let-bindings in `kernel_build_pipeline` — the
+/// inline form relied on LIFO binding-drop order, so the LATER
+/// binding dropped FIRST; the struct form relies on IN-ORDER
+/// field-drop, so the LATER field also drops FIRST. Same
+/// outcome, different mechanism). The sandbox's cgroup rmdir
+/// must run while the LLC flocks are still held; otherwise a
+/// peer could observe the LLC released before the cgroup is
+/// gone and mint a conflicting plan.
+#[derive(Debug)]
+pub(crate) struct BuildReservation {
+    /// cgroup v2 sandbox. `None` when `plan` is `None` (no reservation
+    /// to enforce). Drops FIRST per struct field order — cgroup
+    /// rmdir runs while LLC flocks are still held. `_` prefix
+    /// keeps the binding alive through Drop but marks it as
+    /// not-read — the RAII invariant IS the read.
+    pub(crate) _sandbox: Option<crate::vmm::cgroup_sandbox::BuildSandbox>,
+    /// LLC plan (flock fds + cpus + mems). `None` under
+    /// `KTSTR_BYPASS_LLC_LOCKS=1` or sysfs-unreadable host without
+    /// `--llc-cap`. Drops SECOND per struct field order —
+    /// flocks release AFTER the sandbox rmdir lands.
+    pub(crate) plan: Option<crate::vmm::host_topology::LlcPlan>,
+    /// `make -jN` parallelism hint. `Some(N)` under an active
+    /// `plan`; `None` when no reservation exists (caller falls
+    /// back to `nproc`).
+    pub(crate) make_jobs: Option<usize>,
+}
+
+/// Acquire the two-phase reservation (LLC flocks + cgroup sandbox)
+/// for a kernel build. Factored out of [`kernel_build_pipeline`]
+/// so integration tests can exercise the llc_cap → acquire →
+/// sandbox → make_jobs decision tree without requiring a real
+/// kernel source tree.
+///
+/// Returns a `BuildReservation` whose fields are the three values
+/// `kernel_build_pipeline` used to bind inline; Drop order
+/// matches the prior inline let-bindings so the LIFO cgroup-
+/// rmdir-before-LLC-unlock invariant is preserved.
+///
+/// `cli_label` prefixes operator-facing error text.
+///
+/// `llc_cap` is the resolved cap from
+/// [`LlcCap::resolve`](crate::vmm::host_topology::LlcCap::resolve);
+/// `None` means "lock every LLC" — the pre-flag default that
+/// preserves coordination with concurrent perf-mode runs.
+pub(crate) fn acquire_build_reservation(
+    cli_label: &str,
+    llc_cap: Option<crate::vmm::host_topology::LlcCap>,
+) -> Result<BuildReservation> {
+    let bypass = std::env::var("KTSTR_BYPASS_LLC_LOCKS")
+        .ok()
+        .is_some_and(|v| !v.is_empty());
+    // INVARIANT: `plan` is the first field of BuildReservation but
+    // Drop runs fields in declaration order — we therefore list
+    // `plan` BEFORE `_sandbox` in the struct def and rely on the
+    // LIFO Drop-on-the-struct to drop `_sandbox` first. This
+    // mirrors the original inline let-bindings (plan declared
+    // first, sandbox after) — reordering either would either
+    // (a) unlock LLCs while the sandbox still enforces the
+    // cpuset — a concurrent peer could claim the LLC and stomp
+    // gcc children that haven't exited — or (b) leave the cgroup
+    // hierarchy non-empty when its parent tries to rmdir.
+    let plan: Option<crate::vmm::host_topology::LlcPlan> = if bypass {
+        if llc_cap.is_some() {
+            anyhow::bail!(
+                "{cli_label}: --llc-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; \
+                 unset one of them. --llc-cap is a resource contract; bypass \
+                 disables the contract entirely."
+            );
+        }
+        None
+    } else if let Ok(host_topo) = crate::vmm::host_topology::HostTopology::from_sysfs() {
+        let test_topo = crate::topology::TestTopology::from_system()?;
+        let acquired_plan = crate::vmm::host_topology::acquire_llc_plan(
+            &host_topo, &test_topo, llc_cap,
+        )?;
+        crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);
+        Some(acquired_plan)
+    } else {
+        if llc_cap.is_some() {
+            anyhow::bail!(
+                "{cli_label}: --llc-cap set but host LLC topology unreadable \
+                 from sysfs — cannot enforce the resource budget. Run on a \
+                 host with /sys/devices/system/cpu populated, or drop \
+                 --llc-cap to build without enforcement."
+            );
+        }
+        tracing::warn!(
+            "{cli_label}: could not read host LLC topology from sysfs; \
+             skipping kernel-build LLC reservation. Concurrent perf-mode \
+             runs on this host will NOT be serialized against this build"
+        );
+        None
+    };
+
+    // Phase 2: cgroup v2 sandbox that enforces cpu+mem binding on
+    // make/gcc children. `hard_error_on_degrade` is driven by
+    // whether `--llc-cap` was set: degradation is fatal under
+    // the flag (the flag promises enforcement) and warn-only
+    // without it (pre-flag callers must not regress).
+    let sandbox: Option<crate::vmm::cgroup_sandbox::BuildSandbox> = match plan.as_ref() {
+        Some(p) => Some(crate::vmm::cgroup_sandbox::BuildSandbox::try_create(
+            &p.cpus,
+            &p.mems,
+            llc_cap.is_some(),
+        )?),
+        None => None,
+    };
+
+    // `make -jN` parallelism hint. Under `--llc-cap N`, N matches
+    // the reserved CPU count via `make_jobs_for_plan`; without
+    // the flag, nproc preserves the pre-flag behaviour. See
+    // `make_kernel_with_output` for the resolution.
+    let make_jobs = plan
+        .as_ref()
+        .map(crate::vmm::host_topology::make_jobs_for_plan);
+
+    Ok(BuildReservation {
+        plan,
+        _sandbox: sandbox,
+        make_jobs,
+    })
+}
+
 /// Post-acquisition kernel build pipeline.
 ///
 /// Handles: clean, configure, build, validate config, generate
@@ -1440,58 +1628,57 @@ pub fn kernel_build_pipeline(
     cli_label: &str,
     clean: bool,
     is_local_source: bool,
+    llc_cap: Option<crate::vmm::host_topology::LlcCap>,
 ) -> Result<KernelBuildResult> {
     let source_dir = &acquired.source_dir;
     let (arch, image_name) = crate::fetch::arch_info();
 
-    // Acquire `LOCK_SH` on every host LLC for the duration of the
-    // build. `make -j$(nproc)` fans gcc children across every online
-    // CPU with no flock awareness; without this coordination, a
-    // kernel build running concurrently with a perf-mode test run
-    // saturates the cores perf-mode is measuring on, producing
-    // noise that trips `max_gap_ms` / `max_p99_wake_latency_ns`
-    // thresholds for reasons unrelated to the scheduler under test.
-    // `LOCK_SH` is the same mode no-perf-mode VMs use (see
-    // `vmm::host_topology::acquire_all_llc_shared_locks`); a
-    // perf-mode peer requesting `LOCK_EX` on any one LLC blocks on
-    // the shared lock and correctly fails over to another LLC (or
-    // nextest-retries) until the build finishes.
+    // Two-phase reservation. A concurrent perf-mode test run must
+    // not have its measured CPUs stomped by a `make -j$(nproc)`
+    // explosion of gcc children, and vice-versa a concurrent
+    // kernel build must not have its compile window extended by
+    // a test pinning RT-FIFO on shared cores. Phase 1 of the
+    // reservation is the LLC-level flock from
+    // [`acquire_llc_plan`]: either a capped subset (`--llc-cap N`)
+    // or every host LLC. Phase 2 is the cgroup v2 sandbox from
+    // [`BuildSandbox::try_create`] that binds make/gcc's
+    // cpu+mem sets to the plan's CPUs + NUMA nodes so the
+    // parallelism hint is enforced, not just advisory.
     //
-    // `_llc_locks` binds the held fds to a local so RAII drops them
-    // at function exit, covering every branch including early-
-    // return error paths. Name prefix `_` suppresses the
-    // unused-variable warning without `#[allow(unused_variables)]`.
+    // Binding order is load-bearing: `plan` is declared BEFORE
+    // `_sandbox` so the sandbox's Drop runs FIRST (LIFO), which
+    // migrates the build pid out of the cgroup and rmdirs the
+    // child while the LLC flocks are still held. Otherwise a peer
+    // could observe the LLC released before the cgroup is gone,
+    // mint a new plan against the same LLCs, and see an orphan
+    // cgroup lingering for up to the 24h sweep window.
     //
     // Escape hatches:
-    //   - `KTSTR_BYPASS_LLC_LOCKS=1`: skip the lock acquisition
-    //     entirely; the build proceeds immediately without
-    //     coordinating with any concurrent perf-mode run. Use when
-    //     the operator explicitly accepts measurement noise (one
-    //     shell doing unrelated work, an isolated developer
-    //     workstation, or a CI queue that already serializes jobs
-    //     at a higher layer).
+    //   - `KTSTR_BYPASS_LLC_LOCKS=1`: skip the LLC plan+flock
+    //     acquisition entirely; the build proceeds immediately
+    //     without coordinating with any concurrent perf-mode run.
+    //     Use when the operator explicitly accepts measurement
+    //     noise (one shell doing unrelated work, an isolated
+    //     developer workstation, or a CI queue that already
+    //     serializes jobs at a higher layer). Mutually exclusive
+    //     with `--llc-cap` at CLI parse time — see the CLI
+    //     binaries' pre-dispatch conflict check.
     //   - Sysfs-unreadable host (non-Linux, degraded container):
-    //     `HostTopology::from_sysfs()` returns `Err`, and the
-    //     fallback path emits a `tracing::warn!` and proceeds
-    //     without locks. This matches the no-perf-mode branch's
-    //     behaviour at `vmm::KtstrVmBuilder::build` so the two
-    //     surfaces degrade identically.
-    let _llc_locks: Vec<std::os::fd::OwnedFd> = if std::env::var("KTSTR_BYPASS_LLC_LOCKS")
-        .ok()
-        .is_some_and(|v| !v.is_empty())
-    {
-        Vec::new()
-    } else if let Ok(host_topo) = crate::vmm::host_topology::HostTopology::from_sysfs() {
-        crate::vmm::host_topology::acquire_all_llc_shared_locks(&host_topo)?
-    } else {
-        tracing::warn!(
-            "{cli_label}: could not read host LLC topology from sysfs; \
-             skipping kernel-build all-LLC LOCK_SH acquisition. \
-             Concurrent perf-mode runs on this host will NOT be serialized \
-             against this build"
-        );
-        Vec::new()
-    };
+    //     `HostTopology::from_sysfs()` returns `Err`. Without
+    //     `--llc-cap`, we emit a `tracing::warn!` and proceed
+    //     without locks. With `--llc-cap`, the flag cannot be
+    //     honoured and we fail hard — llc_cap is a contract, not
+    //     a hint: a silent degrade would let a build exceed the
+    //     declared resource budget without surfacing.
+    // `_plan` + `_sandbox` are kept alive via RAII — their Drops
+    // release the LLC flocks and cgroup on scope exit. Struct
+    // field order in BuildReservation ensures `_sandbox` drops
+    // BEFORE `plan`, matching the inline LIFO invariant.
+    let BuildReservation {
+        plan: _plan,
+        _sandbox,
+        make_jobs,
+    } = acquire_build_reservation(cli_label, llc_cap)?;
 
     if clean {
         if !is_local_source {
@@ -1511,7 +1698,7 @@ pub fn kernel_build_pipeline(
     }
 
     Spinner::with_progress("Building kernel...", "Kernel built", |sp| {
-        make_kernel_with_output(source_dir, Some(sp))
+        make_kernel_with_output(source_dir, Some(sp), make_jobs)
     })?;
 
     // Validate critical config options were not silently disabled.
@@ -2215,7 +2402,13 @@ pub fn resolve_cached_kernel(
                 return Ok(entry.path);
             }
             // Cache miss: download and build the requested version.
-            download_and_cache_version(&resolved, cli_label)
+            // llc_cap is None here — resolve_cached_kernel is reached
+            // from test/coverage/shell/run/verifier (via
+            // resolve_kernel_image), and --llc-cap is scoped to the
+            // explicit `kernel build` / `shell --no-perf-mode` paths
+            // only; the auto-build-on-miss codepath is outside that
+            // scope by design.
+            download_and_cache_version(&resolved, cli_label, None)
         }
         KernelId::CacheKey(key) => {
             let cache = crate::cache::CacheDir::new()?;
@@ -2264,7 +2457,15 @@ pub fn resolve_kernel_image(
             KernelId::Path(p) => {
                 let path = std::path::PathBuf::from(&p);
                 if path.is_dir() {
-                    resolve_kernel_dir(&path, policy.cli_label)
+                    // `None` for llc_cap: resolve_kernel_image is
+                    // called by test/coverage/shell/run/verifier —
+                    // subcommands where --llc-cap is not exposed.
+                    // The two kernel-build entry points
+                    // (ktstr/cargo-ktstr `kernel build`) call
+                    // resolve_kernel_dir directly with their flag-
+                    // derived cap and do NOT go through
+                    // resolve_kernel_image.
+                    resolve_kernel_dir(&path, policy.cli_label, None)
                 } else if path.is_file() {
                     if policy.accept_raw_image {
                         Ok(path)
@@ -2315,7 +2516,7 @@ pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
     )?;
     sp.finish(format!("Latest stable: {ver}"));
 
-    let cache_dir = download_and_cache_version(&ver, cli_label)?;
+    let cache_dir = download_and_cache_version(&ver, cli_label, None)?;
     let (_, image_name) = crate::fetch::arch_info();
     Ok(cache_dir.join(image_name))
 }
@@ -2326,7 +2527,15 @@ pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
 /// Checks the cache one more time with the resolved version to cover
 /// races and prefix-resolved entries. Delegates to
 /// [`kernel_build_pipeline`] for configure/build/validate/cache.
-fn download_and_cache_version(version: &str, cli_label: &str) -> Result<std::path::PathBuf> {
+///
+/// `llc_cap` forwards the resource-budget cap to the pipeline so
+/// the LLC flock + cgroup sandbox phases honour it. `None`
+/// preserves the pre-flag "lock every LLC" behaviour.
+pub fn download_and_cache_version(
+    version: &str,
+    cli_label: &str,
+    llc_cap: Option<crate::vmm::host_topology::LlcCap>,
+) -> Result<std::path::PathBuf> {
     let (arch, _) = crate::fetch::arch_info();
     let cache_key = format!("{version}-tarball-{arch}-kc{}", crate::cache_key_suffix());
 
@@ -2349,7 +2558,7 @@ fn download_and_cache_version(version: &str, cli_label: &str) -> Result<std::pat
     sp.finish("Downloaded");
 
     let cache = crate::cache::CacheDir::new()?;
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false)?;
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, llc_cap)?;
 
     match result.entry {
         Some(entry) => Ok(entry.path),
@@ -2365,7 +2574,18 @@ fn download_and_cache_version(version: &str, cli_label: &str) -> Result<std::pat
 /// delegates to [`kernel_build_pipeline`] on miss. `cli_label`
 /// prefixes status output and is passed through to
 /// [`kernel_build_pipeline`] as the diagnostic label.
-pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std::path::PathBuf> {
+///
+/// `llc_cap` forwards the resource-budget cap to the pipeline.
+/// `None` is the default for non-kernel-build callers
+/// (test/coverage/shell auto-build paths) — `--llc-cap` lives on
+/// the explicit kernel-build entrypoint, not test-running
+/// commands, because the auto-build-on-miss path already runs
+/// inside a test invocation where perf-mode constraints dominate.
+pub fn resolve_kernel_dir(
+    path: &std::path::Path,
+    cli_label: &str,
+    llc_cap: Option<crate::vmm::host_topology::LlcCap>,
+) -> Result<std::path::PathBuf> {
     let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
     if !is_source_tree {
         bail!(
@@ -2392,7 +2612,7 @@ pub fn resolve_kernel_dir(path: &std::path::Path, cli_label: &str) -> Result<std
     }
 
     let cache = crate::cache::CacheDir::new()?;
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true)?;
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, llc_cap)?;
 
     // Prefer the cached image path (stable across rebuilds).
     match result.entry {
@@ -2436,6 +2656,359 @@ pub fn new_table() -> comfy_table::Table {
         t.force_no_tty();
     }
     t
+}
+
+// ---------------------------------------------------------------------------
+// `ktstr locks` — observational enumeration of every ktstr flock on the host
+// ---------------------------------------------------------------------------
+//
+// Troubleshooting companion to `--llc-cap`: when a build or test is
+// stalled behind a peer's reservation, `ktstr locks` names the peer
+// (PID + cmdline) without disturbing any of its flocks. Reads
+// `/tmp/ktstr-llc-*.lock`, `/tmp/ktstr-cpu-*.lock`, and
+// `{cache_root}/.locks/*.lock`; calls [`crate::flock::read_holders`]
+// once per file, which does a single `/proc/locks` parse internally.
+
+/// One LLC-lock row in the `ktstr locks` output.
+///
+/// `pub(crate)` so the test-only [`collect_locks_snapshot_from`]
+/// seam can return the type from outside its defining module.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct LlcLockRow {
+    pub(crate) llc_idx: usize,
+    pub(crate) numa_node: Option<usize>,
+    pub(crate) lockfile: String,
+    pub(crate) holders: Vec<crate::flock::HolderInfo>,
+}
+
+/// One per-CPU-lock row. `numa_node` carries the host NUMA node the
+/// CPU lives on, looked up via [`crate::topology::TestTopology`]'s
+/// `cpu_to_node` map; `None` when the sysfs probe failed and the
+/// host topology is unavailable.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct CpuLockRow {
+    pub(crate) cpu: usize,
+    pub(crate) numa_node: Option<usize>,
+    pub(crate) lockfile: String,
+    pub(crate) holders: Vec<crate::flock::HolderInfo>,
+}
+
+/// One cache-entry-lock row. Cache locks live at
+/// `{cache_root}/.locks/{cache_key}.lock`; `cache_key` is parsed
+/// from the filename stem.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct CacheLockRow {
+    pub(crate) cache_key: String,
+    pub(crate) lockfile: String,
+    pub(crate) holders: Vec<crate::flock::HolderInfo>,
+}
+
+/// Snapshot of every ktstr flock discoverable on the host at the
+/// moment this is built. Assembled by [`collect_locks_snapshot`] and
+/// rendered by either the human [`render_locks_human`] or JSON
+/// [`serde_json::to_string_pretty`] path.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct LocksSnapshot {
+    pub(crate) llcs: Vec<LlcLockRow>,
+    pub(crate) cpus: Vec<CpuLockRow>,
+    pub(crate) cache: Vec<CacheLockRow>,
+}
+
+/// Enumerate every ktstr lockfile reachable on the host, attach the
+/// holder list parsed from `/proc/locks`, and return a structured
+/// snapshot suitable for either human or JSON rendering.
+///
+/// Missing paths (no `/tmp` glob matches, no cache `.locks/`) produce
+/// empty row vectors — not an error. The lockfile glob pattern uses
+/// the `glob` crate (already a dep); failures to expand are treated
+/// as "no files matched" and surfaced via `tracing::warn!` so the
+/// operator still sees a populated snapshot for the paths that did
+/// work.
+fn collect_locks_snapshot() -> Result<LocksSnapshot> {
+    let cache_root = CacheDir::default_root().ok();
+    collect_locks_snapshot_from(
+        Path::new("/tmp"),
+        cache_root.as_deref(),
+    )
+}
+
+/// Seam behind [`collect_locks_snapshot`]: enumerate LLC, per-CPU,
+/// and cache-entry lockfiles under the given roots. Tests inject a
+/// tempdir for `tmp_root` + `cache_root` so the `ktstr locks`
+/// snapshot shape can be pinned without touching the real
+/// host `/tmp` or the operator's cache directory.
+///
+/// `tmp_root` is the directory containing `ktstr-llc-*.lock` and
+/// `ktstr-cpu-*.lock` (in production: `/tmp`). `cache_root` is the
+/// cache-directory whose `.locks/` subdirectory holds per-entry
+/// locks (in production: `CacheDir::default_root()`); `None`
+/// suppresses the cache-lock enumeration entirely, matching the
+/// "home unresolvable" production fallback.
+pub(crate) fn collect_locks_snapshot_from(
+    tmp_root: &Path,
+    cache_root: Option<&Path>,
+) -> Result<LocksSnapshot> {
+    use crate::vmm::host_topology::HostTopology;
+
+    // Sysfs probe is best-effort — a container without
+    // /sys/devices/system/cpu populated still gets to see its flocks,
+    // just without NUMA node annotation (degrades to `None` in JSON
+    // and `"?"` in the human table). Both the LLC-index→node lookup
+    // (via `llc_numa_node`) and the per-CPU→node lookup (via
+    // `cpu_to_node`) live on HostTopology — no TestTopology needed.
+    let host_topo = HostTopology::from_sysfs().ok();
+
+    // LLC locks: {tmp_root}/ktstr-llc-{N}.lock
+    let llc_pattern = format!("{}/ktstr-llc-*.lock", tmp_root.display());
+    let mut llcs: Vec<LlcLockRow> = Vec::new();
+    for entry in glob::glob(&llc_pattern)
+        .map_err(|e| anyhow!("glob {llc_pattern}: {e}"))?
+        .flatten()
+    {
+        let Some(stem) = entry.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Stem is like "ktstr-llc-0"; strip prefix to get the index.
+        let Some(idx_str) = stem.strip_prefix("ktstr-llc-") else {
+            continue;
+        };
+        let Ok(llc_idx) = idx_str.parse::<usize>() else {
+            continue;
+        };
+        let holders = crate::flock::read_holders(&entry).unwrap_or_default();
+        let numa_node = host_topo.as_ref().and_then(|t| {
+            if llc_idx < t.llc_groups.len() {
+                Some(t.llc_numa_node(llc_idx))
+            } else {
+                None
+            }
+        });
+        llcs.push(LlcLockRow {
+            llc_idx,
+            numa_node,
+            lockfile: entry.display().to_string(),
+            holders,
+        });
+    }
+    llcs.sort_by_key(|r| r.llc_idx);
+
+    // Per-CPU locks: {tmp_root}/ktstr-cpu-{C}.lock
+    let cpu_pattern = format!("{}/ktstr-cpu-*.lock", tmp_root.display());
+    let mut cpus: Vec<CpuLockRow> = Vec::new();
+    for entry in glob::glob(&cpu_pattern)
+        .map_err(|e| anyhow!("glob {cpu_pattern}: {e}"))?
+        .flatten()
+    {
+        let Some(stem) = entry.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(idx_str) = stem.strip_prefix("ktstr-cpu-") else {
+            continue;
+        };
+        let Ok(cpu) = idx_str.parse::<usize>() else {
+            continue;
+        };
+        let holders = crate::flock::read_holders(&entry).unwrap_or_default();
+        let numa_node = host_topo
+            .as_ref()
+            .and_then(|t| t.cpu_to_node.get(&cpu).copied());
+        cpus.push(CpuLockRow {
+            cpu,
+            numa_node,
+            lockfile: entry.display().to_string(),
+            holders,
+        });
+    }
+    cpus.sort_by_key(|r| r.cpu);
+
+    // Cache-entry locks: {cache_root}/.locks/*.lock — skipped when
+    // `cache_root` is None (unresolvable home / test isolation).
+    let mut cache: Vec<CacheLockRow> = Vec::new();
+    if let Some(cache_root) = cache_root {
+        let locks_dir = cache_root.join(".locks");
+        let pattern = format!("{}/*.lock", locks_dir.display());
+        if let Ok(expanded) = glob::glob(&pattern) {
+            for entry in expanded.flatten() {
+                let Some(stem) = entry.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let holders = crate::flock::read_holders(&entry).unwrap_or_default();
+                cache.push(CacheLockRow {
+                    cache_key: stem.to_string(),
+                    lockfile: entry.display().to_string(),
+                    holders,
+                });
+            }
+        }
+    }
+    cache.sort_by(|a, b| a.cache_key.cmp(&b.cache_key));
+
+    Ok(LocksSnapshot { llcs, cpus, cache })
+}
+
+/// Render a [`LocksSnapshot`] as three stacked comfy-tables for
+/// interactive reading. Empty sections print "(none)" under their
+/// header so the operator can distinguish "no locks of this kind" from
+/// a display bug. NUMA column renders the numeric node when available
+/// or `"?"` when the sysfs probe failed.
+fn render_locks_human(snap: &LocksSnapshot) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    let fmt_holders = |hs: &[crate::flock::HolderInfo]| -> String {
+        if hs.is_empty() {
+            crate::flock::NO_HOLDERS_RECORDED.to_string()
+        } else {
+            // Newline-separated so multi-holder lockfile rows
+            // don't wrap mid-cmdline on narrow terminals (the
+            // prior comma-joined form did). Within a comfy-table
+            // cell, each holder now renders on its own line.
+            hs.iter()
+                .map(|h| format!("{} ({})", h.pid, h.cmdline))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+    let fmt_node = |n: Option<usize>| -> String {
+        match n {
+            Some(v) => v.to_string(),
+            None => "?".to_string(),
+        }
+    };
+
+    writeln!(out, "LLC locks:").unwrap();
+    if snap.llcs.is_empty() {
+        writeln!(out, "  (none)").unwrap();
+    } else {
+        let mut t = new_table();
+        t.set_header(["LLC", "NODE", "LOCKFILE", "HOLDERS"]);
+        for r in &snap.llcs {
+            t.add_row([
+                r.llc_idx.to_string(),
+                fmt_node(r.numa_node),
+                r.lockfile.clone(),
+                fmt_holders(&r.holders),
+            ]);
+        }
+        writeln!(out, "{t}").unwrap();
+    }
+
+    writeln!(out, "\nPer-CPU locks:").unwrap();
+    if snap.cpus.is_empty() {
+        writeln!(out, "  (none)").unwrap();
+    } else {
+        let mut t = new_table();
+        t.set_header(["CPU", "NODE", "LOCKFILE", "HOLDERS"]);
+        for r in &snap.cpus {
+            t.add_row([
+                r.cpu.to_string(),
+                fmt_node(r.numa_node),
+                r.lockfile.clone(),
+                fmt_holders(&r.holders),
+            ]);
+        }
+        writeln!(out, "{t}").unwrap();
+    }
+
+    writeln!(out, "\nCache-entry locks:").unwrap();
+    if snap.cache.is_empty() {
+        writeln!(out, "  (none)").unwrap();
+    } else {
+        let mut t = new_table();
+        t.set_header(["CACHE KEY", "LOCKFILE", "HOLDERS"]);
+        for r in &snap.cache {
+            t.add_row([
+                r.cache_key.clone(),
+                r.lockfile.clone(),
+                fmt_holders(&r.holders),
+            ]);
+        }
+        writeln!(out, "{t}").unwrap();
+    }
+
+    out
+}
+
+/// Shared kill flag for the `ktstr locks --watch` SIGINT handler.
+/// `libc::signal` installs the C-level handler; the handler flips
+/// this atomic so the redraw loop can exit cleanly between frames
+/// instead of being torn down mid-print. The flag stays set for the
+/// remainder of the process lifetime — `ktstr locks` is a one-shot
+/// observational command, so re-arming is unnecessary.
+static LOCKS_WATCH_KILL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// SIGINT handler for `--watch`: flip the kill flag and return. The
+/// main loop observes the flag between frames (at most one interval
+/// after Ctrl-C) and exits. No buffered output is flushed here —
+/// stdout is line-buffered on a pipe and fully flushed per-frame by
+/// `println!`, so a mid-frame interrupt at worst drops the unwritten
+/// portion of the final table, not the prior frame.
+extern "C" fn locks_watch_sigint_handler(_sig: libc::c_int) {
+    LOCKS_WATCH_KILL.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `ktstr locks` entry point. See module-level doc block above.
+///
+/// When `watch` is `Some(interval)`, runs a redraw loop that prints
+/// the snapshot, sleeps `interval`, and repeats until SIGINT. JSON
+/// mode under `--watch` emits one JSON object per interval with a
+/// trailing newline so streaming consumers can read frame-by-frame
+/// via newline-delimited JSON.
+pub fn list_locks(json: bool, watch: Option<std::time::Duration>) -> Result<()> {
+    // One-shot: snapshot, render, done.
+    if watch.is_none() {
+        let snap = collect_locks_snapshot()?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&snap)?);
+        } else {
+            print!("{}", render_locks_human(&snap));
+        }
+        return Ok(());
+    }
+    let interval = watch.unwrap();
+
+    // Install the SIGINT handler once. `libc::signal` returns the
+    // previous handler; we discard it — `ktstr locks` is a terminal
+    // command, nothing restores the prior handler on exit.
+    // SAFETY: libc::signal is an FFI call with no memory effects.
+    // `locks_watch_sigint_handler` is an `extern "C" fn` with the
+    // correct `void(int)` signature. The handler only writes to a
+    // static AtomicBool, which is async-signal-safe. Cast routes
+    // fn-item → `*const ()` → `sighandler_t` so the
+    // `function_casts_as_integer` lint is satisfied.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            locks_watch_sigint_handler as *const () as libc::sighandler_t,
+        );
+    }
+
+    loop {
+        if LOCKS_WATCH_KILL.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        let snap = collect_locks_snapshot()?;
+        if json {
+            // Newline-delimited JSON: one frame = one line-terminated
+            // object. `to_string_pretty` emits embedded newlines; use
+            // the compact form under --watch so streaming consumers
+            // can parse per-line.
+            println!("{}", serde_json::to_string(&snap)?);
+        } else {
+            // ANSI clear-screen + home cursor, then the table.
+            // `\x1b[2J` clears; `\x1b[H` moves to (1,1). Both standard
+            // VT100 — every terminal ktstr supports honors them.
+            print!("\x1b[2J\x1b[H{}", render_locks_human(&snap));
+        }
+        std::thread::sleep(interval);
+    }
+
+    Ok(())
 }
 
 /// Print a styled status message to stderr.
@@ -5957,6 +6530,95 @@ mod tests {
         }
     }
 
+    /// `kernel build --llc-cap N` parses to `KernelCommand::Build
+    /// { llc_cap: Some(N), .. }`. Unlike the shell subcommand,
+    /// kernel-build's `--llc-cap` has NO `requires` constraint:
+    /// builds always use the LLC plan regardless of perf-mode
+    /// (builds don't have a perf-mode toggle at all). A clap
+    /// regression that accidentally added `requires =
+    /// "no_perf_mode"` here would break `ktstr kernel build
+    /// --llc-cap 4` and surface through this test.
+    #[test]
+    fn kernel_build_parses_llc_cap_without_extra_flags() {
+        use clap::Parser as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let parsed = TestCli::try_parse_from([
+            "prog", "build", "6.14.2", "--llc-cap", "4",
+        ])
+        .expect("kernel build --llc-cap N must parse");
+        match parsed.cmd {
+            KernelCommand::Build {
+                llc_cap, version, ..
+            } => {
+                assert_eq!(llc_cap, Some(4));
+                assert_eq!(version.as_deref(), Some("6.14.2"));
+            }
+            other => panic!("expected KernelCommand::Build, got {other:?}"),
+        }
+    }
+
+    /// `kernel build` without `--llc-cap` parses with
+    /// `llc_cap: None` — the pre-flag default. Pins the
+    /// no-flag path so a future rename of the clap field or a
+    /// stray `default_value = "0"` surfaces as a test failure,
+    /// not a silent runtime behavior change.
+    #[test]
+    fn kernel_build_without_llc_cap_defaults_to_none() {
+        use clap::Parser as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2"])
+            .expect("kernel build without --llc-cap must parse");
+        match parsed.cmd {
+            KernelCommand::Build { llc_cap, .. } => {
+                assert_eq!(
+                    llc_cap, None,
+                    "no --llc-cap must produce None, not Some(0)",
+                );
+            }
+            other => panic!("expected KernelCommand::Build, got {other:?}"),
+        }
+    }
+
+    /// `kernel build --llc-cap 0` parses successfully at clap level
+    /// — the "must be ≥ 1" check lives in [`LlcCap::new`], not in
+    /// the clap value parser. Pins the two-layer validation: clap
+    /// accepts any usize; runtime resolution via `LlcCap::resolve`
+    /// is responsible for the "0 is rejected" diagnostic. A future
+    /// refactor that moved the ≥1 check into clap would trip this
+    /// test AND require updating the
+    /// `llc_cap_resolve_zero_env_rejected` error-wording pin.
+    #[test]
+    fn kernel_build_llc_cap_zero_passes_clap() {
+        use clap::Parser as _;
+        #[derive(clap::Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: KernelCommand,
+        }
+        let parsed = TestCli::try_parse_from([
+            "prog", "build", "6.14.2", "--llc-cap", "0",
+        ])
+        .expect("clap-level parse must accept 0; runtime validation rejects");
+        match parsed.cmd {
+            KernelCommand::Build { llc_cap, .. } => {
+                assert_eq!(
+                    llc_cap,
+                    Some(0),
+                    "clap parses 0 verbatim; validation is downstream",
+                );
+            }
+            other => panic!("expected KernelCommand::Build, got {other:?}"),
+        }
+    }
+
     // Channel-routing and ordering pins previously lived here as
     // `eol_legend_emits_via_eprintln` + `kernel_list_footer_ordering_pin`,
     // scanning cli.rs via `include_str!` + a hand-rolled brace-
@@ -5969,4 +6631,248 @@ mod tests {
     // the code that produces it. The old source-scanning machinery
     // (brace-balance walker, identifier-presence bootstrap) has
     // been removed along with the two tests it supported.
+
+    // ─── `ktstr locks` snapshot + JSON serde pins ────────────────
+
+    /// `LocksSnapshot` JSON top-level keys are stable: `llcs`,
+    /// `cpus`, `cache`. Downstream consumers of `ktstr locks --json`
+    /// (shell scripts piping through `jq`, the mdbook recipe pages,
+    /// future dashboards) parse against these names — a refactor
+    /// that renames them would silently break every consumer.
+    ///
+    /// Also pins the `rename_all = "snake_case"` contract on the
+    /// nested row structs: LlcLockRow's "llc_idx" and "numa_node"
+    /// must NOT emit as camelCase.
+    #[test]
+    fn locks_snapshot_json_field_names_are_stable() {
+        let snap = LocksSnapshot {
+            llcs: vec![LlcLockRow {
+                llc_idx: 0,
+                numa_node: Some(1),
+                lockfile: "/tmp/ktstr-llc-0.lock".to_string(),
+                holders: Vec::new(),
+            }],
+            cpus: vec![CpuLockRow {
+                cpu: 3,
+                numa_node: None,
+                lockfile: "/tmp/ktstr-cpu-3.lock".to_string(),
+                holders: Vec::new(),
+            }],
+            cache: vec![CacheLockRow {
+                cache_key: "6.14.2-tarball-x86_64".to_string(),
+                lockfile: "/tmp/.locks/6.14.2-tarball-x86_64.lock".to_string(),
+                holders: Vec::new(),
+            }],
+        };
+        let val = serde_json::to_value(&snap).expect("serde serialize");
+        // Top-level keys.
+        assert!(val.get("llcs").is_some(), "top-level must have 'llcs': {val}");
+        assert!(val.get("cpus").is_some(), "top-level must have 'cpus': {val}");
+        assert!(val.get("cache").is_some(), "top-level must have 'cache': {val}");
+        // Nested LLC row.
+        let llc0 = &val["llcs"][0];
+        assert!(llc0.get("llc_idx").is_some(), "llc_idx (snake_case): {llc0}");
+        assert!(llc0.get("numa_node").is_some(), "numa_node: {llc0}");
+        assert!(llc0.get("lockfile").is_some(), "lockfile: {llc0}");
+        assert!(llc0.get("holders").is_some(), "holders: {llc0}");
+        // Nested CPU row.
+        let cpu0 = &val["cpus"][0];
+        assert!(cpu0.get("cpu").is_some());
+        assert!(cpu0.get("numa_node").is_some());
+        // Nested Cache row — cache_key stays snake_case.
+        let cache0 = &val["cache"][0];
+        assert!(cache0.get("cache_key").is_some(), "cache_key: {cache0}");
+    }
+
+    /// `collect_locks_snapshot_from` on a fresh tempdir with no
+    /// ktstr lockfiles returns an empty LocksSnapshot (all three
+    /// row vectors empty). Production wrapper always sees the same
+    /// behavior when `/tmp` has no `ktstr-*.lock` files and the
+    /// cache dir has no `.locks/` subdirectory.
+    #[test]
+    fn collect_locks_snapshot_empty_roots() {
+        use tempfile::TempDir;
+        let tmp_dir = TempDir::new().expect("tempdir tmp_root");
+        let cache_dir = TempDir::new().expect("tempdir cache_root");
+        let snap = collect_locks_snapshot_from(
+            tmp_dir.path(),
+            Some(cache_dir.path()),
+        )
+        .expect("collect must succeed on empty roots");
+        assert!(snap.llcs.is_empty(), "no ktstr-llc-*.lock → empty llcs");
+        assert!(snap.cpus.is_empty(), "no ktstr-cpu-*.lock → empty cpus");
+        assert!(snap.cache.is_empty(), "no .locks/ → empty cache");
+    }
+
+    /// `collect_locks_snapshot_from` discovers synthetic LLC + CPU
+    /// lockfiles placed under the injected tmp_root. Also pins:
+    /// llc_idx / cpu parse from filename stem, sort ascending,
+    /// exclude files whose stem doesn't match the expected
+    /// `ktstr-{llc,cpu}-{N}` format.
+    #[test]
+    fn collect_locks_snapshot_discovers_lockfiles() {
+        use tempfile::TempDir;
+        let tmp_dir = TempDir::new().expect("tempdir");
+        let path = tmp_dir.path();
+        // Plant 2 LLC lockfiles (out of order — snapshot must sort
+        // ascending), 1 CPU lockfile, and a junk file that mustn't
+        // appear in the snapshot.
+        std::fs::write(path.join("ktstr-llc-5.lock"), b"").expect("plant llc-5");
+        std::fs::write(path.join("ktstr-llc-2.lock"), b"").expect("plant llc-2");
+        std::fs::write(path.join("ktstr-cpu-7.lock"), b"").expect("plant cpu-7");
+        // Junk: looks close but doesn't match the prefix-N-.lock
+        // pattern. The parse::<usize>() on "oops" fails → skip.
+        std::fs::write(path.join("ktstr-llc-oops.lock"), b"").expect("plant junk");
+        let snap = collect_locks_snapshot_from(path, None)
+            .expect("collect must succeed");
+        // LLC rows, ascending.
+        assert_eq!(snap.llcs.len(), 2);
+        assert_eq!(snap.llcs[0].llc_idx, 2, "sort ascending: llc 2 first");
+        assert_eq!(snap.llcs[1].llc_idx, 5, "sort ascending: llc 5 second");
+        // CPU row.
+        assert_eq!(snap.cpus.len(), 1);
+        assert_eq!(snap.cpus[0].cpu, 7);
+        // Cache row empty because cache_root=None.
+        assert!(snap.cache.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // kernel_build_pipeline reservation phase — factored-out
+    // `acquire_build_reservation` covers the llc_cap → acquire →
+    // sandbox → make_jobs flow without needing a real kernel source.
+    // ---------------------------------------------------------------
+
+    /// Serialize `KTSTR_BYPASS_LLC_LOCKS` env-var mutation across
+    /// test threads — same pattern as host_topology's env_lock. Two
+    /// parallel tests can't both mutate the same process-wide env
+    /// var without coordinating.
+    fn bypass_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RAII guard for scoped `KTSTR_BYPASS_LLC_LOCKS` mutation.
+    /// Caller holds `bypass_env_lock()` before constructing.
+    struct BypassGuard;
+    impl BypassGuard {
+        fn set(value: &str) -> Self {
+            // SAFETY: env_lock held by caller; serializes with
+            // every other env-mutating test.
+            unsafe {
+                std::env::set_var("KTSTR_BYPASS_LLC_LOCKS", value);
+            }
+            BypassGuard
+        }
+        fn remove() -> Self {
+            // SAFETY: caller holds env_lock.
+            unsafe {
+                std::env::remove_var("KTSTR_BYPASS_LLC_LOCKS");
+            }
+            BypassGuard
+        }
+    }
+    impl Drop for BypassGuard {
+        fn drop(&mut self) {
+            // SAFETY: guard lifetime bounded by env_lock held by
+            // caller; Drop runs before the mutex guard releases.
+            unsafe {
+                std::env::remove_var("KTSTR_BYPASS_LLC_LOCKS");
+            }
+        }
+    }
+
+    /// `acquire_build_reservation` with
+    /// `KTSTR_BYPASS_LLC_LOCKS=1` + `llc_cap=None` returns a
+    /// no-reservation `BuildReservation`: plan is None, sandbox
+    /// is None, make_jobs is None. Pins the "bypass escape hatch
+    /// disables both layers" contract at the factored-out entry
+    /// point so an integration test can exercise the bypass path
+    /// without a real kernel source tree.
+    #[test]
+    fn acquire_build_reservation_bypass_returns_no_reservation() {
+        let _lock = bypass_env_lock();
+        let _env = BypassGuard::set("1");
+        let r = acquire_build_reservation("test", None)
+            .expect("bypass + no cap must succeed");
+        assert!(r.plan.is_none(), "bypass must produce no LLC plan");
+        assert!(
+            r._sandbox.is_none(),
+            "bypass must produce no cgroup sandbox",
+        );
+        assert!(
+            r.make_jobs.is_none(),
+            "bypass must fall back to nproc (None signals to caller)",
+        );
+    }
+
+    /// `acquire_build_reservation` with
+    /// `KTSTR_BYPASS_LLC_LOCKS=1` + `llc_cap=Some(_)` must error
+    /// with the "resource contract" substring. Pins the conflict
+    /// check at the pipeline's reservation entry point, independent
+    /// of the CLI-layer conflict check (#76 pins the CLI layer).
+    #[test]
+    fn acquire_build_reservation_bypass_with_cap_errors() {
+        let _lock = bypass_env_lock();
+        let _env = BypassGuard::set("1");
+        let cap = crate::vmm::host_topology::LlcCap::new(2)
+            .expect("cap=2 valid");
+        let err = acquire_build_reservation("test", Some(cap))
+            .expect_err("bypass + cap must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("resource contract"),
+            "err must name the resource contract: {msg}",
+        );
+    }
+
+    /// `acquire_build_reservation` without bypass on a functional
+    /// sysfs-capable host: returns a `BuildReservation` whose
+    /// fields are populated consistently — if `plan` is Some, then
+    /// `make_jobs` is Some (same plan), and vice-versa. Pins the
+    /// "plan and make_jobs must never diverge" invariant; a future
+    /// refactor that built `make_jobs` from something other than
+    /// `plan.as_ref()` would drift here.
+    ///
+    /// Runs on any Linux host with `/sys/devices/system/cpu`; the
+    /// host's actual LLC count is irrelevant to the invariant.
+    #[test]
+    fn acquire_build_reservation_plan_and_make_jobs_consistent() {
+        let _lock = bypass_env_lock();
+        let _env = BypassGuard::remove();
+        match acquire_build_reservation("test", None) {
+            Ok(r) => {
+                // Invariant: plan.is_some() iff make_jobs.is_some()
+                assert_eq!(
+                    r.plan.is_some(),
+                    r.make_jobs.is_some(),
+                    "plan and make_jobs must agree on reservation presence",
+                );
+                if let (Some(p), Some(jobs)) = (r.plan.as_ref(), r.make_jobs) {
+                    assert_eq!(
+                        jobs,
+                        crate::vmm::host_topology::make_jobs_for_plan(p),
+                        "make_jobs must equal make_jobs_for_plan(&plan)",
+                    );
+                }
+                // sandbox presence tracks plan presence.
+                assert_eq!(
+                    r.plan.is_some(),
+                    r._sandbox.is_some(),
+                    "sandbox and plan must agree on reservation presence",
+                );
+            }
+            Err(e) => {
+                // Sysfs-unreadable host or contested LLCs. Accept
+                // either outcome; the test's intent is to pin the
+                // invariant in the success case, not force success.
+                eprintln!(
+                    "acquire_build_reservation unavailable on this host: {e:#}"
+                );
+            }
+        }
+    }
 }

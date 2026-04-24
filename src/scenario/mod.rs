@@ -2431,6 +2431,12 @@ mod tests {
         fn clear_cpuset(&self, _: &str) -> Result<()> {
             Ok(())
         }
+        fn set_cpuset_mems(&self, _: &str, _: &BTreeSet<usize>) -> Result<()> {
+            Ok(())
+        }
+        fn clear_cpuset_mems(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
         fn move_task(&self, _: &str, _: libc::pid_t) -> Result<()> {
             Ok(())
         }

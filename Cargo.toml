@@ -101,6 +101,10 @@ siphasher = "1"
 # with an 8-byte needle is O(n) in naive byte compares; memmem uses
 # a two-way algorithm with x86_64 AVX2 / aarch64 Neon when available.
 memchr = "2"
+# Human-readable duration parsing for the `--watch <interval>` flag on
+# `ktstr locks`. Accepts "100ms", "1s", "5m", "1h" forms per rev 5 §6.
+# Tiny crate (~2 modules, zero non-std deps).
+humantime = "2"
 # Safe wrappers around direct syscalls — replaces ad-hoc
 # `libc::uname`/`libc::flock`/`libc::shm_open` sites that each reinvent
 # fd ownership and errno handling. Keeps the libc dep around because
@@ -168,6 +172,25 @@ assert_cmd = "2"
 insta = "1"
 predicates = "3"
 proptest = "1"
+# Grok-style structured log matcher. Used by the watchdog timing
+# precision test to extract the sched_ext stall duration from the
+# kernel's SCX_EXIT_ERROR_STALL message ("…failed to run for
+# N.NNNs"). `default-features = false` disables the default `onig`
+# C-regex engine (which would drag in a C library build). The
+# `fancy-regex` engine is the minimum that supports the lookbehind
+# and atomic-group constructs grok's default `BASE10NUM` / `NUMBER`
+# patterns use; the pure-`regex` backend rejects those patterns
+# at compile time.
+grok = { version = "2", default-features = false, features = ["fancy-regex"] }
+# In-test tracing subscriber that captures `tracing::warn!` /
+# `tracing::info!` events into a per-test buffer, queryable via
+# `logs_contain(&str)`. Used by the `set_rt_priority_warns_without_cap`
+# unit test to pin that the CAP_SYS_NICE-absent path emits an
+# actionable warn event — converted from a pure `eprintln!` that no
+# test could observe. Default feature set filters to the current
+# crate's tracing events, which matches the unit-test use case
+# where the event originates from ktstr itself.
+tracing-test = "0.2"
 trybuild = "1"
 
 [build-dependencies]

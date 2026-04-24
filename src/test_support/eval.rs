@@ -214,6 +214,14 @@ pub(crate) fn run_ktstr_test_inner(
     }
     ensure_kvm()?;
     let kernel = resolve_test_kernel()?;
+    // Hold a reader flock on the cache entry (if the resolved
+    // kernel lives in one). Prevents a concurrent
+    // `cargo ktstr kernel build` from swapping the entry under
+    // the VM mid-run. Dropped when this fn returns; the VM has
+    // finished by then. `None` on non-cache kernels (explicit
+    // KTSTR_TEST_KERNEL, `/lib/modules/...`) — those don't
+    // need coordination.
+    let _kernel_lock = acquire_test_kernel_lock_if_cached(&kernel)?;
     let scheduler = match entry.scheduler.scheduler_binary() {
         Some(b) => {
             // Drop the ResolveSource on this path — the downstream
@@ -1171,6 +1179,82 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
     )
 }
 
+/// If `kernel_path` resolves to an image inside a cache entry, hold a
+/// `LOCK_SH` on that entry's coordination lockfile for the duration of
+/// the returned guard. Prevents a concurrent
+/// `cargo ktstr kernel build` from swapping the entry's directory
+/// (see [`crate::cache::CacheDir::store`]) under the VM while the test
+/// reads from it.
+///
+/// Returns `Ok(None)` when `kernel_path` is not shaped like a cache
+/// entry — explicit `KTSTR_TEST_KERNEL=/path/to/bzImage`,
+/// `/lib/modules/.../vmlinuz`, `/boot/vmlinuz-*`, or any path whose
+/// two-level parent does not match the resolved cache root. Such
+/// paths do not need coordination because the build pipeline never
+/// touches them.
+///
+/// Detection: the image is expected at `{root}/{key}/{image_name}`.
+/// Walk `kernel_path` up by two components (image_name, key) to
+/// produce a candidate root and canonicalize both sides before
+/// comparing — symlinks, redundant `./` segments, and `..` traversals
+/// must all reduce to the same inode path or the entry is treated as
+/// non-cache.
+pub(crate) fn acquire_test_kernel_lock_if_cached(
+    kernel_path: &Path,
+) -> Result<Option<crate::cache::SharedLockGuard>> {
+    // Peel the image filename. Fail → not a cache entry.
+    let Some(entry_dir) = kernel_path.parent() else {
+        return Ok(None);
+    };
+    // Peel the entry directory name (this is the candidate cache
+    // key). Fail → not a cache entry.
+    let Some(key_os) = entry_dir.file_name() else {
+        return Ok(None);
+    };
+    let Some(cache_key) = key_os.to_str() else {
+        return Ok(None);
+    };
+    // The directory above the entry is the candidate cache root.
+    let Some(candidate_root) = entry_dir.parent() else {
+        return Ok(None);
+    };
+
+    // Canonicalize both the candidate root and the resolved cache
+    // root so symlinks / `.` / `..` reduce to the same inode path
+    // before comparing. A non-cache path (e.g. /lib/modules/...)
+    // simply canonicalizes to itself and will not match.
+    let candidate_root_canon = match candidate_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    let resolved_root = match crate::cache::CacheDir::default_root() {
+        Ok(p) => p,
+        // Cache root unresolvable (no HOME / no XDG / env points at a
+        // nonexistent path): no cache exists, so `kernel_path` cannot
+        // be an entry.
+        Err(_) => return Ok(None),
+    };
+    let resolved_root_canon = match resolved_root.canonicalize() {
+        Ok(p) => p,
+        // Cache root resolves but does not exist on disk yet (fresh
+        // developer checkout). `kernel_path` is not inside a cache
+        // entry, so no lock needed.
+        Err(_) => return Ok(None),
+    };
+
+    if candidate_root_canon != resolved_root_canon {
+        return Ok(None);
+    }
+
+    // The path is shaped as a cache entry under the resolved root.
+    // Acquire the reader lock. Propagate errors (fs corruption,
+    // timeout): a real cache-entry path that cannot be locked is an
+    // infrastructure failure, not a silent skip.
+    let cache = crate::cache::CacheDir::with_root(resolved_root_canon);
+    let guard = cache.acquire_shared_lock(cache_key)?;
+    Ok(Some(guard))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::output::{
@@ -1178,9 +1262,10 @@ mod tests {
         STAGE_PAYLOAD_STARTED_NO_RESULT,
     };
     use super::super::test_helpers::{
-        EVAL_TOPO, EnvVarGuard, build_assert_result_json, eevdf_entry, lock_env, make_vm_result,
-        no_repro, sched_entry,
+        EVAL_TOPO, EnvVarGuard, build_assert_result_json, eevdf_entry, isolated_cache_dir,
+        lock_env, make_vm_result, no_repro, sched_entry,
     };
+    use tempfile::TempDir;
     use super::*;
     use crate::assert::{AssertDetail, DetailKind};
     use crate::verifier::SCHED_OUTPUT_END;
@@ -2377,5 +2462,66 @@ mod tests {
             "got: {msg}"
         );
         assert!(msg.contains("--- scheduler log ---"), "got: {msg}");
+    }
+
+    /// `acquire_test_kernel_lock_if_cached` returns `Some(guard)`
+    /// when `kernel_path` is shaped like a real cache entry:
+    /// `{cache_root}/{cache_key}/{image_name}`. Exercises the
+    /// canonicalize + candidate-root-equality branch.
+    ///
+    /// Uses [`isolated_cache_dir`] so the tempdir is both pointed
+    /// at by `KTSTR_CACHE_DIR` AND cleaned up on drop. Holds
+    /// [`lock_env`] throughout so parallel tests don't race the
+    /// env var.
+    #[test]
+    fn acquire_test_kernel_lock_if_cached_returns_guard_on_cache_entry() {
+        let _env_lock = lock_env();
+        let cache = isolated_cache_dir();
+        // Fake cache entry: {cache_root}/my-kernel-key/bzImage.
+        let entry_dir = cache.path().join("my-kernel-key");
+        std::fs::create_dir_all(&entry_dir).expect("create entry dir");
+        let image_path = entry_dir.join("bzImage");
+        std::fs::write(&image_path, b"fake kernel image").expect("plant image");
+
+        let guard = super::acquire_test_kernel_lock_if_cached(&image_path)
+            .expect("lock acquire must not error on valid cache entry");
+        assert!(
+            guard.is_some(),
+            "cache-entry path must produce a SharedLockGuard",
+        );
+        // Confirm the .locks/ subdir materialized as a side effect
+        // of the acquire — pins the integration with
+        // `CacheDir::acquire_shared_lock`'s ensure_lock_dir path.
+        assert!(
+            cache.path().join(".locks").is_dir(),
+            ".locks/ must materialize under the cache root",
+        );
+    }
+
+    /// `acquire_test_kernel_lock_if_cached` returns `Ok(None)`
+    /// when `kernel_path` is NOT under the resolved cache root —
+    /// e.g. a `/lib/modules/…/vmlinuz` bootloader image or an
+    /// operator-supplied raw path. The function silently skips
+    /// locking rather than erroring, matching the doc contract:
+    /// "Such paths do not need coordination because the build
+    /// pipeline never touches them."
+    #[test]
+    fn acquire_test_kernel_lock_if_cached_returns_none_outside_cache() {
+        let _env_lock = lock_env();
+        let cache = isolated_cache_dir();
+        // Path under a DIFFERENT tempdir, not the cache root.
+        let outside = TempDir::new().expect("tempdir outside cache");
+        let entry_dir = outside.path().join("raw-kernel-key");
+        std::fs::create_dir_all(&entry_dir).expect("create entry dir");
+        let image_path = entry_dir.join("bzImage");
+        std::fs::write(&image_path, b"fake kernel image").expect("plant image");
+
+        let guard = super::acquire_test_kernel_lock_if_cached(&image_path)
+            .expect("non-cache path must not error");
+        assert!(
+            guard.is_none(),
+            "path outside {} must skip locking, got guard",
+            cache.path().display(),
+        );
     }
 }

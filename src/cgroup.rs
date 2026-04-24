@@ -46,22 +46,21 @@ fn write_with_timeout(path: &Path, data: &str, timeout: Duration) -> Result<()> 
     }
 }
 
-/// Check whether an anyhow error chain contains a specific OS error.
-fn is_os_error(err: &anyhow::Error, errno: i32) -> bool {
-    for cause in err.chain() {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
-            && io_err.raw_os_error() == Some(errno)
-        {
-            return true;
-        }
-    }
-    false
+/// Walk an `anyhow::Error` chain and return the first
+/// `std::io::Error`'s raw errno, if any. Shared helper for errno
+/// classification across cgroup orchestration — both this module's
+/// ESRCH/EBUSY checks and [`crate::vmm::cgroup_sandbox`]'s
+/// EACCES/EPERM/EBUSY branches walk the same chain shape.
+pub(crate) fn anyhow_first_io_errno(err: &anyhow::Error) -> Option<i32> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(|io| io.raw_os_error())
 }
 
 /// ESRCH: task exited between listing and migration
 /// (`cgroup_procs_write_start` -> `find_task_by_vpid` returns NULL).
 fn is_esrch(err: &anyhow::Error) -> bool {
-    is_os_error(err, libc::ESRCH)
+    anyhow_first_io_errno(err) == Some(libc::ESRCH)
 }
 
 /// EBUSY: either the cgroup v2 no-internal-process constraint
@@ -69,7 +68,7 @@ fn is_esrch(err: &anyhow::Error) -> bool {
 /// transient rejection from a sched_ext BPF `cgroup_prep_move`
 /// callback (`scx_cgroup_can_attach`).
 fn is_ebusy(err: &anyhow::Error) -> bool {
-    is_os_error(err, libc::EBUSY)
+    anyhow_first_io_errno(err) == Some(libc::EBUSY)
 }
 
 /// RAII manager for cgroup v2 filesystem operations.
@@ -143,6 +142,31 @@ impl CgroupManager {
         Ok(())
     }
 
+    /// Enable a controller on the parent cgroup's `cgroup.subtree_control`.
+    ///
+    /// Writes `+{controller}` to `{parent}/cgroup.subtree_control` so
+    /// children created under the parent inherit the controller and
+    /// expose the corresponding `*.cpus`, `*.mems`, etc. files. No-op
+    /// (returns `Ok`) when the subtree_control file does not exist —
+    /// callers treat that as "parent is not a cgroup v2 node" and
+    /// degrade elsewhere.
+    ///
+    /// Unlike [`Self::setup`] and [`Self::enable_subtree_cpuset`],
+    /// which swallow write failures via `tracing::warn!`, this method
+    /// propagates the underlying [`std::io::Error`] so callers can
+    /// classify errnos (EACCES/EPERM for permission, EBUSY for a
+    /// peer holding the subtree) via [`anyhow_first_io_errno`] and
+    /// map them to operator-facing degrade variants. Used by
+    /// [`crate::vmm::cgroup_sandbox::BuildSandbox::try_create`] under
+    /// the `--llc-cap` hard-error contract.
+    pub fn add_parent_subtree_controller(&self, controller: &str) -> Result<()> {
+        let p = self.parent.join("cgroup.subtree_control");
+        if !p.exists() {
+            return Ok(());
+        }
+        write_with_timeout(&p, &format!("+{controller}"), CGROUP_WRITE_TIMEOUT)
+    }
+
     /// Drain tasks from a child cgroup and remove it.
     pub fn remove_cgroup(&self, name: &str) -> Result<()> {
         let p = self.parent.join(name);
@@ -192,6 +216,35 @@ impl CgroupManager {
     /// Clear `cpuset.cpus` for a child cgroup (empty string = inherit parent).
     pub fn clear_cpuset(&self, name: &str) -> Result<()> {
         let p = self.parent.join(name).join("cpuset.cpus");
+        write_with_timeout(&p, "", CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Write `cpuset.mems` for a child cgroup. Constrains which NUMA
+    /// nodes the cgroup's tasks can allocate memory on.
+    ///
+    /// Shape mirrors [`set_cpuset`] exactly — [`TestTopology::cpuset_string`]
+    /// range-compact-formats the node set, [`write_with_timeout`] bounds
+    /// the filesystem-write at 2s. Used by `BuildSandbox` under the
+    /// `--llc-cap` flow to bind build memory to the NUMA nodes hosting
+    /// the locked LLCs, avoiding cross-socket DRAM latency for gcc's
+    /// symbol tables and linker working sets.
+    ///
+    /// Must be called AFTER [`set_cpuset`] and BEFORE any
+    /// [`move_task`]: a task in a cgroup whose `cpuset.mems` is empty
+    /// either fails migration with EINVAL or (if it somehow gets in)
+    /// hits SIGKILL on the next allocation per the kernel's
+    /// `cpuset_update_task_spread` path.
+    pub fn set_cpuset_mems(&self, name: &str, nodes: &BTreeSet<usize>) -> Result<()> {
+        let p = self.parent.join(name).join("cpuset.mems");
+        write_with_timeout(&p, &TestTopology::cpuset_string(nodes), CGROUP_WRITE_TIMEOUT)
+    }
+
+    /// Clear `cpuset.mems` for a child cgroup (empty string = inherit parent).
+    /// Parallels [`clear_cpuset`]; callers use it only when tearing
+    /// down a cpuset-restricted cgroup that needs to accept a
+    /// fresh task binding with a different NUMA budget.
+    pub fn clear_cpuset_mems(&self, name: &str) -> Result<()> {
+        let p = self.parent.join(name).join("cpuset.mems");
         write_with_timeout(&p, "", CGROUP_WRITE_TIMEOUT)
     }
 
@@ -345,6 +398,11 @@ pub trait CgroupOps {
     /// Clear `cpuset.cpus` (inherit from parent). See
     /// [`CgroupManager::clear_cpuset`].
     fn clear_cpuset(&self, name: &str) -> Result<()>;
+    /// Write `cpuset.mems`. See [`CgroupManager::set_cpuset_mems`].
+    fn set_cpuset_mems(&self, name: &str, nodes: &BTreeSet<usize>) -> Result<()>;
+    /// Clear `cpuset.mems` (inherit from parent). See
+    /// [`CgroupManager::clear_cpuset_mems`].
+    fn clear_cpuset_mems(&self, name: &str) -> Result<()>;
     /// Move a single task via `cgroup.procs`. See
     /// [`CgroupManager::move_task`].
     fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()>;
@@ -385,6 +443,12 @@ impl CgroupOps for CgroupManager {
     }
     fn clear_cpuset(&self, name: &str) -> Result<()> {
         CgroupManager::clear_cpuset(self, name)
+    }
+    fn set_cpuset_mems(&self, name: &str, nodes: &BTreeSet<usize>) -> Result<()> {
+        CgroupManager::set_cpuset_mems(self, name, nodes)
+    }
+    fn clear_cpuset_mems(&self, name: &str) -> Result<()> {
+        CgroupManager::clear_cpuset_mems(self, name)
     }
     fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
         CgroupManager::move_task(self, name, pid)
@@ -776,6 +840,48 @@ mod tests {
         let err = write_with_timeout(&fifo_path, "data", Duration::from_millis(50)).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("timed out"), "unexpected error: {msg}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anyhow_first_io_errno_extracts_raw_errno() {
+        let io = std::io::Error::from_raw_os_error(libc::EBUSY);
+        let err = anyhow::Error::new(io);
+        assert_eq!(anyhow_first_io_errno(&err), Some(libc::EBUSY));
+    }
+
+    #[test]
+    fn anyhow_first_io_errno_through_context() {
+        let io = std::io::Error::from_raw_os_error(libc::ESRCH);
+        let err = anyhow::Error::new(io).context("wrapping context");
+        assert_eq!(anyhow_first_io_errno(&err), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn anyhow_first_io_errno_no_io_returns_none() {
+        let err = anyhow::anyhow!("plain text error");
+        assert_eq!(anyhow_first_io_errno(&err), None);
+    }
+
+    #[test]
+    fn add_parent_subtree_controller_missing_file_noop() {
+        let cg = CgroupManager::new("/nonexistent/ktstr-add-parent-sc");
+        assert!(cg.add_parent_subtree_controller("cpuset").is_ok());
+    }
+
+    #[test]
+    fn add_parent_subtree_controller_writes_plus_prefixed_token() {
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-cg-addparent-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // The subtree_control file in a real cgroup v2 tree echoes the
+        // currently-enabled controllers (no `+` prefix) when read back;
+        // here we just observe that our write landed verbatim.
+        let sc = dir.join("cgroup.subtree_control");
+        fs::write(&sc, "").unwrap();
+        let cg = CgroupManager::new(dir.to_str().unwrap());
+        cg.add_parent_subtree_controller("cpuset").unwrap();
+        assert_eq!(fs::read_to_string(&sc).unwrap(), "+cpuset");
         let _ = fs::remove_dir_all(&dir);
     }
 }

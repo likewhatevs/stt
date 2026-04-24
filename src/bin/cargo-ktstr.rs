@@ -230,6 +230,27 @@ enum KtstrCommand {
         #[arg(long)]
         parent_cgroup: Option<String>,
     },
+    /// Enumerate every ktstr flock held on this host.
+    ///
+    /// Troubleshooting companion for `--llc-cap` contention. Scans
+    /// `/tmp/ktstr-llc-*.lock`, `/tmp/ktstr-cpu-*.lock`, and
+    /// `{cache_root}/.locks/*.lock`, cross-referenced against
+    /// `/proc/locks` via [`ktstr::cli::list_locks`] to name the holder
+    /// process (PID + cmdline) for each held lock. Read-only — does
+    /// NOT attempt any flock acquire.
+    Locks {
+        /// Emit the snapshot as JSON (compact object under --watch,
+        /// pretty-printed otherwise). Stable field names; schema
+        /// documented at [`ktstr::cli::list_locks`].
+        #[arg(long)]
+        json: bool,
+        /// Redraw the snapshot on the given interval until SIGINT.
+        /// Value is parsed by `humantime`: `100ms`, `1s`, `5m`, `1h`.
+        /// Human output clears and redraws in place; `--json` emits
+        /// one line-terminated object per interval (ndjson-style).
+        #[arg(long, value_parser = humantime::parse_duration)]
+        watch: Option<std::time::Duration>,
+    },
     /// Boot an interactive shell in a KVM virtual machine.
     ///
     /// Launches a VM with busybox and drops into a shell. Files and
@@ -265,6 +286,14 @@ enum KtstrCommand {
         /// Also settable via KTSTR_NO_PERF_MODE env var.
         #[arg(long)]
         no_perf_mode: bool,
+
+        /// Reserve only N host LLCs for the shell VM. Requires
+        /// `--no-perf-mode` — perf-mode already holds every LLC
+        /// exclusively, so capping under perf-mode would
+        /// double-reserve. See `ktstr::cli::LLC_CAP_HELP` for the
+        /// full contract.
+        #[arg(long, requires = "no_perf_mode", help = ktstr::cli::LLC_CAP_HELP)]
+        llc_cap: Option<usize>,
     },
 }
 
@@ -424,7 +453,7 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> anyhow::Result<()> {
     }
 
     cli::Spinner::with_progress("Building kernel...", "Kernel built", |sp| {
-        cli::make_kernel_with_output(kernel_dir, Some(sp))
+        cli::make_kernel_with_output(kernel_dir, Some(sp), None)
     })?;
 
     cli::validate_kernel_config(kernel_dir)?;
@@ -685,7 +714,25 @@ fn kernel_build(
     git_ref: Option<String>,
     force: bool,
     clean: bool,
+    llc_cap: Option<usize>,
 ) -> Result<(), String> {
+    // Resolve the CLI --llc-cap flag against KTSTR_LLC_CAP env
+    // and the implicit "no cap" default. Conflict with
+    // KTSTR_BYPASS_LLC_LOCKS=1 surfaces here so operators see
+    // the parse-time error, not an opaque pipeline bail later.
+    if llc_cap.is_some()
+        && std::env::var("KTSTR_BYPASS_LLC_LOCKS")
+            .ok()
+            .is_some_and(|v| !v.is_empty())
+    {
+        return Err(
+            "--llc-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
+             --llc-cap is a resource contract; bypass disables the contract entirely."
+                .to_string(),
+        );
+    }
+    let resolved_cap = cli::LlcCap::resolve(llc_cap).map_err(|e| format!("{e:#}"))?;
+
     let cache = CacheDir::new().map_err(|e| format!("open cache: {e:#}"))?;
 
     // Temporary directory for tarball/git source extraction.
@@ -737,8 +784,25 @@ fn kernel_build(
         return Ok(());
     }
 
-    cli::kernel_build_pipeline(&acquired, &cache, "cargo ktstr", clean, source.is_some())
-        .map_err(|e| format!("{e:#}"))?;
+    // `--force` fail-fast pre-check: if tests are actively holding
+    // the cache-entry lock, bail with the PID list rather than
+    // silently waiting to stomp the in-use entry. The guard drops
+    // at the end of this `if` before `kernel_build_pipeline` runs.
+    if force {
+        let _force_check = cache
+            .try_acquire_exclusive_lock(&acquired.cache_key)
+            .map_err(|e| format!("{e:#}"))?;
+    }
+
+    cli::kernel_build_pipeline(
+        &acquired,
+        &cache,
+        "cargo ktstr",
+        clean,
+        source.is_some(),
+        resolved_cap,
+    )
+    .map_err(|e| format!("{e:#}"))?;
 
     Ok(())
 }
@@ -770,10 +834,29 @@ fn run_shell(
     dmesg: bool,
     exec: Option<String>,
     no_perf_mode: bool,
+    llc_cap: Option<usize>,
 ) -> Result<(), String> {
     if no_perf_mode {
         // SAFETY: single-threaded at this point — no concurrent env readers.
         unsafe { std::env::set_var("KTSTR_NO_PERF_MODE", "1") };
+    }
+    if let Some(cap) = llc_cap {
+        // Parse-time conflict with KTSTR_BYPASS_LLC_LOCKS — see
+        // ktstr.rs Shell dispatch for the same check.
+        if std::env::var("KTSTR_BYPASS_LLC_LOCKS")
+            .ok()
+            .is_some_and(|v| !v.is_empty())
+        {
+            return Err(
+                "--llc-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
+                 --llc-cap is a resource contract; bypass disables the contract entirely."
+                    .to_string(),
+            );
+        }
+        // Validate early so a bad cap surfaces at CLI-parse time.
+        cli::LlcCap::new(cap).map_err(|e| format!("{e:#}"))?;
+        // SAFETY: single-threaded at this point — no concurrent env readers.
+        unsafe { std::env::set_var("KTSTR_LLC_CAP", cap.to_string()) };
     }
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     let kernel_path = resolve_kernel_image(kernel.as_deref())?;
@@ -1244,12 +1327,13 @@ fn main() {
                 git_ref,
                 force,
                 clean,
-            } => kernel_build(version, source, git, git_ref, force, clean),
+                llc_cap,
+            } => kernel_build(version, source, git, git_ref, force, clean, llc_cap),
             KernelCommand::Clean {
                 keep,
                 force,
                 corrupt_only,
-            } => cli::kernel_clean(keep, force, corrupt_only).map_err(|e| format!("{e:#}"))
+            } => cli::kernel_clean(keep, force, corrupt_only).map_err(|e| format!("{e:#}")),
         },
         KtstrCommand::Model { command } => match command {
             ModelCommand::Fetch => run_model_fetch(),
@@ -1288,6 +1372,9 @@ fn main() {
         KtstrCommand::Cleanup { parent_cgroup } => {
             cli::cleanup(parent_cgroup).map_err(|e| format!("{e:#}"))
         }
+        KtstrCommand::Locks { json, watch } => {
+            cli::list_locks(json, watch).map_err(|e| format!("{e:#}"))
+        }
         KtstrCommand::Shell {
             kernel,
             topology,
@@ -1296,6 +1383,7 @@ fn main() {
             dmesg,
             exec,
             no_perf_mode,
+            llc_cap,
         } => run_shell(
             kernel,
             topology,
@@ -1304,6 +1392,7 @@ fn main() {
             dmesg,
             exec,
             no_perf_mode,
+            llc_cap,
         ),
     };
 
@@ -2810,5 +2899,106 @@ mod tests {
             msg.contains("no registered ktstr test named"),
             "error path must preserve the actionable diagnostic: {msg}",
         );
+    }
+
+    // -- clap argument-parse pins: Shell --llc-cap requires --no-perf-mode
+    //
+    // `#[arg(long, requires = "no_perf_mode", ...)]` on the
+    // Shell subcommand's `llc_cap` field enforces the constraint
+    // that --llc-cap is only meaningful in no-perf-mode (perf-mode
+    // already holds every LLC exclusively, so capping under
+    // perf-mode would double-reserve). These tests pin the
+    // invariant so a future refactor that drops or renames the
+    // `requires` attribute trips a unit-test regression instead of
+    // surfacing as a runtime double-reservation conflict.
+
+    /// `cargo ktstr shell --llc-cap 4 --no-perf-mode` parses
+    /// successfully with both flags set. Pins the positive path of
+    /// the `requires = "no_perf_mode"` constraint — the happy-path
+    /// invocation an operator would type.
+    #[test]
+    fn parse_shell_llc_cap_with_no_perf_mode_succeeds() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "shell",
+            "--llc-cap",
+            "4",
+            "--no-perf-mode",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Shell {
+                llc_cap,
+                no_perf_mode,
+                ..
+            } => {
+                assert_eq!(llc_cap, Some(4));
+                assert!(no_perf_mode, "--no-perf-mode must be set");
+            }
+            _ => panic!("expected Shell"),
+        }
+    }
+
+    /// `cargo ktstr shell --llc-cap 4` without `--no-perf-mode`
+    /// must FAIL at parse time because of the `requires =
+    /// "no_perf_mode"` constraint. Pins the negative path: if
+    /// the constraint is ever dropped, this test fails so the
+    /// regression can't reach production where it would cause a
+    /// silent double-reservation under perf-mode.
+    #[test]
+    fn parse_shell_llc_cap_without_no_perf_mode_fails() {
+        // `Cargo` intentionally has no Debug derive, so unwrap
+        // helpers that format the Ok variant are unavailable.
+        // Match on Err directly to extract the clap error.
+        let msg = match Cargo::try_parse_from([
+            "cargo", "ktstr", "shell", "--llc-cap", "4",
+        ]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!(
+                "--llc-cap without --no-perf-mode must fail the parse"
+            ),
+        };
+        // clap renders "the following required arguments were not provided"
+        // or similar; lowercase + substring-match is lenient against
+        // clap version-to-version message tweaks while still proving
+        // the constraint fired.
+        assert!(
+            msg.to_ascii_lowercase().contains("no-perf-mode")
+                || msg.to_ascii_lowercase().contains("no_perf_mode"),
+            "clap error must name the missing --no-perf-mode flag, got: {msg}",
+        );
+    }
+
+    /// `cargo ktstr shell --no-perf-mode` without `--llc-cap`
+    /// parses successfully with `llc_cap: None`. Pins the shape of
+    /// the pre-flag default — a user who wants --no-perf-mode
+    /// without resource-budget enforcement must still be able to
+    /// invoke the shell. A regression that tied --llc-cap to
+    /// --no-perf-mode bidirectionally would fail here.
+    #[test]
+    fn parse_shell_no_perf_mode_without_llc_cap_succeeds() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "shell",
+            "--no-perf-mode",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Shell {
+                llc_cap,
+                no_perf_mode,
+                ..
+            } => {
+                assert_eq!(llc_cap, None, "no --llc-cap must produce None");
+                assert!(no_perf_mode);
+            }
+            _ => panic!("expected Shell"),
+        }
     }
 }

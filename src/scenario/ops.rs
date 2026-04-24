@@ -5036,6 +5036,9 @@ mod tests {
         RemoveCgroup(String),
         SetCpuset(String, BTreeSet<usize>),
         ClearCpuset(String),
+        SetCpusetMems(String, BTreeSet<usize>),
+        #[allow(dead_code)] // Emitted by CgroupOps::clear_cpuset_mems; no test asserts on it yet.
+        ClearCpusetMems(String),
         MoveTask(String, libc::pid_t),
         MoveTasks(String, usize), // (cgroup name, number of pids)
         ClearSubtreeControl(String),
@@ -5109,6 +5112,12 @@ mod tests {
         }
         fn clear_cpuset(&self, name: &str) -> Result<()> {
             self.record(CgroupCall::ClearCpuset(name.to_string()))
+        }
+        fn set_cpuset_mems(&self, name: &str, nodes: &BTreeSet<usize>) -> Result<()> {
+            self.record(CgroupCall::SetCpusetMems(name.to_string(), nodes.clone()))
+        }
+        fn clear_cpuset_mems(&self, name: &str) -> Result<()> {
+            self.record(CgroupCall::ClearCpusetMems(name.to_string()))
         }
         fn move_task(&self, name: &str, pid: libc::pid_t) -> Result<()> {
             self.record(CgroupCall::MoveTask(name.to_string(), pid))

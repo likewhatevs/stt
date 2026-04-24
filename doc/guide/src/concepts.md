@@ -16,10 +16,13 @@ ktstr tests compose from four layers:
 These compose orthogonally. A scenario runs with every valid flag
 combination, and checks apply uniformly across all runs.
 
-Three supporting concepts complete the picture:
+Four supporting concepts complete the picture:
 [Ops and Steps](concepts/ops.md) is the primary API for defining
 scenarios -- most tests use `CgroupDef` and `execute_defs` from
 this module. [TestTopology](concepts/topology.md) provides CPU and
 LLC layout for cpuset partitioning.
 [Performance Mode](concepts/performance-mode.md) applies host-side
 isolation for noise-sensitive measurements.
+[Resource Budget](concepts/resource-budget.md) describes the
+`--llc-cap` tier that coordinates concurrent no-perf-mode VMs and
+kernel builds via LLC flocks and cgroup v2 cpuset sandboxes.

@@ -1,0 +1,199 @@
+# Resource Budget
+
+`--llc-cap N` adds a third tier between full performance-mode
+isolation and unreserved no-perf-mode execution. Instead of
+"lock every LLC" (no-perf-mode default) or "lock each reserved LLC
+exclusively" (perf-mode), it reserves a NUMA-aware, consolidation-
+aware subset of `N` LLCs under `LOCK_SH`, enforces the reservation
+via a cgroup v2 cpuset sandbox, and scales `make -jN` fan-out to
+the reserved capacity. See
+[Performance Mode](performance-mode.md#three-way-mode-tier) for
+the comparison against the other two tiers.
+
+## When to use it
+
+- **Multi-tenant CI hosts** where unbounded parallelism starves
+  concurrent builds but the full performance-mode contract
+  (`SCHED_FIFO`, hugepages, NUMA mbind, KVM exit suppression) is
+  too heavy.
+- **Kernel builds run alongside perf-mode VM tests** — the
+  shared `LOCK_SH` coordinates with the perf-mode `LOCK_EX` so
+  `make` never stomps a measurement in progress.
+- **Concurrent no-perf-mode VMs on a shared host** — a cap of `N`
+  bounds how many runs can coexist; peers above the cap wait on
+  flock rather than racing for CPU.
+
+## `LlcCap` — parsed and resolved
+
+`LlcCap::new(N: usize) -> Result<LlcCap>` constructs a cap from a
+CLI integer. `N == 0` is rejected with
+`--llc-cap must be ≥ 1 (got 0)` — zero is a scripting sentinel,
+not a silent "no cap" fallback.
+
+`LlcCap::resolve(cli_flag: Option<usize>) -> Result<Option<LlcCap>>`
+is the three-tier precedence:
+
+1. CLI flag (`--llc-cap N`) wins over env var.
+2. `KTSTR_LLC_CAP=N` env var applies when the CLI flag is absent.
+   Empty string is treated as unset; `0` or non-numeric values
+   produce the same rejection as the CLI path.
+3. Neither set → `Ok(None)`, meaning "lock every LLC" — the
+   pre-flag default.
+
+`LlcCap::effective_count(host_llcs: usize) -> Result<usize>`
+clamps at acquire time, not construction time. `N > host_llcs`
+returns a `ResourceContention` error naming both numbers; the
+host's LLC count is only known after
+`HostTopology::from_sysfs()` resolves.
+
+## `LlcPlan` — the ACQUIRE result
+
+`acquire_llc_plan(topo, test_topo, llc_cap)` runs three phases:
+
+1. **DISCOVER** — for every LLC, stat the canonical
+   `/tmp/ktstr-llc-{N}.lock`, read `/proc/locks` once, and build a
+   snapshot of holders per LLC. No flocks are taken.
+2. **PLAN** — rank LLCs: consolidation (prefer LLCs with existing
+   holders) first, then fresh LLCs, all tiebroken by ascending
+   index. Seed on the highest-scored LLC's NUMA node; greedily
+   fill that node before spilling to nearest-by-distance nodes
+   via `TestTopology::numa_distance`. Final acquire order is
+   ascending LLC index for livelock safety.
+3. **ACQUIRE** — non-blocking `LOCK_SH` on every selected LLC. A
+   single `EWOULDBLOCK` drops every held fd and retries once
+   (one TOCTOU retry — the second DISCOVER's `/proc/locks` read
+   IS the backoff; more retries would amplify livelock risk
+   without adding coordination signal).
+
+The returned `LlcPlan` carries:
+
+- `locked_llcs: Vec<usize>` — selected host LLC indices, ASC.
+- `cpus: Vec<usize>` — flattened CPUs across the selected LLCs.
+- `mems: BTreeSet<usize>` — NUMA nodes hosting those CPUs.
+- `snapshot: Vec<LlcSnapshot>` — per-LLC discovery trail.
+- `locks: Vec<OwnedFd>` — RAII flock handles; Drop releases.
+
+When the plan's `mems` spans more than one node
+(`warn_if_cross_node_spill` fires), stderr gets a `ktstr:
+reserving LLCs […] across N NUMA nodes` warning so the operator
+knows to expect cross-node memory latency. Single-node plans are
+silent.
+
+## Cgroup v2 cpuset sandbox
+
+`BuildSandbox::try_create(plan_cpus, plan_mems, hard_error_on_degrade)`
+writes the plan into a child cgroup under the caller's own cgroup,
+in the kernel-required order: `cpuset.cpus` → `cpuset.mems` →
+`cgroup.procs`. A task in a cgroup with empty `cpuset.mems` may
+be killed by the cpuset allocator, so migration into
+`cgroup.procs` MUST happen after both cpuset fields are populated.
+
+After each cpuset write, `.effective` is read back. Narrowing by
+a parent cgroup (e.g. systemd slice restriction) is a fatal error
+under `--llc-cap` (`hard_error_on_degrade = true`) and a warn-
+only degrade without the flag.
+
+Drop migrates the build pid back to root, tolerates transient
+EBUSY on `cgroup.rmdir` (5 × 10 ms retries), and orphans the
+directory with a `tag=resource_budget.cgroup_orphan_left` warn-
+log if the rmdir still refuses. Orphans older than 24 h are
+swept on the next sandbox creation.
+
+## `make -jN` hint
+
+`make_jobs_for_plan(plan)` returns `plan.cpus.len().max(1)`. The
+kernel-build pipeline threads this as `make -jN`. Without the
+hint, `make -j$(nproc)` fans gcc children across every online
+CPU, defeating the cpuset reservation in scheduling terms — the
+kernel still enforces cpuset membership at the fs layer, but
+gcc's parallel width silently violates the budget. The `.max(1)`
+floor guards against `make -j0` (unbounded on GNU make).
+
+## `ktstr locks` — observational surface
+
+`ktstr locks` (or `cargo ktstr locks`) prints every ktstr flock
+currently held on the host, cross-referenced against
+`/proc/locks` to name each holder by PID + truncated cmdline.
+Read-only — takes no flocks. Three categories:
+
+1. **LLC locks** under `/tmp/ktstr-llc-*.lock`
+2. **Per-CPU locks** under `/tmp/ktstr-cpu-*.lock`
+3. **Cache-entry locks** under `{cache_root}/.locks/*.lock`
+
+Flags:
+
+- `--json` — emit a structured snapshot. One-shot uses
+  `to_string_pretty` for readability; under `--watch` each frame
+  is compact on its own line (ndjson-style) for streaming
+  consumers. Top-level keys: `llcs`, `cpus`, `cache`. Each row
+  names its `lockfile` path and a `holders` array; every holder
+  has `pid` + `cmdline`.
+- `--watch <interval>` — redraw on the given interval until
+  SIGINT. Interval uses `humantime` syntax (`100ms`, `1s`,
+  `5m`, `1h`).
+
+Use `ktstr locks` when `--llc-cap` acquires fail with
+`ResourceContention`: the error already names busy LLCs, but the
+live snapshot shows every contending peer at once.
+
+## `KTSTR_BYPASS_LLC_LOCKS` — escape hatch
+
+Setting `KTSTR_BYPASS_LLC_LOCKS=1` (any non-empty value) skips
+the `acquire_llc_plan` entirely. The VM boots or the kernel
+builds immediately without coordinating against any concurrent
+perf-mode run. Use only when the operator explicitly accepts
+measurement noise:
+
+- A shell session doing unrelated work alongside tests.
+- An isolated developer workstation.
+- A CI queue that already serializes jobs at a higher layer.
+
+Mutually exclusive with `--llc-cap` / `KTSTR_LLC_CAP` at every
+entry point (CLI parse for `shell` + `kernel build` on both
+`ktstr` and `cargo ktstr`, the `kernel_build_pipeline` reservation
+phase, and the library-layer `KtstrVmBuilder::build` no-perf-mode
+branch). The error wording always contains `"resource contract"`
+so operators can grep for it; the contract and the bypass cannot
+coexist at any of those six sites.
+
+Note: the `performance_mode=true` vs `--llc-cap` exclusion is
+weaker. It is enforced at CLI parse (`shell --llc-cap` requires
+`--no-perf-mode` via clap `requires`), but library consumers that
+set `performance_mode=true` on `KtstrVmBuilder` directly see
+`KTSTR_LLC_CAP` silently ignored — the builder's perf-mode branch
+never calls `LlcCap::resolve`, it goes through
+`validate_performance_mode` + `acquire_resource_locks`
+(LOCK_EX) instead.
+
+## Filesystem requirement
+
+Every ktstr lockfile (`/tmp/ktstr-llc-*.lock`,
+`/tmp/ktstr-cpu-*.lock`, `{cache_root}/.locks/*.lock`) must live
+on a local filesystem — tmpfs, ext4, xfs, btrfs, f2fs, or
+bcachefs are the explicitly-accepted set. `flock(2)` behavior
+on NFS, CIFS, SMB2, CephFS, AFS, and FUSE is unreliable: NFSv3
+is advisory-only without an NLM peer and NFSv4 byte-range
+locking does not cover `flock(2)`; SMB does not emit
+`/proc/locks` entries so ktstr cannot enumerate peer holders;
+Ceph MDS does not participate in `flock` serialization across
+nodes; AFS does not support `flock(2)` at all; FUSE flock
+semantics depend on whether the userspace server implements the
+op. `try_flock` statfs-checks every lockfile path at open time
+via `reject_remote_fs` in `src/flock.rs` — hitting any
+deny-listed filesystem produces an actionable runtime error
+naming the filesystem plus the remediation "Move the lockfile
+path to a local filesystem (tmpfs, ext4, xfs, btrfs, f2fs,
+bcachefs)." Unknown local filesystems (zfs, erofs, etc.) are
+not on the deny-list and pass through, on the basis that
+rejecting unknown-but-local is more disruptive than accepting a
+potentially-unreliable `flock`.
+
+## Related
+
+- [Performance Mode](performance-mode.md) — the full-isolation
+  tier; the four-way comparison lives there (tier 4 is the
+  default-mode path that flocks per-CPU lockfiles plus LLC
+  `LOCK_SH`).
+- [Environment Variables](../reference/environment-variables.md)
+  — `KTSTR_LLC_CAP`, `KTSTR_BYPASS_LLC_LOCKS`, and every other
+  ktstr-controlled env var.

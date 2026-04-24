@@ -227,6 +227,7 @@ pub mod non_exhaustive {}
 
 pub mod cache;
 pub mod cgroup;
+pub mod flock;
 
 /// Map a raw errno value to its C constant name.
 ///
@@ -295,7 +296,12 @@ pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
 }
 
 /// Read the kernel ring buffer (equivalent to `dmesg --notime`).
-pub(crate) fn read_kmsg() -> String {
+/// Exposed as `pub` so scenario tests that need to assert on
+/// kernel-log content (e.g. the sched_ext stall duration emitted
+/// by `scx_exit(SCX_EXIT_ERROR_STALL)` in `kernel/sched/ext.c`)
+/// can read the same buffer the framework captures into
+/// `AssertResult::details` on scheduler-died failures.
+pub fn read_kmsg() -> String {
     match rmesg::log_entries(rmesg::Backend::Default, false) {
         Ok(entries) => entries
             .iter()

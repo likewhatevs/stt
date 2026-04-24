@@ -42,6 +42,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 /// Filename prefix that marks an in-progress atomic-store directory
@@ -54,6 +55,40 @@ use serde::{Deserialize, Serialize};
 /// so user input cannot shadow a real tempdir. Centralized here so
 /// the three roles — emitter, scanner, validator — cannot drift.
 const TMP_DIR_PREFIX: &str = ".tmp-";
+
+/// Subdirectory name under the cache root that holds per-entry
+/// coordination lockfiles. Files inside are named
+/// `{cache_key}.lock` — full path is
+/// `{cache_root}/.locks/{cache_key}.lock`.
+///
+/// # Why a subdirectory, not a sibling next to the entry
+///
+/// [`CacheDir::store`] installs new entries via
+/// `renameat2(RENAME_EXCHANGE)` on the entry directory itself. Any
+/// lockfile living INSIDE the entry directory would be swapped along
+/// with the entry — reader processes holding the lockfile's flock
+/// keep a stale inode, and the newly installed entry has a different
+/// lockfile inode that fresh readers target instead. The two sides
+/// stop coordinating.
+///
+/// Parking the lockfile outside every entry keeps its inode stable
+/// across swaps. We pick a dedicated subdirectory rather than
+/// sibling-by-prefix (`.lock-{key}`) so the lockfile namespace is
+/// cleanly separated from the entry namespace. Cache-enumeration code
+/// ([`CacheDir::list`], [`clean_orphaned_tmp_dirs`],
+/// [`CacheDir::clean_all`]) walks first-level children looking for
+/// entries — the `.locks/` dotfile subdirectory is skipped by the
+/// dotfile filter in [`CacheDir::list`] and does not match
+/// [`TMP_DIR_PREFIX`] so it bypasses the orphan sweep too. User
+/// cache keys likewise cannot shadow lockfile paths: lockfiles are
+/// children of `.locks/` rather than first-level entries, so no
+/// [`validate_cache_key`] prefix rejection is needed.
+///
+/// The subdirectory is created lazily on first acquire and reused;
+/// `CacheDir` never removes it. Lockfiles inside persist as empty
+/// sentinels between runs — the flock itself releases on process
+/// death, but the file stays for the next acquirer to reuse.
+const LOCK_DIR_NAME: &str = ".locks";
 
 // serde(default) is stripped from cache types so an old metadata.json
 // missing a required non-Option field (e.g. has_vmlinux) fails at
@@ -604,6 +639,27 @@ impl CacheDir {
         for dir_entry in read_dir {
             let dir_entry = dir_entry?;
             let path = dir_entry.path();
+            let file_name = dir_entry.file_name();
+            let name_hint = file_name.to_string_lossy();
+            // Skip dotfile children BEFORE the is_dir check. The
+            // cache root's dotfile-namespace is reserved for ktstr's
+            // own bookkeeping: `.locks/` (per-entry coordination
+            // lockfiles, see [`LOCK_DIR_NAME`]), `.tmp-*` (in-progress
+            // store tempdirs, see [`TMP_DIR_PREFIX`]), and any future
+            // bookkeeping directory. Cache keys validated by
+            // [`validate_cache_key`] cannot begin with `.` — that
+            // validator rejects only reserved prefixes, but POSIX
+            // convention keeps application-visible data out of
+            // dotfile names, and every bookkeeping surface in this
+            // module follows the convention. Skipping at the first
+            // filter stops `clean_all` / `clean_keep` (which remove
+            // every ListedEntry this function returns) from ever
+            // touching `.locks/` or any future bookkeeping
+            // subdirectory even if `is_dir` would otherwise let it
+            // through.
+            if name_hint.starts_with('.') {
+                continue;
+            }
             if !path.is_dir() {
                 continue;
             }
@@ -701,6 +757,18 @@ impl CacheDir {
     ) -> anyhow::Result<CacheEntry> {
         validate_cache_key(cache_key)?;
         validate_filename(&metadata.image_name)?;
+
+        // Serialize atomic-swap installs against every reader (test
+        // VM holding LOCK_SH on this entry). The guard drops at the
+        // end of this function, after `renameat2` has run and
+        // `_guard` (TmpDirGuard) has cleaned the displaced content.
+        // A 60 s blocking timeout catches pathologically stuck peers
+        // while tolerating a single healthy test run draining. See
+        // [`LOCK_DIR_NAME`] for the `.locks/` subdirectory placement
+        // rationale.
+        let _store_lock =
+            self.acquire_exclusive_lock_blocking(cache_key, STORE_EXCLUSIVE_LOCK_TIMEOUT)?;
+
         let final_dir = self.root.join(cache_key);
         let tmp_dir = self
             .root
@@ -847,6 +915,234 @@ impl CacheDir {
         }
         Ok(count)
     }
+
+    // ------------------------------------------------------------------
+    // Per-entry coordination locks
+    // ------------------------------------------------------------------
+    //
+    // See [`LOCK_DIR_NAME`] for the on-disk shape rationale. A
+    // shared (reader) lock is held by each test-VM run against the
+    // cache entry it resolved its kernel image from; an exclusive
+    // (writer) lock is held by `CacheDir::store` for the window
+    // spanning temp-dir composition → atomic rename. flock(2) is
+    // per-open-file-description; RAII guards drop the OwnedFd which
+    // releases the lock.
+
+    /// Absolute path to the coordination lockfile for `cache_key`.
+    /// The lockfile lives at `{cache_root}/.locks/{cache_key}.lock`
+    /// (see [`LOCK_DIR_NAME`] for the subdirectory placement
+    /// rationale). Does not touch the filesystem — use
+    /// [`CacheDir::ensure_lock_dir`] before opening the file to make
+    /// sure the parent `.locks/` subdirectory exists.
+    pub(crate) fn lock_path(&self, cache_key: &str) -> PathBuf {
+        self.root.join(LOCK_DIR_NAME).join(format!("{cache_key}.lock"))
+    }
+
+    /// Create the `{cache_root}/.locks/` subdirectory if absent.
+    /// Callers invoke this before [`open_lockfile`] so the parent
+    /// exists; `fs::create_dir_all` is idempotent (Ok on existing
+    /// directory), mirroring the lazy-create semantics
+    /// [`CacheDir::store`] uses for the cache root itself.
+    fn ensure_lock_dir(&self) -> anyhow::Result<()> {
+        let dir = self.root.join(LOCK_DIR_NAME);
+        fs::create_dir_all(&dir).with_context(|| {
+            format!("create lock subdirectory {}", dir.display())
+        })
+    }
+
+    /// Acquire `LOCK_SH` on the cache-entry lockfile. Blocks until the
+    /// lock is available or the default shared-lock timeout elapses.
+    ///
+    /// Test-VM runs call this on the entry they resolved their kernel
+    /// image from. A concurrent `CacheDir::store` that holds `LOCK_EX`
+    /// for an atomic-swap install is serialized behind every reader.
+    /// Multiple readers coexist.
+    ///
+    /// The underlying lockfile is created on-demand when it does not
+    /// exist (mode 0o666); the cache root is created if missing
+    /// (matching [`CacheDir::store`]'s lazy root creation). Returns
+    /// `Err` on filesystem errors or timeout.
+    pub fn acquire_shared_lock(&self, cache_key: &str) -> anyhow::Result<SharedLockGuard> {
+        validate_cache_key(cache_key)?;
+        let fd = acquire_flock_with_timeout(
+            self,
+            cache_key,
+            FlockMode::Shared,
+            SHARED_LOCK_DEFAULT_TIMEOUT,
+        )?;
+        Ok(SharedLockGuard { fd })
+    }
+
+    /// Acquire `LOCK_EX` on the cache-entry lockfile. Blocks until the
+    /// lock is available or `timeout` elapses.
+    ///
+    /// Called internally by [`CacheDir::store`] to serialize atomic-swap
+    /// installs against concurrent readers (test runs holding
+    /// `LOCK_SH`). On timeout, the error message lists the PIDs that
+    /// are currently holding the lock (parsed from `/proc/locks`) so
+    /// the operator can kill or wait on them deliberately.
+    pub fn acquire_exclusive_lock_blocking(
+        &self,
+        cache_key: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<ExclusiveLockGuard> {
+        validate_cache_key(cache_key)?;
+        let fd = acquire_flock_with_timeout(self, cache_key, FlockMode::Exclusive, timeout)?;
+        Ok(ExclusiveLockGuard { fd })
+    }
+
+    /// Non-blocking `LOCK_EX` attempt on the cache-entry lockfile. Used
+    /// as a pre-check by `--force` operator-driven rebuilds: fail fast
+    /// with a PID list if tests are actively using the entry, instead
+    /// of silently stomping on an in-flight run.
+    ///
+    /// Returns `Err` immediately when any reader or writer holds the
+    /// lock; the error surfaces the holder PIDs parsed from
+    /// `/proc/locks`.
+    pub fn try_acquire_exclusive_lock(
+        &self,
+        cache_key: &str,
+    ) -> anyhow::Result<ExclusiveLockGuard> {
+        validate_cache_key(cache_key)?;
+        self.ensure_lock_dir()?;
+        let path = self.lock_path(cache_key);
+        // `try_flock` folds `open(O_CLOEXEC) + flock(LOCK_NB)` into a
+        // single call; on `EWOULDBLOCK` it returns `Ok(None)` with the
+        // fd already dropped, so the /proc/locks scan below cannot
+        // confuse our own new fd (just-opened, never flocked) with a
+        // real holder.
+        match crate::flock::try_flock(&path, crate::flock::FlockMode::Exclusive)? {
+            Some(fd) => Ok(ExclusiveLockGuard { fd }),
+            None => {
+                let holders = crate::flock::read_holders(&path).unwrap_or_default();
+                anyhow::bail!(
+                    "cache entry {cache_key:?} is locked by active test runs \
+                     (lockfile {lockfile}, holders: {holders}). Wait for \
+                     those tests to finish, or kill them, then retry.",
+                    lockfile = path.display(),
+                    holders = crate::flock::format_holder_list(&holders),
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache-lock timeouts — reader 10s, writer 60s (INTENTIONAL asymmetry)
+// ---------------------------------------------------------------------------
+//
+// Readers (test VMs) wait 10 s for a writer to finish. Writers
+// (`CacheDir::store`) wait 60 s for all readers to drain. The
+// asymmetry is deliberate, not a tuning artifact:
+//
+// - A writer's critical section is SHORT — temp-dir copy + metadata
+//   write + `renameat2(RENAME_EXCHANGE)` — measured in low seconds
+//   even for multi-GB vmlinux images. A reader waiting 10 s must
+//   have caught a genuinely stuck writer, and surfacing that as an
+//   error beats hanging the test run indefinitely.
+// - A writer's contention is LONG — it must outlast every reader
+//   currently running a test on this entry. A single test run takes
+//   tens of seconds (VM boot + scenario + teardown); several parallel
+//   runs serialize through their own nextest scheduling. 60 s is
+//   empirically enough for the natural drain without rewarding
+//   pathological test loops.
+// - Pathological peers in either direction surface as actionable
+//   errors (holder PIDs + cmdlines in the error text) instead of
+//   silent hangs.
+
+/// Default wall-clock timeout for [`CacheDir::acquire_shared_lock`].
+/// See module-level rationale block above.
+const SHARED_LOCK_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Internal poll interval for [`acquire_flock_with_timeout`]. flock(2)
+/// has no native timed-wait variant; we emulate one by retrying the
+/// non-blocking form with a short sleep. 100ms balances responsiveness
+/// (contention clears in ≤1 poll under normal load) against CPU burn
+/// (at most 10 wakes/s per waiter).
+const FLOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Timeout for [`CacheDir::store`]'s internal `LOCK_EX` acquire.
+/// See module-level rationale block above for the reader/writer
+/// asymmetry (10 s vs 60 s).
+const STORE_EXCLUSIVE_LOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+// Flock primitive lives in [`crate::flock`], shared with
+// `crate::vmm::host_topology`'s LLC / per-CPU acquires. LlcLockMode
+// remains separate at the scheduler-intent layer (perf-mode vs
+// no-perf-mode request, not a flock operation).
+use crate::flock::FlockMode;
+
+/// RAII guard for a `LOCK_SH` hold on a cache-entry lockfile. Dropping
+/// the guard releases the advisory lock via `OwnedFd::drop` — no
+/// explicit `unlock()` call needed. The `fd` field carries the
+/// `OwnedFd` whose Drop releases the kernel-side flock; nothing reads
+/// it after construction, but it must stay named (not `_fd`) so
+/// grep-based audits and struct-literal tools can find the holder
+/// field without a leading-underscore filter.
+#[derive(Debug)]
+pub struct SharedLockGuard {
+    #[allow(dead_code)]
+    fd: std::os::fd::OwnedFd,
+}
+
+/// RAII guard for a `LOCK_EX` hold on a cache-entry lockfile. Dropping
+/// the guard releases the advisory lock via `OwnedFd::drop`.
+#[derive(Debug)]
+pub struct ExclusiveLockGuard {
+    #[allow(dead_code)]
+    fd: std::os::fd::OwnedFd,
+}
+
+/// Poll-acquire an advisory flock with a wall-clock timeout.
+///
+/// `flock(2)` has no native timed-wait form — the blocking variant
+/// cannot be cancelled, so we loop on [`crate::flock::try_flock`]'s
+/// non-blocking operation with [`FLOCK_POLL_INTERVAL`] between
+/// attempts. `try_flock` folds `open(O_CLOEXEC)` + `flock(LOCK_NB)`
+/// and already drops the fd on `Ok(None)`, so stacked
+/// open-file-descriptions cannot build up across iterations.
+///
+/// Creates the `.locks/` subdirectory lazily when missing (matches
+/// [`CacheDir::store`]'s lazy-root semantics for a freshly-resolved
+/// cache path).
+///
+/// Returns `Err` on the wall-clock deadline or on unexpected flock
+/// errors. Timeout errors surface the holder PID list from
+/// `/proc/locks` via [`crate::flock::read_holders`] so operators can
+/// identify the peer holding the lock.
+fn acquire_flock_with_timeout(
+    cache: &CacheDir,
+    cache_key: &str,
+    kind: FlockMode,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::os::fd::OwnedFd> {
+    cache.ensure_lock_dir()?;
+    let path = cache.lock_path(cache_key);
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match crate::flock::try_flock(&path, kind)? {
+            Some(fd) => return Ok(fd),
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let holders = crate::flock::read_holders(&path).unwrap_or_default();
+                    let kind_str = match kind {
+                        FlockMode::Shared => "LOCK_SH",
+                        FlockMode::Exclusive => "LOCK_EX",
+                    };
+                    anyhow::bail!(
+                        "flock {kind_str} on cache entry {cache_key:?} timed \
+                         out after {timeout:?} (lockfile {lockfile}, \
+                         holders: {holders}).",
+                        lockfile = path.display(),
+                        holders = crate::flock::format_holder_list(&holders),
+                    );
+                }
+                std::thread::sleep(FLOCK_POLL_INTERVAL);
+            }
+        }
+    }
 }
 
 /// Scan `cache_root` for `.tmp-{key}-{pid}` directories whose `{pid}`
@@ -949,6 +1245,12 @@ fn clean_orphaned_tmp_dirs(cache_root: &Path) -> anyhow::Result<()> {
             Err(_) => continue, // non-UTF-8, not a `.tmp-` we created
         };
         if !name.starts_with(TMP_DIR_PREFIX) {
+            // Lockfile subdirectory (`.locks/`) and any future
+            // dotfile bookkeeping sibling fall through here. They
+            // don't start with `.tmp-`, so this prefix filter
+            // excludes them from the tmp-dir sweep — exactly the
+            // namespace-separation contract advertised in the
+            // `LOCK_DIR_NAME` comment. No extra check needed.
             continue;
         }
         // Suffix parse: `.tmp-{key}-{pid}`. Key may itself contain
@@ -5452,6 +5754,445 @@ mod tests {
     #[test]
     fn kconfig_status_display_untracked_renders_lowercase_word() {
         assert_eq!(KconfigStatus::Untracked.to_string(), "untracked");
+    }
+
+    // ------------------------------------------------------------
+    // Cache-entry coordination lock tests
+    // ------------------------------------------------------------
+
+    /// `acquire_shared_lock` on a fresh cache root creates the
+    /// lockfile at `{root}/.locks/{key}.lock` (and the parent
+    /// `.locks/` subdirectory) — guards against drift to the old
+    /// sibling layout.
+    #[test]
+    fn acquire_shared_lock_creates_lockfile_at_expected_path() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let _guard = cache.acquire_shared_lock("some-key-123").unwrap();
+        assert!(
+            tmp.path().join(".locks").is_dir(),
+            "parent .locks/ subdirectory must materialize on first acquire",
+        );
+        assert!(
+            tmp.path().join(".locks").join("some-key-123.lock").exists(),
+            "lockfile must materialize at {{cache_root}}/.locks/{{key}}.lock on first acquire",
+        );
+    }
+
+    /// Two concurrent `acquire_shared_lock` calls on the same key
+    /// both succeed — LOCK_SH coexists. Uses separate threads so
+    /// each gets its own open-file-description (flock is per-OFD).
+    #[test]
+    fn acquire_shared_lock_permits_concurrent_readers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().to_path_buf()));
+        let key = "concurrent-sh";
+        let success = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let cache = Arc::clone(&cache);
+            let success = Arc::clone(&success);
+            handles.push(std::thread::spawn(move || {
+                let _g = cache.acquire_shared_lock(key).expect("LOCK_SH must succeed");
+                success.fetch_add(1, Ordering::SeqCst);
+                // Hold briefly so all threads concurrently hold the
+                // lock. Without this sleep, threads could serialize
+                // through a narrow no-contention window and pass
+                // even if the lock mistakenly rejected coexistence.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }));
+        }
+        for h in handles {
+            h.join().expect("reader thread panicked");
+        }
+        assert_eq!(
+            success.load(Ordering::SeqCst),
+            4,
+            "all 4 concurrent LOCK_SH acquires must succeed",
+        );
+    }
+
+    /// `try_acquire_exclusive_lock` fails with an error naming the
+    /// lockfile when a concurrent reader holds LOCK_SH. A
+    /// spawned thread takes LOCK_SH and sleeps; the main thread
+    /// attempts `try_acquire_exclusive_lock` non-blocking and
+    /// asserts the error path fires.
+    #[test]
+    fn try_acquire_exclusive_lock_fails_with_active_reader() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().to_path_buf()));
+        let key = "force-contended";
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let cache_reader = Arc::clone(&cache);
+        let reader = std::thread::spawn(move || {
+            let _g = cache_reader
+                .acquire_shared_lock(key)
+                .expect("reader LOCK_SH must succeed");
+            ready_tx.send(()).unwrap();
+            // Block until the main thread's non-blocking attempt
+            // has had its chance to fail. Without this gate, the
+            // reader could drop its lock before the main thread's
+            // try_acquire_exclusive_lock ran, producing a
+            // false-pass.
+            release_rx.recv().unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader thread did not signal ready in time");
+        // Now the reader is holding LOCK_SH. A non-blocking LOCK_EX
+        // must bail.
+        let err = cache.try_acquire_exclusive_lock(key).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is locked by active test runs")
+                || msg.contains("holders:"),
+            "error must surface the contention diagnostic; got: {msg}",
+        );
+        assert!(
+            msg.contains("lockfile"),
+            "error must name the lockfile path: {msg}",
+        );
+        // Release the reader so the test cleans up.
+        release_tx.send(()).unwrap();
+        reader.join().expect("reader thread panicked");
+    }
+
+    /// `acquire_exclusive_lock_blocking` times out with the
+    /// documented wording when a concurrent reader holds LOCK_SH
+    /// longer than the timeout allows. Uses a 200ms timeout + a
+    /// reader that holds for >500ms to reliably trip the bail.
+    #[test]
+    fn acquire_exclusive_lock_blocking_times_out_on_contention() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().to_path_buf()));
+        let key = "blocking-timeout";
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let cache_reader = Arc::clone(&cache);
+        let reader = std::thread::spawn(move || {
+            let _g = cache_reader
+                .acquire_shared_lock(key)
+                .expect("reader LOCK_SH must succeed");
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader did not signal ready in time");
+        let start = std::time::Instant::now();
+        let err = cache
+            .acquire_exclusive_lock_blocking(key, std::time::Duration::from_millis(200))
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out"),
+            "error must mention the timeout: {msg}",
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150),
+            "acquire should have waited ~timeout (150ms lower bound); \
+             got {elapsed:?}",
+        );
+        release_tx.send(()).unwrap();
+        reader.join().expect("reader thread panicked");
+    }
+
+    /// `store()` acquires its own exclusive lock and completes
+    /// successfully when no readers contend. Regression pin for
+    /// the internal `acquire_exclusive_lock_blocking` call.
+    #[test]
+    fn store_succeeds_under_internal_exclusive_lock() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().join("cache"));
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        let entry = cache
+            .store("internal-lock", &CacheArtifacts::new(&image), &meta)
+            .expect("store must succeed when no readers contend");
+        assert!(entry.path.join("bzImage").exists());
+        // Lockfile should exist in the .locks/ subdirectory
+        // (acquired during store).
+        assert!(
+            tmp.path()
+                .join("cache")
+                .join(".locks")
+                .join("internal-lock.lock")
+                .exists(),
+            "lockfile materialized during store must persist after \
+             store returns (it's fine; the flock is released on fd \
+             drop but the file stays as a reusable sentinel)",
+        );
+    }
+
+    /// `store()` blocks while a reader holds LOCK_SH, then
+    /// completes after the reader releases. Drives the path by
+    /// spawning a reader that holds its lock while attempting
+    /// store in a thread; probes that store() does NOT complete
+    /// within 200ms, then releases the reader and asserts store()
+    /// completes within 10s.
+    #[test]
+    fn store_blocks_while_reader_holds_shared_lock() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        let tmp = TempDir::new().unwrap();
+        let cache = Arc::new(CacheDir::with_root(tmp.path().join("cache-block")));
+        let key = "blocked-store";
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let cache_reader = Arc::clone(&cache);
+        let reader = std::thread::spawn(move || {
+            let _g = cache_reader
+                .acquire_shared_lock(key)
+                .expect("reader LOCK_SH must succeed");
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader did not signal ready in time");
+
+        // Reader is holding LOCK_SH. A store attempt must block.
+        // Spawn the store in a thread and check it hasn't
+        // completed within a short window.
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+        let meta = test_metadata("6.14.2");
+        let (store_done_tx, store_done_rx) = mpsc::channel();
+        let cache_store = Arc::clone(&cache);
+        let image_clone = image.clone();
+        let store_thread = std::thread::spawn(move || {
+            let _ = cache_store.store(key, &CacheArtifacts::new(&image_clone), &meta);
+            store_done_tx.send(()).unwrap();
+        });
+        // Short probe: store must NOT complete while reader holds lock.
+        let early = store_done_rx.recv_timeout(std::time::Duration::from_millis(200));
+        assert!(
+            early.is_err(),
+            "store() must block while reader holds LOCK_SH; got completion signal early",
+        );
+        // Release the reader — store should now unblock and finish.
+        release_tx.send(()).unwrap();
+        let finish = store_done_rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert!(
+            finish.is_ok(),
+            "store() must complete after reader releases; got timeout",
+        );
+        reader.join().expect("reader thread panicked");
+        store_thread.join().expect("store thread panicked");
+    }
+
+    /// `lock_path` returns `{cache_root}/.locks/{key}.lock` — pins
+    /// the exact on-disk shape against a refactor that relocates
+    /// the lockfile. Pure path construction, no filesystem access.
+    #[test]
+    fn lock_path_returns_expected_shape() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let path = cache.lock_path("my-key-42");
+        assert_eq!(path, tmp.path().join(".locks").join("my-key-42.lock"));
+    }
+
+    /// `.locks/` subdirectory PERSISTS after the lock guard drops.
+    /// Kernel_clean and any other walker that relies on list()
+    /// filtering dotfiles assumes `.locks/` outlives individual
+    /// acquires. A regression that rm'd the directory on guard
+    /// drop would cause next-acquire to re-`mkdir` on a different
+    /// inode and invalidate any /proc/locks peer-holder lookup
+    /// (the peer's inode would be stale).
+    #[test]
+    fn locks_subdir_persists_after_guard_drop() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        let locks_dir = tmp.path().join(".locks");
+        {
+            let _guard = cache
+                .acquire_shared_lock("persist-test")
+                .expect("acquire must succeed");
+            assert!(locks_dir.is_dir(), "must exist during guard lifetime");
+        }
+        // Guard dropped. .locks/ must still exist.
+        assert!(
+            locks_dir.is_dir(),
+            ".locks/ must persist after guard drop — next acquire \
+             keys /proc/locks on the existing inode",
+        );
+    }
+
+    /// `CacheDir::list` skips `.locks/` — pins the dotfile-filter
+    /// contract in `CacheDir::list`. kernel_clean iterates what
+    /// `list()` returns, so this is the same guard: `.locks/` is
+    /// NEVER visible to the cleanup path. A future refactor that
+    /// removed the `starts_with('.')` filter would regress
+    /// through this test.
+    #[test]
+    fn list_skips_locks_dotfile_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheDir::with_root(tmp.path().to_path_buf());
+        // Materialize .locks/ via acquire, then list().
+        let _guard = cache.acquire_shared_lock("dummy").expect("acquire");
+        drop(_guard);
+        assert!(
+            tmp.path().join(".locks").is_dir(),
+            ".locks/ must exist after acquire drop",
+        );
+        let entries = cache.list().expect("list must succeed");
+        let keys: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| match e {
+                ListedEntry::Valid(entry) => Some(entry.key.as_str()),
+                ListedEntry::Corrupt { key, .. } => Some(key.as_str()),
+            })
+            .collect();
+        assert!(
+            !keys.iter().any(|k| k.starts_with('.')),
+            "list() must not return dotfile children: {keys:?}",
+        );
+    }
+
+    /// Empty cache root: acquire creates `.locks/` lazily.
+    /// Distinct from `acquire_shared_lock_creates_lockfile_at_expected_path`
+    /// above because THAT test asserts the lockfile path; this
+    /// one pins the LAZY-create behavior — the cache root can be
+    /// totally empty (no kernel entries) and first acquire still
+    /// works.
+    #[test]
+    fn acquire_on_empty_root_creates_locks_dir_lazily() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("pristine");
+        std::fs::create_dir(&root).unwrap();
+        let cache = CacheDir::with_root(root.clone());
+        // Pre-acquire: no .locks/ yet.
+        assert!(!root.join(".locks").exists());
+        let _guard = cache
+            .acquire_shared_lock("lazy-test")
+            .expect("first acquire on empty root must succeed");
+        assert!(
+            root.join(".locks").is_dir(),
+            "first acquire must materialize .locks/ lazily",
+        );
+    }
+
+    /// `clean_all` MUST preserve the `.locks/` subdirectory. The
+    /// `list()` filter skips dotfile children (tested elsewhere);
+    /// `clean_all` removes what `list()` returns, so dotfiles — and
+    /// specifically `.locks/` — survive. Without this guarantee,
+    /// cleaning would delete a live SH flock's lockfile inode,
+    /// leaving the next acquirer's `/proc/locks` lookup blind to
+    /// the peer that still holds the (now-orphaned) fd.
+    ///
+    /// Repro sequence: populate an entry, acquire SH, clean_all,
+    /// assert `.locks/` still exists AND the lockfile still exists
+    /// inside it (the held fd keeps the inode alive even if the
+    /// directory entry were removed — we're checking the directory
+    /// entry specifically).
+    #[test]
+    fn cache_dir_clean_all_preserves_locks_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+        let src_dir = TempDir::new().unwrap();
+        let image = create_fake_image(src_dir.path());
+
+        // Populate a cache entry so clean_all has something to
+        // remove (its job is to tell the dotfile filter apart from
+        // real entries).
+        cache
+            .store("entry-a", &CacheArtifacts::new(&image), &test_metadata("6.14.0"))
+            .expect("store must succeed");
+        // Acquire a shared lock so .locks/{key}.lock materializes.
+        let _guard = cache
+            .acquire_shared_lock("entry-a")
+            .expect("SH acquire must succeed");
+
+        let locks_dir = cache_root.join(".locks");
+        let lockfile = locks_dir.join("entry-a.lock");
+        assert!(locks_dir.is_dir(), "precondition: .locks/ must exist");
+        assert!(lockfile.exists(), "precondition: lockfile must exist");
+
+        // Clean every entry. .locks/ is a dotfile-prefixed child
+        // and must NOT be treated as a cache entry.
+        let removed = cache.clean_all().expect("clean_all must succeed");
+        assert_eq!(removed, 1, "clean_all must remove exactly 1 entry");
+
+        // Post-clean: .locks/ subdirectory survives so the held SH
+        // flock's inode is still the one /proc/locks points at.
+        assert!(
+            locks_dir.is_dir(),
+            ".locks/ subdirectory must survive clean_all — the live \
+             SH flock's inode would otherwise orphan",
+        );
+        assert!(
+            lockfile.exists(),
+            "lockfile must still exist under .locks/ after clean_all",
+        );
+
+        // And the entry itself is gone.
+        assert!(
+            !cache_root.join("entry-a").exists(),
+            "cache entry must be removed by clean_all",
+        );
+    }
+
+    /// `acquire_shared_lock` MUST reject cache keys containing path
+    /// traversal components (`..`, `/`). Without the rejection, a
+    /// key of `"../../etc/passwd"` would join against the cache
+    /// root and materialize a lockfile OUTSIDE `.locks/`, which is
+    /// both a security concern (attacker-controlled write through
+    /// a library entry point) and a correctness failure (the lock
+    /// file's inode won't match anything in subsequent enumeration).
+    ///
+    /// Pins the `validate_cache_key` rejection from the two path-
+    /// traversal entry points — the `/` separator check and the
+    /// `..` component check — with a single test input that
+    /// triggers both. The error text must be actionable; asserting
+    /// against the `"path"` substring in the message catches both
+    /// the separator and traversal rejection arms.
+    #[test]
+    fn cache_dir_acquire_rejects_path_traversal_key() {
+        let tmp = TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let cache = CacheDir::with_root(cache_root.clone());
+
+        // Attacker-shaped key: contains both `/` separators and
+        // `..` traversal, hitting both rejection arms in
+        // `validate_cache_key`.
+        let err = cache
+            .acquire_shared_lock("../../etc/passwd")
+            .expect_err("path-traversal key must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("path"),
+            "error must mention path rejection: {msg}",
+        );
+
+        // Critically: no lockfile must have been created anywhere
+        // outside `.locks/`. Walk two levels above the cache root
+        // to verify nothing landed in `tmp.path()` or a traversal
+        // destination. The cache root itself may or may not exist
+        // (acquire creates `.locks/` lazily, but the validator
+        // rejects BEFORE that materialization).
+        let etc_passwd_lock = tmp.path().join("etc").join("passwd.lock");
+        assert!(
+            !etc_passwd_lock.exists(),
+            "path traversal must NOT create a lockfile outside .locks/",
+        );
+        // And verify .locks/ wasn't touched either — the validator
+        // rejects before any FS state is mutated.
+        assert!(
+            !cache_root.join(".locks").exists()
+                || cache_root.join(".locks").read_dir().unwrap().next().is_none(),
+            ".locks/ must be empty if it exists at all — validator \
+             rejects before lockfile creation",
+        );
     }
 
     use crate::test_support::test_helpers::EnvVarGuard;

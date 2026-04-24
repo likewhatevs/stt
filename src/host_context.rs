@@ -2534,6 +2534,7 @@ Hugepagesize:       2048 kB
             llc_groups: Vec::new(),
             online_cpus: Vec::new(),
             cpu_to_node: std::collections::HashMap::new(),
+            host_node_llcs: std::collections::BTreeMap::new(),
         };
         assert_eq!(count_numa_nodes_in_topology(&topo), 1);
     }
@@ -2553,6 +2554,7 @@ Hugepagesize:       2048 kB
             llc_groups: Vec::new(),
             online_cpus: (0..8).collect(),
             cpu_to_node,
+            host_node_llcs: std::collections::BTreeMap::new(),
         };
         assert_eq!(count_numa_nodes_in_topology(&topo), 1);
     }
@@ -2573,6 +2575,7 @@ Hugepagesize:       2048 kB
             llc_groups: Vec::new(),
             online_cpus: (0..8).collect(),
             cpu_to_node,
+            host_node_llcs: std::collections::BTreeMap::new(),
         };
         assert_eq!(count_numa_nodes_in_topology(&topo), 2);
     }
@@ -2592,6 +2595,7 @@ Hugepagesize:       2048 kB
             llc_groups: Vec::new(),
             online_cpus: vec![0, 1, 2, 3],
             cpu_to_node,
+            host_node_llcs: std::collections::BTreeMap::new(),
         };
         assert_eq!(
             count_numa_nodes_in_topology(&topo),
@@ -2729,6 +2733,7 @@ Hugepagesize:       2048 kB
             llc_groups: Vec::new(),
             online_cpus: vec![0, 1, 2, 3],
             cpu_to_node,
+            host_node_llcs: std::collections::BTreeMap::new(),
         };
         assert_eq!(
             count_numa_nodes_in_topology(&topo),

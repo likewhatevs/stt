@@ -14,6 +14,7 @@
 //! page](https://likewhatevs.github.io/ktstr/guide/concepts/performance-mode.html)
 //! for the isolation options the builder exposes.
 
+pub mod cgroup_sandbox;
 pub mod console;
 mod exit_dispatch;
 pub mod host_topology;
@@ -634,18 +635,60 @@ fn pin_current_thread(cpu: usize, label: &str) {
     }
 }
 
-/// Set the calling thread to SCHED_FIFO at the given priority.
+/// Set the calling thread's CPU mask to the supplied set. Distinct
+/// from [`pin_current_thread`]: that one locks a thread to a single
+/// CPU (the perf-mode contract), this one constrains a thread to a
+/// pool without picking a specific CPU. The kernel picks a runnable
+/// CPU from the mask.
+///
+/// Used by the no-perf + `--llc-cap` path at
+/// [`KtstrVmBuilder::build`]: every vCPU thread gets the reserved
+/// LLC's CPUs as its mask so the vCPU runs inside the resource
+/// budget without fighting the kernel scheduler for a hard pin it
+/// doesn't actually need.
+///
 /// Logs success or warning; does not fail the VM.
+fn set_thread_cpumask(cpus: &[usize], label: &str) {
+    let mut cpuset = nix::sched::CpuSet::new();
+    for &cpu in cpus {
+        if let Err(e) = cpuset.set(cpu) {
+            eprintln!("no_perf_mode: WARNING: cpuset.set({cpu}) for {label}: {e}");
+            return;
+        }
+    }
+    match nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
+        Ok(()) => eprintln!("no_perf_mode: mask {label} to host CPUs {cpus:?}"),
+        Err(e) => eprintln!("no_perf_mode: WARNING: mask {label} to {cpus:?}: {e}"),
+    }
+}
+
+/// Set the calling thread to SCHED_FIFO at the given priority.
+/// Logs success or warning via tracing; does not fail the VM.
+///
+/// Uses `tracing::info!` / `tracing::warn!` rather than `eprintln!`
+/// so the warn-without-CAP_SYS_NICE branch is observable by tests
+/// that install a tracing subscriber (e.g. `tracing-test`).
+/// Previously `eprintln!` made the warning invisible to any test
+/// that didn't fork + redirect fd 2.
 fn set_rt_priority(priority: i32, label: &str) {
     let param = libc::sched_param {
         sched_priority: priority,
     };
     let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
     if rc == 0 {
-        eprintln!("performance_mode: {label} set to SCHED_FIFO priority {priority}");
+        tracing::info!(
+            label = label,
+            priority = priority,
+            "performance_mode: {label} set to SCHED_FIFO priority {priority}",
+        );
     } else {
         let err = std::io::Error::last_os_error();
-        eprintln!("performance_mode: WARNING: SCHED_FIFO for {label}: {err} (need CAP_SYS_NICE)");
+        tracing::warn!(
+            label = label,
+            priority = priority,
+            err = %err,
+            "performance_mode: WARNING: SCHED_FIFO for {label}: {err} (need CAP_SYS_NICE)",
+        );
     }
 }
 
@@ -918,6 +961,21 @@ pub struct KtstrVm {
     /// prevent other VMs from double-booking the same CPUs.
     #[allow(dead_code)]
     cpu_locks: Vec<std::os::fd::OwnedFd>,
+    /// No-perf-mode resource plan, populated when the builder resolves
+    /// an `LlcCap` via `KTSTR_LLC_CAP` (set by `ktstr shell --llc-cap N`
+    /// or `cargo ktstr shell --llc-cap N`). Holds the flattened CPU
+    /// list + RAII flock fds returned by
+    /// [`host_topology::acquire_llc_plan`]. `run_vm` reads the CPU
+    /// list to `sched_setaffinity` every vCPU thread to the reserved
+    /// LLCs' host-CPU set, and `Drop` releases the LLC flocks with
+    /// the VM.
+    ///
+    /// `None` for the pre-flag no-perf path (which keeps using
+    /// `cpu_locks` above) and for perf-mode (which uses
+    /// `pinning_plan`). The two paths are orthogonal — perf-mode
+    /// hard-pins single CPUs, --llc-cap soft-masks a pool.
+    #[allow(dead_code)]
+    no_perf_plan: Option<host_topology::LlcPlan>,
     /// Shell commands to run in the guest to enable a kernel-built scheduler.
     sched_enable_cmds: Vec<String>,
     /// Shell commands to run in the guest to disable a kernel-built scheduler.
@@ -1120,6 +1178,13 @@ impl KtstrVm {
         let mut bsp = vcpus.remove(0);
 
         let ap_pins = vec![None; vcpus.len()];
+        // Shell/interactive path mirrors run_vm: no-perf + --llc-cap
+        // applies the LlcPlan's CPU list as a sched_setaffinity mask
+        // on every vCPU thread. Perf-mode's pin_targets doesn't
+        // apply here — interactive shell runs under no-perf by
+        // convention, and `pin_targets` is empty in this branch.
+        let no_perf_mask: Option<&[usize]> =
+            self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
         let ap_threads = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -1128,6 +1193,7 @@ impl KtstrVm {
             Some(&virtio_con),
             &kill,
             &ap_pins,
+            no_perf_mask,
         )?;
 
         // BSP kick handles for the stdin escape sequence. The stdin thread
@@ -1382,6 +1448,16 @@ impl KtstrVm {
         // Interactive sessions are user-controlled; the builder's timeout
         // (default 60s) must not kill the shell. Use 24 hours as a
         // practical upper bound.
+        //
+        // Apply the no-perf + --llc-cap mask to the BSP thread so
+        // interactive `ktstr shell --no-perf-mode --llc-cap N` runs
+        // inside the reserved LLCs just like run_vm's BSP. No pin
+        // here — perf-mode doesn't apply to interactive shell:
+        // `--llc-cap` requires `--no-perf-mode` on Shell (clap
+        // `requires` attribute on the llc_cap field).
+        if let Some(mask) = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice()) {
+            set_thread_cpumask(mask, "BSP (shell)");
+        }
         register_vcpu_signal_handler();
         let interactive_timeout = Duration::from_secs(24 * 60 * 60);
         self.run_bsp_loop(
@@ -2267,6 +2343,12 @@ impl KtstrVm {
             vec![None; vcpus.len()]
         };
 
+        // No-perf + --llc-cap: flat CPU list from the LLC plan gets
+        // sched_setaffinity'd on every vCPU thread as a mask (not a
+        // hard pin). Mutually exclusive with perf-mode's pin_targets.
+        let no_perf_mask: Option<&[usize]> =
+            self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
+
         let ap_threads = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -2275,11 +2357,14 @@ impl KtstrVm {
             None,
             &kill,
             &ap_pins,
+            no_perf_mask,
         )?;
 
-        // Pin BSP (runs on current thread, pid=0 means calling thread).
+        // Pin / mask BSP (runs on current thread, pid=0 means calling thread).
         if let Some(Some(host_cpu)) = pin_targets.first() {
             pin_current_thread(*host_cpu, "BSP (vCPU 0)");
+        } else if let Some(mask) = no_perf_mask {
+            set_thread_cpumask(mask, "BSP (vCPU 0)");
         }
         if self.performance_mode {
             set_rt_priority(1, "BSP (vCPU 0)");
@@ -2462,7 +2547,11 @@ impl KtstrVm {
     }
 
     /// Spawn AP vCPU threads. Each thread optionally pins itself to a
-    /// host CPU from `pin_targets` (indexed by AP order, 0-based).
+    /// host CPU from `pin_targets` (indexed by AP order, 0-based), OR
+    /// applies a CPU mask from `no_perf_mask` when the no-perf +
+    /// `--llc-cap` path is active. The two are mutually exclusive —
+    /// perf-mode produces `pin_targets` via the PinningPlan;
+    /// `--llc-cap` no-perf produces `no_perf_mask` via the LlcPlan.
     #[allow(clippy::too_many_arguments)]
     fn spawn_ap_threads(
         &self,
@@ -2473,6 +2562,7 @@ impl KtstrVm {
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         kill: &Arc<AtomicBool>,
         pin_targets: &[Option<usize>],
+        no_perf_mask: Option<&[usize]>,
     ) -> Result<Vec<VcpuThread>> {
         // Register the process-wide panic hook that flips `kill` +
         // `exited` on a panicking vCPU thread before the
@@ -2493,6 +2583,7 @@ impl KtstrVm {
             let exited = Arc::new(AtomicBool::new(false));
             let exited_clone = exited.clone();
             let pin_cpu = pin_targets.get(i).copied().flatten();
+            let mask_for_thread: Option<Vec<usize>> = no_perf_mask.map(|m| m.to_vec());
 
             let rt = self.performance_mode;
             let panic_ctx = vcpu_panic::VcpuPanicCtx {
@@ -2505,6 +2596,8 @@ impl KtstrVm {
                     register_vcpu_signal_handler();
                     if let Some(cpu) = pin_cpu {
                         pin_current_thread(cpu, &format!("vCPU {}", i + 1));
+                    } else if let Some(mask) = mask_for_thread.as_deref() {
+                        set_thread_cpumask(mask, &format!("vCPU {}", i + 1));
                     }
                     if rt {
                         set_rt_priority(1, &format!("vCPU {}", i + 1));
@@ -3737,44 +3830,92 @@ impl KtstrVmBuilder {
             self.performance_mode = false;
         }
 
-        let (pinning_plan, mbind_node_map, cpu_locks) = if self.no_perf_mode {
+        let (pinning_plan, mbind_node_map, cpu_locks, no_perf_plan) = if self.no_perf_mode {
             // No-perf-mode VMs have unrestricted vCPU affinity — the
             // host kernel places their threads on any online CPU,
             // including ones a perf-mode peer has flocked and bound
             // its RT-FIFO vCPUs to. Injecting that thread competition
-            // destroys perf-mode's measurement contract. Acquire
-            // `LOCK_SH` on every host LLC so perf-mode's required
+            // destroys perf-mode's measurement contract. The coordination
+            // mechanism is an LLC-level flock set (same as
+            // `kernel_build_pipeline`) so perf-mode's required
             // `LOCK_EX` blocks on any of them and fails over cleanly.
-            // See `host_topology::acquire_all_llc_shared_locks` for
-            // the full rationale (and the `KTSTR_BYPASS_LLC_LOCKS`
-            // escape hatch for operators who accept noise).
+            //
+            // Two paths converge here depending on `KTSTR_LLC_CAP`
+            // (set by `ktstr shell --llc-cap N` or
+            // `cargo ktstr shell --llc-cap N`):
+            //
+            //  - Cap set: `acquire_llc_plan` picks a
+            //    consolidation-aware, NUMA-aware subset of N LLCs,
+            //    returns its `cpus` list + RAII flock fds. The
+            //    `cpus` are threaded into `no_perf_plan` so `run_vm`
+            //    can `sched_setaffinity` every vCPU thread to that
+            //    pool. `cpu_locks` stays empty — the plan owns the
+            //    flocks.
+            //  - No cap: same `acquire_llc_plan` path with
+            //    `llc_cap = None`; the planner's target degenerates
+            //    to "select every LLC" — the pre-flag default.
+            //    The returned
+            //    LlcPlan's flock set matches the pre-flag "every
+            //    LLC shared" reservation. `no_perf_plan` still
+            //    carries the plan so run_vm can apply the host-
+            //    wide mask; on a normal host with full LLC set,
+            //    sched_setaffinity with every online CPU is a
+            //    no-op, matching the pre-flag behaviour.
             //
             // `from_sysfs` returning `Err` (non-Linux, sysfs absent)
-            // degenerates the lock set to empty; no coordination is
-            // possible, but the VM still runs. This preserves the
-            // legacy "no-perf-mode runs everywhere" behaviour on
-            // hosts that literally cannot enumerate LLCs, and the
-            // `tracing::warn!` below makes the fallback visible.
-            let locks = if std::env::var("KTSTR_BYPASS_LLC_LOCKS")
+            // degenerates the lock set to empty AND forces the no-cap
+            // branch; no coordination is possible, but the VM still
+            // runs. `KTSTR_BYPASS_LLC_LOCKS=1` bypasses both paths.
+            //
+            // The CLI binaries reject `--llc-cap` + bypass at parse
+            // time (see `ktstr::cli::LLC_CAP_HELP` and the Shell/
+            // kernel-build dispatch checks in bin/ktstr.rs and
+            // bin/cargo-ktstr.rs), but library consumers building
+            // a `KtstrVmBuilder` directly with both env vars set
+            // would silently lose the cap under a bare `if bypass
+            // { return None-plan }`. Mirror the CLI check here so
+            // the enforcement contract holds for every entry point,
+            // not just the ones that go through the binaries.
+            let bypass = std::env::var("KTSTR_BYPASS_LLC_LOCKS")
                 .ok()
-                .is_some_and(|v| !v.is_empty())
-            {
-                Vec::new()
+                .is_some_and(|v| !v.is_empty());
+            let llc_cap = host_topology::LlcCap::resolve(None)?;
+            if bypass {
+                if llc_cap.is_some() {
+                    anyhow::bail!(
+                        "no-perf-mode: KTSTR_LLC_CAP conflicts with \
+                         KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
+                         KTSTR_LLC_CAP is a resource contract; bypass \
+                         disables the contract entirely."
+                    );
+                }
+                (None, Vec::new(), Vec::new(), None)
             } else if let Ok(host_topo) = host_topology::HostTopology::from_sysfs() {
-                host_topology::acquire_all_llc_shared_locks(&host_topo)?
+                let test_topo = crate::topology::TestTopology::from_system()?;
+                let plan =
+                    host_topology::acquire_llc_plan(&host_topo, &test_topo, llc_cap)?;
+                host_topology::warn_if_cross_node_spill(&plan, &host_topo);
+                (None, Vec::new(), Vec::new(), Some(plan))
             } else {
+                if llc_cap.is_some() {
+                    anyhow::bail!(
+                        "--llc-cap set but host LLC topology unreadable from \
+                         sysfs — cannot enforce the resource budget. Run on a \
+                         host with /sys/devices/system/cpu populated, or drop \
+                         --llc-cap to run without enforcement."
+                    );
+                }
                 tracing::warn!(
                     "no-perf-mode: could not read host LLC topology from sysfs; \
                      skipping all-LLC LOCK_SH acquisition. Concurrent perf-mode \
                      runs on this host will NOT be serialized against this VM"
                 );
-                Vec::new()
-            };
-            (None, Vec::new(), locks)
+                (None, Vec::new(), Vec::new(), None)
+            }
         } else if self.performance_mode {
             let (plan, host_topo) = self.validate_performance_mode()?;
             let node_map = build_per_node_map(&plan, &host_topo, &self.topology);
-            (Some(plan), node_map, Vec::new())
+            (Some(plan), node_map, Vec::new(), None)
         } else {
             let total_cpus = self.topology.total_cpus() as usize;
             let host_topo = host_topology::HostTopology::from_sysfs().ok();
@@ -3784,7 +3925,7 @@ impl KtstrVmBuilder {
                 .unwrap_or(total_cpus);
             let locks =
                 host_topology::acquire_cpu_locks(total_cpus, host_cpus, host_topo.as_ref())?;
-            (None, Vec::new(), locks)
+            (None, Vec::new(), locks, None)
         };
 
         let kernel = self.kernel.context("kernel path required")?;
@@ -3837,6 +3978,7 @@ impl KtstrVmBuilder {
             pinning_plan,
             mbind_node_map,
             cpu_locks,
+            no_perf_plan,
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,
@@ -5455,16 +5597,55 @@ mod tests {
         unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &restore) };
     }
 
+    /// `set_rt_priority` emits a `tracing::warn!` with the
+    /// "need CAP_SYS_NICE" substring when `sched_setscheduler`
+    /// returns an error — the warn-and-proceed invariant that keeps
+    /// vCPU threads running in unprivileged containers with the
+    /// default scheduling policy instead of failing the VM.
+    ///
+    /// Captures tracing output via `tracing_test::traced_test` so the
+    /// assertion observes the actual warn event (not just "the call
+    /// did not panic"). Runs ONLY when the test process lacks
+    /// CAP_SYS_NICE — if the capability is present, the success
+    /// branch fires instead and the warn is never emitted, leaving
+    /// nothing to assert; in that case we restore SCHED_OTHER on
+    /// the probe thread and skip.
     #[test]
+    #[tracing_test::traced_test]
     fn set_rt_priority_warns_without_cap() {
-        // `set_rt_priority` swallows EPERM with an unconditional
-        // stderr warning (one `eprintln!` per call, no
-        // once-gating) rather than panicking or propagating an
-        // error, so vCPU threads running in unprivileged
-        // containers keep booting with the default scheduling
-        // policy. This test exercises that warning path — its
-        // only guard is that the call doesn't panic.
+        // Probe CAP_SYS_NICE: if we CAN set SCHED_FIFO, the test
+        // can't exercise the warn path. Restore SCHED_OTHER and
+        // skip — we can't observe the warn event without actually
+        // failing the syscall.
+        let probe = libc::sched_param { sched_priority: 1 };
+        let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &probe) };
+        if rc == 0 {
+            // Restore SCHED_OTHER so later tests don't inherit RT.
+            let restore = libc::sched_param { sched_priority: 0 };
+            unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &restore) };
+            skip!("CAP_SYS_NICE present — cannot exercise warn path");
+        }
+        // Now we know the syscall will fail. Call set_rt_priority
+        // and assert the warn event fires with the expected
+        // substring. `logs_contain` is injected into the test by
+        // the `#[traced_test]` macro and scans the per-test tracing
+        // buffer.
         set_rt_priority(1, "test-thread");
+        assert!(
+            logs_contain("need CAP_SYS_NICE"),
+            "warn event must include the 'need CAP_SYS_NICE' hint \
+             so operators reading stderr know what permission to \
+             grant",
+        );
+        assert!(
+            logs_contain("SCHED_FIFO"),
+            "warn event must name the policy whose attachment failed",
+        );
+        assert!(
+            logs_contain("test-thread"),
+            "warn event must name the label so operators can attribute \
+             the warning to a specific vCPU / monitor / watchdog thread",
+        );
     }
 
     // -- aarch64 boot tests --

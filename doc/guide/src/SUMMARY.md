@@ -23,6 +23,7 @@
   - [TestTopology](concepts/topology.md)
   - [MemPolicy](concepts/mem-policy.md)
   - [Performance Mode](concepts/performance-mode.md)
+  - [Resource Budget](concepts/resource-budget.md)
 - [Writing Tests](writing-tests.md)
   - [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md)
   - [Custom Scenarios](writing-tests/custom-scenarios.md)
@@ -55,3 +56,4 @@
 - [CI](ci.md)
 - [Troubleshooting](troubleshooting.md)
 - [Environment Variables](reference/environment-variables.md)
+- [Host-State Profiler](reference/host-state-profiler.md)

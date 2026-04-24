@@ -75,6 +75,21 @@ filter = "test(sched_perf_)"
 test-group = "vm-perf"
 threads-required = 1
 
+# ── llc-lock ─────────────────────────────────────────────────────────
+# Serialize tests that touch `/tmp/ktstr-llc-*.lock` or
+# `/tmp/ktstr-cpu-*.lock` at shared indices. Parallel runs race on
+# flock state, producing EWOULDBLOCK outcomes depending on thread
+# ordering and flaking the Acquired/Unavailable assertions. With
+# max-threads = 1 the whole group walks sequentially through the
+# host's lock pool.
+[test-groups.llc-lock]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "test(acquire_llc_plan_) | test(resource_lock_exclusive_) | test(resource_lock_shared_) | test(resource_lock_contention_returns_unavailable) | test(resource_lock_all_or_nothing) | test(resource_lock_service_cpu_contention) | test(resource_lock_empty_llc_indices) | test(resource_lock_release_on_drop) | test(cpu_lock_window_) | test(cpu_lock_acquire_) | test(cpu_lock_llc_shared_protection) | test(cpu_lock_contention_slides_window) | test(cpu_lock_zero_count)"
+test-group = "llc-lock"
+threads-required = 1
+
 # Quick profile: short-circuit long-running tests.
 [[profile.quick.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"

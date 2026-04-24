@@ -312,6 +312,28 @@ See [Performance Mode](concepts/performance-mode.md).
 </details>
 
 <details>
+<summary><b>Resource-budget coordination</b> — <code>--llc-cap N</code> bounds concurrent kernel builds and no-perf-mode VMs per host</summary>
+
+`--llc-cap N` (or `KTSTR_LLC_CAP=N`) constrains a no-perf-mode VM or
+kernel build to a `LOCK_SH` reservation over a NUMA-aware,
+consolidation-aware subset of `N` LLCs — instead of the pre-flag
+"lock every LLC" default. The plan writes the reserved CPUs and
+NUMA nodes into a cgroup v2 cpuset sandbox so `make -jN`
+gcc fan-out and vCPU soft-mask affinity respect the budget.
+On `shell`, mutually exclusive with `performance_mode=true`
+(clap parse rejection); library consumers see the env var
+silently ignored under perf-mode. Mutually exclusive with
+`KTSTR_BYPASS_LLC_LOCKS=1` at every entry point (contract vs.
+bypass conflict rejected at CLI parse plus the library and
+kernel-build-pipeline sites). `ktstr locks` /
+`ktstr locks --json` enumerates every held
+LLC + per-CPU + cache-entry flock on the host with holder PID +
+cmdline for contention diagnosis. See
+[Resource Budget](concepts/resource-budget.md).
+
+</details>
+
+<details>
 <summary><b>Guest coverage</b> — profraw collection from inside the VM, merged with host coverage</summary>
 
 Guest-side profraw collection via shared memory. The host merges
@@ -325,7 +347,7 @@ guest and host coverage for unified `cargo llvm-cov` reports.
 Wraps `cargo nextest run` with automatic kernel resolution.
 Subcommands (in `--help` order): `test`, `coverage`, `llvm-cov`,
 `stats`, `kernel`, `model`, `verifier`, `completions`, `show-host`,
-`show-thresholds`, `cleanup`, `shell`.
+`show-thresholds`, `cleanup`, `locks`, `shell`.
 See [`cargo-ktstr`](running-tests/cargo-ktstr.md).
 
 </details>

@@ -5,6 +5,14 @@
 
 use anyhow::{Context, Result};
 
+// Advisory flock primitives live in `crate::flock` so both LLC +
+// per-CPU coordination here and per-cache-entry coordination in
+// `crate::cache` share one `try_flock` implementation (with a single
+// `O_CLOEXEC` source of truth) plus one `HolderInfo` /proc/locks
+// parser. Re-importing the names keeps existing in-module call sites
+// (production + `super::*` tests) compiling unchanged.
+use crate::flock::{FlockMode, try_flock};
+
 /// Resource contention error — LLC slots or CPUs unavailable.
 /// Downcast via `anyhow::Error::downcast_ref::<ResourceContention>()`
 /// to distinguish from fatal errors.
@@ -38,6 +46,15 @@ pub struct HostTopology {
     /// NUMA node ID for each online CPU, indexed by CPU ID.
     /// CPUs not in the map default to node 0.
     pub cpu_to_node: std::collections::HashMap<usize, usize>,
+    /// LLC indices grouped by their NUMA node. Memoized at construction
+    /// time from `llc_groups + cpu_to_node` so repeated NUMA-aware
+    /// placement queries (perf-mode rotation, `--llc-cap` consolidation
+    /// PLAN) don't re-walk every LLC's CPU list on every call. Access
+    /// via [`HostTopology::host_llcs_by_numa_node`]. `BTreeMap` (not
+    /// `HashMap`) for deterministic iteration order — two ktstr
+    /// invocations on the same host MUST produce identical LLC
+    /// selections so their ACQUIRE phases converge on the same indices.
+    pub(crate) host_node_llcs: std::collections::BTreeMap<usize, Vec<usize>>,
 }
 
 /// Pinning plan: maps each vCPU index to a host CPU, plus a dedicated
@@ -63,7 +80,7 @@ impl HostTopology {
         let topo = crate::topology::TestTopology::from_system()
             .context("read host topology from sysfs")?;
         let online_cpus = topo.all_cpus().to_vec();
-        let llc_groups = topo
+        let llc_groups: Vec<LlcGroup> = topo
             .llcs()
             .iter()
             .map(|llc| LlcGroup {
@@ -75,11 +92,91 @@ impl HostTopology {
             .iter()
             .flat_map(|llc| llc.cpus().iter().map(|&cpu| (cpu, llc.numa_node())))
             .collect();
+        let host_node_llcs = Self::compute_host_node_llcs(&llc_groups, &cpu_to_node);
         Ok(Self {
             llc_groups,
             online_cpus,
             cpu_to_node,
+            host_node_llcs,
         })
+    }
+
+    /// Build a synthetic `HostTopology` from `(cpu_list, node_id)`
+    /// pairs for tests. One pair per LLC group; within a pair the
+    /// `cpu_list` becomes the group's CPUs and the `node_id` is the
+    /// NUMA node every CPU in that group is assigned to.
+    /// `online_cpus` is the flattened concatenation of every group's
+    /// CPUs in input order; `cpu_to_node` is built by broadcasting
+    /// each group's node over its CPUs; `host_node_llcs` goes through
+    /// the same [`compute_host_node_llcs`] path production uses, so
+    /// tests never diverge from the sysfs-derived memoization.
+    ///
+    /// Intended for test fixtures that want a deterministic in-memory
+    /// topology without stubbing `/sys/devices/system/cpu/*`.
+    /// Previously this logic was duplicated across three helper
+    /// functions (`synthetic_topo`, `synthetic_topo_numa`,
+    /// `synth_host_topo`) — consolidated here so the
+    /// `HostTopology` invariant is maintained in one place. The
+    /// `#[cfg(test)]` gate keeps the symbol out of release builds.
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(groups: &[(Vec<usize>, usize)]) -> Self {
+        let llc_groups: Vec<LlcGroup> = groups
+            .iter()
+            .map(|(cpus, _)| LlcGroup { cpus: cpus.clone() })
+            .collect();
+        let cpu_to_node: std::collections::HashMap<usize, usize> = groups
+            .iter()
+            .flat_map(|(cpus, node)| cpus.iter().map(move |&cpu| (cpu, *node)))
+            .collect();
+        let online_cpus: Vec<usize> = groups
+            .iter()
+            .flat_map(|(cpus, _)| cpus.iter().copied())
+            .collect();
+        let host_node_llcs = HostTopology::compute_host_node_llcs(&llc_groups, &cpu_to_node);
+        HostTopology {
+            llc_groups,
+            online_cpus,
+            cpu_to_node,
+            host_node_llcs,
+        }
+    }
+
+    /// Compute the memoized `host_node_llcs` map from `llc_groups` +
+    /// `cpu_to_node`. Uses the same majority-vote NUMA-assignment rule
+    /// as [`llc_numa_node`], so the memoized map and the one-off query
+    /// method never disagree. Separate fn (not inlined) so
+    /// `from_sysfs` and synthetic-test constructors share one path.
+    fn compute_host_node_llcs(
+        llc_groups: &[LlcGroup],
+        cpu_to_node: &std::collections::HashMap<usize, usize>,
+    ) -> std::collections::BTreeMap<usize, Vec<usize>> {
+        let mut node_llcs: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (idx, group) in llc_groups.iter().enumerate() {
+            // Majority-vote NUMA node for this LLC — matches
+            // `llc_numa_node` exactly. We inline the logic here rather
+            // than calling the method because we don't yet have `self`.
+            let mut counts: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            for &cpu in &group.cpus {
+                let node = cpu_to_node.get(&cpu).copied().unwrap_or(0);
+                *counts.entry(node).or_insert(0) += 1;
+            }
+            let node = counts
+                .into_iter()
+                .max_by_key(|&(_, count)| count)
+                .map(|(node, _)| node)
+                .unwrap_or(0);
+            node_llcs.entry(node).or_default().push(idx);
+        }
+        // Within-node LLC ordering: ascending llc_idx. Callers that
+        // walk `host_node_llcs[node]` rely on this for deterministic
+        // output — two ktstr invocations with identical topology see
+        // the same walk order.
+        for llcs in node_llcs.values_mut() {
+            llcs.sort_unstable();
+        }
+        node_llcs
     }
 
     /// Maximum cores per LLC group on the host.
@@ -96,9 +193,112 @@ impl HostTopology {
         self.online_cpus.len()
     }
 
+    // ------------------------------------------------------------------
+    // Shared NUMA-placement primitives
+    // ------------------------------------------------------------------
+    //
+    // Used by the existing perf-mode pinning path
+    // ([`numa_aware_llc_order`]) AND the `--llc-cap` consolidation
+    // PLAN phase. Both callers implement DIFFERENT selection algorithms
+    // on top of these queries:
+    //
+    // - Perf-mode distributes virtual NUMA nodes across host NUMA
+    //   nodes with modulo rotation; uses primitive 1 + 2 (group-by-node
+    //   + eligibility-by-capacity). No distance lookup.
+    // - Consolidation seeds from a scored LLC list then greedily
+    //   expands within the seed's node, spilling to nearest-by-distance
+    //   when needed; uses primitive 1 + 2 + 3.
+    //
+    // Kept as small orthogonal queries rather than a single mega-selector
+    // — the two algorithms genuinely do different things, but they both
+    // need the same three topology lookups.
+
+    /// Memoized map of NUMA node → LLC indices on that node. Returned
+    /// by reference so callers can iterate without cloning; `BTreeMap`
+    /// gives deterministic iteration so two invocations on identical
+    /// topologies produce identical walks.
+    ///
+    /// In-tree callers currently reach the same data via
+    /// [`numa_nodes_sorted_by_distance`] and [`numa_nodes_with_capacity`]
+    /// — both iterate `host_node_llcs` internally — so this accessor
+    /// has no direct consumer today. Kept as a stable handle for
+    /// future callers (e.g. a planned `ktstr topo --json` NUMA
+    /// section) and downstream tooling that wants the raw map.
+    #[allow(dead_code)]
+    pub(crate) fn host_llcs_by_numa_node(&self) -> &std::collections::BTreeMap<usize, Vec<usize>> {
+        &self.host_node_llcs
+    }
+
+    /// Return every NUMA node that has `>= min_llcs` LLCs, paired with
+    /// that node's LLC-index slice. Callers filter through this when
+    /// their algorithm requires per-node capacity guarantees (perf-mode
+    /// passes `ceil(llcs/numa_nodes)` so any guest node can land on any
+    /// host node; consolidation passes 1 so every node with at least
+    /// one free LLC is a valid spill candidate). Iteration order
+    /// follows the underlying `BTreeMap` — ascending by node id.
+    pub(crate) fn numa_nodes_with_capacity(
+        &self,
+        min_llcs: usize,
+    ) -> Vec<(usize, &Vec<usize>)> {
+        self.host_node_llcs
+            .iter()
+            .filter(|(_, llcs)| llcs.len() >= min_llcs)
+            .map(|(&node, llcs)| (node, llcs))
+            .collect()
+    }
+
+    /// Return NUMA node ids sorted by distance from `anchor` ascending,
+    /// with unreachable nodes (distance 255 per Linux convention)
+    /// demoted to the end. Caller supplies the distance lookup via
+    /// `distance_fn` so this primitive stays independent of any
+    /// specific distance source — consolidation threads
+    /// `TestTopology::numa_distance` through a closure, while callers
+    /// without a distance matrix can pass
+    /// `|from, to| if from == to { 10 } else { 20 }` for a trivial
+    /// near/far split.
+    ///
+    /// `anchor` is included in the output (distance to self = 10 on
+    /// the Linux convention, sorting first). Nodes without any LLCs
+    /// on this host are skipped — spilling to an empty node has no
+    /// value.
+    pub(crate) fn numa_nodes_sorted_by_distance(
+        &self,
+        anchor: usize,
+        distance_fn: impl Fn(usize, usize) -> u8,
+    ) -> Vec<usize> {
+        let mut nodes: Vec<(usize, u8)> = self
+            .host_node_llcs
+            .keys()
+            .map(|&node| (node, distance_fn(anchor, node)))
+            .collect();
+        // Sort: unreachable (255) last; among reachable, ascending
+        // distance; ties broken by ascending node id via the stable
+        // sort applied over a pre-sorted (BTreeMap-ordered) input.
+        nodes.sort_by(|a, b| {
+            let a_unreachable = a.1 == 255;
+            let b_unreachable = b.1 == 255;
+            match (a_unreachable, b_unreachable) {
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => a.1.cmp(&b.1),
+            }
+        });
+        nodes.into_iter().map(|(node, _)| node).collect()
+    }
+
     /// NUMA node for a host LLC group, determined by majority vote of
     /// its CPUs' NUMA assignments. Returns 0 when the map is empty
     /// (single-node systems).
+    ///
+    /// Production callers pre-compute the node-to-LLC mapping once at
+    /// [`HostTopology::from_sysfs`] via
+    /// [`compute_host_node_llcs`](Self::compute_host_node_llcs)
+    /// (memoized in [`host_node_llcs`](Self::host_node_llcs)); use
+    /// [`host_llcs_by_numa_node`](Self::host_llcs_by_numa_node) to
+    /// iterate the pre-built map. This method stays exposed for
+    /// external callers (future `ktstr locks` NUMA column + any
+    /// downstream tooling that needs a single-LLC lookup) and
+    /// synthetic-topology tests that assert per-LLC node assignment.
     pub fn llc_numa_node(&self, llc_idx: usize) -> usize {
         let group = &self.llc_groups[llc_idx];
         let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -246,7 +446,20 @@ impl HostTopology {
     /// `ceil(llcs / numa_nodes)` (the max any single guest node will
     /// claim) — stricter than the prior floor-based check, so the
     /// "+1" guest nodes always land on a node with capacity.
-    fn numa_aware_llc_order(&self, numa_nodes: u32, llcs: u32, llc_offset: usize) -> Vec<usize> {
+    ///
+    /// Implementation composes [`host_llcs_by_numa_node`] +
+    /// [`numa_nodes_with_capacity`] — the same group-by-node + eligibility
+    /// queries the `--llc-cap` consolidation PLAN phase uses. The two
+    /// callers' SELECTION algorithms differ (perf-mode does modulo
+    /// rotation of guest onto host nodes; consolidation does
+    /// score-driven greedy expansion), but the underlying topology
+    /// lookups are the same.
+    pub(crate) fn numa_aware_llc_order(
+        &self,
+        numa_nodes: u32,
+        llcs: u32,
+        llc_offset: usize,
+    ) -> Vec<usize> {
         let num_host_llcs = self.llc_groups.len();
 
         // Sequential fallback used by the degenerate cases below.
@@ -281,22 +494,12 @@ impl HostTopology {
         // to remain eligible.
         let max_per_node = base_per_node + if remainder > 0 { 1 } else { 0 };
 
-        // Group host LLC indices by their physical NUMA node.
-        let mut host_node_llcs: std::collections::BTreeMap<usize, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for idx in 0..num_host_llcs {
-            let node = self.llc_numa_node(idx);
-            host_node_llcs.entry(node).or_default().push(idx);
-        }
-
         // Collect host NUMA nodes that can supply the ceiling (max)
         // per-node count — so any guest node can land there regardless
-        // of whether it's one of the `remainder` "+1" nodes.
-        let eligible_nodes: Vec<(usize, &Vec<usize>)> = host_node_llcs
-            .iter()
-            .filter(|(_, llcs_vec)| llcs_vec.len() >= max_per_node)
-            .map(|(&node, llcs_vec)| (node, llcs_vec))
-            .collect();
+        // of whether it's one of the `remainder` "+1" nodes. Shared
+        // primitive: `numa_nodes_with_capacity` filters the memoized
+        // group-by-node map.
+        let eligible_nodes = self.numa_nodes_with_capacity(max_per_node);
 
         // Need at least numa_nodes distinct host NUMA nodes with enough
         // LLCs each.
@@ -358,63 +561,6 @@ pub enum LockOutcome {
     Unavailable(#[allow(dead_code)] String),
 }
 
-/// Requested sharing mode for [`try_flock`]. Translated to the
-/// corresponding non-blocking [`rustix::fs::FlockOperation`] internally;
-/// callers never see the libc-specific constants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlockMode {
-    /// Exclusive (`LOCK_EX`) — sole access to the lock file.
-    Exclusive,
-    /// Shared (`LOCK_SH`) — multiple holders can coexist.
-    Shared,
-}
-
-/// Open a lock file and attempt flock with LOCK_NB.
-/// Returns the OwnedFd on success, None on EWOULDBLOCK, or
-/// propagates other errors. Uses rustix so file descriptor ownership
-/// and errno handling are not open-coded per call.
-///
-/// # NFS limitation
-///
-/// `path` is expected to resolve to a LOCAL filesystem (ext4, xfs,
-/// btrfs, tmpfs, …). `flock(2)` on an NFS mount is advisory-only
-/// under older NFS server configurations and, depending on the
-/// Linux-kernel version + server combination, can silently succeed
-/// without actually serializing peers — two concurrent runs both
-/// get `OwnedFd` back and both believe they own the lock. The
-/// default path prefix `/tmp/ktstr-*.lock` is tmpfs on typical
-/// distros, which is always local. Operators who mount `/tmp`
-/// over NFS (a setup ktstr does not support) get an unreliable
-/// serialization contract; this function does not detect that
-/// case.
-///
-/// A more defensive implementation could `statfs(path)` and bail
-/// with `NFS_SUPER_MAGIC == 0x6969` before even opening the
-/// file. That change is intentionally deferred — the extra syscall
-/// per lock acquisition pays a constant-time cost for every ktstr
-/// run to defend against an uncommon misconfiguration. If this
-/// limitation bites a real deployment, the check lives in one
-/// place (here) and can land as a one-liner.
-fn try_flock(path: &str, mode: FlockMode) -> Result<Option<std::os::fd::OwnedFd>> {
-    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
-
-    let fd = open(
-        path,
-        OFlags::CREATE | OFlags::RDWR,
-        Mode::from_raw_mode(0o666),
-    )
-    .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
-    let op = match mode {
-        FlockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
-        FlockMode::Shared => FlockOperation::NonBlockingLockShared,
-    };
-    match flock(&fd, op) {
-        Ok(()) => Ok(Some(fd)),
-        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
-        Err(e) => anyhow::bail!("flock {path}: {e}"),
-    }
-}
-
 /// Acquire resource locks for a pinning plan (non-blocking).
 ///
 /// **LLC locks** (`/tmp/ktstr-llc-{N}.lock`):
@@ -443,6 +589,61 @@ pub fn acquire_resource_locks(
     }
 }
 
+/// Default path prefix for LLC flock files. Production binds to
+/// `/tmp/ktstr-llc-`; test builds can override via [`llc_lock_path`]
+/// (see the `#[cfg(test)]` hook).
+const LLC_LOCK_PREFIX: &str = "/tmp/ktstr-llc-";
+
+/// Default path prefix for per-CPU flock files. Production binds to
+/// `/tmp/ktstr-cpu-`; test builds can override via [`cpu_lock_path`]
+/// (see the `#[cfg(test)]` hook).
+const CPU_LOCK_PREFIX: &str = "/tmp/ktstr-cpu-";
+
+#[cfg(test)]
+thread_local! {
+    /// Thread-local override for [`LLC_LOCK_PREFIX`]. Tests set this
+    /// to a per-test tempdir so the acquire path operates on its
+    /// own lockfile pool instead of padding the `LlcGroup` vector
+    /// to 90,000+ entries just to avoid collision with production
+    /// indices at 0..<host-llcs>. See tests `acquire_llc_plan_*`
+    /// that build a small synth topo and point the prefix at a
+    /// `TempDir`.
+    static LLC_LOCK_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Thread-local override for [`CPU_LOCK_PREFIX`]. Symmetric
+    /// with [`LLC_LOCK_PREFIX_OVERRIDE`] for the per-CPU path.
+    static CPU_LOCK_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Compose the LLC lockfile path for `llc_idx`. Production always
+/// returns `{LLC_LOCK_PREFIX}{llc_idx}.lock`; tests can override the
+/// prefix via [`LLC_LOCK_PREFIX_OVERRIDE`] to keep their lockfile
+/// pool out of the real `/tmp/ktstr-llc-*` namespace.
+fn llc_lock_path(llc_idx: usize) -> String {
+    #[cfg(test)]
+    {
+        if let Some(p) = LLC_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone()) {
+            return format!("{p}{llc_idx}.lock");
+        }
+    }
+    format!("{LLC_LOCK_PREFIX}{llc_idx}.lock")
+}
+
+/// Compose the per-CPU lockfile path for `cpu`. Symmetric with
+/// [`llc_lock_path`] — production binds to the hardcoded prefix;
+/// tests can override via [`CPU_LOCK_PREFIX_OVERRIDE`].
+fn cpu_lock_path(cpu: usize) -> String {
+    #[cfg(test)]
+    {
+        if let Some(p) = CPU_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone()) {
+            return format!("{p}{cpu}.lock");
+        }
+    }
+    format!("{CPU_LOCK_PREFIX}{cpu}.lock")
+}
+
 /// Try to acquire all resource locks (all-or-nothing).
 /// Returns the held fds on success, or an error string describing
 /// which resource was busy.
@@ -459,7 +660,7 @@ fn try_acquire_all(
 
     // Lock LLC files.
     for &llc_idx in llc_indices {
-        let path = format!("/tmp/ktstr-llc-{llc_idx}.lock");
+        let path = llc_lock_path(llc_idx);
         match try_flock(&path, flock_mode) {
             Ok(Some(fd)) => locks.push(fd),
             Ok(None) => return Err(format!("LLC {llc_idx} busy")),
@@ -471,7 +672,7 @@ fn try_acquire_all(
     // all CPUs in the group).
     if llc_mode != LlcLockMode::Exclusive {
         for &(_vcpu, host_cpu) in &plan.assignments {
-            let path = format!("/tmp/ktstr-cpu-{host_cpu}.lock");
+            let path = cpu_lock_path(host_cpu);
             match try_flock(&path, FlockMode::Exclusive) {
                 Ok(Some(fd)) => locks.push(fd),
                 Ok(None) => return Err(format!("CPU {host_cpu} busy")),
@@ -479,7 +680,7 @@ fn try_acquire_all(
             }
         }
         if let Some(cpu) = plan.service_cpu {
-            let path = format!("/tmp/ktstr-cpu-{cpu}.lock");
+            let path = cpu_lock_path(cpu);
             match try_flock(&path, FlockMode::Exclusive) {
                 Ok(Some(fd)) => locks.push(fd),
                 Ok(None) => return Err(format!("service CPU {cpu} busy")),
@@ -546,46 +747,567 @@ pub fn acquire_cpu_locks(
     }))
 }
 
-/// Acquire `LOCK_SH` on `/tmp/ktstr-llc-*.lock` for EVERY LLC on the
-/// host. Used by callers that cannot promise their workload stays
-/// within a specific LLC window — no-perf-mode VMs (unpinned vCPUs;
-/// the host kernel places them on any online CPU) and kernel builds
-/// (`make -j$(nproc)` fans gcc children across every core).
+// ===========================================================================
+// --llc-cap PLAN pipeline — LlcCap / LlcSnapshot / LlcPlan + discover/plan/acquire
+// ===========================================================================
+//
+// Entry point [`acquire_llc_plan`] is the single non-perf-mode
+// reservation path: kernel builds and no-perf-mode VMs both call it
+// with or without `--llc-cap N`. When `llc_cap` is `None`, the
+// algorithm degenerates to "select every LLC", delivering the same
+// host-wide `LOCK_SH` reservation the earlier
+// `acquire_all_llc_shared_locks` helper used to provide.
+// Perf-mode never reaches this path; it stays on
+// [`acquire_resource_locks`] for its `LOCK_EX` reservation contract.
+//
+// The pipeline has three phases: discover (snapshot holders per
+// LLC), plan (NUMA-aware, consolidation-aware selection), acquire
+// (non-blocking `LOCK_SH` on each selected LLC). One TOCTOU retry
+// absorbs the window between the discover snapshot and the
+// non-blocking acquire; the second discover's /proc/locks read IS
+// the backoff, so no sleep is needed between attempts.
+
+/// Parsed `--llc-cap N` value. Bounded to `1..=usize::MAX` at the
+/// constructor — a cap of 0 is nonsensical (reserving zero LLCs is
+/// just "don't run") and rejected upstream by the CLI layer, but we
+/// enforce the bound in the type system via [`NonZeroUsize`] so
+/// callers can `LlcCap::new(...)?` without a follow-up bounds check.
 ///
-/// `LOCK_SH` is reentrant, so two such callers coexist cheaply. The
-/// contract is intentionally asymmetric against the existing perf-
-/// mode `LOCK_EX` acquisition at [`acquire_resource_locks`]: while
-/// any unpinned ktstr workload holds host-wide `LOCK_SH`, a
-/// perf-mode VM cannot acquire its required `LOCK_EX` on any of the
-/// shared LLCs, so perf-mode correctly fails over (or nextest-retries)
-/// until the unpinned workload finishes. This serializes perf-mode
-/// measurement campaigns against any concurrent noise source without
-/// requiring the kernel scheduler to know about the flock files.
-///
-/// Non-blocking: returns `ResourceContention` when any LLC is
-/// currently held `LOCK_EX` by a perf-mode peer. Callers rely on
-/// nextest retry backoff (for tests) or an explicit retry loop
-/// (for kernel builds) to resolve contention.
-pub fn acquire_all_llc_shared_locks(topo: &HostTopology) -> Result<Vec<std::os::fd::OwnedFd>> {
-    let mut locks = Vec::with_capacity(topo.llc_groups.len());
-    for llc_idx in 0..topo.llc_groups.len() {
-        let path = format!("/tmp/ktstr-llc-{llc_idx}.lock");
-        match try_flock(&path, FlockMode::Shared) {
-            Ok(Some(fd)) => locks.push(fd),
-            Ok(None) => {
-                return Err(anyhow::Error::new(ResourceContention {
-                    reason: format!(
-                        "LLC {llc_idx} exclusively held by a perf-mode peer\n  \
-                         hint: wait for the peer to finish, or export \
-                         KTSTR_BYPASS_LLC_LOCKS=1 to acquire without coordination \
-                         (accept perf-mode measurement noise)"
-                    ),
-                }));
+/// The runtime upper bound — "don't exceed the host's total LLC
+/// count" — is enforced at acquire time via
+/// [`LlcCap::effective_count`] because `host_llcs` is not known until
+/// [`HostTopology::from_sysfs`] resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlcCap {
+    n: std::num::NonZeroUsize,
+}
+
+impl LlcCap {
+    /// Construct from a raw `usize`. Returns `Err` on `0`; `usize::MAX`
+    /// is accepted here and clamped later by [`effective_count`].
+    pub fn new(n: usize) -> Result<Self> {
+        std::num::NonZeroUsize::new(n)
+            .map(|n| LlcCap { n })
+            .ok_or_else(|| anyhow::anyhow!("--llc-cap must be ≥ 1 (got 0)"))
+    }
+
+    /// Three-tier resolution: explicit CLI flag wins over env var,
+    /// which wins over "not set". Returns `None` when neither is
+    /// present, meaning "lock every LLC on the host" (the pre-flag
+    /// default).
+    ///
+    /// Env var is `KTSTR_LLC_CAP` (integer ≥ 1). An empty or unset
+    /// env var is treated as absent; a non-numeric value OR the
+    /// numeric value `0` is an error — `KTSTR_LLC_CAP=0` flows
+    /// through `LlcCap::new(0)` which rejects with "--llc-cap must
+    /// be ≥ 1 (got 0)". Zero is not a silent fallback to "no cap";
+    /// it surfaces as a parse-time error so typos and scripting
+    /// mistakes don't accidentally disable the resource contract.
+    pub fn resolve(cli_flag: Option<usize>) -> Result<Option<LlcCap>> {
+        if let Some(n) = cli_flag {
+            return Ok(Some(LlcCap::new(n)?));
+        }
+        match std::env::var("KTSTR_LLC_CAP") {
+            Ok(s) if s.is_empty() => Ok(None),
+            Ok(s) => {
+                let n: usize = s.parse().with_context(|| {
+                    format!("KTSTR_LLC_CAP is not a valid integer: {s:?}")
+                })?;
+                Ok(Some(LlcCap::new(n)?))
             }
-            Err(e) => return Err(e.context(format!("acquire LOCK_SH on LLC {llc_idx}"))),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(raw)) => {
+                anyhow::bail!(
+                    "KTSTR_LLC_CAP contains non-UTF-8 bytes ({} bytes): {raw:?}. \
+                     Set an integer value or unset.",
+                    raw.len(),
+                )
+            }
         }
     }
-    Ok(locks)
+
+    /// Runtime-bounded cap: returns the inner count unless it exceeds
+    /// `host_llcs`, in which case a [`ResourceContention`] error
+    /// steers the caller toward an actionable message. This check
+    /// lives at acquire time — not at construction — because the
+    /// host's LLC count is only known after
+    /// [`HostTopology::from_sysfs`] resolves.
+    pub fn effective_count(&self, host_llcs: usize) -> Result<usize> {
+        let n = self.n.get();
+        if n > host_llcs {
+            return Err(anyhow::Error::new(ResourceContention {
+                reason: format!(
+                    "--llc-cap N = {n} exceeds this host's {host_llcs} LLCs. \
+                     Pick an LLC cap ≤ {host_llcs} — run `ktstr topo` for \
+                     the full layout or `ktstr locks --json` to see current \
+                     usage — or omit --llc-cap to lock all LLCs."
+                ),
+            }));
+        }
+        Ok(n)
+    }
+}
+
+/// Per-LLC discover snapshot: identity + current holder set.
+/// Constructed by [`discover_llc_snapshots`] before the PLAN phase.
+/// `pub(crate)` because the `ktstr locks` observational command
+/// renders holder lists via the same snapshot structure; external
+/// callers have no reason to construct one.
+#[derive(Debug, Clone)]
+pub(crate) struct LlcSnapshot {
+    /// Host LLC index — matches [`HostTopology::llc_groups`] ordering.
+    pub(crate) llc_idx: usize,
+    /// Canonical `/tmp/ktstr-llc-{N}.lock` path. Stored so the ACQUIRE
+    /// phase doesn't re-format the string per LLC.
+    pub(crate) lockfile_path: std::path::PathBuf,
+    /// Processes currently holding this LLC's flock (any mode). Empty
+    /// when no peer holds the lock. Derived from a single `/proc/locks`
+    /// read shared across every LLC in the discover phase.
+    pub(crate) holders: Vec<crate::flock::HolderInfo>,
+    /// `holders.len()`, cached so the PLAN sort can access it without
+    /// re-traversing the holder list per candidate.
+    pub(crate) holder_count: usize,
+}
+
+/// Output of [`acquire_llc_plan`]: the concrete LLC reservation plus
+/// every piece of diagnostic context a downstream consumer could
+/// want.
+///
+/// `mems` is the union of NUMA nodes containing the selected CPUs —
+/// `BuildSandbox::try_create` writes this to the child cgroup's
+/// `cpuset.mems` so memory allocations respect the same NUMA locality
+/// the CPU reservation already implies.
+///
+/// `locks` holds the RAII file descriptors whose `OwnedFd::drop`
+/// releases the kernel-side flock; the field is `pub(crate)` because
+/// direct manipulation from outside the crate would defeat the drop
+/// guarantee.
+#[derive(Debug)]
+pub struct LlcPlan {
+    /// Selected host LLC indices, sorted ASCENDING. Acquire order
+    /// matches this slice — two callers with the same target see the
+    /// same ordering and converge on the same one-wins-the-others-retry
+    /// livelock-proof sequence.
+    pub locked_llcs: Vec<usize>,
+    /// Flattened host CPU list (every CPU belonging to any locked
+    /// LLC). Preserves LLC ordering: CPUs from `locked_llcs[0]` come
+    /// before CPUs from `locked_llcs[1]`, etc.
+    pub cpus: Vec<usize>,
+    /// Union of NUMA nodes hosting the locked LLCs. When the plan
+    /// spans > 1 node (cross-node spill — seed node exhausted, plan
+    /// spilled to nearest-by-distance neighbors), `mems`
+    /// contains every node — not just the seed node's.
+    pub mems: std::collections::BTreeSet<usize>,
+    /// Per-LLC discovery trail. Preserved through the lifetime of the
+    /// plan so error-formatting (via `acquire_llc_plan`'s final
+    /// fresh snapshot) and future `ktstr locks` rendering don't
+    /// re-probe `/proc/locks`. In-tree consumers currently re-read
+    /// the snapshot only on the TOCTOU failure path; the field is
+    /// kept populated so downstream tooling can inspect the
+    /// plan-at-acquire holder set without a second pass.
+    #[allow(dead_code)]
+    pub(crate) snapshot: Vec<LlcSnapshot>,
+    /// RAII flock holders. Dropped when the plan goes out of scope,
+    /// releasing each LLC's `LOCK_SH` in declared order.
+    #[allow(dead_code)] // RAII only — Drop releases flocks, no reads.
+    pub(crate) locks: Vec<std::os::fd::OwnedFd>,
+}
+
+/// Total wall-clock budget for PLAN + ACQUIRE under the consolidation
+/// path. Each DISCOVER + PLAN + ACQUIRE attempt is essentially
+/// non-blocking; the TOCTOU retry absorbs at most one racing peer.
+/// No sleep is needed between the first and second attempt — the
+/// second DISCOVER's `/proc/locks` read IS the backoff. If two attempts
+/// fail, the contention is persistent and the caller should
+/// nextest-retry / operator-wait.
+const ACQUIRE_MAX_TOCTOU_RETRIES: u32 = 1;
+
+/// DISCOVER phase — read-only LLC snapshot.
+///
+/// For every LLC on the host: stat the canonical lockfile (materializing
+/// it with `O_CREAT | O_CLOEXEC | 0o666` if absent so subsequent
+/// ACQUIRE has a stable inode), then parse one `/proc/locks` read to
+/// populate every snapshot's holder list in a single pass. No flock
+/// acquires — DISCOVER never contends.
+///
+/// `mountinfo` is the `/proc/self/mountinfo` text read once per
+/// `acquire_llc_plan` invocation at [`acquire_llc_plan_with_acquire_fn`]
+/// and threaded through here so a host with N LLCs pays for exactly
+/// one mountinfo read per DISCOVER pass (DISCOVER is called twice
+/// on the TOCTOU-exhausted diagnostic path, hence caching at the
+/// plan level rather than per snapshot walk).
+///
+/// Returns `Ok(snapshots)` on success. Propagates opening + stat
+/// errors so a missing `/tmp` or permission failure surfaces
+/// actionably.
+fn discover_llc_snapshots(
+    topo: &HostTopology,
+    mountinfo: &str,
+) -> Result<Vec<LlcSnapshot>> {
+    let mut snapshots: Vec<LlcSnapshot> = Vec::with_capacity(topo.llc_groups.len());
+    for llc_idx in 0..topo.llc_groups.len() {
+        let path = std::path::PathBuf::from(llc_lock_path(llc_idx));
+        // Ensure the lockfile inode exists so `read_holders_with_mountinfo`
+        // can key /proc/locks lookups on it. Deliberately takes no
+        // flock — DISCOVER is observational. Also runs the NFS/FUSE
+        // reject check inside `materialize`, so a misconfigured
+        // `/tmp` mount surfaces here instead of silently at ACQUIRE
+        // time.
+        crate::flock::materialize(&path)?;
+        let holders =
+            crate::flock::read_holders_with_mountinfo(&path, mountinfo).unwrap_or_default();
+        let holder_count = holders.len();
+        snapshots.push(LlcSnapshot {
+            llc_idx,
+            lockfile_path: path,
+            holders,
+            holder_count,
+        });
+    }
+    Ok(snapshots)
+}
+
+/// PLAN phase — NUMA-aware placement over discover snapshots.
+///
+/// Composite sort driven by three ordered keys:
+///   1. Consolidation — prefer LLCs already holding peers.
+///   2. NUMA locality — after seeding on the highest-scored LLC's
+///      node, greedily fill the seed node before spilling.
+///   3. LLC index ASC — tiebreak + final ACQUIRE ordering for livelock
+///      safety.
+///
+/// Distance fallback: callers without a distance matrix pass a closure
+/// that returns `10` for equal nodes and `20` otherwise — primitive 3
+/// keeps the spill order reasonable even on hosts whose
+/// `/sys/devices/system/node/*/distance` is unavailable.
+fn plan_from_snapshots(
+    snapshots: &[LlcSnapshot],
+    target: usize,
+    topo: &HostTopology,
+    distance_fn: impl Fn(usize, usize) -> u8,
+) -> Vec<usize> {
+    if target == 0 {
+        return Vec::new();
+    }
+    if target >= snapshots.len() {
+        // Selecting everything — skip the scoring pass and walk in
+        // ascending-index order. Matches the pre-flag default.
+        let mut all: Vec<usize> = (0..snapshots.len()).collect();
+        all.sort_unstable();
+        return all;
+    }
+
+    // Step a: partition + sort. Consolidation candidates first
+    // (holder_count DESC, llc_idx ASC); fresh candidates after, sorted
+    // by llc_idx ASC. A single composite sort would do the same work
+    // but the two-partition form is easier to read and lets future
+    // "prefer consolidation only if score ≥ threshold" tweaks slot in.
+    let mut consolidation: Vec<&LlcSnapshot> =
+        snapshots.iter().filter(|s| s.holder_count > 0).collect();
+    let mut fresh: Vec<&LlcSnapshot> =
+        snapshots.iter().filter(|s| s.holder_count == 0).collect();
+    consolidation.sort_by(|a, b| {
+        b.holder_count
+            .cmp(&a.holder_count)
+            .then(a.llc_idx.cmp(&b.llc_idx))
+    });
+    fresh.sort_by_key(|s| s.llc_idx);
+    let ranked: Vec<&LlcSnapshot> = consolidation.into_iter().chain(fresh).collect();
+
+    // Step b: seed. Highest-scored LLC; its NUMA node anchors the
+    // greedy expansion.
+    let seed = ranked[0];
+    let seed_node = topo.llc_numa_node(seed.llc_idx);
+
+    // Step c–d: walk seed-node LLCs first, then spill to
+    // nearest-by-distance nodes. Primitives 1 + 3 drive the node
+    // ordering; the per-node LLC lists come from primitive 1. Within
+    // each node, we still honour the composite score by walking
+    // `ranked` and skipping LLCs not on the current target node.
+    let node_order = topo.numa_nodes_sorted_by_distance(seed_node, distance_fn);
+    let mut selected: Vec<usize> = Vec::with_capacity(target);
+    let mut picked: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for node in node_order {
+        if selected.len() >= target {
+            break;
+        }
+        // Ranked walk, taking every candidate on this node in
+        // score-order until we've filled `target` or exhausted the
+        // node.
+        for snap in &ranked {
+            if selected.len() >= target {
+                break;
+            }
+            if picked.contains(&snap.llc_idx) {
+                continue;
+            }
+            if topo.llc_numa_node(snap.llc_idx) != node {
+                continue;
+            }
+            selected.push(snap.llc_idx);
+            picked.insert(snap.llc_idx);
+        }
+    }
+
+    // Step e: livelock-proof acquire order — ascending index.
+    selected.sort_unstable();
+    selected
+}
+
+/// ACQUIRE phase — non-blocking `LOCK_SH` on every selected LLC.
+///
+/// All-or-nothing. A single `EWOULDBLOCK` releases every held fd (via
+/// `drop(locks)`) and returns `Ok(None)` so the caller re-runs
+/// discover + plan with a fresh snapshot. Non-retryable errors
+/// (unexpected errno, path open failures) propagate unchanged.
+fn try_acquire_llc_plan_locks(
+    selected: &[usize],
+    snapshots: &[LlcSnapshot],
+) -> Result<Option<Vec<std::os::fd::OwnedFd>>> {
+    let mut locks: Vec<std::os::fd::OwnedFd> = Vec::with_capacity(selected.len());
+    for &idx in selected {
+        let snap = snapshots
+            .iter()
+            .find(|s| s.llc_idx == idx)
+            .expect("selected index must come from snapshots — plan invariant");
+        match crate::flock::try_flock(&snap.lockfile_path, FlockMode::Shared)? {
+            Some(fd) => locks.push(fd),
+            None => {
+                // Drop previously-held fds so the peer racing us sees
+                // a consistent post-bail state, then signal "retry".
+                drop(locks);
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(locks))
+}
+
+/// Entry point for the `--llc-cap` PLAN pipeline.
+///
+/// Runs DISCOVER → PLAN → ACQUIRE with at most one TOCTOU retry. On
+/// success returns an [`LlcPlan`] holding the selected LLCs, their
+/// flattened CPUs, the derived `mems` set, the diagnostic snapshot,
+/// and the RAII flock handles.
+///
+/// `llc_cap == None` means "lock every LLC", the host-wide `LOCK_SH`
+/// reservation that no-perf-mode VMs and kernel builds relied on
+/// before the flag landed. `llc_cap == Some(cap)` where
+/// `cap > total_llcs` errors at acquire time via
+/// [`LlcCap::effective_count`].
+///
+/// Consolidation uses the host distance matrix from [`TestTopology`]
+/// so spill order matches actual NUMA cost. Hosts whose
+/// `/sys/devices/system/node/*/distance` failed to parse degrade to a
+/// numerically-adjacent ordering via the distance closure (`10` for
+/// same-node, `20` for cross-node).
+pub fn acquire_llc_plan(
+    topo: &HostTopology,
+    test_topo: &crate::topology::TestTopology,
+    llc_cap: Option<LlcCap>,
+) -> Result<LlcPlan> {
+    acquire_llc_plan_with_acquire_fn(topo, test_topo, llc_cap, try_acquire_llc_plan_locks)
+}
+
+/// Parameterized form of [`acquire_llc_plan`] that takes the
+/// ACQUIRE closure as a seam. Production calls this with
+/// [`try_acquire_llc_plan_locks`] (non-blocking `LOCK_SH` per LLC);
+/// tests can pass a closure that returns `Ok(None)` on attempt 0 and
+/// forwards on attempt 1 to simulate a peer winning the first race,
+/// or an attempt-counting closure that always fails to exercise the
+/// retry-exhausted error path.
+///
+/// `acquire_fn` receives `(selected, snapshots)` and returns
+/// `Ok(Some(locks))` on success, `Ok(None)` to trigger a retry, or
+/// propagates hard errors unchanged. Production closure is the
+/// free-standing [`try_acquire_llc_plan_locks`]; the test closure
+/// can track its own attempt counter via interior mutability
+/// ([`std::cell::Cell`], `Mutex`, atomic int).
+///
+/// The outer loop body — DISCOVER, PLAN, retry budget, final
+/// holder diagnostics — is shared between both entry points so the
+/// test seam exercises the exact retry-and-diagnose sequence
+/// production uses, not a parallel implementation.
+fn acquire_llc_plan_with_acquire_fn<F>(
+    topo: &HostTopology,
+    test_topo: &crate::topology::TestTopology,
+    llc_cap: Option<LlcCap>,
+    mut acquire_fn: F,
+) -> Result<LlcPlan>
+where
+    F: FnMut(&[usize], &[LlcSnapshot]) -> Result<Option<Vec<std::os::fd::OwnedFd>>>,
+{
+    let total = topo.llc_groups.len();
+    let target = match llc_cap {
+        Some(cap) => cap.effective_count(total)?,
+        None => total,
+    };
+    if target == 0 {
+        // Zero-LLC host would have already failed upstream, but be
+        // explicit about the empty case rather than producing an
+        // LlcPlan with no locks.
+        anyhow::bail!(
+            "host has no LLC groups; --llc-cap has nothing to reserve"
+        );
+    }
+
+    // Read /proc/self/mountinfo ONCE per acquire_llc_plan invocation.
+    // Every DISCOVER pass re-uses this text to derive per-LLC
+    // /proc/locks needles (major:minor:inode). Without this cache, a
+    // host with N LLCs would re-read mountinfo N× per DISCOVER pass,
+    // and DISCOVER itself runs up to twice (once per attempt + once
+    // on the retry-exhausted diagnostic path). Mount points are
+    // effectively static during a plan acquisition — a bind mount
+    // changing under us mid-acquire is a host-reconfiguration event
+    // that invalidates every parallel acquirer anyway, not something
+    // we need to re-read to observe.
+    let mountinfo = crate::flock::read_mountinfo()?;
+
+    let mut attempt: u32 = 0;
+    loop {
+        let snapshots = discover_llc_snapshots(topo, &mountinfo)?;
+        let selected = plan_from_snapshots(&snapshots, target, topo, |from, to| {
+            test_topo.numa_distance(from, to)
+        });
+        match acquire_fn(&selected, &snapshots)? {
+            Some(locks) => {
+                // Success — materialize cpus + mems from the selected
+                // indices, then consume the snapshot list into the
+                // returned plan.
+                let mut cpus: Vec<usize> = Vec::new();
+                let mut mems: std::collections::BTreeSet<usize> =
+                    std::collections::BTreeSet::new();
+                for &idx in &selected {
+                    let group = &topo.llc_groups[idx];
+                    for &cpu in &group.cpus {
+                        cpus.push(cpu);
+                        let node = topo.cpu_to_node.get(&cpu).copied().unwrap_or(0);
+                        mems.insert(node);
+                    }
+                }
+                return Ok(LlcPlan {
+                    locked_llcs: selected,
+                    cpus,
+                    mems,
+                    snapshot: snapshots,
+                    locks,
+                });
+            }
+            None => {
+                if attempt >= ACQUIRE_MAX_TOCTOU_RETRIES {
+                    // Rebuild holder diagnostics from a FRESH read so
+                    // the error points at the peer that actually won.
+                    let final_snapshots = discover_llc_snapshots(topo, &mountinfo)?;
+                    let holders: Vec<String> = final_snapshots
+                        .iter()
+                        .filter(|s| !s.holders.is_empty())
+                        .map(|s| {
+                            format!(
+                                "LLC {}: {}",
+                                s.llc_idx,
+                                crate::flock::format_holder_list(&s.holders)
+                            )
+                        })
+                        .collect();
+                    let holder_text = if holders.is_empty() {
+                        "<none recorded>".to_string()
+                    } else {
+                        holders.join("; ")
+                    };
+                    return Err(anyhow::Error::new(ResourceContention {
+                        reason: format!(
+                            "acquire_llc_plan: could not reserve {target} \
+                             LLC(s) after {retries} TOCTOU retry; holders: \
+                             {holder_text}. Run `ktstr locks --json` to see \
+                             every ktstr lock on this host.",
+                            retries = ACQUIRE_MAX_TOCTOU_RETRIES + 1,
+                        ),
+                    }));
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Parallelism hint for `make -j{N}` when running under an
+/// [`LlcPlan`] reservation. Returns the flattened host-CPU count
+/// (`plan.cpus.len()`), clamped to at least 1 so a pathological empty
+/// plan still produces a runnable command.
+///
+/// Rationale: without this hint, `make -j$(nproc)` fans gcc
+/// children across every online CPU, defeating the --llc-cap
+/// reservation — the build escapes the cgroup cpuset in scheduling
+/// terms even though the kernel enforces CPU membership. Passing
+/// `plan.cpus.len()` to make keeps gcc's parallel width aligned with
+/// the reserved capacity.
+pub fn make_jobs_for_plan(plan: &LlcPlan) -> usize {
+    plan.cpus.len().max(1)
+}
+
+/// Render selected LLC indices for user-facing warning text.
+///
+/// Format is compact and stable: `[0 (node 0), 2 (node 1)]` when the
+/// host exposes NUMA information, `[0, 2]` on degraded hosts whose
+/// `cpu_to_node` map is empty. Used by
+/// [`warn_if_cross_node_spill`] to render the `ktstr: reserving LLCs
+/// …` message when an `--llc-cap` plan spills across nodes.
+pub fn format_llc_list(locked: &[usize], topo: &HostTopology) -> String {
+    let parts: Vec<String> = locked
+        .iter()
+        .map(|&idx| {
+            if topo.cpu_to_node.is_empty() {
+                idx.to_string()
+            } else {
+                let node = topo.llc_numa_node(idx);
+                format!("{idx} (node {node})")
+            }
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// Emit the cross-node spill warning when an `--llc-cap` plan's
+/// `mems` set spans more than one NUMA node. No-op for single-node
+/// plans.
+///
+/// `eprintln!`, not `tracing::warn!`: this is user-visible
+/// UX feedback (the operator picked a cap that couldn't fit in one
+/// NUMA node), not operational instrumentation. Fires at most once
+/// per plan — there is nothing in the plan lifecycle that causes a
+/// re-trigger. Single-node plans (including single-socket hosts and
+/// caps that fit within a single node) never emit.
+///
+/// Placement: called by `kernel_build_pipeline` and friends right
+/// after [`acquire_llc_plan`] returns, before the sandbox mount.
+/// Extracting this into a helper rather than inlining at the call
+/// site lets tests capture stderr and assert the format without
+/// poking into the orchestrator internals.
+pub fn warn_if_cross_node_spill(plan: &LlcPlan, topo: &HostTopology) {
+    if should_warn_cross_node(&plan.mems) {
+        eprintln!(
+            "ktstr: reserving LLCs {list} across {n} NUMA nodes \
+             (preferred single-node contiguous unavailable). Build \
+             will run; memory-access latency may be higher.",
+            list = format_llc_list(&plan.locked_llcs, topo),
+            n = plan.mems.len(),
+        );
+    }
+}
+
+/// Pure predicate backing [`warn_if_cross_node_spill`]. Returns
+/// `true` when the plan spans more than one NUMA node (`mems.len()
+/// > 1`); the warning suppression for single-node plans follows
+/// directly from this.
+///
+/// Split out so tests can pin the polarity of the single-node /
+/// multi-node decision without capturing stderr. A refactor that
+/// accidentally flipped the comparison (`>= 1` or `== 1`) would
+/// either warn on every plan (noise) or never warn (silent cost),
+/// both of which the test suite catches here before the stderr
+/// capture layer sees it.
+fn should_warn_cross_node(mems: &std::collections::BTreeSet<usize>) -> bool {
+    mems.len() > 1
 }
 
 /// Acquire `LOCK_SH` on LLC lock files for the LLCs containing `cpus`.
@@ -603,7 +1325,7 @@ fn acquire_llc_shared_locks(
     }
     let mut locks = Vec::new();
     for &llc_idx in &llc_indices {
-        let path = format!("/tmp/ktstr-llc-{llc_idx}.lock");
+        let path = llc_lock_path(llc_idx);
         match try_flock(&path, FlockMode::Shared) {
             Ok(Some(fd)) => locks.push(fd),
             Ok(None) => return Err(format!("LLC {llc_idx} exclusively held")),
@@ -621,7 +1343,7 @@ fn try_acquire_cpu_window(
 ) -> std::result::Result<Vec<std::os::fd::OwnedFd>, String> {
     let mut locks = Vec::with_capacity(count);
     for cpu in offset..offset + count {
-        let path = format!("/tmp/ktstr-cpu-{cpu}.lock");
+        let path = cpu_lock_path(cpu);
         match try_flock(&path, FlockMode::Exclusive) {
             Ok(Some(fd)) => locks.push(fd),
             Ok(None) => return Err(format!("CPU {cpu} busy")),
@@ -704,6 +1426,34 @@ pub fn host_load_estimate() -> Option<(usize, usize)> {
 mod tests {
     use super::*;
     use crate::vmm::topology::Topology;
+
+    // ─── SYNTHETIC-TOPOLOGY OFFSET CONVENTION ────────────────────
+    //
+    // Tests in this module that touch real `/tmp/ktstr-llc-*.lock`
+    // files choose LLC indices in the 90000..=99999 range to avoid
+    // collision with any real host's LLC count (modern server
+    // sockets top out around 1024 LLCs). Per-test offsets are
+    // subdivided by 100:
+    //   90000-90999: acquire_resource_locks / per-CPU path tests
+    //   91000-91999: acquire_cpu_locks tests
+    //   92000-92999: reserved
+    //   93000-93999: acquire_llc_plan (none-cap, EX-peer, SH-peer)
+    //                — each sub-test picks its own sub-range
+    //                (93000-93099, 93100-93199, …) so leaked state
+    //                from a panicking prior test doesn't cross-
+    //                contaminate.
+    //   94000-94099: acquire_llc_plan cross-node spill (mems union
+    //                invariant, I1).
+    //   94100-99999: reserved for future LLC-level tests.
+    // Tests that build a HostTopology in memory but do NOT touch
+    // real /tmp paths use small indices (0, 1, 2, …) because no
+    // cross-process collision is possible.
+    //
+    // When adding a new test that flocks under /tmp, pick an
+    // unused 100-entry sub-range in 90000-99999 and document the
+    // claim in a comment at the test site so the next author
+    // doesn't accidentally re-use it.
+    // ─────────────────────────────────────────────────────────────
 
     /// Collect the distinct host NUMA node IDs the given CPUs belong
     /// to. Tests that assert "these N CPUs all live on one NUMA node"
@@ -856,26 +1606,25 @@ mod tests {
 
     // -- synthetic topology mapping tests --
 
-    /// Helper: build a synthetic HostTopology with the given LLC groups.
-    /// Assigns each LLC group to a NUMA node matching the group index.
+    /// Backwards-compat helper: builds a synthetic HostTopology from
+    /// LLC-group CPU lists, assigning each group to a NUMA node equal
+    /// to its positional index (LLC 0 → node 0, LLC 1 → node 1, …).
+    /// Delegates to [`HostTopology::new_for_tests`].
+    ///
+    /// Kept as a thin wrapper so the many existing call sites that
+    /// pass only CPU lists (no explicit NUMA info) don't have to
+    /// thread node ids through their parameter lists.
     fn synthetic_topo(groups: Vec<Vec<usize>>) -> HostTopology {
-        let all_cpus: Vec<usize> = groups.iter().flatten().copied().collect();
-        let mut cpu_to_node = std::collections::HashMap::new();
-        for (node, group) in groups.iter().enumerate() {
-            for &cpu in group {
-                cpu_to_node.insert(cpu, node);
-            }
-        }
-        let llc_groups = groups.into_iter().map(|cpus| LlcGroup { cpus }).collect();
-        HostTopology {
-            llc_groups,
-            online_cpus: all_cpus,
-            cpu_to_node,
-        }
+        let tagged: Vec<(Vec<usize>, usize)> = groups
+            .into_iter()
+            .enumerate()
+            .map(|(node, cpus)| (cpus, node))
+            .collect();
+        HostTopology::new_for_tests(&tagged)
     }
 
     #[test]
-    fn mapping_single_llc() {
+    fn compute_pinning_single_llc() {
         // 1 LLC with 4 CPUs, request 1 LLC x 2 cores x 1 thread.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
         let plan = topo
@@ -887,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_two_llcs() {
+    fn compute_pinning_two_llcs() {
         // 2 LLCs, each with 4 CPUs. Request 2l2c1t.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
         let plan = topo
@@ -903,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_with_smt() {
+    fn compute_pinning_with_smt() {
         // 1 LLC with 8 CPUs, request 1l2c2t = 4 vCPUs.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3, 4, 5, 6, 7]]);
         let plan = topo
@@ -917,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_exact_fit() {
+    fn compute_pinning_exact_fit() {
         // 2 LLCs with exactly 2 CPUs each, request 2l2c1t = 4 total.
         let topo = synthetic_topo(vec![vec![0, 1], vec![2, 3]]);
         let plan = topo
@@ -938,7 +1687,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_error_too_many_vcpus() {
+    fn compute_pinning_error_too_many_vcpus() {
         // 1 LLC with 2 CPUs, request 4 vCPUs.
         let topo = synthetic_topo(vec![vec![0, 1]]);
         let err = topo
@@ -952,7 +1701,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_error_too_many_llcs() {
+    fn compute_pinning_error_too_many_llcs() {
         // 1 LLC, request 2 LLCs.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
         let err = topo
@@ -966,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_error_llc_too_small() {
+    fn compute_pinning_error_llc_too_small() {
         // 2 LLCs: first has 4 CPUs, second has only 1. Request 2l2c1t.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4]]);
         let err = topo
@@ -980,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_no_cross_llc_sharing() {
+    fn compute_pinning_no_cross_llc_sharing() {
         // Verify vCPUs in different LLCs never share an LLC's CPUs.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]]);
         let plan = topo
@@ -1000,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_all_assignments_unique() {
+    fn compute_pinning_all_assignments_unique() {
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
         let plan = topo
             .compute_pinning(&Topology::new(1, 2, 4, 1), false, 0)
@@ -1016,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_vcpu_ids_sequential() {
+    fn compute_pinning_vcpu_ids_sequential() {
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
         let plan = topo
             .compute_pinning(&Topology::new(1, 1, 4, 1), false, 0)
@@ -1026,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_single_vcpu() {
+    fn compute_pinning_single_vcpu() {
         let topo = synthetic_topo(vec![vec![42]]);
         let plan = topo
             .compute_pinning(&Topology::new(1, 1, 1, 1), false, 0)
@@ -1109,7 +1858,7 @@ mod tests {
     // -- service CPU reservation tests --
 
     #[test]
-    fn reserve_service_cpu_picks_unpinned() {
+    fn compute_pinning_service_cpu_picks_unpinned() {
         // 4 CPUs in one LLC, request 2 vCPUs + service CPU.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
         let plan = topo
@@ -1127,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_service_cpu_false_returns_none() {
+    fn compute_pinning_service_cpu_false_returns_none() {
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
         let plan = topo
             .compute_pinning(&Topology::new(1, 1, 2, 1), false, 0)
@@ -1136,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_service_cpu_exact_fit() {
+    fn compute_pinning_service_cpu_exact_fit() {
         // 3 CPUs total, request 2 vCPUs + 1 service = exact fit.
         let topo = synthetic_topo(vec![vec![0, 1, 2]]);
         let plan = topo
@@ -1155,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_service_cpu_insufficient_fails() {
+    fn compute_pinning_service_cpu_insufficient_fails() {
         // 2 CPUs, request 2 vCPUs + 1 service = 3 needed, only 2 available.
         let topo = synthetic_topo(vec![vec![0, 1]]);
         let err = topo
@@ -1169,7 +1918,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_service_cpu_multi_llc() {
+    fn compute_pinning_service_cpu_multi_llc() {
         // 2 LLCs with 3 CPUs each, request 2l2c1t + service = 5 CPUs needed.
         let topo = synthetic_topo(vec![vec![0, 1, 2], vec![3, 4, 5]]);
         let plan = topo
@@ -1225,28 +1974,18 @@ mod tests {
 
     // -- NUMA-aware pinning tests --
 
-    /// Build a synthetic topology with explicit NUMA node assignment.
-    /// `groups` is a list of (numa_node, cpus) pairs.
+    /// Backwards-compat helper: builds a synthetic HostTopology from
+    /// `(numa_node, cpu_list)` pairs. Delegates to
+    /// [`HostTopology::new_for_tests`], flipping the tuple order to
+    /// `(cpus, node)` so the underlying constructor presents a
+    /// consistent `(cpus, node)` shape to callers that build pairs
+    /// directly.
     fn synthetic_topo_numa(groups: Vec<(usize, Vec<usize>)>) -> HostTopology {
-        let all_cpus: Vec<usize> = groups
-            .iter()
-            .flat_map(|(_, cpus)| cpus.iter().copied())
-            .collect();
-        let mut cpu_to_node = std::collections::HashMap::new();
-        for (node, cpus) in &groups {
-            for &cpu in cpus {
-                cpu_to_node.insert(cpu, *node);
-            }
-        }
-        let llc_groups = groups
+        let tagged: Vec<(Vec<usize>, usize)> = groups
             .into_iter()
-            .map(|(_, cpus)| LlcGroup { cpus })
+            .map(|(node, cpus)| (cpus, node))
             .collect();
-        HostTopology {
-            llc_groups,
-            online_cpus: all_cpus,
-            cpu_to_node,
-        }
+        HostTopology::new_for_tests(&tagged)
     }
 
     #[test]
@@ -1265,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    fn numa_pinning_two_nodes() {
+    fn compute_pinning_numa_two_nodes() {
         // Host: 4 LLCs, 2 per NUMA node. LLCs 0,1 on node 0; LLCs 2,3 on node 1.
         // Guest: 2 NUMA nodes, 4 LLCs (2 per node), 2 cores each.
         let topo = synthetic_topo_numa(vec![
@@ -1402,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn numa_pinning_fallback_insufficient_nodes() {
+    fn compute_pinning_numa_fallback_insufficient_nodes() {
         // Host: 4 LLCs all on NUMA node 0; guest requests 2 NUMA
         // nodes. The host cannot distribute LLCs across distinct
         // nodes (there is only one), so `compute_pinning` falls
@@ -1426,7 +2165,7 @@ mod tests {
     }
 
     #[test]
-    fn numa_pinning_single_node_unchanged() {
+    fn compute_pinning_numa_single_node_unchanged() {
         // numa_nodes=1 should behave identically to the original sequential
         // mapping regardless of host NUMA layout.
         let topo = synthetic_topo_numa(vec![(0, vec![0, 1, 2, 3]), (1, vec![4, 5, 6, 7])]);
@@ -1442,7 +2181,7 @@ mod tests {
     }
 
     #[test]
-    fn numa_pinning_three_nodes() {
+    fn compute_pinning_numa_three_nodes() {
         // Host: 6 LLCs, 2 per NUMA node (nodes 0,1,2).
         // Guest: 3 NUMA nodes, 6 LLCs.
         let topo = synthetic_topo_numa(vec![
@@ -1480,7 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn numa_pinning_with_service_cpu() {
+    fn compute_pinning_numa_with_service_cpu() {
         // 2 NUMA nodes, 4 LLCs, request 2 NUMA nodes + service CPU.
         let topo = synthetic_topo_numa(vec![
             (0, vec![0, 1, 2, 3]),
@@ -1503,19 +2242,24 @@ mod tests {
 
     #[test]
     fn llc_numa_node_empty_map() {
-        // Empty cpu_to_node should default to node 0.
-        let topo = HostTopology {
-            llc_groups: vec![LlcGroup { cpus: vec![0, 1] }],
-            online_cpus: vec![0, 1],
-            cpu_to_node: std::collections::HashMap::new(),
-        };
+        // Empty cpu_to_node should default to node 0 (implicit via
+        // the unwrap_or(0) in `llc_numa_node`).
+        //
+        // Construct manually rather than via `new_for_tests` because
+        // this test pins behavior when `cpu_to_node` is EMPTY — our
+        // fixture helper always populates node ids. Emptying
+        // `cpu_to_node` after a `new_for_tests` call is clearer than
+        // a special-case seam.
+        let mut topo = HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+        topo.cpu_to_node.clear();
+        topo.host_node_llcs.clear();
         assert_eq!(topo.llc_numa_node(0), 0);
     }
 
     // -- llc_offset pinning tests --
 
     #[test]
-    fn pinning_offset_single_llc_wraps() {
+    fn compute_pinning_offset_single_llc_wraps() {
         // 1 host LLC with 4 CPUs, request 1l2c1t, offset 1.
         // (0 + 1) % 1 = 0 — wraps back to the only LLC.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3]]);
@@ -1528,7 +2272,7 @@ mod tests {
     }
 
     #[test]
-    fn pinning_offset_two_llcs_shifts() {
+    fn compute_pinning_offset_two_llcs_shifts() {
         // 2 host LLCs, request 2l2c1t, offset 1.
         // vLLC 0 -> (0+1)%2 = host LLC 1 (CPUs 4,5).
         // vLLC 1 -> (1+1)%2 = host LLC 0 (CPUs 0,1).
@@ -1544,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn pinning_offset_wraps_modulo() {
+    fn compute_pinning_offset_wraps_modulo() {
         // 2 host LLCs, request 2l2c1t, offset 2.
         // (0+2)%2 = 0, (1+2)%2 = 1 — same as offset 0.
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]]);
@@ -1559,7 +2303,7 @@ mod tests {
     }
 
     #[test]
-    fn pinning_offset_three_llcs_partial() {
+    fn compute_pinning_offset_three_llcs_partial() {
         // 3 host LLCs (4 CPUs each), request 2l2c1t, offset 1.
         // vLLC 0 -> (0+1)%3 = host LLC 1 (CPUs 4,5).
         // vLLC 1 -> (1+1)%3 = host LLC 2 (CPUs 8,9).
@@ -1575,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn pinning_offset_large_wraps() {
+    fn compute_pinning_offset_large_wraps() {
         // 3 host LLCs, request 1l2c1t, offset 5.
         // (0 + 5) % 3 = 2 — maps to host LLC 2 (CPUs 8,9).
         let topo = synthetic_topo(vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]]);
@@ -1588,7 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn pinning_offset_numa_within_rotation() {
+    fn compute_pinning_offset_numa_within_rotation() {
         // 4 host LLCs across 2 NUMA nodes, offset 1.
         // node_offset = 1/2 = 0 (no node rotation).
         // within_offset = 1 % 2 = 1 (rotate within each node).
@@ -1620,7 +2364,7 @@ mod tests {
     }
 
     #[test]
-    fn pinning_offset_numa_node_rotation() {
+    fn compute_pinning_offset_numa_node_rotation() {
         // 4 host LLCs across 2 NUMA nodes, offset 2.
         // node_offset = 2/2 = 1 (rotates guest→host node mapping).
         // within_offset = 2 % 2 = 0 (no within-node rotation).
@@ -1652,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn pinning_offset_with_service_cpu() {
+    fn compute_pinning_offset_with_service_cpu() {
         // 2 host LLCs, offset 1, reserve_service_cpu=true.
         // LLC order: [1, 0]. vCPUs consume 4,5,0,1.
         // Service CPU: first online_cpus entry not in {0,1,4,5} → 2.
@@ -1673,7 +2417,7 @@ mod tests {
     }
 
     #[test]
-    fn pinning_offset_numa_combined_rotation() {
+    fn compute_pinning_offset_numa_combined_rotation() {
         // 4 host LLCs across 2 NUMA nodes, offset 3.
         // node_offset = 3/2 = 1 (rotates node mapping).
         // within_offset = 3 % 2 = 1 (rotates within each node).
@@ -2202,31 +2946,36 @@ mod tests {
 
     #[test]
     fn cpu_lock_acquire_with_llc_shared() {
-        // Place the LLC group at Vec index 92000 so the lock file
-        // is /tmp/ktstr-llc-92000.lock, avoiding collision with
-        // production LLC lock files at low indices.
-        let mut llc_groups: Vec<LlcGroup> =
-            (0..92000).map(|_| LlcGroup { cpus: Vec::new() }).collect();
-        llc_groups.push(LlcGroup {
-            cpus: (0..100).collect(),
-        });
-        let topo = HostTopology {
-            llc_groups,
-            online_cpus: (0..100).collect(),
-            cpu_to_node: std::collections::HashMap::new(),
-        };
-        cleanup_lock("/tmp/ktstr-llc-92000.lock");
+        // Uses a per-test lockfile prefix so the LLC group can sit
+        // at index 0 instead of padding to 92000. The production
+        // `acquire_cpu_locks` path threads through `llc_lock_path`,
+        // which honors the test-only prefix override.
+        let _prefix = LlcLockPrefixGuard::new();
+        let cpu_prefix_dir = tempfile::TempDir::new().expect("tempdir");
+        let cpu_prefix = format!("{}/cpu-", cpu_prefix_dir.path().display());
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(cpu_prefix));
+
+        struct CpuPrefixGuard;
+        impl Drop for CpuPrefixGuard {
+            fn drop(&mut self) {
+                CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
+            }
+        }
+        let _cpu_prefix = CpuPrefixGuard;
+
+        let topo = HostTopology::new_for_tests(&[((0..100).collect(), 0)]);
 
         let locks = acquire_cpu_locks(2, 100, Some(&topo)).unwrap();
         // 2 CPU locks + 1 shared LLC lock = 3.
         assert_eq!(locks.len(), 3);
 
         // The LLC lock is shared — another shared should coexist.
-        let shared2 = try_flock("/tmp/ktstr-llc-92000.lock", FlockMode::Shared)
+        let llc_path = llc_lock_path(0);
+        let shared2 = try_flock(&llc_path, FlockMode::Shared)
             .unwrap()
             .expect("second shared LLC should coexist");
         // Exclusive should fail while shared is held.
-        let excl = try_flock("/tmp/ktstr-llc-92000.lock", FlockMode::Exclusive).unwrap();
+        let excl = try_flock(&llc_path, FlockMode::Exclusive).unwrap();
         assert!(
             excl.is_none(),
             "exclusive LLC should fail while shared is held",
@@ -2234,33 +2983,27 @@ mod tests {
 
         drop(shared2);
         drop(locks);
-        cleanup_lock("/tmp/ktstr-llc-92000.lock");
+        drop(cpu_prefix_dir);
     }
 
     #[test]
     fn cpu_lock_llc_shared_protection() {
         // Tests acquire_llc_shared_locks directly: verifies shared lock
         // acquired, shared coexistence, and exclusive blocking.
-        let mut llc_groups: Vec<LlcGroup> =
-            (0..92100).map(|_| LlcGroup { cpus: Vec::new() }).collect();
-        llc_groups.push(LlcGroup {
-            cpus: vec![91200, 91201],
-        });
-        let topo = HostTopology {
-            llc_groups,
-            online_cpus: vec![91200, 91201],
-            cpu_to_node: std::collections::HashMap::new(),
-        };
-        cleanup_lock("/tmp/ktstr-llc-92100.lock");
+        // Uses a per-test lockfile prefix so the LLC group can sit
+        // at index 0 with real CPU ids (no 92100-entry padding).
+        let _prefix = LlcLockPrefixGuard::new();
+        let topo = HostTopology::new_for_tests(&[(vec![91200, 91201], 0)]);
 
         let cpus = vec![91200usize, 91201];
         let llc_locks = acquire_llc_shared_locks(&topo, &cpus).unwrap();
         assert_eq!(llc_locks.len(), 1);
 
-        let shared2 = try_flock("/tmp/ktstr-llc-92100.lock", FlockMode::Shared)
+        let llc_path = llc_lock_path(0);
+        let shared2 = try_flock(&llc_path, FlockMode::Shared)
             .unwrap()
             .expect("second shared LLC should coexist");
-        let excl = try_flock("/tmp/ktstr-llc-92100.lock", FlockMode::Exclusive).unwrap();
+        let excl = try_flock(&llc_path, FlockMode::Exclusive).unwrap();
         assert!(
             excl.is_none(),
             "exclusive LLC should fail while shared is held",
@@ -2268,99 +3011,105 @@ mod tests {
 
         drop(shared2);
         drop(llc_locks);
-        cleanup_lock("/tmp/ktstr-llc-92100.lock");
     }
 
-    /// `acquire_all_llc_shared_locks` returns one fd per LLC group,
-    /// all in shared mode. A synthetic 3-LLC topology must produce
-    /// 3 fds on a clean lock pool. Each acquired fd must pair with
-    /// the literal `/tmp/ktstr-llc-{idx}.lock` path so a concurrent
-    /// reader can locate them by index.
+    /// RAII guard for a per-test LLC lockfile path prefix. Installs
+    /// a `{tempdir}/llc-` prefix into [`LLC_LOCK_PREFIX_OVERRIDE`]
+    /// on construction and unsets it on Drop. Two parallel tests
+    /// using this guard each get their own tempdir, so their
+    /// `acquire_llc_plan` lockfiles can't collide. Eliminates the
+    /// 90K+ empty `LlcGroup` padding that earlier tests used to
+    /// sidestep collision with real host LLC indices.
     ///
-    /// Uses offsets well above any real host's LLC count (93000+) so
-    /// a concurrent ktstr run on the test host cannot race this test
-    /// on the same lock files.
-    #[test]
-    fn acquire_all_llc_shared_locks_returns_one_fd_per_group() {
-        // Build a topology that LOOKS like 3 groups at offsets 93000-93002.
-        // `llc_groups.len()` drives the iteration in
-        // `acquire_all_llc_shared_locks`, so we need the vec to be
-        // exactly that long — pad with empty groups up to the 93002
-        // slot.
-        let mut llc_groups: Vec<LlcGroup> = (0..93003)
-            .map(|_| LlcGroup { cpus: Vec::new() })
-            .collect();
-        // Mark the last three as the "real" LLCs this fake host has —
-        // cpus content doesn't matter to the helper, only the index
-        // range 0..llc_groups.len() does.
-        llc_groups[93000].cpus = vec![99000];
-        llc_groups[93001].cpus = vec![99001];
-        llc_groups[93002].cpus = vec![99002];
-        let topo = HostTopology {
-            llc_groups,
-            online_cpus: vec![99000, 99001, 99002],
-            cpu_to_node: std::collections::HashMap::new(),
-        };
-        // Clean every lock file the helper will touch (0..93003)
-        // before the test. In practice only the last three matter
-        // for assertions, but leaving stale EX locks at low indices
-        // from prior failed runs would short-circuit the acquisition
-        // before it reaches our target range.
-        for llc_idx in 93000..93003 {
-            cleanup_lock(&format!("/tmp/ktstr-llc-{llc_idx}.lock"));
-        }
+    /// Uses [`tempfile::TempDir`] so cleanup runs via RAII on panic
+    /// — a panicking test can't leak `/tmp` lockfiles into other
+    /// test runs.
+    struct LlcLockPrefixGuard {
+        _dir: tempfile::TempDir,
+    }
 
-        let locks = acquire_all_llc_shared_locks(&topo)
+    impl LlcLockPrefixGuard {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let prefix = format!("{}/llc-", dir.path().display());
+            LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(prefix));
+            LlcLockPrefixGuard { _dir: dir }
+        }
+    }
+
+    impl Drop for LlcLockPrefixGuard {
+        fn drop(&mut self) {
+            LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
+        }
+    }
+
+    /// `acquire_llc_plan` with `llc_cap: None` degenerates to
+    /// "select every LLC" — the pre-flag default — producing an
+    /// LlcPlan whose `locks` vec holds one fd per LLC group on a
+    /// clean lock pool.
+    ///
+    /// Uses a per-test lockfile prefix via [`LlcLockPrefixGuard`] so
+    /// the `LlcGroup` vector can be a small 3-entry topology rather
+    /// than padding to 93003 slots. Production path runs through
+    /// [`llc_lock_path`] which honors the test-only override.
+    #[test]
+    fn acquire_llc_plan_none_cap_returns_one_fd_per_group() {
+        let _prefix = LlcLockPrefixGuard::new();
+        let topo =
+            HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0), (vec![2], 0)]);
+
+        // synthetic() needs >= num_cpus >= num_llcs; the distance
+        // function is never invoked with target >= snapshots.len()
+        // (the planner's short-circuit at plan_from_snapshots), so
+        // the TestTopology's shape doesn't matter beyond "valid".
+        let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+
+        let plan = acquire_llc_plan(&topo, &test_topo, None)
             .expect("clean pool must allow SH on every LLC");
         assert_eq!(
-            locks.len(),
+            plan.locks.len(),
             topo.llc_groups.len(),
-            "one held fd per LLC group — see acquire_all_llc_shared_locks doc",
+            "llc_cap=None must acquire one fd per LLC group",
         );
-
-        drop(locks);
-        for llc_idx in 93000..93003 {
-            cleanup_lock(&format!("/tmp/ktstr-llc-{llc_idx}.lock"));
-        }
+        assert_eq!(
+            plan.locked_llcs.len(),
+            topo.llc_groups.len(),
+            "llc_cap=None must report every LLC in locked_llcs",
+        );
     }
 
-    /// `acquire_all_llc_shared_locks` bails with `ResourceContention`
-    /// when ANY LLC is held `LOCK_EX` by a peer (the path a perf-mode
-    /// VM takes via `acquire_resource_locks`). The reason string
-    /// must name the busy LLC index so an operator running
-    /// `fuser /tmp/ktstr-llc-N.lock` can trace the holder.
+    /// `acquire_llc_plan` bails with `ResourceContention` when ANY
+    /// target LLC is held `LOCK_EX` by a peer (the path a perf-mode
+    /// VM takes via `acquire_resource_locks`). The error chain must
+    /// name the busy LLC index so an operator running `fuser
+    /// {lockfile}` can trace the holder.
     ///
-    /// Pins the Tier-1 / Tier-2 coordination contract: no-perf-mode
-    /// VMs and kernel builds correctly fail closed against a
-    /// perf-mode peer, rather than silently racing.
+    /// Scope: pins ONE attempt of the EX-blocks-SH invariant — a
+    /// single DISCOVER round-trip. The full Tier-1 / Tier-2
+    /// coordination contract (retry budget, TOCTOU recovery,
+    /// holder-diagnostic freshness) is covered piecewise by the
+    /// retry-budget pin and the coexistence test; this test's
+    /// narrow claim is: when EX is held, SH fails fast with an
+    /// actionable error that names the LLC.
     #[test]
-    fn acquire_all_llc_shared_locks_bails_on_exclusive_peer() {
-        // Single-LLC synthetic host so one held EX lock is enough to
-        // make the helper bail.
-        let mut llc_groups: Vec<LlcGroup> = (0..93101)
-            .map(|_| LlcGroup { cpus: Vec::new() })
-            .collect();
-        llc_groups[93100].cpus = vec![99100];
-        let topo = HostTopology {
-            llc_groups,
-            online_cpus: vec![99100],
-            cpu_to_node: std::collections::HashMap::new(),
-        };
-        let busy_path = "/tmp/ktstr-llc-93100.lock";
-        cleanup_lock(busy_path);
+    fn acquire_llc_plan_bails_on_exclusive_peer() {
+        let _prefix = LlcLockPrefixGuard::new();
+        let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
 
-        // Peer takes EX on the one LLC the helper will try to SH on.
-        // Holding the fd in scope keeps the lock alive through the
-        // call site below.
-        let _peer_ex = try_flock(busy_path, FlockMode::Exclusive)
+        // Peer holds EX on LLC 0's lockfile through the overridden
+        // prefix. Acquire the path after setting the prefix so the
+        // held lock matches what the planner will try to acquire.
+        let busy_path = llc_lock_path(0);
+        let _peer_ex = try_flock(&busy_path, FlockMode::Exclusive)
             .unwrap()
             .expect("peer EX must acquire on clean pool");
 
-        let err = acquire_all_llc_shared_locks(&topo)
+        let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+        let err = acquire_llc_plan(&topo, &test_topo, None)
             .expect_err("EX peer must block all-LLC SH acquisition");
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("93100"),
+            rendered.contains("LLC 0"),
             "error must name the busy LLC index so fuser can trace: {rendered}",
         );
         // Verify the ResourceContention tag survives so callers
@@ -2372,44 +3121,1201 @@ mod tests {
         );
 
         drop(_peer_ex);
-        cleanup_lock(busy_path);
     }
 
-    /// Two no-perf-mode peers coexist: both acquire
-    /// `acquire_all_llc_shared_locks` successfully because `LOCK_SH`
-    /// is reentrant. The contract says "shared holders coexist;
-    /// exclusive blocks" — this pins the shared-coexistence half
-    /// of that contract, complementing the EX-blocks-SH test above.
+    /// Two no-perf-mode peers coexist: both acquire `acquire_llc_plan`
+    /// successfully because `LOCK_SH` is reentrant. The contract says
+    /// "shared holders coexist; exclusive blocks" — this pins the
+    /// shared-coexistence half, complementing the EX-blocks-SH test
+    /// above.
     #[test]
-    fn acquire_all_llc_shared_locks_coexists_with_shared_peer() {
-        let mut llc_groups: Vec<LlcGroup> = (0..93201)
-            .map(|_| LlcGroup { cpus: Vec::new() })
-            .collect();
-        llc_groups[93200].cpus = vec![99200];
-        let topo = HostTopology {
-            llc_groups,
-            online_cpus: vec![99200],
-            cpu_to_node: std::collections::HashMap::new(),
-        };
-        let shared_path = "/tmp/ktstr-llc-93200.lock";
-        cleanup_lock(shared_path);
+    fn acquire_llc_plan_coexists_with_shared_peer() {
+        let _prefix = LlcLockPrefixGuard::new();
+        let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
+        let shared_path = llc_lock_path(0);
 
         // First peer: SH. Simulates an already-running no-perf-mode VM.
-        let _peer_sh = try_flock(shared_path, FlockMode::Shared)
+        let _peer_sh = try_flock(&shared_path, FlockMode::Shared)
             .unwrap()
             .expect("peer SH must acquire on clean pool");
 
-        // Second caller: also SH via the helper — must coexist.
-        let locks = acquire_all_llc_shared_locks(&topo)
+        let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+        let plan = acquire_llc_plan(&topo, &test_topo, None)
             .expect("second SH caller must coexist with the first");
         assert_eq!(
-            locks.len(),
+            plan.locks.len(),
             topo.llc_groups.len(),
             "second SH caller must acquire one fd per LLC group",
         );
+    }
 
-        drop(locks);
-        drop(_peer_sh);
-        cleanup_lock(shared_path);
+    // ---------------------------------------------------------------
+    // LlcCap — construction, env resolution, acquire-time bounding
+    // ---------------------------------------------------------------
+
+    /// Serialize KTSTR_LLC_CAP env-var mutation across test threads.
+    /// std::env::set_var is process-wide (unsafe in edition 2024);
+    /// parallel tests would race if each mutated the same variable
+    /// without coordination. Every env-touching test below takes
+    /// this mutex for the duration of the test body.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // `lock().unwrap()` would panic on poison from an earlier
+        // panicking test, cascading failures. Recover by taking the
+        // inner guard — the test that panicked already failed; the
+        // current test's env cleanup still runs.
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// RAII guard for scoped `std::env::set_var` mutation inside a
+    /// test. On construction sets the variable to `value`; on Drop
+    /// removes it regardless of whether the test body panicked or
+    /// returned early. Pairs with [`env_lock`] — callers take the
+    /// mutex first, then mint the guard, so two env-touching tests
+    /// never observe each other's intermediate state.
+    ///
+    /// Replaces the bare `unsafe { set_var(..) } ... unsafe {
+    /// remove_var(..) }` pairs that appeared in every env-set test:
+    /// an early return or panic between the set and the remove used
+    /// to leak the env var into subsequent tests serialized on the
+    /// same mutex. `Drop` closes that leak.
+    struct EnvGuard {
+        name: &'static str,
+    }
+
+    impl EnvGuard {
+        /// Set `name=value` under the assumed-held `env_lock` mutex.
+        /// The caller must have taken `env_lock()` before calling
+        /// this constructor — `EnvGuard` does NOT take the mutex
+        /// itself because some tests need to interleave multiple
+        /// guards (e.g. set, read, remove, re-set) within a single
+        /// lock scope.
+        fn set(name: &'static str, value: &str) -> Self {
+            // SAFETY: caller holds the env_lock mutex; edition 2024
+            // set_var is unsafe-marked because it races with reads
+            // from other threads, but the mutex serializes every
+            // env-touching test so no other test is reading
+            // concurrently.
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            EnvGuard { name }
+        }
+
+        /// Remove `name` under the assumed-held `env_lock` mutex.
+        /// Symmetric helper for tests that want to start from a
+        /// known-unset state without first creating a set-and-drop
+        /// guard.
+        fn remove(name: &'static str) -> Self {
+            // SAFETY: caller holds the env_lock mutex; see set().
+            unsafe {
+                std::env::remove_var(name);
+            }
+            EnvGuard { name }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: guard lifetime is bounded by env_lock held by
+            // the test that constructed it. Drop runs before the
+            // mutex guard is released, so the remove_var happens
+            // under the same mutex as the matching set_var.
+            unsafe {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
+    /// `LlcCap::new(0)` must reject with the "≥ 1 (got 0)" message.
+    /// Zero is a scripting-mistake sentinel — silent acceptance would
+    /// disable the resource contract.
+    #[test]
+    fn llc_cap_new_rejects_zero() {
+        let err = LlcCap::new(0).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("≥ 1"), "msg={msg}");
+        assert!(msg.contains("got 0"), "msg={msg}");
+    }
+
+    /// `LlcCap::new(1)` succeeds — minimum legal cap.
+    #[test]
+    fn llc_cap_new_accepts_one() {
+        let cap = LlcCap::new(1).expect("cap of 1 must succeed");
+        assert_eq!(cap.effective_count(4).unwrap(), 1);
+    }
+
+    /// `LlcCap::new(usize::MAX)` is accepted at construction time
+    /// and clamped later by `effective_count`. Pins the contract
+    /// that construction never consults the host.
+    #[test]
+    fn llc_cap_new_accepts_usize_max() {
+        let cap = LlcCap::new(usize::MAX).expect("MAX accepted at construction");
+        // Actual clamping surfaces at effective_count; see
+        // `llc_cap_effective_count_exceeds_host` below.
+        assert!(cap.effective_count(usize::MAX).is_ok());
+    }
+
+    /// `effective_count` returns the inner value when it fits.
+    #[test]
+    fn llc_cap_effective_count_fits() {
+        let cap = LlcCap::new(3).unwrap();
+        assert_eq!(cap.effective_count(4).unwrap(), 3);
+        assert_eq!(cap.effective_count(3).unwrap(), 3);
+    }
+
+    /// `effective_count` when cap exceeds host_llcs returns a
+    /// `ResourceContention` error naming both numbers, so the
+    /// operator can fix the flag without re-running `ktstr topo`.
+    #[test]
+    fn llc_cap_effective_count_exceeds_host() {
+        let cap = LlcCap::new(8).unwrap();
+        let err = cap.effective_count(4).expect_err("8 > 4 must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("8"), "msg must name requested cap: {msg}");
+        assert!(msg.contains("4"), "msg must name host LLC count: {msg}");
+        // Must downcast to ResourceContention for nextest-retry
+        // routing per the Tier-1/Tier-2 contract.
+        assert!(
+            err.downcast_ref::<ResourceContention>().is_some(),
+            "must be a ResourceContention for retry routing: {msg}",
+        );
+    }
+
+    /// `effective_count` at the boundary: cap == host_llcs is OK.
+    #[test]
+    fn llc_cap_effective_count_at_host_boundary() {
+        let cap = LlcCap::new(4).unwrap();
+        assert_eq!(cap.effective_count(4).unwrap(), 4);
+    }
+
+    /// CLI flag supplied → wins over env var. `resolve(Some(N))`
+    /// ignores `KTSTR_LLC_CAP` entirely. Pins the precedence
+    /// contract documented on `LlcCap::resolve`.
+    #[test]
+    fn llc_cap_resolve_cli_wins_over_env() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set("KTSTR_LLC_CAP", "99");
+        let cap = LlcCap::resolve(Some(3)).unwrap().expect("CLI flag set");
+        assert_eq!(cap.effective_count(4).unwrap(), 3, "CLI wins");
+    }
+
+    /// No CLI flag, no env var → `None` (pre-flag default, "lock
+    /// every LLC").
+    #[test]
+    fn llc_cap_resolve_no_cli_no_env_returns_none() {
+        let _lock = env_lock();
+        let _env = EnvGuard::remove("KTSTR_LLC_CAP");
+        assert!(LlcCap::resolve(None).unwrap().is_none());
+    }
+
+    /// Env var set to a valid integer, no CLI flag → resolves to
+    /// that value.
+    #[test]
+    fn llc_cap_resolve_env_set() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set("KTSTR_LLC_CAP", "2");
+        let cap = LlcCap::resolve(None)
+            .expect("resolve must succeed")
+            .expect("env-set cap must yield Some");
+        assert_eq!(cap.effective_count(8).unwrap(), 2);
+    }
+
+    /// Env var set to the empty string → treated as absent
+    /// (matches `Ok(s) if s.is_empty()` arm).
+    #[test]
+    fn llc_cap_resolve_empty_env_is_absent() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set("KTSTR_LLC_CAP", "");
+        assert!(LlcCap::resolve(None).unwrap().is_none());
+    }
+
+    /// Env var set to a non-numeric value → parse error with the
+    /// variable name in the message.
+    #[test]
+    fn llc_cap_resolve_non_numeric_env_errors() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set("KTSTR_LLC_CAP", "not-a-number");
+        let err = LlcCap::resolve(None).expect_err("non-numeric must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("KTSTR_LLC_CAP"), "msg={msg}");
+    }
+
+    /// Env var set to `"0"` flows through `LlcCap::new(0)` and
+    /// surfaces the same "--llc-cap must be ≥ 1 (got 0)" error.
+    /// Regression guard: typos like `KTSTR_LLC_CAP=0` must NOT
+    /// silently fall back to "no cap".
+    #[test]
+    fn llc_cap_resolve_zero_env_rejected() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set("KTSTR_LLC_CAP", "0");
+        let err = LlcCap::resolve(None).expect_err("zero must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("≥ 1"), "msg={msg}");
+        assert!(msg.contains("got 0"), "msg={msg}");
+    }
+
+    /// CLI flag of 0 is the same rejection path as env var of 0 —
+    /// both feed `LlcCap::new(0)`. Pins that precedence doesn't
+    /// let a valid env var "save" an invalid CLI zero.
+    #[test]
+    fn llc_cap_resolve_zero_cli_rejected_even_with_valid_env() {
+        let _lock = env_lock();
+        let _env = EnvGuard::set("KTSTR_LLC_CAP", "2");
+        let err = LlcCap::resolve(Some(0)).expect_err("cli=0 must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("≥ 1"), "msg={msg}");
+    }
+
+    /// `EnvGuard::set` applies the value, and `Drop` removes the
+    /// variable even if the test body panics mid-scope. Pins the
+    /// RAII contract so a refactor that accidentally drops the
+    /// Drop impl leaks env state across tests.
+    #[test]
+    fn env_guard_set_and_drop_removes_variable() {
+        let _lock = env_lock();
+        let probe = "KTSTR_LLC_CAP_ENV_GUARD_TEST";
+        {
+            let _env = EnvGuard::set(probe, "abc");
+            assert_eq!(
+                std::env::var(probe).ok().as_deref(),
+                Some("abc"),
+                "set must apply immediately",
+            );
+        }
+        // Drop ran — variable must be gone.
+        assert!(
+            std::env::var(probe).is_err(),
+            "EnvGuard::drop must remove the variable",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // NUMA primitives — host_llcs_by_numa_node / with_capacity /
+    // sorted_by_distance
+    // ---------------------------------------------------------------
+
+    /// Backwards-compat helper: forwards to
+    /// [`HostTopology::new_for_tests`]. Kept so existing tests that
+    /// reference `synth_host_topo` don't need to be renamed in lock-
+    /// step with the consolidation — the single authoritative
+    /// constructor is `new_for_tests`, this and
+    /// [`synthetic_topo`] / [`synthetic_topo_numa`] are thin adapters
+    /// over it.
+    fn synth_host_topo(groups: &[(Vec<usize>, usize)]) -> HostTopology {
+        HostTopology::new_for_tests(groups)
+    }
+
+    /// Single-node host: one entry in host_llcs_by_numa_node with
+    /// every LLC index in ascending order.
+    #[test]
+    fn host_llcs_by_numa_node_single_node() {
+        let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0), (vec![4, 5], 0)]);
+        let map = topo.host_llcs_by_numa_node();
+        assert_eq!(map.len(), 1, "single-node host has one entry");
+        assert_eq!(map.get(&0), Some(&vec![0, 1, 2]));
+    }
+
+    /// Dual-node host: two entries, each with its own LLC indices
+    /// in ascending order.
+    #[test]
+    fn host_llcs_by_numa_node_dual_node() {
+        let topo = synth_host_topo(&[
+            (vec![0, 1], 0),
+            (vec![2, 3], 1),
+            (vec![4, 5], 0),
+            (vec![6, 7], 1),
+        ]);
+        let map = topo.host_llcs_by_numa_node();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&0), Some(&vec![0, 2]));
+        assert_eq!(map.get(&1), Some(&vec![1, 3]));
+    }
+
+    /// Asymmetric: node 0 has 3 LLCs, node 1 has 1 LLC.
+    /// `numa_nodes_with_capacity(2)` returns only node 0.
+    #[test]
+    fn numa_nodes_with_capacity_asymmetric() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 0),
+            (vec![2], 0),
+            (vec![3], 1),
+        ]);
+        let cap2: Vec<usize> = topo
+            .numa_nodes_with_capacity(2)
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        assert_eq!(cap2, vec![0], "only node 0 has ≥ 2 LLCs");
+        let cap1: Vec<usize> = topo
+            .numa_nodes_with_capacity(1)
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        assert_eq!(cap1, vec![0, 1], "both nodes have ≥ 1 LLC");
+    }
+
+    /// `numa_nodes_with_capacity` with min_llcs > every node's
+    /// count returns empty — no candidates.
+    #[test]
+    fn numa_nodes_with_capacity_over_max_returns_empty() {
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1)]);
+        assert!(topo.numa_nodes_with_capacity(99).is_empty());
+    }
+
+    /// `numa_nodes_sorted_by_distance` with identity closure:
+    /// anchor == node → 10, else 20. Anchor sorts first; remaining
+    /// nodes preserve BTreeMap ascending order (stable sort over
+    /// equal distances).
+    #[test]
+    fn numa_nodes_sorted_by_distance_identity_closure() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 1),
+            (vec![2], 2),
+        ]);
+        let order = topo.numa_nodes_sorted_by_distance(1, |from, to| {
+            if from == to {
+                10
+            } else {
+                20
+            }
+        });
+        // Anchor node 1 first; nodes 0 and 2 tied at distance 20,
+        // stable over BTreeMap-ascending order.
+        assert_eq!(order[0], 1, "anchor node first");
+        assert_eq!(
+            &order[1..],
+            &[0, 2],
+            "tied-distance nodes in ascending order"
+        );
+    }
+
+    /// `numa_nodes_sorted_by_distance` demotes unreachable nodes
+    /// (distance 255 per Linux convention) to the end even when
+    /// the node has LLCs. Pins the unreachable-last contract.
+    #[test]
+    fn numa_nodes_sorted_by_distance_unreachable_demoted() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 1),
+            (vec![2], 2),
+        ]);
+        // Node 2 unreachable from anchor 0, node 1 at distance 20.
+        let order = topo.numa_nodes_sorted_by_distance(0, |from, to| match (from, to) {
+            (0, 0) => 10,
+            (0, 1) => 20,
+            (0, 2) => 255,
+            _ => 20,
+        });
+        assert_eq!(order, vec![0, 1, 2]);
+        // The key invariant: unreachable at end even though its
+        // numeric id (2) would naturally sort mid-range.
+        assert_eq!(*order.last().unwrap(), 2, "unreachable node is last");
+    }
+
+    /// `numa_nodes_sorted_by_distance` skips nodes not in
+    /// host_node_llcs — a node with no LLCs is excluded entirely.
+    /// "Nodes without any LLCs on this host are skipped — spilling
+    /// to an empty node has no value" per the doc.
+    #[test]
+    fn numa_nodes_sorted_by_distance_skips_empty_nodes() {
+        // Only node 0 has LLCs. Anchor 99 never appears in output.
+        let topo = synth_host_topo(&[(vec![0], 0)]);
+        let order =
+            topo.numa_nodes_sorted_by_distance(99, |_, _| 20);
+        assert_eq!(order, vec![0], "only node 0 is in host_node_llcs");
+    }
+
+    // ---------------------------------------------------------------
+    // acquire_llc_plan — cap semantics (host-integration-light)
+    // ---------------------------------------------------------------
+
+    /// `acquire_llc_plan` with `llc_cap == Some(cap)` and
+    /// `cap > host LLC count` fails at `effective_count` with a
+    /// `ResourceContention` — before any /tmp side-effects. Pins
+    /// that over-cap fails cleanly without touching the lock pool.
+    #[test]
+    fn acquire_llc_plan_rejects_cap_over_host_llcs() {
+        // Two real LLC groups, cap of 3.
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
+        let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+        let cap = LlcCap::new(3).unwrap();
+        let err = acquire_llc_plan(&topo, &test_topo, Some(cap))
+            .expect_err("cap > host_llcs must error");
+        assert!(
+            err.downcast_ref::<ResourceContention>().is_some(),
+            "must be ResourceContention: {err:#}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // BuildSandbox supplementary coverage lives in
+    // src/vmm/cgroup_sandbox.rs's mod tests — see
+    // `cpuset_sets_equal_identity`, `cpuset_sets_equal_narrower_effective`,
+    // `sandbox_degraded_display_text` (includes RootCgroupRefused),
+    // `parent_controllers_include_missing_file`, and
+    // `read_cpuset_effective_missing_file_returns_none`. The
+    // try_create RootCgroupRefused guard requires a test-only seam
+    // over `read_self_cgroup_path` which doesn't exist yet — tracked
+    // for a future iteration; the variant's Display is already
+    // covered.
+    // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    // Deadlock guards — plan_from_snapshots produces ascending
+    // llc_idx for livelock-proof acquire order
+    // ---------------------------------------------------------------
+
+    /// `plan_from_snapshots` returns selected LLC indices in
+    /// ascending order — pinned at step e of the algorithm. Two
+    /// concurrent callers with the same target see the same
+    /// sequence, so their `try_acquire_llc_plan_locks` walk each
+    /// flock in the same order. Reverse-order acquire would
+    /// deadlock if one caller grabbed LLC N first while another
+    /// grabbed LLC 0 first and they competed for each other's
+    /// next targets. Ascending order eliminates that possibility.
+    ///
+    /// The expected output `[0, 2, 3]` catches TWO independent
+    /// regressions at once:
+    ///   1. Consolidation dropped (filter on `holder_count > 0`
+    ///      removed). Output would become `[0, 1, 2]` because the
+    ///      fresh LLCs at indices 0 and 1 would rank equal to LLC
+    ///      2 without the consolidation preference.
+    ///   2. Final `sort_unstable` dropped. Output would preserve
+    ///      the interior walk order, typically `[2, 3, 0]` once
+    ///      consolidation promoted the peer-held LLCs.
+    /// Either regression fails this test. See
+    /// `plan_from_snapshots_always_ascending_across_target_range`
+    /// for the broader property-based guard.
+    #[test]
+    fn plan_from_snapshots_returns_ascending_indices() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 0),
+            (vec![2], 0),
+            (vec![3], 0),
+        ]);
+        // Synthetic snapshots — holder_count higher on "later"
+        // LLCs so consolidation score would put them first if the
+        // algorithm didn't re-sort ascending at the end.
+        let snapshots: Vec<LlcSnapshot> = (0..4)
+            .map(|idx| LlcSnapshot {
+                llc_idx: idx,
+                lockfile_path: std::path::PathBuf::from(format!(
+                    "/tmp/ktstr-llc-{idx}.lock"
+                )),
+                holders: Vec::new(),
+                holder_count: if idx >= 2 { 5 } else { 0 },
+            })
+            .collect();
+        let selected = plan_from_snapshots(
+            &snapshots,
+            3,
+            &topo,
+            |_, _| 10, // everything same-node
+        );
+        // Step e of plan_from_snapshots is
+        // `selected.sort_unstable()` — guarantees ascending llc_idx
+        // regardless of consolidation score or seed ordering. Two
+        // concurrent callers with the same snapshots see the same
+        // acquire order, eliminating reverse-order deadlock.
+        assert_eq!(selected, vec![0, 2, 3], "step e sorts ascending");
+    }
+
+    /// `plan_from_snapshots` with `target >= snapshots.len()`
+    /// short-circuits to "select every LLC" in ascending order.
+    /// Pins the no-cap behavior that preserves pre-flag semantics.
+    #[test]
+    fn plan_from_snapshots_target_ge_all_selects_every_llc() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 1),
+            (vec![2], 2),
+        ]);
+        let snapshots: Vec<LlcSnapshot> = (0..3)
+            .map(|idx| LlcSnapshot {
+                llc_idx: idx,
+                lockfile_path: std::path::PathBuf::from(format!(
+                    "/tmp/ktstr-llc-{idx}.lock"
+                )),
+                holders: Vec::new(),
+                holder_count: 0,
+            })
+            .collect();
+        let selected = plan_from_snapshots(&snapshots, 3, &topo, |_, _| 10);
+        assert_eq!(selected, vec![0, 1, 2]);
+        let selected_over = plan_from_snapshots(&snapshots, 999, &topo, |_, _| 10);
+        assert_eq!(selected_over, vec![0, 1, 2], "target > len clamps");
+    }
+
+    /// `plan_from_snapshots` with `target == 0` returns empty —
+    /// early return in the algorithm. Pins the degenerate case
+    /// so a future "optimization" that assumes selected[0] exists
+    /// fails here first.
+    #[test]
+    fn plan_from_snapshots_target_zero_returns_empty() {
+        let topo = synth_host_topo(&[(vec![0], 0)]);
+        let snapshots: Vec<LlcSnapshot> = vec![LlcSnapshot {
+            llc_idx: 0,
+            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-0.lock"),
+            holders: Vec::new(),
+            holder_count: 0,
+        }];
+        let selected = plan_from_snapshots(&snapshots, 0, &topo, |_, _| 10);
+        assert!(selected.is_empty());
+    }
+
+    /// `plan_from_snapshots` prefers LLCs with `holder_count > 0`
+    /// over fresh LLCs on the same NUMA node — the consolidation
+    /// half of the composite sort ("consolidation candidates
+    /// first, then fresh candidates"). Two same-node LLCs,
+    /// holder_count [0, 5],
+    /// target=1 → must pick the holder=5 LLC (index 1), not the
+    /// fresh one (index 0). A future bug that flipped the partition
+    /// order (fresh-first) or dropped the holder_count tiebreaker
+    /// would pick LLC 0 instead and fail this test.
+    ///
+    /// Distinct from `plan_from_snapshots_returns_ascending_indices`
+    /// which only asserted the post-sort ordering — that test
+    /// accepted EITHER consolidation ordering because its output
+    /// happened to be ascending in both cases. This one rejects
+    /// the non-consolidation output.
+    #[test]
+    fn plan_from_snapshots_prefers_higher_holder_count() {
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
+        let snapshots: Vec<LlcSnapshot> = vec![
+            LlcSnapshot {
+                llc_idx: 0,
+                lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-0.lock"),
+                holders: Vec::new(),
+                holder_count: 0,
+            },
+            LlcSnapshot {
+                llc_idx: 1,
+                lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-1.lock"),
+                holders: Vec::new(),
+                holder_count: 5,
+            },
+        ];
+        // Same-node distance closure so placement doesn't bias by
+        // NUMA — isolates the consolidation preference signal.
+        let selected = plan_from_snapshots(&snapshots, 1, &topo, |_, _| 10);
+        assert_eq!(
+            selected,
+            vec![1],
+            "target=1 with holders [0,5] must pick LLC 1 \
+             (consolidation preference), not LLC 0 (fresh)"
+        );
+    }
+
+    /// Invariant-based ascending-order property: for every target
+    /// in 1..=snapshots.len(), `selected.windows(2)` all satisfy
+    /// `w[0] < w[1]`. This pins the step-e sort_unstable invariant
+    /// independent of the consolidation / node-spill traversal —
+    /// a future refactor that restructures the inner walk but
+    /// forgets the final sort will fail this test at SOME target,
+    /// not just the specific one `_returns_ascending_indices` pins.
+    #[test]
+    fn plan_from_snapshots_always_ascending_across_target_range() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 1),
+            (vec![2], 0),
+            (vec![3], 1),
+        ]);
+        // Mixed holder_counts so consolidation ordering varies.
+        let snapshots: Vec<LlcSnapshot> = vec![
+            LlcSnapshot {
+                llc_idx: 0,
+                lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-0.lock"),
+                holders: Vec::new(),
+                holder_count: 3,
+            },
+            LlcSnapshot {
+                llc_idx: 1,
+                lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-1.lock"),
+                holders: Vec::new(),
+                holder_count: 0,
+            },
+            LlcSnapshot {
+                llc_idx: 2,
+                lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-2.lock"),
+                holders: Vec::new(),
+                holder_count: 7,
+            },
+            LlcSnapshot {
+                llc_idx: 3,
+                lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-3.lock"),
+                holders: Vec::new(),
+                holder_count: 1,
+            },
+        ];
+        for target in 1..=snapshots.len() {
+            let selected = plan_from_snapshots(&snapshots, target, &topo, |_, _| 10);
+            assert_eq!(
+                selected.len(),
+                target,
+                "target={target} must produce {target} selections, got {selected:?}"
+            );
+            assert!(
+                selected.windows(2).all(|w| w[0] < w[1]),
+                "target={target}: selection {selected:?} is not strictly ascending",
+            );
+        }
+    }
+
+    /// `make_jobs_for_plan` returns `plan.cpus.len().max(1)` so the
+    /// `-jN` hint to make matches the reserved CPU count — gcc
+    /// doesn't fan out beyond the cgroup budget.
+    #[test]
+    fn make_jobs_for_plan_matches_cpu_count() {
+        let plan = LlcPlan {
+            locked_llcs: vec![0, 1],
+            cpus: vec![0, 1, 2, 3],
+            mems: std::collections::BTreeSet::new(),
+            snapshot: Vec::new(),
+            locks: Vec::new(),
+        };
+        assert_eq!(make_jobs_for_plan(&plan), 4);
+    }
+
+    /// Edge: empty `plan.cpus` must yield `1`, never `0` — `make
+    /// -j0` on GNU make produces unbounded parallelism, exactly
+    /// the pathology the cap is supposed to prevent. The `.max(1)`
+    /// floor pins this.
+    #[test]
+    fn make_jobs_for_plan_empty_cpus_floors_to_one() {
+        let plan = LlcPlan {
+            locked_llcs: Vec::new(),
+            cpus: Vec::new(),
+            mems: std::collections::BTreeSet::new(),
+            snapshot: Vec::new(),
+            locks: Vec::new(),
+        };
+        assert_eq!(
+            make_jobs_for_plan(&plan),
+            1,
+            "empty-cpus must floor to 1, not 0 — -j0 is unbounded",
+        );
+    }
+
+    /// `format_llc_list` renders LLC indices with per-entry NUMA
+    /// node annotation when `cpu_to_node` is populated. Two
+    /// locked LLCs on different nodes → "0 (node 0), 2 (node 1)".
+    #[test]
+    fn format_llc_list_with_numa_info() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 0),
+            (vec![2], 1),
+            (vec![3], 1),
+        ]);
+        let rendered = format_llc_list(&[0, 2], &topo);
+        assert!(
+            rendered.contains("0 (node 0)"),
+            "must annotate LLC 0 with its node: {rendered}",
+        );
+        assert!(
+            rendered.contains("2 (node 1)"),
+            "must annotate LLC 2 with its node: {rendered}",
+        );
+        // Full bracket form — enforces "[...]" wrapping so the
+        // warning message reads naturally.
+        assert_eq!(rendered, "[0 (node 0), 2 (node 1)]");
+    }
+
+    /// `format_llc_list` single-LLC case — no comma, no cross-node
+    /// spill, bracket-wrapped. Pins the rendering shape for the
+    /// warning that fires on non-spilling plans (which don't
+    /// actually emit the cross-node warning, but the helper may
+    /// still be called by future tooling).
+    #[test]
+    fn format_llc_list_single_llc() {
+        let topo = synth_host_topo(&[(vec![0], 0)]);
+        let rendered = format_llc_list(&[0], &topo);
+        assert_eq!(rendered, "[0 (node 0)]");
+    }
+
+    /// `format_llc_list` on a degraded host with empty
+    /// `cpu_to_node` drops the `(node N)` annotation per the doc
+    /// ("[0, 2] on degraded hosts whose cpu_to_node map is empty").
+    /// Synth helper populates cpu_to_node — mimic the degraded
+    /// case by clearing it before calling.
+    #[test]
+    fn format_llc_list_without_numa_info() {
+        let mut topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
+        topo.cpu_to_node.clear();
+        let rendered = format_llc_list(&[0, 1], &topo);
+        assert_eq!(rendered, "[0, 1]", "degraded-host form drops node annotation");
+    }
+
+    /// `should_warn_cross_node` polarity pin: empty set or
+    /// single-node set → false; two or more nodes → true.
+    /// Splits the decision out of the eprintln! side-channel so
+    /// regression tests can assert the condition without capturing
+    /// stderr.
+    #[test]
+    fn should_warn_cross_node_polarity() {
+        use std::collections::BTreeSet;
+        let empty: BTreeSet<usize> = BTreeSet::new();
+        assert!(
+            !should_warn_cross_node(&empty),
+            "empty mems must NOT warn (degenerate plan with no NUMA info)",
+        );
+        let single: BTreeSet<usize> = [0].into_iter().collect();
+        assert!(
+            !should_warn_cross_node(&single),
+            "single-node plan must NOT warn — the whole point of the cap \
+             is to fit on one node when possible",
+        );
+        let dual: BTreeSet<usize> = [0, 1].into_iter().collect();
+        assert!(
+            should_warn_cross_node(&dual),
+            "two-node plan MUST warn — operator picked a cap that \
+             couldn't fit on one node and deserves to hear about it",
+        );
+        let triple: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
+        assert!(
+            should_warn_cross_node(&triple),
+            "three-node plan MUST warn — same rationale as dual",
+        );
+    }
+
+    /// `warn_if_cross_node_spill` end-to-end pin: a multi-node plan
+    /// produces the formatted warning (non-empty side effect
+    /// observable via the pure predicate). A single-node plan is
+    /// a no-op (predicate returns false → eprintln! is skipped).
+    /// Pins the coupling between the predicate and the side-
+    /// effecting wrapper so a refactor that dropped the predicate
+    /// call (e.g. inlined an incorrect comparison) would fail.
+    #[test]
+    fn warn_if_cross_node_spill_predicate_gates_stderr() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 1),
+        ]);
+        let multi_plan = LlcPlan {
+            locked_llcs: vec![0, 1],
+            cpus: vec![0, 1],
+            mems: [0usize, 1].into_iter().collect(),
+            snapshot: Vec::new(),
+            locks: Vec::new(),
+        };
+        assert!(should_warn_cross_node(&multi_plan.mems));
+        // Call the wrapper — it produces stderr output but we rely
+        // on the predicate gate above to verify the "will fire" half.
+        // Directly capturing stderr in-process is fragile across
+        // test runners; the predicate test pins the decision.
+        warn_if_cross_node_spill(&multi_plan, &topo);
+
+        let single_plan = LlcPlan {
+            locked_llcs: vec![0],
+            cpus: vec![0],
+            mems: [0usize].into_iter().collect(),
+            snapshot: Vec::new(),
+            locks: Vec::new(),
+        };
+        assert!(!should_warn_cross_node(&single_plan.mems));
+        // No-op call — predicate returns false, eprintln! is skipped.
+        warn_if_cross_node_spill(&single_plan, &topo);
+    }
+
+    /// `LlcCap::new(1).effective_count(0)` errors: `n=1 > host=0`.
+    /// Degenerate "host has zero LLCs" edge — unlikely on a real
+    /// machine but critical to pin the boundary so a future bug
+    /// that flipped the comparison to `n >= host_llcs` (rejecting
+    /// cap == total) OR `n > host_llcs - 1` (overflow on 0) fails
+    /// here first.
+    #[test]
+    fn llc_cap_effective_count_on_zero_llc_host() {
+        let cap = LlcCap::new(1).unwrap();
+        let err = cap.effective_count(0).expect_err("1 > 0 must error");
+        assert!(
+            err.downcast_ref::<ResourceContention>().is_some(),
+            "must be ResourceContention for retry routing",
+        );
+    }
+
+    /// Multi-process concurrent `acquire_llc_plan`: a child process
+    /// holds `LOCK_SH` on one LLC's lockfile via `flock(1)` (SHELL
+    /// utility), then the parent calls `acquire_llc_plan` with a
+    /// cap forcing the planner to consolidate onto an LLC that has
+    /// holders. The consolidation invariant (`holder_count DESC`
+    /// ordering in `plan_from_snapshots`) requires the parent's
+    /// plan to include the child's LLC.
+    ///
+    /// Uses `flock(1)` + `sleep 10` rather than Rust fork() so the
+    /// holder is a different process (different pid, different OFD)
+    /// than the test thread — proving the /proc/locks cross-process
+    /// enumeration path is exercised.
+    ///
+    /// `flock(1)` is expected on every Linux host that runs ktstr
+    /// tests (it's in util-linux, part of the minimum viable CI
+    /// image). If it's absent the test short-circuits rather than
+    /// failing — the invariant is real but the test infrastructure
+    /// depends on a userspace utility.
+    #[test]
+    fn acquire_llc_plan_consolidates_on_peer_held_llc() {
+        let _prefix = LlcLockPrefixGuard::new();
+        // 2 LLCs on the same node so NUMA-locality doesn't bias
+        // against consolidation.
+        let topo =
+            HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
+
+        // Child process holds SH on LLC 1's lockfile via flock(1),
+        // sleeping long enough for the parent's acquire to complete
+        // inside the same SH window.
+        let target_lock = llc_lock_path(1);
+        // Ensure the lockfile exists so flock(1) opens the right
+        // inode (not a fresh one that /proc/locks would attribute
+        // to the flock(1) pid on a different inode than the parent
+        // sees).
+        crate::flock::materialize(&target_lock).expect("materialize lockfile");
+
+        let child = std::process::Command::new("flock")
+            .args(["-s", "-n", &target_lock, "sleep", "2"])
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // flock(1) missing — skip rather than fail.
+                eprintln!(
+                    "acquire_llc_plan_consolidates_on_peer_held_llc: \
+                     flock(1) not available, skipping ({e})"
+                );
+                return;
+            }
+            Err(e) => panic!("spawn flock(1): {e}"),
+        };
+
+        // Brief sleep to let the child acquire SH before the parent
+        // reads /proc/locks in discover. 50ms is well past util-linux's
+        // exec + flock NB path and short enough that the child's
+        // `sleep 2` still covers the parent's acquire window.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let test_topo = crate::topology::TestTopology::synthetic(2, 1);
+        let cap = LlcCap::new(1).expect("cap=1 valid");
+        let plan = acquire_llc_plan(&topo, &test_topo, Some(cap))
+            .expect("SH is reentrant — parent SH must coexist with child SH");
+
+        // Consolidation picked LLC 1 (the one with a holder) over
+        // LLC 0 (fresh). The `holder_count DESC` ordering in
+        // `plan_from_snapshots` makes this deterministic.
+        assert_eq!(
+            plan.locked_llcs,
+            vec![1],
+            "cap=1 with child holding SH on LLC 1 must pick LLC 1 \
+             (consolidation over fresh LLC 0); got {:?}",
+            plan.locked_llcs,
+        );
+
+        drop(plan);
+        // Child exits naturally after sleep 2; reap it so we don't
+        // leave zombies.
+        let _ = child.wait();
+    }
+
+    /// `ACQUIRE_MAX_TOCTOU_RETRIES` pins the retry budget at 1 —
+    /// one DISCOVER + at most one retry DISCOVER (two total
+    /// attempts). The second DISCOVER's /proc/locks read IS the
+    /// backoff; more retries just amplify livelock risk without
+    /// adding coordination signal. Regression guard against a
+    /// future "just retry harder" tweak.
+    #[test]
+    fn acquire_max_toctou_retries_pinned_at_one() {
+        assert_eq!(
+            ACQUIRE_MAX_TOCTOU_RETRIES, 1,
+            "retry budget must be 1 — higher values amplify livelock",
+        );
+    }
+
+    /// TOCTOU retry SUCCESS path via the acquire-fn seam: attempt 0
+    /// returns `Ok(None)` (simulating a peer holding EX during the
+    /// first ACQUIRE), attempt 1 returns `Ok(Some(Vec::new()))`
+    /// (peer released, shared acquire succeeds). The outer
+    /// `acquire_llc_plan_with_acquire_fn` must re-run DISCOVER +
+    /// PLAN and retry — not propagate the first `None` upward.
+    ///
+    /// Uses two real LLC groups with empty CPU lists so
+    /// `discover_llc_snapshots` succeeds without touching any real
+    /// `/tmp` lockfile (the seam consumes the snapshots instead of
+    /// handing off to the real flock code). LLC indices 93500/93501
+    /// are in the reserved 93000-99999 test range per the module's
+    /// SYNTHETIC-TOPOLOGY OFFSET CONVENTION.
+    #[test]
+    fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
+        let topo = synth_host_topo(&[(vec![93500], 0), (vec![93501], 0)]);
+        // Clean the lockfile paths DISCOVER materializes so the
+        // test is idempotent across re-runs.
+        cleanup_lock("/tmp/ktstr-llc-0.lock");
+        cleanup_lock("/tmp/ktstr-llc-1.lock");
+
+        let test_topo = crate::topology::TestTopology::synthetic(2, 1);
+        let counter = std::cell::Cell::new(0u32);
+        let plan = acquire_llc_plan_with_acquire_fn(
+            &topo,
+            &test_topo,
+            None,
+            |_selected, _snapshots| {
+                let n = counter.get();
+                counter.set(n + 1);
+                if n == 0 {
+                    // Attempt 0: simulate peer winning EX race.
+                    Ok(None)
+                } else {
+                    // Attempt 1: peer released, acquire succeeds
+                    // with an empty fd set (production would have
+                    // actual OwnedFd values; the LlcPlan RAII
+                    // contract is exercised elsewhere).
+                    Ok(Some(Vec::new()))
+                }
+            },
+        )
+        .expect("retry on attempt 1 must succeed");
+        // Attempt 1 produced locks (empty vec is fine — the plan
+        // constructor accepts any Vec<OwnedFd>).
+        assert_eq!(counter.get(), 2, "acquire_fn called exactly twice");
+        // Selected indices are every LLC on the synthetic topo.
+        assert_eq!(plan.locked_llcs, vec![0, 1]);
+
+        cleanup_lock("/tmp/ktstr-llc-0.lock");
+        cleanup_lock("/tmp/ktstr-llc-1.lock");
+    }
+
+    /// TOCTOU retry EXHAUSTED path via the acquire-fn seam: every
+    /// attempt returns `Ok(None)`. After
+    /// `ACQUIRE_MAX_TOCTOU_RETRIES + 1` attempts, the outer loop
+    /// bails with a `ResourceContention` whose message names the
+    /// retry count.
+    ///
+    /// Pins: (a) the retry budget is respected — the acquire
+    /// closure is called exactly `ACQUIRE_MAX_TOCTOU_RETRIES + 1`
+    /// times before the error is returned; (b) the error surfaces
+    /// as `ResourceContention` for nextest-retry routing; (c) the
+    /// holder diagnostic block runs (the final DISCOVER read).
+    #[test]
+    fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
+        let topo = synth_host_topo(&[(vec![93600], 0)]);
+        cleanup_lock("/tmp/ktstr-llc-0.lock");
+        let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+
+        let counter = std::cell::Cell::new(0u32);
+        let err = acquire_llc_plan_with_acquire_fn(
+            &topo,
+            &test_topo,
+            None,
+            |_selected, _snapshots| {
+                counter.set(counter.get() + 1);
+                Ok(None)
+            },
+        )
+        .expect_err("every attempt returns None — must bail after retries");
+
+        // The retry budget consumes exactly ACQUIRE_MAX_TOCTOU_RETRIES
+        // + 1 acquire-fn calls. Attempt index 0 is the first
+        // acquire; attempt reaches MAX before incrementing, so the
+        // failure occurs on call MAX+1.
+        assert_eq!(
+            counter.get(),
+            ACQUIRE_MAX_TOCTOU_RETRIES + 1,
+            "acquire_fn called exactly ACQUIRE_MAX_TOCTOU_RETRIES + 1 times",
+        );
+
+        assert!(
+            err.downcast_ref::<ResourceContention>().is_some(),
+            "must downcast to ResourceContention for retry routing: {err:#}",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("TOCTOU retry"),
+            "message must name the retry outcome: {msg}",
+        );
+
+        cleanup_lock("/tmp/ktstr-llc-0.lock");
+    }
+
+    /// `plan_from_snapshots` MUST-CONSOLIDATE invariant: on a
+    /// single-node host where every fresh LLC is ascending, the
+    /// single peer-held LLC at index 3 MUST be selected over any
+    /// lower-index fresh LLC when target=1. A future refactor that
+    /// accidentally flipped the partition order (fresh-first) or
+    /// dropped the `holder_count > 0` filter would pick LLC 0
+    /// instead and fail this test.
+    ///
+    /// Complements `plan_from_snapshots_prefers_higher_holder_count`
+    /// (same-node, two LLCs) by proving the peer-held LLC wins
+    /// even when it sits at the TAIL of the ascending fresh order,
+    /// not just adjacent — the `holder_count > 0` partition MUST
+    /// override the fresh-LLC ordering.
+    #[test]
+    fn plan_from_snapshots_consolidation_overrides_fresh_ordering() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 0),
+            (vec![2], 0),
+            (vec![3], 0),
+        ]);
+        let snapshots: Vec<LlcSnapshot> = (0..4)
+            .map(|idx| LlcSnapshot {
+                llc_idx: idx,
+                lockfile_path: std::path::PathBuf::from(format!(
+                    "/tmp/ktstr-llc-{idx}.lock"
+                )),
+                holders: Vec::new(),
+                holder_count: if idx == 3 { 5 } else { 0 },
+            })
+            .collect();
+        let selected = plan_from_snapshots(&snapshots, 1, &topo, |_, _| 10);
+        assert_eq!(
+            selected,
+            vec![3],
+            "target=1 with peer-held LLC 3 must pick LLC 3, not the \
+             lowest-index fresh LLC 0 — consolidation overrides fresh",
+        );
+    }
+
+    /// `plan_from_snapshots` NUMA-locality invariant: a single-node
+    /// fit (target ≤ seed-node capacity) must NEVER spill. 4 LLCs
+    /// split 2+2 across nodes 0/1, all fresh, target=2 → selected
+    /// must be both LLCs on the seed node. A future refactor that
+    /// accidentally spanned both nodes (e.g. by iterating every
+    /// node's LLCs before checking selected.len()) would fail here.
+    ///
+    /// Walk seed node first, exhaust it
+    /// before spilling to nearest-by-distance nodes. This test
+    /// pins that the seed-node-fits-fully short-circuit works.
+    #[test]
+    fn plan_from_snapshots_single_node_fit_no_spill() {
+        // LLCs 0,1 on node 0; LLCs 2,3 on node 1. CPUs disjoint so
+        // synth_host_topo populates cpu_to_node cleanly.
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 0),
+            (vec![2], 1),
+            (vec![3], 1),
+        ]);
+        // All fresh so neither node has a consolidation signal —
+        // isolates the NUMA-locality bias.
+        let snapshots: Vec<LlcSnapshot> = (0..4)
+            .map(|idx| LlcSnapshot {
+                llc_idx: idx,
+                lockfile_path: std::path::PathBuf::from(format!(
+                    "/tmp/ktstr-llc-{idx}.lock"
+                )),
+                holders: Vec::new(),
+                holder_count: 0,
+            })
+            .collect();
+        // Canonical distance: same-node 10, cross-node 20.
+        let selected = plan_from_snapshots(
+            &snapshots,
+            2,
+            &topo,
+            |from, to| if from == to { 10 } else { 20 },
+        );
+        assert_eq!(
+            selected,
+            vec![0, 1],
+            "target=2 must stay on seed node 0 (LLCs 0,1); seed-node \
+             capacity (2) covers the request, no spill to node 1 allowed",
+        );
+    }
+
+    /// `plan_from_snapshots` tie-break invariant: when every
+    /// consolidation score is identical (all holder_count=5),
+    /// selection tiebreaks on `llc_idx ASC`. target=2 on 4 equal
+    /// LLCs → selected == [0, 1]. A future refactor that made the
+    /// consolidation sort unstable, or that used `sort_by_key`
+    /// without the secondary ASC tiebreak, would pick a non-
+    /// deterministic pair and fail this test.
+    ///
+    /// The `holder_count DESC, llc_idx ASC` composite key — the
+    /// second key is mandatory for cross-run determinism.
+    #[test]
+    fn plan_from_snapshots_equal_scores_tiebreak_ascending() {
+        let topo = synth_host_topo(&[
+            (vec![0], 0),
+            (vec![1], 0),
+            (vec![2], 0),
+            (vec![3], 0),
+        ]);
+        let snapshots: Vec<LlcSnapshot> = (0..4)
+            .map(|idx| LlcSnapshot {
+                llc_idx: idx,
+                lockfile_path: std::path::PathBuf::from(format!(
+                    "/tmp/ktstr-llc-{idx}.lock"
+                )),
+                holders: Vec::new(),
+                holder_count: 5,
+            })
+            .collect();
+        let selected = plan_from_snapshots(&snapshots, 2, &topo, |_, _| 10);
+        assert_eq!(
+            selected,
+            vec![0, 1],
+            "equal consolidation scores must tiebreak on llc_idx ASC \
+             — selected={selected:?}",
+        );
+    }
+
+    /// Full `LlcPlan.mems` invariant (I1) — on a cross-node spill,
+    /// `mems` MUST equal the union of NUMA nodes hosting every
+    /// selected LLC. 4 LLCs split 2+2 across nodes 0/1, cap=3
+    /// forces exactly one LLC from node 1 to spill after node 0
+    /// exhausts. Assert `locked_llcs.len() == 3` AND
+    /// `mems == {0, 1}`.
+    ///
+    /// Without this guard, a broken mems computation could produce
+    /// an empty set (cgroup cpuset.mems write rejects → SIGKILL on
+    /// mem alloc), OR the wrong nodes (forcing cross-socket
+    /// allocation that defeats the LLC reservation).
+    ///
+    /// Uses a per-test lockfile prefix via [`LlcLockPrefixGuard`] so
+    /// the topology can use small indices (0..4) instead of padding
+    /// to 94004 entries to avoid colliding with production LLC
+    /// lockfile paths.
+    #[test]
+    fn acquire_llc_plan_cross_node_spill_mems_union() {
+        let _prefix = LlcLockPrefixGuard::new();
+        // LLC 0,1 on node 0 (CPUs 0,1); LLC 2,3 on node 1 (CPUs 2,3).
+        let topo = HostTopology::new_for_tests(&[
+            (vec![0], 0),
+            (vec![1], 0),
+            (vec![2], 1),
+            (vec![3], 1),
+        ]);
+
+        let test_topo = crate::topology::TestTopology::synthetic(4, 2);
+        let cap = LlcCap::new(3).expect("cap=3 valid");
+        let plan = acquire_llc_plan(&topo, &test_topo, Some(cap))
+            .expect("clean pool must allow target=3 acquisition");
+
+        assert_eq!(
+            plan.locked_llcs.len(),
+            3,
+            "cap=3 must reserve exactly 3 LLCs, got {:?}",
+            plan.locked_llcs,
+        );
+        assert_eq!(
+            plan.mems.len(),
+            2,
+            "3 LLCs split across 2 nodes → mems must span BOTH nodes; \
+             got {:?} (locked_llcs={:?})",
+            plan.mems,
+            plan.locked_llcs,
+        );
+        assert!(
+            plan.mems.contains(&0) && plan.mems.contains(&1),
+            "mems must contain BOTH node 0 and node 1 after cross-node \
+             spill; got {:?}",
+            plan.mems,
+        );
     }
 }

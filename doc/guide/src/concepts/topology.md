@@ -199,3 +199,13 @@ See also: [CgroupManager](../architecture/cgroup-manager.md) for
 management, [WorkloadHandle](../architecture/workload-handle.md) for
 worker lifecycle, [Scenarios](scenarios.md) for how `CpusetPartition`
 drives cpuset partitioning.
+
+## Host-side reservation
+
+`TestTopology::numa_distance` is also consumed at host-side
+`--llc-cap` plan time: `acquire_llc_plan` uses it to order the
+spill from the seed NUMA node to nearest-by-distance neighbors
+when the capped LLC count cannot fit within a single node. The
+resulting plan is a `LOCK_SH` reservation with a
+`cpuset.mems` union written to a cgroup v2 sandbox. See
+[Resource Budget](resource-budget.md) for the full pipeline.

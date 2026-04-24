@@ -148,5 +148,5 @@ SCX_OPS_DEFINE(ktstr_ops,
 	       .dispatch	= (void *)ktstr_dispatch,
 	       .init		= (void *)ktstr_init,
 	       .exit		= (void *)ktstr_exit,
-	       .timeout_ms	= 5000,
+	       .timeout_ms	= 20000,
 	       .name		= "ktstr");
