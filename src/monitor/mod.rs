@@ -228,16 +228,39 @@ pub fn sample_looks_valid(sample: &MonitorSample) -> bool {
 
 /// Find a vmlinux for tests.
 ///
-/// Reads `KTSTR_KERNEL` for an explicit directory override and
-/// delegates the remaining search to [`crate::kernel_path::resolve_btf`]
-/// so tests pick the same kernel the rest of ktstr does. See that
-/// function for the exact resolution order.
+/// Routes the `KTSTR_KERNEL` read through [`crate::ktstr_kernel_env`]
+/// so the empty/whitespace normalization matches every other reader.
+/// When the env value is a [`crate::kernel_path::KernelId::Version`]
+/// or [`KernelId::CacheKey`], the cache is consulted via
+/// [`crate::cli::resolve_cached_kernel`] and the resolved entry dir is
+/// passed to [`crate::kernel_path::resolve_btf`]; when it is a
+/// [`KernelId::Path`], the path flows through `resolve_btf` directly
+/// as before. Unset env or unresolved Version/CacheKey falls through
+/// to `resolve_btf(None)` so the local-tree / sysfs fallbacks still
+/// apply. See `resolve_btf` for the full resolution order.
 #[cfg(test)]
 pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
-    let kernel_dir = std::env::var("KTSTR_KERNEL").ok();
-    let result = crate::kernel_path::resolve_btf(kernel_dir.as_deref());
+    use crate::kernel_path::KernelId;
+    let raw = crate::ktstr_kernel_env();
+    let resolved_dir: Option<String> = match raw.as_deref().map(KernelId::parse) {
+        Some(KernelId::Path(p)) => p.into_os_string().into_string().ok(),
+        Some(id @ (KernelId::Version(_) | KernelId::CacheKey(_))) => {
+            // Cache lookup. On failure, fall through to `None` so
+            // `resolve_btf(None)` still tries the local-tree / sysfs
+            // fallbacks — a test running with a stale env pointer
+            // shouldn't be any worse off than a test with no env set.
+            crate::cli::resolve_cached_kernel(&id, "ktstr test")
+                .ok()
+                .and_then(|p| p.into_os_string().into_string().ok())
+        }
+        None => None,
+    };
+    let result = crate::kernel_path::resolve_btf(resolved_dir.as_deref());
     if result.is_none() {
-        crate::report::test_skip("no vmlinux found (set KTSTR_KERNEL or place vmlinux in ./linux)");
+        crate::report::test_skip(&format!(
+            "no vmlinux found; {}",
+            crate::KTSTR_KERNEL_HINT
+        ));
     }
     result
 }

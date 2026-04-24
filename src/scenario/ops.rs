@@ -38,7 +38,10 @@ use super::{CgroupGroup, Ctx, process_alive};
 /// `Op::run_payload`) over naming variants directly; new
 /// constructors are added alongside new variants and are the stable
 /// surface.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, strum::EnumDiscriminants)]
+#[strum_discriminants(name(OpKind))]
+#[strum_discriminants(derive(strum::EnumIter))]
+#[strum_discriminants(vis(pub))]
 #[non_exhaustive]
 pub enum Op {
     /// Create a new cgroup under the managed cgroup parent.
@@ -740,23 +743,44 @@ impl HoldSpec {
 
 impl Op {
     /// Return a unique bit index for each Op variant (for op_kinds bitmask).
+    ///
+    /// Dispatched via [`OpKind`] — the auto-generated fieldless shadow
+    /// enum from `#[derive(strum::EnumDiscriminants)]` on [`Op`]. The
+    /// indirection is load-bearing: `OpKind` also derives `EnumIter`,
+    /// so `op_kind_bit_indices_are_unique_and_contiguous` can
+    /// exhaustively verify every `OpKind` maps to a distinct,
+    /// contiguous bit index — guarding against a new variant slipping
+    /// in with a duplicated or gap-leaving index.
     fn discriminant(&self) -> u32 {
+        OpKind::from(self).bit_index()
+    }
+}
+
+impl OpKind {
+    /// Unique bit index per variant, used by [`Op::discriminant`] for
+    /// the `op_kinds` bitmask. Contiguous from 0 — the
+    /// `op_kind_bit_indices_are_unique_and_contiguous` test iterates
+    /// every variant via `EnumIter` and pins this.
+    fn bit_index(self) -> u32 {
         match self {
-            Op::AddCgroup { .. } => 0,
-            Op::RemoveCgroup { .. } => 1,
-            Op::SetCpuset { .. } => 2,
-            Op::ClearCpuset { .. } => 3,
-            Op::SwapCpusets { .. } => 4,
-            Op::Spawn { .. } => 5,
-            Op::StopCgroup { .. } => 6,
-            Op::SetAffinity { .. } => 7,
-            Op::SpawnHost { .. } => 8,
-            Op::MoveAllTasks { .. } => 9,
-            Op::RunPayload { .. } => 10,
-            Op::WaitPayload { .. } => 11,
-            Op::KillPayload { .. } => 12,
+            OpKind::AddCgroup => 0,
+            OpKind::RemoveCgroup => 1,
+            OpKind::SetCpuset => 2,
+            OpKind::ClearCpuset => 3,
+            OpKind::SwapCpusets => 4,
+            OpKind::Spawn => 5,
+            OpKind::StopCgroup => 6,
+            OpKind::SetAffinity => 7,
+            OpKind::SpawnHost => 8,
+            OpKind::MoveAllTasks => 9,
+            OpKind::RunPayload => 10,
+            OpKind::WaitPayload => 11,
+            OpKind::KillPayload => 12,
         }
     }
+}
+
+impl Op {
 
     /// Create a new cgroup.
     pub fn add_cgroup(name: impl Into<Cow<'static, str>>) -> Self {
@@ -3102,6 +3126,54 @@ mod tests {
 
     use super::*;
     use crate::vmm::shm_ring::parse_shm_params_from_str;
+    use strum::IntoEnumIterator;
+
+    /// Exhaustiveness guard for [`OpKind::bit_index`]. A new [`Op`]
+    /// variant auto-generates a matching [`OpKind`] variant (via
+    /// `#[derive(strum::EnumDiscriminants)]`), which the match arms
+    /// in `bit_index` must cover — adding an `Op` variant without
+    /// extending `bit_index` fails compilation. But the arms could
+    /// still drift in a way the compiler cannot see: two variants
+    /// accidentally mapped to the same index, or the contiguous-
+    /// from-zero invariant broken by a typo.
+    ///
+    /// This test iterates every `OpKind` via `EnumIter` and pins
+    /// both invariants:
+    /// - Every variant produces a distinct bit index.
+    /// - Indices are contiguous `0..N` where N = variant count.
+    ///
+    /// A regression — duplicate index, gap, or an off-by-one —
+    /// surfaces here before it silently corrupts the `op_kinds`
+    /// bitmask semantics elsewhere in the crate.
+    #[test]
+    fn op_kind_bit_indices_are_unique_and_contiguous() {
+        let kinds: Vec<OpKind> = OpKind::iter().collect();
+        let indices: Vec<u32> = kinds.iter().copied().map(OpKind::bit_index).collect();
+
+        // Unique: every kind has a distinct index.
+        let unique: std::collections::BTreeSet<u32> = indices.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            indices.len(),
+            "OpKind::bit_index produced duplicates. \
+             Pairs (OpKind, bit_index): {:?}. Fix the match in \
+             OpKind::bit_index so every variant maps to a distinct \
+             bit.",
+            kinds.iter().zip(&indices).collect::<Vec<_>>(),
+        );
+
+        // Contiguous: indices form `0..N`.
+        let expected: Vec<u32> = (0..kinds.len() as u32).collect();
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted, expected,
+            "OpKind::bit_index indices must be contiguous from 0 \
+             (no gaps, no duplicates). Got sorted indices {sorted:?} \
+             for {} OpKind variants; expected {expected:?}.",
+            kinds.len(),
+        );
+    }
 
     // -- Traverse combinator (test-only) --
 

@@ -454,6 +454,49 @@ pub mod prelude {
     };
 }
 
+/// Name of the environment variable that selects a kernel for every
+/// ktstr entry point (`ktstr run`, `ktstr shell`, `cargo ktstr test`,
+/// in-process tests, post-run analysis). Single source of truth so
+/// the name is not spelled by hand at each reader; if the name ever
+/// changes, the change lands in one place instead of fanning out to
+/// every call site.
+pub const KTSTR_KERNEL_ENV: &str = "KTSTR_KERNEL";
+
+/// Shared skip / error hint for call sites that cannot proceed
+/// without a resolvable kernel. Phrased so the user sees the same
+/// wording regardless of which layer surfaced the failure — tests,
+/// CLI, monitor probes, and sidecar writers all point the operator
+/// at the same remediation. Referenced by the non-VM-boot skip
+/// paths in `cache.rs`, `probe/btf.rs`, `monitor/mod.rs`,
+/// `test_support/eval.rs`, and `test_support/mod.rs`.
+///
+/// Format: caller prefixes the actionable first clause (e.g.
+/// "no vmlinux found") and appends this constant as the
+/// remediation tail. Keeping the prefix per-caller lets each site
+/// name the specific artifact it needs while the `KTSTR_KERNEL`
+/// wording stays consistent.
+pub const KTSTR_KERNEL_HINT: &str = "set KTSTR_KERNEL to a kernel source directory, \
+    a version (e.g. `6.14.2`), or a cache key (see `cargo ktstr kernel list`), or run \
+    `cargo ktstr kernel build` to populate the cache";
+
+/// Read [`KTSTR_KERNEL_ENV`] once, normalizing the raw value:
+/// missing / empty / whitespace-only reads collapse to `None`, and
+/// a surrounding-whitespace trim is applied so a shell-quoted
+/// `KTSTR_KERNEL=" ../linux"` behaves the same as the unquoted
+/// form. Every caller that reads the env var should route through
+/// this helper so the normalization rules live in one place; a
+/// future change to the rules (e.g. accepting a trailing slash)
+/// propagates to every site automatically.
+///
+/// Returns the raw string; callers that need a structured
+/// identifier parse with [`kernel_path::KernelId::parse`].
+pub fn ktstr_kernel_env() -> Option<String> {
+    std::env::var(KTSTR_KERNEL_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Find a bootable kernel image on the host.
 ///
 /// Resolution chain:
@@ -488,16 +531,16 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
     // to avoid silently returning a different kernel.
     let mut skip_cache_scan = false;
 
-    // 1. KTSTR_KERNEL env var with KernelId parsing.
-    if let Some(val) = std::env::var("KTSTR_KERNEL")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    {
+    // 1. KTSTR_KERNEL env var with KernelId parsing. Route through
+    // `ktstr_kernel_env()` so the empty/whitespace normalization
+    // matches every other reader in the crate.
+    if let Some(val) = ktstr_kernel_env() {
         match KernelId::parse(&val) {
             KernelId::Path(_) => match kernel_path::find_image(Some(&val), release_ref) {
                 Some(p) => return Ok(Some(p)),
-                None => anyhow::bail!("KTSTR_KERNEL={val} does not contain a kernel image"),
+                None => anyhow::bail!(
+                    "KTSTR_KERNEL={val} does not contain a kernel image. {KTSTR_KERNEL_HINT}"
+                ),
             },
             KernelId::Version(ref ver) => {
                 // Only tarball keys use the {ver}-tarball-{arch}-kc{suffix} pattern.
@@ -969,5 +1012,115 @@ mod tests {
             worker_ready_marker_path(u32::MAX),
             "/tmp/ktstr-worker-ready-4294967295"
         );
+    }
+
+    // -- ktstr_kernel_env + KTSTR_KERNEL round-trip --
+    //
+    // KTSTR_KERNEL is the canonical cross-process hand-off for kernel
+    // selection: `cargo ktstr test` resolves `--kernel` in the parent,
+    // writes the resolved path back through `KTSTR_KERNEL_ENV`, and
+    // every reader in the child (`find_kernel`, `detect_kernel_version`,
+    // `find_test_vmlinux`) pulls it via `ktstr_kernel_env`. A
+    // normalization drift between writer and reader would produce
+    // silent resolution errors on the child side. Pin the round-trip
+    // so such a drift is caught at test time.
+
+    /// `ktstr_kernel_env` must return exactly the unmodified interior
+    /// string when the env holds a plain absolute path. This is the
+    /// happy-path channel between the parent's
+    /// `std::fs::canonicalize(&p)` → `cmd.env(KTSTR_KERNEL_ENV, dir)`
+    /// and the child's `ktstr_kernel_env` read. A regression that
+    /// changed the normalization (adding a trailing slash, resolving
+    /// symlinks, URL-encoding, etc.) would break the hand-off.
+    #[test]
+    fn ktstr_kernel_env_round_trips_absolute_path() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+        let _guard = EnvVarGuard::set(KTSTR_KERNEL_ENV, &canonical);
+        let read_back = ktstr_kernel_env().expect("env is set");
+        assert_eq!(
+            std::path::PathBuf::from(&read_back),
+            canonical,
+            "writer-reader round-trip must preserve the exact path; \
+             drift between parent's canonicalize output and child's \
+             ktstr_kernel_env read breaks every downstream resolver",
+        );
+    }
+
+    /// Unset env reads as `None` — the default-resolution branch
+    /// that `find_kernel`'s cache scan and `find_test_vmlinux`'s
+    /// local-tree fallback both depend on.
+    #[test]
+    fn ktstr_kernel_env_unset_is_none() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::remove(KTSTR_KERNEL_ENV);
+        assert!(
+            ktstr_kernel_env().is_none(),
+            "unset KTSTR_KERNEL must read as None so fallback resolvers activate",
+        );
+    }
+
+    /// Empty-string env reads as `None`. Every reader should treat
+    /// `KTSTR_KERNEL=""` the same as "unset" rather than erroring
+    /// on an empty path — shells and Makefiles routinely emit empty
+    /// values for unused variables, and failing on them would break
+    /// unrelated CI flows.
+    #[test]
+    fn ktstr_kernel_env_empty_is_none() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set(KTSTR_KERNEL_ENV, "");
+        assert!(
+            ktstr_kernel_env().is_none(),
+            "empty KTSTR_KERNEL must collapse to None; CI flows routinely \
+             pass empty strings for unused variables",
+        );
+    }
+
+    /// Whitespace-only env reads as `None`. A shell-quoted
+    /// `KTSTR_KERNEL="   "` is semantically the empty case even
+    /// though `std::env::var` sees a non-empty string — the reader
+    /// must trim before the empty check.
+    #[test]
+    fn ktstr_kernel_env_whitespace_is_none() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set(KTSTR_KERNEL_ENV, "   \t\n  ");
+        assert!(
+            ktstr_kernel_env().is_none(),
+            "whitespace-only KTSTR_KERNEL must collapse to None via trim \
+             + empty-filter; no caller parses a whitespace-only value \
+             meaningfully",
+        );
+    }
+
+    /// A valid path with surrounding whitespace is trimmed and
+    /// returned as the interior token. Pins the contract that the
+    /// reader tolerates shell-quoting quirks without distorting the
+    /// underlying value.
+    #[test]
+    fn ktstr_kernel_env_trims_surrounding_whitespace() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set(KTSTR_KERNEL_ENV, "  ../linux  ");
+        let read_back = ktstr_kernel_env().expect("env is set");
+        assert_eq!(
+            read_back, "../linux",
+            "surrounding whitespace must be trimmed but the interior \
+             preserved verbatim",
+        );
+    }
+
+    /// `KTSTR_KERNEL_ENV` must match the literal spelling `"KTSTR_KERNEL"`.
+    /// Trivial pin, but load-bearing: readers that bypass the helper
+    /// (e.g. hand-rolled `std::env::var("KTSTR_KERNEL")` in an ad-hoc
+    /// script) match this string. A typo here would silently divorce
+    /// the crate's canonical reader from every external tool.
+    #[test]
+    fn ktstr_kernel_env_constant_is_literal() {
+        assert_eq!(KTSTR_KERNEL_ENV, "KTSTR_KERNEL");
     }
 }

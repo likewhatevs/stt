@@ -347,6 +347,24 @@ pub static METRICS: &[MetricDef] = &[
         // improvement raises it. `default_abs = 10.0` is the absolute
         // iteration-count floor below which deltas are noise;
         // `default_rel = 0.10` mirrors the `total_iterations` gate.
+        //
+        // Derivation of `abs = 10`: this metric is PER-WORKER. In-tree
+        // fixtures span `workers_per_cgroup` from 1 through 8 (see
+        // the KtstrTestEntry declarations under src/scenario/*.rs and
+        // tests/*.rs); `KtstrTestEntry::DEFAULT.workers_per_cgroup`
+        // is 2, with scenario-level overrides commonly picking 4 or
+        // 8. A per-worker floor of 10 therefore corresponds to
+        // aggregate regressions of 10-80 total iterations across the
+        // supported worker counts — high enough that a lightly-
+        // loaded scheduler's jitter does not flag a regression, low
+        // enough that a genuine drop (e.g. a cgroup that fell behind
+        // by 10 iterations at workers=1, or 80 at workers=8) still
+        // trips the gate. Going below 10 would flag normal cross-run
+        // jitter on single-worker configs; going above 10 would mask
+        // regressions on low-worker-count tests. The `rel=0.10`
+        // companion gate handles larger throughputs proportionally,
+        // so the `abs=10` floor only binds in the small-count regime
+        // where rel-only would let single-digit losses slip through.
         name: "worst_iterations_per_worker",
         polarity: crate::test_support::Polarity::HigherBetter,
         default_abs: 10.0,

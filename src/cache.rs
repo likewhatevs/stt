@@ -5094,7 +5094,7 @@ mod tests {
     #[test]
     fn strip_vmlinux_debug_preserves_monitor_symbols() {
         let Some(path) = crate::monitor::find_test_vmlinux() else {
-            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
+            skip!("no vmlinux found; {}", crate::KTSTR_KERNEL_HINT);
         };
         // find_test_vmlinux may return /sys/kernel/btf/vmlinux (raw BTF,
         // not an ELF), which strip_vmlinux_debug cannot parse.
@@ -5191,7 +5191,7 @@ mod tests {
     #[test]
     fn strip_vmlinux_debug_shrinks_when_source_has_debug_info() {
         let Some(path) = crate::monitor::find_test_vmlinux() else {
-            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
+            skip!("no vmlinux found; {}", crate::KTSTR_KERNEL_HINT);
         };
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
@@ -5223,7 +5223,7 @@ mod tests {
     #[test]
     fn strip_vmlinux_debug_preserves_bpf_idr_symbols() {
         let Some(path) = crate::monitor::find_test_vmlinux() else {
-            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
+            skip!("no vmlinux found; {}", crate::KTSTR_KERNEL_HINT);
         };
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF (not ELF), cannot strip debug");
@@ -5250,7 +5250,7 @@ mod tests {
     #[test]
     fn strip_vmlinux_debug_preserves_function_symbols() {
         let Some(path) = crate::monitor::find_test_vmlinux() else {
-            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
+            skip!("no vmlinux found; {}", crate::KTSTR_KERNEL_HINT);
         };
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF (not ELF), cannot strip debug");

@@ -1995,7 +1995,7 @@ mod tests {
     #[test]
     fn parse_btf_functions_accepts_elf_vmlinux() {
         let Some(path) = crate::monitor::find_test_vmlinux() else {
-            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
+            skip!("no vmlinux found; {}", crate::KTSTR_KERNEL_HINT);
         };
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF, this test exercises the ELF path");
@@ -2015,7 +2015,7 @@ mod tests {
     #[test]
     fn resolve_field_specs_accepts_elf_vmlinux() {
         let Some(path) = crate::monitor::find_test_vmlinux() else {
-            skip!("no vmlinux found; set KTSTR_KERNEL or place vmlinux in ./linux");
+            skip!("no vmlinux found; {}", crate::KTSTR_KERNEL_HINT);
         };
         if path.starts_with("/sys/") {
             skip!("vmlinux is raw BTF, this test exercises the ELF path");

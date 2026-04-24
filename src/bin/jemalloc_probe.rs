@@ -3048,9 +3048,9 @@ fn append_probe_output_to_sidecar(
     // that refuses fdatasync). `main()` installs
     // `tracing_subscriber` so `tracing::warn!` lands on stderr by
     // default; without the init, these structured events would be
-    // dropped. Mirrors the sibling `atomic_mutate_sidecar` warn at
-    // `src/test_support/sidecar.rs` so both routes surface the
-    // same failure mode with the same fields.
+    // dropped. Structured `dir` + `err` fields let log aggregators
+    // thread the failure back to the right run without needing to
+    // parse free-form text.
     let parent_dir = path.parent().unwrap_or(Path::new("."));
     match std::fs::File::open(parent_dir) {
         Ok(parent) => {

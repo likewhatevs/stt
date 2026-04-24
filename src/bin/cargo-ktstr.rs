@@ -424,7 +424,30 @@ fn run_cargo_sub(
     if let Some(ref val) = kernel {
         match KernelId::parse(val) {
             KernelId::Path(p) => {
-                let dir = std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(&p));
+                // Canonicalize BEFORE export. The exec'd cargo
+                // subcommand changes cwd to the workspace root (or
+                // wherever `cargo` itself runs from), so a relative
+                // path like `../linux` interpreted from cargo-ktstr's
+                // cwd and the same string interpreted from the child's
+                // cwd resolve to different directories. `canonicalize`
+                // pins the string to an absolute realpath at the
+                // parent's cwd so every downstream reader
+                // (`find_kernel` in the child, `detect_kernel_version`
+                // in the sidecar writer, `find_test_vmlinux` in any
+                // nested probe) sees the same directory. The previous
+                // `unwrap_or_else(|_| PathBuf::from(&p))` silently
+                // fell back to the raw string on canonicalize failure
+                // — bail loudly instead so a typo doesn't exec into a
+                // successful-looking run that silently picks up a
+                // different kernel via `find_kernel`'s fallback chain.
+                let dir = std::fs::canonicalize(&p).map_err(|e| {
+                    format!(
+                        "--kernel {}: path does not exist or cannot be \
+                         canonicalized ({e:#}). {hint}",
+                        p.display(),
+                        hint = ktstr::KTSTR_KERNEL_HINT,
+                    )
+                })?;
                 // Boundary bridge: `build_kernel` returns
                 // `anyhow::Result<()>` while this function still
                 // returns `Result<(), String>`, so we stringify at
@@ -432,13 +455,26 @@ fn run_cargo_sub(
                 // cargo-ktstr.rs is pending and would drop this
                 // last bridge.
                 build_kernel(&dir, false).map_err(|e| format!("{e:#}"))?;
-                cmd.env("KTSTR_KERNEL", &dir);
+                cmd.env(ktstr::KTSTR_KERNEL_ENV, &dir);
             }
             id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
                 let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
                     .map_err(|e| format!("{e:#}"))?;
-                eprintln!("cargo ktstr: using kernel {}", cache_dir.display());
-                cmd.env("KTSTR_KERNEL", &cache_dir);
+                // Canonicalize the cache dir defensively. `CacheDir`
+                // roots at the XDG cache home (or `KTSTR_CACHE_DIR`),
+                // both of which are typically absolute — but an
+                // operator-supplied `KTSTR_CACHE_DIR=./cache` would
+                // produce a relative path here and reach the same
+                // cwd-divergence bug the Path branch defends against.
+                // `canonicalize` resolves that from the parent's cwd;
+                // a failure means the cache dir was removed between
+                // lookup and export (rare race), in which case we
+                // fall back to the original path rather than bailing
+                // — the child will re-enter its own cache lookup and
+                // surface the real missing-entry error.
+                let dir = std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir);
+                eprintln!("cargo ktstr: using kernel {}", dir.display());
+                cmd.env(ktstr::KTSTR_KERNEL_ENV, &dir);
             }
         }
     }

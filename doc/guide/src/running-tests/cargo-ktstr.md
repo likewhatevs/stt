@@ -1,13 +1,15 @@
 # cargo-ktstr
 
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
-workflow. Subcommands in `--help` order: `test`, `coverage`,
-`stats`, `kernel`, `model`, `verifier`, `completions`,
-`show-host`, `show-thresholds`, `cleanup`, `shell`.
+workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
+`coverage`, `llvm-cov`, `stats`, `kernel`, `model`, `verifier`,
+`completions`, `show-host`, `show-thresholds`, `cleanup`, `shell`.
 
 ## test
 
 Build the kernel (if needed) and run tests via `cargo nextest run`.
+Also available as `cargo ktstr nextest` — a visible clap alias that
+expands to the same subcommand, so the two forms are interchangeable.
 
 ```sh
 cargo ktstr test                                               # auto-discover kernel
@@ -94,6 +96,37 @@ Arguments after `coverage` are passed through to
 cargo ktstr coverage -- --workspace --profile ci --lcov --output-path lcov.info
 cargo ktstr coverage -- --features integration
 ```
+
+## llvm-cov
+
+Raw passthrough to `cargo llvm-cov` with arbitrary arguments. Use
+this for `llvm-cov` subcommands that don't fit the `coverage`
+flow — `report`, `clean`, `show-env`, etc. When you want
+`cargo llvm-cov nextest`, prefer [`cargo ktstr coverage`](#coverage);
+this subcommand carries the same kernel-resolution and
+`--no-perf-mode` plumbing but hands every remaining argument to
+`cargo llvm-cov` unchanged.
+
+```sh
+cargo ktstr llvm-cov report --lcov --output-path lcov.info    # generate report from prior run
+cargo ktstr llvm-cov clean --workspace                         # wipe accumulated coverage data
+cargo ktstr llvm-cov show-env                                  # print env cargo-llvm-cov would set
+cargo ktstr llvm-cov --kernel ../linux report                  # pin kernel + passthrough
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--kernel ID` | auto | Kernel identifier: path, version, or cache key. Same resolution as `test` and `coverage`. |
+| `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
+
+Note: a bare `cargo ktstr llvm-cov` (no trailing subcommand)
+dispatches to `cargo llvm-cov`, which runs `cargo test` — ktstr
+tests rely on the nextest harness for gauntlet expansion
+(flag-profile × topology-preset variants) and VM dispatch. Under
+bare `cargo test`, only the `#[test]` stubs run and gauntlet
+variants are silently skipped. Always pass a subcommand after
+`llvm-cov` (most often `nextest`, for which `cargo ktstr coverage`
+is the shorter route).
 
 ## kernel
 

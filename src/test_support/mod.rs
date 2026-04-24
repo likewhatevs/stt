@@ -144,10 +144,8 @@ pub(crate) fn require_kernel() -> std::path::PathBuf {
     match crate::find_kernel() {
         Ok(Some(p)) => p,
         Ok(None) => panic!(
-            "ktstr_test: test requires a kernel but none was found. \
-             Set KTSTR_KERNEL to a kernel source dir / version / cache key, \
-             place a built kernel under ./linux or ../linux, or run \
-             `cargo ktstr kernel build` to populate the cache."
+            "ktstr_test: test requires a kernel but none was found. {}",
+            crate::KTSTR_KERNEL_HINT
         ),
         Err(e) => panic!("ktstr_test: kernel resolution failed: {e:#}"),
     }
@@ -166,9 +164,10 @@ pub(crate) fn require_vmlinux(kernel_path: &std::path::Path) -> std::path::PathB
         panic!(
             "ktstr_test: no vmlinux found alongside {}. The cache entry or \
              kernel build is incomplete. Rebuild with `cargo ktstr kernel \
-             build --force` or point KTSTR_KERNEL at a directory that \
-             contains both the kernel image and `vmlinux`.",
+             build --force`; the specified kernel must include `vmlinux` \
+             alongside the boot image. {}",
             kernel_path.display(),
+            crate::KTSTR_KERNEL_HINT,
         )
     })
 }

@@ -26,32 +26,170 @@ use btf_rs::{Btf, Type};
 ///
 /// Any other input is rejected with a "not recognized as raw BTF or
 /// ELF vmlinux" error.
+///
+/// # BTF sidecar cache
+///
+/// For ELF inputs only, the extracted `.BTF` section bytes are cached
+/// as a sibling file at `<path>.btf` (e.g. `vmlinux` →
+/// `vmlinux.btf`). On subsequent loads, if the sidecar exists and
+/// its mtime is greater than or equal to the vmlinux mtime, the
+/// cached bytes are read and parsed directly, skipping the goblin
+/// ELF parse + `.BTF` section extraction (the slow path on a
+/// multi-hundred-MB vmlinux).
+///
+/// The sidecar is written lazily on first load after a cache miss.
+/// Write failures (e.g. read-only directory) are logged at
+/// `tracing::warn` level and do not fail the load — the function
+/// falls through with the freshly-parsed BTF. Raw-BTF inputs never
+/// write a sidecar: the input file IS the BTF blob and a sidecar
+/// would just be a redundant copy of itself.
+///
+/// Staleness: mtime-based, no content hash. `CacheDir::store`'s
+/// atomic rename path bumps vmlinux mtime when an entry is replaced,
+/// so a previously-written sidecar next to the old vmlinux surfaces
+/// as stale (`mtime(sidecar) < mtime(vmlinux)`) and the bytes are
+/// re-extracted + re-written on the next load. Source-tree
+/// vmlinuxes rebuilt in place bump mtime the same way.
 pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
     let data = std::fs::read(path).context("read file")?;
-    // Try raw BTF first (starts with BTF magic 0x9FEB)
-    if data.len() >= 4 && data[0] == 0x9F && data[1] == 0xEB {
+    // Raw BTF: first 2 bytes are the 0x9FEB magic. Parse directly;
+    // never write a sidecar (would be a byte-for-byte self-copy).
+    if is_raw_btf(&data) {
         return Btf::from_bytes(&data).map_err(|e| anyhow::anyhow!("{e}"));
     }
-    // Try ELF — extract .BTF section
-    if let Ok(elf) = goblin::elf::Elf::parse(&data) {
-        let btf_shdr = elf
-            .section_headers
-            .iter()
-            .find(|shdr| elf.shdr_strtab.get_at(shdr.sh_name) == Some(".BTF"));
-        if let Some(shdr) = btf_shdr {
-            let offset = shdr.sh_offset as usize;
-            let size = shdr.sh_size as usize;
-            let btf_data = data
-                .get(offset..offset + size)
-                .context(".BTF section data out of bounds")?;
-            return Btf::from_bytes(btf_data).map_err(|e| anyhow::anyhow!("{e}"));
+
+    // ELF path: try the BTF sidecar cache before re-parsing ELF.
+    let sidecar = btf_sidecar_path(path);
+    if sidecar_fresh(&sidecar, path) {
+        match std::fs::read(&sidecar) {
+            Ok(cached) if is_raw_btf(&cached) => {
+                match Btf::from_bytes(&cached) {
+                    Ok(btf) => return Ok(btf),
+                    Err(e) => {
+                        // Parse failure on a fresh-looking sidecar:
+                        // treat as corrupt and fall through to ELF
+                        // extraction. The subsequent write overwrites
+                        // the corrupt file.
+                        tracing::warn!(
+                            path = %sidecar.display(),
+                            err = %e,
+                            "btf sidecar parse failed; falling back to ELF extraction",
+                        );
+                    }
+                }
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    path = %sidecar.display(),
+                    "btf sidecar lacks 0x9FEB magic; falling back to ELF extraction",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %sidecar.display(),
+                    err = %e,
+                    "btf sidecar read failed; falling back to ELF extraction",
+                );
+            }
         }
-        bail!("vmlinux ELF has no .BTF section");
     }
-    bail!(
-        "{}: not recognized as raw BTF (missing 0x9FEB magic) or ELF vmlinux",
-        path.display()
-    )
+
+    // Fallback: parse ELF, extract `.BTF` section bytes.
+    let elf = goblin::elf::Elf::parse(&data).map_err(|_| {
+        anyhow::anyhow!(
+            "{}: not recognized as raw BTF (missing 0x9FEB magic) or ELF vmlinux",
+            path.display()
+        )
+    })?;
+    let btf_shdr = elf
+        .section_headers
+        .iter()
+        .find(|shdr| elf.shdr_strtab.get_at(shdr.sh_name) == Some(".BTF"));
+    let shdr = match btf_shdr {
+        Some(s) => s,
+        None => bail!("vmlinux ELF has no .BTF section"),
+    };
+    let offset = shdr.sh_offset as usize;
+    let size = shdr.sh_size as usize;
+    let btf_data = data
+        .get(offset..offset + size)
+        .context(".BTF section data out of bounds")?;
+    let btf = Btf::from_bytes(btf_data).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Write sidecar on successful parse. Errors are non-fatal — the
+    // load succeeds regardless, we just miss the cache on future loads.
+    if let Err(e) = write_btf_sidecar(&sidecar, btf_data) {
+        tracing::warn!(
+            path = %sidecar.display(),
+            err = %e,
+            "btf sidecar write failed; BTF will be re-extracted from ELF on next load",
+        );
+    }
+
+    Ok(btf)
+}
+
+/// Sidecar path for a given vmlinux path: append `.btf` to the
+/// existing filename so the sidecar sits next to vmlinux in the
+/// same directory (e.g. `<cache-entry>/vmlinux` →
+/// `<cache-entry>/vmlinux.btf`). Using append-suffix rather than
+/// `with_extension` preserves any existing extension on the input
+/// (uncommon for real vmlinuxes, but robust against paths like
+/// `vmlinux.elf`).
+fn btf_sidecar_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".btf");
+    std::path::PathBuf::from(name)
+}
+
+/// True iff `data` begins with the little-endian raw-BTF magic
+/// (bytes 0x9F then 0xEB in file order, i.e. the u16 0xEB9F read LE).
+///
+/// `is_raw_btf` accepts only little-endian BTF; the host
+/// architectures ktstr supports are LE, so a big-endian BTF blob
+/// here would signal an unsupported configuration. `btf-rs` itself
+/// would parse big-endian BTF too — it branches on the magic at
+/// `cbtf::btf_header::from_reader` and reads the remaining fields
+/// through `Endianness::Big` — but such inputs are not a supported
+/// ktstr configuration, so we reject them at the sidecar/magic
+/// gate and let the caller see the "not recognized as raw BTF"
+/// error from the ELF-parse fallback.
+fn is_raw_btf(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == 0x9F && data[1] == 0xEB
+}
+
+/// Is the sidecar at least as new as its vmlinux? Returns false when
+/// either file is missing or any mtime cannot be read (safe-default:
+/// treat as miss and re-extract from ELF).
+fn sidecar_fresh(sidecar: &Path, vmlinux: &Path) -> bool {
+    let Ok(sidecar_mtime) = std::fs::metadata(sidecar).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let Ok(vmlinux_mtime) = std::fs::metadata(vmlinux).and_then(|m| m.modified()) else {
+        return false;
+    };
+    sidecar_mtime >= vmlinux_mtime
+}
+
+/// Atomically write `bytes` to `sidecar`. Creates a tempfile in the
+/// sidecar's parent directory and persists it via rename so
+/// concurrent readers either see the old sidecar or the new one,
+/// never a partial write.
+fn write_btf_sidecar(sidecar: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = sidecar
+        .parent()
+        .context("btf sidecar path has no parent directory")?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .context("create tempfile for btf sidecar")?;
+    tmp.write_all(bytes)
+        .context("write btf sidecar contents")?;
+    tmp.as_file()
+        .sync_all()
+        .context("fsync btf sidecar before rename")?;
+    tmp.persist(sidecar)
+        .map_err(|e| anyhow::anyhow!("persist btf sidecar: {}", e.error))?;
+    Ok(())
 }
 
 /// Byte offsets of kernel struct fields needed for host-side rq monitoring.
@@ -1268,5 +1406,407 @@ mod tests {
         std::fs::write(&f, b"").unwrap();
         assert!(KernelOffsets::from_vmlinux(&f).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- BTF sidecar cache --
+    //
+    // These tests exercise the `<path>.btf` sidecar pipeline: pure
+    // helper functions (path derivation, magic check, freshness)
+    // directly, plus end-to-end load_btf_from_path behavior against a
+    // real-ELF fixture when one is available on the host.
+
+    #[test]
+    fn btf_sidecar_path_appends_dot_btf() {
+        let p = std::path::Path::new("/cache/vmlinux");
+        assert_eq!(
+            btf_sidecar_path(p),
+            std::path::PathBuf::from("/cache/vmlinux.btf"),
+        );
+    }
+
+    #[test]
+    fn btf_sidecar_path_preserves_existing_extension() {
+        // Append-suffix semantics, NOT `with_extension` which would
+        // replace `.elf` with `.btf`.
+        let p = std::path::Path::new("/cache/vmlinux.elf");
+        assert_eq!(
+            btf_sidecar_path(p),
+            std::path::PathBuf::from("/cache/vmlinux.elf.btf"),
+        );
+    }
+
+    #[test]
+    fn is_raw_btf_accepts_little_endian_magic() {
+        // Little-endian BTF begins with bytes 0x9F 0xEB in file
+        // order. `is_raw_btf` accepts only little-endian BTF: the
+        // host architectures ktstr supports are LE, so a big-endian
+        // BTF blob is an unsupported configuration even though
+        // btf-rs itself could parse it (see the sibling
+        // `is_raw_btf_rejects_wrong_magic_and_short_input` where
+        // the BE magic is explicitly rejected).
+        assert!(is_raw_btf(&[0x9F, 0xEB, 0x01, 0x00]));
+    }
+
+    #[test]
+    fn is_raw_btf_rejects_wrong_magic_and_short_input() {
+        // ELF magic — bytes-wise distinct from BTF magic.
+        assert!(!is_raw_btf(&[0x7F, b'E', b'L', b'F']));
+        // Big-endian BTF magic: file-order bytes 0xEB 0x9F. btf-rs
+        // itself would parse such a blob (branches on the magic at
+        // cbtf::btf_header::from_reader), but ktstr supports only
+        // LE hosts, so `is_raw_btf` deliberately rejects BE and
+        // lets the caller surface "not recognized as raw BTF" via
+        // the ELF-parse fallback.
+        assert!(!is_raw_btf(&[0xEB, 0x9F, 0x01, 0x00]));
+        // Too short to carry the 2-byte magic.
+        assert!(!is_raw_btf(&[0x9F]));
+        assert!(!is_raw_btf(&[]));
+    }
+
+    #[test]
+    fn sidecar_fresh_false_when_either_file_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktstr-btf-sidecar-missing-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vmlinux = dir.join("vmlinux");
+        let sidecar = dir.join("vmlinux.btf");
+        std::fs::write(&vmlinux, b"vmlinux-bytes").unwrap();
+        // sidecar missing → not fresh
+        assert!(!sidecar_fresh(&sidecar, &vmlinux));
+        std::fs::write(&sidecar, b"cached-btf").unwrap();
+        // both present → fresh (sidecar written after vmlinux)
+        assert!(sidecar_fresh(&sidecar, &vmlinux));
+        // vmlinux missing → not fresh (safe default)
+        std::fs::remove_file(&vmlinux).unwrap();
+        assert!(!sidecar_fresh(&sidecar, &vmlinux));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end: first load extracts BTF from ELF vmlinux and
+    /// writes the sidecar; second load reads the sidecar bytes
+    /// directly and parses them. Exercises both branches of
+    /// `load_btf_from_path` against a real vmlinux.
+    ///
+    /// Skipped when no test vmlinux is available or when
+    /// `find_test_vmlinux` resolves to raw BTF (sysfs), which
+    /// exercises a different branch that never writes a sidecar.
+    #[test]
+    fn load_btf_writes_sidecar_then_hits_cache_on_second_load() {
+        use std::time::Duration;
+
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            // Raw BTF input never writes a sidecar — wrong branch.
+            return;
+        }
+
+        // Run against a fresh temp copy so the test does not mutate
+        // the shared kernel cache or source tree. The copy shares
+        // the same directory so the sidecar's tempfile+rename lands
+        // on the same filesystem.
+        let dir = std::env::temp_dir().join(format!(
+            "ktstr-btf-sidecar-e2e-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vmlinux = dir.join("vmlinux");
+        std::fs::copy(&path, &vmlinux).unwrap();
+        let sidecar = dir.join("vmlinux.btf");
+        // Ensure vmlinux mtime is strictly less than whatever the
+        // sidecar write will stamp — avoids a same-second tie that
+        // could false-pass the freshness check on low-resolution
+        // filesystems.
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Pre-state: no sidecar exists.
+        assert!(
+            !sidecar.exists(),
+            "precondition: sidecar should not exist before first load",
+        );
+
+        // First load: extract + write sidecar.
+        let btf1 = load_btf_from_path(&vmlinux).expect("first load must succeed");
+        // Consume btf1 so the optimizer cannot elide the parse.
+        let _ = format!("{:?}", btf1.resolve_types_by_name("task_struct").is_ok());
+        assert!(
+            sidecar.exists(),
+            "first load must write sidecar at {}",
+            sidecar.display(),
+        );
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        assert!(
+            is_raw_btf(&sidecar_bytes),
+            "sidecar contents must carry the raw BTF 0x9FEB magic",
+        );
+
+        // Sanity: sidecar mtime is at/after vmlinux mtime so the
+        // freshness check on the second load picks it up.
+        assert!(
+            sidecar_fresh(&sidecar, &vmlinux),
+            "sidecar mtime must be ≥ vmlinux mtime after first load",
+        );
+
+        // Second load: should hit the cache. We verify by deleting
+        // the ELF so that any fallback to ELF parsing would fail —
+        // but wait, the function reads the ELF path first for its
+        // bytes; deletion would break even the sidecar branch
+        // (since the function reads `path` unconditionally at the
+        // top). Instead, pin the behavior by checking that a second
+        // load still succeeds AND the sidecar mtime is unchanged
+        // (a second write would bump it).
+        let sidecar_mtime_before = std::fs::metadata(&sidecar)
+            .unwrap()
+            .modified()
+            .unwrap();
+        // Sleep a bit so a spurious sidecar rewrite would be
+        // detectable via an mtime bump.
+        std::thread::sleep(Duration::from_millis(50));
+        let btf2 = load_btf_from_path(&vmlinux).expect("second load must succeed");
+        let _ = format!("{:?}", btf2.resolve_types_by_name("task_struct").is_ok());
+        let sidecar_mtime_after = std::fs::metadata(&sidecar)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            sidecar_mtime_before, sidecar_mtime_after,
+            "second load must hit sidecar cache — mtime bump proves a \
+             redundant rewrite",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Simulating a stale sidecar by making its mtime older than
+    /// vmlinux's: the next load must ignore the cached bytes and
+    /// re-extract from ELF, then overwrite the sidecar. Exercises
+    /// the `mtime(sidecar) < mtime(vmlinux)` staleness guard.
+    #[test]
+    fn load_btf_rejects_stale_sidecar() {
+        use std::time::{Duration, SystemTime};
+
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "ktstr-btf-sidecar-stale-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vmlinux = dir.join("vmlinux");
+        std::fs::copy(&path, &vmlinux).unwrap();
+        let sidecar = dir.join("vmlinux.btf");
+
+        // Plant a sidecar that predates vmlinux by writing garbage
+        // and stamping its mtime into the past. `set_times` is the
+        // portable way to force a past mtime.
+        std::fs::write(&sidecar, b"stale-sidecar-bytes").unwrap();
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&sidecar)
+            .unwrap();
+        f.set_modified(past).unwrap();
+        drop(f);
+
+        // Precondition: sidecar is older than vmlinux.
+        assert!(
+            !sidecar_fresh(&sidecar, &vmlinux),
+            "precondition: planted sidecar must be stale",
+        );
+
+        let btf = load_btf_from_path(&vmlinux)
+            .expect("load must succeed via ELF fallback despite stale sidecar");
+        let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+
+        // Post-condition: sidecar has been overwritten with fresh
+        // BTF bytes (must now start with the BTF magic, not the
+        // garbage we planted).
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        assert!(
+            is_raw_btf(&sidecar_bytes),
+            "load must overwrite stale sidecar with fresh BTF bytes",
+        );
+        assert!(
+            sidecar_fresh(&sidecar, &vmlinux),
+            "sidecar must be fresh again after re-extraction",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sidecar with correct mtime but garbage contents (no 0x9FEB
+    /// magic): the load must recover by falling through to ELF
+    /// extraction and overwriting the corrupt sidecar. Exercises
+    /// the "fresh but lacks magic" branch of the match inside
+    /// `load_btf_from_path`.
+    #[test]
+    fn load_btf_recovers_from_corrupt_sidecar() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "ktstr-btf-sidecar-corrupt-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vmlinux = dir.join("vmlinux");
+        std::fs::copy(&path, &vmlinux).unwrap();
+        let sidecar = dir.join("vmlinux.btf");
+        // Plant a sidecar that is newer than vmlinux but whose
+        // contents do not carry the BTF magic.
+        std::fs::write(&sidecar, b"not-btf-bytes").unwrap();
+        assert!(
+            sidecar_fresh(&sidecar, &vmlinux),
+            "precondition: planted sidecar must be mtime-fresh",
+        );
+
+        let btf = load_btf_from_path(&vmlinux)
+            .expect("load must recover when sidecar is fresh-but-corrupt");
+        let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+
+        // Corrupt sidecar should have been overwritten.
+        let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+        assert!(
+            is_raw_btf(&sidecar_bytes),
+            "corrupt sidecar must be overwritten on next load",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the sidecar would be written to a read-only directory,
+    /// the load must still succeed — sidecar writes are
+    /// best-effort and never surface as errors. Exercises the
+    /// tracing::warn fallback in `write_btf_sidecar`'s error path.
+    #[test]
+    #[cfg(unix)]
+    fn load_btf_survives_readonly_sidecar_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+        // Root skips DAC permission checks entirely, so a
+        // read-only directory still lets root write inside. The
+        // test cannot distinguish "sidecar write skipped due to
+        // best-effort" from "sidecar write succeeded because we
+        // are root" — skip under euid 0 to avoid a false-pass on
+        // CI runners that sandbox as root.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "ktstr-btf-sidecar-ro-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vmlinux = dir.join("vmlinux");
+        std::fs::copy(&path, &vmlinux).unwrap();
+        // Mark directory read-only after the vmlinux is in place.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Load must succeed despite the sidecar write failing.
+        let btf = load_btf_from_path(&vmlinux)
+            .expect("load must succeed even when sidecar dir is read-only");
+        let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+
+        // Sidecar must not exist — write should have failed.
+        let sidecar = dir.join("vmlinux.btf");
+        assert!(
+            !sidecar.exists(),
+            "sidecar must not exist after write to read-only dir",
+        );
+
+        // Restore permissions for cleanup.
+        let _ =
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Raw-BTF inputs (files that already carry 0x9FEB magic) must
+    /// never have a sidecar written alongside them — the input file
+    /// IS the BTF blob, and a sidecar would be a byte-for-byte
+    /// copy of itself. Exercises the raw-BTF early-return branch.
+    #[test]
+    fn load_btf_skips_sidecar_for_raw_btf_input() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if !path.starts_with("/sys/") {
+            // Generate a raw-BTF file from the ELF so this test
+            // exercises the raw-BTF path even when
+            // find_test_vmlinux returns an ELF.
+            let dir = std::env::temp_dir().join(format!(
+                "ktstr-btf-sidecar-raw-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let src_data = std::fs::read(&path).unwrap();
+            let elf = match goblin::elf::Elf::parse(&src_data) {
+                Ok(e) => e,
+                Err(_) => {
+                    // Raw BTF already — skip the ELF extraction.
+                    let raw = dir.join("vmlinux.btf-raw");
+                    std::fs::copy(&path, &raw).unwrap();
+                    let _ = load_btf_from_path(&raw)
+                        .expect("raw-BTF load must succeed");
+                    let sidecar = btf_sidecar_path(&raw);
+                    assert!(
+                        !sidecar.exists(),
+                        "raw-BTF input must not produce a sidecar",
+                    );
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return;
+                }
+            };
+            let btf_shdr = elf
+                .section_headers
+                .iter()
+                .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".BTF"));
+            let shdr = match btf_shdr {
+                Some(s) => s,
+                None => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return;
+                }
+            };
+            let offset = shdr.sh_offset as usize;
+            let size = shdr.sh_size as usize;
+            let raw_bytes = &src_data[offset..offset + size];
+            let raw = dir.join("vmlinux.btf-raw");
+            std::fs::write(&raw, raw_bytes).unwrap();
+            let _ = load_btf_from_path(&raw).expect("raw-BTF load must succeed");
+            // The sidecar would be at `<raw>.btf` — must NOT exist.
+            let sidecar = btf_sidecar_path(&raw);
+            assert!(
+                !sidecar.exists(),
+                "raw-BTF input must not produce a sidecar at {}",
+                sidecar.display(),
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        // /sys/kernel/btf/vmlinux path: raw BTF on a read-only
+        // filesystem. Any sidecar write would fail anyway, and the
+        // sidecar path itself ("/sys/kernel/btf/vmlinux.btf") is
+        // not writable — we cannot assert much here beyond "load
+        // must succeed," which the pre-existing tests already
+        // cover.
     }
 }

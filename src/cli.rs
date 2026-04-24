@@ -1623,6 +1623,43 @@ pub fn show_run_host(run: &str, dir: Option<&Path>) -> Result<String> {
     Ok(host.format_human())
 }
 
+/// Return the registered test name whose Levenshtein edit distance
+/// from `query` is smallest AND within the closeness threshold, or
+/// `None` if no candidate is close enough.
+///
+/// Threshold: `distance <= max(3, query.len() / 3)`. Two
+/// considerations drove this shape:
+/// - A flat `distance <= 3` cap misses legitimate typos on long
+///   snake_case names — e.g. a 5-character drop from a 50-char test
+///   name is a clear "did you mean" case but would fall outside
+///   cargo's conventional 3-char cap.
+/// - A pure relative cap like `query.len() / 3` under-tolerates on
+///   short names (a 9-char query tolerates only 3 edits, identical
+///   to the absolute cap; a 6-char query tolerates 2 — strict, but
+///   proportionate).
+///
+/// Taking the max preserves the absolute-3 floor while letting
+/// longer names benefit from proportional slack. Empty registry (no
+/// tests declared in the running process) returns `None` cleanly.
+/// Ties in distance resolve to the FIRST name encountered in the
+/// `KTSTR_TESTS` iteration — stable across runs because linkme's
+/// distributed slice preserves declaration order.
+fn suggest_closest_test_name(query: &str) -> Option<&'static str> {
+    let threshold = std::cmp::max(3, query.len() / 3);
+    let mut best: Option<(usize, &'static str)> = None;
+    for entry in crate::test_support::KTSTR_TESTS.iter() {
+        let d = strsim::levenshtein(query, entry.name);
+        if d > threshold {
+            continue;
+        }
+        match best {
+            Some((best_d, _)) if best_d <= d => continue,
+            _ => best = Some((d, entry.name)),
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
 /// Render the resolved, merged `Assert` thresholds for the named
 /// test — the same merge chain evaluated at run time in
 /// `run_ktstr_test_inner`:
@@ -1634,10 +1671,15 @@ pub fn show_run_host(run: &str, dir: Option<&Path>) -> Result<String> {
 /// nextest `--list` output, or the Debug impl of `Assert`.
 pub fn show_thresholds(test_name: &str) -> Result<String> {
     let entry = crate::test_support::find_test(test_name).ok_or_else(|| {
+        let suggestion = suggest_closest_test_name(test_name)
+            .map(|s| format!(" Did you mean `{s}`?"))
+            .unwrap_or_default();
         anyhow!(
-            "no registered ktstr test named '{test_name}'. Run `cargo nextest list` to see \
-             the available test names — then pass just the function-name component to \
-             `show-thresholds`, not the `<binary>::` prefix that nextest prepends to each line."
+            "no registered ktstr test named '{test_name}'.{suggestion} \
+             Run `cargo nextest list` to see the available test names \
+             — then pass just the function-name component to \
+             `show-thresholds`, not the `<binary>::` prefix that \
+             nextest prepends to each line."
         )
     })?;
     let merged = crate::assert::Assert::default_checks()
@@ -4880,6 +4922,130 @@ mod tests {
         );
     }
 
+    /// `suggest_closest_test_name` — positive case: a query that is
+    /// a one-character typo of a registered test returns that
+    /// registered name. Uses the linkme distributed slice directly
+    /// to pick a real entry, then mutates a single byte to guarantee
+    /// edit distance 1 (well inside the `max(3, len/3)` threshold).
+    ///
+    /// Picks a long name (> 9 chars) so the absolute-3 floor is NOT
+    /// the binding constraint on the len/3 formula either way —
+    /// either branch correctly admits distance-1.
+    #[test]
+    fn suggest_closest_test_name_finds_near_match() {
+        let Some(entry) = crate::test_support::KTSTR_TESTS
+            .iter()
+            .find(|e| e.name.len() >= 10 && !(e.name.starts_with("__unit_test_") && e.name.ends_with("__")))
+        else {
+            skip!(
+                "no registered non-sentinel test with name >= 10 chars \
+                 — cannot construct a positive strsim probe"
+            );
+        };
+        // Mutate one byte to a different ASCII letter to produce
+        // edit distance 1 without colliding with another registered
+        // name.
+        let mut mutated: Vec<u8> = entry.name.bytes().collect();
+        mutated[0] = if mutated[0] == b'z' { b'a' } else { b'z' };
+        let query = std::str::from_utf8(&mutated).expect("ASCII mutation stays UTF-8");
+        let suggestion = suggest_closest_test_name(query)
+            .expect("distance-1 typo on a registered name must yield a suggestion");
+        assert_eq!(
+            suggestion, entry.name,
+            "a single-byte typo must suggest the exact name it was derived from",
+        );
+    }
+
+    /// `suggest_closest_test_name` — negative case: a query totally
+    /// unrelated to any registered name must return `None` instead
+    /// of over-suggesting a distant match. A 40-char random ASCII
+    /// string has no expected Levenshtein relationship to the
+    /// snake_case test names in `KTSTR_TESTS`, so the threshold
+    /// `max(3, len/3) == 13` filters every candidate out.
+    #[test]
+    fn suggest_closest_test_name_returns_none_for_unrelated_query() {
+        // 40 chars of `x` — distance to any real snake_case test
+        // name is dominated by the cardinality difference (most
+        // test names share few chars with a uniform string), so
+        // every candidate exceeds the threshold and the helper
+        // correctly declines.
+        let unrelated = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        assert_eq!(
+            suggest_closest_test_name(unrelated),
+            None,
+            "a query with no lexical relationship to any registered \
+             test name must yield no suggestion (not an over-reach)",
+        );
+    }
+
+    /// `suggest_closest_test_name` — boundary case: a query whose
+    /// edit distance EXACTLY matches the threshold still yields a
+    /// suggestion. Constructs a 12-char query from a registered
+    /// name by flipping 4 bytes: distance = 4, threshold for a
+    /// 12-char query = `max(3, 12/3) = 4`, so the candidate just
+    /// fits.
+    ///
+    /// Guards against an off-by-one that changes `<=` to `<` on the
+    /// threshold check, which would silently drop boundary matches
+    /// and make the helper stricter than documented.
+    #[test]
+    fn suggest_closest_test_name_accepts_at_threshold_boundary() {
+        // Look for a registered test name with length >= 12 so we
+        // can take its 12-char prefix and mutate 4 bytes.
+        let Some(entry) = crate::test_support::KTSTR_TESTS
+            .iter()
+            .find(|e| e.name.len() >= 12 && !(e.name.starts_with("__unit_test_") && e.name.ends_with("__")))
+        else {
+            skip!(
+                "no registered non-sentinel test with name >= 12 chars \
+                 — cannot construct a boundary strsim probe"
+            );
+        };
+        // Preserve entry.name's full length so the helper doesn't
+        // fall back to a longer/shorter registered name with smaller
+        // distance. Flip exactly 4 bytes at the START (positions
+        // chosen to avoid `_` separators that would land on many
+        // snake_case names at predictable offsets).
+        let mut mutated: Vec<u8> = entry.name.bytes().collect();
+        // Flip 4 distinct positions to ASCII letters that differ
+        // from the original at each index. Using 2, 4, 6, 8 — all
+        // likely to be alphanumeric in a snake_case test name.
+        for &pos in &[2usize, 4, 6, 8] {
+            if pos >= mutated.len() {
+                skip!("entry.name too short for boundary probe");
+            }
+            mutated[pos] = if mutated[pos] == b'z' { b'a' } else { b'z' };
+        }
+        let query = std::str::from_utf8(&mutated).expect("ASCII mutation stays UTF-8");
+        // Guard: the 4-byte flip above MUST produce exactly
+        // distance-4 against the source name. If the registered
+        // set contains a near-neighbor name that happens to be
+        // closer to `query`, the suggestion could drift and the
+        // test would false-fail — skip in that case rather than
+        // ship a flaky assertion.
+        if strsim::levenshtein(query, entry.name) != 4 {
+            skip!("mutation did not produce distance-4 against source");
+        }
+        let threshold = std::cmp::max(3, query.len() / 3);
+        assert_eq!(
+            threshold, 4,
+            "boundary test presumes threshold == 4 for 12-char query; \
+             got {threshold}. If query length changed, update the \
+             test OR the mutation count to maintain the boundary.",
+        );
+        let suggestion = suggest_closest_test_name(query)
+            .expect("distance equal to threshold must still yield a suggestion");
+        // The suggestion may legitimately be a CLOSER name than
+        // `entry.name` if the registry contains one within
+        // distance 4 of `query`; the load-bearing invariant is
+        // "SOME suggestion is emitted at the threshold boundary",
+        // not "the suggestion matches our mutated source".
+        assert!(
+            !suggestion.is_empty(),
+            "boundary-distance query must yield a non-empty suggestion",
+        );
+    }
+
     /// The `UNTRACKED_KCONFIG_EXPLANATION` must reference the tag word
     /// `untracked kconfig` verbatim so the legend under the table
     /// matches the per-row tag produced by `format_entry_row`
@@ -5384,10 +5550,45 @@ mod tests {
             let call_pos = src
                 .find(&needle_call)
                 .unwrap_or_else(|| panic!("helper call site for {helper} must exist in cli.rs"));
-            // Look at the ~120 bytes following the call for the
-            // eprintln!; the block body is short and contiguous.
-            let end = (call_pos + 200).min(src.len());
-            let window = &src[call_pos..end];
+            // Expand the window to the FULL `if let Some(..) = helper(..)
+            // { .. }` body by finding the `{` that opens the if-body
+            // and scanning forward until the matching `}`. The old
+            // 200-byte fixed window was vulnerable to two silent
+            // failure modes: (a) a block that grows past 200 bytes
+            // leaves a regression at the tail invisible to this
+            // check; (b) a block that shrinks below 200 bytes pulls
+            // the scan into the NEXT if-let block, where a legitimate
+            // `eprintln!` in an unrelated handler falsely satisfies
+            // THIS helper's assertion.
+            //
+            // Scanner: once the opening `{` is found, count `{`/`}`
+            // balance with awareness of `"..."` string literals (so
+            // a format arg like `"{legend}"` doesn't disturb the
+            // count, even though in practice `{id}` is brace-
+            // balanced; the "..." skip is kept as a correctness
+            // guarantee against `"{"` / `"}"` literals a future
+            // edit might introduce). Raw strings, block comments,
+            // and char literals are not handled — the if-let
+            // bodies in kernel_list are one-liner `eprintln!`
+            // emitters that contain none of those, and a future
+            // addition would fail this scanner fast enough to
+            // surface the need rather than silently miscount.
+            let brace_open = src[call_pos..]
+                .find('{')
+                .map(|off| call_pos + off)
+                .unwrap_or_else(|| {
+                    panic!("no `{{` after `= {helper}(` — cli.rs structure changed")
+                });
+            let brace_close = matching_brace_end(src.as_bytes(), brace_open)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "unbalanced braces after `= {helper}(` starting at byte {brace_open} \
+                         — the if-let block boundary could not be resolved"
+                    )
+                });
+            // Include both the call prefix AND the full body in the
+            // window so diagnostics show the surrounding context.
+            let window = &src[call_pos..=brace_close];
             assert!(
                 window.contains("eprintln!"),
                 "{helper} call site must be followed by `eprintln!` \
@@ -5413,6 +5614,79 @@ mod tests {
                  {window:?}",
             );
         }
+    }
+
+    /// Return the byte offset of the `}` that matches the `{` at
+    /// `bytes[start]`, scanning forward with `"..."` string-literal
+    /// awareness so format args and literal quotes don't disturb the
+    /// brace count. Returns `None` if no match is found before
+    /// end-of-input. The caller guarantees `bytes[start] == b'{'`;
+    /// a debug assert pins that precondition so a caller bug
+    /// surfaces at the call site rather than returning a nonsense
+    /// offset.
+    fn matching_brace_end(bytes: &[u8], start: usize) -> Option<usize> {
+        debug_assert_eq!(
+            bytes.get(start),
+            Some(&b'{'),
+            "matching_brace_end must be called with start pointing at `{{`",
+        );
+        let mut depth: i32 = 0;
+        let mut in_string = false;
+        let mut i = start;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                match b {
+                    b'\\' => i += 1, // skip the escaped byte
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Exercise the scanner against a hand-built snippet so the
+    /// `eol_legend_emits_via_eprintln` test's correctness doesn't
+    /// ride on an invariant only observable on real cli.rs bytes.
+    /// Covers: nested braces, `"..."` string literals with embedded
+    /// braces (including escaped quotes), and the unbalanced-input
+    /// branch returning `None`.
+    #[test]
+    fn matching_brace_end_handles_strings_and_nesting() {
+        // Simple balanced block.
+        let src = br#"{ eprintln!("x"); }"#;
+        assert_eq!(matching_brace_end(src, 0), Some(src.len() - 1));
+
+        // Nested braces.
+        let src = br#"{ let x = { 1 + 2 }; }"#;
+        assert_eq!(matching_brace_end(src, 0), Some(src.len() - 1));
+
+        // String literal containing a lone `}` must NOT close the
+        // outer brace prematurely.
+        let src = br#"{ println!("a}b"); }"#;
+        assert_eq!(matching_brace_end(src, 0), Some(src.len() - 1));
+
+        // Escaped quote inside a string must NOT close the string.
+        let src = br#"{ println!("a\"}b"); }"#;
+        assert_eq!(matching_brace_end(src, 0), Some(src.len() - 1));
+
+        // Unbalanced: opening brace with no closer returns None.
+        let src = br#"{ unterminated"#;
+        assert_eq!(matching_brace_end(src, 0), None);
     }
 
     /// Pin the annotation-footer emission order in `kernel_list`:

@@ -279,6 +279,94 @@ pub(crate) fn validate_entry(
 }
 
 // ---------------------------------------------------------------------------
+// Panic payload extraction
+// ---------------------------------------------------------------------------
+
+/// Convert a `catch_unwind` / `JoinHandle::join` panic payload into a
+/// human-readable string, preserving whatever message the panic
+/// actually carried.
+///
+/// The panic payload from `std::panic::catch_unwind` is
+/// `Box<dyn Any + Send>`. The two common cases — `&'static str`
+/// (from `panic!("literal")`) and `String` (from `panic!("{x}")` /
+/// `panic!("{}", msg)`) — require explicit downcast; without them
+/// the test-side diagnostic collapses to the useless "Box<Any>"
+/// rendering that `panic_any` fall-through produces. A payload
+/// carrying some other type drops to a `{:?}` rendering via the
+/// `Box<dyn Any>` itself, which at least lets a reader see the
+/// payload's type name.
+///
+/// Ladder (matches the de facto std-library convention used by
+/// `Mutex::unwrap_or_else`, `rayon::scope`'s panic diagnostics,
+/// etc.):
+///
+/// 1. `payload.downcast_ref::<&'static str>()` — covers
+///    `panic!("literal")`.
+/// 2. `payload.downcast_ref::<String>()` — covers
+///    `panic!("{x}")` / `panic!("formatted: {}", y)`.
+/// 3. Fallback: `format!("{payload:?}")` — any other payload type
+///    renders via its `Debug` impl (or the `Box<dyn Any>` Debug
+///    impl, which prints `Any { .. }`).
+pub(crate) fn panic_payload_to_string(
+    payload: Box<dyn std::any::Any + Send>,
+) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        format!("{payload:?}")
+    }
+}
+
+#[cfg(test)]
+mod panic_payload_tests {
+    use super::panic_payload_to_string;
+
+    /// `panic!("str-literal")` panics with a `&'static str` payload.
+    /// The helper must recover the literal exactly.
+    #[test]
+    fn panic_payload_str_literal_recovered() {
+        let result = std::panic::catch_unwind(|| {
+            panic!("a-string-literal");
+        });
+        let payload = result.expect_err("closure must panic");
+        assert_eq!(panic_payload_to_string(payload), "a-string-literal");
+    }
+
+    /// `panic!("{x}")` with a formatted arg panics with a `String`
+    /// payload. The helper must preserve the FORMATTED text, not
+    /// drop back to a `Box<dyn Any>` stringification.
+    #[test]
+    fn panic_payload_formatted_string_recovered() {
+        let n: u32 = 42;
+        let result = std::panic::catch_unwind(|| {
+            panic!("formatted-{n}-panic");
+        });
+        let payload = result.expect_err("closure must panic");
+        assert_eq!(panic_payload_to_string(payload), "formatted-42-panic");
+    }
+
+    /// A non-string payload (e.g. a numeric value via `panic_any`)
+    /// drops to the `Debug` fallback rather than panicking the
+    /// helper itself. The exact rendering is not pinned beyond a
+    /// non-empty string — the contract is "never panic, always
+    /// return SOMETHING useful".
+    #[test]
+    fn panic_payload_non_string_falls_back_to_debug() {
+        let result = std::panic::catch_unwind(|| {
+            std::panic::panic_any(127i32);
+        });
+        let payload = result.expect_err("closure must panic");
+        let rendered = panic_payload_to_string(payload);
+        assert!(
+            !rendered.is_empty(),
+            "non-string payload must render to SOMETHING (non-empty)",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared FlagDecl fixtures
 // ---------------------------------------------------------------------------
 //

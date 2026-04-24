@@ -34,30 +34,15 @@
 //! table below enumerates every observable exit status the worker
 //! can produce so a failing test can grep the full set in one pass:
 //!
-//! - `0`: normal `exit(0)`. The worker never reaches this path —
-//!   the default mode parks forever (`sleep(3600s)` loop) and the
-//!   `--churn` mode spins a `loop { spawn+join }` with no break —
-//!   so `0` in practice means a refactor silently dropped the
-//!   terminal-loop black-boxing and let the optimizer fold it away
-//!   (the `loop { … }` bodies have no `break` and no `Result`
-//!   return, so there is no legitimate "clean shutdown" code path
-//!   into `exit(0)`). Listed for grep-friendliness: a reader
-//!   sweeping the legend for "exit code 0" finds the row here
-//!   rather than wondering whether it was intentionally
-//!   undocumented.
-//! - `2`: `bytes == 0` (caller bug — zero-size alloc would panic in `touch`).
-//! - `3`: default-mode `/proc/self/task` self-check saw a thread count != 1.
-//! - `4`: ready-marker write failed.
-//! - `5`: argv parse failed (missing `<BYTES>` or not a `usize`).
-//! - `6`: default-mode `read_dir("/proc/self/task")` itself failed
-//!   (procfs unreadable — distinct from code 3's "procfs readable
-//!   but reported extra threads").
-//! - `101`: Rust panic. Any `panic!` / `debug_assert!` / indexing
-//!   out-of-bounds inside this binary converts to a `101` exit via
-//!   the default panic hook. Matches the
-//!   `jemalloc_probe_tests.rs` ready-marker-wait legend so a test
-//!   operator seeing `101` can locate it here without cross-
-//!   referencing the panic hook behavior elsewhere.
+//! | Code  | Condition                                                                                                                                                                                                                                                                           |
+//! |------:|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+//! |   `0` | Normal `exit(0)`. Unreachable under correct execution — the default mode parks forever (`sleep(3600s)` loop) and `--churn` spins `loop { spawn+join }` with no break. Listed for grep completeness: a `0` in practice means a refactor dropped the terminal-loop black-boxing and the optimizer folded the loop away. |
+//! |   `2` | `bytes == 0` (caller bug — zero-size alloc would panic in `touch`).                                                                                                                                                                                                                 |
+//! |   `3` | Default-mode `/proc/self/task` self-check saw a thread count != 1. Typical cause: `MALLOC_CONF=background_thread:true` / `_RJEM_MALLOC_CONF=…` spawned a jemalloc helper during init.                                                                                               |
+//! |   `4` | Ready-marker write failed (path unwritable, e.g. parent directory missing).                                                                                                                                                                                                         |
+//! |   `5` | Argv parse failed (missing `<BYTES>` or not a `usize`).                                                                                                                                                                                                                             |
+//! |   `6` | Default-mode `read_dir("/proc/self/task")` itself failed. Distinct from code 3 ("procfs readable but reported extra threads") — 6 points at a broken/unmounted procfs.                                                                                                              |
+//! | `101` | Rust panic. `panic!` / `debug_assert!` / indexing out-of-bounds routes through the default panic hook. Matches the `jemalloc_probe_tests.rs` ready-marker-wait legend so an operator seeing `101` locates it here without cross-referencing the panic hook behavior elsewhere.      |
 //!
 //! Argv is hand-rolled (one flag, one positional). The tipping
 //! point for switching to `clap-derive` is when the surface needs

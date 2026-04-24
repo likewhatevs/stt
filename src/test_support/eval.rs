@@ -1161,9 +1161,10 @@ pub fn resolve_test_kernel() -> Result<PathBuf> {
 
     anyhow::bail!(
         "no kernel found\n  \
-         hint: run `cargo ktstr kernel build` to download and build the latest stable kernel\n  \
-         hint: or set KTSTR_KERNEL=/path/to/linux\n  \
-         hint: or set KTSTR_TEST_KERNEL=/path/to/{image_name}",
+         hint: {kernel_hint}\n  \
+         hint: or set KTSTR_TEST_KERNEL=/path/to/{image_name} to point at a \
+         pre-built bootable image directly (bypasses KTSTR_KERNEL resolution)",
+        kernel_hint = crate::KTSTR_KERNEL_HINT,
         image_name = if cfg!(target_arch = "aarch64") {
             "Image"
         } else {

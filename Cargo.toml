@@ -111,6 +111,12 @@ rustix = { version = "1", features = ["fs", "shm", "system"] }
 # the list of variant names so `WorkType::ALL_NAMES` stays in lock-step
 # with the enum definition without a hand-maintained parallel table.
 strum = { version = "0.27", features = ["derive"] }
+# Levenshtein edit distance for the "did you mean?" suggestion in
+# `cli::show_thresholds`'s unknown-test-name error path. Already
+# present transitively via clap — promoting it to a direct dep makes
+# the intent explicit and survives a future clap version that drops
+# the transitive exposure.
+strsim = "0.11"
 # jemalloc as global allocator for the ktstr/cargo-ktstr binaries.
 # binary-only — the library stays allocator-agnostic so downstream
 # consumers pick their own allocator. `stats` feature compiles

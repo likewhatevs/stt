@@ -5564,12 +5564,10 @@ mod tests {
 
     // -- mtime-size warm-cache sidecar helpers --
 
-    /// `sidecar_lock_path_appends_lock_extension` in sidecar.rs
-    /// pins the `.lock` suffix derivation; this test pins the
-    /// analogous `.mtime-size` suffix for the warm-cache sidecar
-    /// path. A future reshape of the naming scheme breaks caches
-    /// symmetrically across every ktstr invocation, so the path
-    /// is a hard-coded contract the test captures verbatim.
+    /// Pin the `.mtime-size` suffix derivation for the warm-cache
+    /// sidecar path. A future reshape of the naming scheme breaks
+    /// caches symmetrically across every ktstr invocation, so the
+    /// path is a hard-coded contract the test captures verbatim.
     #[test]
     fn mtime_size_sidecar_path_appends_suffix() {
         let artifact = std::path::Path::new("/tmp/model.gguf");

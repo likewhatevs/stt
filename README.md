@@ -263,8 +263,10 @@ cargo nextest run                                          # tests find the cach
 
 ```sh
 cargo ktstr test                                           # build/resolve kernel + run tests
+cargo ktstr nextest                                        # visible alias for `test`
 cargo ktstr test --kernel ~/linux -- -E 'test(my_test)'    # local source tree + nextest filter
-cargo ktstr coverage                                       # tests under llvm-cov
+cargo ktstr coverage                                       # tests under cargo-llvm-cov nextest
+cargo ktstr llvm-cov report --lcov --output-path lcov.info # raw llvm-cov passthrough (report/clean/show-env)
 cargo ktstr kernel build 6.14.2                            # cache a specific version
 cargo ktstr kernel build --source ~/linux                  # build from local source tree
 cargo ktstr kernel build --git URL --ref v6.14             # shallow-clone a git tree
@@ -279,6 +281,7 @@ cargo ktstr show-host                                      # print current host 
 cargo ktstr show-thresholds my_test                        # print resolved Assert thresholds for a test
 cargo ktstr cleanup                                        # remove leftover ktstr cgroups
 cargo ktstr shell --kernel 6.14.2                          # interactive VM shell
+cargo ktstr shell --kernel 6.14.2 --no-perf-mode           # shell on shared runners (skip flock/pinning/RT)
 cargo ktstr completions bash                               # shell completions
 ```
 

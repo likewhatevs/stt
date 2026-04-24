@@ -232,8 +232,11 @@ hosts where topology reservation is unavailable or undesirable.
 Available via:
 
 - `ktstr run --no-perf-mode`
+- `ktstr shell --no-perf-mode`
 - `cargo ktstr test --no-perf-mode`
 - `cargo ktstr coverage --no-perf-mode`
+- `cargo ktstr llvm-cov --no-perf-mode`
+- `cargo ktstr shell --no-perf-mode`
 - `KTSTR_NO_PERF_MODE=1` (any value; presence is sufficient)
 
 The env var is read by every VM builder call site (test harness,
