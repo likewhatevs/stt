@@ -120,6 +120,7 @@ fn skip_with_reason(reason: &str) {
 }
 
 #[test]
+#[ignore] // requires CAP_SYS_PTRACE or ptrace_scope=0 for sibling attach
 fn probe_sigint_mid_multi_snapshot_produces_partial_output() {
     let worker_bin = env!("CARGO_BIN_EXE_ktstr-jemalloc-alloc-worker");
     let probe_bin = env!("CARGO_BIN_EXE_ktstr-jemalloc-probe");
