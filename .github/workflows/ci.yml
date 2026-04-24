@@ -42,7 +42,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain from rust-toolchain.toml
-        run: rustup show active-toolchain || rustup toolchain install
+        run: |
+          source "$HOME/.cargo/env"
+          rustup show active-toolchain || rustup toolchain install
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -80,7 +83,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain from rust-toolchain.toml
-        run: rustup show active-toolchain || rustup toolchain install
+        run: |
+          source "$HOME/.cargo/env"
+          rustup show active-toolchain || rustup toolchain install
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -114,7 +120,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain from rust-toolchain.toml
-        run: rustup show active-toolchain || rustup toolchain install
+        run: |
+          source "$HOME/.cargo/env"
+          rustup show active-toolchain || rustup toolchain install
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
@@ -144,7 +153,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain from rust-toolchain.toml
-        run: rustup show active-toolchain || rustup toolchain install
+        run: |
+          source "$HOME/.cargo/env"
+          rustup show active-toolchain || rustup toolchain install
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest

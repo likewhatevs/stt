@@ -64,7 +64,9 @@ runs:
 
     - name: Provision Rust toolchain from rust-toolchain.toml
       shell: bash
-      run: rustup show active-toolchain || rustup toolchain install
+      run: |
+        /usr/bin/rustup-init -y && rustup show active-toolchain || rustup toolchain install
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - uses: mozilla-actions/sccache-action@v0.0.9
       with:

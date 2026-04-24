@@ -6813,7 +6813,7 @@ mod tests {
     /// `KTSTR_BYPASS_LLC_LOCKS=1` + `llc_cap=Some(_)` must error
     /// with the "resource contract" substring. Pins the conflict
     /// check at the pipeline's reservation entry point, independent
-    /// of the CLI-layer conflict check (#76 pins the CLI layer).
+    /// of the CLI-layer conflict check (separate tests pin the CLI layer).
     #[test]
     fn acquire_build_reservation_bypass_with_cap_errors() {
         let _lock = bypass_env_lock();

@@ -1886,7 +1886,7 @@ mod tests {
         assert!(out.contains("differs"));
     }
 
-    // -- Batch 17 coverage expansion --
+    // -- comparison coverage expansion --
 
     /// Pin all four branches of `cgroup_cell` directly. Existing
     /// tests only exercise the (Some, Some) path transitively via
