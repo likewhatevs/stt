@@ -203,9 +203,7 @@ pub fn custom_cgroup_cpuset_workload_variety(ctx: &Ctx) -> Result<AssertResult> 
 pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult> {
     // Dynamic cgroup ops with diverse workloads.
     if ctx.topo.all_cpus().len() < 5 {
-        return Ok(AssertResult::skip(
-            "need >=5 CPUs for dynamic cgroup add",
-        ));
+        return Ok(AssertResult::skip("need >=5 CPUs for dynamic cgroup add"));
     }
     let names: Vec<String> = (0..3).map(|i| format!("cg_{i}")).collect();
     let mut _guard = CgroupGroup::new(ctx.cgroups);

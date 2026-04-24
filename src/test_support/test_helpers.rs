@@ -307,9 +307,7 @@ pub(crate) fn validate_entry(
 /// 3. Fallback: `format!("{payload:?}")` — any other payload type
 ///    renders via its `Debug` impl (or the `Box<dyn Any>` Debug
 ///    impl, which prints `Any { .. }`).
-pub(crate) fn panic_payload_to_string(
-    payload: Box<dyn std::any::Any + Send>,
-) -> String {
+pub(crate) fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {

@@ -268,8 +268,7 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
 /// between what's printed and what's documented elsewhere is
 /// impossible by construction; pinned by
 /// `dirty_tree_cache_skip_hint_shape` below.
-pub const DIRTY_TREE_CACHE_SKIP_HINT: &str =
-    "skipping cache — working tree has uncommitted changes; \
+pub const DIRTY_TREE_CACHE_SKIP_HINT: &str = "skipping cache — working tree has uncommitted changes; \
      commit or stash to enable caching";
 
 /// Hint shown in place of [`DIRTY_TREE_CACHE_SKIP_HINT`] when the
@@ -279,8 +278,7 @@ pub const DIRTY_TREE_CACHE_SKIP_HINT: &str =
 /// kernel-source fetch mode that produces a git-tracked tree).
 /// Pinned by `non_git_tree_cache_skip_hint_shape` below so a
 /// wording drift is caught in unit tests.
-pub const NON_GIT_TREE_CACHE_SKIP_HINT: &str =
-    "skipping cache — source tree is not a git repository so dirty \
+pub const NON_GIT_TREE_CACHE_SKIP_HINT: &str = "skipping cache — source tree is not a git repository so dirty \
      state cannot be detected; put the source under git, or replace \
      `--source` with one of the content-keyed fetch modes that does \
      not need dirty-state detection — `kernel build VERSION` \
@@ -294,11 +292,7 @@ pub const NON_GIT_TREE_CACHE_SKIP_HINT: &str =
 /// of `kernel_list` lets both branches be pinned in unit tests
 /// without capturing stderr.
 pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
-    if any_eol {
-        Some(EOL_EXPLANATION)
-    } else {
-        None
-    }
+    if any_eol { Some(EOL_EXPLANATION) } else { None }
 }
 
 /// Explanation of the `(untracked kconfig)` tag. Consumer-facing
@@ -310,8 +304,7 @@ pub(crate) fn eol_legend_if_any(any_eol: bool) -> Option<&'static str> {
 /// The `(corrupt)` tag is deliberately not in this legend family —
 /// its remediation is operational, not informational. See
 /// [`format_corrupt_footer`] for the full rationale.
-pub const UNTRACKED_KCONFIG_EXPLANATION: &str =
-    "(untracked kconfig) marks entries with no recorded ktstr.kconfig hash \
+pub const UNTRACKED_KCONFIG_EXPLANATION: &str = "(untracked kconfig) marks entries with no recorded ktstr.kconfig hash \
      (pre-dates kconfig hash tracking). Rebuild with: kernel build --force VERSION";
 
 /// Decide whether to emit the `(untracked kconfig)` legend under the
@@ -332,8 +325,7 @@ pub(crate) fn untracked_legend_if_any(any_untracked: bool) -> Option<&'static st
 /// surfaced via a `*_legend_if_any` helper. Verbatim wording
 /// preserved from the prior inline `eprintln!` in `kernel_list`
 /// so existing operators see no behavioural change.
-pub const STALE_KCONFIG_EXPLANATION: &str =
-    "warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. \
+pub const STALE_KCONFIG_EXPLANATION: &str = "warning: entries marked (stale kconfig) were built against a different ktstr.kconfig. \
      Rebuild with: kernel build --force <entry version>";
 
 /// Decide whether to emit the `(stale kconfig)` legend under the
@@ -440,7 +432,11 @@ pub(crate) fn corrupt_footer_if_any(corrupt_count: usize, cache_root: &Path) -> 
     if corrupt_count == 0 {
         return None;
     }
-    let noun = if corrupt_count == 1 { "entry" } else { "entries" };
+    let noun = if corrupt_count == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
     let summary = format!(
         "{corrupt_count} corrupt {noun}. \
          Run `cargo ktstr kernel clean --corrupt-only` to remove.",
@@ -969,7 +965,10 @@ pub fn kernel_clean(keep: Option<usize>, force: bool, corrupt_only: bool) -> Res
         for listed in &to_remove {
             match listed {
                 crate::cache::ListedEntry::Valid(entry) => {
-                    println!("{}", format_entry_row(entry, &kconfig_hash, &active_prefixes));
+                    println!(
+                        "{}",
+                        format_entry_row(entry, &kconfig_hash, &active_prefixes)
+                    );
                 }
                 crate::cache::ListedEntry::Corrupt { key, reason, .. } => {
                     println!("  {key:<48} (corrupt: {reason})");
@@ -1350,9 +1349,7 @@ pub fn filter_scenarios<'a>(
             .and_then(suggest_closest_scenario_name)
             .map(|s| format!(" Did you mean `{s}`?"))
             .unwrap_or_default();
-        bail!(
-            "no scenarios matched filter.{hint} Run 'ktstr list' to see available scenarios.",
-        );
+        bail!("no scenarios matched filter.{hint} Run 'ktstr list' to see available scenarios.",);
     }
     Ok(refs)
 }
@@ -1559,9 +1556,8 @@ pub(crate) fn acquire_build_reservation(
         None
     } else if let Ok(host_topo) = crate::vmm::host_topology::HostTopology::from_sysfs() {
         let test_topo = crate::topology::TestTopology::from_system()?;
-        let acquired_plan = crate::vmm::host_topology::acquire_llc_plan(
-            &host_topo, &test_topo, llc_cap,
-        )?;
+        let acquired_plan =
+            crate::vmm::host_topology::acquire_llc_plan(&host_topo, &test_topo, llc_cap)?;
         crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);
         Some(acquired_plan)
     } else {
@@ -2510,10 +2506,7 @@ pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
     ));
 
     let sp = Spinner::start("Fetching latest kernel version...");
-    let ver = crate::fetch::fetch_latest_stable_version(
-        crate::fetch::shared_client(),
-        cli_label,
-    )?;
+    let ver = crate::fetch::fetch_latest_stable_version(crate::fetch::shared_client(), cli_label)?;
     sp.finish(format!("Latest stable: {ver}"));
 
     let cache_dir = download_and_cache_version(&ver, cli_label, None)?;
@@ -2730,10 +2723,7 @@ pub(crate) struct LocksSnapshot {
 /// work.
 fn collect_locks_snapshot() -> Result<LocksSnapshot> {
     let cache_root = CacheDir::default_root().ok();
-    collect_locks_snapshot_from(
-        Path::new("/tmp"),
-        cache_root.as_deref(),
-    )
+    collect_locks_snapshot_from(Path::new("/tmp"), cache_root.as_deref())
 }
 
 /// Seam behind [`collect_locks_snapshot`]: enumerate LLC, per-CPU,
@@ -2939,8 +2929,7 @@ fn render_locks_human(snap: &LocksSnapshot) -> String {
 /// instead of being torn down mid-print. The flag stays set for the
 /// remainder of the process lifetime — `ktstr locks` is a one-shot
 /// observational command, so re-arming is unnecessary.
-static LOCKS_WATCH_KILL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static LOCKS_WATCH_KILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// SIGINT handler for `--watch`: flip the kill flag and return. The
 /// main loop observes the flag between frames (at most one interval
@@ -3047,8 +3036,7 @@ fn warn(msg: &str) {
 /// runs, so without the hook the terminal stays in echo-disabled /
 /// non-canonical mode and the multi-line panic message staircases
 /// (LF without CR) before SIGABRT kills the process.
-static SPINNER_SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
-    std::sync::Mutex::new(None);
+static SPINNER_SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
 
 /// Tracks whether a [`Spinner`] is currently alive. `Spinner::start`
 /// flips this from `false` to `true`; `Drop` flips it back. A
@@ -3061,8 +3049,7 @@ static SPINNER_SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> =
 /// away) rather than panic in production; the flag is still
 /// maintained so a future `debug_assert` → `assert` upgrade would
 /// not need a second seam.
-static SPINNER_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SPINNER_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Install a panic hook that restores stdin termios from
 /// [`SPINNER_SAVED_TERMIOS`] before the default panic handler prints.
@@ -3400,12 +3387,7 @@ mod tests {
     /// here.
     #[test]
     fn parse_topology_string_names_failing_field() {
-        for (pos, field) in [
-            (0, "numa_nodes"),
-            (1, "llcs"),
-            (2, "cores"),
-            (3, "threads"),
-        ] {
+        for (pos, field) in [(0, "numa_nodes"), (1, "llcs"), (2, "cores"), (3, "threads")] {
             let mut parts = vec!["1"; 4];
             parts[pos] = "abc";
             let input = parts.join(",");
@@ -5122,10 +5104,7 @@ mod tests {
             reason: "metadata.json missing".to_string(),
         };
 
-        let entries_with_corrupt = [
-            crate::cache::ListedEntry::Valid(valid_1),
-            corrupt_entry,
-        ];
+        let entries_with_corrupt = [crate::cache::ListedEntry::Valid(valid_1), corrupt_entry];
         let entries_clean_only = [crate::cache::ListedEntry::Valid(valid_2)];
 
         fn any_corrupt(entries: &[crate::cache::ListedEntry]) -> bool {
@@ -5392,10 +5371,7 @@ mod tests {
     /// invariant on clean runs is enforced by the gate.
     #[test]
     fn stale_legend_if_any_branches() {
-        assert_eq!(
-            stale_legend_if_any(true),
-            Some(STALE_KCONFIG_EXPLANATION),
-        );
+        assert_eq!(stale_legend_if_any(true), Some(STALE_KCONFIG_EXPLANATION),);
         assert_eq!(stale_legend_if_any(false), None);
     }
 
@@ -5448,8 +5424,7 @@ mod tests {
         assert_eq!(corrupt_footer_if_any(0, root), None);
         // Positive count → Some, with the count-summary line AND the
         // full format_corrupt_footer body.
-        let one = corrupt_footer_if_any(1, root)
-            .expect("positive count must yield Some(footer)");
+        let one = corrupt_footer_if_any(1, root).expect("positive count must yield Some(footer)");
         assert!(
             one.contains("1 corrupt entry."),
             "singular form (count == 1) must render as `1 corrupt entry.`; got: {one}",
@@ -5466,8 +5441,7 @@ mod tests {
              detail after the count summary: {one}",
         );
 
-        let many = corrupt_footer_if_any(3, root)
-            .expect("positive count must yield Some(footer)");
+        let many = corrupt_footer_if_any(3, root).expect("positive count must yield Some(footer)");
         assert!(
             many.contains("3 corrupt entries."),
             "plural form (count > 1) must render as `N corrupt entries.`; got: {many}",
@@ -5773,10 +5747,9 @@ mod tests {
     /// either branch correctly admits distance-1.
     #[test]
     fn suggest_closest_test_name_finds_near_match() {
-        let Some(entry) = crate::test_support::KTSTR_TESTS
-            .iter()
-            .find(|e| e.name.len() >= 10 && !(e.name.starts_with("__unit_test_") && e.name.ends_with("__")))
-        else {
+        let Some(entry) = crate::test_support::KTSTR_TESTS.iter().find(|e| {
+            e.name.len() >= 10 && !(e.name.starts_with("__unit_test_") && e.name.ends_with("__"))
+        }) else {
             skip!(
                 "no registered non-sentinel test with name >= 10 chars \
                  — cannot construct a positive strsim probe"
@@ -5832,10 +5805,9 @@ mod tests {
     fn suggest_closest_test_name_accepts_at_threshold_boundary() {
         // Look for a registered test name with length >= 12 so we
         // can take its 12-char prefix and mutate 4 bytes.
-        let Some(entry) = crate::test_support::KTSTR_TESTS
-            .iter()
-            .find(|e| e.name.len() >= 12 && !(e.name.starts_with("__unit_test_") && e.name.ends_with("__")))
-        else {
+        let Some(entry) = crate::test_support::KTSTR_TESTS.iter().find(|e| {
+            e.name.len() >= 12 && !(e.name.starts_with("__unit_test_") && e.name.ends_with("__"))
+        }) else {
             skip!(
                 "no registered non-sentinel test with name >= 12 chars \
                  — cannot construct a boundary strsim probe"
@@ -5958,8 +5930,7 @@ mod tests {
         let mut mutated: Vec<u8> = s.name.bytes().collect();
         mutated[0] = if mutated[0] == b'z' { b'a' } else { b'z' };
         let query = std::str::from_utf8(&mutated).unwrap();
-        let hint = scenario_filter_hint(query)
-            .expect("near match must produce a hint");
+        let hint = scenario_filter_hint(query).expect("near match must produce a hint");
         assert!(
             hint.starts_with(" Did you mean `"),
             "hint must start with ` Did you mean \\`` prefix: {hint}",
@@ -6025,8 +5996,8 @@ mod tests {
                  registered scenario; cannot exercise the bail branch"
             );
         }
-        let err = filter_scenarios(&scenarios, Some(&query))
-            .expect_err("non-matching filter must bail");
+        let err =
+            filter_scenarios(&scenarios, Some(&query)).expect_err("non-matching filter must bail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no scenarios matched filter"),
@@ -6049,9 +6020,8 @@ mod tests {
     #[test]
     fn filter_scenarios_unrelated_filter_bails_without_hint() {
         let scenarios = crate::scenario::all_scenarios();
-        let err =
-            filter_scenarios(&scenarios, Some("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))
-                .expect_err("unrelated filter must bail");
+        let err = filter_scenarios(&scenarios, Some("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))
+            .expect_err("unrelated filter must bail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no scenarios matched filter"),
@@ -6141,21 +6111,20 @@ mod tests {
         // short-circuits the EOL guard regardless of active list.
         // entry_hash == current → Matches; entry_hash != current →
         // Stale; None → Untracked.
-        let build_row =
-            |key: &str, version: Option<&str>, entry_hash: Option<&str>| -> String {
-                let meta = KernelMetadata::new(
-                    KernelSource::Tarball,
-                    "x86_64".to_string(),
-                    "bzImage".to_string(),
-                    "2026-04-12T10:00:00Z".to_string(),
-                )
-                .with_version(version.map(str::to_string))
-                .with_ktstr_kconfig_hash(entry_hash.map(str::to_string));
-                let entry = cache
-                    .store(key, &CacheArtifacts::new(&image), &meta)
-                    .unwrap();
-                format_entry_row(&entry, current_hash, &active_prefixes)
-            };
+        let build_row = |key: &str, version: Option<&str>, entry_hash: Option<&str>| -> String {
+            let meta = KernelMetadata::new(
+                KernelSource::Tarball,
+                "x86_64".to_string(),
+                "bzImage".to_string(),
+                "2026-04-12T10:00:00Z".to_string(),
+            )
+            .with_version(version.map(str::to_string))
+            .with_ktstr_kconfig_hash(entry_hash.map(str::to_string));
+            let entry = cache
+                .store(key, &CacheArtifacts::new(&image), &meta)
+                .unwrap();
+            format_entry_row(&entry, current_hash, &active_prefixes)
+        };
 
         // c8 is exactly 48 chars to pin column-boundary behavior:
         // `format!("{:<48}", key)` emits the key with exactly ONE
@@ -6245,11 +6214,7 @@ mod tests {
         )
         .with_version(Some("2.6.32".to_string()));
         let entry = cache
-            .store(
-                "fetch-failed-fallback",
-                &CacheArtifacts::new(&image),
-                &meta,
-            )
+            .store("fetch-failed-fallback", &CacheArtifacts::new(&image), &meta)
             .unwrap();
 
         let row_fallback = format_entry_row(&entry, "kconfig_hash", &[]);
@@ -6490,14 +6455,8 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let err = TestCli::try_parse_from([
-            "prog",
-            "clean",
-            "--keep",
-            "2",
-            "--corrupt-only",
-        ])
-        .expect_err("--keep together with --corrupt-only must fail parsing");
+        let err = TestCli::try_parse_from(["prog", "clean", "--keep", "2", "--corrupt-only"])
+            .expect_err("--keep together with --corrupt-only must fail parsing");
         let msg = err.to_string();
         assert!(
             msg.to_ascii_lowercase().contains("cannot be used with")
@@ -6546,10 +6505,8 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from([
-            "prog", "build", "6.14.2", "--llc-cap", "4",
-        ])
-        .expect("kernel build --llc-cap N must parse");
+        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--llc-cap", "4"])
+            .expect("kernel build --llc-cap N must parse");
         match parsed.cmd {
             KernelCommand::Build {
                 llc_cap, version, ..
@@ -6578,10 +6535,7 @@ mod tests {
             .expect("kernel build without --llc-cap must parse");
         match parsed.cmd {
             KernelCommand::Build { llc_cap, .. } => {
-                assert_eq!(
-                    llc_cap, None,
-                    "no --llc-cap must produce None, not Some(0)",
-                );
+                assert_eq!(llc_cap, None, "no --llc-cap must produce None, not Some(0)",);
             }
             other => panic!("expected KernelCommand::Build, got {other:?}"),
         }
@@ -6603,10 +6557,8 @@ mod tests {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from([
-            "prog", "build", "6.14.2", "--llc-cap", "0",
-        ])
-        .expect("clap-level parse must accept 0; runtime validation rejects");
+        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--llc-cap", "0"])
+            .expect("clap-level parse must accept 0; runtime validation rejects");
         match parsed.cmd {
             KernelCommand::Build { llc_cap, .. } => {
                 assert_eq!(
@@ -6666,12 +6618,24 @@ mod tests {
         };
         let val = serde_json::to_value(&snap).expect("serde serialize");
         // Top-level keys.
-        assert!(val.get("llcs").is_some(), "top-level must have 'llcs': {val}");
-        assert!(val.get("cpus").is_some(), "top-level must have 'cpus': {val}");
-        assert!(val.get("cache").is_some(), "top-level must have 'cache': {val}");
+        assert!(
+            val.get("llcs").is_some(),
+            "top-level must have 'llcs': {val}"
+        );
+        assert!(
+            val.get("cpus").is_some(),
+            "top-level must have 'cpus': {val}"
+        );
+        assert!(
+            val.get("cache").is_some(),
+            "top-level must have 'cache': {val}"
+        );
         // Nested LLC row.
         let llc0 = &val["llcs"][0];
-        assert!(llc0.get("llc_idx").is_some(), "llc_idx (snake_case): {llc0}");
+        assert!(
+            llc0.get("llc_idx").is_some(),
+            "llc_idx (snake_case): {llc0}"
+        );
         assert!(llc0.get("numa_node").is_some(), "numa_node: {llc0}");
         assert!(llc0.get("lockfile").is_some(), "lockfile: {llc0}");
         assert!(llc0.get("holders").is_some(), "holders: {llc0}");
@@ -6694,11 +6658,8 @@ mod tests {
         use tempfile::TempDir;
         let tmp_dir = TempDir::new().expect("tempdir tmp_root");
         let cache_dir = TempDir::new().expect("tempdir cache_root");
-        let snap = collect_locks_snapshot_from(
-            tmp_dir.path(),
-            Some(cache_dir.path()),
-        )
-        .expect("collect must succeed on empty roots");
+        let snap = collect_locks_snapshot_from(tmp_dir.path(), Some(cache_dir.path()))
+            .expect("collect must succeed on empty roots");
         assert!(snap.llcs.is_empty(), "no ktstr-llc-*.lock → empty llcs");
         assert!(snap.cpus.is_empty(), "no ktstr-cpu-*.lock → empty cpus");
         assert!(snap.cache.is_empty(), "no .locks/ → empty cache");
@@ -6723,8 +6684,7 @@ mod tests {
         // Junk: looks close but doesn't match the prefix-N-.lock
         // pattern. The parse::<usize>() on "oops" fails → skip.
         std::fs::write(path.join("ktstr-llc-oops.lock"), b"").expect("plant junk");
-        let snap = collect_locks_snapshot_from(path, None)
-            .expect("collect must succeed");
+        let snap = collect_locks_snapshot_from(path, None).expect("collect must succeed");
         // LLC rows, ascending.
         assert_eq!(snap.llcs.len(), 2);
         assert_eq!(snap.llcs[0].llc_idx, 2, "sort ascending: llc 2 first");
@@ -6796,8 +6756,7 @@ mod tests {
     fn acquire_build_reservation_bypass_returns_no_reservation() {
         let _lock = bypass_env_lock();
         let _env = BypassGuard::set("1");
-        let r = acquire_build_reservation("test", None)
-            .expect("bypass + no cap must succeed");
+        let r = acquire_build_reservation("test", None).expect("bypass + no cap must succeed");
         assert!(r.plan.is_none(), "bypass must produce no LLC plan");
         assert!(
             r._sandbox.is_none(),
@@ -6818,10 +6777,9 @@ mod tests {
     fn acquire_build_reservation_bypass_with_cap_errors() {
         let _lock = bypass_env_lock();
         let _env = BypassGuard::set("1");
-        let cap = crate::vmm::host_topology::LlcCap::new(2)
-            .expect("cap=2 valid");
-        let err = acquire_build_reservation("test", Some(cap))
-            .expect_err("bypass + cap must error");
+        let cap = crate::vmm::host_topology::LlcCap::new(2).expect("cap=2 valid");
+        let err =
+            acquire_build_reservation("test", Some(cap)).expect_err("bypass + cap must error");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("resource contract"),
@@ -6869,9 +6827,7 @@ mod tests {
                 // Sysfs-unreadable host or contested LLCs. Accept
                 // either outcome; the test's intent is to pin the
                 // invariant in the success case, not force success.
-                eprintln!(
-                    "acquire_build_reservation unavailable on this host: {e:#}"
-                );
+                eprintln!("acquire_build_reservation unavailable on this host: {e:#}");
             }
         }
     }

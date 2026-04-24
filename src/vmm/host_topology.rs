@@ -236,10 +236,7 @@ impl HostTopology {
     /// host node; consolidation passes 1 so every node with at least
     /// one free LLC is a valid spill candidate). Iteration order
     /// follows the underlying `BTreeMap` — ascending by node id.
-    pub(crate) fn numa_nodes_with_capacity(
-        &self,
-        min_llcs: usize,
-    ) -> Vec<(usize, &Vec<usize>)> {
+    pub(crate) fn numa_nodes_with_capacity(&self, min_llcs: usize) -> Vec<(usize, &Vec<usize>)> {
         self.host_node_llcs
             .iter()
             .filter(|(_, llcs)| llcs.len() >= min_llcs)
@@ -810,9 +807,9 @@ impl LlcCap {
         match std::env::var("KTSTR_LLC_CAP") {
             Ok(s) if s.is_empty() => Ok(None),
             Ok(s) => {
-                let n: usize = s.parse().with_context(|| {
-                    format!("KTSTR_LLC_CAP is not a valid integer: {s:?}")
-                })?;
+                let n: usize = s
+                    .parse()
+                    .with_context(|| format!("KTSTR_LLC_CAP is not a valid integer: {s:?}"))?;
                 Ok(Some(LlcCap::new(n)?))
             }
             Err(std::env::VarError::NotPresent) => Ok(None),
@@ -940,10 +937,7 @@ const ACQUIRE_MAX_TOCTOU_RETRIES: u32 = 1;
 /// Returns `Ok(snapshots)` on success. Propagates opening + stat
 /// errors so a missing `/tmp` or permission failure surfaces
 /// actionably.
-fn discover_llc_snapshots(
-    topo: &HostTopology,
-    mountinfo: &str,
-) -> Result<Vec<LlcSnapshot>> {
+fn discover_llc_snapshots(topo: &HostTopology, mountinfo: &str) -> Result<Vec<LlcSnapshot>> {
     let mut snapshots: Vec<LlcSnapshot> = Vec::with_capacity(topo.llc_groups.len());
     for llc_idx in 0..topo.llc_groups.len() {
         let path = std::path::PathBuf::from(llc_lock_path(llc_idx));
@@ -1004,8 +998,7 @@ fn plan_from_snapshots(
     // "prefer consolidation only if score ≥ threshold" tweaks slot in.
     let mut consolidation: Vec<&LlcSnapshot> =
         snapshots.iter().filter(|s| s.holder_count > 0).collect();
-    let mut fresh: Vec<&LlcSnapshot> =
-        snapshots.iter().filter(|s| s.holder_count == 0).collect();
+    let mut fresh: Vec<&LlcSnapshot> = snapshots.iter().filter(|s| s.holder_count == 0).collect();
     consolidation.sort_by(|a, b| {
         b.holder_count
             .cmp(&a.holder_count)
@@ -1146,9 +1139,7 @@ where
         // Zero-LLC host would have already failed upstream, but be
         // explicit about the empty case rather than producing an
         // LlcPlan with no locks.
-        anyhow::bail!(
-            "host has no LLC groups; --llc-cap has nothing to reserve"
-        );
+        anyhow::bail!("host has no LLC groups; --llc-cap has nothing to reserve");
     }
 
     // Read /proc/self/mountinfo ONCE per acquire_llc_plan invocation.
@@ -1175,8 +1166,7 @@ where
                 // indices, then consume the snapshot list into the
                 // returned plan.
                 let mut cpus: Vec<usize> = Vec::new();
-                let mut mems: std::collections::BTreeSet<usize> =
-                    std::collections::BTreeSet::new();
+                let mut mems: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
                 for &idx in &selected {
                     let group = &topo.llc_groups[idx];
                     for &cpu in &group.cpus {
@@ -3055,8 +3045,7 @@ mod tests {
     #[test]
     fn acquire_llc_plan_none_cap_returns_one_fd_per_group() {
         let _prefix = LlcLockPrefixGuard::new();
-        let topo =
-            HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0), (vec![2], 0)]);
+        let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0), (vec![2], 0)]);
 
         // synthetic() needs >= num_cpus >= num_llcs; the distance
         // function is never invoked with target >= snapshots.len()
@@ -3440,12 +3429,7 @@ mod tests {
     /// `numa_nodes_with_capacity(2)` returns only node 0.
     #[test]
     fn numa_nodes_with_capacity_asymmetric() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 0),
-            (vec![2], 0),
-            (vec![3], 1),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 1)]);
         let cap2: Vec<usize> = topo
             .numa_nodes_with_capacity(2)
             .into_iter()
@@ -3474,18 +3458,9 @@ mod tests {
     /// equal distances).
     #[test]
     fn numa_nodes_sorted_by_distance_identity_closure() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 1),
-            (vec![2], 2),
-        ]);
-        let order = topo.numa_nodes_sorted_by_distance(1, |from, to| {
-            if from == to {
-                10
-            } else {
-                20
-            }
-        });
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1), (vec![2], 2)]);
+        let order =
+            topo.numa_nodes_sorted_by_distance(1, |from, to| if from == to { 10 } else { 20 });
         // Anchor node 1 first; nodes 0 and 2 tied at distance 20,
         // stable over BTreeMap-ascending order.
         assert_eq!(order[0], 1, "anchor node first");
@@ -3501,11 +3476,7 @@ mod tests {
     /// the node has LLCs. Pins the unreachable-last contract.
     #[test]
     fn numa_nodes_sorted_by_distance_unreachable_demoted() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 1),
-            (vec![2], 2),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1), (vec![2], 2)]);
         // Node 2 unreachable from anchor 0, node 1 at distance 20.
         let order = topo.numa_nodes_sorted_by_distance(0, |from, to| match (from, to) {
             (0, 0) => 10,
@@ -3527,8 +3498,7 @@ mod tests {
     fn numa_nodes_sorted_by_distance_skips_empty_nodes() {
         // Only node 0 has LLCs. Anchor 99 never appears in output.
         let topo = synth_host_topo(&[(vec![0], 0)]);
-        let order =
-            topo.numa_nodes_sorted_by_distance(99, |_, _| 20);
+        let order = topo.numa_nodes_sorted_by_distance(99, |_, _| 20);
         assert_eq!(order, vec![0], "only node 0 is in host_node_llcs");
     }
 
@@ -3546,8 +3516,8 @@ mod tests {
         let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
         let test_topo = crate::topology::TestTopology::synthetic(4, 1);
         let cap = LlcCap::new(3).unwrap();
-        let err = acquire_llc_plan(&topo, &test_topo, Some(cap))
-            .expect_err("cap > host_llcs must error");
+        let err =
+            acquire_llc_plan(&topo, &test_topo, Some(cap)).expect_err("cap > host_llcs must error");
         assert!(
             err.downcast_ref::<ResourceContention>().is_some(),
             "must be ResourceContention: {err:#}"
@@ -3595,21 +3565,14 @@ mod tests {
     /// for the broader property-based guard.
     #[test]
     fn plan_from_snapshots_returns_ascending_indices() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 0),
-            (vec![2], 0),
-            (vec![3], 0),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
         // Synthetic snapshots — holder_count higher on "later"
         // LLCs so consolidation score would put them first if the
         // algorithm didn't re-sort ascending at the end.
         let snapshots: Vec<LlcSnapshot> = (0..4)
             .map(|idx| LlcSnapshot {
                 llc_idx: idx,
-                lockfile_path: std::path::PathBuf::from(format!(
-                    "/tmp/ktstr-llc-{idx}.lock"
-                )),
+                lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
                 holders: Vec::new(),
                 holder_count: if idx >= 2 { 5 } else { 0 },
             })
@@ -3633,17 +3596,11 @@ mod tests {
     /// Pins the no-cap behavior that preserves pre-flag semantics.
     #[test]
     fn plan_from_snapshots_target_ge_all_selects_every_llc() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 1),
-            (vec![2], 2),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1), (vec![2], 2)]);
         let snapshots: Vec<LlcSnapshot> = (0..3)
             .map(|idx| LlcSnapshot {
                 llc_idx: idx,
-                lockfile_path: std::path::PathBuf::from(format!(
-                    "/tmp/ktstr-llc-{idx}.lock"
-                )),
+                lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
                 holders: Vec::new(),
                 holder_count: 0,
             })
@@ -3723,12 +3680,7 @@ mod tests {
     /// not just the specific one `_returns_ascending_indices` pins.
     #[test]
     fn plan_from_snapshots_always_ascending_across_target_range() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 1),
-            (vec![2], 0),
-            (vec![3], 1),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1), (vec![2], 0), (vec![3], 1)]);
         // Mixed holder_counts so consolidation ordering varies.
         let snapshots: Vec<LlcSnapshot> = vec![
             LlcSnapshot {
@@ -3810,12 +3762,7 @@ mod tests {
     /// locked LLCs on different nodes → "0 (node 0), 2 (node 1)".
     #[test]
     fn format_llc_list_with_numa_info() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 0),
-            (vec![2], 1),
-            (vec![3], 1),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 1), (vec![3], 1)]);
         let rendered = format_llc_list(&[0, 2], &topo);
         assert!(
             rendered.contains("0 (node 0)"),
@@ -3852,7 +3799,10 @@ mod tests {
         let mut topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
         topo.cpu_to_node.clear();
         let rendered = format_llc_list(&[0, 1], &topo);
-        assert_eq!(rendered, "[0, 1]", "degraded-host form drops node annotation");
+        assert_eq!(
+            rendered, "[0, 1]",
+            "degraded-host form drops node annotation"
+        );
     }
 
     /// `should_warn_cross_node` polarity pin: empty set or
@@ -3896,10 +3846,7 @@ mod tests {
     /// call (e.g. inlined an incorrect comparison) would fail.
     #[test]
     fn warn_if_cross_node_spill_predicate_gates_stderr() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 1),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1)]);
         let multi_plan = LlcPlan {
             locked_llcs: vec![0, 1],
             cpus: vec![0, 1],
@@ -3965,8 +3912,7 @@ mod tests {
         let _prefix = LlcLockPrefixGuard::new();
         // 2 LLCs on the same node so NUMA-locality doesn't bias
         // against consolidation.
-        let topo =
-            HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
+        let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
 
         // Child process holds SH on LLC 1's lockfile via flock(1),
         // sleeping long enough for the parent's acquire to complete
@@ -4059,11 +4005,8 @@ mod tests {
 
         let test_topo = crate::topology::TestTopology::synthetic(2, 1);
         let counter = std::cell::Cell::new(0u32);
-        let plan = acquire_llc_plan_with_acquire_fn(
-            &topo,
-            &test_topo,
-            None,
-            |_selected, _snapshots| {
+        let plan =
+            acquire_llc_plan_with_acquire_fn(&topo, &test_topo, None, |_selected, _snapshots| {
                 let n = counter.get();
                 counter.set(n + 1);
                 if n == 0 {
@@ -4076,9 +4019,8 @@ mod tests {
                     // contract is exercised elsewhere).
                     Ok(Some(Vec::new()))
                 }
-            },
-        )
-        .expect("retry on attempt 1 must succeed");
+            })
+            .expect("retry on attempt 1 must succeed");
         // Attempt 1 produced locks (empty vec is fine — the plan
         // constructor accepts any Vec<OwnedFd>).
         assert_eq!(counter.get(), 2, "acquire_fn called exactly twice");
@@ -4107,16 +4049,12 @@ mod tests {
         let test_topo = crate::topology::TestTopology::synthetic(1, 1);
 
         let counter = std::cell::Cell::new(0u32);
-        let err = acquire_llc_plan_with_acquire_fn(
-            &topo,
-            &test_topo,
-            None,
-            |_selected, _snapshots| {
+        let err =
+            acquire_llc_plan_with_acquire_fn(&topo, &test_topo, None, |_selected, _snapshots| {
                 counter.set(counter.get() + 1);
                 Ok(None)
-            },
-        )
-        .expect_err("every attempt returns None — must bail after retries");
+            })
+            .expect_err("every attempt returns None — must bail after retries");
 
         // The retry budget consumes exactly ACQUIRE_MAX_TOCTOU_RETRIES
         // + 1 acquire-fn calls. Attempt index 0 is the first
@@ -4156,18 +4094,11 @@ mod tests {
     /// override the fresh-LLC ordering.
     #[test]
     fn plan_from_snapshots_consolidation_overrides_fresh_ordering() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 0),
-            (vec![2], 0),
-            (vec![3], 0),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
         let snapshots: Vec<LlcSnapshot> = (0..4)
             .map(|idx| LlcSnapshot {
                 llc_idx: idx,
-                lockfile_path: std::path::PathBuf::from(format!(
-                    "/tmp/ktstr-llc-{idx}.lock"
-                )),
+                lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
                 holders: Vec::new(),
                 holder_count: if idx == 3 { 5 } else { 0 },
             })
@@ -4195,20 +4126,13 @@ mod tests {
     fn plan_from_snapshots_single_node_fit_no_spill() {
         // LLCs 0,1 on node 0; LLCs 2,3 on node 1. CPUs disjoint so
         // synth_host_topo populates cpu_to_node cleanly.
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 0),
-            (vec![2], 1),
-            (vec![3], 1),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 1), (vec![3], 1)]);
         // All fresh so neither node has a consolidation signal —
         // isolates the NUMA-locality bias.
         let snapshots: Vec<LlcSnapshot> = (0..4)
             .map(|idx| LlcSnapshot {
                 llc_idx: idx,
-                lockfile_path: std::path::PathBuf::from(format!(
-                    "/tmp/ktstr-llc-{idx}.lock"
-                )),
+                lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
                 holders: Vec::new(),
                 holder_count: 0,
             })
@@ -4240,18 +4164,11 @@ mod tests {
     /// second key is mandatory for cross-run determinism.
     #[test]
     fn plan_from_snapshots_equal_scores_tiebreak_ascending() {
-        let topo = synth_host_topo(&[
-            (vec![0], 0),
-            (vec![1], 0),
-            (vec![2], 0),
-            (vec![3], 0),
-        ]);
+        let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
         let snapshots: Vec<LlcSnapshot> = (0..4)
             .map(|idx| LlcSnapshot {
                 llc_idx: idx,
-                lockfile_path: std::path::PathBuf::from(format!(
-                    "/tmp/ktstr-llc-{idx}.lock"
-                )),
+                lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
                 holders: Vec::new(),
                 holder_count: 5,
             })
@@ -4285,12 +4202,8 @@ mod tests {
     fn acquire_llc_plan_cross_node_spill_mems_union() {
         let _prefix = LlcLockPrefixGuard::new();
         // LLC 0,1 on node 0 (CPUs 0,1); LLC 2,3 on node 1 (CPUs 2,3).
-        let topo = HostTopology::new_for_tests(&[
-            (vec![0], 0),
-            (vec![1], 0),
-            (vec![2], 1),
-            (vec![3], 1),
-        ]);
+        let topo =
+            HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0), (vec![2], 1), (vec![3], 1)]);
 
         let test_topo = crate::topology::TestTopology::synthetic(4, 2);
         let cap = LlcCap::new(3).expect("cap=3 valid");

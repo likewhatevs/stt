@@ -44,8 +44,7 @@ mod tests {
         });
         let text = std::str::from_utf8(&bytes).expect("stderr is UTF-8");
         assert_eq!(
-            text,
-            "ktstr: SKIP: topology mismatch: requires 4 cores, got 2\n",
+            text, "ktstr: SKIP: topology mismatch: requires 4 cores, got 2\n",
             "expected canonical banner with trailing newline",
         );
     }

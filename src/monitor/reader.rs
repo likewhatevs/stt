@@ -1190,8 +1190,7 @@ pub(crate) fn monitor_loop(
             {
                 let n = prev.cpus.len().min(cpus.len()).min(stall_trackers.len());
                 for i in 0..n {
-                    let is_stall =
-                        is_cpu_stalled(&prev.cpus[i], &cpus[i], preemption_threshold_ns);
+                    let is_stall = is_cpu_stalled(&prev.cpus[i], &cpus[i], preemption_threshold_ns);
                     stall_trackers[i].record(is_stall, cpus[i].rq_clock as f64, sample_idx);
                 }
             }

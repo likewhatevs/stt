@@ -130,7 +130,8 @@ fn fio_extract_metrics_smoke_from_realistic_json() {
 /// pre-pass, not by metric values).
 #[test]
 fn stress_ng_extract_metrics_smoke_returns_empty() {
-    let metrics = extract_metrics("irrelevant stdout", &STRESS_NG.output, MetricStream::Stdout).unwrap();
+    let metrics =
+        extract_metrics("irrelevant stdout", &STRESS_NG.output, MetricStream::Stdout).unwrap();
     assert!(
         metrics.is_empty(),
         "ExitCode output emits no metrics; got {metrics:?}"

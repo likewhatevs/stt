@@ -67,9 +67,7 @@ use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 /// doubling keeps the per-window activity at the same floor
 /// rather than halving it.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 6)]
-fn host_state_pipeline_e2e_capture_write_load_compare(
-    ctx: &Ctx,
-) -> Result<AssertResult> {
+fn host_state_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertResult> {
     let baseline_path = std::path::PathBuf::from("/tmp/baseline.hst.zst");
     let candidate_path = std::path::PathBuf::from("/tmp/candidate.hst.zst");
 
@@ -149,7 +147,11 @@ fn host_state_pipeline_e2e_capture_write_load_compare(
     // `pcomm` across the workload's threads (they all fork from
     // the test binary), so the default grouping joins baseline
     // and candidate under one key.
-    let diff = compare(&loaded_baseline, &loaded_candidate, &CompareOptions::default());
+    let diff = compare(
+        &loaded_baseline,
+        &loaded_candidate,
+        &CompareOptions::default(),
+    );
 
     if diff.rows.is_empty() {
         return Ok(AssertResult::fail(AssertDetail::new(
@@ -179,10 +181,10 @@ fn host_state_pipeline_e2e_capture_write_load_compare(
         "nr_wakeups",
         "minflt",
     ];
-    let has_nonzero_delta = diff.rows.iter().any(|r| {
-        tracked_metrics.contains(&r.metric_name)
-            && r.delta.is_some_and(|d| d != 0.0)
-    });
+    let has_nonzero_delta = diff
+        .rows
+        .iter()
+        .any(|r| tracked_metrics.contains(&r.metric_name) && r.delta.is_some_and(|d| d != 0.0));
 
     if !has_nonzero_delta {
         // Dump the observed deltas so a reviewer chasing a

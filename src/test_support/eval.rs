@@ -1075,9 +1075,7 @@ pub enum ResolveSource {
 ///   `target/release/` ([`TargetRelease`](ResolveSource::TargetRelease)),
 ///   on-demand build ([`AutoBuilt`](ResolveSource::AutoBuilt)).
 ///   Exhausting every branch is a hard error.
-pub fn resolve_scheduler(
-    spec: &SchedulerSpec,
-) -> Result<(Option<PathBuf>, ResolveSource)> {
+pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, ResolveSource)> {
     match spec {
         SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => {
             Ok((None, ResolveSource::NotFound))
@@ -1265,10 +1263,10 @@ mod tests {
         EVAL_TOPO, EnvVarGuard, build_assert_result_json, eevdf_entry, isolated_cache_dir,
         lock_env, make_vm_result, no_repro, sched_entry,
     };
-    use tempfile::TempDir;
     use super::*;
     use crate::assert::{AssertDetail, DetailKind};
     use crate::verifier::SCHED_OUTPUT_END;
+    use tempfile::TempDir;
 
     // -- dedupe_include_files tests --
     //
@@ -1855,7 +1853,10 @@ mod tests {
     fn eval_assert_failure_includes_sched_log() {
         let json = build_assert_result_json(
             false,
-            vec![AssertDetail::new(DetailKind::Stuck, "worker 0 stuck 5000ms")],
+            vec![AssertDetail::new(
+                DetailKind::Stuck,
+                "worker 0 stuck 5000ms",
+            )],
         );
         let output = format!(
             "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
@@ -1980,10 +1981,8 @@ mod tests {
 
     #[test]
     fn eval_no_sched_output_no_fingerprint() {
-        let json = build_assert_result_json(
-            false,
-            vec![AssertDetail::new(DetailKind::Stuck, "stuck")],
-        );
+        let json =
+            build_assert_result_json(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
         let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_no_fp__");
         let result = make_vm_result(&output, "", 0, false);

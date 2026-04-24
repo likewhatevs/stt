@@ -329,12 +329,7 @@ pub(crate) fn get_or_build_base(
             // We won the race — build, write, release.
             tracing::debug!("initramfs shm: builder (O_EXCL won)");
             let t0 = std::time::Instant::now();
-            let data = initramfs::build_initramfs_base(
-                payload,
-                extras,
-                include_files,
-                busybox,
-            )?;
+            let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
             tracing::debug!(
                 elapsed_us = t0.elapsed().as_micros(),
                 bytes = data.len(),
@@ -383,12 +378,7 @@ pub(crate) fn get_or_build_base(
 
     // 3. Fallback: build without SHM coordination.
     let t0 = std::time::Instant::now();
-    let data = initramfs::build_initramfs_base(
-        payload,
-        extras,
-        include_files,
-        busybox,
-    )?;
+    let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
     let arc = Arc::new(data);
     tracing::debug!(
         elapsed_us = t0.elapsed().as_micros(),
@@ -1183,8 +1173,7 @@ impl KtstrVm {
         // on every vCPU thread. Perf-mode's pin_targets doesn't
         // apply here — interactive shell runs under no-perf by
         // convention, and `pin_targets` is empty in this branch.
-        let no_perf_mask: Option<&[usize]> =
-            self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
+        let no_perf_mask: Option<&[usize]> = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
         let ap_threads = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -1617,21 +1606,15 @@ impl KtstrVm {
                 // hash them accordingly so a binary-change
                 // invalidates the cache. The scheduler stays in
                 // the non-shell path.
-                let has_jemalloc_extras =
-                    probe.as_deref().is_some() || worker.as_deref().is_some();
-                let shell_mode =
-                    busybox || !include_files.is_empty() || has_jemalloc_extras;
+                let has_jemalloc_extras = probe.as_deref().is_some() || worker.as_deref().is_some();
+                let shell_mode = busybox || !include_files.is_empty() || has_jemalloc_extras;
 
                 // Merge include_files with probe + worker so both
                 // the cache key and the actual archive build see
                 // the same input set.
-                let mut merged_includes: Vec<(String, PathBuf)> =
-                    include_files.clone();
+                let mut merged_includes: Vec<(String, PathBuf)> = include_files.clone();
                 if let Some(p) = probe.as_deref() {
-                    merged_includes.push((
-                        "bin/ktstr-jemalloc-probe".to_string(),
-                        p.to_path_buf(),
-                    ));
+                    merged_includes.push(("bin/ktstr-jemalloc-probe".to_string(), p.to_path_buf()));
                 }
                 if let Some(w) = worker.as_deref() {
                     merged_includes.push((
@@ -1662,13 +1645,7 @@ impl KtstrVm {
                     .iter()
                     .map(|(a, p)| (a.as_str(), p.as_path()))
                     .collect();
-                let base = get_or_build_base(
-                    &payload,
-                    &extras,
-                    &include_refs,
-                    busybox,
-                    &key,
-                )?;
+                let base = get_or_build_base(&payload, &extras, &include_refs, busybox, &key)?;
                 Ok((base, key))
             })
             .ok()
@@ -2346,8 +2323,7 @@ impl KtstrVm {
         // No-perf + --llc-cap: flat CPU list from the LLC plan gets
         // sched_setaffinity'd on every vCPU thread as a mask (not a
         // hard pin). Mutually exclusive with perf-mode's pin_targets.
-        let no_perf_mask: Option<&[usize]> =
-            self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
+        let no_perf_mask: Option<&[usize]> = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
 
         let ap_threads = self.spawn_ap_threads(
             vcpus,
@@ -3265,8 +3241,7 @@ impl KtstrVm {
                     .join()
                     .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
                 let base_bytes: &[u8] = base.as_ref();
-                let suffix =
-                    initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
+                let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
                 let uncompressed_size = base_bytes.len() + suffix.len();
 
                 // Compress before computing memory so the formula uses
@@ -3316,8 +3291,7 @@ impl KtstrVm {
                     .join()
                     .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
                 let base_bytes: &[u8] = base.as_ref();
-                let suffix =
-                    initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
+                let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
                 let initrd_data = initramfs::lz4_compress_combined(base_bytes, &suffix);
                 let total_size = initrd_data.len() as u64;
                 let load_addr = aarch64_initrd_addr(memory_mb, self.shm_size, total_size);
@@ -3892,8 +3866,7 @@ impl KtstrVmBuilder {
                 (None, Vec::new(), Vec::new(), None)
             } else if let Ok(host_topo) = host_topology::HostTopology::from_sysfs() {
                 let test_topo = crate::topology::TestTopology::from_system()?;
-                let plan =
-                    host_topology::acquire_llc_plan(&host_topo, &test_topo, llc_cap)?;
+                let plan = host_topology::acquire_llc_plan(&host_topo, &test_topo, llc_cap)?;
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
                 (None, Vec::new(), Vec::new(), Some(plan))
             } else {

@@ -375,9 +375,7 @@ pub(crate) fn fetch_releases(client: &Client) -> Result<Vec<Release>> {
     if !response.status().is_success() {
         anyhow::bail!("fetch {url}: HTTP {}", response.status());
     }
-    let body = response
-        .text()
-        .with_context(|| "read response body")?;
+    let body = response.text().with_context(|| "read response body")?;
     let json: serde_json::Value =
         serde_json::from_str(&body).with_context(|| "parse releases.json")?;
     let releases = json
@@ -423,8 +421,8 @@ pub fn fetch_latest_stable_version(client: &Client, cli_label: &str) -> Result<S
         break;
     }
 
-    let version = best
-        .ok_or_else(|| anyhow!("no stable kernel with patch >= 8 found in releases.json"))?;
+    let version =
+        best.ok_or_else(|| anyhow!("no stable kernel with patch >= 8 found in releases.json"))?;
     eprintln!("{cli_label}: latest stable kernel: {version}");
     Ok(version.to_string())
 }
@@ -515,12 +513,7 @@ const PROBE_PATCH_MAX: u32 = 500;
 /// Returns `Ok(true)` iff the server returned a 2xx status AND the
 /// response body is not HTML (some CDN error pages return 200 with
 /// text/html). Network / transport failures propagate as `Err`.
-fn probe_patch_exists(
-    client: &Client,
-    major: u32,
-    prefix: &str,
-    patch: u32,
-) -> Result<bool> {
+fn probe_patch_exists(client: &Client, major: u32, prefix: &str, patch: u32) -> Result<bool> {
     let url =
         format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{prefix}.{patch}.tar.xz");
     let response = client
@@ -711,16 +704,12 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource> {
             // the HEAD commit id is not itself a tree, so peel HEAD
             // to its root tree before diffing or the diff silently
             // returns an error and index dirt goes undetected.
-            let head_tree = repo
-                .head_tree()
-                .with_context(|| "read HEAD tree")?;
+            let head_tree = repo.head_tree().with_context(|| "read HEAD tree")?;
             let head_tree_id = head_tree.id;
 
             // Check HEAD-vs-index for tracked file changes.
             let mut index_dirty = false;
-            let index = repo
-                .index_or_empty()
-                .with_context(|| "open index")?;
+            let index = repo.index_or_empty().with_context(|| "open index")?;
             let _ = repo.tree_index_status(
                 &head_tree_id,
                 &index,
@@ -987,7 +976,14 @@ mod tests {
         run(&["init", "-q", "-b", "main"]);
         std::fs::write(dir.join("file.txt"), "original\n").unwrap();
         run(&["add", "file.txt"]);
-        run(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "initial"]);
+        run(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ]);
     }
 
     /// On a clean repo, `local_source` must report `is_dirty=false` and
@@ -995,7 +991,11 @@ mod tests {
     /// with the HEAD short-hash.
     #[test]
     fn local_source_clean_repo_populates_hash() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             skip!("git CLI unavailable");
         }
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1028,7 +1028,11 @@ mod tests {
     /// build's source identity would mislead a reproducer.
     #[test]
     fn local_source_dirty_tracked_file_clears_hash() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             skip!("git CLI unavailable");
         }
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1062,7 +1066,11 @@ mod tests {
     /// same `git_hash=None` invariant applies.
     #[test]
     fn local_source_dirty_staged_only_clears_hash() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             skip!("git CLI unavailable");
         }
         let tmp = tempfile::TempDir::new().unwrap();

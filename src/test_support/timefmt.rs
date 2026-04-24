@@ -201,8 +201,14 @@ mod tests {
         assert_eq!(stamp.len(), 16, "compact form must be 16 chars: {stamp}");
         assert!(stamp.ends_with('Z'), "must end with Z: {stamp}");
         assert!(stamp.contains('T'), "must contain T separator: {stamp}");
-        assert!(!stamp.contains(':'), "compact form must not contain ':': {stamp}");
-        assert!(!stamp.contains('-'), "compact form must not contain '-': {stamp}");
+        assert!(
+            !stamp.contains(':'),
+            "compact form must not contain ':': {stamp}"
+        );
+        assert!(
+            !stamp.contains('-'),
+            "compact form must not contain '-': {stamp}"
+        );
         assert!(
             stamp[..8].chars().all(|c| c.is_ascii_digit()),
             "date prefix must be all digits: {stamp}",

@@ -868,7 +868,10 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let fallback: Vec<f64> = rows.iter().map(|r| r.fallback_count as f64).collect();
     let keep_last: Vec<f64> = rows.iter().map(|r| r.keep_last_count as f64).collect();
     let p99_wake_lat: Vec<f64> = rows.iter().map(|r| r.worst_p99_wake_latency_us).collect();
-    let median_wake_lat: Vec<f64> = rows.iter().map(|r| r.worst_median_wake_latency_us).collect();
+    let median_wake_lat: Vec<f64> = rows
+        .iter()
+        .map(|r| r.worst_median_wake_latency_us)
+        .collect();
     let wake_cv: Vec<f64> = rows.iter().map(|r| r.worst_wake_latency_cv).collect();
     let total_iters: Vec<f64> = rows.iter().map(|r| r.total_iterations as f64).collect();
     let mean_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_mean_run_delay_us).collect();
@@ -1040,12 +1043,7 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
 }
 
 /// Find topology names where a scenario exceeds the threshold.
-fn find_worst_topos(
-    df: &DataFrame,
-    scenario: &str,
-    metric: &str,
-    threshold: f64,
-) -> Vec<String> {
+fn find_worst_topos(df: &DataFrame, scenario: &str, metric: &str, threshold: f64) -> Vec<String> {
     let filtered = df
         .clone()
         .lazy()
@@ -1518,9 +1516,9 @@ pub(crate) fn compare_rows(
                 continue;
             }
         }
-        let row_a = rows_a.iter().find(|r| {
-            (&r.scenario, &r.topology, &r.work_type, &r.flags) == key_b
-        });
+        let row_a = rows_a
+            .iter()
+            .find(|r| (&r.scenario, &r.topology, &r.work_type, &r.flags) == key_b);
         let Some(row_a) = row_a else {
             report.new_in_b += 1;
             continue;
@@ -1606,9 +1604,9 @@ pub(crate) fn compare_rows(
                 continue;
             }
         }
-        let exists_in_b = rows_b.iter().any(|r| {
-            (&r.scenario, &r.topology, &r.work_type, &r.flags) == key_a
-        });
+        let exists_in_b = rows_b
+            .iter()
+            .any(|r| (&r.scenario, &r.topology, &r.work_type, &r.flags) == key_a);
         if !exists_in_b {
             report.removed_from_a += 1;
         }
@@ -2377,7 +2375,14 @@ mod tests {
     #[test]
     fn list_metrics_text_header_pins_column_names() {
         let out = list_metrics(false).expect("text render must succeed");
-        for header in ["NAME", "POLARITY", "DEFAULT_ABS", "DEFAULT_REL", "UNIT", "DESCRIPTION"] {
+        for header in [
+            "NAME",
+            "POLARITY",
+            "DEFAULT_ABS",
+            "DEFAULT_REL",
+            "UNIT",
+            "DESCRIPTION",
+        ] {
             assert!(
                 out.contains(header),
                 "list_metrics(false) output missing column header {header}: {out}",
@@ -2407,8 +2412,7 @@ mod tests {
         }
 
         let out = list_metrics(true).expect("json render must succeed");
-        let parsed: Vec<MetricEntry> =
-            serde_json::from_str(&out).expect("json output must parse");
+        let parsed: Vec<MetricEntry> = serde_json::from_str(&out).expect("json output must parse");
         assert_eq!(
             parsed.len(),
             METRICS.len(),
@@ -2501,7 +2505,10 @@ mod tests {
         assert_eq!(read_metric(&row, "total_fallback"), Some(11.0));
         assert_eq!(read_metric(&row, "total_keep_last"), Some(4.0));
         assert_eq!(read_metric(&row, "worst_p99_wake_latency_us"), Some(99.0));
-        assert_eq!(read_metric(&row, "worst_median_wake_latency_us"), Some(50.0));
+        assert_eq!(
+            read_metric(&row, "worst_median_wake_latency_us"),
+            Some(50.0)
+        );
         assert_eq!(read_metric(&row, "worst_wake_latency_cv"), Some(0.5));
         assert_eq!(read_metric(&row, "total_iterations"), Some(1000.0));
         assert_eq!(read_metric(&row, "worst_mean_run_delay_us"), Some(25.0));
@@ -2666,7 +2673,12 @@ mod tests {
         let mut row_a = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         let mut row_b = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         row_a.skipped = true; // A side was skipped
-        let res = compare_rows(&[row_a.clone()], &[row_b.clone()], None, &ComparisonPolicy::default());
+        let res = compare_rows(
+            &[row_a.clone()],
+            &[row_b.clone()],
+            None,
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res.regressions, 0);
         assert_eq!(res.improvements, 0);
         assert_eq!(
@@ -2728,7 +2740,12 @@ mod tests {
             cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
             cmp_row("beta", "tiny-1llc", true, 30.0, 0),
         ];
-        let res = compare_rows(&rows_a, &rows_b, Some("alpha"), &ComparisonPolicy::default());
+        let res = compare_rows(
+            &rows_a,
+            &rows_b,
+            Some("alpha"),
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res.regressions, 1, "only alpha row should compare");
         assert_eq!(res.findings.len(), 1);
         assert_eq!(res.findings[0].scenario, "alpha");
@@ -2746,7 +2763,12 @@ mod tests {
         assert_eq!(res_topo.findings.len(), 2);
 
         // Non-matching filter yields no comparisons at all.
-        let res_none = compare_rows(&rows_a, &rows_b, Some("nomatch"), &ComparisonPolicy::default());
+        let res_none = compare_rows(
+            &rows_a,
+            &rows_b,
+            Some("nomatch"),
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res_none.regressions, 0);
         assert_eq!(res_none.improvements, 0);
         assert_eq!(res_none.unchanged, 0);
@@ -2786,7 +2808,12 @@ mod tests {
         // can't promote it to significant.
         let rows_a_small = vec![cmp_row("t", "tiny-1llc", true, 1.0, 0)];
         let rows_b_small = vec![cmp_row("t", "tiny-1llc", true, 1.5, 0)];
-        let res_small = compare_rows(&rows_a_small, &rows_b_small, None, &ComparisonPolicy::uniform(1.0));
+        let res_small = compare_rows(
+            &rows_a_small,
+            &rows_b_small,
+            None,
+            &ComparisonPolicy::uniform(1.0),
+        );
         assert!(
             !res_small
                 .findings
@@ -3063,8 +3090,7 @@ mod tests {
     #[test]
     fn comparison_policy_load_json_nonexistent_path_surfaces_path() {
         let path = std::path::Path::new("/nonexistent/ktstr/policy-DOES-NOT-EXIST.json");
-        let err = ComparisonPolicy::load_json(path)
-            .expect_err("nonexistent path must fail");
+        let err = ComparisonPolicy::load_json(path).expect_err("nonexistent path must fail");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains(&path.display().to_string()),
@@ -3092,8 +3118,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         // Not JSON — clearly malformed.
         std::fs::write(tmp.path(), "this is not json at all {{{").expect("write");
-        let err = ComparisonPolicy::load_json(tmp.path())
-            .expect_err("malformed JSON must fail");
+        let err = ComparisonPolicy::load_json(tmp.path()).expect_err("malformed JSON must fail");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains(&tmp.path().display().to_string()),
@@ -3117,13 +3142,8 @@ mod tests {
     #[test]
     fn comparison_policy_load_json_rejects_unknown_fields() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        std::fs::write(
-            tmp.path(),
-            r#"{"default_percentage": 10.0}"#,
-        )
-        .expect("write");
-        let err = ComparisonPolicy::load_json(tmp.path())
-            .expect_err("unknown field must fail");
+        std::fs::write(tmp.path(), r#"{"default_percentage": 10.0}"#).expect("write");
+        let err = ComparisonPolicy::load_json(tmp.path()).expect_err("unknown field must fail");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("default_percentage")
@@ -3223,8 +3243,7 @@ mod tests {
         assert!(loaded.per_metric_percent.is_empty());
 
         // Only default_percent set → empty per_metric.
-        std::fs::write(tmp.path(), r#"{"default_percent": 7.5}"#)
-            .expect("write partial policy");
+        std::fs::write(tmp.path(), r#"{"default_percent": 7.5}"#).expect("write partial policy");
         let loaded = ComparisonPolicy::load_json(tmp.path()).expect("load partial policy");
         assert_eq!(loaded.default_percent, Some(7.5));
         assert!(loaded.per_metric_percent.is_empty());
@@ -3235,13 +3254,9 @@ mod tests {
             r#"{"per_metric_percent": {"worst_spread": 3.0}}"#,
         )
         .expect("write per-metric-only policy");
-        let loaded =
-            ComparisonPolicy::load_json(tmp.path()).expect("load per-metric-only policy");
+        let loaded = ComparisonPolicy::load_json(tmp.path()).expect("load per-metric-only policy");
         assert_eq!(loaded.default_percent, None);
-        assert_eq!(
-            loaded.per_metric_percent.get("worst_spread"),
-            Some(&3.0),
-        );
+        assert_eq!(loaded.per_metric_percent.get("worst_spread"), Some(&3.0),);
     }
 
     /// End-to-end pin: `compare_rows` with a per-metric policy
@@ -3390,10 +3405,7 @@ mod tests {
 
         // Each flag profile's spread moved by 90 → one regression
         // (llc 10→100) and one improvement (borrow 100→10).
-        assert_eq!(
-            res.regressions, 1,
-            "llc regression should fire (10 → 100)",
-        );
+        assert_eq!(res.regressions, 1, "llc regression should fire (10 → 100)",);
         assert_eq!(
             res.improvements, 1,
             "borrow improvement should fire (100 → 10)",
@@ -3427,7 +3439,12 @@ mod tests {
         // Filtering to "alpha" excludes beta entirely; the failed row
         // is filtered out before the passed gate runs, so
         // skipped_failed=0.
-        let filtered = compare_rows(&rows_a, &rows_b, Some("alpha"), &ComparisonPolicy::default());
+        let filtered = compare_rows(
+            &rows_a,
+            &rows_b,
+            Some("alpha"),
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(filtered.skipped_failed, 0);
         assert_eq!(filtered.regressions, 1);
         assert_eq!(filtered.findings.len(), 1);
@@ -3450,7 +3467,12 @@ mod tests {
         let mut b2 = cmp_row("test2", "tiny-1llc", true, 30.0, 0);
         b2.scheduler = "scx_beta".into();
 
-        let res = compare_rows(&[a1, a2], &[b1, b2], Some("scx_alpha"), &ComparisonPolicy::default());
+        let res = compare_rows(
+            &[a1, a2],
+            &[b1, b2],
+            Some("scx_alpha"),
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res.regressions, 1, "only the scx_alpha row compares");
         assert_eq!(res.findings.len(), 1);
         assert_eq!(res.findings[0].scenario, "test1");
@@ -3500,7 +3522,12 @@ mod tests {
 
         // Filter to "alpha" -- beta and gamma are excluded by the
         // substring filter on both passes.
-        let res = compare_rows(&rows_a, &rows_b, Some("alpha"), &ComparisonPolicy::default());
+        let res = compare_rows(
+            &rows_a,
+            &rows_b,
+            Some("alpha"),
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res.regressions, 1);
         assert_eq!(res.new_in_b, 0, "beta is filtered out, not new");
         assert_eq!(res.removed_from_a, 0, "gamma is filtered out, not removed");
@@ -3542,12 +3569,18 @@ mod tests {
         let ha = host_ctx("6.14.0", Some("preempt=lazy"));
         let hb = host_ctx("6.15.1", Some("preempt=lazy"));
         let out = format_host_delta(Some(&ha), Some(&hb), "a", "b");
-        assert!(out.starts_with("\nhost delta ('a' → 'b'):\n"), "got: {out:?}");
+        assert!(
+            out.starts_with("\nhost delta ('a' → 'b'):\n"),
+            "got: {out:?}"
+        );
         // `kernel_release` differs between the two contexts so the
         // diff body must be non-empty — confirms we routed through
         // the `else` arm and not the `identical` arm.
         let body = &out["\nhost delta ('a' → 'b'):\n".len()..];
-        assert!(!body.is_empty(), "differing contexts must produce a diff body");
+        assert!(
+            !body.is_empty(),
+            "differing contexts must produce a diff body"
+        );
         // Pin the trailing-newline contract: the other three arms
         // (`identical`, left-only, right-only) all end with '\n'; the
         // differ arm delegates to `HostContext::diff()` whose output
@@ -3731,7 +3764,10 @@ mod tests {
         // overriding `test_name` per run gives the two runs
         // distinct rows so compare_runs has something to report
         // without tripping the empty-sidecars bail.
-        for (name, run_key) in [("dir_thread_fixture_a", run_a), ("dir_thread_fixture_b", run_b)] {
+        for (name, run_key) in [
+            ("dir_thread_fixture_a", run_a),
+            ("dir_thread_fixture_b", run_b),
+        ] {
             let run_dir = alt_root.path().join(run_key);
             std::fs::create_dir_all(&run_dir).expect("create run dir");
             let sidecar = SidecarResult {

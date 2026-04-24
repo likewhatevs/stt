@@ -303,8 +303,15 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
 #[derive(Debug, Clone)]
 pub enum Aggregated {
     Sum(u64),
-    OrdinalRange { min: i64, max: i64 },
-    Mode { value: String, count: usize, total: usize },
+    OrdinalRange {
+        min: i64,
+        max: i64,
+    },
+    Mode {
+        value: String,
+        count: usize,
+        total: usize,
+    },
     Affinity(AffinitySummary),
 }
 
@@ -1151,11 +1158,7 @@ mod tests {
         };
         let diff = compare(&snap_with(vec![ta]), &snap_with(vec![tb]), &opts);
         assert!(diff.only_baseline.is_empty(), "{:?}", diff.only_baseline);
-        assert!(
-            diff.only_candidate.is_empty(),
-            "{:?}",
-            diff.only_candidate,
-        );
+        assert!(diff.only_candidate.is_empty(), "{:?}", diff.only_candidate,);
         assert!(
             diff.rows
                 .iter()
@@ -1218,10 +1221,7 @@ mod tests {
             .expect("policy row");
         assert!(policy_row.delta.is_none());
         match (&policy_row.baseline, &policy_row.candidate) {
-            (
-                Aggregated::Mode { value: a, .. },
-                Aggregated::Mode { value: b, .. },
-            ) => {
+            (Aggregated::Mode { value: a, .. }, Aggregated::Mode { value: b, .. }) => {
                 assert_eq!(a, "SCHED_OTHER");
                 assert_eq!(b, "SCHED_FIFO");
             }
@@ -1329,11 +1329,7 @@ mod tests {
             &snap_with(vec![b]),
             &CompareOptions::default(),
         );
-        let solo_rows: Vec<&DiffRow> = diff
-            .rows
-            .iter()
-            .filter(|r| r.group_key == "solo")
-            .collect();
+        let solo_rows: Vec<&DiffRow> = diff.rows.iter().filter(|r| r.group_key == "solo").collect();
         assert_eq!(solo_rows.len(), HOST_STATE_METRICS.len());
     }
 
@@ -1433,10 +1429,8 @@ mod tests {
     /// broad and narrow patterns.
     #[test]
     fn flatten_first_match_wins_over_later_pattern() {
-        let pats = compile_flatten_patterns(&[
-            "/kubepods/*/workload".into(),
-            "/kubepods/**".into(),
-        ]);
+        let pats =
+            compile_flatten_patterns(&["/kubepods/*/workload".into(), "/kubepods/**".into()]);
         assert_eq!(
             flatten_cgroup_path("/kubepods/pod-abc/workload", &pats),
             "/kubepods/*/workload",
@@ -1536,10 +1530,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("metric {name} not in registry"));
             let agg = aggregate(def.rule, &[&t]);
             match agg {
-                Aggregated::Sum(v) => assert_eq!(
-                    v, 1,
-                    "accessor for {name} did not read the {name} field",
-                ),
+                Aggregated::Sum(v) => {
+                    assert_eq!(v, 1, "accessor for {name} did not read the {name} field",)
+                }
                 other => panic!("expected Sum for {name}, got {other:?}"),
             }
         }
@@ -1648,7 +1641,15 @@ mod tests {
             GroupBy::Pcomm,
         )
         .unwrap();
-        for h in ["pcomm", "threads", "metric", "baseline", "candidate", "delta", "%"] {
+        for h in [
+            "pcomm",
+            "threads",
+            "metric",
+            "baseline",
+            "candidate",
+            "delta",
+            "%",
+        ] {
             assert!(out.contains(h), "missing header {h}:\n{out}");
         }
     }
@@ -1751,7 +1752,10 @@ mod tests {
             GroupBy::Cgroup,
         )
         .unwrap();
-        assert!(out.contains("cpu_usage_usec"), "missing enrichment header:\n{out}");
+        assert!(
+            out.contains("cpu_usage_usec"),
+            "missing enrichment header:\n{out}"
+        );
         assert!(out.contains("10"), "missing baseline usec:\n{out}");
         assert!(out.contains("50"), "missing candidate usec:\n{out}");
         assert!(out.contains("+40"), "missing delta:\n{out}");
@@ -1861,14 +1865,7 @@ mod tests {
 
         let diff = compare(&loaded_a, &loaded_b, &CompareOptions::default());
         let mut out = String::new();
-        write_diff(
-            &mut out,
-            &diff,
-            tmp_a.path(),
-            tmp_b.path(),
-            GroupBy::Pcomm,
-        )
-        .unwrap();
+        write_diff(&mut out, &diff, tmp_a.path(), tmp_b.path(), GroupBy::Pcomm).unwrap();
 
         // Column headers present.
         assert!(out.contains("pcomm"));

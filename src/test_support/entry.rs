@@ -1749,7 +1749,9 @@ mod tests {
         // synthesizing a commit here would be a lie when the
         // binary was built from a different tree.
         assert!(
-            SchedulerSpec::Path("/usr/bin/scx_external").scheduler_commit().is_none(),
+            SchedulerSpec::Path("/usr/bin/scx_external")
+                .scheduler_commit()
+                .is_none(),
             "Path(_) points at an externally-built binary — \
              scheduler_commit must be None so consumers don't treat \
              a fabricated commit as authoritative. Got: {:?}",

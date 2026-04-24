@@ -213,4 +213,3 @@ pub const WORKER_STDERR_PREFIX: &str = "jemalloc-alloc-worker:";
 /// `pid=` / `bytes=` tail is NOT part of the constant, matching
 /// the [`WORKER_STDERR_PREFIX`] convention.
 pub const WORKER_STDOUT_READY_PREFIX: &str = "jemalloc-alloc-worker ready";
-

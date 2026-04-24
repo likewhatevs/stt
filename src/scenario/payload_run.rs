@@ -527,7 +527,11 @@ impl PayloadHandle {
                 // sends killpg + single-pid SIGKILL to close the
                 // pipes and guarantee the leader exits; the
                 // trailing `wait` reaps it so the pid slot is freed.
-                kill_payload_process_group(&child, self.payload.name, self.payload.uses_parent_pgrp);
+                kill_payload_process_group(
+                    &child,
+                    self.payload.name,
+                    self.payload.uses_parent_pgrp,
+                );
                 let _ = child.wait();
                 Err(e).with_context(|| format!("wait payload '{}'", self.payload.name))
             }
@@ -596,7 +600,11 @@ impl PayloadHandle {
                         // pipe drain failed — descendants may still
                         // hold the pipes. Kill the group to release
                         // them, then reap the leader zombie.
-                        kill_payload_process_group(&child, self.payload.name, self.payload.uses_parent_pgrp);
+                        kill_payload_process_group(
+                            &child,
+                            self.payload.name,
+                            self.payload.uses_parent_pgrp,
+                        );
                         let _ = child.wait();
                         Err(e).with_context(|| format!("reap payload '{}'", self.payload.name))
                     }
@@ -1427,9 +1435,7 @@ fn cgroup_sync_pre_exec(
 /// the cgroup.procs open/write can fail; a failure drops the
 /// handle, which also closes the release write end, giving the
 /// child's pre_exec a fast EOF-driven bail.
-fn spawn_with_cgroup_sync(
-    handles: CgroupSyncHandles,
-) -> Result<libc::pid_t> {
+fn spawn_with_cgroup_sync(handles: CgroupSyncHandles) -> Result<libc::pid_t> {
     use std::io::{Read, Write};
     let CgroupSyncHandles {
         notify,
@@ -1482,8 +1488,9 @@ fn spawn_with_cgroup_sync(
         if ready < 0 {
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() != Some(libc::EINTR) {
-                return Err(anyhow::Error::new(e)
-                    .context("poll(notify_r) for cgroup-sync pid-notify"));
+                return Err(
+                    anyhow::Error::new(e).context("poll(notify_r) for cgroup-sync pid-notify")
+                );
             }
         } else if ready == 0 {
             anyhow::bail!(
@@ -1528,12 +1535,8 @@ fn spawn_with_cgroup_sync(
             )
         })?;
     let line = format!("{child_pid}\n");
-    f.write_all(line.as_bytes()).with_context(|| {
-        format!(
-            "write pid {child_pid} to {}",
-            cgroup_procs_path.display(),
-        )
-    })?;
+    f.write_all(line.as_bytes())
+        .with_context(|| format!("write pid {child_pid} to {}", cgroup_procs_path.display(),))?;
     drop(f);
 
     // Step 3: release the child. One byte is enough; the content
@@ -1810,8 +1813,7 @@ fn spawn_and_wait(
     uses_parent_pgrp: bool,
 ) -> Result<SpawnOutput> {
     let _sigchld = SigchldScope::new();
-    let (cmd, sync_handles) =
-        build_command(binary, args, cgroup_path, uses_parent_pgrp)?;
+    let (cmd, sync_handles) = build_command(binary, args, cgroup_path, uses_parent_pgrp)?;
     let mut child = match sync_handles {
         Some(handles) => drive_cgroup_handshake(cmd, handles, binary)?,
         None => {
@@ -1858,14 +1860,13 @@ fn wait_with_deadline(
 
     let deadline = std::time::Instant::now() + timeout;
 
-    let pid = libc::pid_t::try_from(child.id())
-        .expect("child pid fits in pid_t (Linux pid_max <= 2^22)");
+    let pid =
+        libc::pid_t::try_from(child.id()).expect("child pid fits in pid_t (Linux pid_max <= 2^22)");
     // `pidfd_open(pid, 0)`: returns an fd that becomes readable when
     // the pid exits. No `PIDFD_NONBLOCK` flag — epoll is the gate.
     let pidfd_raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0i32) };
     if pidfd_raw < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("pidfd_open({pid})"));
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("pidfd_open({pid})"));
     }
     // SAFETY: the syscall succeeded and returned a fresh fd.
     let pidfd: OwnedFd = unsafe { OwnedFd::from_raw_fd(pidfd_raw as i32) };
@@ -1920,8 +1921,8 @@ fn wait_with_deadline(
         // accepted value instead of bubbling up a conversion error.
         let ms_u32 = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
         let ms_u32 = std::cmp::min(ms_u32, i32::MAX as u32);
-        let timeout_param = EpollTimeout::try_from(ms_u32)
-            .with_context(|| "epoll timeout conversion")?;
+        let timeout_param =
+            EpollTimeout::try_from(ms_u32).with_context(|| "epoll timeout conversion")?;
 
         match epoll.wait(&mut events, timeout_param) {
             Ok(_) => {
@@ -1953,8 +1954,7 @@ fn spawn_child(
     uses_parent_pgrp: bool,
 ) -> Result<(std::process::Child, SigchldScope)> {
     let sigchld = SigchldScope::new();
-    let (cmd, sync_handles) =
-        build_command(binary, args, cgroup_path, uses_parent_pgrp)?;
+    let (cmd, sync_handles) = build_command(binary, args, cgroup_path, uses_parent_pgrp)?;
     let child = match sync_handles {
         Some(handles) => drive_cgroup_handshake(cmd, handles, binary)?,
         None => {
@@ -2068,10 +2068,7 @@ fn wait_and_capture(child: &mut std::process::Child) -> Result<SpawnOutput> {
 /// upstream error. That trade is deliberate: past the cap there is
 /// no way to report "invalid UTF-8" meaningfully since the tail is
 /// gone, and making the pre-cap path lossy keeps semantics uniform.
-fn drain_capped(
-    src: impl std::io::Read,
-    label: &'static str,
-) -> std::io::Result<(String, bool)> {
+fn drain_capped(src: impl std::io::Read, label: &'static str) -> std::io::Result<(String, bool)> {
     use std::io::Read;
     // One extra byte probes whether the source had more to offer —
     // `Take` returns EOF at exactly the cap, indistinguishable from
@@ -3683,7 +3680,11 @@ mod tests {
             exit_code: 0,
         };
         let (_, pm) = evaluate(&JSON_PAYLOAD, &[], output);
-        assert_eq!(pm.metrics.len(), 1, "stderr fallback must fire on empty result");
+        assert_eq!(
+            pm.metrics.len(),
+            1,
+            "stderr fallback must fire on empty result"
+        );
         assert_eq!(pm.metrics[0].name, "throughput");
         assert_eq!(pm.metrics[0].value, 42.0);
     }
@@ -3706,8 +3707,7 @@ mod tests {
     #[test]
     fn evaluate_falls_back_when_stdout_json_has_no_numeric_leaves() {
         let output = SpawnOutput {
-            stdout: r#"{"status": "ok", "ready": true, "note": null}"#
-                .to_string(),
+            stdout: r#"{"status": "ok", "ready": true, "note": null}"#.to_string(),
             stderr: r#"{"iops": 9001}"#.to_string(),
             exit_code: 0,
         };
@@ -3974,8 +3974,7 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn multi-sleeper");
-        let pgid = libc::pid_t::try_from(child.id())
-            .expect("child pid fits in pid_t");
+        let pgid = libc::pid_t::try_from(child.id()).expect("child pid fits in pid_t");
         let start = std::time::Instant::now();
         let out = wait_with_deadline(
             &mut child,
@@ -4047,8 +4046,7 @@ mod tests {
     /// errno paths surfaces here.
     #[test]
     fn spawn_error_context_enoent_attaches_remediation() {
-        let err =
-            std::io::Error::from_raw_os_error(libc::ENOENT);
+        let err = std::io::Error::from_raw_os_error(libc::ENOENT);
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         let wrapped = super::spawn_error_context(err, "fio");
         let rendered = format!("{wrapped:#}");
@@ -4076,8 +4074,7 @@ mod tests {
         // users who e.g. hit a permission problem — the remediation
         // paths above (include-files, pre-install) are orthogonal
         // to the failure mode. Pin the absence.
-        let err =
-            std::io::Error::from_raw_os_error(libc::EACCES);
+        let err = std::io::Error::from_raw_os_error(libc::EACCES);
         assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
         let wrapped = super::spawn_error_context(err, "fio");
         let rendered = format!("{wrapped:#}");
@@ -4110,8 +4107,7 @@ mod tests {
     /// payload run.
     #[test]
     fn build_command_without_cgroup_returns_no_sync_handles() {
-        let (_cmd, handles) =
-            super::build_command("/bin/true", &[], None, false).unwrap();
+        let (_cmd, handles) = super::build_command("/bin/true", &[], None, false).unwrap();
         assert!(
             handles.is_none(),
             "no cgroup_path ⇒ no sync handles — got Some(_)",
@@ -4127,9 +4123,8 @@ mod tests {
     #[test]
     fn build_command_with_cgroup_returns_sync_handles() {
         let fake_cg = std::path::PathBuf::from("/nonexistent/fake-cgroup");
-        let (_cmd, handles) =
-            super::build_command("/bin/true", &[], Some(&fake_cg), false)
-                .expect("build_command must defer cgroup-path validation to sync");
+        let (_cmd, handles) = super::build_command("/bin/true", &[], Some(&fake_cg), false)
+            .expect("build_command must defer cgroup-path validation to sync");
         let handles = handles.expect("cgroup path ⇒ handles");
         assert_eq!(
             handles.cgroup_procs_path,
@@ -4196,8 +4191,9 @@ mod tests {
         use std::os::fd::FromRawFd;
 
         // Stand-in for cgroup.procs in a temp dir.
-        let tmp_dir = std::env::temp_dir()
-            .join(format!("ktstr-cgroup-sync-test-{}", unsafe { libc::getpid() }));
+        let tmp_dir = std::env::temp_dir().join(format!("ktstr-cgroup-sync-test-{}", unsafe {
+            libc::getpid()
+        }));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let procs_path = tmp_dir.join("cgroup.procs");
         std::fs::write(&procs_path, b"").unwrap();
@@ -4243,16 +4239,18 @@ mod tests {
                 // Dummy fd the drop will close — we need
                 // something valid. /dev/null satisfies that.
                 write_fd: unsafe {
-                    std::os::fd::OwnedFd::from_raw_fd(
-                        libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY),
-                    )
+                    std::os::fd::OwnedFd::from_raw_fd(libc::open(
+                        c"/dev/null".as_ptr(),
+                        libc::O_WRONLY,
+                    ))
                 },
             },
             release: super::PipePair {
                 read_fd: unsafe {
-                    std::os::fd::OwnedFd::from_raw_fd(
-                        libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY),
-                    )
+                    std::os::fd::OwnedFd::from_raw_fd(libc::open(
+                        c"/dev/null".as_ptr(),
+                        libc::O_RDONLY,
+                    ))
                 },
                 write_fd: release_w,
             },
@@ -4269,7 +4267,9 @@ mod tests {
 
         // The child thread must complete after the release byte
         // arrives — join here and capture any panic propagation.
-        child_thread.join().expect("child thread completes after release");
+        child_thread
+            .join()
+            .expect("child thread completes after release");
 
         // The temp cgroup.procs file must now contain the pid
         // followed by a newline.
@@ -4295,9 +4295,8 @@ mod tests {
     #[test]
     fn spawn_with_cgroup_sync_errors_on_missing_cgroup_procs_path() {
         use std::os::fd::FromRawFd;
-        let missing_path = std::path::PathBuf::from(
-            "/nonexistent/dir/that/does/not/exist/cgroup.procs",
-        );
+        let missing_path =
+            std::path::PathBuf::from("/nonexistent/dir/that/does/not/exist/cgroup.procs");
 
         let notify = super::PipePair::new().unwrap();
         let release = super::PipePair::new().unwrap();
@@ -4329,16 +4328,18 @@ mod tests {
             notify: super::PipePair {
                 read_fd: notify_r,
                 write_fd: unsafe {
-                    std::os::fd::OwnedFd::from_raw_fd(
-                        libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY),
-                    )
+                    std::os::fd::OwnedFd::from_raw_fd(libc::open(
+                        c"/dev/null".as_ptr(),
+                        libc::O_WRONLY,
+                    ))
                 },
             },
             release: super::PipePair {
                 read_fd: unsafe {
-                    std::os::fd::OwnedFd::from_raw_fd(
-                        libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY),
-                    )
+                    std::os::fd::OwnedFd::from_raw_fd(libc::open(
+                        c"/dev/null".as_ptr(),
+                        libc::O_RDONLY,
+                    ))
                 },
                 write_fd: release_w,
             },
@@ -4399,9 +4400,8 @@ mod tests {
         // Pick a path that cannot possibly open — including a
         // guaranteed-missing parent dir so the open step fails
         // hard in `drive_cgroup_handshake`.
-        let missing_cgroup = std::path::PathBuf::from(
-            "/nonexistent/ktstr-cgroup-sync-deadlock-guard",
-        );
+        let missing_cgroup =
+            std::path::PathBuf::from("/nonexistent/ktstr-cgroup-sync-deadlock-guard");
 
         // Run the whole exercise in a worker thread so the test
         // driver can time-box it: if the child's release read
@@ -4409,26 +4409,19 @@ mod tests {
         // thread rather than hang the test harness.
         let (tx, rx) = mpsc::channel::<anyhow::Result<()>>();
         let worker = std::thread::spawn(move || {
-            let (cmd, handles) = super::build_command(
-                "/bin/true",
-                &[],
-                Some(&missing_cgroup),
-                false,
-            )
-            .expect("build_command");
+            let (cmd, handles) =
+                super::build_command("/bin/true", &[], Some(&missing_cgroup), false)
+                    .expect("build_command");
             let handles = handles.expect("handles present when cgroup_path is Some");
             let result = super::drive_cgroup_handshake(cmd, handles, "/bin/true");
             // drive_cgroup_handshake must surface an error
             // (the cgroup-path open failed) — if it succeeds
             // that's also a correctness violation because the
             // target directory does not exist.
-            let err = result.expect_err(
-                "handshake against nonexistent cgroup.procs must Err",
-            );
+            let err = result.expect_err("handshake against nonexistent cgroup.procs must Err");
             let rendered = format!("{err:#}");
             assert!(
-                rendered.contains("open cgroup.procs")
-                    || rendered.contains("cgroup.procs"),
+                rendered.contains("open cgroup.procs") || rendered.contains("cgroup.procs"),
                 "handshake error must name the failing step: {rendered}",
             );
             let _ = tx.send(Ok(()));
@@ -4459,9 +4452,9 @@ mod tests {
                  never delivers EOF when the parent drops its \
                  write end.",
             ),
-            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
-                "worker thread disconnected without reporting",
-            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("worker thread disconnected without reporting",)
+            }
         }
     }
 }

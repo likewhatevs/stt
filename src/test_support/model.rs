@@ -93,9 +93,9 @@
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::KTSTR_TESTS;
@@ -780,10 +780,7 @@ fn compute_sha_verdict(
                     Err(e) => {
                         if !is_valid_sha256_hex(spec.sha256_hex) {
                             return Err(e).with_context(|| {
-                                format!(
-                                    "check SHA-256 pin for cached model '{}'",
-                                    spec.file_name,
-                                )
+                                format!("check SHA-256 pin for cached model '{}'", spec.file_name,)
                             });
                         }
                         ShaVerdict::CheckFailed(format!("{e:#}"))
@@ -2292,11 +2289,9 @@ pub(crate) fn extract_via_llm(
 /// round-trip; this helper owns the parse contract alone.
 fn parse_llm_response(response: &str, stream: super::MetricStream) -> Vec<super::Metric> {
     match super::metrics::find_and_parse_json(response) {
-        Some(json) => super::metrics::walk_json_leaves(
-            &json,
-            super::MetricSource::LlmExtract,
-            stream,
-        ),
+        Some(json) => {
+            super::metrics::walk_json_leaves(&json, super::MetricSource::LlmExtract, stream)
+        }
         None => {
             // Intentionally log only `response.len()` (byte count), not
             // the body. The response can run up to SAMPLE_LEN tokens —
@@ -2317,8 +2312,8 @@ fn parse_llm_response(response: &str, stream: super::MetricStream) -> Vec<super:
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{EnvVarGuard, isolated_cache_dir, lock_env};
+    use super::*;
 
     #[test]
     fn resolve_cache_root_honors_ktstr_cache_dir() {
@@ -2331,8 +2326,7 @@ mod tests {
         // inside `lock_env()` itself, so a panic inside the
         // critical section is safe to recover through.
         let _lock = lock_env();
-        let _env =
-            EnvVarGuard::set("KTSTR_CACHE_DIR", "/explicit/override");
+        let _env = EnvVarGuard::set("KTSTR_CACHE_DIR", "/explicit/override");
         let root = resolve_cache_root().unwrap();
         assert_eq!(root, PathBuf::from("/explicit/override"));
     }
@@ -2993,8 +2987,7 @@ mod tests {
         // (skip! early-returns, so the restore must precede it) and
         // emit through the centralized skip reporter.
         if std::fs::File::open(&on_disk).is_ok() {
-            std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644))
-                .unwrap();
+            std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644)).unwrap();
             skip!(
                 "open(0o000) succeeded — process has a DAC bypass (root, \
                  CAP_DAC_OVERRIDE, or equivalent)"
@@ -3112,8 +3105,7 @@ mod tests {
     fn resolve_cache_root_honors_xdg_cache_home() {
         let _lock = lock_env();
         let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
-        let _env_xdg =
-            EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
+        let _env_xdg = EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
         let root = resolve_cache_root().unwrap();
         assert_eq!(
             root,
@@ -3150,8 +3142,7 @@ mod tests {
     fn resolve_cache_root_treats_empty_ktstr_cache_dir_as_unset() {
         let _lock = lock_env();
         let _env_ktstr = EnvVarGuard::set("KTSTR_CACHE_DIR", "");
-        let _env_xdg =
-            EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
+        let _env_xdg = EnvVarGuard::set("XDG_CACHE_HOME", "/xdg/caches");
         let root = resolve_cache_root().unwrap();
         assert_eq!(
             root,
@@ -4028,14 +4019,22 @@ mod tests {
         // the Check evaluator can thread the reason into the
         // AssertResult. The "returns empty" test-name predates the
         // signature change — kept for git blame continuity.
-        let err = extract_via_llm("arbitrary stdout", None, crate::test_support::MetricStream::Stdout)
-            .expect_err("offline gate must produce Err");
+        let err = extract_via_llm(
+            "arbitrary stdout",
+            None,
+            crate::test_support::MetricStream::Stdout,
+        )
+        .expect_err("offline gate must produce Err");
         assert!(
             err.contains(OFFLINE_ENV),
             "reason should name the offline env var, got: {err}"
         );
-        let err = extract_via_llm("stdout with hint", Some("focus"), crate::test_support::MetricStream::Stdout)
-            .expect_err("offline gate must produce Err with hint variant");
+        let err = extract_via_llm(
+            "stdout with hint",
+            Some("focus"),
+            crate::test_support::MetricStream::Stdout,
+        )
+        .expect_err("offline gate must produce Err with hint variant");
         assert!(err.contains(OFFLINE_ENV));
     }
 
@@ -4086,10 +4085,7 @@ mod tests {
         reset();
         {
             let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(
-                guard.is_none(),
-                "reset must clear MODEL_CACHE to None"
-            );
+            assert!(guard.is_none(), "reset must clear MODEL_CACHE to None");
         }
         assert!(
             !PREFETCH_CHECKED.load(Ordering::Acquire),
@@ -4097,7 +4093,11 @@ mod tests {
         );
         // Subsequent extract_via_llm under the same offline gate must
         // re-trip ensure() rather than reading a stale cached entry.
-        let _ = extract_via_llm("post-reset call", None, crate::test_support::MetricStream::Stdout);
+        let _ = extract_via_llm(
+            "post-reset call",
+            None,
+            crate::test_support::MetricStream::Stdout,
+        );
         let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         let cached = guard
             .as_ref()
@@ -4167,7 +4167,11 @@ mod tests {
             0,
             "reset() must zero the load counter on every call",
         );
-        let _ = extract_via_llm("post-reset", None, crate::test_support::MetricStream::Stdout);
+        let _ = extract_via_llm(
+            "post-reset",
+            None,
+            crate::test_support::MetricStream::Stdout,
+        );
         assert_eq!(
             MODEL_CACHE_LOAD_COUNT.load(Ordering::Relaxed),
             1,
@@ -4312,10 +4316,7 @@ mod tests {
     /// `false` and trips the assertion.
     #[test]
     fn entries_require_model_workload_llm_extract_non_first_position() {
-        let workloads: &[&Payload] = &[
-            &EXIT_CODE_BINARY_PAYLOAD,
-            &LLM_EXTRACT_BINARY_PAYLOAD,
-        ];
+        let workloads: &[&Payload] = &[&EXIT_CODE_BINARY_PAYLOAD, &LLM_EXTRACT_BINARY_PAYLOAD];
         let entry = KtstrTestEntry {
             name: "llm_workload_non_first",
             payload: Some(&EXIT_CODE_BINARY_PAYLOAD),
@@ -4531,7 +4532,8 @@ mod tests {
             got.len(),
         );
         assert!(
-            got.iter().all(|m| matches!(m.source, crate::test_support::MetricSource::LlmExtract)),
+            got.iter()
+                .all(|m| matches!(m.source, crate::test_support::MetricSource::LlmExtract)),
             "every metric from parse_llm_response must carry MetricSource::LlmExtract; got: {got:?}",
         );
     }
@@ -5037,8 +5039,7 @@ mod tests {
         // fires (otherwise the tempdir cleanup chokes on some
         // filesystems).
         if std::fs::File::open(&on_disk).is_ok() {
-            std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644))
-                .unwrap();
+            std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644)).unwrap();
             skip!(
                 "open(0o000) succeeded — process has a DAC bypass (root, \
                  CAP_DAC_OVERRIDE, or equivalent); offline-gate CheckFailed \
@@ -5053,8 +5054,7 @@ mod tests {
         let underlying_err = match &st.sha_verdict {
             ShaVerdict::CheckFailed(e) => e.clone(),
             other => {
-                std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644))
-                    .unwrap();
+                std::fs::set_permissions(&on_disk, std::fs::Permissions::from_mode(0o644)).unwrap();
                 panic!(
                     "0o000 on a readable-shape pin must yield \
                      ShaVerdict::CheckFailed; got: {other:?}",
@@ -5596,8 +5596,7 @@ mod tests {
         write_mtime_size_sidecar(&artifact).expect("write must succeed");
         let meta = std::fs::metadata(&artifact).unwrap();
         let expected = mtime_size_from_metadata(&meta).unwrap();
-        let read_back =
-            read_mtime_size_sidecar(&artifact).expect("sidecar must read back");
+        let read_back = read_mtime_size_sidecar(&artifact).expect("sidecar must read back");
         assert_eq!(
             read_back, expected,
             "round-trip must recover the (mtime, size) tuple written",
@@ -5697,11 +5696,7 @@ mod tests {
         let artifact = tmp.path().join("artifact.bin");
         std::fs::write(&artifact, b"x").unwrap();
         // Older-schema shape: `{mtime} {size}` on line 1, no magic.
-        std::fs::write(
-            mtime_size_sidecar_path(&artifact),
-            b"12345 100\n",
-        )
-        .unwrap();
+        std::fs::write(mtime_size_sidecar_path(&artifact), b"12345 100\n").unwrap();
         assert!(
             read_mtime_size_sidecar(&artifact).is_none(),
             "sidecar missing the magic header must fail the version gate",
@@ -5775,8 +5770,14 @@ mod tests {
             .expect("mtime before UNIX_EPOCH")
             .as_secs() as i64;
         let times = [
-            libc::timeval { tv_sec: secs, tv_usec: 0 },
-            libc::timeval { tv_sec: secs, tv_usec: 0 },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
         ];
         let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         let rc = unsafe { libc::utimes(cstr.as_ptr(), times.as_ptr()) };

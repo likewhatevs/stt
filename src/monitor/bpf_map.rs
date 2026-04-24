@@ -671,7 +671,6 @@ impl<'a> BpfMapAccessor<'a> {
 
         read_percpu_array_value(&self.ctx(), map, key, &per_cpu_offsets)
     }
-
 }
 
 /// Owns a [`GuestKernel`] and provides BPF map access.

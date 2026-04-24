@@ -515,8 +515,7 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         let exe = crate::resolve_current_exe().unwrap();
-        let missing_scheduler =
-            PathBuf::from("/nonexistent/build_vm_builder_base_test_scheduler");
+        let missing_scheduler = PathBuf::from("/nonexistent/build_vm_builder_base_test_scheduler");
         let result = build_vm_builder_base(
             &entry,
             &exe,

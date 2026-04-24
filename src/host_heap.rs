@@ -230,10 +230,30 @@ impl HostHeapState {
             };
             let _ = writeln!(out, "{key}: {} → {}", render(a), render(b));
         }
-        row_opt(&mut out, "allocated_bytes", a_allocated.as_ref(), b_allocated.as_ref());
-        row_opt(&mut out, "active_bytes", a_active.as_ref(), b_active.as_ref());
-        row_opt(&mut out, "resident_bytes", a_resident.as_ref(), b_resident.as_ref());
-        row_opt(&mut out, "mapped_bytes", a_mapped.as_ref(), b_mapped.as_ref());
+        row_opt(
+            &mut out,
+            "allocated_bytes",
+            a_allocated.as_ref(),
+            b_allocated.as_ref(),
+        );
+        row_opt(
+            &mut out,
+            "active_bytes",
+            a_active.as_ref(),
+            b_active.as_ref(),
+        );
+        row_opt(
+            &mut out,
+            "resident_bytes",
+            a_resident.as_ref(),
+            b_resident.as_ref(),
+        );
+        row_opt(
+            &mut out,
+            "mapped_bytes",
+            a_mapped.as_ref(),
+            b_mapped.as_ref(),
+        );
         row_opt(&mut out, "narenas", a_narenas.as_ref(), b_narenas.as_ref());
         out
     }
@@ -509,7 +529,10 @@ mod tests {
         // populates. `narenas` in particular is a jemalloc-init
         // constant (4*ncpus by default) and always non-zero on a
         // multi-core host.
-        assert!(h.narenas.is_some(), "narenas must populate on a libjemalloc build");
+        assert!(
+            h.narenas.is_some(),
+            "narenas must populate on a libjemalloc build"
+        );
         assert!(
             h.narenas.unwrap() > 0,
             "narenas must be > 0; jemalloc computes 4*ncpus at init",

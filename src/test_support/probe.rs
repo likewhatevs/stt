@@ -130,9 +130,7 @@ fn classify_repro_vm_status(
         return "repro VM: timed out".to_string();
     }
     if let Some(reason) = extract_not_attached_reason(output) {
-        return format!(
-            "repro VM: scheduler did not attach ({reason}) (exit code {exit_code})",
-        );
+        return format!("repro VM: scheduler did not attach ({reason}) (exit code {exit_code})",);
     }
     if has_crash_message || output.contains(super::SENTINEL_SCHEDULER_DIED) {
         // Describe qemu's exit disposition precisely: a crash sentinel
@@ -1791,7 +1789,10 @@ mod tests {
         // Negative assertions: none of the internal vocabulary may
         // leak into the user-facing status — each term is a
         // usability bug and must stay out of the rendered string.
-        assert!(!status.contains("BSP"), "user-facing status leaks BSP: {status}");
+        assert!(
+            !status.contains("BSP"),
+            "user-facing status leaks BSP: {status}"
+        );
         assert!(
             !status.contains("VmResult::exit_code"),
             "user-facing status leaks VmResult::exit_code: {status}",
@@ -1824,12 +1825,8 @@ mod tests {
         // crash signals and exit_code=1 the result should be the
         // abnormal-exit branch, not a NOT_ATTACHED branch with an
         // empty reason.
-        let status = classify_repro_vm_status(
-            false,
-            false,
-            "SCHEDULER_NOT_ATTACHED\nKTSTR_EXIT=1",
-            1,
-        );
+        let status =
+            classify_repro_vm_status(false, false, "SCHEDULER_NOT_ATTACHED\nKTSTR_EXIT=1", 1);
         assert_eq!(status, "repro VM: exited abnormally (exit code 1)");
     }
 }

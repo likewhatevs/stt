@@ -442,7 +442,12 @@ mod tests {
 
     #[test]
     fn json_malformed_returns_empty() {
-        let m = extract_metrics("garbage not json", &OutputFormat::Json, MetricStream::Stdout).unwrap();
+        let m = extract_metrics(
+            "garbage not json",
+            &OutputFormat::Json,
+            MetricStream::Stdout,
+        )
+        .unwrap();
         assert!(m.is_empty());
     }
 
@@ -493,8 +498,12 @@ mod tests {
         // surfaced as a threaded reason string so the Check
         // evaluator can attach it to the AssertResult. The exact
         // reason message includes the offline-gate env-var name.
-        let err = extract_metrics("anything", &OutputFormat::LlmExtract(None), MetricStream::Stdout)
-            .expect_err("offline gate must produce Err from extract_metrics");
+        let err = extract_metrics(
+            "anything",
+            &OutputFormat::LlmExtract(None),
+            MetricStream::Stdout,
+        )
+        .expect_err("offline gate must produce Err from extract_metrics");
         assert!(
             err.contains(super::super::model::OFFLINE_ENV),
             "reason should name the offline env var, got: {err}"
@@ -693,7 +702,12 @@ mod tests {
         // preceding noise extracts cleanly, so the failure
         // above is specifically due to the preceding bracket
         // noise, not the JSON itself.
-        let m_clean = extract_metrics(r#"{"iops": 400}"#, &OutputFormat::Json, MetricStream::Stdout).unwrap();
+        let m_clean = extract_metrics(
+            r#"{"iops": 400}"#,
+            &OutputFormat::Json,
+            MetricStream::Stdout,
+        )
+        .unwrap();
         let clean_names: Vec<&str> = m_clean.iter().map(|x| x.name.as_str()).collect();
         assert!(
             clean_names.iter().any(|n| *n == "iops"),
@@ -740,12 +754,10 @@ mod tests {
     #[test]
     fn walk_json_leaves_tags_stream_orthogonally_to_source() {
         let obj: serde_json::Value = serde_json::from_str(r#"{"a": 1}"#).unwrap();
-        let arr: serde_json::Value =
-            serde_json::from_str(r#"[{"a": 1}, {"b": 2}]"#).unwrap();
-        for (fixture_label, value, expected_len) in [
-            ("object", &obj, 1_usize),
-            ("array", &arr, 2_usize),
-        ] {
+        let arr: serde_json::Value = serde_json::from_str(r#"[{"a": 1}, {"b": 2}]"#).unwrap();
+        for (fixture_label, value, expected_len) in
+            [("object", &obj, 1_usize), ("array", &arr, 2_usize)]
+        {
             for (src, stream) in [
                 (MetricSource::Json, MetricStream::Stdout),
                 (MetricSource::Json, MetricStream::Stderr),
@@ -795,11 +807,7 @@ mod tests {
         let json = r#"{"iops": 100}"#;
         for stream in [MetricStream::Stdout, MetricStream::Stderr] {
             let metrics = extract_metrics(json, &OutputFormat::Json, stream).unwrap();
-            assert_eq!(
-                metrics.len(),
-                1,
-                "one leaf expected from {{\"iops\": 100}}",
-            );
+            assert_eq!(metrics.len(), 1, "one leaf expected from {{\"iops\": 100}}",);
             assert_eq!(
                 metrics[0].stream, stream,
                 "extract_metrics must thread stream={stream:?} to the \

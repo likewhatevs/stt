@@ -1785,8 +1785,7 @@ mod tests {
 
         // Legacy frame: [magic 4B] [chunk_size LE u32] [chunk bytes]...
         // Input fits in one LZ4_CHUNK_SIZE chunk, so a single chunk suffices.
-        let chunk_size =
-            u32::from_le_bytes(compressed[4..8].try_into().unwrap()) as usize;
+        let chunk_size = u32::from_le_bytes(compressed[4..8].try_into().unwrap()) as usize;
         let expected_uncompressed = base.len() + suffix.len();
         let decompressed =
             lz4_flex::block::decompress(&compressed[8..8 + chunk_size], expected_uncompressed)

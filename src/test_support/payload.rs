@@ -1008,9 +1008,15 @@ mod tests {
 
     #[test]
     fn payload_kernel_default_const_is_scheduler_kind() {
-        assert!(matches!(Payload::KERNEL_DEFAULT.kind, PayloadKind::Scheduler(_)));
+        assert!(matches!(
+            Payload::KERNEL_DEFAULT.kind,
+            PayloadKind::Scheduler(_)
+        ));
         assert_eq!(Payload::KERNEL_DEFAULT.display_name(), "kernel_default");
-        assert!(matches!(Payload::KERNEL_DEFAULT.output, OutputFormat::ExitCode));
+        assert!(matches!(
+            Payload::KERNEL_DEFAULT.output,
+            OutputFormat::ExitCode
+        ));
         assert!(Payload::KERNEL_DEFAULT.default_args.is_empty());
         assert!(Payload::KERNEL_DEFAULT.default_checks.is_empty());
         assert!(Payload::KERNEL_DEFAULT.metrics.is_empty());
@@ -1405,7 +1411,9 @@ mod tests {
 
     #[test]
     fn as_scheduler_extracts_ref_for_scheduler_kind() {
-        let s = Payload::KERNEL_DEFAULT.as_scheduler().expect("Scheduler kind");
+        let s = Payload::KERNEL_DEFAULT
+            .as_scheduler()
+            .expect("Scheduler kind");
         assert_eq!(s.name, "eevdf");
     }
 

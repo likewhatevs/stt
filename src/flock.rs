@@ -373,10 +373,7 @@ pub(crate) fn read_holders_for_needle(needle: &str) -> Result<Vec<HolderInfo>> {
 /// [`read_holders_for_needle`] caller expects. Extracted so batched
 /// callers and the per-needle wrapper both key against the same seam
 /// rather than duplicating the `.into_iter().map()` plumbing.
-pub(crate) fn read_holders_from_contents(
-    contents: &str,
-    needle: &str,
-) -> Vec<HolderInfo> {
+pub(crate) fn read_holders_from_contents(contents: &str, needle: &str) -> Vec<HolderInfo> {
     let pids = parse_flock_pids_for_needle(contents, needle);
     pids.into_iter().map(holder_info_for_pid).collect()
 }
@@ -459,10 +456,7 @@ pub(crate) fn read_holders(path: &Path) -> Result<Vec<HolderInfo>> {
 /// format, the same /proc/locks scan, the same HolderInfo shape —
 /// just with the mountinfo text supplied by the caller rather than
 /// read inside this function.
-pub(crate) fn read_holders_with_mountinfo(
-    path: &Path,
-    mountinfo: &str,
-) -> Result<Vec<HolderInfo>> {
+pub(crate) fn read_holders_with_mountinfo(path: &Path, mountinfo: &str) -> Result<Vec<HolderInfo>> {
     let needle = needle_from_path_with_mountinfo(path, mountinfo)?;
     read_holders_for_needle(&needle)
 }
@@ -480,8 +474,7 @@ pub(crate) fn read_holders_with_mountinfo(
 /// instrumentation has a single place to land.
 pub(crate) fn read_mountinfo() -> Result<String> {
     use anyhow::Context;
-    std::fs::read_to_string("/proc/self/mountinfo")
-        .context("read /proc/self/mountinfo")
+    std::fs::read_to_string("/proc/self/mountinfo").context("read /proc/self/mountinfo")
 }
 
 /// Build a /proc/locks match needle for `path` using
@@ -506,20 +499,16 @@ pub(crate) fn needle_from_path(path: &Path) -> Result<String> {
 ///
 /// Used by [`read_holders_with_mountinfo`] so a caller walking N
 /// lockfiles pays for exactly one mountinfo read instead of N.
-pub(crate) fn needle_from_path_with_mountinfo(
-    path: &Path,
-    mountinfo: &str,
-) -> Result<String> {
+pub(crate) fn needle_from_path_with_mountinfo(path: &Path, mountinfo: &str) -> Result<String> {
     use anyhow::Context;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
 
-    let meta = fs::metadata(path).with_context(|| {
-        format!("stat lockfile {} for holder lookup", path.display())
-    })?;
+    let meta = fs::metadata(path)
+        .with_context(|| format!("stat lockfile {} for holder lookup", path.display()))?;
     let inode = meta.ino();
-    let (major, minor) = mount_major_minor_for_path_with_contents(path, mountinfo)
-        .with_context(|| {
+    let (major, minor) =
+        mount_major_minor_for_path_with_contents(path, mountinfo).with_context(|| {
             format!(
                 "resolve kernel major:minor for {} via /proc/self/mountinfo",
                 path.display()
@@ -603,10 +592,7 @@ pub(crate) fn needle_from_fd<F: std::os::fd::AsRawFd>(fd: &F) -> Result<Option<S
 /// Production callers obtain `contents` from [`read_mountinfo`] —
 /// either once per batch (acquire_llc_plan DISCOVER) or per-call
 /// (one-shot needle derivation via [`needle_from_path`]).
-fn mount_major_minor_for_path_with_contents(
-    path: &Path,
-    contents: &str,
-) -> Result<(u32, u32)> {
+fn mount_major_minor_for_path_with_contents(path: &Path, contents: &str) -> Result<(u32, u32)> {
     use std::fs;
 
     // Canonicalize the query path. When the lockfile doesn't yet
@@ -743,9 +729,8 @@ fn unescape_mountinfo_field(raw: &str) -> std::borrow::Cow<'_, str> {
             && is_octal_digit(bytes[i + 2])
             && is_octal_digit(bytes[i + 3])
         {
-            let b = ((bytes[i + 1] - b'0') << 6)
-                | ((bytes[i + 2] - b'0') << 3)
-                | (bytes[i + 3] - b'0');
+            let b =
+                ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
             out.push(b);
             i += 4;
         } else {
@@ -895,7 +880,10 @@ mod tests {
         // Reason substring pins the NFSv3 advisory-only rationale
         // so a future refactor that drops the actionable "why" text
         // regresses through this test, not just the name check.
-        assert!(msg.contains("NFSv3"), "err must name NFSv3 in reason: {msg}");
+        assert!(
+            msg.contains("NFSv3"),
+            "err must name NFSv3 in reason: {msg}"
+        );
         assert!(
             msg.contains("is not supported"),
             "err must contain the canonical rejection phrase: {msg}",
@@ -1002,11 +990,9 @@ mod tests {
         let mountinfo = "\
 22 28 0:21 / /tmp rw,nosuid,nodev shared:5 - tmpfs tmpfs rw,size=8g
 ";
-        let (major, minor) = mount_major_minor_for_path_from_contents(
-            mountinfo,
-            Path::new("/tmp/ktstr-llc-0.lock"),
-        )
-        .expect("tmp mount covers the lockfile path");
+        let (major, minor) =
+            mount_major_minor_for_path_from_contents(mountinfo, Path::new("/tmp/ktstr-llc-0.lock"))
+                .expect("tmp mount covers the lockfile path");
         assert_eq!((major, minor), (0, 21));
     }
 
@@ -1067,11 +1053,9 @@ mod tests {
 ";
         // /tmp/foo/ is NOT under /tmp/foobar/ on a component
         // boundary — only /tmp matches.
-        let (major, minor) = mount_major_minor_for_path_from_contents(
-            mountinfo,
-            Path::new("/tmp/foo/entry.lock"),
-        )
-        .expect("path under /tmp (not /tmp/foobar) resolves to the tmp mount");
+        let (major, minor) =
+            mount_major_minor_for_path_from_contents(mountinfo, Path::new("/tmp/foo/entry.lock"))
+                .expect("path under /tmp (not /tmp/foobar) resolves to the tmp mount");
         assert_eq!(
             (major, minor),
             (0, 21),
@@ -1102,11 +1086,9 @@ mod tests {
 22 28 BAD:NUMBER / /tmp rw - tmpfs tmpfs rw
 35 28 0:42 / /tmp rw - tmpfs tmpfs rw
 ";
-        let (major, minor) = mount_major_minor_for_path_from_contents(
-            mountinfo,
-            Path::new("/tmp/entry.lock"),
-        )
-        .expect("second (valid) line still matches after malformed first");
+        let (major, minor) =
+            mount_major_minor_for_path_from_contents(mountinfo, Path::new("/tmp/entry.lock"))
+                .expect("second (valid) line still matches after malformed first");
         assert_eq!((major, minor), (0, 42));
     }
 
@@ -1119,11 +1101,9 @@ mod tests {
 22 28 0:21
 35 28 0:42 / /tmp rw - tmpfs tmpfs rw
 ";
-        let (major, minor) = mount_major_minor_for_path_from_contents(
-            mountinfo,
-            Path::new("/tmp/entry.lock"),
-        )
-        .expect("truncated line skipped; second line matches");
+        let (major, minor) =
+            mount_major_minor_for_path_from_contents(mountinfo, Path::new("/tmp/entry.lock"))
+                .expect("truncated line skipped; second line matches");
         assert_eq!((major, minor), (0, 42));
     }
 
@@ -1201,9 +1181,9 @@ mod tests {
         let decoded = unescape_mountinfo_field(raw);
         match decoded {
             std::borrow::Cow::Borrowed(b) => assert_eq!(b, raw),
-            std::borrow::Cow::Owned(_) => panic!(
-                "unescape must return Cow::Borrowed when input has no `\\`"
-            ),
+            std::borrow::Cow::Owned(_) => {
+                panic!("unescape must return Cow::Borrowed when input has no `\\`")
+            }
         }
     }
 
@@ -1582,8 +1562,7 @@ mod tests {
 
         // 2. Scan /proc/locks with that needle — our pid must be
         // a holder of the just-taken flock.
-        let holders = read_holders_for_needle(&needle)
-            .expect("/proc/locks readable");
+        let holders = read_holders_for_needle(&needle).expect("/proc/locks readable");
         let our_pid = std::process::id();
         assert!(
             holders.iter().any(|h| h.pid == our_pid),
@@ -1629,8 +1608,7 @@ mod tests {
 
         // Cached: read mountinfo once, pass the text through.
         let mountinfo = read_mountinfo().expect("read mountinfo");
-        let cached = needle_from_path_with_mountinfo(&path, &mountinfo)
-            .expect("cached needle");
+        let cached = needle_from_path_with_mountinfo(&path, &mountinfo).expect("cached needle");
 
         assert_eq!(
             cached, uncached,
@@ -1670,8 +1648,7 @@ mod tests {
 
         // Cached: read mountinfo once, pass through.
         let mountinfo = read_mountinfo().expect("read mountinfo");
-        let cached = read_holders_with_mountinfo(&path, &mountinfo)
-            .expect("cached holders");
+        let cached = read_holders_with_mountinfo(&path, &mountinfo).expect("cached holders");
 
         // /proc/locks race-safety: holder sets can drift between two
         // scans on a loaded host (peer exits, a separate test flock

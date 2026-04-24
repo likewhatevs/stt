@@ -180,8 +180,7 @@ fn now_unix_sec() -> u64 {
 /// self-probe guard and test bodies — centralized so a future
 /// platform constraint change lands in one place.
 fn self_pid() -> i32 {
-    libc::pid_t::try_from(std::process::id())
-        .expect("Linux pid_max <= 2^22 so pid fits in pid_t")
+    libc::pid_t::try_from(std::process::id()).expect("Linux pid_max <= 2^22 so pid fits in pid_t")
 }
 
 /// Render the optional per-thread comm string as a trailing
@@ -313,7 +312,6 @@ mod arch {
         }
         Ok(tpidr)
     }
-
 }
 
 /// Candidate symbol names for jemalloc's per-thread state.
@@ -955,14 +953,12 @@ pub(crate) fn find_tsd_tls(elf: &Elf<'_>, elf_path: &Path) -> Result<TsdTlsSymbo
 
     // Order-preserving name search across symbol tables.
     let finders: [(&str, &dyn Fn(&str) -> Option<u64>); 2] = [
-        (
-            ".symtab",
-            &|name| find_symbol_by_name(&elf.syms, &elf.strtab, name),
-        ),
-        (
-            ".dynsym",
-            &|name| find_symbol_by_name(&elf.dynsyms, &elf.dynstrtab, name),
-        ),
+        (".symtab", &|name| {
+            find_symbol_by_name(&elf.syms, &elf.strtab, name)
+        }),
+        (".dynsym", &|name| {
+            find_symbol_by_name(&elf.dynsyms, &elf.dynstrtab, name)
+        }),
     ];
     for (_table_name, finder) in finders {
         for name in TSD_TLS_SYMBOL_NAMES {
@@ -1175,8 +1171,7 @@ pub(crate) fn resolve_field_offsets(elf_path: &Path) -> Result<CounterOffsets> {
 /// error diagnostics (it names whichever file the bytes came from
 /// — either the target ELF or an external debuginfo file).
 fn resolve_field_offsets_from_bytes(data: &[u8], source_path: &Path) -> Result<CounterOffsets> {
-    let elf = Elf::parse(data)
-        .with_context(|| format!("parse ELF {}", source_path.display()))?;
+    let elf = Elf::parse(data).with_context(|| format!("parse ELF {}", source_path.display()))?;
 
     let load_section = |id: gimli::SectionId| -> Result<Cow<'_, [u8]>> {
         let name = id.name();
@@ -1552,10 +1547,9 @@ pub(crate) fn find_jemalloc_via_maps(
 ) -> std::result::Result<(TsdTlsSymbol, CounterOffsets), FatalError> {
     let exe_link = format!("/proc/{pid}/exe");
     let exe_path = fs::read_link(&exe_link).map_err(|e| {
-        FatalError::readlink_failure(
-            anyhow::Error::from(e)
-                .context(format!("readlink {exe_link} (need it to gate static-TLS match)")),
-        )
+        FatalError::readlink_failure(anyhow::Error::from(e).context(format!(
+            "readlink {exe_link} (need it to gate static-TLS match)"
+        )))
     })?;
 
     let maps_path = format!("/proc/{pid}/maps");
@@ -1970,8 +1964,7 @@ fn probe_single_thread(
             // crash or are interrupted before `interrupt`/`waitpid`.
             attached_lock().insert(tid);
 
-            ptrace::interrupt(pid)
-                .map_err(|e| ThreadProbeError::ptrace_interrupt(tid, e))?;
+            ptrace::interrupt(pid).map_err(|e| ThreadProbeError::ptrace_interrupt(tid, e))?;
             match waitpid(pid, None) {
                 Ok(WaitStatus::Stopped(_, _) | WaitStatus::PtraceEvent(_, _, _)) => {}
                 Ok(other) => return Err(ThreadProbeError::waitpid_unexpected(tid, other)),
@@ -2537,7 +2530,10 @@ fn take_snapshot(
 /// `Ok` / `AllFailed` run outcomes for single-snapshot runs and
 /// (collectively across all snapshots) for multi-snapshot runs.
 fn all_failed(threads: &[ThreadResult]) -> bool {
-    threads.is_empty() || threads.iter().all(|t| matches!(t, ThreadResult::Err { .. }))
+    threads.is_empty()
+        || threads
+            .iter()
+            .all(|t| matches!(t, ThreadResult::Err { .. }))
 }
 
 /// Re-stat the target's `/proc/<pid>/exe` and bail fatal if the
@@ -2631,9 +2627,7 @@ fn run(cli: &Cli) -> RunOutcome {
         )));
     }
     if !Path::new(&format!("/proc/{pid}")).exists() {
-        return RunOutcome::Fatal(FatalError::pid_missing(anyhow!(
-            "pid {pid} does not exist"
-        )));
+        return RunOutcome::Fatal(FatalError::pid_missing(anyhow!("pid {pid} does not exist")));
     }
 
     // Capture the target ELF's (dev, inode) BEFORE the ELF/DWARF
@@ -2684,8 +2678,7 @@ fn run(cli: &Cli) -> RunOutcome {
     // for cached tids and read counters directly via
     // `process_vm_readv`. See `probe_single_thread` for the
     // consistency trade-off.
-    let mut tp_cache: std::collections::HashMap<i32, u64> =
-        std::collections::HashMap::new();
+    let mut tp_cache: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
     for i in 0..cli.snapshots {
         if CLEANUP_REQUESTED.load(Ordering::SeqCst) {
             interrupted = true;
@@ -2698,8 +2691,7 @@ fn run(cli: &Cli) -> RunOutcome {
         // Skip on iteration 0 because `exe_identity` was just
         // captured before the loop.
         if i > 0 {
-            if let Err(e) = ensure_exe_identity_unchanged(pid, &exe_identity, "between snapshots")
-            {
+            if let Err(e) = ensure_exe_identity_unchanged(pid, &exe_identity, "between snapshots") {
                 return RunOutcome::Fatal(FatalError::exe_identity_changed(e));
             }
         }
@@ -2739,9 +2731,9 @@ fn run(cli: &Cli) -> RunOutcome {
         // cancellable; a SIGINT mid-sleep ends the run with the
         // snapshots taken so far + `interrupted: true` on the output.
         if i + 1 < cli.snapshots {
-            let interval_ms = cli.interval_ms.expect(
-                "interval_ms guaranteed Some for snapshots > 1 by validate_sampling_flags",
-            );
+            let interval_ms = cli
+                .interval_ms
+                .expect("interval_ms guaranteed Some for snapshots > 1 by validate_sampling_flags");
             if sleep_with_cancel(interval_ms) {
                 interrupted = true;
                 break;
@@ -2937,11 +2929,7 @@ fn synthesize_payload_metrics(
 /// "regenerate, don't migrate", so a parse failure points at an
 /// out-of-sync schema rather than something the probe should paper
 /// over.
-fn append_probe_output_to_sidecar(
-    path: &Path,
-    out: &ProbeOutput,
-    exit_code: i32,
-) -> Result<()> {
+fn append_probe_output_to_sidecar(path: &Path, out: &ProbeOutput, exit_code: i32) -> Result<()> {
     use ktstr::test_support::SidecarResult;
     use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
 
@@ -3597,7 +3585,10 @@ mod tests {
             align.is_power_of_two(),
             "p_align {align} must be a power of two",
         );
-        assert!(rounded >= align, "aligned_size {rounded} must be >= align {align}");
+        assert!(
+            rounded >= align,
+            "aligned_size {rounded} must be >= align {align}"
+        );
         assert!(
             rounded % align == 0,
             "aligned_size {rounded} must be a multiple of align {align}",
@@ -3916,8 +3907,8 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("spawn sleep for non-self pid acceptance test");
-        let child_pid = libc::pid_t::try_from(child.id())
-            .expect("Linux pid_max <= 2^22 so pid fits in pid_t");
+        let child_pid =
+            libc::pid_t::try_from(child.id()).expect("Linux pid_max <= 2^22 so pid fits in pid_t");
         let self_pid = self_pid();
         assert_ne!(
             child_pid, self_pid,
@@ -3963,7 +3954,10 @@ mod tests {
         assert!(msg.contains("(1) run as root"), "got: {msg}");
         assert!(msg.contains("(2) setcap"), "got: {msg}");
         assert!(msg.contains("(3) run under the"), "got: {msg}");
-        assert!(msg.contains("(4) set /proc/sys/kernel/yama/ptrace_scope=0"), "got: {msg}");
+        assert!(
+            msg.contains("(4) set /proc/sys/kernel/yama/ptrace_scope=0"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -3985,7 +3979,10 @@ mod tests {
         let err = ThreadProbeError::ptrace_interrupt(17, nix::errno::Errno::ESRCH);
         assert_eq!(err.kind, ThreadErrorKind::PtraceInterrupt);
         let msg = format!("{}", err.source);
-        assert!(msg.contains("ptrace(PTRACE_INTERRUPT) on tid 17"), "got: {msg}");
+        assert!(
+            msg.contains("ptrace(PTRACE_INTERRUPT) on tid 17"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -4037,11 +4034,8 @@ mod tests {
 
     #[test]
     fn process_vm_readv_err_renders_address_hex() {
-        let err = ThreadProbeError::process_vm_readv_err(
-            123,
-            0xdeadbeef,
-            nix::errno::Errno::EFAULT,
-        );
+        let err =
+            ThreadProbeError::process_vm_readv_err(123, 0xdeadbeef, nix::errno::Errno::EFAULT);
         assert_eq!(err.kind, ThreadErrorKind::ProcessVmReadv);
         let msg = format!("{}", err.source);
         assert!(msg.contains("tid 123"), "got: {msg}");
@@ -4055,7 +4049,10 @@ mod tests {
         let err = ThreadProbeError::process_vm_readv_short(200, 12, 24);
         assert_eq!(err.kind, ThreadErrorKind::ProcessVmReadv);
         let msg = format!("{}", err.source);
-        assert!(msg.contains("short process_vm_readv on tid 200"), "got: {msg}");
+        assert!(
+            msg.contains("short process_vm_readv on tid 200"),
+            "got: {msg}"
+        );
         assert!(msg.contains("got 12 bytes"), "got: {msg}");
         assert!(msg.contains("expected 24"), "got: {msg}");
     }
@@ -4081,14 +4078,8 @@ mod tests {
     /// as the default; validation passes.
     #[test]
     fn cli_explicit_count_one_without_interval_accepted() {
-        let cli = Cli::try_parse_from([
-            "ktstr-jemalloc-probe",
-            "--pid",
-            "42",
-            "--snapshots",
-            "1",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["ktstr-jemalloc-probe", "--pid", "42", "--snapshots", "1"])
+            .unwrap();
         assert_eq!(cli.snapshots, 1);
         assert!(cli.interval_ms.is_none());
         assert!(cli.validate_sampling_flags().is_ok());
@@ -4119,14 +4110,8 @@ mod tests {
     /// an empty `snapshots` array.
     #[test]
     fn cli_count_zero_rejected() {
-        let err = Cli::try_parse_from([
-            "ktstr-jemalloc-probe",
-            "--pid",
-            "42",
-            "--snapshots",
-            "0",
-        ])
-        .unwrap_err();
+        let err = Cli::try_parse_from(["ktstr-jemalloc-probe", "--pid", "42", "--snapshots", "0"])
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("0 is not in") || msg.contains("invalid value"),
@@ -4357,8 +4342,7 @@ mod tests {
     /// `--pid 0` is rejected at parse time: Linux tgids start at 1.
     #[test]
     fn cli_pid_zero_rejected() {
-        let err =
-            Cli::try_parse_from(["ktstr-jemalloc-probe", "--pid", "0"]).unwrap_err();
+        let err = Cli::try_parse_from(["ktstr-jemalloc-probe", "--pid", "0"]).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("0 is not in") || msg.contains("invalid value"),
@@ -4385,14 +4369,8 @@ mod tests {
     /// be explicit about the inter-snapshot wait.
     #[test]
     fn cli_count_greater_than_one_requires_interval() {
-        let cli = Cli::try_parse_from([
-            "ktstr-jemalloc-probe",
-            "--pid",
-            "42",
-            "--snapshots",
-            "3",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["ktstr-jemalloc-probe", "--pid", "42", "--snapshots", "3"])
+            .unwrap();
         let err = cli.validate_sampling_flags().unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("requires --interval-ms"), "got: {msg}");
@@ -4435,7 +4413,10 @@ mod tests {
         let start = std::time::Instant::now();
         let cancelled = sleep_with_cancel(25);
         let elapsed = start.elapsed();
-        assert!(!cancelled, "sleep should not report cancellation when flag stays clear");
+        assert!(
+            !cancelled,
+            "sleep should not report cancellation when flag stays clear"
+        );
         assert!(
             elapsed >= std::time::Duration::from_millis(20),
             "sleep returned too fast: {elapsed:?}",
@@ -4583,7 +4564,7 @@ mod tests {
             snapshots: vec![
                 Snapshot {
                     timestamp_unix_sec: 1_700_000_000,
-                elapsed_since_start_ns: 0,
+                    elapsed_since_start_ns: 0,
                     threads: vec![ThreadResult::Ok {
                         tid: 42,
                         comm: Some("worker".to_string()),
@@ -4594,7 +4575,7 @@ mod tests {
                 },
                 Snapshot {
                     timestamp_unix_sec: 1_700_000_001,
-                elapsed_since_start_ns: 0,
+                    elapsed_since_start_ns: 0,
                     threads: vec![ThreadResult::Ok {
                         tid: 42,
                         comm: Some("worker".to_string()),
@@ -4627,7 +4608,10 @@ mod tests {
             v.get("threads").is_none(),
             "top-level threads must not appear on ProbeOutput: {s}",
         );
-        assert!(v.get("snapshots").is_some(), "snapshots array required: {s}");
+        assert!(
+            v.get("snapshots").is_some(),
+            "snapshots array required: {s}"
+        );
         assert!(v.get("started_at_unix_sec").is_some());
         assert!(v.get("interval_ms").is_some());
         assert!(v.get("interrupted").is_some());
@@ -4659,11 +4643,18 @@ mod tests {
             }],
         };
         let s = serde_json::to_string(&out).unwrap();
-        assert!(!s.contains("\"interval_ms\""), "interval_ms must be omitted when None: {s}");
+        assert!(
+            !s.contains("\"interval_ms\""),
+            "interval_ms must be omitted when None: {s}"
+        );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert!(v.get("interval_ms").is_none());
         let snaps = v.get("snapshots").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(snaps.len(), 1, "single-snapshot must emit snapshots of length 1");
+        assert_eq!(
+            snaps.len(),
+            1,
+            "single-snapshot must emit snapshots of length 1"
+        );
     }
 
     /// `ExeIdentity::capture` on the probe's own pid round-trips
@@ -4676,7 +4667,10 @@ mod tests {
         let pid = self_pid();
         let a = ExeIdentity::capture(pid).expect("stat /proc/self/exe");
         let b = ExeIdentity::capture(pid).expect("stat /proc/self/exe");
-        assert_eq!(a, b, "ExeIdentity must be stable across back-to-back captures");
+        assert_eq!(
+            a, b,
+            "ExeIdentity must be stable across back-to-back captures"
+        );
     }
 
     /// `take_snapshot` polls `CLEANUP_REQUESTED` at the TOP of the
@@ -4778,7 +4772,10 @@ mod tests {
             run_start,
             &mut tp_cache,
         );
-        assert!(!interrupted, "clear flag + empty tids must not mark interrupted");
+        assert!(
+            !interrupted,
+            "clear flag + empty tids must not mark interrupted"
+        );
         assert!(snap.threads.is_empty());
     }
 
@@ -4837,10 +4834,7 @@ mod tests {
     #[test]
     fn ensure_exe_identity_unchanged_error_wraps_into_run_outcome_fatal() {
         let pid = self_pid();
-        let baseline = ExeIdentity {
-            dev: 0,
-            ino: 0,
-        };
+        let baseline = ExeIdentity { dev: 0, ino: 0 };
         let err = ensure_exe_identity_unchanged(pid, &baseline, "between snapshots")
             .expect_err("synthetic mismatch");
         // Simulate the `run()` call-site: wrap in RunOutcome::Fatal.
@@ -4958,8 +4952,7 @@ mod tests {
         std::fs::write(&path, minimal_sidecar_json()).unwrap();
 
         let out = probe_output_fixture();
-        append_probe_output_to_sidecar(&path, &out, 0)
-            .expect("append happy path");
+        append_probe_output_to_sidecar(&path, &out, 0).expect("append happy path");
 
         let re_read = std::fs::read_to_string(&path).unwrap();
         let sc: ktstr::test_support::SidecarResult =
@@ -5120,7 +5113,11 @@ mod tests {
 
         let after: ktstr::test_support::SidecarResult =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(after.metrics.len(), 3, "expected 2 pre-existing + 1 appended");
+        assert_eq!(
+            after.metrics.len(),
+            3,
+            "expected 2 pre-existing + 1 appended"
+        );
         // Pre-existing entries unchanged in order and content.
         assert_eq!(after.metrics[0].metrics[0].name, "primary.bogo_ops");
         assert_eq!(after.metrics[0].metrics[0].value, 12345.0);
@@ -5467,10 +5464,7 @@ mod tests {
     #[test]
     fn fatal_kind_tag_strings_pinned() {
         assert_eq!(FatalKind::PidMissing.tag(), "pid-missing");
-        assert_eq!(
-            FatalKind::ExeIdentityChanged.tag(),
-            "exe-identity-changed",
-        );
+        assert_eq!(FatalKind::ExeIdentityChanged.tag(), "exe-identity-changed",);
         assert_eq!(FatalKind::JemallocNotFound.tag(), "jemalloc-not-found");
         assert_eq!(FatalKind::JemallocInDso.tag(), "jemalloc-in-dso");
         assert_eq!(FatalKind::ReadlinkFailure.tag(), "readlink-failure");
@@ -5513,7 +5507,10 @@ mod tests {
         let mut count = 0;
         for kind in FatalKind::iter() {
             let tag = kind.tag();
-            assert!(!tag.is_empty(), "FatalKind::{kind:?}.tag() returned empty string");
+            assert!(
+                !tag.is_empty(),
+                "FatalKind::{kind:?}.tag() returned empty string"
+            );
             assert!(
                 tag.chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
@@ -5584,9 +5581,7 @@ mod tests {
         // longer has a task_struct for it, so every subsequent
         // syscall against it returns ESRCH regardless of which
         // path we're on.
-        let mut child = Command::new("/bin/true")
-            .spawn()
-            .expect("spawn /bin/true");
+        let mut child = Command::new("/bin/true").spawn().expect("spawn /bin/true");
         let dead_tid = child.id() as i32;
         let _ = child.wait();
 
@@ -5770,7 +5765,8 @@ mod tests {
              /usr/lib/debug/.build-id/<xx>/<rest>.debug lookup convention",
         );
         assert!(
-            hex.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
             "build-id must contain only ASCII hex digits [0-9a-f]; got {hex:?}",
         );
     }
@@ -5827,10 +5823,7 @@ mod tests {
              (the distro convention documented in the helper's doc block)",
         );
         // 2. parent/debuglink_name.
-        assert_eq!(
-            paths[1],
-            PathBuf::from("/usr/bin/ktstr-test-target.debug"),
-        );
+        assert_eq!(paths[1], PathBuf::from("/usr/bin/ktstr-test-target.debug"),);
         // 3. parent/.debug/debuglink_name.
         assert_eq!(
             paths[2],
@@ -5903,11 +5896,16 @@ mod tests {
         );
         // build-id + parent + parent/.debug = 3 candidates. No
         // /usr/lib/debug-rooted candidate because parent is relative.
-        assert_eq!(paths.len(), 3, "relative target must skip lib-debug root; got {paths:?}");
+        assert_eq!(
+            paths.len(),
+            3,
+            "relative target must skip lib-debug root; got {paths:?}"
+        );
         assert!(
             !paths
                 .iter()
-                .any(|p| p.starts_with("/usr/lib/debug") && !p.to_string_lossy().contains(".build-id")),
+                .any(|p| p.starts_with("/usr/lib/debug")
+                    && !p.to_string_lossy().contains(".build-id")),
             "no /usr/lib/debug-rooted debuglink candidate when target \
              parent is relative; got {paths:?}",
         );
@@ -6013,7 +6011,9 @@ mod tests {
             PathBuf::from("/usr/lib/debug/usr/bin/ktstr-test-target.debug"),
         );
         assert!(
-            !paths.iter().any(|p| p.to_string_lossy().contains(".build-id")),
+            !paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains(".build-id")),
             "no build-id candidate must appear when build_id hint is None; \
              got {paths:?}",
         );
@@ -6063,11 +6063,8 @@ mod tests {
         let target = Path::new("/");
         // Both hints present: build-id still emits, debuglink branch
         // skips (parent = None).
-        let paths = candidate_debuginfo_paths(
-            target,
-            Some("orphan.debug"),
-            Some("abcdef0123456789"),
-        );
+        let paths =
+            candidate_debuginfo_paths(target, Some("orphan.debug"), Some("abcdef0123456789"));
         assert_eq!(
             paths.len(),
             1,
@@ -6113,7 +6110,9 @@ mod tests {
              (3 on an absolute target); got {paths:?}",
         );
         assert!(
-            !paths.iter().any(|p| p.to_string_lossy().contains(".build-id")),
+            !paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains(".build-id")),
             "no build-id candidate must appear when hint is an empty string; \
              got {paths:?}",
         );

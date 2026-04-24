@@ -192,12 +192,8 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
         cgroup_stats(400, 0, 0, 2 << 20),
     );
 
-    snapshot(vec![ta], cgroup_stats_a)
-        .write(&a_path)
-        .unwrap();
-    snapshot(vec![tb], cgroup_stats_b)
-        .write(&b_path)
-        .unwrap();
+    snapshot(vec![ta], cgroup_stats_a).write(&a_path).unwrap();
+    snapshot(vec![tb], cgroup_stats_b).write(&b_path).unwrap();
 
     let loaded_a = HostStateSnapshot::load(&a_path).unwrap();
     let loaded_b = HostStateSnapshot::load(&b_path).unwrap();

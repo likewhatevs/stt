@@ -236,7 +236,11 @@ impl CgroupManager {
     /// `cpuset_update_task_spread` path.
     pub fn set_cpuset_mems(&self, name: &str, nodes: &BTreeSet<usize>) -> Result<()> {
         let p = self.parent.join(name).join("cpuset.mems");
-        write_with_timeout(&p, &TestTopology::cpuset_string(nodes), CGROUP_WRITE_TIMEOUT)
+        write_with_timeout(
+            &p,
+            &TestTopology::cpuset_string(nodes),
+            CGROUP_WRITE_TIMEOUT,
+        )
     }
 
     /// Clear `cpuset.mems` for a child cgroup (empty string = inherit parent).
@@ -534,11 +538,7 @@ fn drain_pids_to_root(procs_path: &Path, context: &str) {
 /// boundary; `cleanup_all`'s outer warn still uses `parent =` for the
 /// top-level read_dir failure since that warn is emitted by the
 /// caller, not here.
-fn for_each_child_dir(
-    path: &Path,
-    context: &str,
-    mut f: impl FnMut(&Path),
-) -> std::io::Result<()> {
+fn for_each_child_dir(path: &Path, context: &str, mut f: impl FnMut(&Path)) -> std::io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = match entry {
             Ok(e) => e,
@@ -665,8 +665,7 @@ mod tests {
     /// deleting arbitrary files under the cgroup parent.
     #[test]
     fn cleanup_all_skips_non_dir_entries() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-cg-nondir-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-nondir-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let cg = CgroupManager::new(dir.to_str().unwrap());
         cg.create_cgroup("cg_child").unwrap();
@@ -696,8 +695,7 @@ mod tests {
     /// function-pointer arg drives.
     #[test]
     fn cleanup_recursive_removes_nested_dirs_depth_first() {
-        let base =
-            std::env::temp_dir().join(format!("ktstr-cg-nested-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("ktstr-cg-nested-{}", std::process::id()));
         let root = base.join("root");
         fs::create_dir_all(root.join("mid").join("leaf")).unwrap();
         fs::create_dir_all(root.join("sibling")).unwrap();
@@ -871,8 +869,7 @@ mod tests {
 
     #[test]
     fn add_parent_subtree_controller_writes_plus_prefixed_token() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-cg-addparent-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-addparent-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         // The subtree_control file in a real cgroup v2 tree echoes the
         // currently-enabled controllers (no `+` prefix) when read back;

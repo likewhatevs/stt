@@ -663,14 +663,8 @@ mod tests {
     /// subcommand — complements the cargo-ktstr mirror test.
     #[test]
     fn parse_shell_llc_cap_with_no_perf_mode_succeeds() {
-        let parsed = Cli::try_parse_from([
-            "ktstr",
-            "shell",
-            "--llc-cap",
-            "4",
-            "--no-perf-mode",
-        ])
-        .unwrap_or_else(|e| panic!("{e}"));
+        let parsed = Cli::try_parse_from(["ktstr", "shell", "--llc-cap", "4", "--no-perf-mode"])
+            .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
             Command::Shell {
                 llc_cap,
@@ -696,9 +690,7 @@ mod tests {
         // Match on Err directly to extract the clap error.
         let msg = match Cli::try_parse_from(["ktstr", "shell", "--llc-cap", "4"]) {
             Err(e) => e.to_string(),
-            Ok(_) => panic!(
-                "--llc-cap without --no-perf-mode must fail the parse"
-            ),
+            Ok(_) => panic!("--llc-cap without --no-perf-mode must fail the parse"),
         };
         assert!(
             msg.to_ascii_lowercase().contains("no-perf-mode")

@@ -180,10 +180,9 @@ fn write_btf_sidecar(sidecar: &Path, bytes: &[u8]) -> Result<()> {
     let parent = sidecar
         .parent()
         .context("btf sidecar path has no parent directory")?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .context("create tempfile for btf sidecar")?;
-    tmp.write_all(bytes)
-        .context("write btf sidecar contents")?;
+    let mut tmp =
+        tempfile::NamedTempFile::new_in(parent).context("create tempfile for btf sidecar")?;
+    tmp.write_all(bytes).context("write btf sidecar contents")?;
     tmp.as_file()
         .sync_all()
         .context("fsync btf sidecar before rename")?;
@@ -1465,10 +1464,8 @@ mod tests {
 
     #[test]
     fn sidecar_fresh_false_when_either_file_missing() {
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-btf-sidecar-missing-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-btf-sidecar-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let vmlinux = dir.join("vmlinux");
         let sidecar = dir.join("vmlinux.btf");
@@ -1508,10 +1505,8 @@ mod tests {
         // the shared kernel cache or source tree. The copy shares
         // the same directory so the sidecar's tempfile+rename lands
         // on the same filesystem.
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-btf-sidecar-e2e-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-btf-sidecar-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let vmlinux = dir.join("vmlinux");
         std::fs::copy(&path, &vmlinux).unwrap();
@@ -1558,19 +1553,13 @@ mod tests {
         // top). Instead, pin the behavior by checking that a second
         // load still succeeds AND the sidecar mtime is unchanged
         // (a second write would bump it).
-        let sidecar_mtime_before = std::fs::metadata(&sidecar)
-            .unwrap()
-            .modified()
-            .unwrap();
+        let sidecar_mtime_before = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
         // Sleep a bit so a spurious sidecar rewrite would be
         // detectable via an mtime bump.
         std::thread::sleep(Duration::from_millis(50));
         let btf2 = load_btf_from_path(&vmlinux).expect("second load must succeed");
         let _ = format!("{:?}", btf2.resolve_types_by_name("task_struct").is_ok());
-        let sidecar_mtime_after = std::fs::metadata(&sidecar)
-            .unwrap()
-            .modified()
-            .unwrap();
+        let sidecar_mtime_after = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
         assert_eq!(
             sidecar_mtime_before, sidecar_mtime_after,
             "second load must hit sidecar cache — mtime bump proves a \
@@ -1595,10 +1584,8 @@ mod tests {
             return;
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-btf-sidecar-stale-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-btf-sidecar-stale-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let vmlinux = dir.join("vmlinux");
         std::fs::copy(&path, &vmlinux).unwrap();
@@ -1609,10 +1596,7 @@ mod tests {
         // portable way to force a past mtime.
         std::fs::write(&sidecar, b"stale-sidecar-bytes").unwrap();
         let past = SystemTime::now() - Duration::from_secs(3600);
-        let f = std::fs::File::options()
-            .write(true)
-            .open(&sidecar)
-            .unwrap();
+        let f = std::fs::File::options().write(true).open(&sidecar).unwrap();
         f.set_modified(past).unwrap();
         drop(f);
 
@@ -1656,10 +1640,8 @@ mod tests {
             return;
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-btf-sidecar-corrupt-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-btf-sidecar-corrupt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let vmlinux = dir.join("vmlinux");
         std::fs::copy(&path, &vmlinux).unwrap();
@@ -1711,10 +1693,7 @@ mod tests {
             return;
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-btf-sidecar-ro-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ktstr-btf-sidecar-ro-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let vmlinux = dir.join("vmlinux");
         std::fs::copy(&path, &vmlinux).unwrap();
@@ -1734,8 +1713,7 @@ mod tests {
         );
 
         // Restore permissions for cleanup.
-        let _ =
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1752,10 +1730,8 @@ mod tests {
             // Generate a raw-BTF file from the ELF so this test
             // exercises the raw-BTF path even when
             // find_test_vmlinux returns an ELF.
-            let dir = std::env::temp_dir().join(format!(
-                "ktstr-btf-sidecar-raw-{}",
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("ktstr-btf-sidecar-raw-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let src_data = std::fs::read(&path).unwrap();
             let elf = match goblin::elf::Elf::parse(&src_data) {
@@ -1764,8 +1740,7 @@ mod tests {
                     // Raw BTF already — skip the ELF extraction.
                     let raw = dir.join("vmlinux.btf-raw");
                     std::fs::copy(&path, &raw).unwrap();
-                    let _ = load_btf_from_path(&raw)
-                        .expect("raw-BTF load must succeed");
+                    let _ = load_btf_from_path(&raw).expect("raw-BTF load must succeed");
                     let sidecar = btf_sidecar_path(&raw);
                     assert!(
                         !sidecar.exists(),

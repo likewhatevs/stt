@@ -203,10 +203,7 @@ fn lookup_thread_returns_exceeds_cap_on_saturated_scan() {
         .flat_map(|i| {
             vec![
                 metric(&format!("snapshots.0.threads.{i}.tid"), (i as f64) + 100.0),
-                metric(
-                    &format!("snapshots.0.threads.{i}.allocated_bytes"),
-                    1024.0,
-                ),
+                metric(&format!("snapshots.0.threads.{i}.allocated_bytes"), 1024.0),
             ]
         })
         .collect();

@@ -257,10 +257,7 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
     };
     let result = crate::kernel_path::resolve_btf(resolved_dir.as_deref());
     if result.is_none() {
-        crate::report::test_skip(&format!(
-            "no vmlinux found; {}",
-            crate::KTSTR_KERNEL_HINT
-        ));
+        crate::report::test_skip(&format!("no vmlinux found; {}", crate::KTSTR_KERNEL_HINT));
     }
     result
 }

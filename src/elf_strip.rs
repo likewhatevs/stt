@@ -64,14 +64,10 @@ mod tests {
         let bytes = std::fs::read(&exe).expect("read self binary");
 
         let no_delete = rewrite(&bytes, |_| false).expect("rewrite no-op");
-        assert!(
-            !no_delete.is_empty(),
-            "round-trip output must not be empty",
-        );
-        let _: Builder<'_> = Builder::read(no_delete.as_slice())
-            .expect("round-trip output must parse");
-        let round_tripped =
-            File::parse(no_delete.as_slice()).expect("round-trip File::parse");
+        assert!(!no_delete.is_empty(), "round-trip output must not be empty",);
+        let _: Builder<'_> =
+            Builder::read(no_delete.as_slice()).expect("round-trip output must parse");
+        let round_tripped = File::parse(no_delete.as_slice()).expect("round-trip File::parse");
         let has_comment = round_tripped
             .sections()
             .any(|s| s.name().ok() == Some(".comment"));
@@ -82,16 +78,11 @@ mod tests {
              round-trip dropped it)",
         );
 
-        let stripped =
-            rewrite(&bytes, |name| name == b".comment").expect("rewrite strip");
-        assert!(
-            !stripped.is_empty(),
-            "stripped output must not be empty",
-        );
+        let stripped = rewrite(&bytes, |name| name == b".comment").expect("rewrite strip");
+        assert!(!stripped.is_empty(), "stripped output must not be empty",);
         let _: Builder<'_> =
             Builder::read(stripped.as_slice()).expect("stripped output must parse");
-        let stripped_file =
-            File::parse(stripped.as_slice()).expect("stripped File::parse");
+        let stripped_file = File::parse(stripped.as_slice()).expect("stripped File::parse");
         let still_has_comment = stripped_file
             .sections()
             .any(|s| s.name().ok() == Some(".comment"));
@@ -130,11 +121,7 @@ mod tests {
             object::Architecture::X86_64,
             object::Endianness::Little,
         );
-        let text_id = obj.add_section(
-            Vec::new(),
-            b".text".to_vec(),
-            object::SectionKind::Text,
-        );
+        let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
         obj.append_section_data(text_id, &[0xCC; 64], 1);
         let _ = obj.add_symbol(write::Symbol {
             name: b"test_sym".to_vec(),
@@ -148,8 +135,7 @@ mod tests {
         });
         let bytes = obj.write().expect("serialize fixture ELF");
 
-        let fixture_check =
-            File::parse(bytes.as_slice()).expect("pre-flip File::parse fixture");
+        let fixture_check = File::parse(bytes.as_slice()).expect("pre-flip File::parse fixture");
         fixture_check.symbol_by_name("test_sym").expect(
             "fixture sanity check: test_sym must exist in fresh-built ELF \
              before any SHT_NOBITS mutation (distinguishes fixture-build \
@@ -167,7 +153,9 @@ mod tests {
         }
         assert!(flipped, "fixture must contain a .text section");
         let mut out = Vec::new();
-        builder.write(&mut out).expect("Builder::write NOBITS'd ELF");
+        builder
+            .write(&mut out)
+            .expect("Builder::write NOBITS'd ELF");
 
         let file = File::parse(&out[..]).expect("re-parse output as ELF");
         let sym = file

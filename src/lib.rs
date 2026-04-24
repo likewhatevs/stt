@@ -1006,7 +1006,10 @@ mod tests {
         use crate::worker_ready::{WORKER_READY_MARKER_PREFIX, worker_ready_marker_path};
         assert_eq!(WORKER_READY_MARKER_PREFIX, "/tmp/ktstr-worker-ready-");
         assert_eq!(worker_ready_marker_path(0), "/tmp/ktstr-worker-ready-0");
-        assert_eq!(worker_ready_marker_path(12345), "/tmp/ktstr-worker-ready-12345");
+        assert_eq!(
+            worker_ready_marker_path(12345),
+            "/tmp/ktstr-worker-ready-12345"
+        );
         assert_eq!(
             worker_ready_marker_path(u32::MAX),
             "/tmp/ktstr-worker-ready-4294967295"

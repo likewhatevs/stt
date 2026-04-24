@@ -427,8 +427,7 @@ fn write_valid_entry(dir: &std::path::Path, ktstr_kconfig_hash: Option<&str>) {
          \"has_vmlinux\":false\
          }}",
     );
-    std::fs::write(dir.join("metadata.json"), metadata.as_bytes())
-        .expect("write metadata.json");
+    std::fs::write(dir.join("metadata.json"), metadata.as_bytes()).expect("write metadata.json");
     std::fs::write(dir.join("Image"), b"").expect("write Image");
 }
 
@@ -440,8 +439,7 @@ fn write_valid_entry(dir: &std::path::Path, ktstr_kconfig_hash: Option<&str>) {
 /// string. The tag rendered in the row is `(corrupt)`.
 fn write_corrupt_entry(dir: &std::path::Path) {
     std::fs::create_dir_all(dir).expect("create fixture corrupt dir");
-    std::fs::write(dir.join("metadata.json"), b"{")
-        .expect("write malformed metadata.json");
+    std::fs::write(dir.join("metadata.json"), b"{").expect("write malformed metadata.json");
 }
 
 /// Build the shared fixture cache for the legend tests. Returns the

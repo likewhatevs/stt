@@ -676,8 +676,9 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                     p.validate().map_err(|e| format!("{e:#}"))?;
                     p
                 }
-                (None, Some(path)) => ktstr::cli::ComparisonPolicy::load_json(path)
-                    .map_err(|e| format!("{e:#}"))?,
+                (None, Some(path)) => {
+                    ktstr::cli::ComparisonPolicy::load_json(path).map_err(|e| format!("{e:#}"))?
+                }
                 (None, None) => ktstr::cli::ComparisonPolicy::default(),
                 (Some(_), Some(_)) => {
                     // Defence-in-depth: clap's `conflicts_with` is
@@ -690,14 +691,8 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                     );
                 }
             };
-            let exit = cli::compare_runs(
-                a,
-                b,
-                filter.as_deref(),
-                &resolved_policy,
-                dir.as_deref(),
-            )
-            .map_err(|e| format!("{e:#}"))?;
+            let exit = cli::compare_runs(a, b, filter.as_deref(), &resolved_policy, dir.as_deref())
+                .map_err(|e| format!("{e:#}"))?;
             if exit != 0 {
                 std::process::exit(exit);
             }
@@ -1261,9 +1256,7 @@ fn run_model_status() -> Result<(), String> {
             );
         }
         ktstr::test_support::ShaVerdict::Mismatches => {
-            println!(
-                "(cached file failed SHA-256 check; {RE_FETCH_TAIL})",
-            );
+            println!("(cached file failed SHA-256 check; {RE_FETCH_TAIL})",);
         }
         ktstr::test_support::ShaVerdict::Matches => {}
     }
@@ -1483,8 +1476,7 @@ mod tests {
     fn parse_nextest_alias_dispatches_to_test() {
         let Cargo {
             command: CargoSub::Ktstr(k),
-        } = Cargo::try_parse_from(["cargo", "ktstr", "nextest"])
-            .unwrap_or_else(|e| panic!("{e}"));
+        } = Cargo::try_parse_from(["cargo", "ktstr", "nextest"]).unwrap_or_else(|e| panic!("{e}"));
         assert!(
             matches!(k.command, KtstrCommand::Test { .. }),
             "`nextest` alias must dispatch to the Test variant",
@@ -1689,10 +1681,7 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::LlvmCov { args, .. } => {
-                assert_eq!(
-                    args,
-                    vec!["report", "--lcov", "--output-path", "lcov.info"]
-                );
+                assert_eq!(args, vec!["report", "--lcov", "--output-path", "lcov.info"]);
             }
             _ => panic!("expected LlvmCov"),
         }
@@ -2037,9 +2026,7 @@ mod tests {
             KtstrCommand::Stats {
                 command:
                     Some(StatsCommand::Compare {
-                        threshold,
-                        policy,
-                        ..
+                        threshold, policy, ..
                     }),
                 ..
             } => {
@@ -2094,7 +2081,9 @@ mod tests {
         };
         let rendered = err.to_string();
         assert!(
-            rendered.to_ascii_lowercase().contains("cannot be used with")
+            rendered
+                .to_ascii_lowercase()
+                .contains("cannot be used with")
                 || rendered.to_ascii_lowercase().contains("conflict"),
             "clap error must surface the conflict between \
              --threshold and --policy; got: {rendered}",
@@ -2107,15 +2096,8 @@ mod tests {
     fn parse_stats_show_host_with_run() {
         let Cargo {
             command: CargoSub::Ktstr(k),
-        } = Cargo::try_parse_from([
-            "cargo",
-            "ktstr",
-            "stats",
-            "show-host",
-            "--run",
-            "my-run-id",
-        ])
-        .unwrap_or_else(|e| panic!("{e}"));
+        } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "show-host", "--run", "my-run-id"])
+            .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::Stats {
                 command: Some(StatsCommand::ShowHost { run, dir }),
@@ -2170,10 +2152,7 @@ mod tests {
     #[test]
     fn parse_stats_show_host_missing_run_rejected() {
         let rejected = Cargo::try_parse_from(["cargo", "ktstr", "stats", "show-host"]);
-        assert!(
-            rejected.is_err(),
-            "stats show-host must require --run",
-        );
+        assert!(rejected.is_err(), "stats show-host must require --run",);
     }
 
     // -- try_get_matches_from: kernel list --
@@ -2815,13 +2794,8 @@ mod tests {
     fn parse_show_thresholds_with_test_arg() {
         let Cargo {
             command: CargoSub::Ktstr(k),
-        } = Cargo::try_parse_from([
-            "cargo",
-            "ktstr",
-            "show-thresholds",
-            "my_test_fn",
-        ])
-        .unwrap_or_else(|e| panic!("{e}"));
+        } = Cargo::try_parse_from(["cargo", "ktstr", "show-thresholds", "my_test_fn"])
+            .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::ShowThresholds { test } => {
                 assert_eq!(test, "my_test_fn");
@@ -2845,13 +2819,7 @@ mod tests {
     /// silently drop the second arg or reinterpret it as a flag.
     #[test]
     fn parse_show_thresholds_extra_arg_rejected() {
-        let rejected = Cargo::try_parse_from([
-            "cargo",
-            "ktstr",
-            "show-thresholds",
-            "a",
-            "b",
-        ]);
+        let rejected = Cargo::try_parse_from(["cargo", "ktstr", "show-thresholds", "a", "b"]);
         assert!(
             rejected.is_err(),
             "show-thresholds must accept exactly one positional arg",
@@ -2892,8 +2860,7 @@ mod tests {
     /// wrapping it.
     #[test]
     fn show_thresholds_helper_unknown_test_returns_error() {
-        let err = cli::show_thresholds("definitely_not_a_registered_test_xyz")
-            .unwrap_err();
+        let err = cli::show_thresholds("definitely_not_a_registered_test_xyz").unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no registered ktstr test named"),
@@ -2953,13 +2920,9 @@ mod tests {
         // `Cargo` intentionally has no Debug derive, so unwrap
         // helpers that format the Ok variant are unavailable.
         // Match on Err directly to extract the clap error.
-        let msg = match Cargo::try_parse_from([
-            "cargo", "ktstr", "shell", "--llc-cap", "4",
-        ]) {
+        let msg = match Cargo::try_parse_from(["cargo", "ktstr", "shell", "--llc-cap", "4"]) {
             Err(e) => e.to_string(),
-            Ok(_) => panic!(
-                "--llc-cap without --no-perf-mode must fail the parse"
-            ),
+            Ok(_) => panic!("--llc-cap without --no-perf-mode must fail the parse"),
         };
         // clap renders "the following required arguments were not provided"
         // or similar; lowercase + substring-match is lenient against
@@ -2982,13 +2945,8 @@ mod tests {
     fn parse_shell_no_perf_mode_without_llc_cap_succeeds() {
         let Cargo {
             command: CargoSub::Ktstr(k),
-        } = Cargo::try_parse_from([
-            "cargo",
-            "ktstr",
-            "shell",
-            "--no-perf-mode",
-        ])
-        .unwrap_or_else(|e| panic!("{e}"));
+        } = Cargo::try_parse_from(["cargo", "ktstr", "shell", "--no-perf-mode"])
+            .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::Shell {
                 llc_cap,

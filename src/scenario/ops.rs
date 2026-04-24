@@ -781,7 +781,6 @@ impl OpKind {
 }
 
 impl Op {
-
     /// Create a new cgroup.
     pub fn add_cgroup(name: impl Into<Cow<'static, str>>) -> Self {
         Op::AddCgroup { name: name.into() }
@@ -1994,9 +1993,7 @@ fn run_scenario(
 
     // Final liveness check. sched_pid == None ⇒ no scheduler
     // configured (kernel-default path); no liveness to report on.
-    let sched_dead = ctx
-        .sched_pid
-        .is_some_and(|pid| !process_alive(pid));
+    let sched_dead = ctx.sched_pid.is_some_and(|pid| !process_alive(pid));
 
     // --- Backdrop teardown ---
     let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo);
@@ -2264,10 +2261,7 @@ fn build_stimulus(
 /// validation is unit-testable without standing up a full Ctx
 /// / scenario state. See the caller for how the allowlist is
 /// threaded through Op::RunPayload execution.
-fn validate_known_flags(
-    payload: &crate::test_support::Payload,
-    args: &[String],
-) -> Result<()> {
+fn validate_known_flags(payload: &crate::test_support::Payload, args: &[String]) -> Result<()> {
     let Some(allowlist) = payload.known_flags else {
         return Ok(());
     };
@@ -2639,8 +2633,7 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 if let Err(err) = ctx.cgroups.remove_cgroup(cgroup)
                     && !crate::scenario::is_io_not_found(&err)
                 {
-                    let hint = crate::scenario::remove_cgroup_errno_hint(&err)
-                        .unwrap_or("");
+                    let hint = crate::scenario::remove_cgroup_errno_hint(&err).unwrap_or("");
                     tracing::warn!(
                         cgroup = %cgroup,
                         err = %format!("{err:#}"),
@@ -3167,7 +3160,8 @@ mod tests {
         let mut sorted = indices.clone();
         sorted.sort_unstable();
         assert_eq!(
-            sorted, expected,
+            sorted,
+            expected,
             "OpKind::bit_index indices must be contiguous from 0 \
              (no gaps, no duplicates). Got sorted indices {sorted:?} \
              for {} OpKind variants; expected {expected:?}.",
@@ -3372,11 +3366,7 @@ mod tests {
             uses_parent_pgrp: false,
             known_flags: Some(&["runtime", "threads", "verbose"]),
         };
-        let args = vec![
-            "--runtime=30".into(),
-            "--threds".into(),
-            "--verbose".into(),
-        ];
+        let args = vec!["--runtime=30".into(), "--threds".into(), "--verbose".into()];
         let err = validate_known_flags(&WITH_ALLOWLIST, &args)
             .expect_err("typo between two known flags must be rejected");
         let msg = format!("{err:#}");
@@ -3408,8 +3398,7 @@ mod tests {
         // "threds" is a typo for "threads" — the exact failure
         // the allowlist exists to catch.
         let args = vec!["--threds".to_string(), "4".to_string()];
-        let err = validate_known_flags(&WITH_ALLOWLIST, &args)
-            .expect_err("typo must be rejected");
+        let err = validate_known_flags(&WITH_ALLOWLIST, &args).expect_err("typo must be rejected");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("--threds"),
@@ -3444,8 +3433,7 @@ mod tests {
             "--whatever=x".into(),
             "--threds".into(),
         ];
-        validate_known_flags(&NO_ALLOWLIST, &args)
-            .expect("None allowlist must pass any flag");
+        validate_known_flags(&NO_ALLOWLIST, &args).expect("None allowlist must pass any flag");
     }
 
     // -- Op discriminant tests --
@@ -4716,7 +4704,10 @@ mod tests {
         assert!(err.contains("cg_bind_test"), "bail must name cgroup: {err}");
         // Uncovered node (1) and the covering cpuset node (0) must
         // both appear so the reader sees the exact disjoint pair.
-        assert!(err.contains("[1]"), "bail must name uncovered node 1: {err}");
+        assert!(
+            err.contains("[1]"),
+            "bail must name uncovered node 1: {err}"
+        );
         assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
         // Both escape hatches must surface — pin the enumerated
         // `(a)` / `(b)` markers so a regression that collapses them
@@ -4786,8 +4777,14 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("cg_preferred_test"), "bail must name cgroup: {err}");
-        assert!(err.contains("[1]"), "bail must name uncovered node 1: {err}");
+        assert!(
+            err.contains("cg_preferred_test"),
+            "bail must name cgroup: {err}"
+        );
+        assert!(
+            err.contains("[1]"),
+            "bail must name uncovered node 1: {err}"
+        );
         assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
         assert!(
             err.contains("(a) add .mpol_flags(MpolFlags::STATIC_NODES)"),
@@ -4826,10 +4823,16 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("cg_interleave_test"), "bail must name cgroup: {err}");
+        assert!(
+            err.contains("cg_interleave_test"),
+            "bail must name cgroup: {err}"
+        );
         // Only node 1 is uncovered (node 0 is covered by cpuset); the
         // bail should not list node 0 in the uncovered set.
-        assert!(err.contains("[1]"), "bail must name uncovered node 1: {err}");
+        assert!(
+            err.contains("[1]"),
+            "bail must name uncovered node 1: {err}"
+        );
         assert!(err.contains("{0}"), "bail must name cpuset node 0: {err}");
         assert!(
             err.contains("(a) add .mpol_flags(MpolFlags::STATIC_NODES)"),
@@ -4883,8 +4886,8 @@ mod tests {
         let ctx = ctx_from(&cg, &topo);
         let cpuset: BTreeSet<usize> = (0..4).collect();
         let policy = MemPolicy::Bind([0].into_iter().collect());
-        let flags = crate::workload::MpolFlags::STATIC_NODES
-            | crate::workload::MpolFlags::RELATIVE_NODES;
+        let flags =
+            crate::workload::MpolFlags::STATIC_NODES | crate::workload::MpolFlags::RELATIVE_NODES;
         let err = validate_mempolicy_cpuset(&policy, flags, &cpuset, &ctx, "cg_0")
             .expect_err("STATIC_NODES | RELATIVE_NODES must be rejected");
         let rendered = format!("{err:#}");
@@ -4919,7 +4922,10 @@ mod tests {
         .expect_err("unknown bit must bail");
         let s = err.to_string();
         assert!(s.contains("cg_unknown_bit"), "bail must name cgroup: {s}");
-        assert!(s.contains("unknown bit"), "bail must name the unknown-bit contract: {s}");
+        assert!(
+            s.contains("unknown bit"),
+            "bail must name the unknown-bit contract: {s}"
+        );
         assert!(
             s.contains("STATIC_NODES"),
             "bail must enumerate the known bits so the user sees what IS supported: {s}",
@@ -6226,7 +6232,8 @@ mod tests {
         let cgroups = CgroupManager::new("/nonexistent");
         let topo = mock_topo();
         let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
-        let backdrop = super::super::backdrop::Backdrop::new().with_payload(&Payload::KERNEL_DEFAULT);
+        let backdrop =
+            super::super::backdrop::Backdrop::new().with_payload(&Payload::KERNEL_DEFAULT);
         let err = execute_scenario_with(
             &ctx,
             backdrop,
@@ -6670,9 +6677,10 @@ mod tests {
             .add_cgroup_no_cpuset("shared")
             .expect("add backdrop cgroup");
         let mut scenario = ScenarioState::new(&mut step_state, &mut backdrop_state);
-        let err = apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("shared")])
-            .expect_err("apply_ops must reject a step-local AddCgroup whose \
-                         name already lives in the Backdrop");
+        let err = apply_ops(&ctx, &mut scenario, &[Op::add_cgroup("shared")]).expect_err(
+            "apply_ops must reject a step-local AddCgroup whose \
+                         name already lives in the Backdrop",
+        );
         let msg = format!("{err:?}");
         assert!(
             msg.contains("'shared'") && msg.contains("collides"),
@@ -6880,9 +6888,9 @@ mod tests {
     #[test]
     fn build_stimulus_warns_on_step_idx_saturation() {
         use std::sync::{Arc, Mutex};
-        use tracing::{Event, Subscriber};
         use tracing::field::{Field, Visit};
         use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Subscriber};
         use tracing::{Level, Metadata};
 
         // Capturing subscriber that records `(level, message)` pairs
@@ -6904,8 +6912,12 @@ mod tests {
             }
         }
         impl Subscriber for CaptureSubscriber {
-            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
-            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
             fn record(&self, _: &Id, _: &Record<'_>) {}
             fn record_follows_from(&self, _: &Id, _: &Id) {}
             fn event(&self, event: &Event<'_>) {
@@ -6921,7 +6933,9 @@ mod tests {
         }
 
         let events: Arc<Mutex<Vec<(Level, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let sub = CaptureSubscriber { events: events.clone() };
+        let sub = CaptureSubscriber {
+            events: events.clone(),
+        };
 
         tracing::subscriber::with_default(sub, || {
             let mock = MockCgroupOps::new();
@@ -6946,8 +6960,10 @@ mod tests {
             .map(|(_, msg)| msg)
             .collect();
         assert!(
-            warn_hits.iter().any(|m| m.contains("step_index")
-                && m.contains("StimulusPayload field overflowed u16")),
+            warn_hits
+                .iter()
+                .any(|m| m.contains("step_index")
+                    && m.contains("StimulusPayload field overflowed u16")),
             "saturation must emit a tracing::warn naming step_index; got warns: {warn_hits:?}",
         );
         // Sanity: no warn should fire for the in-range 0 call.

@@ -232,10 +232,7 @@ pub(crate) fn format_sched_died_after_step(
 /// invariant documented on [`format_sched_died_after_step`].
 /// Structural routing is via [`DetailKind::SchedulerDied`] on the
 /// emitted detail.
-pub(crate) fn format_sched_died_after_all_steps(
-    total_steps: usize,
-    elapsed_s: f64,
-) -> String {
+pub(crate) fn format_sched_died_after_all_steps(total_steps: usize, elapsed_s: f64) -> String {
     format!(
         "{SCHED_DIED_PREFIX} unexpectedly (detected after all {total_steps} steps completed, {elapsed_s:.1}s elapsed)",
     )
@@ -759,8 +756,7 @@ impl AssertResult {
         s.total_iterations += o.total_iterations;
         s.worst_spread = s.worst_spread.max(o.worst_spread);
         s.worst_migration_ratio = s.worst_migration_ratio.max(o.worst_migration_ratio);
-        s.worst_p99_wake_latency_us =
-            s.worst_p99_wake_latency_us.max(o.worst_p99_wake_latency_us);
+        s.worst_p99_wake_latency_us = s.worst_p99_wake_latency_us.max(o.worst_p99_wake_latency_us);
         s.worst_median_wake_latency_us = s
             .worst_median_wake_latency_us
             .max(o.worst_median_wake_latency_us);
@@ -1304,7 +1300,11 @@ impl Assert {
         row(&mut out, "max_spread_pct", &self.max_spread_pct);
         row(&mut out, "max_throughput_cv", &self.max_throughput_cv);
         row(&mut out, "min_work_rate", &self.min_work_rate);
-        row(&mut out, "max_p99_wake_latency_ns", &self.max_p99_wake_latency_ns);
+        row(
+            &mut out,
+            "max_p99_wake_latency_ns",
+            &self.max_p99_wake_latency_ns,
+        );
         row(&mut out, "max_wake_latency_cv", &self.max_wake_latency_cv);
         row(&mut out, "min_iteration_rate", &self.min_iteration_rate);
         row(&mut out, "max_migration_ratio", &self.max_migration_ratio);
@@ -2254,7 +2254,10 @@ mod tests {
             "format_human must open with the first threshold row \
              (header ownership belongs to the caller); got: {out}",
         );
-        assert!(out.ends_with('\n'), "format_human output must end with newline");
+        assert!(
+            out.ends_with('\n'),
+            "format_human output must end with newline"
+        );
     }
 
     /// Fields populated on `Assert::default_checks()` render with
@@ -2861,12 +2864,14 @@ mod tests {
             // ratios is just a memoization of the computation, not a
             // transformation.
             assert_eq!(
-                pre_tail, cg.computed_wake_latency_tail_ratio(),
+                pre_tail,
+                cg.computed_wake_latency_tail_ratio(),
                 "[{label}] computed accessor must not depend on \
                  derive_ratios having fired",
             );
             assert_eq!(
-                pre_iter, cg.computed_iterations_per_worker(),
+                pre_iter,
+                cg.computed_iterations_per_worker(),
                 "[{label}] computed accessor must not depend on \
                  derive_ratios having fired",
             );
@@ -2931,11 +2936,7 @@ mod tests {
             median_wake_latency_us: f64::NAN,
             ..CgroupStats::default()
         };
-        assert_finite_eq(
-            cg.computed_wake_latency_tail_ratio(),
-            0.0,
-            "nan-median",
-        );
+        assert_finite_eq(cg.computed_wake_latency_tail_ratio(), 0.0, "nan-median");
 
         // --- NaN p99 with positive median: without an explicit
         // sanitizer on the numerator, `NaN / 10.0 = NaN`. The
@@ -2974,11 +2975,7 @@ mod tests {
             median_wake_latency_us: f64::INFINITY,
             ..CgroupStats::default()
         };
-        assert_finite_eq(
-            cg.computed_wake_latency_tail_ratio(),
-            0.0,
-            "inf-median",
-        );
+        assert_finite_eq(cg.computed_wake_latency_tail_ratio(), 0.0, "inf-median");
 
         // --- +Infinity p99 with positive median: `inf / 10 = inf`.
         // Same gap as the NaN-p99 case.
@@ -3000,11 +2997,7 @@ mod tests {
             median_wake_latency_us: 0.0,
             ..CgroupStats::default()
         };
-        assert_finite_eq(
-            cg.computed_wake_latency_tail_ratio(),
-            0.0,
-            "both-zero",
-        );
+        assert_finite_eq(cg.computed_wake_latency_tail_ratio(), 0.0, "both-zero");
 
         // --- Negative median: `neg > 0.0` is false, guard fires.
         // Pins the comparator direction: a regression to `!= 0.0`
@@ -3456,11 +3449,13 @@ mod tests {
                  has drifted from the struct definition",
             );
             let json = serde_json::Value::Object(obj).to_string();
-            let err = serde_json::from_str::<CgroupStats>(&json).err().unwrap_or_else(
-                || panic!(
-                    "deserialize must reject CgroupStats with `{field}` removed, but succeeded",
-                ),
-            );
+            let err = serde_json::from_str::<CgroupStats>(&json)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "deserialize must reject CgroupStats with `{field}` removed, but succeeded",
+                    )
+                });
             let msg = format!("{err}");
             assert!(
                 msg.contains(field),
@@ -3569,9 +3564,8 @@ mod tests {
         // the absence round-trips without error.
         obj.remove("ext_metrics");
         let without_ext_metrics = serde_json::Value::Object(obj).to_string();
-        let parsed: ScenarioStats = serde_json::from_str(&without_ext_metrics).expect(
-            "deserialize must tolerate missing ext_metrics (the sole exempt field)",
-        );
+        let parsed: ScenarioStats = serde_json::from_str(&without_ext_metrics)
+            .expect("deserialize must tolerate missing ext_metrics (the sole exempt field)");
         assert!(
             parsed.ext_metrics.is_empty(),
             "missing ext_metrics must default to empty, got {:?}",
@@ -4592,7 +4586,8 @@ mod tests {
         assert!(
             r.details
                 .iter()
-                .any(|d| matches!(d.kind, DetailKind::Skip) && d.message.contains("no worker reports")),
+                .any(|d| matches!(d.kind, DetailKind::Skip)
+                    && d.message.contains("no worker reports")),
             "skip detail must carry the 'no worker reports' reason: {:?}",
             r.details,
         );
@@ -4834,7 +4829,11 @@ mod tests {
             "median: {}",
             s.worst_median_wake_latency_us
         );
-        assert!(s.worst_wake_latency_cv > 0.0, "cv: {}", s.worst_wake_latency_cv);
+        assert!(
+            s.worst_wake_latency_cv > 0.0,
+            "cv: {}",
+            s.worst_wake_latency_cv
+        );
         assert_eq!(s.total_iterations, 300);
     }
 

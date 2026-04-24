@@ -219,10 +219,7 @@ impl BuildSandbox {
         match rustix::fs::statfs("/sys/fs/cgroup") {
             Ok(sfs) if (sfs.f_type as i64) == CGROUP2_SUPER_MAGIC => {}
             Ok(_) | Err(_) => {
-                return Self::degraded_or_err(
-                    SandboxDegraded::NoCgroupV2,
-                    hard_error_on_degrade,
-                );
+                return Self::degraded_or_err(SandboxDegraded::NoCgroupV2, hard_error_on_degrade);
             }
         }
 
@@ -232,10 +229,7 @@ impl BuildSandbox {
         let parent_rel = match read_self_cgroup_path() {
             Ok(rel) => rel,
             Err(_) => {
-                return Self::degraded_or_err(
-                    SandboxDegraded::NoCgroupV2,
-                    hard_error_on_degrade,
-                );
+                return Self::degraded_or_err(SandboxDegraded::NoCgroupV2, hard_error_on_degrade);
             }
         };
         // Guard against the root cgroup (0::/). The root has no
@@ -266,10 +260,7 @@ impl BuildSandbox {
         let parent_str = match parent_abs.to_str() {
             Some(s) => s,
             None => {
-                return Self::degraded_or_err(
-                    SandboxDegraded::NoCgroupV2,
-                    hard_error_on_degrade,
-                );
+                return Self::degraded_or_err(SandboxDegraded::NoCgroupV2, hard_error_on_degrade);
             }
         };
         let cg = CgroupManager::new(parent_str);
@@ -471,10 +462,7 @@ impl BuildSandbox {
     /// `Err(anyhow)` depending on `hard_error_on_degrade`.
     /// Centralized so every degrade site renders the same
     /// operator-facing text.
-    fn degraded_or_err(
-        kind: SandboxDegraded,
-        hard_error_on_degrade: bool,
-    ) -> Result<Self> {
+    fn degraded_or_err(kind: SandboxDegraded, hard_error_on_degrade: bool) -> Result<Self> {
         if hard_error_on_degrade {
             Err(anyhow::anyhow!(
                 "--llc-cap: {kind}. This host cannot enforce the \
@@ -591,8 +579,7 @@ pub(crate) fn is_root_cgroup(parent_rel: &str) -> bool {
 /// `trim_start_matches('/').join()` against `/sys/fs/cgroup` to
 /// form the absolute parent cgroup path.
 fn read_self_cgroup_path() -> Result<String> {
-    let text = std::fs::read_to_string("/proc/self/cgroup")
-        .context("read /proc/self/cgroup")?;
+    let text = std::fs::read_to_string("/proc/self/cgroup").context("read /proc/self/cgroup")?;
     for line in text.lines() {
         // cgroup v2 line format: `0::/path`. Hybrid cgroup v1+v2
         // may also list `0::/path`; ignore v1 controller-specific
@@ -611,9 +598,7 @@ fn read_self_cgroup_path() -> Result<String> {
 fn parent_controllers_include(parent_abs: &Path, controller: &str) -> bool {
     let path = parent_abs.join("cgroup.controllers");
     match std::fs::read_to_string(&path) {
-        Ok(contents) => contents
-            .split_whitespace()
-            .any(|c| c == controller),
+        Ok(contents) => contents.split_whitespace().any(|c| c == controller),
         Err(_) => false,
     }
 }
@@ -704,8 +689,7 @@ pub(crate) fn sweep_skip_reason(
     // treat as "still present" to avoid sweeping another user's
     // in-progress build.
     let kill_rc = unsafe { libc::kill(pid, 0) };
-    let live = kill_rc == 0
-        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    let live = kill_rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
     if live {
         return Some(SweepSkip::PidLive);
     }
@@ -739,7 +723,10 @@ fn sweep_orphan_sandboxes(parent_abs: &Path) {
             continue;
         }
         // Parse the trailing `-{pid}` segment.
-        let pid = match name.rsplit_once('-').and_then(|(_, tail)| tail.parse::<i32>().ok()) {
+        let pid = match name
+            .rsplit_once('-')
+            .and_then(|(_, tail)| tail.parse::<i32>().ok())
+        {
             Some(p) => p,
             None => continue,
         };
@@ -816,7 +803,10 @@ mod tests {
         // outright.
         let rel = read_self_cgroup_path().expect("proc self cgroup readable");
         // Always starts with '/'.
-        assert!(rel.starts_with('/'), "cgroup path must be absolute-ish: {rel}");
+        assert!(
+            rel.starts_with('/'),
+            "cgroup path must be absolute-ish: {rel}"
+        );
     }
 
     #[test]
@@ -827,10 +817,7 @@ mod tests {
         let mut b = BTreeSet::new();
         b.insert(0);
         b.insert(2);
-        assert!(
-            cpuset_sets_equal(&a, &b),
-            "identity sets must be equal",
-        );
+        assert!(cpuset_sets_equal(&a, &b), "identity sets must be equal",);
     }
 
     #[test]
@@ -912,8 +899,8 @@ mod tests {
     /// an unrelated entry must not disturb it.
     #[test]
     fn sweep_orphan_sandboxes_ignores_non_ktstr_entries() {
-        let dir = std::env::temp_dir()
-            .join(format!("ktstr-sandbox-sweep-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-sandbox-sweep-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let unrelated = dir.join("some-other-dir");
         std::fs::create_dir(&unrelated).unwrap();
@@ -956,10 +943,8 @@ mod tests {
     /// branch specifically.
     #[test]
     fn sweep_orphan_sandboxes_skips_empty_pid_suffix() {
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-sandbox-empty-suffix-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-sandbox-empty-suffix-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let empty_suffix = dir.join("ktstr-build-");
         std::fs::create_dir(&empty_suffix).unwrap();
@@ -978,10 +963,8 @@ mod tests {
     /// simpler parse-fails-directly-after-prefix case.
     #[test]
     fn sweep_orphan_sandboxes_skips_direct_non_numeric_pid() {
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-sandbox-non-numeric-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-sandbox-non-numeric-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let non_numeric = dir.join("ktstr-build-NOTAPID");
         std::fs::create_dir(&non_numeric).unwrap();
@@ -1038,13 +1021,10 @@ mod tests {
         // `CgroupManager::remove_cgroup` early-return on nonexistent
         // paths, so Drop is a no-op when the parent cgroup doesn't
         // exist.
-        let fake_parent = std::path::PathBuf::from(
-            "/nonexistent/ktstr-build-sandbox-is-active-test",
-        );
+        let fake_parent =
+            std::path::PathBuf::from("/nonexistent/ktstr-build-sandbox-is-active-test");
         let active = BuildSandbox::Active(Box::new(SandboxInner {
-            cg: CgroupManager::new(
-                fake_parent.to_str().expect("utf-8 test path"),
-            ),
+            cg: CgroupManager::new(fake_parent.to_str().expect("utf-8 test path")),
             name: "ktstr-build-test-name".to_string(),
             parent_cgroup: fake_parent,
             our_pid: 1,
@@ -1153,13 +1133,9 @@ mod tests {
     /// the Drop invariant that a bogus parent doesn't panic.
     #[test]
     fn build_sandbox_drop_on_nonexistent_parent_does_not_panic() {
-        let fake_parent = std::path::PathBuf::from(
-            "/nonexistent/ktstr-build-drop-test-xyz",
-        );
+        let fake_parent = std::path::PathBuf::from("/nonexistent/ktstr-build-drop-test-xyz");
         let sandbox = BuildSandbox::Active(Box::new(SandboxInner {
-            cg: CgroupManager::new(
-                fake_parent.to_str().expect("utf-8 test path"),
-            ),
+            cg: CgroupManager::new(fake_parent.to_str().expect("utf-8 test path")),
             name: "ktstr-build-drop-test-name".to_string(),
             parent_cgroup: fake_parent,
             our_pid: 1,
@@ -1351,7 +1327,10 @@ mod tests {
         let calls = mock.calls_snapshot();
         assert_eq!(
             calls,
-            vec!["set_cpuset(sbx)".to_string(), "remove_cgroup(sbx)".to_string()],
+            vec![
+                "set_cpuset(sbx)".to_string(),
+                "remove_cgroup(sbx)".to_string()
+            ],
             "exact call order: set_cpuset THEN remove_cgroup, with NO \
              set_cpuset_mems or move_task",
         );
@@ -1446,8 +1425,7 @@ mod tests {
             actime: secs as libc::time_t,
             modtime: secs as libc::time_t,
         };
-        let cpath = std::ffi::CString::new(child.to_str().expect("utf8"))
-            .expect("nul-free");
+        let cpath = std::ffi::CString::new(child.to_str().expect("utf8")).expect("nul-free");
         // SAFETY: `cpath` is a valid nul-terminated C string built
         // from a just-created directory path; `&buf` is an aligned
         // struct living on this frame. utime(2) is safe to call
@@ -1568,8 +1546,7 @@ mod tests {
     fn apply_sandbox_sequence_success_does_not_call_remove_cgroup() {
         let mock = MockCgroupOps::default();
         let (cpus, mems) = test_sets();
-        apply_sandbox_sequence(&mock, "sbx", &cpus, &mems, 42)
-            .expect("all steps ok must succeed");
+        apply_sandbox_sequence(&mock, "sbx", &cpus, &mems, 42).expect("all steps ok must succeed");
         let calls = mock.calls_snapshot();
         assert_eq!(
             calls,

@@ -264,9 +264,8 @@ impl HostStateSnapshot {
         use anyhow::Context;
         let bytes = std::fs::read(path)
             .with_context(|| format!("read host-state snapshot from {}", path.display()))?;
-        let json = zstd::decode_all(bytes.as_slice()).with_context(|| {
-            format!("zstd decompress host-state snapshot {}", path.display())
-        })?;
+        let json = zstd::decode_all(bytes.as_slice())
+            .with_context(|| format!("zstd decompress host-state snapshot {}", path.display()))?;
         let snap: HostStateSnapshot = serde_json::from_slice(&json).with_context(|| {
             format!(
                 "parse host-state snapshot JSON from {} (did the capture format change?)",
@@ -288,8 +287,8 @@ impl HostStateSnapshot {
     pub fn write(&self, path: &std::path::Path) -> anyhow::Result<()> {
         use anyhow::Context;
         let json = serde_json::to_vec(self).context("serialize host-state snapshot to JSON")?;
-        let compressed = zstd::encode_all(json.as_slice(), 3)
-            .context("zstd compress host-state snapshot")?;
+        let compressed =
+            zstd::encode_all(json.as_slice(), 3).context("zstd compress host-state snapshot")?;
         std::fs::write(path, compressed)
             .with_context(|| format!("write host-state snapshot to {}", path.display()))?;
         Ok(())
@@ -806,10 +805,7 @@ fn affinity_zeroed_buffer(bits: usize) -> Vec<libc::c_ulong> {
 /// `written_bytes` is the byte count the syscall reported; we
 /// iterate only that range so a small mask inside a large
 /// buffer does not scan past what the kernel actually wrote.
-fn extract_cpus_from_mask(
-    buffer: &[libc::c_ulong],
-    written_bytes: usize,
-) -> Option<Vec<u32>> {
+fn extract_cpus_from_mask(buffer: &[libc::c_ulong], written_bytes: usize) -> Option<Vec<u32>> {
     let word_bytes = std::mem::size_of::<libc::c_ulong>();
     let word_bits = libc::c_ulong::BITS as usize;
     let written_words = written_bytes / word_bytes;
@@ -1072,13 +1068,14 @@ pub fn capture_thread_at(
     let comm = read_thread_comm_at(proc_root, tgid, tid).unwrap_or_default();
     let cgroup = read_cgroup_at(proc_root, tgid, tid).unwrap_or_default();
     let stat = read_stat_at(proc_root, tgid, tid);
-    let (run_time_ns, wait_time_ns, timeslices) =
-        read_schedstat_at(proc_root, tgid, tid);
+    let (run_time_ns, wait_time_ns, timeslices) = read_schedstat_at(proc_root, tgid, tid);
     let io = read_io_at(proc_root, tgid, tid);
     let status = read_status_at(proc_root, tgid, tid);
     let sched = read_sched_at(proc_root, tgid, tid);
     let cpu_affinity = if use_syscall_affinity {
-        read_affinity(tid).or(status.cpus_allowed).unwrap_or_default()
+        read_affinity(tid)
+            .or(status.cpus_allowed)
+            .unwrap_or_default()
     } else {
         status.cpus_allowed.unwrap_or_default()
     };
@@ -1155,13 +1152,7 @@ pub fn capture_with(
     for tgid in iter_tgids_at(proc_root) {
         let pcomm = read_process_comm_at(proc_root, tgid).unwrap_or_default();
         for tid in iter_task_ids_at(proc_root, tgid) {
-            let t = capture_thread_at(
-                proc_root,
-                tgid,
-                tid,
-                &pcomm,
-                use_syscall_affinity,
-            );
+            let t = capture_thread_at(proc_root, tgid, tid, &pcomm, use_syscall_affinity);
             // Ghost-thread filter: a tid that exited between the
             // `iter_task_ids_at` readdir and our per-file reads
             // produces an all-Default `ThreadState` — empty comm
@@ -1188,7 +1179,10 @@ pub fn capture_with(
     let mut cgroup_stats: BTreeMap<String, CgroupStats> = BTreeMap::new();
     for t in &threads {
         if !t.cgroup.is_empty() && !cgroup_stats.contains_key(&t.cgroup) {
-            cgroup_stats.insert(t.cgroup.clone(), read_cgroup_stats_at(cgroup_root, &t.cgroup));
+            cgroup_stats.insert(
+                t.cgroup.clone(),
+                read_cgroup_stats_at(cgroup_root, &t.cgroup),
+            );
         }
     }
     HostStateSnapshot {
@@ -1380,10 +1374,7 @@ mod tests {
         let f = parse_status(raw);
         assert_eq!(f.voluntary_csw, Some(100));
         assert_eq!(f.nonvoluntary_csw, Some(5));
-        assert_eq!(
-            f.cpus_allowed.as_deref(),
-            Some(&[0u32, 1, 2, 3, 5][..])
-        );
+        assert_eq!(f.cpus_allowed.as_deref(), Some(&[0u32, 1, 2, 3, 5][..]));
     }
 
     #[test]
@@ -1391,10 +1382,7 @@ mod tests {
         assert_eq!(parse_cpu_list("0-3").unwrap(), vec![0, 1, 2, 3]);
         assert_eq!(parse_cpu_list("5").unwrap(), vec![5]);
         assert_eq!(parse_cpu_list("0,2,4").unwrap(), vec![0, 2, 4]);
-        assert_eq!(
-            parse_cpu_list("0-2,4,6-7").unwrap(),
-            vec![0, 1, 2, 4, 6, 7]
-        );
+        assert_eq!(parse_cpu_list("0-2,4,6-7").unwrap(), vec![0, 1, 2, 4, 6, 7]);
     }
 
     #[test]
@@ -1500,7 +1488,10 @@ mod tests {
     fn iter_task_ids_self_returns_at_least_main_tid() {
         let pid = std::process::id() as i32;
         let tids = iter_task_ids(pid);
-        assert!(tids.contains(&pid), "main tid {pid} absent from /proc/self/task");
+        assert!(
+            tids.contains(&pid),
+            "main tid {pid} absent from /proc/self/task"
+        );
     }
 
     #[test]
@@ -1688,7 +1679,10 @@ mod tests {
     #[test]
     fn policy_name_negative_integer_renders_unknown() {
         assert_eq!(policy_name(-1), "SCHED_UNKNOWN(-1)");
-        assert_eq!(policy_name(i32::MIN), format!("SCHED_UNKNOWN({})", i32::MIN));
+        assert_eq!(
+            policy_name(i32::MIN),
+            format!("SCHED_UNKNOWN({})", i32::MIN)
+        );
     }
 
     /// parse_cpu_stat on empty input produces all-`None`. Same
@@ -1911,7 +1905,10 @@ mod tests {
     fn read_affinity_for_self_returns_at_least_one_cpu() {
         let pid = std::process::id() as i32;
         let cpus = read_affinity(pid).expect("own affinity must resolve");
-        assert!(!cpus.is_empty(), "self affinity must carry at least one CPU");
+        assert!(
+            !cpus.is_empty(),
+            "self affinity must carry at least one CPU"
+        );
         // CPUs come out sorted.
         let mut sorted = cpus.clone();
         sorted.sort_unstable();
@@ -1933,13 +1930,7 @@ mod tests {
     /// on `ThreadState` round-trips with a known value. `cpus` is
     /// the `Cpus_allowed_list` value (a range string the
     /// `parse_cpu_list` helper decodes).
-    fn stage_synthetic_proc(
-        root: &Path,
-        tgid: i32,
-        tid: i32,
-        pcomm: &str,
-        comm: &str,
-    ) {
+    fn stage_synthetic_proc(root: &Path, tgid: i32, tid: i32, pcomm: &str, comm: &str) {
         use std::fs;
         let tgid_dir = root.join(tgid.to_string());
         let task_dir = tgid_dir.join("task").join(tid.to_string());
@@ -2019,11 +2010,7 @@ mod tests {
 
         // cgroup: v2-style single entry (0::path). read_cgroup_at
         // parses the `0::` prefix.
-        fs::write(
-            task_dir.join("cgroup"),
-            "0::/ktstr.slice/worker0\n",
-        )
-        .unwrap();
+        fs::write(task_dir.join("cgroup"), "0::/ktstr.slice/worker0\n").unwrap();
     }
 
     /// Ghost-thread filter: a tid whose directory exists but
@@ -2050,13 +2037,7 @@ mod tests {
         let ghost_tid: i32 = 202;
 
         // Stage the live thread in full.
-        stage_synthetic_proc(
-            proc_tmp.path(),
-            tgid,
-            live_tid,
-            "pcomm-proc",
-            "live-thread",
-        );
+        stage_synthetic_proc(proc_tmp.path(), tgid, live_tid, "pcomm-proc", "live-thread");
 
         // Stage a ghost tid directory with NO inner files —
         // simulates the "readdir saw it, per-file reads all
@@ -2079,7 +2060,10 @@ mod tests {
             1,
             "ghost tid with empty comm + zero start must be filtered; \
              got threads: {:?}",
-            snap.threads.iter().map(|t| (t.tid, &t.comm)).collect::<Vec<_>>(),
+            snap.threads
+                .iter()
+                .map(|t| (t.tid, &t.comm))
+                .collect::<Vec<_>>(),
         );
         assert_eq!(snap.threads[0].tid, live_tid as u32);
         assert_eq!(snap.threads[0].comm, "live-thread");
@@ -2095,13 +2079,7 @@ mod tests {
         let tgid: i32 = 42;
         let tid: i32 = 101;
 
-        stage_synthetic_proc(
-            proc_tmp.path(),
-            tgid,
-            tid,
-            "pcomm-proc",
-            "worker-thread",
-        );
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "pcomm-proc", "worker-thread");
 
         let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
 

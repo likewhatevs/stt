@@ -169,8 +169,7 @@ mod tests {
         });
         let text = std::str::from_utf8(&bytes).expect("stderr is UTF-8");
         assert_eq!(
-            text,
-            "ktstr: SKIP: macro-level reason with format-args substitution\n",
+            text, "ktstr: SKIP: macro-level reason with format-args substitution\n",
             "expected canonical banner with format-args substitution",
         );
         assert!(

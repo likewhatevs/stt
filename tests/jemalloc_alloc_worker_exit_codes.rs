@@ -150,7 +150,10 @@ fn worker_exits_4_on_ready_marker_write_fail() {
     let output = assert_worker_exits(
         &["1024"],
         &[
-            (WORKER_READY_MARKER_OVERRIDE_ENV, "/nonexistent-ktstr-test-dir/marker"),
+            (
+                WORKER_READY_MARKER_OVERRIDE_ENV,
+                "/nonexistent-ktstr-test-dir/marker",
+            ),
             ("MALLOC_CONF", "background_thread:false"),
             ("_RJEM_MALLOC_CONF", "background_thread:false"),
         ],
@@ -287,7 +290,10 @@ fn worker_stderr_lines_share_centralized_prefix() {
     let output = assert_worker_exits(
         &["1024"],
         &[
-            (WORKER_READY_MARKER_OVERRIDE_ENV, "/nonexistent-ktstr-test-dir/marker"),
+            (
+                WORKER_READY_MARKER_OVERRIDE_ENV,
+                "/nonexistent-ktstr-test-dir/marker",
+            ),
             ("MALLOC_CONF", "background_thread:false"),
             ("_RJEM_MALLOC_CONF", "background_thread:false"),
         ],

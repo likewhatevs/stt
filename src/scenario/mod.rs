@@ -664,8 +664,12 @@ pub(crate) fn remove_cgroup_errno_hint(err: &anyhow::Error) -> Option<&'static s
         .downcast_ref::<std::io::Error>()?
         .raw_os_error()?;
     match raw {
-        libc::EBUSY => Some("EBUSY: cgroup still has live tasks — workloads were not drained before teardown"),
-        libc::EACCES => Some("EACCES: permission denied — check cgroup owner / `user.slice` delegation"),
+        libc::EBUSY => {
+            Some("EBUSY: cgroup still has live tasks — workloads were not drained before teardown")
+        }
+        libc::EACCES => {
+            Some("EACCES: permission denied — check cgroup owner / `user.slice` delegation")
+        }
         _ => None,
     }
 }
@@ -1002,11 +1006,7 @@ impl<'a> Ctx<'a> {
 /// `move_tasks` is ESRCH-tolerant — a worker that exits between
 /// fork and cgroup placement is warned and skipped, unlike the
 /// original per-pid `move_task` which propagated ESRCH.
-fn spawn_and_move<F>(
-    ctx: &Ctx,
-    names: &[String],
-    mut cfg_fn: F,
-) -> Result<Vec<WorkloadHandle>>
+fn spawn_and_move<F>(ctx: &Ctx, names: &[String], mut cfg_fn: F) -> Result<Vec<WorkloadHandle>>
 where
     F: FnMut(usize, &str) -> Result<WorkloadConfig>,
 {
@@ -2466,11 +2466,7 @@ mod tests {
     fn cgroup_group_drop_is_panic_free_on_every_error_kind() {
         for (label, kind, raw) in [
             ("ENOENT", std::io::ErrorKind::NotFound, Some(libc::ENOENT)),
-            (
-                "EBUSY",
-                std::io::ErrorKind::Other,
-                Some(libc::EBUSY),
-            ),
+            ("EBUSY", std::io::ErrorKind::Other, Some(libc::EBUSY)),
             (
                 "EACCES",
                 std::io::ErrorKind::PermissionDenied,
@@ -2508,7 +2504,9 @@ mod tests {
             anyhow::Error::new(std::io::Error::from(k)).context("wrap")
         };
         assert!(is_io_not_found(&wrap(std::io::ErrorKind::NotFound)));
-        assert!(!is_io_not_found(&wrap(std::io::ErrorKind::PermissionDenied)));
+        assert!(!is_io_not_found(&wrap(
+            std::io::ErrorKind::PermissionDenied
+        )));
         assert!(!is_io_not_found(&wrap(std::io::ErrorKind::Other)));
         // anyhow::anyhow! without an underlying io::Error must not
         // look like NotFound even if the message contains "not found".
@@ -2523,12 +2521,12 @@ mod tests {
     /// drops the hint (or hallucinates one) surfaces in test output.
     #[test]
     fn remove_cgroup_errno_hint_covers_ebusy_and_eacces() {
-        let busy = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EBUSY))
-            .context("wrap");
-        let acces = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EACCES))
-            .context("wrap");
-        let enotempty = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOTEMPTY))
-            .context("wrap");
+        let busy =
+            anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EBUSY)).context("wrap");
+        let acces =
+            anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EACCES)).context("wrap");
+        let enotempty =
+            anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOTEMPTY)).context("wrap");
         let non_io = anyhow::anyhow!("not an io error");
 
         assert!(

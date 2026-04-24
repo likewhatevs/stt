@@ -71,17 +71,15 @@ fn main() {
     // the existence-only gate for `vmlinux.h`. The eventual regen
     // path below re-reads the bytes via `vmlinux_gen` and fails
     // loudly there if the source is truly unusable.
-    let current_hash: Option<String> = current_btf.as_ref().and_then(|p| {
-        match std::fs::read(p) {
-            Ok(bytes) => Some(format!("{:016x}", siphash_13(&bytes))),
-            Err(e) => {
-                println!(
-                    "cargo:warning=BTF source {} present but unreadable \
+    let current_hash: Option<String> = current_btf.as_ref().and_then(|p| match std::fs::read(p) {
+        Ok(bytes) => Some(format!("{:016x}", siphash_13(&bytes))),
+        Err(e) => {
+            println!(
+                "cargo:warning=BTF source {} present but unreadable \
                      ({e}); skipping hash check, reusing existing vmlinux.h",
-                    p.display(),
-                );
-                None
-            }
+                p.display(),
+            );
+            None
         }
     });
     let stored_hash: Option<String> = std::fs::read_to_string(&hash_path)
@@ -95,8 +93,8 @@ fn main() {
     //   - current and stored hashes differ (real drift).
     // An unreadable BTF with vmlinux.h already in place falls
     // through to "no regen" per `current_hash.is_none()`.
-    let should_regen = !vmlinux_h.exists()
-        || (current_hash.is_some() && current_hash != stored_hash);
+    let should_regen =
+        !vmlinux_h.exists() || (current_hash.is_some() && current_hash != stored_hash);
     if should_regen {
         let btf_source = current_btf.unwrap_or_else(|| {
             panic!(
@@ -198,9 +196,8 @@ int main(void) {{
             // clean single-line display. The reader at the top of
             // main uses `.trim()` on the stored value, so the
             // newline round-trips.
-            std::fs::write(&hash_path, format!("{hash}\n")).unwrap_or_else(|e| {
-                panic!("write BTF hash sidecar {}: {e}", hash_path.display())
-            });
+            std::fs::write(&hash_path, format!("{hash}\n"))
+                .unwrap_or_else(|e| panic!("write BTF hash sidecar {}: {e}", hash_path.display()));
         }
     }
 

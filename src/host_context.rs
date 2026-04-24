@@ -291,14 +291,8 @@ impl HostContext {
     /// the pin is robust against fixture evolution.
     pub fn test_fixture() -> HostContext {
         let mut sched_tunables = BTreeMap::new();
-        sched_tunables.insert(
-            "sched_migration_cost_ns".to_string(),
-            "500000".to_string(),
-        );
-        sched_tunables.insert(
-            "sched_latency_ns".to_string(),
-            "24000000".to_string(),
-        );
+        sched_tunables.insert("sched_migration_cost_ns".to_string(), "500000".to_string());
+        sched_tunables.insert("sched_latency_ns".to_string(), "24000000".to_string());
         HostContext {
             cpu_model: Some("Intel(R) Xeon(R) Test CPU".to_string()),
             cpu_vendor: Some("GenuineIntel".to_string()),
@@ -321,9 +315,7 @@ impl HostContext {
             kernel_name: Some("Linux".to_string()),
             kernel_release: Some("6.16.0-test".to_string()),
             arch: Some("x86_64".to_string()),
-            kernel_cmdline: Some(
-                "BOOT_IMAGE=/boot/vmlinuz-test root=/dev/sda1".to_string(),
-            ),
+            kernel_cmdline: Some("BOOT_IMAGE=/boot/vmlinuz-test root=/dev/sda1".to_string()),
             heap_state: Some(crate::host_heap::HostHeapState::test_fixture()),
         }
     }
@@ -545,11 +537,31 @@ impl HostContext {
             }
         }
         let mut out = String::new();
-        row(&mut out, "kernel_name", a_kernel_name.as_ref(), b_kernel_name.as_ref());
-        row(&mut out, "kernel_release", a_kernel_release.as_ref(), b_kernel_release.as_ref());
+        row(
+            &mut out,
+            "kernel_name",
+            a_kernel_name.as_ref(),
+            b_kernel_name.as_ref(),
+        );
+        row(
+            &mut out,
+            "kernel_release",
+            a_kernel_release.as_ref(),
+            b_kernel_release.as_ref(),
+        );
         row(&mut out, "arch", a_arch.as_ref(), b_arch.as_ref());
-        row(&mut out, "cpu_model", a_cpu_model.as_ref(), b_cpu_model.as_ref());
-        row(&mut out, "cpu_vendor", a_cpu_vendor.as_ref(), b_cpu_vendor.as_ref());
+        row(
+            &mut out,
+            "cpu_model",
+            a_cpu_model.as_ref(),
+            b_cpu_model.as_ref(),
+        );
+        row(
+            &mut out,
+            "cpu_vendor",
+            a_cpu_vendor.as_ref(),
+            b_cpu_vendor.as_ref(),
+        );
         row(
             &mut out,
             "total_memory_kb",
@@ -574,14 +586,38 @@ impl HostContext {
             a_hugepages_size_kb.as_ref(),
             b_hugepages_size_kb.as_ref(),
         );
-        row(&mut out, "online_cpus", a_online_cpus.as_ref(), b_online_cpus.as_ref());
-        row(&mut out, "numa_nodes", a_numa_nodes.as_ref(), b_numa_nodes.as_ref());
-        row(&mut out, "thp_enabled", a_thp_enabled.as_ref(), b_thp_enabled.as_ref());
-        row(&mut out, "thp_defrag", a_thp_defrag.as_ref(), b_thp_defrag.as_ref());
-        row(&mut out, "kernel_cmdline", a_kernel_cmdline.as_ref(), b_kernel_cmdline.as_ref());
+        row(
+            &mut out,
+            "online_cpus",
+            a_online_cpus.as_ref(),
+            b_online_cpus.as_ref(),
+        );
+        row(
+            &mut out,
+            "numa_nodes",
+            a_numa_nodes.as_ref(),
+            b_numa_nodes.as_ref(),
+        );
+        row(
+            &mut out,
+            "thp_enabled",
+            a_thp_enabled.as_ref(),
+            b_thp_enabled.as_ref(),
+        );
+        row(
+            &mut out,
+            "thp_defrag",
+            a_thp_defrag.as_ref(),
+            b_thp_defrag.as_ref(),
+        );
+        row(
+            &mut out,
+            "kernel_cmdline",
+            a_kernel_cmdline.as_ref(),
+            b_kernel_cmdline.as_ref(),
+        );
         {
-            let mut cpus: std::collections::BTreeSet<usize> =
-                std::collections::BTreeSet::new();
+            let mut cpus: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
             cpus.extend(a_cpufreq_governor.keys().copied());
             cpus.extend(b_cpufreq_governor.keys().copied());
             for cpu in cpus {
@@ -639,8 +675,16 @@ impl HostContext {
                 let _ = writeln!(
                     &mut out,
                     "  heap_state: {} → {}",
-                    if a.is_some() { "(present)" } else { "(unknown)" },
-                    if b.is_some() { "(present)" } else { "(unknown)" },
+                    if a.is_some() {
+                        "(present)"
+                    } else {
+                        "(unknown)"
+                    },
+                    if b.is_some() {
+                        "(present)"
+                    } else {
+                        "(unknown)"
+                    },
                 );
             }
             _ => {}
@@ -679,8 +723,7 @@ static STATIC_HOST_INFO: OnceLock<StaticHostInfo> = OnceLock::new();
 /// `collect_host_context` calls happen. Production builds do not
 /// carry the counter.
 #[cfg(test)]
-static STATIC_INIT_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static STATIC_INIT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Test-only call counter for [`read_meminfo`]. Pinned by
 /// `call_counts_*` tests to prove the `/proc/meminfo` dedup holds
@@ -688,8 +731,7 @@ static STATIC_INIT_CALLS: std::sync::atomic::AtomicUsize =
 /// pre-dedup two reads on the cold path. Production builds do not
 /// carry the counter.
 #[cfg(test)]
-static MEMINFO_READ_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static MEMINFO_READ_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Capture the host context. Static fields are collected once
 /// and cached; dynamic fields are re-read on every call so
@@ -1239,7 +1281,10 @@ mod tests {
             .kernel_cmdline
             .as_deref()
             .expect("/proc/cmdline is always readable on a running Linux system");
-        assert!(!cmdline.is_empty(), "populated kernel_cmdline must not be empty");
+        assert!(
+            !cmdline.is_empty(),
+            "populated kernel_cmdline must not be empty"
+        );
         assert_eq!(cmdline, cmdline.trim());
     }
 
@@ -1354,9 +1399,11 @@ mod tests {
     fn host_context_empty_round_trips_via_json() {
         let empty = HostContext::default();
         let json = serde_json::to_string(&empty).expect("serialize empty");
-        assert_eq!(json, "{}", "default host context must serialize to empty object");
-        let decoded: HostContext =
-            serde_json::from_str(&json).expect("deserialize empty");
+        assert_eq!(
+            json, "{}",
+            "default host context must serialize to empty object"
+        );
+        let decoded: HostContext = serde_json::from_str(&json).expect("deserialize empty");
         assert!(decoded.cpu_model.is_none());
         assert!(decoded.kernel_name.is_none());
         assert!(decoded.kernel_cmdline.is_none());
@@ -1605,8 +1652,7 @@ Another_Unknown: 77 kB
 
     #[test]
     fn parse_meminfo_crlf_line_endings() {
-        let text =
-            "MemTotal:       512 kB\r\nHugePages_Total:    2\r\nHugepagesize:   2048 kB\r\n";
+        let text = "MemTotal:       512 kB\r\nHugePages_Total:    2\r\nHugepagesize:   2048 kB\r\n";
         let out = parse_meminfo(text);
         assert_eq!(out.mem_total_kb, Some(512));
         assert_eq!(out.hugepages_total, Some(2));
@@ -1970,8 +2016,7 @@ Hugepagesize:       2048 kB
         b.thp_enabled = Some("always [madvise] never".to_string());
         b.thp_defrag = Some("always [madvise] never".to_string());
         b.kernel_cmdline = Some("preempt=lazy".to_string());
-        b.cpufreq_governor
-            .insert(0, "performance".to_string());
+        b.cpufreq_governor.insert(0, "performance".to_string());
         let mut tunables = BTreeMap::new();
         tunables.insert("sched_migration_cost_ns".to_string(), "500000".to_string());
         b.sched_tunables = Some(tunables);
@@ -2779,9 +2824,7 @@ Hugepagesize:       2048 kB
     #[test]
     fn parse_bracketed_active_policy_thp_defrag_hyphenated() {
         assert_eq!(
-            parse_bracketed_active_policy(
-                "always defer [defer+madvise] madvise never",
-            ),
+            parse_bracketed_active_policy("always defer [defer+madvise] madvise never",),
             Some("defer+madvise"),
         );
     }

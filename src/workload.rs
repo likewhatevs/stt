@@ -1355,9 +1355,7 @@ fn classify_wait_outcome(
 ) -> WorkerExitInfo {
     match source {
         Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => WorkerExitInfo::Exited(code),
-        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
-            WorkerExitInfo::Signaled(sig as i32)
-        }
+        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => WorkerExitInfo::Signaled(sig as i32),
         Ok(nix::sys::wait::WaitStatus::StillAlive) => WorkerExitInfo::TimedOut,
         Ok(_) => WorkerExitInfo::TimedOut,
         Err(e) => WorkerExitInfo::WaitFailed(e.to_string()),
@@ -1831,7 +1829,9 @@ impl WorkloadHandle {
                     // subreaper then inherits us), so the guard is a
                     // narrowing of the leak window, not an elimination.
                     if unsafe { libc::getppid() } == 1 {
-                        unsafe { libc::_exit(0); }
+                        unsafe {
+                            libc::_exit(0);
+                        }
                     }
                     // Make this worker its own process-group leader so
                     // any descendants it spawns inherit `pgid == worker_pid`.
@@ -2243,14 +2243,8 @@ impl WorkloadHandle {
             // straight into `Pid::from_raw` without a sign cast —
             // the old u32→i32 session-wide-reap hazard is avoided.
             let npid = nix::unistd::Pid::from_raw(pid);
-            let waited = nix::sys::wait::waitpid(
-                npid,
-                Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-            );
-            let still_running = matches!(
-                waited,
-                Ok(nix::sys::wait::WaitStatus::StillAlive),
-            );
+            let waited = nix::sys::wait::waitpid(npid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+            let still_running = matches!(waited, Ok(nix::sys::wait::WaitStatus::StillAlive),);
             // Preserve the reap shape for the sentinel path below:
             // the WNOHANG attempt tells us "exited / signaled /
             // still running" on the fast path; the SIGKILL + blocking
@@ -2433,16 +2427,22 @@ fn clamp_futex_wake_n(n: usize) -> i32 {
 /// conditional separator — an empty hint disappears cleanly.
 fn mmap_shared_anon_errno_hint(errno: Option<i32>) -> &'static str {
     match errno {
-        Some(libc::ENOMEM) => " (ENOMEM: host is out of memory \
+        Some(libc::ENOMEM) => {
+            " (ENOMEM: host is out of memory \
              or /proc/sys/vm/max_map_count is too low — \
-             check `sysctl vm.max_map_count` and `free -h`)",
-        Some(libc::EPERM) => " (EPERM: MAP_SHARED|MAP_ANONYMOUS \
+             check `sysctl vm.max_map_count` and `free -h`)"
+        }
+        Some(libc::EPERM) => {
+            " (EPERM: MAP_SHARED|MAP_ANONYMOUS \
              rejected by the kernel — check memory cgroup \
-             limits and container seccomp policy)",
-        Some(libc::EINVAL) => " (EINVAL: invalid length or \
+             limits and container seccomp policy)"
+        }
+        Some(libc::EINVAL) => {
+            " (EINVAL: invalid length or \
              flag combination — verify num_workers > 0 so the \
              region size is non-zero, and that the total size \
-             does not overflow usize)",
+             does not overflow usize)"
+        }
         _ => "",
     }
 }
@@ -3110,10 +3110,8 @@ fn worker_main(
                 // a stale wake_ns and contaminates the resume-latency
                 // histogram.
                 let wake_ts_ptr = unsafe { (futex_ptr as *mut u8).add(8) as *mut u64 };
-                let gen_atom =
-                    unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU64) };
-                let wake_atom =
-                    unsafe { &*(wake_ts_ptr as *const std::sync::atomic::AtomicU64) };
+                let gen_atom = unsafe { &*(futex_ptr as *const std::sync::atomic::AtomicU64) };
+                let wake_atom = unsafe { &*(wake_ts_ptr as *const std::sync::atomic::AtomicU64) };
                 if is_messenger {
                     // Messenger: stamp wake time, advance generation, wake workers.
                     // Advance the generation and wake the workers
@@ -3289,8 +3287,7 @@ fn worker_main(
                     x
                 };
                 for _ in 0..touches_per_cycle {
-                    let page_idx =
-                        (xorshift64(&mut page_fault_rng_state) as usize) % page_count;
+                    let page_idx = (xorshift64(&mut page_fault_rng_state) as usize) % page_count;
                     let page_ptr = unsafe { (ptr as *mut u8).add(page_idx * 4096) };
                     unsafe { std::ptr::write_volatile(page_ptr, 1u8) };
                     work_units = work_units.wrapping_add(1);
@@ -3438,15 +3435,14 @@ fn worker_main(
     // snapshots succeeded, else zero (the start-of-loop read already
     // emitted a warning if schedstat is unavailable).
     let schedstat_end = read_schedstat();
-    let (ss_delay_delta, ss_ts_delta, ss_cpu_delta) =
-        match (schedstat_start, schedstat_end) {
-            (Some((cpu_s, delay_s, ts_s)), Some((cpu_e, delay_e, ts_e))) => (
-                delay_e.saturating_sub(delay_s),
-                ts_e.saturating_sub(ts_s),
-                cpu_e.saturating_sub(cpu_s),
-            ),
-            _ => (0, 0, 0),
-        };
+    let (ss_delay_delta, ss_ts_delta, ss_cpu_delta) = match (schedstat_start, schedstat_end) {
+        (Some((cpu_s, delay_s, ts_s)), Some((cpu_e, delay_e, ts_e))) => (
+            delay_e.saturating_sub(delay_s),
+            ts_e.saturating_sub(ts_s),
+            cpu_e.saturating_sub(cpu_s),
+        ),
+        _ => (0, 0, 0),
+    };
 
     // NUMA: read numa_maps and vmstat after workload.
     let numa_pages = read_numa_maps_pages();
@@ -3937,7 +3933,10 @@ mod tests {
         );
 
         let einval = mmap_shared_anon_errno_hint(Some(libc::EINVAL));
-        assert!(einval.starts_with(' '), "EINVAL hint must start with a space");
+        assert!(
+            einval.starts_with(' '),
+            "EINVAL hint must start with a space"
+        );
         assert!(
             einval.contains("EINVAL"),
             "EINVAL arm must name the errno; got {einval:?}",
@@ -4017,10 +4016,7 @@ mod tests {
 
     #[test]
     fn classify_wait_outcome_exited_preserves_code() {
-        let status = nix::sys::wait::WaitStatus::Exited(
-            nix::unistd::Pid::from_raw(123),
-            42,
-        );
+        let status = nix::sys::wait::WaitStatus::Exited(nix::unistd::Pid::from_raw(123), 42);
         match classify_wait_outcome(Ok(status)) {
             WorkerExitInfo::Exited(code) => assert_eq!(code, 42),
             other => panic!("expected Exited(42), got {other:?}"),
@@ -4056,9 +4052,7 @@ mod tests {
         // that can't describe a worker exit for a ptrace-free fork —
         // the catch-all arm must collapse it to TimedOut rather than
         // silently dropping the reap.
-        let status = nix::sys::wait::WaitStatus::Continued(
-            nix::unistd::Pid::from_raw(123),
-        );
+        let status = nix::sys::wait::WaitStatus::Continued(nix::unistd::Pid::from_raw(123));
         match classify_wait_outcome(Ok(status)) {
             WorkerExitInfo::TimedOut => {}
             other => panic!("expected TimedOut (exotic→TimedOut), got {other:?}"),
@@ -4124,17 +4118,15 @@ mod tests {
         // Lowercase user input: from_name misses, suggest hits,
         // from_name on the canonical spelling succeeds.
         assert!(WorkType::from_name("cpuspin").is_none());
-        let canonical =
-            WorkType::suggest("cpuspin").expect("suggest must find CpuSpin");
+        let canonical = WorkType::suggest("cpuspin").expect("suggest must find CpuSpin");
         assert_eq!(canonical, "CpuSpin");
-        let wt = WorkType::from_name(canonical)
-            .expect("from_name must build from canonical spelling");
+        let wt =
+            WorkType::from_name(canonical).expect("from_name must build from canonical spelling");
         assert!(matches!(wt, WorkType::CpuSpin));
 
         // Uppercase user input roundtrips too.
         assert!(WorkType::from_name("YIELDHEAVY").is_none());
-        let canonical =
-            WorkType::suggest("YIELDHEAVY").expect("suggest must find YieldHeavy");
+        let canonical = WorkType::suggest("YIELDHEAVY").expect("suggest must find YieldHeavy");
         assert_eq!(canonical, "YieldHeavy");
         let wt = WorkType::from_name(canonical).expect("from_name must build");
         assert!(matches!(wt, WorkType::YieldHeavy));
@@ -5666,9 +5658,7 @@ mod tests {
         // built without `CONFIG_SCHEDSTATS` — treat that as a skip
         // rather than a test failure.
         let Some((cpu_time, _run_delay, timeslices)) = read_schedstat() else {
-            eprintln!(
-                "skipping: /proc/self/schedstat not available (CONFIG_SCHEDSTATS off)"
-            );
+            eprintln!("skipping: /proc/self/schedstat not available (CONFIG_SCHEDSTATS off)");
             return;
         };
         assert!(cpu_time > 0);
@@ -6064,11 +6054,7 @@ mod tests {
 
     #[test]
     fn spawn_futex_ping_pong_produces_work() {
-        let reports = spawn_and_collect_after(
-            WorkType::FutexPingPong { spin_iters: 1024 },
-            2,
-            500,
-        );
+        let reports = spawn_and_collect_after(WorkType::FutexPingPong { spin_iters: 1024 }, 2, 500);
         assert_eq!(reports.len(), 2);
         for r in &reports {
             assert!(
@@ -6303,9 +6289,7 @@ mod tests {
         let deadline = Instant::now() + timeout;
         while !path.exists() {
             if nix::sys::signal::kill(nix::unistd::Pid::from_raw(liveness_pid), None).is_err() {
-                panic!(
-                    "pid {liveness_pid} exited before writing ready file {path:?} — {context}",
-                );
+                panic!("pid {liveness_pid} exited before writing ready file {path:?} — {context}",);
             }
             if Instant::now() >= deadline {
                 panic!(
@@ -6446,9 +6430,7 @@ mod tests {
         match &r.exit_info {
             Some(WorkerExitInfo::TimedOut) => {}
             Some(WorkerExitInfo::Signaled(sig)) if *sig == libc::SIGKILL => {}
-            other => panic!(
-                "expected TimedOut or Signaled(SIGKILL), got {other:?}",
-            ),
+            other => panic!("expected TimedOut or Signaled(SIGKILL), got {other:?}",),
         }
     }
 
@@ -6524,8 +6506,7 @@ mod tests {
         );
         let read_deadline = Instant::now() + Duration::from_secs(3);
         let gpid_str = loop {
-            let s = std::fs::read_to_string(pidfile)
-                .expect("pidfile readable once exists");
+            let s = std::fs::read_to_string(pidfile).expect("pidfile readable once exists");
             if !s.trim().is_empty() {
                 break s;
             }
@@ -6587,11 +6568,7 @@ mod tests {
     /// Last-resort SIGKILL + assertion-panic wrapper around
     /// [`wait_for_grandchild_reap`]. Ensures a test failure never
     /// leaks a live grandchild into the host.
-    fn assert_grandchild_reaped_within(
-        gpid: libc::pid_t,
-        timeout: Duration,
-        context: &str,
-    ) {
+    fn assert_grandchild_reaped_within(gpid: libc::pid_t, timeout: Duration, context: &str) {
         if wait_for_grandchild_reap(gpid, timeout).is_err() {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(gpid),
@@ -6645,7 +6622,9 @@ mod tests {
             // _exit is async-signal-safe; eprintln goes to the
             // harness-captured test log.
             eprintln!("fork failed: {}", std::io::Error::last_os_error());
-            unsafe { libc::_exit(127); }
+            unsafe {
+                libc::_exit(127);
+            }
         }
         if gpid == 0 {
             // Close every inherited fd above stdio BEFORE exec so
@@ -6672,7 +6651,9 @@ mod tests {
             let rc = unsafe { libc::close_range(3, u32::MAX, 0) };
             if rc != 0 {
                 for fd in 3..=256 {
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                 }
             }
             // Grandchild: exec immediately. `execv` returns only on
@@ -6696,13 +6677,15 @@ mod tests {
             std::env::temp_dir().join(format!("ktstr-grandchild-pid-{worker_pid}.tmp"));
         if let Err(e) = std::fs::write(&pidfile_tmp, gpid.to_string()) {
             eprintln!("failed to write grandchild pidfile tmp {pidfile_tmp:?}: {e}");
-            unsafe { libc::_exit(127); }
+            unsafe {
+                libc::_exit(127);
+            }
         }
         if let Err(e) = std::fs::rename(&pidfile_tmp, &pidfile) {
-            eprintln!(
-                "failed to rename grandchild pidfile {pidfile_tmp:?} → {pidfile:?}: {e}"
-            );
-            unsafe { libc::_exit(127); }
+            eprintln!("failed to rename grandchild pidfile {pidfile_tmp:?} → {pidfile:?}: {e}");
+            unsafe {
+                libc::_exit(127);
+            }
         }
         worker_pid
     }
@@ -6840,15 +6823,16 @@ mod tests {
         // repeated pid would mean the spawn logic conflated two
         // workers (or the pidfile scheme collides across workers,
         // which would also break this multi-worker reaping test).
-        let unique: std::collections::HashSet<libc::pid_t> =
-            worker_pids.iter().copied().collect();
+        let unique: std::collections::HashSet<libc::pid_t> = worker_pids.iter().copied().collect();
         assert_eq!(
             unique.len(),
             worker_pids.len(),
             "WorkloadHandle::worker_pids returned duplicates: {worker_pids:?}",
         );
-        let pidfiles: Vec<std::path::PathBuf> =
-            worker_pids.iter().map(|&p| grandchild_pidfile_path(p)).collect();
+        let pidfiles: Vec<std::path::PathBuf> = worker_pids
+            .iter()
+            .map(|&p| grandchild_pidfile_path(p))
+            .collect();
         for p in &pidfiles {
             let _ = std::fs::remove_file(p);
         }
@@ -6917,10 +6901,7 @@ mod tests {
         let config = WorkloadConfig {
             num_workers: 1,
             affinity: AffinityMode::None,
-            work_type: WorkType::custom(
-                "grandchild_panic",
-                forks_grandchild_and_panics_fn,
-            ),
+            work_type: WorkType::custom("grandchild_panic", forks_grandchild_and_panics_fn),
             sched_policy: SchedPolicy::Normal,
             ..Default::default()
         };
@@ -7098,8 +7079,7 @@ mod tests {
     /// always alive, so the early-exit probe never fires.
     #[test]
     fn wait_for_file_or_panic_returns_when_file_appears() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-wfp-happy-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-wfp-happy-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("ready");
         // Pre-create the marker so the first iteration exits the
@@ -7900,8 +7880,7 @@ mod tests {
             );
         }
         if num_cpus > 1 {
-            let total_migrations: u64 =
-                reports.iter().map(|r| r.migration_count).sum();
+            let total_migrations: u64 = reports.iter().map(|r| r.migration_count).sum();
             assert!(
                 total_migrations > 0,
                 "expected ≥ 1 migration across {num_workers} \

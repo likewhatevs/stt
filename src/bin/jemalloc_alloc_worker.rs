@@ -251,9 +251,7 @@ fn main() {
         _ => worker_ready_marker_path(pid),
     };
     if let Err(e) = std::fs::write(&ready_path, b"ready\n") {
-        eprintln!(
-            "{WORKER_STDERR_PREFIX} failed to write ready marker {ready_path}: {e}"
-        );
+        eprintln!("{WORKER_STDERR_PREFIX} failed to write ready marker {ready_path}: {e}");
         std::process::exit(4);
     }
     // The stdout line is a human-useful breadcrumb if the test

@@ -263,8 +263,7 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
                 // message is — a forward-compat regression-resilient
                 // check costs one string search.
                 let msg = e.to_string();
-                let is_missing_host = msg.contains("missing field")
-                    && msg.contains("`host`");
+                let is_missing_host = msg.contains("missing field") && msg.contains("`host`");
                 if is_missing_host {
                     eprintln!(
                         "ktstr_test: skipping {}: {e} — the `host` field was \
@@ -1013,17 +1012,14 @@ mod tests {
     /// dirs, so the tightening is safe and rules out future stray
     /// files (a `.json.tmp` atomic-write residue, for instance) from
     /// inflating the count assertions.
-    fn find_sidecars_by_prefix(
-        dir: &std::path::Path,
-        prefix: &str,
-    ) -> Vec<std::path::PathBuf> {
+    fn find_sidecars_by_prefix(dir: &std::path::Path, prefix: &str) -> Vec<std::path::PathBuf> {
         std::fs::read_dir(dir)
             .expect("sidecar dir must exist for lookup")
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.starts_with(prefix) && n.ends_with(".ktstr.json")
-                })
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".ktstr.json"))
             })
             .collect()
     }
@@ -1042,10 +1038,7 @@ mod tests {
     /// "one-call-one-file" invariant for single-variant tests.
     /// Centralizes the pattern so the 5 single-variant writer tests
     /// share one length check + error message.
-    fn find_single_sidecar_by_prefix(
-        dir: &std::path::Path,
-        prefix: &str,
-    ) -> std::path::PathBuf {
+    fn find_single_sidecar_by_prefix(dir: &std::path::Path, prefix: &str) -> std::path::PathBuf {
         let paths = find_sidecars_by_prefix(dir, prefix);
         assert_eq!(
             paths.len(),
@@ -1172,7 +1165,10 @@ mod tests {
     fn test_fixture_payload_and_metrics_empty() {
         let sc = SidecarResult::test_fixture();
         assert!(sc.payload.is_none(), "fixture must default to payload=None");
-        assert!(sc.metrics.is_empty(), "fixture must default to metrics=empty");
+        assert!(
+            sc.metrics.is_empty(),
+            "fixture must default to metrics=empty"
+        );
     }
 
     /// Summary guard on every empty-collection / None-Option /
@@ -1191,17 +1187,32 @@ mod tests {
     fn test_fixture_all_collections_empty_by_default() {
         let sc = SidecarResult::test_fixture();
         assert!(sc.metrics.is_empty(), "metrics must default empty");
-        assert!(sc.active_flags.is_empty(), "active_flags must default empty");
-        assert!(sc.stimulus_events.is_empty(), "stimulus_events must default empty");
-        assert!(sc.verifier_stats.is_empty(), "verifier_stats must default empty");
+        assert!(
+            sc.active_flags.is_empty(),
+            "active_flags must default empty"
+        );
+        assert!(
+            sc.stimulus_events.is_empty(),
+            "stimulus_events must default empty"
+        );
+        assert!(
+            sc.verifier_stats.is_empty(),
+            "verifier_stats must default empty"
+        );
         assert!(sc.sysctls.is_empty(), "sysctls must default empty");
         assert!(sc.kargs.is_empty(), "kargs must default empty");
         assert!(sc.payload.is_none(), "payload must default None");
         assert!(sc.monitor.is_none(), "monitor must default None");
         assert!(sc.kvm_stats.is_none(), "kvm_stats must default None");
-        assert!(sc.kernel_version.is_none(), "kernel_version must default None");
+        assert!(
+            sc.kernel_version.is_none(),
+            "kernel_version must default None"
+        );
         assert!(sc.host.is_none(), "host must default None");
-        assert!(sc.timestamp.is_empty(), "timestamp must default empty String");
+        assert!(
+            sc.timestamp.is_empty(),
+            "timestamp must default empty String"
+        );
         assert!(sc.run_id.is_empty(), "run_id must default empty String");
         assert!(
             sc.stats.cgroups.is_empty(),
@@ -1528,7 +1539,10 @@ mod tests {
         assert_eq!(loaded.verifier_stats.len(), 1);
         assert_eq!(loaded.verifier_stats[0].name, "audit_prog");
         assert_eq!(loaded.verifier_stats[0].verified_insns, 999);
-        assert!(loaded.kvm_stats.is_some(), "kvm_stats must round-trip as Some");
+        assert!(
+            loaded.kvm_stats.is_some(),
+            "kvm_stats must round-trip as Some"
+        );
         assert_eq!(loaded.sysctls, vec!["sysctl.kernel.audit_sysctl=1"]);
         assert_eq!(loaded.kargs, vec!["audit_karg"]);
         assert_eq!(loaded.kernel_version.as_deref(), Some("6.99.0"));
@@ -1634,13 +1648,15 @@ mod tests {
                  list has drifted from the struct definition",
             );
             let json = serde_json::Value::Object(obj).to_string();
-            let err = serde_json::from_str::<SidecarResult>(&json).err().unwrap_or_else(
-                || panic!(
-                    "deserialize must reject SidecarResult with `{field}` removed, \
+            let err = serde_json::from_str::<SidecarResult>(&json)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "deserialize must reject SidecarResult with `{field}` removed, \
                      but succeeded — a regression may have added \
                      `#[serde(default)]` to this field",
-                ),
-            );
+                    )
+                });
             let msg = format!("{err}");
             assert!(
                 msg.contains(field),
@@ -1870,9 +1886,10 @@ mod tests {
         // on a running Linux process (uname syscall, no filesystem
         // dependency), matching the baseline asserted by
         // `host_context::tests::collect_host_context_returns_populated_struct_on_linux`.
-        let host = loaded.host.as_ref().expect(
-            "write_sidecar must populate host field from collect_host_context",
-        );
+        let host = loaded
+            .host
+            .as_ref()
+            .expect("write_sidecar must populate host field from collect_host_context");
         assert_eq!(host.kernel_name.as_deref(), Some("Linux"));
         // Pair the uname check with a field that `HostContext::default()`
         // leaves None. A regression that swapped the full
@@ -2092,8 +2109,10 @@ mod tests {
              partial revert (one of the two sorts dropped) must \
              fail this assertion. Got distinct hashes for: \
              sysctls={:?}, kargs={:?} vs sysctls={:?}, kargs={:?}",
-            forward.sysctls, forward.kargs,
-            partial.sysctls, partial.kargs,
+            forward.sysctls,
+            forward.kargs,
+            partial.sysctls,
+            partial.kargs,
         );
     }
 
@@ -2347,7 +2366,10 @@ mod tests {
         // and this comment are intentionally load-bearing.
         let base = SidecarResult::test_fixture;
         let none = base();
-        assert!(none.payload.is_none(), "fixture default for payload must remain None");
+        assert!(
+            none.payload.is_none(),
+            "fixture default for payload must remain None"
+        );
         let fio = SidecarResult {
             payload: Some("fio".to_string()),
             ..base()
@@ -2692,9 +2714,10 @@ mod tests {
         // baseline. A regression that dropped the skip-path capture
         // would leave `host: None` in only the skip bucket, producing
         // silent per-run partial data.
-        let host = loaded.host.as_ref().expect(
-            "write_skip_sidecar must populate host field from collect_host_context",
-        );
+        let host = loaded
+            .host
+            .as_ref()
+            .expect("write_skip_sidecar must populate host field from collect_host_context");
         assert_eq!(host.kernel_name.as_deref(), Some("Linux"));
         // Pair the uname check with a Default-distinguishing field —
         // see `write_sidecar_writes_file` for the rationale. Keeps
@@ -3089,9 +3112,7 @@ mod tests {
         };
         let with_commit = SidecarResult {
             topology: "1n1l2c1t".to_string(),
-            scheduler_commit: Some(
-                "0000000000000000000000000000000000000000".to_string(),
-            ),
+            scheduler_commit: Some("0000000000000000000000000000000000000000".to_string()),
             ..SidecarResult::test_fixture()
         };
         assert_eq!(
@@ -3115,10 +3136,7 @@ mod tests {
     fn sidecar_result_roundtrip_with_populated_host_context() {
         use crate::host_context::HostContext;
         let mut tunables = std::collections::BTreeMap::new();
-        tunables.insert(
-            "sched_migration_cost_ns".to_string(),
-            "500000".to_string(),
-        );
+        tunables.insert("sched_migration_cost_ns".to_string(), "500000".to_string());
         let ctx = HostContext {
             cpu_model: Some("Example CPU".to_string()),
             cpu_vendor: Some("GenuineExample".to_string()),
@@ -3194,8 +3212,9 @@ mod tests {
     #[test]
     fn sidecars_in_a_run_carry_identical_host_context() {
         const N: usize = 8;
-        let samples: Vec<crate::host_context::HostContext> =
-            (0..N).map(|_| crate::host_context::collect_host_context()).collect();
+        let samples: Vec<crate::host_context::HostContext> = (0..N)
+            .map(|_| crate::host_context::collect_host_context())
+            .collect();
         let first = samples
             .first()
             .expect("N > 0 samples must produce at least one host context");

@@ -61,7 +61,9 @@ fn wait_for_worker_ready(pid: i32, timeout: Duration) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    Err(format!("worker pid {pid} never wrote ready marker {marker}"))
+    Err(format!(
+        "worker pid {pid} never wrote ready marker {marker}"
+    ))
 }
 
 /// Multi-snapshot run interrupted mid-sleep by SIGINT must exit

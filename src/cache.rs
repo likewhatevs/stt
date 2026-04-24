@@ -770,13 +770,11 @@ impl CacheDir {
             self.acquire_exclusive_lock_blocking(cache_key, STORE_EXCLUSIVE_LOCK_TIMEOUT)?;
 
         let final_dir = self.root.join(cache_key);
-        let tmp_dir = self
-            .root
-            .join(format!(
-                "{TMP_DIR_PREFIX}{}-{}",
-                cache_key,
-                std::process::id(),
-            ));
+        let tmp_dir = self.root.join(format!(
+            "{TMP_DIR_PREFIX}{}-{}",
+            cache_key,
+            std::process::id(),
+        ));
 
         // Clean up any stale temp dir from a prior crash. create_dir_all
         // on tmp_dir also creates self.root lazily on first store.
@@ -935,7 +933,9 @@ impl CacheDir {
     /// [`CacheDir::ensure_lock_dir`] before opening the file to make
     /// sure the parent `.locks/` subdirectory exists.
     pub(crate) fn lock_path(&self, cache_key: &str) -> PathBuf {
-        self.root.join(LOCK_DIR_NAME).join(format!("{cache_key}.lock"))
+        self.root
+            .join(LOCK_DIR_NAME)
+            .join(format!("{cache_key}.lock"))
     }
 
     /// Create the `{cache_root}/.locks/` subdirectory if absent.
@@ -945,9 +945,8 @@ impl CacheDir {
     /// [`CacheDir::store`] uses for the cache root itself.
     fn ensure_lock_dir(&self) -> anyhow::Result<()> {
         let dir = self.root.join(LOCK_DIR_NAME);
-        fs::create_dir_all(&dir).with_context(|| {
-            format!("create lock subdirectory {}", dir.display())
-        })
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("create lock subdirectory {}", dir.display()))
     }
 
     /// Acquire `LOCK_SH` on the cache-entry lockfile. Blocks until the
@@ -1064,8 +1063,7 @@ const FLOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// Timeout for [`CacheDir::store`]'s internal `LOCK_EX` acquire.
 /// See module-level rationale block above for the reader/writer
 /// asymmetry (10 s vs 60 s).
-const STORE_EXCLUSIVE_LOCK_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(60);
+const STORE_EXCLUSIVE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // Flock primitive lives in [`crate::flock`], shared with
 // `crate::vmm::host_topology`'s LLC / per-CPU acquires. LlcLockMode
@@ -1320,9 +1318,7 @@ fn validate_cache_key(key: &str) -> anyhow::Result<()> {
         anyhow::bail!("cache key must not contain null bytes");
     }
     if key.starts_with(TMP_DIR_PREFIX) {
-        anyhow::bail!(
-            "cache key must not start with {TMP_DIR_PREFIX} (reserved): {key:?}",
-        );
+        anyhow::bail!("cache key must not start with {TMP_DIR_PREFIX} (reserved): {key:?}",);
     }
     Ok(())
 }
@@ -1900,11 +1896,8 @@ mod tests {
                 "build_base_elf_with_text_symbol: unsupported arch {other:?}; supported: X86_64, I386",
             ),
         };
-        let mut obj = write::Object::new(
-            object::BinaryFormat::Elf,
-            arch,
-            object::Endianness::Little,
-        );
+        let mut obj =
+            write::Object::new(object::BinaryFormat::Elf, arch, object::Endianness::Little);
         let text_id = obj.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
         obj.append_section_data(text_id, &[0xCC; 64], 1);
         let _ = obj.add_symbol(write::Symbol {
@@ -2666,7 +2659,10 @@ mod tests {
     fn classify_corrupt_reason_covers_every_documented_prefix() {
         let cases: &[(&str, &str)] = &[
             ("metadata.json missing", "missing"),
-            ("metadata.json unreadable: Is a directory (os error 21)", "unreadable"),
+            (
+                "metadata.json unreadable: Is a directory (os error 21)",
+                "unreadable",
+            ),
             (
                 "metadata.json schema drift: missing field `source` at line 1 column 21",
                 "schema_drift",
@@ -2687,10 +2683,7 @@ mod tests {
                 "image file bzImage missing from entry directory",
                 "image_missing",
             ),
-            (
-                "some future prefix nobody wrote yet",
-                "unknown",
-            ),
+            ("some future prefix nobody wrote yet", "unknown"),
         ];
         for (reason, expected) in cases {
             assert_eq!(
@@ -2939,9 +2932,8 @@ mod tests {
         let bytes: &[u8] = b"/tmp/ktstr-\xFFcache";
         let value = OsStr::from_bytes(bytes);
         let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", value);
-        let err = resolve_cache_root().expect_err(
-            "non-UTF-8 KTSTR_CACHE_DIR must bail, not silently fall through",
-        );
+        let err = resolve_cache_root()
+            .expect_err("non-UTF-8 KTSTR_CACHE_DIR must bail, not silently fall through");
         let msg = err.to_string();
         assert!(
             msg.contains("KTSTR_CACHE_DIR"),
@@ -2953,9 +2945,7 @@ mod tests {
              got: {msg}",
         );
         assert!(
-            msg.contains("UTF-8")
-                || msg.contains("unset")
-                || msg.contains("ASCII"),
+            msg.contains("UTF-8") || msg.contains("unset") || msg.contains("ASCII"),
             "error must name a remediation (UTF-8 replacement or unset), \
              got: {msg}",
         );
@@ -3022,9 +3012,7 @@ mod tests {
     fn clean_orphaned_tmp_dirs_leaves_malformed_suffix_alone() {
         let tmp = TempDir::new().unwrap();
         // Case A: non-numeric suffix.
-        let nonnum = tmp
-            .path()
-            .join(format!("{TMP_DIR_PREFIX}somekey-notapid"));
+        let nonnum = tmp.path().join(format!("{TMP_DIR_PREFIX}somekey-notapid"));
         std::fs::create_dir_all(&nonnum).unwrap();
         // Case B: empty suffix (name ends with `-`).
         let empty_suf = tmp.path().join(format!("{TMP_DIR_PREFIX}somekey-"));
@@ -3054,7 +3042,10 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
 
         clean_orphaned_tmp_dirs(tmp.path()).unwrap();
-        assert!(real_entry.exists(), "unrelated cache entry must be preserved");
+        assert!(
+            real_entry.exists(),
+            "unrelated cache entry must be preserved"
+        );
         assert!(other.exists(), "unrelated directory must be preserved");
     }
 
@@ -3113,12 +3104,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dead_pid = libc::pid_t::MAX;
         let live_pid = unsafe { libc::getpid() };
-        let dead = tmp
-            .path()
-            .join(format!("{TMP_DIR_PREFIX}a-{dead_pid}"));
-        let live = tmp
-            .path()
-            .join(format!("{TMP_DIR_PREFIX}b-{live_pid}"));
+        let dead = tmp.path().join(format!("{TMP_DIR_PREFIX}a-{dead_pid}"));
+        let live = tmp.path().join(format!("{TMP_DIR_PREFIX}b-{live_pid}"));
         let unrelated = tmp.path().join("c-regular-entry");
         std::fs::create_dir_all(&dead).unwrap();
         std::fs::create_dir_all(&live).unwrap();
@@ -4026,8 +4013,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
-        let meta =
-            test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("deadbeef".to_string()));
+        let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("deadbeef".to_string()));
         let entry = cache
             .store("kc-match", &CacheArtifacts::new(&image), &meta)
             .unwrap();
@@ -4072,8 +4058,7 @@ mod tests {
         let cache = CacheDir::with_root(tmp.path().join("cache"));
         let src_dir = TempDir::new().unwrap();
         let image = create_fake_image(src_dir.path());
-        let meta =
-            test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("old_cached".to_string()));
+        let meta = test_metadata("6.14.2").with_ktstr_kconfig_hash(Some("old_cached".to_string()));
         let entry = cache
             .store("kc-stale", &CacheArtifacts::new(&image), &meta)
             .unwrap();
@@ -4218,8 +4203,11 @@ mod tests {
         // "missing field", which `read_metadata` maps to
         // `Err(String)`, which `prefer_source_tree_for_dwarf`'s
         // `.ok()?` turns into `None`.
-        fs::write(cache_entry.join("metadata.json"), br#"{"not_kernel_metadata": true}"#)
-            .unwrap();
+        fs::write(
+            cache_entry.join("metadata.json"),
+            br#"{"not_kernel_metadata": true}"#,
+        )
+        .unwrap();
 
         assert_eq!(
             prefer_source_tree_for_dwarf(&cache_entry),
@@ -4233,8 +4221,7 @@ mod tests {
         // both of which map to `Err(String)` inside `read_metadata`.
         let other_entry = tmp.path().join("other");
         fs::create_dir_all(&other_entry).unwrap();
-        fs::write(other_entry.join("metadata.json"), b"not json at all {{{")
-            .unwrap();
+        fs::write(other_entry.join("metadata.json"), b"not json at all {{{").unwrap();
         assert_eq!(
             prefer_source_tree_for_dwarf(&other_entry),
             None,
@@ -5002,7 +4989,9 @@ mod tests {
     fn neutralize_alloc_relocs_noop_when_no_alloc_reloc_sections() {
         // Base ELF carries only .text + anchor symbol — no reloc
         // sections at all, so the filter matches nothing.
-        let data = build_base_elf_with_text_symbol(object::Architecture::X86_64).write().unwrap();
+        let data = build_base_elf_with_text_symbol(object::Architecture::X86_64)
+            .write()
+            .unwrap();
 
         let processed = neutralize_alloc_relocs(&data).unwrap();
         assert_eq!(
@@ -5795,7 +5784,9 @@ mod tests {
             let cache = Arc::clone(&cache);
             let success = Arc::clone(&success);
             handles.push(std::thread::spawn(move || {
-                let _g = cache.acquire_shared_lock(key).expect("LOCK_SH must succeed");
+                let _g = cache
+                    .acquire_shared_lock(key)
+                    .expect("LOCK_SH must succeed");
                 success.fetch_add(1, Ordering::SeqCst);
                 // Hold briefly so all threads concurrently hold the
                 // lock. Without this sleep, threads could serialize
@@ -5849,8 +5840,7 @@ mod tests {
         let err = cache.try_acquire_exclusive_lock(key).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("is locked by active test runs")
-                || msg.contains("holders:"),
+            msg.contains("is locked by active test runs") || msg.contains("holders:"),
             "error must surface the contention diagnostic; got: {msg}",
         );
         assert!(
@@ -6106,7 +6096,11 @@ mod tests {
         // remove (its job is to tell the dotfile filter apart from
         // real entries).
         cache
-            .store("entry-a", &CacheArtifacts::new(&image), &test_metadata("6.14.0"))
+            .store(
+                "entry-a",
+                &CacheArtifacts::new(&image),
+                &test_metadata("6.14.0"),
+            )
             .expect("store must succeed");
         // Acquire a shared lock so .locks/{key}.lock materializes.
         let _guard = cache
@@ -6189,7 +6183,12 @@ mod tests {
         // rejects before any FS state is mutated.
         assert!(
             !cache_root.join(".locks").exists()
-                || cache_root.join(".locks").read_dir().unwrap().next().is_none(),
+                || cache_root
+                    .join(".locks")
+                    .read_dir()
+                    .unwrap()
+                    .next()
+                    .is_none(),
             ".locks/ must be empty if it exists at all — validator \
              rejects before lockfile creation",
         );

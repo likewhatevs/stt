@@ -416,10 +416,7 @@ fn scenario_watchdog_timing_precision(
 fn parse_stall_duration_seconds(kmsg: &str) -> Option<f64> {
     let grok = grok::Grok::with_default_patterns();
     let pattern = grok
-        .compile(
-            r"failed to run for %{INT:seconds}\.%{INT:millis}s",
-            false,
-        )
+        .compile(r"failed to run for %{INT:seconds}\.%{INT:millis}s", false)
         .expect("grok pattern compiles with fancy-regex backend");
     let matches = pattern.match_against(kmsg)?;
     let seconds: u64 = matches.get("seconds")?.parse().ok()?;
