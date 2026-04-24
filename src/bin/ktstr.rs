@@ -186,13 +186,13 @@ enum Command {
         #[arg(long)]
         no_perf_mode: bool,
 
-        /// Reserve only N host LLCs for the shell VM. Requires
+        /// Reserve only N host CPUs for the shell VM. Requires
         /// `--no-perf-mode` — perf-mode already holds every LLC
         /// exclusively, so capping under perf-mode would
-        /// double-reserve. See `ktstr::cli::LLC_CAP_HELP` for the
+        /// double-reserve. See `ktstr::cli::CPU_CAP_HELP` for the
         /// full contract.
-        #[arg(long, requires = "no_perf_mode", help = ktstr::cli::LLC_CAP_HELP)]
-        llc_cap: Option<usize>,
+        #[arg(long, requires = "no_perf_mode", help = ktstr::cli::CPU_CAP_HELP)]
+        cpu_cap: Option<usize>,
     },
     /// Capture or compare a host-wide per-thread state snapshot.
     ///
@@ -221,7 +221,7 @@ enum Command {
     },
     /// Enumerate every ktstr flock held on this host.
     ///
-    /// Troubleshooting companion for `--llc-cap` contention. Scans
+    /// Troubleshooting companion for `--cpu-cap` contention. Scans
     /// `/tmp/ktstr-llc-*.lock`, `/tmp/ktstr-cpu-*.lock`, and
     /// `{cache_root}/.locks/*.lock`, cross-referenced against
     /// `/proc/locks` via [`ktstr::cli::list_locks`] to name the
@@ -280,26 +280,26 @@ fn kernel_build(
     git_ref: Option<String>,
     force: bool,
     clean: bool,
-    llc_cap: Option<usize>,
+    cpu_cap: Option<usize>,
 ) -> Result<()> {
     use ktstr::cache::CacheDir;
     use ktstr::fetch;
 
-    // Resolve the CLI --llc-cap flag against KTSTR_LLC_CAP env and
+    // Resolve the CLI --cpu-cap flag against KTSTR_CPU_CAP env and
     // the implicit "no cap" default. Conflict with
     // KTSTR_BYPASS_LLC_LOCKS=1 surfaces here so operators see the
     // parse-time error, not an opaque pipeline bail later.
-    if llc_cap.is_some()
+    if cpu_cap.is_some()
         && std::env::var("KTSTR_BYPASS_LLC_LOCKS")
             .ok()
             .is_some_and(|v| !v.is_empty())
     {
         anyhow::bail!(
-            "--llc-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
-             --llc-cap is a resource contract; bypass disables the contract entirely."
+            "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
+             --cpu-cap is a resource contract; bypass disables the contract entirely."
         );
     }
-    let resolved_cap = cli::LlcCap::resolve(llc_cap)?;
+    let resolved_cap = cli::CpuCap::resolve(cpu_cap)?;
 
     let cache = CacheDir::new()?;
 
@@ -543,8 +543,8 @@ fn main() -> Result<()> {
                 git_ref,
                 force,
                 clean,
-                llc_cap,
-            } => kernel_build(version, source, git, git_ref, force, clean, llc_cap)?,
+                cpu_cap,
+            } => kernel_build(version, source, git, git_ref, force, clean, cpu_cap)?,
             KernelCommand::Clean {
                 keep,
                 force,
@@ -560,13 +560,13 @@ fn main() -> Result<()> {
             dmesg,
             exec,
             no_perf_mode,
-            llc_cap,
+            cpu_cap,
         } => {
             if no_perf_mode {
                 // SAFETY: single-threaded at this point — no concurrent env readers.
                 unsafe { std::env::set_var("KTSTR_NO_PERF_MODE", "1") };
             }
-            if let Some(cap) = llc_cap {
+            if let Some(cap) = cpu_cap {
                 // Parse-time conflict with KTSTR_BYPASS_LLC_LOCKS — see
                 // kernel_build fn for the same check on the build path.
                 if std::env::var("KTSTR_BYPASS_LLC_LOCKS")
@@ -574,21 +574,21 @@ fn main() -> Result<()> {
                     .is_some_and(|v| !v.is_empty())
                 {
                     anyhow::bail!(
-                        "--llc-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset \
-                         one of them. --llc-cap is a resource contract; bypass \
+                        "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset \
+                         one of them. --cpu-cap is a resource contract; bypass \
                          disables the contract entirely."
                     );
                 }
-                // Validate the cap up front via LlcCap::new so a value
-                // of 0 or a bogus KTSTR_LLC_CAP env overlay surfaces
+                // Validate the cap up front via CpuCap::new so a value
+                // of 0 or a bogus KTSTR_CPU_CAP env overlay surfaces
                 // at CLI-parse time, not deep inside VM build. The
-                // LlcCap value itself is passed to the VMM via
-                // KTSTR_LLC_CAP — KtstrVmBuilder::build re-resolves it
+                // CpuCap value itself is passed to the VMM via
+                // KTSTR_CPU_CAP — KtstrVmBuilder::build re-resolves it
                 // from the env there, so every resolve path (direct
                 // CLI, env overlay, nested exec) agrees on precedence.
-                cli::LlcCap::new(cap)?;
+                cli::CpuCap::new(cap)?;
                 // SAFETY: single-threaded at this point — no concurrent env readers.
-                unsafe { std::env::set_var("KTSTR_LLC_CAP", cap.to_string()) };
+                unsafe { std::env::set_var("KTSTR_CPU_CAP", cap.to_string()) };
             }
             cli::check_kvm()?;
             let kernel_path = cli::resolve_kernel_image(
@@ -648,7 +648,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    // -- clap argument-parse pins: Shell --llc-cap requires --no-perf-mode
+    // -- clap argument-parse pins: Shell --cpu-cap requires --no-perf-mode
     //
     // Mirror of the same constraint on the `cargo ktstr shell`
     // subcommand. ktstr and cargo-ktstr define separate Shell
@@ -658,39 +658,39 @@ mod tests {
     // requires, ktstr loses it — would surface here without waiting
     // for a runtime double-reservation bug.
 
-    /// `ktstr shell --llc-cap 4 --no-perf-mode` parses successfully.
+    /// `ktstr shell --cpu-cap 4 --no-perf-mode` parses successfully.
     /// Positive-path pin for the standalone `ktstr` binary's Shell
     /// subcommand — complements the cargo-ktstr mirror test.
     #[test]
-    fn parse_shell_llc_cap_with_no_perf_mode_succeeds() {
-        let parsed = Cli::try_parse_from(["ktstr", "shell", "--llc-cap", "4", "--no-perf-mode"])
+    fn parse_shell_cpu_cap_with_no_perf_mode_succeeds() {
+        let parsed = Cli::try_parse_from(["ktstr", "shell", "--cpu-cap", "4", "--no-perf-mode"])
             .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
             Command::Shell {
-                llc_cap,
+                cpu_cap,
                 no_perf_mode,
                 ..
             } => {
-                assert_eq!(llc_cap, Some(4));
+                assert_eq!(cpu_cap, Some(4));
                 assert!(no_perf_mode, "--no-perf-mode must be set");
             }
             _ => panic!("expected Shell"),
         }
     }
 
-    /// `ktstr shell --llc-cap 4` without `--no-perf-mode` FAILS at
+    /// `ktstr shell --cpu-cap 4` without `--no-perf-mode` FAILS at
     /// parse time via the `requires = "no_perf_mode"` constraint.
     /// Negative-path pin — a regression that drops the requires
     /// attribute would allow the command to parse and then
     /// double-reserve under perf-mode at runtime.
     #[test]
-    fn parse_shell_llc_cap_without_no_perf_mode_fails() {
+    fn parse_shell_cpu_cap_without_no_perf_mode_fails() {
         // `Cli` intentionally has no Debug derive, so unwrap
         // helpers that format the Ok variant are unavailable.
         // Match on Err directly to extract the clap error.
-        let msg = match Cli::try_parse_from(["ktstr", "shell", "--llc-cap", "4"]) {
+        let msg = match Cli::try_parse_from(["ktstr", "shell", "--cpu-cap", "4"]) {
             Err(e) => e.to_string(),
-            Ok(_) => panic!("--llc-cap without --no-perf-mode must fail the parse"),
+            Ok(_) => panic!("--cpu-cap without --no-perf-mode must fail the parse"),
         };
         assert!(
             msg.to_ascii_lowercase().contains("no-perf-mode")
@@ -699,22 +699,23 @@ mod tests {
         );
     }
 
-    /// `ktstr shell --no-perf-mode` without `--llc-cap` parses
-    /// successfully with `llc_cap: None`. Pins the shape of the
-    /// pre-flag default — a regression that made --llc-cap
-    /// mandatory-with-no-perf-mode would break the shared-runner
-    /// path that uses --no-perf-mode alone.
+    /// `ktstr shell --no-perf-mode` without `--cpu-cap` parses
+    /// successfully with `cpu_cap: None`. Pins the shape of the
+    /// unset sentinel (expanded to the 30% default by the planner)
+    /// — a regression that made --cpu-cap mandatory-with-no-perf-mode
+    /// would break the shared-runner path that uses --no-perf-mode
+    /// alone.
     #[test]
-    fn parse_shell_no_perf_mode_without_llc_cap_succeeds() {
+    fn parse_shell_no_perf_mode_without_cpu_cap_succeeds() {
         let parsed = Cli::try_parse_from(["ktstr", "shell", "--no-perf-mode"])
             .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
             Command::Shell {
-                llc_cap,
+                cpu_cap,
                 no_perf_mode,
                 ..
             } => {
-                assert_eq!(llc_cap, None, "no --llc-cap must produce None");
+                assert_eq!(cpu_cap, None, "no --cpu-cap must produce None");
                 assert!(no_perf_mode);
             }
             _ => panic!("expected Shell"),

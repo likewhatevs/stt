@@ -572,35 +572,35 @@ fn kernel_list_legend_ordering_pins_untracked_stale_corrupt() {
     }
 }
 
-// -- --llc-cap vs KTSTR_BYPASS_LLC_LOCKS conflict — ktstr binary sites --
+// -- --cpu-cap vs KTSTR_BYPASS_LLC_LOCKS conflict — ktstr binary sites --
 //
-// Pins the parse-time rejection when both the --llc-cap resource
+// Pins the parse-time rejection when both the --cpu-cap resource
 // contract and the KTSTR_BYPASS_LLC_LOCKS=1 escape hatch are
 // active simultaneously. All three ktstr-binary sites (shell,
 // kernel build, library fallback via shell --no-perf-mode) must
 // bail with "resource contract" in the error text so the operator
 // sees the contradiction before a pipeline deep-bail.
 
-/// `ktstr shell --no-perf-mode --llc-cap N` under
+/// `ktstr shell --no-perf-mode --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with "resource contract" in
 /// the error. Pins the rejection at bin/ktstr.rs:577.
 #[test]
-fn ktstr_shell_llc_cap_with_bypass_errors() {
+fn ktstr_shell_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     ktstr()
         .env("KTSTR_CACHE_DIR", tmp.path())
         .env("KTSTR_BYPASS_LLC_LOCKS", "1")
-        .args(["shell", "--no-perf-mode", "--llc-cap", "2"])
+        .args(["shell", "--no-perf-mode", "--cpu-cap", "2"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("resource contract"));
 }
 
-/// `ktstr kernel build --llc-cap N` under
+/// `ktstr kernel build --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with "resource contract" in
 /// the error. Pins the rejection at bin/ktstr.rs:298.
 #[test]
-fn ktstr_kernel_build_llc_cap_with_bypass_errors() {
+fn ktstr_kernel_build_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     ktstr()
         .env("KTSTR_CACHE_DIR", tmp.path())
@@ -609,8 +609,8 @@ fn ktstr_kernel_build_llc_cap_with_bypass_errors() {
             "kernel",
             "build",
             "--source",
-            "/nonexistent/ktstr-ktstr-llc-cap-bypass-test",
-            "--llc-cap",
+            "/nonexistent/ktstr-ktstr-cpu-cap-bypass-test",
+            "--cpu-cap",
             "2",
         ])
         .assert()
@@ -619,20 +619,20 @@ fn ktstr_kernel_build_llc_cap_with_bypass_errors() {
 }
 
 /// Library-layer fallback via `ktstr shell --no-perf-mode` under
-/// `KTSTR_LLC_CAP` + `KTSTR_BYPASS_LLC_LOCKS`. This exercises the
+/// `KTSTR_CPU_CAP` + `KTSTR_BYPASS_LLC_LOCKS`. This exercises the
 /// KtstrVmBuilder::build site at vmm/mod.rs:3866 — the CLI binary
-/// checks KTSTR_BYPASS against the --llc-cap FLAG, but a consumer
-/// setting KTSTR_LLC_CAP env + KTSTR_BYPASS_LLC_LOCKS env (no
-/// --llc-cap flag) flows through the library-layer check instead.
+/// checks KTSTR_BYPASS against the --cpu-cap FLAG, but a consumer
+/// setting KTSTR_CPU_CAP env + KTSTR_BYPASS_LLC_LOCKS env (no
+/// --cpu-cap flag) flows through the library-layer check instead.
 /// Both paths must emit "resource contract" so the operator sees
 /// a consistent message regardless of which layer detects the
 /// conflict.
 #[test]
-fn ktstr_library_llc_cap_env_with_bypass_errors() {
+fn ktstr_library_cpu_cap_env_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     ktstr()
         .env("KTSTR_CACHE_DIR", tmp.path())
-        .env("KTSTR_LLC_CAP", "2")
+        .env("KTSTR_CPU_CAP", "2")
         .env("KTSTR_BYPASS_LLC_LOCKS", "1")
         .args(["shell", "--no-perf-mode"])
         .assert()

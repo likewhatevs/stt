@@ -1,14 +1,24 @@
 # Resource Budget
 
-`--llc-cap N` adds a third tier between full performance-mode
+`--cpu-cap N` adds a third tier between full performance-mode
 isolation and unreserved no-perf-mode execution. Instead of
-"lock every LLC" (no-perf-mode default) or "lock each reserved LLC
-exclusively" (perf-mode), it reserves a NUMA-aware, consolidation-
-aware subset of `N` LLCs under `LOCK_SH`, enforces the reservation
-via a cgroup v2 cpuset sandbox, and scales `make -jN` fan-out to
-the reserved capacity. See
+"lock each reserved LLC exclusively" (perf-mode), it reserves a
+NUMA-aware, consolidation-aware set of host CPUs under `LOCK_SH`,
+enforces the reservation via a cgroup v2 cpuset sandbox, and scales
+`make -jN` fan-out to the reserved capacity. The flock granularity
+stays per-LLC: every selected LLC is flocked whole, but `plan.cpus`
+holds EXACTLY `N` CPUs (the last LLC is partial-taken when the
+budget falls mid-LLC). See
 [Performance Mode](performance-mode.md#three-way-mode-tier) for
 the comparison against the other two tiers.
+
+Every no-perf-mode VM and kernel build runs through this pipeline
+— there is no "no cap" path. When `--cpu-cap` is absent, the
+planner applies a **30% default** of the calling process's
+sched_getaffinity cpuset (minimum 1 CPU). This keeps
+`sched_setaffinity` safe under cgroup-restricted CI runners (CI
+hosts, systemd slices, sudo-under-a-limited-cpuset) where the
+process cannot run on every online CPU even if sysfs lists them.
 
 ## When to use it
 
@@ -20,60 +30,100 @@ the comparison against the other two tiers.
   shared `LOCK_SH` coordinates with the perf-mode `LOCK_EX` so
   `make` never stomps a measurement in progress.
 - **Concurrent no-perf-mode VMs on a shared host** — a cap of `N`
-  bounds how many runs can coexist; peers above the cap wait on
-  flock rather than racing for CPU.
+  CPUs bounds how much capacity each run reserves; peers that
+  would exceed the host's flock availability wait rather than
+  racing for CPU.
 
-## `LlcCap` — parsed and resolved
+## `CpuCap` — parsed and resolved
 
-`LlcCap::new(N: usize) -> Result<LlcCap>` constructs a cap from a
-CLI integer. `N == 0` is rejected with
-`--llc-cap must be ≥ 1 (got 0)` — zero is a scripting sentinel,
+`CpuCap::new(N: usize) -> Result<CpuCap>` constructs a cap from a
+CLI integer. `N` is a CPU count. `N == 0` is rejected with
+`--cpu-cap must be ≥ 1 CPU (got 0)` — zero is a scripting sentinel,
 not a silent "no cap" fallback.
 
-`LlcCap::resolve(cli_flag: Option<usize>) -> Result<Option<LlcCap>>`
+`CpuCap::resolve(cli_flag: Option<usize>) -> Result<Option<CpuCap>>`
 is the three-tier precedence:
 
-1. CLI flag (`--llc-cap N`) wins over env var.
-2. `KTSTR_LLC_CAP=N` env var applies when the CLI flag is absent.
+1. CLI flag (`--cpu-cap N`) wins over env var.
+2. `KTSTR_CPU_CAP=N` env var applies when the CLI flag is absent.
    Empty string is treated as unset; `0` or non-numeric values
    produce the same rejection as the CLI path.
-3. Neither set → `Ok(None)`, meaning "lock every LLC" — the
-   pre-flag default.
+3. Neither set → `Ok(None)`. The planner expands this into the
+   30%-of-allowed default at acquire time.
 
-`LlcCap::effective_count(host_llcs: usize) -> Result<usize>`
-clamps at acquire time, not construction time. `N > host_llcs`
-returns a `ResourceContention` error naming both numbers; the
-host's LLC count is only known after
-`HostTopology::from_sysfs()` resolves.
+`CpuCap::effective_count(allowed_cpus: usize) -> Result<usize>`
+clamps at acquire time, not construction time.
+`N > allowed_cpus` returns a `ResourceContention` error naming
+both numbers — operators reading the error see immediately that
+the cap exceeds the process's `sched_getaffinity` cpuset, not the
+host's total online CPU count. Fixing the cap requires either
+lowering `N` or releasing the cgroup restriction on the calling
+process.
+
+## `host_allowed_cpus` — the reference set
+
+`host_allowed_cpus()` reads the calling process's allowed CPUs
+via `sched_getaffinity(0)` with a `/proc/self/status`
+`Cpus_allowed_list:` fallback. Every consumer of the `--cpu-cap`
+pipeline plans against this set instead of
+`HostTopology::online_cpus`, so `sched_setaffinity` on the plan's
+CPU list never produces an empty effective mask under a
+cgroup-restricted runner.
+
+An empty allowed set is a bail condition, not a fallback to
+"every CPU" — guessing on a misconfigured host is worse than
+failing visibly. A host topology that has no LLC overlapping the
+allowed set (sysfs and `sched_getaffinity` disagree — e.g. stale
+sysfs after hot-plug, cgroup cpuset pinned to CPUs the kernel no
+longer reports in LLC groups) also bails with an actionable
+diagnostic.
 
 ## `LlcPlan` — the ACQUIRE result
 
-`acquire_llc_plan(topo, test_topo, llc_cap)` runs three phases:
+`acquire_llc_plan(topo, test_topo, cpu_cap)` runs three phases:
 
 1. **DISCOVER** — for every LLC, stat the canonical
    `/tmp/ktstr-llc-{N}.lock`, read `/proc/locks` once, and build a
    snapshot of holders per LLC. No flocks are taken.
-2. **PLAN** — rank LLCs: consolidation (prefer LLCs with existing
-   holders) first, then fresh LLCs, all tiebroken by ascending
-   index. Seed on the highest-scored LLC's NUMA node; greedily
-   fill that node before spilling to nearest-by-distance nodes
-   via `TestTopology::numa_distance`. Final acquire order is
-   ascending LLC index for livelock safety.
+2. **PLAN** — rank LLCs (eligible = at least one allowed CPU):
+   consolidation (prefer LLCs with existing holders) first, then
+   fresh LLCs, all tiebroken by ascending index. Seed on the
+   highest-scored LLC's NUMA node; greedily fill that node before
+   spilling to nearest-by-distance nodes via
+   `TestTopology::numa_distance`. Accumulate allowed-CPU
+   contribution per LLC until the accumulated count meets
+   `target_cpus`. Final acquire order is ascending LLC index for
+   livelock safety.
 3. **ACQUIRE** — non-blocking `LOCK_SH` on every selected LLC. A
    single `EWOULDBLOCK` drops every held fd and retries once
    (one TOCTOU retry — the second DISCOVER's `/proc/locks` read
    IS the backoff; more retries would amplify livelock risk
    without adding coordination signal).
 
+### Partial-take on the last LLC
+
+Post-ACQUIRE, the materialization layer walks each selected LLC's
+CPUs in ascending order, intersects with the allowed set, and
+STOPS at exactly `target_cpus` total. The last selected LLC
+typically contributes only a prefix of its allowed CPUs — the
+flock is still held at LLC granularity (coordination with
+concurrent ktstr peers is always per-LLC), but `plan.cpus`
+reflects the exact CPU budget. `sched_setaffinity` masks and
+cgroup `cpuset.cpus` writes narrow to that exact set.
+
 The returned `LlcPlan` carries:
 
 - `locked_llcs: Vec<usize>` — selected host LLC indices, ASC.
-- `cpus: Vec<usize>` — flattened CPUs across the selected LLCs.
-- `mems: BTreeSet<usize>` — NUMA nodes hosting those CPUs.
+- `cpus: Vec<usize>` — flat list of reserved CPUs, sized exactly
+  `target_cpus` (a subset of every selected LLC's allowed CPUs,
+  with the last LLC possibly contributing only a prefix).
+- `mems: BTreeSet<usize>` — NUMA nodes actually hosting
+  `plan.cpus` (an LLC that contributes a partial slice only
+  registers the nodes of its used CPUs).
 - `snapshot: Vec<LlcSnapshot>` — per-LLC discovery trail.
 - `locks: Vec<OwnedFd>` — RAII flock handles; Drop releases.
 
-When the plan's `mems` spans more than one node
+When `mems` spans more than one node
 (`warn_if_cross_node_spill` fires), stderr gets a `ktstr:
 reserving LLCs […] across N NUMA nodes` warning so the operator
 knows to expect cross-node memory latency. Single-node plans are
@@ -90,7 +140,7 @@ be killed by the cpuset allocator, so migration into
 
 After each cpuset write, `.effective` is read back. Narrowing by
 a parent cgroup (e.g. systemd slice restriction) is a fatal error
-under `--llc-cap` (`hard_error_on_degrade = true`) and a warn-
+under `--cpu-cap` (`hard_error_on_degrade = true`) and a warn-
 only degrade without the flag.
 
 Drop migrates the build pid back to root, tolerates transient
@@ -132,14 +182,14 @@ Flags:
   SIGINT. Interval uses `humantime` syntax (`100ms`, `1s`,
   `5m`, `1h`).
 
-Use `ktstr locks` when `--llc-cap` acquires fail with
+Use `ktstr locks` when `--cpu-cap` acquires fail with
 `ResourceContention`: the error already names busy LLCs, but the
 live snapshot shows every contending peer at once.
 
 ## `KTSTR_BYPASS_LLC_LOCKS` — escape hatch
 
 Setting `KTSTR_BYPASS_LLC_LOCKS=1` (any non-empty value) skips
-the `acquire_llc_plan` entirely. The VM boots or the kernel
+`acquire_llc_plan` entirely. The VM boots or the kernel
 builds immediately without coordinating against any concurrent
 perf-mode run. Use only when the operator explicitly accepts
 measurement noise:
@@ -148,7 +198,7 @@ measurement noise:
 - An isolated developer workstation.
 - A CI queue that already serializes jobs at a higher layer.
 
-Mutually exclusive with `--llc-cap` / `KTSTR_LLC_CAP` at every
+Mutually exclusive with `--cpu-cap` / `KTSTR_CPU_CAP` at every
 entry point (CLI parse for `shell` + `kernel build` on both
 `ktstr` and `cargo ktstr`, the `kernel_build_pipeline` reservation
 phase, and the library-layer `KtstrVmBuilder::build` no-perf-mode
@@ -156,12 +206,12 @@ branch). The error wording always contains `"resource contract"`
 so operators can grep for it; the contract and the bypass cannot
 coexist at any of those six sites.
 
-Note: the `performance_mode=true` vs `--llc-cap` exclusion is
-weaker. It is enforced at CLI parse (`shell --llc-cap` requires
+Note: the `performance_mode=true` vs `--cpu-cap` exclusion is
+weaker. It is enforced at CLI parse (`shell --cpu-cap` requires
 `--no-perf-mode` via clap `requires`), but library consumers that
 set `performance_mode=true` on `KtstrVmBuilder` directly see
-`KTSTR_LLC_CAP` silently ignored — the builder's perf-mode branch
-never calls `LlcCap::resolve`, it goes through
+`KTSTR_CPU_CAP` silently ignored — the builder's perf-mode branch
+never calls `CpuCap::resolve`, it goes through
 `validate_performance_mode` + `acquire_resource_locks`
 (LOCK_EX) instead.
 
@@ -191,9 +241,7 @@ potentially-unreliable `flock`.
 ## Related
 
 - [Performance Mode](performance-mode.md) — the full-isolation
-  tier; the four-way comparison lives there (tier 4 is the
-  default-mode path that flocks per-CPU lockfiles plus LLC
-  `LOCK_SH`).
+  tier; the tier comparison lives there.
 - [Environment Variables](../reference/environment-variables.md)
-  — `KTSTR_LLC_CAP`, `KTSTR_BYPASS_LLC_LOCKS`, and every other
+  — `KTSTR_CPU_CAP`, `KTSTR_BYPASS_LLC_LOCKS`, and every other
   ktstr-controlled env var.

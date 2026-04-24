@@ -24,5 +24,5 @@ LLC layout for cpuset partitioning.
 [Performance Mode](concepts/performance-mode.md) applies host-side
 isolation for noise-sensitive measurements.
 [Resource Budget](concepts/resource-budget.md) describes the
-`--llc-cap` tier that coordinates concurrent no-perf-mode VMs and
+`--cpu-cap` tier that coordinates concurrent no-perf-mode VMs and
 kernel builds via LLC flocks and cgroup v2 cpuset sandboxes.

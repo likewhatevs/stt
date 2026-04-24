@@ -15,16 +15,16 @@ use crate::runner::RunConfig;
 use crate::scenario::{Scenario, flags};
 use crate::workload::WorkType;
 
-/// Re-export of the internal `vmm::host_topology::LlcCap` type so
+/// Re-export of the internal `vmm::host_topology::CpuCap` type so
 /// the `ktstr` and `cargo-ktstr` CLI binaries (which import this
 /// module through the `pub mod cli` surface) can resolve
-/// `--llc-cap N` without depending on the `pub(crate)` `vmm`
+/// `--cpu-cap N` without depending on the `pub(crate)` `vmm`
 /// module. Keeping the canonical definition in `vmm::host_topology`
 /// (so the `acquire_llc_plan` internal call site consumes its own
 /// type without needing `cli`) and re-exporting here — versus
 /// inverting the dependency — avoids pulling the CLI module into
 /// the VMM internals.
-pub use crate::vmm::host_topology::LlcCap;
+pub use crate::vmm::host_topology::CpuCap;
 
 /// Shared `kernel` subcommand tree used by both `ktstr` and
 /// `cargo ktstr`. The two binaries embed this as
@@ -68,8 +68,8 @@ pub enum KernelCommand {
         /// and is ignored in those modes.
         #[arg(long)]
         clean: bool,
-        #[arg(long, help = LLC_CAP_HELP)]
-        llc_cap: Option<usize>,
+        #[arg(long, help = CPU_CAP_HELP)]
+        cpu_cap: Option<usize>,
     },
     /// Remove cached kernel images.
     Clean {
@@ -133,35 +133,42 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
      on cache miss. When absent, resolves via cache then filesystem, \
      falling back to downloading the latest stable kernel.";
 
-/// Help text for the `--llc-cap N` flag. Shared across `ktstr kernel build`,
+/// Help text for the `--cpu-cap N` flag. Shared across `ktstr kernel build`,
 /// `cargo ktstr kernel build`, and `ktstr shell` so the operator-facing
 /// wording is identical regardless of entry point.
 ///
 /// This flag is the resource-budget contract: the operator promises
 /// (and the framework enforces) that the build or no-perf-mode shell
-/// VM will stay within N LLCs' worth of CPU and the NUMA nodes hosting
-/// them. Setting `--llc-cap N` flips several internal defaults on this
-/// run: the LLC discovery uses a consolidation-aware, NUMA-aware plan
-/// instead of "lock every LLC"; make's `-jN` parallelism matches the
-/// reserved CPU count so gcc can't fan out beyond the budget; a cgroup
-/// v2 sandbox binds make + gcc's cpuset to the plan's CPUs and
-/// `cpuset.mems` to the plan's NUMA nodes, so any degradation is fatal
-/// under the flag rather than a silent warning.
-pub const LLC_CAP_HELP: &str = "Reserve only N host LLCs for the build or \
-     no-perf-mode shell. Integer ≥ 1; must be ≤ total host LLCs (see \
-     `ktstr topo`). When absent, every LLC on the host is reserved. \
-     The planner prefers LLCs on a single NUMA node and only spills \
-     across nodes when N exceeds the single-node capacity (run \
-     `ktstr locks --watch 1s` to observe NUMA placement live). Under \
-     --llc-cap, make's `-jN` parallelism matches the reserved CPU \
-     count and the kernel build runs inside a cgroup v2 sandbox that \
-     pins gcc/ld to the reserved CPUs + NUMA nodes; if the sandbox \
-     cannot be installed (missing cgroup v2, missing cpuset \
-     controller, permission denied), the build aborts rather than \
-     running without enforcement. Mutually exclusive with \
+/// VM will stay within N CPUs' worth of reservation and the NUMA
+/// nodes hosting them. Setting `--cpu-cap N` flips several internal
+/// defaults on this run: the LLC discovery walks whole LLCs in
+/// consolidation- and NUMA-aware order until the CPU budget is met;
+/// make's `-jN` parallelism matches the plan's CPU count so gcc
+/// can't fan out beyond the budget; a cgroup v2 sandbox binds make +
+/// gcc's cpuset to the plan's CPUs and `cpuset.mems` to the plan's
+/// NUMA nodes, so any degradation is fatal under the flag rather
+/// than a silent warning.
+pub const CPU_CAP_HELP: &str = "Reserve exactly N host CPUs for the build or \
+     no-perf-mode shell. Integer ≥ 1; must be ≤ the calling process's \
+     sched_getaffinity cpuset size (the allowed CPU count, NOT the \
+     host's total online CPUs — under a cgroup-restricted runner the \
+     allowed set is typically smaller). When absent, 30% of the \
+     allowed CPUs are reserved (minimum 1). The planner walks whole \
+     LLCs in consolidation- and NUMA-aware order, filtered to the \
+     allowed cpuset, partial-taking the last LLC so `plan.cpus.len() \
+     == N` exactly. The flock set may cover more LLCs than strictly \
+     required (flock coordination is per-LLC even when the last LLC \
+     is only partially used for the CPU budget). Run `ktstr locks \
+     --watch 1s` to observe NUMA placement live. Under --cpu-cap, \
+     make's `-jN` parallelism matches the reserved CPU count and the \
+     kernel build runs inside a cgroup v2 sandbox that pins gcc/ld \
+     to the reserved CPUs + NUMA nodes; if the sandbox cannot be \
+     installed (missing cgroup v2, missing cpuset controller, \
+     permission denied), the build aborts rather than running \
+     without enforcement. Mutually exclusive with \
      KTSTR_BYPASS_LLC_LOCKS=1. On `ktstr shell`, requires \
      --no-perf-mode (perf-mode already holds every LLC exclusively). \
-     Also settable via KTSTR_LLC_CAP env var (CLI flag wins when both \
+     Also settable via KTSTR_CPU_CAP env var (CLI flag wins when both \
      are present).";
 
 /// Literal text of the `(EOL)` tag explanation. Lives inside a macro
@@ -1227,7 +1234,7 @@ pub fn run_make_with_output(
 /// Build the kernel with output piped through a spinner.
 ///
 /// `jobs_override` supplies the `-jN` count when set (used by
-/// `kernel_build_pipeline` under `--llc-cap` to keep gcc's
+/// `kernel_build_pipeline` under `--cpu-cap` to keep gcc's
 /// parallelism aligned with the reserved CPU count). `None`
 /// falls back to `std::thread::available_parallelism`.
 pub fn make_kernel_with_output(
@@ -1478,7 +1485,7 @@ pub struct KernelBuildResult {
 /// Two-phase build reservation handles (LLC flock plan + cgroup v2
 /// sandbox + make -jN hint). Consumed by
 /// [`kernel_build_pipeline`]; the factored-out
-/// [`acquire_build_reservation`] builds it from `llc_cap` without
+/// [`acquire_build_reservation`] builds it from `cpu_cap` without
 /// depending on kernel source, enabling integration tests that
 /// exercise the reservation logic against synthetic topologies.
 ///
@@ -1503,7 +1510,7 @@ pub(crate) struct BuildReservation {
     pub(crate) _sandbox: Option<crate::vmm::cgroup_sandbox::BuildSandbox>,
     /// LLC plan (flock fds + cpus + mems). `None` under
     /// `KTSTR_BYPASS_LLC_LOCKS=1` or sysfs-unreadable host without
-    /// `--llc-cap`. Drops SECOND per struct field order —
+    /// `--cpu-cap`. Drops SECOND per struct field order —
     /// flocks release AFTER the sandbox rmdir lands.
     pub(crate) plan: Option<crate::vmm::host_topology::LlcPlan>,
     /// `make -jN` parallelism hint. `Some(N)` under an active
@@ -1514,7 +1521,7 @@ pub(crate) struct BuildReservation {
 
 /// Acquire the two-phase reservation (LLC flocks + cgroup sandbox)
 /// for a kernel build. Factored out of [`kernel_build_pipeline`]
-/// so integration tests can exercise the llc_cap → acquire →
+/// so integration tests can exercise the cpu_cap → acquire →
 /// sandbox → make_jobs decision tree without requiring a real
 /// kernel source tree.
 ///
@@ -1525,13 +1532,13 @@ pub(crate) struct BuildReservation {
 ///
 /// `cli_label` prefixes operator-facing error text.
 ///
-/// `llc_cap` is the resolved cap from
-/// [`LlcCap::resolve`](crate::vmm::host_topology::LlcCap::resolve);
-/// `None` means "lock every LLC" — the pre-flag default that
-/// preserves coordination with concurrent perf-mode runs.
+/// `cpu_cap` is the resolved CPU-count cap from
+/// [`CpuCap::resolve`](crate::vmm::host_topology::CpuCap::resolve);
+/// `None` means "reserve 30% of the calling process's allowed-CPU
+/// set", applied inside the planner at acquire time.
 pub(crate) fn acquire_build_reservation(
     cli_label: &str,
-    llc_cap: Option<crate::vmm::host_topology::LlcCap>,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<BuildReservation> {
     let bypass = std::env::var("KTSTR_BYPASS_LLC_LOCKS")
         .ok()
@@ -1547,10 +1554,10 @@ pub(crate) fn acquire_build_reservation(
     // gcc children that haven't exited — or (b) leave the cgroup
     // hierarchy non-empty when its parent tries to rmdir.
     let plan: Option<crate::vmm::host_topology::LlcPlan> = if bypass {
-        if llc_cap.is_some() {
+        if cpu_cap.is_some() {
             anyhow::bail!(
-                "{cli_label}: --llc-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; \
-                 unset one of them. --llc-cap is a resource contract; bypass \
+                "{cli_label}: --cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; \
+                 unset one of them. --cpu-cap is a resource contract; bypass \
                  disables the contract entirely."
             );
         }
@@ -1558,16 +1565,16 @@ pub(crate) fn acquire_build_reservation(
     } else if let Ok(host_topo) = crate::vmm::host_topology::HostTopology::from_sysfs() {
         let test_topo = crate::topology::TestTopology::from_system()?;
         let acquired_plan =
-            crate::vmm::host_topology::acquire_llc_plan(&host_topo, &test_topo, llc_cap)?;
+            crate::vmm::host_topology::acquire_llc_plan(&host_topo, &test_topo, cpu_cap)?;
         crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);
         Some(acquired_plan)
     } else {
-        if llc_cap.is_some() {
+        if cpu_cap.is_some() {
             anyhow::bail!(
-                "{cli_label}: --llc-cap set but host LLC topology unreadable \
+                "{cli_label}: --cpu-cap set but host LLC topology unreadable \
                  from sysfs — cannot enforce the resource budget. Run on a \
                  host with /sys/devices/system/cpu populated, or drop \
-                 --llc-cap to build without enforcement."
+                 --cpu-cap to build without enforcement."
             );
         }
         tracing::warn!(
@@ -1580,22 +1587,24 @@ pub(crate) fn acquire_build_reservation(
 
     // Phase 2: cgroup v2 sandbox that enforces cpu+mem binding on
     // make/gcc children. `hard_error_on_degrade` is driven by
-    // whether `--llc-cap` was set: degradation is fatal under
-    // the flag (the flag promises enforcement) and warn-only
-    // without it (pre-flag callers must not regress).
+    // whether `--cpu-cap` was set explicitly: degradation is fatal
+    // under the flag (the flag promises enforcement), and warn-only
+    // when the 30%-of-allowed default was expanded (the default
+    // contract is best-effort — a parent cgroup narrowing the
+    // reservation should not fail the build).
     let sandbox: Option<crate::vmm::cgroup_sandbox::BuildSandbox> = match plan.as_ref() {
         Some(p) => Some(crate::vmm::cgroup_sandbox::BuildSandbox::try_create(
             &p.cpus,
             &p.mems,
-            llc_cap.is_some(),
+            cpu_cap.is_some(),
         )?),
         None => None,
     };
 
-    // `make -jN` parallelism hint. Under `--llc-cap N`, N matches
-    // the reserved CPU count via `make_jobs_for_plan`; without
-    // the flag, nproc preserves the pre-flag behaviour. See
-    // `make_kernel_with_output` for the resolution.
+    // `make -jN` parallelism hint. `N` = `plan.cpus.len()` via
+    // `make_jobs_for_plan` — the reserved CPU count, whether that
+    // came from an explicit `--cpu-cap N` or the 30%-of-allowed
+    // default. See `make_kernel_with_output` for the resolution.
     let make_jobs = plan
         .as_ref()
         .map(crate::vmm::host_topology::make_jobs_for_plan);
@@ -1625,7 +1634,7 @@ pub fn kernel_build_pipeline(
     cli_label: &str,
     clean: bool,
     is_local_source: bool,
-    llc_cap: Option<crate::vmm::host_topology::LlcCap>,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<KernelBuildResult> {
     let source_dir = &acquired.source_dir;
     let (arch, image_name) = crate::fetch::arch_info();
@@ -1636,8 +1645,10 @@ pub fn kernel_build_pipeline(
     // kernel build must not have its compile window extended by
     // a test pinning RT-FIFO on shared cores. Phase 1 of the
     // reservation is the LLC-level flock from
-    // [`acquire_llc_plan`]: either a capped subset (`--llc-cap N`)
-    // or every host LLC. Phase 2 is the cgroup v2 sandbox from
+    // [`acquire_llc_plan`]: whole-LLC flocks whose count is
+    // chosen to cover the CPU budget (either an explicit
+    // `--cpu-cap N` or the 30%-of-allowed default). Phase 2 is
+    // the cgroup v2 sandbox from
     // [`BuildSandbox::try_create`] that binds make/gcc's
     // cpu+mem sets to the plan's CPUs + NUMA nodes so the
     // parallelism hint is enforced, not just advisory.
@@ -1658,13 +1669,13 @@ pub fn kernel_build_pipeline(
     //     noise (one shell doing unrelated work, an isolated
     //     developer workstation, or a CI queue that already
     //     serializes jobs at a higher layer). Mutually exclusive
-    //     with `--llc-cap` at CLI parse time — see the CLI
+    //     with `--cpu-cap` at CLI parse time — see the CLI
     //     binaries' pre-dispatch conflict check.
     //   - Sysfs-unreadable host (non-Linux, degraded container):
     //     `HostTopology::from_sysfs()` returns `Err`. Without
-    //     `--llc-cap`, we emit a `tracing::warn!` and proceed
-    //     without locks. With `--llc-cap`, the flag cannot be
-    //     honoured and we fail hard — llc_cap is a contract, not
+    //     `--cpu-cap`, we emit a `tracing::warn!` and proceed
+    //     without locks. With `--cpu-cap`, the flag cannot be
+    //     honoured and we fail hard — cpu_cap is a contract, not
     //     a hint: a silent degrade would let a build exceed the
     //     declared resource budget without surfacing.
     // `_plan` + `_sandbox` are kept alive via RAII — their Drops
@@ -1675,7 +1686,7 @@ pub fn kernel_build_pipeline(
         plan: _plan,
         _sandbox,
         make_jobs,
-    } = acquire_build_reservation(cli_label, llc_cap)?;
+    } = acquire_build_reservation(cli_label, cpu_cap)?;
 
     if clean {
         if !is_local_source {
@@ -2399,9 +2410,9 @@ pub fn resolve_cached_kernel(
                 return Ok(entry.path);
             }
             // Cache miss: download and build the requested version.
-            // llc_cap is None here — resolve_cached_kernel is reached
+            // cpu_cap is None here — resolve_cached_kernel is reached
             // from test/coverage/shell/run/verifier (via
-            // resolve_kernel_image), and --llc-cap is scoped to the
+            // resolve_kernel_image), and --cpu-cap is scoped to the
             // explicit `kernel build` / `shell --no-perf-mode` paths
             // only; the auto-build-on-miss codepath is outside that
             // scope by design.
@@ -2454,9 +2465,9 @@ pub fn resolve_kernel_image(
             KernelId::Path(p) => {
                 let path = std::path::PathBuf::from(&p);
                 if path.is_dir() {
-                    // `None` for llc_cap: resolve_kernel_image is
+                    // `None` for cpu_cap: resolve_kernel_image is
                     // called by test/coverage/shell/run/verifier —
-                    // subcommands where --llc-cap is not exposed.
+                    // subcommands where --cpu-cap is not exposed.
                     // The two kernel-build entry points
                     // (ktstr/cargo-ktstr `kernel build`) call
                     // resolve_kernel_dir directly with their flag-
@@ -2522,13 +2533,14 @@ pub fn auto_download_kernel(cli_label: &str) -> Result<std::path::PathBuf> {
 /// races and prefix-resolved entries. Delegates to
 /// [`kernel_build_pipeline`] for configure/build/validate/cache.
 ///
-/// `llc_cap` forwards the resource-budget cap to the pipeline so
-/// the LLC flock + cgroup sandbox phases honour it. `None`
-/// preserves the pre-flag "lock every LLC" behaviour.
+/// `cpu_cap` forwards the resource-budget cap to the pipeline so
+/// the LLC flock + cgroup sandbox phases honour it. `None` means
+/// "reserve 30% of the allowed-CPU set" (see
+/// [`CpuCap::resolve`](crate::vmm::host_topology::CpuCap::resolve)).
 pub fn download_and_cache_version(
     version: &str,
     cli_label: &str,
-    llc_cap: Option<crate::vmm::host_topology::LlcCap>,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<std::path::PathBuf> {
     let (arch, _) = crate::fetch::arch_info();
     let cache_key = format!("{version}-tarball-{arch}-kc{}", crate::cache_key_suffix());
@@ -2552,7 +2564,7 @@ pub fn download_and_cache_version(
     sp.finish("Downloaded");
 
     let cache = crate::cache::CacheDir::new()?;
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, llc_cap)?;
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, cpu_cap)?;
 
     match result.entry {
         Some(entry) => Ok(entry.path),
@@ -2569,16 +2581,16 @@ pub fn download_and_cache_version(
 /// prefixes status output and is passed through to
 /// [`kernel_build_pipeline`] as the diagnostic label.
 ///
-/// `llc_cap` forwards the resource-budget cap to the pipeline.
+/// `cpu_cap` forwards the resource-budget cap to the pipeline.
 /// `None` is the default for non-kernel-build callers
-/// (test/coverage/shell auto-build paths) — `--llc-cap` lives on
+/// (test/coverage/shell auto-build paths) — `--cpu-cap` lives on
 /// the explicit kernel-build entrypoint, not test-running
 /// commands, because the auto-build-on-miss path already runs
 /// inside a test invocation where perf-mode constraints dominate.
 pub fn resolve_kernel_dir(
     path: &std::path::Path,
     cli_label: &str,
-    llc_cap: Option<crate::vmm::host_topology::LlcCap>,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<std::path::PathBuf> {
     let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
     if !is_source_tree {
@@ -2606,7 +2618,7 @@ pub fn resolve_kernel_dir(
     }
 
     let cache = crate::cache::CacheDir::new()?;
-    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, llc_cap)?;
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap)?;
 
     // Prefer the cached image path (stable across rebuilds).
     match result.entry {
@@ -2656,7 +2668,7 @@ pub fn new_table() -> comfy_table::Table {
 // `ktstr locks` — observational enumeration of every ktstr flock on the host
 // ---------------------------------------------------------------------------
 //
-// Troubleshooting companion to `--llc-cap`: when a build or test is
+// Troubleshooting companion to `--cpu-cap`: when a build or test is
 // stalled behind a peer's reservation, `ktstr locks` names the peer
 // (PID + cmdline) without disturbing any of its flocks. Reads
 // `/tmp/ktstr-llc-*.lock`, `/tmp/ktstr-cpu-*.lock`, and
@@ -6492,42 +6504,43 @@ mod tests {
         }
     }
 
-    /// `kernel build --llc-cap N` parses to `KernelCommand::Build
-    /// { llc_cap: Some(N), .. }`. Unlike the shell subcommand,
-    /// kernel-build's `--llc-cap` has NO `requires` constraint:
+    /// `kernel build --cpu-cap N` parses to `KernelCommand::Build
+    /// { cpu_cap: Some(N), .. }`. Unlike the shell subcommand,
+    /// kernel-build's `--cpu-cap` has NO `requires` constraint:
     /// builds always use the LLC plan regardless of perf-mode
     /// (builds don't have a perf-mode toggle at all). A clap
     /// regression that accidentally added `requires =
     /// "no_perf_mode"` here would break `ktstr kernel build
-    /// --llc-cap 4` and surface through this test.
+    /// --cpu-cap 4` and surface through this test.
     #[test]
-    fn kernel_build_parses_llc_cap_without_extra_flags() {
+    fn kernel_build_parses_cpu_cap_without_extra_flags() {
         use clap::Parser as _;
         #[derive(clap::Parser, Debug)]
         struct TestCli {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--llc-cap", "4"])
-            .expect("kernel build --llc-cap N must parse");
+        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--cpu-cap", "4"])
+            .expect("kernel build --cpu-cap N must parse");
         match parsed.cmd {
             KernelCommand::Build {
-                llc_cap, version, ..
+                cpu_cap, version, ..
             } => {
-                assert_eq!(llc_cap, Some(4));
+                assert_eq!(cpu_cap, Some(4));
                 assert_eq!(version.as_deref(), Some("6.14.2"));
             }
             other => panic!("expected KernelCommand::Build, got {other:?}"),
         }
     }
 
-    /// `kernel build` without `--llc-cap` parses with
-    /// `llc_cap: None` — the pre-flag default. Pins the
-    /// no-flag path so a future rename of the clap field or a
-    /// stray `default_value = "0"` surfaces as a test failure,
-    /// not a silent runtime behavior change.
+    /// `kernel build` without `--cpu-cap` parses with
+    /// `cpu_cap: None` — the "unset" sentinel the downstream planner
+    /// expands into the 30%-of-allowed default. Pins the no-flag
+    /// path so a future rename of the clap field or a stray
+    /// `default_value = "0"` surfaces as a test failure, not a
+    /// silent runtime behavior change.
     #[test]
-    fn kernel_build_without_llc_cap_defaults_to_none() {
+    fn kernel_build_without_cpu_cap_defaults_to_none() {
         use clap::Parser as _;
         #[derive(clap::Parser, Debug)]
         struct TestCli {
@@ -6535,37 +6548,37 @@ mod tests {
             cmd: KernelCommand,
         }
         let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2"])
-            .expect("kernel build without --llc-cap must parse");
+            .expect("kernel build without --cpu-cap must parse");
         match parsed.cmd {
-            KernelCommand::Build { llc_cap, .. } => {
-                assert_eq!(llc_cap, None, "no --llc-cap must produce None, not Some(0)",);
+            KernelCommand::Build { cpu_cap, .. } => {
+                assert_eq!(cpu_cap, None, "no --cpu-cap must produce None, not Some(0)",);
             }
             other => panic!("expected KernelCommand::Build, got {other:?}"),
         }
     }
 
-    /// `kernel build --llc-cap 0` parses successfully at clap level
-    /// — the "must be ≥ 1" check lives in [`LlcCap::new`], not in
+    /// `kernel build --cpu-cap 0` parses successfully at clap level
+    /// — the "must be ≥ 1" check lives in [`CpuCap::new`], not in
     /// the clap value parser. Pins the two-layer validation: clap
-    /// accepts any usize; runtime resolution via `LlcCap::resolve`
+    /// accepts any usize; runtime resolution via `CpuCap::resolve`
     /// is responsible for the "0 is rejected" diagnostic. A future
     /// refactor that moved the ≥1 check into clap would trip this
     /// test AND require updating the
-    /// `llc_cap_resolve_zero_env_rejected` error-wording pin.
+    /// `cpu_cap_resolve_zero_env_rejected` error-wording pin.
     #[test]
-    fn kernel_build_llc_cap_zero_passes_clap() {
+    fn kernel_build_cpu_cap_zero_passes_clap() {
         use clap::Parser as _;
         #[derive(clap::Parser, Debug)]
         struct TestCli {
             #[command(subcommand)]
             cmd: KernelCommand,
         }
-        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--llc-cap", "0"])
+        let parsed = TestCli::try_parse_from(["prog", "build", "6.14.2", "--cpu-cap", "0"])
             .expect("clap-level parse must accept 0; runtime validation rejects");
         match parsed.cmd {
-            KernelCommand::Build { llc_cap, .. } => {
+            KernelCommand::Build { cpu_cap, .. } => {
                 assert_eq!(
-                    llc_cap,
+                    cpu_cap,
                     Some(0),
                     "clap parses 0 verbatim; validation is downstream",
                 );
@@ -6701,7 +6714,7 @@ mod tests {
 
     // ---------------------------------------------------------------
     // kernel_build_pipeline reservation phase — factored-out
-    // `acquire_build_reservation` covers the llc_cap → acquire →
+    // `acquire_build_reservation` covers the cpu_cap → acquire →
     // sandbox → make_jobs flow without needing a real kernel source.
     // ---------------------------------------------------------------
 
@@ -6749,7 +6762,7 @@ mod tests {
     }
 
     /// `acquire_build_reservation` with
-    /// `KTSTR_BYPASS_LLC_LOCKS=1` + `llc_cap=None` returns a
+    /// `KTSTR_BYPASS_LLC_LOCKS=1` + `cpu_cap=None` returns a
     /// no-reservation `BuildReservation`: plan is None, sandbox
     /// is None, make_jobs is None. Pins the "bypass escape hatch
     /// disables both layers" contract at the factored-out entry
@@ -6772,7 +6785,7 @@ mod tests {
     }
 
     /// `acquire_build_reservation` with
-    /// `KTSTR_BYPASS_LLC_LOCKS=1` + `llc_cap=Some(_)` must error
+    /// `KTSTR_BYPASS_LLC_LOCKS=1` + `cpu_cap=Some(_)` must error
     /// with the "resource contract" substring. Pins the conflict
     /// check at the pipeline's reservation entry point, independent
     /// of the CLI-layer conflict check (separate tests pin the CLI layer).
@@ -6780,7 +6793,7 @@ mod tests {
     fn acquire_build_reservation_bypass_with_cap_errors() {
         let _lock = bypass_env_lock();
         let _env = BypassGuard::set("1");
-        let cap = crate::vmm::host_topology::LlcCap::new(2).expect("cap=2 valid");
+        let cap = crate::vmm::host_topology::CpuCap::new(2).expect("cap=2 valid");
         let err =
             acquire_build_reservation("test", Some(cap)).expect_err("bypass + cap must error");
         let msg = format!("{err:#}");

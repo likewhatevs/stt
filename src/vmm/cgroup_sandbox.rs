@@ -3,7 +3,7 @@
 //!
 //! Wraps [`CgroupManager`](crate::cgroup::CgroupManager) to enforce CPU
 //! + NUMA memory binding for `make` and its gcc/ld children when the
-//!   user passes `--llc-cap N`. The sandbox contract is:
+//!   user passes `--cpu-cap N`. The sandbox contract is:
 //!
 //!  - A dedicated child cgroup is created under the caller's own
 //!    cgroup (parsed from `/proc/self/cgroup`). Name format is
@@ -21,7 +21,7 @@
 //!    child's parent had a narrower view than the plan asked for
 //!    (e.g. kernel returned `EINVAL` silently, systemd restricted
 //!    the slice, or a prior ancestor cpuset shrunk our window).
-//!    Degradation under `--llc-cap` is fatal; without the flag, it
+//!    Degradation under `--cpu-cap` is fatal; without the flag, it
 //!    warns and proceeds.
 //!  - `Drop` migrates the build pid back to root, tolerates
 //!    transient EBUSY on `cgroup.rmdir` (up to 5 x 10ms retries),
@@ -71,7 +71,7 @@ const RMDIR_EBUSY_BACKOFF: Duration = Duration::from_millis(10);
 const ORPHAN_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Failure modes for the cgroup v2 sandbox. Surfaces as
-/// `BuildSandbox::Degraded(…)` when `--llc-cap` is NOT set; a
+/// `BuildSandbox::Degraded(…)` when `--cpu-cap` is NOT set; a
 /// future tightening under the flag would reject these.
 ///
 /// `#[non_exhaustive]` because the kernel surface we sense grows
@@ -158,7 +158,7 @@ pub(crate) struct SandboxInner {
     our_pid: u32,
 }
 
-/// RAII guard for a `--llc-cap` build sandbox.
+/// RAII guard for a `--cpu-cap` build sandbox.
 ///
 /// Returned by [`BuildSandbox::try_create`]. Two shapes:
 ///
@@ -167,7 +167,7 @@ pub(crate) struct SandboxInner {
 ///  - `Degraded(SandboxDegraded)`: one of the preconditions
 ///    failed, no cgroup was created, Drop is a no-op. The caller
 ///    inspects the variant to decide whether to abort (under
-///    `--llc-cap`) or continue without enforcement.
+///    `--cpu-cap`) or continue without enforcement.
 #[derive(Debug)]
 pub enum BuildSandbox {
     /// Sandbox is live and enforcing CPU / NUMA binding.
@@ -175,7 +175,7 @@ pub enum BuildSandbox {
     /// Pre-condition failed; no cgroup was created. `Drop` is a
     /// no-op. The payload surfaces via `Display` from the calling
     /// site's diagnostic rendering (e.g. `degraded_or_err`'s
-    /// `"--llc-cap: {kind}. ..."`); readers never destructure the
+    /// `"--cpu-cap: {kind}. ..."`); readers never destructure the
     /// variant directly, which the dead-code lint flags as an
     /// unread field. Kept intact so future consumers (telemetry,
     /// test-only inspection) can pattern-match the kind without an
@@ -201,13 +201,14 @@ impl BuildSandbox {
     /// sub-command, an external test that exercises sandbox Drop
     /// in isolation).
     ///
-    /// `hard_error_on_degrade` controls the `--llc-cap` strict
-    /// contract: when `true`, any `SandboxDegraded` outcome is
-    /// converted into an `Err(anyhow!(…))` with an actionable
-    /// message; when `false`, `Ok(Degraded(…))` is returned and
-    /// the caller proceeds without enforcement (the pre-flag
-    /// behaviour, preserved so existing no-perf-mode callers don't
-    /// regress).
+    /// `hard_error_on_degrade` controls the `--cpu-cap` strict
+    /// contract: when `true` (operator passed `--cpu-cap N`
+    /// explicitly), any `SandboxDegraded` outcome is converted into
+    /// an `Err(anyhow!(…))` with an actionable message. When
+    /// `false` (the 30%-of-allowed default applied because no flag
+    /// was set), `Ok(Degraded(…))` is returned and the caller
+    /// proceeds without cgroup enforcement — the LLC flocks still
+    /// coordinate against perf-mode peers.
     pub fn try_create(
         plan_cpus: &[usize],
         plan_mems: &BTreeSet<usize>,
@@ -349,7 +350,7 @@ impl BuildSandbox {
 
         // Step F.1: cpuset.cpus — write, then readback .effective.
         // Disagreement means the kernel narrowed the set (parent
-        // restriction or invalid bits). Under `--llc-cap` this is
+        // restriction or invalid bits). Under `--cpu-cap` this is
         // unacceptable; without it, warn and proceed.
         let cpu_set: BTreeSet<usize> = plan_cpus.iter().copied().collect();
         if let Err(e) = cg.set_cpuset(&name, &cpu_set) {
@@ -374,7 +375,7 @@ impl BuildSandbox {
             if hard_error_on_degrade {
                 let _ = cg.remove_cgroup(&name);
                 anyhow::bail!(
-                    "--llc-cap: cpuset.cpus narrowed by parent cgroup \
+                    "--cpu-cap: cpuset.cpus narrowed by parent cgroup \
                      (requested {cpu_set:?}, effective {eff:?}). \
                      Run `ktstr locks --json` to inspect peers."
                 );
@@ -404,7 +405,7 @@ impl BuildSandbox {
             if hard_error_on_degrade {
                 let _ = cg.remove_cgroup(&name);
                 anyhow::bail!(
-                    "--llc-cap: cpuset.mems narrowed by parent cgroup \
+                    "--cpu-cap: cpuset.mems narrowed by parent cgroup \
                      (requested {plan_mems:?}, effective {eff:?}).\n\
                      \n\
                      Remediation:\n\
@@ -416,7 +417,7 @@ impl BuildSandbox {
                           widen that parent's cpuset.mems or move this \
                           process under a wider cgroup (systemd-run \
                           --user --scope -p Delegate=cpuset).\n\
-                       2. Drop --llc-cap to build under LLC flock \
+                       2. Drop --cpu-cap to build under LLC flock \
                           coordination alone, trading NUMA enforcement \
                           for the noisier fallback path."
                 );
@@ -449,13 +450,14 @@ impl BuildSandbox {
     }
 
     /// Return `true` when the sandbox successfully installed
-    /// kernel-enforced CPU binding. Current production callers use
-    /// `hard_error_on_degrade = true` and never observe the
-    /// `Degraded` variant — an error propagates instead — so this
-    /// accessor is unused in-tree today. Kept for the future
-    /// `hard_error_on_degrade = false` path (pre-flag default) and
-    /// downstream tooling that wants a Boolean rather than a
-    /// `matches!` macro dance.
+    /// kernel-enforced CPU binding. Current production callers pass
+    /// `hard_error_on_degrade = true` when `--cpu-cap N` was
+    /// explicit (degrade is fatal under the flag) and `false` when
+    /// the 30%-of-allowed default expanded from a cap-unset call
+    /// (degrade warns and proceeds). The `false` path can return a
+    /// `Degraded` variant that this accessor inspects — callers
+    /// that want a Boolean rather than a `matches!` macro dance
+    /// read it here; downstream tooling has the same use case.
     #[allow(dead_code)]
     pub fn is_active(&self) -> bool {
         matches!(self, BuildSandbox::Active(_))
@@ -468,7 +470,7 @@ impl BuildSandbox {
     fn degraded_or_err(kind: SandboxDegraded, hard_error_on_degrade: bool) -> Result<Self> {
         if hard_error_on_degrade {
             Err(anyhow::anyhow!(
-                "--llc-cap: {kind}. This host cannot enforce the \
+                "--cpu-cap: {kind}. This host cannot enforce the \
                  resource budget.\n\
                  \n\
                  Remediation (pick one):\n\
@@ -478,19 +480,19 @@ impl BuildSandbox {
                       \n\
                         systemd-run --user --scope \\\n\
                             -p 'Delegate=cpuset cpu' \\\n\
-                            cargo ktstr kernel build --source <path> --llc-cap N\n\
+                            cargo ktstr kernel build --source <path> --cpu-cap N\n\
                       \n\
-                   2. Re-run with sudo preserving env so KTSTR_LLC_CAP / \
+                   2. Re-run with sudo preserving env so KTSTR_CPU_CAP / \
                       KTSTR_CACHE_DIR / RUST_LOG propagate to the root \
                       invocation:\n\
                       \n\
-                        sudo -E cargo ktstr kernel build --source <path> --llc-cap N\n\
+                        sudo -E cargo ktstr kernel build --source <path> --cpu-cap N\n\
                       \n\
                    3. Enable cpuset delegation on the caller's cgroup \
                       by adding `cpuset` to the parent's cgroup.subtree_control \
                       (requires CAP_SYS_ADMIN).\n\
                    \n\
-                   4. Drop --llc-cap to build without the cgroup-level \
+                   4. Drop --cpu-cap to build without the cgroup-level \
                       resource contract (falls back to LLC flock \
                       coordination only)."
             ))
@@ -844,7 +846,7 @@ mod tests {
     fn sandbox_degraded_display_text() {
         // Each variant must render an operator-facing string that
         // keys on its specific failure — they surface in the
-        // `--llc-cap` hard-error message and the no-flag warn,
+        // `--cpu-cap` hard-error message and the no-flag warn,
         // and a log-scraper keying on keywords like "cpuset" or
         // "subtree_control" must find the matching variant's
         // text. Non-empty was the prior bar; keyword-contains
@@ -1039,7 +1041,7 @@ mod tests {
     /// `BuildSandbox::try_create` on a host that lacks cgroup v2 at
     /// `/sys/fs/cgroup` must surface `NoCgroupV2` when
     /// `hard_error_on_degrade=false`, and a hard error naming the
-    /// "--llc-cap" contract when `hard_error_on_degrade=true`.
+    /// "--cpu-cap" contract when `hard_error_on_degrade=true`.
     /// Exercises the step-A statfs guard.
     ///
     /// Can't reliably fake the `statfs` magic test without mount
@@ -1060,7 +1062,7 @@ mod tests {
         let mems: BTreeSet<usize> = BTreeSet::new();
 
         // hard_error_on_degrade=false: caller that would otherwise
-        // not have set --llc-cap. Any degrade variant surfaces as
+        // not have set --cpu-cap. Any degrade variant surfaces as
         // Ok(Degraded(_)).
         let result = BuildSandbox::try_create(&cpus, &mems, false);
         match &result {
@@ -1090,7 +1092,7 @@ mod tests {
 
     /// `BuildSandbox::try_create` with `hard_error_on_degrade=true`
     /// must convert any `Degraded` outcome into an `Err(anyhow)`
-    /// with the "--llc-cap" and "Remediation" substrings. On a
+    /// with the "--cpu-cap" and "Remediation" substrings. On a
     /// fully-configured host that produces an `Active` sandbox, the
     /// test accepts the Ok path and does not assert error text.
     #[test]
@@ -1111,10 +1113,10 @@ mod tests {
             }
             Err(e) => {
                 // Degraded was converted to a hard error per the
-                // `--llc-cap` contract.
+                // `--cpu-cap` contract.
                 let msg = format!("{e:#}");
                 assert!(
-                    msg.contains("--llc-cap"),
+                    msg.contains("--cpu-cap"),
                     "hard error must name the contract flag: {msg}",
                 );
                 assert!(

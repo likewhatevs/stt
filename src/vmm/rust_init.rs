@@ -174,6 +174,15 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // SAFETY: single-threaded context — PID 1 before any threads spawn.
     unsafe {
         std::env::set_var("PATH", build_include_path());
+        // Mark this process tree as running under guest init (PID 1).
+        // Workers forked inside the guest legitimately have
+        // `getppid() == 1` because init IS their parent, so the
+        // host-side orphan-detection fast-path in `workload.rs` must
+        // skip the `_exit(0)` branch when this variable is present.
+        // The variable is inherited across fork/exec, so every
+        // descendant of guest init (including workloads that re-exec
+        // /init to run scenarios) observes it.
+        std::env::set_var("KTSTR_GUEST_INIT", "1");
     }
 
     // Shell mode: interactive busybox shell instead of test dispatch.

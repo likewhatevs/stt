@@ -631,7 +631,7 @@ fn pin_current_thread(cpu: usize, label: &str) {
 /// pool without picking a specific CPU. The kernel picks a runnable
 /// CPU from the mask.
 ///
-/// Used by the no-perf + `--llc-cap` path at
+/// Used by the no-perf + `--cpu-cap` path at
 /// [`KtstrVmBuilder::build`]: every vCPU thread gets the reserved
 /// LLC's CPUs as its mask so the vCPU runs inside the resource
 /// budget without fighting the kernel scheduler for a hard pin it
@@ -951,19 +951,23 @@ pub struct KtstrVm {
     /// prevent other VMs from double-booking the same CPUs.
     #[allow(dead_code)]
     cpu_locks: Vec<std::os::fd::OwnedFd>,
-    /// No-perf-mode resource plan, populated when the builder resolves
-    /// an `LlcCap` via `KTSTR_LLC_CAP` (set by `ktstr shell --llc-cap N`
-    /// or `cargo ktstr shell --llc-cap N`). Holds the flattened CPU
-    /// list + RAII flock fds returned by
+    /// No-perf-mode resource plan. Populated for every no-perf-mode
+    /// VM — either the operator-set CPU count
+    /// (`--cpu-cap N` / `KTSTR_CPU_CAP=N`) or the 30%-of-allowed
+    /// default when neither is present. Holds the flat CPU list +
+    /// RAII flock fds returned by
     /// [`host_topology::acquire_llc_plan`]. `run_vm` reads the CPU
-    /// list to `sched_setaffinity` every vCPU thread to the reserved
-    /// LLCs' host-CPU set, and `Drop` releases the LLC flocks with
+    /// list to `sched_setaffinity` every vCPU thread onto the
+    /// reserved host CPUs, and `Drop` releases the LLC flocks with
     /// the VM.
     ///
-    /// `None` for the pre-flag no-perf path (which keeps using
-    /// `cpu_locks` above) and for perf-mode (which uses
-    /// `pinning_plan`). The two paths are orthogonal — perf-mode
-    /// hard-pins single CPUs, --llc-cap soft-masks a pool.
+    /// `None` only in the degraded-sysfs case (no-perf-mode on a
+    /// host whose `/sys/devices/system/cpu` cannot be read AND no
+    /// explicit cap was set — the build bails with an error when
+    /// a cap IS set under the same sysfs failure), and for
+    /// perf-mode (which uses `pinning_plan`). The two paths are
+    /// orthogonal — perf-mode hard-pins single CPUs, --cpu-cap
+    /// soft-masks a pool.
     #[allow(dead_code)]
     no_perf_plan: Option<host_topology::LlcPlan>,
     /// Shell commands to run in the guest to enable a kernel-built scheduler.
@@ -1168,7 +1172,7 @@ impl KtstrVm {
         let mut bsp = vcpus.remove(0);
 
         let ap_pins = vec![None; vcpus.len()];
-        // Shell/interactive path mirrors run_vm: no-perf + --llc-cap
+        // Shell/interactive path mirrors run_vm: no-perf + --cpu-cap
         // applies the LlcPlan's CPU list as a sched_setaffinity mask
         // on every vCPU thread. Perf-mode's pin_targets doesn't
         // apply here — interactive shell runs under no-perf by
@@ -1438,12 +1442,12 @@ impl KtstrVm {
         // (default 60s) must not kill the shell. Use 24 hours as a
         // practical upper bound.
         //
-        // Apply the no-perf + --llc-cap mask to the BSP thread so
-        // interactive `ktstr shell --no-perf-mode --llc-cap N` runs
+        // Apply the no-perf + --cpu-cap mask to the BSP thread so
+        // interactive `ktstr shell --no-perf-mode --cpu-cap N` runs
         // inside the reserved LLCs just like run_vm's BSP. No pin
         // here — perf-mode doesn't apply to interactive shell:
-        // `--llc-cap` requires `--no-perf-mode` on Shell (clap
-        // `requires` attribute on the llc_cap field).
+        // `--cpu-cap` requires `--no-perf-mode` on Shell (clap
+        // `requires` attribute on the cpu_cap field).
         if let Some(mask) = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice()) {
             set_thread_cpumask(mask, "BSP (shell)");
         }
@@ -2320,7 +2324,7 @@ impl KtstrVm {
             vec![None; vcpus.len()]
         };
 
-        // No-perf + --llc-cap: flat CPU list from the LLC plan gets
+        // No-perf + --cpu-cap: flat CPU list from the LLC plan gets
         // sched_setaffinity'd on every vCPU thread as a mask (not a
         // hard pin). Mutually exclusive with perf-mode's pin_targets.
         let no_perf_mask: Option<&[usize]> = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
@@ -2525,9 +2529,9 @@ impl KtstrVm {
     /// Spawn AP vCPU threads. Each thread optionally pins itself to a
     /// host CPU from `pin_targets` (indexed by AP order, 0-based), OR
     /// applies a CPU mask from `no_perf_mask` when the no-perf +
-    /// `--llc-cap` path is active. The two are mutually exclusive —
+    /// `--cpu-cap` path is active. The two are mutually exclusive —
     /// perf-mode produces `pin_targets` via the PinningPlan;
-    /// `--llc-cap` no-perf produces `no_perf_mask` via the LlcPlan.
+    /// `--cpu-cap` no-perf produces `no_perf_mask` via the LlcPlan.
     #[allow(clippy::too_many_arguments)]
     fn spawn_ap_threads(
         &self,
@@ -3805,44 +3809,41 @@ impl KtstrVmBuilder {
         }
 
         let (pinning_plan, mbind_node_map, cpu_locks, no_perf_plan) = if self.no_perf_mode {
-            // No-perf-mode VMs have unrestricted vCPU affinity — the
-            // host kernel places their threads on any online CPU,
-            // including ones a perf-mode peer has flocked and bound
-            // its RT-FIFO vCPUs to. Injecting that thread competition
-            // destroys perf-mode's measurement contract. The coordination
-            // mechanism is an LLC-level flock set (same as
-            // `kernel_build_pipeline`) so perf-mode's required
+            // No-perf-mode VMs would otherwise have unrestricted vCPU
+            // affinity — the host kernel places their threads on any
+            // online CPU, including ones a perf-mode peer has flocked
+            // and bound its RT-FIFO vCPUs to. Injecting that thread
+            // competition destroys perf-mode's measurement contract.
+            // The coordination mechanism is an LLC-level flock set
+            // (same as `kernel_build_pipeline`) so perf-mode's required
             // `LOCK_EX` blocks on any of them and fails over cleanly.
             //
-            // Two paths converge here depending on `KTSTR_LLC_CAP`
-            // (set by `ktstr shell --llc-cap N` or
-            // `cargo ktstr shell --llc-cap N`):
+            // `--cpu-cap` (or `KTSTR_CPU_CAP`) is a CPU-count budget:
+            // the planner walks whole LLCs in contention- / NUMA-aware
+            // order, filtered to the calling process's allowed cpuset
+            // (sched_getaffinity), and accumulates until N CPUs are
+            // reserved. `acquire_llc_plan` returns the selected LLC
+            // list + flat `cpus` (intersection with allowed) + RAII
+            // flock fds. The `cpus` are threaded into `no_perf_plan`
+            // so `run_vm` can `sched_setaffinity` every vCPU thread
+            // onto that pool. `cpu_locks` stays empty — the plan
+            // owns the flocks.
             //
-            //  - Cap set: `acquire_llc_plan` picks a
-            //    consolidation-aware, NUMA-aware subset of N LLCs,
-            //    returns its `cpus` list + RAII flock fds. The
-            //    `cpus` are threaded into `no_perf_plan` so `run_vm`
-            //    can `sched_setaffinity` every vCPU thread to that
-            //    pool. `cpu_locks` stays empty — the plan owns the
-            //    flocks.
-            //  - No cap: same `acquire_llc_plan` path with
-            //    `llc_cap = None`; the planner's target degenerates
-            //    to "select every LLC" — the pre-flag default.
-            //    The returned
-            //    LlcPlan's flock set matches the pre-flag "every
-            //    LLC shared" reservation. `no_perf_plan` still
-            //    carries the plan so run_vm can apply the host-
-            //    wide mask; on a normal host with full LLC set,
-            //    sched_setaffinity with every online CPU is a
-            //    no-op, matching the pre-flag behaviour.
+            // When the cap is absent (`CpuCap::resolve(None) ==
+            // Ok(None)`), the planner applies the 30%-of-allowed
+            // default (`default_cpu_budget`). The resulting plan
+            // reserves a subset of host LLCs, not "every LLC" as the
+            // 15ee285 path did — so no-perf-mode VMs never fight
+            // concurrent builds or other no-perf peers for the full
+            // host, regardless of whether the user set the flag.
             //
             // `from_sysfs` returning `Err` (non-Linux, sysfs absent)
-            // degenerates the lock set to empty AND forces the no-cap
-            // branch; no coordination is possible, but the VM still
+            // still forces the no-cap branch; `acquire_llc_plan` is
+            // skipped, no coordination is possible, but the VM still
             // runs. `KTSTR_BYPASS_LLC_LOCKS=1` bypasses both paths.
             //
-            // The CLI binaries reject `--llc-cap` + bypass at parse
-            // time (see `ktstr::cli::LLC_CAP_HELP` and the Shell/
+            // The CLI binaries reject `--cpu-cap` + bypass at parse
+            // time (see `ktstr::cli::CPU_CAP_HELP` and the Shell/
             // kernel-build dispatch checks in bin/ktstr.rs and
             // bin/cargo-ktstr.rs), but library consumers building
             // a `KtstrVmBuilder` directly with both env vars set
@@ -3853,34 +3854,34 @@ impl KtstrVmBuilder {
             let bypass = std::env::var("KTSTR_BYPASS_LLC_LOCKS")
                 .ok()
                 .is_some_and(|v| !v.is_empty());
-            let llc_cap = host_topology::LlcCap::resolve(None)?;
+            let cpu_cap = host_topology::CpuCap::resolve(None)?;
             if bypass {
-                if llc_cap.is_some() {
+                if cpu_cap.is_some() {
                     anyhow::bail!(
-                        "no-perf-mode: KTSTR_LLC_CAP conflicts with \
+                        "no-perf-mode: KTSTR_CPU_CAP conflicts with \
                          KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
-                         KTSTR_LLC_CAP is a resource contract; bypass \
+                         KTSTR_CPU_CAP is a resource contract; bypass \
                          disables the contract entirely."
                     );
                 }
                 (None, Vec::new(), Vec::new(), None)
             } else if let Ok(host_topo) = host_topology::HostTopology::from_sysfs() {
                 let test_topo = crate::topology::TestTopology::from_system()?;
-                let plan = host_topology::acquire_llc_plan(&host_topo, &test_topo, llc_cap)?;
+                let plan = host_topology::acquire_llc_plan(&host_topo, &test_topo, cpu_cap)?;
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
                 (None, Vec::new(), Vec::new(), Some(plan))
             } else {
-                if llc_cap.is_some() {
+                if cpu_cap.is_some() {
                     anyhow::bail!(
-                        "--llc-cap set but host LLC topology unreadable from \
+                        "--cpu-cap set but host LLC topology unreadable from \
                          sysfs — cannot enforce the resource budget. Run on a \
                          host with /sys/devices/system/cpu populated, or drop \
-                         --llc-cap to run without enforcement."
+                         --cpu-cap to run without enforcement."
                     );
                 }
                 tracing::warn!(
                     "no-perf-mode: could not read host LLC topology from sysfs; \
-                     skipping all-LLC LOCK_SH acquisition. Concurrent perf-mode \
+                     skipping CPU-budget LLC reservation. Concurrent perf-mode \
                      runs on this host will NOT be serialized against this VM"
                 );
                 (None, Vec::new(), Vec::new(), None)

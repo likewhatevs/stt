@@ -205,11 +205,11 @@ each LLC group and checks the total (plus service CPU) fits within
 the host's online CPUs. If validation fails, the build returns an
 error (tests skip with `ResourceContention`).
 
-## Four-way mode tier
+## Three-way mode tier
 
-ktstr's host-side resource coordination has four effective tiers,
+ktstr's host-side resource coordination has three effective tiers,
 selected by the combination of `performance_mode`,
-`--no-perf-mode`/`KTSTR_NO_PERF_MODE`, and `--llc-cap`/`KTSTR_LLC_CAP`:
+`--no-perf-mode`/`KTSTR_NO_PERF_MODE`, and `--cpu-cap`/`KTSTR_CPU_CAP`:
 
 ### Tier 1: performance mode (full isolation)
 
@@ -225,54 +225,54 @@ isolation feature listed under "What it does": vCPU pinning via
 scheduling, and (x86_64) PAUSE/HLT exit suppression +
 KVM_HINTS_REALTIME CPUID.
 
-### Tier 2: no-perf-mode (unreserved)
+### Tier 2: no-perf-mode with CPU-cap reservation
 
-Enabled by `--no-perf-mode` / `KTSTR_NO_PERF_MODE=1`. Acquires a
-`LOCK_SH` reservation across every host LLC (the pre-flag default for
-this mode) and does no isolation work. Multiple no-perf-mode VMs
-coexist on the same LLCs because shared locks are reentrant, but a
-concurrent perf-mode VM attempting `LOCK_EX` on any of those LLCs
-blocks until every no-perf-mode peer has released. No pinning, no
-hugepages, no mbind, no RT promotion, no KVM exit suppression.
+Enabled by `--no-perf-mode` / `KTSTR_NO_PERF_MODE=1`. Every
+no-perf-mode VM goes through `acquire_llc_plan`: the reservation
+is `LOCK_SH` across a NUMA-aware, consolidation-aware set of
+LLCs, sized to meet the CPU budget — either `--cpu-cap N` (or
+`KTSTR_CPU_CAP=N`) if set, or 30% of the calling process's
+sched_getaffinity cpuset (minimum 1) if not. The flock granularity
+stays per-LLC; `plan.cpus` holds EXACTLY the budget (partial-take
+on the last LLC when the budget falls mid-LLC). Multiple
+no-perf-mode VMs coexist on the same LLCs because shared locks
+are reentrant; a concurrent perf-mode VM attempting `LOCK_EX`
+blocks until every no-perf-mode peer has released.
 
-### Tier 3: no-perf-mode with `--llc-cap N` (resource budget)
+Enforcement under `--cpu-cap`:
 
-Enabled by passing `--llc-cap N` (or `KTSTR_LLC_CAP=N`) alongside
-`--no-perf-mode`. The reservation is still `LOCK_SH`, but now
-constrained to a NUMA-aware, consolidation-aware subset of `N` LLCs
-(selected by [`acquire_llc_plan`]). Additional enforcement:
-
-- **cgroup v2 cpuset sandbox** -- the reserved CPUs and derived NUMA
+- **cgroup v2 cpuset sandbox** — the reserved CPUs and derived NUMA
   nodes are written to a child cgroup's `cpuset.cpus` and
   `cpuset.mems`, and the build pid is migrated into that cgroup, so
-  `make -jN` gcc children inherit the binding. Under `--llc-cap`,
-  narrowing by a parent cgroup is a fatal error; without the flag the
-  earlier tiers warn and proceed.
-- **Soft-mask affinity** -- vCPU threads receive a
+  `make -jN` gcc children inherit the binding. Under `--cpu-cap`,
+  narrowing by a parent cgroup is a fatal error; without the flag
+  (but with `acquire_llc_plan` still running on the 30% default)
+  the sandbox warns and proceeds.
+- **Soft-mask affinity** — vCPU threads receive a
   `sched_setaffinity` mask covering only the reserved CPUs, so the
-  guest's CPU placement respects the cap even though no pinning is
+  guest's CPU placement respects the budget even though no pinning is
   applied.
 - **No RT scheduling, no hugepages, no mbind, no KVM exit
-  suppression** -- these remain off; `--llc-cap` is not a partial
+  suppression** — these remain off; `--cpu-cap` is not a partial
   performance mode.
-- **`make -jN` hint** -- kernel-build pipelines pass `plan.cpus.len()`
+- **`make -jN` hint** — kernel-build pipelines pass `plan.cpus.len()`
   to `make` so gcc's fan-out matches the reserved capacity rather
   than `nproc`.
 
 This tier is mutually exclusive with `performance_mode=true` (on
-the CLI, clap `requires = "no_perf_mode"` rejects `--llc-cap`
+the CLI, clap `requires = "no_perf_mode"` rejects `--cpu-cap`
 without `--no-perf-mode` at parse time) and with
 `KTSTR_BYPASS_LLC_LOCKS=1` (rejected at every entry point because
 the contract and the bypass escape hatch are contradictory).
 Library consumers that set `performance_mode=true` on
-`KtstrVmBuilder` directly bypass the CLI parse — `KTSTR_LLC_CAP`
+`KtstrVmBuilder` directly bypass the CLI parse — `KTSTR_CPU_CAP`
 is silently ignored in that path because the builder's perf-mode
-branch never consults `LlcCap::resolve`.
+branch never consults `CpuCap::resolve`.
 
-See [Resource Budget](resource-budget.md) for the `LlcCap`,
+See [Resource Budget](resource-budget.md) for the `CpuCap`,
 `LlcPlan`, and `ktstr locks` surfaces in detail.
 
-### Tier 4: default (per-CPU window + LLC LOCK_SH)
+### Tier 3: default (per-CPU window + LLC LOCK_SH)
 
 Selected when neither `performance_mode=true` nor
 `--no-perf-mode`/`KTSTR_NO_PERF_MODE` is set — the default path
@@ -288,45 +288,43 @@ is purely for host-scheduling-noise avoidance between concurrent
 VMs.
 
 This is the ONLY tier that actually flocks per-CPU lockfiles.
-Tier 1 skips them (LLC EX already covers all CPUs in the group),
-tier 2 skips them (all-LLC SH does not need CPU-granularity
-reservation), and tier 3 skips them (capped LLC SH is enforced
-via the cgroup cpuset, not per-CPU flocks).
+Tier 1 skips them (LLC EX already covers all CPUs in the group);
+tier 2 skips them (capped LLC SH is enforced via the cgroup
+cpuset and the flock is sufficient per-LLC coordination).
 
 ## Disabling performance mode
 
 `--no-perf-mode` (or `KTSTR_NO_PERF_MODE=1`) forces
-`performance_mode=false`. The result is **tier 2 or tier 3 above**,
-depending on whether `--llc-cap` is also set. The feature differences
+`performance_mode=false`. The result is **tier 2 above** — a
+CPU-capped `LOCK_SH` reservation (either explicit `--cpu-cap N`
+or the 30%-of-allowed default). The feature differences
 relative to tier 1 are:
 
-- **LLC flock mode** -- tier 1 holds `LOCK_EX` on each reserved LLC;
-  tiers 2 and 3 hold `LOCK_SH`. Multiple shared holders coexist; an
+- **LLC flock mode** — tier 1 holds `LOCK_EX` on each reserved LLC;
+  tier 2 holds `LOCK_SH`. Multiple shared holders coexist; an
   exclusive holder blocks every shared acquirer and vice-versa.
-- **Per-CPU flocks** -- tier 1 relies on LLC-level `LOCK_EX` for
+- **Per-CPU flocks** — tier 1 relies on LLC-level `LOCK_EX` for
   exclusivity; per-CPU `/tmp/ktstr-cpu-{C}.lock` files are skipped
   (`try_acquire_all` in `vmm/host_topology.rs` short-circuits the
   per-CPU loop when `LlcLockMode == Exclusive` because the LLC
-  lock already covers every CPU in the group). Tiers 2 and 3 do
-  not touch per-CPU locks either. The default-mode path (tier 4
-  below) is the only one that flocks `/tmp/ktstr-cpu-{C}.lock`.
-- **vCPU pinning** -- tier 1 pins via `sched_setaffinity` to the
-  reserved LLC's CPUs. Tier 3 applies soft-mask affinity (cap-scoped
-  but no 1:1 vCPU-to-CPU binding). Tier 2 applies no affinity.
-- **RT scheduling** -- tier 1 only; tiers 2 and 3 run vCPU threads at
+  lock already covers every CPU in the group). Tier 2 also skips
+  them — the cgroup cpuset is the enforcement layer.
+- **vCPU pinning** — tier 1 pins via `sched_setaffinity` to the
+  reserved LLC's CPUs. Tier 2 applies soft-mask affinity
+  (budget-scoped but no 1:1 vCPU-to-CPU binding).
+- **RT scheduling** — tier 1 only; tier 2 runs vCPU threads at
   normal priority.
-- **Hugepages** -- tier 1 only; tiers 2 and 3 use regular pages.
-- **NUMA mbind** -- tier 1 only; tier 3 instead writes `cpuset.mems`
+- **Hugepages** — tier 1 only; tier 2 uses regular pages.
+- **NUMA mbind** — tier 1 only; tier 2 instead writes `cpuset.mems`
   on its child cgroup to achieve NUMA locality at the cgroup layer.
-- **KVM exit suppression** (x86_64) -- tier 1 only; tiers 2 and 3
-  leave PAUSE and HLT exits enabled.
-- **KVM_HINTS_REALTIME CPUID** (x86_64) -- tier 1 only; tiers 2 and
-  3 leave the guest on PV spinlocks and standard cpuidle.
+- **KVM exit suppression** (x86_64) — tier 1 only; tier 2 leaves
+  PAUSE and HLT exits enabled.
+- **KVM_HINTS_REALTIME CPUID** (x86_64) — tier 1 only; tier 2 leaves
+  the guest on PV spinlocks and standard cpuidle.
 
-Use tier 2 on shared CI runners or unprivileged containers where any
-LLC reservation is unacceptable. Use tier 3 on multi-tenant hosts
-where you want bounded concurrency (at most `N` concurrent builds per
-host) but cannot afford the full perf-mode contract. Use tier 1 for
+Use tier 2 on multi-tenant hosts where you want bounded concurrency
+(at most `N` concurrent builds or no-perf-mode VMs per host) but
+cannot afford the full perf-mode contract. Use tier 1 for
 regression measurement where host jitter must be controlled.
 
 Available via:
@@ -339,7 +337,8 @@ Available via:
 - `cargo ktstr shell --no-perf-mode`
 - `KTSTR_NO_PERF_MODE=1` (any value; presence is sufficient)
 
-`--llc-cap N` layers on top of any of the above. The env var is read
-by every VM builder call site (test harness, auto-repro, verifier,
-shell). The CLI flags set the env var before test execution so
-library consumers inherit it.
+`--cpu-cap N` layers on top of any of the above when present;
+when absent, the 30%-of-allowed default applies automatically.
+The env var is read by every VM builder call site (test harness,
+auto-repro, verifier, shell). The CLI flags set the env var
+before test execution so library consumers inherit it.

@@ -231,28 +231,33 @@ pub enum PayloadKind {
     /// [`Scheduler`](crate::test_support::Scheduler)'s `config_file`
     /// field get automatic packaging: the config file is placed at
     /// `/include-files/{filename}` without a `-i` flag — the field
-    /// is the source the harness reads. Binary-kind payloads get
-    /// no auto-derivation from the `PayloadKind::Binary(name)` they
-    /// carry — that `name` is the spawn target only. Host binaries
-    /// and fixtures a binary-kind payload needs in the guest must
-    /// be declared explicitly via
-    /// [`Payload::include_files`](Payload::include_files) on
-    /// `#[derive(Payload)]` or
-    /// [`extra_include_files`](crate::test_support::KtstrTestEntry::extra_include_files)
-    /// on `#[ktstr_test]`; the packaging mechanism is the same
-    /// declarative pipeline, but the input is a separate explicit
-    /// list rather than the binary name.
+    /// is the source the harness reads.
     ///
-    /// **If a Binary-kind payload's spawn target is a host binary
-    /// that should be packaged into the guest, that binary's name
-    /// MUST also appear in the payload's `include_files`.** The
+    /// # Binary-kind packaging
+    ///
+    /// Payloads built via `#[derive(Payload)]` get automatic binary
+    /// packaging: the derive macro prepends the `binary = "..."`
+    /// spec to the emitted `include_files` slice, so the spawn
+    /// target is packaged into the guest without requiring a
+    /// separate `#[include_files("...")]` entry. Auxiliary files
+    /// the payload needs (helpers, config files, fixtures) still
+    /// go on `#[include_files(...)]` — the derive only injects the
+    /// primary binary.
+    ///
+    /// Payloads constructed manually via struct literal (rather
+    /// than the derive) do not get this auto-injection: the
     /// harness does not derive `include_files` from the
-    /// `PayloadKind::Binary(name)`; a binary referenced at spawn
-    /// time but not listed as an include is expected to already
-    /// be present in the guest filesystem (e.g. a standard
-    /// `busybox` applet on the base image). Forgetting the
-    /// include-entry surfaces as an `ENOENT` at `exec` time inside
-    /// the guest.
+    /// `PayloadKind::Binary(name)` at aggregation time. Manual
+    /// constructions must list the binary in
+    /// [`Payload::include_files`](Payload::include_files)
+    /// themselves, or declare it on
+    /// [`extra_include_files`](crate::test_support::KtstrTestEntry::extra_include_files)
+    /// at the `#[ktstr_test]` level. A binary referenced at spawn
+    /// time but neither auto-injected nor listed as an include is
+    /// expected to already be present in the guest filesystem
+    /// (e.g. a standard `busybox` applet on the base image);
+    /// otherwise the omission surfaces as `ENOENT` at `exec` time
+    /// inside the guest.
     ///
     /// # Fork / kill semantics
     ///

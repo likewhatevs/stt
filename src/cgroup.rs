@@ -158,7 +158,7 @@ impl CgroupManager {
     /// peer holding the subtree) via [`anyhow_first_io_errno`] and
     /// map them to operator-facing degrade variants. Used by
     /// [`crate::vmm::cgroup_sandbox::BuildSandbox::try_create`] under
-    /// the `--llc-cap` hard-error contract.
+    /// the `--cpu-cap` hard-error contract.
     pub fn add_parent_subtree_controller(&self, controller: &str) -> Result<()> {
         let p = self.parent.join("cgroup.subtree_control");
         if !p.exists() {
@@ -225,7 +225,7 @@ impl CgroupManager {
     /// Shape mirrors [`set_cpuset`] exactly — [`TestTopology::cpuset_string`]
     /// range-compact-formats the node set, [`write_with_timeout`] bounds
     /// the filesystem-write at 2s. Used by `BuildSandbox` under the
-    /// `--llc-cap` flow to bind build memory to the NUMA nodes hosting
+    /// `--cpu-cap` flow to bind build memory to the NUMA nodes hosting
     /// the locked LLCs, avoiding cross-socket DRAM latency for gcc's
     /// symbol tables and linker working sets.
     ///

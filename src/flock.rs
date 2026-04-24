@@ -39,7 +39,7 @@
 //! /proc/locks line — a naive `read_holders()` would silently return
 //! empty on every btrfs-backed `/tmp`, every overlay-rootfs
 //! container, and every bind-mounted /tmp, which is a silent
-//! correctness failure for `--llc-cap` contention diagnostics and
+//! correctness failure for `--cpu-cap` contention diagnostics and
 //! the `ktstr locks` observational command.
 //!
 //! Two needle producers, one format:

@@ -331,35 +331,35 @@ fn kernel_list_json() {
         .stdout(predicate::str::contains("entries"));
 }
 
-// -- --llc-cap vs KTSTR_BYPASS_LLC_LOCKS conflict — cargo-ktstr sites --
+// -- --cpu-cap vs KTSTR_BYPASS_LLC_LOCKS conflict — cargo-ktstr sites --
 //
-// Pins the parse-time rejection when both the --llc-cap resource
+// Pins the parse-time rejection when both the --cpu-cap resource
 // contract and the KTSTR_BYPASS_LLC_LOCKS=1 escape hatch are
 // active simultaneously. Both sites (cargo-ktstr shell and
 // cargo-ktstr kernel build) must bail with "resource contract" in
 // the error text so the operator sees the contradiction before a
 // pipeline deep-bail.
 
-/// `cargo ktstr shell --no-perf-mode --llc-cap N` under
+/// `cargo ktstr shell --no-perf-mode --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with the "resource contract"
 /// substring. Pins the rejection at bin/cargo-ktstr.rs:851.
 #[test]
-fn cargo_ktstr_shell_llc_cap_with_bypass_errors() {
+fn cargo_ktstr_shell_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     cargo_ktstr()
         .env("KTSTR_CACHE_DIR", tmp.path())
         .env("KTSTR_BYPASS_LLC_LOCKS", "1")
-        .args(["shell", "--no-perf-mode", "--llc-cap", "2"])
+        .args(["shell", "--no-perf-mode", "--cpu-cap", "2"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("resource contract"));
 }
 
-/// `cargo ktstr kernel build --llc-cap N` under
+/// `cargo ktstr kernel build --cpu-cap N` under
 /// KTSTR_BYPASS_LLC_LOCKS=1 must fail with the "resource contract"
 /// substring. Pins the rejection at bin/cargo-ktstr.rs:729.
 #[test]
-fn cargo_ktstr_kernel_build_llc_cap_with_bypass_errors() {
+fn cargo_ktstr_kernel_build_cpu_cap_with_bypass_errors() {
     let tmp = tempfile::TempDir::new().unwrap();
     // Pass a clearly-nonexistent --source so if the conflict check
     // were somehow skipped, we'd get a source-acquire failure (not
@@ -371,8 +371,8 @@ fn cargo_ktstr_kernel_build_llc_cap_with_bypass_errors() {
             "kernel",
             "build",
             "--source",
-            "/nonexistent/ktstr-cargo-ktstr-llc-cap-bypass-test",
-            "--llc-cap",
+            "/nonexistent/ktstr-cargo-ktstr-cpu-cap-bypass-test",
+            "--cpu-cap",
             "2",
         ])
         .assert()

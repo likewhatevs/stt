@@ -1697,7 +1697,11 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
 ///
 /// - `binary = "..."` — the binary name resolved by the guest's
 ///   include-files infrastructure (required). Becomes
-///   [`PayloadKind::Binary(name)`](ktstr::test_support::PayloadKind::Binary).
+///   [`PayloadKind::Binary(name)`](ktstr::test_support::PayloadKind::Binary),
+///   and is also auto-prepended to the emitted `include_files` slice
+///   so the binary is packaged into the initramfs without needing a
+///   separate `#[include_files("...")]` entry. Extra auxiliary files
+///   (helpers, configs, fixtures) still go on `#[include_files(...)]`.
 ///
 /// # Optional struct-level attributes
 ///
@@ -1729,6 +1733,14 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
 /// - `#[metric(name = "...", polarity = ..., unit = "...")]` —
 ///   kwarg form. `polarity` is one of `HigherBetter`, `LowerBetter`,
 ///   `TargetValue(f64)`, `Unknown`. May repeat; entries accumulate.
+/// - `#[include_files("helper", "config.json", ...)]` — variadic
+///   string literals appended to the emitted `include_files` slice
+///   after the auto-injected binary entry. Each entry passes through
+///   the same resolver used by the CLI `-i` flag (bare names search
+///   host `PATH`; explicit paths must exist; directories are walked).
+///   The primary binary is already packaged automatically, so this
+///   attribute is only needed for auxiliary files the payload
+///   depends on.
 ///
 /// # Const name derivation
 ///
@@ -1929,6 +1941,18 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
         ));
     }
     let const_name = format_ident!("{}", camel_to_screaming_snake(base));
+
+    // Auto-inject the `binary` spec as the first entry in the emitted
+    // `include_files` slice so `#[payload(binary = "X")]` alone is
+    // enough to package `X` into the initramfs — no separate
+    // `#[include_files("X")]` required. The runtime's
+    // `dedupe_include_files` canonicalizes host paths, so a user who
+    // also writes `#[include_files("X")]` (or lists the same binary
+    // on `#[ktstr_test(extra_include_files = [..])]`) still works:
+    // the duplicate collapses silently. User-declared entries follow
+    // in source order — preserving the existing first-declared-wins
+    // behavior within the user's own list.
+    include_files.insert(0, binary.clone());
 
     let expanded = quote! {
         #struct_vis const #const_name: ::ktstr::test_support::Payload =

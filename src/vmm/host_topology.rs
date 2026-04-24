@@ -48,7 +48,7 @@ pub struct HostTopology {
     pub cpu_to_node: std::collections::HashMap<usize, usize>,
     /// LLC indices grouped by their NUMA node. Memoized at construction
     /// time from `llc_groups + cpu_to_node` so repeated NUMA-aware
-    /// placement queries (perf-mode rotation, `--llc-cap` consolidation
+    /// placement queries (perf-mode rotation, `--cpu-cap` consolidation
     /// PLAN) don't re-walk every LLC's CPU list on every call. Access
     /// via [`HostTopology::host_llcs_by_numa_node`]. `BTreeMap` (not
     /// `HashMap`) for deterministic iteration order — two ktstr
@@ -198,7 +198,7 @@ impl HostTopology {
     // ------------------------------------------------------------------
     //
     // Used by the existing perf-mode pinning path
-    // ([`numa_aware_llc_order`]) AND the `--llc-cap` consolidation
+    // ([`numa_aware_llc_order`]) AND the `--cpu-cap` consolidation
     // PLAN phase. Both callers implement DIFFERENT selection algorithms
     // on top of these queries:
     //
@@ -446,7 +446,7 @@ impl HostTopology {
     ///
     /// Implementation composes [`host_llcs_by_numa_node`] +
     /// [`numa_nodes_with_capacity`] — the same group-by-node + eligibility
-    /// queries the `--llc-cap` consolidation PLAN phase uses. The two
+    /// queries the `--cpu-cap` consolidation PLAN phase uses. The two
     /// callers' SELECTION algorithms differ (perf-mode does modulo
     /// rotation of guest onto host nodes; consolidation does
     /// score-driven greedy expansion), but the underlying topology
@@ -745,77 +745,153 @@ pub fn acquire_cpu_locks(
 }
 
 // ===========================================================================
-// --llc-cap PLAN pipeline — LlcCap / LlcSnapshot / LlcPlan + discover/plan/acquire
+// --cpu-cap PLAN pipeline — CpuCap / LlcSnapshot / LlcPlan + discover/plan/acquire
 // ===========================================================================
 //
 // Entry point [`acquire_llc_plan`] is the single non-perf-mode
 // reservation path: kernel builds and no-perf-mode VMs both call it
-// with or without `--llc-cap N`. When `llc_cap` is `None`, the
-// algorithm degenerates to "select every LLC", delivering the same
-// host-wide `LOCK_SH` reservation the earlier
-// `acquire_all_llc_shared_locks` helper used to provide.
+// with or without `--cpu-cap N`. `--cpu-cap` is a CPU-count budget:
+// the planner reserves exactly N host CPUs by walking whole LLCs in
+// contention- / NUMA-aware order and partial-taking the last LLC
+// so `plan.cpus.len() == N`. The flock is per-LLC even when the
+// last LLC is only partially used — coordination with concurrent
+// ktstr peers is unchanged at LLC granularity. When `--cpu-cap`
+// is absent the planner defaults to 30% of the calling process's
+// sched_getaffinity cpuset (see [`default_cpu_budget`] and
+// [`host_allowed_cpus`]) — not 30% of the host's online CPU count,
+// because a CI runner whose parent cgroup pins ktstr to a 4-CPU
+// subset must plan within THAT subset or sched_setaffinity on the
+// resulting mask produces an empty effective set.
 // Perf-mode never reaches this path; it stays on
 // [`acquire_resource_locks`] for its `LOCK_EX` reservation contract.
 //
 // The pipeline has three phases: discover (snapshot holders per
-// LLC), plan (NUMA-aware, consolidation-aware selection), acquire
-// (non-blocking `LOCK_SH` on each selected LLC). One TOCTOU retry
-// absorbs the window between the discover snapshot and the
-// non-blocking acquire; the second discover's /proc/locks read IS
-// the backoff, so no sleep is needed between attempts.
+// LLC), plan (NUMA-aware, consolidation-aware selection, filtered
+// to the process's allowed cpuset), acquire (non-blocking `LOCK_SH`
+// on each selected LLC). One TOCTOU retry absorbs the window between
+// the discover snapshot and the non-blocking acquire; the second
+// discover's /proc/locks read IS the backoff, so no sleep is needed
+// between attempts.
 
-/// Parsed `--llc-cap N` value. Bounded to `1..=usize::MAX` at the
-/// constructor — a cap of 0 is nonsensical (reserving zero LLCs is
-/// just "don't run") and rejected upstream by the CLI layer, but we
-/// enforce the bound in the type system via [`NonZeroUsize`] so
-/// callers can `LlcCap::new(...)?` without a follow-up bounds check.
+/// Return the CPUs the calling process is allowed to run on, per
+/// `sched_getaffinity(2)` with a `/proc/self/status` Cpus_allowed_list
+/// fallback. Every consumer of the `--cpu-cap` pipeline plans against
+/// this set instead of `HostTopology::online_cpus` so
+/// `sched_setaffinity` on the plan's CPU list never produces an empty
+/// effective mask under a cgroup-restricted runner (CI hosts, systemd
+/// slices, sudo -u under a limited cpuset).
 ///
-/// The runtime upper bound — "don't exceed the host's total LLC
-/// count" — is enforced at acquire time via
-/// [`LlcCap::effective_count`] because `host_llcs` is not known until
-/// [`HostTopology::from_sysfs`] resolves.
+/// Returns an empty vec only when BOTH the syscall AND procfs fail —
+/// a pathological host that can't enumerate its own affinity. Callers
+/// treat that as a bail reason, not a fallback "every CPU" permission:
+/// guessing on a misconfigured host is worse than failing visibly.
+///
+/// Tests override the return value via [`ALLOWED_CPUS_OVERRIDE`] so
+/// the 30% default and allowed-cpu filtering are deterministic in
+/// unit tests regardless of the CI runner's real cpuset.
+pub(crate) fn host_allowed_cpus() -> Vec<usize> {
+    #[cfg(test)]
+    {
+        if let Some(override_set) = ALLOWED_CPUS_OVERRIDE.with(|p| p.borrow().clone()) {
+            return override_set;
+        }
+    }
+    if let Some(cpus) = crate::host_state::read_affinity(0) {
+        return cpus.into_iter().map(|c| c as usize).collect();
+    }
+    if let Ok(raw) = std::fs::read_to_string("/proc/self/status") {
+        for line in raw.lines() {
+            if let Some(v) = line.strip_prefix("Cpus_allowed_list:")
+                && let Some(parsed) = crate::host_state::parse_cpu_list(v.trim())
+            {
+                return parsed.into_iter().map(|c| c as usize).collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for [`host_allowed_cpus`]. Set via
+    /// [`AllowedCpusGuard`] to make 30%-of-allowed calculations and
+    /// plan filtering deterministic in unit tests. Mirrors the
+    /// [`LLC_LOCK_PREFIX_OVERRIDE`] pattern.
+    pub(crate) static ALLOWED_CPUS_OVERRIDE: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Default CPU budget when `--cpu-cap` is not set: 30% of the
+/// allowed-CPU count, rounded up, with a min-1 floor for small or
+/// degenerate hosts. 30% leaves enough headroom for concurrent peers
+/// (tests, builds) while still reserving a non-trivial slice; the
+/// min-1 floor prevents returning 0 on a 1- or 2-CPU host, where
+/// ceil(×0.30) ≥ 1 anyway — the `.max(1)` is defense in depth for
+/// future ratio tweaks.
+fn default_cpu_budget(allowed_cpus: usize) -> usize {
+    allowed_cpus.saturating_mul(30).div_ceil(100).max(1)
+}
+
+/// Parsed `--cpu-cap N` value. N is a CPU count: the planner reserves
+/// exactly N host CPUs by walking whole LLCs in contention- /
+/// NUMA-aware order (filtered to the calling process's allowed
+/// cpuset) and partial-taking the last LLC so `plan.cpus.len() == N`.
+/// The flock set is still per-LLC (the last LLC is flocked whole
+/// even when only a prefix of its CPUs enters `plan.cpus`).
+/// Bounded to `1..=usize::MAX` at the constructor — a cap of 0 is
+/// nonsensical (reserving zero CPUs is just "don't run") and
+/// rejected upstream by the CLI layer, but we enforce the bound in
+/// the type system via [`NonZeroUsize`] so callers can
+/// `CpuCap::new(...)?` without a follow-up bounds check.
+///
+/// The runtime upper bound — "don't exceed the process's allowed
+/// CPU count" — is enforced at acquire time via
+/// [`CpuCap::effective_count`] because the allowed set is not known
+/// until [`host_allowed_cpus`] reads `sched_getaffinity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LlcCap {
+pub struct CpuCap {
     n: std::num::NonZeroUsize,
 }
 
-impl LlcCap {
-    /// Construct from a raw `usize`. Returns `Err` on `0`; `usize::MAX`
-    /// is accepted here and clamped later by [`effective_count`].
+impl CpuCap {
+    /// Construct from a raw `usize` CPU count. Returns `Err` on `0`;
+    /// `usize::MAX` is accepted here and clamped later by
+    /// [`effective_count`].
     pub fn new(n: usize) -> Result<Self> {
         std::num::NonZeroUsize::new(n)
-            .map(|n| LlcCap { n })
-            .ok_or_else(|| anyhow::anyhow!("--llc-cap must be ≥ 1 (got 0)"))
+            .map(|n| CpuCap { n })
+            .ok_or_else(|| anyhow::anyhow!("--cpu-cap must be ≥ 1 CPU (got 0)"))
     }
 
     /// Three-tier resolution: explicit CLI flag wins over env var,
     /// which wins over "not set". Returns `None` when neither is
-    /// present, meaning "lock every LLC on the host" (the pre-flag
-    /// default).
+    /// present, meaning "use the 30% default of the allowed CPU set"
+    /// (see [`default_cpu_budget`]).
     ///
-    /// Env var is `KTSTR_LLC_CAP` (integer ≥ 1). An empty or unset
-    /// env var is treated as absent; a non-numeric value OR the
-    /// numeric value `0` is an error — `KTSTR_LLC_CAP=0` flows
-    /// through `LlcCap::new(0)` which rejects with "--llc-cap must
-    /// be ≥ 1 (got 0)". Zero is not a silent fallback to "no cap";
-    /// it surfaces as a parse-time error so typos and scripting
-    /// mistakes don't accidentally disable the resource contract.
-    pub fn resolve(cli_flag: Option<usize>) -> Result<Option<LlcCap>> {
+    /// Env var is `KTSTR_CPU_CAP` (integer ≥ 1, CPU count). An empty
+    /// or unset env var is treated as absent; a non-numeric value
+    /// OR the numeric value `0` is an error — `KTSTR_CPU_CAP=0`
+    /// flows through `CpuCap::new(0)` which rejects with "--cpu-cap
+    /// must be ≥ 1 CPU (got 0)". Zero is not a silent fallback to
+    /// "no cap"; it surfaces as a parse-time error so typos and
+    /// scripting mistakes don't accidentally disable the resource
+    /// contract.
+    pub fn resolve(cli_flag: Option<usize>) -> Result<Option<CpuCap>> {
         if let Some(n) = cli_flag {
-            return Ok(Some(LlcCap::new(n)?));
+            return Ok(Some(CpuCap::new(n)?));
         }
-        match std::env::var("KTSTR_LLC_CAP") {
+        match std::env::var("KTSTR_CPU_CAP") {
             Ok(s) if s.is_empty() => Ok(None),
             Ok(s) => {
                 let n: usize = s
                     .parse()
-                    .with_context(|| format!("KTSTR_LLC_CAP is not a valid integer: {s:?}"))?;
-                Ok(Some(LlcCap::new(n)?))
+                    .with_context(|| format!("KTSTR_CPU_CAP is not a valid integer: {s:?}"))?;
+                Ok(Some(CpuCap::new(n)?))
             }
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(std::env::VarError::NotUnicode(raw)) => {
                 anyhow::bail!(
-                    "KTSTR_LLC_CAP contains non-UTF-8 bytes ({} bytes): {raw:?}. \
+                    "KTSTR_CPU_CAP contains non-UTF-8 bytes ({} bytes): {raw:?}. \
                      Set an integer value or unset.",
                     raw.len(),
                 )
@@ -824,20 +900,22 @@ impl LlcCap {
     }
 
     /// Runtime-bounded cap: returns the inner count unless it exceeds
-    /// `host_llcs`, in which case a [`ResourceContention`] error
-    /// steers the caller toward an actionable message. This check
-    /// lives at acquire time — not at construction — because the
-    /// host's LLC count is only known after
-    /// [`HostTopology::from_sysfs`] resolves.
-    pub fn effective_count(&self, host_llcs: usize) -> Result<usize> {
+    /// `allowed_cpus` (the calling process's sched_getaffinity cpuset
+    /// count), in which case a [`ResourceContention`] error steers
+    /// the caller toward an actionable message. This check lives at
+    /// acquire time — not at construction — because the allowed set
+    /// is not known until [`host_allowed_cpus`] reads the syscall.
+    pub fn effective_count(&self, allowed_cpus: usize) -> Result<usize> {
         let n = self.n.get();
-        if n > host_llcs {
+        if n > allowed_cpus {
             return Err(anyhow::Error::new(ResourceContention {
                 reason: format!(
-                    "--llc-cap N = {n} exceeds this host's {host_llcs} LLCs. \
-                     Pick an LLC cap ≤ {host_llcs} — run `ktstr topo` for \
-                     the full layout or `ktstr locks --json` to see current \
-                     usage — or omit --llc-cap to lock all LLCs."
+                    "--cpu-cap N = {n} exceeds the {allowed_cpus} CPUs this \
+                     process is allowed on (from sched_getaffinity / \
+                     Cpus_allowed_list). Pick a cap ≤ {allowed_cpus}, release \
+                     the cgroup/taskset constraint restricting this process, \
+                     or omit --cpu-cap to use the 30% default of the allowed \
+                     set."
                 ),
             }));
         }
@@ -886,8 +964,9 @@ pub struct LlcPlan {
     /// same ordering and converge on the same one-wins-the-others-retry
     /// livelock-proof sequence.
     pub locked_llcs: Vec<usize>,
-    /// Flattened host CPU list (every CPU belonging to any locked
-    /// LLC). Preserves LLC ordering: CPUs from `locked_llcs[0]` come
+    /// Flattened host CPU list, sized exactly `target_cpus`. The last
+    /// locked LLC may contribute only a prefix of its allowed CPUs.
+    /// Preserves LLC ordering: CPUs from `locked_llcs[0]` come
     /// before CPUs from `locked_llcs[1]`, etc.
     pub cpus: Vec<usize>,
     /// Union of NUMA nodes hosting the locked LLCs. When the plan
@@ -970,35 +1049,77 @@ fn discover_llc_snapshots(topo: &HostTopology, mountinfo: &str) -> Result<Vec<Ll
 ///   3. LLC index ASC — tiebreak + final ACQUIRE ordering for livelock
 ///      safety.
 ///
+/// `target_cpus` is the exact number of allowed CPUs the plan
+/// reserves. The walk selects whole LLCs (filtered to their
+/// allowed-CPU overlap) until the accumulated contribution meets
+/// the budget. The LAST selected LLC may contribute more allowed
+/// CPUs than the remaining budget needs; the materialization layer
+/// at [`acquire_llc_plan_with_acquire_fn`] takes only the needed
+/// prefix of that LLC's allowed CPUs into `plan.cpus`. The flock
+/// is always held at LLC granularity — coordination with concurrent
+/// ktstr peers happens per-LLC, regardless of how many of the LLC's
+/// CPUs are consumed here. LLCs whose CPUs are all outside
+/// `allowed` are skipped entirely — locking one would never
+/// contribute a schedulable CPU to `plan.cpus`.
+///
 /// Distance fallback: callers without a distance matrix pass a closure
 /// that returns `10` for equal nodes and `20` otherwise — primitive 3
 /// keeps the spill order reasonable even on hosts whose
 /// `/sys/devices/system/node/*/distance` is unavailable.
 fn plan_from_snapshots(
     snapshots: &[LlcSnapshot],
-    target: usize,
+    target_cpus: usize,
     topo: &HostTopology,
+    allowed: &std::collections::BTreeSet<usize>,
     distance_fn: impl Fn(usize, usize) -> u8,
 ) -> Vec<usize> {
-    if target == 0 {
+    if target_cpus == 0 {
         return Vec::new();
     }
-    if target >= snapshots.len() {
-        // Selecting everything — skip the scoring pass and walk in
-        // ascending-index order. Matches the pre-flag default.
-        let mut all: Vec<usize> = (0..snapshots.len()).collect();
+
+    // Allowed-CPU count contributed by each LLC. An LLC with zero
+    // overlap contributes no schedulable CPUs to `plan.cpus`, so
+    // reserving it adds a useless flock and no planning value — drop
+    // those up front so every subsequent walk only considers
+    // candidates that can actually carry budget.
+    let llc_allowed_cpus = |idx: usize| -> usize {
+        topo.llc_groups[idx]
+            .cpus
+            .iter()
+            .filter(|c| allowed.contains(c))
+            .count()
+    };
+    let total_allowed_in_llcs: usize = (0..snapshots.len()).map(llc_allowed_cpus).sum();
+    if target_cpus >= total_allowed_in_llcs {
+        // Budget ≥ sum of per-LLC contributions: select every LLC
+        // that has at least one allowed CPU, in ascending order.
+        // Short-circuits the scoring walk when the cap degenerates
+        // to "reserve everything we can schedule on."
+        let mut all: Vec<usize> = (0..snapshots.len())
+            .filter(|&idx| llc_allowed_cpus(idx) > 0)
+            .collect();
         all.sort_unstable();
         return all;
     }
 
-    // Step a: partition + sort. Consolidation candidates first
-    // (holder_count DESC, llc_idx ASC); fresh candidates after, sorted
-    // by llc_idx ASC. A single composite sort would do the same work
-    // but the two-partition form is easier to read and lets future
-    // "prefer consolidation only if score ≥ threshold" tweaks slot in.
-    let mut consolidation: Vec<&LlcSnapshot> =
-        snapshots.iter().filter(|s| s.holder_count > 0).collect();
-    let mut fresh: Vec<&LlcSnapshot> = snapshots.iter().filter(|s| s.holder_count == 0).collect();
+    // Step a: partition + sort. Only LLCs with at least one allowed
+    // CPU are eligible — locking an out-of-cpuset LLC is useless.
+    // Consolidation candidates first (holder_count DESC, llc_idx ASC);
+    // fresh candidates after, sorted by llc_idx ASC. A single
+    // composite sort would do the same work but the two-partition
+    // form is easier to read and lets future "prefer consolidation
+    // only if score ≥ threshold" tweaks slot in.
+    let eligible = |s: &&LlcSnapshot| -> bool { llc_allowed_cpus(s.llc_idx) > 0 };
+    let mut consolidation: Vec<&LlcSnapshot> = snapshots
+        .iter()
+        .filter(|s| s.holder_count > 0)
+        .filter(eligible)
+        .collect();
+    let mut fresh: Vec<&LlcSnapshot> = snapshots
+        .iter()
+        .filter(|s| s.holder_count == 0)
+        .filter(eligible)
+        .collect();
     consolidation.sort_by(|a, b| {
         b.holder_count
             .cmp(&a.holder_count)
@@ -1006,9 +1127,15 @@ fn plan_from_snapshots(
     });
     fresh.sort_by_key(|s| s.llc_idx);
     let ranked: Vec<&LlcSnapshot> = consolidation.into_iter().chain(fresh).collect();
+    if ranked.is_empty() {
+        // No LLC on this host overlaps the caller's allowed cpuset.
+        // Bail upstream handles this as ResourceContention; here we
+        // just return empty so the caller can surface the diagnostic.
+        return Vec::new();
+    }
 
-    // Step b: seed. Highest-scored LLC; its NUMA node anchors the
-    // greedy expansion.
+    // Step b: seed. Highest-scored eligible LLC; its NUMA node
+    // anchors the greedy expansion.
     let seed = ranked[0];
     let seed_node = topo.llc_numa_node(seed.llc_idx);
 
@@ -1017,18 +1144,22 @@ fn plan_from_snapshots(
     // ordering; the per-node LLC lists come from primitive 1. Within
     // each node, we still honour the composite score by walking
     // `ranked` and skipping LLCs not on the current target node.
+    // Accumulation is by allowed-CPU contribution — an LLC with 4
+    // CPUs of which 2 are in `allowed` counts as 2 toward the
+    // budget and the other 2 never appear in `plan.cpus`.
     let node_order = topo.numa_nodes_sorted_by_distance(seed_node, distance_fn);
-    let mut selected: Vec<usize> = Vec::with_capacity(target);
+    let mut selected: Vec<usize> = Vec::new();
     let mut picked: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut accumulated: usize = 0;
     for node in node_order {
-        if selected.len() >= target {
+        if accumulated >= target_cpus {
             break;
         }
         // Ranked walk, taking every candidate on this node in
-        // score-order until we've filled `target` or exhausted the
-        // node.
+        // score-order until we've filled `target_cpus` or exhausted
+        // the node.
         for snap in &ranked {
-            if selected.len() >= target {
+            if accumulated >= target_cpus {
                 break;
             }
             if picked.contains(&snap.llc_idx) {
@@ -1039,6 +1170,7 @@ fn plan_from_snapshots(
             }
             selected.push(snap.llc_idx);
             picked.insert(snap.llc_idx);
+            accumulated += llc_allowed_cpus(snap.llc_idx);
         }
     }
 
@@ -1076,18 +1208,21 @@ fn try_acquire_llc_plan_locks(
     Ok(Some(locks))
 }
 
-/// Entry point for the `--llc-cap` PLAN pipeline.
+/// Entry point for the `--cpu-cap` PLAN pipeline.
 ///
 /// Runs DISCOVER → PLAN → ACQUIRE with at most one TOCTOU retry. On
 /// success returns an [`LlcPlan`] holding the selected LLCs, their
-/// flattened CPUs, the derived `mems` set, the diagnostic snapshot,
-/// and the RAII flock handles.
+/// flattened CPUs (intersected with the calling process's allowed
+/// cpuset), the derived `mems` set, the diagnostic snapshot, and the
+/// RAII flock handles.
 ///
-/// `llc_cap == None` means "lock every LLC", the host-wide `LOCK_SH`
-/// reservation that no-perf-mode VMs and kernel builds relied on
-/// before the flag landed. `llc_cap == Some(cap)` where
-/// `cap > total_llcs` errors at acquire time via
-/// [`LlcCap::effective_count`].
+/// `cpu_cap == None` means "reserve 30% of the allowed-CPU set" (see
+/// [`default_cpu_budget`]). `cpu_cap == Some(cap)` where
+/// `cap > allowed_cpus` errors at acquire time via
+/// [`CpuCap::effective_count`]. The allowed-CPU set comes from
+/// [`host_allowed_cpus`] — `sched_getaffinity(0)` with a procfs
+/// fallback — so plans are always schedulable under cgroup-restricted
+/// runners (CI hosts, systemd slices, sudo under a limited cpuset).
 ///
 /// Consolidation uses the host distance matrix from [`TestTopology`]
 /// so spill order matches actual NUMA cost. Hosts whose
@@ -1097,9 +1232,9 @@ fn try_acquire_llc_plan_locks(
 pub fn acquire_llc_plan(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
-    llc_cap: Option<LlcCap>,
+    cpu_cap: Option<CpuCap>,
 ) -> Result<LlcPlan> {
-    acquire_llc_plan_with_acquire_fn(topo, test_topo, llc_cap, try_acquire_llc_plan_locks)
+    acquire_llc_plan_with_acquire_fn(topo, test_topo, cpu_cap, try_acquire_llc_plan_locks)
 }
 
 /// Parameterized form of [`acquire_llc_plan`] that takes the
@@ -1124,22 +1259,44 @@ pub fn acquire_llc_plan(
 fn acquire_llc_plan_with_acquire_fn<F>(
     topo: &HostTopology,
     test_topo: &crate::topology::TestTopology,
-    llc_cap: Option<LlcCap>,
+    cpu_cap: Option<CpuCap>,
     mut acquire_fn: F,
 ) -> Result<LlcPlan>
 where
     F: FnMut(&[usize], &[LlcSnapshot]) -> Result<Option<Vec<std::os::fd::OwnedFd>>>,
 {
-    let total = topo.llc_groups.len();
-    let target = match llc_cap {
-        Some(cap) => cap.effective_count(total)?,
-        None => total,
+    // Resolve the calling process's allowed cpuset. Plans must fit
+    // inside this set — sched_setaffinity against a mask outside the
+    // process's cgroup cpuset either fails outright or produces an
+    // empty effective set (the vCPU thread then cannot run). Reading
+    // the syscall ONCE here and threading it through means every
+    // TOCTOU retry sees the same baseline; a cgroup change mid-plan
+    // is a host-reconfiguration event the retry budget does not
+    // attempt to absorb.
+    let allowed_vec = host_allowed_cpus();
+    if allowed_vec.is_empty() {
+        anyhow::bail!(
+            "acquire_llc_plan: could not determine the calling process's \
+             allowed CPU set (both sched_getaffinity and \
+             /proc/self/status Cpus_allowed_list failed). Cannot plan a \
+             reservation without knowing which CPUs are schedulable."
+        );
+    }
+    let allowed: std::collections::BTreeSet<usize> = allowed_vec.iter().copied().collect();
+    let allowed_cpus = allowed.len();
+
+    let target_cpus = match cpu_cap {
+        Some(cap) => cap.effective_count(allowed_cpus)?,
+        None => default_cpu_budget(allowed_cpus),
     };
-    if target == 0 {
-        // Zero-LLC host would have already failed upstream, but be
-        // explicit about the empty case rather than producing an
-        // LlcPlan with no locks.
-        anyhow::bail!("host has no LLC groups; --llc-cap has nothing to reserve");
+    if target_cpus == 0 {
+        // Defense in depth. `default_cpu_budget` has a `.max(1)`
+        // floor and `effective_count` on a `NonZeroUsize` cap can
+        // never return 0, but surfacing this as an explicit bail
+        // catches future regressions (e.g. someone wires a signed
+        // integer into the budget math) instead of silently
+        // producing a plan with no locks.
+        anyhow::bail!("acquire_llc_plan: CPU budget resolved to zero");
     }
 
     // Read /proc/self/mountinfo ONCE per acquire_llc_plan invocation.
@@ -1157,19 +1314,53 @@ where
     let mut attempt: u32 = 0;
     loop {
         let snapshots = discover_llc_snapshots(topo, &mountinfo)?;
-        let selected = plan_from_snapshots(&snapshots, target, topo, |from, to| {
+        let selected = plan_from_snapshots(&snapshots, target_cpus, topo, &allowed, |from, to| {
             test_topo.numa_distance(from, to)
         });
+        if selected.is_empty() {
+            // Every LLC's CPU set lies outside the allowed cpuset —
+            // sysfs disagrees with sched_getaffinity. This is a host
+            // misconfiguration (stale sysfs after hotplug, cgroup
+            // pinned to a CPU range the kernel no longer reports in
+            // llc_groups, etc.). Bail with actionable text rather
+            // than looping through retries that cannot change the
+            // outcome.
+            anyhow::bail!(
+                "acquire_llc_plan: no host LLC overlaps the process's \
+                 {allowed_cpus}-CPU allowed set — sysfs LLC groups and \
+                 sched_getaffinity disagree. Check for a stale \
+                 /sys/devices/system/cpu view or a cgroup cpuset that \
+                 excludes every LLC."
+            );
+        }
         match acquire_fn(&selected, &snapshots)? {
             Some(locks) => {
                 // Success — materialize cpus + mems from the selected
-                // indices, then consume the snapshot list into the
-                // returned plan.
+                // indices, intersecting each LLC's CPU list with
+                // `allowed` so `plan.cpus` never contains a CPU the
+                // process cannot run on, and TRUNCATING at exactly
+                // `target_cpus` so the last-LLC overshoot
+                // contributes only the prefix the budget needs. The
+                // full LLC is still flocked (the coordination unit
+                // is per-LLC), but the CPUs beyond `target_cpus`
+                // never appear in `plan.cpus` — sched_setaffinity
+                // masks and cgroup cpuset.cpus writes reflect the
+                // exact budget. `mems` collects the NUMA nodes of
+                // CPUs that actually appear in `plan.cpus`; an LLC
+                // that contributes a partial slice on a cross-node
+                // split only registers the nodes of its
+                // actually-used CPUs.
                 let mut cpus: Vec<usize> = Vec::new();
                 let mut mems: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-                for &idx in &selected {
+                'outer: for &idx in &selected {
                     let group = &topo.llc_groups[idx];
                     for &cpu in &group.cpus {
+                        if !allowed.contains(&cpu) {
+                            continue;
+                        }
+                        if cpus.len() >= target_cpus {
+                            break 'outer;
+                        }
                         cpus.push(cpu);
                         let node = topo.cpu_to_node.get(&cpu).copied().unwrap_or(0);
                         mems.insert(node);
@@ -1206,8 +1397,8 @@ where
                     };
                     return Err(anyhow::Error::new(ResourceContention {
                         reason: format!(
-                            "acquire_llc_plan: could not reserve {target} \
-                             LLC(s) after {retries} TOCTOU retry; holders: \
+                            "acquire_llc_plan: could not reserve {target_cpus} \
+                             CPU(s) after {retries} TOCTOU retry; holders: \
                              {holder_text}. Run `ktstr locks --json` to see \
                              every ktstr lock on this host.",
                             retries = ACQUIRE_MAX_TOCTOU_RETRIES + 1,
@@ -1226,7 +1417,7 @@ where
 /// plan still produces a runnable command.
 ///
 /// Rationale: without this hint, `make -j$(nproc)` fans gcc
-/// children across every online CPU, defeating the --llc-cap
+/// children across every online CPU, defeating the --cpu-cap
 /// reservation — the build escapes the cgroup cpuset in scheduling
 /// terms even though the kernel enforces CPU membership. Passing
 /// `plan.cpus.len()` to make keeps gcc's parallel width aligned with
@@ -1241,7 +1432,7 @@ pub fn make_jobs_for_plan(plan: &LlcPlan) -> usize {
 /// host exposes NUMA information, `[0, 2]` on degraded hosts whose
 /// `cpu_to_node` map is empty. Used by
 /// [`warn_if_cross_node_spill`] to render the `ktstr: reserving LLCs
-/// …` message when an `--llc-cap` plan spills across nodes.
+/// …` message when an `--cpu-cap` plan spills across nodes.
 pub fn format_llc_list(locked: &[usize], topo: &HostTopology) -> String {
     let parts: Vec<String> = locked
         .iter()
@@ -1257,7 +1448,7 @@ pub fn format_llc_list(locked: &[usize], topo: &HostTopology) -> String {
     format!("[{}]", parts.join(", "))
 }
 
-/// Emit the cross-node spill warning when an `--llc-cap` plan's
+/// Emit the cross-node spill warning when an `--cpu-cap` plan's
 /// `mems` set spans more than one NUMA node. No-op for single-node
 /// plans.
 ///
@@ -3033,38 +3224,78 @@ mod tests {
         }
     }
 
-    /// `acquire_llc_plan` with `llc_cap: None` degenerates to
-    /// "select every LLC" — the pre-flag default — producing an
-    /// LlcPlan whose `locks` vec holds one fd per LLC group on a
-    /// clean lock pool.
+    /// RAII guard for a per-test override of
+    /// [`host_allowed_cpus`]'s return value via
+    /// [`ALLOWED_CPUS_OVERRIDE`]. Lets tests pin the 30%-default and
+    /// allowed-cpu filtering math to a known input regardless of
+    /// what the CI runner's real sched_getaffinity returns. Unset on
+    /// Drop so a panicking test cannot leak state across the suite.
+    struct AllowedCpusGuard;
+
+    impl AllowedCpusGuard {
+        fn new(cpus: Vec<usize>) -> Self {
+            ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(cpus));
+            AllowedCpusGuard
+        }
+    }
+
+    impl Drop for AllowedCpusGuard {
+        fn drop(&mut self) {
+            ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
+        }
+    }
+
+    /// `acquire_llc_plan` with `cpu_cap: None` reserves exactly 30%
+    /// of the allowed-CPU set (ceiling), walking whole LLCs and
+    /// partial-taking the last LLC's CPUs when the budget falls
+    /// mid-LLC. On a 10-CPU host split across 5 LLCs (2 CPUs each)
+    /// where every CPU is in the allowed set: ceil(10 * 0.30) = 3
+    /// CPUs → flock 2 LLCs (the first LLC's 2 CPUs + 1 CPU from
+    /// the second), `plan.cpus` holds exactly 3 CPUs.
     ///
     /// Uses a per-test lockfile prefix via [`LlcLockPrefixGuard`] so
-    /// the `LlcGroup` vector can be a small 3-entry topology rather
-    /// than padding to 93003 slots. Production path runs through
-    /// [`llc_lock_path`] which honors the test-only override.
+    /// the `LlcGroup` vector can be a small 5-entry topology rather
+    /// than padding to host-LLC-count slots. Production path runs
+    /// through [`llc_lock_path`] which honors the test-only override.
+    /// Uses [`AllowedCpusGuard`] to pin the allowed-CPU set so the
+    /// 30%-default math is deterministic regardless of the CI
+    /// runner's real sched_getaffinity.
     #[test]
-    fn acquire_llc_plan_none_cap_returns_one_fd_per_group() {
+    fn acquire_llc_plan_none_cap_reserves_thirty_percent_cpus() {
         let _prefix = LlcLockPrefixGuard::new();
-        let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0), (vec![2], 0)]);
+        let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let topo = HostTopology::new_for_tests(&[
+            (vec![0, 1], 0),
+            (vec![2, 3], 0),
+            (vec![4, 5], 0),
+            (vec![6, 7], 0),
+            (vec![8, 9], 0),
+        ]);
 
         // synthetic() needs >= num_cpus >= num_llcs; the distance
-        // function is never invoked with target >= snapshots.len()
+        // function is never invoked with target_cpus >= sum-of-allowed
         // (the planner's short-circuit at plan_from_snapshots), so
         // the TestTopology's shape doesn't matter beyond "valid".
         let test_topo = crate::topology::TestTopology::synthetic(4, 1);
 
         let plan = acquire_llc_plan(&topo, &test_topo, None)
-            .expect("clean pool must allow SH on every LLC");
-        assert_eq!(
-            plan.locks.len(),
-            topo.llc_groups.len(),
-            "llc_cap=None must acquire one fd per LLC group",
-        );
+            .expect("clean pool must allow SH on every selected LLC");
+        // 30% of 10 CPUs = ceil(3.0) = 3 CPUs. 2-CPU LLCs: LLC 0
+        // contributes 2, LLC 1 contributes 1 (partial-take), total
+        // exactly 3.
         assert_eq!(
             plan.locked_llcs.len(),
-            topo.llc_groups.len(),
-            "llc_cap=None must report every LLC in locked_llcs",
+            2,
+            "budget of 3 CPUs flocks 2 LLCs (2 CPUs + 1 partial): {:?}",
+            plan.locked_llcs,
         );
+        assert_eq!(
+            plan.cpus.len(),
+            3,
+            "plan.cpus is truncated to exactly the budget: {:?}",
+            plan.cpus,
+        );
+        assert_eq!(plan.locks.len(), 2, "one fd per selected LLC");
     }
 
     /// `acquire_llc_plan` bails with `ResourceContention` when ANY
@@ -3083,6 +3314,7 @@ mod tests {
     #[test]
     fn acquire_llc_plan_bails_on_exclusive_peer() {
         let _prefix = LlcLockPrefixGuard::new();
+        let _allowed = AllowedCpusGuard::new(vec![0]);
         let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
 
         // Peer holds EX on LLC 0's lockfile through the overridden
@@ -3095,7 +3327,7 @@ mod tests {
 
         let test_topo = crate::topology::TestTopology::synthetic(4, 1);
         let err = acquire_llc_plan(&topo, &test_topo, None)
-            .expect_err("EX peer must block all-LLC SH acquisition");
+            .expect_err("EX peer must block SH acquisition of the only LLC");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("LLC 0"),
@@ -3120,6 +3352,7 @@ mod tests {
     #[test]
     fn acquire_llc_plan_coexists_with_shared_peer() {
         let _prefix = LlcLockPrefixGuard::new();
+        let _allowed = AllowedCpusGuard::new(vec![0]);
         let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
         let shared_path = llc_lock_path(0);
 
@@ -3139,10 +3372,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // LlcCap — construction, env resolution, acquire-time bounding
+    // CpuCap — construction, env resolution, acquire-time bounding
     // ---------------------------------------------------------------
 
-    /// Serialize KTSTR_LLC_CAP env-var mutation across test threads.
+    /// Serialize KTSTR_CPU_CAP env-var mutation across test threads.
     /// std::env::set_var is process-wide (unsafe in edition 2024);
     /// parallel tests would race if each mutated the same variable
     /// without coordination. Every env-touching test below takes
@@ -3220,53 +3453,53 @@ mod tests {
         }
     }
 
-    /// `LlcCap::new(0)` must reject with the "≥ 1 (got 0)" message.
+    /// `CpuCap::new(0)` must reject with the "≥ 1 (got 0)" message.
     /// Zero is a scripting-mistake sentinel — silent acceptance would
     /// disable the resource contract.
     #[test]
-    fn llc_cap_new_rejects_zero() {
-        let err = LlcCap::new(0).unwrap_err();
+    fn cpu_cap_new_rejects_zero() {
+        let err = CpuCap::new(0).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("≥ 1"), "msg={msg}");
         assert!(msg.contains("got 0"), "msg={msg}");
     }
 
-    /// `LlcCap::new(1)` succeeds — minimum legal cap.
+    /// `CpuCap::new(1)` succeeds — minimum legal cap.
     #[test]
-    fn llc_cap_new_accepts_one() {
-        let cap = LlcCap::new(1).expect("cap of 1 must succeed");
+    fn cpu_cap_new_accepts_one() {
+        let cap = CpuCap::new(1).expect("cap of 1 must succeed");
         assert_eq!(cap.effective_count(4).unwrap(), 1);
     }
 
-    /// `LlcCap::new(usize::MAX)` is accepted at construction time
+    /// `CpuCap::new(usize::MAX)` is accepted at construction time
     /// and clamped later by `effective_count`. Pins the contract
     /// that construction never consults the host.
     #[test]
-    fn llc_cap_new_accepts_usize_max() {
-        let cap = LlcCap::new(usize::MAX).expect("MAX accepted at construction");
+    fn cpu_cap_new_accepts_usize_max() {
+        let cap = CpuCap::new(usize::MAX).expect("MAX accepted at construction");
         // Actual clamping surfaces at effective_count; see
-        // `llc_cap_effective_count_exceeds_host` below.
+        // `cpu_cap_effective_count_exceeds_host` below.
         assert!(cap.effective_count(usize::MAX).is_ok());
     }
 
     /// `effective_count` returns the inner value when it fits.
     #[test]
-    fn llc_cap_effective_count_fits() {
-        let cap = LlcCap::new(3).unwrap();
+    fn cpu_cap_effective_count_fits() {
+        let cap = CpuCap::new(3).unwrap();
         assert_eq!(cap.effective_count(4).unwrap(), 3);
         assert_eq!(cap.effective_count(3).unwrap(), 3);
     }
 
-    /// `effective_count` when cap exceeds host_llcs returns a
-    /// `ResourceContention` error naming both numbers, so the
-    /// operator can fix the flag without re-running `ktstr topo`.
+    /// `effective_count` when cap exceeds the allowed-CPU count
+    /// returns a `ResourceContention` error naming both numbers, so
+    /// the operator can fix the flag without re-running `ktstr topo`.
     #[test]
-    fn llc_cap_effective_count_exceeds_host() {
-        let cap = LlcCap::new(8).unwrap();
+    fn cpu_cap_effective_count_exceeds_host() {
+        let cap = CpuCap::new(8).unwrap();
         let err = cap.effective_count(4).expect_err("8 > 4 must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("8"), "msg must name requested cap: {msg}");
-        assert!(msg.contains("4"), "msg must name host LLC count: {msg}");
+        assert!(msg.contains("4"), "msg must name allowed-CPU count: {msg}");
         // Must downcast to ResourceContention for nextest-retry
         // routing per the Tier-1/Tier-2 contract.
         assert!(
@@ -3275,40 +3508,41 @@ mod tests {
         );
     }
 
-    /// `effective_count` at the boundary: cap == host_llcs is OK.
+    /// `effective_count` at the boundary: cap == allowed_cpus is OK.
     #[test]
-    fn llc_cap_effective_count_at_host_boundary() {
-        let cap = LlcCap::new(4).unwrap();
+    fn cpu_cap_effective_count_at_host_boundary() {
+        let cap = CpuCap::new(4).unwrap();
         assert_eq!(cap.effective_count(4).unwrap(), 4);
     }
 
     /// CLI flag supplied → wins over env var. `resolve(Some(N))`
-    /// ignores `KTSTR_LLC_CAP` entirely. Pins the precedence
-    /// contract documented on `LlcCap::resolve`.
+    /// ignores `KTSTR_CPU_CAP` entirely. Pins the precedence
+    /// contract documented on `CpuCap::resolve`.
     #[test]
-    fn llc_cap_resolve_cli_wins_over_env() {
+    fn cpu_cap_resolve_cli_wins_over_env() {
         let _lock = env_lock();
-        let _env = EnvGuard::set("KTSTR_LLC_CAP", "99");
-        let cap = LlcCap::resolve(Some(3)).unwrap().expect("CLI flag set");
+        let _env = EnvGuard::set("KTSTR_CPU_CAP", "99");
+        let cap = CpuCap::resolve(Some(3)).unwrap().expect("CLI flag set");
         assert_eq!(cap.effective_count(4).unwrap(), 3, "CLI wins");
     }
 
-    /// No CLI flag, no env var → `None` (pre-flag default, "lock
-    /// every LLC").
+    /// No CLI flag, no env var → `None` (the 30%-of-allowed default
+    /// is applied at acquire time — `resolve` never synthesizes a
+    /// cap here).
     #[test]
-    fn llc_cap_resolve_no_cli_no_env_returns_none() {
+    fn cpu_cap_resolve_no_cli_no_env_returns_none() {
         let _lock = env_lock();
-        let _env = EnvGuard::remove("KTSTR_LLC_CAP");
-        assert!(LlcCap::resolve(None).unwrap().is_none());
+        let _env = EnvGuard::remove("KTSTR_CPU_CAP");
+        assert!(CpuCap::resolve(None).unwrap().is_none());
     }
 
     /// Env var set to a valid integer, no CLI flag → resolves to
     /// that value.
     #[test]
-    fn llc_cap_resolve_env_set() {
+    fn cpu_cap_resolve_env_set() {
         let _lock = env_lock();
-        let _env = EnvGuard::set("KTSTR_LLC_CAP", "2");
-        let cap = LlcCap::resolve(None)
+        let _env = EnvGuard::set("KTSTR_CPU_CAP", "2");
+        let cap = CpuCap::resolve(None)
             .expect("resolve must succeed")
             .expect("env-set cap must yield Some");
         assert_eq!(cap.effective_count(8).unwrap(), 2);
@@ -3317,45 +3551,45 @@ mod tests {
     /// Env var set to the empty string → treated as absent
     /// (matches `Ok(s) if s.is_empty()` arm).
     #[test]
-    fn llc_cap_resolve_empty_env_is_absent() {
+    fn cpu_cap_resolve_empty_env_is_absent() {
         let _lock = env_lock();
-        let _env = EnvGuard::set("KTSTR_LLC_CAP", "");
-        assert!(LlcCap::resolve(None).unwrap().is_none());
+        let _env = EnvGuard::set("KTSTR_CPU_CAP", "");
+        assert!(CpuCap::resolve(None).unwrap().is_none());
     }
 
     /// Env var set to a non-numeric value → parse error with the
     /// variable name in the message.
     #[test]
-    fn llc_cap_resolve_non_numeric_env_errors() {
+    fn cpu_cap_resolve_non_numeric_env_errors() {
         let _lock = env_lock();
-        let _env = EnvGuard::set("KTSTR_LLC_CAP", "not-a-number");
-        let err = LlcCap::resolve(None).expect_err("non-numeric must error");
+        let _env = EnvGuard::set("KTSTR_CPU_CAP", "not-a-number");
+        let err = CpuCap::resolve(None).expect_err("non-numeric must error");
         let msg = format!("{err:#}");
-        assert!(msg.contains("KTSTR_LLC_CAP"), "msg={msg}");
+        assert!(msg.contains("KTSTR_CPU_CAP"), "msg={msg}");
     }
 
-    /// Env var set to `"0"` flows through `LlcCap::new(0)` and
-    /// surfaces the same "--llc-cap must be ≥ 1 (got 0)" error.
-    /// Regression guard: typos like `KTSTR_LLC_CAP=0` must NOT
+    /// Env var set to `"0"` flows through `CpuCap::new(0)` and
+    /// surfaces the same "--cpu-cap must be ≥ 1 (got 0)" error.
+    /// Regression guard: typos like `KTSTR_CPU_CAP=0` must NOT
     /// silently fall back to "no cap".
     #[test]
-    fn llc_cap_resolve_zero_env_rejected() {
+    fn cpu_cap_resolve_zero_env_rejected() {
         let _lock = env_lock();
-        let _env = EnvGuard::set("KTSTR_LLC_CAP", "0");
-        let err = LlcCap::resolve(None).expect_err("zero must error");
+        let _env = EnvGuard::set("KTSTR_CPU_CAP", "0");
+        let err = CpuCap::resolve(None).expect_err("zero must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("≥ 1"), "msg={msg}");
         assert!(msg.contains("got 0"), "msg={msg}");
     }
 
     /// CLI flag of 0 is the same rejection path as env var of 0 —
-    /// both feed `LlcCap::new(0)`. Pins that precedence doesn't
+    /// both feed `CpuCap::new(0)`. Pins that precedence doesn't
     /// let a valid env var "save" an invalid CLI zero.
     #[test]
-    fn llc_cap_resolve_zero_cli_rejected_even_with_valid_env() {
+    fn cpu_cap_resolve_zero_cli_rejected_even_with_valid_env() {
         let _lock = env_lock();
-        let _env = EnvGuard::set("KTSTR_LLC_CAP", "2");
-        let err = LlcCap::resolve(Some(0)).expect_err("cli=0 must error");
+        let _env = EnvGuard::set("KTSTR_CPU_CAP", "2");
+        let err = CpuCap::resolve(Some(0)).expect_err("cli=0 must error");
         let msg = format!("{err:#}");
         assert!(msg.contains("≥ 1"), "msg={msg}");
     }
@@ -3367,7 +3601,7 @@ mod tests {
     #[test]
     fn env_guard_set_and_drop_removes_variable() {
         let _lock = env_lock();
-        let probe = "KTSTR_LLC_CAP_ENV_GUARD_TEST";
+        let probe = "KTSTR_CPU_CAP_ENV_GUARD_TEST";
         {
             let _env = EnvGuard::set(probe, "abc");
             assert_eq!(
@@ -3506,18 +3740,21 @@ mod tests {
     // acquire_llc_plan — cap semantics (host-integration-light)
     // ---------------------------------------------------------------
 
-    /// `acquire_llc_plan` with `llc_cap == Some(cap)` and
-    /// `cap > host LLC count` fails at `effective_count` with a
+    /// `acquire_llc_plan` with `cpu_cap == Some(cap)` and
+    /// `cap > allowed-CPU count` fails at `effective_count` with a
     /// `ResourceContention` — before any /tmp side-effects. Pins
     /// that over-cap fails cleanly without touching the lock pool.
+    /// The test pins a 2-CPU allowed set and caps at 3 CPUs, the
+    /// minimum pair that exercises the "N > allowed" branch.
     #[test]
-    fn acquire_llc_plan_rejects_cap_over_host_llcs() {
-        // Two real LLC groups, cap of 3.
+    fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
+        let _allowed = AllowedCpusGuard::new(vec![0, 1]);
+        // Two real LLC groups (one CPU each), cap of 3 CPUs.
         let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
         let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-        let cap = LlcCap::new(3).unwrap();
-        let err =
-            acquire_llc_plan(&topo, &test_topo, Some(cap)).expect_err("cap > host_llcs must error");
+        let cap = CpuCap::new(3).unwrap();
+        let err = acquire_llc_plan(&topo, &test_topo, Some(cap))
+            .expect_err("cap > allowed_cpus must error");
         assert!(
             err.downcast_ref::<ResourceContention>().is_some(),
             "must be ResourceContention: {err:#}"
@@ -3578,10 +3815,12 @@ mod tests {
                 holder_count: if idx >= 2 { 5 } else { 0 },
             })
             .collect();
+        let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
         let selected = plan_from_snapshots(
             &snapshots,
             3,
             &topo,
+            &allowed,
             |_, _| 10, // everything same-node
         );
         // Step e of plan_from_snapshots is
@@ -3592,9 +3831,12 @@ mod tests {
         assert_eq!(selected, vec![0, 2, 3], "step e sorts ascending");
     }
 
-    /// `plan_from_snapshots` with `target >= snapshots.len()`
-    /// short-circuits to "select every LLC" in ascending order.
-    /// Pins the no-cap behavior that preserves pre-flag semantics.
+    /// `plan_from_snapshots` with `target_cpus >= sum of allowed
+    /// CPUs across every LLC` short-circuits to "select every LLC
+    /// with at least one allowed CPU" in ascending order. Pins the
+    /// saturation-case behaviour: the CPU budget covers or exceeds
+    /// the total schedulable capacity, so the walk picks every
+    /// eligible LLC without running the scoring pass.
     #[test]
     fn plan_from_snapshots_target_ge_all_selects_every_llc() {
         let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1), (vec![2], 2)]);
@@ -3606,9 +3848,10 @@ mod tests {
                 holder_count: 0,
             })
             .collect();
-        let selected = plan_from_snapshots(&snapshots, 3, &topo, |_, _| 10);
+        let allowed: std::collections::BTreeSet<usize> = (0..3).collect();
+        let selected = plan_from_snapshots(&snapshots, 3, &topo, &allowed, |_, _| 10);
         assert_eq!(selected, vec![0, 1, 2]);
-        let selected_over = plan_from_snapshots(&snapshots, 999, &topo, |_, _| 10);
+        let selected_over = plan_from_snapshots(&snapshots, 999, &topo, &allowed, |_, _| 10);
         assert_eq!(selected_over, vec![0, 1, 2], "target > len clamps");
     }
 
@@ -3625,7 +3868,8 @@ mod tests {
             holders: Vec::new(),
             holder_count: 0,
         }];
-        let selected = plan_from_snapshots(&snapshots, 0, &topo, |_, _| 10);
+        let allowed: std::collections::BTreeSet<usize> = [0].into_iter().collect();
+        let selected = plan_from_snapshots(&snapshots, 0, &topo, &allowed, |_, _| 10);
         assert!(selected.is_empty());
     }
 
@@ -3663,7 +3907,8 @@ mod tests {
         ];
         // Same-node distance closure so placement doesn't bias by
         // NUMA — isolates the consolidation preference signal.
-        let selected = plan_from_snapshots(&snapshots, 1, &topo, |_, _| 10);
+        let allowed: std::collections::BTreeSet<usize> = (0..2).collect();
+        let selected = plan_from_snapshots(&snapshots, 1, &topo, &allowed, |_, _| 10);
         assert_eq!(
             selected,
             vec![1],
@@ -3709,16 +3954,20 @@ mod tests {
                 holder_count: 1,
             },
         ];
-        for target in 1..=snapshots.len() {
-            let selected = plan_from_snapshots(&snapshots, target, &topo, |_, _| 10);
+        let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
+        // Each LLC has 1 CPU, so target_cpus == #LLCs to select. The
+        // ascending-order invariant is agnostic to CPU-count vs
+        // LLC-count semantics — the post-step-e sort holds regardless.
+        for target_cpus in 1..=snapshots.len() {
+            let selected = plan_from_snapshots(&snapshots, target_cpus, &topo, &allowed, |_, _| 10);
             assert_eq!(
                 selected.len(),
-                target,
-                "target={target} must produce {target} selections, got {selected:?}"
+                target_cpus,
+                "target_cpus={target_cpus} must produce {target_cpus} selections, got {selected:?}"
             );
             assert!(
                 selected.windows(2).all(|w| w[0] < w[1]),
-                "target={target}: selection {selected:?} is not strictly ascending",
+                "target_cpus={target_cpus}: selection {selected:?} is not strictly ascending",
             );
         }
     }
@@ -3874,15 +4123,15 @@ mod tests {
         warn_if_cross_node_spill(&single_plan, &topo);
     }
 
-    /// `LlcCap::new(1).effective_count(0)` errors: `n=1 > host=0`.
+    /// `CpuCap::new(1).effective_count(0)` errors: `n=1 > host=0`.
     /// Degenerate "host has zero LLCs" edge — unlikely on a real
     /// machine but critical to pin the boundary so a future bug
     /// that flipped the comparison to `n >= host_llcs` (rejecting
     /// cap == total) OR `n > host_llcs - 1` (overflow on 0) fails
     /// here first.
     #[test]
-    fn llc_cap_effective_count_on_zero_llc_host() {
-        let cap = LlcCap::new(1).unwrap();
+    fn cpu_cap_effective_count_on_zero_llc_host() {
+        let cap = CpuCap::new(1).unwrap();
         let err = cap.effective_count(0).expect_err("1 > 0 must error");
         assert!(
             err.downcast_ref::<ResourceContention>().is_some(),
@@ -3948,7 +4197,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         let test_topo = crate::topology::TestTopology::synthetic(2, 1);
-        let cap = LlcCap::new(1).expect("cap=1 valid");
+        let cap = CpuCap::new(1).expect("cap=1 valid");
         let plan = acquire_llc_plan(&topo, &test_topo, Some(cap))
             .expect("SH is reentrant — parent SH must coexist with child SH");
 
@@ -3998,6 +4247,7 @@ mod tests {
     /// SYNTHETIC-TOPOLOGY OFFSET CONVENTION.
     #[test]
     fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
+        let _allowed = AllowedCpusGuard::new(vec![93500, 93501]);
         let topo = synth_host_topo(&[(vec![93500], 0), (vec![93501], 0)]);
         // Clean the lockfile paths DISCOVER materializes so the
         // test is idempotent across re-runs.
@@ -4025,8 +4275,10 @@ mod tests {
         // Attempt 1 produced locks (empty vec is fine — the plan
         // constructor accepts any Vec<OwnedFd>).
         assert_eq!(counter.get(), 2, "acquire_fn called exactly twice");
-        // Selected indices are every LLC on the synthetic topo.
-        assert_eq!(plan.locked_llcs, vec![0, 1]);
+        // 30% of 2 allowed CPUs = ceil(0.6) = 1 CPU → pick 1 LLC
+        // (seed-node first: LLC 0). `selected` holds only LLC 0;
+        // the second LLC stays unlocked.
+        assert_eq!(plan.locked_llcs, vec![0]);
 
         cleanup_lock("/tmp/ktstr-llc-0.lock");
         cleanup_lock("/tmp/ktstr-llc-1.lock");
@@ -4045,6 +4297,7 @@ mod tests {
     /// holder diagnostic block runs (the final DISCOVER read).
     #[test]
     fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
+        let _allowed = AllowedCpusGuard::new(vec![93600]);
         let topo = synth_host_topo(&[(vec![93600], 0)]);
         cleanup_lock("/tmp/ktstr-llc-0.lock");
         let test_topo = crate::topology::TestTopology::synthetic(1, 1);
@@ -4104,7 +4357,8 @@ mod tests {
                 holder_count: if idx == 3 { 5 } else { 0 },
             })
             .collect();
-        let selected = plan_from_snapshots(&snapshots, 1, &topo, |_, _| 10);
+        let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
+        let selected = plan_from_snapshots(&snapshots, 1, &topo, &allowed, |_, _| 10);
         assert_eq!(
             selected,
             vec![3],
@@ -4139,12 +4393,10 @@ mod tests {
             })
             .collect();
         // Canonical distance: same-node 10, cross-node 20.
-        let selected = plan_from_snapshots(
-            &snapshots,
-            2,
-            &topo,
-            |from, to| if from == to { 10 } else { 20 },
-        );
+        let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
+        let selected = plan_from_snapshots(&snapshots, 2, &topo, &allowed, |from, to| {
+            if from == to { 10 } else { 20 }
+        });
         assert_eq!(
             selected,
             vec![0, 1],
@@ -4174,12 +4426,162 @@ mod tests {
                 holder_count: 5,
             })
             .collect();
-        let selected = plan_from_snapshots(&snapshots, 2, &topo, |_, _| 10);
+        let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
+        let selected = plan_from_snapshots(&snapshots, 2, &topo, &allowed, |_, _| 10);
         assert_eq!(
             selected,
             vec![0, 1],
             "equal consolidation scores must tiebreak on llc_idx ASC \
              — selected={selected:?}",
+        );
+    }
+
+    /// `default_cpu_budget` math: 30% rounded UP with min-1 floor.
+    /// Covers the small-host edge (1 CPU → 1 CPU budget), the
+    /// rounding boundary (3 CPUs → ceil(0.9) = 1 CPU), the
+    /// non-trivial case (10 CPUs → 3 CPUs), and the large case
+    /// (100 CPUs → 30 CPUs). Zero-input is pinned at min-1 for
+    /// defense in depth even though production callers bail
+    /// upstream on empty allowed sets.
+    #[test]
+    fn default_cpu_budget_30_percent_rounded_up_min_one() {
+        assert_eq!(default_cpu_budget(0), 1, "min-1 floor");
+        assert_eq!(default_cpu_budget(1), 1, "ceil(0.3) = 1");
+        assert_eq!(default_cpu_budget(3), 1, "ceil(0.9) = 1");
+        assert_eq!(default_cpu_budget(4), 2, "ceil(1.2) = 2");
+        assert_eq!(default_cpu_budget(10), 3, "ceil(3.0) = 3");
+        assert_eq!(default_cpu_budget(100), 30, "exact 30%");
+    }
+
+    /// `acquire_llc_plan` bails with a diagnostic when the allowed
+    /// CPU set has no overlap with ANY host LLC — a misconfigured
+    /// host where sysfs and sched_getaffinity disagree. Pins the
+    /// plan_from_snapshots-returns-empty → bail path so a future
+    /// refactor that silently produces an empty plan surfaces as a
+    /// test failure rather than an "no-op" VM boot.
+    #[test]
+    fn acquire_llc_plan_bails_when_no_llc_overlaps_allowed() {
+        let _prefix = LlcLockPrefixGuard::new();
+        // Allowed CPUs {100, 101} don't overlap ANY of the host's
+        // LLCs (CPUs 0, 1). plan_from_snapshots returns empty →
+        // acquire_llc_plan bails with the no-overlap diagnostic.
+        let _allowed = AllowedCpusGuard::new(vec![100, 101]);
+        let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
+        let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+        let err = acquire_llc_plan(&topo, &test_topo, None)
+            .expect_err("no LLC overlap must bail, not silently run");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no host LLC overlaps"),
+            "err must name the no-overlap condition: {msg}"
+        );
+    }
+
+    /// Allowed-cpu filter invariant — LLCs whose CPUs are entirely
+    /// outside the allowed set MUST NOT appear in `selected`, even
+    /// when their consolidation score would otherwise promote them.
+    ///
+    /// Four LLCs, two CPUs each. Allowed set = {0, 1, 4, 5} —
+    /// contains every CPU of LLCs 0 and 2, NONE of LLCs 1 or 3.
+    /// target_cpus=3 → planner picks LLC 0 (2 allowed CPUs,
+    /// accumulated 2 < 3 keeps walking) then LLC 2 (1 more CPU is
+    /// enough to cover the budget once materialization
+    /// partial-takes; the plan_from_snapshots walk itself stops
+    /// once accumulated ≥ target, which here fires at accumulated
+    /// == 4 ≥ 3). `selected` is [0, 2]; LLCs 1 and 3 must stay
+    /// out of the list.
+    ///
+    /// Regresses any refactor that drops the eligibility filter —
+    /// e.g. a cleaner that collapses the `filter(eligible)` pass
+    /// into the sort closure would produce a plan containing an
+    /// LLC with zero schedulable CPUs, which sched_setaffinity on
+    /// the resulting mask would reject.
+    #[test]
+    fn plan_from_snapshots_filters_llcs_outside_allowed_set() {
+        let topo = synth_host_topo(&[
+            (vec![0, 1], 0),
+            (vec![2, 3], 0),
+            (vec![4, 5], 0),
+            (vec![6, 7], 0),
+        ]);
+        let snapshots: Vec<LlcSnapshot> = (0..4)
+            .map(|idx| LlcSnapshot {
+                llc_idx: idx,
+                lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
+                holders: Vec::new(),
+                holder_count: 0,
+            })
+            .collect();
+        let allowed: std::collections::BTreeSet<usize> = [0, 1, 4, 5].into_iter().collect();
+        let selected = plan_from_snapshots(&snapshots, 3, &topo, &allowed, |_, _| 10);
+        assert_eq!(
+            selected,
+            vec![0, 2],
+            "planner must skip LLCs 1 and 3 (no allowed-CPU overlap) \
+             and pick LLCs 0 and 2 whose CPUs are fully in allowed; \
+             got {selected:?}"
+        );
+    }
+
+    /// Partial-take on the last selected LLC — when the budget
+    /// falls mid-LLC, `plan.cpus` contains only the budget-needed
+    /// prefix of that LLC's allowed CPUs, not the whole LLC. Two
+    /// 4-CPU LLCs, cpu_cap = 5 → LLC 0 contributes 4 CPUs, LLC 1
+    /// contributes 1 CPU, `plan.cpus.len() == 5`, both LLCs are
+    /// flocked. Regresses any refactor that reverts to the
+    /// round-up-whole-LLC policy (which would produce 8 CPUs,
+    /// over-reserving).
+    #[test]
+    fn acquire_llc_plan_partial_take_last_llc_matches_exact_budget() {
+        let _prefix = LlcLockPrefixGuard::new();
+        let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        let topo = HostTopology::new_for_tests(&[(vec![0, 1, 2, 3], 0), (vec![4, 5, 6, 7], 0)]);
+        let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+        let cap = CpuCap::new(5).expect("cap=5 valid");
+        let plan = acquire_llc_plan(&topo, &test_topo, Some(cap))
+            .expect("clean pool must allow SH on both LLCs");
+
+        assert_eq!(
+            plan.locked_llcs,
+            vec![0, 1],
+            "budget of 5 CPUs crosses LLC boundary — both must be flocked"
+        );
+        assert_eq!(
+            plan.cpus.len(),
+            5,
+            "plan.cpus is EXACTLY the budget, not rounded up: {:?}",
+            plan.cpus,
+        );
+        // Partial-take is deterministic: first LLC fully, then the
+        // ordered prefix of the second.
+        assert_eq!(plan.cpus, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// Partial-LLC allowed overlap — an LLC that contains SOME
+    /// allowed CPUs is still selectable, and its contribution to
+    /// the CPU budget is the size of the intersection, not the
+    /// full LLC. Two LLCs with 2 CPUs each; allowed = {0, 2} (one
+    /// CPU from each LLC). target_cpus=2 → both LLCs must be
+    /// selected (each contributes 1 allowed CPU, total 2 meets the
+    /// budget).
+    #[test]
+    fn plan_from_snapshots_partial_llc_overlap_counted_correctly() {
+        let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+        let snapshots: Vec<LlcSnapshot> = (0..2)
+            .map(|idx| LlcSnapshot {
+                llc_idx: idx,
+                lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
+                holders: Vec::new(),
+                holder_count: 0,
+            })
+            .collect();
+        let allowed: std::collections::BTreeSet<usize> = [0, 2].into_iter().collect();
+        let selected = plan_from_snapshots(&snapshots, 2, &topo, &allowed, |_, _| 10);
+        assert_eq!(
+            selected,
+            vec![0, 1],
+            "target_cpus=2 with 1 allowed CPU per LLC must pick \
+             BOTH LLCs — each contributes 1, total 2 meets budget"
         );
     }
 
@@ -4202,19 +4604,21 @@ mod tests {
     #[test]
     fn acquire_llc_plan_cross_node_spill_mems_union() {
         let _prefix = LlcLockPrefixGuard::new();
+        let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
         // LLC 0,1 on node 0 (CPUs 0,1); LLC 2,3 on node 1 (CPUs 2,3).
         let topo =
             HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0), (vec![2], 1), (vec![3], 1)]);
 
         let test_topo = crate::topology::TestTopology::synthetic(4, 2);
-        let cap = LlcCap::new(3).expect("cap=3 valid");
+        // Each LLC has 1 CPU, so cap=3 CPUs → exactly 3 LLCs.
+        let cap = CpuCap::new(3).expect("cap=3 valid");
         let plan = acquire_llc_plan(&topo, &test_topo, Some(cap))
-            .expect("clean pool must allow target=3 acquisition");
+            .expect("clean pool must allow 3-CPU acquisition");
 
         assert_eq!(
             plan.locked_llcs.len(),
             3,
-            "cap=3 must reserve exactly 3 LLCs, got {:?}",
+            "cap=3 CPUs with 1-CPU LLCs must reserve exactly 3 LLCs, got {:?}",
             plan.locked_llcs,
         );
         assert_eq!(

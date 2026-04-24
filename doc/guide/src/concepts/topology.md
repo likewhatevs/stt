@@ -203,9 +203,11 @@ drives cpuset partitioning.
 ## Host-side reservation
 
 `TestTopology::numa_distance` is also consumed at host-side
-`--llc-cap` plan time: `acquire_llc_plan` uses it to order the
+`--cpu-cap` plan time: `acquire_llc_plan` uses it to order the
 spill from the seed NUMA node to nearest-by-distance neighbors
-when the capped LLC count cannot fit within a single node. The
-resulting plan is a `LOCK_SH` reservation with a
-`cpuset.mems` union written to a cgroup v2 sandbox. See
-[Resource Budget](resource-budget.md) for the full pipeline.
+when the CPU budget cannot fit within a single node. The
+resulting plan is a `LOCK_SH` reservation on every selected LLC
+(flock granularity stays per-LLC even when the last LLC is
+partial-taken for the CPU budget) with a `cpuset.mems` union
+written to a cgroup v2 sandbox. See [Resource Budget](resource-budget.md)
+for the full pipeline.

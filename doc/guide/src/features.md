@@ -312,23 +312,25 @@ See [Performance Mode](concepts/performance-mode.md).
 </details>
 
 <details>
-<summary><b>Resource-budget coordination</b> — <code>--llc-cap N</code> bounds concurrent kernel builds and no-perf-mode VMs per host</summary>
+<summary><b>Resource-budget coordination</b> — <code>--cpu-cap N</code> bounds concurrent kernel builds and no-perf-mode VMs per host</summary>
 
-`--llc-cap N` (or `KTSTR_LLC_CAP=N`) constrains a no-perf-mode VM or
-kernel build to a `LOCK_SH` reservation over a NUMA-aware,
-consolidation-aware subset of `N` LLCs — instead of the pre-flag
-"lock every LLC" default. The plan writes the reserved CPUs and
-NUMA nodes into a cgroup v2 cpuset sandbox so `make -jN`
-gcc fan-out and vCPU soft-mask affinity respect the budget.
-On `shell`, mutually exclusive with `performance_mode=true`
-(clap parse rejection); library consumers see the env var
-silently ignored under perf-mode. Mutually exclusive with
-`KTSTR_BYPASS_LLC_LOCKS=1` at every entry point (contract vs.
+`--cpu-cap N` (or `KTSTR_CPU_CAP=N`) constrains a no-perf-mode VM or
+kernel build to exactly `N` host CPUs, selected by walking whole LLCs
+in NUMA-aware, consolidation-aware order (filtered to the calling
+process's sched_getaffinity cpuset), and partial-taking the last LLC
+so `plan.cpus.len() == N`. The full LLC is still flocked for
+per-LLC coordination with concurrent ktstr peers. When the flag is
+absent, the planner defaults to 30% of the allowed-CPU set (minimum
+1). The plan writes the reserved CPUs and NUMA nodes into a cgroup
+v2 cpuset sandbox so `make -jN` gcc fan-out and vCPU soft-mask
+affinity respect the budget. On `shell`, mutually exclusive with
+`performance_mode=true` (clap parse rejection); library consumers
+see the env var silently ignored under perf-mode. Mutually exclusive
+with `KTSTR_BYPASS_LLC_LOCKS=1` at every entry point (contract vs.
 bypass conflict rejected at CLI parse plus the library and
-kernel-build-pipeline sites). `ktstr locks` /
-`ktstr locks --json` enumerates every held
-LLC + per-CPU + cache-entry flock on the host with holder PID +
-cmdline for contention diagnosis. See
+kernel-build-pipeline sites). `ktstr locks` / `ktstr locks --json`
+enumerates every held LLC + per-CPU + cache-entry flock on the host
+with holder PID + cmdline for contention diagnosis. See
 [Resource Budget](concepts/resource-budget.md).
 
 </details>

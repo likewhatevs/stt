@@ -1828,7 +1828,22 @@ impl WorkloadHandle {
                     // triggered when the CURRENT parent dies, and the
                     // subreaper then inherits us), so the guard is a
                     // narrowing of the leak window, not an elimination.
-                    if unsafe { libc::getppid() } == 1 {
+                    //
+                    // Guest-init exception: inside a ktstr guest VM the
+                    // test driver IS pid 1 (it runs as /init), so every
+                    // worker forked by a scenario legitimately has
+                    // `getppid() == 1` even though the parent is alive
+                    // and well. Firing the orphan guard there would kill
+                    // every worker on startup and produce sentinel
+                    // "0 cpus, 0 iterations" reports. `ktstr_guest_init`
+                    // sets `KTSTR_GUEST_INIT=1` before dispatch; that
+                    // variable is inherited by every descendant process,
+                    // so its presence is a reliable signal that pid 1 is
+                    // the legitimate parent. Host-side workloads leave
+                    // the variable unset and retain the orphan detection.
+                    if std::env::var_os("KTSTR_GUEST_INIT").is_none()
+                        && unsafe { libc::getppid() } == 1
+                    {
                         unsafe {
                             libc::_exit(0);
                         }
