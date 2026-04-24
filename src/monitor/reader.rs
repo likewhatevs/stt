@@ -485,12 +485,6 @@ impl GuestMem {
         self.walk_4level(p4d_pa, kva)
     }
 
-    /// aarch64 stub: 5-level paging is not used.
-    #[cfg(target_arch = "aarch64")]
-    fn walk_5level(&self, _cr3_pa: u64, _kva: Kva) -> Option<u64> {
-        None
-    }
-
     /// Guest memory size in bytes.
     pub fn size(&self) -> u64 {
         self.size

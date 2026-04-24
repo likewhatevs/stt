@@ -8,6 +8,7 @@ use kvm_bindings::{
 };
 use kvm_ioctls::VcpuFd;
 
+#[cfg(test)]
 use crate::vmm::topology::Topology;
 
 /// Maximum cache level supported by arm64 CLIDR_EL1 (7 Ctype fields).
@@ -275,7 +276,8 @@ pub fn mpidr_to_fdt_reg(mpidr: u64) -> u64 {
 /// (arch/arm64/kvm/sys_regs.c) maps vcpu_id linearly into affinity
 /// levels (Aff0 bits [3:0], Aff1 bits [11:4], Aff2 bits [19:12]), which
 /// does not match this layout.
-pub fn mpidr_from_topology(topo: &Topology, cpu_id: u32) -> u64 {
+#[cfg(test)]
+fn mpidr_from_topology(topo: &Topology, cpu_id: u32) -> u64 {
     let (llc, core, thread) = topo.decompose(cpu_id);
     let aff0 = thread as u64;
     let aff1 = core as u64;

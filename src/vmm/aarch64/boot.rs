@@ -11,8 +11,6 @@ use crate::vmm::kvm::{CMDLINE_MAX, KERNEL_LOAD_ADDR};
 pub struct KernelLoadResult {
     /// Entry point address (kernel_load from PE loader).
     pub entry: u64,
-    /// End of the kernel image in guest physical memory.
-    pub kernel_end: u64,
 }
 
 /// Gzip magic bytes.
@@ -60,7 +58,6 @@ pub fn load_kernel(
         .context("load decompressed aarch64 Image")?;
         Ok(KernelLoadResult {
             entry: result.kernel_load.raw_value(),
-            kernel_end: result.kernel_end,
         })
     } else {
         let result = PE::load(
@@ -72,7 +69,6 @@ pub fn load_kernel(
         .context("load aarch64 Image")?;
         Ok(KernelLoadResult {
             entry: result.kernel_load.raw_value(),
-            kernel_end: result.kernel_end,
         })
     }
 }
@@ -147,12 +143,8 @@ mod tests {
 
     #[test]
     fn kernel_load_result_fields() {
-        let r = KernelLoadResult {
-            entry: 0x28_0000,
-            kernel_end: 0x40_0000,
-        };
+        let r = KernelLoadResult { entry: 0x28_0000 };
         assert_eq!(r.entry, 0x28_0000);
-        assert_eq!(r.kernel_end, 0x40_0000);
     }
 
     #[test]

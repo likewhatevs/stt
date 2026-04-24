@@ -1254,6 +1254,7 @@ pub(crate) fn shm_unlink_base(content_hash: u64) {
 /// Segment name for the LZ4-compressed version of a base initramfs.
 /// Uses `lz4` prefix to avoid collisions with segments written by
 /// previous compression formats (zstd, gzip).
+#[cfg(target_arch = "x86_64")]
 fn shm_lz4_segment_name(content_hash: u64) -> String {
     format!("/ktstr-lz4-{content_hash:016x}")
 }
@@ -1262,6 +1263,7 @@ fn shm_lz4_segment_name(content_hash: u64) -> String {
 /// The fd has a shared flock held; drop the OwnedFd (via
 /// [`shm_close_fd`] or scope exit) to release the lock and close.
 /// Returns `None` on miss or error.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::fd::OwnedFd, usize)> {
     let name = shm_lz4_segment_name(content_hash);
     let fd = rustix::shm::open(
@@ -1280,6 +1282,7 @@ pub(crate) fn shm_open_lz4(content_hash: u64) -> Option<(std::os::fd::OwnedFd, u
 }
 
 /// Store compressed initramfs data into an LZ4 SHM segment.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
     shm_store(&shm_lz4_segment_name(content_hash), data)
 }
@@ -1300,16 +1303,19 @@ pub(crate) fn shm_store_lz4(content_hash: u64, data: &[u8]) -> Result<()> {
 /// (e.g. `ReservationGuard` in the VMM) and is munmapped when that
 /// reservation drops — which must happen BEFORE this guard drops,
 /// so the lock protects the mapping right up until tear-down.
+#[cfg(target_arch = "x86_64")]
 pub(crate) struct CowOverlayGuard {
     fd: std::os::fd::OwnedFd,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl CowOverlayGuard {
     fn new(fd: std::os::fd::OwnedFd) -> Self {
         Self { fd }
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Drop for CowOverlayGuard {
     fn drop(&mut self) {
         // fd was obtained via shm_open in the COW overlay path; release
@@ -1350,6 +1356,7 @@ impl Drop for CowOverlayGuard {
 /// level. The caller is also responsible for ensuring `shm_fd` is a
 /// valid, open file descriptor with `LOCK_SH` already held (the
 /// guard inherits both).
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn cow_overlay(
     host_addr: *mut u8,
     len: usize,
@@ -1381,6 +1388,7 @@ pub(crate) unsafe fn cow_overlay(
 }
 
 /// Close a SHM fd and release its shared flock.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn shm_close_fd(fd: std::os::fd::OwnedFd) {
     // Explicit flock-unlock so a cooperating writer waiting on LOCK_EX
     // observes ordering with our earlier reads (LOCK_SH); the OwnedFd

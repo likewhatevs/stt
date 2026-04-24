@@ -17,6 +17,7 @@ pub(crate) const COM1_IRQ: u32 = 4;
 #[cfg(target_arch = "x86_64")]
 pub(crate) const COM2_IRQ: u32 = 3;
 
+#[cfg(any(target_arch = "x86_64", test))]
 const NUM_REGS: u16 = 8;
 
 /// EventFd-based interrupt trigger. Signals the eventfd on each
@@ -33,6 +34,7 @@ impl vm_superio::Trigger for EventFdTrigger {
 
 /// Serial wrapper around vm-superio::Serial with output capture.
 pub struct Serial {
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     base: u16,
     inner: vm_superio::Serial<EventFdTrigger, vm_superio::serial::NoEvents, Vec<u8>>,
 }
@@ -60,6 +62,7 @@ impl Serial {
 
     /// Handle a port I/O write from the guest. Returns true if the port
     /// is in this serial's range.
+    #[cfg(any(target_arch = "x86_64", test))]
     pub fn handle_out(&mut self, port: u16, data: &[u8]) -> bool {
         let Some(offset) = self.offset(port) else {
             return false;
@@ -72,6 +75,7 @@ impl Serial {
 
     /// Handle a port I/O read from the guest. Returns true if the port
     /// is in this serial's range.
+    #[cfg(any(target_arch = "x86_64", test))]
     pub fn handle_in(&mut self, port: u16, data: &mut [u8]) -> bool {
         let Some(offset) = self.offset(port) else {
             return false;
@@ -119,6 +123,7 @@ impl Serial {
         self.inner.writer_mut().clear();
     }
 
+    #[cfg(any(target_arch = "x86_64", test))]
     fn offset(&self, port: u16) -> Option<u8> {
         if port >= self.base && port < self.base + NUM_REGS {
             Some((port - self.base) as u8)
