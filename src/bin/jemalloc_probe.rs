@@ -105,13 +105,17 @@
 //!
 //! Address math:
 //! - Variant II (x86_64): TP points to END of TLS block.
-//!     addr(tsd_tls) = fs_base - round_up(PT_TLS.p_memsz, PT_TLS.p_align) + st_value
-//!     addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
+//!   ```text
+//!   addr(tsd_tls) = fs_base - round_up(PT_TLS.p_memsz, PT_TLS.p_align) + st_value
+//!   addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
+//!   ```
 //! - Variant I (aarch64): TP points to start of the 16-byte TCB
 //!   header; TLS block starts after the header, aligned up to
 //!   PT_TLS.p_align (AArch64 ELF ABI, IHI 0056D §4.1).
-//!     addr(tsd_tls) = TPIDR_EL0 + round_up(16, PT_TLS.p_align) + st_value
-//!     addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
+//!   ```text
+//!   addr(tsd_tls) = TPIDR_EL0 + round_up(16, PT_TLS.p_align) + st_value
+//!   addr(field)   = addr(tsd_tls) + offsetof(tsd_s, field)
+//!   ```
 
 // Link jemalloc as the global allocator for binary-homogeneity
 // across ktstr bins — the probe does NOT read its own TSD, so the
@@ -952,6 +956,7 @@ pub(crate) fn find_tsd_tls(elf: &Elf<'_>, elf_path: &Path) -> Result<TsdTlsSymbo
     let (tls_image_aligned_size, p_align) = extract_pt_tls_layout(elf)?;
 
     // Order-preserving name search across symbol tables.
+    #[allow(clippy::type_complexity)]
     let finders: [(&str, &dyn Fn(&str) -> Option<u64>); 2] = [
         (".symtab", &|name| {
             find_symbol_by_name(&elf.syms, &elf.strtab, name)
@@ -2122,6 +2127,7 @@ fn read_thread_start_time(pid: i32, tid: i32) -> Option<u64> {
 ///   - **Single-line input with no trailing newline**: the
 ///     common `/proc` shape. `lines().next()` returns the whole
 ///     buffer and the parser runs unchanged.
+///
 /// Each edge case either produces the correct `starttime` value
 /// or a safe `None` return, never a latent misalignment that
 /// yields a plausible-looking wrong integer.
@@ -2690,10 +2696,10 @@ fn run(cli: &Cli) -> RunOutcome {
         // longer valid and subsequent snapshots would read garbage.
         // Skip on iteration 0 because `exe_identity` was just
         // captured before the loop.
-        if i > 0 {
-            if let Err(e) = ensure_exe_identity_unchanged(pid, &exe_identity, "between snapshots") {
-                return RunOutcome::Fatal(FatalError::exe_identity_changed(e));
-            }
+        if i > 0
+            && let Err(e) = ensure_exe_identity_unchanged(pid, &exe_identity, "between snapshots")
+        {
+            return RunOutcome::Fatal(FatalError::exe_identity_changed(e));
         }
         // Re-enumerate /proc/<pid>/task per snapshot so threads
         // spawned AFTER the previous enumeration are visible from

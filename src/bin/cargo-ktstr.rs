@@ -821,6 +821,7 @@ fn resolve_kernel_image(kernel: Option<&str>) -> Result<PathBuf, String> {
     ktstr::cli::resolve_kernel_image(kernel, &KERNEL_POLICY).map_err(|e| format!("{e:#}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_shell(
     kernel: Option<String>,
     topology: String,

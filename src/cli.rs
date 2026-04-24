@@ -680,6 +680,7 @@ pub fn format_entry_row(
 ///   - `"image file <name> missing from entry directory"` —
 ///     metadata parsed cleanly but the declared image file is gone
 ///     (partial download, manual deletion, failed strip+rename).
+///
 ///   The example above shows the schema-drift case; consumers that
 ///   treat corrupt entries as a single category can key on the
 ///   `"error"` key alone.
@@ -885,11 +886,11 @@ pub fn kernel_list(json: bool) -> Result<()> {
 /// - Input order is preserved in the output — `cache.list()` sorts
 ///   `built_at`-descending, so the retained `keep` prefix is the
 ///   most recent entries.
-fn partition_clean_candidates<'a>(
-    entries: &'a [crate::cache::ListedEntry],
+fn partition_clean_candidates(
+    entries: &[crate::cache::ListedEntry],
     keep: Option<usize>,
     corrupt_only: bool,
-) -> Vec<&'a crate::cache::ListedEntry> {
+) -> Vec<&crate::cache::ListedEntry> {
     let skip = keep.unwrap_or(0);
     let mut valid_kept = 0usize;
     let mut to_remove: Vec<&crate::cache::ListedEntry> = Vec::new();
@@ -3091,11 +3092,11 @@ fn install_spinner_termios_panic_hook() {
             // terminal state is indeterminate and the hook
             // cannot safely restore, so we fall through to the
             // default handler unchanged.
-            if let Ok(guard) = SPINNER_SAVED_TERMIOS.try_lock() {
-                if let Some(termios) = *guard {
-                    unsafe {
-                        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios);
-                    }
+            if let Ok(guard) = SPINNER_SAVED_TERMIOS.try_lock()
+                && let Some(termios) = *guard
+            {
+                unsafe {
+                    libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &termios);
                 }
             }
             default(info);
@@ -3388,7 +3389,7 @@ mod tests {
     #[test]
     fn parse_topology_string_names_failing_field() {
         for (pos, field) in [(0, "numa_nodes"), (1, "llcs"), (2, "cores"), (3, "threads")] {
-            let mut parts = vec!["1"; 4];
+            let mut parts = ["1"; 4];
             parts[pos] = "abc";
             let input = parts.join(",");
             let err = parse_topology_string(&input).expect_err("non-numeric must fail");
@@ -3407,7 +3408,7 @@ mod tests {
     #[test]
     fn parse_topology_string_rejects_zero_dimensions() {
         for pos in 0..4 {
-            let mut parts = vec!["1"; 4];
+            let mut parts = ["1"; 4];
             parts[pos] = "0";
             let input = parts.join(",");
             let err = parse_topology_string(&input).expect_err("zero must fail");
@@ -5191,6 +5192,7 @@ mod tests {
     ///    know to handle `null` without reading source;
     /// 5. the corrupt-entry `error` marker appears so the two
     ///    entry shapes (valid vs corrupt) are both documented.
+    ///
     /// Not pinning the entire byte sequence because a small
     /// wording tweak should not require a snapshot update — the
     /// discoverability contract is the invariant.
@@ -5260,7 +5262,8 @@ mod tests {
         // and are covered above. `error` is corrupt-only — asserted
         // separately so the failure message does not mislead a
         // future reader into grepping the valid-entry code path.
-        for corrupt_entry_field in ["error"] {
+        {
+            let corrupt_entry_field = "error";
             assert!(
                 KERNEL_LIST_LONG_ABOUT.contains(corrupt_entry_field),
                 "KERNEL_LIST_LONG_ABOUT must mention corrupt-entry JSON \

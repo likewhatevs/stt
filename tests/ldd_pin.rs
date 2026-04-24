@@ -150,7 +150,7 @@ fn ktstr_binary_dynamic_deps_pinned() {
     // a best-effort hardening step rather than failing the test
     // on a non-critical format diff.
     if let Some(after_arrow) = libgcc_line.split("=>").nth(1) {
-        let resolved_path = after_arrow.trim().split_whitespace().next().unwrap_or("");
+        let resolved_path = after_arrow.split_whitespace().next().unwrap_or("");
         if !resolved_path.is_empty() {
             let p = std::path::Path::new(resolved_path);
             assert!(

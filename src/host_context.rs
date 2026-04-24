@@ -2001,32 +2001,35 @@ Hugepagesize:       2048 kB
     #[test]
     fn diff_renders_every_documented_field() {
         let a = HostContext::default();
-        let mut b = HostContext::default();
-        b.kernel_name = Some("Linux".to_string());
-        b.kernel_release = Some("6.11.0".to_string());
-        b.arch = Some("x86_64".to_string());
-        b.cpu_model = Some("Example CPU".to_string());
-        b.cpu_vendor = Some("GenuineIntel".to_string());
-        b.total_memory_kb = Some(16_384_000);
-        b.hugepages_total = Some(0);
-        b.hugepages_free = Some(0);
-        b.hugepages_size_kb = Some(2048);
-        b.online_cpus = Some(8);
-        b.numa_nodes = Some(1);
-        b.thp_enabled = Some("always [madvise] never".to_string());
-        b.thp_defrag = Some("always [madvise] never".to_string());
-        b.kernel_cmdline = Some("preempt=lazy".to_string());
-        b.cpufreq_governor.insert(0, "performance".to_string());
+        let heap = crate::host_heap::HostHeapState {
+            active_bytes: Some(1),
+            allocated_bytes: Some(2),
+            resident_bytes: Some(3),
+            mapped_bytes: Some(4),
+            narenas: Some(1),
+        };
         let mut tunables = BTreeMap::new();
         tunables.insert("sched_migration_cost_ns".to_string(), "500000".to_string());
-        b.sched_tunables = Some(tunables);
-        let mut heap = crate::host_heap::HostHeapState::default();
-        heap.active_bytes = Some(1);
-        heap.allocated_bytes = Some(2);
-        heap.resident_bytes = Some(3);
-        heap.mapped_bytes = Some(4);
-        heap.narenas = Some(1);
-        b.heap_state = Some(heap);
+        let mut b = HostContext {
+            kernel_name: Some("Linux".to_string()),
+            kernel_release: Some("6.11.0".to_string()),
+            arch: Some("x86_64".to_string()),
+            cpu_model: Some("Example CPU".to_string()),
+            cpu_vendor: Some("GenuineIntel".to_string()),
+            total_memory_kb: Some(16_384_000),
+            hugepages_total: Some(0),
+            hugepages_free: Some(0),
+            hugepages_size_kb: Some(2048),
+            online_cpus: Some(8),
+            numa_nodes: Some(1),
+            thp_enabled: Some("always [madvise] never".to_string()),
+            thp_defrag: Some("always [madvise] never".to_string()),
+            kernel_cmdline: Some("preempt=lazy".to_string()),
+            sched_tunables: Some(tunables),
+            heap_state: Some(heap),
+            ..Default::default()
+        };
+        b.cpufreq_governor.insert(0, "performance".to_string());
 
         let out = a.diff(&b);
         for key in HOST_CONTEXT_FIELDS {
@@ -2184,8 +2187,10 @@ Hugepagesize:       2048 kB
     /// `None` (read_dir failure).
     #[test]
     fn format_human_sched_tunables_empty_vs_none() {
-        let mut ctx = HostContext::default();
-        ctx.sched_tunables = Some(BTreeMap::new());
+        let mut ctx = HostContext {
+            sched_tunables: Some(BTreeMap::new()),
+            ..Default::default()
+        };
         let out_empty = ctx.format_human();
         assert!(
             out_empty.contains("sched_tunables: (empty)"),

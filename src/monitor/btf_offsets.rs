@@ -1775,7 +1775,6 @@ mod tests {
                 sidecar.display(),
             );
             let _ = std::fs::remove_dir_all(&dir);
-            return;
         }
         // /sys/kernel/btf/vmlinux path: raw BTF on a read-only
         // filesystem. Any sidecar write would fail anyway, and the

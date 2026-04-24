@@ -1494,7 +1494,8 @@ mod tests {
     /// would catch itself.
     #[test]
     fn sum_metric_accessors_read_expected_field() {
-        let cases: &[(&str, fn(&mut ThreadState))] = &[
+        type MetricSetter = fn(&mut ThreadState);
+        let cases: &[(&str, MetricSetter)] = &[
             ("run_time_ns", |t| t.run_time_ns = 1),
             ("wait_time_ns", |t| t.wait_time_ns = 1),
             ("timeslices", |t| t.timeslices = 1),

@@ -641,7 +641,8 @@ fn capture_stderr_serializes_concurrent_callers() {
             let others: Vec<String> = markers
                 .iter()
                 .enumerate()
-                .filter_map(|(j, m)| (j != i).then(|| m.clone()))
+                .filter(|&(j, _m)| j != i)
+                .map(|(_j, m)| m.clone())
                 .collect();
             std::thread::spawn(move || {
                 let (_, bytes) = capture_stderr(|| {

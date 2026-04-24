@@ -1133,7 +1133,7 @@ where
     let total = topo.llc_groups.len();
     let target = match llc_cap {
         Some(cap) => cap.effective_count(total)?,
-        None => (total + 3) / 4,
+        None => total,
     };
     if target == 0 {
         // Zero-LLC host would have already failed upstream, but be
@@ -1286,9 +1286,9 @@ pub fn warn_if_cross_node_spill(plan: &LlcPlan, topo: &HostTopology) {
 }
 
 /// Pure predicate backing [`warn_if_cross_node_spill`]. Returns
-/// `true` when the plan spans more than one NUMA node (`mems.len()
-/// > 1`); the warning suppression for single-node plans follows
-/// directly from this.
+/// `true` when the plan spans more than one NUMA node
+/// (`mems.len() > 1`); the warning suppression for single-node
+/// plans follows directly from this.
 ///
 /// Split out so tests can pin the polarity of the single-node /
 /// multi-node decision without capturing stderr. A refactor that
@@ -3560,6 +3560,7 @@ mod tests {
     ///   2. Final `sort_unstable` dropped. Output would preserve
     ///      the interior walk order, typically `[2, 3, 0]` once
     ///      consolidation promoted the peer-held LLCs.
+    ///
     /// Either regression fails this test. See
     /// `plan_from_snapshots_always_ascending_across_target_range`
     /// for the broader property-based guard.

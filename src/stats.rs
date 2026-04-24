@@ -3698,7 +3698,7 @@ mod tests {
     /// shearing content on one side of the cycle.
     #[test]
     fn gauntlet_row_round_trip_non_empty_collections() {
-        let mut row = make_row("scn", "topo", false, 3.14);
+        let mut row = make_row("scn", "topo", false, std::f64::consts::PI);
         row.flags = vec!["a".into(), "b".into(), "c".into()];
         row.ext_metrics.insert("m1".into(), 1.0);
         row.ext_metrics.insert("m2".into(), 2.5);

@@ -123,8 +123,8 @@
 //!
 //! Both properties are invariants the `ktstr-jemalloc-alloc-worker`
 //! + `jemalloc_probe_tests.rs` pair depends on; breaking either
-//! without updating this module's scheme produces silent poll
-//! timeouts rather than loud errors.
+//!   without updating this module's scheme produces silent poll
+//!   timeouts rather than loud errors.
 
 /// Prefix for the pid-scoped ready-marker path. The final segment is
 /// the worker's pid rendered as a decimal ASCII integer.

@@ -854,6 +854,7 @@ fn canonicalize_active_flags(flags: &[String]) -> Vec<String> {
 ///      (see `run_ktstr_test_inner`),
 ///    - `ResourceContention` at `builder.build()` or `vm.run()`
 ///      (topology-level unavailability — the VM never booted).
+///
 ///    These paths write a MINIMAL sidecar: empty VM telemetry,
 ///    `work_type = "skipped"`, and `payload` pinned to the entry's
 ///    declared payload so stats can still attribute the skip to

@@ -64,12 +64,13 @@ fn format_exit_status(status: std::process::ExitStatus) -> String {
 /// branch under test — a bare "got exit code X" without context would
 /// force the reader to map the call site back to the branch by hand.
 ///
-/// Centralises the spawn + `output.status.code()` + `format_exit_status`
-/// + stderr-lossy render triad that every test in this file otherwise
-/// retypes. A retype-drift (e.g. swapping `Some(expected)` for
-/// `Ok(expected)`, or dropping the stderr render on failure) would
-/// previously hide in one test's boilerplate; centralising forces
-/// every caller through the same assertion shape.
+/// Centralises the spawn + `output.status.code()` +
+/// `format_exit_status` + stderr-lossy render triad that every
+/// test in this file otherwise retypes. A retype-drift (e.g.
+/// swapping `Some(expected)` for `Ok(expected)`, or dropping the
+/// stderr render on failure) would previously hide in one test's
+/// boilerplate; centralising forces every caller through the same
+/// assertion shape.
 ///
 /// Most callers hand a `&[(&str, &str)]` slice literal for `envs`;
 /// tests that set zero env vars pass `&[]`. The `&[(&str, &str)]`

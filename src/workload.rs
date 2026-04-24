@@ -6759,6 +6759,7 @@ mod tests {
     ///     `_exit(0)`s WITHIN the deadline. The graceful branch's
     ///     `waited` is `Exited(0)`; the same unconditional killpg
     ///     must still reap the grandchild.
+    ///
     /// The Drop branch is pinned by
     /// [`drop_reaps_custom_grandchild_via_process_group`] (handle is
     /// dropped with no stop_and_collect call → `impl Drop`'s killpg
@@ -7805,8 +7806,8 @@ mod tests {
     ///    scheduler; combined with the migration check in the
     ///    outer `worker_main` loop (gated on
     ///    `work_units.is_multiple_of(1024)`) firing every 64 outer
-    ///    iters for this test's parameters (touches_per_cycle=16
-    ///    + spin_iters=32 = 48 work_units/iter,
+    ///    iters for this test's parameters (touches_per_cycle=16 +
+    ///    spin_iters=32 = 48 work_units/iter,
     ///    gcd(48, 1024) = 16, period = 1024/16 = 64; the default
     ///    16-iter period documented in
     ///    doc/guide/src/architecture/workers.md assumes

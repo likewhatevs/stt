@@ -84,6 +84,7 @@ fn wait_for_worker_ready(pid: i32, timeout: Duration) -> Result<(), String> {
 ///    - `interrupted: true`
 ///    - `snapshots.len() < 20` (interrupt landed before completion)
 ///    - at least one snapshot emitted (interrupt landed AFTER first)
+///
 /// Pre-check YAMA `ptrace_scope`. Returns `true` when the test
 /// should skip — i.e. the file is readable and its value is > 0
 /// AND the caller is not privileged (`geteuid() != 0` stands in

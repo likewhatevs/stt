@@ -2245,6 +2245,7 @@ fn build_stimulus(
 ///   every policy node must appear in the cpuset's covered NUMA
 ///   nodes. Bail naming the uncovered nodes AND both escape
 ///   hatches (STATIC_NODES opt-in; widening the cpuset).
+///
 /// Reject `--flag` args whose bare name is not in the payload's
 /// `known_flags` allowlist. Returns `Ok(())` when the payload
 /// declared no allowlist (`known_flags: None`) — the opt-in

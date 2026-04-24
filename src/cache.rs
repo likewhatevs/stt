@@ -6037,9 +6037,9 @@ mod tests {
         let entries = cache.list().expect("list must succeed");
         let keys: Vec<&str> = entries
             .iter()
-            .filter_map(|e| match e {
-                ListedEntry::Valid(entry) => Some(entry.key.as_str()),
-                ListedEntry::Corrupt { key, .. } => Some(key.as_str()),
+            .map(|e| match e {
+                ListedEntry::Valid(entry) => entry.key.as_str(),
+                ListedEntry::Corrupt { key, .. } => key.as_str(),
             })
             .collect();
         assert!(

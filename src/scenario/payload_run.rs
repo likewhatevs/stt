@@ -1110,7 +1110,7 @@ fn build_command(
         cmd.process_group(0);
     }
 
-    if cgroup_path.is_some() {
+    if let Some(cgroup_path) = cgroup_path {
         // Two-pipe cgroup-placement handshake. `notify_*` carries
         // the child's pid from its pre_exec hook up to the parent
         // so the parent can address the `cgroup.procs` write
@@ -1164,7 +1164,7 @@ fn build_command(
         let handles = CgroupSyncHandles {
             notify,
             release,
-            cgroup_procs_path: cgroup_path.unwrap().join("cgroup.procs"),
+            cgroup_procs_path: cgroup_path.join("cgroup.procs"),
         };
         return Ok((cmd, Some(handles)));
     }

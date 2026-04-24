@@ -631,7 +631,7 @@ mod tests {
         let m = extract_metrics(input, &OutputFormat::Json, MetricStream::Stdout).unwrap();
         let names: Vec<&str> = m.iter().map(|x| x.name.as_str()).collect();
         assert!(
-            !names.iter().any(|n| *n == "iops"),
+            !names.contains(&"iops"),
             "regression check: the finder picking up the dmesg \
              timestamp array means the real stdout `iops` metric \
              is NOT extracted; if this ever starts containing \
@@ -710,7 +710,7 @@ mod tests {
         .unwrap();
         let clean_names: Vec<&str> = m_clean.iter().map(|x| x.name.as_str()).collect();
         assert!(
-            clean_names.iter().any(|n| *n == "iops"),
+            clean_names.contains(&"iops"),
             "control: stdout JSON in isolation must extract the \
              `iops` metric so the preceding assertion is \
              isolating the noise-interaction behaviour, not \

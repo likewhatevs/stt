@@ -690,7 +690,7 @@ pub fn parse_cpu_list(s: &str) -> Option<Vec<u32>> {
 ///
 /// Without this split, the previous implementation collapsed
 /// every error to None indistinguishably — EINVAL on a
-/// >1024-CPU host was treated the same as EPERM, and every
+/// \>1024-CPU host was treated the same as EPERM, and every
 /// caller had to rely on the procfs fallback for correctness,
 /// making the syscall path effectively useless on the very
 /// hosts where affinity data matters most (1000-plus-CPU NUMA
@@ -1848,7 +1848,7 @@ mod tests {
         // Plant CPU bits in word 0 AND word 3; tell the
         // extractor only word 0 was written by the kernel.
         buf[0] = (1 as libc::c_ulong) << 7; // CPU 7
-        buf[3] = (1 as libc::c_ulong) << 0; // would-be CPU 3*word_bits
+        buf[3] = 1 as libc::c_ulong; // would-be CPU 3*word_bits
         let one_word_bytes = std::mem::size_of::<libc::c_ulong>();
         let cpus = extract_cpus_from_mask(&buf, one_word_bytes).expect("non-empty mask");
         // Only the bit in the first (kernel-written) word comes back.

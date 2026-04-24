@@ -3,7 +3,7 @@
 //!
 //! Wraps [`CgroupManager`](crate::cgroup::CgroupManager) to enforce CPU
 //! + NUMA memory binding for `make` and its gcc/ld children when the
-//! user passes `--llc-cap N`. The sandbox contract is:
+//!   user passes `--llc-cap N`. The sandbox contract is:
 //!
 //!  - A dedicated child cgroup is created under the caller's own
 //!    cgroup (parsed from `/proc/self/cgroup`). Name format is
@@ -11,7 +11,7 @@
 //!    never collide and an orphan from a previous run is
 //!    identifiable by its `{pid}` suffix.
 //!  - Writes are strictly ordered per kernel rules:
-//!        cpuset.cpus → cpuset.mems → cgroup.procs
+//!    cpuset.cpus → cpuset.mems → cgroup.procs
 //!    A task in a cgroup with an empty `cpuset.mems` may be killed by
 //!    the kernel's cpuset allocation path; migrating the build shell
 //!    into `cgroup.procs` before both cpuset fields are populated
@@ -214,9 +214,12 @@ impl BuildSandbox {
         hard_error_on_degrade: bool,
     ) -> Result<Self> {
         // Step A: statfs /sys/fs/cgroup to confirm cgroup v2 is the
-        // active mount. The f_type field varies in signed-ness across
-        // glibc targets; cast to i64 to compare uniformly.
+        // active mount.
         match rustix::fs::statfs("/sys/fs/cgroup") {
+            // f_type is FsWord which varies across targets (i64 on
+            // gnu x86_64/aarch64, u32 on s390x, u64 on musl). Cast
+            // to i64 so the comparison compiles uniformly.
+            #[allow(clippy::unnecessary_cast)]
             Ok(sfs) if (sfs.f_type as i64) == CGROUP2_SUPER_MAGIC => {}
             Ok(_) | Err(_) => {
                 return Self::degraded_or_err(SandboxDegraded::NoCgroupV2, hard_error_on_degrade);
@@ -1125,8 +1128,8 @@ mod tests {
     /// Drop on an Active sandbox with a non-existent parent cgroup
     /// path must NOT panic. The production Drop calls drain_tasks
     /// + remove_cgroup, both of which short-circuit on
-    /// `!parent.exists()` (src/cgroup.rs), so the teardown is a
-    /// safe no-op when we hand it a bogus path.
+    ///   `!parent.exists()` (src/cgroup.rs), so the teardown is a
+    ///   safe no-op when we hand it a bogus path.
     ///
     /// Distinct from `build_sandbox_is_active_discriminates_variants`:
     /// that test asserts the `is_active()` accessor; this one pins
