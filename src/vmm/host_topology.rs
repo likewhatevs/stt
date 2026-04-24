@@ -1133,7 +1133,7 @@ where
     let total = topo.llc_groups.len();
     let target = match llc_cap {
         Some(cap) => cap.effective_count(total)?,
-        None => total,
+        None => (total + 3) / 4,
     };
     if target == 0 {
         // Zero-LLC host would have already failed upstream, but be
