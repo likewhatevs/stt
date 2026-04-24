@@ -80,7 +80,7 @@ use ktstr::test_support::{LLM_DEBUG_RESPONSES_ENV, MetricSource};
 /// 4. `value.is_finite()` on every metric.
 /// 5. `value >= 0.0` on every metric.
 /// 6. `value < 1e12` on every metric.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 2048)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 2048, payload = SCHBENCH)]
 fn llm_extract_schbench_surfaces_sane_metrics(ctx: &Ctx) -> Result<AssertResult> {
     let (assert_result, metrics) = ctx.payload(&SCHBENCH).run()?;
     // Forward the gate's verdict on any upstream failure:

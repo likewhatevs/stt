@@ -83,6 +83,7 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
         assert: ktstr::assert::Assert::NO_OVERRIDES.fail_on_stall(false),
         bpf_map_write: &[&BPF_NOOP],
         duration: std::time::Duration::from_secs(10),
+        watchdog_timeout: std::time::Duration::from_secs(15),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
