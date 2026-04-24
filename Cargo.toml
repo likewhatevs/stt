@@ -176,6 +176,11 @@ flate2 = "1"
 gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
 libbpf-cargo = "0.26"
 reqwest = { version = "0.13", features = ["blocking"] }
+# Stable hash for BTF content drift detection in build.rs.
+# Reusing the same crate ktstr uses for sidecar_variant_hash keeps
+# the dep graph narrow and pins one algorithm across every hashing
+# site in the project. See build.rs `siphash_13` for the call site.
+siphasher = "1"
 tar = "0.4"
 
 [[bin]]

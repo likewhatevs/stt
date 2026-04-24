@@ -39,12 +39,14 @@ fn main() {
     // content change and regenerate. The pre-hash design only
     // regenerated when `vmlinux.h` was absent entirely, which
     // meant a BTF-content change paired with an unrelated build-
-    // script trigger would leave stale `vmlinux.h` in place. The
-    // FNV-1a hash of the BTF bytes is written alongside
-    // `vmlinux.h` as `vmlinux.h.btf-hash`; regen fires when the
+    // script trigger would leave stale `vmlinux.h` in place. A
+    // SipHasher13 hash of the BTF bytes is written alongside
+    // `vmlinux.h` as `vmlinux.btf.hash`; regen fires when the
     // file is absent OR the stored hash differs from the current
     // BTF's hash. Operators who need to force regen unconditionally
-    // still have `cargo clean` as the escape hatch.
+    // still have `cargo clean` as the escape hatch. The algorithm
+    // mirrors `src/test_support/sidecar.rs::sidecar_variant_hash`
+    // so the project uses a single stable hash family.
     println!("cargo:rerun-if-env-changed=KTSTR_KERNEL");
     println!("cargo:rerun-if-changed=src/kernel_path.rs");
     println!("cargo:rerun-if-changed=src/bpf/vmlinux_gen.c");
@@ -52,7 +54,7 @@ fn main() {
 
     // Generate vmlinux.h from kernel BTF.
     let vmlinux_h = out_dir.join("vmlinux.h");
-    let hash_path = out_dir.join("vmlinux.h.btf-hash");
+    let hash_path = out_dir.join("vmlinux.btf.hash");
     // Resolve BTF + compute content hash eagerly. `resolve_btf`
     // returns `Option` to degrade cleanly when no BTF is reachable
     // (no KTSTR_KERNEL + no host BTF): if `vmlinux.h` is already in
@@ -71,7 +73,7 @@ fn main() {
     // loudly there if the source is truly unusable.
     let current_hash: Option<String> = current_btf.as_ref().and_then(|p| {
         match std::fs::read(p) {
-            Ok(bytes) => Some(format!("{:016x}", fnv1a_64(&bytes))),
+            Ok(bytes) => Some(format!("{:016x}", siphash_13(&bytes))),
             Err(e) => {
                 println!(
                     "cargo:warning=BTF source {} present but unreadable \
@@ -180,7 +182,7 @@ int main(void) {{
         let hash_opt: Option<String> = match current_hash.as_deref() {
             Some(h) => Some(h.to_string()),
             None => match std::fs::read(&btf_source) {
-                Ok(bytes) => Some(format!("{:016x}", fnv1a_64(&bytes))),
+                Ok(bytes) => Some(format!("{:016x}", siphash_13(&bytes))),
                 Err(e) => {
                     println!(
                         "cargo:warning=post-regen BTF re-read failed ({e}); \
@@ -400,28 +402,22 @@ int main(void) {{
     }
 }
 
-/// 64-bit FNV-1a hash. Used to detect BTF content drift between
-/// `vmlinux.h` regenerations without adding a crate to
-/// `[build-dependencies]`.
+/// 64-bit SipHash-1-3 of `bytes`. Used to detect BTF content drift
+/// between `vmlinux.h` regenerations.
 ///
-/// FNV-1a is a non-cryptographic hash — collisions are
-/// astronomically unlikely for the drift-detection use case
-/// (a BTF change that collides on a 64-bit FNV-1a would have to
-/// hit a ~1-in-2^64 chance) but NOT adversarial-safe. The hash
-/// file is a build-artifact sidecar, not a signed manifest, so
-/// non-cryptographic is the right choice.
-///
-/// The constants are the canonical FNV-1a 64-bit offset basis
-/// (`0xcbf29ce484222325`) and prime (`0x100000001b3`); see the
-/// FNV reference page:
-/// <http://www.isthe.com/chongo/tech/comp/fnv/>.
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for &byte in bytes {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+/// Algorithm mirrors `src/test_support/sidecar.rs::sidecar_variant_hash`
+/// — `SipHasher13::new_with_keys(0, 0)` + `h.write(bytes)` +
+/// `h.finish()`. Zero keys are deliberate: this is a drift hash, not
+/// a DoS-mitigation hash, and stable (key-less) output lets a future
+/// build.rs invocation compare against a sidecar written by a prior
+/// run without coordinating on a key. SipHasher13 is faster than
+/// SipHasher24 at the cost of reduced crypto strength — acceptable
+/// because the hash is a build-artifact sidecar, not a signed
+/// manifest.
+fn siphash_13(bytes: &[u8]) -> u64 {
+    use siphasher::sip::SipHasher13;
+    use std::hash::Hasher;
+    let mut h = SipHasher13::new_with_keys(0, 0);
+    h.write(bytes);
+    h.finish()
 }
