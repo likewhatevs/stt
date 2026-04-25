@@ -233,6 +233,7 @@ pub(crate) fn make_vm_result(
         verifier_stats: Vec::new(),
         kvm_stats: None,
         crash_message: None,
+        cleanup_duration: None,
     }
 }
 

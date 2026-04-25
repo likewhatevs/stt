@@ -3559,6 +3559,20 @@ fn worker_main(
 //    per-iteration `black_box` increments with the caller's
 //    arithmetic, defeating the granularity defense.
 //
+// Backend assumption: these barriers assume the LLVM backend
+// (rustc default for every release toolchain). On the cranelift
+// backend, `black_box` is a pure no-op identity function —
+// `rustc_codegen_cranelift/src/intrinsics/mod.rs` carries a
+// literal `FIXME implement black_box semantics` and just writes
+// the value back unchanged. Any build with
+// `-Z codegen-backend=cranelift` would silently lose every
+// `black_box` barrier in this file. Volatile loads/stores and
+// real syscalls survive that backend swap, so the cache-pressure
+// and PageFaultChurn variants stay anchored, but every
+// `spin_burst` / `matrix_multiply` / `work_units` increment
+// would become DCE-eligible. Stick with the LLVM backend for
+// release / nextest / `cargo ktstr test` runs.
+//
 // Future maintainers: if you see code like
 // `*work_units = std::hint::black_box(work_units.wrapping_add(1));`
 // or `unsafe { ptr::read_volatile(&buf[idx]) }` and your reflex is

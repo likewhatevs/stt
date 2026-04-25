@@ -163,6 +163,20 @@ pub struct SidecarResult {
     /// re-running the test rather than carrying a compat shim for
     /// older JSON.
     pub host: Option<crate::host_context::HostContext>,
+    /// Wall-clock milliseconds spent in
+    /// [`KtstrVm::collect_results`](crate::vmm::KtstrVm) — the host-side
+    /// teardown window from BSP exit through SHM drain (mirrors
+    /// [`VmResult::cleanup_duration`](crate::vmm::VmResult::cleanup_duration);
+    /// `Duration` is converted to `u64` ms here because every other
+    /// timing field on this struct that lands in a sidecar-comparison
+    /// CLI uses integer ms or seconds, and JSON has no native
+    /// `Duration`). `None` when the run was killed by the watchdog
+    /// before `collect_results` returned, or for the `host_only` /
+    /// host-only-stub paths that never boot a VM. Always emitted
+    /// (`"cleanup_duration_ms": null` on absence); required on
+    /// deserialize per the same symmetry rule that governs every other
+    /// nullable on this struct.
+    pub cleanup_duration_ms: Option<u64>,
 }
 
 #[cfg(test)]
@@ -221,6 +235,7 @@ impl SidecarResult {
             timestamp: String::new(),
             run_id: String::new(),
             host: None,
+            cleanup_duration_ms: None,
         }
     }
 }
@@ -582,6 +597,13 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
             let entry = cache.lookup(&key)?;
             entry.metadata.version
         }
+        // Multi-kernel specs in KTSTR_KERNEL never reach this
+        // function in production — `find_kernel`'s env reader bails
+        // before sidecar writing happens. This arm is defensive: if
+        // the env value is somehow a range or git spec, return
+        // `None` rather than guessing one endpoint, and the sidecar
+        // record will leave `kernel_version` as null.
+        KernelId::Range { .. } | KernelId::Git { .. } => None,
     }
 }
 
@@ -922,6 +944,10 @@ pub(crate) fn write_skip_sidecar(
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
         host: Some(crate::host_context::collect_host_context()),
+        // Skip paths never reach `collect_results`, so cleanup
+        // duration is undefined. Emit `null` per the sidecar's
+        // symmetric serialize/deserialize contract.
+        cleanup_duration_ms: None,
     };
     serialize_and_write_sidecar(&sidecar, "skip sidecar")
 }
@@ -978,6 +1004,7 @@ pub(crate) fn write_sidecar(
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
         host: Some(crate::host_context::collect_host_context()),
+        cleanup_duration_ms: vm_result.cleanup_duration.map(|d| d.as_millis() as u64),
     };
     serialize_and_write_sidecar(&sidecar, "sidecar")
 }
@@ -1319,6 +1346,7 @@ mod tests {
             timestamp: String::new(),
             run_id: String::new(),
             host: None,
+            cleanup_duration_ms: Some(123),
         };
         let json = serde_json::to_string_pretty(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -1353,6 +1381,7 @@ mod tests {
             timestamp,
             run_id,
             host,
+            cleanup_duration_ms,
         } = loaded;
         // Hash-participating string fields round-trip verbatim.
         assert_eq!(test_name, "my_test");
@@ -1398,6 +1427,11 @@ mod tests {
         assert_eq!(deltas.total_dispatch_keep_last, 3);
         assert_eq!(stimulus_events.len(), 1);
         assert_eq!(stimulus_events[0].label, "StepStart[0]");
+        assert_eq!(
+            cleanup_duration_ms,
+            Some(123),
+            "cleanup_duration_ms round-tripped",
+        );
     }
 
     /// Exhaustive schema-audit gate for `SidecarResult`'s serde
@@ -1504,6 +1538,7 @@ mod tests {
                 kernel_name: Some("AuditLinux".to_string()),
                 ..Default::default()
             }),
+            cleanup_duration_ms: Some(987),
         };
 
         let json = serde_json::to_string(&sc).expect("serialize");
@@ -1552,6 +1587,7 @@ mod tests {
         assert_eq!(loaded.run_id, "audit-run-id");
         let host = loaded.host.expect("host round-trips");
         assert_eq!(host.kernel_name.as_deref(), Some("AuditLinux"));
+        assert_eq!(loaded.cleanup_duration_ms, Some(987));
     }
 
     #[test]
@@ -2826,6 +2862,7 @@ mod tests {
             timestamp: _,
             run_id: _,
             host,
+            cleanup_duration_ms,
         } = loaded;
         assert!(payload.is_none());
         assert!(metrics.is_empty());
@@ -2842,6 +2879,7 @@ mod tests {
         assert!(kargs.is_empty());
         assert!(kernel_version.is_none());
         assert!(host.is_none());
+        assert!(cleanup_duration_ms.is_none());
     }
 
     /// Populated `payload` + `metrics` survive round-trip with the

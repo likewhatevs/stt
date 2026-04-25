@@ -147,7 +147,7 @@ fn schbench_identity_fields_are_stable() {
     assert!(matches!(SCHBENCH.output, OutputFormat::LlmExtract(None)));
     assert_eq!(
         SCHBENCH.default_args,
-        &["--runtime", "30", "--message-threads", "2"]
+        &["--runtime", "5", "--message-threads", "2"]
     );
     assert!(SCHBENCH.metrics.is_empty());
     assert_eq!(SCHBENCH.default_checks.len(), 1);

@@ -686,6 +686,20 @@ pub struct KtstrTestEntry {
     /// dependencies that don't belong on a specific Payload —
     /// auxiliary data files, per-test helper scripts, fixtures.
     pub extra_include_files: &'static [&'static str],
+    /// Maximum acceptable wall-clock duration of host-side VM teardown
+    /// (BSP exit through SHM drain). Compared against
+    /// [`VmResult::cleanup_duration`](crate::vmm::VmResult::cleanup_duration)
+    /// in `evaluate_vm_result`; when the budget is exceeded the test's
+    /// `AssertResult` is folded with a failing
+    /// [`AssertDetail`](crate::assert::AssertDetail). Catches
+    /// sub-watchdog cleanup regressions (e.g. a 30s teardown that the
+    /// 60s host watchdog would silently absorb) at the test that
+    /// declares the budget rather than at gross-timeout failure.
+    /// `None` (the default) disables the check, leaving the watchdog
+    /// as the only guard. Populated by
+    /// `#[ktstr_test(cleanup_budget_ms = N)]` or by direct entry
+    /// construction.
+    pub cleanup_budget: Option<Duration>,
 }
 
 /// Placeholder function for [`KtstrTestEntry::DEFAULT`].
@@ -755,6 +769,7 @@ impl KtstrTestEntry {
         expect_err: false,
         host_only: false,
         extra_include_files: &[],
+        cleanup_budget: None,
     };
 
     /// Reject values that would boot a broken VM or leave assertions

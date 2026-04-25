@@ -269,9 +269,23 @@ pub struct StressNgPayload;
 /// append `--json -` via `.arg("--json").arg("-")` on the runtime
 /// builder — the JSON block lands on stdout, the stdout-primary
 /// pass consumes it, and the stderr fallback never fires.
+///
+/// **`--runtime 5` tradeoff.** The 5-second `default_args` runtime
+/// is sized for fast CI smoke signal, NOT for tail-latency
+/// regression hunting — schbench's sample count scales with
+/// runtime (`nr_samples` in `show_latencies`), so 5 s collects
+/// roughly a sixth of what `--runtime 30` does and leaves p99.9+
+/// estimates dominated by variance. Scheduler authors
+/// investigating tail regressions should override via
+/// `.arg("--runtime").arg("30")` on the
+/// [`PayloadRun`](ktstr::scenario::payload_run::PayloadRun)
+/// builder returned by `ctx.payload(&SCHBENCH)`. schbench parses
+/// argv with `getopt_long` and each `case 'r'` overwrites
+/// `runtime = atoi(optarg)`, so the trailing setting wins on
+/// duplicates and the appended override takes effect.
 #[derive(Payload)]
 #[payload(binary = "schbench", output = LlmExtract)]
-#[default_args("--runtime", "30", "--message-threads", "2")]
+#[default_args("--runtime", "5", "--message-threads", "2")]
 #[default_check(exit_code_eq(0))]
 #[allow(dead_code)]
 pub struct SchbenchPayload;
@@ -305,13 +319,17 @@ pub struct SchbenchPayload;
 /// See the SCHBENCH doc's "Contract — no polarity-classified
 /// metrics by design" section for the full rationale and the
 /// stdout-vs-stderr extraction fallback.
+///
+/// **`--runtime 5` tradeoff inherited from [`SCHBENCH`].** See the
+/// SCHBENCH doc for the fast-CI vs tail-latency tradeoff and the
+/// `.arg("--runtime").arg("30")` override path.
 #[derive(Payload)]
 #[payload(
     binary = "schbench",
     name = "schbench_hinted",
     output = LlmExtract("wakeup latency percentiles"),
 )]
-#[default_args("--runtime", "30", "--message-threads", "2")]
+#[default_args("--runtime", "5", "--message-threads", "2")]
 #[default_check(exit_code_eq(0))]
 #[allow(dead_code)]
 pub struct SchbenchHintedPayload;
@@ -361,9 +379,13 @@ pub struct SchbenchHintedPayload;
 /// [`Polarity::Unknown`](ktstr::test_support::Polarity::Unknown),
 /// so the JSON blob is surfaced in sidecar output for regression
 /// tracking even when a specific percentile is not pinned here.
+///
+/// **`--runtime 5` tradeoff inherited from [`SCHBENCH`].** See the
+/// SCHBENCH doc for the fast-CI vs tail-latency tradeoff and the
+/// `.arg("--runtime").arg("30")` override path.
 #[derive(Payload)]
 #[payload(binary = "schbench", name = "schbench_json", output = Json)]
-#[default_args("--runtime", "30", "--message-threads", "2", "--json", "-")]
+#[default_args("--runtime", "5", "--message-threads", "2", "--json", "-")]
 #[default_check(exit_code_eq(0))]
 #[metric(name = "rps", polarity = HigherBetter, unit = "rps")]
 #[metric(name = "wakeup_latencies_usec.p99", polarity = LowerBetter, unit = "us")]

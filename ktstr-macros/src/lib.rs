@@ -47,8 +47,15 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///     onto `KtstrTestEntry::duration`
 ///   - `watchdog_timeout_s = N` — watchdog fire threshold in
 ///     seconds; maps onto `KtstrTestEntry::watchdog_timeout`
-///   - `scheduler = PATH` — path to a `const Scheduler` (default
-///     `Scheduler::EEVDF`, which runs without an scx scheduler)
+///   - `cleanup_budget_ms = N` — sub-watchdog cap on host-side VM
+///     teardown wall time; maps onto `KtstrTestEntry::cleanup_budget`
+///     as `Duration::from_millis(N)`. Default: `None` (unenforced).
+///   - `scheduler = PATH` — path to a `const Payload` (typically
+///     produced by `Payload::from_scheduler(&...)`). Maps onto
+///     `KtstrTestEntry::scheduler`, which is typed
+///     `&'static Payload`. Default: `&Payload::KERNEL_DEFAULT`,
+///     the no-scx placeholder that runs under the kernel's
+///     default scheduler.
 ///   - `payload = PATH` — path to a `const Payload` used as the
 ///     primary binary workload (must be `PayloadKind::Binary`;
 ///     runtime-enforced). Default: `None` (scheduler-only test).
@@ -130,6 +137,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut bpf_map_write: Option<syn::Path> = None;
     let mut expect_err: bool = false;
     let mut host_only: bool = false;
+    let mut cleanup_budget_ms: Option<u64> = None;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match attr_parser.parse(attr) {
@@ -289,7 +297,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "max_llcs"
                     | "max_numa_nodes"
                     | "max_cpus"
-                    | "max_p99_wake_latency_ns" => {
+                    | "max_p99_wake_latency_ns"
+                    | "cleanup_budget_ms" => {
                         let lit_int = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Int(li),
@@ -340,6 +349,13 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                             "max_gap_ms" => {
                                 max_gap_ms = Some(
+                                    lit_int
+                                        .base10_parse::<u64>()
+                                        .unwrap_or_else(|e| panic!("{e}")),
+                                )
+                            }
+                            "cleanup_budget_ms" => {
+                                cleanup_budget_ms = Some(
                                     lit_int
                                         .base10_parse::<u64>()
                                         .unwrap_or_else(|e| panic!("{e}")),
@@ -569,7 +585,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only"),
+                            format!("unknown attribute `{ident}`, expected: llcs, sockets, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_sockets, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only, cleanup_budget_ms"),
                         )
                         .to_compile_error()
                         .into();
@@ -708,6 +724,17 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             proc_macro2::Span::call_site(),
             "workers_per_cgroup must be > 0 (a zero-worker cgroup emits no \
              WorkerReports and assertions vacuously pass)",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if cleanup_budget_ms == Some(0) {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "cleanup_budget_ms must be > 0 — a zero budget would \
+             reject every successful run (any measurable cleanup \
+             duration overshoots zero). Omit the attribute to \
+             disable the check.",
         )
         .to_compile_error()
         .into();
@@ -876,6 +903,16 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let cross_node_mig_tokens = option_tokens(&max_cross_node_migration_ratio);
     let slow_tier_tokens = option_tokens(&max_slow_tier_ratio);
 
+    // `cleanup_budget_ms` lives on the macro side as `Option<u64>` of
+    // milliseconds; the entry field is `Option<Duration>`, so wrap
+    // the literal in `Duration::from_millis(...)` at emission time.
+    let cleanup_budget_tokens = match cleanup_budget_ms {
+        Some(ms) => {
+            quote! { ::core::option::Option::Some(::std::time::Duration::from_millis(#ms)) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+
     let bpf_map_write_tokens = match &bpf_map_write {
         Some(p) => quote! { &[&#p] },
         None => quote! { &[] },
@@ -1031,6 +1068,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             expect_err: #expect_err,
             host_only: #host_only,
             extra_include_files: &[#(#extra_include_files),*],
+            cleanup_budget: #cleanup_budget_tokens,
         };
 
         #[test]

@@ -50,15 +50,38 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 filter = "test(compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
-# Model-loaded integration tests: real CPU inference on the 2.44 GiB
-# Qwen3 GGUF runs the SAMPLE_LEN-token loop, which routinely takes
-# 2-5 minutes per call on host CPU. The default 60s × 2 budget
-# terminates these long before they finish; the override budgets
-# 600s × 2 (20 min total) so a slow CI runner with greedy sampling
-# on a 64-core box still completes inside the cap. Tests are
-# `#[ignore]`'d by default and only run via `--run-ignored=only` —
-# the override applies to ignored runs the same way nextest applies
-# any other override.
+# EEVDF tests: no sched_ext scheduler attached, so VM lifecycle is
+# bounded by the 60s host watchdog at `runtime.rs::KTSTR_VM_TIMEOUT`
+# plus VM setup overhead. 75s gives a margin above that ceiling so
+# nextest does not race the watchdog. retries=0 because a watchdog
+# timeout is never transient — re-running just burns the same time.
+[[profile.default.overrides]]
+filter = "test(eevdf_)"
+slow-timeout = { period = "75s", terminate-after = 2 }
+retries = 0
+
+# Model-loaded tests: real CPU inference on the 2.44 GiB Qwen3 GGUF
+# runs the SAMPLE_LEN-token loop, which routinely takes 2-5 minutes
+# per call on host CPU. The default 60s × 2 budget terminates these
+# long before they finish; the override budgets 600s × 2 (20 min
+# total) so a slow CI runner with greedy sampling on a 64-core box
+# still completes inside the cap.
+#
+# Two populations match this filter:
+#   * Unit tests in `src/test_support/model.rs` are `#[ignore]`'d by
+#     default and only run via `--run-ignored=only` — the override
+#     applies to ignored runs the same way nextest applies any other
+#     override.
+#   * The integration test
+#     `tests/llm_extract_e2e_test.rs::model_loaded_llm_extract_schbench`
+#     runs by default; the host-side `host_side_llm_extract` path
+#     (`src/test_support/eval.rs`) loads the GGUF post-VM-exit and
+#     runs inference on host CPU. The 2-5 minute inference window
+#     alone exceeds the 60s default budget on EVERY run regardless
+#     of cache state — the 600s override is required for warm-cache
+#     runs too. A cold cache additionally pays the GGUF download cost
+#     on top of that. retries=0: inference time is deterministic, so
+#     a timeout-killed run is never transient.
 [[profile.default.overrides]]
 filter = "test(model_loaded_)"
 slow-timeout = { period = "600s", terminate-after = 2 }
