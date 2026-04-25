@@ -23,6 +23,13 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 
 # ── Overrides ─────────────────────────────────────────────────────────
 
+# LLM e2e: VM boot + schbench + host-side model load (~2.4 GiB mmap)
+# + inference. The model load and inference run AFTER vm.run() returns,
+# so the total wall time is VM time + extraction time.
+[[profile.default.overrides]]
+filter = "test(llm_extract_)"
+slow-timeout = { period = "180s", terminate-after = 4 }
+
 # Boot tests under coverage instrumentation (llvm-cov) are 5-10x slower.
 [[profile.default.overrides]]
 filter = "test(boot_kernel) | test(bench_boot)"
