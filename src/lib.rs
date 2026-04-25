@@ -1142,6 +1142,45 @@ mod tests {
         );
     }
 
+    /// `find_kernel` must call `KernelId::validate()` BEFORE the
+    /// generic "multi-kernel specs are not supported in env-var form"
+    /// bail when the env value parses as a Range or Git spec, so an
+    /// inverted range like `KTSTR_KERNEL=6.16..6.12` surfaces the
+    /// actionable "swap the endpoints" diagnostic. A future
+    /// regression that drops the validate() call (or reorders it
+    /// after the generic bail) would flip the error from the
+    /// specific form to the generic redirect, landing here.
+    ///
+    /// `KTSTR_CACHE_DIR` is pointed at a fresh tempdir so the cache
+    /// scan can't preempt the env-reader (the reader runs first
+    /// regardless, but pinning the cache state prevents host noise
+    /// from changing the assertion shape).
+    #[test]
+    fn find_kernel_inverted_range_env_surfaces_swap_diagnostic() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let _cache_guard = EnvVarGuard::set("KTSTR_CACHE_DIR", &cache_root);
+        let _kernel_guard = EnvVarGuard::set(KTSTR_KERNEL_ENV, "6.16..6.12");
+
+        let err = find_kernel().expect_err("inverted range must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("inverted kernel range"),
+            "validate() diagnostic must surface ahead of the generic \
+             env-form bail; got: {msg}",
+        );
+        assert!(
+            msg.contains("6.12..6.16"),
+            "swap suggestion must appear in the error; got: {msg}",
+        );
+        assert!(
+            !msg.contains("not supported in env-var form"),
+            "validate() must short-circuit before the generic bail; got: {msg}",
+        );
+    }
+
     /// `KTSTR_KERNEL_ENV` must match the literal spelling `"KTSTR_KERNEL"`.
     /// Trivial pin, but load-bearing: readers that bypass the helper
     /// (e.g. hand-rolled `std::env::var("KTSTR_KERNEL")` in an ad-hoc

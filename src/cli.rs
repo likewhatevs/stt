@@ -6915,4 +6915,64 @@ mod tests {
             }
         }
     }
+
+    // -- inverted-range diagnostic wiring --
+
+    /// `resolve_cached_kernel` must call `KernelId::validate()` BEFORE
+    /// the generic "not yet supported" bail so an inverted range
+    /// surfaces the actionable "swap the endpoints" diagnostic
+    /// instead of getting masked by the redirect. A future regression
+    /// that drops the validate() call would flip the error text from
+    /// the specific message to the generic one, landing here.
+    #[test]
+    fn resolve_cached_kernel_surfaces_inverted_range_diagnostic() {
+        let id = crate::kernel_path::KernelId::Range {
+            start: "6.16".to_string(),
+            end: "6.12".to_string(),
+        };
+        let err = resolve_cached_kernel(&id, "ktstr-test").expect_err("inverted range must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("inverted kernel range"),
+            "validate() diagnostic must surface ahead of the generic \
+             'not yet supported' bail; got: {msg}",
+        );
+        assert!(
+            msg.contains("6.12..6.16"),
+            "swap suggestion must appear in the error; got: {msg}",
+        );
+        // Ensure we did NOT get the generic bail's text.
+        assert!(
+            !msg.contains("not yet supported in this context"),
+            "validate() must short-circuit before the generic bail; got: {msg}",
+        );
+    }
+
+    /// Companion for `resolve_kernel_image`: same wiring guarantee,
+    /// different entry point. The function takes `&str` not
+    /// `&KernelId` so we pass the raw spec; internally `KernelId::parse`
+    /// produces a Range, then `validate()` rejects.
+    #[test]
+    fn resolve_kernel_image_surfaces_inverted_range_diagnostic() {
+        let policy = KernelResolvePolicy {
+            cli_label: "ktstr-test",
+            accept_raw_image: false,
+        };
+        let err = resolve_kernel_image(Some("6.16..6.12"), &policy)
+            .expect_err("inverted range must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("inverted kernel range"),
+            "validate() diagnostic must surface ahead of the generic \
+             'not yet supported' bail; got: {msg}",
+        );
+        assert!(
+            msg.contains("6.12..6.16"),
+            "swap suggestion must appear in the error; got: {msg}",
+        );
+        assert!(
+            !msg.contains("not yet supported in this context"),
+            "validate() must short-circuit before the generic bail; got: {msg}",
+        );
+    }
 }
