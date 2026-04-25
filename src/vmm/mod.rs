@@ -641,7 +641,13 @@ fn pin_current_thread(cpu: usize, label: &str) {
 /// doesn't actually need.
 ///
 /// Logs success or warning; does not fail the VM.
-fn set_thread_cpumask(cpus: &[usize], label: &str) {
+///
+/// `pub(crate)` so non-vmm consumers (the host-side LlmExtract
+/// pipeline in `test_support::eval`) can use the same primitive
+/// to broaden the calling thread's mask before running inference,
+/// which would otherwise inherit a perf-mode single-CPU pin from
+/// the just-finished VM run.
+pub(crate) fn set_thread_cpumask(cpus: &[usize], label: &str) {
     let mut cpuset = nix::sched::CpuSet::new();
     for &cpu in cpus {
         if let Err(e) = cpuset.set(cpu) {

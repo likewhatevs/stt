@@ -824,8 +824,61 @@ pub(crate) fn run_ktstr_test_inner(
         Err(e) => return Err(e.context("run ktstr_test VM")),
     };
 
-    // Drop the VM to release CPU/LLC flock fds before auto-repro.
+    // Drop the VM to release CPU/LLC flock fds before auto-repro
+    // and host-side LlmExtract inference. Both downstream phases
+    // run under the test-runner's main thread, NOT inside a vCPU
+    // worker, so neither needs the VM-side CPU/LLC reservation.
+    // Releasing here lets concurrent ktstr peers (other tests
+    // running in parallel under nextest, or `cargo ktstr kernel
+    // build` rebuilding cache entries) acquire the same LLC slots
+    // while inference / repro proceed.
     drop(vm);
+
+    // Release the kernel-cache shared lock before
+    // `host_side_llm_extract` runs. The shared lock at
+    // [`acquire_test_kernel_lock_if_cached`] guards against a
+    // concurrent `cargo ktstr kernel build` swapping the entry
+    // under the VM mid-run; the VM is dropped by line 828 so the
+    // image bytes are no longer mapped, and the host-side LLM
+    // extraction does NOT reread the kernel image. Holding the
+    // lock through inference would block kernel-cache rebuilds
+    // for the inference duration (multiple seconds for a 2.4 GiB
+    // model load on a cold cache) without any benefit. The
+    // explicit drop also documents the lock's narrowed scope —
+    // RAII would otherwise drop it at function return, after
+    // inference completes.
+    drop(_kernel_lock);
+
+    // Broaden the calling thread's CPU mask before
+    // `host_side_llm_extract` runs. After `vm.run()` the
+    // BSP / vCPU 0 thread carries either:
+    //   - a single-CPU pin (perf-mode at vmm/mod.rs:2354 via
+    //     `pin_current_thread`) — LLM inference on 1 CPU is
+    //     dramatically slow (10x+ in throughput) and gives the
+    //     other free host CPUs no work, OR
+    //   - a multi-CPU LLC-aware mask (no-perf-mode at
+    //     vmm/mod.rs:2356 via `set_thread_cpumask` against
+    //     `no_perf_plan.cpus`) — already pool-style, but narrower
+    //     than the host-allowed cpuset.
+    // Inference is a host-side post-VM-exit phase that doesn't
+    // share the VM's measurement contract; it should use whatever
+    // CPUs the host process is permitted on (cgroup cpuset / sudo
+    // -u limits / CI runner allocation), which is exactly what
+    // `host_allowed_cpus()` returns via `sched_getaffinity(0)`.
+    // The team-lead's #30 direction: "use no-perf-mode cpuset for
+    // inference" — `set_thread_cpumask` against the broader
+    // host-allowed pool is the no-perf-mode primitive applied to
+    // a wider set than any single LLC-plan would carve out.
+    //
+    // Empty `host_allowed_cpus()` (sched_getaffinity unavailable,
+    // procfs fallback failed) skips the call rather than masking
+    // to zero CPUs (which would block forever); inference inherits
+    // whatever the test left behind. Logged as a warning by
+    // `set_thread_cpumask` itself if the syscall fails.
+    let host_cpus = crate::vmm::host_topology::host_allowed_cpus();
+    if !host_cpus.is_empty() {
+        crate::vmm::set_thread_cpumask(&host_cpus, "host-side LlmExtract inference");
+    }
 
     // Log verifier stats count for visibility.
     if !result.verifier_stats.is_empty() {
