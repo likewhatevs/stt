@@ -682,6 +682,12 @@ pub struct ModelStatus {
 /// Mirrors [`crate::cache`]'s kernel cache resolver so the same env
 /// overrides (`KTSTR_CACHE_DIR`, `XDG_CACHE_HOME`) govern both.
 pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
+    eprintln!(
+        "resolve_cache_root: HOME={:?} XDG_CACHE_HOME={:?} KTSTR_CACHE_DIR={:?}",
+        std::env::var("HOME"),
+        std::env::var("XDG_CACHE_HOME"),
+        std::env::var("KTSTR_CACHE_DIR"),
+    );
     if let Ok(dir) = std::env::var("KTSTR_CACHE_DIR")
         && !dir.is_empty()
     {
@@ -692,12 +698,22 @@ pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
     {
         return Ok(PathBuf::from(xdg).join("ktstr").join("models"));
     }
-    let home = std::env::var("HOME").map_err(|_| {
-        anyhow::anyhow!(
-            "HOME not set; cannot resolve model cache directory. \
-             Set KTSTR_CACHE_DIR to specify a cache location."
-        )
-    })?;
+    // Reject HOME ∈ {unset, "", "/"}: an empty or root-only HOME
+    // produces a junk cache path. PathBuf::from("/").join(".cache")
+    // yields "/.cache" — a path whose statvfs reports the root
+    // filesystem's free space, not a usable user-cache filesystem.
+    // PathBuf::from("").join(".cache") yields ".cache" relative to
+    // CWD, also wrong. A legitimate HOME that happens to be "/" is
+    // a process-environment configuration error (root with no home,
+    // container init forgot to set HOME); the actionable response
+    // is the same as the unset case.
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() || home == "/" {
+        anyhow::bail!(
+            "HOME is unset, empty, or `/`; cannot resolve model cache directory. \
+             Set KTSTR_CACHE_DIR or XDG_CACHE_HOME to specify a cache location."
+        );
+    }
     Ok(PathBuf::from(home)
         .join(".cache")
         .join("ktstr")

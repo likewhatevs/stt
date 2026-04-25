@@ -291,6 +291,10 @@ pub(crate) fn run_ktstr_test_inner(
         .into_iter()
         .map(std::path::PathBuf::from)
         .collect();
+    eprintln!(
+        "ktstr_test[{}]: all_include_files = {:?}",
+        entry.name, declarative_specs
+    );
     let mut resolved_includes: Vec<(String, std::path::PathBuf, &'static str)> =
         if declarative_specs.is_empty() {
             Vec::new()
@@ -301,12 +305,28 @@ pub(crate) fn run_ktstr_test_inner(
                 .map(|(a, h)| (a, h, "declarative"))
                 .collect()
         };
+    eprintln!(
+        "ktstr_test[{}]: resolved_includes = {:?}",
+        entry.name,
+        resolved_includes
+            .iter()
+            .map(|(a, h, o)| (a.as_str(), h.display().to_string(), *o))
+            .collect::<Vec<_>>()
+    );
     if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
         resolved_includes.push((archive_path, host_path, "scheduler config_file"));
         sched_args.push("--config".to_string());
         sched_args.push(guest_path);
     }
     let unioned = dedupe_include_files(&resolved_includes)?;
+    eprintln!(
+        "ktstr_test[{}]: unioned (after dedupe) = {:?}",
+        entry.name,
+        unioned
+            .iter()
+            .map(|(a, h)| (a.as_str(), h.display().to_string()))
+            .collect::<Vec<_>>()
+    );
     if !unioned.is_empty() {
         builder = builder.include_files(unioned);
     }
