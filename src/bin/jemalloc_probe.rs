@@ -2896,6 +2896,7 @@ fn apply_probe_metric_hints(m: &mut ktstr::test_support::Metric) {
 fn synthesize_payload_metrics(
     out: &ProbeOutput,
     exit_code: i32,
+    payload_index: usize,
 ) -> Result<ktstr::test_support::PayloadMetrics> {
     use ktstr::test_support::{MetricSource, MetricStream, PayloadMetrics, walk_json_leaves};
     let value = serde_json::to_value(out)
@@ -2916,7 +2917,11 @@ fn synthesize_payload_metrics(
         m.name = format!("{SIDECAR_METRIC_PREFIX}.{}", m.name);
         apply_probe_metric_hints(m);
     }
-    Ok(PayloadMetrics { metrics, exit_code })
+    Ok(PayloadMetrics {
+        payload_index,
+        metrics,
+        exit_code,
+    })
 }
 
 /// Append a synthesized [`PayloadMetrics`] to the
@@ -3060,7 +3065,13 @@ fn append_probe_output_to_sidecar(path: &Path, out: &ProbeOutput, exit_code: i32
         )
     })?;
 
-    let payload_metrics = synthesize_payload_metrics(out, exit_code)?;
+    // Probe-synthesized PayloadMetrics gets the next index slot —
+    // the probe runs out-of-band, after the test's guest-VM emit
+    // pipeline has finished, so it has no SHM-allocated index of
+    // its own. Slot at `sidecar.metrics.len()` keeps every entry's
+    // `payload_index` distinct and matches the position-of-append
+    // semantics the prior schema implicitly used.
+    let payload_metrics = synthesize_payload_metrics(out, exit_code, sidecar.metrics.len())?;
     sidecar.metrics.push(payload_metrics);
 
     let serialized = serde_json::to_string_pretty(&sidecar)
@@ -5091,6 +5102,7 @@ mod tests {
         let mut sc: ktstr::test_support::SidecarResult =
             serde_json::from_str(&minimal_sidecar_json()).unwrap();
         sc.metrics.push(PayloadMetrics {
+            payload_index: 0,
             metrics: vec![Metric {
                 name: "primary.bogo_ops".to_string(),
                 value: 12345.0,
@@ -5102,6 +5114,7 @@ mod tests {
             exit_code: 0,
         });
         sc.metrics.push(PayloadMetrics {
+            payload_index: 1,
             metrics: vec![Metric {
                 name: "secondary.latency_us".to_string(),
                 value: 42.0,
@@ -5377,8 +5390,9 @@ mod tests {
                 ],
             }],
         };
-        let pm = synthesize_payload_metrics(&out, 7).expect("synthesize");
+        let pm = synthesize_payload_metrics(&out, 7, 0).expect("synthesize");
         assert_eq!(pm.exit_code, 7, "exit_code flows through");
+        assert_eq!(pm.payload_index, 0, "payload_index flows through");
 
         // All prefixed.
         for m in &pm.metrics {

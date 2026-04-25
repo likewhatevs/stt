@@ -84,6 +84,7 @@ fn metric(name: &str, value: f64) -> Metric {
 
 fn payload_with(metrics: Vec<Metric>) -> PayloadMetrics {
     PayloadMetrics {
+        payload_index: 0,
         metrics,
         exit_code: 0,
     }

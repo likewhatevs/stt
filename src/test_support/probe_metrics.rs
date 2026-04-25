@@ -269,6 +269,7 @@ mod tests {
 
     fn empty_payload() -> PayloadMetrics {
         PayloadMetrics {
+            payload_index: 0,
             metrics: Vec::new(),
             exit_code: 0,
         }

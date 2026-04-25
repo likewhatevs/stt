@@ -1456,6 +1456,7 @@ mod tests {
             scheduler_commit: Some("deadbeef1234567890abcdef".to_string()),
             payload: Some("audit_payload".to_string()),
             metrics: vec![PayloadMetrics {
+                payload_index: 0,
                 metrics: vec![Metric {
                     name: "audit_metric".to_string(),
                     value: 42.0,
@@ -2853,6 +2854,7 @@ mod tests {
     fn sidecar_payload_and_metrics_roundtrip_populated() {
         use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
         let pm = PayloadMetrics {
+            payload_index: 0,
             metrics: vec![Metric {
                 name: "iops".to_string(),
                 value: 5000.0,
@@ -2971,6 +2973,7 @@ mod tests {
         let ok = AssertResult::pass();
         let metrics = vec![
             PayloadMetrics {
+                payload_index: 0,
                 metrics: vec![Metric {
                     name: "iops".to_string(),
                     value: 1200.0,
@@ -2982,6 +2985,7 @@ mod tests {
                 exit_code: 0,
             },
             PayloadMetrics {
+                payload_index: 1,
                 metrics: vec![],
                 exit_code: 2,
             },

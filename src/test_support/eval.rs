@@ -121,7 +121,7 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 // VM's RAM budget cannot accommodate it). The host runs
 // `extract_via_llm` here, after VM exit, on the captured text — same
 // stdout-primary / stderr-fallback contract that previously lived in
-// the guest's `evaluate()` — and replaces the empty `metrics` vec on
+// the prior in-VM extraction path — and replaces the empty `metrics` vec on
 // the paired `PayloadMetrics` with the extracted result.
 
 /// Run [`crate::test_support::model::extract_via_llm`] against every
@@ -130,75 +130,133 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 /// result, and return any failure details that should fold into the
 /// test's AssertResult.
 ///
-/// Pairing is by emission order: the i-th `RawPayloadOutput` pairs
-/// with the i-th `PayloadMetrics` entry whose `metrics` is empty.
-/// Non-LlmExtract payloads (Json, ExitCode) emit only
-/// `MSG_TYPE_PAYLOAD_METRICS` (with extracted metrics already
-/// populated for Json, or empty-by-design for ExitCode), and are
-/// passed through unchanged. ExitCode entries are NOT host-extracted
-/// because they have no `RawPayloadOutput` companion — the pairing
-/// loop walks the empty-metrics slots only when there is a raw
-/// output to consume.
+/// Pairing is by explicit
+/// [`crate::test_support::PayloadMetrics::payload_index`] equality:
+/// every guest-side payload-pipeline emission allocates one index
+/// from the per-process counter (see
+/// [`crate::scenario::payload_run`]) and stamps it onto BOTH the
+/// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`] and the
+/// [`MSG_TYPE_PAYLOAD_METRICS`] message it emits. The host walks
+/// `raw_outputs`, looks up each entry's index in a
+/// `HashMap<payload_index, vec position>` built once over
+/// `payload_metrics`, and writes the extracted metrics into the
+/// matched slot. Non-LlmExtract payloads (Json, ExitCode) emit only
+/// `MSG_TYPE_PAYLOAD_METRICS` and are not in the raw-output stream,
+/// so they pass through unchanged regardless of how their own
+/// index sits relative to the LlmExtract pairs.
+///
+/// Index-based pairing replaces the prior emission-order pairing
+/// which conflated a `Json` payload that legitimately produced zero
+/// metrics (no numeric leaves) with an `LlmExtract` placeholder.
+///
+/// `shm_drops` is the
+/// [`crate::vmm::shm_ring::ShmDrainResult::drops`] counter — total
+/// messages the guest's `shm_write` dropped (ring full, or
+/// overflow paths that should not fire in practice). The header's
+/// counter conflates every message type, so we cannot tell whether
+/// a dropped message was an LlmExtract pair or some other type
+/// (profraw, stimulus, payload metrics for a different test). The
+/// safe interpretation: when ANY drops occurred AND the test used
+/// LlmExtract (`raw_outputs` non-empty), surface a host-actionable
+/// detail. The dropped message MAY have been an LlmExtract
+/// `RawPayloadOutput` — losing one silently would make extracted
+/// metrics quietly incomplete — and a multi-MB workload output
+/// (dmesg flood, large schbench latency table) is the most
+/// plausible victim.
 ///
 /// Failure shape:
+/// - SHM ring overflow with LlmExtract in use: a single detail
+///   naming the drops counter so the test author knows to either
+///   shrink the workload's stdout/stderr or expand the SHM ring
+///   capacity. The detail does NOT block the rest of the host-side
+///   extraction path — the raw outputs that DID arrive still get
+///   processed.
 /// - Model load fails (e.g. `KTSTR_MODEL_OFFLINE=1` with cold cache,
 ///   SHA mismatch on a corrupted cached GGUF): append a single
 ///   `LlmExtract model load failed: <reason>` detail. metrics
 ///   remain empty. No structural-sanity checks fire — we have
 ///   nothing to check against.
 /// - Structural-sanity violation (duplicate metric name, non-finite
-///   value, source tag drift): append a single detail describing
-///   the first violation. The metric set is still populated on the
-///   PayloadMetrics slot so debugging tools and the sidecar see
-///   what the model produced; the detail communicates the
-///   rejection.
+///   value, source tag drift): every violation found contributes
+///   its own detail (see [`validate_llm_extraction`]). The metric
+///   set is still populated on the PayloadMetrics slot so debugging
+///   tools and the sidecar see what the model produced.
+/// - Raw output's `payload_index` has no matching `PayloadMetrics`
+///   entry (guest emitted a raw output without its companion empty-
+///   metrics PM, or emission was lost to SHM ring overflow):
+///   append a `LlmExtract host pairing` detail naming the orphan
+///   index and skip the extraction for that raw output. The other
+///   raw outputs still get extracted — dropping every extraction
+///   because one orphan exists would lose information the test
+///   author can still act on.
 fn host_side_llm_extract(
     payload_metrics: &mut [crate::test_support::PayloadMetrics],
     raw_outputs: &[crate::test_support::RawPayloadOutput],
+    shm_drops: u64,
 ) -> Vec<crate::assert::AssertDetail> {
     let mut failures = Vec::new();
     if raw_outputs.is_empty() {
         return failures;
     }
-    // Build an index over `payload_metrics` of slots whose metrics
-    // are empty — those are the candidates for host-side extraction.
-    // We pair by occurrence order, so a guest-side run with a Json
-    // payload that legitimately produced zero metrics (e.g. payload
-    // emitted no JSON at all) will be misclassified as "LlmExtract
-    // placeholder" if a raw output exists at the same index. In
-    // practice this conflation cannot fire: the guest only emits
-    // raw outputs for LlmExtract payloads, and the i-th raw output
-    // pairs with the i-th empty-metrics slot — non-LlmExtract
-    // payloads do not interpose their empty-metrics slots into the
-    // LlmExtract pairing because the guest emits the raw output
-    // BEFORE the empty-metrics PM in `evaluate_llm_extract_deferred`,
-    // so the SHM emission order keeps them in lockstep.
-    let empty_indices: Vec<usize> = payload_metrics
-        .iter()
-        .enumerate()
-        .filter(|(_, pm)| pm.metrics.is_empty())
-        .map(|(i, _)| i)
-        .collect();
-    if empty_indices.len() < raw_outputs.len() {
-        // The pairing invariant has been violated. The most likely
-        // cause is a future code change that emits raw outputs from
-        // a non-LlmExtract path or that drops the empty-PM
-        // companion. Surface as a failure detail so the test fails
-        // loudly, but fall through to the pairing loop so the
-        // raw outputs that DO have a slot still get extracted —
-        // dropping every extraction because one slot was missing
-        // would lose information the test author can still act on.
+    // SHM ring overflow with LlmExtract in use: surface BEFORE the
+    // pairing loop so the operator sees the drops first. The
+    // counter conflates every message type, so this fires even if
+    // the dropped message was a profraw entry rather than a raw
+    // output — but the dominant cause of drops with LlmExtract in
+    // play is a multi-MB workload output blowing the ring's
+    // capacity, and a false positive (drops for some other type)
+    // is preferable to silent metric loss.
+    if shm_drops > 0 {
         failures.push(crate::assert::AssertDetail::new(
             crate::assert::DetailKind::Other,
             format!(
-                "LlmExtract host pairing: {} raw outputs but only {} empty-metrics PayloadMetrics \
-                 slots — guest emission order may have drifted from the documented contract",
-                raw_outputs.len(),
-                empty_indices.len(),
+                "SHM ring overflow: {shm_drops} message(s) dropped while LlmExtract was in use. \
+                 The test's stdout/stderr may have exceeded the ring's configured capacity, \
+                 silently truncating the input the host's extract_via_llm received. \
+                 Shrink the workload's output volume (e.g. trim the latency table, \
+                 disable verbose logging, redirect noisy stderr to /dev/null), or \
+                 expand the SHM ring via the VMM's shm_size config so all guest \
+                 emissions fit. The drops counter conflates message types, so the \
+                 dropped message may be a profraw or stimulus entry rather than \
+                 an LlmExtract payload — but the test cannot prove the LlmExtract \
+                 raw-output stream is complete with a non-zero counter, and silently \
+                 truncated metrics propagate as flaky regressions downstream."
             ),
         ));
     }
-    for (raw, &pm_idx) in raw_outputs.iter().zip(empty_indices.iter()) {
+    // Build a HashMap from each PayloadMetrics' payload_index to its
+    // position in the slice. Last-occurrence wins on duplicate
+    // indices — but the guest's per-process counter is monotonic
+    // and never reuses a value within a single VM run, so a
+    // duplicate index in this map is a guest-side bug. The map is
+    // keyed by usize (the index) and valued by usize (the slice
+    // position) so the pair-loop below can rewrite the matching
+    // slot in O(1).
+    let pm_index_lookup: std::collections::HashMap<usize, usize> = payload_metrics
+        .iter()
+        .enumerate()
+        .map(|(pos, pm)| (pm.payload_index, pos))
+        .collect();
+    for raw in raw_outputs {
+        let Some(&pm_pos) = pm_index_lookup.get(&raw.payload_index) else {
+            // Orphan raw output — no PayloadMetrics carries the
+            // matching index. Most likely cause is SHM ring overflow
+            // dropping the empty-metrics PM, or a guest-side emit
+            // path that ships RawPayloadOutput without its companion
+            // PayloadMetrics. Surface as a failure detail so the
+            // test fails loudly; skip extraction for this raw entry
+            // and keep going on the rest.
+            failures.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!(
+                    "LlmExtract host pairing: raw output at payload_index={} has no \
+                     matching PayloadMetrics slot — guest emission contract violated, \
+                     or SHM ring dropped the empty-metrics companion message",
+                    raw.payload_index,
+                ),
+            ));
+            continue;
+        };
         let hint_ref = raw.hint.as_deref();
         // Stdout-primary: try stdout first.
         let stdout_result = super::model::extract_via_llm(
@@ -248,8 +306,23 @@ fn host_side_llm_extract(
             // load-failure reason.
             continue;
         }
-        // Structural-sanity check.
-        if let Some(reason) = validate_llm_extraction(&metrics) {
+        // Apply payload-author-declared polarity / unit hints. The
+        // guest shipped these in `raw.metric_hints` because the
+        // model-driven extraction runs post-VM-exit on the host —
+        // the original `&'static [MetricHint]` slice cannot
+        // round-trip through SHM. Mirrors the guest-side
+        // `resolve_polarities` pass that runs on Json / ExitCode
+        // payloads inside `payload_run::evaluate` so LlmExtract
+        // metrics reach the sidecar with the same polarity / unit
+        // classification a Json payload would receive.
+        crate::scenario::payload_run::resolve_polarities_owned(&mut metrics, &raw.metric_hints);
+        // Structural-sanity check. Every violation found surfaces
+        // its own AssertDetail so a metric set that breaks multiple
+        // invariants (e.g. NaN values AND a duplicate name) gives
+        // the test author the full picture in one run rather than
+        // forcing them to fix one defect class, re-run, fix the
+        // next, re-run again.
+        for reason in validate_llm_extraction(&metrics) {
             failures.push(crate::assert::AssertDetail::new(
                 crate::assert::DetailKind::Other,
                 reason,
@@ -260,15 +333,23 @@ fn host_side_llm_extract(
         // so debugging tools and the sidecar see what the model
         // emitted. The accompanying AssertDetail communicates the
         // rejection.
-        payload_metrics[pm_idx].metrics = metrics;
+        payload_metrics[pm_pos].metrics = metrics;
     }
     failures
 }
 
 /// Structural-sanity check on a freshly-extracted
-/// `OutputFormat::LlmExtract` metric set. Returns `None` when the
-/// set is structurally well-formed; `Some(reason)` with the first
-/// violation otherwise.
+/// `OutputFormat::LlmExtract` metric set. Returns a `Vec<String>`
+/// of every violation found; an empty vec means the set is
+/// structurally well-formed.
+///
+/// Every metric is checked against ALL three invariants — a single
+/// metric can contribute up to three violations (e.g. a duplicate
+/// name AND a NaN value AND a non-LlmExtract source tag) so the
+/// test author sees every defect class in one failure rather than
+/// having to re-run after fixing each one in turn. Across the
+/// whole set, every duplicate-name occurrence beyond the first
+/// reports its own violation.
 ///
 /// Universal checks only — every condition here is workload-
 /// agnostic. Workload-specific assertions (latency ranges, RPS
@@ -289,12 +370,13 @@ fn host_side_llm_extract(
 ///    so any drift here points at a bypass — the value didn't come
 ///    from the LLM-driven path even though it landed in a slot
 ///    we marked LlmExtract.
-fn validate_llm_extraction(metrics: &[crate::test_support::Metric]) -> Option<String> {
+fn validate_llm_extraction(metrics: &[crate::test_support::Metric]) -> Vec<String> {
     use std::collections::HashSet;
+    let mut violations = Vec::new();
     let mut seen: HashSet<&str> = HashSet::with_capacity(metrics.len());
     for m in metrics {
         if !seen.insert(m.name.as_str()) {
-            return Some(format!(
+            violations.push(format!(
                 "LlmExtract emitted duplicate metric name '{}' — downstream stats would \
                  misattribute one value to the other; check the LLM walker for an \
                  aggregation bug or a malformed JSON path emitted by the model",
@@ -302,21 +384,21 @@ fn validate_llm_extraction(metrics: &[crate::test_support::Metric]) -> Option<St
             ));
         }
         if !m.value.is_finite() {
-            return Some(format!(
+            violations.push(format!(
                 "LlmExtract metric '{}' has non-finite value {} — NaN / ±inf must not \
                  propagate into PayloadMetrics",
                 m.name, m.value,
             ));
         }
         if m.source != crate::test_support::MetricSource::LlmExtract {
-            return Some(format!(
+            violations.push(format!(
                 "LlmExtract metric '{}' has source {:?}, expected MetricSource::LlmExtract — \
                  a value reached the LlmExtract slot without traversing the LLM walker",
                 m.name, m.source,
             ));
         }
     }
-    None
+    violations
 }
 
 /// Run a single ktstr_test and return the VM's AssertResult.
@@ -584,17 +666,16 @@ pub(crate) fn run_ktstr_test_inner(
     // events + per-payload metrics + raw outputs from
     // `OutputFormat::LlmExtract` payloads.
     //
-    // Pairing contract: every guest-side LlmExtract `.run()` /
-    // `.wait()` / `.kill()` / `.try_wait()` invocation emits exactly
-    // ONE `MSG_TYPE_RAW_PAYLOAD_OUTPUT` followed immediately by ONE
-    // `MSG_TYPE_PAYLOAD_METRICS` (with empty `metrics`). Non-LlmExtract
-    // payloads emit only the latter. The host walks both streams in
-    // iteration order and the i-th raw entry pairs with the
-    // RawPayloadOutput-PayloadMetrics-pair indexed by its own
-    // ordinal among ENTRY ARRIVAL — a cross-stream index match using
-    // a per-arrival counter on the LlmExtract-bearing PayloadMetrics
-    // entries. See `host_side_llm_extract` for the pairing
-    // implementation.
+    // Pairing contract: every guest-side payload-pipeline emit
+    // (one per `.run()` / `.wait()` / `.kill()` / `.try_wait()`
+    // terminal call) allocates one `payload_index` from
+    // `payload_run`'s per-process counter and stamps it onto the
+    // emitted `PayloadMetrics`. LlmExtract invocations additionally
+    // emit a `RawPayloadOutput` carrying the SAME index. Non-
+    // LlmExtract payloads emit only the `PayloadMetrics`. The host
+    // pairs an LlmExtract `RawPayloadOutput` to its empty-metrics
+    // companion by EQUAL `payload_index`, not by emission order —
+    // see `host_side_llm_extract` for the pairing implementation.
     let mut stimulus_events = Vec::new();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
     let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
@@ -645,18 +726,22 @@ pub(crate) fn run_ktstr_test_inner(
     }
 
     // Host-side `OutputFormat::LlmExtract` resolution. For every
-    // empty-metrics PayloadMetrics that arrived alongside a
-    // RawPayloadOutput, run the LLM-backed extraction here on the
-    // host and replace the empty `metrics` vec with the extracted
-    // result. The model lives at the host's cache and the guest VM
-    // never had it, so this is the only correct place for the call.
+    // RawPayloadOutput drained from SHM, look up its
+    // `payload_index` in the PayloadMetrics slice, run the
+    // LLM-backed extraction on the host, and replace the empty
+    // `metrics` vec on the matched slot with the extracted result.
+    // The model lives at the host's cache and the guest VM never
+    // had it, so this is the only correct place for the call.
     //
-    // Returns a list of `(payload_index, AssertDetail)` pairs for any
-    // host-side failure (model unavailable, universal invariant
-    // violation) so the test verdict can fold them in. Pairing is by
-    // emission order — the i-th raw_output corresponds to the i-th
-    // empty-metrics payload_metrics entry.
-    let host_extract_failures = host_side_llm_extract(&mut payload_metrics, &raw_outputs);
+    // Pairing is by explicit `payload_index` equality, not emission
+    // order — emission order would conflate a `Json` payload that
+    // produced zero numeric leaves with an LlmExtract placeholder.
+    // Returns a flat `Vec<AssertDetail>` of host-side failures
+    // (model unavailable, universal invariant violation, orphan
+    // raw outputs) for the test verdict to fold in.
+    let shm_drops = result.shm_data.as_ref().map_or(0, |s| s.drops);
+    let host_extract_failures =
+        host_side_llm_extract(&mut payload_metrics, &raw_outputs, shm_drops);
 
     // auto_repro is enabled when:
     // - entry.auto_repro is true (default)
@@ -2822,10 +2907,10 @@ mod tests {
     //
     // Pin the three universal structural-sanity checks the function
     // is documented to enforce: unique metric names, finite values,
-    // `MetricSource::LlmExtract` source tag. Each violation produces
-    // a Some with a kind-specific substring; clean input produces
-    // None. These are pure-function tests over synthetic Metric
-    // vectors — no model load, no VM, no SHM ring.
+    // `MetricSource::LlmExtract` source tag. Every violation found
+    // contributes a String to the returned Vec; an empty Vec means
+    // the metric set is clean. These are pure-function tests over
+    // synthetic Metric vectors — no model load, no VM, no SHM ring.
 
     /// Build a clean LlmExtract-tagged metric for use in the
     /// validation tests. Each test mutates one field to construct
@@ -2853,11 +2938,16 @@ mod tests {
             llm_metric("latency.p99", 1.0),
             llm_metric("latency.p99", 2.0),
         ];
-        let reason = validate_llm_extraction(&metrics)
-            .expect("duplicate name must produce a violation reason");
+        let violations = validate_llm_extraction(&metrics);
+        assert_eq!(
+            violations.len(),
+            1,
+            "exactly one duplicate-name violation expected, got {violations:?}",
+        );
         assert!(
-            reason.contains("duplicate metric name"),
-            "diagnostic must mention 'duplicate metric name': {reason}",
+            violations[0].contains("duplicate metric name"),
+            "diagnostic must mention 'duplicate metric name': {}",
+            violations[0],
         );
     }
 
@@ -2867,11 +2957,16 @@ mod tests {
     #[test]
     fn validate_llm_extraction_nan_rejects() {
         let metrics = vec![llm_metric("latency.p99", f64::NAN)];
-        let reason =
-            validate_llm_extraction(&metrics).expect("NaN must produce a violation reason");
+        let violations = validate_llm_extraction(&metrics);
+        assert_eq!(
+            violations.len(),
+            1,
+            "exactly one non-finite violation expected, got {violations:?}",
+        );
         assert!(
-            reason.contains("non-finite"),
-            "diagnostic must mention 'non-finite': {reason}",
+            violations[0].contains("non-finite"),
+            "diagnostic must mention 'non-finite': {}",
+            violations[0],
         );
     }
 
@@ -2884,19 +2979,25 @@ mod tests {
     fn validate_llm_extraction_wrong_source_rejects() {
         let mut metrics = vec![llm_metric("latency.p99", 1.0)];
         metrics[0].source = crate::test_support::MetricSource::Json;
-        let reason = validate_llm_extraction(&metrics)
-            .expect("non-LlmExtract source must produce a violation reason");
+        let violations = validate_llm_extraction(&metrics);
+        assert_eq!(
+            violations.len(),
+            1,
+            "exactly one wrong-source violation expected, got {violations:?}",
+        );
         assert!(
-            reason.contains("MetricSource::LlmExtract"),
-            "diagnostic must mention 'MetricSource::LlmExtract': {reason}",
+            violations[0].contains("MetricSource::LlmExtract"),
+            "diagnostic must mention 'MetricSource::LlmExtract': {}",
+            violations[0],
         );
     }
 
     /// Structurally clean input — distinct names, finite values,
-    /// `LlmExtract` source on every entry — produces `None`. Pins
-    /// the happy path so a regression that adds an unwanted check
-    /// (e.g. minimum metric count, value-magnitude bound) breaks
-    /// this test instead of silently rejecting valid extractions.
+    /// `LlmExtract` source on every entry — produces an empty Vec.
+    /// Pins the happy path so a regression that adds an unwanted
+    /// check (e.g. minimum metric count, value-magnitude bound)
+    /// breaks this test instead of silently rejecting valid
+    /// extractions.
     #[test]
     fn validate_llm_extraction_clean_input_passes() {
         let metrics = vec![
@@ -2905,8 +3006,786 @@ mod tests {
             llm_metric("rps", 1000.0),
         ];
         assert!(
-            validate_llm_extraction(&metrics).is_none(),
-            "clean input must pass, got Some",
+            validate_llm_extraction(&metrics).is_empty(),
+            "clean input must produce an empty violations Vec",
         );
+    }
+
+    /// A single metric that breaks BOTH the non-finite invariant
+    /// AND the wrong-source invariant produces TWO violations in
+    /// the same call — proves per-metric checks run independently
+    /// and aren't short-circuited by an earlier failure on the
+    /// same metric. Pins the "report every defect class in one
+    /// run" UX: a flaky LLM run that produces NaN-valued metrics
+    /// with the wrong source tag surfaces both signals to the
+    /// test author rather than forcing two debug iterations.
+    #[test]
+    fn validate_llm_extraction_single_metric_multiple_violations() {
+        let mut metrics = vec![llm_metric("latency.p99", f64::INFINITY)];
+        metrics[0].source = crate::test_support::MetricSource::Json;
+        let violations = validate_llm_extraction(&metrics);
+        assert_eq!(
+            violations.len(),
+            2,
+            "non-finite + wrong-source on the same metric must produce 2 violations, got {violations:?}",
+        );
+        // Order is fixed: non-finite check runs before source
+        // check inside the per-metric loop. Pin both diagnostics
+        // by content rather than by index so a future re-ordering
+        // surfaces here as a content mismatch instead of an
+        // off-by-one.
+        let messages: Vec<&str> = violations.iter().map(String::as_str).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("non-finite")),
+            "non-finite violation must appear: {messages:?}",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("MetricSource::LlmExtract")),
+            "wrong-source violation must appear: {messages:?}",
+        );
+    }
+
+    /// Across the whole metric set, every duplicate-name occurrence
+    /// after the first reports its own violation. Three identical
+    /// names → two duplicate-name violations (the first occurrence
+    /// is the "original," the next two are duplicates). Pins the
+    /// "report every defect" semantics so a regression to first-
+    /// violation-only behavior surfaces here.
+    #[test]
+    fn validate_llm_extraction_multiple_duplicates_each_surface() {
+        let metrics = vec![
+            llm_metric("rps", 1.0),
+            llm_metric("rps", 2.0),
+            llm_metric("rps", 3.0),
+        ];
+        let violations = validate_llm_extraction(&metrics);
+        assert_eq!(
+            violations.len(),
+            2,
+            "three same-name metrics → two duplicate-name violations, got {violations:?}",
+        );
+        for v in &violations {
+            assert!(
+                v.contains("duplicate metric name"),
+                "every violation must call out duplicate name: {v}",
+            );
+        }
+    }
+
+    /// Heterogeneous violation classes across DIFFERENT metrics in
+    /// a single call: a duplicate name on one metric, NaN value on
+    /// another, wrong source on a third. Verifies the function
+    /// collects across ALL metrics, not just within a single one.
+    /// Pins the "see every defect class in one run" UX.
+    #[test]
+    fn validate_llm_extraction_heterogeneous_violations_across_metrics() {
+        let mut metrics = vec![
+            llm_metric("rps", 1.0),
+            llm_metric("rps", 2.0),              // duplicate name
+            llm_metric("latency.p99", f64::NAN), // non-finite
+            llm_metric("p50", 1.0),
+        ];
+        metrics[3].source = crate::test_support::MetricSource::Json; // wrong source on p50
+        let violations = validate_llm_extraction(&metrics);
+        assert_eq!(
+            violations.len(),
+            3,
+            "three independent violations expected, got {violations:?}",
+        );
+        let messages: Vec<&str> = violations.iter().map(String::as_str).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("duplicate metric name") && m.contains("'rps'")),
+            "duplicate-name on 'rps' must appear: {messages:?}",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("non-finite") && m.contains("'latency.p99'")),
+            "non-finite on 'latency.p99' must appear: {messages:?}",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("MetricSource::LlmExtract") && m.contains("'p50'")),
+            "wrong-source on 'p50' must appear: {messages:?}",
+        );
+    }
+
+    // -- host_side_llm_extract pairing tests --
+    //
+    // The pairing logic is tested without invoking the model: every
+    // case below either constructs an orphan raw output (no
+    // PayloadMetrics with matching `payload_index`) — which short-
+    // circuits BEFORE extract_via_llm — or supplies an empty raw
+    // outputs vec (returns immediately). The pairing-by-index
+    // contract is the entire moving part on the `payload_index`
+    // axis; once a match is found, the extraction-and-polarity
+    // pipeline is exercised by the integration test
+    // `llm_extract_e2e_test.rs`.
+
+    fn empty_raw(payload_index: usize) -> crate::test_support::RawPayloadOutput {
+        crate::test_support::RawPayloadOutput {
+            payload_index,
+            stdout: String::new(),
+            stderr: String::new(),
+            hint: None,
+            metric_hints: Vec::new(),
+        }
+    }
+
+    fn empty_pm(payload_index: usize) -> crate::test_support::PayloadMetrics {
+        crate::test_support::PayloadMetrics {
+            payload_index,
+            metrics: Vec::new(),
+            exit_code: 0,
+        }
+    }
+
+    /// Empty raw outputs slice — the function returns immediately
+    /// without examining `payload_metrics` or hitting the model.
+    /// Pins the no-LlmExtract-payloads happy path.
+    #[test]
+    fn host_side_llm_extract_empty_raw_outputs_returns_no_failures() {
+        let mut pm = vec![empty_pm(0), empty_pm(1)];
+        let failures = host_side_llm_extract(&mut pm, &[], 0);
+        assert!(failures.is_empty(), "empty raw outputs → no failures");
+    }
+
+    /// Orphan raw output: a `RawPayloadOutput` whose `payload_index`
+    /// has no matching `PayloadMetrics` slot. Surfaces as a single
+    /// pairing-failure detail naming the orphan index. The detail
+    /// kind is `Other` so the failure-rendering pipeline treats it
+    /// as a non-classified diagnostic.
+    #[test]
+    fn host_side_llm_extract_orphan_raw_output_surfaces_pairing_failure() {
+        // Only PayloadMetrics has payload_index=0; raw output claims
+        // payload_index=42 — no slot to write to.
+        let mut pm = vec![empty_pm(0)];
+        let raws = vec![empty_raw(42)];
+        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        assert_eq!(
+            failures.len(),
+            1,
+            "orphan raw output must produce exactly one failure detail, got {failures:?}",
+        );
+        let msg = &failures[0].message;
+        assert!(
+            msg.contains("LlmExtract host pairing"),
+            "diagnostic must call out 'LlmExtract host pairing': {msg}",
+        );
+        assert!(
+            msg.contains("payload_index=42"),
+            "diagnostic must cite the orphan index (42), got: {msg}",
+        );
+        // The valid PayloadMetrics slot at index 0 must NOT have been
+        // mutated — the orphan path skips extraction.
+        assert!(
+            pm[0].metrics.is_empty(),
+            "no extraction should have run on the orphan path",
+        );
+    }
+
+    /// Multiple orphan raw outputs each surface their own failure
+    /// detail; the function does not abort on the first. Pins the
+    /// "process every raw, surface every orphan" semantics so a
+    /// regression that returns early after the first failure is
+    /// caught.
+    #[test]
+    fn host_side_llm_extract_multiple_orphans_each_surface() {
+        let mut pm = vec![empty_pm(0)];
+        let raws = vec![empty_raw(10), empty_raw(20), empty_raw(30)];
+        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        assert_eq!(
+            failures.len(),
+            3,
+            "every orphan must surface its own detail, got {failures:?}",
+        );
+        let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("payload_index=10")));
+        assert!(messages.iter().any(|m| m.contains("payload_index=20")));
+        assert!(messages.iter().any(|m| m.contains("payload_index=30")));
+    }
+
+    /// Json payload that produced zero metrics (empty `metrics` vec)
+    /// must NOT be conflated with an LlmExtract placeholder when an
+    /// LlmExtract raw output is also present at a different index.
+    /// This pins the motivating scenario for #20: positional pairing
+    /// would have written the LlmExtract result into the Json
+    /// payload's empty slot.
+    ///
+    /// Setup: a Json payload at `payload_index=5` with empty metrics
+    /// (indistinguishable from an LlmExtract placeholder by content
+    /// alone). A raw output with `payload_index=99` (no matching
+    /// slot).
+    ///
+    /// Expected: the raw output is reported as orphan; the Json
+    /// payload's empty slot is NEVER touched.
+    #[test]
+    fn host_side_llm_extract_json_zero_leaves_not_conflated_with_llm_placeholder() {
+        let mut pm = vec![empty_pm(5)];
+        let raws = vec![empty_raw(99)];
+        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        // Orphan failure surfaces, not a write to the Json slot.
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(failures[0].message.contains("payload_index=99"));
+        // The Json slot was untouched — its `metrics` is still
+        // empty, exactly as the guest emitted it.
+        assert!(
+            pm[0].metrics.is_empty(),
+            "Json empty-metrics slot must not be written by LlmExtract pairing",
+        );
+        assert_eq!(
+            pm[0].payload_index, 5,
+            "Json slot's payload_index must be untouched",
+        );
+    }
+
+    /// SHM ring overflow with LlmExtract in use: a non-zero
+    /// `shm_drops` while raw outputs are present surfaces a
+    /// `SHM ring overflow` detail. Pins the design contract from
+    /// task #8 — silent metric truncation must propagate as a
+    /// host-actionable failure rather than letting downstream
+    /// stats see a quietly-incomplete metric set.
+    ///
+    /// Constructed with an ORPHAN raw output (payload_index=99
+    /// has no matching `PayloadMetrics` slot) so the pairing
+    /// loop hits the orphan path and SKIPS `extract_via_llm`
+    /// entirely. The overflow detail surfaces from the pre-loop
+    /// drops check independently of whether any matched pairs
+    /// reached the model — this keeps the unit test fast (no
+    /// model load) while still pinning the overflow contract.
+    #[test]
+    fn host_side_llm_extract_shm_drops_with_raw_outputs_surfaces_overflow_detail() {
+        let mut pm = vec![empty_pm(0)];
+        let raws = vec![empty_raw(99)]; // orphan — no matching slot
+        let failures = host_side_llm_extract(&mut pm, &raws, 7);
+        let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("SHM ring overflow")),
+            "drops > 0 with LlmExtract in use must surface 'SHM ring overflow': {messages:?}",
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("7 message(s) dropped")),
+            "diagnostic must cite the actual drops count, got: {messages:?}",
+        );
+        // Orphan raw output also surfaces its own pairing failure
+        // — both signals coexist; one does not suppress the other.
+        assert!(
+            messages.iter().any(|m| m.contains("payload_index=99")),
+            "orphan pairing failure must still surface alongside overflow: {messages:?}",
+        );
+    }
+
+    /// Zero drops + zero raw outputs: no overflow detail surfaces
+    /// (correctly — there's nothing to report). Pins the
+    /// no-LlmExtract path so a regression that always emits the
+    /// overflow detail (false positive on every run) breaks here.
+    #[test]
+    fn host_side_llm_extract_zero_drops_and_no_raws_no_overflow_detail() {
+        let mut pm = vec![empty_pm(0)];
+        let failures = host_side_llm_extract(&mut pm, &[], 0);
+        assert!(
+            failures.is_empty(),
+            "no LlmExtract + no drops → no failures, got: {failures:?}",
+        );
+    }
+
+    /// Non-zero drops but no raw outputs: no overflow detail
+    /// surfaces. A drops counter > 0 in a Json/ExitCode-only test
+    /// is the VMM's responsibility to surface elsewhere — the
+    /// LlmExtract path owns this detail only when the
+    /// LlmExtract code path was actually exercised. Pins that the
+    /// `raw_outputs.is_empty()` early return short-circuits before
+    /// the drops check, keeping the detail scoped to the LlmExtract
+    /// caller's mental model.
+    #[test]
+    fn host_side_llm_extract_drops_without_raws_skips_overflow_detail() {
+        let mut pm = vec![empty_pm(0)];
+        let failures = host_side_llm_extract(&mut pm, &[], 42);
+        assert!(
+            failures.is_empty(),
+            "drops without LlmExtract raw outputs must not produce LlmExtract-scope detail, got: {failures:?}",
+        );
+    }
+
+    // -- offline-gate / empty-stream / stream-fallback tests --
+    //
+    // These tests drive `host_side_llm_extract` through its
+    // model-touching paths via the offline gate (`KTSTR_MODEL_OFFLINE=1`).
+    // The gate makes `extract_via_llm` return Err deterministically,
+    // so the tests pin the host-side dispatch behavior without
+    // standing up the ~2.4 GiB model.
+    //
+    // Every test holds `lock_env()` and calls `super::super::model::reset()`
+    // before the gate is set, ensuring no previously-memoized
+    // `Ok(model)` slot bypasses the gate. Reset is paired with an
+    // `EnvVarGuard` so the gate is removed at drop time even if the
+    // test panics.
+    //
+    // The companion happy-path tests for stdout-primary / stderr-fallback
+    // with a real model live in the integration test
+    // `tests/llm_extract_e2e_test.rs` — pinned by task #13. The unit
+    // tests here pin the deterministic boundaries that don't require
+    // a model.
+
+    /// Task #7: a `RawPayloadOutput` carrying empty stdout AND empty
+    /// stderr — paired with a matching `PayloadMetrics` slot — must
+    /// not panic the host extraction. Under the offline gate, the
+    /// stdout call surfaces a load-failed detail (deterministic),
+    /// the stderr fallback is short-circuited (because the load_err
+    /// is Some), and the PayloadMetrics slot's metrics stays empty.
+    ///
+    /// Pins the empty-input boundary against three regressions:
+    /// 1. A `String::is_empty()` check that crashed the prompt
+    ///    composer on empty input (covered by model.rs but
+    ///    boundary-tested again here at the eval level).
+    /// 2. A panic in the polarity resolver if it received an empty
+    ///    metric vec.
+    /// 3. A regression that ran extract_via_llm on empty stdout
+    ///    AND THEN ran extract_via_llm on empty stderr, doubling
+    ///    the model-load attempt. The current contract:
+    ///    `metrics.is_empty() && load_err.is_none() && !raw.stderr.is_empty()`
+    ///    in eval.rs:281 — empty stderr blocks the fallback.
+    ///
+    /// Holds [`lock_env`] across the env mutations and pairs an
+    /// [`isolated_cache_dir`] with the offline-gate `EnvVarGuard`
+    /// so the gate trips deterministically on a guaranteed-cold
+    /// cache root rather than relying on the operator's home
+    /// having no model entry. The reset clears any
+    /// previously-memoized `Ok(model)` slot in `MODEL_CACHE`.
+    #[test]
+    fn host_side_llm_extract_with_empty_streams_no_panic_no_metrics() {
+        let _env_lock = lock_env();
+        super::super::model::reset();
+        let _cache = isolated_cache_dir();
+        let _offline = EnvVarGuard::set(crate::test_support::OFFLINE_ENV, "1");
+        let mut pm = vec![empty_pm(0)];
+        let raws = vec![empty_raw(0)];
+        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        // Under the offline gate, the stdout extract_via_llm call
+        // returns Err — the load-failed branch fires. Empty stderr
+        // also blocks the fallback, so a single load-failure detail
+        // is the expected shape.
+        assert_eq!(
+            failures.len(),
+            1,
+            "empty streams under offline gate must produce exactly one load-failed detail, \
+             got: {failures:?}",
+        );
+        assert!(
+            failures[0].message.contains("LlmExtract model load failed"),
+            "load-failure detail must surface the diagnostic prefix; got: {}",
+            failures[0].message,
+        );
+        // PayloadMetrics slot stays empty — no metrics extracted, no
+        // partial pollution.
+        assert!(
+            pm[0].metrics.is_empty(),
+            "PM slot must remain empty when extraction failed; got: {:?}",
+            pm[0].metrics,
+        );
+    }
+
+    /// Task #9: with `KTSTR_MODEL_OFFLINE=1` set, `host_side_llm_extract`
+    /// must surface an actionable `LlmExtract model load failed`
+    /// detail naming the offline env var. Pins the host-side
+    /// equivalent of the `extract_via_llm_returns_empty_when_backend_unavailable`
+    /// test in model.rs — the model.rs test pins the call-site
+    /// behavior, this test pins how the host's eval pipeline surfaces
+    /// that error to the test verdict.
+    ///
+    /// A regression that swallowed the offline-gate Err (e.g. by
+    /// returning Vec::new() instead of `Err(reason)` from
+    /// `extract_via_llm`, or by `match ... { Err(_) => () }`-ing
+    /// the load failure inside `host_side_llm_extract`) would
+    /// leave the test passing with empty metrics — a silent
+    /// regression that `stats compare` would only catch days
+    /// later as zero-metric runs accumulating in the sidecar.
+    #[test]
+    fn host_side_llm_extract_under_offline_gate_surfaces_actionable_detail() {
+        let _env_lock = lock_env();
+        super::super::model::reset();
+        let _cache = isolated_cache_dir();
+        let _offline = EnvVarGuard::set(crate::test_support::OFFLINE_ENV, "1");
+        let mut pm = vec![empty_pm(0)];
+        // Non-empty stdout — proves the failure path fires regardless
+        // of input shape (not gated on emptiness).
+        let raws = vec![crate::test_support::RawPayloadOutput {
+            payload_index: 0,
+            stdout: "arbitrary stdout content for the model".to_string(),
+            stderr: String::new(),
+            hint: None,
+            metric_hints: Vec::new(),
+        }];
+        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        assert_eq!(
+            failures.len(),
+            1,
+            "offline gate must produce exactly one load-failed detail, got: {failures:?}",
+        );
+        // Strict shape-of-emission contract:
+        // 1. Detail kind is `Other` — the framework surfaces an
+        //    uncategorized infrastructure failure here, not a domain
+        //    `Starved` / `Saturation` / etc. classification. Stats
+        //    tooling that buckets by DetailKind needs this stable.
+        // 2. Message BEGINS WITH the canonical prefix
+        //    `"LlmExtract model load failed:"` — not just contains.
+        //    A regression that prepended a noisy banner would land
+        //    the prefix mid-string and pass a `.contains` check
+        //    while breaking grep / log-pattern consumers.
+        // 3. Message contains `OFFLINE_ENV` so the operator knows
+        //    where to look (the framework wraps the reason verbatim;
+        //    `extract_via_llm`'s offline-gate Err surfaces the env
+        //    var name in its reason string — see model.rs:1151+ for
+        //    the bail! sites that name `OFFLINE_ENV`).
+        let detail = &failures[0];
+        assert_eq!(
+            detail.kind,
+            DetailKind::Other,
+            "load-failure detail kind must be `Other` (the framework's bucket \
+             for infrastructure failures); got: {:?}",
+            detail.kind,
+        );
+        let msg = &detail.message;
+        assert!(
+            msg.starts_with("LlmExtract model load failed:"),
+            "diagnostic must BEGIN WITH 'LlmExtract model load failed:' \
+             — a substring-only match would let a regression bury the prefix \
+             behind banner noise. got: {msg:?}",
+        );
+        assert!(
+            msg.contains(crate::test_support::OFFLINE_ENV),
+            "actionable diagnostic must name the offline env var so the operator \
+             knows to unset KTSTR_MODEL_OFFLINE or pre-seed the cache; got: {msg}",
+        );
+        assert!(
+            pm[0].metrics.is_empty(),
+            "load failure must leave the PM slot empty; got: {:?}",
+            pm[0].metrics,
+        );
+    }
+
+    /// Task #10 (offline-gate side): when stdout's `extract_via_llm`
+    /// call surfaces a load-failure reason, the stderr fallback is
+    /// SKIPPED — the failure reason is identical across both calls
+    /// and re-invoking inference would burn cycles to no purpose.
+    /// Pins the `load_err.is_none()` clause in the fallback gate
+    /// (eval.rs:281): `metrics.is_empty() && load_err.is_none() &&
+    /// !raw.stderr.is_empty()`.
+    ///
+    /// Setup: empty stdout + non-empty stderr, under the offline
+    /// gate. Pre-gate, the model is uncached (`reset()` clears it).
+    ///
+    /// Expected: exactly ONE load-failure detail surfaces (from the
+    /// stdout path). If the fallback erroneously fired, we'd see
+    /// either a SECOND load-failure detail (if extract_via_llm
+    /// re-Err'd) or an extracted-metrics outcome that contradicts
+    /// the offline-gate contract.
+    #[test]
+    fn host_side_llm_extract_offline_gate_skips_stderr_fallback() {
+        let _env_lock = lock_env();
+        super::super::model::reset();
+        let _cache = isolated_cache_dir();
+        let _offline = EnvVarGuard::set(crate::test_support::OFFLINE_ENV, "1");
+        let mut pm = vec![empty_pm(0)];
+        let raws = vec![crate::test_support::RawPayloadOutput {
+            payload_index: 0,
+            stdout: String::new(),
+            stderr: "stderr body that the fallback would reach if not gated".to_string(),
+            hint: None,
+            metric_hints: Vec::new(),
+        }];
+        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        // Exactly ONE failure detail — the fallback's `load_err.is_none()`
+        // gate blocks a second extract_via_llm call when stdout's
+        // result was Err.
+        assert_eq!(
+            failures.len(),
+            1,
+            "stderr fallback must be skipped when stdout's call already returned Err; \
+             a second 'model load failed' detail would mean the gate regressed. \
+             got: {failures:?}",
+        );
+        assert!(
+            failures[0].message.contains("LlmExtract model load failed"),
+            "the lone surfaced detail must be the load-failure: {}",
+            failures[0].message,
+        );
+    }
+
+    /// Task #10 (multi-pair side): the offline-gate behavior is
+    /// per-pair, not global — a load-failure on one
+    /// (RawPayloadOutput, PayloadMetrics) pair must NOT short-
+    /// circuit processing of subsequent pairs. Each pair gets its
+    /// own load-failure detail, stamped independently.
+    ///
+    /// Setup: TWO matched pairs, both under the offline gate. The
+    /// expected outcome is two load-failure details — one per
+    /// pair. A regression that bailed after the first failure
+    /// (e.g. an `if !failures.is_empty() { return failures }` in
+    /// the loop) would surface only one detail.
+    #[test]
+    fn host_side_llm_extract_offline_gate_per_pair_failure_detail() {
+        let _env_lock = lock_env();
+        super::super::model::reset();
+        let _cache = isolated_cache_dir();
+        let _offline = EnvVarGuard::set(crate::test_support::OFFLINE_ENV, "1");
+        let mut pm = vec![empty_pm(0), empty_pm(1)];
+        let raws = vec![
+            crate::test_support::RawPayloadOutput {
+                payload_index: 0,
+                stdout: "first pair stdout".to_string(),
+                stderr: String::new(),
+                hint: None,
+                metric_hints: Vec::new(),
+            },
+            crate::test_support::RawPayloadOutput {
+                payload_index: 1,
+                stdout: "second pair stdout".to_string(),
+                stderr: String::new(),
+                hint: None,
+                metric_hints: Vec::new(),
+            },
+        ];
+        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        assert_eq!(
+            failures.len(),
+            2,
+            "two matched pairs under offline gate must each surface their own load-failure \
+             detail; a regression that bailed after the first failure would surface only one. \
+             got: {failures:?}",
+        );
+        for f in &failures {
+            assert!(
+                f.message.contains("LlmExtract model load failed"),
+                "every detail must be a load-failure: {}",
+                f.message,
+            );
+        }
+        // Both PM slots stay empty — no metrics extracted on either path.
+        assert!(
+            pm[0].metrics.is_empty() && pm[1].metrics.is_empty(),
+            "both PM slots must remain empty under the offline gate",
+        );
+    }
+
+    /// Task #10 (orphan + load-failure interaction): a mix of an
+    /// orphan raw output (no matching PM slot) AND a matched-but-
+    /// load-failing pair under the offline gate produces TWO
+    /// distinct details — one orphan-pairing and one load-failure.
+    /// Pins that the orphan path and the model-failure path are
+    /// orthogonal contributors to the failure list.
+    #[test]
+    fn host_side_llm_extract_orphan_and_load_failure_both_surface() {
+        let _env_lock = lock_env();
+        super::super::model::reset();
+        let _cache = isolated_cache_dir();
+        let _offline = EnvVarGuard::set(crate::test_support::OFFLINE_ENV, "1");
+        let mut pm = vec![empty_pm(0)];
+        let raws = vec![
+            crate::test_support::RawPayloadOutput {
+                payload_index: 0,
+                stdout: "matched pair".to_string(),
+                stderr: String::new(),
+                hint: None,
+                metric_hints: Vec::new(),
+            },
+            crate::test_support::RawPayloadOutput {
+                payload_index: 99,
+                stdout: "orphan".to_string(),
+                stderr: String::new(),
+                hint: None,
+                metric_hints: Vec::new(),
+            },
+        ];
+        let failures = host_side_llm_extract(&mut pm, &raws, 0);
+        assert_eq!(
+            failures.len(),
+            2,
+            "mixed orphan + matched-but-load-failing must surface both details independently; \
+             got: {failures:?}",
+        );
+        let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("LlmExtract host pairing") && m.contains("payload_index=99")),
+            "orphan detail naming index 99 must surface: {messages:?}",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("LlmExtract model load failed")),
+            "load-failure detail must surface: {messages:?}",
+        );
+    }
+
+    /// Task #10 (drops + offline gate): a non-zero drops counter
+    /// AND a load failure both surface — the overflow detail and
+    /// the load-failure detail are independent. Pins that the
+    /// drops detail emits BEFORE the pair loop (eval.rs:209) and
+    /// is not gated on extraction success.
+    #[test]
+    fn host_side_llm_extract_drops_and_load_failure_compose() {
+        let _env_lock = lock_env();
+        super::super::model::reset();
+        let _cache = isolated_cache_dir();
+        let _offline = EnvVarGuard::set(crate::test_support::OFFLINE_ENV, "1");
+        let mut pm = vec![empty_pm(0)];
+        let raws = vec![crate::test_support::RawPayloadOutput {
+            payload_index: 0,
+            stdout: "matched pair".to_string(),
+            stderr: String::new(),
+            hint: None,
+            metric_hints: Vec::new(),
+        }];
+        let failures = host_side_llm_extract(&mut pm, &raws, 5);
+        assert!(
+            failures.len() >= 2,
+            "drops + load failure must each contribute their own detail; got: {failures:?}",
+        );
+        let messages: Vec<&str> = failures.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("SHM ring overflow")),
+            "drops detail must surface: {messages:?}",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("LlmExtract model load failed")),
+            "load-failure detail must surface: {messages:?}",
+        );
+    }
+
+    /// Task #12 (SHM wire-frame round-trip): the full
+    /// guest→SHM→host transport for `MSG_TYPE_RAW_PAYLOAD_OUTPUT`
+    /// must preserve BOTH stdout and stderr streams independently.
+    /// A regression that concatenated the streams (e.g. a guest-
+    /// side "merge before serialize" or a host-side "join after
+    /// deserialize") would silently break schbench-style payloads
+    /// that emit metrics on stderr only — the metric extraction
+    /// would land on the merged blob, contaminating both metric
+    /// values and the `MetricStream` tag attribution.
+    ///
+    /// This test exercises the actual TLV transport: it allocates
+    /// a SHM ring buffer, writes a `serde_json`-serialized
+    /// `RawPayloadOutput` under `MSG_TYPE_RAW_PAYLOAD_OUTPUT`
+    /// (mirroring `emit_raw_payload_output_to_shm` at
+    /// src/scenario/payload_run.rs), drains via `shm_drain` (the
+    /// host-side reader), and decodes the entry exactly as
+    /// `run_ktstr_test_inner` does at eval.rs:717-723. Asserts:
+    /// 1. The drained entry's `msg_type` is `MSG_TYPE_RAW_PAYLOAD_OUTPUT`.
+    /// 2. The CRC matches.
+    /// 3. JSON deserialization restores the struct.
+    /// 4. Both stream markers land in their correct fields —
+    ///    stdout marker in `stdout`, stderr marker in `stderr`.
+    /// 5. Markers are NOT swapped, NOT concatenated, NOT merged.
+    ///
+    /// The markers are deliberately distinctive ASCII strings that
+    /// would be trivially detectable in either field if a regression
+    /// merged them, and trivially missing if a regression dropped
+    /// one.
+    #[test]
+    fn raw_payload_output_shm_wire_round_trip_preserves_both_streams() {
+        use crate::vmm::shm_ring;
+
+        const STDOUT_MARKER: &str = "STDOUT_MARKER_DISTINCT_E2E_a1b2c3";
+        const STDERR_MARKER: &str = "STDERR_MARKER_DISTINCT_E2E_x9y8z7";
+
+        // Allocate and initialize a ring buffer large enough for one
+        // serialized RawPayloadOutput with a comfortable margin.
+        // The serialized JSON is on the order of a few hundred bytes
+        // (markers are short); 4 KiB of data area is plenty.
+        const DATA_BYTES: usize = 4096;
+        let shm_size = shm_ring::HEADER_SIZE + DATA_BYTES;
+        let mut buf = vec![0u8; shm_size];
+        shm_ring::shm_init(&mut buf, 0, shm_size);
+
+        // Build the RawPayloadOutput exactly as the guest would —
+        // distinct stdout / stderr markers in their respective fields.
+        let original = crate::test_support::RawPayloadOutput {
+            payload_index: 13,
+            stdout: STDOUT_MARKER.to_string(),
+            stderr: STDERR_MARKER.to_string(),
+            hint: Some("focus".to_string()),
+            metric_hints: Vec::new(),
+        };
+        let payload = serde_json::to_vec(&original).expect("serialize RawPayloadOutput");
+
+        // Write under MSG_TYPE_RAW_PAYLOAD_OUTPUT. shm_write returns
+        // the bytes written (header + payload); a drop returns 0,
+        // which would mean our ring sizing was wrong.
+        let written =
+            shm_ring::shm_write(&mut buf, 0, shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT, &payload);
+        assert_eq!(
+            written,
+            shm_ring::MSG_HEADER_SIZE + payload.len(),
+            "shm_write must place a full TLV; got {written}, expected header+payload",
+        );
+
+        // Host-side drain — what `run_ktstr_test_inner` invokes
+        // at the end of a VM run.
+        let drained = shm_ring::shm_drain(&buf, 0);
+        assert_eq!(drained.entries.len(), 1, "exactly one entry expected");
+        assert_eq!(
+            drained.drops, 0,
+            "no drops expected for a single small message"
+        );
+
+        let entry = &drained.entries[0];
+        assert_eq!(
+            entry.msg_type,
+            shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT,
+            "msg_type must round-trip as MSG_TYPE_RAW_PAYLOAD_OUTPUT; got 0x{:08x}",
+            entry.msg_type,
+        );
+        assert!(
+            entry.crc_ok,
+            "CRC must match — torn payload bytes would produce a CRC mismatch and silently \
+             drop the message host-side (eval.rs:717 gates on `entry.crc_ok`)",
+        );
+
+        // Decode exactly the way eval.rs:718 does.
+        let restored: crate::test_support::RawPayloadOutput =
+            serde_json::from_slice(&entry.payload).expect("decode RawPayloadOutput from SHM");
+
+        // The load-bearing assertions: BOTH stream markers must
+        // survive, in the CORRECT field, NOT swapped.
+        assert_eq!(
+            restored.stdout, STDOUT_MARKER,
+            "stdout marker must round-trip into the stdout field; \
+             a regression that swapped the streams would surface here",
+        );
+        assert_eq!(
+            restored.stderr, STDERR_MARKER,
+            "stderr marker must round-trip into the stderr field; \
+             a regression that swapped the streams would surface here",
+        );
+        // Anti-merge guards: stdout must NOT contain the stderr
+        // marker, and vice versa. A concatenation regression would
+        // land both markers in one field.
+        assert!(
+            !restored.stdout.contains(STDERR_MARKER),
+            "stdout field must NOT contain the stderr marker; \
+             a regression that merged the streams (e.g. stderr appended \
+             to stdout before serialize) would land both markers in \
+             stdout. Got stdout: {:?}",
+            restored.stdout,
+        );
+        assert!(
+            !restored.stderr.contains(STDOUT_MARKER),
+            "stderr field must NOT contain the stdout marker; \
+             symmetric anti-merge guard. Got stderr: {:?}",
+            restored.stderr,
+        );
+        // The other fields ride along — pin them too so a future
+        // wire-format change that drops payload_index or hint
+        // surfaces here.
+        assert_eq!(restored.payload_index, original.payload_index);
+        assert_eq!(restored.hint.as_deref(), Some("focus"));
     }
 }

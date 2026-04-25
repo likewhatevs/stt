@@ -55,31 +55,35 @@
 //! payload's [`OutputFormat::LlmExtract`] fires:
 //!
 //! 1. [`compose_prompt`] assembles `{LLM_EXTRACT_PROMPT_TEMPLATE}\n\n{focus}STDOUT:\n{body}`.
-//! 2. `load_inference` (module-private) routes both artifact paths
-//!    through [`ensure`] — SHA-checking the cached GGUF model and
-//!    tokenizer or surfacing the offline-gate/missing-cache error —
-//!    then opens the GGUF, builds the Qwen3 `ModelWeights`, loads
-//!    the tokenizer, and resolves the `<|im_end|>` EOS token id.
-//!    This is the failure point for `KTSTR_MODEL_OFFLINE=1` with an
-//!    uncached artifact and for a placeholder/malformed SHA pin.
-//!    The result is memoized in the process-wide [`MODEL_CACHE`]
+//! 2. `load_inference` (module-private) routes the GGUF model
+//!    artifact through [`ensure`] — SHA-checking the cached file or
+//!    surfacing the offline-gate/missing-cache error — then loads
+//!    the model via `llama_cpp_2::LlamaModel::load_from_file`
+//!    against the process-wide `LlamaBackend`, with the GGUF
+//!    carrying its own tokenizer + EOS metadata so no separate
+//!    tokenizer artifact is involved — failures here surface for
+//!    `KTSTR_MODEL_OFFLINE=1` with an uncached artifact, for a
+//!    placeholder/malformed SHA pin, and for a corrupt GGUF, with
+//!    the result memoized in the process-wide [`MODEL_CACHE`]
 //!    `Mutex<Option<Arc<Result<Mutex<LoadedInference>, String>>>>`
-//!    via [`memoized_inference`]: concurrent first-call races
-//!    serialize on the outer `Mutex` (at most one load runs
-//!    end-to-end), and a failed load is cached as `Err` so subsequent
-//!    calls fail-closed without repeating the 2.44 GiB load. The
-//!    inner `Mutex` then serializes repeated generation passes
-//!    against the shared `ModelWeights`. Tests that mutate
-//!    `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` call
-//!    [`reset`] (cfg(test)-only) before asserting offline-gate
-//!    trip behavior so a previously-memoized `Ok(_)` does not bypass
-//!    the gate.
-//! 3. `invoke_with_model` (module-private) runs one greedy
-//!    generation pass against the loaded state: clears the KV cache
-//!    up front (idempotence guarantee), feeds the ChatML-wrapped
-//!    `/no_think`-directed prompt through the forward loop under
-//!    `Sampling::ArgMax` with a fixed seed (deterministic output
-//!    per prompt+weights), then passes the decoded text through
+//!    via [`memoized_inference`] (concurrent first-call races
+//!    serialize on the outer `Mutex` so at most one load runs
+//!    end-to-end, and a failed load is cached as `Err` so
+//!    subsequent calls fail-closed without repeating the 2.44 GiB
+//!    load; the inner `Mutex` then serializes repeated generation
+//!    passes against the shared `LlamaModel`); tests that mutate
+//!    `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` call [`reset`]
+//!    (cfg(test)-only) before asserting offline-gate trip behavior
+//!    so a previously-memoized `Ok(_)` does not bypass the gate.
+//! 3. `invoke_with_model` (module-private) builds a fresh
+//!    `LlamaContext` per call — fresh-context-per-call sidesteps the
+//!    self-referential lifetime issue that storing the context on
+//!    `LoadedInference` would create — feeds the ChatML-wrapped
+//!    `/no_think`-directed prompt as a single batched decode, then
+//!    samples token-by-token via `LlamaSampler::greedy()` (greedy
+//!    ArgMax — output is a deterministic function of prompt + weights
+//!    without a separate seed). EOS detection uses
+//!    `LlamaModel::is_eog_token`. The decoded text passes through
 //!    `strip_think_block` (module-private) to remove any leaked
 //!    `<think>…</think>` region before returning.
 //! 4. On `Ok`, [`super::metrics::find_and_parse_json`] extracts the
@@ -96,22 +100,167 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use llama_cpp_2::llama_backend::LlamaBackend;
 
 use super::KTSTR_TESTS;
 use super::payload::OutputFormat;
 
-/// Set by [`prefetch_if_required`] when both [`ensure`] calls
-/// succeed; read by [`load_inference`] to skip the redundant second
-/// SHA hash. Cleared by [`reset`] alongside [`MODEL_CACHE`]
-/// so cfg(test) callers that re-flip `KTSTR_MODEL_OFFLINE` do not
-/// observe a stale "prefetch ran successfully" signal that would
-/// route the next `load_inference` through `locate()` and bypass the
-/// offline gate that [`ensure`] enforces.
+/// Process-wide [`LlamaBackend`] handle. The llama.cpp C library uses
+/// a single global init/teardown pair (`llama_backend_init` /
+/// `llama_backend_free`) and the [`LlamaBackend::init`] wrapper
+/// enforces "exactly one live instance per process" — calling
+/// `init()` a second time while the first is still alive returns
+/// `LlamaCppError::BackendAlreadyInitialized`. A `OnceLock` matches
+/// that contract: every caller observes the same `&'static
+/// LlamaBackend`, and the lazy init lives until the process exits
+/// (we never drop it; doing so would void [`LlamaModel`]s loaded
+/// against it).
 ///
-/// Set only on the all-success path of `prefetch_if_required` — after
-/// both `ensure(&DEFAULT_MODEL)` and `ensure(&DEFAULT_TOKENIZER)`
-/// return `Ok`.
+/// `init()` returns `Err` only on `BackendAlreadyInitialized` per
+/// llama-cpp-2's documented contract, which the `OnceLock` makes
+/// unreachable. A failure here is a programmer/environment bug —
+/// panic with the rendered reason rather than threading a fallible
+/// return through every caller.
+///
+/// Log suppression: `send_logs_to_tracing(LogOptions::default()
+/// .with_logs_enabled(false))` is called inside the OnceLock
+/// initializer, BEFORE any `LlamaModel::load_from_file` call hits
+/// the C side. This routes llama.cpp's internal log stream
+/// (model-load progress, GGML init chatter, KV-cache reservation
+/// notes) to a no-op sink so CI test output stays clean of engine-
+/// internal noise. The upstream wrapper tracks log-state via a
+/// `OnceLock`-backed singleton itself ("TODO: Reinitialize the
+/// state to support calling send_logs_to_tracing multiple times" in
+/// upstream `lib.rs`), so we get exactly one call per process.
+/// Operators debugging engine-level issues can re-route logs by
+/// wrapping the body in a tracing-subscriber filter and calling
+/// the upstream API directly from a test fixture.
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+
+fn global_backend() -> &'static LlamaBackend {
+    BACKEND.get_or_init(|| {
+        // Suppress llama.cpp's internal logs first — `send_logs_to_tracing`
+        // runs once per process, so calling it before the first
+        // `LlamaModel::load_from_file` is the only window where the
+        // suppression takes effect. After this point all
+        // llama.cpp/GGML logs flow into a no-op sink.
+        llama_cpp_2::send_logs_to_tracing(
+            llama_cpp_2::LogOptions::default().with_logs_enabled(false),
+        );
+        LlamaBackend::init().expect("llama_cpp_2::LlamaBackend::init must succeed exactly once")
+    })
+}
+
+/// Structured error type for the inference engine path
+/// ([`load_inference`] + [`invoke_with_model`]).
+///
+/// Each variant maps to one upstream `llama-cpp-2` failure surface,
+/// preserving the source error via `#[source]` so
+/// `anyhow::Error::new(InferenceError::...)` retains the full chain
+/// downstream callers can walk via `.chain()` / `.root_cause()`.
+///
+/// The variants split along upstream fallible boundaries:
+///
+/// - [`Self::ModelLoad`] — `LlamaModel::load_from_file` failed (path
+///   not readable, GGUF metadata corrupt, the linked llama.cpp
+///   build's loader rejected the format). Carries the resolved
+///   `PathBuf` because the offline-gate / cache resolution is
+///   already handled upstream and the operator wants to know which
+///   artifact slot tripped.
+/// - [`Self::ContextCreate`] — `LlamaModel::new_context` failed.
+///   Practically only fires under exotic context-param shapes
+///   (negative `n_ctx`, oversize KV reservations) — the reason
+///   string carries the upstream Display.
+/// - [`Self::Tokenize`] — `LlamaModel::str_to_token` failed
+///   (NUL-byte in the prompt, or `c_int` overflow on prompt length;
+///   the latter is theoretically reachable via a multi-GiB prompt).
+///   The `prompt_excerpt` carries the first 64 bytes so an operator
+///   debugging tokenization can see what hit the boundary without
+///   the full prompt body in the error chain.
+/// - [`Self::Decode`] — `LlamaContext::decode` failed (KV-cache
+///   exhaustion via `NoKvCacheSlot`, empty batch via `NTokensZero`,
+///   or an unknown ffi code).
+/// - [`Self::Generation`] — catch-all for the per-token-step
+///   failures that are not first-class llama.cpp surfaces:
+///   `LlamaBatch::add` (`InsufficientSpace`) and
+///   `LlamaModel::token_to_piece` (`UnknownTokenType`,
+///   `InsufficientBufferSpace`, `FromUtf8Error`). Each call site
+///   threads its own `reason` string identifying the step
+///   ("seed prompt batch", "decode generated token", etc.) so the
+///   error chain is actionable without a typed source variant per
+///   distinct llama-cpp-2 error.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InferenceError {
+    #[error("load GGUF model at {path}")]
+    ModelLoad {
+        path: PathBuf,
+        #[source]
+        source: llama_cpp_2::LlamaModelLoadError,
+    },
+
+    #[error("create LlamaContext for inference")]
+    ContextCreate {
+        #[source]
+        source: llama_cpp_2::LlamaContextLoadError,
+    },
+
+    #[error("tokenize ChatML prompt (excerpt: {prompt_excerpt:?})")]
+    Tokenize {
+        prompt_excerpt: String,
+        #[source]
+        source: llama_cpp_2::StringToTokenError,
+    },
+
+    #[error("llama_decode failed")]
+    Decode {
+        #[source]
+        source: llama_cpp_2::DecodeError,
+    },
+
+    #[error("inference generation step failed: {reason}")]
+    Generation { reason: String },
+}
+
+/// Truncation byte count for [`InferenceError::Tokenize::prompt_excerpt`].
+/// The full ChatML-wrapped prompt body can run into multiple KiB
+/// — surfacing all of it in an error chain would crowd the
+/// rendering downstream consumers print. 64 bytes is enough to
+/// fingerprint which prompt category triggered the failure
+/// (compose_prompt always opens with the literal
+/// `<|im_start|>user\n` ChatML header).
+const PROMPT_EXCERPT_BYTES: usize = 64;
+
+/// Take the first [`PROMPT_EXCERPT_BYTES`] bytes of `prompt`,
+/// snapped backward to a char boundary so a multi-byte UTF-8
+/// codepoint at the boundary doesn't panic the slice. Used by
+/// [`InferenceError::Tokenize`] to keep the error chain compact.
+fn prompt_excerpt(prompt: &str) -> String {
+    if prompt.len() <= PROMPT_EXCERPT_BYTES {
+        return prompt.to_string();
+    }
+    // Walk backward from PROMPT_EXCERPT_BYTES until we hit a char
+    // boundary. The first byte (offset 0) is always a boundary, so
+    // this loop terminates.
+    let mut end = PROMPT_EXCERPT_BYTES;
+    while end > 0 && !prompt.is_char_boundary(end) {
+        end -= 1;
+    }
+    prompt[..end].to_string()
+}
+
+/// Set by [`prefetch_if_required`] when [`ensure`] succeeds for
+/// [`DEFAULT_MODEL`]; read by [`load_inference`] to skip the
+/// redundant SHA hash. Cleared by [`reset`] alongside
+/// [`MODEL_CACHE`] so cfg(test) callers that re-flip
+/// `KTSTR_MODEL_OFFLINE` do not observe a stale "prefetch ran
+/// successfully" signal that would route the next `load_inference`
+/// through `locate()` and bypass the offline gate that [`ensure`]
+/// enforces.
+///
+/// Set only on the success path of `prefetch_if_required` — after
+/// `ensure(&DEFAULT_MODEL)` returns `Ok`.
 ///
 /// Stays `false` on every prefetch short-circuit (no-test-needs-it,
 /// offline gate, ensure error) so `load_inference` falls back to
@@ -133,15 +282,15 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// arriving with the slot still `None` runs `load_inference`
 /// end-to-end and stores the result; competing callers block on the
 /// `lock()` until the initializer returns, then read the now-`Some`
-/// slot and proceed. So the 2.44 GiB GGUF load, tokenizer parse, and
-/// EOS-id resolution in `load_inference` happen at most once per
-/// process rather than once per racing thread.
+/// slot and proceed. So the 2.44 GiB GGUF load in `load_inference`
+/// happens at most once per process rather than once per racing
+/// thread.
 ///
 /// # Fail-closed on load error
 ///
 /// The stored value is a [`Result`] so a load failure (missing model
-/// under the offline gate, malformed SHA pin, corrupt GGUF, tokenizer
-/// parse error) is memoized as `Err(message)`. Subsequent calls
+/// under the offline gate, malformed SHA pin, corrupt GGUF) is
+/// memoized as `Err(message)`. Subsequent calls
 /// observe the cached error and return an empty metric set without
 /// re-attempting the load. Retrying would repeat the same failure —
 /// the offline gate does not flip, a placeholder pin does not become
@@ -163,8 +312,8 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// e.into_inner())` so a poisoned lock does not wedge later callers.
 /// Fail-closed memoization therefore applies exclusively to errors
 /// returned through the normal `Result` channel; load paths that can
-/// panic (e.g. candle-side allocation failure) do not poison the
-/// cache.
+/// panic (e.g. llama.cpp-side allocation failure surfacing through
+/// the FFI as a non-Result panic) do not poison the cache.
 ///
 /// The panic-then-retry behavior described above only applies under
 /// the `panic = "unwind"` strategy — i.e. the default debug/test
@@ -186,10 +335,10 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// **First-call blocking.** The first caller to reach
 /// [`memoized_inference`] with an empty slot runs `load_inference`
 /// inside the outer lock. That load opens the pinned Qwen3-4B
-/// Q4_K_M GGUF (~2.44 GiB): `std::fs::File::open` +
-/// `gguf_file::Content::read` parse the header, then
-/// `ModelWeights::from_gguf` reads the per-layer quantized tensors
-/// into `ModelWeights`. Every concurrent caller queued behind the
+/// Q4_K_M GGUF (~2.44 GiB) via
+/// `llama_cpp_2::LlamaModel::load_from_file`, which mmap's the file
+/// and routes the per-layer quantized tensors into a `LlamaModel`
+/// owned by llama.cpp. Every concurrent caller queued behind the
 /// outer mutex blocks for that entire window. Under nextest's
 /// default parallel execution, every `LlmExtract` test racing
 /// into the first call serializes here until the loader returns.
@@ -204,10 +353,15 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 ///
 /// The inner `Mutex<LoadedInference>` is held for the full duration
 /// of a generation pass and serializes concurrent inference calls
-/// against the shared `ModelWeights`. Holding the inner mutex via
+/// against the shared `LlamaModel`. Holding the inner mutex via
 /// the cloned `Arc` (rather than via the outer slot) means a caller
 /// running inference does not block other callers from observing
-/// the slot is already populated.
+/// the slot is already populated. A fresh `LlamaContext` is built
+/// per call from `&LlamaModel` (the model's `new_context` borrows
+/// `&self`) so the per-generation KV state never aliases across
+/// invocations — KV state lives on the `LlamaContext`, which is
+/// constructed and destroyed per call, so no cross-invocation
+/// `clear_kv_cache` step is needed.
 ///
 /// # Test-only reset
 ///
@@ -237,6 +391,94 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// `LlmExtract` surface deterministic across the process lifetime
 /// and lets callers log the error exactly once on the first
 /// extraction attempt rather than on every subsequent one.
+///
+/// # Blast radius for transient failures (intentional)
+///
+/// The fail-closed-forever policy applies UNIFORMLY across both
+/// permanent and transient failure modes. A first-call failure
+/// from a transient cause poisons the slot for the entire process
+/// lifetime exactly the same as a permanent cause:
+///
+/// * **NFS hiccup / network pause** during the initial GGUF read —
+///   `LlamaModel::load_from_file` returns an I/O error, that error
+///   is memoized, and every later `LlmExtract` test in the same
+///   process gets `LlmExtract model load failed: <io error>`
+///   without re-attempting the read even after the network
+///   recovers.
+/// * **OOM kill survival** — a transient memory-pressure event that
+///   caused the loader to fail (e.g. concurrent test consumed the
+///   page cache, leaving llama.cpp's mmap to thrash and produce a
+///   read failure) sticks for the whole process even after memory
+///   pressure clears.
+/// * **Tempfile race during prefetch** — if the eager
+///   `prefetch_if_required` path landed a partial file under the
+///   pinned name and the loader saw a truncated read, the cached
+///   Err sticks until process exit even if a later writer
+///   completes the file under the same path.
+/// * **NFS file-handle stale** after a server-side rename — the
+///   first `read` returns ESTALE, that error memoizes, and every
+///   later call observes it even after the client revalidates
+///   the handle.
+///
+/// The blast radius is **session-wide** in nextest's default
+/// concurrent test execution: every `#[ktstr_test]` annotated as
+/// `OutputFormat::LlmExtract` shares the same process and the same
+/// `MODEL_CACHE`. A single transient failure on the FIRST call
+/// surfaces an `LlmExtract model load failed` AssertDetail on
+/// every subsequent LlmExtract test in the run. Operator
+/// observation: a CI report shows the failing tests clustered
+/// with the same error message, and the fix is a re-run rather
+/// than a per-test retry.
+///
+/// This is INTENTIONAL despite the wider blast radius. Three
+/// reasons rule against per-call retry:
+///
+/// 1. **Discriminating transient from permanent at the load
+///    boundary is unreliable.** A `std::io::Error` does not carry
+///    a bit that says "transient" — an ESTALE, ETIMEDOUT, or
+///    ENOMEM is recoverable in principle but the loader sees the
+///    same `Err(io)` shape as ENOENT or EACCES. A retry policy
+///    keyed on errno would mis-classify a real configuration
+///    error as transient and burn 30s+ of wasted retries on each
+///    of dozens of tests.
+/// 2. **A retry under load pressure compounds the original
+///    failure.** Re-attempting a 2.44 GiB mmap that just OOM-killed
+///    a peer most likely re-OOMs. Keeping the Err sticky lets the
+///    operator restart the process in a less-pressured environment
+///    rather than blocking forward progress on a doomed retry.
+/// 3. **Test determinism is more important than blast-radius
+///    minimization.** A flaky retry policy that sometimes recovers
+///    and sometimes doesn't would surface as intermittent
+///    "LlmExtract worked in run N, failed in run N+1, worked in
+///    N+2" reports — exactly the failure mode `LlmExtract` tests
+///    must avoid (they already produce model-driven outputs that
+///    drift across runs without a retry-induced jitter on top).
+///    A sticky-Err keeps a failed run failing identically, which
+///    operators can investigate once and fix at the source.
+///
+/// **Mitigation for the operator**: the cached error string
+/// captures the full anyhow chain (the `{e:#}` rendering at the
+/// memoization site, see "Fail-closed on load error" above). An
+/// operator who sees a transient-flavored error (ESTALE, ETIMEDOUT,
+/// ENOMEM, EAGAIN) can re-run the test process to retry from a
+/// clean slate. CI orchestration should treat first-call LlmExtract
+/// failures as a re-run signal rather than a hard fail when the
+/// underlying error is recognizably transient — the framework
+/// surfaces the cause verbatim to enable that decision.
+///
+/// **Mitigation considered and rejected**: a timestamp-based
+/// retry where the cached Err expires after N seconds and the
+/// next call re-attempts the load. Rejected because (a) the retry
+/// would race against the caller's own deadline (LlmExtract
+/// tests run with `timeout` on the payload and expect the host
+/// to either succeed quickly or surface a stable error), and (b)
+/// the timestamp would need to be tested for monotonicity across
+/// concurrent calls, adding lock contention to a hot path. A
+/// future revision could differentiate `LoadFailureKind::Transient`
+/// vs `Permanent` in `load_inference` and apply retry to the
+/// transient subset only — but that requires a structured error
+/// type at the loader boundary which llama-cpp-2 currently does
+/// not surface, so the work is gated on upstream API support.
 type CachedInference = Result<Mutex<LoadedInference>, String>;
 static MODEL_CACHE: Mutex<Option<Arc<CachedInference>>> = Mutex::new(None);
 
@@ -316,8 +558,6 @@ pub struct ModelSpec {
 ///
 /// 1. **`url`** — point at the new artifact on Hugging Face. Must be
 ///    `https://` (the fetcher rejects `http://` unconditionally).
-///    Keep the same repo owner (`Qwen/`) when possible so the paired
-///    [`DEFAULT_TOKENIZER`] URL continues to resolve.
 /// 2. **`sha256_hex`** — re-compute via
 ///    ```text
 ///    curl -fL <new_url> | sha256sum
@@ -354,26 +594,6 @@ pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
     size_bytes: 2500 * 1024 * 1024,
 };
 
-/// Tokenizer artifact paired with [`DEFAULT_MODEL`]. The GGUF file
-/// carries model weights but not the byte-level BPE (BBPE) merge
-/// table used for encode/decode, so a separate `tokenizer.json`
-/// sits alongside the model in the cache. Both entries are
-/// prefetched together so LlmExtract inference never trips on a
-/// half-ready cache.
-///
-/// URL sources the tokenizer from `Qwen/Qwen3-4B` (the non-GGUF
-/// upstream repo) because the GGUF repo `Qwen/Qwen3-4B-GGUF` that
-/// hosts [`DEFAULT_MODEL`] only ships the quantized weight file —
-/// its `tokenizer.json` is not published there. Pulling each
-/// artifact from its authoritative repo keeps the two pins in sync
-/// with the same Qwen3-4B release.
-pub const DEFAULT_TOKENIZER: ModelSpec = ModelSpec {
-    file_name: "Qwen3-4B-tokenizer.json",
-    url: "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/tokenizer.json",
-    sha256_hex: "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
-    size_bytes: 11 * 1024 * 1024,
-};
-
 /// Canonical list of every [`ModelSpec`] declared in this module.
 /// Single source of truth for the "iterate all specs at compile
 /// time" shape checks below — adding a new `ModelSpec` const
@@ -384,8 +604,13 @@ pub const DEFAULT_TOKENIZER: ModelSpec = ModelSpec {
 ///
 /// The array is `&[&ModelSpec]` so the compile-time iterator below
 /// walks pointers, not values — the entries are `const` references
-/// to the module-level `DEFAULT_*` constants.
-const ALL_MODEL_SPECS: &[&ModelSpec] = &[&DEFAULT_MODEL, &DEFAULT_TOKENIZER];
+/// to the module-level `DEFAULT_*` constants. Currently a single
+/// entry — the GGUF carries its own tokenizer surface via
+/// `llama-cpp-2`'s `LlamaModel`, so no separate tokenizer artifact
+/// is registered — the slice is kept as a slice (rather than a bare
+/// `const`) so future additions slot in without rewriting the
+/// validator below.
+const ALL_MODEL_SPECS: &[&ModelSpec] = &[&DEFAULT_MODEL];
 
 // Module-scope compile-time shape check on every ModelSpec's SHA
 // pin: 64 ASCII hex chars, anything else is a typo. Placed at
@@ -396,14 +621,10 @@ const ALL_MODEL_SPECS: &[&ModelSpec] = &[&DEFAULT_MODEL, &DEFAULT_TOKENIZER];
 // The `is_valid_sha256_hex` helper is const-evaluated, so the
 // entire check folds at compile time with no runtime cost.
 //
-// Previously this was two hand-rolled per-spec asserts (one for
-// DEFAULT_MODEL, one for DEFAULT_TOKENIZER); a third ModelSpec
-// addition would have silently slipped past the check until
-// someone noticed the missing line. Iterating [`ALL_MODEL_SPECS`]
-// with a const `while` loop means the validator auto-applies to
-// every future spec, and forgetting to register a new spec is the
-// more likely (and easier-to-review) failure mode than forgetting
-// to hand-roll a matching assert.
+// Iterating [`ALL_MODEL_SPECS`] with a const `while` loop means the
+// validator auto-applies to every future spec, and forgetting to
+// register a new spec is the more likely (and easier-to-review)
+// failure mode than forgetting to hand-roll a matching assert.
 const _: () = {
     let mut i = 0;
     while i < ALL_MODEL_SPECS.len() {
@@ -417,14 +638,12 @@ const _: () = {
     }
 };
 
-// Ballpark size bounds on the pinned artifacts. The pinned Qwen3-4B
+// Ballpark size bounds on the pinned artifact. The pinned Qwen3-4B
 // Q4_K_M GGUF is ~2.44 GiB; bound tight at 3 GiB so a silent swap to a
 // higher-bit quantization (Q5/Q6/Q8) of the same 4B-parameter base —
 // which would balloon the artifact past 3 GiB and multiply inference
 // latency — fails this check instead of slipping through. The lower
 // bound of 100 MiB rejects a wildly truncated or placeholder pin.
-// Tokenizer is ~11 MiB; 3-50 MiB brackets the realistic range for a
-// sentencepiece/BPE tokenizer JSON.
 //
 // Module scope (not inside `#[test]`) so a pin rotation that slips
 // past the ballpark fails `cargo check` without `--tests`, mirroring
@@ -436,14 +655,6 @@ const _: () = assert!(
 const _: () = assert!(
     DEFAULT_MODEL.size_bytes < 3 * 1024 * 1024 * 1024,
     "DEFAULT_MODEL.size_bytes must stay under 3 GiB — higher-bit quant swap suspected",
-);
-const _: () = assert!(
-    DEFAULT_TOKENIZER.size_bytes > 3 * 1024 * 1024,
-    "DEFAULT_TOKENIZER.size_bytes must exceed 3 MiB — pin truncation suspected",
-);
-const _: () = assert!(
-    DEFAULT_TOKENIZER.size_bytes < 50 * 1024 * 1024,
-    "DEFAULT_TOKENIZER.size_bytes must stay under 50 MiB — unexpected artifact shape",
 );
 
 // Every registered ModelSpec must declare a POSITIVE size_bytes. A
@@ -678,9 +889,16 @@ pub struct ModelStatus {
     pub sha_verdict: ShaVerdict,
 }
 
-/// Resolve the cache root, creating it lazily when a writer needs it.
-/// Mirrors [`crate::cache`]'s kernel cache resolver so the same env
-/// overrides (`KTSTR_CACHE_DIR`, `XDG_CACHE_HOME`) govern both.
+/// Resolve the model cache root, creating it lazily when a writer
+/// needs it. Delegates to
+/// [`crate::cache::resolve_cache_root_with_suffix`] with the
+/// `"models"` suffix so the kernel cache and the model cache share a
+/// single source of truth for env-variable handling
+/// (`KTSTR_CACHE_DIR` non-UTF-8 bail, `XDG_CACHE_HOME`) and
+/// HOME validation (3 arms: unset/empty, literal `/`, non-absolute
+/// path). The thin wrapper preserves the per-call
+/// `tracing::debug!` env-snapshot for operators diagnosing
+/// cache-resolution surprises with `RUST_LOG=debug`.
 pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
     // Trace the env-var snapshot at debug level. The earlier
     // implementation emitted this on every call as an unconditional
@@ -696,38 +914,7 @@ pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
         ktstr_cache_dir = ?std::env::var("KTSTR_CACHE_DIR"),
         "model::resolve_cache_root: env snapshot",
     );
-    if let Ok(dir) = std::env::var("KTSTR_CACHE_DIR")
-        && !dir.is_empty()
-    {
-        return Ok(PathBuf::from(dir));
-    }
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
-        && !xdg.is_empty()
-    {
-        return Ok(PathBuf::from(xdg).join("ktstr").join("models"));
-    }
-    // Reject HOME ∈ {unset, "", "/"}: an empty or root-only HOME
-    // produces a junk cache path. PathBuf::from("/").join(".cache")
-    // yields "/.cache" — a path whose statvfs reports the root
-    // filesystem's free space, not a usable user-cache filesystem.
-    // PathBuf::from("").join(".cache") yields ".cache" relative to
-    // CWD, also wrong. A literal `/` HOME is a process-environment
-    // artifact (root user with no home, container init that didn't
-    // set HOME) — same fix as the unset case. Other malformed HOME
-    // values (non-existent directory, relative path, etc.) pass
-    // through this gate; downstream open()/statvfs() surface the
-    // real error from the resulting model cache path.
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() || home == "/" {
-        anyhow::bail!(
-            "HOME is unset, empty, or `/`; cannot resolve model cache directory. \
-             Set KTSTR_CACHE_DIR or XDG_CACHE_HOME to specify a cache location."
-        );
-    }
-    Ok(PathBuf::from(home)
-        .join(".cache")
-        .join("ktstr")
-        .join("models"))
+    crate::cache::resolve_cache_root_with_suffix("models")
 }
 
 /// Compute the [`ShaVerdict`] for the cached artifact at `path`
@@ -1109,9 +1296,8 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
 /// (`3_000_000`), `FETCH_MIN_TIMEOUT_SECS` is 60 s, and
 /// `FETCH_MAX_TIMEOUT_SECS` is 1800 s (30 min). The proportional
 /// term budgets a 3 MB/s sustained-throughput floor over the
-/// artifact body; the 60 s floor keeps small artifacts
-/// (kilobyte-scale tokenizers, future micro-pins) from getting a
-/// sub-second cap that TLS handshake + request/response round-trip
+/// artifact body; the 60 s floor keeps small artifacts from getting
+/// a sub-second cap that TLS handshake + request/response round-trip
 /// would blow past before the first body byte arrives. A regression
 /// below the 3 MB/s floor surfaces as a timeout rather than hanging
 /// the test setup until an external watchdog fires.
@@ -1121,9 +1307,9 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
 /// a typo'd or unexpectedly large pin (e.g. a 20 GiB `size_bytes`)
 /// would demand roughly 2 h of linear budget with no CI wall-clock
 /// cap to stop it. The ceiling kicks in at `1800 s × 3 MB/s =
-/// 5.4 GB` of body; every current pin (`DEFAULT_MODEL` ≈ 2.44 GiB,
-/// `DEFAULT_TOKENIZER` ≈ 11 MiB) is well under that crossover and
-/// continues to receive its linear budget unchanged, and a future 5
+/// 5.4 GB` of body; the current pin (`DEFAULT_MODEL` ≈ 2.44 GiB) is
+/// well under that crossover and continues to receive its linear
+/// budget unchanged, and a future 5
 /// GiB model pin (`5 × 1024³ / 3_000_000 ≈ 1789 s`) also sits just
 /// under the cap. Pins beyond ~5 GB are the ones we explicitly want
 /// bounded — the ceiling says "any artifact this codebase fetches
@@ -1325,9 +1511,9 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     // hang forever on a slow or unreachable mirror. 30s connect
     // catches DNS/TLS wedges early. The overall timeout scales with
     // `spec.size_bytes` via [`fetch_timeout_for_size`] so a 2.44 GiB
-    // model and an 11 MiB tokenizer do not share a single one-size-
-    // fits-all cap — the previous fixed 15-minute ceiling either let
-    // a wedged tokenizer download hang for 15 minutes past any
+    // model does not share a single one-size-fits-all cap — the
+    // previous fixed 15-minute ceiling either let a wedged download
+    // hang for 15 minutes past any
     // reasonable budget or starved the model on slow CI CDNs. Tests
     // that don't actually hit the network (offline gate, cached path)
     // never enter this branch.
@@ -1447,7 +1633,7 @@ const fn is_all_hex_ascii(s: &str) -> bool {
 /// Canonical predicate for a well-formed SHA-256 hex pin: exactly
 /// [`SHA256_HEX_LEN`] ASCII characters, each a hex digit
 /// (`0-9a-fA-F`). `const fn` so module-scope compile-time asserts
-/// on [`DEFAULT_MODEL`] / [`DEFAULT_TOKENIZER`] pins fold to a
+/// on [`DEFAULT_MODEL`] pins fold to a
 /// no-op at build time, and so [`status`] / [`ensure`] can gate on
 /// it without runtime diagnostic construction (they produce
 /// context-specific error messages themselves).
@@ -1543,9 +1729,9 @@ fn check_sha256(path: &std::path::Path, expected_hex: &str) -> Result<bool> {
 /// case (`"Https://"`) variants are rejected alongside `http://`
 /// and every other scheme. RFC 3986 §3.1 declares URL schemes
 /// case-insensitive, so in principle this is stricter than the
-/// spec — but every pin in this crate ([`DEFAULT_MODEL`],
-/// [`DEFAULT_TOKENIZER`], and the fixtures in the nearby tests)
-/// uses lowercase, the compile-time `is_valid_sha256_hex` guards
+/// spec — but every pin in this crate ([`DEFAULT_MODEL`] and the
+/// fixtures in the nearby tests) uses lowercase, the compile-time
+/// `is_valid_sha256_hex` guards
 /// do not reach scheme validation, and a mixed-case scheme in a
 /// `ModelSpec::url` field is almost certainly a typo worth failing
 /// closed on rather than silently normalizing. The
@@ -1598,17 +1784,15 @@ where
     })
 }
 
-/// Prefetch [`DEFAULT_MODEL`] and [`DEFAULT_TOKENIZER`] when at least
-/// one registered test needs the LlmExtract backend. No-op when
-/// `KTSTR_MODEL_OFFLINE` is set or no test declares
-/// [`OutputFormat::LlmExtract`].
+/// Prefetch [`DEFAULT_MODEL`] when at least one registered test
+/// needs the LlmExtract backend. No-op when `KTSTR_MODEL_OFFLINE` is
+/// set or no test declares [`OutputFormat::LlmExtract`].
 ///
-/// Both artifacts are ensured together because inference needs both —
-/// deferring the tokenizer to first-call would only move a failure
-/// that setup already has the authority to surface.
+/// The GGUF carries its own tokenizer surface, so prefetch only has
+/// the single weight artifact to fetch.
 ///
-/// On full success sets [`PREFETCH_CHECKED`] so [`load_inference`]
-/// can skip re-hashing.
+/// On success sets [`PREFETCH_CHECKED`] so [`load_inference`] can
+/// skip re-hashing.
 ///
 /// Returns `Ok(None)` when no fetch was attempted; `Ok(Some(path))`
 /// with the model path on success; `Err` on fetch/check failure.
@@ -1637,36 +1821,32 @@ pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
     // of feedback instead of staring at a silent stall. Any status
     // error here is non-fatal — we fall through to `ensure`, which
     // surfaces the real failure with full context. On an already-
-    // populated cache both probes succeed with
+    // populated cache the probe succeeds with
     // `s.sha_verdict.is_match()` and we skip the announcement
     // entirely, matching the existing "zero noise on cache hit"
     // semantics.
     let model_missing = status_indicates_fetch_needed(&status(&DEFAULT_MODEL));
-    let tokenizer_missing = status_indicates_fetch_needed(&status(&DEFAULT_TOKENIZER));
-    let announced = model_missing || tokenizer_missing;
-    let expected_total = DEFAULT_MODEL.size_bytes + DEFAULT_TOKENIZER.size_bytes;
-    if announced {
+    let expected_total = DEFAULT_MODEL.size_bytes;
+    if model_missing {
         // Render size via indicatif::HumanBytes so the value stays
         // in lockstep with `ModelSpec::size_bytes`; a hardcoded
         // "~2.4 GiB" literal drifted every time the pin rotated.
         eprintln!(
-            "ktstr_test: downloading LlmExtract model + tokenizer (~{}; first run only) …",
+            "ktstr_test: downloading LlmExtract model (~{}; first run only) …",
             indicatif::HumanBytes(expected_total),
         );
         tracing::info!(
             model_missing,
-            tokenizer_missing,
             expected_total_bytes = expected_total,
             "downloading LlmExtract model on first run",
         );
     }
     let model_path = ensure(&DEFAULT_MODEL)?;
-    ensure(&DEFAULT_TOKENIZER)?;
     // Release pairs with Acquire in load_inference to establish
     // happens-before between the ensure-side filesystem writes
     // (tempfile persist) and the fast-path reader.
     PREFETCH_CHECKED.store(true, Ordering::Release);
-    if announced {
+    if model_missing {
         // Dual-emit the completion signal so structured-log
         // consumers (cargo-ktstr, downstream pipelines) see both
         // start and end of the prefetch phase — symmetric with
@@ -1844,24 +2024,151 @@ fn strip_chatml_control_tokens(s: &str) -> std::borrow::Cow<'_, str> {
 /// rather than silently truncating.
 const SAMPLE_LEN: usize = 512;
 
-/// Deterministic seed. ArgMax sampling ignores the RNG but
-/// `LogitsProcessor::from_sampling` still consumes a seed; pinning
-/// it keeps the constructor call a pure function of the pinned
-/// model weights.
-const SEED: u64 = 299_792_458;
+/// Context window passed to `LlamaContextParams::with_n_ctx`. Sized
+/// at 2048 because the prompt template is short (~120 tokens) and
+/// every benchmark this pipeline targets emits at most a few hundred
+/// metric leaves; the body almost always fits in the remaining
+/// budget after [`SAMPLE_LEN`] is reserved for generation. A larger
+/// context would cost KV memory linearly without adding headroom for
+/// the realistic input shape.
+///
+/// Promoted to a module-level `const` so the prompt-budget
+/// arithmetic in `invoke_with_model` and the
+/// `n_ctx_budget_*` test fixtures share one source of truth.
+const N_CTX_TOKENS: usize = 2048;
 
-/// Loaded inference state: the Qwen3 weights, its tokenizer, and the
-/// resolved EOS token id. Threaded through `load_inference` and
-/// `invoke_with_model` — both module-private. Nothing outside
-/// `model.rs` constructs or observes this type.
-struct LoadedInference {
-    model: candle_transformers::models::quantized_qwen3::ModelWeights,
-    tokenizer: tokenizers::Tokenizer,
-    eos_id: u32,
-    device: candle::Device,
+/// Per-invocation token budget for the prompt — the prompt's
+/// `str_to_token` output must not exceed this count, or `ctx.decode`
+/// would either reject the batch (`NTokensZero` / `NoKvCacheSlot`)
+/// or silently truncate the KV cache, producing degenerate output.
+/// The budget reserves [`SAMPLE_LEN`] tokens for generation plus a
+/// 64-token cushion for the ChatML wrapper Qwen3 layers around the
+/// composed prompt (`<|im_start|>user\n…<|im_end|>\n<|im_start|>assistant\n`
+/// at ~12-16 tokens, with margin for tokenizer drift across model
+/// variants).
+///
+/// `invoke_with_model` enforces this budget post-tokenization: if
+/// the prompt's token count exceeds it, the body is byte-truncated
+/// (snapped to a UTF-8 boundary) and re-tokenized. Byte truncation
+/// is approximate — Qwen3-4B's BBPE tokenizer averages ~3.5 chars /
+/// token on English benchmark text — so we use a 3:1 chars-per-token
+/// floor to size the byte budget conservatively, then verify with a
+/// second tokenization pass that the truncated prompt fits.
+const MAX_PROMPT_TOKENS: usize = N_CTX_TOKENS - SAMPLE_LEN - 64;
+
+/// Approximate bytes-per-token floor for the Qwen3 BBPE tokenizer on
+/// English text. Used by the byte-truncation pre-pass that bounds
+/// prompt body size before re-tokenization. Conservative — real
+/// English text averages ~3.5-4 chars/token, so a 3:1 ratio under-
+/// estimates token count and over-truncates body bytes when in
+/// doubt. The verification pass that follows re-tokenization
+/// catches any case where this floor was still optimistic.
+const BYTES_PER_TOKEN_FLOOR: usize = 3;
+
+/// Truncate `prompt` so its tokenization fits inside
+/// [`MAX_PROMPT_TOKENS`]. Returns the (possibly truncated) prompt
+/// alongside an indicator flagging whether truncation occurred so
+/// the caller can `tracing::warn!` and the test fixture can pin
+/// the truncation behavior.
+///
+/// Strategy: tokenize the full prompt first. If the result fits,
+/// return it as-is. Otherwise, byte-truncate the prompt to a
+/// conservative budget computed from
+/// [`BYTES_PER_TOKEN_FLOOR`] × [`MAX_PROMPT_TOKENS`], snap to a
+/// UTF-8 char boundary so we never split a multi-byte codepoint,
+/// re-tokenize, and pin a final assertion that the result is now
+/// within budget. The conservative ratio means a single retry pass
+/// is sufficient for English benchmark output; pathological inputs
+/// (e.g. long runs of single-byte tokens like raw whitespace
+/// emoji) would need a second retry, but those don't exist in any
+/// realistic benchmark stdout this pipeline targets.
+///
+/// On the (theoretical) failure of the second tokenization to fit,
+/// returns an error rather than silently shipping an oversize
+/// prompt — the caller wraps that into the
+/// [`InferenceError::Tokenize`] failure surface. Failing closed
+/// here keeps the inference path's "ctx.decode either succeeds or
+/// produces an actionable error" contract intact.
+fn fit_prompt_to_context(
+    model: &llama_cpp_2::model::LlamaModel,
+    prompt: &str,
+) -> Result<Vec<llama_cpp_2::token::LlamaToken>, InferenceError> {
+    use llama_cpp_2::model::AddBos;
+
+    // First-pass tokenization: most inputs fit and short-circuit
+    // here without any allocation past the token vec.
+    let initial = model
+        .str_to_token(prompt, AddBos::Never)
+        .map_err(|source| InferenceError::Tokenize {
+            prompt_excerpt: prompt_excerpt(prompt),
+            source,
+        })?;
+    if initial.len() <= MAX_PROMPT_TOKENS {
+        return Ok(initial);
+    }
+
+    // Over budget. Byte-truncate to a conservative budget computed
+    // from the chars-per-token floor, snapping back to a UTF-8 char
+    // boundary so we never produce an invalid-UTF-8 fragment.
+    let byte_budget = MAX_PROMPT_TOKENS.saturating_mul(BYTES_PER_TOKEN_FLOOR);
+    let mut end = byte_budget.min(prompt.len());
+    while end > 0 && !prompt.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = &prompt[..end];
+    let retokenized = model
+        .str_to_token(truncated, AddBos::Never)
+        .map_err(|source| InferenceError::Tokenize {
+            prompt_excerpt: prompt_excerpt(truncated),
+            source,
+        })?;
+
+    if retokenized.len() > MAX_PROMPT_TOKENS {
+        // Pathological shape — the BPE tokenizer ran below the
+        // chars-per-token floor for this input. Surface as a
+        // typed error rather than slicing further; the operator
+        // can re-tune `BYTES_PER_TOKEN_FLOOR` if a real workload
+        // hits this.
+        return Err(InferenceError::Generation {
+            reason: format!(
+                "prompt token count {} still exceeds budget {} after \
+                 byte-truncation to {} bytes — tokenizer ran below the \
+                 {} chars-per-token floor; tune BYTES_PER_TOKEN_FLOOR",
+                retokenized.len(),
+                MAX_PROMPT_TOKENS,
+                end,
+                BYTES_PER_TOKEN_FLOOR,
+            ),
+        });
+    }
+
+    tracing::warn!(
+        original_tokens = initial.len(),
+        truncated_tokens = retokenized.len(),
+        max_prompt_tokens = MAX_PROMPT_TOKENS,
+        truncated_bytes = prompt.len() - end,
+        "LlmExtract prompt exceeded context budget; truncated body to fit",
+    );
+    Ok(retokenized)
 }
 
-/// Build the bundled Qwen3 weights + tokenizer + EOS id.
+/// Loaded inference state: the GGUF-backed `LlamaModel`. The model
+/// owns its tokenizer + EOS metadata internally — no separate
+/// tokenizer handle is needed. `LlamaContext` is intentionally NOT
+/// stored here: it borrows from `&LlamaModel` (`new_context<'a>(&'a
+/// self, ...)`), so caching one alongside the model would create a
+/// self-referential struct. `invoke_with_model` builds a fresh
+/// context per call instead, which also gives every invocation a
+/// clean KV state without an explicit `clear_kv_cache` step.
+///
+/// Threaded through `load_inference` and `invoke_with_model` — both
+/// module-private. Nothing outside `model.rs` constructs or observes
+/// this type.
+struct LoadedInference {
+    model: llama_cpp_2::model::LlamaModel,
+}
+
+/// Load the bundled Qwen3 weights via `llama-cpp-2`.
 ///
 /// When [`PREFETCH_CHECKED`] is set, uses [`locate`] and skips
 /// re-hashing the model's ~2.44 GiB. Otherwise falls back to
@@ -1871,43 +2178,35 @@ struct LoadedInference {
 /// [`MODEL_CACHE`] caches the returned `Result` (Ok or Err), so this
 /// body runs at most once per process. The `cfg(test)`-only `reset`
 /// hook is the sole way to clear the slot and re-enter this function.
+///
+/// Errors surface through [`InferenceError`]: cache-resolution
+/// failures bubble out of `ensure()` / `locate()` as anyhow chains,
+/// while engine-level load failures wrap into
+/// [`InferenceError::ModelLoad`] carrying the resolved
+/// `PathBuf` plus the upstream `LlamaModelLoadError` source.
 fn load_inference() -> anyhow::Result<LoadedInference> {
-    use candle::{Device, quantized::gguf_file};
-    use candle_transformers::models::quantized_qwen3::ModelWeights;
-    use tokenizers::Tokenizer;
+    use llama_cpp_2::model::LlamaModel;
+    use llama_cpp_2::model::params::LlamaModelParams;
 
     // Acquire pairs with the Release store in prefetch_if_required.
-    let (model_path, tokenizer_path) = if PREFETCH_CHECKED.load(Ordering::Acquire) {
-        (locate(&DEFAULT_MODEL)?, locate(&DEFAULT_TOKENIZER)?)
+    let model_path = if PREFETCH_CHECKED.load(Ordering::Acquire) {
+        locate(&DEFAULT_MODEL)?
     } else {
-        (ensure(&DEFAULT_MODEL)?, ensure(&DEFAULT_TOKENIZER)?)
+        ensure(&DEFAULT_MODEL)?
     };
 
-    let device = Device::Cpu;
+    // CPU-only: no GPU layer offload. The
+    // process-wide `BACKEND` is a `OnceLock<LlamaBackend>` that
+    // initializes lazily on first call here; subsequent calls in
+    // the same process reuse the same handle.
+    let model =
+        LlamaModel::load_from_file(global_backend(), &model_path, &LlamaModelParams::default())
+            .map_err(|source| InferenceError::ModelLoad {
+                path: model_path.clone(),
+                source,
+            })?;
 
-    let mut file = std::fs::File::open(&model_path).map_err(|e| {
-        anyhow::Error::new(e).context(format!("open GGUF model at {}", model_path.display()))
-    })?;
-    let content = gguf_file::Content::read(&mut file)
-        .map_err(|e| anyhow::Error::new(e.with_path(&model_path)))?;
-    let model = ModelWeights::from_gguf(content, &mut file, &device).map_err(anyhow::Error::new)?;
-
-    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-        anyhow::Error::from_boxed(e)
-            .context(format!("load tokenizer at {}", tokenizer_path.display()))
-    })?;
-
-    let eos_id = *tokenizer
-        .get_vocab(true)
-        .get("<|im_end|>")
-        .ok_or_else(|| anyhow::anyhow!("tokenizer vocab missing '<|im_end|>' EOS token"))?;
-
-    Ok(LoadedInference {
-        model,
-        tokenizer,
-        eos_id,
-        device,
-    })
+    Ok(LoadedInference { model })
 }
 
 /// Wrap a raw user prompt in Qwen3 ChatML with the `/no_think`
@@ -1938,106 +2237,155 @@ fn wrap_chatml_no_think(prompt: &str) -> String {
 /// block stripped.
 ///
 /// Idempotent: repeated calls with the same `LoadedInference` are
-/// safe; each invocation starts with a clean KV cache. The cache is
-/// cleared up front on every call so repeated invocations don't
-/// carry state across the prompt forward pass's position offsets —
-/// the callee owns that invariant rather than pushing it onto
-/// callers.
+/// safe. A fresh `LlamaContext` is built per call from the cached
+/// `&LlamaModel`, so each invocation starts with an empty KV cache
+/// without needing an explicit clear step. KV state lives on the
+/// `LlamaContext` (per-call), not on the `LlamaModel` (cached) —
+/// so cross-invocation aliasing is structurally impossible.
 ///
-/// Greedy: `Sampling::ArgMax` with a fixed seed. Output is a
-/// deterministic function of the prompt + weights.
+/// Greedy: `LlamaSampler::greedy()` selects the ArgMax token from
+/// the logits at every step. Output is a deterministic function of
+/// the prompt + weights — `greedy()` carries no RNG state, so
+/// there is no seed to pin.
 fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Result<String> {
-    use candle::Tensor;
-    use candle_transformers::generation::{LogitsProcessor, Sampling};
+    use std::num::NonZeroU32;
 
-    // Reset the per-layer K/V tensors so the prompt pass below can
-    // use `forward(input, 0)` — candle's
-    // `quantized_qwen3::ModelWeights::forward(input, index_pos)`
-    // interprets `index_pos` as the absolute slot into which each
-    // incoming token's attention K/V is written. At `index_pos=0`
-    // the forward overwrites slots `[0, prompt_len)` and relies on
-    // "no earlier cached state at those positions" for the
-    // attention math — a stale K/V from a prior invocation at
-    // position N < prompt_len would alias the new prompt and
-    // silently poison the output logits.
+    use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::llama_batch::LlamaBatch;
+    use llama_cpp_2::sampling::LlamaSampler;
+
+    // Context window: [`N_CTX_TOKENS`] = 2048 tokens. Prompt +
+    // generation must fit within this; `fit_prompt_to_context`
+    // below enforces the prompt budget post-tokenization, so any
+    // oversize body is truncated before `ctx.decode` would reject
+    // it. The remaining budget after [`SAMPLE_LEN`] reservation is
+    // [`MAX_PROMPT_TOKENS`].
     //
-    // Caller contract inverted at this layer: the callee
-    // (`invoke_with_model`) owns the "start from a clean KV" invariant
-    // unconditionally instead of pushing it onto `extract_via_llm` /
-    // downstream wrappers that would otherwise need to remember
-    // whether the last caller left the cache dirty. Clearing costs a
-    // layer-scoped vec walk per call (see
-    // `candle_transformers::models::quantized_qwen3::ModelWeights::clear_kv_cache`),
-    // which is trivial next to the ~SAMPLE_LEN-token generation that
-    // follows.
-    state.model.clear_kv_cache();
+    // Threading: `LlamaContextParams::default()` caps both
+    // `n_threads` and `n_threads_batch` at 4 (see upstream
+    // `llama-cpp-2-0.1.145/src/context/params/get_set.rs:154` and
+    // `:184`). Inference is matmul-bound for every quantized layer
+    // pass, so on any host with more than 4 cores the default
+    // strands the matmul on a fraction of the box — the prompt
+    // pre-fill and per-token generation both stretch from
+    // milliseconds to seconds. Pull the actual core count from
+    // `std::thread::available_parallelism` (which reads
+    // `sched_getaffinity` for the current thread; honors cgroup
+    // cpuset when the harness propagates affinity into the test
+    // process — a constrained worker on a 64-core Threadripper that
+    // has been pinned to 8 cores reads 8 here, matching the
+    // workload's actual budget). The OpenMP build path (the
+    // `openmp` feature on `llama-cpp-2`) further parallelizes
+    // matmul across the threads we hand it.
+    //
+    // `available_parallelism` returns `Result` only because the
+    // syscall can fail under unusual containerization shapes
+    // (no /proc, mountns drop, etc.). Falling back to the static
+    // default of 4 on that path is safe — the run will be slow but
+    // correct, and the fallback only fires under environments where
+    // the operator has already chosen to constrain visibility.
+    // `i32::try_from` cannot fail in practice (modern hosts top out
+    // around 256 cores; `i32::MAX = 2^31 - 1`), but the fallible
+    // form keeps the conversion explicit.
+    let n_threads: i32 = std::thread::available_parallelism()
+        .ok()
+        .and_then(|p| i32::try_from(p.get()).ok())
+        .unwrap_or(4);
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(N_CTX_TOKENS as u32))
+        .with_n_threads(n_threads)
+        .with_n_threads_batch(n_threads);
+    let mut ctx = state
+        .model
+        .new_context(global_backend(), ctx_params)
+        .map_err(|source| InferenceError::ContextCreate { source })?;
 
     let chat_prompt = wrap_chatml_no_think(prompt);
-    let encoding = state
-        .tokenizer
-        .encode(chat_prompt, true)
-        .map_err(anyhow::Error::from_boxed)?;
-    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    // ChatML control tokens (`<|im_start|>`, `<|im_end|>`) carry the
+    // turn structure — [`fit_prompt_to_context`] tokenizes with
+    // `AddBos::Never` because the prompt template already opens with
+    // `<|im_start|>user`. A leading BOS would shift attention
+    // positions and mis-align the model's expected ChatML turn
+    // structure. The helper enforces the [`MAX_PROMPT_TOKENS`]
+    // budget and byte-truncates the body if a pathologically long
+    // benchmark output would otherwise overflow the context window.
+    let prompt_tokens = fit_prompt_to_context(&state.model, &chat_prompt)?;
 
-    let mut logits_processor = LogitsProcessor::from_sampling(SEED, Sampling::ArgMax);
+    // Prompt batch sized to fit `N_CTX_TOKENS` — any prompt that
+    // fits the context after `fit_prompt_to_context` truncation fits
+    // the batch.
+    let mut batch = LlamaBatch::new(N_CTX_TOKENS, 1);
 
-    // Prompt pass: feed the whole prompt at index_pos=0. qwen3's
-    // forward already narrows to the last position and returns shape
-    // `(b, vocab)`; the caller's `squeeze(0)` strips the batch dim.
-    let input = Tensor::new(prompt_tokens.as_slice(), &state.device)
-        .and_then(|t| t.unsqueeze(0))
-        .map_err(anyhow::Error::new)?;
-    let logits = state
-        .model
-        .forward(&input, 0)
-        .and_then(|l| l.squeeze(0))
-        .map_err(anyhow::Error::new)?;
-    let mut next_token = logits_processor
-        .sample(&logits)
-        .map_err(anyhow::Error::new)?;
-
-    let mut generated: Vec<u32> = Vec::with_capacity(SAMPLE_LEN);
-    if next_token != state.eos_id {
-        generated.push(next_token);
+    let last_index: i32 = (prompt_tokens.len() - 1) as i32;
+    for (i, token) in (0_i32..).zip(prompt_tokens.iter().copied()) {
+        // logits=true only for the last prompt token — we sample
+        // from the position immediately after the prompt, and
+        // requesting logits on every prompt token would burn memory
+        // bandwidth on output we don't read.
+        let is_last = i == last_index;
+        batch
+            .add(token, i, &[0], is_last)
+            .map_err(|e| InferenceError::Generation {
+                reason: format!("seed prompt batch at position {i}: {e}"),
+            })?;
     }
+    ctx.decode(&mut batch)
+        .map_err(|source| InferenceError::Decode { source })?;
 
-    // Generation loop. index_pos advances to the absolute position
-    // of the token being processed — the KV cache uses it to place
-    // each new token's Q/K/V in the right slot. On step 0 the position
-    // is `prompt_tokens.len()`, i.e. the slot immediately after the
-    // prompt pass's last token.
-    for step in 0..SAMPLE_LEN.saturating_sub(1) {
-        if next_token == state.eos_id {
+    let mut sampler = LlamaSampler::greedy();
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut decoded = String::new();
+
+    // Each generation step writes the just-sampled token at the
+    // absolute position immediately after the prompt — `prompt_len`,
+    // `prompt_len + 1`, `prompt_len + 2`, … — so the KV slot for
+    // the new token doesn't alias the prompt. `prompt_len` is the
+    // batch's `n_tokens` after the prompt-pass `decode`; iterating
+    // from there with a `zip` ties the position counter directly to
+    // the loop iterator without a separate `n_cur += 1` step.
+    let prompt_len = batch.n_tokens();
+    let mut hit_eos = false;
+    for (n_cur, _) in (prompt_len..).zip(0..SAMPLE_LEN) {
+        // Sample from the latest decoded position — `batch.n_tokens()
+        // - 1` is the index of the most recently decoded slot, and
+        // its logits are what `greedy()` selects from.
+        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        sampler.accept(token);
+
+        if state.model.is_eog_token(token) {
+            hit_eos = true;
             break;
         }
-        let input = Tensor::new(&[next_token], &state.device)
-            .and_then(|t| t.unsqueeze(0))
-            .map_err(anyhow::Error::new)?;
-        let logits = state
+
+        // Stateful UTF-8 decode: a single token may end mid-codepoint,
+        // so the decoder buffers partial bytes between calls. Append
+        // each piece to `decoded` as the bytes resolve.
+        let piece = state
             .model
-            .forward(&input, prompt_tokens.len() + step)
-            .and_then(|l| l.squeeze(0))
-            .map_err(anyhow::Error::new)?;
-        next_token = logits_processor
-            .sample(&logits)
-            .map_err(anyhow::Error::new)?;
-        if next_token == state.eos_id {
-            break;
-        }
-        generated.push(next_token);
+            .token_to_piece(token, &mut decoder, true, None)
+            .map_err(|e| InferenceError::Generation {
+                reason: format!("token_to_piece for token at position {n_cur}: {e}"),
+            })?;
+        decoded.push_str(&piece);
+
+        // Feed the just-sampled token back as the next batch input.
+        batch.clear();
+        batch
+            .add(token, n_cur, &[0], true)
+            .map_err(|e| InferenceError::Generation {
+                reason: format!("seed generation batch at position {n_cur}: {e}"),
+            })?;
+        ctx.decode(&mut batch)
+            .map_err(|source| InferenceError::Decode { source })?;
     }
 
-    if next_token != state.eos_id {
+    if !hit_eos {
         tracing::warn!(
             "generation hit {} token cap without EOS — output may be truncated",
             SAMPLE_LEN,
         );
     }
 
-    let decoded = state
-        .tokenizer
-        .decode(&generated, true)
-        .map_err(anyhow::Error::from_boxed)?;
     Ok(strip_think_block(&decoded))
 }
 
@@ -2200,9 +2548,10 @@ pub(crate) fn reset() {
 /// [`Check`](crate::test_support::Check) evaluation reports each
 /// referenced metric as missing.
 ///
-/// No retry: under `Sampling::ArgMax` with a fixed seed, a second
-/// inference call on the same prompt + weights produces byte-
-/// identical output. Retrying would only burn wall time without
+/// No retry: under `LlamaSampler::greedy()` (deterministic ArgMax,
+/// no RNG state), a second inference call on the same prompt +
+/// weights produces byte-identical output. Retrying would only burn
+/// wall time without
 /// changing the result.
 /// Return signature — `Result<Vec<Metric>, String>` — distinguishes
 /// three outcomes:
@@ -3182,6 +3531,11 @@ mod tests {
     /// (typically a small constrained mount), not a usable user
     /// cache. A legitimate root user without a configured home
     /// should set KTSTR_CACHE_DIR or XDG_CACHE_HOME explicitly.
+    /// The shared validation in
+    /// [`crate::cache::resolve_cache_root_with_suffix`] surfaces
+    /// the literal-`/` arm with a path-shape-specific diagnostic
+    /// naming `/.cache/ktstr` so the operator immediately sees
+    /// what would have been written.
     #[test]
     fn resolve_cache_root_rejects_root_slash_home() {
         let _lock = lock_env();
@@ -3191,8 +3545,12 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("HOME is unset, empty, or `/`"),
-            "expected HOME=/ rejection, got: {msg}"
+            msg.contains("HOME is `/`"),
+            "expected HOME=/ specific rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains("/.cache/ktstr"),
+            "diagnostic must cite the offending cache path, got: {msg}"
         );
         assert!(
             msg.contains("KTSTR_CACHE_DIR"),
@@ -3202,7 +3560,11 @@ mod tests {
 
     /// HOME=`""` is rejected for the same reason as unset — joining
     /// `.cache` onto an empty PathBuf yields a relative `.cache`
-    /// rooted at CWD instead of a stable user cache.
+    /// rooted at CWD instead of a stable user cache. Both shapes
+    /// collapse into the empty string at the
+    /// `unwrap_or_default()` site in
+    /// [`crate::cache::resolve_cache_root_with_suffix`], so they
+    /// share the same "HOME is unset or empty" diagnostic.
     #[test]
     fn resolve_cache_root_rejects_empty_home() {
         let _lock = lock_env();
@@ -3212,13 +3574,14 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("HOME is unset, empty, or `/`"),
+            msg.contains("HOME is unset or empty"),
             "expected empty-HOME rejection, got: {msg}"
         );
     }
 
-    /// HOME unset is rejected (carried over from prior behavior;
-    /// the bail message is now shared with the empty / `/` cases).
+    /// HOME unset is rejected via the same arm as empty — both
+    /// land at the empty-string check after `unwrap_or_default()`
+    /// in the shared validation helper.
     #[test]
     fn resolve_cache_root_rejects_unset_home() {
         let _lock = lock_env();
@@ -3228,8 +3591,60 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("HOME is unset, empty, or `/`"),
+            msg.contains("HOME is unset or empty"),
             "expected unset-HOME rejection, got: {msg}"
+        );
+    }
+
+    /// HOME=relative-path is rejected by the third arm of the
+    /// shared validation. Pin the model-cache resolver inherits
+    /// the same protection — a regression that bypassed the
+    /// shared helper would leave the model cache silently
+    /// resolving against CWD even though the kernel cache caught
+    /// the same shape.
+    #[test]
+    fn resolve_cache_root_rejects_relative_home() {
+        let _lock = lock_env();
+        let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _env_home = EnvVarGuard::set("HOME", "relative/dir");
+        let err = resolve_cache_root().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not an absolute path"),
+            "expected relative-path rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains("relative/dir"),
+            "diagnostic must cite the offending HOME value, got: {msg}"
+        );
+    }
+
+    /// Non-UTF-8 KTSTR_CACHE_DIR must bail with the actionable
+    /// diagnostic the shared validation surfaces. Pre-unification
+    /// (model.rs:806) the model resolver silently fell through on
+    /// `Err(VarError::NotUnicode)` and the operator's override
+    /// vanished without a trace; the shared helper now catches
+    /// this for both caches.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_cache_root_rejects_non_utf8_ktstr_cache_dir() {
+        let _lock = lock_env();
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bytes: &[u8] = b"/tmp/ktstr-\xFFmodels";
+        let value = OsStr::from_bytes(bytes);
+        let _env_ktstr = EnvVarGuard::set("KTSTR_CACHE_DIR", value);
+        let err = resolve_cache_root()
+            .expect_err("non-UTF-8 KTSTR_CACHE_DIR must bail through the shared helper");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("KTSTR_CACHE_DIR"),
+            "error must name the offending variable, got: {msg}",
+        );
+        assert!(
+            msg.contains("non-UTF-8"),
+            "error must mention non-UTF-8, got: {msg}",
         );
     }
 
@@ -3776,52 +4191,10 @@ mod tests {
         }
     }
 
-    /// `DEFAULT_TOKENIZER.sha256_hex` must pass the same shape gate
-    /// that `check_sha256` and `ensure()` enforce: 64 ASCII hex
-    /// digits, no more, no less. A placeholder or malformed pin
-    /// would fail this check at build time (via
-    /// `default_tokenizer_sha_is_valid_shape`) instead of surfacing
-    /// mid-CI when prefetch tries to check.
-    #[test]
-    fn default_tokenizer_sha_is_valid_shape() {
-        assert!(
-            is_valid_sha256_hex(DEFAULT_TOKENIZER.sha256_hex),
-            "DEFAULT_TOKENIZER.sha256_hex must be 64 ASCII hex chars: {:?}",
-            DEFAULT_TOKENIZER.sha256_hex
-        );
-    }
-
-    /// `DEFAULT_TOKENIZER.url` must be HTTPS. The cache fetcher
-    /// rejects non-HTTPS URLs via `reject_insecure_url`, so a typo
-    /// that downgraded the scheme to `http://` would fail prefetch
-    /// at first use. Pin the scheme at build time so the regression
-    /// surfaces without running the fetcher.
-    #[test]
-    fn default_tokenizer_url_is_https() {
-        assert!(
-            DEFAULT_TOKENIZER.url.starts_with("https://"),
-            "DEFAULT_TOKENIZER.url must be HTTPS: {:?}",
-            DEFAULT_TOKENIZER.url
-        );
-    }
-
-    /// `DEFAULT_TOKENIZER.file_name` must end with `.json` — the
-    /// tokenizers crate loads by JSON path and a non-JSON extension
-    /// would fail at load time. Pin the convention so a pin swap to
-    /// a different tokenizer format surfaces early.
-    #[test]
-    fn default_tokenizer_file_name_ends_with_json() {
-        assert!(
-            DEFAULT_TOKENIZER.file_name.ends_with(".json"),
-            "DEFAULT_TOKENIZER.file_name must end with .json: {:?}",
-            DEFAULT_TOKENIZER.file_name
-        );
-    }
-
-    /// Mirror [`default_tokenizer_sha_is_valid_shape`] for
-    /// `DEFAULT_MODEL`. Paired so a pin swap on either artifact
-    /// surfaces through the shape check before the artifact is
-    /// fetched.
+    /// Build-time shape gate for `DEFAULT_MODEL.sha256_hex`: 64 ASCII
+    /// hex digits, no more, no less. A placeholder or malformed pin
+    /// fails this check at build time instead of surfacing mid-CI
+    /// when prefetch tries to check.
     #[test]
     fn default_model_sha_is_valid_shape() {
         assert!(
@@ -3831,7 +4204,10 @@ mod tests {
         );
     }
 
-    /// Mirror [`default_tokenizer_url_is_https`] for `DEFAULT_MODEL`.
+    /// `DEFAULT_MODEL.url` must be HTTPS — the cache fetcher rejects
+    /// non-HTTPS URLs via `reject_insecure_url`, so a typo that
+    /// downgraded the scheme to `http://` would fail prefetch at
+    /// first use. Pin the scheme at build time.
     #[test]
     fn default_model_url_is_https() {
         assert!(
@@ -3841,16 +4217,442 @@ mod tests {
         );
     }
 
-    /// Mirror [`default_tokenizer_file_name_ends_with_json`] for
-    /// `DEFAULT_MODEL` — the cache fetcher and GGUF loader both
-    /// expect the artifact to be a GGUF file, so a pin swap to a
-    /// different format surfaces before inference tries to parse it.
+    /// The cache fetcher and GGUF loader both expect the artifact to
+    /// be a GGUF file, so a pin swap to a different format surfaces
+    /// before inference tries to parse it.
     #[test]
     fn default_model_file_name_ends_with_gguf() {
         assert!(
             DEFAULT_MODEL.file_name.ends_with(".gguf"),
             "DEFAULT_MODEL.file_name must end with .gguf: {:?}",
             DEFAULT_MODEL.file_name
+        );
+    }
+
+    // -- llama-cpp-2 migration shape tests --
+    //
+    // Pin the post-migration invariants that hold without loading
+    // the 2.4 GiB GGUF: the registered ModelSpec list, the
+    // `LoadedInference` field shape, and the `LlamaBackend`
+    // singleton contract. These regress instantly on an accidental
+    // re-introduction of a separate tokenizer artifact, an extra
+    // field on the inference state, or a per-call backend init.
+
+    /// `ALL_MODEL_SPECS` registers exactly one entry: the GGUF
+    /// model. A regression that re-introduced a side-loaded artifact
+    /// (e.g. a separate tokenizer or sentence-piece file) would
+    /// break this test before any prefetch / load-inference call hit
+    /// the wire. The GGUF carries its own tokenizer surface via
+    /// llama-cpp-2, so no separate artifact should ever land here.
+    #[test]
+    fn all_model_specs_registers_only_default_model() {
+        assert_eq!(
+            ALL_MODEL_SPECS.len(),
+            1,
+            "post-migration ALL_MODEL_SPECS holds the GGUF only — \
+             {} entries registered: {:?}",
+            ALL_MODEL_SPECS.len(),
+            ALL_MODEL_SPECS
+                .iter()
+                .map(|s| s.file_name)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            ALL_MODEL_SPECS[0].file_name, DEFAULT_MODEL.file_name,
+            "the single registered spec must be DEFAULT_MODEL"
+        );
+    }
+
+    /// `global_backend()` returns the same `&'static LlamaBackend`
+    /// across calls. Pins the [`OnceLock`] singleton contract:
+    /// `LlamaBackend::init` enforces "exactly one live instance per
+    /// process" (a second `init()` while one is alive returns
+    /// `LlamaCppError::BackendAlreadyInitialized`), so the
+    /// `OnceLock` wrapper must hand back the same handle on every
+    /// call. A regression that re-initialized the backend per call
+    /// would (a) panic on the second call, or (b) leak a backend
+    /// handle every test boot.
+    ///
+    /// Pointer-identity via `std::ptr::eq` rather than `==`: the
+    /// `LlamaBackend` `PartialEq` impl compares the (empty) struct
+    /// data and would return `true` for two independent inits.
+    /// Pointer equality only holds when both calls observed the
+    /// same `OnceLock` slot.
+    #[test]
+    fn global_backend_returns_same_handle_across_calls() {
+        let a = global_backend();
+        let b = global_backend();
+        assert!(
+            std::ptr::eq(a, b),
+            "global_backend must return the same &'static LlamaBackend \
+             across calls (ptr eq), got distinct instances",
+        );
+    }
+
+    /// `LoadedInference` carries only the `LlamaModel` post-migration:
+    /// no separate tokenizer handle, no EOS id (the model exposes
+    /// `is_eog_token`), no device (CPU-only via `LlamaModelParams::default`).
+    /// Pinning the field count compile-time-checked via the struct's
+    /// `Debug` impl would require deriving `Debug`; instead, a runtime
+    /// `size_of` assertion catches an accidental field addition that
+    /// would balloon the struct beyond the single `LlamaModel`
+    /// wrapper. Tracks `std::mem::size_of::<llama_cpp_2::model::LlamaModel>()`
+    /// at the upstream pin (0.1.145) — a future llama-cpp-2 update
+    /// that grows `LlamaModel` will trip this test, prompting an
+    /// audit of any new fields and a deliberate update to the
+    /// expected size.
+    ///
+    /// Not a hard pin on a specific byte count — `LlamaModel`'s
+    /// internal layout is not stable across patch versions — but
+    /// pins the "no extra field on `LoadedInference`" invariant by
+    /// asserting the struct is byte-identical in size to its single
+    /// `model` field.
+    #[test]
+    fn loaded_inference_holds_only_the_model_field() {
+        assert_eq!(
+            std::mem::size_of::<LoadedInference>(),
+            std::mem::size_of::<llama_cpp_2::model::LlamaModel>(),
+            "LoadedInference must hold only the `model: LlamaModel` field — \
+             a size delta means an extra field crept in, breaking the \
+             post-migration shape",
+        );
+    }
+
+    /// `load_inference` under the offline gate produces an `Err`
+    /// whose error chain mentions the offline-gate env var. The
+    /// existing `load_inference_errs_with_offline_message_under_offline_gate`
+    /// test pins the same error path; this test additionally pins
+    /// that the rendered error chain references `DEFAULT_MODEL`'s
+    /// file name so an operator reading the error knows which
+    /// artifact failed to resolve. Without this assertion, a
+    /// regression that drops the file_name context (e.g.
+    /// `ensure(...)?` without `with_context`) would silently
+    /// reduce diagnostic quality.
+    ///
+    /// Calls [`reset`] under [`lock_env`] so a previously-memoized
+    /// `Ok(_)` slot does not bypass the offline gate.
+    #[test]
+    fn load_inference_offline_gate_error_names_the_artifact() {
+        let _lock = lock_env();
+        reset();
+        let _cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
+        let err = load_inference()
+            .err()
+            .expect("offline gate must produce Err");
+        let rendered = format!("{err:#}");
+        // `ensure()`'s offline-gate failure message threads the
+        // ModelSpec's file_name through `with_context` so the
+        // operator sees which artifact tripped the gate.
+        assert!(
+            rendered.contains(DEFAULT_MODEL.file_name),
+            "offline-gate error chain must name the artifact ({}); got: {rendered}",
+            DEFAULT_MODEL.file_name,
+        );
+    }
+
+    /// `LlamaModel::load_from_file` against a non-existent path
+    /// produces an `Err` rather than panicking — surfacing the
+    /// missing-cache failure through the regular `Result` channel
+    /// so callers can render an actionable diagnostic. Drives the
+    /// path directly through `load_from_file` (rather than through
+    /// `load_inference`'s `ensure`/`locate` resolution) so the test
+    /// pins the engine-level behavior independent of the cache-
+    /// resolution wrapper.
+    ///
+    /// The `KTSTR_CACHE_DIR` redirection here is precautionary —
+    /// the path passed to `load_from_file` is unrelated to the
+    /// cache root, but isolating the env still prevents
+    /// cross-contamination from a sibling test running in
+    /// parallel.
+    #[test]
+    fn llama_model_load_from_file_returns_err_for_missing_path() {
+        use llama_cpp_2::model::LlamaModel;
+        use llama_cpp_2::model::params::LlamaModelParams;
+
+        let _lock = lock_env();
+        let _cache = isolated_cache_dir();
+        let nonexistent =
+            std::path::PathBuf::from("/nonexistent/ktstr/load-test/missing-model.gguf");
+        // Wrap in `std::panic::catch_unwind` because the upstream
+        // crate's `load_from_file` may emit a `debug_assert!` on
+        // a missing path under `cfg(debug_assertions)` (see
+        // llama-cpp-2 0.1.145 model.rs:801). The test must not
+        // crash on either branch — debug asserts and Err returns
+        // both encode "missing file is not loadable", and either
+        // is acceptable here.
+        let result = std::panic::catch_unwind(|| {
+            LlamaModel::load_from_file(global_backend(), &nonexistent, &LlamaModelParams::default())
+        });
+        match result {
+            Ok(Ok(_)) => panic!("load_from_file unexpectedly succeeded on a non-existent path",),
+            Ok(Err(_)) => {} // happy path: error returned
+            Err(_) => {}     // happy path: debug_assert tripped
+        }
+    }
+
+    /// `LlamaContextParams::default()` caps `n_threads` and
+    /// `n_threads_batch` at 4 (upstream `llama-cpp-2` 0.1.145
+    /// `src/context/params/get_set.rs:154` + `:184`). On any host
+    /// with more than 4 cores, defaulting strands matmul on a
+    /// fraction of the box and stretches inference from
+    /// milliseconds to seconds per token. `invoke_with_model`
+    /// builds its `LlamaContextParams` from
+    /// `std::thread::available_parallelism` to honor the kernel's
+    /// actual core budget (which respects cgroup cpuset bounds, so
+    /// a constrained worker on a 64-core host that's allocated 8
+    /// cores reads 8 here — matching the workload's true budget).
+    ///
+    /// This test pins the upstream-default values so a future
+    /// patch bump that changes the defaults silently to a
+    /// host-aware value (or, conversely, that lowers them
+    /// further) trips this test before it lands undetected. The
+    /// failure forces an audit of `invoke_with_model`'s threading
+    /// config: do we still need to override, or can we drop the
+    /// `with_n_threads` calls?
+    #[test]
+    fn llama_context_params_default_threading_caps_at_4() {
+        use llama_cpp_2::context::params::LlamaContextParams;
+        let params = LlamaContextParams::default();
+        assert_eq!(
+            params.n_threads(),
+            4,
+            "upstream LlamaContextParams::default().n_threads is the \
+             load-bearing constraint that justifies invoke_with_model's \
+             explicit with_n_threads override; if this changes, audit \
+             the override"
+        );
+        assert_eq!(
+            params.n_threads_batch(),
+            4,
+            "upstream LlamaContextParams::default().n_threads_batch \
+             same justification as n_threads"
+        );
+    }
+
+    /// `std::thread::available_parallelism` returns at least 1 on
+    /// every supported platform (this is the documented contract).
+    /// `invoke_with_model` consumes the value via `.ok().and_then(|p|
+    /// i32::try_from(p.get()).ok()).unwrap_or(4)`. Pin the
+    /// "available_parallelism is positive" half of the contract so a
+    /// regression that returned 0 (which `i32::try_from` would
+    /// silently accept) does not let an n_threads=0 setting reach
+    /// llama.cpp — n_threads=0 in llama.cpp's context-init code
+    /// historically wedged matmul, so the floor matters.
+    #[test]
+    fn available_parallelism_returns_positive_count() {
+        let p = std::thread::available_parallelism()
+            .expect("available_parallelism must succeed on the test host");
+        assert!(
+            p.get() >= 1,
+            "available_parallelism must report >= 1 (got {})",
+            p.get(),
+        );
+    }
+
+    /// `InferenceError::ModelLoad` Display includes the path (so an
+    /// operator scanning logs can tell which artifact slot failed)
+    /// and the chain reaches the upstream `LlamaModelLoadError`
+    /// source (so `anyhow::Error::root_cause` can extract the
+    /// concrete reason — null pointer return, NUL-byte in path,
+    /// etc.).
+    ///
+    /// Constructed synthetically with a `LlamaModelLoadError::NullResult`
+    /// (the `#[non_exhaustive]` variant llama.cpp returns when the
+    /// loader rejects the file). This pins the Display + Source
+    /// contract end-to-end: a regression that drops the `#[source]`
+    /// attribute (or replaces the structured wrapper with
+    /// `anyhow::Error::msg(...)`) breaks the chain walk, and a
+    /// regression that drops the `path` field breaks the Display.
+    #[test]
+    fn inference_error_model_load_preserves_path_and_source_chain() {
+        let path = std::path::PathBuf::from("/tmp/synthetic-test-model.gguf");
+        let err = InferenceError::ModelLoad {
+            path: path.clone(),
+            source: llama_cpp_2::LlamaModelLoadError::NullResult,
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(&path.display().to_string()),
+            "ModelLoad Display must mention the path; got: {rendered}",
+        );
+        // Wrap into anyhow::Error and walk the chain — the source
+        // must be reachable downstream.
+        let wrapped = anyhow::Error::new(err);
+        let chain: Vec<&(dyn std::error::Error + 'static)> = wrapped.chain().collect();
+        assert!(
+            chain.len() >= 2,
+            "InferenceError::ModelLoad must expose its source via #[source]; \
+             got chain depth {}",
+            chain.len(),
+        );
+        let root = wrapped.root_cause();
+        let root_msg = format!("{root}");
+        assert!(
+            !root_msg.is_empty(),
+            "root_cause must produce a non-empty Display",
+        );
+    }
+
+    /// `InferenceError::Tokenize::prompt_excerpt` is bounded at
+    /// [`PROMPT_EXCERPT_BYTES`] (64 bytes) and does NOT include the
+    /// full prompt body. Pin the bound so a regression that removes
+    /// the `prompt_excerpt` truncation and ships multi-KiB prompts
+    /// in the error chain breaks this test.
+    #[test]
+    fn inference_error_tokenize_excerpt_bounded_at_64_bytes() {
+        let long_prompt = "x".repeat(8 * 1024);
+        let excerpt = prompt_excerpt(&long_prompt);
+        assert_eq!(
+            excerpt.len(),
+            PROMPT_EXCERPT_BYTES,
+            "prompt_excerpt must truncate to {} bytes; got {}",
+            PROMPT_EXCERPT_BYTES,
+            excerpt.len(),
+        );
+        assert!(
+            long_prompt.starts_with(&excerpt),
+            "prompt_excerpt must be a prefix of the input",
+        );
+    }
+
+    /// `prompt_excerpt` snaps to a char boundary on truncation —
+    /// a 4-byte UTF-8 codepoint that straddles the
+    /// [`PROMPT_EXCERPT_BYTES`] cutoff must not panic the slice and
+    /// must not produce an invalid UTF-8 fragment.
+    ///
+    /// Build a prompt that places a 4-byte codepoint (`U+1F600`,
+    /// the grinning face emoji) starting at byte offset 62 — 2
+    /// bytes before the 64-byte cap, so the codepoint runs from
+    /// 62..66 and the cap falls inside it. The snap-back must
+    /// retreat to byte 62 (the last char boundary at or below 64).
+    #[test]
+    fn prompt_excerpt_snaps_back_to_char_boundary_on_multibyte_split() {
+        let mut prompt = String::with_capacity(80);
+        // 62 bytes of ASCII to push the multi-byte codepoint to the
+        // 64-byte cutoff zone.
+        prompt.push_str(&"a".repeat(62));
+        prompt.push('\u{1F600}'); // 4 bytes
+        prompt.push('z');
+        assert!(
+            prompt.len() > PROMPT_EXCERPT_BYTES,
+            "test fixture must exceed the cap to drive the snap-back path",
+        );
+        let excerpt = prompt_excerpt(&prompt);
+        // The cap is 64 bytes; the codepoint runs 62..66, so the
+        // snap-back retreats to byte 62 (the boundary just before
+        // the codepoint starts). The excerpt is 62 bytes, all ASCII
+        // 'a'.
+        assert_eq!(
+            excerpt.len(),
+            62,
+            "snap-back must retreat to the char boundary at byte 62; \
+             got {} bytes",
+            excerpt.len(),
+        );
+        assert!(
+            excerpt.chars().all(|c| c == 'a'),
+            "snap-back must retain only the ASCII prefix, not the \
+             partial codepoint; got: {excerpt:?}",
+        );
+    }
+
+    /// `InferenceError::ContextCreate` carries `#[source]
+    /// LlamaContextLoadError`; the typed source surfaces in the
+    /// chain via `.source()` so `anyhow::Error::new(...)` and
+    /// `.chain()` traversal preserve it. `InferenceError::Generation`
+    /// still carries `reason: String`; pin both shapes here so a
+    /// regression that swaps Display/Debug or that flattens the
+    /// source onto Display surfaces here.
+    #[test]
+    fn inference_error_string_variants_emit_reason_verbatim() {
+        use std::error::Error as _;
+        let ctx_err = InferenceError::ContextCreate {
+            source: llama_cpp_2::LlamaContextLoadError::NullReturn,
+        };
+        let rendered = format!("{ctx_err}");
+        assert_eq!(
+            rendered, "create LlamaContext for inference",
+            "ContextCreate Display must be the static prefix only \
+             — the source error reaches downstream callers via the \
+             error chain rather than the Display, so a regression \
+             that flattens it onto Display surfaces here",
+        );
+        let source = ctx_err
+            .source()
+            .expect("ContextCreate must expose its #[source] via std::error::Error::source");
+        let source_rendered = format!("{source}");
+        assert!(
+            source_rendered.contains("null reference from llama.cpp"),
+            "ContextCreate's source must be the upstream LlamaContextLoadError; \
+             got: {source_rendered}",
+        );
+
+        let gen_err = InferenceError::Generation {
+            reason: "synthetic generation step failure".to_string(),
+        };
+        let rendered = format!("{gen_err}");
+        assert!(
+            rendered.contains("synthetic generation step failure"),
+            "Generation Display must include the reason; got: {rendered}",
+        );
+    }
+
+    /// The context-window budget pins the prompt + generation
+    /// arithmetic. `MAX_PROMPT_TOKENS = N_CTX_TOKENS - SAMPLE_LEN -
+    /// 64` reserves space for [`SAMPLE_LEN`] generation tokens plus
+    /// a 64-token cushion for the ChatML wrapper. A drive-by tweak
+    /// that shrinks `N_CTX_TOKENS` below the
+    /// `SAMPLE_LEN + cushion` floor would underflow this
+    /// arithmetic; pin the relationship so that regression
+    /// surfaces at compile time. Const-block asserts fold at
+    /// compile time, so the regression fails the build rather than
+    /// a runtime test.
+    #[test]
+    fn context_budget_arithmetic_holds() {
+        const _: () = assert!(
+            N_CTX_TOKENS > SAMPLE_LEN + 64,
+            "N_CTX_TOKENS must exceed SAMPLE_LEN + 64 so \
+             MAX_PROMPT_TOKENS computes to a positive value",
+        );
+        const _: () = assert!(
+            MAX_PROMPT_TOKENS == N_CTX_TOKENS - SAMPLE_LEN - 64,
+            "MAX_PROMPT_TOKENS must equal N_CTX_TOKENS - SAMPLE_LEN - 64 \
+             (the documented context-window budget arithmetic)",
+        );
+        // Budget must be large enough that the `LLM_EXTRACT_PROMPT_TEMPLATE`
+        // (~120 tokens) plus the ChatML wrapper still leaves
+        // multi-hundred-token room for the body — otherwise even
+        // empty stdout would trigger truncation.
+        const _: () = assert!(
+            MAX_PROMPT_TOKENS > 256,
+            "MAX_PROMPT_TOKENS must leave non-trivial room for the \
+             prompt template + body",
+        );
+    }
+
+    /// `BYTES_PER_TOKEN_FLOOR` is the conservative chars-per-token
+    /// estimate used by `fit_prompt_to_context` to size the
+    /// byte-truncation budget. Real BBPE tokenizers on English
+    /// average ~3.5-4 chars/token; a 3:1 ratio is the
+    /// conservative floor that under-counts tokens (and therefore
+    /// over-truncates bytes) when in doubt. Pin the floor so a
+    /// regression that flipped it to 4 (over-optimistic, would
+    /// produce post-truncation token vecs that still exceed the
+    /// budget) surfaces at compile time.
+    #[test]
+    fn bytes_per_token_floor_is_conservative() {
+        const _: () = assert!(
+            BYTES_PER_TOKEN_FLOOR >= 3,
+            "BYTES_PER_TOKEN_FLOOR must be a conservative under-count \
+             of real BPE chars/token; >= 3 leaves margin for tokenizer \
+             drift",
+        );
+        const _: () = assert!(
+            BYTES_PER_TOKEN_FLOOR <= 4,
+            "BYTES_PER_TOKEN_FLOOR > 4 would be over-optimistic for \
+             BBPE on English text and would routinely over-shoot the \
+             budget",
         );
     }
 
@@ -4261,6 +5063,64 @@ mod tests {
         );
     }
 
+    /// Sticky-error contract: once `MODEL_CACHE` holds an `Err`,
+    /// every subsequent `extract_via_llm` returns the byte-identical
+    /// reason without re-rendering. The previous test
+    /// (`model_cache_loads_at_most_once_per_populated_slot`) pins
+    /// the slow-path counter; this test pins the visible behavior
+    /// downstream callers consume — same `String` every time.
+    ///
+    /// The string-equality assertion is load-bearing: a regression
+    /// that re-rendered the error chain on each call (e.g. by
+    /// calling `format!("{e:#}")` inside `extract_via_llm` rather
+    /// than relying on the cached `String`) would still satisfy the
+    /// "Err stays Err" property of the slow-path counter test, but
+    /// would re-construct the message every call — burning CPU on a
+    /// hot path the cache is meant to make trivial. Comparing
+    /// `String == String` proves the cache is handing back the same
+    /// pre-rendered value.
+    ///
+    /// Drives via the offline gate so no model load runs. Calls
+    /// `reset()` under `lock_env` first so a previously-memoized
+    /// `Ok(_)` cannot bypass the gate.
+    #[test]
+    fn extract_via_llm_returns_byte_identical_cached_error_on_repeat() {
+        let _lock = lock_env();
+        reset();
+        let _cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
+
+        let first = extract_via_llm("call one", None, crate::test_support::MetricStream::Stdout)
+            .expect_err("offline gate must produce Err on first call");
+        let second = extract_via_llm("call two", None, crate::test_support::MetricStream::Stdout)
+            .expect_err("offline gate must produce Err on second call");
+        let third = extract_via_llm(
+            "call three",
+            Some("hint"),
+            crate::test_support::MetricStream::Stderr,
+        )
+        .expect_err("offline gate must produce Err on third call");
+
+        // Each call returns the SAME cached String — pre-rendered
+        // once at memoization time, cloned on every subsequent
+        // observation. A re-render would produce identical contents
+        // (the underlying error is the same) but would cost a fresh
+        // allocation per call; equality via `String == String`
+        // doesn't distinguish those, but byte-identical content
+        // proves the cached error is consistent regardless of
+        // distinct stdout / hint / stream inputs to the wrapper.
+        assert_eq!(
+            first, second,
+            "calls one and two must return the same cached Err string",
+        );
+        assert_eq!(
+            second, third,
+            "third call (different stdout, hint, stream) must still return \
+             the same cached Err — the failure is in the load step, not \
+             the per-call inputs",
+        );
+    }
+
     /// `any_test_requires_model()` scans [`KTSTR_TESTS`] and returns
     /// `true` iff at least one registered entry declares
     /// `OutputFormat::LlmExtract` on its primary payload or any of its
@@ -4620,6 +5480,109 @@ mod tests {
         );
     }
 
+    /// Task #10 (stream-tagging side, Stdout case): every metric
+    /// emitted by `parse_llm_response` with `MetricStream::Stdout`
+    /// must carry `MetricStream::Stdout` on its `stream` field.
+    /// `parse_llm_response` is the seam where the host-side
+    /// stdout-primary path's stream tag is stamped — `host_side_llm_extract`
+    /// passes `MetricStream::Stdout` to `extract_via_llm` for the
+    /// stdout call (eval.rs:265), and `extract_via_llm` forwards
+    /// the same stream tag to `parse_llm_response` (model.rs:2329),
+    /// which threads it into `walk_json_leaves`. A regression that
+    /// hard-coded `Stdout` here regardless of input would slip
+    /// past with this test passing — see the sibling
+    /// `parse_llm_response_stream_tagging_stderr` for the inverse.
+    #[test]
+    fn parse_llm_response_stream_tagging_stdout() {
+        let got = parse_llm_response(
+            r#"{"iops": 1000, "latency_ms": 42}"#,
+            crate::test_support::MetricStream::Stdout,
+        );
+        assert!(
+            !got.is_empty(),
+            "valid JSON must produce metrics; got empty",
+        );
+        for m in &got {
+            assert_eq!(
+                m.stream,
+                crate::test_support::MetricStream::Stdout,
+                "metric `{}` must carry MetricStream::Stdout when parse_llm_response \
+                 was invoked with Stdout; got stream={:?}",
+                m.name,
+                m.stream,
+            );
+        }
+    }
+
+    /// Task #10 (stream-tagging side, Stderr case): the inverse of
+    /// `parse_llm_response_stream_tagging_stdout`. When called with
+    /// `MetricStream::Stderr`, every emitted metric must carry the
+    /// Stderr tag — proves the stream parameter actually flows to
+    /// the leaf walker.
+    ///
+    /// This is the unit-test counterpart to the host's stderr-fallback
+    /// path: `host_side_llm_extract` passes `MetricStream::Stderr` to
+    /// `extract_via_llm` for the stderr call (eval.rs:285), so a
+    /// stderr-fallback metric set must be tagged Stderr. Without this
+    /// pin, a regression that hard-coded `Stdout` in
+    /// `walk_json_leaves` (or in `parse_llm_response`) would slip
+    /// past every existing test, because the existing tests only
+    /// invoked `parse_llm_response` with Stdout. Downstream review
+    /// tooling that filters stderr-sourced metrics (the "well-behaved
+    /// payloads keep stdout canonical" review hint) would silently
+    /// stop working.
+    #[test]
+    fn parse_llm_response_stream_tagging_stderr() {
+        let got = parse_llm_response(
+            r#"{"latency_p99": 1234, "rps": 500}"#,
+            crate::test_support::MetricStream::Stderr,
+        );
+        assert!(
+            !got.is_empty(),
+            "valid JSON must produce metrics; got empty",
+        );
+        for m in &got {
+            assert_eq!(
+                m.stream,
+                crate::test_support::MetricStream::Stderr,
+                "metric `{}` must carry MetricStream::Stderr when parse_llm_response \
+                 was invoked with Stderr; got stream={:?}. A regression that \
+                 ignored the stream parameter and hard-coded Stdout would surface here.",
+                m.name,
+                m.stream,
+            );
+        }
+    }
+
+    /// Task #10 (orthogonality side): the stream tag is stamped
+    /// orthogonally to the source tag — every metric MUST carry
+    /// `MetricSource::LlmExtract` regardless of which stream tag
+    /// was passed. Pins the two tags don't accidentally couple
+    /// (e.g. a regression that flipped source to Json when stream
+    /// was Stderr would surface here for the Stderr case).
+    #[test]
+    fn parse_llm_response_source_independent_of_stream_tag() {
+        for stream in [
+            crate::test_support::MetricStream::Stdout,
+            crate::test_support::MetricStream::Stderr,
+        ] {
+            let got = parse_llm_response(r#"{"x": 1, "y": 2}"#, stream);
+            assert!(
+                !got.is_empty(),
+                "must produce metrics for stream={stream:?}"
+            );
+            for m in &got {
+                assert_eq!(
+                    m.source,
+                    crate::test_support::MetricSource::LlmExtract,
+                    "metric source must be LlmExtract regardless of stream tag; \
+                     stream={stream:?}, got source={:?}",
+                    m.source,
+                );
+            }
+        }
+    }
+
     /// Mixed inventory: one LlmExtract entry alongside many non-LLM
     /// entries still returns `true`. Pins the `.any()` short-circuit
     /// against a regression that accidentally required every entry
@@ -4895,10 +5858,10 @@ mod tests {
     /// `Error::msg` (which drops the chain) to `Error::new`. Wrap
     /// a known `std::io::Error`, then walk the anyhow error's
     /// chain iterator and assert the underlying io::Error is
-    /// reachable as the root cause. A regression that reverted any
-    /// of the candle/tokenizer conversions to `Error::msg` would
-    /// silently hide the original error, but this test documents the
-    /// mechanism rather than dynamically scanning production code.
+    /// reachable as the root cause. The test documents the
+    /// `anyhow::Error::new` mechanism that `load_inference` and
+    /// `invoke_with_model` use to wrap llama-cpp-2 errors without
+    /// dropping their source chain.
     #[test]
     fn anyhow_error_new_preserves_source_chain() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "fixture io error");
@@ -4920,25 +5883,25 @@ mod tests {
     }
 
     /// `anyhow::Error::from_boxed` preserves the underlying error's
-    /// Display output through the chain — exercising the
-    /// migration for tokenizer errors (which arrive as
-    /// `Box<dyn std::error::Error + Send + Sync>` per
-    /// tokenizers-0.21.4/src/tokenizer/mod.rs:51). Check both the
-    /// context layer and the inner message are visible in the chain.
-    /// Unlike `anyhow_error_new_preserves_source_chain`, the concrete
-    /// type stored under `from_boxed` is the trait object itself, so
-    /// `downcast_ref::<io::Error>()` on root_cause returns None —
-    /// that's an artifact of trait-object storage, not a chain loss.
-    /// The Display path is what `.context()` users consume, so pin
-    /// the Display round-trip.
+    /// Display output through the chain — pin the round-trip for
+    /// any future call site that has to wrap a
+    /// `Box<dyn std::error::Error + Send + Sync>` (the canonical
+    /// shape returned by many third-party crates' fallible APIs).
+    /// Check both the context layer and the inner message are
+    /// visible in the chain. Unlike `anyhow_error_new_preserves_source_chain`,
+    /// the concrete type stored under `from_boxed` is the trait
+    /// object itself, so `downcast_ref::<io::Error>()` on root_cause
+    /// returns None — that's an artifact of trait-object storage,
+    /// not a chain loss. The Display path is what `.context()`
+    /// users consume, so pin the Display round-trip.
     #[test]
     fn anyhow_error_from_boxed_preserves_display_chain() {
         let io_err = std::io::Error::new(std::io::ErrorKind::InvalidData, "fixture boxed error");
         let boxed: Box<dyn std::error::Error + Send + Sync + 'static> = Box::new(io_err);
-        let wrapped = anyhow::Error::from_boxed(boxed).context("tokenizer layer");
+        let wrapped = anyhow::Error::from_boxed(boxed).context("boxed-error context");
         let rendered = format!("{wrapped:#}");
         assert!(
-            rendered.contains("tokenizer layer"),
+            rendered.contains("boxed-error context"),
             "context layer missing from chain Display: {rendered:?}"
         );
         assert!(
@@ -5269,15 +6232,15 @@ mod tests {
         );
     }
 
-    /// `fetch_timeout_for_size` for the tokenizer (11 MiB) is below
-    /// the body-over-floor crossover point (60 s × 3 MB/s = 180 MB)
-    /// so it returns exactly the 60-second floor. Pins the floor-
-    /// wins branch so a regression that swapped `max()` for `+`
-    /// (adding body seconds to the floor instead of clamping) would
-    /// surface here.
+    /// `fetch_timeout_for_size` for an 11 MiB synthetic input is
+    /// below the body-over-floor crossover point (60 s × 3 MB/s =
+    /// 180 MB) so it returns exactly the 60-second floor. Pins the
+    /// floor-wins branch so a regression that swapped `max()` for
+    /// `+` (adding body seconds to the floor instead of clamping)
+    /// would surface here.
     #[test]
-    fn fetch_timeout_for_size_tokenizer_hits_floor() {
-        let got = fetch_timeout_for_size(DEFAULT_TOKENIZER.size_bytes);
+    fn fetch_timeout_for_size_small_artifact_hits_floor() {
+        let got = fetch_timeout_for_size(11 * 1024 * 1024);
         assert_eq!(got, std::time::Duration::from_secs(60));
     }
 
@@ -5297,10 +6260,8 @@ mod tests {
     /// timeout is strictly linear in `size_bytes`: the larger one
     /// gets exactly `(large_bytes - small_bytes) / 3_000_000`
     /// seconds more. Pin the linear relationship on two synthetic
-    /// sizes that clear the crossover. `DEFAULT_TOKENIZER` and
-    /// `DEFAULT_MODEL` cannot both participate because the former
-    /// sits under the floor — using synthetic sizes keeps this a
-    /// test of the formula, not a test of the current pins.
+    /// sizes that clear the crossover — using synthetic sizes keeps
+    /// this a test of the formula, not a test of any specific pin.
     #[test]
     fn fetch_timeout_for_size_is_linear_above_floor() {
         let small_bytes: u64 = 300 * 1024 * 1024; // 300 MiB, above floor.
@@ -5319,8 +6280,8 @@ mod tests {
     }
 
     /// Any artifact at or below the `floor_seconds × bandwidth`
-    /// boundary gets the 60-second floor: an 11 MiB tokenizer and
-    /// a 1 KiB fake pin collapse to the same 60 s cap. Pins the
+    /// boundary gets the 60-second floor: an 11 MiB synthetic input
+    /// and a 1 KiB fake pin collapse to the same 60 s cap. Pins the
     /// floor as a hard guarantee for all small artifacts so a
     /// regression that dropped the floor (e.g. `max` → just the
     /// proportional term) would surface as a sub-60 s result on
@@ -5328,9 +6289,9 @@ mod tests {
     #[test]
     fn fetch_timeout_for_size_floor_applies_uniformly_below_crossover() {
         let tiny = fetch_timeout_for_size(1024);
-        let tokenizer = fetch_timeout_for_size(DEFAULT_TOKENIZER.size_bytes);
+        let small = fetch_timeout_for_size(11 * 1024 * 1024);
         assert_eq!(tiny, std::time::Duration::from_secs(60));
-        assert_eq!(tokenizer, std::time::Duration::from_secs(60));
+        assert_eq!(small, std::time::Duration::from_secs(60));
     }
 
     /// Artifacts large enough that the proportional term would

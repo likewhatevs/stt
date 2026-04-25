@@ -1980,9 +1980,31 @@ fn strip_debug_prefix(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     .map_err(|e| anyhow::anyhow!("rewrite stripped vmlinux (fallback): {e}"))
 }
 
-/// Resolve the cache root directory path.
+/// Resolve the cache root directory path with a per-cache `suffix`
+/// (`"kernels"` for the kernel cache, `"models"` for the model cache).
 ///
-/// Does not create the directory -- the caller is responsible for
+/// Single source of truth for env-variable handling and HOME
+/// validation across both ktstr cache flavors. Both
+/// [`resolve_cache_root`] (kernel cache) and
+/// [`crate::test_support::model::resolve_cache_root`] (model cache)
+/// route through here so a future change to environment-variable
+/// semantics or HOME validation lands once.
+///
+/// Resolution cascade:
+/// 1. `KTSTR_CACHE_DIR` (with non-UTF-8 bail). The override returns
+///    the path verbatim — no `suffix` is appended, since the
+///    operator who sets `KTSTR_CACHE_DIR` is naming the literal
+///    cache root they want. The kernel cache and the model cache
+///    co-locate under the same root in this case but never collide
+///    on filesystem paths because cache keys (kernel build hashes)
+///    and GGUF filenames live in disjoint name spaces under the
+///    root.
+/// 2. `XDG_CACHE_HOME/ktstr/{suffix}` when set and non-empty.
+/// 3. `$HOME/.cache/ktstr/{suffix}` after HOME validation (3 arms:
+///    unset/empty, literal `/`, non-absolute path — see body
+///    comments for the per-shape rationale).
+///
+/// Does not create the directory — the caller is responsible for
 /// ensuring it exists.
 ///
 /// Non-UTF-8 handling: `KTSTR_CACHE_DIR` is the explicit operator
@@ -1992,13 +2014,10 @@ fn strip_debug_prefix(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// [`crate::test_support::test_helpers::EnvVarGuard`] accepts
 /// arbitrary `OsStr`, so a test fixture or a real-world
 /// locale-encoded path can legally put non-UTF-8 bytes in this
-/// variable. Previously `std::env::var` would swallow such values
-/// as `Err(VarError::NotUnicode)` and the `if let Ok(..)` guard
-/// dropped them without a diagnostic. Now a non-UTF-8
-/// `KTSTR_CACHE_DIR` surfaces as an actionable error naming the
-/// variable and pointing at a UTF-8 replacement path — the
-/// override no longer fails silently.
-fn resolve_cache_root() -> anyhow::Result<PathBuf> {
+/// variable. A non-UTF-8 `KTSTR_CACHE_DIR` surfaces as an
+/// actionable error naming the variable and pointing at a UTF-8
+/// replacement path — the override never fails silently.
+pub(crate) fn resolve_cache_root_with_suffix(suffix: &str) -> anyhow::Result<PathBuf> {
     // 1. Explicit override.
     match std::env::var("KTSTR_CACHE_DIR") {
         Ok(dir) if !dir.is_empty() => return Ok(PathBuf::from(dir)),
@@ -2015,36 +2034,142 @@ fn resolve_cache_root() -> anyhow::Result<PathBuf> {
             );
         }
     }
-    // 2. XDG_CACHE_HOME/ktstr/kernels.
+    // 2. XDG_CACHE_HOME/ktstr/{suffix}.
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
         && !xdg.is_empty()
     {
-        return Ok(PathBuf::from(xdg).join("ktstr").join("kernels"));
+        return Ok(PathBuf::from(xdg).join("ktstr").join(suffix));
     }
-    // 3. $HOME/.cache/ktstr/kernels.
+    // 3. $HOME/.cache/ktstr/{suffix}.
     //
-    // Reject HOME ∈ {unset, "", "/"}: an empty or root-only HOME
-    // produces a junk cache path. PathBuf::from("/").join(".cache")
-    // yields "/.cache" — a path whose statvfs reports the root
-    // filesystem's free space, not a usable user-cache filesystem.
-    // PathBuf::from("").join(".cache") yields ".cache" relative to
-    // CWD, also wrong. A literal `/` HOME is a process-environment
-    // artifact (root user with no home, container init that didn't
-    // set HOME) — same fix as the unset case. Other malformed HOME
-    // values (non-existent directory, relative path, etc.) pass
-    // through this gate; downstream open()/statvfs() surface the
-    // real error from the resulting cache path.
+    // HOME shape validation lives in [`validate_home_for_cache`]
+    // below — it reads `HOME` and rejects unset/empty, literal
+    // `/`, and non-absolute values, returning the validated
+    // `PathBuf` for the caller to extend with the cache-flavor
+    // suffix. The gate is INTENTIONALLY NARROW: it catches only
+    // shapes where the resulting cache path is structurally wrong
+    // before the filesystem has had a chance to surface its own
+    // diagnostic. Other malformed HOME values (non-existent
+    // directory, path pointing at a non-directory, kernel pseudo-
+    // filesystem like /proc) pass through; downstream
+    // open()/statvfs() surface the real error with the offending
+    // path embedded so the operator sees what HOME actually
+    // expanded to.
+    //
+    // Cases this gate does NOT catch (intentional):
+    //
+    // - `HOME=/nonexistent`: ENOENT at use-time, with the offending
+    //   path in the error message. Pre-validating with `Path::exists`
+    //   would race against an operator who creates the directory
+    //   between our check and the use site, OR mask a stale-NFS
+    //   timeout that would otherwise surface as a real error.
+    // - `HOME=/dev/null`: ENOTDIR at use-time. Same race rationale
+    //   as `/nonexistent`; pre-flighting with metadata() adds a
+    //   syscall on every cache lookup for a vanishingly rare case.
+    // - `HOME=/proc`, `HOME=/sys`, `HOME=/`-rooted pseudo-fs paths:
+    //   these surface as EROFS or EACCES on write attempts. The
+    //   error path is well-described by the OS-level diagnostic;
+    //   adding a special case here would be churn without payoff.
+    // - `HOME=//`, `HOME=/./`, `HOME=/.`: these expand to root via
+    //   POSIX path normalization. PathBuf does not normalize at
+    //   `from`, so the literal junk-path lands on the filesystem
+    //   layer. We could canonicalize() here to catch them, but
+    //   canonicalize is a syscall on every cache lookup and these
+    //   shapes are rare enough (operator typo or shell quoting
+    //   accident) that the OS-level "operation not permitted on
+    //   /.cache" suffices.
+    let home = validate_home_for_cache()?;
+    Ok(home.join(".cache").join("ktstr").join(suffix))
+}
+
+/// Read `HOME` from the environment, reject values that produce a
+/// guaranteed-junk cache path, and return the validated `PathBuf`.
+///
+/// On `Ok` the returned PathBuf is `PathBuf::from(<HOME value>)` —
+/// the caller appends the cache-flavor suffix (e.g. `.cache/ktstr/kernels`).
+/// On `Err` the diagnostic names the specific rejection case so the
+/// operator can fix HOME or set `KTSTR_CACHE_DIR` / `XDG_CACHE_HOME`
+/// instead.
+///
+/// Three rejected shapes (full rationale in the body comments
+/// above [`resolve_cache_root_with_suffix`]'s HOME-fallback site,
+/// repeated near the matching check below):
+/// 1. Unset / empty (`std::env::var().unwrap_or_default()` collapses
+///    both `Err(NotPresent)` and `Ok("")` into `""`).
+/// 2. Literal `/` (root user / container init with no home).
+/// 3. Non-absolute (CWD-relative cache state — silently relocates).
+///
+/// Cases this gate INTENTIONALLY does not catch (`HOME=/nonexistent`,
+/// `HOME=/dev/null`, `HOME=/proc`, `HOME=//`, `HOME=/.`, etc.) are
+/// deferred to filesystem-level errors at use time — see the call
+/// site's comment block for the per-shape rationale.
+///
+/// `pub(crate)` because both the kernel cache (this module) and
+/// the model cache ([`crate::test_support::model::resolve_cache_root`])
+/// reach this helper transitively through
+/// [`resolve_cache_root_with_suffix`]. There is now exactly one
+/// place that defines what "valid HOME for ktstr cache derivation"
+/// means; a future change to the validation policy lands once and
+/// flows through both cache flavors.
+pub(crate) fn validate_home_for_cache() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() || home == "/" {
+    // 1. Unset / empty: `PathBuf::from("").join(".cache")` yields
+    //    `.cache` relative to CWD — almost never what the operator
+    //    wants. Catches the bare `unset HOME` and the
+    //    `HOME=` (assigned but empty) cases together because
+    //    `std::env::var().unwrap_or_default()` collapses both into
+    //    the empty string.
+    if home.is_empty() {
         anyhow::bail!(
-            "HOME is unset, empty, or `/`; cannot resolve cache directory. \
-             Set KTSTR_CACHE_DIR or XDG_CACHE_HOME to specify a cache location."
+            "HOME is unset or empty; cannot resolve cache directory. \
+             Set KTSTR_CACHE_DIR to an absolute path (e.g. /tmp/ktstr-cache) or \
+             XDG_CACHE_HOME to specify a cache location explicitly."
         );
     }
-    Ok(PathBuf::from(home)
-        .join(".cache")
-        .join("ktstr")
-        .join("kernels"))
+    // 2. Literal `/`: a process-environment artifact (root user with
+    //    no home dir, container init that didn't set HOME).
+    //    `PathBuf::from("/").join(".cache")` yields `/.cache` —
+    //    statvfs reports the root filesystem's free space, not a
+    //    usable user-cache filesystem; cache writes also escalate
+    //    to root-fs writes.
+    if home == "/" {
+        anyhow::bail!(
+            "HOME is `/`; the resulting cache path /.cache/ktstr would alias the \
+             root filesystem rather than naming a user cache. This usually means \
+             the process inherited HOME from a container init or root login that \
+             did not set a real home. Set KTSTR_CACHE_DIR to an absolute path \
+             (e.g. /tmp/ktstr-cache) or XDG_CACHE_HOME to bypass HOME entirely."
+        );
+    }
+    // 3. Relative path: `PathBuf::from("relative").join(".cache")`
+    //    yields `relative/.cache` resolved against CWD at every
+    //    call. Cache state would silently relocate as the operator
+    //    moves between directories — a usability nightmare worse
+    //    than the deferred-error case. POSIX HOME is documented as
+    //    an absolute pathname.
+    if !home.starts_with('/') {
+        anyhow::bail!(
+            "HOME={home:?} is not an absolute path; ktstr requires HOME to start \
+             with `/` so the cache root resolves consistently regardless of the \
+             current working directory. Set HOME to an absolute path, or set \
+             KTSTR_CACHE_DIR / XDG_CACHE_HOME to a specific cache location."
+        );
+    }
+    Ok(PathBuf::from(home))
+}
+
+/// Resolve the kernel cache root directory path.
+///
+/// Thin wrapper over [`resolve_cache_root_with_suffix`] with the
+/// `"kernels"` suffix. The model cache uses the same helper with
+/// the `"models"` suffix from
+/// [`crate::test_support::model::resolve_cache_root`]; both share the
+/// `KTSTR_CACHE_DIR` / `XDG_CACHE_HOME` / `HOME` cascade verbatim.
+///
+/// Does not create the directory -- the caller is responsible for
+/// ensuring it exists.
+fn resolve_cache_root() -> anyhow::Result<PathBuf> {
+    resolve_cache_root_with_suffix("kernels")
 }
 
 #[cfg(test)]
@@ -3157,7 +3282,7 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("HOME is unset, empty, or `/`"),
+            msg.contains("HOME is unset or empty"),
             "expected HOME-unset error, got: {msg}"
         );
         assert!(
@@ -3171,8 +3296,8 @@ mod tests {
     /// `/.cache/ktstr/kernels` — that path's statvfs reports the
     /// root filesystem's free space, which is typically a small
     /// constrained mount and never the user's intended cache
-    /// location. Bail with the same actionable diagnostic as the
-    /// unset-HOME case.
+    /// location. Bail with a diagnostic that names the resulting
+    /// junk path and points the operator at a remediation.
     #[test]
     fn cache_resolve_root_home_root_slash_error() {
         let _lock = lock_env();
@@ -3182,8 +3307,12 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("HOME is unset, empty, or `/`"),
-            "expected HOME=/ error, got: {msg}"
+            msg.contains("HOME is `/`"),
+            "expected HOME=/ specific error, got: {msg}"
+        );
+        assert!(
+            msg.contains("/.cache/ktstr"),
+            "diagnostic must cite the offending cache path, got: {msg}"
         );
         assert!(
             msg.contains("KTSTR_CACHE_DIR"),
@@ -3194,7 +3323,8 @@ mod tests {
     /// A HOME literal of `""` (empty string) — just as broken as
     /// unset, since `PathBuf::from("").join(".cache")` produces a
     /// relative `.cache` rooted at the process CWD instead of the
-    /// user's home. Same bail.
+    /// user's home. Same bail as the unset case (the gate's
+    /// `unwrap_or_default()` collapses both into the empty string).
     #[test]
     fn cache_resolve_root_home_empty_error() {
         let _lock = lock_env();
@@ -3204,8 +3334,82 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("HOME is unset, empty, or `/`"),
+            msg.contains("HOME is unset or empty"),
             "expected HOME-empty error, got: {msg}"
+        );
+    }
+
+    /// A relative-path HOME (e.g. `HOME=relative/dir`) silently
+    /// resolves the cache against CWD, which silently relocates
+    /// the cache as the operator changes directories — a usability
+    /// nightmare worse than a deferred error. Pin the explicit
+    /// rejection so a regression that drops the absolute-path
+    /// check surfaces here instead of as a hard-to-diagnose
+    /// "cache contents disappeared" report from the operator.
+    #[test]
+    fn cache_resolve_root_home_relative_path_error() {
+        let _lock = lock_env();
+        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _guard3 = EnvVarGuard::set("HOME", "relative/dir");
+        let err = resolve_cache_root().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not an absolute path"),
+            "expected relative-path-specific error, got: {msg}"
+        );
+        assert!(
+            msg.contains("relative/dir"),
+            "diagnostic must cite the offending HOME value, got: {msg}"
+        );
+        assert!(
+            msg.contains("KTSTR_CACHE_DIR"),
+            "error should suggest KTSTR_CACHE_DIR, got: {msg}"
+        );
+    }
+
+    /// A bare-name HOME (no path separators at all, e.g. `HOME=tmp`)
+    /// is also relative — `PathBuf::from("tmp").join(".cache")`
+    /// yields `tmp/.cache` against CWD. Pin separately from the
+    /// `relative/dir` case to confirm the absolute-path check
+    /// isn't accidentally permissive on shapes that lack a `/`.
+    #[test]
+    fn cache_resolve_root_home_bare_name_relative_error() {
+        let _lock = lock_env();
+        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _guard3 = EnvVarGuard::set("HOME", "tmp");
+        let err = resolve_cache_root().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not an absolute path"),
+            "expected relative-path-specific error, got: {msg}"
+        );
+        assert!(
+            msg.contains("\"tmp\""),
+            "diagnostic must cite the offending HOME value via its Debug \
+             representation, got: {msg}"
+        );
+    }
+
+    /// Sanity check the happy path: an absolute HOME pointing at a
+    /// real directory must resolve through the gate to the expected
+    /// `$HOME/.cache/ktstr/kernels` path. Pins that the new
+    /// validation does not over-reject — a regression that hardens
+    /// the gate further (e.g. requires HOME to exist via metadata)
+    /// would break this.
+    #[test]
+    fn cache_resolve_root_home_absolute_passes() {
+        let _lock = lock_env();
+        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let tmp = TempDir::new().expect("tempdir");
+        let _guard3 = EnvVarGuard::set("HOME", tmp.path());
+        let resolved = resolve_cache_root().expect("absolute HOME must resolve");
+        let expected = tmp.path().join(".cache").join("ktstr").join("kernels");
+        assert_eq!(
+            resolved, expected,
+            "absolute HOME must produce $HOME/.cache/ktstr/kernels",
         );
     }
 
@@ -7128,4 +7332,142 @@ mod tests {
     }
 
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+    // -- validate_home_for_cache direct unit tests --
+    //
+    // These tests pin the helper directly. The helper reads
+    // `HOME` from the process environment, so each test holds
+    // [`lock_env`] across the env mutation and uses
+    // [`EnvVarGuard`] to scope the change. The integration-level
+    // pins on the full `KTSTR_CACHE_DIR → XDG_CACHE_HOME → HOME`
+    // cascade live in model.rs and cache.rs as
+    // `resolve_cache_root_*` tests; this set covers the helper's
+    // contract surface so a regression in the validation logic
+    // surfaces against this dedicated entry point as well as the
+    // integration paths.
+
+    /// Unset `HOME` — `env::var().unwrap_or_default()` collapses
+    /// `Err(NotPresent)` and `Ok("")` into the same empty-string
+    /// branch. Pins the matching arm.
+    #[test]
+    fn validate_home_for_cache_rejects_unset() {
+        let _env_lock = lock_env();
+        let _home = EnvVarGuard::remove("HOME");
+        let err = super::validate_home_for_cache().expect_err("unset HOME must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HOME is unset or empty"),
+            "diagnostic must call out unset/empty: {msg}",
+        );
+    }
+
+    /// Empty `HOME` — explicitly assigned to the empty string.
+    /// Hits the same is_empty() arm as unset; verifies the
+    /// `unwrap_or_default()` collapse so the diagnostic shape is
+    /// identical for both cases.
+    #[test]
+    fn validate_home_for_cache_rejects_empty() {
+        let _env_lock = lock_env();
+        let _home = EnvVarGuard::set("HOME", "");
+        let err = super::validate_home_for_cache().expect_err("empty HOME must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HOME is unset or empty"),
+            "diagnostic must call out unset/empty: {msg}",
+        );
+    }
+
+    /// Literal `/` — the container-init / no-home shape. Pins the
+    /// dedicated arm (separate from the more general
+    /// `is_empty()` check) so the operator-facing diagnostic stays
+    /// specific to this case rather than collapsing into a generic
+    /// "unset" message.
+    #[test]
+    fn validate_home_for_cache_rejects_root_slash() {
+        let _env_lock = lock_env();
+        let _home = EnvVarGuard::set("HOME", "/");
+        let err = super::validate_home_for_cache().expect_err("HOME=/ must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HOME is `/`"),
+            "diagnostic must call out the root-slash case specifically: {msg}",
+        );
+        assert!(
+            msg.contains("/.cache/ktstr"),
+            "diagnostic must explain why (/.cache/ktstr aliases root fs): {msg}",
+        );
+    }
+
+    /// Relative path — would resolve against CWD at every call,
+    /// silently relocating the cache as the operator changes
+    /// directories. Pins the absolute-path requirement.
+    #[test]
+    fn validate_home_for_cache_rejects_relative_path() {
+        let _env_lock = lock_env();
+        for rel in ["relative", "./relative", "home/user", "."] {
+            let _home = EnvVarGuard::set("HOME", rel);
+            let err = super::validate_home_for_cache()
+                .expect_err(&format!("relative path '{rel}' must be rejected"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not an absolute path"),
+                "[rel={rel:?}] diagnostic must call out non-absolute: {msg}",
+            );
+            assert!(
+                msg.contains(&format!("{rel:?}")),
+                "[rel={rel:?}] diagnostic must echo the offending value verbatim: {msg}",
+            );
+        }
+    }
+
+    /// Acceptable shapes — absolute paths starting with `/` and
+    /// longer than just `/`. Pins the happy path so a regression
+    /// that tightened one of the rejection arms (e.g. a length
+    /// check that accidentally rejected `/a`) surfaces here.
+    /// Also pins that the returned PathBuf carries the HOME bytes
+    /// verbatim — no canonicalization, no .cache/ktstr suffix.
+    #[test]
+    fn validate_home_for_cache_accepts_absolute_paths() {
+        let _env_lock = lock_env();
+        for ok in [
+            "/home/user",
+            "/var/empty",
+            "/root",
+            "/a", // shortest non-`/` absolute path
+            "/home/user with spaces",
+            "/home/user/.local/share",
+        ] {
+            let _home = EnvVarGuard::set("HOME", ok);
+            let got = super::validate_home_for_cache()
+                .unwrap_or_else(|e| panic!("absolute path {ok:?} must be accepted; got: {e:#}"));
+            assert_eq!(
+                got,
+                std::path::PathBuf::from(ok),
+                "returned PathBuf must equal the HOME value verbatim — \
+                 helper does not append the cache suffix or canonicalize",
+            );
+        }
+    }
+
+    /// Edge: a path that starts with `/` but contains junk later
+    /// (e.g. `//`, `/./`, `/.`). The helper does NOT canonicalize —
+    /// these accept and surface the OS-level diagnostic at use
+    /// time per the body comments above the helper. Pins this
+    /// "intentionally not caught" boundary so a future change that
+    /// adds canonicalization (which would BREAK this test) is
+    /// forced to update the doc comments at the same time.
+    #[test]
+    fn validate_home_for_cache_does_not_canonicalize_dots_and_doubles() {
+        let _env_lock = lock_env();
+        for not_normalized in ["//", "/./", "/.", "/foo//bar", "/./home"] {
+            let _home = EnvVarGuard::set("HOME", not_normalized);
+            super::validate_home_for_cache().unwrap_or_else(|e| {
+                panic!(
+                    "non-normalized but absolute path {not_normalized:?} must \
+                     pass the helper (downstream OS surfaces the diagnostic); \
+                     got: {e:#}",
+                )
+            });
+        }
+    }
 }

@@ -272,7 +272,7 @@ cargo ktstr kernel build --source ~/linux                  # build from local so
 cargo ktstr kernel build --git URL --ref v6.14             # shallow-clone a git tree
 cargo ktstr kernel list                                    # list cached kernels (shows (EOL) tags)
 cargo ktstr kernel clean --keep 3                          # keep 3 most recent
-cargo ktstr model fetch                                    # prefetch the LlmExtract model + tokenizer
+cargo ktstr model fetch                                    # prefetch the LlmExtract model
 cargo ktstr model status                                   # report whether a SHA-checked model is cached
 cargo ktstr verifier --scheduler scx_my_sched              # BPF verifier stats
 cargo ktstr stats                                          # aggregate gauntlet sidecars

@@ -72,6 +72,12 @@ runs:
     - uses: mozilla-actions/sccache-action@v0.0.9
       with:
         disable_annotations: true
+        # Pin the sccache binary version so a future action release
+        # that ships a newer sccache cannot silently invalidate the
+        # cache: the cache key embeds the toolchain hash but not the
+        # sccache binary version, so a binary upgrade can mask misses
+        # with format-incompatible reads.
+        version: "v0.10.0"
 
     - name: Install cargo tools
       if: inputs.tools != ''

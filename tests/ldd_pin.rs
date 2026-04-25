@@ -94,7 +94,7 @@ fn ktstr_binary_dynamic_deps_pinned() {
     //     under panic=abort, the linker pulls it in for stack-unwind
     //     metadata referenced by the standard library.
     //   libm.so.6    — transcendental math (exp/log/sqrt) used
-    //     transitively by a few deps (rand, polars, candle).
+    //     transitively by several deps (rand, polars, llama-cpp-2).
     //   libc.so.6    — glibc itself.
     // Third-party jemalloc ships vendored and statically-linked
     // (see Cargo.toml comment on tikv-jemallocator). libbpf is

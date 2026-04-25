@@ -727,9 +727,10 @@ pub enum OutputFormat {
     /// the host's post-VM-exit pipeline runs `extract_via_llm` on
     /// the captured text. Test bodies for LlmExtract payloads must
     /// return `Ok(assert_result)` without inspecting `metrics.metrics`
-    /// directly. Runtime `.check(...)` for `ExitCodeEq` is honored
-    /// guest-side; metric-level `.check(...)` calls hard-assert —
-    /// declare them via `default_checks` on the `Payload` so the
+    /// directly. Runtime `.check()` on LlmExtract payloads accepts
+    /// only `Check::ExitCodeEq`; metric-level variants
+    /// (`Min`/`Max`/`Range`/`Exists`) panic at runtime. Declare
+    /// metric checks via `default_checks` on the `Payload` so the
     /// host can apply them.
     ///
     /// Same stdout-primary / stderr-fallback contract as `Json`,
@@ -1002,8 +1003,25 @@ pub struct Metric {
 /// cgroup placement) is carried by the enclosing sidecar record —
 /// not by `PayloadMetrics` itself, which holds only the extracted
 /// metrics and exit code.
+///
+/// The `payload_index` field stamps every per-invocation emission
+/// (one `PayloadMetrics` value per `.run()` / `.wait()` / `.kill()` /
+/// `.try_wait()` call) with a monotonically increasing per-process
+/// counter — assigned at emit time inside the guest VM. Hosts use
+/// the index to pair an [`OutputFormat::LlmExtract`] payload's
+/// empty-metrics `PayloadMetrics` slot with its companion
+/// [`crate::test_support::RawPayloadOutput`] without relying on
+/// emission order, which would conflate a `Json` payload that
+/// legitimately produced zero metrics (no numeric leaves) with an
+/// `LlmExtract` placeholder.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PayloadMetrics {
+    /// Per-invocation index assigned at emit time. Monotonically
+    /// increasing within a single guest VM process, starting at 0.
+    /// Pairs with [`crate::test_support::RawPayloadOutput::payload_index`]
+    /// for `OutputFormat::LlmExtract` payloads — the host matches
+    /// raw output to its empty-metrics slot by equal index.
+    pub payload_index: usize,
     /// Extracted metrics. Empty when [`OutputFormat::ExitCode`] is
     /// used or when JSON parsing found no numeric leaves.
     pub metrics: Vec<Metric>,
@@ -1024,6 +1042,38 @@ impl PayloadMetrics {
     }
 }
 
+/// Owned-strings counterpart to [`MetricHint`] used to ship the
+/// payload's polarity / unit declarations across the guest-to-host
+/// SHM ring.
+///
+/// `MetricHint` carries `&'static str` references that cannot
+/// round-trip through serde; the guest builds a `Vec<WireMetricHint>`
+/// from `payload.metrics` at LlmExtract emit time and the host
+/// consumes it in [`crate::scenario::payload_run::resolve_polarities_owned`]
+/// to stamp the host-extracted [`Metric`] set.
+///
+/// Wire-only — never constructed in test bodies. Public-by-crate so
+/// `eval.rs` can decode and consume it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WireMetricHint {
+    /// Dotted-path metric name, mirrors [`MetricHint::name`].
+    pub name: String,
+    /// Regression direction, mirrors [`MetricHint::polarity`].
+    pub polarity: Polarity,
+    /// Display unit, mirrors [`MetricHint::unit`].
+    pub unit: String,
+}
+
+impl From<&MetricHint> for WireMetricHint {
+    fn from(h: &MetricHint) -> Self {
+        Self {
+            name: h.name.to_string(),
+            polarity: h.polarity,
+            unit: h.unit.to_string(),
+        }
+    }
+}
+
 /// Raw stdout/stderr captured from a payload that declared
 /// [`OutputFormat::LlmExtract`].
 ///
@@ -1031,20 +1081,32 @@ impl PayloadMetrics {
 /// [`PayloadMetrics`](PayloadMetrics) so the host can run the
 /// LLM-backed extraction post-VM-exit. LLM extraction never runs in
 /// the guest: the model (~2.4 GiB) does not fit in guest VM RAM, and
-/// the cache lives on the host. Pairing with the empty
-/// `PayloadMetrics` is by emission order — every guest-side
-/// `OutputFormat::LlmExtract` `.run()` / `.wait()` / `.kill()` /
-/// `.try_wait()` invocation emits one
-/// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` followed immediately by one
-/// `MSG_TYPE_PAYLOAD_METRICS`, and the host's drain loop pairs them
-/// by index.
+/// the cache lives on the host. Each `RawPayloadOutput` carries a
+/// `payload_index` matching the empty-metrics `PayloadMetrics`
+/// slot's `payload_index`. The host pairs them by equal index, not
+/// emission order — see [`payload_index`](Self::payload_index).
 ///
 /// `hint` is the focus directive declared on the payload's
 /// `OutputFormat::LlmExtract(Some(hint))`. Stored as `Option<String>`
 /// (rather than `Option<&'static str>`) because the SHM transport is
 /// owned-bytes only.
+///
+/// `metric_hints` carries an owned-strings copy of the payload's
+/// `metrics: &[MetricHint]` slice — required to apply
+/// [`Polarity`] and unit classification on the host after extraction.
+/// The guest's static `&'static [MetricHint]` cannot round-trip
+/// across SHM, so [`WireMetricHint`] mirrors the fields with owned
+/// `String`s. Empty slice when the payload declared no hints.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RawPayloadOutput {
+    /// Per-invocation index — equals the
+    /// [`PayloadMetrics::payload_index`] of the empty-metrics slot
+    /// emitted by the same `OutputFormat::LlmExtract` invocation.
+    /// The host pairs raw output to its empty-metrics slot by equal
+    /// index rather than emission order, which would conflate a
+    /// `Json` payload that legitimately produced zero metrics with
+    /// an `LlmExtract` placeholder.
+    pub payload_index: usize,
     /// Stdout captured from the payload's child process. Non-UTF-8
     /// bytes are replaced with U+FFFD per the framework's
     /// stream-capture contract.
@@ -1060,6 +1122,11 @@ pub(crate) struct RawPayloadOutput {
     /// payload declared `LlmExtract(None)` or `LlmExtract`. The
     /// host's `extract_via_llm` threads this into the prompt.
     pub hint: Option<String>,
+    /// Owned-strings copy of the payload's `metrics` slice. Consumed
+    /// by [`crate::scenario::payload_run::resolve_polarities_owned`]
+    /// on the host to apply [`Polarity`] + unit to the host-extracted
+    /// metric set. Empty when the payload declared no hints.
+    pub metric_hints: Vec<WireMetricHint>,
 }
 
 #[cfg(test)]
@@ -1125,6 +1192,7 @@ mod tests {
     #[test]
     fn metric_set_get_returns_value() {
         let pm = PayloadMetrics {
+            payload_index: 0,
             metrics: vec![Metric {
                 name: "iops".to_string(),
                 value: 1000.0,
@@ -1483,5 +1551,148 @@ mod tests {
         assert_eq!(a.name, Payload::KERNEL_DEFAULT.name);
         assert_eq!(a.is_scheduler(), Payload::KERNEL_DEFAULT.is_scheduler());
         assert_eq!(a.as_scheduler().map(|s| s.name), Some("eevdf"));
+    }
+
+    /// Round-trip a [`RawPayloadOutput`] carrying NON-empty stdout
+    /// AND non-empty stderr through serde_json::to_vec /
+    /// from_slice — the wire format the guest's
+    /// `emit_raw_payload_output_to_shm` actually uses on the SHM ring
+    /// (see src/scenario/payload_run.rs `emit_raw_payload_output_to_shm`).
+    /// Pins the wire-format invariant for the deferred LlmExtract
+    /// path: both raw streams MUST survive the guest→host transport,
+    /// because the host's `host_side_llm_extract` runs the model
+    /// stdout-primary with stderr-fallback, and a regression that
+    /// dropped either stream on the wire would silently degrade the
+    /// extraction (e.g. a schbench-style payload that emits its
+    /// summary on stderr would land empty on the host).
+    ///
+    /// Round-trip rather than direct value comparison so a future
+    /// change to field naming, serde rename, or representation
+    /// surfaces here as a failed deserialize rather than a silent
+    /// per-field shape drift.
+    #[test]
+    fn raw_payload_output_serde_round_trip_carries_both_streams() {
+        let original = RawPayloadOutput {
+            payload_index: 17,
+            stdout: "stdout document with metrics: {\"iops\": 100}\n".to_string(),
+            stderr: "stderr fallback document: {\"latency\": 42}\n".to_string(),
+            hint: Some("focus on iops".to_string()),
+            metric_hints: vec![
+                WireMetricHint {
+                    name: "iops".to_string(),
+                    polarity: Polarity::HigherBetter,
+                    unit: "iops".to_string(),
+                },
+                WireMetricHint {
+                    name: "latency".to_string(),
+                    polarity: Polarity::LowerBetter,
+                    unit: "ns".to_string(),
+                },
+            ],
+        };
+        let bytes = serde_json::to_vec(&original).expect("RawPayloadOutput must always serialize");
+        let restored: RawPayloadOutput =
+            serde_json::from_slice(&bytes).expect("wire format must round-trip");
+
+        assert_eq!(restored.payload_index, original.payload_index);
+        assert_eq!(
+            restored.stdout, original.stdout,
+            "stdout must round-trip byte-for-byte; lost stdout would degrade \
+             the host's stdout-primary extraction silently",
+        );
+        assert_eq!(
+            restored.stderr, original.stderr,
+            "stderr must round-trip byte-for-byte; lost stderr would silently \
+             defeat the stderr-fallback contract for payloads (e.g. schbench) \
+             that emit structured output on stderr only",
+        );
+        assert_eq!(restored.hint, original.hint);
+        assert_eq!(restored.metric_hints.len(), original.metric_hints.len());
+        for (got, want) in restored
+            .metric_hints
+            .iter()
+            .zip(original.metric_hints.iter())
+        {
+            assert_eq!(got.name, want.name);
+            assert_eq!(got.polarity, want.polarity);
+            assert_eq!(got.unit, want.unit);
+        }
+    }
+
+    /// Boundary case for the wire-format pin: empty stdout AND empty
+    /// stderr round-trip cleanly without panicking the deserializer
+    /// or collapsing into a None / null. Pins that the SHM transport
+    /// preserves the empty-string distinction the host needs to
+    /// distinguish "stream had no bytes" from "stream was missing"
+    /// (the host's stderr fallback is gated on `!stderr.is_empty()` —
+    /// an absent vs empty stderr would behave differently on the
+    /// host if the wire format dropped the field).
+    #[test]
+    fn raw_payload_output_serde_round_trip_empty_streams_preserved() {
+        let original = RawPayloadOutput {
+            payload_index: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            hint: None,
+            metric_hints: Vec::new(),
+        };
+        let bytes = serde_json::to_vec(&original).expect("serialize");
+        let restored: RawPayloadOutput = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.payload_index, 0);
+        assert!(
+            restored.stdout.is_empty(),
+            "empty stdout must survive round-trip as empty string, not vanish to None or null"
+        );
+        assert!(
+            restored.stderr.is_empty(),
+            "empty stderr must survive round-trip as empty string"
+        );
+        assert!(restored.hint.is_none(), "absent hint must survive as None");
+        assert!(
+            restored.metric_hints.is_empty(),
+            "empty metric_hints must survive as empty Vec"
+        );
+    }
+
+    /// Asymmetric stream content: stdout populated, stderr empty.
+    /// Common shape for well-behaved payloads (fio, stress-ng JSON
+    /// mode) where stdout is canonical. Pins that the wire format
+    /// does not "collapse" the empty stderr into the populated
+    /// stdout (e.g. via a smart serializer that omits empty
+    /// fields and then a deserializer that maps absence to a
+    /// duplicate of the other field).
+    #[test]
+    fn raw_payload_output_serde_round_trip_stdout_only() {
+        let original = RawPayloadOutput {
+            payload_index: 3,
+            stdout: r#"{"throughput": 9000}"#.to_string(),
+            stderr: String::new(),
+            hint: None,
+            metric_hints: Vec::new(),
+        };
+        let bytes = serde_json::to_vec(&original).expect("serialize");
+        let restored: RawPayloadOutput = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.stdout, original.stdout);
+        assert!(restored.stderr.is_empty(), "stderr must remain empty");
+    }
+
+    /// Inverse of `raw_payload_output_serde_round_trip_stdout_only`:
+    /// stderr populated, stdout empty — the schbench-style shape that
+    /// drives the stderr-fallback contract on the host. A regression
+    /// that dropped this stream-asymmetric variant on the wire would
+    /// silently break every stderr-only payload's metrics.
+    #[test]
+    fn raw_payload_output_serde_round_trip_stderr_only() {
+        let original = RawPayloadOutput {
+            payload_index: 9,
+            stdout: String::new(),
+            stderr: r#"{"latency_p99": 1234}"#.to_string(),
+            hint: None,
+            metric_hints: Vec::new(),
+        };
+        let bytes = serde_json::to_vec(&original).expect("serialize");
+        let restored: RawPayloadOutput = serde_json::from_slice(&bytes).expect("deserialize");
+        assert!(restored.stdout.is_empty(), "stdout must remain empty");
+        assert_eq!(restored.stderr, original.stderr);
     }
 }

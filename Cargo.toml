@@ -147,15 +147,30 @@ sha2 = "0.10"
 # model-cache verify path.
 hex = "0.4"
 # Local inference backend for `OutputFormat::LlmExtract`. CPU-only —
-# no cuda/metal feature flags are forwarded. Pinned to exact patch
-# versions because candle + tokenizers are pre-1.0: a semver-
-# compatible patch bump can still break the quantized_qwen3 /
-# ConcatKvCache / Tokenizer::from_file API surface that `model.rs`
-# consumes. `cargo update -p` is how we opt into a new version.
-candle = { package = "candle-core", version = "=0.10.2", default-features = false }
-candle-nn = { version = "=0.10.2", default-features = false }
-candle-transformers = { version = "=0.10.2", default-features = false }
-tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy-regex"] }
+# `openmp` enables OpenMP-parallel matmul (no GPU offload). The GGUF
+# carries its own tokenizer surface, so no separate tokenizer crate is
+# needed. The `sampler` feature enables the `LlamaSampler` builder API
+# (`greedy()`, `accept()`, `sample()`) used by `invoke_with_model`.
+# Build dep on cmake — the linked llama.cpp C++ sources are built from
+# source via `llama-cpp-sys-2`'s build script.
+llama-cpp-2 = { version = "0.1.145", default-features = false, features = ["openmp", "sampler"] }
+# Stateful UTF-8 decoder required by `LlamaModel::token_to_piece` —
+# a single token may carry a partial multi-byte UTF-8 sequence and
+# only a stateful decoder can stitch consecutive tokens into valid
+# UTF-8 without dropping bytes. Already a transitive dep of
+# `llama-cpp-2`; pinned as a direct dep so the call site's intent is
+# explicit and survives a future llama-cpp-2 reorganization that
+# changes its re-export surface.
+encoding_rs = "0.8"
+# Error-enum derives for the `InferenceError` type that
+# `load_inference` and `invoke_with_model` return. Already a
+# transitive dep via `llama-cpp-2`'s own thiserror-derived error
+# types; promoted to a direct dep so the migration's
+# `#[derive(thiserror::Error)]` site is explicit. Pinned at the v2
+# series to match what `llama-cpp-2` already pulls in (v2.0.18);
+# v2's `#[source]` attribute matches the structured-error
+# pattern phd-2's analysis recommended.
+thiserror = "2"
 
 [profile.release]
 lto = "thin"
@@ -163,7 +178,6 @@ panic = "abort"
 
 [features]
 integration = []
-mkl = ["candle/mkl", "candle-transformers/mkl", "candle-nn/mkl"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }

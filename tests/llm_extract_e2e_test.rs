@@ -17,8 +17,8 @@
 //! inference call — and isolating it keeps the cheap scheduler
 //! tests free of that cost when filtering via nextest.
 //!
-//! **Host-only LLM extraction.** The model (~2.4 GiB GGUF +
-//! tokenizer) does NOT load inside the guest VM: the test VM's RAM
+//! **Host-only LLM extraction.** The model (~2.4 GiB GGUF) does
+//! NOT load inside the guest VM: the test VM's RAM
 //! budget cannot fit it, and the cache lives on the host. The
 //! guest-side `evaluate()` skips every model code path for
 //! `OutputFormat::LlmExtract` payloads, ships the raw

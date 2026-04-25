@@ -112,9 +112,16 @@ pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
 /// [`RawPayloadOutput`](crate::test_support::RawPayloadOutput).
 ///
 /// Emitted ALONGSIDE [`MSG_TYPE_PAYLOAD_METRICS`] (with empty
-/// `metrics`) so the host can pair them by emission order. The host
-/// drains every entry, runs `extract_via_llm` on the captured text
-/// stdout-primary with stderr-fallback, and replaces the paired
+/// `metrics`) so the host can pair them by `payload_index`
+/// equality. Both messages carry the same per-invocation
+/// `payload_index` allocated from the guest's per-process
+/// counter; the host's drain loop builds a
+/// `HashMap<payload_index, slot>` over `PayloadMetrics` and looks
+/// up each `RawPayloadOutput`'s index in O(1) — no reliance on SHM
+/// emission order, which would conflate a `Json` payload that
+/// produced zero numeric leaves with an LlmExtract placeholder.
+/// The host then runs `extract_via_llm` on the captured text
+/// stdout-primary with stderr-fallback, and replaces the matched
 /// PayloadMetrics' empty `metrics` vec with the extracted result.
 ///
 /// LLM extraction NEVER runs in the guest: the model (~2.4 GiB) does
