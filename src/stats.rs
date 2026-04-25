@@ -537,9 +537,22 @@ pub struct GauntletRow {
     pub work_type: String,
     /// Scheduler binary name carried from the source sidecar
     /// (`SidecarResult::scheduler`). Surfaced through the substring
-    /// filter in [`compare_rows`] so users can narrow A/B comparisons
+    /// filter in [`compare_rows`] and the typed
+    /// [`RowFilter::scheduler`] so users can narrow A/B comparisons
     /// by scheduler name.
     pub scheduler: String,
+    /// Kernel version carried from the source sidecar
+    /// (`SidecarResult::kernel_version`). `None` when the sidecar
+    /// writer could not extract a version (e.g. a raw kernel image
+    /// path with no metadata.json sibling, or a dirty source tree
+    /// where HEAD does not describe the build). Surfaced via the
+    /// typed [`RowFilter::kernel_version`] for narrowing — when the
+    /// user passes `--kernel-version 6.14.2`, rows with `None` are
+    /// dropped to preserve the operator's intent ("only this
+    /// kernel"); a `None`-as-wildcard would silently dilute the
+    /// filtered set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_version: Option<String>,
     /// Active scheduler flags carried from
     /// `SidecarResult::active_flags`. Previously this field did not
     /// exist on the row; every A/B comparison therefore ignored
@@ -688,6 +701,100 @@ pub struct GauntletRow {
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
+/// Typed-field filter set for narrowing [`GauntletRow`] sets in the
+/// `cargo ktstr stats compare` pipeline. Every field is `None` /
+/// empty by default; populated fields are AND-combined and applied
+/// via [`apply_row_filters`] in `compare_runs` before the rows reach
+/// `compare_rows`.
+///
+/// Match semantics:
+/// - `kernel_version` / `scheduler` / `topology` / `work_type` —
+///   STRICT EQUALITY against the row's corresponding field. The
+///   sibling substring filter on [`compare_rows`] (`-E`) stays as
+///   the only fuzzy-match knob; typed fields are exact so a
+///   `--scheduler scx_rusty` filter does NOT spuriously match
+///   `scx_rusty_alt`.
+/// - `flags` — AND-combined: every entry in the filter must appear
+///   somewhere in the row's `flags` vec. The row may carry
+///   additional flags beyond the filter set; the filter pins
+///   "at-least-these-flags-are-active", not "exactly-these".
+/// - `kernel_version` against a row whose `kernel_version` is `None`
+///   ALWAYS fails (no wildcard semantic) — the operator wrote a
+///   specific version and a `None`-row would silently dilute the
+///   set.
+///
+/// Empty `RowFilter` (every field `None`/empty) is the no-op default
+/// and matches every row. Use [`RowFilter::default()`] to build it.
+#[derive(Clone, Debug, Default)]
+pub struct RowFilter {
+    /// Match against `GauntletRow::kernel_version`. `None` here means
+    /// "do not filter on kernel version"; `Some("6.14.2")` requires
+    /// the row's kernel version to equal `"6.14.2"`. A row whose
+    /// kernel_version is itself `None` never matches a `Some`
+    /// filter.
+    pub kernel_version: Option<String>,
+    /// Match against `GauntletRow::scheduler` (strict equality).
+    /// `None` here is "do not filter on scheduler".
+    pub scheduler: Option<String>,
+    /// Match against `GauntletRow::topology` (strict equality on the
+    /// rendered form, e.g. `"1n2l4c2t"`). `None` here is "do not
+    /// filter on topology".
+    pub topology: Option<String>,
+    /// Match against `GauntletRow::work_type` (strict equality).
+    /// `None` here is "do not filter on work type".
+    pub work_type: Option<String>,
+    /// Repeatable flag filter, AND-combined: every entry must appear
+    /// in `GauntletRow::flags`. Empty vec disables the filter.
+    pub flags: Vec<String>,
+}
+
+impl RowFilter {
+    /// Returns true when every populated filter field matches the
+    /// row. The empty `RowFilter` (default) returns true for every
+    /// row — it's the identity filter.
+    pub fn matches(&self, row: &GauntletRow) -> bool {
+        if let Some(want) = &self.kernel_version
+            && row.kernel_version.as_deref() != Some(want.as_str())
+        {
+            return false;
+        }
+        if let Some(want) = &self.scheduler
+            && row.scheduler != *want
+        {
+            return false;
+        }
+        if let Some(want) = &self.topology
+            && row.topology != *want
+        {
+            return false;
+        }
+        if let Some(want) = &self.work_type
+            && row.work_type != *want
+        {
+            return false;
+        }
+        for required in &self.flags {
+            if !row.flags.iter().any(|f| f == required) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Drop rows from `rows` that do not match every populated filter
+/// field on `filter`. Returns the surviving rows in their original
+/// order. The caller is responsible for any further dedup or
+/// aggregation; this helper preserves duplicates as written.
+///
+/// Used by [`compare_runs`] before the surviving rows reach
+/// [`compare_rows`], so the substring-`-E` filter and the typed
+/// filters compose: typed narrows happen first, substring runs over
+/// the surviving set.
+pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<GauntletRow> {
+    rows.iter().filter(|r| filter.matches(r)).cloned().collect()
+}
+
 /// Convert a SidecarResult to a GauntletRow for run-to-run comparison.
 ///
 /// Non-finite f64 values (NaN, ±Infinity) are sanitized to 0.0 with a
@@ -749,6 +856,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         topology: sc.topology.clone(),
         work_type: sc.work_type.clone(),
         scheduler: sc.scheduler.clone(),
+        kernel_version: sc.kernel_version.clone(),
         flags: sc.active_flags.clone(),
         passed: sc.passed,
         skipped: sc.skipped,
@@ -1628,6 +1736,7 @@ pub fn compare_runs(
     a: &str,
     b: &str,
     filter: Option<&str>,
+    row_filter: &RowFilter,
     policy: &ComparisonPolicy,
     dir: Option<&std::path::Path>,
 ) -> anyhow::Result<i32> {
@@ -1662,6 +1771,16 @@ pub fn compare_runs(
 
     let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
     let rows_b: Vec<GauntletRow> = sidecars_b.iter().map(sidecar_to_row).collect();
+
+    // Apply typed filters (--kernel-version / --scheduler / --topology
+    // / --work-type / --flag) before the substring filter inside
+    // `compare_rows`. Typed filters are strict-equality / AND-combined
+    // and run cheaply over the row vectors here; the substring
+    // filter stays inside `compare_rows` because it joins the row's
+    // fields into a search string and reuses that join across the
+    // comparison loop.
+    let rows_a = apply_row_filters(&rows_a, row_filter);
+    let rows_b = apply_row_filters(&rows_b, row_filter);
 
     let report = compare_rows(&rows_a, &rows_b, filter, policy);
 
@@ -1800,6 +1919,7 @@ mod tests {
             topology: topo.into(),
             work_type: "CpuSpin".into(),
             scheduler: String::new(),
+            kernel_version: None,
             flags: Vec::new(),
             skipped: false,
             passed,
@@ -3787,6 +3907,7 @@ mod tests {
             run_a,
             run_b,
             None,
+            &RowFilter::default(),
             &ComparisonPolicy::default(),
             Some(alt_root.path()),
         )
@@ -3810,8 +3931,15 @@ mod tests {
         // above actually went through the Some(d) arm rather than
         // happening to work because runs_root() also had these
         // names.
-        let err = compare_runs(run_a, run_b, None, &ComparisonPolicy::default(), None)
-            .expect_err("compare_runs without --dir must fail on missing unique fixtures");
+        let err = compare_runs(
+            run_a,
+            run_b,
+            None,
+            &RowFilter::default(),
+            &ComparisonPolicy::default(),
+            None,
+        )
+        .expect_err("compare_runs without --dir must fail on missing unique fixtures");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains(run_a),
@@ -3839,5 +3967,267 @@ mod tests {
              otherwise this test cannot distinguish threading \
              from fallback",
         );
+    }
+
+    // -- RowFilter / apply_row_filters --
+
+    /// Helper that builds a `GauntletRow` with controllable
+    /// scheduler / topology / work_type / kernel_version / flags
+    /// for the filter tests. The metric fields default to harmless
+    /// passing values; tests are interested in identity-field
+    /// matching, not metrics.
+    fn make_filter_row(
+        scenario: &str,
+        scheduler: &str,
+        topology: &str,
+        work_type: &str,
+        kernel_version: Option<&str>,
+        flags: &[&str],
+    ) -> GauntletRow {
+        GauntletRow {
+            scenario: scenario.into(),
+            topology: topology.into(),
+            work_type: work_type.into(),
+            scheduler: scheduler.into(),
+            kernel_version: kernel_version.map(str::to_owned),
+            flags: flags.iter().map(|s| (*s).to_owned()).collect(),
+            passed: true,
+            skipped: false,
+            spread: 0.0,
+            gap_ms: 0,
+            migrations: 0,
+            migration_ratio: 0.0,
+            imbalance_ratio: 0.0,
+            max_dsq_depth: 0,
+            stall_count: 0,
+            fallback_count: 0,
+            keep_last_count: 0,
+            worst_p99_wake_latency_us: 0.0,
+            worst_median_wake_latency_us: 0.0,
+            worst_wake_latency_cv: 0.0,
+            total_iterations: 0,
+            worst_mean_run_delay_us: 0.0,
+            worst_run_delay_us: 0.0,
+            worst_wake_latency_tail_ratio: 0.0,
+            worst_iterations_per_worker: 0.0,
+            page_locality: 0.0,
+            cross_node_migration_ratio: 0.0,
+            ext_metrics: BTreeMap::new(),
+        }
+    }
+
+    /// Default `RowFilter` (every field None/empty) matches every
+    /// row — it's the identity filter. Pins the no-op contract so a
+    /// future regression that flipped the default to a "match
+    /// nothing" semantic lands here.
+    #[test]
+    fn row_filter_default_matches_every_row() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.2"), &[]);
+        let filter = RowFilter::default();
+        assert!(filter.matches(&row), "empty filter must match every row");
+    }
+
+    /// `--scheduler` is strict equality, NOT substring. A filter of
+    /// `"scx"` does not match a row with scheduler `"scx_rusty"`.
+    /// Pins the typed-vs-substring asymmetry: -E stays as the
+    /// substring knob; typed flags exact-match.
+    #[test]
+    fn row_filter_scheduler_strict_equality_rejects_prefix() {
+        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "CpuSpin", None, &[]);
+        let filter = RowFilter {
+            scheduler: Some("scx".to_string()),
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter.matches(&row),
+            "strict-equality scheduler filter must NOT match a prefix; \
+             got match for scheduler=`scx_rusty` against filter=`scx`",
+        );
+    }
+
+    /// Exact scheduler match passes; the strict-equality contract's
+    /// happy path.
+    #[test]
+    fn row_filter_scheduler_strict_equality_matches_exact() {
+        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "CpuSpin", None, &[]);
+        let filter = RowFilter {
+            scheduler: Some("scx_rusty".to_string()),
+            ..RowFilter::default()
+        };
+        assert!(filter.matches(&row));
+    }
+
+    /// `--kernel-version 6.14.2` against a row whose
+    /// kernel_version is None must NOT match — the operator
+    /// opted in to a specific kernel and a None-row would
+    /// silently dilute the filtered set.
+    #[test]
+    fn row_filter_kernel_version_none_row_never_matches_some_filter() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let filter = RowFilter {
+            kernel_version: Some("6.14.2".to_string()),
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter.matches(&row),
+            "None-row must not match Some-filter; got dilution",
+        );
+    }
+
+    /// `--kernel-version 6.14.2` against a row whose
+    /// kernel_version is `Some("6.14.2")` matches.
+    #[test]
+    fn row_filter_kernel_version_exact_match() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.2"), &[]);
+        let filter = RowFilter {
+            kernel_version: Some("6.14.2".to_string()),
+            ..RowFilter::default()
+        };
+        assert!(filter.matches(&row));
+    }
+
+    /// `--kernel-version 6.14.2` against a row whose
+    /// kernel_version is `Some("6.14.3")` rejects.
+    #[test]
+    fn row_filter_kernel_version_mismatch_rejects() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.3"), &[]);
+        let filter = RowFilter {
+            kernel_version: Some("6.14.2".to_string()),
+            ..RowFilter::default()
+        };
+        assert!(!filter.matches(&row));
+    }
+
+    /// `--topology 1n2l4c1t` strict-equal against the row's
+    /// rendered topology. The filter is the same string the
+    /// `Topology::Display` impl emits and `cargo ktstr stats list`
+    /// shows; passing the exact form that appears in the listing
+    /// is the operator's expected workflow.
+    #[test]
+    fn row_filter_topology_strict_equality() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let filter_match = RowFilter {
+            topology: Some("1n2l4c1t".to_string()),
+            ..RowFilter::default()
+        };
+        assert!(filter_match.matches(&row));
+        let filter_miss = RowFilter {
+            topology: Some("1n2l4c2t".to_string()),
+            ..RowFilter::default()
+        };
+        assert!(!filter_miss.matches(&row));
+    }
+
+    /// Repeatable `--flag` is AND-combined: every entry in the
+    /// filter must appear in the row's flags vec. The row may
+    /// carry additional flags (the filter is at-least-these, not
+    /// exactly-these) — pinned here by adding `extra` to the row
+    /// and confirming it doesn't break the match.
+    #[test]
+    fn row_filter_flags_and_combined_subset() {
+        let row = make_filter_row(
+            "t",
+            "scx_a",
+            "1n2l4c1t",
+            "CpuSpin",
+            None,
+            &["llc", "rusty_balance", "extra"],
+        );
+        let filter = RowFilter {
+            flags: vec!["llc".to_string(), "rusty_balance".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            filter.matches(&row),
+            "AND-combined flags must match when row has all required \
+             entries (extra flags are fine); got rejection",
+        );
+    }
+
+    /// AND-combined: a single missing required flag rejects the
+    /// whole match, even when other required flags are present.
+    #[test]
+    fn row_filter_flags_missing_required_rejects() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &["llc"]);
+        let filter = RowFilter {
+            flags: vec!["llc".to_string(), "rusty_balance".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter.matches(&row),
+            "missing single required flag must reject the whole match",
+        );
+    }
+
+    /// Multiple typed filters compose with AND semantics: every
+    /// populated field must match. A mismatch on any one field
+    /// rejects the whole match. Pinned via a row that matches 3
+    /// of 4 filter fields and assertion that it still rejects.
+    #[test]
+    fn row_filter_multi_field_and_composes() {
+        let row = make_filter_row(
+            "t",
+            "scx_a",
+            "1n2l4c1t",
+            "CpuSpin",
+            Some("6.14.2"),
+            &["llc"],
+        );
+        // 3 of 4 typed fields match (scheduler, topology, kernel_version);
+        // work_type mismatches. Whole filter must reject.
+        let filter = RowFilter {
+            scheduler: Some("scx_a".to_string()),
+            topology: Some("1n2l4c1t".to_string()),
+            kernel_version: Some("6.14.2".to_string()),
+            work_type: Some("YieldHeavy".to_string()),
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter.matches(&row),
+            "AND composition must reject when any single field mismatches; \
+             got match despite work_type divergence",
+        );
+    }
+
+    /// `apply_row_filters` preserves the original row order and
+    /// drops only non-matching rows. Pinned by feeding a 3-row
+    /// vec where row 1 of 3 matches; result must be a 1-element
+    /// vec with the original middle row.
+    #[test]
+    fn apply_row_filters_preserves_order_drops_mismatch() {
+        let rows = vec![
+            make_filter_row("t1", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]),
+            make_filter_row("t2", "scx_b", "1n2l4c1t", "CpuSpin", None, &[]),
+            make_filter_row("t3", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]),
+        ];
+        let filter = RowFilter {
+            scheduler: Some("scx_b".to_string()),
+            ..RowFilter::default()
+        };
+        let kept = apply_row_filters(&rows, &filter);
+        assert_eq!(kept.len(), 1, "expected 1 surviving row, got {kept:?}");
+        assert_eq!(kept[0].scenario, "t2");
+    }
+
+    /// `apply_row_filters` with the default filter is the identity
+    /// — every row survives in original order.
+    #[test]
+    fn apply_row_filters_default_is_identity() {
+        let rows = vec![
+            make_filter_row("t1", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]),
+            make_filter_row(
+                "t2",
+                "scx_b",
+                "1n2l4c2t",
+                "YieldHeavy",
+                Some("6.14.2"),
+                &["llc"],
+            ),
+        ];
+        let kept = apply_row_filters(&rows, &RowFilter::default());
+        assert_eq!(kept.len(), rows.len());
+        for (a, b) in kept.iter().zip(rows.iter()) {
+            assert_eq!(a.scenario, b.scenario);
+        }
     }
 }

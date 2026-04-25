@@ -309,6 +309,17 @@ enum ModelCommand {
     Status,
 }
 
+// `clippy::large_enum_variant` triggers because clap's argument
+// derives produce variant-sized cells of `Option<String>` /
+// `Option<PathBuf>` per CLI flag. Boxing each variant would
+// distort every match arm's pattern shape (`Some(StatsCommand::
+// Compare { .. })` becomes `Some(StatsCommand::Compare(box))`)
+// and force every dispatch site through an extra deref. The enum
+// is constructed once per CLI invocation and immediately
+// pattern-matched into a single subcommand call — no allocation
+// hot path, no cache pressure. Suppress at the enum level rather
+// than wrapping each variant in `Box`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum StatsCommand {
     /// List test runs under `{CARGO_TARGET_DIR or "target"}/ktstr/`.
@@ -422,6 +433,38 @@ enum StatsCommand {
         /// CI host.
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
+        /// Strict equality match against the sidecar's
+        /// `kernel_version` field (e.g. `--kernel-version 6.14.2`).
+        /// Rows whose `kernel_version` is `None` (sidecar writer
+        /// could not extract a version) NEVER match a `Some` filter
+        /// — passing `--kernel-version` is an opt-in that demands a
+        /// known-version row.
+        #[arg(long)]
+        kernel_version: Option<String>,
+        /// Strict equality match against the sidecar's `scheduler`
+        /// field (e.g. `--scheduler scx_rusty`). Distinct from `-E`,
+        /// which matches a substring across the joined fields. Use
+        /// this when the operator wants to pin a specific scheduler
+        /// rather than narrow on a fragment.
+        #[arg(long)]
+        scheduler: Option<String>,
+        /// Strict equality match against the rendered topology label
+        /// (e.g. `--topology 1n2l4c2t`). The label is what
+        /// `Topology::Display` produces; `cargo ktstr stats list`
+        /// shows the form per-row.
+        #[arg(long)]
+        topology: Option<String>,
+        /// Strict equality match against the sidecar's `work_type`
+        /// field (e.g. `--work-type CpuSpin`).
+        #[arg(long)]
+        work_type: Option<String>,
+        /// Repeatable AND-combined flag filter (e.g.
+        /// `--flag llc --flag rusty_balance`). Every flag listed
+        /// must be present in the sidecar's `active_flags`; the row
+        /// may carry additional flags beyond the filter set. Empty
+        /// repeats are rejected by clap (zero-width match).
+        #[arg(long = "flag")]
+        flags: Vec<String>,
     },
 }
 
@@ -681,6 +724,11 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             threshold,
             policy,
             dir,
+            kernel_version,
+            scheduler,
+            topology,
+            work_type,
+            flags,
         }) => {
             // Resolve `--threshold N` / `--policy PATH` / neither
             // into a single `ComparisonPolicy`. Clap's
@@ -712,8 +760,27 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                     );
                 }
             };
-            let exit = cli::compare_runs(a, b, filter.as_deref(), &resolved_policy, dir.as_deref())
-                .map_err(|e| format!("{e:#}"))?;
+            // Typed filters compose with the substring `-E` filter:
+            // typed narrows happen first inside `compare_runs` (strict
+            // equality / AND-combined), then the substring runs over
+            // the surviving set inside `compare_rows`. See
+            // `RowFilter` doc for the full match-semantics contract.
+            let row_filter = ktstr::cli::RowFilter {
+                kernel_version: kernel_version.clone(),
+                scheduler: scheduler.clone(),
+                topology: topology.clone(),
+                work_type: work_type.clone(),
+                flags: flags.clone(),
+            };
+            let exit = cli::compare_runs(
+                a,
+                b,
+                filter.as_deref(),
+                &row_filter,
+                &resolved_policy,
+                dir.as_deref(),
+            )
+            .map_err(|e| format!("{e:#}"))?;
             if exit != 0 {
                 std::process::exit(exit);
             }
@@ -1912,6 +1979,7 @@ mod tests {
                         threshold,
                         policy,
                         dir,
+                        ..
                     }),
                 ..
             } => {
@@ -1993,6 +2061,7 @@ mod tests {
                         threshold,
                         policy,
                         dir,
+                        ..
                     }),
                 ..
             } => {
