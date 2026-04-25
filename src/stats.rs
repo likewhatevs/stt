@@ -796,7 +796,7 @@ pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<Gauntl
 }
 
 /// One aggregated [`GauntletRow`] produced by [`group_and_average`],
-/// plus the pass-bookkeeping needed to render `N/M` in the per-key
+/// plus the pass-bookkeeping needed to render `N/M` in the per-group
 /// summary block.
 ///
 /// `row` carries arithmetic-mean metric values across every
@@ -836,10 +836,10 @@ pub struct AveragedGroup {
     /// directly into [`compare_rows`] when `--average` is active.
     pub row: GauntletRow,
     /// Number of contributors where both `passed && !skipped`.
-    /// Renders as the numerator of the per-key `N/M` summary.
+    /// Renders as the numerator of the per-group `N/M` summary.
     pub passes_observed: u32,
     /// Total contributors in the group (`= group.len()`). Renders
-    /// as the denominator of the per-key `N/M` summary.
+    /// as the denominator of the per-group `N/M` summary.
     pub total_observed: u32,
 }
 
@@ -2068,7 +2068,7 @@ pub fn compare_runs(
     // [`group_and_average`]' grouping key, so the post-aggregation row
     // vec joins cleanly across A/B sides without duplicate-key
     // collisions. The averaged side-tables (`avg_a` / `avg_b`)
-    // carry the per-key `passes_observed` / `total_observed` for
+    // carry the per-group `passes_observed` / `total_observed` for
     // the `N/M` summary block printed below the comparison table.
     //
     // The pre-aggregation row counts (`pre_agg_a` / `pre_agg_b`)

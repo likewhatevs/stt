@@ -456,9 +456,9 @@ enum StatsCommand {
         topology: Option<String>,
         /// Strict equality match against the sidecar's `work_type`
         /// field (e.g. `--work-type CpuSpin`). Valid names are the
-        /// PascalCase variants of `WorkType` — see
-        /// `WorkType::ALL_NAMES` in `ktstr::workload` for the
-        /// compile-time list.
+        /// PascalCase variants of `WorkType`. See
+        /// `WorkType::ALL_NAMES` for the canonical variant list, or
+        /// `doc/guide/src/concepts/work-types.md`.
         #[arg(long)]
         work_type: Option<String>,
         /// Repeatable AND-combined flag filter (e.g.
@@ -472,11 +472,11 @@ enum StatsCommand {
         /// group into a single row carrying the arithmetic mean
         /// of its passing contributors' metrics. Smooths run-to-
         /// run jitter when each side carries multiple trials per
-        /// key. The header line above the comparison table reports
-        /// the post-aggregation row counts; a per-key `N/M`
-        /// (`passes_observed`/`total_observed`) block prints below
-        /// the summary for every group whose contributor count
-        /// includes a failure or skip on either side.
+        /// key. A header line above the comparison table reads
+        /// `averaged across N runs (A) and M runs (B)`; a per-
+        /// group `passes_observed/total_observed` block prints
+        /// below the summary, naming each side independently
+        /// (`-` for sides that lack the group entirely).
         ///
         /// Aggregation rules: failing/skipped contributors are
         /// excluded from the metric mean (they would carry
