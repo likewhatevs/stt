@@ -2650,7 +2650,7 @@ fn worker_main(
                 iterations += 1;
             }
             WorkType::YieldHeavy => {
-                work_units = work_units.wrapping_add(1);
+                work_units = std::hint::black_box(work_units.wrapping_add(1));
                 std::thread::yield_now();
                 iterations += 1;
             }
@@ -2678,7 +2678,7 @@ fn worker_main(
                 let buf = [0u8; 4096];
                 for _ in 0..16 {
                     let _ = f.write_all(&buf);
-                    work_units = work_units.wrapping_add(1);
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
                 }
                 // Sleep 100us to simulate I/O completion latency.
                 // On tmpfs, fsync is noop_fsync (returns 0), so without
@@ -2895,7 +2895,7 @@ fn worker_main(
                         Phase::Yield(dur) => {
                             let end = Instant::now() + *dur;
                             while Instant::now() < end && !STOP.load(Ordering::Relaxed) {
-                                work_units = work_units.wrapping_add(1);
+                                work_units = std::hint::black_box(work_units.wrapping_add(1));
                                 let before_yield = Instant::now();
                                 std::thread::yield_now();
                                 reservoir_push(
@@ -2928,7 +2928,7 @@ fn worker_main(
                                 let buf = [0u8; 4096];
                                 for _ in 0..16 {
                                     let _ = f.write_all(&buf);
-                                    work_units = work_units.wrapping_add(1);
+                                    work_units = std::hint::black_box(work_units.wrapping_add(1));
                                 }
                                 let before_sleep = Instant::now();
                                 std::thread::sleep(Duration::from_micros(100));
@@ -2949,7 +2949,7 @@ fn worker_main(
                 let pid = unsafe { libc::fork() };
                 match pid {
                     -1 => {
-                        work_units = work_units.wrapping_add(1);
+                        work_units = std::hint::black_box(work_units.wrapping_add(1));
                         iterations += 1;
                     }
                     0 => {
@@ -2972,7 +2972,7 @@ fn worker_main(
                             before_wait.elapsed().as_nanos() as u64,
                             MAX_WAKE_SAMPLES,
                         );
-                        work_units = work_units.wrapping_add(1);
+                        work_units = std::hint::black_box(work_units.wrapping_add(1));
                         iterations += 1;
                     }
                 }
@@ -3219,8 +3219,12 @@ fn worker_main(
                         let buf = matrix_buf
                             .get_or_insert_with(|| vec![0u64; 3 * matrix_size * matrix_size]);
                         for _ in 0..operations {
-                            matrix_multiply(buf, matrix_size);
-                            work_units = work_units.wrapping_add(1);
+                            // matrix_multiply itself folds a black_box-wrapped
+                            // C-region read into `work_units` as the post-loop
+                            // sink (see matrix_multiply doc), so the per-call
+                            // accumulator increment lives inside the helper.
+                            matrix_multiply(buf, matrix_size, &mut work_units);
+                            work_units = std::hint::black_box(work_units.wrapping_add(1));
                         }
                     }
                 }
@@ -3305,7 +3309,7 @@ fn worker_main(
                     let page_idx = (xorshift64(&mut page_fault_rng_state) as usize) % page_count;
                     let page_ptr = unsafe { (ptr as *mut u8).add(page_idx * 4096) };
                     unsafe { std::ptr::write_volatile(page_ptr, 1u8) };
-                    work_units = work_units.wrapping_add(1);
+                    work_units = std::hint::black_box(work_units.wrapping_add(1));
                 }
                 unsafe {
                     libc::madvise(ptr, region_size, libc::MADV_DONTNEED);
@@ -3509,8 +3513,75 @@ fn worker_main(
     }
 }
 
+// =====================================================================
+// Workload primitives — DO NOT remove the "weird-looking" constructs
+// =====================================================================
+//
+// The functions below (`spin_burst`, `cache_rmw_loop`,
+// `matrix_multiply`, the per-WorkType inline loops in `worker_main`)
+// are the kernels of every workload primitive ktstr exposes. They
+// look like trivial loops but carry MULTIPLE LAYERS of optimization-
+// elimination defenses that a casual reader (or a future maintainer
+// running clippy with cleanup intent) might be tempted to remove
+// as "redundant ceremony". Each layer is load-bearing:
+//
+// 1. **`std::hint::black_box(value)`** — a value-elimination
+//    barrier. Routing `wrapping_add(1)` results, multiplicand
+//    loads, and accumulator updates through `black_box` prevents
+//    LLVM from constant-folding, partial-evaluating, or
+//    algebraically simplifying the expressions. WITHOUT this,
+//    `for _ in 0..count { x = x.wrapping_add(1) }` collapses to
+//    `x += count` at `-O2`, defeating the per-iteration timing
+//    granularity these workloads need to drive scheduler events.
+//
+// 2. **`ptr::read_volatile` / `ptr::write_volatile`** — a memory-
+//    operation-elimination barrier. `black_box` keeps a value live,
+//    but a sufficiently smart pass can still prove the BACKING
+//    LOAD/STORE dead and synthesize the bytes from thin air. The
+//    workloads' cache-pressure variants depend on actual L1/L2/LLC
+//    line traffic — a process-local `Vec<u8>` whose contents no
+//    external observer reads is otherwise DCE-eligible. Volatile
+//    operations are not eliminable: every access becomes a real
+//    `mov` against the actual memory slot.
+//
+// 3. **Real syscalls** (`futex`, `pipe`, `read`, `write`,
+//    `nanosleep`, `sched_yield`, `mmap`, etc.) — opaque to LLVM by
+//    construction. The optimizer cannot reason across the
+//    user-kernel boundary, so syscall sites act as natural barriers
+//    that force surrounding values to materialize. WorkTypes that
+//    need scheduler events (`FutexFanOut`, `IoSync`, `Phase::Yield`)
+//    rely on this implicit barrier in addition to the explicit
+//    `black_box` / volatile pairs above.
+//
+// 4. **`#[inline(never)]`** on the workload helpers (`spin_burst`,
+//    `cache_rmw_loop`, `matrix_multiply`) — keeps each call a
+//    distinct boundary in the IR. Without it, inlining can fuse
+//    per-iteration `black_box` increments with the caller's
+//    arithmetic, defeating the granularity defense.
+//
+// Future maintainers: if you see code like
+// `*work_units = std::hint::black_box(work_units.wrapping_add(1));`
+// or `unsafe { ptr::read_volatile(&buf[idx]) }` and your reflex is
+// "this can be simplified", STOP. Read this comment block. Each
+// of these constructs has a documented function in the workload's
+// optimization-resistance contract. Removing one (a) breaks the
+// scheduler-event timing the workload claims to produce, (b)
+// degrades the cache-pressure traffic, (c) collapses multi-step
+// arithmetic into a single fold, OR (d) all three. The breakage
+// won't surface as a test failure — it'll surface as silently
+// degraded workload realism, which is much harder to debug than
+// a panic.
+
 /// CPU spin burst: black_box increment + spin_loop hint, repeated `count` times.
-#[inline(always)]
+///
+/// `#[inline(never)]` is deliberate: when this is inlined into a
+/// caller that also does observable work after the loop, LLVM can
+/// merge `count`-many `wrapping_add(1)` operations into a single
+/// `+ count` operation, defeating the point of the per-iteration
+/// `black_box`. Forcing the function out-of-line keeps each
+/// iteration's `black_box`-wrapped increment visible as a
+/// distinct call-and-return boundary the optimizer cannot fold.
+#[inline(never)]
 fn spin_burst(work_units: &mut u64, count: u64) {
     for _ in 0..count {
         *work_units = std::hint::black_box(work_units.wrapping_add(1));
@@ -3520,25 +3591,43 @@ fn spin_burst(work_units: &mut u64, count: u64) {
 
 /// Strided read-modify-write over a cache buffer.
 ///
-/// Both the per-byte RMW and the `work_units` bump route through
-/// `std::hint::black_box` so `-O2`/`-O3` cannot dead-code-eliminate
-/// the buffer traffic that is the POINT of `WorkType::CachePressure`
-/// / `CacheYield` / `CachePipe`. `buf` is a process-local `Vec<u8>`
-/// owned by the worker loop — no external observer reads it, so
-/// without an explicit barrier LLVM may prove every store dead and
-/// collapse the loop body to the `work_units` increment alone. The
-/// `work_units` bump flows into the shared iter-slot atomic store
-/// and the worker report, which keeps THAT dependency live, but
-/// that observable flow does not force the independent cache
-/// traffic to execute. Routing the loaded byte through `black_box`
-/// on read and the newly-written byte through `black_box` on write
-/// makes the cache-line traffic unelidable.
+/// `-O2`/`-O3` are aggressive about eliminating "no-observer" memory
+/// traffic on a process-local `Vec<u8>`: nothing outside the worker
+/// reads `buf`, so without an explicit barrier LLVM may prove every
+/// store dead and collapse the loop body to the `work_units`
+/// increment alone. `work_units` flows into a shared iter-slot
+/// atomic and the worker report, which keeps THAT dependency live,
+/// but that observable flow does not force the independent cache
+/// traffic to execute.
+///
+/// `black_box` on a value defeats VALUE elimination — the load /
+/// store has to materialize bytes the optimizer can't reason about
+/// — but a sufficiently smart pass can still prove the BACKING
+/// memory access dead and replace it with synthesized bytes. To
+/// pin the cache-line traffic itself, route the load through
+/// `ptr::read_volatile` and the store through `ptr::write_volatile`.
+/// Volatile memory operations are not eliminable: each one becomes
+/// a real `mov` against the actual buffer slot, which is what the
+/// `WorkType::CachePressure` / `CacheYield` / `CachePipe` workloads
+/// claim to exercise. The `work_units` bump retains its `black_box`
+/// wrap separately to defeat increment-fusion across iterations.
+///
+/// `#[inline(never)]` matches `spin_burst`'s rationale: forcing
+/// out-of-line keeps the per-iteration volatile load/store and
+/// `black_box`-wrapped increment visible as distinct boundaries
+/// LLVM cannot collapse with surrounding caller arithmetic.
+#[inline(never)]
 fn cache_rmw_loop(buf: &mut [u8], stride: usize, iters: u64, work_units: &mut u64) {
     let len = buf.len();
     let mut idx = 0;
     for _ in 0..iters {
-        let cur = std::hint::black_box(buf[idx]);
-        buf[idx] = std::hint::black_box(cur.wrapping_add(1));
+        // SAFETY: `idx` stays in `0..len` (mod by len at the bottom
+        // of the loop), so `&buf[idx]` is a valid `&u8` and
+        // `&mut buf[idx]` is a valid `&mut u8`. Volatile read/write
+        // through these references is sound; volatility just suppresses
+        // optimization, it does not change pointer-validity rules.
+        let cur = unsafe { std::ptr::read_volatile(&buf[idx]) };
+        unsafe { std::ptr::write_volatile(&mut buf[idx], cur.wrapping_add(1)) };
         idx = (idx + stride) % len;
         *work_units = std::hint::black_box(work_units.wrapping_add(1));
     }
@@ -3550,7 +3639,30 @@ fn cache_rmw_loop(buf: &mut [u8], stride: usize, iters: u64, work_units: &mut u6
 /// storage is naturally 8-byte aligned. An earlier version took a
 /// `&mut [u8]` and cast to `*mut u64`, which was UB because a
 /// `Vec<u8>` is only 1-byte aligned.
-fn matrix_multiply(data: &mut [u64], size: usize) {
+///
+/// Optimization-elimination barrier: every multiplicand load goes
+/// through `black_box`, the accumulator is `black_box`-clobbered
+/// before the write, and the C-region store uses `write_volatile`.
+/// Volatile is load-bearing on the write side: `matrix_buf` in
+/// `worker_main` is a process-local `Vec<u64>` whose C region (the
+/// upper third) is NEVER read by `matrix_multiply` or by any caller
+/// — every subsequent iteration overwrites the same C indices and
+/// the buffer is dropped at worker-exit without being inspected.
+/// LLVM is therefore free to mark the store dead and elide both the
+/// store AND the multiplication chain feeding it (load-load-mul-add
+/// dependency collapses to nothing without an observable sink). The
+/// per-load `black_box` and the post-mul `black_box(acc)` keep the
+/// arithmetic live, but a non-volatile write on a dead-output slot
+/// remains DCE-eligible. `write_volatile` makes the store non-
+/// elidable, so the compute path the workload claims to exercise
+/// actually executes under `-O2`/`-O3`.
+///
+/// `#[inline(never)]` matches `spin_burst` / `cache_rmw_loop` —
+/// forcing out-of-line keeps the volatile-store and per-iteration
+/// `black_box` wrappers visible as distinct boundaries the
+/// optimizer can't collapse against the caller's arithmetic.
+#[inline(never)]
+fn matrix_multiply(data: &mut [u64], size: usize, work_units: &mut u64) {
     debug_assert_eq!(data.len(), 3 * size * size);
     let stride = size * size;
     for i in 0..size {
@@ -3562,9 +3674,38 @@ fn matrix_multiply(data: &mut [u64], size: usize) {
                         .wrapping_mul(std::hint::black_box(data[stride + k * size + j])),
                 );
             }
-            data[2 * stride + i * size + j] = std::hint::black_box(acc);
+            // SAFETY: `2 * stride + i * size + j` is in-bounds for a
+            // slice of length `3 * stride` whenever `i, j < size`,
+            // which the surrounding `for` ranges enforce. The
+            // `debug_assert_eq!` above pins the length contract; the
+            // slice's element type (`u64`) is naturally aligned via
+            // `Vec<u64>` allocation. A non-volatile `data[idx] = ...`
+            // would be DCE-eligible because no later code reads the
+            // C region; the volatile store is the documented escape
+            // hatch.
+            unsafe {
+                std::ptr::write_volatile(
+                    &mut data[2 * stride + i * size + j] as *mut u64,
+                    std::hint::black_box(acc),
+                );
+            }
         }
     }
+    // Defense-in-depth read-back sink: route a single C-region
+    // value back into `work_units` through `black_box`. The
+    // `write_volatile` above is the primary defense — volatility
+    // forces every store to materialize — but a future LLVM that
+    // reasons more aggressively about volatility provenance could
+    // still mark the entire C region as a write-only buffer whose
+    // contents the program never inspects, and elide the multiply
+    // chain feeding the volatile sink. By feeding one extracted
+    // value back into the observable `work_units` accumulator the
+    // multiply chain has a load-bearing consumer that flows into
+    // the worker report. `data[2 * stride]` is the first slot of
+    // the C region, in-bounds because `size >= 1` is enforced by
+    // the call site (the worker only invokes matrix_multiply when
+    // `matrix_size > 0`).
+    *work_units = work_units.wrapping_add(std::hint::black_box(data[2 * stride]));
 }
 
 /// Write 1 byte to partner, poll for response, read, record wake latency.
@@ -4227,8 +4368,11 @@ mod tests {
         let mut data = vec![0u64; 3];
         data[0] = 3; // A
         data[1] = 5; // B
-        matrix_multiply(&mut data, 1);
+        let mut work_units = 0u64;
+        matrix_multiply(&mut data, 1, &mut work_units);
         assert_eq!(data[2], 15, "C = A * B for 1x1 matrix");
+        // Read-back sink consumed C[0] (= 15) into work_units.
+        assert_eq!(work_units, 15, "post-loop sink folds C[0] into work_units");
     }
 
     #[test]
@@ -4246,7 +4390,8 @@ mod tests {
         data[stride + 1] = 6;
         data[stride + 2] = 7;
         data[stride + 3] = 8;
-        matrix_multiply(&mut data, size);
+        let mut work_units = 0u64;
+        matrix_multiply(&mut data, size, &mut work_units);
         assert_eq!(data[2 * stride], 19);
         assert_eq!(data[2 * stride + 1], 22);
         assert_eq!(data[2 * stride + 2], 43);
@@ -4266,7 +4411,8 @@ mod tests {
         data[stride] = 1;
         data[stride + 4] = 1;
         data[stride + 8] = 1;
-        matrix_multiply(&mut data, size);
+        let mut work_units = 0u64;
+        matrix_multiply(&mut data, size, &mut work_units);
         let c = &data[2 * stride..3 * stride];
         // Diagonal entries carry A's diagonal because B = I.
         assert_eq!(c[0], 2);
@@ -4296,7 +4442,8 @@ mod tests {
         // `cargo nextest run --release` would run the test expecting
         // a panic the release binary can't raise.
         let mut data = vec![0u64; 5]; // 3 * 2 * 2 = 12, so 5 is wrong.
-        matrix_multiply(&mut data, 2);
+        let mut work_units = 0u64;
+        matrix_multiply(&mut data, 2, &mut work_units);
     }
 
     #[test]
