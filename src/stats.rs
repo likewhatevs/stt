@@ -795,7 +795,7 @@ pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<Gauntl
     rows.iter().filter(|r| filter.matches(r)).cloned().collect()
 }
 
-/// One aggregated [`GauntletRow`] produced by [`aggregate_rows`],
+/// One aggregated [`GauntletRow`] produced by [`group_and_average`],
 /// plus the pass-bookkeeping needed to render `N/M` in the per-key
 /// summary block.
 ///
@@ -813,8 +813,8 @@ pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<Gauntl
 /// `passed` on `row` is the AND across every contributor: a single
 /// failing contributor in the group flips the aggregated row to
 /// `passed = false`, which routes the pair through
-/// [`compare_rows`]' `skipped_failed` gate. `skipped` follows the
-/// same AND rule — any skipped contributor flips the aggregate to
+/// [`compare_rows`]' `skipped_failed` gate. `skipped` follows an
+/// OR rule — any skipped contributor flips the aggregate to
 /// skipped.
 ///
 /// `passes_observed` and `total_observed` count the contributors:
@@ -829,9 +829,10 @@ pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<Gauntl
 /// drops the pair from the regression math.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct AveragedRow {
+pub struct AveragedGroup {
     /// Aggregated row carrying arithmetic-mean metric values plus
-    /// the AND-of-contributors `passed` / `skipped` flags. Fed
+    /// the AND-of-contributors `passed` / OR-of-contributors
+    /// `skipped` flags. Fed
     /// directly into [`compare_rows`] when `--average` is active.
     pub row: GauntletRow,
     /// Number of contributors where both `passed && !skipped`.
@@ -844,7 +845,7 @@ pub struct AveragedRow {
 
 /// Group `rows` by `(scenario, topology, work_type, flags)` and
 /// arithmetic-mean their metric fields, returning one
-/// [`AveragedRow`] per distinct key.
+/// [`AveragedGroup`] per distinct key.
 ///
 /// Group key matches [`compare_rows`]' pairing key so the post-
 /// aggregation row vec joins cleanly across A/B sides under the
@@ -894,7 +895,7 @@ pub struct AveragedRow {
 /// order) so we maintain a parallel `Vec<key>` to preserve
 /// first-seen ordering. Stable order keeps test fixtures
 /// deterministic across runs.
-pub fn aggregate_rows(rows: &[GauntletRow]) -> Vec<AveragedRow> {
+pub fn group_and_average(rows: &[GauntletRow]) -> Vec<AveragedGroup> {
     type Key<'a> = (&'a str, &'a str, &'a str, &'a [String]);
 
     struct Accumulator<'a> {
@@ -1063,7 +1064,7 @@ pub fn aggregate_rows(rows: &[GauntletRow]) -> Vec<AveragedRow> {
                 .map(|(k, (sum, count))| (k, sum / f64::from(count)))
                 .collect(),
         };
-        out.push(AveragedRow {
+        out.push(AveragedGroup {
             row: aggregated,
             passes_observed: acc.passes_observed,
             total_observed: acc.total_observed,
@@ -2064,7 +2065,7 @@ pub fn compare_runs(
     // work_type, flags) group into a single row carrying
     // arithmetic-mean metric values across the group's passing
     // contributors. The pairing key inside `compare_rows` matches
-    // [`aggregate_rows`]' grouping key, so the post-aggregation row
+    // [`group_and_average`]' grouping key, so the post-aggregation row
     // vec joins cleanly across A/B sides without duplicate-key
     // collisions. The averaged side-tables (`avg_a` / `avg_b`)
     // carry the per-key `passes_observed` / `total_observed` for
@@ -2078,8 +2079,8 @@ pub fn compare_runs(
     let pre_agg_a = rows_a.len();
     let pre_agg_b = rows_b.len();
     let (rows_a_for_compare, rows_b_for_compare, avg_a, avg_b) = if average {
-        let avg_a = aggregate_rows(&rows_a);
-        let avg_b = aggregate_rows(&rows_b);
+        let avg_a = group_and_average(&rows_a);
+        let avg_b = group_and_average(&rows_b);
         let a_rows: Vec<GauntletRow> = avg_a.iter().map(|r| r.row.clone()).collect();
         let b_rows: Vec<GauntletRow> = avg_b.iter().map(|r| r.row.clone()).collect();
         (a_rows, b_rows, Some(avg_a), Some(avg_b))
@@ -2091,21 +2092,13 @@ pub fn compare_runs(
 
     if average {
         // Header line above the comparison table announcing the
-        // pre-aggregation contributor counts and the post-aggregation
-        // unique-key counts. The two numbers answer different
-        // operator questions: pre-aggregation = "how many trials
-        // got folded?", post-aggregation = "how many distinct
-        // (scenario, topology, work_type, flags) groups did I just
-        // compare?". Distinct from the table itself so the table
-        // preset (`new_table`) can keep using its bare
-        // `set_header(...)` row form without building a multi-row
-        // title cell.
-        let post_a = avg_a.as_ref().map(Vec::len).unwrap_or(0);
-        let post_b = avg_b.as_ref().map(Vec::len).unwrap_or(0);
-        println!(
-            "averaged across {pre_agg_a} run row(s) into {post_a} group(s) for '{a}' \
-             and {pre_agg_b} run row(s) into {post_b} group(s) for '{b}'",
-        );
+        // pre-aggregation contributor counts. Distinct from the
+        // table itself so the table preset (`new_table`) can keep
+        // using its bare `set_header(...)` row form without
+        // building a multi-row title cell. Construction is
+        // factored out to [`format_average_header`] so the
+        // exact-string contract can be unit-tested.
+        println!("{}", format_average_header(pre_agg_a, pre_agg_b, a, b));
     }
 
     use comfy_table::{Cell, Color};
@@ -2142,56 +2135,9 @@ pub fn compare_runs(
         );
     }
     if let (Some(avg_a), Some(avg_b)) = (&avg_a, &avg_b) {
-        // Per-key `N/M` block: one line per aggregated row that
-        // had at least one failing or skipped contributor on
-        // either side. Healthy keys (every contributor passed on
-        // both sides) are suppressed to keep the block focused
-        // on operator-actionable information. The line names
-        // each side independently — the same key can be 5/5 on
-        // one side and 3/5 on the other.
-        type SummaryKey<'a> = (&'a str, &'a str, &'a str, &'a [String]);
-        type SummaryValue<'a> = (Option<&'a AveragedRow>, Option<&'a AveragedRow>);
-        let mut keys: BTreeMap<SummaryKey<'_>, SummaryValue<'_>> = BTreeMap::new();
-        for ar in avg_a {
-            let k = (
-                ar.row.scenario.as_str(),
-                ar.row.topology.as_str(),
-                ar.row.work_type.as_str(),
-                ar.row.flags.as_slice(),
-            );
-            keys.entry(k).or_insert((None, None)).0 = Some(ar);
-        }
-        for br in avg_b {
-            let k = (
-                br.row.scenario.as_str(),
-                br.row.topology.as_str(),
-                br.row.work_type.as_str(),
-                br.row.flags.as_slice(),
-            );
-            keys.entry(k).or_insert((None, None)).1 = Some(br);
-        }
-        let mut printed_header = false;
-        for ((scn, topo, wt, _flags), (ka, kb)) in keys.into_iter() {
-            let needs_print = ka.is_some_and(|r| r.passes_observed != r.total_observed)
-                || kb.is_some_and(|r| r.passes_observed != r.total_observed);
-            if !needs_print {
-                continue;
-            }
-            if !printed_header {
-                println!("per-key pass counts (passes_observed/total_observed):");
-                printed_header = true;
-            }
-            let fmt_side = |r: Option<&AveragedRow>| -> String {
-                r.map(|x| format!("{}/{}", x.passes_observed, x.total_observed))
-                    .unwrap_or_else(|| "-".to_string())
-            };
-            println!(
-                "  {scn}/{topo}/{wt}: {a}={pa} {b}={pb}",
-                a = a,
-                b = b,
-                pa = fmt_side(ka),
-                pb = fmt_side(kb),
-            );
+        let block = format_per_group_pass_counts(avg_a, avg_b, a, b);
+        if !block.is_empty() {
+            print!("{block}");
         }
     }
     if report.new_in_b > 0 {
@@ -2238,6 +2184,102 @@ pub fn compare_runs(
 /// "captured in X only, delta unavailable" message rather than
 /// silently suppressing the section — a mixed-tooling-version run
 /// comparison should surface the asymmetry.
+/// Format the one-line averaging-mode header that prints above
+/// the comparison table when `--average` is active.
+///
+/// Pure function of (`pre_agg_a`, `pre_agg_b`, `a`, `b`) so the
+/// exact-string contract — the operator-visible "averaged across
+/// N runs (A) and M runs (B)" surface — can be unit-tested
+/// without capturing stdout from `compare_runs`.
+///
+/// `pre_agg_a` / `pre_agg_b` are the post-typed-filter contributor
+/// row counts (i.e. the number of sidecar rows that fed
+/// [`group_and_average`]), NOT the post-aggregation unique-key
+/// counts. The two answer different operator questions; the
+/// header surfaces the contributor count because that's the
+/// "how many trials got folded?" intuition the `--average` flag
+/// is actually delivering.
+pub(crate) fn format_average_header(
+    pre_agg_a: usize,
+    pre_agg_b: usize,
+    a: &str,
+    b: &str,
+) -> String {
+    format!("averaged across {pre_agg_a} runs ({a}) and {pre_agg_b} runs ({b})")
+}
+
+/// Format the per-group `passes_observed/total_observed` block
+/// that prints below the summary line when `--average` is active.
+///
+/// Pure function of (`avg_a`, `avg_b`, `a`, `b`) so the rendered
+/// surface — one line per (scenario, topology, work_type, flags)
+/// group present on either side, with `N/M` per side and `-` for
+/// any side that lacks the group — can be unit-tested without
+/// capturing stdout. Returns the trailing-newline-terminated
+/// block, or empty string when neither side has groups.
+///
+/// Line shape:
+/// `  scenario/topology/work_type: {a}=N/M {b}=N/M`
+///
+/// The leading two-space indent matches the sibling
+/// `summary:` block's continuation lines (e.g.
+/// `"  N (scenario, topology, work_type) row pair(s) skipped..."`)
+/// so the per-group block reads as a continuation of the same
+/// summary section. A blank line separates this block from the
+/// preceding `summary:` line for readability.
+///
+/// Groups present on only one side render `-` for the missing
+/// side (also counted in `compare_rows`' `new_in_b` /
+/// `removed_from_a` upstream — the per-group block surfaces the
+/// asymmetry by name so the operator can see *which* groups went
+/// missing without cross-referencing the summary counters).
+pub(crate) fn format_per_group_pass_counts(
+    avg_a: &[AveragedGroup],
+    avg_b: &[AveragedGroup],
+    a: &str,
+    b: &str,
+) -> String {
+    type SummaryKey<'a> = (&'a str, &'a str, &'a str, &'a [String]);
+    type SummaryValue<'a> = (Option<&'a AveragedGroup>, Option<&'a AveragedGroup>);
+    let mut keys: BTreeMap<SummaryKey<'_>, SummaryValue<'_>> = BTreeMap::new();
+    for ar in avg_a {
+        let k = (
+            ar.row.scenario.as_str(),
+            ar.row.topology.as_str(),
+            ar.row.work_type.as_str(),
+            ar.row.flags.as_slice(),
+        );
+        keys.entry(k).or_insert((None, None)).0 = Some(ar);
+    }
+    for br in avg_b {
+        let k = (
+            br.row.scenario.as_str(),
+            br.row.topology.as_str(),
+            br.row.work_type.as_str(),
+            br.row.flags.as_slice(),
+        );
+        keys.entry(k).or_insert((None, None)).1 = Some(br);
+    }
+    if keys.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str("per-group pass counts (passes_observed/total_observed):\n");
+    for ((scn, topo, wt, _flags), (ka, kb)) in keys.into_iter() {
+        let fmt_side = |r: Option<&AveragedGroup>| -> String {
+            r.map(|x| format!("{}/{}", x.passes_observed, x.total_observed))
+                .unwrap_or_else(|| "-".to_string())
+        };
+        out.push_str(&format!(
+            "  {scn}/{topo}/{wt}: {a}={pa} {b}={pb}\n",
+            pa = fmt_side(ka),
+            pb = fmt_side(kb),
+        ));
+    }
+    out
+}
+
 pub(crate) fn format_host_delta(
     host_a: Option<&crate::host_context::HostContext>,
     host_b: Option<&crate::host_context::HostContext>,
@@ -4610,7 +4652,7 @@ mod tests {
         }
     }
 
-    // -- aggregate_rows / AveragedRow --
+    // -- group_and_average / AveragedGroup --
 
     /// Mutate a row's metric fields away from defaults so
     /// aggregation has a non-zero signal to average. Returns the
@@ -4642,8 +4684,8 @@ mod tests {
     /// don't need to special-case the `--average` path on empty
     /// run directories.
     #[test]
-    fn aggregate_rows_empty_input_yields_empty_output() {
-        let out = aggregate_rows(&[]);
+    fn group_and_average_empty_input_yields_empty_output() {
+        let out = group_and_average(&[]);
         assert!(out.is_empty());
     }
 
@@ -4653,10 +4695,10 @@ mod tests {
     /// `denom` math (e.g. division by `total_observed` instead of
     /// `passes_observed`) lands here.
     #[test]
-    fn aggregate_rows_single_pass_passes_through_metrics() {
+    fn group_and_average_single_pass_passes_through_metrics() {
         let mut row = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut row, 12.0, 200, 50, 1000);
-        let out = aggregate_rows(std::slice::from_ref(&row));
+        let out = group_and_average(std::slice::from_ref(&row));
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 1);
@@ -4677,14 +4719,14 @@ mod tests {
     /// every metric field. f64 means are exact (modulo IEEE
     /// rounding); u64/i64 means are rounded to nearest.
     #[test]
-    fn aggregate_rows_multi_pass_arithmetic_mean() {
+    fn group_and_average_multi_pass_arithmetic_mean() {
         let mut a = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut a, 10.0, 100, 30, 900);
         let mut b = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut b, 20.0, 200, 60, 1100);
         let mut c = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut c, 30.0, 300, 90, 1000);
-        let out = aggregate_rows(&[a, b, c]);
+        let out = group_and_average(&[a, b, c]);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 3);
@@ -4713,12 +4755,12 @@ mod tests {
     /// key. Pins the group-key contract so a regression that
     /// dropped flags from the key would land here as a collision.
     #[test]
-    fn aggregate_rows_distinct_groups_stay_separate() {
+    fn group_and_average_distinct_groups_stay_separate() {
         let mut a = make_row("alpha", "tiny-1llc", true, 0.0);
         paint_metrics(&mut a, 10.0, 100, 30, 1000);
         let mut b = make_row("beta", "tiny-1llc", true, 0.0);
         paint_metrics(&mut b, 50.0, 500, 100, 2000);
-        let out = aggregate_rows(&[a, b]);
+        let out = group_and_average(&[a, b]);
         assert_eq!(out.len(), 2);
         // First-seen iteration order preserved (alpha before beta).
         assert_eq!(out[0].row.scenario, "alpha");
@@ -4731,7 +4773,7 @@ mod tests {
     /// pin for the join key — averaging must respect the same
     /// four-tuple.
     #[test]
-    fn aggregate_rows_different_flags_stay_separate() {
+    fn group_and_average_different_flags_stay_separate() {
         let mut llc1 = make_row("t", "tiny-1llc", true, 0.0);
         llc1.flags = vec!["llc".to_string()];
         paint_metrics(&mut llc1, 10.0, 100, 30, 1000);
@@ -4741,7 +4783,7 @@ mod tests {
         let mut borrow1 = make_row("t", "tiny-1llc", true, 0.0);
         borrow1.flags = vec!["borrow".to_string()];
         paint_metrics(&mut borrow1, 80.0, 800, 200, 5000);
-        let out = aggregate_rows(&[llc1, llc2, borrow1]);
+        let out = group_and_average(&[llc1, llc2, borrow1]);
         assert_eq!(out.len(), 2);
         let llc_ar = out
             .iter()
@@ -4762,7 +4804,7 @@ mod tests {
     /// `total_observed` still counts every contributor;
     /// `passes_observed` counts only the clean ones.
     #[test]
-    fn aggregate_rows_failed_contributors_excluded_from_mean_and_flag_aggregate() {
+    fn group_and_average_failed_contributors_excluded_from_mean_and_flag_aggregate() {
         let mut pass1 = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut pass1, 10.0, 100, 30, 1000);
         let mut fail = make_row("t", "tiny-1llc", false, 0.0);
@@ -4772,7 +4814,7 @@ mod tests {
         paint_metrics(&mut fail, 10000.0, 99999, 99999, 99999);
         let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut pass2, 30.0, 300, 90, 1000);
-        let out = aggregate_rows(&[pass1, fail, pass2]);
+        let out = group_and_average(&[pass1, fail, pass2]);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 2);
@@ -4793,7 +4835,7 @@ mod tests {
     /// OR rule). `passes_observed` does not count them; the
     /// passing-only entries still feed the mean cleanly.
     #[test]
-    fn aggregate_rows_skipped_contributors_excluded_from_mean_and_flag_aggregate() {
+    fn group_and_average_skipped_contributors_excluded_from_mean_and_flag_aggregate() {
         let mut pass1 = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut pass1, 10.0, 100, 30, 1000);
         let mut skip = make_row("t", "tiny-1llc", true, 0.0);
@@ -4803,7 +4845,7 @@ mod tests {
         paint_metrics(&mut skip, 9999.0, 99999, 99999, 99999);
         let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut pass2, 50.0, 500, 70, 2000);
-        let out = aggregate_rows(&[pass1, skip, pass2]);
+        let out = group_and_average(&[pass1, skip, pass2]);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 2);
@@ -4827,12 +4869,12 @@ mod tests {
     /// fed the running sums). Pins the divide-by-zero guard:
     /// `denom` must default to 1.0 when `passes_observed = 0`.
     #[test]
-    fn aggregate_rows_all_failed_collapses_to_default_zero_metrics_and_failed_flag() {
+    fn group_and_average_all_failed_collapses_to_default_zero_metrics_and_failed_flag() {
         let mut fail1 = make_row("t", "tiny-1llc", false, 0.0);
         paint_metrics(&mut fail1, 99.0, 999, 99, 999);
         let mut fail2 = make_row("t", "tiny-1llc", false, 0.0);
         paint_metrics(&mut fail2, 88.0, 888, 88, 888);
-        let out = aggregate_rows(&[fail1, fail2]);
+        let out = group_and_average(&[fail1, fail2]);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 0);
@@ -4852,14 +4894,14 @@ mod tests {
     /// NOT treated as a stored zero — its denominator is the
     /// present-only count.
     #[test]
-    fn aggregate_rows_ext_metrics_average_per_key_present_count() {
+    fn group_and_average_ext_metrics_average_per_key_present_count() {
         let mut a = make_row("t", "tiny-1llc", true, 0.0);
         a.ext_metrics.insert("shared".into(), 10.0);
         a.ext_metrics.insert("a_only".into(), 100.0);
         let mut b = make_row("t", "tiny-1llc", true, 0.0);
         b.ext_metrics.insert("shared".into(), 30.0);
         b.ext_metrics.insert("b_only".into(), 200.0);
-        let out = aggregate_rows(&[a, b]);
+        let out = group_and_average(&[a, b]);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         // shared: (10 + 30) / 2 = 20.
@@ -4870,17 +4912,17 @@ mod tests {
         assert_eq!(ar.row.ext_metrics.get("b_only"), Some(&200.0));
     }
 
-    /// `aggregate_rows` preserves first-seen iteration order so
+    /// `group_and_average` preserves first-seen iteration order so
     /// downstream tests against the result remain deterministic
     /// even though the internal map uses BTreeMap (key-sorted)
     /// for storage. Pinned by feeding keys in z→a order and
     /// asserting the output keeps that order.
     #[test]
-    fn aggregate_rows_preserves_first_seen_order() {
+    fn group_and_average_preserves_first_seen_order() {
         let zebra = make_row("zebra", "tiny-1llc", true, 0.0);
         let alpha = make_row("alpha", "tiny-1llc", true, 0.0);
         let mango = make_row("mango", "tiny-1llc", true, 0.0);
-        let out = aggregate_rows(&[zebra, alpha, mango]);
+        let out = group_and_average(&[zebra, alpha, mango]);
         let names: Vec<&str> = out.iter().map(|r| r.row.scenario.as_str()).collect();
         assert_eq!(
             names,
@@ -4895,7 +4937,7 @@ mod tests {
     /// (default_abs=5.0, default_rel=0.25) clears both gates,
     /// producing a regression. Pins the full averaging pipeline.
     #[test]
-    fn aggregate_rows_then_compare_rows_yields_regression_on_means() {
+    fn group_and_average_then_compare_rows_yields_regression_on_means() {
         let mut a1 = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut a1, 10.0, 100, 30, 1000);
         let mut a2 = make_row("t", "tiny-1llc", true, 0.0);
@@ -4909,8 +4951,8 @@ mod tests {
         let mut b3 = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut b3, 32.0, 320, 80, 1000);
 
-        let agg_a = aggregate_rows(&[a1, a2, a3]);
-        let agg_b = aggregate_rows(&[b1, b2, b3]);
+        let agg_a = group_and_average(&[a1, a2, a3]);
+        let agg_b = group_and_average(&[b1, b2, b3]);
         let rows_a: Vec<GauntletRow> = agg_a.iter().map(|r| r.row.clone()).collect();
         let rows_b: Vec<GauntletRow> = agg_b.iter().map(|r| r.row.clone()).collect();
         let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
@@ -4995,6 +5037,158 @@ mod tests {
             "an 18-unit worst_spread regression on the aggregated mean \
              (a=12 → b=30) must clear the default dual gate and surface \
              exit code 1; got {exit}",
+        );
+    }
+
+    // -- format_average_header / format_per_group_pass_counts --
+
+    /// `format_average_header` renders the exact header line that
+    /// `compare_runs` prints above the comparison table when
+    /// `--average` is active. Pins the operator-visible surface
+    /// (the "averaged across N runs (A) and M runs (B)" string)
+    /// so a regression that reworded the header without
+    /// updating downstream parsers / scripts lands here.
+    #[test]
+    fn format_average_header_exact_string() {
+        let out = format_average_header(5, 3, "kernel-6.14", "kernel-6.15");
+        assert_eq!(
+            out,
+            "averaged across 5 runs (kernel-6.14) and 3 runs (kernel-6.15)",
+        );
+    }
+
+    /// Zero-contributor sides are surfaced verbatim — operator
+    /// will see `0 runs` for an empty side. Pins the empty-side
+    /// edge case so a regression that special-cased `pre_agg = 0`
+    /// (e.g. omitted the side, said "no contributors") would
+    /// fail here. The companion empty-rows path is already
+    /// guarded upstream by `compare_runs`' `sidecars_*.is_empty()`
+    /// bail; this test guards the formatter itself in case it's
+    /// reused outside the compare path.
+    #[test]
+    fn format_average_header_zero_contributor_sides_render_verbatim() {
+        assert_eq!(
+            format_average_header(0, 0, "a", "b"),
+            "averaged across 0 runs (a) and 0 runs (b)",
+        );
+    }
+
+    /// Helper for the per-group-block tests: build an
+    /// `AveragedGroup` with the named identity and pass counters
+    /// while leaving every metric field at zero. Metrics aren't
+    /// observed by [`format_per_group_pass_counts`] — only the
+    /// identity tuple and pass counters drive the output.
+    fn group(
+        scenario: &str,
+        topology: &str,
+        work_type: &str,
+        flags: &[&str],
+        passes_observed: u32,
+        total_observed: u32,
+    ) -> AveragedGroup {
+        let mut row = make_row(scenario, topology, true, 0.0);
+        row.work_type = work_type.into();
+        row.flags = flags.iter().map(|s| (*s).to_string()).collect();
+        AveragedGroup {
+            row,
+            passes_observed,
+            total_observed,
+        }
+    }
+
+    /// Empty input: no groups on either side. The formatter
+    /// returns an empty string so the caller can suppress the
+    /// block entirely (no header, no body, no separator).
+    #[test]
+    fn format_per_group_pass_counts_empty_returns_empty_string() {
+        let out = format_per_group_pass_counts(&[], &[], "a", "b");
+        assert!(
+            out.is_empty(),
+            "empty input must yield empty output, got: {out:?}",
+        );
+    }
+
+    /// Both-sides-present: every (scenario, topology, work_type,
+    /// flags) group renders one line. Healthy 5/5 groups appear
+    /// alongside unhealthy 3/5 groups — the spec is "show every
+    /// group", not "show only the broken ones".
+    #[test]
+    fn format_per_group_pass_counts_renders_every_group_with_n_over_m() {
+        let avg_a = vec![
+            group("alpha", "tiny-1llc", "CpuSpin", &[], 5, 5),
+            group("beta", "tiny-1llc", "CpuSpin", &[], 3, 5),
+        ];
+        let avg_b = vec![
+            group("alpha", "tiny-1llc", "CpuSpin", &[], 4, 5),
+            group("beta", "tiny-1llc", "CpuSpin", &[], 5, 5),
+        ];
+        let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
+        // Header line present.
+        assert!(
+            out.contains("per-group pass counts"),
+            "header line must appear, got: {out:?}",
+        );
+        // Both groups render with their per-side N/M counters.
+        assert!(
+            out.contains("alpha/tiny-1llc/CpuSpin: a=5/5 b=4/5"),
+            "alpha group line missing; got: {out:?}",
+        );
+        assert!(
+            out.contains("beta/tiny-1llc/CpuSpin: a=3/5 b=5/5"),
+            "beta group line missing; got: {out:?}",
+        );
+        // Trailing newline so the next section reads cleanly.
+        assert!(
+            out.ends_with('\n'),
+            "block must end with newline, got: {out:?}",
+        );
+    }
+
+    /// One-side-only group renders `-` for the missing side.
+    /// Pins the asymmetric-key path: a B-side row that has no
+    /// A-side match gets `a=-`; symmetric for A-only / B-side.
+    /// The block surfaces the asymmetry by name so the operator
+    /// doesn't have to cross-reference the summary's `new_in_b`
+    /// / `removed_from_a` counters to know which groups went
+    /// missing.
+    #[test]
+    fn format_per_group_pass_counts_one_side_missing_renders_dash() {
+        let avg_a = vec![group("only_a", "tiny-1llc", "CpuSpin", &[], 5, 5)];
+        let avg_b = vec![group("only_b", "tiny-1llc", "CpuSpin", &[], 3, 5)];
+        let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
+        assert!(
+            out.contains("only_a/tiny-1llc/CpuSpin: a=5/5 b=-"),
+            "A-only group must render b=-; got: {out:?}",
+        );
+        assert!(
+            out.contains("only_b/tiny-1llc/CpuSpin: a=- b=3/5"),
+            "B-only group must render a=-; got: {out:?}",
+        );
+    }
+
+    /// Different `flags` profiles for the same (scenario,
+    /// topology, work_type) tuple render as separate lines. The
+    /// flag tuple is part of the join key; treating two flag
+    /// profiles as the same group would silently merge their
+    /// pass counts and hide flag-specific failures.
+    #[test]
+    fn format_per_group_pass_counts_distinct_flags_render_separately() {
+        let avg_a = vec![
+            group("t", "tiny-1llc", "CpuSpin", &["llc"], 5, 5),
+            group("t", "tiny-1llc", "CpuSpin", &["borrow"], 4, 5),
+        ];
+        let avg_b = vec![
+            group("t", "tiny-1llc", "CpuSpin", &["llc"], 3, 5),
+            group("t", "tiny-1llc", "CpuSpin", &["borrow"], 5, 5),
+        ];
+        let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
+        // Both lines must appear separately — not collapsed.
+        // Count occurrences of "t/tiny-1llc/CpuSpin" — there
+        // should be exactly 2 (one per flag profile).
+        let occurrences = out.matches("t/tiny-1llc/CpuSpin").count();
+        assert_eq!(
+            occurrences, 2,
+            "two flag profiles must render as two separate lines; got: {out:?}",
         );
     }
 }

@@ -280,11 +280,14 @@ Sidecar analysis and run-to-run comparison. See
 [Runs](runs.md) for the directory layout.
 
 ```sh
-cargo ktstr stats                          # print analysis of newest run
-cargo ktstr stats list                     # list runs
-cargo ktstr stats list-metrics             # list registered regression metrics
-cargo ktstr stats compare <a> <b>          # compare two runs
-cargo ktstr stats compare <a> <b> -E filt  # compare with filter
+cargo ktstr stats                                             # print analysis of newest run
+cargo ktstr stats list                                        # list runs
+cargo ktstr stats list-metrics                                # list registered regression metrics
+cargo ktstr stats compare <a> <b>                             # compare two runs
+cargo ktstr stats compare <a> <b> -E filt                     # substring filter
+cargo ktstr stats compare <a> <b> --scheduler scx_rusty       # pin scheduler
+cargo ktstr stats compare <a> <b> --work-type CpuSpin         # pin work type
+cargo ktstr stats compare <a> <b> --average                   # average across trials
 ```
 
 When invoked without a subcommand, prints gauntlet analysis from
@@ -361,6 +364,12 @@ thresholds from the unified metric registry, and print colored output
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-E FILTER` | -- | Substring filter applied to `scenario topology scheduler work_type`. The scheduler is searchable via the filter but is not part of the pairing key, so the same `(scenario, topology, work_type)` pair still compares across different scheduler binaries when the filter does not constrain it. |
+| `--kernel-version VER` | -- | Strict equality match against the sidecar's `kernel_version` field (e.g. `--kernel-version 6.14.2`). Rows with no recorded kernel version never match. |
+| `--scheduler NAME` | -- | Strict equality match against the sidecar's `scheduler` field (e.g. `--scheduler scx_rusty`). Unlike `-E`, which matches a substring across joined fields, this pins a specific scheduler. |
+| `--topology LABEL` | -- | Strict equality match against the rendered topology label (e.g. `--topology 1n2l4c2t`). The label is what `Topology::Display` produces; `cargo ktstr stats list` shows the form per-row. |
+| `--work-type TYPE` | -- | Strict equality match against the sidecar's `work_type` field (e.g. `--work-type CpuSpin`). |
+| `--flag NAME` | -- | Repeatable AND-combined flag filter (e.g. `--flag llc --flag rusty_balance`). Every listed flag must be present in the row's `active_flags`; the row may carry additional flags beyond the filter set. |
+| `--average` | off | Aggregate every (scenario, topology, work_type, flags) group into a single row carrying the arithmetic mean of its passing contributors' metrics. Smooths run-to-run jitter when each side carries multiple trials per key. Failing and skipped contributors are excluded from the metric mean; the aggregated row's `passed` is the AND across every contributor. |
 | `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy` — use `--threshold` for a uniform bound, `--policy` when per-metric overrides are needed. |
 | `--policy FILE` | -- | Path to a JSON `ComparisonPolicy` file with per-metric thresholds. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }`. Priority is per-metric override → `default_percent` → each metric's registry `default_rel`. Per-metric keys are rejected at load time if they do not match a metric in the `METRICS` registry (catches typos). Mutually exclusive with `--threshold`. |
 | `--dir DIR` | `target/ktstr/` | Alternate run root to resolve `a` / `b` against. Defaults to `test_support::runs_root()` (typically `target/ktstr/`). Useful when comparing archived sidecar trees copied off a CI host. |

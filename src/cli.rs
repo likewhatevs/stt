@@ -1888,7 +1888,7 @@ pub fn compare_runs(
 /// policy is the only item in `stats` that a CLI or external
 /// consumer constructs directly; every other item is internal
 /// plumbing reached via `cli::compare_runs`.
-pub use crate::stats::{AveragedRow, ComparisonPolicy, RowFilter, aggregate_rows};
+pub use crate::stats::{AveragedGroup, ComparisonPolicy, RowFilter, group_and_average};
 
 /// Collect the current host context via
 /// [`crate::host_context::collect_host_context`] and render it as

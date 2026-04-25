@@ -455,7 +455,10 @@ enum StatsCommand {
         #[arg(long)]
         topology: Option<String>,
         /// Strict equality match against the sidecar's `work_type`
-        /// field (e.g. `--work-type CpuSpin`).
+        /// field (e.g. `--work-type CpuSpin`). Valid names are the
+        /// PascalCase variants of `WorkType` — see
+        /// `WorkType::ALL_NAMES` in `ktstr::workload` for the
+        /// compile-time list.
         #[arg(long)]
         work_type: Option<String>,
         /// Repeatable AND-combined flag filter (e.g.
