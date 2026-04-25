@@ -72,8 +72,6 @@ jobs:
       fail-fast: false
       matrix:
         kernel-version: ['6.14', '7.0']
-    env:
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain from rust-toolchain.toml
@@ -105,8 +103,6 @@ jobs:
 
   coverage-x64:
     runs-on: [self-hosted, X64]
-    env:
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain from rust-toolchain.toml
@@ -134,8 +130,6 @@ jobs:
 
   coverage-arm64:
     runs-on: [self-hosted, Linux, kvm, kernel-build, ARM64]
-    env:
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain from rust-toolchain.toml

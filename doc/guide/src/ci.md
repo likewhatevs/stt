@@ -133,9 +133,6 @@ Run tests under `cargo ktstr coverage` for coverage reports:
 ```yaml
 coverage:
   runs-on: [self-hosted, X64]
-  env:
-    RUSTC_WRAPPER: ""
-    KTSTR_GHA_CACHE: "1"
   steps:
     - uses: actions/checkout@v5
     - uses: dtolnay/rust-toolchain@stable
@@ -157,10 +154,8 @@ coverage:
     - run: cargo ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
 ```
 
-`RUSTC_WRAPPER` must be empty (or unset) -- `sccache` is
-incompatible with coverage instrumentation. Requires
-`llvm-tools-preview` rustup component and `cargo-llvm-cov`. Pass
-`--exclude-from-report <crate>` to exclude scheduler crates from
+Requires `llvm-tools-preview` rustup component and `cargo-llvm-cov`.
+Pass `--exclude-from-report <crate>` to exclude scheduler crates from
 coverage reports (the example excludes `scx-ktstr`, the project's
 own test fixture scheduler).
 
@@ -184,14 +179,15 @@ subcommands and options.
 ## aarch64
 
 aarch64 runners use the same workflow as x64. Copy the x64 workflow
-above and apply these three differences:
+above and apply these differences:
 
 - Runner labels: `[self-hosted, Linux, kvm, kernel-build, ARM64]`
   (adjust to match your runner pool).
 - Cache key prefix: `arm64` instead of `x64`.
-- `RUSTC_WRAPPER`: set to empty string unless sccache is installed
-  on the arm64 runner — the workflow's global `RUSTC_WRAPPER=sccache`
-  breaks builds when sccache is absent.
+- `sccache` must be installed on every runner the workflow targets
+  (x64 and arm64). The workflow's global `RUSTC_WRAPPER=sccache`
+  applies to every job; a runner without `sccache` on `$PATH`
+  fails the first cargo invocation.
 
 ## Performance mode
 
