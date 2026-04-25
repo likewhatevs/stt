@@ -7,10 +7,22 @@
 //! (the ordering between `.init_array` entries is unspecified). To keep
 //! coverage data from being dropped, [`try_flush_profraw`] resolves the
 //! LLVM runtime symbols via ELF `.symtab` (they have hidden visibility,
-//! so `dlsym` can't see them), initializes the profile writer against an
-//! in-tmpfs path, calls `__llvm_profile_write_file`, reads the file back,
-//! and publishes it through the guest-to-host SHM ring under
-//! [`MSG_TYPE_PROFRAW`].
+//! so `dlsym` can't see them), serializes profraw into a heap buffer
+//! via `__llvm_profile_write_buffer`, and publishes it through the
+//! guest-to-host SHM ring under [`MSG_TYPE_PROFRAW`].
+//!
+//! VP data scope: the buffer flush covers coverage counters and
+//! bitmaps only; PGO value-profile data is not preserved.
+//! `__llvm_profile_write_buffer` passes a NULL `VPDataReader` to
+//! `lprofWriteData` (defined in
+//! `compiler-rt/lib/profile/InstrProfilingBuffer.c`),
+//! whereas the file-based `__llvm_profile_write_file` path passes
+//! `lprofGetVPDataReader()` (`InstrProfilingFile.c`) and DOES
+//! capture VP records. This matches the current `-C instrument-coverage`
+//! use case, which does not emit VP data. Combining coverage with PGO
+//! (`-C profile-generate`) in the same binary would silently lose VP
+//! records on this path; switch back to the file-based serializer if
+//! that combination becomes a requirement.
 //!
 //! On the host, [`write_profraw`] receives those bytes via the SHM ring
 //! and writes them into `LLVM_COV_TARGET_DIR` (or a fallback sibling
@@ -24,8 +36,17 @@
 //!   symbol virtual addresses can be rebased to runtime pointers.
 //! - [`parse_shm_params`] extracts the SHM base/size the host injected
 //!   via `/proc/cmdline` (`KTSTR_SHM_BASE` / `KTSTR_SHM_SIZE`).
+//!
+//! `/proc/self/exe` is read via `memmap2::Mmap` rather than
+//! `std::fs::read` so the kernel page cache backs the bytes goblin
+//! parses; for coverage-instrumented binaries (hundreds of MiB up to
+//! ~1 GiB) this avoids the heap allocation + copy of the entire
+//! binary on every flush. The ELF is parsed once and reused across
+//! [`pie_load_bias`] and [`find_symbol_vaddrs`] so a single
+//! `goblin::elf::Elf::parse` covers both lookups.
 
 use anyhow::{Context, Result};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use crate::vmm;
@@ -39,13 +60,15 @@ pub(crate) const MSG_TYPE_PROFRAW: u32 = u32::from_be_bytes(*b"PRAW");
 
 /// Flush LLVM coverage profraw to the SHM ring buffer.
 ///
-/// Sets `LLVM_PROFILE_FILE` and calls `__llvm_profile_initialize` to
-/// configure the output path, then `__llvm_profile_write_file` to write
-/// profraw to a tmpfs file inside the guest. Reads the file back and
-/// writes the contents to the SHM ring for host-side extraction.
+/// Resolves `__llvm_profile_get_size_for_buffer` and
+/// `__llvm_profile_write_buffer` from the test binary's `.symtab`,
+/// allocates a heap buffer of the reported size, calls
+/// `__llvm_profile_write_buffer` to serialize the profile counters
+/// into it, and publishes the buffer through the SHM ring for
+/// host-side extraction.
 ///
 /// All symbols have hidden visibility in compiler-rt, so we resolve
-/// them via ELF .symtab parsing (dlsym cannot find hidden symbols).
+/// them via ELF `.symtab` parsing (dlsym cannot find hidden symbols).
 ///
 /// No-op when built without `-C instrument-coverage` or when SHM
 /// parameters are absent from the kernel command line.
@@ -54,59 +77,86 @@ pub(crate) fn try_flush_profraw() {
         return;
     }
 
-    let exe = match std::fs::read("/proc/self/exe") {
-        Ok(data) => data,
+    // Memory-map the test binary's executable image. memmap2's `Mmap`
+    // borrows from the underlying file mapping; the page cache is the
+    // backing store, so goblin's parse + symtab walk reads pages on
+    // demand instead of paying for a full read+copy of the (possibly
+    // ~1 GiB) coverage-instrumented binary.
+    //
+    // SAFETY: `/proc/self/exe` is a kernel symlink to the running
+    // binary's underlying file (proc(5)); File::open captures an fd
+    // that pins the inode for the mmap's lifetime, so even a concurrent
+    // binary replacement on disk leaves the mapped pages valid. No part
+    // of ktstr or its callers writes to the test binary during a run,
+    // satisfying memmap2's no-concurrent-modification invariant.
+    let exe_file = match File::open("/proc/self/exe") {
+        Ok(f) => f,
         Err(_) => return,
     };
-    let slide = pie_load_bias(&exe);
+    let mmap = match unsafe { memmap2::Mmap::map(&exe_file) } {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let bytes: &[u8] = &mmap;
 
-    // Resolve both symbols in a single pass through the ELF .symtab.
+    // Parse the ELF once and reuse it for both `pie_load_bias` and
+    // `find_symbol_vaddrs`; a second parse cost a measurable share of
+    // teardown latency on coverage builds.
+    let elf = match goblin::elf::Elf::parse(bytes) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let slide = pie_load_bias(&elf);
+
+    // Resolve both buffer-API symbols in a single pass through the
+    // ELF .symtab.
     let vaddrs = find_symbol_vaddrs(
-        &exe,
-        &["__llvm_profile_initialize", "__llvm_profile_write_file"],
+        &elf,
+        &[
+            "__llvm_profile_get_size_for_buffer",
+            "__llvm_profile_write_buffer",
+        ],
     );
 
-    // Set profraw output path, then call __llvm_profile_initialize to
-    // read it and register the atexit handler.
-    // SAFETY: single-threaded guest dispatch context.
-    unsafe { std::env::set_var("LLVM_PROFILE_FILE", "/tmp/ktstr.profraw") };
-    if let Some(vaddr) = vaddrs[0]
-        && vaddr != 0
-    {
-        let f: extern "C" fn() =
-            unsafe { std::mem::transmute((vaddr as usize).wrapping_add(slide)) };
-        f();
-    }
-
-    // Write profraw to the file.
-    let write_file_vaddr = match vaddrs[1] {
+    let size_vaddr = match vaddrs[0] {
         Some(v) if v != 0 => v,
         _ => return,
     };
-    let write_file: extern "C" fn() -> i32 =
-        unsafe { std::mem::transmute((write_file_vaddr as usize).wrapping_add(slide)) };
-    if write_file() != 0 {
+    let write_vaddr = match vaddrs[1] {
+        Some(v) if v != 0 => v,
+        _ => return,
+    };
+
+    // SAFETY: vaddr + slide is the runtime address of the
+    // hidden-visibility compiler-rt entry point with the C signature
+    // `uint64_t (void)`; treating it as `extern "C" fn() -> u64`
+    // matches that ABI. The dispatch context is single-threaded.
+    let get_size: extern "C" fn() -> u64 =
+        unsafe { std::mem::transmute((size_vaddr as usize).wrapping_add(slide)) };
+    // SAFETY: same, for `int (char *)` → `extern "C" fn(*mut c_char) -> i32`.
+    let write_buffer: extern "C" fn(*mut std::os::raw::c_char) -> i32 =
+        unsafe { std::mem::transmute((write_vaddr as usize).wrapping_add(slide)) };
+
+    let needed = get_size() as usize;
+    if needed == 0 {
         return;
     }
 
-    // Read the profraw file and send through SHM ring.
-    let data = match std::fs::read("/tmp/ktstr.profraw") {
-        Ok(d) if !d.is_empty() => d,
-        _ => return,
-    };
-    vmm::shm_ring::write_msg(MSG_TYPE_PROFRAW, &data);
+    let mut buf: Vec<u8> = vec![0u8; needed];
+    // `__llvm_profile_write_buffer` returns 0 on success.
+    if write_buffer(buf.as_mut_ptr().cast::<std::os::raw::c_char>()) != 0 {
+        return;
+    }
+
+    vmm::shm_ring::write_msg(MSG_TYPE_PROFRAW, &buf);
 }
 
 /// Resolve multiple symbol virtual addresses in a single pass through
 /// the ELF .symtab. Returns addresses in the same order as `names`.
-pub(crate) fn find_symbol_vaddrs(data: &[u8], names: &[&str]) -> Vec<Option<u64>> {
+pub(crate) fn find_symbol_vaddrs(elf: &goblin::elf::Elf<'_>, names: &[&str]) -> Vec<Option<u64>> {
     let mut results = vec![None; names.len()];
     let mut remaining = names.len();
-
-    let elf = match goblin::elf::Elf::parse(data) {
-        Ok(e) => e,
-        Err(_) => return results,
-    };
 
     for sym in elf.syms.iter() {
         if remaining == 0 {
@@ -138,12 +188,7 @@ pub(crate) fn find_symbol_vaddrs(data: &[u8], names: &[&str]) -> Vec<Option<u64>
 /// offset from e_phoff.
 ///
 /// Returns 0 for ET_EXEC (non-PIE), where st_value is already absolute.
-pub(crate) fn pie_load_bias(data: &[u8]) -> usize {
-    let elf = match goblin::elf::Elf::parse(data) {
-        Ok(e) => e,
-        Err(_) => return 0,
-    };
-
+pub(crate) fn pie_load_bias(elf: &goblin::elf::Elf<'_>) -> usize {
     if elf.header.e_type != goblin::elf::header::ET_DYN {
         return 0;
     }
@@ -343,8 +388,9 @@ mod tests {
     fn find_symbol_vaddrs_resolves_known_symbol() {
         let exe = crate::resolve_current_exe().unwrap();
         let data = std::fs::read(&exe).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
         // "main" is present in the symtab of any Rust test binary.
-        let results = find_symbol_vaddrs(&data, &["main"]);
+        let results = find_symbol_vaddrs(&elf, &["main"]);
         assert_eq!(results.len(), 1);
         assert!(
             results[0].is_some(),
@@ -357,7 +403,8 @@ mod tests {
     fn find_symbol_vaddrs_missing_symbol_returns_none() {
         let exe = crate::resolve_current_exe().unwrap();
         let data = std::fs::read(&exe).unwrap();
-        let results = find_symbol_vaddrs(&data, &["__nonexistent_symbol_xyz__"]);
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let results = find_symbol_vaddrs(&elf, &["__nonexistent_symbol_xyz__"]);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_none());
     }
@@ -366,9 +413,92 @@ mod tests {
     fn find_symbol_vaddrs_mixed_results() {
         let exe = crate::resolve_current_exe().unwrap();
         let data = std::fs::read(&exe).unwrap();
-        let results = find_symbol_vaddrs(&data, &["main", "__nonexistent_symbol_xyz__"]);
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let results = find_symbol_vaddrs(&elf, &["main", "__nonexistent_symbol_xyz__"]);
         assert_eq!(results.len(), 2);
         assert!(results[0].is_some(), "main should resolve");
         assert!(results[1].is_none(), "nonexistent should not resolve");
+    }
+
+    // -- pie_load_bias --
+
+    /// `pie_load_bias` on the running test binary returns a non-zero
+    /// slide. Rust's default release/test build is PIE (`ET_DYN`), and
+    /// on a stock Linux kernel (`randomize_va_space=2`) ASLR places
+    /// the image at a random base, so `runtime_phdr - file_phdr_offset`
+    /// is virtually always a large non-zero value. Guards both that
+    /// the function takes the ET_DYN path AND that the AT_PHDR /
+    /// e_phoff arithmetic produces something usable.
+    #[test]
+    fn pie_load_bias_returns_nonzero_slide_on_pie_test_binary() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let data = std::fs::read(&exe).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        // Sanity: the test binary really is ET_DYN. If a future
+        // toolchain change flips the default to ET_EXEC, this guard
+        // surfaces the change before the slide assertion fails for
+        // the wrong reason.
+        assert_eq!(
+            elf.header.e_type,
+            goblin::elf::header::ET_DYN,
+            "Rust test binaries default to PIE (ET_DYN); got e_type={}",
+            elf.header.e_type,
+        );
+        let slide = pie_load_bias(&elf);
+        assert_ne!(
+            slide, 0,
+            "ET_DYN binary under default ASLR must produce a non-zero \
+             load bias; if this assertion fails check that \
+             /proc/sys/kernel/randomize_va_space is non-zero",
+        );
+    }
+
+    /// Mutating `e_type` to ET_EXEC routes `pie_load_bias` through
+    /// the early-exit branch and returns 0 — the contract for non-PIE
+    /// binaries where `st_value` is already absolute.
+    ///
+    /// The mutation writes `ET_EXEC` (= 2) into the `e_type` field at
+    /// byte offset 16 (= `SIZEOF_IDENT` in `goblin::elf::header`).
+    /// Endianness is chosen from `e_ident[EI_DATA]` (= byte 5, see
+    /// `EI_DATA`, `ELFDATA2LSB`, `ELFDATA2MSB` in
+    /// `goblin::elf::header`) so the test
+    /// works on both little-endian (x86_64, aarch64) and big-endian
+    /// hosts. Re-parsing the mutated buffer yields a synthetic
+    /// `Elf<'_>` whose header reports ET_EXEC; everything else
+    /// (sections, segments, strtab) stays consistent because we only
+    /// touched the type byte.
+    #[test]
+    fn pie_load_bias_returns_zero_for_et_exec() {
+        let exe = crate::resolve_current_exe().unwrap();
+        let mut data = std::fs::read(&exe).unwrap();
+
+        // EI_DATA byte tells us the file's endianness.
+        let little_endian = match data[goblin::elf::header::EI_DATA] {
+            goblin::elf::header::ELFDATA2LSB => true,
+            goblin::elf::header::ELFDATA2MSB => false,
+            other => panic!("unexpected EI_DATA byte: 0x{other:02x}"),
+        };
+        let et_exec_bytes: [u8; 2] = if little_endian {
+            goblin::elf::header::ET_EXEC.to_le_bytes()
+        } else {
+            goblin::elf::header::ET_EXEC.to_be_bytes()
+        };
+        // e_type sits immediately after e_ident (which is SIZEOF_IDENT
+        // = 16 bytes). Overwrite both bytes of the u16.
+        data[goblin::elf::header::SIZEOF_IDENT] = et_exec_bytes[0];
+        data[goblin::elf::header::SIZEOF_IDENT + 1] = et_exec_bytes[1];
+
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        assert_eq!(
+            elf.header.e_type,
+            goblin::elf::header::ET_EXEC,
+            "byte mutation should have made the parsed header report ET_EXEC",
+        );
+        assert_eq!(
+            pie_load_bias(&elf),
+            0,
+            "ET_EXEC binary must short-circuit to 0; absolute st_value \
+             needs no slide",
+        );
     }
 }

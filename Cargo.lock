@@ -2939,6 +2939,7 @@ dependencies = [
  "llama-cpp-2",
  "lz4_flex",
  "memchr",
+ "memmap2",
  "nix 0.31.2",
  "object",
  "opendal",

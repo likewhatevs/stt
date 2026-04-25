@@ -65,6 +65,14 @@ polars = { version = "0.53.0", default-features = false, features = ["lazy", "de
 linkme = "0.3"
 ktstr-macros = { version = "0.4.8", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
+# Memory-map /proc/self/exe in `try_flush_profraw` instead of reading
+# the whole binary into a Vec<u8>. Coverage-instrumented test binaries
+# are large (hundreds of MiB to ~1 GiB), and the read+copy cost on the
+# guest's coverage-flush path was a measurable share of teardown
+# latency. Already in the dep tree transitively (blazesym, gix); pinned
+# here so `src/test_support/profraw.rs` doesn't depend on either crate's
+# re-export surface.
+memmap2 = "0.9"
 # DWARF parser for resolving struct-member offsets in jemalloc's tsd_t
 # at probe time (jemalloc-probe binary). Already present transitively
 # via blazesym; pinned as a direct dep so the probe's offset-recovery
