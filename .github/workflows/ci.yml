@@ -51,10 +51,10 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Install ktstr
-        run: cargo install --path . --locked
+        run: cargo install --path . --locked --features mkl
       - name: Build test kernel
         run: cargo ktstr kernel build ${{ matrix.kernel-version }}
-      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
+      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration,mkl
       - name: Test statistics
         if: ${{ !cancelled() }}
         run: cargo ktstr stats
@@ -117,10 +117,10 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - name: Install ktstr
-        run: cargo install --path . --locked
+        run: cargo install --path . --locked --features mkl
       - name: Build test kernel
         run: cargo ktstr kernel build
-      - run: cargo ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
+      - run: cargo ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration,mkl --exclude-from-report scx-ktstr
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:

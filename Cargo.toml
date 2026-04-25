@@ -163,6 +163,7 @@ panic = "abort"
 
 [features]
 integration = []
+mkl = ["candle/mkl", "candle-transformers/mkl", "candle-nn/mkl"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
