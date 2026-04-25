@@ -877,6 +877,31 @@ pub struct MetricHint {
 /// separate `WireMetricBounds` type is needed because `&'static
 /// MetricBounds` carries no string slices that would defeat
 /// serialization.
+///
+/// # Example
+///
+/// Schbench-style bounds: at least five percentile rows, every
+/// reported value non-negative (latencies cannot be negative
+/// microseconds), no upper magnitude cap because the value range
+/// scales with workload duration. The struct is `#[non_exhaustive]`
+/// to reserve room for future bound classes; out-of-crate callers
+/// construct values through the [`MetricBounds::new`] const
+/// constructor (or [`MetricBounds::NONE`] for the all-disabled
+/// baseline).
+///
+/// ```
+/// use ktstr::test_support::MetricBounds;
+///
+/// const SCHBENCH_BOUNDS: MetricBounds =
+///     MetricBounds::new(Some(5), Some(0.0), None);
+/// ```
+///
+/// Attach to a payload via `metric_bounds: Some(&SCHBENCH_BOUNDS)`
+/// in the `Payload` struct literal (or via `#[derive(Payload)]`
+/// once the macro grows the `metric_bounds` attribute hook). The
+/// host's `host_side_llm_extract` reads the value off the
+/// `RawPayloadOutput` after extraction and surfaces one
+/// `AssertDetail` per bound violation.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct MetricBounds {
@@ -918,6 +943,23 @@ impl MetricBounds {
         value_min: None,
         value_max: None,
     };
+
+    /// Const constructor that takes all three bounds at once. The
+    /// only out-of-crate construction path (the struct itself is
+    /// `#[non_exhaustive]` so external callers cannot use struct-
+    /// literal syntax). Pass `None` to disable any individual
+    /// bound; pass `Some(value)` to enable it.
+    pub const fn new(
+        min_count: Option<usize>,
+        value_min: Option<f64>,
+        value_max: Option<f64>,
+    ) -> MetricBounds {
+        MetricBounds {
+            min_count,
+            value_min,
+            value_max,
+        }
+    }
 }
 
 /// Assertion check evaluated against an extracted

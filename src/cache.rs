@@ -2091,13 +2091,21 @@ pub(crate) fn resolve_cache_root_with_suffix(suffix: &str) -> anyhow::Result<Pat
 /// operator can fix HOME or set `KTSTR_CACHE_DIR` / `XDG_CACHE_HOME`
 /// instead.
 ///
-/// Three rejected shapes (full rationale in the body comments
+/// Four rejected shapes (full rationale in the body comments
 /// above [`resolve_cache_root_with_suffix`]'s HOME-fallback site,
 /// repeated near the matching check below):
-/// 1. Unset / empty (`std::env::var().unwrap_or_default()` collapses
-///    both `Err(NotPresent)` and `Ok("")` into `""`).
-/// 2. Literal `/` (root user / container init with no home).
-/// 3. Non-absolute (CWD-relative cache state — silently relocates).
+/// 1. **Unset** (`Err(NotPresent)` — HOME never assigned in the
+///    process environment). The body distinguishes this from the
+///    set-but-empty case with a dedicated diagnostic so the operator
+///    can tell whether the variable is missing entirely or assigned
+///    to the empty string by an inherited shell.
+/// 2. **Set-but-empty** (`Ok("")` — HOME assigned to the empty
+///    string, often by a shell rc file that did `export HOME=` to
+///    "unset" it). Same downstream effect as unset but a different
+///    operator-facing root cause.
+/// 3. **Literal `/`** (root user / container init with no home).
+/// 4. **Non-absolute** (CWD-relative cache state — silently
+///    relocates as the operator changes directories).
 ///
 /// Cases this gate INTENTIONALLY does not catch (`HOME=/nonexistent`,
 /// `HOME=/dev/null`, `HOME=/proc`, `HOME=//`, `HOME=/.`, etc.) are

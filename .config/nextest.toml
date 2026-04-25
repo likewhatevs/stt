@@ -50,6 +50,20 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 filter = "test(compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
+# Model-loaded integration tests: real CPU inference on the 2.44 GiB
+# Qwen3 GGUF runs the SAMPLE_LEN-token loop, which routinely takes
+# 2-5 minutes per call on host CPU. The default 60s × 2 budget
+# terminates these long before they finish; the override budgets
+# 600s × 2 (20 min total) so a slow CI runner with greedy sampling
+# on a 64-core box still completes inside the cap. Tests are
+# `#[ignore]`'d by default and only run via `--run-ignored=only` —
+# the override applies to ignored runs the same way nextest applies
+# any other override.
+[[profile.default.overrides]]
+filter = "test(model_loaded_)"
+slow-timeout = { period = "600s", terminate-after = 2 }
+retries = 0
+
 # ── vm-cli ───────────────────────────────────────────────────────────
 [test-groups.vm-cli]
 max-threads = 1

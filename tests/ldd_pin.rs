@@ -35,8 +35,14 @@
 //!
 //! # glibc version assumption
 //!
-//! The 3-entry baseline (libgcc_s.so.1, libm.so.6, libc.so.6)
-//! assumes **glibc >= 2.34**. Starting with 2.34 (released
+//! The 5-entry baseline (libgomp.so.1, libstdc++.so.6,
+//! libgcc_s.so.1, libm.so.6, libc.so.6) assumes **glibc >= 2.34**
+//! AND a host C++ runtime that ships libstdc++ + libgomp. The
+//! libgomp + libstdc++ entries are pulled by `llama-cpp-2`'s
+//! `openmp` feature: the upstream `llama-cpp-sys-2` build links
+//! the linked llama.cpp C++ sources, dragging libstdc++ in for
+//! the runtime, and the OpenMP-parallel matmul path drags libgomp
+//! in for the parallel runtime. Starting with glibc 2.34 (released
 //! 2021-08-01), glibc consolidated `libpthread.so.0`,
 //! `libdl.so.2`, `libutil.so.1`, and `libanl.so.1` into
 //! `libc.so.6`; a binary that pulls in any of those legacy libs

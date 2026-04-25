@@ -190,6 +190,25 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 ///   raw outputs still get extracted — dropping every extraction
 ///   because one orphan exists would lose information the test
 ///   author can still act on.
+/// - Per-payload bounds violation (when the payload declared
+///   `metric_bounds`, see [`crate::test_support::MetricBounds`]):
+///   each violation surfaces as its own detail via
+///   [`validate_metric_bounds`] — minimum metric count below the
+///   declared floor, value below `value_min`, value above
+///   `value_max`. The bounds pass runs AFTER the structural-sanity
+///   pass and ONLY when extraction succeeded; load-failed pairs
+///   skip the bounds check (the empty placeholder would otherwise
+///   spuriously trip a `min_count` violation on every offline-gated
+///   test).
+/// - Orphan `PayloadMetrics` (a guest-side LlmExtract emission
+///   produced an empty-metrics `PayloadMetrics` whose
+///   `payload_index` has NO matching `RawPayloadOutput` companion):
+///   the post-pairing scan flags the missing raw output. Most
+///   common cause is a CRC-bad raw-output message silently dropped
+///   during SHM drain — the drops counter only tracks ring-full
+///   in `shm_write`, so a CRC drop does NOT inflate `shm_drops`
+///   yet still loses the raw output. Pairs symmetrically with the
+///   raw-output orphan-pairing detail above.
 fn host_side_llm_extract(
     payload_metrics: &mut [crate::test_support::PayloadMetrics],
     raw_outputs: &[crate::test_support::RawPayloadOutput],
@@ -374,44 +393,43 @@ fn host_side_llm_extract(
     // Ambiguity disclosure: we cannot tell from PayloadMetrics
     // alone which empty-metrics entries were intended as
     // LlmExtract placeholders versus legitimate Json-with-no-leaves
-    // or ExitCode-only payloads. Surface ONLY when the test
-    // contains at least one LlmExtract pair (`raw_outputs` is
-    // non-empty), which means LlmExtract is exercised and a
-    // dropped raw-output is at least possible. The detail's prose
-    // calls out the ambiguity so an operator running a
-    // mixed-format test (LlmExtract + Json) can dismiss false
-    // positives. Surfaces as a single combined detail listing
-    // the suspicious indices rather than per-PM, keeping the
-    // failure-rendering compact when many empty PMs coexist.
-    if !raw_outputs.is_empty() {
-        let raw_indices: std::collections::HashSet<usize> =
-            raw_outputs.iter().map(|raw| raw.payload_index).collect();
-        let suspicious: Vec<usize> = payload_metrics
-            .iter()
-            .filter(|pm| pm.metrics.is_empty() && !raw_indices.contains(&pm.payload_index))
-            .map(|pm| pm.payload_index)
-            .collect();
-        if !suspicious.is_empty() {
-            failures.push(crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::Other,
-                format!(
-                    "LlmExtract host pairing: {} empty-metrics PayloadMetrics \
-                     entries at payload_index={:?} have no matching RawPayloadOutput. \
-                     If these were intended as LlmExtract payloads, the raw-output \
-                     SHM messages may have been silently dropped during drain \
-                     (CRC mismatch — the drop is invisible to the shm_drops \
-                     counter, which only tracks ring-full / overflow). Re-run; \
-                     transient CRC corruption is rare. False-positive case: a \
-                     `Json` payload with no numeric leaves and an `ExitCode` \
-                     payload both produce empty-metrics PayloadMetrics by design \
-                     and would also surface here in a mixed-format test — \
-                     dismiss this detail if your test mixes LlmExtract with \
-                     legitimately-empty other formats.",
-                    suspicious.len(),
-                    suspicious,
-                ),
-            ));
-        }
+    // or ExitCode-only payloads. We only reach this scan when
+    // `raw_outputs` is non-empty (the function early-returned at
+    // the top of the body when it was empty), so by construction
+    // the test exercises LlmExtract and a dropped raw-output is at
+    // least possible. The detail's prose calls out the ambiguity
+    // so an operator running a mixed-format test (LlmExtract + Json)
+    // can dismiss false positives. Surfaces as a single combined
+    // detail listing the suspicious indices rather than per-PM,
+    // keeping the failure-rendering compact when many empty PMs
+    // coexist.
+    let raw_indices: std::collections::HashSet<usize> =
+        raw_outputs.iter().map(|raw| raw.payload_index).collect();
+    let suspicious: Vec<usize> = payload_metrics
+        .iter()
+        .filter(|pm| pm.metrics.is_empty() && !raw_indices.contains(&pm.payload_index))
+        .map(|pm| pm.payload_index)
+        .collect();
+    if !suspicious.is_empty() {
+        failures.push(crate::assert::AssertDetail::new(
+            crate::assert::DetailKind::Other,
+            format!(
+                "LlmExtract host pairing: {} empty-metrics PayloadMetrics \
+                 entries at payload_index={:?} have no matching RawPayloadOutput. \
+                 If these were intended as LlmExtract payloads, the raw-output \
+                 SHM messages may have been silently dropped during drain \
+                 (CRC mismatch — the drop is invisible to the shm_drops \
+                 counter, which only tracks ring-full / overflow). Re-run; \
+                 transient CRC corruption is rare. False-positive case: a \
+                 `Json` payload with no numeric leaves and an `ExitCode` \
+                 payload both produce empty-metrics PayloadMetrics by design \
+                 and would also surface here in a mixed-format test — \
+                 dismiss this detail if your test mixes LlmExtract with \
+                 legitimately-empty other formats.",
+                suspicious.len(),
+                suspicious,
+            ),
+        ));
     }
 
     failures
@@ -852,14 +870,16 @@ pub(crate) fn run_ktstr_test_inner(
     // Broaden the calling thread's CPU mask before
     // `host_side_llm_extract` runs. After `vm.run()` the
     // BSP / vCPU 0 thread carries either:
-    //   - a single-CPU pin (perf-mode at vmm/mod.rs:2354 via
-    //     `pin_current_thread`) — LLM inference on 1 CPU is
-    //     dramatically slow (10x+ in throughput) and gives the
+    //   - a single-CPU pin (perf-mode path: the vmm `vm.run`
+    //     entry calls `pin_current_thread` to nail the BSP to one
+    //     CPU for ipi-latency stability) — LLM inference on 1 CPU
+    //     is dramatically slow (10x+ in throughput) and gives the
     //     other free host CPUs no work, OR
-    //   - a multi-CPU LLC-aware mask (no-perf-mode at
-    //     vmm/mod.rs:2356 via `set_thread_cpumask` against
-    //     `no_perf_plan.cpus`) — already pool-style, but narrower
-    //     than the host-allowed cpuset.
+    //   - a multi-CPU LLC-aware mask (no-perf-mode path: the vmm
+    //     applies `set_thread_cpumask` against the
+    //     `no_perf_plan.cpus` set so the BSP can roam within an
+    //     LLC) — already pool-style, but narrower than the
+    //     host-allowed cpuset.
     // Inference is a host-side post-VM-exit phase that doesn't
     // share the VM's measurement contract; it should use whatever
     // CPUs the host process is permitted on (cgroup cpuset / sudo
