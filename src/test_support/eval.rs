@@ -11,15 +11,12 @@
 //! Supporting items:
 //! - [`resolve_scheduler`] / [`resolve_test_kernel`] locate the
 //!   scheduler binary and kernel image from env + cache + filesystem.
-//! - [`nextest_setup`] is the `setup-script` entry point that warms the
-//!   SHM initramfs cache before nextest starts running tests.
 //! - [`scheduler_label`] formats the `[sched=...]` bracket in error
 //!   headers.
 //! - [`format_monitor_section`] and [`trim_settle_samples`] handle the
 //!   `--- monitor ---` block in failed-test output.
 
 use anyhow::{Context, Result};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::assert::AssertResult;
@@ -1141,6 +1138,52 @@ fn evaluate_vm_result(
             check_result.merge(AssertResult::fail(detail.clone()));
         }
 
+        // Cleanup-budget enforcement. When the entry sets
+        // `cleanup_budget` and `collect_results` produced a measurement
+        // (i.e. `run_vm` returned normally — see
+        // `VmResult::cleanup_duration`), fold a failing
+        // `AssertDetail` into the test verdict if teardown overran the
+        // budget. Skipped when either side is `None`: an absent budget
+        // means the entry opted out, an absent measurement means the
+        // run never reached `collect_results` (BSP panic propagated
+        // through `?`, or any pre-BSP setup error returning an `Err`
+        // before `VmRunState` is constructed). Note: a host-watchdog
+        // timeout is NOT a `None` case — `run_bsp_loop` exits cleanly
+        // with `timed_out = true` and `collect_results` still
+        // populates `cleanup_duration` to `Some(_)`, per the field
+        // contract documented at `src/vmm/mod.rs` for
+        // `VmResult::cleanup_duration`. The surrounding error path
+        // (BSP panic propagation, pre-BSP setup `Err`) already
+        // produces a failure verdict in the absent-measurement case,
+        // so a budget check here would double-report.
+        //
+        // Contract: this check only fires inside the parse-success arm
+        // (the `if let Ok(mut check_result)` above) — i.e. when the
+        // guest-side test body emitted a parseable AssertResult into
+        // SHM or COM2. Tests whose body panics or fails to write a
+        // result skip budget enforcement entirely; the watchdog
+        // timeout / no-parseable-result branch below produces its own
+        // verdict in those cases. Tests that opt into
+        // `cleanup_budget_ms` MUST ensure their body returns
+        // `Ok(AssertResult)` (e.g. `Ok(AssertResult::pass())`) before
+        // teardown begins, otherwise the budget knob is silently
+        // inert.
+        if let (Some(budget), Some(measured)) = (entry.cleanup_budget, result.cleanup_duration)
+            && measured > budget
+        {
+            check_result.merge(AssertResult::fail(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!(
+                    "vm cleanup overran budget: measured {:.3}s, budget {:.3}s. \
+                     Likely a regression in host-side teardown — investigate \
+                     the post-BSP-exit join/drain path \
+                     (`vmm::KtstrVm::collect_results`).",
+                    measured.as_secs_f64(),
+                    budget.as_secs_f64(),
+                ),
+            )));
+        }
+
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
@@ -1514,69 +1557,6 @@ fn ensure_kvm() -> Result<()> {
             "/dev/kvm not accessible — KVM is required for ktstr_test. \
              Check that KVM is enabled and your user is in the kvm group.",
         )?;
-    Ok(())
-}
-
-/// Setup function for nextest `setup-script` integration.
-///
-/// Validates KVM access, discovers a kernel, writes `KTSTR_TEST_KERNEL`
-/// to `env_writer`, and warms the SHM initramfs cache for each binary.
-pub fn nextest_setup(binaries: &[&Path], env_writer: &mut dyn Write) -> Result<()> {
-    ensure_kvm()?;
-    let kernel = resolve_test_kernel()?;
-    writeln!(env_writer, "KTSTR_TEST_KERNEL={}", kernel.display())
-        .context("write KTSTR_TEST_KERNEL to env")?;
-
-    for bin in binaries {
-        let key = vmm::BaseKey::new(bin, None, None, None)?;
-        let _ = vmm::get_or_build_base(bin, &[], &[], false, &key)?;
-    }
-
-    // Eager-conditional prefetch: if any registered test declares
-    // OutputFormat::LlmExtract, make sure the default model is in
-    // the cache before tests start. Fetch failures surface as a
-    // warning rather than a hard setup error so scheduler-only test
-    // runs remain decoupled from the model cache's availability;
-    // the LlmExtract invocation path fails loudly when the model is
-    // genuinely missing at test time.
-    //
-    // Channel policy for setup messages:
-    //
-    // * **Failure paths** dual-emit on stderr AND tracing —
-    //   `eprintln!` reaches nextest-direct users (no tracing
-    //   subscriber installed in the default test dispatch path), and
-    //   `tracing::{warn,error}!` reaches cargo-ktstr-wrapped runs
-    //   plus any external structured-log consumer. Both fire from
-    //   this module so the emit site is the single source of truth
-    //   for the message text.
-    // * **Success paths** are tracing-only HERE. The stderr line for
-    //   the cache-ready notice is owned by
-    //   [`super::model::prefetch_if_required`] and fires on cache
-    //   miss only (model.rs:`ktstr: model cache ready`) — emitting
-    //   `eprintln!` again at this call site would double-log on
-    //   every cold boot. The structured tracing line stays local so
-    //   observability consumers see an event whether the cache was
-    //   hit or missed.
-    //
-    // Do NOT "fix" this asymmetry by adding `eprintln!` to the Ok
-    // arm without deleting the one at model.rs — the duplication
-    // would be visible noise on every cold-start test run. If a
-    // future refactor consolidates the stderr emit to this site, it
-    // MUST remove the callee's eprintln in the same change.
-    match super::model::prefetch_if_required() {
-        Ok(Some(path)) => {
-            tracing::info!(path = %path.display(), "model cache ready");
-        }
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("ktstr_test: model prefetch failed; LlmExtract tests may fail: {e:#}");
-            tracing::warn!(
-                err = %format!("{e:#}"),
-                "model prefetch failed; LlmExtract tests may fail",
-            );
-        }
-    }
-
     Ok(())
 }
 
@@ -2101,25 +2081,6 @@ mod tests {
         );
     }
 
-    // -- nextest_setup --
-
-    #[test]
-    fn nextest_setup_writes_kernel_env() {
-        let _lock = lock_env();
-        let exe = crate::resolve_current_exe().unwrap();
-        let _env = EnvVarGuard::set("KTSTR_TEST_KERNEL", &exe);
-
-        let mut buf = Vec::new();
-        let result = nextest_setup(&[exe.as_path()], &mut buf);
-
-        assert!(result.is_ok(), "nextest_setup failed: {result:?}");
-        let output = String::from_utf8(buf).unwrap();
-        assert!(
-            output.starts_with("KTSTR_TEST_KERNEL="),
-            "expected KTSTR_TEST_KERNEL=..., got: {output}"
-        );
-    }
-
     // -- evaluate_vm_result error path tests --
 
     #[test]
@@ -2465,6 +2426,122 @@ mod tests {
         assert!(msg.contains("spread 45%"), "got: {msg}");
     }
 
+    /// Cleanup-budget enforcement: when the entry's `cleanup_budget`
+    /// is set and the run's measured `cleanup_duration` exceeds it,
+    /// `evaluate_vm_result` folds a failing `AssertDetail` (kind
+    /// `Other`) carrying the "vm cleanup overran budget" message into
+    /// the test verdict. The guest body returned a passing
+    /// `AssertResult` (so the parse-success arm is taken — the only
+    /// arm where this check fires, see the contract paragraph at
+    /// `evaluate_vm_result`'s budget block); the budget overshoot
+    /// flips the merged verdict to a failure, which propagates as a
+    /// `bail!` error string downstream.
+    #[test]
+    fn eval_cleanup_budget_overshoot_folds_failing_detail() {
+        let json = build_assert_result_json(true, vec![]);
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let mut entry = eevdf_entry("__eval_cleanup_overshoot__");
+        entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
+        let mut result = make_vm_result(&output, "", 0, false);
+        result.cleanup_duration = Some(std::time::Duration::from_secs(10));
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
+        let msg = format!(
+            "{}",
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &[],
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro,
+            )
+            .unwrap_err()
+        );
+        assert!(
+            msg.contains("vm cleanup overran budget"),
+            "budget-overshoot detail must surface in the error string, got: {msg}",
+        );
+        assert!(
+            msg.contains("measured 10.000s"),
+            "measured duration must be rendered, got: {msg}",
+        );
+        assert!(
+            msg.contains("budget 1.000s"),
+            "budget must be rendered, got: {msg}",
+        );
+    }
+
+    /// Cleanup-budget no-fire: when the run's `cleanup_duration` is
+    /// strictly under the entry's `cleanup_budget`, the guest's
+    /// passing `AssertResult` survives the merge and
+    /// `evaluate_vm_result` returns `Ok`. Verifies that
+    /// `measured < budget` passes without folding a fail; the exact
+    /// `measured == budget` boundary is covered separately by
+    /// [`eval_cleanup_budget_equal_passes`].
+    #[test]
+    fn eval_cleanup_budget_under_passes() {
+        let json = build_assert_result_json(true, vec![]);
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let mut entry = eevdf_entry("__eval_cleanup_under__");
+        entry.cleanup_budget = Some(std::time::Duration::from_secs(5));
+        let mut result = make_vm_result(&output, "", 0, false);
+        result.cleanup_duration = Some(std::time::Duration::from_millis(500));
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
+        assert!(
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &[],
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro,
+            )
+            .is_ok(),
+            "cleanup_duration under budget must keep the verdict Ok",
+        );
+    }
+
+    /// Cleanup-budget boundary pin: `measured == budget` must NOT
+    /// fold a fail because the enforcement at
+    /// `evaluate_vm_result`'s budget block uses strict `>`. A future
+    /// regression that flips the comparator to `>=` (or to `<` on the
+    /// pass-side) flips the verdict here, surfacing the bug. Together
+    /// with [`eval_cleanup_budget_overshoot_folds_failing_detail`] and
+    /// [`eval_cleanup_budget_under_passes`] this test pins the full
+    /// {<, ==, >} comparator triplet.
+    #[test]
+    fn eval_cleanup_budget_equal_passes() {
+        let json = build_assert_result_json(true, vec![]);
+        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let mut entry = eevdf_entry("__eval_cleanup_equal__");
+        entry.cleanup_budget = Some(std::time::Duration::from_secs(5));
+        let mut result = make_vm_result(&output, "", 0, false);
+        result.cleanup_duration = Some(std::time::Duration::from_secs(5));
+        let assertions = crate::assert::Assert::NO_OVERRIDES;
+        assert!(
+            evaluate_vm_result(
+                &entry,
+                &result,
+                &assertions,
+                &[],
+                &[],
+                &[],
+                &EVAL_TOPO,
+                &[],
+                &no_repro,
+            )
+            .is_ok(),
+            "cleanup_duration EQUAL to budget must keep the verdict Ok \
+             (strict `>` comparator); a `>=` regression lands here",
+        );
+    }
+
     #[test]
     fn eval_assert_failure_includes_sched_log() {
         let json = build_assert_result_json(
@@ -2684,6 +2761,7 @@ mod tests {
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
+            cleanup_duration: None,
         };
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(
@@ -2990,6 +3068,7 @@ mod tests {
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
+            cleanup_duration: None,
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
@@ -3071,6 +3150,7 @@ mod tests {
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
+            cleanup_duration: None,
         };
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(

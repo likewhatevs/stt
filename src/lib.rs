@@ -438,13 +438,13 @@ pub mod prelude {
     // and a second prelude line would shadow harmlessly but add noise.
     //
     // The following items are intentionally NOT in the prelude. They
-    // are binary-entry helpers (the `ktstr` / `cargo-ktstr` bins),
-    // macro-generated glue the `#[ktstr_test]` expansion consumes, or
-    // nextest-setup-script entry points — audiences distinct from the
-    // test-author surface this module provides. Import directly from
-    // `ktstr::test_support::<item>` when needed:
+    // are binary-entry helpers (the `ktstr` / `cargo-ktstr` bins) or
+    // macro-generated glue the `#[ktstr_test]` expansion consumes —
+    // audiences distinct from the test-author surface this module
+    // provides. Import directly from `ktstr::test_support::<item>`
+    // when needed:
     // `newest_run_dir`, `runs_root`, `analyze_sidecars`, `ktstr_main`,
-    // `ktstr_test_early_dispatch`, `run_ktstr_test`, `nextest_setup`,
+    // `ktstr_test_early_dispatch`, `run_ktstr_test`,
     // `resolve_scheduler`, `resolve_test_kernel`.
     pub use crate::topology::{LlcInfo, NodeMemInfo, TestTopology};
     pub use crate::workload::{
@@ -573,6 +573,32 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
                 }
                 // Explicit cache key not found — skip general cache scan.
                 skip_cache_scan = true;
+            }
+            // Multi-kernel specs (`A..B` ranges, `git+URL#REF` sources)
+            // are only meaningful at the test/coverage/verifier
+            // subcommand entry points where the runner can fan out
+            // across kernels. The KTSTR_KERNEL env reader resolves a
+            // single kernel image for in-process use (BTF lookup,
+            // direct boot path) and has no dispatch loop, so a range
+            // or git spec here cannot be expanded.
+            //
+            // Run `validate()` first so an inverted range surfaces
+            // the specific "swap the endpoints" diagnostic instead
+            // of getting masked by the generic "not supported in
+            // env-var form" bail below — operators with a typo see
+            // the actionable fix; valid-but-unsupported specs get
+            // the generic redirect.
+            id @ (KernelId::Range { .. } | KernelId::Git { .. }) => {
+                if let Err(e) = id.validate() {
+                    anyhow::bail!("KTSTR_KERNEL={val}: {e}");
+                }
+                anyhow::bail!(
+                    "KTSTR_KERNEL={val}: multi-kernel specs (ranges, \
+                     git sources) are not supported in env-var form. \
+                     Use --kernel on the test/coverage/verifier \
+                     subcommands, or set KTSTR_KERNEL to a single \
+                     version, cache key, or path."
+                );
             }
         }
     }

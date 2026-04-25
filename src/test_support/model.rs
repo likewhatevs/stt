@@ -25,28 +25,16 @@
 //! pin, so a killed process never leaves a partial file masquerading
 //! as a cached model.
 //!
-//! # Eager-conditional prefetch
+//! # Lazy model load
 //!
-//! [`prefetch_if_required`] scans [`KTSTR_TESTS`] for any registered
-//! entry whose payload or workloads declare
-//! [`OutputFormat::LlmExtract`] and invokes [`ensure`] when at least
-//! one match is found. Offline runs set `KTSTR_MODEL_OFFLINE=1` to
-//! skip the fetch entirely; a missing model then surfaces as a
-//! per-test failure rather than a nextest setup abort, which matches
-//! the semantics test authors already expect from other offline env
-//! gates.
-//!
-//! # Wiring into `nextest_setup`
-//!
-//! [`prefetch_if_required`] is invoked by
-//! [`nextest_setup`](crate::test_support::nextest_setup) during
-//! nextest's test-setup phase, after the kernel + initramfs warm
-//! but before any test body executes. Tests that need
-//! `OutputFormat::LlmExtract` therefore observe the model either
-//! already cached on disk or missing with a surfaced fetch error —
-//! they never race against a half-downloaded artifact. Tests that
-//! do not declare LlmExtract skip the prefetch entirely thanks to
-//! [`any_test_requires_model`]'s scan.
+//! There is no eager prefetch step. The model is loaded on first
+//! [`extract_via_llm`] call by [`load_inference`]'s `ensure(&DEFAULT_MODEL)`
+//! invocation, which fetches the GGUF on cache miss, SHA-checks the
+//! cached file on hit, and respects `KTSTR_MODEL_OFFLINE=1` (offline
+//! runs skip the fetch and surface a per-test load failure). The first
+//! LlmExtract test in the process pays the cold-cache fetch + SHA-verify
+//! cost (seconds on warm cache, minutes on cold cache with download);
+//! subsequent tests see the memoized result.
 //!
 //! # LlmExtract extraction pipeline
 //!
@@ -98,14 +86,10 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use llama_cpp_2::llama_backend::LlamaBackend;
-
-use super::KTSTR_TESTS;
-use super::payload::OutputFormat;
 
 /// Process-wide [`LlamaBackend`] handle. The llama.cpp C library uses
 /// a single global init/teardown pair (`llama_backend_init` /
@@ -250,23 +234,6 @@ fn prompt_excerpt(prompt: &str) -> String {
     prompt[..end].to_string()
 }
 
-/// Set by [`prefetch_if_required`] when [`ensure`] succeeds for
-/// [`DEFAULT_MODEL`]; read by [`load_inference`] to skip the
-/// redundant SHA hash. Cleared by [`reset`] alongside
-/// [`MODEL_CACHE`] so cfg(test) callers that re-flip
-/// `KTSTR_MODEL_OFFLINE` do not observe a stale "prefetch ran
-/// successfully" signal that would route the next `load_inference`
-/// through `locate()` and bypass the offline gate that [`ensure`]
-/// enforces.
-///
-/// Set only on the success path of `prefetch_if_required` — after
-/// `ensure(&DEFAULT_MODEL)` returns `Ok`.
-///
-/// Stays `false` on every prefetch short-circuit (no-test-needs-it,
-/// offline gate, ensure error) so `load_inference` falls back to
-/// [`ensure`] and first-use SHA checking still happens.
-static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
-
 /// Process-wide memoized inference state.
 ///
 /// The outer `Mutex` serializes initialization and gates access to the
@@ -345,11 +312,9 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// This is deliberate — the single-loader contract is what gives
 /// the cached `Arc<CachedInference>` its "load exactly once per
 /// process" invariant and avoids paying 2+ GiB of wasted load
-/// work per additional concurrent first-caller. `nextest_setup`
-/// (the top-level-script hook) kicks the load before any test
-/// thread starts so nextest-direct runs never hit this path;
-/// cargo-test-direct runs or test harnesses that skip the hook
-/// pay the serialization cost once.
+/// work per additional concurrent first-caller. The first
+/// `LlmExtract` test in a process pays the load cost once;
+/// subsequent tests reuse the memoized [`MODEL_CACHE`] slot.
 ///
 /// The inner `Mutex<LoadedInference>` is held for the full duration
 /// of a generation pass and serializes concurrent inference calls
@@ -410,11 +375,10 @@ static PREFETCH_CHECKED: AtomicBool = AtomicBool::new(false);
 ///   page cache, leaving llama.cpp's mmap to thrash and produce a
 ///   read failure) sticks for the whole process even after memory
 ///   pressure clears.
-/// * **Tempfile race during prefetch** — if the eager
-///   `prefetch_if_required` path landed a partial file under the
-///   pinned name and the loader saw a truncated read, the cached
-///   Err sticks until process exit even if a later writer
-///   completes the file under the same path.
+/// * **Tempfile race during fetch** — if [`ensure`] landed a
+///   partial file under the pinned name and the loader saw a
+///   truncated read, the cached Err sticks until process exit
+///   even if a later writer completes the file under the same path.
 /// * **NFS file-handle stale** after a server-side rename — the
 ///   first `read` returns ESTALE, that error memoizes, and every
 ///   later call observes it even after the client revalidates
@@ -683,10 +647,10 @@ const _: () = {
     }
 };
 
-/// Environment variable that opts out of the eager prefetch.
+/// Environment variable that opts out of the lazy model fetch.
 /// `KTSTR_MODEL_OFFLINE=1` (or any non-empty value) leaves the cache
 /// untouched; `LlmExtract` tests then surface missing-model errors
-/// at invocation time instead of at nextest setup.
+/// at `ensure()` invocation time instead of fetching the GGUF on demand.
 pub const OFFLINE_ENV: &str = "KTSTR_MODEL_OFFLINE";
 
 /// Environment variable that opts into raw-response tracing for
@@ -734,29 +698,9 @@ fn env_value_is_opt_in(val: Option<&str>) -> bool {
     matches!(val, Some(s) if !s.is_empty())
 }
 
-/// "Does this status probe say the cache needs fetching?" —
-/// extracted from [`prefetch_if_required`] so the
-/// error-resilience contract is unit-testable without touching
-/// the real cache directory.
-///
-/// The contract:
-/// - `Ok(Matches)` → `false` (cache is valid, no fetch)
-/// - `Ok(Mismatches)` / `Ok(NotCached)` / `Ok(CheckFailed)` → `true`
-/// - `Err(_)` → `false` — a status probe error is **non-fatal**.
-///   Prefetch skips the announcement for this artifact and falls
-///   through to [`ensure`], which surfaces the real error with
-///   full context (see the doc block at the probe site in
-///   `prefetch_if_required`). Treating `Err` as "fetch needed"
-///   would double-announce (probe-side false positive + ensure
-///   re-surface) and obscure the true failure.
-fn status_indicates_fetch_needed(st: &Result<ModelStatus>) -> bool {
-    matches!(st, Ok(s) if !s.sha_verdict.is_match())
-}
-
 /// Read [`OFFLINE_ENV`] and return the trimmed value IFF it is set
 /// to a non-empty string. Centralizes the "non-empty env-var means
-/// opt-in" predicate used by [`ensure`] and [`prefetch_if_required`]
-/// so the condition stays uniform (e.g. both treat
+/// opt-in" predicate used by [`ensure`] (treating
 /// `KTSTR_MODEL_OFFLINE=` as "not set" — the empty-string case).
 ///
 /// Returns `None` when the env var is absent or set to empty
@@ -854,8 +798,7 @@ impl ShaVerdict {
 
     /// Whether the cached file passed its SHA-256 check. `true`
     /// iff the variant is [`Self::Matches`]. [`ensure`]'s fast path
-    /// and the lazy-prefetch probe in [`prefetch_if_required`] gate
-    /// on this. Named `is_match` (not `matches`) to match the
+    /// gates on this. Named `is_match` (not `matches`) to match the
     /// `is_*` accessor convention used by sibling enums
     /// (e.g. `KconfigStatus::{is_stale, is_untracked}` and the
     /// `ShaVerdict::is_cached` accessor right above) and to avoid
@@ -1006,23 +949,21 @@ fn compute_sha_verdict(
 }
 
 /// Return the on-disk path the spec would occupy and the outcome
-/// of the SHA-256 integrity check as a [`ShaVerdict`]. Used by both
-/// the CLI's `model status` subcommand and the eager prefetch
-/// fast-path. Uses the warm-cache sidecar short-circuit for
-/// responsiveness; see [`compute_sha_verdict`] for the strict-
-/// integrity alternative consumed by [`ensure`].
+/// of the SHA-256 integrity check as a [`ShaVerdict`]. Used by the
+/// CLI's `model status` subcommand. Uses the warm-cache sidecar
+/// short-circuit for responsiveness; see [`compute_sha_verdict`] for
+/// the strict-integrity alternative consumed by [`ensure`].
 pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
     let root = resolve_cache_root()?;
     let path = root.join(spec.file_name);
     // `status()` uses the warm-cache sidecar fast path because its
-    // caller (the CLI `model status` subcommand, the eager
-    // prefetch, and operators running `cargo ktstr model status`)
-    // want an inexpensive "is the cache healthy enough to skip
-    // re-fetching" answer. `ensure()`, the integrity gate that
-    // hands out the cached path to downstream LlmExtract, calls
-    // [`compute_sha_verdict`] with `use_sidecar_fastpath = false`
-    // to bypass the sidecar and re-hash, trading the ~10s SHA
-    // walk for strict integrity.
+    // callers (the CLI `model status` subcommand and operators running
+    // `cargo ktstr model status`) want an inexpensive "is the cache
+    // healthy enough to skip re-fetching" answer. `ensure()`, the
+    // integrity gate that hands out the cached path to downstream
+    // LlmExtract, calls [`compute_sha_verdict`] with
+    // `use_sidecar_fastpath = false` to bypass the sidecar and
+    // re-hash, trading the ~10s SHA walk for strict integrity.
     let sha_verdict = compute_sha_verdict(&path, spec, true)?;
     Ok(ModelStatus {
         spec: *spec,
@@ -1744,145 +1685,6 @@ fn reject_insecure_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// True iff any entry in `KTSTR_TESTS` declares
-/// [`OutputFormat::LlmExtract`] on its primary payload or any
-/// workload. The prefetcher uses this to decide whether the fetch is
-/// worth attempting — a scheduler-only or binary-only test run does
-/// not need the model.
-///
-/// Per-binary scope: each integration-test binary links its own
-/// `KTSTR_TESTS` distributed slice, so this predicate answers the
-/// question for the calling binary's inventory, not for the project
-/// as a whole. An integration test that declares `LlmExtract`
-/// (e.g. `tests/llm_extract_e2e_test.rs`) makes its binary's
-/// `any_test_requires_model()` return `true`; a scheduler-only
-/// binary (e.g. `tests/eevdf_tests.rs`) leaves it at `false`.
-pub fn any_test_requires_model() -> bool {
-    entries_require_model(KTSTR_TESTS.iter())
-}
-
-/// Predicate core for [`any_test_requires_model`]. Extracted so unit
-/// tests can exercise both the positive (LlmExtract entry present)
-/// and negative (empty / non-LlmExtract inventory) arms against
-/// synthetic `KtstrTestEntry` lists — the real [`KTSTR_TESTS`]
-/// slice for the lib-crate test binary carries only the
-/// `__unit_test_dummy__` sentinel, so without this seam the
-/// `returns true` arm would have no in-tree test able to reach it.
-fn entries_require_model<'a, I>(entries: I) -> bool
-where
-    I: Iterator<Item = &'a super::KtstrTestEntry>,
-{
-    entries.into_iter().any(|entry| {
-        let primary_needs = entry
-            .payload
-            .is_some_and(|p| matches!(p.output, OutputFormat::LlmExtract(_)));
-        let workload_needs = entry
-            .workloads
-            .iter()
-            .any(|w| matches!(w.output, OutputFormat::LlmExtract(_)));
-        primary_needs || workload_needs
-    })
-}
-
-/// Prefetch [`DEFAULT_MODEL`] when at least one registered test
-/// needs the LlmExtract backend. No-op when `KTSTR_MODEL_OFFLINE` is
-/// set or no test declares [`OutputFormat::LlmExtract`].
-///
-/// The GGUF carries its own tokenizer surface, so prefetch only has
-/// the single weight artifact to fetch.
-///
-/// On success sets [`PREFETCH_CHECKED`] so [`load_inference`] can
-/// skip re-hashing.
-///
-/// Returns `Ok(None)` when no fetch was attempted; `Ok(Some(path))`
-/// with the model path on success; `Err` on fetch/check failure.
-pub fn prefetch_if_required() -> Result<Option<PathBuf>> {
-    if !any_test_requires_model() {
-        return Ok(None);
-    }
-    if let Some(v) = read_offline_env() {
-        let v_safe = sanitize_env_value(&v);
-        // Dual-emit: stderr for nextest-direct first-time-user
-        // visibility (no tracing subscriber is installed in the
-        // test-support dispatch path), tracing for structured-log
-        // consumers (cargo-ktstr, downstream pipelines).
-        eprintln!(
-            "ktstr_test: LlmExtract offline gate set ({OFFLINE_ENV}={v_safe}); skipping model prefetch"
-        );
-        tracing::warn!(
-            env_var = OFFLINE_ENV,
-            value = %v_safe,
-            "offline gate set; skipping eager model prefetch",
-        );
-        return Ok(None);
-    }
-    // Probe cache status before kicking off the (potentially
-    // ~2-minute, ~2.4 GiB) download so first-time users get a line
-    // of feedback instead of staring at a silent stall. Any status
-    // error here is non-fatal — we fall through to `ensure`, which
-    // surfaces the real failure with full context. On an already-
-    // populated cache the probe succeeds with
-    // `s.sha_verdict.is_match()` and we skip the announcement
-    // entirely, matching the existing "zero noise on cache hit"
-    // semantics.
-    let model_missing = status_indicates_fetch_needed(&status(&DEFAULT_MODEL));
-    let expected_total = DEFAULT_MODEL.size_bytes;
-    if model_missing {
-        // Render size via indicatif::HumanBytes so the value stays
-        // in lockstep with `ModelSpec::size_bytes`; a hardcoded
-        // "~2.4 GiB" literal drifted every time the pin rotated.
-        eprintln!(
-            "ktstr_test: downloading LlmExtract model (~{}; first run only) …",
-            indicatif::HumanBytes(expected_total),
-        );
-        tracing::info!(
-            model_missing,
-            expected_total_bytes = expected_total,
-            "downloading LlmExtract model on first run",
-        );
-    }
-    let model_path = ensure(&DEFAULT_MODEL)?;
-    // Release pairs with Acquire in load_inference to establish
-    // happens-before between the ensure-side filesystem writes
-    // (tempfile persist) and the fast-path reader.
-    PREFETCH_CHECKED.store(true, Ordering::Release);
-    if model_missing {
-        // Dual-emit the completion signal so structured-log
-        // consumers (cargo-ktstr, downstream pipelines) see both
-        // start and end of the prefetch phase — symmetric with
-        // the `tracing::info!` at the download-announcement site
-        // above.
-        eprintln!("ktstr_test: model cache ready");
-        tracing::info!(
-            model_path = %model_path.display(),
-            expected_total_bytes = expected_total,
-            "LlmExtract model cache ready",
-        );
-    }
-    Ok(Some(model_path))
-}
-
-/// Resolve the cache path for `spec` without re-hashing. Fails if
-/// the file is missing.
-///
-/// Callers must have already SHA-checked the artifact in this
-/// process (via [`prefetch_if_required`]); otherwise use [`ensure`]
-/// so the first use triggers a SHA check.
-fn locate(spec: &ModelSpec) -> Result<PathBuf> {
-    let root = resolve_cache_root()?;
-    let path = root.join(spec.file_name);
-    if !path.is_file() {
-        anyhow::bail!(
-            "model '{}' not present at {} — was SHA-checked earlier in this process \
-             but has since been removed; re-run to re-fetch, or check whether another \
-             process cleared the cache",
-            spec.file_name,
-            path.display(),
-        );
-    }
-    Ok(path)
-}
-
 // ---------------------------------------------------------------------------
 // LlmExtract runtime
 // ---------------------------------------------------------------------------
@@ -2170,9 +1972,9 @@ struct LoadedInference {
 
 /// Load the bundled Qwen3 weights via `llama-cpp-2`.
 ///
-/// When [`PREFETCH_CHECKED`] is set, uses [`locate`] and skips
-/// re-hashing the model's ~2.44 GiB. Otherwise falls back to
-/// [`ensure`] so first use triggers a SHA check.
+/// Resolves the cached model via [`ensure`] so first use triggers a
+/// SHA check; subsequent in-process calls hit the memoized
+/// [`MODEL_CACHE`] slot below and never re-enter this function.
 ///
 /// Production callers reach this only through [`memoized_inference`];
 /// [`MODEL_CACHE`] caches the returned `Result` (Ok or Err), so this
@@ -2180,20 +1982,15 @@ struct LoadedInference {
 /// hook is the sole way to clear the slot and re-enter this function.
 ///
 /// Errors surface through [`InferenceError`]: cache-resolution
-/// failures bubble out of `ensure()` / `locate()` as anyhow chains,
-/// while engine-level load failures wrap into
-/// [`InferenceError::ModelLoad`] carrying the resolved
-/// `PathBuf` plus the upstream `LlamaModelLoadError` source.
+/// failures bubble out of `ensure()` as anyhow chains, while engine-
+/// level load failures wrap into [`InferenceError::ModelLoad`]
+/// carrying the resolved `PathBuf` plus the upstream
+/// `LlamaModelLoadError` source.
 fn load_inference() -> anyhow::Result<LoadedInference> {
     use llama_cpp_2::model::LlamaModel;
     use llama_cpp_2::model::params::LlamaModelParams;
 
-    // Acquire pairs with the Release store in prefetch_if_required.
-    let model_path = if PREFETCH_CHECKED.load(Ordering::Acquire) {
-        locate(&DEFAULT_MODEL)?
-    } else {
-        ensure(&DEFAULT_MODEL)?
-    };
+    let model_path = ensure(&DEFAULT_MODEL)?;
 
     // CPU-only: no GPU layer offload. The
     // process-wide `BACKEND` is a `OnceLock<LlamaBackend>` that
@@ -2502,9 +2299,9 @@ fn memoized_inference() -> Arc<CachedInference> {
     arc
 }
 
-/// Clear [`MODEL_CACHE`] and [`PREFETCH_CHECKED`] so the next
-/// [`extract_via_llm`] / [`load_inference`] call re-runs the load
-/// path end-to-end (including [`ensure`]'s offline-gate check).
+/// Clear [`MODEL_CACHE`] so the next [`extract_via_llm`] /
+/// [`load_inference`] call re-runs the load path end-to-end
+/// (including [`ensure`]'s offline-gate check).
 ///
 /// # When to call
 ///
@@ -2531,7 +2328,6 @@ fn memoized_inference() -> Arc<CachedInference> {
 /// affordance for re-exercising the load path.
 #[cfg(test)]
 pub(crate) fn reset() {
-    PREFETCH_CHECKED.store(false, Ordering::Release);
     MODEL_CACHE_LOAD_COUNT.store(0, Ordering::Relaxed);
     let mut guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
@@ -2735,62 +2531,6 @@ mod tests {
         assert!(env_value_is_opt_in(Some("true")));
         assert!(env_value_is_opt_in(Some("0"))); // deliberately opt-in: non-empty is the rule
         assert!(env_value_is_opt_in(Some("anything at all")));
-    }
-
-    /// Fabricate a `ModelStatus` with a chosen verdict — used by
-    /// the status-resilience tests below. Uses DEFAULT_MODEL's
-    /// static spec so `ModelSpec: Copy` is honoured and no real
-    /// filesystem access happens.
-    fn mock_status(verdict: ShaVerdict) -> ModelStatus {
-        ModelStatus {
-            spec: DEFAULT_MODEL,
-            path: PathBuf::from("/tmp/mock"),
-            sha_verdict: verdict,
-        }
-    }
-
-    /// `Ok(Matches)` must signal "no fetch needed" — this is the
-    /// warm-cache happy path. A regression that flipped the
-    /// polarity would re-download the model on every run.
-    #[test]
-    fn status_indicates_fetch_needed_ok_matches_false() {
-        assert!(!status_indicates_fetch_needed(&Ok(mock_status(
-            ShaVerdict::Matches
-        ))));
-    }
-
-    /// Every non-matching `Ok` verdict (Mismatches, NotCached,
-    /// CheckFailed) must return `true` so the prefetch announcer
-    /// fires. A regression that collapsed any of these into
-    /// "not needed" would silence the first-run download banner.
-    #[test]
-    fn status_indicates_fetch_needed_ok_non_matching_true() {
-        assert!(status_indicates_fetch_needed(&Ok(mock_status(
-            ShaVerdict::Mismatches
-        ))));
-        assert!(status_indicates_fetch_needed(&Ok(mock_status(
-            ShaVerdict::NotCached
-        ))));
-        assert!(status_indicates_fetch_needed(&Ok(mock_status(
-            ShaVerdict::CheckFailed("io error".into()),
-        ))));
-    }
-
-    /// A status probe error (`resolve_cache_root` fail, malformed
-    /// pin, etc.) must NOT cause prefetch_if_required to report
-    /// "fetch needed" — the error path is non-fatal and the
-    /// downstream `ensure()` call re-surfaces the real failure
-    /// with richer context. Returning `true` here would
-    /// double-announce and obscure the true error. Pins the
-    /// error-resilience contract documented at the probe call
-    /// site.
-    #[test]
-    fn status_indicates_fetch_needed_err_is_false() {
-        let err: Result<ModelStatus> = Err(anyhow::anyhow!("simulated probe failure"));
-        assert!(
-            !status_indicates_fetch_needed(&err),
-            "status probe error must be non-fatal (return false); instead it reported fetch-needed",
-        );
     }
 
     #[test]
@@ -3156,9 +2896,8 @@ mod tests {
     /// A regression that folded the no-file branch into a different
     /// variant (e.g. `Mismatches` via a "nothing to match" read)
     /// would break downstream dispatch — `ensure()` expects
-    /// `NotCached` to trigger a fetch, `prefetch_if_required`
-    /// expects it to announce a download, and the CLI readout
-    /// expects it to print the "no cached copy" hint.
+    /// `NotCached` to trigger a fetch, and the CLI readout expects
+    /// it to print the "no cached copy" hint.
     #[test]
     fn status_reports_not_cached_when_file_absent() {
         let _lock = lock_env();
@@ -3191,9 +2930,9 @@ mod tests {
     /// `is_cached()` returning true on `NotCached`) would pass the
     /// construction tests above — those only look at the variant
     /// the path produced — but fail here. The helpers are relied on
-    /// by `ensure()` fast path, `prefetch_if_required`, the CLI
-    /// readout, and the `model status` integration test; a silent
-    /// helper regression would cascade into all of them.
+    /// by `ensure()`'s fast path, the CLI readout, and the `model
+    /// status` integration test; a silent helper regression would
+    /// cascade into all of them.
     #[test]
     fn sha_verdict_helpers_match_variant_semantics() {
         // NotCached: no file present → is_cached=false, is_match=false, check_error=None.
@@ -5036,9 +4775,10 @@ mod tests {
     /// the offline-gate trip point so a regression that swallowed
     /// the env var context would fire here first.
     ///
-    /// Calls [`reset`] under [`lock_env`] so a `PREFETCH_CHECKED
-    /// = true` set by an earlier test does not route this call through
-    /// `locate()` (which skips the offline-gate `ensure()` it expects).
+    /// Calls [`reset`] under [`lock_env`] so a memoized `Ok(_)` slot
+    /// in [`MODEL_CACHE`] from an earlier successful load cannot
+    /// short-circuit `load_inference` and bypass the offline gate
+    /// this test means to exercise.
     #[test]
     fn load_inference_errs_with_offline_message_under_offline_gate() {
         let _lock = lock_env();
@@ -5102,30 +4842,25 @@ mod tests {
         assert!(err.contains(OFFLINE_ENV));
     }
 
-    /// `reset()` clears both [`MODEL_CACHE`] and
-    /// [`PREFETCH_CHECKED`] so the next `extract_via_llm` /
-    /// `load_inference` call re-runs the load path end-to-end.
+    /// `reset()` clears [`MODEL_CACHE`] so the next `extract_via_llm`
+    /// / `load_inference` call re-runs the load path end-to-end
+    /// (including `ensure()`'s offline-gate check).
     ///
-    /// The contract this pins:
-    /// 1. After `reset()`, the outer `MODEL_CACHE` slot is
-    ///    `None` — the next `extract_via_llm` call re-runs
-    ///    `load_inference` (and through it, `ensure()`'s offline gate).
-    /// 2. After `reset()`, `PREFETCH_CHECKED` is `false` so
-    ///    the next `load_inference` falls back to `ensure()` rather
-    ///    than `locate()` and the offline gate is consulted again.
+    /// The contract this pins: after `reset()`, the outer
+    /// `MODEL_CACHE` slot is `None` so the next `extract_via_llm`
+    /// call re-runs `load_inference` and re-trips `ensure()`'s
+    /// offline gate. Without the reset, a memoized `Ok(_)` slot from
+    /// an earlier successful load would short-circuit
+    /// `extract_via_llm` and return cached inference state without
+    /// ever consulting `ensure()`, silently bypassing the gate.
     ///
     /// Drives the contract with `KTSTR_MODEL_OFFLINE=1`: a first
-    /// `extract_via_llm` call populates the slot with `Err`. We then
-    /// flip the slot to a synthetic `Ok(...)` payload (so the bug-
-    /// pollution the reset is preventing is visible — without the
-    /// reset, a downstream call would observe the synthetic Ok and
-    /// skip the offline gate). After `reset()`, the next
-    /// `extract_via_llm` call re-runs `ensure()`, the offline gate
-    /// trips, and the cache lands at `Err` again. `assert_eq!` on
-    /// the rendered error chains proves the same offline-gate code
-    /// path ran both times.
+    /// `extract_via_llm` call populates the slot with `Err`. After
+    /// `reset()`, the next `extract_via_llm` call re-runs `ensure()`,
+    /// the offline gate trips, and the cache lands at `Err` again —
+    /// proving the load path ran end-to-end after the reset.
     #[test]
-    fn reset_clears_model_cache_and_prefetch_checked() {
+    fn reset_clears_model_cache() {
         let _lock = lock_env();
         // Seed a populated slot so we can prove reset clears it. Use
         // the offline-gate path so seeding doesn't try to load the
@@ -5142,19 +4877,12 @@ mod tests {
                 "first extract_via_llm should populate MODEL_CACHE"
             );
         }
-        // Stamp PREFETCH_CHECKED so we can prove the reset clears it
-        // alongside the cache.
-        PREFETCH_CHECKED.store(true, Ordering::Release);
-        // Reset: both must be cleared.
+        // Reset: cache must be cleared.
         reset();
         {
             let guard = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             assert!(guard.is_none(), "reset must clear MODEL_CACHE to None");
         }
-        assert!(
-            !PREFETCH_CHECKED.load(Ordering::Acquire),
-            "reset must clear PREFETCH_CHECKED to false"
-        );
         // Subsequent extract_via_llm under the same offline gate must
         // re-trip ensure() rather than reading a stale cached entry.
         let _ = extract_via_llm(
@@ -5482,9 +5210,9 @@ mod tests {
     }
 
     /// `ensure(&DEFAULT_MODEL)` returns Ok when the model is on disk
-    /// and the SHA matches. Pins the cache-warm fast path that
-    /// production callers (the LlmExtract pipeline, prefetch_if_required)
-    /// rely on for sub-second resolution after the first download.
+    /// and the SHA matches. Pins the cache-warm fast path that the
+    /// production LlmExtract pipeline relies on for sub-second
+    /// resolution after the first download.
     /// A regression that always re-downloaded (e.g. a sidecar bug
     /// that always reported "stale") would not break any unit test
     /// (those run under offline-gate) but would silently inflate
@@ -5497,8 +5225,9 @@ mod tests {
         let _offline_off = EnvVarGuard::remove(OFFLINE_ENV);
         // Fail closed: don't trigger a multi-minute download from a
         // unit test. If the model isn't there, skip with a clear
-        // message and rely on a CI prefetch step to populate the
-        // cache before this test runs.
+        // message and rely on a prior LlmExtract test (or an
+        // operator-driven `cargo ktstr ... model fetch`) to populate
+        // the cache before this test runs.
         match status(&DEFAULT_MODEL) {
             Ok(s) if s.sha_verdict.is_match() => {
                 // Model is on disk and SHA matches; ensure() must
@@ -5531,7 +5260,7 @@ mod tests {
     // `extract_via_llm_returns_empty_when_backend_unavailable`
     // (which asserts the OFFLINE_ENV name surfaces in the error
     // chain). B5 (schbench smoke) is the existing
-    // `tests/llm_extract_e2e_test.rs::llm_extract_schbench_surfaces_sane_metrics`.
+    // `tests/llm_extract_e2e_test.rs::model_loaded_llm_extract_schbench`.
     // No duplicate coverage.
 
     /// Helper: skip a model-loaded test cleanly when the cache is
@@ -5900,188 +5629,6 @@ mod tests {
         }
     }
 
-    /// `any_test_requires_model()` scans [`KTSTR_TESTS`] and returns
-    /// `true` iff at least one registered entry declares
-    /// `OutputFormat::LlmExtract` on its primary payload or any of its
-    /// workloads. In the lib crate's test binary the only registered
-    /// entry is `__unit_test_dummy__` (see `mod.rs` tests module), which
-    /// is built from `KtstrTestEntry::DEFAULT` and therefore carries
-    /// `payload: None` and `workloads: &[]`. Neither matches
-    /// `OutputFormat::LlmExtract(_)`, so the scan returns `false`.
-    ///
-    /// Pinning this behavior guards two regressions at once:
-    /// (1) a default that silently flipped to an LlmExtract-requiring
-    /// payload would now force every lib-test run to prefetch a 2.44
-    /// GiB model, and (2) a regression in the is_some_and /
-    /// workloads.iter().any scan that reported `true` for empty
-    /// inventories would drag LlmExtract-less test binaries into a
-    /// pointless prefetch attempt.
-    ///
-    /// If a future dev-time test is registered via
-    /// `#[distributed_slice(KTSTR_TESTS)]` with an `LlmExtract` payload,
-    /// this assertion MUST flip to `true` — the test is the pin on the
-    /// current inventory, not a forever-true invariant.
-    #[test]
-    fn any_test_requires_model_returns_false_for_dummy_only_inventory() {
-        assert!(
-            !any_test_requires_model(),
-            "lib crate test binary registers only __unit_test_dummy__ (no LlmExtract payload); \
-             any_test_requires_model() must return false. If this assertion fails, a new test \
-             entry was added with OutputFormat::LlmExtract — update this pin accordingly."
-        );
-    }
-
-    // Synthetic `Payload` values pinned to `'static` lifetimes so they
-    // can be assigned into `KtstrTestEntry`'s scheduler / payload /
-    // workloads slots (each requires `&'static Payload`). Kept local
-    // to the test module — production consumers build payloads via
-    // `#[derive(Payload)]` or use the curated fixtures in
-    // `tests/common/fixtures.rs`.
-    use super::super::{KtstrTestEntry, OutputFormat, Payload, PayloadKind};
-
-    const LLM_EXTRACT_BINARY_PAYLOAD: Payload = Payload {
-        name: "llm_extract_stub",
-        kind: PayloadKind::Binary("schbench-stub"),
-        output: OutputFormat::LlmExtract(None),
-        default_args: &[],
-        default_checks: &[],
-        metrics: &[],
-        include_files: &[],
-        uses_parent_pgrp: false,
-        known_flags: None,
-        metric_bounds: None,
-    };
-
-    const EXIT_CODE_BINARY_PAYLOAD: Payload = Payload {
-        name: "exit_code_stub",
-        kind: PayloadKind::Binary("some-bin"),
-        output: OutputFormat::ExitCode,
-        default_args: &[],
-        default_checks: &[],
-        metrics: &[],
-        include_files: &[],
-        uses_parent_pgrp: false,
-        known_flags: None,
-        metric_bounds: None,
-    };
-
-    /// Empty inventory must return false. Pins the "no iteration, no
-    /// result" boundary — an integration-test binary that registers
-    /// zero `#[ktstr_test]` entries (e.g. a pure `#[test]`-only
-    /// binary like `jemalloc_alloc_worker_exit_codes.rs`) must not
-    /// drag its process into a model prefetch.
-    #[test]
-    fn entries_require_model_empty_iter_returns_false() {
-        let entries: [&KtstrTestEntry; 0] = [];
-        assert!(!entries_require_model(entries.iter().copied()));
-    }
-
-    /// A non-LlmExtract inventory returns false even when non-empty.
-    /// Pins the "scheduler-only / binary-with-json-output inventories
-    /// stay out of the prefetch path" contract.
-    #[test]
-    fn entries_require_model_no_llm_extract_returns_false() {
-        let entry = KtstrTestEntry {
-            name: "scheduler_only",
-            payload: None,
-            workloads: &[],
-            ..KtstrTestEntry::DEFAULT
-        };
-        let entries = [&entry];
-        assert!(!entries_require_model(entries.iter().copied()));
-    }
-
-    /// The positive case under the primary-payload slot: an integration-
-    /// test binary like `tests/llm_extract_e2e_test.rs` declares a
-    /// `Payload` with `OutputFormat::LlmExtract` via its `#[ktstr_test]`
-    /// entry's `payload = SOME_LLM_FIXTURE` attribute, which materializes
-    /// into the entry's `payload: Some(&…)` slot. `entries_require_model`
-    /// must return `true` for that shape — without the pin here the
-    /// primary-slot branch has no in-tree test that reaches it (the lib
-    /// crate's `KTSTR_TESTS` only has `__unit_test_dummy__`).
-    #[test]
-    fn entries_require_model_primary_payload_llm_extract_returns_true() {
-        let entry = KtstrTestEntry {
-            name: "llm_primary",
-            payload: Some(&LLM_EXTRACT_BINARY_PAYLOAD),
-            workloads: &[],
-            ..KtstrTestEntry::DEFAULT
-        };
-        let entries = [&entry];
-        assert!(entries_require_model(entries.iter().copied()));
-    }
-
-    /// Positive case via the `workloads` slot: a test declaring
-    /// `#[ktstr_test(workloads = [FIXTURE])]` where the workload
-    /// fixture carries `OutputFormat::LlmExtract` must also trip the
-    /// predicate. Guards the `.any()` over `entry.workloads` arm.
-    #[test]
-    fn entries_require_model_workload_llm_extract_returns_true() {
-        let workloads: &[&Payload] = &[&LLM_EXTRACT_BINARY_PAYLOAD];
-        let entry = KtstrTestEntry {
-            name: "llm_workload",
-            payload: Some(&EXIT_CODE_BINARY_PAYLOAD),
-            workloads,
-            ..KtstrTestEntry::DEFAULT
-        };
-        let entries = [&entry];
-        assert!(entries_require_model(entries.iter().copied()));
-    }
-
-    /// LlmExtract workload in NON-first position within a
-    /// multi-workload slice. The sibling
-    /// `entries_require_model_workload_llm_extract_returns_true`
-    /// exercises a single-element workloads array — a regression
-    /// that short-circuited on `workloads[0]` alone (instead of
-    /// `.any()`) would still pass that test. This test
-    /// configures the LlmExtract workload at index 1, preceded by
-    /// a non-LLM exit-code workload, so a first-only scan returns
-    /// `false` and trips the assertion.
-    #[test]
-    fn entries_require_model_workload_llm_extract_non_first_position() {
-        let workloads: &[&Payload] = &[&EXIT_CODE_BINARY_PAYLOAD, &LLM_EXTRACT_BINARY_PAYLOAD];
-        let entry = KtstrTestEntry {
-            name: "llm_workload_non_first",
-            payload: Some(&EXIT_CODE_BINARY_PAYLOAD),
-            workloads,
-            ..KtstrTestEntry::DEFAULT
-        };
-        let entries = [&entry];
-        assert!(
-            entries_require_model(entries.iter().copied()),
-            "LlmExtract workload at NON-first position must still \
-             trip the predicate. A regression that short-circuited \
-             on workloads[0] alone instead of `.any()` over the \
-             full slice would fail here.",
-        );
-    }
-
-    /// Three workloads, LlmExtract at the TAIL. Belt-and-suspenders
-    /// variant of the non-first-position test: exercises the
-    /// "must scan all the way to the end" path, catching a
-    /// regression that bounded the scan to a fixed prefix (e.g.
-    /// `workloads.iter().take(2).any(...)`).
-    #[test]
-    fn entries_require_model_workload_llm_extract_tail_position() {
-        let workloads: &[&Payload] = &[
-            &EXIT_CODE_BINARY_PAYLOAD,
-            &EXIT_CODE_BINARY_PAYLOAD,
-            &LLM_EXTRACT_BINARY_PAYLOAD,
-        ];
-        let entry = KtstrTestEntry {
-            name: "llm_workload_tail",
-            payload: Some(&EXIT_CODE_BINARY_PAYLOAD),
-            workloads,
-            ..KtstrTestEntry::DEFAULT
-        };
-        let entries = [&entry];
-        assert!(
-            entries_require_model(entries.iter().copied()),
-            "LlmExtract workload at the TAIL must trip the predicate; \
-             a regression that bounded the scan to a prefix would fail here",
-        );
-    }
-
     /// A model response with no JSON region at all (plain prose)
     /// must route through the `Ok(Vec::new())` branch — the fallback
     /// for stochastic "model output was not parseable" runs. Pins
@@ -6362,31 +5909,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Mixed inventory: one LlmExtract entry alongside many non-LLM
-    /// entries still returns `true`. Pins the `.any()` short-circuit
-    /// against a regression that accidentally required every entry
-    /// to match.
-    #[test]
-    fn entries_require_model_mixed_inventory_returns_true() {
-        let llm_entry = KtstrTestEntry {
-            name: "llm_mixed",
-            payload: Some(&LLM_EXTRACT_BINARY_PAYLOAD),
-            ..KtstrTestEntry::DEFAULT
-        };
-        let plain_a = KtstrTestEntry {
-            name: "plain_a",
-            payload: None,
-            ..KtstrTestEntry::DEFAULT
-        };
-        let plain_b = KtstrTestEntry {
-            name: "plain_b",
-            payload: Some(&EXIT_CODE_BINARY_PAYLOAD),
-            ..KtstrTestEntry::DEFAULT
-        };
-        let entries = [&plain_a, &llm_entry, &plain_b];
-        assert!(entries_require_model(entries.iter().copied()));
     }
 
     // -- strip_think_block --
@@ -7272,54 +6794,6 @@ mod tests {
             "decode_to_string must report `replaced=true` when a \
              byte is replaced with U+FFFD",
         );
-    }
-
-    /// `locate()` is the fast-path sibling of `ensure()` used by
-    /// `load_inference` when `PREFETCH_CHECKED` is set: it resolves
-    /// the cache path without re-hashing, but bails if the file has
-    /// disappeared between the successful prefetch and the lazy load.
-    /// Pins the error wording for that bail so a caller relying on
-    /// the "has since been removed" diagnostic (or the file-name and
-    /// path in the rendered chain) still sees it if the function is
-    /// refactored. Empty cache dir + absent file drives execution to
-    /// the `!path.is_file()` branch; no SHA check or download fires.
-    #[test]
-    fn locate_errors_when_cached_file_missing() {
-        let _lock = lock_env();
-        let cache = isolated_cache_dir();
-        let err = locate(&DEFAULT_MODEL).unwrap_err();
-        let rendered = format!("{err:#}");
-        assert!(
-            rendered.contains("has since been removed"),
-            "expected 'has since been removed' diagnostic, got: {rendered}"
-        );
-        assert!(
-            rendered.contains(DEFAULT_MODEL.file_name),
-            "error must name the missing artifact: {rendered}"
-        );
-        let expected_path = cache.path().join(DEFAULT_MODEL.file_name);
-        assert!(
-            rendered.contains(&expected_path.display().to_string()),
-            "error must include the resolved cache path: {rendered}"
-        );
-    }
-
-    /// Happy-path complement to [`locate_errors_when_cached_file_missing`].
-    /// With the file present at `root.join(spec.file_name)`, locate()
-    /// must return Ok with the resolved PathBuf — no SHA check, no
-    /// network. File contents are irrelevant: locate() gates on
-    /// `path.is_file()` only (the caller contract is that SHA was
-    /// checked earlier via `prefetch_if_required`). An empty file is
-    /// enough to pass `is_file()` and prove the Ok branch returns the
-    /// expected `root.join(file_name)` path.
-    #[test]
-    fn locate_returns_path_when_cached_file_present() {
-        let _lock = lock_env();
-        let cache = isolated_cache_dir();
-        let expected_path = cache.path().join(DEFAULT_MODEL.file_name);
-        std::fs::write(&expected_path, []).unwrap();
-        let got = locate(&DEFAULT_MODEL).unwrap();
-        assert_eq!(got, expected_path);
     }
 
     /// `fetch_timeout_for_size(0)` returns exactly the 60-second

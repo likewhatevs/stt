@@ -61,13 +61,15 @@
 //! schbench's `write_json_stats` and is fixed by the schbench
 //! source, independent of the model.
 //!
-//! **Model availability**: tests here depend on `KTSTR_TESTS`'s
-//! `any_test_requires_model() == true`, which triggers
-//! `prefetch_if_required()` at nextest setup to populate the model
-//! cache. With `KTSTR_MODEL_OFFLINE=1` and a cold cache, the
-//! host-side load fails and `host_side_llm_extract` appends an
-//! `LlmExtract model load failed: <reason>` detail to the test's
-//! AssertResult.
+//! Model availability: tests here lazy-load the LLM model on the
+//! first `extract_via_llm` invocation (see `load_inference` in
+//! `src/test_support/model.rs`). With `KTSTR_MODEL_OFFLINE=1` and a
+//! cold cache, the load fails and `host_side_llm_extract` appends an
+//! `LlmExtract model load failed` detail. Inference itself is
+//! multi-minute on host CPU regardless of cache state, so the
+//! `test(model_loaded_)` nextest override at `.config/nextest.toml`
+//! extends the slow-timeout to cover EVERY run; a cold cache
+//! additionally pays the GGUF download cost on top of that.
 
 mod common;
 
@@ -95,7 +97,7 @@ use ktstr::scenario::Ctx;
 /// does not fit in guest RAM. See the module doc for the universal
 /// invariants the host applies.
 #[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 2048, payload = SCHBENCH)]
-fn llm_extract_schbench_surfaces_sane_metrics(ctx: &Ctx) -> Result<AssertResult> {
+fn model_loaded_llm_extract_schbench(ctx: &Ctx) -> Result<AssertResult> {
     let (assert_result, _metrics) = ctx.payload(&SCHBENCH).run()?;
     // For `OutputFormat::LlmExtract` payloads, `metrics.metrics` is
     // intentionally empty inside the guest body — extraction is

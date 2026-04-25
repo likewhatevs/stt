@@ -81,7 +81,7 @@ pub use entry::{
     BpfMapWrite, CgroupPath, KTSTR_TESTS, KtstrTestEntry, MemSideCache, NumaDistance, NumaNode,
     Scheduler, SchedulerSpec, Sysctl, Topology, TopologyConstraints, find_test,
 };
-pub use eval::{ResolveSource, nextest_setup, resolve_scheduler, resolve_test_kernel};
+pub use eval::{ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
 pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
@@ -89,7 +89,7 @@ pub use metrics::{
 };
 pub use model::{
     DEFAULT_MODEL, LLM_DEBUG_RESPONSES_ENV, ModelSpec, ModelStatus, OFFLINE_ENV, ShaVerdict,
-    any_test_requires_model, ensure, prefetch_if_required, status,
+    ensure, status,
 };
 pub(crate) use output::{
     SENTINEL_EXEC_EXIT_PREFIX, SENTINEL_EXIT_PREFIX, SENTINEL_INIT_STARTED,
