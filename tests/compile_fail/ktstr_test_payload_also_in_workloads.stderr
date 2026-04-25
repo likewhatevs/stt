@@ -1,5 +1,5 @@
 error: `FIO` appears in both `payload = ...` and `workloads = [..]` — pick one. The primary payload runs as the test's main workload; entries in `workloads` are composed alongside it.
-  --> tests/compile_fail/ktstr_test_payload_also_in_workloads.rs:17:42
+  --> tests/compile_fail/ktstr_test_payload_also_in_workloads.rs:18:42
    |
-17 | #[ktstr_test(payload = FIO, workloads = [FIO])]
+18 | #[ktstr_test(payload = FIO, workloads = [FIO])]
    |                                          ^^^

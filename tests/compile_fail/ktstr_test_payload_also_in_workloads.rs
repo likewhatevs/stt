@@ -12,6 +12,7 @@ const FIO: Payload = Payload::new(
     &[],
     false,
     None,
+    None,
 );
 
 #[ktstr_test(payload = FIO, workloads = [FIO])]
