@@ -3328,6 +3328,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: Some(&["runtime", "threads", "verbose"]),
+            metric_bounds: None,
         };
         let args: Vec<String> = vec![
             "--runtime=30".into(),
@@ -3366,6 +3367,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: Some(&["runtime", "threads", "verbose"]),
+            metric_bounds: None,
         };
         let args = vec!["--runtime=30".into(), "--threds".into(), "--verbose".into()];
         let err = validate_known_flags(&WITH_ALLOWLIST, &args)
@@ -3395,6 +3397,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: Some(&["runtime", "threads"]),
+            metric_bounds: None,
         };
         // "threds" is a typo for "threads" — the exact failure
         // the allowlist exists to catch.
@@ -3428,6 +3431,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let args: Vec<String> = vec![
             "--anything".into(),
@@ -3452,6 +3456,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let ops: Vec<Op> = vec![
             Op::AddCgroup { name: "a".into() },
@@ -3514,6 +3519,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         assert_eq!(Op::AddCgroup { name: "a".into() }.discriminant(), 0);
         assert_eq!(Op::RemoveCgroup { cgroup: "a".into() }.discriminant(), 1);
@@ -5497,6 +5503,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let def = CgroupDef::named("cg_0").workload(&FIO);
         let p = def.payload.expect("workload was attached");
@@ -5535,6 +5542,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
 
         let cgroups = CgroupManager::new("/nonexistent");
@@ -5587,6 +5595,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let step = Step::with_payload(&FIO, HoldSpec::Fixed(Duration::from_millis(50)));
         assert_eq!(step.ops.len(), 1);
@@ -5622,6 +5631,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
 
         let op = Op::run_payload(&FIO, vec!["--warmup".into()]);
@@ -5774,6 +5784,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
 
         let mock = MockCgroupOps::new();
@@ -5814,6 +5825,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
 
         let mock = MockCgroupOps::new();
@@ -5886,6 +5898,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
 
         let mock = MockCgroupOps::new();
@@ -5994,6 +6007,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6318,6 +6332,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6377,6 +6392,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6428,6 +6444,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6478,6 +6495,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
@@ -6520,6 +6538,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mock = MockCgroupOps::new();
         let topo = mock_topo();

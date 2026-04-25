@@ -211,6 +211,7 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
+        metric_bounds: None,
     };
 
     #[test]

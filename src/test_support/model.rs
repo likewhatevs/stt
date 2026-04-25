@@ -3558,13 +3558,15 @@ mod tests {
         );
     }
 
-    /// HOME=`""` is rejected for the same reason as unset — joining
-    /// `.cache` onto an empty PathBuf yields a relative `.cache`
-    /// rooted at CWD instead of a stable user cache. Both shapes
-    /// collapse into the empty string at the
-    /// `unwrap_or_default()` site in
-    /// [`crate::cache::resolve_cache_root_with_suffix`], so they
-    /// share the same "HOME is unset or empty" diagnostic.
+    /// HOME=`""` is rejected by the empty-string arm of the
+    /// shared validator. Joining `.cache` onto an empty PathBuf
+    /// yields a relative `.cache` rooted at CWD instead of a
+    /// stable user cache. The diagnostic explicitly names the
+    /// empty-string shape (`Ok("")`) so an operator can identify
+    /// a Dockerfile `ENV HOME=` or shell-rc `export HOME=` typo
+    /// rather than confusing it with the container-init-dropped-HOME
+    /// case, which is rejected by a separate arm with a distinct
+    /// message.
     #[test]
     fn resolve_cache_root_rejects_empty_home() {
         let _lock = lock_env();
@@ -3574,14 +3576,17 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("HOME is unset or empty"),
-            "expected empty-HOME rejection, got: {msg}"
+            msg.contains("HOME is set to the empty string"),
+            "expected empty-HOME-specific rejection, got: {msg}"
         );
     }
 
-    /// HOME unset is rejected via the same arm as empty — both
-    /// land at the empty-string check after `unwrap_or_default()`
-    /// in the shared validation helper.
+    /// HOME unset (`Err(NotPresent)`) is rejected by a separate
+    /// arm of the shared validator — distinct from the empty-string
+    /// shape. The diagnostic names the unset case so an operator
+    /// debugging a container init that dropped HOME sees the actual
+    /// misconfiguration shape rather than a generic message that
+    /// conflates unset with empty.
     #[test]
     fn resolve_cache_root_rejects_unset_home() {
         let _lock = lock_env();
@@ -3591,8 +3596,12 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("HOME is unset or empty"),
-            "expected unset-HOME rejection, got: {msg}"
+            msg.contains("HOME is unset"),
+            "expected unset-HOME-specific rejection, got: {msg}"
+        );
+        assert!(
+            !msg.contains("HOME is set to the empty string"),
+            "unset HOME must NOT use the empty-string diagnostic, got: {msg}",
         );
     }
 
@@ -4598,6 +4607,177 @@ mod tests {
         );
     }
 
+    /// `InferenceError::Decode` Display is the static prefix
+    /// `"llama_decode failed"` (no source flattened in) and the
+    /// upstream `DecodeError` reaches `.source()` for chain
+    /// traversal. Pins the same Display+chain split as
+    /// `inference_error_string_variants_emit_reason_verbatim` does
+    /// for `ContextCreate`, but for the Decode variant which is
+    /// hit during the per-token generation loop in
+    /// `invoke_with_model`.
+    ///
+    /// `DecodeError::NoKvCacheSlot` is the canonical "context
+    /// exhausted" surface; pinning it pins the most operationally-
+    /// relevant Decode failure path. A regression that flattened
+    /// `DecodeError` onto Display (e.g. via `#[error("llama_decode
+    /// failed: {source}")]`) would surface here as a Display string
+    /// containing `"NoKvCacheSlot"` rather than the static prefix.
+    #[test]
+    fn inference_error_decode_display_and_source_chain() {
+        use std::error::Error as _;
+        let err = InferenceError::Decode {
+            source: llama_cpp_2::DecodeError::NoKvCacheSlot,
+        };
+        let rendered = format!("{err}");
+        assert_eq!(
+            rendered, "llama_decode failed",
+            "Decode Display must be the static prefix only; the source \
+             error reaches downstream callers via the error chain rather \
+             than the Display",
+        );
+        let source = err
+            .source()
+            .expect("Decode must expose its #[source] via std::error::Error::source");
+        let source_rendered = format!("{source}");
+        assert!(
+            source_rendered.contains("NoKvCacheSlot"),
+            "Decode's source must be the upstream DecodeError; got: {source_rendered}",
+        );
+
+        // Walk the chain via anyhow to verify the source is reachable
+        // through the same path the production callers use.
+        let wrapped = anyhow::Error::new(InferenceError::Decode {
+            source: llama_cpp_2::DecodeError::NTokensZero,
+        });
+        let chain_depth = wrapped.chain().count();
+        assert!(
+            chain_depth >= 2,
+            "InferenceError::Decode must expose its source via #[source]; \
+             got chain depth {chain_depth}",
+        );
+    }
+
+    /// `InferenceError::Tokenize` Display includes the
+    /// `prompt_excerpt` (so an operator scanning logs can see the
+    /// boundary input that hit tokenizer rejection) and the chain
+    /// reaches the upstream `StringToTokenError` via `.source()`.
+    /// Pairs with the existing
+    /// `inference_error_tokenize_excerpt_bounded_at_64_bytes` (which
+    /// pins the truncation length); this test pins the Display
+    /// format and source-chain shape.
+    ///
+    /// Synthetic `StringToTokenError::NulError` constructed from a
+    /// `CString::new(b"\0")` failure — the canonical NUL-byte
+    /// rejection that drives the production tokenize path's Err
+    /// arm. A regression that dropped the `prompt_excerpt` from
+    /// the `#[error("...")]` template would break the Display
+    /// pin; a regression that swapped `#[source]` for
+    /// `anyhow::Error::msg(...)` would break the chain pin.
+    #[test]
+    fn inference_error_tokenize_display_and_source_chain() {
+        use std::error::Error as _;
+        let nul_err = std::ffi::CString::new(b"\0".to_vec())
+            .expect_err("CString::new on NUL-bearing input must fail");
+        let err = InferenceError::Tokenize {
+            prompt_excerpt: "user-supplied prompt fragment".to_string(),
+            source: llama_cpp_2::StringToTokenError::NulError(nul_err),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("user-supplied prompt fragment"),
+            "Tokenize Display must echo the prompt_excerpt; got: {rendered}",
+        );
+        assert!(
+            rendered.contains("tokenize ChatML prompt"),
+            "Tokenize Display must carry the static prefix; got: {rendered}",
+        );
+        let source = err
+            .source()
+            .expect("Tokenize must expose its #[source] via std::error::Error::source");
+        // The NulError carries C-string nul-position info via the
+        // upstream Display; we only pin that the source is non-empty
+        // (specific C-string error wording is upstream-controlled
+        // and not load-bearing for the framework's contract).
+        let source_rendered = format!("{source}");
+        assert!(
+            !source_rendered.is_empty(),
+            "Tokenize source Display must produce a non-empty string",
+        );
+    }
+
+    /// `prompt_excerpt` on input shorter than [`PROMPT_EXCERPT_BYTES`]
+    /// returns the input unchanged — no truncation, no padding.
+    /// Pairs with the existing
+    /// `inference_error_tokenize_excerpt_bounded_at_64_bytes` (which
+    /// pins the over-cap path) by closing the under-cap boundary.
+    /// A regression that always allocated PROMPT_EXCERPT_BYTES of
+    /// space (e.g. via `String::with_capacity` without re-trimming)
+    /// would not change the test's output, but a regression that
+    /// over-eagerly truncated short inputs (e.g.
+    /// `s[..PROMPT_EXCERPT_BYTES.min(s.len())]` with an off-by-one)
+    /// would break here.
+    #[test]
+    fn prompt_excerpt_short_input_passes_through_unchanged() {
+        for s in &[
+            "",
+            "a",
+            "short",
+            "exactly thirty-four chars long.",
+            "almost-full",
+        ] {
+            let got = prompt_excerpt(s);
+            assert_eq!(
+                got, *s,
+                "input shorter than the cap must round-trip unchanged; \
+                 got {got:?} for input {s:?}",
+            );
+            assert!(
+                got.len() <= PROMPT_EXCERPT_BYTES,
+                "short input must remain bounded by PROMPT_EXCERPT_BYTES; \
+                 got {} bytes",
+                got.len(),
+            );
+        }
+    }
+
+    /// `prompt_excerpt` on input EXACTLY at the cap returns the input
+    /// unchanged — the boundary case where neither truncation nor
+    /// snap-back fires. Pins that the bound is `<= PROMPT_EXCERPT_BYTES`
+    /// (inclusive) rather than `< PROMPT_EXCERPT_BYTES` (which would
+    /// trip the truncation path one byte early).
+    #[test]
+    fn prompt_excerpt_exact_cap_input_passes_through_unchanged() {
+        let exactly_cap = "x".repeat(PROMPT_EXCERPT_BYTES);
+        let got = prompt_excerpt(&exactly_cap);
+        assert_eq!(
+            got.len(),
+            PROMPT_EXCERPT_BYTES,
+            "exact-cap input must round-trip at exactly {} bytes; got {}",
+            PROMPT_EXCERPT_BYTES,
+            got.len(),
+        );
+        assert_eq!(
+            got, exactly_cap,
+            "exact-cap input must round-trip byte-for-byte",
+        );
+    }
+
+    /// `wrap_chatml_no_think` on the empty body still produces a
+    /// well-formed ChatML wrap — the user-turn carries an empty body
+    /// followed by `/no_think`. Pins the empty-input boundary so a
+    /// regression that special-cased empty input (e.g. by skipping
+    /// the `/no_think` directive) would break here. The model would
+    /// re-enable thinking mode on a degenerate empty prompt and
+    /// burn the SAMPLE_LEN budget on a reasoning trace.
+    #[test]
+    fn wrap_chatml_no_think_empty_body_still_carries_no_think_directive() {
+        let got = wrap_chatml_no_think("");
+        assert_eq!(
+            got, "<|im_start|>user\n /no_think<|im_end|>\n<|im_start|>assistant\n",
+            "empty body must still produce a well-formed ChatML wrap with /no_think",
+        );
+    }
+
     /// The context-window budget pins the prompt + generation
     /// arithmetic. `MAX_PROMPT_TOKENS = N_CTX_TOKENS - SAMPLE_LEN -
     /// 64` reserves space for [`SAMPLE_LEN`] generation tokens plus
@@ -5121,6 +5301,223 @@ mod tests {
         );
     }
 
+    // -- Integration tests (model required) --
+    //
+    // These tests load the ~2.44 GiB GGUF and run real inference.
+    // Marked `#[ignore]` so default `cargo nextest run` skips them
+    // (CI runs without the model cache populated would either bail
+    // on offline-gate or burn ~2 minutes downloading). Run on a
+    // host with the model present via:
+    //   `cargo nextest run --run-ignored only -E 'test(/model_loaded_/)'`
+    // or
+    //   `cargo nextest run --run-ignored all` (everything else too).
+    //
+    // The unit tests above exercise the entire control surface of
+    // `extract_via_llm` under the offline gate (load failure, error
+    // stickiness, at-most-one-load invariant). These integration
+    // tests pin the WORKING-MODEL path — the contract that
+    // extract_via_llm + parse_llm_response + walk_json_leaves
+    // produces a non-empty Metric Vec when fed reasonable JSON-
+    // shaped input AND the model is actually loaded. Without these,
+    // a regression that broke the happy path (e.g. a llama-cpp-2
+    // upgrade that changes inference output shape) would only
+    // surface in the e2e VM-based test, which is slower and less
+    // diagnosable.
+
+    /// Real model load + real extraction on JSON-shaped stdout.
+    /// Asserts: ensure() succeeds, extract_via_llm returns Ok with
+    /// at least one metric, every metric carries `MetricSource::LlmExtract`,
+    /// every metric carries `MetricStream::Stdout`, every metric value
+    /// is finite. Pins the happy-path contract: real model + real
+    /// inference on a structured input produces well-formed metrics.
+    ///
+    /// The exact metric names and values are NOT pinned — model
+    /// output is sensitive to weight pin, prompt template, and
+    /// llama-cpp-2 internals (greedy is deterministic for fixed
+    /// weights, but any of those changing rotates the output). The
+    /// invariants asserted here are framework-level and stable
+    /// regardless of which specific metrics the model emits.
+    ///
+    /// Holds `lock_env()` and `reset()` so a previously-memoized
+    /// `Err(_)` from an earlier offline-gated test does not bypass
+    /// the load. Pairs an `EnvVarGuard::remove(OFFLINE_ENV)` so the
+    /// gate is explicitly off for this test even if the test
+    /// process inherited an `OFFLINE_ENV=1` from an earlier crash.
+    #[test]
+    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    fn model_loaded_extract_via_llm_stdout_produces_well_formed_metrics() {
+        let _lock = lock_env();
+        reset();
+        let _offline_off = EnvVarGuard::remove(OFFLINE_ENV);
+        // Skip cleanly if the model is not on disk. `ensure()` would
+        // download it otherwise; on an air-gapped runner the
+        // download fails and we'd see a misleading "extraction
+        // produced no metrics" failure. Bail with a clear message
+        // instead.
+        match ensure(&DEFAULT_MODEL) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "model_loaded_extract_via_llm_stdout: skipping — model unavailable: {e:#}"
+                );
+                return;
+            }
+        }
+        let stdout = r#"{"latency_ns_p50": 1234, "latency_ns_p99": 5678, "rps": 1000}"#;
+        let metrics = extract_via_llm(stdout, None, crate::test_support::MetricStream::Stdout)
+            .expect("extract_via_llm must succeed when model is loaded");
+        assert!(
+            !metrics.is_empty(),
+            "well-formed JSON stdout must produce at least one extracted metric; \
+             got empty Vec",
+        );
+        for m in &metrics {
+            assert_eq!(
+                m.source,
+                crate::test_support::MetricSource::LlmExtract,
+                "every metric must carry MetricSource::LlmExtract; got {:?}",
+                m.source,
+            );
+            assert_eq!(
+                m.stream,
+                crate::test_support::MetricStream::Stdout,
+                "every metric must carry MetricStream::Stdout when extract_via_llm \
+                 was invoked with Stdout; got {:?}",
+                m.stream,
+            );
+            assert!(
+                m.value.is_finite(),
+                "every metric value must be finite; got {} for {}",
+                m.value,
+                m.name,
+            );
+        }
+    }
+
+    /// Mirror of `model_loaded_extract_via_llm_stdout_produces_well_formed_metrics`
+    /// for the Stderr-tagged variant. Drives the same input through
+    /// `extract_via_llm(..., MetricStream::Stderr)` and asserts every
+    /// emitted metric carries `MetricStream::Stderr`. Pins that the
+    /// stream-tag parameter actually flows from the public Stderr
+    /// dispatch point through to the leaf walker — under offline-gate
+    /// unit tests this can only be inferred via the chain proof; with
+    /// a real model it can be observed end-to-end.
+    #[test]
+    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    fn model_loaded_extract_via_llm_stderr_tags_metrics_with_stderr() {
+        let _lock = lock_env();
+        reset();
+        let _offline_off = EnvVarGuard::remove(OFFLINE_ENV);
+        match ensure(&DEFAULT_MODEL) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "model_loaded_extract_via_llm_stderr: skipping — model unavailable: {e:#}"
+                );
+                return;
+            }
+        }
+        let stderr = r#"{"latency_ns_p50": 1234, "latency_ns_p99": 5678}"#;
+        let metrics = extract_via_llm(stderr, None, crate::test_support::MetricStream::Stderr)
+            .expect("extract_via_llm must succeed when model is loaded");
+        assert!(
+            !metrics.is_empty(),
+            "well-formed JSON stderr must produce at least one extracted metric",
+        );
+        for m in &metrics {
+            assert_eq!(
+                m.stream,
+                crate::test_support::MetricStream::Stderr,
+                "every metric must carry MetricStream::Stderr when extract_via_llm \
+                 was invoked with Stderr; got {:?}",
+                m.stream,
+            );
+        }
+    }
+
+    /// `extract_via_llm` is deterministic across consecutive calls
+    /// on the same input: greedy sampling (`LlamaSampler::greedy()`)
+    /// has no RNG state, so two calls with identical (text, hint,
+    /// stream) must produce byte-identical metric Vecs.
+    ///
+    /// Pins the deterministic-output contract that downstream
+    /// regression tooling (stats compare across runs, snapshot
+    /// pinning) depends on. A regression that introduced any RNG —
+    /// `Sampling::TopK`, a temperature > 0, a seed-driven sampler —
+    /// would surface here as a metric Vec drift between calls.
+    #[test]
+    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    fn model_loaded_extract_via_llm_is_deterministic_across_calls() {
+        let _lock = lock_env();
+        reset();
+        let _offline_off = EnvVarGuard::remove(OFFLINE_ENV);
+        match ensure(&DEFAULT_MODEL) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "model_loaded_extract_via_llm_deterministic: skipping — model unavailable: {e:#}"
+                );
+                return;
+            }
+        }
+        let stdout = r#"{"throughput": 9000, "latency": 100}"#;
+        let first = extract_via_llm(stdout, None, crate::test_support::MetricStream::Stdout)
+            .expect("first call must succeed");
+        let second = extract_via_llm(stdout, None, crate::test_support::MetricStream::Stdout)
+            .expect("second call must succeed");
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "deterministic output: metric count must match across calls; \
+             got {} vs {}",
+            first.len(),
+            second.len(),
+        );
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.name, b.name, "metric names must match position-wise");
+            assert_eq!(a.value, b.value, "metric values must match position-wise");
+            assert_eq!(a.source, b.source, "metric sources must match");
+            assert_eq!(a.stream, b.stream, "metric streams must match");
+        }
+    }
+
+    /// `ensure(&DEFAULT_MODEL)` returns Ok when the model is on disk
+    /// and the SHA matches. Pins the cache-warm fast path that
+    /// production callers (the LlmExtract pipeline, prefetch_if_required)
+    /// rely on for sub-second resolution after the first download.
+    /// A regression that always re-downloaded (e.g. a sidecar bug
+    /// that always reported "stale") would not break any unit test
+    /// (those run under offline-gate) but would silently inflate
+    /// every test run's wall clock by the model-download time.
+    #[test]
+    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    fn model_loaded_ensure_default_model_succeeds() {
+        let _lock = lock_env();
+        reset();
+        let _offline_off = EnvVarGuard::remove(OFFLINE_ENV);
+        // Fail closed: don't trigger a multi-minute download from a
+        // unit test. If the model isn't there, skip with a clear
+        // message and rely on a CI prefetch step to populate the
+        // cache before this test runs.
+        match status(&DEFAULT_MODEL) {
+            Ok(s) if s.sha_verdict.is_match() => {
+                // Model is on disk and SHA matches; ensure() must
+                // return its path without redownloading.
+                let path = ensure(&DEFAULT_MODEL).expect("warm cache: ensure must succeed");
+                assert!(
+                    path.exists(),
+                    "ensure must return a path that exists on disk; got: {}",
+                    path.display(),
+                );
+            }
+            other => {
+                eprintln!(
+                    "model_loaded_ensure_default_model: skipping — cache not warm: {other:?}"
+                );
+            }
+        }
+    }
+
     /// `any_test_requires_model()` scans [`KTSTR_TESTS`] and returns
     /// `true` iff at least one registered entry declares
     /// `OutputFormat::LlmExtract` on its primary payload or any of its
@@ -5170,6 +5567,7 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
+        metric_bounds: None,
     };
 
     const EXIT_CODE_BINARY_PAYLOAD: Payload = Payload {
@@ -5182,6 +5580,7 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
+        metric_bounds: None,
     };
 
     /// Empty inventory must return false. Pins the "no iteration, no
@@ -6168,6 +6567,329 @@ mod tests {
     fn strip_think_block_preserves_inner_opener_with_missing_outer_close() {
         let s = "<think>the string <think> appears</think>";
         assert_eq!(strip_think_block(s), s);
+    }
+
+    // -- Group A test plan gap fills (A4-f, A5-b, A6-b, A7-a, A8) --
+    //
+    // Targeted gap-fills against the tester's group-A unit-test plan
+    // for the post-migration model.rs. Existing coverage already pins
+    // most A1-A6 cases (compose_prompt, wrap_chatml_no_think,
+    // strip_think_block, parse_llm_response, global_backend, model
+    // cache invariants); these tests close the items that weren't
+    // previously covered.
+
+    /// **TC-A4-f**: `parse_llm_response` on a truncated JSON region
+    /// (the model emits a partial object that ends mid-value before
+    /// the closing brace). The recovery walker
+    /// [`super::super::metrics::find_and_parse_json`] requires a
+    /// balanced bracket sequence to extract a region; truncated
+    /// input fails the balance check and routes through the empty-
+    /// fallback branch. Pin this so a regression that tried to
+    /// "recover" partial JSON via best-effort parsing (which would
+    /// produce arbitrary metric values from incomplete numeric
+    /// literals) breaks here.
+    #[test]
+    fn parse_llm_response_truncated_json_returns_empty() {
+        // Truncated mid-value: opening brace, key, partial number.
+        // No closing brace — the bracket-balance scan in
+        // `find_and_parse_json` cannot resolve this to a region.
+        let truncated = r#"{"latency_ns": 1234, "rps": 10"#;
+        let got = parse_llm_response(truncated, crate::test_support::MetricStream::Stdout);
+        assert!(
+            got.is_empty(),
+            "truncated JSON (no closing brace) must route through the \
+             empty-fallback branch, not produce a partial extraction; got: {got:?}",
+        );
+    }
+
+    /// **TC-A4-f variant**: truncated JSON with a balanced inner
+    /// region — the recovery walker is documented to find the FIRST
+    /// balanced region, so a truncation that severs an outer object
+    /// still recovers a complete inner one.
+    #[test]
+    fn parse_llm_response_truncated_outer_with_balanced_inner_recovers_inner() {
+        // Outer object truncated, inner object complete and balanced.
+        // The balanced-bracket scan finds the inner first.
+        let s = r#"prefix prose {"iops": 42} more text {"latency": 99 unterminated"#;
+        let got = parse_llm_response(s, crate::test_support::MetricStream::Stdout);
+        assert!(
+            !got.is_empty(),
+            "complete inner object must be recovered even when an \
+             outer truncation appears later in the response; got empty",
+        );
+        let iops = got.iter().find(|m| m.name == "iops");
+        assert!(
+            iops.is_some(),
+            "the recovered region must yield the inner object's `iops` \
+             metric; got: {got:?}",
+        );
+    }
+
+    /// **TC-A5-b**: `global_backend()` is thread-safe across
+    /// concurrent first-call races. Multiple threads invoking it
+    /// simultaneously must all observe the same `&'static LlamaBackend`
+    /// — the [`OnceLock`] singleton serializes the init, but a
+    /// regression that swapped `OnceLock` for an unsynchronized
+    /// `Option<LlamaBackend>` would either panic on the second
+    /// `LlamaBackend::init` call or hand back distinct instances.
+    ///
+    /// Drives N threads scoped via [`std::thread::scope`] so each
+    /// captures a `&'static LlamaBackend` reference, returns it,
+    /// and the parent asserts pointer-identity across every pair.
+    /// `std::thread::scope` ensures every spawned thread joins
+    /// before the function returns — no leaked threads on test
+    /// failure.
+    #[test]
+    fn global_backend_concurrent_first_call_returns_same_handle() {
+        const N: usize = 8;
+        // Capture pointer values as `usize` for cross-thread transport
+        // — raw pointers are not `Send`, but their numeric address is
+        // a plain integer the parent can compare for identity. The
+        // pointer is to a `&'static LlamaBackend` from `OnceLock`, so
+        // the address is stable for the program's lifetime.
+        let pointers: Vec<usize> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    s.spawn(|| {
+                        let p: *const llama_cpp_2::llama_backend::LlamaBackend = global_backend();
+                        p as usize
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("scoped thread panicked"))
+                .collect()
+        });
+        // Every captured address must equal the first — a single
+        // OnceLock-backed init produces one canonical handle.
+        let first = pointers[0];
+        for (i, p) in pointers.iter().enumerate() {
+            assert_eq!(
+                *p, first,
+                "thread {i} captured a distinct &LlamaBackend (address {p:#x} \
+                 vs canonical {first:#x}); OnceLock concurrency contract violated",
+            );
+        }
+    }
+
+    /// **TC-A6-b**: `memoized_inference()` runs `load_inference`
+    /// AT MOST ONCE across concurrent first-call races. Multiple
+    /// threads invoking the public path
+    /// (`extract_via_llm` → `memoized_inference`) simultaneously
+    /// before the slot is populated must serialize on the outer
+    /// `Mutex` and produce a single load attempt — the race-loss
+    /// threads observe the populated `Arc` and short-circuit.
+    ///
+    /// Drives N threads via [`std::sync::Barrier`] to maximize the
+    /// race window: every thread blocks at the barrier and releases
+    /// simultaneously, hammering `extract_via_llm` from N starting
+    /// points within microseconds of each other. Under the offline
+    /// gate, `load_inference` returns Err on its first invocation
+    /// — which is then memoized — so the spy
+    /// [`MODEL_CACHE_LOAD_COUNT`] must read exactly 1 after the
+    /// race, regardless of N.
+    ///
+    /// A regression that used `try_lock` instead of `lock` on the
+    /// outer mutex (or that constructed a fresh `LoadedInference`
+    /// per call) would ramp the counter to N rather than 1.
+    #[test]
+    fn memoized_inference_concurrent_first_call_loads_exactly_once() {
+        use std::sync::{Arc, Barrier};
+
+        const N: usize = 8;
+        let _lock = lock_env();
+        reset();
+        let _cache = isolated_cache_dir();
+        let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
+
+        let barrier = Arc::new(Barrier::new(N));
+        let _: Vec<()> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let b = Arc::clone(&barrier);
+                    s.spawn(move || {
+                        b.wait();
+                        let _ = extract_via_llm(
+                            "concurrent race driver",
+                            None,
+                            crate::test_support::MetricStream::Stdout,
+                        );
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("scoped thread panicked"))
+                .collect()
+        });
+
+        let load_count = MODEL_CACHE_LOAD_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            load_count, 1,
+            "memoized_inference must enter the slow path exactly once \
+             across N={N} concurrent first-call attempts; got {load_count}. \
+             A counter > 1 indicates the outer Mutex serialization regressed.",
+        );
+    }
+
+    /// **TC-A7-a** (composition): `strip_think_block` followed by
+    /// [`super::super::metrics::find_and_parse_json`] round-trips
+    /// the structured payload from a model response that wraps its
+    /// JSON output in a thinking block. This is the production
+    /// path the LlmExtract pipeline runs in
+    /// [`parse_llm_response`]: the response is FIRST passed through
+    /// strip_think_block-equivalent recovery (the `<think>` block
+    /// is dropped before the JSON walker scans), and the JSON
+    /// region inside the response is extracted and parsed.
+    ///
+    /// Pin the round-trip so a regression in either component (a
+    /// strip_think_block bug that leaks tag bytes into the output,
+    /// a find_and_parse_json bug that fails on non-prose-prefix
+    /// inputs) surfaces here as a missing or mis-valued metric.
+    /// The two helpers are independently tested elsewhere; this
+    /// test pins their composition matches what the pipeline
+    /// actually does.
+    #[test]
+    fn strip_think_block_then_find_and_parse_json_round_trips_metrics() {
+        let model_output = "<think>let me reason about the JSON shape... \
+                            the user wants metric extraction</think>\n\
+                            Here are the metrics: \
+                            {\"latency_ns_p99\": 4242, \"rps\": 1000}\n\
+                            (end of response)";
+        let stripped = strip_think_block(model_output);
+        // The think block must be gone — pin the negative.
+        assert!(
+            !stripped.contains("<think>"),
+            "strip must remove the opening tag; got: {stripped:?}",
+        );
+        assert!(
+            !stripped.contains("</think>"),
+            "strip must remove the closing tag; got: {stripped:?}",
+        );
+        // Now the json walker recovers the metrics object.
+        let parsed = super::super::metrics::find_and_parse_json(&stripped)
+            .expect("composition: stripped output must yield a parseable JSON region");
+        // Walk it as the production pipeline does.
+        let metrics = super::super::metrics::walk_json_leaves(
+            &parsed,
+            crate::test_support::MetricSource::LlmExtract,
+            crate::test_support::MetricStream::Stdout,
+        );
+        assert!(
+            metrics.len() >= 2,
+            "composition: must recover both numeric leaves \
+             (latency_ns_p99=4242, rps=1000); got {} metrics: {metrics:?}",
+            metrics.len(),
+        );
+        let latency = metrics
+            .iter()
+            .find(|m| m.name.contains("latency_ns_p99"))
+            .expect("latency_ns_p99 must survive composition");
+        assert_eq!(latency.value, 4242.0);
+        let rps = metrics
+            .iter()
+            .find(|m| m.name == "rps")
+            .expect("rps must survive composition");
+        assert_eq!(rps.value, 1000.0);
+    }
+
+    // --- Group A8: stateful UTF-8 decoder via encoding_rs ---
+    //
+    // `invoke_with_model` uses a stateful `encoding_rs::UTF_8.new_decoder()`
+    // to stitch token-piece byte sequences across `token_to_piece`
+    // calls. A single token may carry a partial multi-byte UTF-8
+    // codepoint; without statefulness the decoder would either
+    // emit a U+FFFD replacement on a partial byte run OR drop the
+    // partial bytes silently — both regressions corrupt the model's
+    // output.
+    //
+    // These tests drive `encoding_rs::UTF_8.new_decoder()` directly
+    // (the exact API call site at model.rs:2336) without loading
+    // the model, pinning the decoder's contract independent of any
+    // upstream llama-cpp-2 changes. A regression that swapped the
+    // decoder for `String::from_utf8_lossy` (which is NOT stateful)
+    // would surface here as a corrupted multi-byte stitch.
+
+    /// **TC-A8-a**: a 4-byte UTF-8 codepoint split across two
+    /// decoder calls stitches into a single character. Drives a
+    /// 4-byte sequence (U+1F600 GRINNING FACE = `0xF0 0x9F 0x98 0x80`)
+    /// fed as bytes 0..2 then bytes 2..4 — a partial-codepoint
+    /// scenario that mirrors a model emitting a token whose bytes
+    /// span the codepoint boundary.
+    #[test]
+    fn encoding_rs_utf8_decoder_stitches_split_codepoint() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut decoded = String::with_capacity(16);
+
+        // First half: bytes 0..2 of the 4-byte codepoint. The
+        // decoder must NOT emit U+FFFD for partial input; it
+        // buffers the bytes internally.
+        let (_result_a, _read_a, _replaced_a) =
+            decoder.decode_to_string(&[0xF0, 0x9F], &mut decoded, false);
+        assert_eq!(
+            decoded, "",
+            "partial codepoint (bytes 0..2 of 4) must NOT emit any \
+             output yet — the decoder buffers; got: {decoded:?}",
+        );
+
+        // Second half: bytes 2..4 complete the codepoint.
+        let (_result_b, _read_b, _replaced_b) =
+            decoder.decode_to_string(&[0x98, 0x80], &mut decoded, true);
+        assert_eq!(
+            decoded, "\u{1F600}",
+            "completed codepoint must emit the grinning face emoji \
+             stitched across two calls; got: {decoded:?}",
+        );
+    }
+
+    /// **TC-A8-b**: a complete multi-byte codepoint delivered in a
+    /// single call decodes correctly without splitting. Pins the
+    /// non-degenerate happy path so a regression that special-
+    /// cased the split-byte path (and broke the unsplit case)
+    /// surfaces here.
+    #[test]
+    fn encoding_rs_utf8_decoder_handles_complete_codepoint_single_call() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut decoded = String::with_capacity(16);
+
+        // Two complete codepoints in one call: ASCII 'A' (1 byte)
+        // and U+00E9 LATIN SMALL LETTER E WITH ACUTE (`0xC3 0xA9`,
+        // 2 bytes). Mixed widths exercise the decoder's per-byte
+        // codepoint-boundary tracking.
+        let (_result, _read, _replaced) =
+            decoder.decode_to_string(&[b'A', 0xC3, 0xA9], &mut decoded, true);
+        assert_eq!(
+            decoded, "A\u{00E9}",
+            "complete-in-one-call codepoints (ASCII + 2-byte) must \
+             decode without buffering; got: {decoded:?}",
+        );
+    }
+
+    /// **TC-A8-c**: a lone invalid byte (0xFF — never valid in
+    /// UTF-8) must emit U+FFFD REPLACEMENT CHARACTER under the
+    /// `decode_to_string` (with-replacement) API. Pins that the
+    /// production code path uses replacement semantics — a
+    /// regression to `decode_to_string_without_replacement` would
+    /// surface as an Err result rather than a U+FFFD-bearing
+    /// String, breaking the "always produce a String, never panic"
+    /// contract `invoke_with_model` relies on.
+    #[test]
+    fn encoding_rs_utf8_decoder_replaces_lone_invalid_byte() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut decoded = String::with_capacity(8);
+
+        let (_result, _read, replaced) = decoder.decode_to_string(&[0xFF], &mut decoded, true);
+        assert!(
+            decoded.contains('\u{FFFD}'),
+            "0xFF (never valid UTF-8) must surface as U+FFFD \
+             REPLACEMENT CHARACTER; got: {decoded:?}",
+        );
+        assert!(
+            replaced,
+            "decode_to_string must report `replaced=true` when a \
+             byte is replaced with U+FFFD",
+        );
     }
 
     /// `locate()` is the fast-path sibling of `ensure()` used by

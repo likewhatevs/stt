@@ -2919,6 +2919,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -3028,6 +3029,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {

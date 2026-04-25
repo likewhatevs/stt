@@ -749,6 +749,7 @@ const PAYLOAD_A: Payload = Payload::new(
     &[],
     false,
     None,
+    None,
 );
 
 #[allow(dead_code)]
@@ -762,6 +763,7 @@ const PAYLOAD_B: Payload = Payload::new(
     &[],
     false,
     None,
+    None,
 );
 
 #[allow(dead_code)]
@@ -774,6 +776,7 @@ const PAYLOAD_C: Payload = Payload::new(
     &[],
     &[],
     false,
+    None,
     None,
 );
 

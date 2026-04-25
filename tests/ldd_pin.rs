@@ -90,12 +90,19 @@ fn ktstr_binary_dynamic_deps_pinned() {
         .collect();
 
     // Expected dynamic dep set on a glibc-linked Linux host:
-    //   libgcc_s.so.1 — Rust unwinding personality on Linux. Even
+    //   libgomp.so.1   — OpenMP runtime. `llama-cpp-2` builds with
+    //     the `openmp` feature enabled (see Cargo.toml comment on
+    //     llama-cpp-2) for OpenMP-parallel matmul during inference;
+    //     the upstream C++ link pulls in libgomp from the system.
+    //   libstdc++.so.6 — C++ standard library, pulled by the
+    //     `llama-cpp-sys-2` build that links the linked llama.cpp
+    //     C++ sources.
+    //   libgcc_s.so.1  — Rust unwinding personality on Linux. Even
     //     under panic=abort, the linker pulls it in for stack-unwind
     //     metadata referenced by the standard library.
-    //   libm.so.6    — transcendental math (exp/log/sqrt) used
+    //   libm.so.6      — transcendental math (exp/log/sqrt) used
     //     transitively by several deps (rand, polars, llama-cpp-2).
-    //   libc.so.6    — glibc itself.
+    //   libc.so.6      — glibc itself.
     // Third-party jemalloc ships vendored and statically-linked
     // (see Cargo.toml comment on tikv-jemallocator). libbpf is
     // vendored via libbpf-sys. No additional .so links should
@@ -105,7 +112,7 @@ fn ktstr_binary_dynamic_deps_pinned() {
     // transitive crate dep introduced a dynamic link requirement.
     // Confirm the new link is intentional, then bump this pin and
     // note the reason in the commit message.
-    const EXPECTED_DEPS: usize = 3;
+    const EXPECTED_DEPS: usize = 5;
 
     assert_eq!(
         deps.len(),

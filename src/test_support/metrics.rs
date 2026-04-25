@@ -1304,6 +1304,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let stdout = r#"{"throughput": 42.5}"#;
         let m = extract_metrics(stdout, &EXAMPLE_PAYLOAD.output, MetricStream::Stdout).unwrap();

@@ -1026,6 +1026,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let entry = KtstrTestEntry {
             name: "payload_entry",
@@ -1050,6 +1051,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         // stress-ng emits progress / metrics / summaries to stderr; stdout
         // is blank. `OutputFormat::Json` yields zero metrics — stdout has
@@ -1070,6 +1072,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let entry = KtstrTestEntry {
             name: "multi_workload",
@@ -1099,6 +1102,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1139,6 +1143,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         // stress-ng emits progress / metrics / summaries to stderr; stdout
         // is blank. `OutputFormat::Json` yields zero metrics — stdout has
@@ -1159,6 +1164,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         fn good_test_func(_: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -1620,6 +1626,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let entry = KtstrTestEntry {
             name: "bad_required",
@@ -1644,6 +1651,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let entry = KtstrTestEntry {
             name: "bad_both",
@@ -1814,6 +1822,7 @@ mod tests {
             include_files: &["sched-helper"],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         static PRIMARY: crate::test_support::Payload = crate::test_support::Payload {
             name: "primary",
@@ -1825,6 +1834,7 @@ mod tests {
             include_files: &["fio"],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         static WL_A: crate::test_support::Payload = crate::test_support::Payload {
             name: "wl_a",
@@ -1836,6 +1846,7 @@ mod tests {
             include_files: &["stress-ng"],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         static WL_B: crate::test_support::Payload = crate::test_support::Payload {
             name: "wl_b",
@@ -1847,6 +1858,7 @@ mod tests {
             include_files: &["schbench"],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         static WORKLOADS: &[&crate::test_support::Payload] = &[&WL_A, &WL_B];
         let entry = KtstrTestEntry {
@@ -1888,6 +1900,7 @@ mod tests {
             include_files: &["sched-helper"],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let entry = KtstrTestEntry {
             name: "t",

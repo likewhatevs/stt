@@ -2112,20 +2112,47 @@ pub(crate) fn resolve_cache_root_with_suffix(suffix: &str) -> anyhow::Result<Pat
 /// means; a future change to the validation policy lands once and
 /// flows through both cache flavors.
 pub(crate) fn validate_home_for_cache() -> anyhow::Result<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    // 1. Unset / empty: `PathBuf::from("").join(".cache")` yields
-    //    `.cache` relative to CWD — almost never what the operator
-    //    wants. Catches the bare `unset HOME` and the
-    //    `HOME=` (assigned but empty) cases together because
-    //    `std::env::var().unwrap_or_default()` collapses both into
-    //    the empty string.
-    if home.is_empty() {
-        anyhow::bail!(
-            "HOME is unset or empty; cannot resolve cache directory. \
-             Set KTSTR_CACHE_DIR to an absolute path (e.g. /tmp/ktstr-cache) or \
-             XDG_CACHE_HOME to specify a cache location explicitly."
-        );
-    }
+    // Distinguish unset (`Err(NotPresent)` — HOME never assigned in
+    // the process environment) from empty (`Ok("")` — HOME assigned
+    // but to the empty string) so the operator's diagnostic names
+    // the actual misconfiguration shape. The two failure modes
+    // arise from different bugs in practice:
+    //   - Unset: container init dropped HOME (`docker run` without
+    //     `-e HOME=...`, systemd unit without `Environment=HOME=...`).
+    //   - Empty: a Dockerfile `ENV HOME=` line, a shell rc that
+    //     accidentally `unset`s HOME via assignment-expansion (e.g.
+    //     `export HOME=$HOME_OVERRIDE` when `HOME_OVERRIDE` is unset
+    //     under `set -u` semantics inverted).
+    // Non-UTF-8 HOME (`Err(NotUnicode)`) is treated as unset for
+    // diagnostic purposes — the operator's remediation is the same
+    // (set KTSTR_CACHE_DIR / XDG_CACHE_HOME), and naming the raw
+    // bytes here would surface environment-leakage in the error.
+    let home = match std::env::var("HOME") {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => {
+            // Empty assignment.
+            anyhow::bail!(
+                "HOME is set to the empty string; cannot resolve cache directory. \
+                 An empty HOME usually means a Dockerfile or shell rc has \
+                 `export HOME=` or `ENV HOME=` with no value. Either set HOME \
+                 to a real absolute path, or set KTSTR_CACHE_DIR to an absolute \
+                 path (e.g. /tmp/ktstr-cache) or XDG_CACHE_HOME to specify a \
+                 cache location explicitly."
+            );
+        }
+        Err(_) => {
+            // Unset (NotPresent) or non-UTF-8 (NotUnicode) — both
+            // surface as "no usable HOME for derivation" with the
+            // same remediation.
+            anyhow::bail!(
+                "HOME is unset; cannot resolve cache directory. \
+                 The container init or login shell did not assign HOME — set \
+                 it to an absolute path, or set KTSTR_CACHE_DIR to an absolute \
+                 path (e.g. /tmp/ktstr-cache) or XDG_CACHE_HOME to specify a \
+                 cache location explicitly."
+            );
+        }
+    };
     // 2. Literal `/`: a process-environment artifact (root user with
     //    no home dir, container init that didn't set HOME).
     //    `PathBuf::from("/").join(".cache")` yields `/.cache` —
@@ -3282,8 +3309,13 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("HOME is unset or empty"),
+            msg.contains("HOME is unset"),
             "expected HOME-unset error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("HOME is set to the empty string"),
+            "unset HOME must NOT use the empty-string diagnostic — the two \
+             cases are distinct now (NotPresent vs Ok(\"\")), got: {msg}",
         );
         assert!(
             msg.contains("KTSTR_CACHE_DIR"),
@@ -3320,11 +3352,15 @@ mod tests {
         );
     }
 
-    /// A HOME literal of `""` (empty string) — just as broken as
-    /// unset, since `PathBuf::from("").join(".cache")` produces a
+    /// A HOME literal of `""` (empty string) is just as broken as
+    /// unset (`PathBuf::from("").join(".cache")` produces a
     /// relative `.cache` rooted at the process CWD instead of the
-    /// user's home. Same bail as the unset case (the gate's
-    /// `unwrap_or_default()` collapses both into the empty string).
+    /// user's home), but the diagnostic now distinguishes the two
+    /// shapes: empty-string assignment hits the `Ok("")` arm of
+    /// `validate_home_for_cache`, surfacing "HOME is set to the
+    /// empty string" so an operator can identify a Dockerfile
+    /// `ENV HOME=` or shell-rc `export HOME=` typo as the cause
+    /// rather than a missing init-time assignment.
     #[test]
     fn cache_resolve_root_home_empty_error() {
         let _lock = lock_env();
@@ -3334,8 +3370,13 @@ mod tests {
         let err = resolve_cache_root().unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("HOME is unset or empty"),
-            "expected HOME-empty error, got: {msg}"
+            msg.contains("HOME is set to the empty string"),
+            "empty-HOME bail must use the empty-string diagnostic, got: {msg}",
+        );
+        assert!(
+            !msg.contains("HOME is unset"),
+            "empty-HOME must NOT use the unset diagnostic — the two \
+             cases are distinct now, got: {msg}",
         );
     }
 
@@ -7346,9 +7387,11 @@ mod tests {
     // surfaces against this dedicated entry point as well as the
     // integration paths.
 
-    /// Unset `HOME` — `env::var().unwrap_or_default()` collapses
-    /// `Err(NotPresent)` and `Ok("")` into the same empty-string
-    /// branch. Pins the matching arm.
+    /// Unset `HOME` — `env::var()` returns `Err(NotPresent)` and
+    /// the validator surfaces "HOME is unset" as the matching
+    /// arm. Distinguished from the empty-string case below so an
+    /// operator hitting either shape sees the actual misconfiguration
+    /// in the diagnostic.
     #[test]
     fn validate_home_for_cache_rejects_unset() {
         let _env_lock = lock_env();
@@ -7356,15 +7399,22 @@ mod tests {
         let err = super::validate_home_for_cache().expect_err("unset HOME must be rejected");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("HOME is unset or empty"),
-            "diagnostic must call out unset/empty: {msg}",
+            msg.contains("HOME is unset"),
+            "diagnostic must call out the unset case specifically: {msg}",
+        );
+        assert!(
+            !msg.contains("HOME is set to the empty string"),
+            "unset HOME must NOT use the empty-string diagnostic — the two \
+             cases are distinct now (NotPresent vs Ok(\"\")): {msg}",
         );
     }
 
     /// Empty `HOME` — explicitly assigned to the empty string.
-    /// Hits the same is_empty() arm as unset; verifies the
-    /// `unwrap_or_default()` collapse so the diagnostic shape is
-    /// identical for both cases.
+    /// `env::var()` returns `Ok("")` and the validator surfaces
+    /// "HOME is set to the empty string" so an operator can
+    /// identify a Dockerfile `ENV HOME=` or shell-rc `export HOME=`
+    /// typo as the cause rather than confusing it with the
+    /// container-init-dropped-HOME case.
     #[test]
     fn validate_home_for_cache_rejects_empty() {
         let _env_lock = lock_env();
@@ -7372,8 +7422,13 @@ mod tests {
         let err = super::validate_home_for_cache().expect_err("empty HOME must be rejected");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("HOME is unset or empty"),
-            "diagnostic must call out unset/empty: {msg}",
+            msg.contains("HOME is set to the empty string"),
+            "diagnostic must call out the empty-string case specifically: {msg}",
+        );
+        assert!(
+            !msg.contains("HOME is unset"),
+            "empty HOME must NOT use the unset diagnostic — the two \
+             cases are distinct now: {msg}",
         );
     }
 

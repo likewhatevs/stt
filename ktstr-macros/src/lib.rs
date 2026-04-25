@@ -1661,6 +1661,7 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
                 &[],
                 false,
                 None,
+                None,
             );
 
         impl #enum_name {
@@ -1965,6 +1966,7 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
                 &[#(#metrics),*],
                 &[#(#include_files),*],
                 false,
+                None,
                 None,
             );
     };

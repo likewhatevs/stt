@@ -68,6 +68,7 @@ static JEMALLOC_PROBE: Payload = Payload::new(
     &[],
     false,
     None,
+    None,
 );
 
 /// Probe invocation without exit-code gating. Used by the error-
@@ -82,6 +83,7 @@ static JEMALLOC_PROBE_NO_EXIT_CHECK: Payload = Payload::new(
     &[],
     &[],
     false,
+    None,
     None,
 );
 
@@ -105,6 +107,7 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload::new(
     &[],
     false,
     None,
+    None,
 );
 
 /// Churn-mode allocator worker. Same binary as
@@ -124,6 +127,7 @@ static JEMALLOC_ALLOC_WORKER_CHURN: Payload = Payload::new(
     &[],
     &[],
     false,
+    None,
     None,
 );
 

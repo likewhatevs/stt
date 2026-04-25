@@ -144,6 +144,23 @@ pub struct Payload {
     /// Flag names in the slice are bare (no leading `--`) and
     /// match the syntax of `Op::RunPayload`'s per-flag slot.
     pub known_flags: Option<&'static [&'static str]>,
+
+    /// Per-payload validation bounds applied host-side to
+    /// extracted metrics (`OutputFormat::LlmExtract` only). When
+    /// `None` (the default), only the framework's universal
+    /// invariants apply. When `Some(&MetricBounds { … })`, each
+    /// declared bound is enforced after extraction in
+    /// [`crate::test_support::eval::host_side_llm_extract`] and
+    /// any violation surfaces as an [`crate::assert::AssertDetail`].
+    /// See [`MetricBounds`] for the per-bound contract and the
+    /// rationale for declaring this per-payload rather than
+    /// globally.
+    ///
+    /// `Json` and `ExitCode` payloads ignore this field — their
+    /// extraction runs guest-side and goes through `default_checks`
+    /// for assertion. The bound-checking pass is host-only because
+    /// LlmExtract metrics are extracted host-side post-VM-exit.
+    pub metric_bounds: Option<&'static MetricBounds>,
 }
 
 impl std::fmt::Debug for Payload {
@@ -353,6 +370,7 @@ impl Payload {
         &[],
         false,
         None,
+        None,
     );
 
     /// Short, human-readable name for logging and sidecar output.
@@ -400,6 +418,7 @@ impl Payload {
         include_files: &'static [&'static str],
         uses_parent_pgrp: bool,
         known_flags: Option<&'static [&'static str]>,
+        metric_bounds: Option<&'static MetricBounds>,
     ) -> Payload {
         Payload {
             name,
@@ -411,6 +430,7 @@ impl Payload {
             include_files,
             uses_parent_pgrp,
             known_flags,
+            metric_bounds,
         }
     }
 
@@ -430,6 +450,7 @@ impl Payload {
             &[],
             &[],
             false,
+            None,
             None,
         )
     }
@@ -459,6 +480,7 @@ impl Payload {
             &[],
             &[],
             false,
+            None,
             None,
         )
     }
@@ -820,6 +842,84 @@ pub struct MetricHint {
     pub unit: &'static str,
 }
 
+/// Per-payload validation bounds applied host-side to extracted
+/// metrics from `OutputFormat::LlmExtract` payloads.
+///
+/// The framework's universal invariants in
+/// [`crate::test_support::eval::validate_llm_extraction`] (unique
+/// names, finite values, `MetricSource::LlmExtract`) are workload-
+/// agnostic and apply to every LlmExtract payload. Workload-
+/// specific bounds — minimum metric count, sign, magnitude — vary
+/// per payload (schbench's > 5 latency rows vs a single-throughput
+/// benchmark; non-negative microseconds vs delta-emitting payloads
+/// that legitimately report negatives) and cannot be globalized.
+///
+/// `MetricBounds` lets the payload author declare these bounds
+/// declaratively on the `Payload` struct via the `metric_bounds`
+/// field. The host applies them after extraction in
+/// [`crate::test_support::eval::host_side_llm_extract`]; each
+/// violation surfaces as its own [`crate::assert::AssertDetail`]
+/// with `DetailKind::Other`.
+///
+/// Every bound is `Option`-wrapped so a payload can declare any
+/// subset: a payload that only cares about metric count leaves
+/// `value_min` / `value_max` as `None`; a payload that only cares
+/// about value magnitude leaves `min_count` as `None`.
+///
+/// `#[non_exhaustive]` so future bound classes (per-metric ranges,
+/// required-name lists) can land without breaking existing
+/// `MetricBounds { ... }` literals — call sites must use
+/// struct-update or named-field initialization patterns.
+///
+/// Wire-format note: `MetricBounds` rides through the SHM ring on
+/// `RawPayloadOutput::metric_bounds` (owned form). The struct's
+/// fields (`Option<usize>` / `Option<f64>`) are serde-trivial; no
+/// separate `WireMetricBounds` type is needed because `&'static
+/// MetricBounds` carries no string slices that would defeat
+/// serialization.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct MetricBounds {
+    /// Minimum total metric count. When `Some(n)`, an extracted
+    /// metric set with fewer than `n` entries surfaces an
+    /// `AssertDetail` naming the shortfall. `None` disables the
+    /// count check (the universal "did we extract anything"
+    /// invariant in `validate_llm_extraction` does NOT enforce
+    /// a lower bound — payloads that genuinely produce zero
+    /// metrics on a clean run are allowed under the universal
+    /// rules).
+    pub min_count: Option<usize>,
+
+    /// Universal lower bound applied to every metric value. When
+    /// `Some(v)`, any metric with `value < v` surfaces an
+    /// `AssertDetail` naming the metric and the bound. `None`
+    /// disables the lower-bound check — payloads that emit
+    /// signed delta metrics (improvement = negative latency
+    /// delta) leave this `None`.
+    pub value_min: Option<f64>,
+
+    /// Universal upper bound applied to every metric value. When
+    /// `Some(v)`, any metric with `value > v` surfaces an
+    /// `AssertDetail` naming the metric and the bound. `None`
+    /// disables the upper-bound check — payloads that emit
+    /// large-but-legitimate metrics (memory bytes in a multi-TB
+    /// container, RSS in petabyte ranges) leave this `None`.
+    pub value_max: Option<f64>,
+}
+
+impl MetricBounds {
+    /// Const constructor for the all-disabled defaults — every
+    /// bound is `None`, so applying these to a metric set produces
+    /// zero violations regardless of input shape. Useful as a
+    /// const seed in tests and as the documented "no extra checks"
+    /// baseline.
+    pub const NONE: MetricBounds = MetricBounds {
+        min_count: None,
+        value_min: None,
+        value_max: None,
+    };
+}
+
 /// Assertion check evaluated against an extracted
 /// [`PayloadMetrics`] (or the exit code for
 /// [`Check::ExitCodeEq`](Check::ExitCodeEq)).
@@ -1127,6 +1227,15 @@ pub(crate) struct RawPayloadOutput {
     /// on the host to apply [`Polarity`] + unit to the host-extracted
     /// metric set. Empty when the payload declared no hints.
     pub metric_hints: Vec<WireMetricHint>,
+    /// Owned copy of the payload's [`MetricBounds`] declaration —
+    /// `Some(bounds)` when the payload set
+    /// [`Payload::metric_bounds`], `None` when it didn't. Consumed
+    /// by the host's `host_side_llm_extract` after extraction to
+    /// apply per-payload validation (minimum metric count, value
+    /// magnitude bounds). `MetricBounds` is `Copy` + serde, so no
+    /// owned-strings conversion is needed — the value rides through
+    /// SHM by value.
+    pub metric_bounds: Option<MetricBounds>,
 }
 
 #[cfg(test)]
@@ -1283,6 +1392,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         match FIO.kind {
             PayloadKind::Binary(name) => assert_eq!(name, "fio"),
@@ -1319,6 +1429,7 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
+        metric_bounds: None,
     };
 
     #[test]
@@ -1589,6 +1700,7 @@ mod tests {
                     unit: "ns".to_string(),
                 },
             ],
+            metric_bounds: None,
         };
         let bytes = serde_json::to_vec(&original).expect("RawPayloadOutput must always serialize");
         let restored: RawPayloadOutput =
@@ -1635,6 +1747,7 @@ mod tests {
             stderr: String::new(),
             hint: None,
             metric_hints: Vec::new(),
+            metric_bounds: None,
         };
         let bytes = serde_json::to_vec(&original).expect("serialize");
         let restored: RawPayloadOutput = serde_json::from_slice(&bytes).expect("deserialize");
@@ -1669,6 +1782,7 @@ mod tests {
             stderr: String::new(),
             hint: None,
             metric_hints: Vec::new(),
+            metric_bounds: None,
         };
         let bytes = serde_json::to_vec(&original).expect("serialize");
         let restored: RawPayloadOutput = serde_json::from_slice(&bytes).expect("deserialize");
@@ -1689,6 +1803,7 @@ mod tests {
             stderr: r#"{"latency_p99": 1234}"#.to_string(),
             hint: None,
             metric_hints: Vec::new(),
+            metric_bounds: None,
         };
         let bytes = serde_json::to_vec(&original).expect("serialize");
         let restored: RawPayloadOutput = serde_json::from_slice(&bytes).expect("deserialize");

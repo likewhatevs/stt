@@ -357,7 +357,13 @@ fn evaluate(
     output: SpawnOutput,
 ) -> (AssertResult, PayloadMetrics) {
     if let OutputFormat::LlmExtract(hint) = payload.output {
-        return evaluate_llm_extract_deferred(output, hint, payload.metrics, checks);
+        return evaluate_llm_extract_deferred(
+            output,
+            hint,
+            payload.metrics,
+            payload.metric_bounds,
+            checks,
+        );
     }
     // `extract_metrics` is infallible for ExitCode + Json (the only
     // remaining variants the guest evaluates). The Result return type
@@ -510,16 +516,35 @@ fn evaluate_llm_extract_deferred(
     output: SpawnOutput,
     hint: Option<&'static str>,
     metric_hints: &'static [crate::test_support::MetricHint],
+    metric_bounds: Option<&'static crate::test_support::MetricBounds>,
     checks: &[Check],
 ) -> (AssertResult, PayloadMetrics) {
-    let bad: Vec<&Check> = checks
+    let bad: Vec<String> = checks
         .iter()
         .filter(|c| !matches!(c, Check::ExitCodeEq(_)))
+        .map(|c| match c {
+            Check::Min { metric, value } => format!("Min {{ metric: {metric:?}, value: {value} }}"),
+            Check::Max { metric, value } => format!("Max {{ metric: {metric:?}, value: {value} }}"),
+            Check::Range { metric, lo, hi } => {
+                format!("Range {{ metric: {metric:?}, lo: {lo}, hi: {hi} }}")
+            }
+            Check::Exists(metric) => format!("Exists({metric:?})"),
+            // `ExitCodeEq` is filtered out above; keep an explicit
+            // unreachable arm so a future Check variant added on
+            // the LlmExtract-acceptable side surfaces here at
+            // compile time rather than rendering as a fallback
+            // Debug.
+            Check::ExitCodeEq(_) => unreachable!(
+                "ExitCodeEq is filtered out of the bad list above; \
+                 this arm is exhaustive-match coverage for the variant"
+            ),
+        })
         .collect();
     assert!(
         bad.is_empty(),
         "metric-level .check() on LlmExtract payloads cannot be evaluated guest-side; \
-         declare these as default_checks on the Payload instead. Forbidden: {bad:?}"
+         declare these as default_checks on the Payload instead. Forbidden: [{}]",
+        bad.join(", "),
     );
 
     let exit_code = output.exit_code;
@@ -536,6 +561,11 @@ fn evaluate_llm_extract_deferred(
             .iter()
             .map(crate::test_support::WireMetricHint::from)
             .collect(),
+        // `MetricBounds` is `Copy`, so the static reference's
+        // payload value rides through SHM by value. `None` means
+        // the payload declared no per-payload bounds — the host
+        // skips the bounds-validation pass for this entry.
+        metric_bounds: metric_bounds.copied(),
     };
     emit_raw_payload_output_to_shm(&raw);
 
@@ -2288,6 +2318,7 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
+        metric_bounds: None,
     };
 
     const EEVDF_SCHED_PAYLOAD: Payload = Payload {
@@ -2300,6 +2331,7 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
+        metric_bounds: None,
     };
 
     #[test]
@@ -3042,6 +3074,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         resolve_polarities(&mut metrics, &HINTED);
         assert_eq!(metrics[0].polarity, Polarity::HigherBetter);
@@ -3095,6 +3128,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let handle = PayloadRun::new(&ctx, &SLEEPER)
             .spawn()
@@ -3120,6 +3154,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mut handle = PayloadRun::new(&ctx, &SLEEPER)
             .spawn()
@@ -3270,6 +3305,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let cgroups = CgroupManager::new("/nonexistent");
         let topo = TestTopology::synthetic(4, 1);
@@ -3397,6 +3433,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mut ms = vec![
             Metric {
@@ -3470,6 +3507,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mut ms = vec![Metric {
             name: "iops".into(),
@@ -3507,6 +3545,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mut ms = vec![
             Metric {
@@ -3546,6 +3585,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let mut ms = vec![Metric {
             name: "anything".into(),
@@ -3889,6 +3929,7 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
+        metric_bounds: None,
     };
 
     /// Well-behaved case: stdout carries the JSON document; stderr
@@ -4196,6 +4237,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let handle = PayloadRun::new(&ctx, &MULTI_SLEEPER)
             .spawn()
@@ -4259,6 +4301,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: false,
             known_flags: None,
+            metric_bounds: None,
         };
         let handle = PayloadRun::new(&ctx, &MULTI_SLEEPER)
             .spawn()
@@ -4320,6 +4363,7 @@ mod tests {
             include_files: &[],
             uses_parent_pgrp: true,
             known_flags: None,
+            metric_bounds: None,
         };
         let handle = PayloadRun::new(&ctx, &PARENT_PGRP_SLEEPER)
             .spawn()
@@ -4885,6 +4929,7 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
+        metric_bounds: None,
     };
 
     /// LlmExtract payload with a focus hint — pins that the hint
@@ -4901,6 +4946,7 @@ mod tests {
         include_files: &[],
         uses_parent_pgrp: false,
         known_flags: None,
+        metric_bounds: None,
     };
 
     /// `evaluate` on a `LlmExtract` payload must NOT run
@@ -4921,7 +4967,7 @@ mod tests {
     /// (or accidentally treats LlmExtract like Json on the
     /// extraction axis) surfaces here as a non-empty metrics vec.
     #[test]
-    fn evaluate_llm_extract_returns_empty_metrics_no_extraction() {
+    fn evaluate_llm_extract_does_not_extract_from_stdout() {
         let output = SpawnOutput {
             stdout: r#"{"iops": 4242, "latency": 10}"#.to_string(),
             stderr: String::new(),
@@ -4946,7 +4992,7 @@ mod tests {
         );
     }
 
-    /// Mirror of `evaluate_llm_extract_returns_empty_metrics_no_extraction`
+    /// Mirror of `evaluate_llm_extract_does_not_extract_from_stdout`
     /// with stderr carrying the JSON document and stdout empty —
     /// the schbench-style shape that drives the host's stderr
     /// fallback. The guest's deferral path must NOT pull metrics
