@@ -642,22 +642,64 @@ fn pin_current_thread(cpu: usize, label: &str) {
 ///
 /// Logs success or warning; does not fail the VM.
 ///
+/// Best-effort partial-mask semantics: a single bad CPU (out of
+/// `CpuSet`'s static bitmap range) does NOT abort the whole call.
+/// The bad entry is logged and skipped, and the resulting mask
+/// reflects every CPU that fit. This is preferable to the
+/// alternative — silently inheriting whatever overly-narrow mask
+/// the thread already had (often a single-CPU perf-mode pin) and
+/// quietly losing the broadening the caller asked for. The only
+/// case that early-returns is "every requested CPU was rejected,"
+/// which would otherwise call `sched_setaffinity` with an empty
+/// mask and block the thread forever.
+///
 /// `pub(crate)` so non-vmm consumers (the host-side LlmExtract
 /// pipeline in `test_support::eval`) can use the same primitive
 /// to broaden the calling thread's mask before running inference,
 /// which would otherwise inherit a perf-mode single-CPU pin from
 /// the just-finished VM run.
 pub(crate) fn set_thread_cpumask(cpus: &[usize], label: &str) {
+    // Build the cpuset by adding every CPU we can. A bad CPU
+    // (out-of-range for `CpuSet`'s static bitmap, currently 1024 on
+    // x86_64) skips that single entry and continues the loop rather
+    // than aborting the whole call. The early-return form gave us
+    // the worst of both worlds: the thread inherited whatever
+    // overly-narrow mask was already in place (e.g. a single-CPU
+    // perf-mode pin) and the caller silently lost the broadening
+    // it asked for. A partial mask — every CPU that fit, minus the
+    // bad one — preserves most of the intent and remains observable
+    // via the per-skip warning + the post-loop summary.
     let mut cpuset = nix::sched::CpuSet::new();
+    let mut applied: Vec<usize> = Vec::with_capacity(cpus.len());
+    let mut skipped: Vec<usize> = Vec::new();
     for &cpu in cpus {
-        if let Err(e) = cpuset.set(cpu) {
-            eprintln!("no_perf_mode: WARNING: cpuset.set({cpu}) for {label}: {e}");
-            return;
+        match cpuset.set(cpu) {
+            Ok(()) => applied.push(cpu),
+            Err(e) => {
+                eprintln!("no_perf_mode: WARNING: cpuset.set({cpu}) for {label}: {e}; skipping");
+                skipped.push(cpu);
+            }
         }
     }
+    if !skipped.is_empty() {
+        eprintln!(
+            "no_perf_mode: {label}: skipped {} of {} requested CPUs ({skipped:?}); proceeding with {applied:?}",
+            skipped.len(),
+            cpus.len(),
+        );
+    }
+    // If every requested CPU failed to bind we have nothing to apply
+    // — calling sched_setaffinity with an empty mask would block the
+    // thread forever. Bail rather than mask to zero.
+    if applied.is_empty() {
+        eprintln!(
+            "no_perf_mode: WARNING: {label}: no valid CPUs to mask (every requested entry failed)"
+        );
+        return;
+    }
     match nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
-        Ok(()) => eprintln!("no_perf_mode: mask {label} to host CPUs {cpus:?}"),
-        Err(e) => eprintln!("no_perf_mode: WARNING: mask {label} to {cpus:?}: {e}"),
+        Ok(()) => eprintln!("no_perf_mode: mask {label} to host CPUs {applied:?}"),
+        Err(e) => eprintln!("no_perf_mode: WARNING: mask {label} to {applied:?}: {e}"),
     }
 }
 
