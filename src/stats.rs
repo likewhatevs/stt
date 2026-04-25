@@ -795,6 +795,283 @@ pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<Gauntl
     rows.iter().filter(|r| filter.matches(r)).cloned().collect()
 }
 
+/// One aggregated [`GauntletRow`] produced by [`aggregate_rows`],
+/// plus the pass-bookkeeping needed to render `N/M` in the per-key
+/// summary block.
+///
+/// `row` carries arithmetic-mean metric values across every
+/// non-failing, non-skipped contributor in the group; the
+/// (`scenario`, `topology`, `work_type`, `flags`, `scheduler`,
+/// `kernel_version`) identity is taken verbatim from the first
+/// contributor in iteration order — every contributor in the group
+/// shares the identity tuple by construction (it IS the group key
+/// for the first four fields, and `scheduler` / `kernel_version`
+/// are typed-filter-narrowed at the call site, so they can only
+/// vary if the operator passed no `--scheduler` /
+/// `--kernel-version` filter).
+///
+/// `passed` on `row` is the AND across every contributor: a single
+/// failing contributor in the group flips the aggregated row to
+/// `passed = false`, which routes the pair through
+/// [`compare_rows`]' `skipped_failed` gate. `skipped` follows the
+/// same AND rule — any skipped contributor flips the aggregate to
+/// skipped.
+///
+/// `passes_observed` and `total_observed` count the contributors:
+/// `total_observed = group.len()`, `passes_observed` counts entries
+/// where both `passed && !skipped`. Failing/skipped contributors do
+/// NOT participate in the metric mean (they would carry
+/// failure-mode telemetry, not scheduler behaviour); only passing
+/// non-skipped contributors feed the running sums. When no
+/// contributor passed cleanly the running sum is zero and the
+/// resulting `row` carries default-zero metric values plus
+/// `passed = false` — the downstream `skipped_failed` gate then
+/// drops the pair from the regression math.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct AveragedRow {
+    /// Aggregated row carrying arithmetic-mean metric values plus
+    /// the AND-of-contributors `passed` / `skipped` flags. Fed
+    /// directly into [`compare_rows`] when `--average` is active.
+    pub row: GauntletRow,
+    /// Number of contributors where both `passed && !skipped`.
+    /// Renders as the numerator of the per-key `N/M` summary.
+    pub passes_observed: u32,
+    /// Total contributors in the group (`= group.len()`). Renders
+    /// as the denominator of the per-key `N/M` summary.
+    pub total_observed: u32,
+}
+
+/// Group `rows` by `(scenario, topology, work_type, flags)` and
+/// arithmetic-mean their metric fields, returning one
+/// [`AveragedRow`] per distinct key.
+///
+/// Group key matches [`compare_rows`]' pairing key so the post-
+/// aggregation row vec joins cleanly across A/B sides under the
+/// same identity contract — different flag profiles do not
+/// collide.
+///
+/// Aggregation rules:
+/// - `passed` aggregates as a logical AND across every contributor.
+///   A single fail flips the aggregate to `passed = false`.
+/// - `skipped` aggregates as a logical OR across every contributor:
+///   any single skipped contributor flips the aggregate to
+///   `skipped = true`. The OR aligns with [`compare_rows`]' skip
+///   gate (one skipped side drops the pair) — averaging across a
+///   mixed pass-and-skip set would silently dilute the metric mean
+///   with rows that didn't run.
+/// - Metrics (`f64` / `u64` / `i64` fields, plus `ext_metrics`
+///   entries) are summed only across contributors where
+///   `passed && !skipped`, then divided by that count to yield an
+///   arithmetic mean. Failing/skipped contributors carry telemetry
+///   dominated by the failure mode, NOT scheduler behaviour, and
+///   are therefore excluded from the mean. When no contributor
+///   passed cleanly, every metric defaults to zero and the
+///   aggregate's `passed = false` routes the pair to
+///   [`compare_rows`]' `skipped_failed` gate.
+/// - `u64` / `i64` fields take the rounded mean
+///   (`(sum / count).round() as u64`). The 0.5-unit rounding error
+///   is well below every integer metric's `default_abs` gate (the
+///   smallest is `stall_count = 1.0`).
+/// - `ext_metrics` keys are unioned across passing contributors;
+///   each key's mean is computed only across contributors that
+///   carried it. A key present in some passing rows and absent
+///   from others uses the present-only count as its denominator —
+///   absent-and-zero are not equivalent (the `BTreeMap<String,
+///   f64>` shape cannot represent "absent" with a stored zero).
+/// - Identity fields (`scenario`, `topology`, `work_type`, `flags`,
+///   `scheduler`, `kernel_version`) come from the first contributor
+///   in iteration order. Every contributor in the group shares the
+///   first four by construction (group key); `scheduler` and
+///   `kernel_version` may vary across the group if the operator did
+///   not narrow via typed filters first, but the aggregated row
+///   carries the first contributor's value in any case — the join
+///   downstream uses the four-tuple, so scheduler/version on the
+///   aggregate is metadata, not a join key.
+///
+/// Group iteration order matches the order of FIRST appearance of
+/// each key in `rows`; `BTreeMap` ordering is by key (not iteration
+/// order) so we maintain a parallel `Vec<key>` to preserve
+/// first-seen ordering. Stable order keeps test fixtures
+/// deterministic across runs.
+pub fn aggregate_rows(rows: &[GauntletRow]) -> Vec<AveragedRow> {
+    type Key<'a> = (&'a str, &'a str, &'a str, &'a [String]);
+
+    struct Accumulator<'a> {
+        first: &'a GauntletRow,
+        total_observed: u32,
+        passes_observed: u32,
+        any_skipped: bool,
+        any_failed: bool,
+        // Sums across passing+non-skipped contributors only.
+        // Counts are tracked per ext_metric key separately because
+        // a key may be absent from some contributors.
+        sum_spread: f64,
+        sum_gap_ms: u64,
+        sum_migrations: u64,
+        sum_migration_ratio: f64,
+        sum_imbalance_ratio: f64,
+        sum_max_dsq_depth: u64,
+        sum_stall_count: usize,
+        sum_fallback_count: i64,
+        sum_keep_last_count: i64,
+        sum_p99_wake: f64,
+        sum_median_wake: f64,
+        sum_wake_cv: f64,
+        sum_total_iterations: u64,
+        sum_mean_run_delay: f64,
+        sum_run_delay: f64,
+        sum_tail_ratio: f64,
+        sum_iters_per_worker: f64,
+        sum_page_locality: f64,
+        sum_cross_node_mig: f64,
+        // Per-ext-metric (sum, count) so a key absent from some
+        // contributors averages only over those that carried it.
+        ext_sums: BTreeMap<String, (f64, u32)>,
+    }
+
+    let mut order: Vec<Key<'_>> = Vec::new();
+    let mut groups: BTreeMap<Key<'_>, Accumulator<'_>> = BTreeMap::new();
+
+    for row in rows {
+        let key: Key<'_> = (
+            row.scenario.as_str(),
+            row.topology.as_str(),
+            row.work_type.as_str(),
+            row.flags.as_slice(),
+        );
+        let acc = groups.entry(key).or_insert_with(|| {
+            order.push(key);
+            Accumulator {
+                first: row,
+                total_observed: 0,
+                passes_observed: 0,
+                any_skipped: false,
+                any_failed: false,
+                sum_spread: 0.0,
+                sum_gap_ms: 0,
+                sum_migrations: 0,
+                sum_migration_ratio: 0.0,
+                sum_imbalance_ratio: 0.0,
+                sum_max_dsq_depth: 0,
+                sum_stall_count: 0,
+                sum_fallback_count: 0,
+                sum_keep_last_count: 0,
+                sum_p99_wake: 0.0,
+                sum_median_wake: 0.0,
+                sum_wake_cv: 0.0,
+                sum_total_iterations: 0,
+                sum_mean_run_delay: 0.0,
+                sum_run_delay: 0.0,
+                sum_tail_ratio: 0.0,
+                sum_iters_per_worker: 0.0,
+                sum_page_locality: 0.0,
+                sum_cross_node_mig: 0.0,
+                ext_sums: BTreeMap::new(),
+            }
+        });
+        acc.total_observed += 1;
+        if row.skipped {
+            acc.any_skipped = true;
+            continue;
+        }
+        if !row.passed {
+            acc.any_failed = true;
+            continue;
+        }
+        acc.passes_observed += 1;
+        acc.sum_spread += row.spread;
+        acc.sum_gap_ms += row.gap_ms;
+        acc.sum_migrations += row.migrations;
+        acc.sum_migration_ratio += row.migration_ratio;
+        acc.sum_imbalance_ratio += row.imbalance_ratio;
+        acc.sum_max_dsq_depth += u64::from(row.max_dsq_depth);
+        acc.sum_stall_count += row.stall_count;
+        acc.sum_fallback_count += row.fallback_count;
+        acc.sum_keep_last_count += row.keep_last_count;
+        acc.sum_p99_wake += row.worst_p99_wake_latency_us;
+        acc.sum_median_wake += row.worst_median_wake_latency_us;
+        acc.sum_wake_cv += row.worst_wake_latency_cv;
+        acc.sum_total_iterations += row.total_iterations;
+        acc.sum_mean_run_delay += row.worst_mean_run_delay_us;
+        acc.sum_run_delay += row.worst_run_delay_us;
+        acc.sum_tail_ratio += row.worst_wake_latency_tail_ratio;
+        acc.sum_iters_per_worker += row.worst_iterations_per_worker;
+        acc.sum_page_locality += row.page_locality;
+        acc.sum_cross_node_mig += row.cross_node_migration_ratio;
+        for (k, v) in &row.ext_metrics {
+            let entry = acc.ext_sums.entry(k.clone()).or_insert((0.0, 0));
+            entry.0 += *v;
+            entry.1 += 1;
+        }
+    }
+
+    let mut out = Vec::with_capacity(order.len());
+    for key in order {
+        let acc = groups
+            .remove(&key)
+            .expect("first-seen key must still be in groups map");
+        let n = acc.passes_observed;
+        let denom = if n == 0 { 1.0 } else { f64::from(n) };
+        // Rounded mean for integer-typed fields. When n == 0 the
+        // sums are all zero, so dividing by 1.0 still yields 0 —
+        // the aggregate's passed=false routes the pair through
+        // skipped_failed downstream and the metrics are never
+        // consulted.
+        let round_u32 = |sum: u64| -> u32 {
+            (sum as f64 / denom).round().clamp(0.0, f64::from(u32::MAX)) as u32
+        };
+        let round_u64 = |sum: u64| -> u64 { (sum as f64 / denom).round() as u64 };
+        let round_i64 = |sum: i64| -> i64 { (sum as f64 / denom).round() as i64 };
+        let round_usize = |sum: usize| -> usize { (sum as f64 / denom).round() as usize };
+
+        let aggregated = GauntletRow {
+            scenario: acc.first.scenario.clone(),
+            topology: acc.first.topology.clone(),
+            work_type: acc.first.work_type.clone(),
+            scheduler: acc.first.scheduler.clone(),
+            kernel_version: acc.first.kernel_version.clone(),
+            flags: acc.first.flags.clone(),
+            // ALL must pass: any failed or skipped contributor
+            // flips the aggregate. A group with zero
+            // passes_observed (every contributor failed or was
+            // skipped) collapses to passed=false here.
+            passed: !acc.any_failed && !acc.any_skipped && n > 0,
+            skipped: acc.any_skipped,
+            spread: acc.sum_spread / denom,
+            gap_ms: round_u64(acc.sum_gap_ms),
+            migrations: round_u64(acc.sum_migrations),
+            migration_ratio: acc.sum_migration_ratio / denom,
+            imbalance_ratio: acc.sum_imbalance_ratio / denom,
+            max_dsq_depth: round_u32(acc.sum_max_dsq_depth),
+            stall_count: round_usize(acc.sum_stall_count),
+            fallback_count: round_i64(acc.sum_fallback_count),
+            keep_last_count: round_i64(acc.sum_keep_last_count),
+            worst_p99_wake_latency_us: acc.sum_p99_wake / denom,
+            worst_median_wake_latency_us: acc.sum_median_wake / denom,
+            worst_wake_latency_cv: acc.sum_wake_cv / denom,
+            total_iterations: round_u64(acc.sum_total_iterations),
+            worst_mean_run_delay_us: acc.sum_mean_run_delay / denom,
+            worst_run_delay_us: acc.sum_run_delay / denom,
+            worst_wake_latency_tail_ratio: acc.sum_tail_ratio / denom,
+            worst_iterations_per_worker: acc.sum_iters_per_worker / denom,
+            page_locality: acc.sum_page_locality / denom,
+            cross_node_migration_ratio: acc.sum_cross_node_mig / denom,
+            ext_metrics: acc
+                .ext_sums
+                .into_iter()
+                .map(|(k, (sum, count))| (k, sum / f64::from(count)))
+                .collect(),
+        };
+        out.push(AveragedRow {
+            row: aggregated,
+            passes_observed: acc.passes_observed,
+            total_observed: acc.total_observed,
+        });
+    }
+    out
+}
+
 /// Convert a SidecarResult to a GauntletRow for run-to-run comparison.
 ///
 /// Non-finite f64 values (NaN, ±Infinity) are sanitized to 0.0 with a
@@ -1739,6 +2016,7 @@ pub fn compare_runs(
     row_filter: &RowFilter,
     policy: &ComparisonPolicy,
     dir: Option<&std::path::Path>,
+    average: bool,
 ) -> anyhow::Result<i32> {
     // `--dir` overrides the default runs root. Earlier versions of
     // this function accepted the flag through the CLI but never
@@ -1782,7 +2060,53 @@ pub fn compare_runs(
     let rows_a = apply_row_filters(&rows_a, row_filter);
     let rows_b = apply_row_filters(&rows_b, row_filter);
 
-    let report = compare_rows(&rows_a, &rows_b, filter, policy);
+    // When `--average` is active, fold every (scenario, topology,
+    // work_type, flags) group into a single row carrying
+    // arithmetic-mean metric values across the group's passing
+    // contributors. The pairing key inside `compare_rows` matches
+    // [`aggregate_rows`]' grouping key, so the post-aggregation row
+    // vec joins cleanly across A/B sides without duplicate-key
+    // collisions. The averaged side-tables (`avg_a` / `avg_b`)
+    // carry the per-key `passes_observed` / `total_observed` for
+    // the `N/M` summary block printed below the comparison table.
+    //
+    // The pre-aggregation row counts (`pre_agg_a` / `pre_agg_b`)
+    // are captured before the `rows_*` vectors are moved into the
+    // `if average` arm so the header line below can report
+    // contributor counts (the operator's intuition for "how many
+    // trials feed each aggregate") rather than unique-key counts.
+    let pre_agg_a = rows_a.len();
+    let pre_agg_b = rows_b.len();
+    let (rows_a_for_compare, rows_b_for_compare, avg_a, avg_b) = if average {
+        let avg_a = aggregate_rows(&rows_a);
+        let avg_b = aggregate_rows(&rows_b);
+        let a_rows: Vec<GauntletRow> = avg_a.iter().map(|r| r.row.clone()).collect();
+        let b_rows: Vec<GauntletRow> = avg_b.iter().map(|r| r.row.clone()).collect();
+        (a_rows, b_rows, Some(avg_a), Some(avg_b))
+    } else {
+        (rows_a, rows_b, None, None)
+    };
+
+    let report = compare_rows(&rows_a_for_compare, &rows_b_for_compare, filter, policy);
+
+    if average {
+        // Header line above the comparison table announcing the
+        // pre-aggregation contributor counts and the post-aggregation
+        // unique-key counts. The two numbers answer different
+        // operator questions: pre-aggregation = "how many trials
+        // got folded?", post-aggregation = "how many distinct
+        // (scenario, topology, work_type, flags) groups did I just
+        // compare?". Distinct from the table itself so the table
+        // preset (`new_table`) can keep using its bare
+        // `set_header(...)` row form without building a multi-row
+        // title cell.
+        let post_a = avg_a.as_ref().map(Vec::len).unwrap_or(0);
+        let post_b = avg_b.as_ref().map(Vec::len).unwrap_or(0);
+        println!(
+            "averaged across {pre_agg_a} run row(s) into {post_a} group(s) for '{a}' \
+             and {pre_agg_b} run row(s) into {post_b} group(s) for '{b}'",
+        );
+    }
 
     use comfy_table::{Cell, Color};
     let mut table = crate::cli::new_table();
@@ -1816,6 +2140,59 @@ pub fn compare_runs(
              because one or both runs failed",
             report.skipped_failed,
         );
+    }
+    if let (Some(avg_a), Some(avg_b)) = (&avg_a, &avg_b) {
+        // Per-key `N/M` block: one line per aggregated row that
+        // had at least one failing or skipped contributor on
+        // either side. Healthy keys (every contributor passed on
+        // both sides) are suppressed to keep the block focused
+        // on operator-actionable information. The line names
+        // each side independently — the same key can be 5/5 on
+        // one side and 3/5 on the other.
+        type SummaryKey<'a> = (&'a str, &'a str, &'a str, &'a [String]);
+        type SummaryValue<'a> = (Option<&'a AveragedRow>, Option<&'a AveragedRow>);
+        let mut keys: BTreeMap<SummaryKey<'_>, SummaryValue<'_>> = BTreeMap::new();
+        for ar in avg_a {
+            let k = (
+                ar.row.scenario.as_str(),
+                ar.row.topology.as_str(),
+                ar.row.work_type.as_str(),
+                ar.row.flags.as_slice(),
+            );
+            keys.entry(k).or_insert((None, None)).0 = Some(ar);
+        }
+        for br in avg_b {
+            let k = (
+                br.row.scenario.as_str(),
+                br.row.topology.as_str(),
+                br.row.work_type.as_str(),
+                br.row.flags.as_slice(),
+            );
+            keys.entry(k).or_insert((None, None)).1 = Some(br);
+        }
+        let mut printed_header = false;
+        for ((scn, topo, wt, _flags), (ka, kb)) in keys.into_iter() {
+            let needs_print = ka.is_some_and(|r| r.passes_observed != r.total_observed)
+                || kb.is_some_and(|r| r.passes_observed != r.total_observed);
+            if !needs_print {
+                continue;
+            }
+            if !printed_header {
+                println!("per-key pass counts (passes_observed/total_observed):");
+                printed_header = true;
+            }
+            let fmt_side = |r: Option<&AveragedRow>| -> String {
+                r.map(|x| format!("{}/{}", x.passes_observed, x.total_observed))
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            println!(
+                "  {scn}/{topo}/{wt}: {a}={pa} {b}={pb}",
+                a = a,
+                b = b,
+                pa = fmt_side(ka),
+                pb = fmt_side(kb),
+            );
+        }
     }
     if report.new_in_b > 0 {
         println!(
@@ -3910,6 +4287,7 @@ mod tests {
             &RowFilter::default(),
             &ComparisonPolicy::default(),
             Some(alt_root.path()),
+            false,
         )
         .expect("compare_runs must resolve runs under the dir arg");
         assert_eq!(
@@ -3938,6 +4316,7 @@ mod tests {
             &RowFilter::default(),
             &ComparisonPolicy::default(),
             None,
+            false,
         )
         .expect_err("compare_runs without --dir must fail on missing unique fixtures");
         let rendered = format!("{err:#}");
@@ -4229,5 +4608,393 @@ mod tests {
         for (a, b) in kept.iter().zip(rows.iter()) {
             assert_eq!(a.scenario, b.scenario);
         }
+    }
+
+    // -- aggregate_rows / AveragedRow --
+
+    /// Mutate a row's metric fields away from defaults so
+    /// aggregation has a non-zero signal to average. Returns the
+    /// row reference for chaining.
+    fn paint_metrics(row: &mut GauntletRow, spread: f64, gap_ms: u64, migrations: u64, iters: u64) {
+        row.spread = spread;
+        row.gap_ms = gap_ms;
+        row.migrations = migrations;
+        row.migration_ratio = spread / 100.0;
+        row.imbalance_ratio = spread / 10.0;
+        row.max_dsq_depth = (gap_ms / 10) as u32;
+        row.stall_count = (migrations / 10) as usize;
+        row.fallback_count = migrations as i64;
+        row.keep_last_count = -(migrations as i64);
+        row.worst_p99_wake_latency_us = spread * 2.0;
+        row.worst_median_wake_latency_us = spread;
+        row.worst_wake_latency_cv = spread / 50.0;
+        row.total_iterations = iters;
+        row.worst_mean_run_delay_us = gap_ms as f64;
+        row.worst_run_delay_us = (gap_ms * 2) as f64;
+        row.worst_wake_latency_tail_ratio = spread / 25.0;
+        row.worst_iterations_per_worker = iters as f64 / 10.0;
+        row.page_locality = 1.0 - spread / 100.0;
+        row.cross_node_migration_ratio = spread / 200.0;
+    }
+
+    /// Empty input produces zero aggregated rows. Pins the empty-
+    /// vec edge case so callers iterating over the result vector
+    /// don't need to special-case the `--average` path on empty
+    /// run directories.
+    #[test]
+    fn aggregate_rows_empty_input_yields_empty_output() {
+        let out = aggregate_rows(&[]);
+        assert!(out.is_empty());
+    }
+
+    /// Single passing contributor: aggregate is a faithful copy
+    /// of the input, with `passes_observed = total_observed = 1`.
+    /// Pins the trivial pass-through path so a regression in the
+    /// `denom` math (e.g. division by `total_observed` instead of
+    /// `passes_observed`) lands here.
+    #[test]
+    fn aggregate_rows_single_pass_passes_through_metrics() {
+        let mut row = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut row, 12.0, 200, 50, 1000);
+        let out = aggregate_rows(std::slice::from_ref(&row));
+        assert_eq!(out.len(), 1);
+        let ar = &out[0];
+        assert_eq!(ar.passes_observed, 1);
+        assert_eq!(ar.total_observed, 1);
+        assert!(ar.row.passed);
+        assert!(!ar.row.skipped);
+        assert_eq!(ar.row.spread, 12.0);
+        assert_eq!(ar.row.gap_ms, 200);
+        assert_eq!(ar.row.migrations, 50);
+        assert_eq!(ar.row.total_iterations, 1000);
+        assert_eq!(ar.row.fallback_count, 50);
+        assert_eq!(ar.row.keep_last_count, -50);
+        assert_eq!(ar.row.worst_p99_wake_latency_us, 24.0);
+    }
+
+    /// Three passing contributors with the same key are folded
+    /// into a single aggregate carrying the arithmetic mean of
+    /// every metric field. f64 means are exact (modulo IEEE
+    /// rounding); u64/i64 means are rounded to nearest.
+    #[test]
+    fn aggregate_rows_multi_pass_arithmetic_mean() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut a, 10.0, 100, 30, 900);
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut b, 20.0, 200, 60, 1100);
+        let mut c = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut c, 30.0, 300, 90, 1000);
+        let out = aggregate_rows(&[a, b, c]);
+        assert_eq!(out.len(), 1);
+        let ar = &out[0];
+        assert_eq!(ar.passes_observed, 3);
+        assert_eq!(ar.total_observed, 3);
+        assert!(ar.row.passed);
+        assert!(!ar.row.skipped);
+        // f64 mean: (10 + 20 + 30) / 3 = 20.0 exactly.
+        assert_eq!(ar.row.spread, 20.0);
+        // u64 rounded mean: (100 + 200 + 300) / 3 = 200.0 exactly.
+        assert_eq!(ar.row.gap_ms, 200);
+        // u64 rounded mean: (30 + 60 + 90) / 3 = 60.
+        assert_eq!(ar.row.migrations, 60);
+        // u64 rounded mean: (900 + 1100 + 1000) / 3 = 1000.
+        assert_eq!(ar.row.total_iterations, 1000);
+        // i64 mean for fallback_count: (30 + 60 + 90)/3 = 60.
+        assert_eq!(ar.row.fallback_count, 60);
+        // i64 mean for keep_last_count: (-30 + -60 + -90)/3 = -60.
+        assert_eq!(ar.row.keep_last_count, -60);
+        // f64 mean for derived field
+        // worst_p99_wake_latency_us: (20 + 40 + 60)/3 = 40.
+        assert_eq!(ar.row.worst_p99_wake_latency_us, 40.0);
+    }
+
+    /// Different (scenario, topology, work_type, flags) groups
+    /// produce distinct aggregates — the four-tuple is the join
+    /// key. Pins the group-key contract so a regression that
+    /// dropped flags from the key would land here as a collision.
+    #[test]
+    fn aggregate_rows_distinct_groups_stay_separate() {
+        let mut a = make_row("alpha", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut a, 10.0, 100, 30, 1000);
+        let mut b = make_row("beta", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut b, 50.0, 500, 100, 2000);
+        let out = aggregate_rows(&[a, b]);
+        assert_eq!(out.len(), 2);
+        // First-seen iteration order preserved (alpha before beta).
+        assert_eq!(out[0].row.scenario, "alpha");
+        assert_eq!(out[1].row.scenario, "beta");
+    }
+
+    /// Different `flags` profiles for the same (scenario,
+    /// topology, work_type) tuple yield distinct aggregates.
+    /// Mirrors the `compare_rows_same_key_different_flags_do_not_collide`
+    /// pin for the join key — averaging must respect the same
+    /// four-tuple.
+    #[test]
+    fn aggregate_rows_different_flags_stay_separate() {
+        let mut llc1 = make_row("t", "tiny-1llc", true, 0.0);
+        llc1.flags = vec!["llc".to_string()];
+        paint_metrics(&mut llc1, 10.0, 100, 30, 1000);
+        let mut llc2 = make_row("t", "tiny-1llc", true, 0.0);
+        llc2.flags = vec!["llc".to_string()];
+        paint_metrics(&mut llc2, 14.0, 140, 50, 1200);
+        let mut borrow1 = make_row("t", "tiny-1llc", true, 0.0);
+        borrow1.flags = vec!["borrow".to_string()];
+        paint_metrics(&mut borrow1, 80.0, 800, 200, 5000);
+        let out = aggregate_rows(&[llc1, llc2, borrow1]);
+        assert_eq!(out.len(), 2);
+        let llc_ar = out
+            .iter()
+            .find(|r| r.row.flags == vec!["llc".to_string()])
+            .expect("llc aggregate must exist");
+        assert_eq!(llc_ar.passes_observed, 2);
+        assert_eq!(llc_ar.row.spread, 12.0);
+        let borrow_ar = out
+            .iter()
+            .find(|r| r.row.flags == vec!["borrow".to_string()])
+            .expect("borrow aggregate must exist");
+        assert_eq!(borrow_ar.passes_observed, 1);
+        assert_eq!(borrow_ar.row.spread, 80.0);
+    }
+
+    /// Failing contributors are excluded from the metric mean and
+    /// flip the aggregate's `passed` to false. The aggregate's
+    /// `total_observed` still counts every contributor;
+    /// `passes_observed` counts only the clean ones.
+    #[test]
+    fn aggregate_rows_failed_contributors_excluded_from_mean_and_flag_aggregate() {
+        let mut pass1 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut pass1, 10.0, 100, 30, 1000);
+        let mut fail = make_row("t", "tiny-1llc", false, 0.0);
+        // The failing row's metrics are pathologically large —
+        // if they leaked into the mean, the aggregate's `spread`
+        // would explode upward.
+        paint_metrics(&mut fail, 10000.0, 99999, 99999, 99999);
+        let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut pass2, 30.0, 300, 90, 1000);
+        let out = aggregate_rows(&[pass1, fail, pass2]);
+        assert_eq!(out.len(), 1);
+        let ar = &out[0];
+        assert_eq!(ar.passes_observed, 2);
+        assert_eq!(ar.total_observed, 3);
+        // ALL-must-pass: a single failure flips the aggregate.
+        assert!(
+            !ar.row.passed,
+            "any failing contributor must flip the aggregate to passed=false",
+        );
+        // Mean of only the passing entries: (10 + 30) / 2 = 20.0.
+        // If the failing row leaked in, this would be ~3346.
+        assert_eq!(ar.row.spread, 20.0);
+        assert_eq!(ar.row.gap_ms, 200);
+    }
+
+    /// Skipped contributors are excluded from the metric mean
+    /// and flip the aggregate's `skipped` to true (any-skipped
+    /// OR rule). `passes_observed` does not count them; the
+    /// passing-only entries still feed the mean cleanly.
+    #[test]
+    fn aggregate_rows_skipped_contributors_excluded_from_mean_and_flag_aggregate() {
+        let mut pass1 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut pass1, 10.0, 100, 30, 1000);
+        let mut skip = make_row("t", "tiny-1llc", true, 0.0);
+        skip.skipped = true;
+        // Pathological metrics on the skipped row to prove the
+        // exclusion is real.
+        paint_metrics(&mut skip, 9999.0, 99999, 99999, 99999);
+        let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut pass2, 50.0, 500, 70, 2000);
+        let out = aggregate_rows(&[pass1, skip, pass2]);
+        assert_eq!(out.len(), 1);
+        let ar = &out[0];
+        assert_eq!(ar.passes_observed, 2);
+        assert_eq!(ar.total_observed, 3);
+        assert!(
+            ar.row.skipped,
+            "any skipped contributor must flip the aggregate to skipped=true",
+        );
+        assert!(
+            !ar.row.passed,
+            "skipped aggregate must collapse `passed` to false so compare_rows \
+             routes the pair through the skipped_failed gate",
+        );
+        // Mean of (pass1, pass2): (10 + 50)/2 = 30.0.
+        assert_eq!(ar.row.spread, 30.0);
+        assert_eq!(ar.row.gap_ms, 300);
+    }
+
+    /// All contributors fail: aggregate has `passes_observed = 0`,
+    /// `passed = false`, and zero metric values (no contributor
+    /// fed the running sums). Pins the divide-by-zero guard:
+    /// `denom` must default to 1.0 when `passes_observed = 0`.
+    #[test]
+    fn aggregate_rows_all_failed_collapses_to_default_zero_metrics_and_failed_flag() {
+        let mut fail1 = make_row("t", "tiny-1llc", false, 0.0);
+        paint_metrics(&mut fail1, 99.0, 999, 99, 999);
+        let mut fail2 = make_row("t", "tiny-1llc", false, 0.0);
+        paint_metrics(&mut fail2, 88.0, 888, 88, 888);
+        let out = aggregate_rows(&[fail1, fail2]);
+        assert_eq!(out.len(), 1);
+        let ar = &out[0];
+        assert_eq!(ar.passes_observed, 0);
+        assert_eq!(ar.total_observed, 2);
+        assert!(!ar.row.passed);
+        // Failed-only group: every metric collapses to its zero
+        // default. The aggregate's `passed=false` then routes the
+        // pair through compare_rows' skipped_failed gate.
+        assert_eq!(ar.row.spread, 0.0);
+        assert_eq!(ar.row.gap_ms, 0);
+        assert_eq!(ar.row.migrations, 0);
+    }
+
+    /// `ext_metrics` keys are unioned across passing
+    /// contributors; each key averages over the contributors
+    /// that carried it. A key absent on some passing rows is
+    /// NOT treated as a stored zero — its denominator is the
+    /// present-only count.
+    #[test]
+    fn aggregate_rows_ext_metrics_average_per_key_present_count() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.ext_metrics.insert("shared".into(), 10.0);
+        a.ext_metrics.insert("a_only".into(), 100.0);
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.ext_metrics.insert("shared".into(), 30.0);
+        b.ext_metrics.insert("b_only".into(), 200.0);
+        let out = aggregate_rows(&[a, b]);
+        assert_eq!(out.len(), 1);
+        let ar = &out[0];
+        // shared: (10 + 30) / 2 = 20.
+        assert_eq!(ar.row.ext_metrics.get("shared"), Some(&20.0));
+        // a_only: present only in a → mean over 1 entry = 100.
+        assert_eq!(ar.row.ext_metrics.get("a_only"), Some(&100.0));
+        // b_only: present only in b → mean over 1 entry = 200.
+        assert_eq!(ar.row.ext_metrics.get("b_only"), Some(&200.0));
+    }
+
+    /// `aggregate_rows` preserves first-seen iteration order so
+    /// downstream tests against the result remain deterministic
+    /// even though the internal map uses BTreeMap (key-sorted)
+    /// for storage. Pinned by feeding keys in z→a order and
+    /// asserting the output keeps that order.
+    #[test]
+    fn aggregate_rows_preserves_first_seen_order() {
+        let zebra = make_row("zebra", "tiny-1llc", true, 0.0);
+        let alpha = make_row("alpha", "tiny-1llc", true, 0.0);
+        let mango = make_row("mango", "tiny-1llc", true, 0.0);
+        let out = aggregate_rows(&[zebra, alpha, mango]);
+        let names: Vec<&str> = out.iter().map(|r| r.row.scenario.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["zebra", "alpha", "mango"],
+            "output must follow first-seen iteration order, not key sort",
+        );
+    }
+
+    /// End-to-end: aggregated rows feed `compare_rows` cleanly.
+    /// Side A has [10, 12, 14] (mean 12); side B has [28, 30, 32]
+    /// (mean 30). The 18-unit delta on `worst_spread`
+    /// (default_abs=5.0, default_rel=0.25) clears both gates,
+    /// producing a regression. Pins the full averaging pipeline.
+    #[test]
+    fn aggregate_rows_then_compare_rows_yields_regression_on_means() {
+        let mut a1 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut a1, 10.0, 100, 30, 1000);
+        let mut a2 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut a2, 12.0, 120, 35, 1000);
+        let mut a3 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut a3, 14.0, 140, 40, 1000);
+        let mut b1 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut b1, 28.0, 280, 70, 1000);
+        let mut b2 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut b2, 30.0, 300, 75, 1000);
+        let mut b3 = make_row("t", "tiny-1llc", true, 0.0);
+        paint_metrics(&mut b3, 32.0, 320, 80, 1000);
+
+        let agg_a = aggregate_rows(&[a1, a2, a3]);
+        let agg_b = aggregate_rows(&[b1, b2, b3]);
+        let rows_a: Vec<GauntletRow> = agg_a.iter().map(|r| r.row.clone()).collect();
+        let rows_b: Vec<GauntletRow> = agg_b.iter().map(|r| r.row.clone()).collect();
+        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
+        let spread = res
+            .findings
+            .iter()
+            .find(|f| f.metric.name == "worst_spread")
+            .expect("worst_spread must regress on aggregated means");
+        assert!(spread.is_regression);
+        assert_eq!(spread.val_a, 12.0, "mean of [10, 12, 14] = 12");
+        assert_eq!(spread.val_b, 30.0, "mean of [28, 30, 32] = 30");
+        assert_eq!(spread.delta, 18.0);
+    }
+
+    /// `compare_runs` with `average=true` must thread the
+    /// aggregation step into the comparison and return the
+    /// expected exit code. End-to-end pin against on-disk
+    /// fixtures so a regression in the aggregation→compare wiring
+    /// (e.g. forgetting to pass the aggregated rows down) lands
+    /// here.
+    ///
+    /// Fixture: two runs each carrying three sidecars under the
+    /// same (scenario, topology, work_type) key. Side A's three
+    /// trials cluster around `worst_spread = 10` (mean 12); side
+    /// B's three cluster around `worst_spread = 30` (mean 30).
+    /// The 18-unit delta clears the default dual gate, so
+    /// `compare_runs` returns exit code 1 (regressions detected).
+    #[test]
+    fn compare_runs_with_average_flag_produces_regression_on_aggregated_means() {
+        use crate::test_support::SidecarResult;
+
+        let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
+        let run_a = "__avg_thread_a__";
+        let run_b = "__avg_thread_b__";
+
+        // Three trials per side, same (scenario, topology,
+        // work_type) so they aggregate into a single key. Vary
+        // the per-trial spread so the mean is non-degenerate
+        // (regression flags would also fire if the values were
+        // identical, but the average path is exercised either way).
+        let trials_a = [(10.0, 100), (12.0, 120), (14.0, 140)];
+        let trials_b = [(28.0, 280), (30.0, 300), (32.0, 320)];
+
+        for (run_key, trials) in [(run_a, &trials_a), (run_b, &trials_b)] {
+            let run_dir = alt_root.path().join(run_key);
+            std::fs::create_dir_all(&run_dir).expect("create run dir");
+            for (i, (spread, gap_ms)) in trials.iter().enumerate() {
+                let trial_name = format!("avg_trial_{run_key}_{i}");
+                let mut sidecar = SidecarResult {
+                    test_name: "avg_test".to_string(),
+                    topology: "1n2l4c1t".to_string(),
+                    work_type: "CpuSpin".to_string(),
+                    ..SidecarResult::test_fixture()
+                };
+                sidecar.stats.worst_spread = *spread;
+                sidecar.stats.worst_gap_ms = *gap_ms;
+                sidecar.passed = true;
+                sidecar.skipped = false;
+                let json = serde_json::to_string(&sidecar).expect("serialize fixture sidecar");
+                let sidecar_path = run_dir.join(format!("{trial_name}.ktstr.json"));
+                std::fs::write(&sidecar_path, json).expect("write fixture sidecar");
+            }
+        }
+
+        // Without --average: three sidecars per side share one
+        // join key, so each B-side row's first A-side match wins
+        // (per-row regression). The point of THIS test is the
+        // average-path branch, so we only check the
+        // average=true exit code.
+        let exit = compare_runs(
+            run_a,
+            run_b,
+            None,
+            &RowFilter::default(),
+            &ComparisonPolicy::default(),
+            Some(alt_root.path()),
+            true,
+        )
+        .expect("compare_runs with --average must succeed against valid fixtures");
+        assert_eq!(
+            exit, 1,
+            "an 18-unit worst_spread regression on the aggregated mean \
+             (a=12 → b=30) must clear the default dual gate and surface \
+             exit code 1; got {exit}",
+        );
     }
 }

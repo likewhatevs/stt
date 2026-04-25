@@ -1876,8 +1876,9 @@ pub fn compare_runs(
     row_filter: &RowFilter,
     policy: &ComparisonPolicy,
     dir: Option<&Path>,
+    average: bool,
 ) -> Result<i32> {
-    crate::stats::compare_runs(a, b, filter, row_filter, policy, dir)
+    crate::stats::compare_runs(a, b, filter, row_filter, policy, dir, average)
 }
 
 /// Re-export the comparison-policy type so downstream crates using
@@ -1887,7 +1888,7 @@ pub fn compare_runs(
 /// policy is the only item in `stats` that a CLI or external
 /// consumer constructs directly; every other item is internal
 /// plumbing reached via `cli::compare_runs`.
-pub use crate::stats::{ComparisonPolicy, RowFilter};
+pub use crate::stats::{AveragedRow, ComparisonPolicy, RowFilter, aggregate_rows};
 
 /// Collect the current host context via
 /// [`crate::host_context::collect_host_context`] and render it as

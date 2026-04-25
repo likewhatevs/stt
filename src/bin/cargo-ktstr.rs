@@ -465,6 +465,25 @@ enum StatsCommand {
         /// repeats are rejected by clap (zero-width match).
         #[arg(long = "flag")]
         flags: Vec<String>,
+        /// Aggregate every (scenario, topology, work_type, flags)
+        /// group into a single row carrying the arithmetic mean
+        /// of its passing contributors' metrics. Smooths run-to-
+        /// run jitter when each side carries multiple trials per
+        /// key. The header line above the comparison table reports
+        /// the post-aggregation row counts; a per-key `N/M`
+        /// (`passes_observed`/`total_observed`) block prints below
+        /// the summary for every group whose contributor count
+        /// includes a failure or skip on either side.
+        ///
+        /// Aggregation rules: failing/skipped contributors are
+        /// excluded from the metric mean (they would carry
+        /// failure-mode telemetry, not scheduler behaviour); the
+        /// aggregated row's `passed` is the AND across every
+        /// contributor (a single failure flips the aggregate to
+        /// `failed`, which routes the pair through `compare_rows`'
+        /// `skipped_failed` gate).
+        #[arg(long)]
+        average: bool,
     },
 }
 
@@ -729,6 +748,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             topology,
             work_type,
             flags,
+            average,
         }) => {
             // Resolve `--threshold N` / `--policy PATH` / neither
             // into a single `ComparisonPolicy`. Clap's
@@ -779,6 +799,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 &row_filter,
                 &resolved_policy,
                 dir.as_deref(),
+                *average,
             )
             .map_err(|e| format!("{e:#}"))?;
             if exit != 0 {
@@ -2179,6 +2200,71 @@ mod tests {
             "clap error must surface the conflict between \
              --threshold and --policy; got: {rendered}",
         );
+    }
+
+    /// Bare `compare` defaults `--average` to `false` — the
+    /// aggregation path must be opt-in so existing CLI invocations
+    /// retain their per-trial-row comparison semantics.
+    #[test]
+    fn parse_stats_compare_average_default_false() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "compare", "a", "b"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::Compare { average, .. }),
+                ..
+            } => {
+                assert!(
+                    !average,
+                    "bare compare must default --average to false so \
+                     existing scripts retain per-trial-row semantics",
+                );
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    /// `--average` parses as a bare flag (no value) and lifts the
+    /// `average: bool` field on `StatsCommand::Compare` to true.
+    /// Pins the clap binding so a regression that dropped the
+    /// derive arg, renamed the flag, or accidentally made it
+    /// take a value lands at parse time.
+    #[test]
+    fn parse_stats_compare_with_average() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "compare", "a", "b", "--average"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command:
+                    Some(StatsCommand::Compare {
+                        average,
+                        threshold,
+                        policy,
+                        dir,
+                        ..
+                    }),
+                ..
+            } => {
+                assert!(average, "--average must lift the flag to true");
+                assert!(
+                    threshold.is_none(),
+                    "bare --average must not spuriously populate --threshold",
+                );
+                assert!(
+                    policy.is_none(),
+                    "bare --average must not spuriously populate --policy",
+                );
+                assert!(
+                    dir.is_none(),
+                    "bare --average must not spuriously populate --dir",
+                );
+            }
+            _ => panic!("expected Stats Compare"),
+        }
     }
 
     /// `cargo ktstr stats show-host --run X` parses to
