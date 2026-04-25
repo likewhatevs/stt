@@ -771,6 +771,23 @@ pub struct VmResult {
     /// Crash message from SHM (MSG_TYPE_CRASH). Reliable delivery via
     /// memcpy unlike serial which truncates large backtraces.
     pub crash_message: Option<String>,
+    /// Wall-clock time from BSP exit to the moment
+    /// [`KtstrVm::collect_results`] finishes assembling [`VmResult`].
+    /// Records the host-side cost of every teardown step that runs
+    /// after the guest has stopped advancing: watchdog join, AP joins,
+    /// monitor join, BPF-writer join, SHM drain, exit/crash-message
+    /// extraction, and BPF verifier-stat read. Always `Some(_)` for
+    /// VMs whose [`KtstrVm::run_vm`] returns normally — including the
+    /// host-watchdog timeout path, because `run_bsp_loop` exits cleanly
+    /// with `timed_out = true` and `collect_results` still executes,
+    /// populating the field. `None` only when `run_vm` does not
+    /// complete (a BSP panic propagated through `?`, or any pre-BSP
+    /// setup error that returns an `Err` before `VmRunState` is
+    /// constructed) and on the `test_fixture` / skip-sidecar paths
+    /// that never boot a VM. Persisted via
+    /// [`SidecarResult`](crate::test_support::SidecarResult) so stats
+    /// tooling can flag cleanup regressions across runs.
+    pub cleanup_duration: Option<Duration>,
 }
 
 impl VmResult {
@@ -809,6 +826,7 @@ impl VmResult {
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
+            cleanup_duration: None,
         }
     }
 }
@@ -865,6 +883,17 @@ struct VmRunState {
     com2: Arc<PiMutex<console::Serial>>,
     kill: Arc<AtomicBool>,
     vm: kvm::KtstrKvm,
+    /// Captured immediately after the BSP exits its run loop. Subtracted
+    /// from `Instant::now()` in [`KtstrVm::collect_results`] right before
+    /// the [`VmResult`] is returned to populate
+    /// [`VmResult::cleanup_duration`]. Records the wall-clock cost of
+    /// every host-side teardown step that runs after the guest has stopped
+    /// advancing, in execution order: the watchdog-thread join in
+    /// [`KtstrVm::run_vm`], then the AP-thread joins, the monitor-thread
+    /// join, the BPF-map-writer join, the SHM-ring drain, the post-exit
+    /// exit-code/crash-message extraction, and finally the BPF
+    /// verifier-stat read inside [`KtstrVm::collect_results`].
+    cleanup_start: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,7 +1138,14 @@ impl KtstrVm {
 
         tracing::debug!(elapsed_us = start.elapsed().as_micros(), "total_setup");
 
-        let run = self.run_vm(start, vm)?;
+        // Run-phase clock approximates the watchdog's hard_deadline
+        // (both post-setup; the watchdog computes its deadline slightly
+        // later, inside the spawned thread) so the BSP loop and monitor
+        // thread don't charge VM setup overhead against the guest's
+        // timeout budget.
+        let run_start = Instant::now();
+
+        let run = self.run_vm(run_start, vm)?;
 
         // mut needed on x86_64 for kvm_stats assignment below.
         #[allow(unused_mut)]
@@ -2329,7 +2365,7 @@ impl KtstrVm {
 
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
-    fn run_vm(&self, start: Instant, mut vm: kvm::KtstrKvm) -> Result<VmRunState> {
+    fn run_vm(&self, run_start: Instant, mut vm: kvm::KtstrKvm) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
@@ -2418,7 +2454,7 @@ impl KtstrVm {
             pts
         };
 
-        let monitor_handle = self.start_monitor(&vm, &kill, start, vcpu_pthreads)?;
+        let monitor_handle = self.start_monitor(&vm, &kill, run_start, vcpu_pthreads)?;
 
         // BPF map write thread: sleeps, discovers a BPF map, writes a value.
         let bpf_write_handle = self.start_bpf_map_write(&vm, &kill)?;
@@ -2557,12 +2593,21 @@ impl KtstrVm {
                     None,
                     &kill,
                     has_immediate_exit,
-                    start,
+                    run_start,
                     timeout,
                 )
             },
         );
         bsp_done.store(true, Ordering::Release);
+        // Sample cleanup start at the earliest moment after BSP exit so
+        // every host-side teardown step lands inside the window, in
+        // execution order: watchdog join (immediately below), AP joins,
+        // monitor join, BPF writer join, SHM drain, exit-code and
+        // crash-message extraction, and verifier-stat read (the rest
+        // run inside `collect_results`). `collect_results` reads
+        // `Instant::now()` at the end and the difference becomes
+        // `VmResult::cleanup_duration`.
+        let cleanup_start = Instant::now();
         eprintln!("BSP: exited run loop, code={exit_code} timed_out={timed_out}");
 
         // Join the watchdog before dropping `bsp`. The watchdog holds an
@@ -2580,6 +2625,7 @@ impl KtstrVm {
             com2,
             kill,
             vm,
+            cleanup_start,
         })
     }
 
@@ -2667,7 +2713,7 @@ impl KtstrVm {
         &self,
         vm: &kvm::KtstrKvm,
         kill: &Arc<AtomicBool>,
-        start: Instant,
+        run_start: Instant,
         vcpu_pthreads: Vec<libc::pthread_t>,
     ) -> Result<Option<JoinHandle<monitor::reader::MonitorLoopResult>>> {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
@@ -2796,7 +2842,7 @@ impl KtstrVm {
                 // discovery races with scheduler BPF program registration.
                 if let Some(base) = shm_base_pa {
                     let slot_pa = base + shm_ring::SIGNAL_SLOT_BASE as u64 + 1;
-                    let deadline = start + Duration::from_secs(30);
+                    let deadline = run_start + Duration::from_secs(30);
                     while std::time::Instant::now() < deadline {
                         if kill_clone.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
@@ -2849,7 +2895,7 @@ impl KtstrVm {
                     &offsets,
                     Duration::from_millis(100),
                     &kill_clone,
-                    start,
+                    run_start,
                     &mon_cfg,
                 )
             })
@@ -3047,13 +3093,13 @@ impl KtstrVm {
         virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
         kill: &Arc<AtomicBool>,
         has_immediate_exit: bool,
-        start: Instant,
+        run_start: Instant,
         timeout: Duration,
     ) -> (i32, bool) {
         let mut exit_code: i32 = -1;
 
         loop {
-            if start.elapsed() > timeout {
+            if run_start.elapsed() > timeout {
                 return (exit_code, true);
             }
             if kill.load(Ordering::Acquire) {
@@ -3219,6 +3265,17 @@ impl KtstrVm {
         // Collect BPF verifier stats from host-side memory reads.
         let verifier_stats = self.collect_verifier_stats(&run.vm);
 
+        // Sample cleanup elapsed AFTER every blocking step that runs on
+        // the post-BSP-exit critical path so the duration captures the
+        // full host-side teardown cost, not a partial window. The full
+        // ordered set is: watchdog join (in `run_vm`, before
+        // `cleanup_start` is stored on `VmRunState`), AP joins, monitor
+        // join, BPF writer join, SHM drain, exit-code and crash-message
+        // extraction, verifier-stat read. Captured before constructing
+        // the result so the `Instant::now()` here is the latest possible
+        // read.
+        let cleanup_duration = Some(run.cleanup_start.elapsed());
+
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
             exit_code,
@@ -3232,6 +3289,7 @@ impl KtstrVm {
             verifier_stats,
             kvm_stats: None,
             crash_message,
+            cleanup_duration,
         })
     }
 
@@ -4371,6 +4429,7 @@ mod tests {
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
+            cleanup_duration: Some(Duration::from_millis(50)),
         };
         assert!(r.success);
         assert_eq!(r.exit_code, 0);
@@ -4381,6 +4440,7 @@ mod tests {
         assert!(r.monitor.is_none());
         assert!(r.shm_data.is_none());
         assert!(r.stimulus_events.is_empty());
+        assert_eq!(r.cleanup_duration, Some(Duration::from_millis(50)));
         // Second construction covers the opposite polarity of
         // every boolean/numeric field so no field is silently
         // dropped by a future refactor that only exercises the
@@ -4398,11 +4458,13 @@ mod tests {
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
+            cleanup_duration: None,
         };
         assert!(!r2.success);
         assert_eq!(r2.exit_code, 1);
         assert!(r2.timed_out);
         assert_eq!(r2.duration, Duration::from_millis(500));
+        assert!(r2.cleanup_duration.is_none());
     }
 
     #[test]
@@ -4702,6 +4764,7 @@ mod tests {
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
+            cleanup_duration: None,
         };
         assert!(r.monitor.is_none());
         // Output and exit_code must still be accessible.
@@ -4740,6 +4803,7 @@ mod tests {
             verifier_stats: Vec::new(),
             kvm_stats: None,
             crash_message: None,
+            cleanup_duration: None,
         };
         let mon = r.monitor.as_ref().unwrap();
         assert_eq!(mon.summary.total_samples, 5);

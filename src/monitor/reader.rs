@@ -994,7 +994,7 @@ pub(crate) struct MonitorLoopResult {
 /// Configuration for the monitor sampling loop.
 ///
 /// Bundles the parameters that `monitor_loop` needs beyond the
-/// required `mem`, `rq_pas`, `offsets`, `interval`, `kill`, and `start`.
+/// required `mem`, `rq_pas`, `offsets`, `interval`, `kill`, and `run_start`.
 pub(crate) struct MonitorConfig<'a> {
     /// Per-CPU physical addresses of `scx_sched_pcpu`. When present (and
     /// `event_offsets` exist), each sample includes event counters.
@@ -1034,7 +1034,7 @@ pub(crate) fn monitor_loop(
     offsets: &KernelOffsets,
     interval: Duration,
     kill: &AtomicBool,
-    start: Instant,
+    run_start: Instant,
     cfg: &MonitorConfig<'_>,
 ) -> MonitorLoopResult {
     let event_pcpu_pas = cfg.event_pcpu_pas;
@@ -1221,7 +1221,7 @@ pub(crate) fn monitor_loop(
         });
 
         samples.push(MonitorSample {
-            elapsed_ms: start.elapsed().as_millis() as u64,
+            elapsed_ms: run_start.elapsed().as_millis() as u64,
             cpus: cpus.clone(),
             prog_stats,
         });
