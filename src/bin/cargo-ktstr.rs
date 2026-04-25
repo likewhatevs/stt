@@ -571,7 +571,14 @@ fn run_cargo_sub(
             // actionable error so the user knows the spec parsed
             // correctly but the calling subcommand hasn't wired up
             // the multi-kernel pipeline yet.
-            KernelId::Range { .. } | KernelId::Git { .. } => {
+            //
+            // Run `validate()` first so an inverted range surfaces
+            // the specific "swap the endpoints" diagnostic before
+            // the generic "not yet supported" redirect masks it,
+            // matching the pattern in `cli::resolve_kernel_image`
+            // and `cli::resolve_cached_kernel`.
+            id @ (KernelId::Range { .. } | KernelId::Git { .. }) => {
+                id.validate().map_err(|e| format!("--kernel {val}: {e}"))?;
                 return Err(format!(
                     "--kernel {val}: kernel ranges and git sources are \
                      not yet supported in this context — use a single \
