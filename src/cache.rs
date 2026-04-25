@@ -2022,12 +2022,25 @@ fn resolve_cache_root() -> anyhow::Result<PathBuf> {
         return Ok(PathBuf::from(xdg).join("ktstr").join("kernels"));
     }
     // 3. $HOME/.cache/ktstr/kernels.
-    let home = std::env::var("HOME").map_err(|_| {
-        anyhow::anyhow!(
-            "HOME not set; cannot resolve cache directory. \
-             Set KTSTR_CACHE_DIR to specify a cache location."
-        )
-    })?;
+    //
+    // Reject HOME ∈ {unset, "", "/"}: an empty or root-only HOME
+    // produces a junk cache path. PathBuf::from("/").join(".cache")
+    // yields "/.cache" — a path whose statvfs reports the root
+    // filesystem's free space, not a usable user-cache filesystem.
+    // PathBuf::from("").join(".cache") yields ".cache" relative to
+    // CWD, also wrong. A literal `/` HOME is a process-environment
+    // artifact (root user with no home, container init that didn't
+    // set HOME) — same fix as the unset case. Other malformed HOME
+    // values (non-existent directory, relative path, etc.) pass
+    // through this gate; downstream open()/statvfs() surface the
+    // real error from the resulting cache path.
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() || home == "/" {
+        anyhow::bail!(
+            "HOME is unset, empty, or `/`; cannot resolve cache directory. \
+             Set KTSTR_CACHE_DIR or XDG_CACHE_HOME to specify a cache location."
+        );
+    }
     Ok(PathBuf::from(home)
         .join(".cache")
         .join("ktstr")
@@ -2497,6 +2510,15 @@ mod tests {
 
     #[test]
     fn cache_dir_default_root_returns_path() {
+        // `lock_env()` serializes against every other env-touching
+        // test in the crate (test_support/model.rs, test_helpers
+        // siblings, the cache_resolve_root_* tests below). nextest
+        // runs unit tests concurrently within a binary and
+        // `std::env::set_var` is process-wide, so a sibling test
+        // that mutates HOME / XDG_CACHE_HOME / KTSTR_CACHE_DIR
+        // without the lock can race the save / mutate / restore
+        // window of an `EnvVarGuard` here. Tester finding T1.
+        let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
         let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
         let resolved = CacheDir::default_root().unwrap();
@@ -3077,6 +3099,11 @@ mod tests {
 
     #[test]
     fn cache_resolve_root_ktstr_cache_dir() {
+        // `lock_env()` serializes against sibling env-touching tests
+        // in test_support/model.rs and the cache_resolve_root_* group
+        // below. See `cache_dir_default_root_returns_path` for the
+        // long-form rationale (Tester finding T1).
+        let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("custom-cache");
         // Temporarily set env var for this test.
@@ -3087,6 +3114,7 @@ mod tests {
 
     #[test]
     fn cache_resolve_root_xdg_cache_home() {
+        let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
         let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
         let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path());
@@ -3096,6 +3124,7 @@ mod tests {
 
     #[test]
     fn cache_resolve_root_empty_ktstr_cache_dir_falls_through() {
+        let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
         let _guard1 = EnvVarGuard::set("KTSTR_CACHE_DIR", "");
         let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path());
@@ -3105,6 +3134,7 @@ mod tests {
 
     #[test]
     fn cache_resolve_root_empty_xdg_falls_to_home() {
+        let _lock = lock_env();
         let tmp = TempDir::new().unwrap();
         let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
         let _guard2 = EnvVarGuard::set("XDG_CACHE_HOME", "");
@@ -3120,18 +3150,62 @@ mod tests {
 
     #[test]
     fn cache_resolve_root_home_unset_error() {
+        let _lock = lock_env();
         let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
         let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
         let _guard3 = EnvVarGuard::remove("HOME");
         let err = resolve_cache_root().unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("HOME not set"),
+            msg.contains("HOME is unset, empty, or `/`"),
             "expected HOME-unset error, got: {msg}"
         );
         assert!(
             msg.contains("KTSTR_CACHE_DIR"),
             "error should suggest KTSTR_CACHE_DIR, got: {msg}"
+        );
+    }
+
+    /// A HOME literal of `"/"` (legacy root convention, container
+    /// init that forgot to override HOME) must NOT silently produce
+    /// `/.cache/ktstr/kernels` — that path's statvfs reports the
+    /// root filesystem's free space, which is typically a small
+    /// constrained mount and never the user's intended cache
+    /// location. Bail with the same actionable diagnostic as the
+    /// unset-HOME case.
+    #[test]
+    fn cache_resolve_root_home_root_slash_error() {
+        let _lock = lock_env();
+        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _guard3 = EnvVarGuard::set("HOME", "/");
+        let err = resolve_cache_root().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HOME is unset, empty, or `/`"),
+            "expected HOME=/ error, got: {msg}"
+        );
+        assert!(
+            msg.contains("KTSTR_CACHE_DIR"),
+            "error should suggest KTSTR_CACHE_DIR, got: {msg}"
+        );
+    }
+
+    /// A HOME literal of `""` (empty string) — just as broken as
+    /// unset, since `PathBuf::from("").join(".cache")` produces a
+    /// relative `.cache` rooted at the process CWD instead of the
+    /// user's home. Same bail.
+    #[test]
+    fn cache_resolve_root_home_empty_error() {
+        let _lock = lock_env();
+        let _guard1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _guard2 = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _guard3 = EnvVarGuard::set("HOME", "");
+        let err = resolve_cache_root().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HOME is unset, empty, or `/`"),
+            "expected HOME-empty error, got: {msg}"
         );
     }
 
@@ -3150,6 +3224,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn cache_resolve_root_non_utf8_ktstr_cache_dir_bails() {
+        // `lock_env()` for the same reason every other env-touching
+        // cache.rs test holds it (Tester finding T1).
+        let _lock = lock_env();
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
         let bytes: &[u8] = b"/tmp/ktstr-\xFFcache";
@@ -7050,5 +7127,5 @@ mod tests {
         );
     }
 
-    use crate::test_support::test_helpers::EnvVarGuard;
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 }

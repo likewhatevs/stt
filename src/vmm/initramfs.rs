@@ -862,10 +862,6 @@ pub fn build_initramfs_base(
     // Include files: copied verbatim, preserving original content and
     // debug symbols. No strip_debug — included files are user-provided
     // and may be non-ELF.
-    eprintln!(
-        "build_initramfs_base: packing {} include_files entries",
-        validated_includes.len()
-    );
     for (archive_path, host_path, mode) in &validated_includes {
         let data = std::fs::read(host_path).with_context(|| {
             format!(
@@ -874,13 +870,6 @@ pub fn build_initramfs_base(
                 host_path.display()
             )
         })?;
-        eprintln!(
-            "build_initramfs_base: pack '{}' from {} ({} bytes, mode={:o})",
-            archive_path,
-            host_path.display(),
-            data.len(),
-            *mode
-        );
         write_entry(&mut archive, archive_path, &data, *mode)?;
     }
 

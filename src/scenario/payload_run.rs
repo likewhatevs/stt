@@ -49,7 +49,9 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::assert::{AssertDetail, AssertResult, DetailKind};
 use crate::scenario::Ctx;
-use crate::test_support::{Check, Metric, Payload, PayloadKind, PayloadMetrics, extract_metrics};
+use crate::test_support::{
+    Check, Metric, OutputFormat, Payload, PayloadKind, PayloadMetrics, extract_metrics,
+};
 
 /// Builder returned by [`Ctx::payload`](crate::scenario::Ctx).
 ///
@@ -277,82 +279,98 @@ fn payload_binary(payload: &Payload) -> Result<&'static str> {
 /// invocation — so the host can reconstruct per-call provenance in
 /// the sidecar without any Ctx-side accumulator.
 ///
-/// Metric extraction is stdout-primary, stderr-fallback:
-/// [`extract_metrics`] runs first against stdout, and only when the
-/// result is empty AND stderr is non-empty is it retried against
-/// stderr. Well-behaved binaries keep stdout as the canonical metric
-/// stream; payloads like schbench that write structured output only
-/// to stderr (`show_latencies` → `fprintf(stderr, ...)`) are still
-/// parsed. The streams are never concatenated — the two drain
-/// threads in [`wait_and_capture`] run concurrently and provide no
-/// ordering guarantee, so a merged blob would corrupt any document
-/// whose bytes span both. Stderr is still passed separately to
-/// [`evaluate_checks`] so the exit-code-mismatch detail renders
+/// # Per-format behavior
+///
+/// `OutputFormat::ExitCode` and `OutputFormat::Json` extract
+/// in-process: stdout-primary with a stderr fallback when stdout
+/// yields an empty metric set. The streams are never concatenated —
+/// the two drain threads in [`wait_and_capture`] run concurrently and
+/// provide no ordering guarantee, so a merged blob would corrupt any
+/// document whose bytes span both. Stderr is still passed separately
+/// to [`evaluate_checks`] so the exit-code-mismatch detail renders
 /// stderr without stdout prefix.
+///
+/// `OutputFormat::LlmExtract` is HOST-ONLY. The guest does NOT load
+/// the ~2.4 GiB local model into VM RAM (the cache lives on the host
+/// and the model exceeds the test VM's memory budget). For LlmExtract
+/// payloads this function:
+///
+/// 1. Skips [`extract_metrics`] entirely — no model dispatch reaches
+///    any guest call graph.
+/// 2. Emits a [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT)
+///    SHM message carrying both raw stdout and stderr plus the
+///    payload's hint and exit code.
+/// 3. Emits a paired [`MSG_TYPE_PAYLOAD_METRICS`] SHM message with
+///    `metrics: vec![]` so per-invocation ordering still aligns with
+///    sidecar entries.
+/// 4. Evaluates `Check::ExitCodeEq` checks guest-side and returns
+///    the resulting [`AssertResult`] (passing when no ExitCodeEq
+///    check is declared or every declared one matches `exit_code`).
+///    Metric-level checks (`Min`/`Max`/`Range`/`Exists`) cannot be
+///    evaluated guest-side and hard-assert. The authoritative
+///    metric verdict is computed host-side post-VM-exit by
+///    [`crate::test_support::eval`] after running
+///    [`crate::test_support::model::extract_via_llm`] on the
+///    captured text and applying the universal LlmExtract invariants
+///    + the payload's `default_checks`.
+///
+/// Test bodies for LlmExtract payloads must be thin wrappers
+/// (`Ok(assert_result)`) — they cannot inspect `metrics.metrics`
+/// directly because extraction is deferred host-side. Runtime
+/// `.check(...)` for `ExitCodeEq` is honored guest-side; runtime
+/// `.check(...)` for metric-level variants hard-asserts at
+/// `evaluate_llm_extract_deferred`. Declare metric checks via
+/// `default_checks` on the `Payload` instead so the host can apply
+/// them.
 fn evaluate(
     payload: &Payload,
     checks: &[Check],
     output: SpawnOutput,
 ) -> (AssertResult, PayloadMetrics) {
-    // `extract_metrics` returns Result specifically so an
-    // `OutputFormat::LlmExtract` setup failure (model cache load,
-    // not mere "no metrics extracted") can surface its reason into
-    // the AssertResult rather than collapse into a vague
-    // "metric 'X' not found" downstream. Non-LlmExtract formats are
-    // infallible and always Ok.
+    if let OutputFormat::LlmExtract(hint) = payload.output {
+        return evaluate_llm_extract_deferred(output, hint, checks);
+    }
+    // `extract_metrics` is infallible for ExitCode + Json (the only
+    // remaining variants the guest evaluates). The Result return type
+    // is preserved so the host-side pipeline — which will call
+    // `extract_metrics` against `OutputFormat::Json` on the stdout
+    // captured before sidecar write — keeps a uniform signature with
+    // the LlmExtract dispatcher in `model::extract_via_llm`.
     let stdout_result = extract_metrics(
         &output.stdout,
         &payload.output,
         crate::test_support::MetricStream::Stdout,
     );
-    let (mut metrics, mut extract_err) = match stdout_result {
-        Ok(m) => (m, None::<String>),
-        Err(msg) => (Vec::new(), Some(msg)),
-    };
+    let mut metrics = stdout_result.unwrap_or_default();
     if metrics.is_empty() && !output.stderr.is_empty() {
-        // Stderr fallback — only retry if stdout produced neither
-        // metrics nor a load-failure reason (a load failure is
-        // sticky across stdout/stderr — reason string is identical,
-        // no point re-invoking inference).
-        //
-        // The fallback is deliberately GLOBAL (variant-agnostic)
-        // rather than a per-`OutputFormat` opt-in. Evaluated
-        // alternatives + why this is the right shape:
+        // Stderr fallback — runs only when stdout produced no
+        // metrics. Variant-agnostic by design:
         //
         // * `ExitCode`: `extract_metrics` returns `Ok(vec![])` on
         //   both stdout and stderr for this variant (no parsing
         //   path), so running the fallback is a no-op — no stored
-        //   state, no wasted work beyond one function call. Adding
-        //   a per-variant gate would be complexity without
-        //   behavioral difference.
-        // * `Json` / `LlmExtract`: both BENEFIT from the fallback.
-        //   The motivating case is schbench-like payloads that
-        //   write structured output to stderr only (see
-        //   `SchbenchPayload` in tests/common/fixtures.rs for the
-        //   long-form rationale). A per-variant knob would require
-        //   every new fixture declaring those variants to also
-        //   remember to opt in — easy to miss, and the default
-        //   should match the common case.
-        // * A future "stdout-only" variant would be the one case
-        //   where opt-in is appropriate. That's the trigger for
-        //   adding the knob: a concrete use case, not speculative
-        //   flexibility. Do NOT introduce a `stderr_fallback:
-        //   bool` field on `OutputFormat` in anticipation.
+        //   state, no wasted work beyond one function call. A
+        //   per-variant gate would be complexity without behavioral
+        //   difference.
+        // * `Json`: BENEFITS from the fallback. The motivating case
+        //   is schbench-like payloads that write structured output
+        //   to stderr only (see `SchbenchPayload` in
+        //   tests/common/fixtures.rs for the long-form rationale).
+        // * `LlmExtract` is short-circuited above and never reaches
+        //   this branch.
         //
         // The streams are never merged — fallback replaces, not
         // concatenates — so an upstream that genuinely writes to
         // both stdout and stderr gets only the stdout metrics,
         // which matches the "well-behaved binaries keep stdout
         // canonical" language on the `OutputFormat` doc.
-        if extract_err.is_none() {
-            match extract_metrics(
-                &output.stderr,
-                &payload.output,
-                crate::test_support::MetricStream::Stderr,
-            ) {
-                Ok(m) => metrics = m,
-                Err(msg) => extract_err = Some(msg),
-            }
+        let stderr_result = extract_metrics(
+            &output.stderr,
+            &payload.output,
+            crate::test_support::MetricStream::Stderr,
+        );
+        if let Ok(m) = stderr_result {
+            metrics = m;
         }
     }
     resolve_polarities(&mut metrics, payload);
@@ -363,37 +381,6 @@ fn evaluate(
     };
 
     emit_payload_metrics_to_shm(&payload_metrics);
-
-    // Short-circuit when LlmExtract load failed: running
-    // `evaluate_checks` against an empty metrics vec would flood
-    // the AssertResult with a cascade of "metric 'X' not found"
-    // Other-kind details, burying the real root cause. Surface
-    // the load-failure detail as the sole (and first) entry and
-    // set passed=false directly.
-    if let Some(reason) = extract_err {
-        let mut result = AssertResult {
-            passed: false,
-            skipped: false,
-            details: vec![crate::assert::AssertDetail::new(
-                crate::assert::DetailKind::Other,
-                format!("LlmExtract model load failed: {reason}"),
-            )],
-            stats: Default::default(),
-        };
-        // Still run the exit-code gate if a Check::ExitCodeEq is
-        // set on the payload — exit code is orthogonal to the
-        // metric pipeline and may still be meaningful (e.g. the
-        // payload itself crashed before the model-load cache check
-        // returned Err, so the user wants both signals). Delegated
-        // to `exit_code_mismatch_detail` so this branch and
-        // `evaluate_checks`'s pre-pass produce bit-identical
-        // AssertDetails for the same (expected, actual, stderr)
-        // inputs — no drift between the two call sites.
-        if let Some(detail) = exit_code_mismatch_detail(checks, output.exit_code, &output.stderr) {
-            result.details.push(detail);
-        }
-        return (result, payload_metrics);
-    }
 
     let result = evaluate_checks(checks, &payload_metrics, &output.stderr);
     (result, payload_metrics)
@@ -425,6 +412,89 @@ fn emit_payload_metrics_to_shm(pm: &PayloadMetrics) {
         }
         Err(e) => eprintln!("ktstr: serialize PayloadMetrics for SHM emit: {e}"),
     }
+}
+
+/// Serialize a [`RawPayloadOutput`] and emit it on the guest-to-host
+/// SHM ring under
+/// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT).
+///
+/// Mirrors [`emit_payload_metrics_to_shm`]'s shape: the same
+/// `serde_json::to_vec` infallibility argument applies (all fields
+/// owned `String` / `Option<String>` / `i32`), the defensive
+/// `eprintln!` guards a future fallible-serializer addition, and a
+/// full ring is handled silently by `write_msg`.
+fn emit_raw_payload_output_to_shm(raw: &crate::test_support::RawPayloadOutput) {
+    match serde_json::to_vec(raw) {
+        Ok(bytes) => crate::vmm::shm_ring::write_msg(
+            crate::vmm::shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT,
+            &bytes,
+        ),
+        Err(e) => eprintln!("ktstr: serialize RawPayloadOutput for SHM emit: {e}"),
+    }
+}
+
+/// Guest-side post-exit pipeline for `OutputFormat::LlmExtract`
+/// payloads. Skips every model-loading code path and ships the
+/// captured raw output across the SHM ring for host-side extraction.
+///
+/// LLM extraction is HOST-ONLY: the model (~2.4 GiB) does not fit in
+/// the test VM's RAM budget and the cache lives on the host. The
+/// host's `eval.rs` post-VM-exit pipeline drains the SHM ring,
+/// matches each [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`] entry to its paired
+/// [`MSG_TYPE_PAYLOAD_METRICS`] entry by emission order, runs
+/// [`crate::test_support::model::extract_via_llm`] stdout-primary
+/// with a stderr-fallback retry, and replaces the empty `metrics`
+/// vec on the paired entry with the extracted result before the
+/// sidecar write.
+///
+/// Emission order is fixed: raw-output FIRST, then empty
+/// payload-metrics. Pairing on the host walks both message-type
+/// streams in iteration order so the per-payload index lines up.
+///
+/// Check handling: `Check::ExitCodeEq` is evaluated guest-side here
+/// via [`exit_code_mismatch_detail`] because the exit code is
+/// available in `output.exit_code`; the resulting detail (if any) is
+/// folded into the returned `AssertResult`. Metric-level checks
+/// (`Min`/`Max`/`Range`/`Exists`) cannot be evaluated guest-side —
+/// metrics are extracted host-side post-VM-exit — and a runtime
+/// `.check(...)` for any of those variants on a LlmExtract payload
+/// hard-asserts. Test authors must declare metric checks via
+/// `default_checks` on the `Payload`, not via the runtime builder.
+fn evaluate_llm_extract_deferred(
+    output: SpawnOutput,
+    hint: Option<&'static str>,
+    checks: &[Check],
+) -> (AssertResult, PayloadMetrics) {
+    let bad: Vec<&Check> = checks
+        .iter()
+        .filter(|c| !matches!(c, Check::ExitCodeEq(_)))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "metric-level .check() on LlmExtract payloads cannot be evaluated guest-side; \
+         declare these as default_checks on the Payload instead. Forbidden: {bad:?}"
+    );
+
+    let exit_code = output.exit_code;
+    let raw = crate::test_support::RawPayloadOutput {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        hint: hint.map(str::to_string),
+    };
+    emit_raw_payload_output_to_shm(&raw);
+
+    let payload_metrics = PayloadMetrics {
+        metrics: Vec::new(),
+        exit_code,
+    };
+    emit_payload_metrics_to_shm(&payload_metrics);
+
+    let mut result = AssertResult::pass();
+    if let Some(detail) = exit_code_mismatch_detail(checks, exit_code, &raw.stderr) {
+        result.merge(AssertResult::fail(detail));
+    }
+
+    (result, payload_metrics)
 }
 
 // ---------------------------------------------------------------------------
@@ -873,9 +943,11 @@ fn evaluate_checks(checks: &[Check], pm: &PayloadMetrics, stderr: &str) -> Asser
     let mut result = AssertResult::pass();
     // Pre-pass: exit-code checks first. Delegates to
     // `exit_code_mismatch_detail` so the detail's kind + message
-    // stay in lockstep with the LlmExtract-failure branch in
-    // `evaluate`. Short-circuit on mismatch — a bad exit probably
-    // means the metric extraction found nothing useful.
+    // stay in lockstep with the host-side ExitCodeEq evaluation that
+    // applies to `OutputFormat::LlmExtract` payloads after the host's
+    // raw-output-driven extraction completes. Short-circuit on
+    // mismatch — a bad exit probably means the metric extraction
+    // found nothing useful.
     if let Some(detail) = exit_code_mismatch_detail(checks, pm.exit_code, stderr) {
         result.merge(AssertResult::fail(detail));
         return result;
@@ -933,11 +1005,11 @@ fn missing_metric(metric: &str) -> AssertDetail {
 /// `ExitCodeEq` check is declared, or when every declared one
 /// matches the observed exit code.
 ///
-/// Shared between [`evaluate`]'s LlmExtract-load-failure branch
-/// and [`evaluate_checks`]'s pre-pass so both sites produce
-/// bit-identical details for the same inputs — without this
-/// helper the two branches drift on kind, message format, or
-/// the "which Check wins" order.
+/// Shared between [`evaluate_checks`]'s pre-pass and the host-side
+/// LlmExtract evaluation in `crate::test_support::eval` so the two
+/// sites produce bit-identical details for the same inputs — without
+/// this helper they would drift on kind, message format, or the
+/// "which Check wins" order.
 fn exit_code_mismatch_detail(
     checks: &[Check],
     actual_exit_code: i32,

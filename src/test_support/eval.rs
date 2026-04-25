@@ -108,6 +108,217 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host-side OutputFormat::LlmExtract resolution
+// ---------------------------------------------------------------------------
+//
+// The guest's `payload_run::evaluate_llm_extract_deferred` ships
+// raw stdout/stderr across the SHM ring under
+// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` and emits an empty-metrics
+// `PayloadMetrics` placeholder under `MSG_TYPE_PAYLOAD_METRICS` for
+// every `OutputFormat::LlmExtract` invocation. The guest does NOT
+// load the local model into VM RAM (the model is ~2.4 GiB; the test
+// VM's RAM budget cannot accommodate it). The host runs
+// `extract_via_llm` here, after VM exit, on the captured text — same
+// stdout-primary / stderr-fallback contract that previously lived in
+// the guest's `evaluate()` — and replaces the empty `metrics` vec on
+// the paired `PayloadMetrics` with the extracted result.
+
+/// Run [`crate::test_support::model::extract_via_llm`] against every
+/// `OutputFormat::LlmExtract` raw output drained from SHM, replace
+/// the paired empty-metrics `PayloadMetrics` slot with the extracted
+/// result, and return any failure details that should fold into the
+/// test's AssertResult.
+///
+/// Pairing is by emission order: the i-th `RawPayloadOutput` pairs
+/// with the i-th `PayloadMetrics` entry whose `metrics` is empty.
+/// Non-LlmExtract payloads (Json, ExitCode) emit only
+/// `MSG_TYPE_PAYLOAD_METRICS` (with extracted metrics already
+/// populated for Json, or empty-by-design for ExitCode), and are
+/// passed through unchanged. ExitCode entries are NOT host-extracted
+/// because they have no `RawPayloadOutput` companion — the pairing
+/// loop walks the empty-metrics slots only when there is a raw
+/// output to consume.
+///
+/// Failure shape:
+/// - Model load fails (e.g. `KTSTR_MODEL_OFFLINE=1` with cold cache,
+///   SHA mismatch on a corrupted cached GGUF): append a single
+///   `LlmExtract model load failed: <reason>` detail. metrics
+///   remain empty. No structural-sanity checks fire — we have
+///   nothing to check against.
+/// - Structural-sanity violation (duplicate metric name, non-finite
+///   value, source tag drift): append a single detail describing
+///   the first violation. The metric set is still populated on the
+///   PayloadMetrics slot so debugging tools and the sidecar see
+///   what the model produced; the detail communicates the
+///   rejection.
+fn host_side_llm_extract(
+    payload_metrics: &mut [crate::test_support::PayloadMetrics],
+    raw_outputs: &[crate::test_support::RawPayloadOutput],
+) -> Vec<crate::assert::AssertDetail> {
+    let mut failures = Vec::new();
+    if raw_outputs.is_empty() {
+        return failures;
+    }
+    // Build an index over `payload_metrics` of slots whose metrics
+    // are empty — those are the candidates for host-side extraction.
+    // We pair by occurrence order, so a guest-side run with a Json
+    // payload that legitimately produced zero metrics (e.g. payload
+    // emitted no JSON at all) will be misclassified as "LlmExtract
+    // placeholder" if a raw output exists at the same index. In
+    // practice this conflation cannot fire: the guest only emits
+    // raw outputs for LlmExtract payloads, and the i-th raw output
+    // pairs with the i-th empty-metrics slot — non-LlmExtract
+    // payloads do not interpose their empty-metrics slots into the
+    // LlmExtract pairing because the guest emits the raw output
+    // BEFORE the empty-metrics PM in `evaluate_llm_extract_deferred`,
+    // so the SHM emission order keeps them in lockstep.
+    let empty_indices: Vec<usize> = payload_metrics
+        .iter()
+        .enumerate()
+        .filter(|(_, pm)| pm.metrics.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    if empty_indices.len() < raw_outputs.len() {
+        // The pairing invariant has been violated. The most likely
+        // cause is a future code change that emits raw outputs from
+        // a non-LlmExtract path or that drops the empty-PM
+        // companion. Surface as a failure detail so the test fails
+        // loudly, but fall through to the pairing loop so the
+        // raw outputs that DO have a slot still get extracted —
+        // dropping every extraction because one slot was missing
+        // would lose information the test author can still act on.
+        failures.push(crate::assert::AssertDetail::new(
+            crate::assert::DetailKind::Other,
+            format!(
+                "LlmExtract host pairing: {} raw outputs but only {} empty-metrics PayloadMetrics \
+                 slots — guest emission order may have drifted from the documented contract",
+                raw_outputs.len(),
+                empty_indices.len(),
+            ),
+        ));
+    }
+    for (raw, &pm_idx) in raw_outputs.iter().zip(empty_indices.iter()) {
+        let hint_ref = raw.hint.as_deref();
+        // Stdout-primary: try stdout first.
+        let stdout_result = super::model::extract_via_llm(
+            &raw.stdout,
+            hint_ref,
+            crate::test_support::MetricStream::Stdout,
+        );
+        let (mut metrics, load_err) = match stdout_result {
+            Ok(m) => (m, None::<String>),
+            Err(reason) => (Vec::new(), Some(reason)),
+        };
+        // Stderr fallback — only if stdout produced no metrics AND
+        // the stdout call did not surface a load-failure reason
+        // (the failure reason is identical across both calls; no
+        // point re-invoking inference). Mirrors the legacy guest-
+        // side fallback gate exactly. The Err arm here is
+        // theoretically unreachable: when stdout's call returned
+        // `Ok`, the model is memoized in `MODEL_CACHE` and a second
+        // call cannot fail to load. Handled defensively in case a
+        // future refactor changes that invariant — same surface
+        // shape as a stdout-side load failure.
+        if metrics.is_empty() && load_err.is_none() && !raw.stderr.is_empty() {
+            match super::model::extract_via_llm(
+                &raw.stderr,
+                hint_ref,
+                crate::test_support::MetricStream::Stderr,
+            ) {
+                Ok(m) => metrics = m,
+                Err(reason) => {
+                    failures.push(crate::assert::AssertDetail::new(
+                        crate::assert::DetailKind::Other,
+                        format!("LlmExtract model load failed: {reason}"),
+                    ));
+                    continue;
+                }
+            }
+        }
+        if let Some(reason) = load_err {
+            failures.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                format!("LlmExtract model load failed: {reason}"),
+            ));
+            // Leave metrics empty in the PayloadMetrics slot. Skip
+            // the structural-sanity check below — running it on an
+            // empty vec would either no-op (no metrics to scan) or
+            // produce a misleading detail that buries the real
+            // load-failure reason.
+            continue;
+        }
+        // Structural-sanity check.
+        if let Some(reason) = validate_llm_extraction(&metrics) {
+            failures.push(crate::assert::AssertDetail::new(
+                crate::assert::DetailKind::Other,
+                reason,
+            ));
+        }
+        // Replace the empty-metrics slot with the extracted result.
+        // Even if validation fails above, populate the PayloadMetrics
+        // so debugging tools and the sidecar see what the model
+        // emitted. The accompanying AssertDetail communicates the
+        // rejection.
+        payload_metrics[pm_idx].metrics = metrics;
+    }
+    failures
+}
+
+/// Structural-sanity check on a freshly-extracted
+/// `OutputFormat::LlmExtract` metric set. Returns `None` when the
+/// set is structurally well-formed; `Some(reason)` with the first
+/// violation otherwise.
+///
+/// Universal checks only — every condition here is workload-
+/// agnostic. Workload-specific assertions (latency ranges, RPS
+/// ceilings, sign / magnitude bounds, minimum metric count) belong
+/// in a per-payload validation API the framework does not yet
+/// expose; the test author owns those.
+///
+/// 1. Every metric name is unique. Duplicate dotted paths imply
+///    the LLM walker emitted the same key twice (malformed JSON
+///    walkthrough or a walker aggregation bug) — downstream stats
+///    would misattribute one value to the other regardless of which
+///    workload produced the output.
+/// 2. Every value is finite. NaN / ±inf in `PayloadMetrics`
+///    poisons percentile comparisons downstream and never
+///    represents a legitimate measurement, regardless of workload.
+/// 3. Every metric carries `MetricSource::LlmExtract`. The host's
+///    `extract_via_llm` walker stamps this field unconditionally,
+///    so any drift here points at a bypass — the value didn't come
+///    from the LLM-driven path even though it landed in a slot
+///    we marked LlmExtract.
+fn validate_llm_extraction(metrics: &[crate::test_support::Metric]) -> Option<String> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<&str> = HashSet::with_capacity(metrics.len());
+    for m in metrics {
+        if !seen.insert(m.name.as_str()) {
+            return Some(format!(
+                "LlmExtract emitted duplicate metric name '{}' — downstream stats would \
+                 misattribute one value to the other; check the LLM walker for an \
+                 aggregation bug or a malformed JSON path emitted by the model",
+                m.name,
+            ));
+        }
+        if !m.value.is_finite() {
+            return Some(format!(
+                "LlmExtract metric '{}' has non-finite value {} — NaN / ±inf must not \
+                 propagate into PayloadMetrics",
+                m.name, m.value,
+            ));
+        }
+        if m.source != crate::test_support::MetricSource::LlmExtract {
+            return Some(format!(
+                "LlmExtract metric '{}' has source {:?}, expected MetricSource::LlmExtract — \
+                 a value reached the LlmExtract slot without traversing the LLM walker",
+                m.name, m.source,
+            ));
+        }
+    }
+    None
+}
+
 /// Run a single ktstr_test and return the VM's AssertResult.
 /// Dedupe a resolved include-file list produced by unioning the
 /// per-payload `include_files` specs through
@@ -291,10 +502,6 @@ pub(crate) fn run_ktstr_test_inner(
         .into_iter()
         .map(std::path::PathBuf::from)
         .collect();
-    eprintln!(
-        "ktstr_test[{}]: all_include_files = {:?}",
-        entry.name, declarative_specs
-    );
     let mut resolved_includes: Vec<(String, std::path::PathBuf, &'static str)> =
         if declarative_specs.is_empty() {
             Vec::new()
@@ -305,28 +512,12 @@ pub(crate) fn run_ktstr_test_inner(
                 .map(|(a, h)| (a, h, "declarative"))
                 .collect()
         };
-    eprintln!(
-        "ktstr_test[{}]: resolved_includes = {:?}",
-        entry.name,
-        resolved_includes
-            .iter()
-            .map(|(a, h, o)| (a.as_str(), h.display().to_string(), *o))
-            .collect::<Vec<_>>()
-    );
     if let Some((archive_path, host_path, guest_path)) = config_file_parts(entry) {
         resolved_includes.push((archive_path, host_path, "scheduler config_file"));
         sched_args.push("--config".to_string());
         sched_args.push(guest_path);
     }
     let unioned = dedupe_include_files(&resolved_includes)?;
-    eprintln!(
-        "ktstr_test[{}]: unioned (after dedupe) = {:?}",
-        entry.name,
-        unioned
-            .iter()
-            .map(|(a, h)| (a.as_str(), h.display().to_string()))
-            .collect::<Vec<_>>()
-    );
     if !unioned.is_empty() {
         builder = builder.include_files(unioned);
     }
@@ -390,9 +581,23 @@ pub(crate) fn run_ktstr_test_inner(
     }
 
     // Extract profraw from SHM ring buffer and collect stimulus
-    // events + per-payload metrics.
+    // events + per-payload metrics + raw outputs from
+    // `OutputFormat::LlmExtract` payloads.
+    //
+    // Pairing contract: every guest-side LlmExtract `.run()` /
+    // `.wait()` / `.kill()` / `.try_wait()` invocation emits exactly
+    // ONE `MSG_TYPE_RAW_PAYLOAD_OUTPUT` followed immediately by ONE
+    // `MSG_TYPE_PAYLOAD_METRICS` (with empty `metrics`). Non-LlmExtract
+    // payloads emit only the latter. The host walks both streams in
+    // iteration order and the i-th raw entry pairs with the
+    // RawPayloadOutput-PayloadMetrics-pair indexed by its own
+    // ordinal among ENTRY ARRIVAL — a cross-stream index match using
+    // a per-arrival counter on the LlmExtract-bearing PayloadMetrics
+    // entries. See `host_side_llm_extract` for the pairing
+    // implementation.
     let mut stimulus_events = Vec::new();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
+    let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
     if let Some(ref shm) = result.shm_data {
         for entry in &shm.entries {
             if entry.msg_type == MSG_TYPE_PROFRAW
@@ -428,8 +633,30 @@ pub(crate) fn run_ktstr_test_inner(
                     Err(e) => eprintln!("ktstr_test: decode payload metrics from SHM: {e}"),
                 }
             }
+            if entry.msg_type == crate::vmm::shm_ring::MSG_TYPE_RAW_PAYLOAD_OUTPUT && entry.crc_ok {
+                match serde_json::from_slice::<crate::test_support::RawPayloadOutput>(
+                    &entry.payload,
+                ) {
+                    Ok(raw) => raw_outputs.push(raw),
+                    Err(e) => eprintln!("ktstr_test: decode raw payload output from SHM: {e}"),
+                }
+            }
         }
     }
+
+    // Host-side `OutputFormat::LlmExtract` resolution. For every
+    // empty-metrics PayloadMetrics that arrived alongside a
+    // RawPayloadOutput, run the LLM-backed extraction here on the
+    // host and replace the empty `metrics` vec with the extracted
+    // result. The model lives at the host's cache and the guest VM
+    // never had it, so this is the only correct place for the call.
+    //
+    // Returns a list of `(payload_index, AssertDetail)` pairs for any
+    // host-side failure (model unavailable, universal invariant
+    // violation) so the test verdict can fold them in. Pairing is by
+    // emission order — the i-th raw_output corresponds to the i-th
+    // empty-metrics payload_metrics entry.
+    let host_extract_failures = host_side_llm_extract(&mut payload_metrics, &raw_outputs);
 
     // auto_repro is enabled when:
     // - entry.auto_repro is true (default)
@@ -468,6 +695,7 @@ pub(crate) fn run_ktstr_test_inner(
         &merged_assert,
         &stimulus_events,
         &payload_metrics,
+        &host_extract_failures,
         &vm_topology,
         active_flags,
         &repro_fn,
@@ -483,6 +711,13 @@ pub(crate) fn run_ktstr_test_inner(
 /// is the per-invocation accumulator drained from the guest SHM ring;
 /// the sidecar writer receives it verbatim so stats tooling sees one
 /// entry per `ctx.payload(X).run()` / `.spawn().wait()`.
+///
+/// `host_extract_failures` carries the universal-invariant +
+/// model-load failures produced by [`host_side_llm_extract`] when
+/// the run's `OutputFormat::LlmExtract` payloads were resolved on
+/// the host. The folded details are appended to the test's
+/// AssertResult so a host-side LlmExtract failure surfaces in the
+/// same failure-rendering pipeline as a guest-emitted check failure.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_vm_result(
     entry: &KtstrTestEntry,
@@ -490,6 +725,7 @@ fn evaluate_vm_result(
     merged_assert: &crate::assert::Assert,
     stimulus_events: &[StimulusEvent],
     payload_metrics: &[crate::test_support::PayloadMetrics],
+    host_extract_failures: &[crate::assert::AssertDetail],
     topo: &Topology,
     active_flags: &[String],
     repro_fn: &dyn Fn(&str) -> Option<String>,
@@ -552,9 +788,21 @@ fn evaluate_vm_result(
         }
     };
 
-    if let Ok(check_result) =
+    if let Ok(mut check_result) =
         parse_assert_result_shm(result.shm_data.as_ref()).or_else(|_| parse_assert_result(output))
     {
+        // Fold host-side LlmExtract failures into the guest's
+        // AssertResult before the sidecar write so per-run stats
+        // tooling sees the host-extracted verdict, not the guest's
+        // placeholder pass(). Each host-side failure is appended as
+        // an `AssertDetail` exactly as if it had been raised inside
+        // the guest's `evaluate_checks` — same kind, same prose
+        // shape — so failure-rendering downstream is uniform across
+        // sources.
+        for detail in host_extract_failures {
+            check_result.merge(AssertResult::fail(detail.clone()));
+        }
+
         // Write sidecar before checking pass/fail so both outcomes are captured.
         // A sidecar write failure is logged but not propagated: the test
         // verdict itself is still valid — only post-run stats tooling
@@ -1549,6 +1797,7 @@ mod tests {
             &assertions,
             &[],
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1584,6 +1833,7 @@ mod tests {
             &assertions,
             &[],
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1614,6 +1864,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -1658,6 +1909,7 @@ mod tests {
             &assertions,
             &[],
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &repro_fn,
@@ -1700,6 +1952,7 @@ mod tests {
             &assertions,
             &[],
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &repro_fn,
@@ -1731,6 +1984,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -1770,6 +2024,7 @@ mod tests {
             &assertions,
             &[],
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -1796,6 +2051,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -1828,6 +2084,7 @@ mod tests {
                 &assertions,
                 &[],
                 &[],
+                &[],
                 &EVAL_TOPO,
                 &[],
                 &no_repro,
@@ -1856,6 +2113,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &[],
                 &EVAL_TOPO,
@@ -1892,6 +2150,7 @@ mod tests {
                 &assertions,
                 &[],
                 &[],
+                &[],
                 &EVAL_TOPO,
                 &[],
                 &no_repro
@@ -1924,6 +2183,7 @@ mod tests {
                 &assertions,
                 &[],
                 &[],
+                &[],
                 &EVAL_TOPO,
                 &[],
                 &no_repro
@@ -1947,6 +2207,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -1981,6 +2242,7 @@ mod tests {
             &assertions,
             &[],
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -2013,6 +2275,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &[],
                 &EVAL_TOPO,
@@ -2093,6 +2356,7 @@ mod tests {
                 &assertions,
                 &[],
                 &[],
+                &[],
                 &EVAL_TOPO,
                 &[],
                 &no_repro
@@ -2120,6 +2384,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -2161,6 +2426,7 @@ mod tests {
             &assertions,
             &[],
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -2184,6 +2450,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -2212,6 +2479,7 @@ mod tests {
             &assertions,
             &[],
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -2238,6 +2506,7 @@ mod tests {
             &assertions,
             &[],
             &[],
+            &[],
             &EVAL_TOPO,
             &[],
             &no_repro,
@@ -2258,6 +2527,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -2284,6 +2554,7 @@ mod tests {
             &entry,
             &result,
             &assertions,
+            &[],
             &[],
             &[],
             &EVAL_TOPO,
@@ -2330,6 +2601,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &[],
                 &EVAL_TOPO,
@@ -2388,6 +2660,7 @@ mod tests {
                 &entry,
                 &result,
                 &assertions,
+                &[],
                 &[],
                 &[],
                 &EVAL_TOPO,
@@ -2470,6 +2743,7 @@ mod tests {
                 &assertions,
                 &[],
                 &[],
+                &[],
                 &EVAL_TOPO,
                 &[],
                 &no_repro
@@ -2541,6 +2815,98 @@ mod tests {
             guard.is_none(),
             "path outside {} must skip locking, got guard",
             cache.path().display(),
+        );
+    }
+
+    // -- validate_llm_extraction tests --
+    //
+    // Pin the three universal structural-sanity checks the function
+    // is documented to enforce: unique metric names, finite values,
+    // `MetricSource::LlmExtract` source tag. Each violation produces
+    // a Some with a kind-specific substring; clean input produces
+    // None. These are pure-function tests over synthetic Metric
+    // vectors — no model load, no VM, no SHM ring.
+
+    /// Build a clean LlmExtract-tagged metric for use in the
+    /// validation tests. Each test mutates one field to construct
+    /// its violation case, leaving every other invariant satisfied
+    /// so the failure is unambiguously attributable to the mutated
+    /// field rather than collateral defaults.
+    fn llm_metric(name: &str, value: f64) -> crate::test_support::Metric {
+        crate::test_support::Metric {
+            name: name.to_owned(),
+            value,
+            polarity: crate::test_support::Polarity::Unknown,
+            unit: String::new(),
+            source: crate::test_support::MetricSource::LlmExtract,
+            stream: crate::test_support::MetricStream::Stdout,
+        }
+    }
+
+    /// Two metrics sharing the same `name` violate the uniqueness
+    /// invariant. The diagnostic must call out "duplicate metric
+    /// name" so a reader can tell which check fired without
+    /// re-reading the function.
+    #[test]
+    fn validate_llm_extraction_duplicate_name_rejects() {
+        let metrics = vec![
+            llm_metric("latency.p99", 1.0),
+            llm_metric("latency.p99", 2.0),
+        ];
+        let reason = validate_llm_extraction(&metrics)
+            .expect("duplicate name must produce a violation reason");
+        assert!(
+            reason.contains("duplicate metric name"),
+            "diagnostic must mention 'duplicate metric name': {reason}",
+        );
+    }
+
+    /// A NaN value violates the finite-only invariant; the
+    /// diagnostic must call out "non-finite" so the reader can tell
+    /// which check fired.
+    #[test]
+    fn validate_llm_extraction_nan_rejects() {
+        let metrics = vec![llm_metric("latency.p99", f64::NAN)];
+        let reason =
+            validate_llm_extraction(&metrics).expect("NaN must produce a violation reason");
+        assert!(
+            reason.contains("non-finite"),
+            "diagnostic must mention 'non-finite': {reason}",
+        );
+    }
+
+    /// A metric tagged with the wrong source (Json instead of
+    /// LlmExtract) violates the source-tag invariant. The
+    /// diagnostic must mention `MetricSource::LlmExtract` so the
+    /// reader can tell which check fired and what the expected
+    /// source was.
+    #[test]
+    fn validate_llm_extraction_wrong_source_rejects() {
+        let mut metrics = vec![llm_metric("latency.p99", 1.0)];
+        metrics[0].source = crate::test_support::MetricSource::Json;
+        let reason = validate_llm_extraction(&metrics)
+            .expect("non-LlmExtract source must produce a violation reason");
+        assert!(
+            reason.contains("MetricSource::LlmExtract"),
+            "diagnostic must mention 'MetricSource::LlmExtract': {reason}",
+        );
+    }
+
+    /// Structurally clean input — distinct names, finite values,
+    /// `LlmExtract` source on every entry — produces `None`. Pins
+    /// the happy path so a regression that adds an unwanted check
+    /// (e.g. minimum metric count, value-magnitude bound) breaks
+    /// this test instead of silently rejecting valid extractions.
+    #[test]
+    fn validate_llm_extraction_clean_input_passes() {
+        let metrics = vec![
+            llm_metric("latency.p50", 1.0),
+            llm_metric("latency.p99", 2.0),
+            llm_metric("rps", 1000.0),
+        ];
+        assert!(
+            validate_llm_extraction(&metrics).is_none(),
+            "clean input must pass, got Some",
         );
     }
 }

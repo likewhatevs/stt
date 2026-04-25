@@ -95,6 +95,7 @@ pub(crate) use output::{
     SENTINEL_EXEC_EXIT_PREFIX, SENTINEL_EXIT_PREFIX, SENTINEL_INIT_STARTED,
     SENTINEL_PAYLOAD_STARTING, SENTINEL_SCHEDULER_DIED, SENTINEL_SCHEDULER_NOT_ATTACHED,
 };
+pub(crate) use payload::RawPayloadOutput;
 pub use payload::{
     Check, Metric, MetricHint, MetricSource, MetricStream, OutputFormat, Payload, PayloadKind,
     PayloadMetrics, Polarity,

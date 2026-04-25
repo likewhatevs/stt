@@ -15,14 +15,16 @@
 //! pass/fail is handled by the [`Check::ExitCodeEq`] pre-pass
 //! elsewhere.
 //!
-//! [`OutputFormat::LlmExtract`] routes the same (possibly
-//! stderr-sourced) output through
-//! [`crate::test_support::model::extract_via_llm`]: the model owns
-//! prompt composition and the initial JSON-from-prose parse, then
-//! feeds the resulting `serde_json::Value` into this module's
-//! [`walk_json_leaves`] with the source pre-tagged to
-//! [`MetricSource::LlmExtract`]. One extraction walker, two
-//! acquisition paths.
+//! [`OutputFormat::LlmExtract`] is HOST-ONLY. The guest-side
+//! `extract_metrics` short-circuits the LlmExtract arm to an empty
+//! metric set so the guest never loads the ~2.4 GiB local model into
+//! its constrained VM RAM. The captured raw stdout/stderr are shipped
+//! over the SHM ring as a `MSG_TYPE_RAW_PAYLOAD_OUTPUT` entry; the
+//! host's `eval.rs` post-VM-exit pipeline calls
+//! [`crate::test_support::model::extract_via_llm`] on the captured
+//! text and threads the resulting metrics back into the
+//! [`PayloadMetrics`](crate::test_support::PayloadMetrics) slot the
+//! guest emitted alongside.
 
 use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Polarity};
 
@@ -42,21 +44,23 @@ use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Pola
 /// [`Check`](crate::test_support::Check) evaluation reports each
 /// referenced metric as missing rather than failing the whole run.
 ///
-/// [`OutputFormat::LlmExtract`] with an optional `hint` delegates to
-/// [`crate::test_support::model::extract_via_llm`], which composes a
-/// prompt (appending the hint when present), runs a single
-/// deterministic (ArgMax) inference pass, and walks the resulting
-/// JSON with [`MetricSource::LlmExtract`]. An unavailable inference
-/// backend (missing cache, forward-pass failure) yields an empty
-/// metric set, matching the non-fatal contract above.
+/// [`OutputFormat::LlmExtract`] returns an empty `Vec` from this
+/// function regardless of `output`. The LLM-backed extraction does
+/// NOT run here: the guest does not load the 2.4 GiB model, and the
+/// host runs `extract_via_llm` post-VM-exit on the raw output that
+/// the guest shipped over the SHM ring. Callers that need
+/// LlmExtract metrics must consume the host-extracted result through
+/// the `eval.rs` pipeline. The `hint` carried on the
+/// `LlmExtract(Option<&'static str>)` payload is preserved on the
+/// raw-output SHM message for the host extractor to consume.
 ///
 /// # Known truncation point: depth cap
 ///
-/// Both the `Json` and `LlmExtract` arms route through
-/// [`walk_json_leaves`], which enforces a hard recursion cap of
-/// [`MAX_WALK_DEPTH`] (currently 64). Subtrees past that depth are
-/// silently dropped from the metric list — a `tracing::warn!` fires
-/// and a sentinel metric named [`WALK_TRUNCATION_SENTINEL_NAME`]
+/// The `Json` arm routes through [`walk_json_leaves`], which enforces
+/// a hard recursion cap of [`MAX_WALK_DEPTH`] (currently 64).
+/// Subtrees past that depth are silently dropped from the metric
+/// list — a `tracing::warn!` fires and a sentinel metric named
+/// [`WALK_TRUNCATION_SENTINEL_NAME`]
 /// (`__walk_json_leaves_truncated`) is appended to the return
 /// value, with `value` set to the depth at which truncation
 /// occurred. Callers that want to distinguish "no deep metrics"
@@ -64,7 +68,9 @@ use crate::test_support::{Metric, MetricSource, MetricStream, OutputFormat, Pola
 /// for a metric with that name. Practical upper bound: 64 is well
 /// below serde_json's default parse recursion limit (128) and
 /// covers every realistic payload schema observed in the crate
-/// (fio maxes out around depth 8, schbench around depth 3).
+/// (fio maxes out around depth 8, schbench around depth 3). The same
+/// cap applies to the host-side LlmExtract pipeline that runs the
+/// model response through this module's walker.
 pub fn extract_metrics(
     output: &str,
     format: &OutputFormat,
@@ -75,7 +81,18 @@ pub fn extract_metrics(
         OutputFormat::Json => Ok(find_and_parse_json(output)
             .map(|v| walk_json_leaves(&v, MetricSource::Json, stream))
             .unwrap_or_default()),
-        OutputFormat::LlmExtract(hint) => super::model::extract_via_llm(output, *hint, stream),
+        // LlmExtract is host-only — the guest captures raw text and
+        // ships it across the SHM ring; the host runs
+        // `extract_via_llm` post-VM-exit. Returning an empty vec here
+        // is the no-op the guest's `evaluate()` short-circuits past
+        // when emitting `MSG_TYPE_RAW_PAYLOAD_OUTPUT`, and is also
+        // the correct value for any non-payload-pipeline caller that
+        // happens to invoke `extract_metrics` against an LlmExtract
+        // format on the host (e.g. unit tests for the dispatcher
+        // shape) — those callers should reach for
+        // `crate::test_support::model::extract_via_llm` directly when
+        // they want the LLM-backed extraction.
+        OutputFormat::LlmExtract(_) => Ok(Vec::new()),
     }
 }
 
@@ -473,65 +490,49 @@ mod tests {
         assert_eq!(m.len(), 3);
     }
 
+    /// `extract_metrics` short-circuits the `OutputFormat::LlmExtract`
+    /// arm to `Ok(Vec::new())` regardless of input. The LLM-backed
+    /// extraction has moved host-side: the guest-facing `evaluate()`
+    /// path does NOT load the 2.4 GiB model into VM RAM. Pinning this
+    /// invariant here ensures a future refactor cannot reintroduce
+    /// the in-VM model load by silently re-routing the LlmExtract arm
+    /// back through `super::model::extract_via_llm`.
+    ///
+    /// Both the `None` (no-hint) and `Some(hint)` payload shapes are
+    /// covered together — neither must trigger any model-side code
+    /// path. If a future change splits the dispatch by hint presence,
+    /// the assertion would surface the regression before it hit a
+    /// guest VM.
     #[test]
-    fn llm_extract_returns_empty_when_backend_unavailable() {
-        // LlmExtract delegates to `model::extract_via_llm`, which
-        // calls `load_inference` followed by `invoke_with_model`.
-        // Forcing the offline gate makes `ensure()` bail on the
-        // uncached model, so `load_inference` surfaces
-        // an `anyhow::Error` and the pipeline returns an empty
-        // metric set — non-fatal extraction error so downstream
-        // Check evaluation reports each referenced metric as missing
-        // rather than failing the whole run.
-        //
-        // Calls `model::reset()` under `lock_env()` so a
-        // previously memoized `Ok(_)` slot in `MODEL_CACHE` cannot
-        // bypass the offline gate. Without the reset, the test could
-        // pass for the wrong reason — cached inference yielding an
-        // empty Vec rather than `ensure()` tripping on the offline
-        // env var.
-        let _lock = super::super::test_helpers::lock_env();
-        super::super::model::reset();
-        let _cache = super::super::test_helpers::isolated_cache_dir();
-        let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
-        // Return is `Err(reason)` — a model-cache load failure is
-        // surfaced as a threaded reason string so the Check
-        // evaluator can attach it to the AssertResult. The exact
-        // reason message includes the offline-gate env-var name.
-        let err = extract_metrics(
-            "anything",
-            &OutputFormat::LlmExtract(None),
-            MetricStream::Stdout,
-        )
-        .expect_err("offline gate must produce Err from extract_metrics");
-        assert!(
-            err.contains(super::super::model::OFFLINE_ENV),
-            "reason should name the offline env var, got: {err}"
-        );
-    }
-
-    #[test]
-    fn llm_extract_with_hint_returns_empty_when_backend_unavailable() {
-        // Same contract as `llm_extract_returns_empty_when_backend_unavailable`
-        // but exercising the hint-carrying variant so the dispatch path
-        // that plumbs `hint` into `extract_via_llm` is covered.
-        //
-        // Same `model::reset()` rationale: the offline-gate
-        // assertion is meaningful only when MODEL_CACHE starts empty.
-        let _lock = super::super::test_helpers::lock_env();
-        super::super::model::reset();
-        let _cache = super::super::test_helpers::isolated_cache_dir();
-        let _env_offline = super::super::test_helpers::EnvVarGuard::set("KTSTR_MODEL_OFFLINE", "1");
-        let err = extract_metrics(
-            "anything",
-            &OutputFormat::LlmExtract(Some("focus on latency")),
-            MetricStream::Stdout,
-        )
-        .expect_err("offline gate must produce Err from extract_metrics");
-        assert!(
-            err.contains(super::super::model::OFFLINE_ENV),
-            "reason should name the offline env var, got: {err}"
-        );
+    fn llm_extract_returns_empty_unconditionally() {
+        // No env-var locking, no model::reset() — this test covers a
+        // pure constant-return contract; if the assertion ever
+        // requires environment manipulation again, the LlmExtract
+        // arm has been re-wired back through `extract_via_llm` and
+        // the host-only invariant has been broken.
+        for (label, format) in [
+            ("no-hint", OutputFormat::LlmExtract(None)),
+            (
+                "with-hint",
+                OutputFormat::LlmExtract(Some("focus on latency")),
+            ),
+        ] {
+            for input in [
+                "",
+                "anything",
+                r#"{"latency_us": 42}"#,
+                "schbench-shaped percentile table\n50.0%: 100ns\n",
+            ] {
+                let m = extract_metrics(input, &format, MetricStream::Stdout)
+                    .unwrap_or_else(|e| panic!("{label}: extract_metrics returned Err: {e}"));
+                assert!(
+                    m.is_empty(),
+                    "{label}: LlmExtract arm must short-circuit to empty Vec; \
+                     got {} metric(s) for input {input:?}",
+                    m.len(),
+                );
+            }
+        }
     }
 
     #[test]

@@ -718,12 +718,29 @@ pub enum OutputFormat {
     /// [`MetricSource::LlmExtract`]. The optional `&'static str` is
     /// a user-provided focus hint appended to the default prompt.
     ///
+    /// **Host-only, deferred extraction.** Unlike `Json`, the LLM
+    /// extraction does NOT run inside the guest VM — the model
+    /// (~2.4 GiB) does not fit in guest RAM and the cache lives on
+    /// the host. Inside the guest, `ctx.payload(P).run()` returns
+    /// empty metrics; the captured raw stdout/stderr ship across
+    /// the SHM ring as a `MSG_TYPE_RAW_PAYLOAD_OUTPUT` entry, and
+    /// the host's post-VM-exit pipeline runs `extract_via_llm` on
+    /// the captured text. Test bodies for LlmExtract payloads must
+    /// return `Ok(assert_result)` without inspecting `metrics.metrics`
+    /// directly. Runtime `.check(...)` for `ExitCodeEq` is honored
+    /// guest-side; metric-level `.check(...)` calls hard-assert —
+    /// declare them via `default_checks` on the `Payload` so the
+    /// host can apply them.
+    ///
+    /// Same stdout-primary / stderr-fallback contract as `Json`,
+    /// applied host-side rather than guest-side.
+    ///
     /// When present, the hint is emitted on its own line as
     /// `Focus: <hint>\n\n` between the default prompt template and
-    /// the `STDOUT:` section (see `compose_prompt` in `test_support::model`).
-    /// An empty or whitespace-only hint is dropped — the line is not
-    /// emitted — so a caller passing `Some("")` or `Some("   ")` sees
-    /// the same prompt as `None`.
+    /// the `STDOUT:` section (see `compose_prompt` in
+    /// `test_support::model`). An empty or whitespace-only hint is
+    /// dropped — the line is not emitted — so a caller passing
+    /// `Some("")` or `Some("   ")` sees the same prompt as `None`.
     LlmExtract(Option<&'static str>),
 }
 
@@ -1005,6 +1022,44 @@ impl PayloadMetrics {
             .find(|m| m.name == name)
             .map(|m| m.value)
     }
+}
+
+/// Raw stdout/stderr captured from a payload that declared
+/// [`OutputFormat::LlmExtract`].
+///
+/// Emitted by the guest alongside an empty
+/// [`PayloadMetrics`](PayloadMetrics) so the host can run the
+/// LLM-backed extraction post-VM-exit. LLM extraction never runs in
+/// the guest: the model (~2.4 GiB) does not fit in guest VM RAM, and
+/// the cache lives on the host. Pairing with the empty
+/// `PayloadMetrics` is by emission order — every guest-side
+/// `OutputFormat::LlmExtract` `.run()` / `.wait()` / `.kill()` /
+/// `.try_wait()` invocation emits one
+/// `MSG_TYPE_RAW_PAYLOAD_OUTPUT` followed immediately by one
+/// `MSG_TYPE_PAYLOAD_METRICS`, and the host's drain loop pairs them
+/// by index.
+///
+/// `hint` is the focus directive declared on the payload's
+/// `OutputFormat::LlmExtract(Some(hint))`. Stored as `Option<String>`
+/// (rather than `Option<&'static str>`) because the SHM transport is
+/// owned-bytes only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RawPayloadOutput {
+    /// Stdout captured from the payload's child process. Non-UTF-8
+    /// bytes are replaced with U+FFFD per the framework's
+    /// stream-capture contract.
+    pub stdout: String,
+    /// Stderr captured from the payload's child process. The host's
+    /// `extract_metrics` runs stdout-primary with stderr-fallback,
+    /// matching the legacy guest-side dispatch contract. Non-UTF-8
+    /// bytes are replaced with U+FFFD per the framework's
+    /// stream-capture contract.
+    pub stderr: String,
+    /// Optional focus directive declared on
+    /// `OutputFormat::LlmExtract(Some(hint))`. `None` when the
+    /// payload declared `LlmExtract(None)` or `LlmExtract`. The
+    /// host's `extract_via_llm` threads this into the prompt.
+    pub hint: Option<String>,
 }
 
 #[cfg(test)]

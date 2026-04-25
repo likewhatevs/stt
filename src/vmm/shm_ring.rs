@@ -98,7 +98,30 @@ pub const MSG_TYPE_CRASH: u32 = 0x4352_5348; // "CRSH"
 /// in order and feeds the resulting `Vec<PayloadMetrics>` to the
 /// sidecar writer so per-invocation provenance is preserved across
 /// composed payload runs.
+///
+/// For [`OutputFormat::LlmExtract`](crate::test_support::OutputFormat::LlmExtract)
+/// payloads, this carries an empty `metrics` vec — extraction runs
+/// host-side post-VM-exit on the paired
+/// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`] entry and replaces the empty vec
+/// with the extracted metrics before sidecar write.
 pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
+
+/// Message type for raw stdout/stderr captured from a payload that
+/// declared [`OutputFormat::LlmExtract`](crate::test_support::OutputFormat::LlmExtract).
+/// Payload: JSON-encoded
+/// [`RawPayloadOutput`](crate::test_support::RawPayloadOutput).
+///
+/// Emitted ALONGSIDE [`MSG_TYPE_PAYLOAD_METRICS`] (with empty
+/// `metrics`) so the host can pair them by emission order. The host
+/// drains every entry, runs `extract_via_llm` on the captured text
+/// stdout-primary with stderr-fallback, and replaces the paired
+/// PayloadMetrics' empty `metrics` vec with the extracted result.
+///
+/// LLM extraction NEVER runs in the guest: the model (~2.4 GiB) does
+/// not fit in the guest VM's available RAM, and the cache lives on
+/// the host. The guest captures raw text only and ships it across
+/// the SHM ring for host-side resolution.
+pub const MSG_TYPE_RAW_PAYLOAD_OUTPUT: u32 = 0x5241_574f; // "RAWO"
 
 /// Current header version.
 pub const SHM_RING_VERSION: u32 = 1;

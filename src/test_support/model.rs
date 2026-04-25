@@ -682,11 +682,19 @@ pub struct ModelStatus {
 /// Mirrors [`crate::cache`]'s kernel cache resolver so the same env
 /// overrides (`KTSTR_CACHE_DIR`, `XDG_CACHE_HOME`) govern both.
 pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
-    eprintln!(
-        "resolve_cache_root: HOME={:?} XDG_CACHE_HOME={:?} KTSTR_CACHE_DIR={:?}",
-        std::env::var("HOME"),
-        std::env::var("XDG_CACHE_HOME"),
-        std::env::var("KTSTR_CACHE_DIR"),
+    // Trace the env-var snapshot at debug level. The earlier
+    // implementation emitted this on every call as an unconditional
+    // `eprintln!`, which spammed every CI test boot with HOME /
+    // XDG_CACHE_HOME / KTSTR_CACHE_DIR diagnostics that operators
+    // never asked for. Routed through `tracing::debug!` so the
+    // information is available with `RUST_LOG=debug` for operators
+    // diagnosing a cache-resolution surprise without cluttering the
+    // default test output.
+    tracing::debug!(
+        home = ?std::env::var("HOME"),
+        xdg_cache_home = ?std::env::var("XDG_CACHE_HOME"),
+        ktstr_cache_dir = ?std::env::var("KTSTR_CACHE_DIR"),
+        "model::resolve_cache_root: env snapshot",
     );
     if let Ok(dir) = std::env::var("KTSTR_CACHE_DIR")
         && !dir.is_empty()
@@ -703,10 +711,12 @@ pub(crate) fn resolve_cache_root() -> Result<PathBuf> {
     // yields "/.cache" — a path whose statvfs reports the root
     // filesystem's free space, not a usable user-cache filesystem.
     // PathBuf::from("").join(".cache") yields ".cache" relative to
-    // CWD, also wrong. A legitimate HOME that happens to be "/" is
-    // a process-environment configuration error (root with no home,
-    // container init forgot to set HOME); the actionable response
-    // is the same as the unset case.
+    // CWD, also wrong. A literal `/` HOME is a process-environment
+    // artifact (root user with no home, container init that didn't
+    // set HOME) — same fix as the unset case. Other malformed HOME
+    // values (non-existent directory, relative path, etc.) pass
+    // through this gate; downstream open()/statvfs() surface the
+    // real error from the resulting model cache path.
     let home = std::env::var("HOME").unwrap_or_default();
     if home.is_empty() || home == "/" {
         anyhow::bail!(
@@ -3164,6 +3174,62 @@ mod tests {
             root,
             PathBuf::from("/xdg/caches").join("ktstr").join("models"),
             "empty KTSTR_CACHE_DIR must be treated as unset so XDG wins",
+        );
+    }
+
+    /// HOME=`/` is rejected — the resulting `/.cache/ktstr/models`
+    /// path's statvfs reports the root filesystem's free space
+    /// (typically a small constrained mount), not a usable user
+    /// cache. A legitimate root user without a configured home
+    /// should set KTSTR_CACHE_DIR or XDG_CACHE_HOME explicitly.
+    #[test]
+    fn resolve_cache_root_rejects_root_slash_home() {
+        let _lock = lock_env();
+        let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _env_home = EnvVarGuard::set("HOME", "/");
+        let err = resolve_cache_root().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HOME is unset, empty, or `/`"),
+            "expected HOME=/ rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains("KTSTR_CACHE_DIR"),
+            "error must suggest KTSTR_CACHE_DIR, got: {msg}"
+        );
+    }
+
+    /// HOME=`""` is rejected for the same reason as unset — joining
+    /// `.cache` onto an empty PathBuf yields a relative `.cache`
+    /// rooted at CWD instead of a stable user cache.
+    #[test]
+    fn resolve_cache_root_rejects_empty_home() {
+        let _lock = lock_env();
+        let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _env_home = EnvVarGuard::set("HOME", "");
+        let err = resolve_cache_root().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HOME is unset, empty, or `/`"),
+            "expected empty-HOME rejection, got: {msg}"
+        );
+    }
+
+    /// HOME unset is rejected (carried over from prior behavior;
+    /// the bail message is now shared with the empty / `/` cases).
+    #[test]
+    fn resolve_cache_root_rejects_unset_home() {
+        let _lock = lock_env();
+        let _env_ktstr = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _env_xdg = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _env_home = EnvVarGuard::remove("HOME");
+        let err = resolve_cache_root().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("HOME is unset, empty, or `/`"),
+            "expected unset-HOME rejection, got: {msg}"
         );
     }
 
