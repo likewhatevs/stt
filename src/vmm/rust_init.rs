@@ -33,9 +33,12 @@ const HVC0: &str = "/dev/hvc0";
 /// `"1"` activates the event, `"0"` deactivates it.
 const TRACE_SCHED_EXT_DUMP_ENABLE: &str =
     "/sys/kernel/tracing/events/sched_ext/sched_ext_dump/enable";
-/// Global tracefs on/off switch. Writing `"0"` flushes in-flight
-/// trace data out of the kernel ring buffer so the trace_pipe reader
-/// drains cleanly before reboot.
+/// Global tracefs on/off switch. Writing `"0"` stops new events from
+/// being recorded into the ring buffer (`ring_buffer_record_off`); the
+/// userspace trace_pipe reader still has to drain whatever is already
+/// buffered before reboot. Disabling the producer side first is what
+/// makes the reader's drain window terminate — once no new events
+/// arrive, poll eventually returns 0 and the drain_deadline elapses.
 const TRACE_TRACING_ON: &str = "/sys/kernel/tracing/tracing_on";
 /// tracefs streaming endpoint for the active trace. The trace_pipe
 /// reader opens this once per boot and forwards every line to COM1.
@@ -394,9 +397,29 @@ pub(crate) fn ktstr_guest_init() -> ! {
         stop.store(true, Ordering::Release);
     }
 
-    // Flush COM1 trace data before reboot. tracing_on=0 wakes the
-    // blocked reader via ring_buffer_wake_waiters and causes EOF after
-    // all buffered events are drained.
+    // Flush COM1 trace data before reboot. The reader thread runs on
+    // a poll(POLLIN, 200ms) cadence over a non-blocking trace_pipe fd
+    // (see start_trace_pipe), so setting `stop` is what bounds
+    // `handle.join()` — the thread observes the flag at the next poll
+    // wake and enters its 5s drain window. Effective shutdown latency
+    // is up to ~5.2s in the worst case: the 200ms poll cadence elapses
+    // before the thread notices the stop flag, then the 5s drain
+    // deadline begins. Disabling the tracepoint and writing 0 to
+    // `tracing_on` first quiesces the producer side so the drain
+    // window terminates promptly: no new events are recorded into the
+    // ring buffer, the reader sees POLLIN until the buffer is empty,
+    // then poll returns 0 each cycle and the drain_deadline elapses
+    // cleanly. Trace events arriving after the 5s deadline are dropped
+    // by design — bounded drain is the explicit tradeoff that
+    // guarantees cleanup completes (a faulty producer that never
+    // pauses cannot wedge teardown).
+    //
+    // tracing_on=0 alone does NOT wake a trace_pipe reader stuck at
+    // `iter->pos == 0` — the kernel wake fires `ring_buffer_wake_waiters`
+    // but the trace_pipe wait uses `wait_pipe_cond` (not
+    // `rb_wait_once`), and that condition only flips when `iter->closed`
+    // or `iter->wait_index` change. The non-blocking + poll design
+    // sidesteps this by never blocking in the kernel wait at all.
     let _ = fs::write(TRACE_SCHED_EXT_DUMP_ENABLE, "0");
     if let Some(ref stop) = trace_stop {
         stop.store(true, Ordering::Release);
@@ -1243,6 +1266,24 @@ fn dump_file_to_com2(path: &str) {
 
 /// Enable sched_ext_dump trace event and pipe trace_pipe to COM1 in a
 /// background thread. Returns the stop flag and thread join handle.
+///
+/// The reader opens trace_pipe with `O_NONBLOCK` and uses `poll()` on
+/// a 200ms cadence so the loop is responsive to `stop` even when the
+/// kernel never emits a sched_ext_dump event. A blocking `read(2)` on
+/// trace_pipe parks the task in `tracing_wait_pipe` (kernel/trace/trace.c);
+/// once that wait is entered with `iter->pos == 0` (no event ever
+/// dispatched into the iterator), the kernel re-enters `wait_on_pipe`
+/// after every wake because the inner loop in `tracing_wait_pipe` only
+/// breaks when `!tracer_tracing_is_on(tr) && iter->pos`. Writing 0 to
+/// `tracing_on` does fire `ring_buffer_wake_waiters`, but the
+/// trace_pipe path supplies `wait_pipe_cond` (not the default
+/// `rb_wait_once`) and that condition only flips when `iter->closed`
+/// or `iter->wait_index` change — neither is touched by the trace_pipe
+/// fops, so the wake produces a spurious return into `tracing_wait_pipe`
+/// which immediately re-sleeps. Going non-blocking sidesteps the kernel
+/// wait entirely: every iteration the userspace thread checks the stop
+/// flag, polls for data, and drains any pending events without ever
+/// parking in the kernel.
 fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandle<()>>) {
     if Path::new(TRACE_SCHED_EXT_DUMP_ENABLE).exists() {
         let _ = fs::write(TRACE_SCHED_EXT_DUMP_ENABLE, "1");
@@ -1252,7 +1293,12 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
         let handle = std::thread::Builder::new()
             .name("trace-pipe".into())
             .spawn(move || {
-                let Ok(mut trace) = fs::File::open(TRACE_PIPE) else {
+                use std::os::unix::fs::OpenOptionsExt;
+                let Ok(mut trace) = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(TRACE_PIPE)
+                else {
                     return;
                 };
                 let Ok(mut com1) = fs::OpenOptions::new().write(true).open(COM1) else {
@@ -1268,13 +1314,49 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
                     if drain_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                         break;
                     }
-                    match trace.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let _ = com1.write_all(&buf[..n]);
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+
+                    let mut pollfds = [PollFd::new(trace.as_fd(), PollFlags::POLLIN)];
+                    match poll(&mut pollfds, PollTimeout::from(200u16)) {
+                        Ok(0) => continue,
+                        Ok(_) => {}
+                        Err(nix::errno::Errno::EINTR) => continue,
                         Err(_) => break,
+                    }
+                    if let Some(revents) = pollfds[0].revents() {
+                        if revents.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
+                            break;
+                        }
+                        if !revents.contains(PollFlags::POLLIN) {
+                            // POLLHUP without POLLIN means no buffered
+                            // data to drain; with POLLIN, fall through
+                            // to read first so events that arrived
+                            // before hangup still reach COM1.
+                            if revents.contains(PollFlags::POLLHUP) {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Drain every byte poll says is ready before
+                    // returning to the stop-flag check; otherwise a
+                    // continuous trace stream could starve the stop
+                    // signal for arbitrarily long. Inner-loop exits use
+                    // `break` (not `return`) so the outer poll loop
+                    // observes fd state (POLLHUP/POLLERR) and the
+                    // drain_deadline check on the next iteration —
+                    // terminating the thread from inside the drain
+                    // would skip both.
+                    loop {
+                        match trace.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let _ = com1.write_all(&buf[..n]);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
                     }
                 }
             })
