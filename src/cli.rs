@@ -2453,6 +2453,28 @@ pub fn resolve_cached_kernel(
             )
         }
         KernelId::Path(_) => bail!("resolve_cached_kernel called with Path variant"),
+        // Multi-kernel specs cannot resolve to a single cache entry.
+        // This function returns one path; range/git fan-out belongs
+        // upstream in the dispatch loop that iterates kernels. Bail
+        // with an actionable redirect that cites the value the user
+        // wrote — `KernelId::Display` renders Range as `start..end`
+        // and Git as `git+URL#REF`, matching the sibling cache-key
+        // bail above that cites `{key}`.
+        //
+        // Run `validate()` first so an inverted range surfaces the
+        // specific "swap the endpoints" diagnostic before the
+        // generic "not yet supported" redirect masks it. Operators
+        // with a typo see the actionable fix; valid-but-unsupported
+        // specs get the redirect.
+        KernelId::Range { .. } | KernelId::Git { .. } => {
+            id.validate()
+                .map_err(|e| anyhow::anyhow!("--kernel {id}: {e}"))?;
+            bail!(
+                "--kernel {id}: kernel ranges and git sources are not \
+                 yet supported in this context — use a single kernel \
+                 version, cache key, or path"
+            )
+        }
     }
 }
 
@@ -2520,6 +2542,27 @@ pub fn resolve_kernel_image(
                 crate::kernel_path::find_image_in_dir(&cache_dir).ok_or_else(|| {
                     anyhow::anyhow!("no kernel image found in {}", cache_dir.display())
                 })
+            }
+            // Multi-kernel specs cannot resolve to a single image
+            // here. The dispatch loop that fans out range expansion
+            // and git fetch lives one level up at the test/coverage/
+            // verifier subcommand entry; this resolver is the
+            // single-kernel leaf. Bail with an actionable redirect
+            // so the user knows the spec is recognised but the
+            // calling subcommand hasn't wired up the multi-kernel
+            // pipeline yet.
+            //
+            // Run `validate()` first so an inverted range surfaces
+            // the specific "swap the endpoints" diagnostic before
+            // the generic "not yet supported" redirect masks it.
+            id @ (KernelId::Range { .. } | KernelId::Git { .. }) => {
+                id.validate()
+                    .map_err(|e| anyhow::anyhow!("--kernel {val}: {e}"))?;
+                bail!(
+                    "--kernel {val}: kernel ranges and git sources are not \
+                     yet supported in this context — use a single kernel \
+                     version, cache key, or path"
+                )
             }
         }
     } else {

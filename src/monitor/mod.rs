@@ -253,6 +253,14 @@ pub fn find_test_vmlinux() -> Option<std::path::PathBuf> {
                 .ok()
                 .and_then(|p| p.into_os_string().into_string().ok())
         }
+        // Multi-kernel specs (`A..B` ranges, `git+URL#REF`) cannot
+        // resolve to a single BTF source — there is no dispatch
+        // loop here, just a one-shot lookup feeding `resolve_btf`.
+        // Treat as "no env hint" and let the local-tree / sysfs
+        // fallbacks pick a vmlinux if one exists; the env value
+        // would have surfaced a hard error at the actual VM-boot
+        // entry point instead.
+        Some(KernelId::Range { .. }) | Some(KernelId::Git { .. }) => None,
         None => None,
     };
     let result = crate::kernel_path::resolve_btf(resolved_dir.as_deref());

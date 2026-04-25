@@ -564,6 +564,20 @@ fn run_cargo_sub(
                 eprintln!("cargo ktstr: using kernel {}", dir.display());
                 cmd.env(ktstr::KTSTR_KERNEL_ENV, &dir);
             }
+            // Multi-kernel specs cannot resolve to a single
+            // KTSTR_KERNEL export here. The dispatch loop that fans
+            // out range expansion and git fetch will land at this
+            // call site in a follow-up stage; for now, surface an
+            // actionable error so the user knows the spec parsed
+            // correctly but the calling subcommand hasn't wired up
+            // the multi-kernel pipeline yet.
+            KernelId::Range { .. } | KernelId::Git { .. } => {
+                return Err(format!(
+                    "--kernel {val}: kernel ranges and git sources are \
+                     not yet supported in this context — use a single \
+                     kernel version, cache key, or path"
+                ));
+            }
         }
     }
 

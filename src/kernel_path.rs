@@ -18,19 +18,26 @@
 //    an `include!`'d fragment — build.rs isn't a crate, so the item
 //    resolves at crate-root visibility there. Use `pub` for items
 //    build.rs needs, `fn` (private) for items lib.rs alone uses.
-// 3. **No `#[cfg(test)]` items referencing non-std test helpers.**
-//    build.rs still compiles them. Keep `#[cfg(test)]` blocks inside
-//    this file restricted to std-only APIs so build.rs can still
-//    compile the fragment.
+// 3. **`#[cfg(test)]` blocks may use non-std test helpers freely.**
+//    Cargo does not set `cfg(test)` when compiling build scripts, so
+//    `#[cfg(test)]` items inside this file are simply elided from the
+//    build.rs view of the fragment — `tempfile`, `proptest`, etc. are
+//    safe to import inside `#[cfg(test)] mod tests { ... }`. The
+//    std-only rule (#1 above) applies to non-`cfg(test)` items only.
 // 4. **All functions are pure.** Callers supply inputs and handle
 //    caching — no global state, no `std::env::set_var`, no FS
 //    writes outside the caller-provided paths. Pure is what makes
 //    the double-consumer (build + runtime) safe.
 
-/// Kernel identifier: filesystem path, version string, or cache key.
+/// Kernel identifier: filesystem path, version string, cache key,
+/// stable-release range, or git source.
 ///
 /// Parsing heuristic (see [`KernelId::parse`]):
-/// - Contains `/` or starts with `.` or `~`: [`KernelId::Path`]
+/// - Contains `/` (without a `git+` prefix) or starts with `.` or `~`:
+///   [`KernelId::Path`]
+/// - Starts with `git+`: [`KernelId::Git`] (form `git+URL#REF`)
+/// - Contains `..` between two version-shaped tokens:
+///   [`KernelId::Range`] (inclusive on both endpoints)
 /// - Matches `MAJOR.MINOR[.PATCH][-rcN]`: [`KernelId::Version`]
 /// - Otherwise: [`KernelId::CacheKey`]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,11 +48,73 @@ pub enum KernelId {
     Version(String),
     /// Cache key (e.g. "6.14.2-tarball-x86_64-kc...").
     CacheKey(String),
+    /// Inclusive range of stable kernel versions, expanded against
+    /// kernel.org's release index at resolve time. `start` and `end`
+    /// are both [`KernelId::Version`]-shaped strings (e.g. "6.10",
+    /// "6.13"); the resolver fans this out to every release in
+    /// [start, end] inclusive on both endpoints. A version present in
+    /// the range but missing from the upstream index is a hard error
+    /// before any boot — partial expansions are not silently dropped.
+    Range {
+        /// Inclusive lower bound, version-shaped.
+        start: String,
+        /// Inclusive upper bound, version-shaped.
+        end: String,
+    },
+    /// Git source: clone `url`, check out `git_ref`. `git_ref` may be
+    /// a branch, tag, or sha — current `KernelId::parse` stores it
+    /// verbatim with no remote contact. Branches will be resolved to
+    /// a sha at cache-resolution time (Stage 3 wiring; the resolver
+    /// will call `git ls-remote` once per branch ref to anchor
+    /// cached builds to a content-addressable
+    /// `(URL, resolved_sha)` cache key so identical underlying
+    /// commits collapse to one cache entry regardless of which
+    /// spelling produced them).
+    Git {
+        /// Remote URL (https or git@).
+        url: String,
+        /// Branch name, tag, or sha. Stored verbatim by `parse`;
+        /// branches will be resolved to a sha at cache-resolution
+        /// time so cached builds remain content-addressed.
+        git_ref: String,
+    },
 }
 
 impl KernelId {
     /// Parse a string into a kernel identifier.
+    ///
+    /// Recognizes (in order):
+    /// - `git+URL#REF` → [`KernelId::Git`] (the `git+` prefix takes
+    ///   precedence over the `/`-contains test below, since URLs
+    ///   contain `/`).
+    /// - `START..END` where both endpoints are version-shaped →
+    ///   [`KernelId::Range`] with both endpoints inclusive. The `..`
+    ///   spelling is fixed regardless of inclusivity (Rust's
+    ///   exclusive-`..` / inclusive-`..=` distinction does not apply
+    ///   here — the range is always closed).
+    /// - `/`-containing or `.`/`~`-prefixed → [`KernelId::Path`].
+    /// - Version-shaped → [`KernelId::Version`].
+    /// - Anything else → [`KernelId::CacheKey`].
     pub fn parse(s: &str) -> Self {
+        if let Some(rest) = s.strip_prefix("git+")
+            && let Some((url, git_ref)) = rest.rsplit_once('#')
+            && !url.is_empty()
+            && !git_ref.is_empty()
+        {
+            return KernelId::Git {
+                url: url.to_string(),
+                git_ref: git_ref.to_string(),
+            };
+        }
+        if let Some((start, end)) = s.split_once("..")
+            && _is_version_string(start)
+            && _is_version_string(end)
+        {
+            return KernelId::Range {
+                start: start.to_string(),
+                end: end.to_string(),
+            };
+        }
         if s.contains('/') || s.starts_with('.') || s.starts_with('~') {
             return KernelId::Path(std::path::PathBuf::from(s));
         }
@@ -53,6 +122,83 @@ impl KernelId {
             return KernelId::Version(s.to_string());
         }
         KernelId::CacheKey(s.to_string())
+    }
+
+    /// Parse a comma-separated list of kernel specs into a vector of
+    /// identifiers. Empty entries are silently skipped (so trailing
+    /// commas or repeated separators are forgiving). Each non-empty
+    /// segment is fed through [`KernelId::parse`] verbatim — so
+    /// `parse_list("6.10,git+URL#main,/srv/linux")` returns three
+    /// distinct variants. Deduplication is the resolver's
+    /// responsibility (after canonicalization to a cache key); this
+    /// function preserves order and duplicates as written.
+    pub fn parse_list(s: &str) -> Vec<KernelId> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|seg| !seg.is_empty())
+            .map(KernelId::parse)
+            .collect()
+    }
+
+    /// Validate a parsed `KernelId` for resolve-time legality. Returns
+    /// `Err(message)` when the identifier carries a structural problem
+    /// the parser couldn't catch on its own — currently:
+    ///
+    /// - [`KernelId::Range`] with `start > end` after numeric
+    ///   component-wise comparison. The parser cannot reject this at
+    ///   parse time because both endpoints are valid version strings
+    ///   in isolation; the inversion only surfaces when the two are
+    ///   compared.
+    ///
+    /// All other variants always return `Ok(())` — this is a hook for
+    /// future per-variant invariants, not a general-purpose validator.
+    /// Use `Result<(), String>` rather than `anyhow::Result` because
+    /// this file is included from `build.rs` (see file header rule
+    /// #1, no non-std imports outside `cfg(test)`).
+    ///
+    /// Comparison semantics: each endpoint decomposes to a
+    /// `(major, minor, patch, rc)` tuple where missing patch maps to
+    /// `0` and missing `-rc` maps to `u64::MAX` so a release
+    /// (`6.10`) sorts strictly above any pre-release (`6.10-rc3`) of
+    /// the same major.minor.patch. Inverted ranges include
+    /// `7.0..6.99`, `6.10..6.5`, `6.10..6.10-rc3` (release > rc), and
+    /// `6.10-rc3..6.10-rc1`. Equal endpoints (`6.10..6.10`) pass
+    /// validation as a single-element range.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            KernelId::Range { start, end } => {
+                let start_key = decompose_version_for_compare(start).ok_or_else(|| {
+                    format!(
+                        "kernel range start `{start}` is not a parseable version \
+                         (version components must fit u64). Direct callers that \
+                         construct `KernelId::Range` outside `KernelId::parse` are \
+                         responsible for endpoint validity; the parser admits a \
+                         strict subset.",
+                    )
+                })?;
+                let end_key = decompose_version_for_compare(end).ok_or_else(|| {
+                    format!(
+                        "kernel range end `{end}` is not a parseable version \
+                         (version components must fit u64). Direct callers that \
+                         construct `KernelId::Range` outside `KernelId::parse` are \
+                         responsible for endpoint validity; the parser admits a \
+                         strict subset.",
+                    )
+                })?;
+                if start_key > end_key {
+                    return Err(format!(
+                        "inverted kernel range `{start}..{end}`: start version is greater \
+                         than end version. Swap the endpoints (`{end}..{start}`) or omit \
+                         the range to pass a single version.",
+                    ));
+                }
+                Ok(())
+            }
+            KernelId::Path(_)
+            | KernelId::Version(_)
+            | KernelId::CacheKey(_)
+            | KernelId::Git { .. } => Ok(()),
+        }
     }
 }
 
@@ -62,6 +208,8 @@ impl std::fmt::Display for KernelId {
             KernelId::Path(p) => write!(f, "{}", p.display()),
             KernelId::Version(v) => write!(f, "{v}"),
             KernelId::CacheKey(k) => write!(f, "{k}"),
+            KernelId::Range { start, end } => write!(f, "{start}..{end}"),
+            KernelId::Git { url, git_ref } => write!(f, "git+{url}#{git_ref}"),
         }
     }
 }
@@ -104,6 +252,50 @@ fn _is_version_string(s: &str) -> bool {
     }
     // No more segments allowed (rejects `1.2.3.4`).
     parts.next().is_none()
+}
+
+/// Decompose a version-shaped string into a `(major, minor, patch,
+/// rc)` tuple suitable for `Ord` comparison. Returns `None` when the
+/// input doesn't match the kernel-version grammar — same predicate as
+/// [`_is_version_string`] but extracting numeric components rather
+/// than just yes/no.
+///
+/// Comparison semantics:
+/// - Missing patch defaults to `0` so `6.10` and `6.10.0` compare
+///   equal.
+/// - Missing `-rcN` defaults to `u64::MAX` so a release
+///   (`6.10`, `6.10.5`) sorts strictly above any pre-release
+///   (`6.10-rc3`, `6.10.5-rc1`) of the same `major.minor.patch`. A
+///   future major/minor/patch bump still dominates because the tuple
+///   is compared in declaration order — the rc-as-MAX trick only
+///   resolves ties on the leading three components.
+///
+/// Used by [`KernelId::validate`] to detect inverted ranges
+/// (`6.16..6.12`, `6.10..6.10-rc3`, `7.0..6.99`).
+fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u64)> {
+    let (version_part, rc_part) = match s.split_once("-rc") {
+        Some((v, rc)) => (v, Some(rc)),
+        None => (s, None),
+    };
+    // rc must be a non-empty digit string when present.
+    let rc: u64 = match rc_part {
+        Some(rc) if rc.is_empty() || !rc.bytes().all(|b| b.is_ascii_digit()) => return None,
+        Some(rc) => rc.parse().ok()?,
+        None => u64::MAX,
+    };
+    let mut parts = version_part.split('.');
+    let major: u64 = parts.next()?.parse().ok()?;
+    let minor: u64 = parts.next()?.parse().ok()?;
+    let patch: u64 = match parts.next() {
+        Some("") => return None,
+        Some(p) => p.parse().ok()?,
+        None => 0,
+    };
+    // Reject `1.2.3.4` and similar — only major.minor[.patch] is grammar.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch, rc))
 }
 
 /// Read the running kernel release from `/proc/sys/kernel/osrelease`.
@@ -778,6 +970,428 @@ mod tests {
             KernelId::CacheKey("my-key".to_string()).to_string(),
             "my-key"
         );
+        assert_eq!(
+            KernelId::Range {
+                start: "6.10".to_string(),
+                end: "6.13".to_string(),
+            }
+            .to_string(),
+            "6.10..6.13",
+        );
+        assert_eq!(
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: "main".to_string(),
+            }
+            .to_string(),
+            "git+https://example.com/r.git#main",
+        );
+    }
+
+    // -- KernelId::parse — Range arm --
+
+    #[test]
+    fn kernel_id_parse_range_versions() {
+        assert_eq!(
+            KernelId::parse("6.10..6.15"),
+            KernelId::Range {
+                start: "6.10".to_string(),
+                end: "6.15".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_range_patch_versions() {
+        assert_eq!(
+            KernelId::parse("6.10.5..6.10.10"),
+            KernelId::Range {
+                start: "6.10.5".to_string(),
+                end: "6.10.10".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_range_rc() {
+        assert_eq!(
+            KernelId::parse("6.10..6.10-rc3"),
+            KernelId::Range {
+                start: "6.10".to_string(),
+                end: "6.10-rc3".to_string(),
+            },
+        );
+    }
+
+    /// Both endpoints non-version: not a Range. The `/`-contains
+    /// test fails too, so this falls to the version-shaped check
+    /// (also fails on the `..`) and lands as CacheKey.
+    #[test]
+    fn kernel_id_parse_range_non_version_falls_through() {
+        assert_eq!(
+            KernelId::parse("foo..bar"),
+            KernelId::CacheKey("foo..bar".to_string()),
+        );
+    }
+
+    /// One endpoint version-shaped, the other not: the Range arm
+    /// requires BOTH endpoints to pass `_is_version_string`, so
+    /// `6.10..foo` falls through to CacheKey.
+    #[test]
+    fn kernel_id_parse_range_one_non_version() {
+        assert_eq!(
+            KernelId::parse("6.10..foo"),
+            KernelId::CacheKey("6.10..foo".to_string()),
+        );
+    }
+
+    /// Trailing `..` with no second endpoint: `_is_version_string("")`
+    /// is false, so the Range arm doesn't fire. Falls to CacheKey
+    /// (the version-shaped check also fails because the trailing `..`
+    /// means a parts-iter sees an empty patch component).
+    #[test]
+    fn kernel_id_parse_range_empty_endpoint() {
+        assert_eq!(
+            KernelId::parse("6.10.."),
+            KernelId::CacheKey("6.10..".to_string()),
+        );
+    }
+
+    // -- KernelId::parse — Git arm --
+
+    #[test]
+    fn kernel_id_parse_git_branch() {
+        assert_eq!(
+            KernelId::parse("git+https://example.com/r.git#main"),
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: "main".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_git_sha() {
+        assert_eq!(
+            KernelId::parse("git+https://example.com/r.git#abc1234"),
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: "abc1234".to_string(),
+            },
+        );
+    }
+
+    /// The Git arm splits on the LAST `#` so URL fragments survive
+    /// inside the URL slot — `git+https://x#frag#main` parses as
+    /// url=`https://x#frag`, git_ref=`main`. A future regression
+    /// that swapped to `split_once('#')` would land here as a
+    /// flipped URL/ref.
+    #[test]
+    fn kernel_id_parse_git_multi_hash_url() {
+        assert_eq!(
+            KernelId::parse("git+https://x#frag#main"),
+            KernelId::Git {
+                url: "https://x#frag".to_string(),
+                git_ref: "main".to_string(),
+            },
+        );
+    }
+
+    /// Empty git_ref after the `#`: the Git arm requires a non-empty
+    /// ref so it skips. The string still contains `/` (the URL's
+    /// scheme separator and path), so the `/`-contains Path arm
+    /// fires next and the value lands as a Path holding the literal
+    /// `git+` spelling. That's a degenerate Path — the auto-build
+    /// step will reject `git+...` as a non-existent directory at
+    /// resolve time, surfacing the typo with a clear filesystem
+    /// error instead of letting the Git arm swallow an empty ref.
+    #[test]
+    fn kernel_id_parse_git_empty_ref_falls_through() {
+        assert_eq!(
+            KernelId::parse("git+https://example.com/r.git#"),
+            KernelId::Path(PathBuf::from("git+https://example.com/r.git#")),
+        );
+    }
+
+    /// Empty URL before the `#`: the Git arm fails on the empty url
+    /// check. Unlike the empty-ref case above, this string contains
+    /// no `/`, so the Path arm doesn't fire either. `_is_version_string`
+    /// fails on the leading `git+`, so it lands as CacheKey holding
+    /// the literal spelling — which a downstream cache lookup will
+    /// reject as a missing entry.
+    #[test]
+    fn kernel_id_parse_git_empty_url_falls_through() {
+        assert_eq!(
+            KernelId::parse("git+#main"),
+            KernelId::CacheKey("git+#main".to_string()),
+        );
+    }
+
+    /// `git+` prefix takes precedence over the `/`-contains Path
+    /// test. A user pointing at a local clone via `git+/local/repo#v1`
+    /// should get a Git, not a Path. This pins the parse-arm
+    /// ordering — flipping the Path check above the Git check would
+    /// land here as KernelId::Path("git+/local/repo#v1").
+    #[test]
+    fn kernel_id_parse_git_beats_path() {
+        assert_eq!(
+            KernelId::parse("git+/local/repo#v1"),
+            KernelId::Git {
+                url: "/local/repo".to_string(),
+                git_ref: "v1".to_string(),
+            },
+        );
+    }
+
+    // -- KernelId::parse_list --
+
+    #[test]
+    fn kernel_id_parse_list_basic() {
+        let list = KernelId::parse_list("6.10,6.13");
+        assert_eq!(
+            list,
+            vec![
+                KernelId::Version("6.10".to_string()),
+                KernelId::Version("6.13".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn kernel_id_parse_list_mixed() {
+        let list = KernelId::parse_list("6.10,git+url#main,/srv/linux");
+        assert_eq!(list.len(), 3, "expected 3 entries, got {list:?}");
+        assert!(matches!(list[0], KernelId::Version(ref v) if v == "6.10"));
+        assert!(matches!(
+            list[1],
+            KernelId::Git { ref url, ref git_ref } if url == "url" && git_ref == "main"
+        ));
+        assert!(matches!(list[2], KernelId::Path(ref p) if p == &PathBuf::from("/srv/linux")));
+    }
+
+    #[test]
+    fn kernel_id_parse_list_empty() {
+        assert_eq!(KernelId::parse_list(""), Vec::<KernelId>::new());
+    }
+
+    /// Trailing / leading / repeated commas are forgiving — empty
+    /// segments are silently dropped so `,6.10,,` yields just one
+    /// entry. Spec says: defer dedup to the resolver but do not
+    /// inject empty Cache-key entries from an operator typo.
+    #[test]
+    fn kernel_id_parse_list_trailing_comma() {
+        assert_eq!(
+            KernelId::parse_list(",6.10,,"),
+            vec![KernelId::Version("6.10".to_string())],
+        );
+    }
+
+    /// Whitespace around comma-separated entries gets trimmed before
+    /// `parse` runs so `"6.10 , 6.13"` produces clean Version variants
+    /// rather than CacheKey entries with embedded spaces.
+    #[test]
+    fn kernel_id_parse_list_whitespace() {
+        assert_eq!(
+            KernelId::parse_list("6.10 , 6.13"),
+            vec![
+                KernelId::Version("6.10".to_string()),
+                KernelId::Version("6.13".to_string()),
+            ],
+        );
+    }
+
+    /// A single-entry list with no commas falls through `split(',')`
+    /// as one segment and produces the same Variant `parse` would
+    /// have produced directly. Pins the parse_list/parse equivalence
+    /// for the trivial case so a future regression that special-cased
+    /// "must contain comma" lands here.
+    #[test]
+    fn kernel_id_parse_list_single() {
+        assert_eq!(
+            KernelId::parse_list("6.10"),
+            vec![KernelId::Version("6.10".to_string())],
+        );
+    }
+
+    /// Duplicate entries are PRESERVED at parse time — `parse_list`
+    /// is a pure splitter, and dedup is the resolver's job (after
+    /// canonicalization to a cache key, since `6.10` and `v6.10` and
+    /// a tag pointing at the same sha all collapse). Pin the count
+    /// AND the index of each occurrence so a future regression that
+    /// added an early dedup at parse time (which would silently
+    /// collapse `6.10,6.10` to one entry and lose the operator's
+    /// "run twice" intent if they later added that semantic) lands
+    /// here.
+    #[test]
+    fn kernel_id_parse_list_preserves_dups() {
+        let list = KernelId::parse_list("6.10,6.10,6.13");
+        assert_eq!(list.len(), 3, "expected 3 entries, got {list:?}");
+        assert_eq!(list[0], KernelId::Version("6.10".to_string()));
+        assert_eq!(list[1], KernelId::Version("6.10".to_string()));
+        assert_eq!(list[2], KernelId::Version("6.13".to_string()));
+    }
+
+    // -- KernelId::validate — inverted-range rejection --
+
+    /// Forward range `6.10..6.13` validates fine — the most common
+    /// happy-path case, here as a baseline for the failure tests
+    /// below.
+    #[test]
+    fn kernel_id_validate_range_forward_ok() {
+        let id = KernelId::parse("6.10..6.13");
+        assert!(id.validate().is_ok(), "forward range must validate: {id:?}");
+    }
+
+    /// Equal endpoints `6.10..6.10` validate fine — degenerate
+    /// single-element range, not inverted.
+    #[test]
+    fn kernel_id_validate_range_equal_endpoints_ok() {
+        let id = KernelId::parse("6.10..6.10");
+        assert!(
+            id.validate().is_ok(),
+            "equal endpoints must validate: {id:?}"
+        );
+    }
+
+    /// `6.16..6.12` — same major, minor decreases. Reject. The error
+    /// message must name both endpoints AND suggest the swapped
+    /// spelling so the operator can fix the typo without re-reading
+    /// the help.
+    #[test]
+    fn kernel_id_validate_range_inverted_minor() {
+        let id = KernelId::parse("6.16..6.12");
+        let err = id.validate().unwrap_err();
+        assert!(
+            err.contains("inverted kernel range"),
+            "error must say 'inverted kernel range', got: {err}",
+        );
+        assert!(
+            err.contains("6.16..6.12"),
+            "error must cite the spec, got: {err}"
+        );
+        assert!(
+            err.contains("6.12..6.16"),
+            "error must suggest the swapped form, got: {err}",
+        );
+    }
+
+    /// `7.0..6.99` — major decreases. Reject.
+    #[test]
+    fn kernel_id_validate_range_inverted_major() {
+        let id = KernelId::parse("7.0..6.99");
+        assert!(id.validate().is_err(), "inverted major must reject: {id:?}");
+    }
+
+    /// `6.10.5..6.10.3` — same major.minor, patch decreases. Reject.
+    #[test]
+    fn kernel_id_validate_range_inverted_patch() {
+        let id = KernelId::parse("6.10.5..6.10.3");
+        assert!(id.validate().is_err(), "inverted patch must reject: {id:?}");
+    }
+
+    /// `6.10..6.10-rc3` — release > rc per the rc-as-MAX rule, so
+    /// pre-release on the upper end is inverted. Reject. Catches the
+    /// common operator mistake of "I want 6.10 latest stable up
+    /// through the rc series" written in reverse order.
+    #[test]
+    fn kernel_id_validate_range_inverted_rc_below_release() {
+        let id = KernelId::parse("6.10..6.10-rc3");
+        assert!(
+            id.validate().is_err(),
+            "release > rc — `6.10..6.10-rc3` must reject: {id:?}",
+        );
+    }
+
+    /// `6.10-rc3..6.10` — pre-release < release. Forward direction;
+    /// validate passes. The companion to `inverted_rc_below_release`.
+    #[test]
+    fn kernel_id_validate_range_rc_below_release_forward_ok() {
+        let id = KernelId::parse("6.10-rc3..6.10");
+        assert!(
+            id.validate().is_ok(),
+            "rc < release — `6.10-rc3..6.10` must validate: {id:?}",
+        );
+    }
+
+    /// `6.10-rc3..6.10-rc1` — same major.minor.patch but rc decreases.
+    /// Reject. Pre-release ordering must follow numeric rcN order.
+    #[test]
+    fn kernel_id_validate_range_inverted_rc_to_rc() {
+        let id = KernelId::parse("6.10-rc3..6.10-rc1");
+        assert!(id.validate().is_err(), "rc3..rc1 must reject: {id:?}");
+    }
+
+    /// `6.10..6.10.5` — `6.10` decomposes to (6,10,0,MAX), `6.10.5`
+    /// to (6,10,5,MAX). Forward direction. Validates.
+    #[test]
+    fn kernel_id_validate_range_missing_patch_treated_as_zero() {
+        let id = KernelId::parse("6.10..6.10.5");
+        assert!(
+            id.validate().is_ok(),
+            "missing patch defaults to 0, so `6.10..6.10.5` is forward: {id:?}",
+        );
+    }
+
+    /// All non-Range variants validate trivially — Path, Version,
+    /// CacheKey, Git all return Ok. Pins the "validate is currently
+    /// only meaningful for Range" contract: a future field with its
+    /// own resolve-time invariant should add an arm here, not slip
+    /// through silently.
+    #[test]
+    fn kernel_id_validate_non_range_variants_ok() {
+        assert!(KernelId::Version("6.14.2".to_string()).validate().is_ok());
+        assert!(KernelId::CacheKey("my-key".to_string()).validate().is_ok());
+        assert!(KernelId::Path(PathBuf::from("../linux")).validate().is_ok(),);
+        assert!(
+            KernelId::Git {
+                url: "https://example.com/r.git".to_string(),
+                git_ref: "main".to_string(),
+            }
+            .validate()
+            .is_ok(),
+        );
+    }
+
+    /// Direct construction with an unparseable `start` endpoint
+    /// (callers that build `KernelId::Range` outside `KernelId::parse`
+    /// can put any string in either slot — the Display round-trip
+    /// gives them the spelling back, but `validate()` is the safety
+    /// net for resolve-time legality). Asserts the error names the
+    /// "not a parseable version" condition so a downstream tool can
+    /// distinguish this from the inverted-range message above.
+    #[test]
+    fn kernel_id_validate_range_unparseable_start() {
+        let id = KernelId::Range {
+            start: "garbage".to_string(),
+            end: "6.10".to_string(),
+        };
+        let err = id.validate().unwrap_err();
+        assert!(
+            err.contains("not a parseable version"),
+            "error must say 'not a parseable version', got: {err}",
+        );
+        assert!(
+            err.contains("garbage"),
+            "error must cite the bad endpoint, got: {err}"
+        );
+    }
+
+    /// Companion to `unparseable_start` for the `end` slot.
+    #[test]
+    fn kernel_id_validate_range_unparseable_end() {
+        let id = KernelId::Range {
+            start: "6.10".to_string(),
+            end: "garbage".to_string(),
+        };
+        let err = id.validate().unwrap_err();
+        assert!(
+            err.contains("not a parseable version"),
+            "error must say 'not a parseable version', got: {err}",
+        );
+        assert!(
+            err.contains("garbage"),
+            "error must cite the bad endpoint, got: {err}"
+        );
     }
 
     // -- _is_version_string --
@@ -827,6 +1441,25 @@ mod tests {
                 KernelId::Path(p) => prop_assert!(p == s, "Path payload drift for {s:?}"),
                 KernelId::Version(v) => prop_assert!(v == s, "Version payload drift for {s:?}"),
                 KernelId::CacheKey(k) => prop_assert!(k == s, "CacheKey payload drift for {s:?}"),
+                KernelId::Range { start, end } => {
+                    // Range is constructed only when both endpoints
+                    // are version-shaped, so the payload round-trips
+                    // through the `start..end` rendering. Display
+                    // emits the same separator the parser consumed.
+                    prop_assert!(
+                        format!("{start}..{end}") == s,
+                        "Range payload drift for {s:?}",
+                    );
+                }
+                KernelId::Git { url, git_ref } => {
+                    // Git is constructed only on the `git+URL#REF`
+                    // prefix branch with non-empty url and git_ref;
+                    // round-trip the full prefix/separator shape.
+                    prop_assert!(
+                        format!("git+{url}#{git_ref}") == s,
+                        "Git payload drift for {s:?}",
+                    );
+                }
             }
         }
 
