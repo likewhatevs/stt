@@ -72,8 +72,8 @@ pub(crate) use args::{
 };
 pub use sidecar::{SidecarResult, collect_pool, newest_run_dir, runs_root};
 pub(crate) use sidecar::{
-    apply_archive_source_override, collect_sidecars, format_callback_profile, format_kvm_stats,
-    format_verifier_stats, sidecar_dir,
+    apply_archive_source_override, collect_sidecars, collect_sidecars_with_errors,
+    format_callback_profile, format_kvm_stats, format_verifier_stats, sidecar_dir,
 };
 
 pub use dispatch::{

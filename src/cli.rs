@@ -2632,13 +2632,26 @@ fn project_optional_fields(sc: &crate::test_support::SidecarResult) -> [(&'stati
 }
 
 /// File-walk statistics for the run directory under
-/// [`explain_sidecar`]. `walked` counts every `.ktstr.json` file
-/// the walker visited (corrupt + valid); `valid` counts how many
-/// of those parsed into a [`crate::test_support::SidecarResult`].
-/// `walked - valid` is the silent-skip count.
+/// [`explain_sidecar`]. `walked` counts every `.ktstr.json`
+/// file the walker visited; `valid` counts how many parsed
+/// into a [`crate::test_support::SidecarResult`]; `errors`
+/// carries the per-file parse failures (path + serde error
+/// message).
+///
+/// Files whose `read_to_string` fails (permission denied,
+/// mid-rotate truncation, etc.) silently drop from both
+/// `valid` and `errors` — they count in `walked` but appear
+/// in neither output channel. `walked - valid - errors.len()`
+/// is the implicit silent-drop count, zero in a clean run.
+///
+/// `errors` surfaces in both render paths: text appends a
+/// trailing block listing corrupt paths, JSON exposes them
+/// under `_walk.errors` so dashboard consumers can surface
+/// them without parsing prose.
 struct WalkStats {
     walked: usize,
     valid: usize,
+    errors: Vec<(std::path::PathBuf, String)>,
 }
 
 /// Count `.ktstr.json` files under `run_dir` using
@@ -2681,18 +2694,29 @@ fn count_sidecar_files(run_dir: &Path) -> usize {
 
 /// Load sidecars under `run_dir` and report file-walk statistics.
 ///
-/// Delegates parsing to [`crate::test_support::collect_sidecars`]
-/// — that helper emits per-file `eprintln!` hints on parse
-/// failure, surfacing the actionable schema-drift message to
-/// the operator. The `walked` count is derived independently via
-/// [`count_sidecar_files`] so the diagnostic header reports
-/// total `.ktstr.json` files visited (corrupt + valid), while
-/// `collect_sidecars`'s parse hints carry the per-file detail.
+/// Delegates parsing to
+/// [`crate::test_support::collect_sidecars_with_errors`] — that
+/// helper emits per-file `eprintln!` hints on parse failure
+/// (surfacing the actionable schema-drift message to the
+/// operator) AND returns a structured `(path, error)` list that
+/// flows into [`WalkStats::errors`] for the JSON / text renderers
+/// to surface alongside the per-field breakdown. The `walked`
+/// count is derived independently via [`count_sidecar_files`] so
+/// the diagnostic header reports total `.ktstr.json` files
+/// visited (corrupt + valid), independent of any parse-failure
+/// short-circuit.
 fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResult>, WalkStats) {
     let walked = count_sidecar_files(run_dir);
-    let sidecars = crate::test_support::collect_sidecars(run_dir);
+    let (sidecars, errors) = crate::test_support::collect_sidecars_with_errors(run_dir);
     let valid = sidecars.len();
-    (sidecars, WalkStats { walked, valid })
+    (
+        sidecars,
+        WalkStats {
+            walked,
+            valid,
+            errors,
+        },
+    )
 }
 
 /// Diagnose `Option`-field absences for a run's sidecars. Mirrors
@@ -2716,21 +2740,26 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 /// pattern is intentional. This DOES match
 /// [`show_run_host`]'s pattern.
 ///
-/// `json: true` emits a JSON object with two top-level keys:
-/// `"_walk"` (an envelope carrying `walked` and `valid` counts —
-/// the same numbers the text header reports) and `"fields"`
-/// (a map keyed by [`SIDECAR_NONE_CATALOG`] field name where
-/// each value is `{ "none_count": N, "some_count": M,
-/// "classification": "...", "causes": [...], "fix": "..." }`).
-/// `none_count` and `some_count` are the across-all-sidecars-
-/// in-this-run counts of `None` and `Some(_)` for that field,
-/// summing to `_walk.valid` — both are emitted so dashboard
-/// consumers do not need to derive the second from the first.
-/// `fix` carries an operator-actionable remediation string for
-/// fields where one applies, or JSON null otherwise. This shape
-/// is dashboard-friendly: a CI consumer can ingest the JSON
+/// `json: true` emits a JSON object with three top-level keys:
+/// `"_schema_version"` (a string version stamp — currently
+/// `"1"` — that consumers can gate on for incompatible shape
+/// changes), `"_walk"` (an envelope carrying `walked` / `valid`
+/// counts — the same numbers the text header reports — plus an
+/// `errors` array of `{path, error}` pairs covering every parse
+/// failure), and `"fields"` (a map keyed by
+/// [`SIDECAR_NONE_CATALOG`] field name where each value is
+/// `{ "none_count": N, "some_count": M, "classification": "...",
+/// "causes": [...], "fix": "..." }`). `none_count` and
+/// `some_count` are the across-all-sidecars-in-this-run counts
+/// of `None` and `Some(_)` for that field, summing to
+/// `_walk.valid` — both are emitted so dashboard consumers do
+/// not need to derive the second from the first. `fix` carries
+/// an operator-actionable remediation string for fields where
+/// one applies, or JSON null otherwise. This shape is
+/// dashboard-friendly: a CI consumer can ingest the JSON
 /// without parsing per-sidecar prose. The text form retains
-/// per-sidecar detail for human triage.
+/// per-sidecar detail for human triage and appends a trailing
+/// "corrupt sidecars" block when parse errors occurred.
 ///
 /// # Errors
 ///
@@ -2786,6 +2815,13 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
 /// before rendering so output is stable across filesystem
 /// `read_dir` orderings — operators diffing two `explain-sidecar`
 /// runs see content changes, not iteration-order noise.
+///
+/// When `walk_stats.errors` is non-empty, a trailing block
+/// "corrupt sidecars (N):" lists each `(path, error)` pair so
+/// operators see parse failures alongside the per-sidecar
+/// breakdown rather than relying on the eprintln-only stderr
+/// path. Block emits only when errors exist — the common
+/// all-valid case stays unchanged.
 fn render_explain_sidecar_text(
     sidecars: &[crate::test_support::SidecarResult],
     walk_stats: &WalkStats,
@@ -2862,93 +2898,160 @@ fn render_explain_sidecar_text(
         }
         out.push('\n');
     }
+    if !walk_stats.errors.is_empty() {
+        let _ = writeln!(out, "corrupt sidecars ({}):", walk_stats.errors.len());
+        for (path, error) in &walk_stats.errors {
+            let _ = writeln!(out, "  {}", path.display());
+            let _ = writeln!(out, "    error: {error}");
+        }
+        out.push('\n');
+    }
     out
 }
 
+/// JSON schema version stamp emitted on
+/// [`ExplainOutput::_schema_version`]. Bumped on any incompatible
+/// shape change (key rename, key removal, semantic shift) so
+/// dashboard consumers can gate on a known shape rather than
+/// guessing from the keys present. Additive shape changes (new
+/// optional keys, new entries in `fields`) do NOT bump this.
+const EXPLAIN_SIDECAR_SCHEMA_VERSION: &str = "1";
+
+/// Top-level JSON shape for [`explain_sidecar`] in `--json` mode.
+/// Serialized via `serde_json::to_string_pretty`. Field order
+/// matches the on-disk JSON output order — `_schema_version`
+/// first so consumers gating on it see it before scanning the
+/// rest of the document, then `_walk`, then `fields`.
+///
+/// `fields` uses [`std::collections::BTreeMap`] so JSON output
+/// orders entries alphabetically (deterministic across
+/// invocations); a [`std::collections::HashMap`] would surface
+/// hash-randomized ordering.
+#[derive(serde::Serialize)]
+struct ExplainOutput<'a> {
+    _schema_version: &'a str,
+    _walk: WalkStatsJson<'a>,
+    fields: std::collections::BTreeMap<&'a str, FieldDiagnostic<'a>>,
+}
+
+/// Walk-statistics envelope under
+/// [`ExplainOutput::_walk`]. Mirrors [`WalkStats`] in shape and
+/// holds a freshly built `Vec<WalkError>` populated from the
+/// source [`WalkStats::errors`] — paths are rendered via
+/// `Path::display()` (a `String` allocation per entry, required
+/// because `PathBuf` has no stable JSON-string `Serialize`
+/// surface across platforms), but the error message is borrowed
+/// as `&'a str` to avoid cloning.
+#[derive(serde::Serialize)]
+struct WalkStatsJson<'a> {
+    walked: usize,
+    valid: usize,
+    errors: Vec<WalkError<'a>>,
+}
+
+/// Per-file parse-failure entry for
+/// [`WalkStatsJson::errors`]. `path` renders as an owned
+/// `String` via `Path::display().to_string()` — matches the text
+/// output's path encoding and side-steps the lossy / platform-
+/// specific `PathBuf` → JSON conversion. `error` borrows the
+/// serde error message verbatim from [`WalkStats::errors`].
+#[derive(serde::Serialize)]
+struct WalkError<'a> {
+    path: String,
+    error: &'a str,
+}
+
+/// Per-field diagnostic entry under [`ExplainOutput::fields`].
+/// Mirrors the prior manual `Map::insert` shape exactly:
+/// `none_count` + `some_count` (counts across all valid
+/// sidecars, summing to `_walk.valid`), `classification` as a
+/// short tag string, `causes` as a borrowed slice, and `fix` as
+/// `Option<&str>` (JSON string when Some, JSON null when None).
+#[derive(serde::Serialize)]
+struct FieldDiagnostic<'a> {
+    none_count: usize,
+    some_count: usize,
+    classification: &'a str,
+    causes: &'a [&'a str],
+    fix: Option<&'a str>,
+}
+
 /// Render the aggregate JSON shape for [`explain_sidecar`]. The
-/// top-level object has two keys: `"_walk"` (an envelope
-/// carrying the walked / valid counts so JSON consumers see the
-/// corrupt-file signal alongside the per-field breakdown) and
-/// `"fields"` — a map keyed by [`SIDECAR_NONE_CATALOG`] field
-/// name where each value carries `none_count` and `some_count`
-/// (counts across all valid sidecars in the run, summing to
-/// `_walk.valid`) plus the static classification, causes, and
-/// `fix` catalog entry. The `fix` key is JSON null for fields
-/// whose `None` is the steady-state shape.
+/// top-level object has three keys: `_schema_version` (stamps
+/// the shape so dashboards can gate on a known version),
+/// `_walk` (walked / valid counts plus a per-file `errors` list
+/// covering every parse failure), and `fields` (a map keyed by
+/// [`SIDECAR_NONE_CATALOG`] field name with per-field
+/// none_count/some_count/classification/causes/fix). The `fix`
+/// key is JSON null for fields whose `None` is the steady-state
+/// shape.
+///
+/// Construction uses `#[derive(serde::Serialize)]` structs and
+/// `serde_json::to_string_pretty` rather than manual
+/// `serde_json::Map::insert` calls — the derive path keeps the
+/// shape definition in one place (struct fields), so a future
+/// shape change is a struct edit rather than coordinating
+/// matching insert order across construction code and
+/// documentation.
 fn render_explain_sidecar_json(
     sidecars: &[crate::test_support::SidecarResult],
     walk_stats: &WalkStats,
 ) -> String {
-    let mut fields = serde_json::Map::new();
-    for entry in SIDECAR_NONE_CATALOG {
-        let none_count = sidecars
-            .iter()
-            .filter(|sc| {
-                project_optional_fields(sc)
-                    .iter()
-                    .any(|(n, b)| *n == entry.field && !*b)
-            })
-            .count();
-        // `some_count = total - none_count`. Total is the
-        // count of sidecars in this run (`sidecars.len()` ==
-        // `walk_stats.valid`); we subtract rather than count
-        // separately so the two never disagree on rounding /
-        // off-by-one. Saturating subtraction is defensive
-        // against an underflow that the projection helper's
-        // boolean partition makes impossible — every sidecar
-        // contributes exactly 0 or 1 to `none_count` per field.
-        let some_count = sidecars.len().saturating_sub(none_count);
-        let mut field_obj = serde_json::Map::new();
-        field_obj.insert(
-            "none_count".to_string(),
-            serde_json::Value::from(none_count),
-        );
-        field_obj.insert(
-            "some_count".to_string(),
-            serde_json::Value::from(some_count),
-        );
-        field_obj.insert(
-            "classification".to_string(),
-            serde_json::Value::from(entry.classification.as_str()),
-        );
-        field_obj.insert(
-            "causes".to_string(),
-            serde_json::Value::Array(
-                entry
-                    .causes
-                    .iter()
-                    .map(|c| serde_json::Value::from(*c))
-                    .collect(),
-            ),
-        );
-        // `fix` emits as JSON null when None so dashboard
-        // consumers see the key uniformly across entries
-        // (no `serde_json::Map::contains_key` branching).
-        // `serde_json::json!(Option<&str>)` produces a JSON
-        // string for `Some` and a JSON null for `None`,
-        // collapsing the prior match arm.
-        field_obj.insert("fix".to_string(), serde_json::json!(entry.fix));
-        fields.insert(
-            entry.field.to_string(),
-            serde_json::Value::Object(field_obj),
-        );
-    }
-    let mut top = serde_json::Map::new();
-    let mut walk = serde_json::Map::new();
-    walk.insert(
-        "walked".to_string(),
-        serde_json::Value::from(walk_stats.walked),
-    );
-    walk.insert(
-        "valid".to_string(),
-        serde_json::Value::from(walk_stats.valid),
-    );
-    top.insert("_walk".to_string(), serde_json::Value::Object(walk));
-    top.insert("fields".to_string(), serde_json::Value::Object(fields));
-    let value = serde_json::Value::Object(top);
-    serde_json::to_string_pretty(&value).expect(
-        "static-shape JSON serialization is infallible — the value \
-         contains no NaN, no non-string keys, and no unsupported types",
+    let fields: std::collections::BTreeMap<&str, FieldDiagnostic<'_>> = SIDECAR_NONE_CATALOG
+        .iter()
+        .map(|entry| {
+            let none_count = sidecars
+                .iter()
+                .filter(|sc| {
+                    project_optional_fields(sc)
+                        .iter()
+                        .any(|(n, b)| *n == entry.field && !*b)
+                })
+                .count();
+            // `some_count = total - none_count`. Total is the
+            // count of sidecars in this run (`sidecars.len()` ==
+            // `walk_stats.valid`); subtract rather than count
+            // separately so the two never disagree on rounding /
+            // off-by-one. Saturating subtraction is defensive
+            // against an underflow that the projection helper's
+            // boolean partition makes impossible — every sidecar
+            // contributes exactly 0 or 1 to `none_count` per field.
+            let some_count = sidecars.len().saturating_sub(none_count);
+            (
+                entry.field,
+                FieldDiagnostic {
+                    none_count,
+                    some_count,
+                    classification: entry.classification.as_str(),
+                    causes: entry.causes,
+                    fix: entry.fix,
+                },
+            )
+        })
+        .collect();
+    let errors: Vec<WalkError<'_>> = walk_stats
+        .errors
+        .iter()
+        .map(|(path, error)| WalkError {
+            path: path.display().to_string(),
+            error,
+        })
+        .collect();
+    let output = ExplainOutput {
+        _schema_version: EXPLAIN_SIDECAR_SCHEMA_VERSION,
+        _walk: WalkStatsJson {
+            walked: walk_stats.walked,
+            valid: walk_stats.valid,
+            errors,
+        },
+        fields,
+    };
+    serde_json::to_string_pretty(&output).expect(
+        "static-shape JSON serialization is infallible — every \
+         field in ExplainOutput / WalkStatsJson / WalkError / \
+         FieldDiagnostic is a primitive, &str, or Vec/BTreeMap \
+         of those — no NaN, no non-string keys, no unsupported \
+         types",
     )
 }
 
@@ -5524,6 +5627,175 @@ mod tests {
             5,
             "kernel_commit rustdoc enumerates 5 None causes; catalog \
              must mirror that",
+        );
+    }
+
+    /// Schema version stamp is `"1"` — pin it as a constant test
+    /// so a future shape change that bumps the version surfaces
+    /// here. Dashboard consumers gate on this string; a silent
+    /// bump would mask incompatibility.
+    #[test]
+    fn explain_sidecar_schema_version_constant_is_one() {
+        assert_eq!(super::EXPLAIN_SIDECAR_SCHEMA_VERSION, "1");
+    }
+
+    /// JSON output stamps `_schema_version: "1"` so dashboard
+    /// consumers can gate on a known shape. Surfaces at the
+    /// top level alongside `_walk` and `fields`.
+    #[test]
+    fn explain_sidecar_json_includes_schema_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-schema");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-schema", Some(tmp.path()), true).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("json output must round-trip parse");
+        assert_eq!(
+            parsed.get("_schema_version").and_then(|v| v.as_str()),
+            Some(super::EXPLAIN_SIDECAR_SCHEMA_VERSION),
+            "JSON output must stamp _schema_version: {out}",
+        );
+    }
+
+    /// JSON `_walk.errors` is an empty array when every walked
+    /// file parses cleanly. Dashboard consumers expect the key to
+    /// be present even when empty (uniform shape, no
+    /// `contains_key` branching).
+    #[test]
+    fn explain_sidecar_json_walk_errors_empty_when_all_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-clean-walk");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-clean-walk", Some(tmp.path()), true).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("json output must round-trip parse");
+        let errors = parsed
+            .get("_walk")
+            .and_then(|w| w.get("errors"))
+            .and_then(|e| e.as_array())
+            .expect("_walk.errors must be a JSON array");
+        assert!(
+            errors.is_empty(),
+            "no parse failures — _walk.errors must be empty: {out}",
+        );
+    }
+
+    /// JSON `_walk.errors` lists `{path, error}` pairs for every
+    /// file that failed to parse. The valid file stays counted
+    /// in `_walk.valid`; the corrupt one surfaces under errors.
+    /// Pins the structured-error channel — previously parse
+    /// failures were eprintln-only and dashboard consumers had
+    /// no programmatic way to surface them.
+    #[test]
+    fn explain_sidecar_json_walk_errors_lists_corrupt_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-mixed-errs-json");
+        std::fs::create_dir(&run_dir).unwrap();
+        let valid = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("a-0000000000000000.ktstr.json"),
+            serde_json::to_string(&valid).unwrap(),
+        )
+        .unwrap();
+        let corrupt_path = run_dir.join("b-0000000000000000.ktstr.json");
+        std::fs::write(&corrupt_path, "garbage{").unwrap();
+        let out = super::explain_sidecar("run-mixed-errs-json", Some(tmp.path()), true).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("json output must round-trip parse");
+        let walk = parsed.get("_walk").expect("must have _walk key");
+        assert_eq!(walk.get("walked").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(walk.get("valid").and_then(|v| v.as_u64()), Some(1));
+        let errors = walk
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .expect("_walk.errors must be a JSON array");
+        assert_eq!(errors.len(), 1, "exactly one parse failure expected: {out}",);
+        let entry = &errors[0];
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("each error entry must carry a string `path`");
+        assert_eq!(
+            path,
+            corrupt_path.display().to_string(),
+            "error path must match the corrupt file's resolved path",
+        );
+        let error = entry
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("each error entry must carry a string `error`");
+        assert!(
+            !error.is_empty(),
+            "error message must not be empty (serde_json should produce \
+             a parse-error message for `garbage{{`): {out}",
+        );
+    }
+
+    /// Text output appends a trailing "corrupt sidecars (N):"
+    /// block when parse failures occurred. Each entry lists the
+    /// path on its own line, then the error message indented as
+    /// "    error: ...". Operators see parse failures inline
+    /// rather than relying on stderr eprintln.
+    #[test]
+    fn explain_sidecar_text_appends_corrupt_sidecars_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-text-corrupt");
+        std::fs::create_dir(&run_dir).unwrap();
+        let valid = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("a-0000000000000000.ktstr.json"),
+            serde_json::to_string(&valid).unwrap(),
+        )
+        .unwrap();
+        let corrupt_path = run_dir.join("b-0000000000000000.ktstr.json");
+        std::fs::write(&corrupt_path, "garbage{").unwrap();
+        let out = super::explain_sidecar("run-text-corrupt", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("corrupt sidecars (1):"),
+            "text output must include trailing corrupt-sidecars block \
+             when errors exist: {out}",
+        );
+        assert!(
+            out.contains(&corrupt_path.display().to_string()),
+            "corrupt-sidecars block must list the corrupt file's path: {out}",
+        );
+        assert!(
+            out.contains("    error:"),
+            "corrupt-sidecars block must indent each error under its path: {out}",
+        );
+    }
+
+    /// The "corrupt sidecars" block is suppressed when the walk
+    /// produced zero parse failures. Common case for clean runs;
+    /// emitting an empty header would be visual noise.
+    #[test]
+    fn explain_sidecar_text_omits_corrupt_block_when_no_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-text-clean");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-text-clean", Some(tmp.path()), false).unwrap();
+        assert!(
+            !out.contains("corrupt sidecars"),
+            "no parse failures — corrupt-sidecars block must be \
+             suppressed: {out}",
         );
     }
 

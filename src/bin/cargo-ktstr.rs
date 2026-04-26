@@ -476,10 +476,26 @@ enum StatsCommand {
     /// Default output is per-sidecar text blocks with a header
     /// line reporting walked / parsed counts (so a corrupt
     /// `.ktstr.json` file surfaces as a parse-failure delta
-    /// against the file count). `--json` emits a single object
-    /// with `_walk` carrying the same counts and `fields`
-    /// carrying one aggregated entry per optional field with a
-    /// run-wide `none_count`.
+    /// against the file count). Each `None` cause carries an
+    /// optional `fix:` line with an operator-actionable
+    /// remediation when one applies (e.g. "set KTSTR_KERNEL to
+    /// a local kernel source tree" recovers `kernel_commit =
+    /// None` for env-unset cases). When the walk encounters
+    /// parse failures, the text output appends a trailing
+    /// `corrupt sidecars (N):` block listing each corrupt path
+    /// with the serde error message.
+    ///
+    /// `--json` emits a single object with three top-level
+    /// keys: `_schema_version` (string version stamp —
+    /// currently `"1"` — that consumers can gate on for
+    /// incompatible shape changes), `_walk` (carrying the same
+    /// walked / valid counts plus an `errors` array of
+    /// `{path, error}` pairs covering every parse failure),
+    /// and `fields` (one entry per optional field with run-wide
+    /// `none_count` + `some_count` summing to `_walk.valid`,
+    /// plus the static `classification` / `causes` /
+    /// `fix` catalog entry; `fix` is a JSON string when a
+    /// remediation applies, JSON null otherwise).
     ExplainSidecar {
         /// Run key (from `cargo ktstr stats list`).
         #[arg(long)]

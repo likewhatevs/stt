@@ -405,14 +405,46 @@ impl SidecarResult {
 
 /// Scan a directory for ktstr sidecar JSON files. Recurses one level
 /// into subdirectories to handle per-job gauntlet layouts.
+///
+/// Convenience wrapper over [`collect_sidecars_with_errors`] for
+/// callers that only need the parsed sidecars and not the
+/// per-file parse-failure list. The eprintln-driven diagnostic
+/// path is preserved unchanged inside the underlying walker.
 pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
+    collect_sidecars_with_errors(dir).0
+}
+
+/// Scan a directory for ktstr sidecar JSON files, returning both
+/// the parsed sidecars and a list of `(path, serde-error message)`
+/// pairs for every file that failed to deserialize. Recurses one
+/// level into subdirectories to handle per-job gauntlet layouts.
+///
+/// Surfaces parse failures in two channels:
+/// - `eprintln!` to stderr (preserved for the operator-facing
+///   pre-1.0 disposable-sidecar diagnostic — host-missing
+///   schema-drift case carries an enriched message).
+/// - The returned errors vec, capturing the same `(path, msg)`
+///   pair for structured callers (`explain-sidecar`'s walker
+///   output) that need to render parse failures alongside the
+///   per-field breakdown rather than relying on the operator
+///   eyeballing stderr.
+///
+/// Both channels surface every parse failure — the eprintln path
+/// is informational, the returned vec is structured. Callers that
+/// don't need structured errors should use [`collect_sidecars`].
+pub(crate) fn collect_sidecars_with_errors(
+    dir: &std::path::Path,
+) -> (Vec<SidecarResult>, Vec<(std::path::PathBuf, String)>) {
     let mut sidecars = Vec::new();
+    let mut errors: Vec<(std::path::PathBuf, String)> = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return sidecars,
+        Err(_) => return (sidecars, errors),
     };
     let mut subdirs = Vec::new();
-    let try_load = |path: &std::path::Path, out: &mut Vec<SidecarResult>| {
+    let try_load = |path: &std::path::Path,
+                    out: &mut Vec<SidecarResult>,
+                    errs: &mut Vec<(std::path::PathBuf, String)>| {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             return;
         }
@@ -454,6 +486,12 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
                 } else {
                     eprintln!("ktstr_test: skipping {}: {e}", path.display());
                 }
+                // Capture the unadorned serde error in the
+                // structured channel — the eprintln-only enrichment
+                // is operator prose, not part of the structured
+                // error surface. Consumers that want the enrichment
+                // can layer it on top of the raw serde message.
+                errs.push((path.to_path_buf(), msg));
             }
         }
     };
@@ -463,16 +501,16 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
             subdirs.push(path);
             continue;
         }
-        try_load(&path, &mut sidecars);
+        try_load(&path, &mut sidecars, &mut errors);
     }
     for sub in subdirs {
         if let Ok(entries) = std::fs::read_dir(&sub) {
             for entry in entries.flatten() {
-                try_load(&entry.path(), &mut sidecars);
+                try_load(&entry.path(), &mut sidecars, &mut errors);
             }
         }
     }
-    sidecars
+    (sidecars, errors)
 }
 
 /// Pool every sidecar JSON under every run directory at `root`.

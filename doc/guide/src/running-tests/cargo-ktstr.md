@@ -622,14 +622,37 @@ points at a local kernel git tree). Fields whose `None` is
 the steady-state shape (or a multi-cause set with no single
 remediation) emit no `fix:` line.
 
-`--json` emits a single object with `_walk` (carrying the
-`walked` / `valid` counts — same numbers the text header
-reports under "walked N sidecar file(s), parsed M valid")
-and `fields`. Each entry under `fields` carries `none_count`
-and `some_count` (counts across all valid sidecars in the
-run, summing to `_walk.valid`), `classification`, `causes`,
-and `fix` (string when a remediation applies, JSON null
-otherwise).
+When the walk encounters parse failures, the text output
+appends a trailing `corrupt sidecars (N):` block listing
+each corrupt path on its own line followed by the serde
+error message indented as `error: ...`. The block is
+suppressed when every sidecar parsed cleanly.
+
+`--json` emits a single object with three top-level keys:
+`_schema_version` (a string version stamp — currently
+`"1"` — that consumers can gate on for incompatible shape
+changes), `_walk` (an envelope carrying `walked` / `valid`
+counts — same numbers the text header reports under "walked
+N sidecar file(s), parsed M valid" — plus an `errors` array
+of `{path, error}` entries covering every parse failure),
+and `fields`. Each entry under `fields` carries
+`none_count` and `some_count` (counts across all valid
+sidecars in the run, summing to `_walk.valid`),
+`classification`, `causes`, and `fix` (string when a
+remediation applies, JSON null otherwise).
+
+Output produced before the schema-version stamp landed has
+no `_schema_version` key; consumers should treat the key's
+absence as pre-stamp output (compatible with shape `"1"` in
+practice but unstamped). Parse the stamp as an integer (not
+a substring or float) when gating on it.
+
+The version bumps on incompatible shape changes (key
+rename, key removal, semantic shift in an existing key) but
+NOT on additive changes (new optional top-level keys, new
+entries in `fields`, new optional sub-keys under existing
+entries). Pin loosely — gate on `>= "1"` rather than `== "1"`
+so dashboard code keeps working when the catalog grows.
 
 ```sh
 cargo ktstr stats explain-sidecar --run RUN_ID                       # text per-sidecar diagnostic
