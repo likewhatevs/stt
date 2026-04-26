@@ -505,6 +505,15 @@ enum StatsCommand {
     /// when a remediation applies, JSON null otherwise). All-
     /// corrupt runs render the same shape with `valid = 0` and
     /// per-field counts at zero — never bail.
+    ///
+    /// Exit code is 0 even for all-corrupt runs — the
+    /// diagnostic surface is the structured `_walk.errors`
+    /// array (or the trailing `corrupt sidecars` text block),
+    /// not the process exit code. CI scripts that need to fail
+    /// on parse failures must gate on `_walk.valid > 0` or
+    /// `_walk.errors.len() == 0` rather than the exit status.
+    /// The only non-zero exits are missing-run-directory and
+    /// empty-run (zero `.ktstr.json` files).
     ExplainSidecar {
         /// Run key (from `cargo ktstr stats list`).
         #[arg(long)]
@@ -622,6 +631,26 @@ enum StatsCommand {
         /// outside any git repo at write time) NEVER match a
         /// populated filter — same opt-in policy as `--kernel`.
         ///
+        /// Also accepts git revspecs (`HEAD`, `HEAD~N`, branch
+        /// names, tags, `A..B` ranges) resolved against the
+        /// project repo (`gix::discover` from cwd) into the same
+        /// 7-char short hashes the sidecar writer records. A range
+        /// expands to every commit reachable from `B` but not from
+        /// `A`, each treated as an OR-combined exact-match
+        /// filter. Example: `--project-commit HEAD~3..HEAD` keeps
+        /// rows whose `project_commit` matches every commit
+        /// reachable from `HEAD` but not from `HEAD~3` (the walk
+        /// is breadth-first across the full commit DAG, so for
+        /// linear histories this is "the last 3 commits"; for
+        /// histories with merges it includes every commit on every
+        /// branch joined since `HEAD~3`).
+        /// Unrecognized inputs and `<hash>-dirty` forms (which
+        /// revspec parsing rejects) pass through as literal
+        /// exact-match filters, preserving compatibility with
+        /// hand-typed dirty entries. When run outside any git tree,
+        /// every input passes through as a literal — revspec
+        /// resolution requires the cwd to be inside a project repo.
+        ///
         /// Filters on the ktstr framework commit
         /// (`SidecarResult::project_commit`); the scheduler
         /// binary's commit (`SidecarResult::scheduler_commit`,
@@ -653,6 +682,23 @@ enum StatsCommand {
         /// `Local` tree, or `detect_kernel_commit`'s gix probe
         /// failed) NEVER match a populated filter — same opt-in
         /// policy as `--project-commit` / `--kernel`.
+        ///
+        /// Also accepts git revspecs (`HEAD`, `HEAD~N`, branch
+        /// names, tags, `A..B` ranges) resolved against the
+        /// kernel repo (`gix::open` against `KTSTR_KERNEL`'s
+        /// path) into the same 7-char short hashes the sidecar
+        /// writer records. A range expands to every commit
+        /// reachable from `B` but not from `A`, each treated as
+        /// an OR-combined exact-match filter. Example:
+        /// `--kernel-commit v6.14..v6.15` keeps rows whose
+        /// `kernel_commit` falls in that release window.
+        /// Unrecognized inputs and `<hash>-dirty` forms (which
+        /// revspec parsing rejects) pass through as literal
+        /// exact-match filters, preserving compatibility with
+        /// hand-typed dirty entries. When `KTSTR_KERNEL` is unset
+        /// or points outside any git tree, every input passes
+        /// through as a literal — revspec resolution requires the
+        /// repo to be available.
         ///
         /// Filters on the kernel SOURCE TREE commit
         /// (`SidecarResult::kernel_commit`), NOT on the kernel
@@ -1866,6 +1912,51 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                     );
                 }
             };
+            // Resolve git revspecs in `--project-commit` /
+            // `--kernel-commit` flags (HEAD~1, tags, branch names,
+            // `A..B` ranges) into 7-char short hashes BEFORE
+            // constructing BuildCompareFilters. The shared and
+            // per-side vecs each go through `resolve_commit_specs`
+            // independently so a per-side override that uses a
+            // revspec ("--a-project-commit HEAD~1") expands the
+            // same way a shared one would.
+            //
+            // Project-side repo: `gix::discover` from cwd, mirroring
+            // `detect_project_commit`'s open mode at sidecar-write
+            // time. `gix::discover` walks parents until it finds a
+            // `.git` marker so the operator can run `cargo ktstr
+            // stats compare` from anywhere inside the project tree;
+            // failure (cwd outside any repo) collapses to `None`
+            // and every input passes through as a literal — matching
+            // the documented "literal fallback" contract.
+            //
+            // Kernel-side repo: `gix::open` against the path in
+            // `KTSTR_KERNEL`, mirroring `detect_kernel_commit`'s
+            // open mode. `KTSTR_KERNEL` unset / empty / non-git
+            // collapses to `None` — every input passes through as
+            // a literal. `KTSTR_KERNEL` may carry a Version /
+            // CacheKey (not a path) on the test/coverage paths;
+            // here on the stats path the caller is doing post-hoc
+            // analysis, so a path is the relevant interpretation.
+            // A non-path value falls through to literal too.
+            let project_repo = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| gix::discover(cwd).ok());
+            let kernel_repo = ktstr::ktstr_kernel_env()
+                .map(std::path::PathBuf::from)
+                .and_then(|p| gix::open(p).ok());
+            let project_commit =
+                resolve_commit_specs(project_repo.as_ref(), project_commit, "project-commit");
+            let kernel_commit =
+                resolve_commit_specs(kernel_repo.as_ref(), kernel_commit, "kernel-commit");
+            let a_project_commit =
+                resolve_commit_specs(project_repo.as_ref(), a_project_commit, "a-project-commit");
+            let a_kernel_commit =
+                resolve_commit_specs(kernel_repo.as_ref(), a_kernel_commit, "a-kernel-commit");
+            let b_project_commit =
+                resolve_commit_specs(project_repo.as_ref(), b_project_commit, "b-project-commit");
+            let b_kernel_commit =
+                resolve_commit_specs(kernel_repo.as_ref(), b_kernel_commit, "b-kernel-commit");
             // Construct the BuildCompareFilters from the raw CLI
             // inputs. Sugar logic (shared `--X` pins both sides;
             // per-side `--a-X` / `--b-X` REPLACES the shared value
@@ -1874,24 +1965,24 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             // a dumb data carrier.
             let build = BuildCompareFilters {
                 shared_kernel: kernel.clone(),
-                shared_project_commit: project_commit.clone(),
-                shared_kernel_commit: kernel_commit.clone(),
+                shared_project_commit: project_commit,
+                shared_kernel_commit: kernel_commit,
                 shared_run_source: run_source.clone(),
                 shared_scheduler: scheduler.clone(),
                 shared_topology: topology.clone(),
                 shared_work_type: work_type.clone(),
                 shared_flags: flags.clone(),
                 a_kernel: a_kernel.clone(),
-                a_project_commit: a_project_commit.clone(),
-                a_kernel_commit: a_kernel_commit.clone(),
+                a_project_commit,
+                a_kernel_commit,
                 a_run_source: a_run_source.clone(),
                 a_scheduler: a_scheduler.clone(),
                 a_topology: a_topology.clone(),
                 a_work_type: a_work_type.clone(),
                 a_flags: a_flags.clone(),
                 b_kernel: b_kernel.clone(),
-                b_project_commit: b_project_commit.clone(),
-                b_kernel_commit: b_kernel_commit.clone(),
+                b_project_commit,
+                b_kernel_commit,
                 b_run_source: b_run_source.clone(),
                 b_scheduler: b_scheduler.clone(),
                 b_topology: b_topology.clone(),
@@ -1916,6 +2007,244 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
     }
 }
 
+/// Probe whether `repo`'s worktree differs from its HEAD
+/// commit, ignoring submodules. Returns `Some(true)` when the
+/// index differs from the HEAD tree or the worktree differs
+/// from the index for any tracked file; `Some(false)` when
+/// neither leg observed a difference; `None` when the HEAD-tree
+/// peel itself failed (HEAD points at something that cannot be
+/// read as a tree).
+///
+/// MIRROR of [`crate::test_support::sidecar::repo_is_dirty`]
+/// (private to that module — the binary crate cannot reach
+/// pub(crate) items in the lib crate). The two implementations
+/// MUST stay aligned: the canonical version lives in sidecar.rs
+/// and is what the sidecar writer applies when emitting the
+/// `-dirty` suffix at run time. Drift here would cause
+/// `--project-commit HEAD` to resolve to `<hash>` while the
+/// pool contains `<hash>-dirty`, missing every target row.
+///
+/// PROBE LEGS (matching the canonical version):
+/// - tree-vs-index: peel HEAD to its tree, then `tree_index_status`
+///   diff against the on-disk index.
+/// - index-vs-worktree: `repo.status()` configured with
+///   `Submodule::Given { ignore: All }` so submodule worktree
+///   state is skipped. Short-circuited when the tree-vs-index
+///   leg already flipped dirty.
+///
+/// FAILURE DEGRADATION: any individual leg failure silently
+/// degrades to "no signal"; only HEAD-tree peel failure returns
+/// `None`. Callers degrade `None` via `unwrap_or(false)` so the
+/// dirty-suffix only fires on a positive signal.
+fn repo_is_dirty_local(repo: &gix::Repository) -> Option<bool> {
+    let head_tree_id = repo.head_tree().ok()?.id;
+
+    let mut index_dirty = false;
+    if let Ok(index) = repo.index() {
+        let _ = repo.tree_index_status(
+            &head_tree_id,
+            &index,
+            None,
+            gix::status::tree_index::TrackRenames::Disabled,
+            |_, _, _| {
+                index_dirty = true;
+                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+            },
+        );
+    }
+
+    let worktree_dirty = if index_dirty {
+        false
+    } else {
+        repo.status(gix::progress::Discard)
+            .ok()
+            .and_then(|s| {
+                s.index_worktree_rewrites(None)
+                    .index_worktree_submodules(gix::status::Submodule::Given {
+                        ignore: gix::submodule::config::Ignore::All,
+                        check_dirty: false,
+                    })
+                    .index_worktree_options_mut(|opts| {
+                        opts.dirwalk_options = None;
+                    })
+                    .into_index_worktree_iter(Vec::new())
+                    .ok()
+                    .map(|mut iter| iter.next().is_some())
+            })
+            .unwrap_or(false)
+    };
+
+    Some(index_dirty || worktree_dirty)
+}
+
+/// Resolve git revspecs (HEAD~1, tags, branch names, ranges
+/// `A..B`) in `--project-commit` / `--kernel-commit` filter
+/// inputs into the 7-char short hashes the sidecar's
+/// `project_commit` / `kernel_commit` fields are written with.
+///
+/// Each entry in `raw` is treated independently. `repo` is the
+/// repository against which to resolve (cwd-discovered for
+/// project commits, opened from `KTSTR_KERNEL` for kernel
+/// commits); when `None` (no repo available — cwd outside any
+/// git tree, or `KTSTR_KERNEL` unset) every input passes
+/// through verbatim as a literal. `flag_name` is the
+/// user-visible CLI flag (e.g. `"project-commit"`,
+/// `"a-kernel-commit"`) included in stderr warnings for
+/// fall-through arms so the operator can identify which input
+/// did not resolve as expected.
+///
+/// Per-input resolution:
+/// - `repo.rev_parse(input)` succeeds with `Spec::Include(id)`
+///   or `Spec::ExcludeParents(id)` (single-commit revspec):
+///   push the commit's 7-char short hex. When the resolved OID
+///   equals current HEAD AND the worktree is dirty, append
+///   `-dirty` to the short hex so the filter matches the
+///   suffixed entries `detect_project_commit` /
+///   `detect_kernel_commit` write at sidecar-write time.
+///   Historical commits (Include / ExcludeParents resolving to
+///   non-HEAD OIDs) never get the suffix — the operator named
+///   that specific commit and current worktree state has no
+///   bearing on its identity in the recorded pool.
+/// - `repo.rev_parse(input)` succeeds with `Spec::Range { from,
+///   to }` (an `A..B` revspec): walk via `repo.rev_walk([to])
+///   .with_hidden([from]).all()` and push each yielded
+///   commit's 7-char short hex. Range commits never get the
+///   `-dirty` suffix even if the walk includes HEAD — `A..B`
+///   is a content-set query, not a current-state query. A
+///   walk-init failure prints a stderr warning naming the
+///   input and the gix error, then falls through to literal.
+/// - `repo.rev_parse(input)` succeeds with another spec kind
+///   (`Exclude`, `Merge`, `IncludeOnlyParents`): push the input
+///   unchanged. Those forms have no useful single-side
+///   expansion for an OR-combined exact-match filter, and a
+///   stderr warning is emitted so the operator notices that the
+///   input was not expanded.
+/// - `repo.rev_parse(input)` returns `Err`: push the input
+///   unchanged (literal fallback) and emit a stderr warning.
+///   This preserves the existing exact-match contract for
+///   hand-typed short hashes — a `--project-commit abc1234-dirty`
+///   argument never resolves as a revspec (revspec parsing
+///   rejects the `-dirty` suffix) and lands as a literal,
+///   matching the `-dirty`-suffixed entries in the sidecar
+///   pool. The warning is unconditional on this arm so a
+///   typo'd revspec ("HEAD~XYZ") surfaces visibly; legitimate
+///   literal hashes also produce a (harmless) line, which is
+///   the documented tradeoff for catching typos at parse time.
+///
+/// Resolution happens BEFORE [`BuildCompareFilters`]
+/// construction so the sugar logic in `build()` operates on
+/// already-expanded vecs and stays free of repo I/O. The
+/// expansion is order-preserving on the input, with each
+/// range entry yielding its commits in walk order; downstream
+/// `RowFilter::matches` is OR-combined so order does not affect
+/// the matched set.
+fn resolve_commit_specs(
+    repo: Option<&gix::Repository>,
+    raw: &[String],
+    flag_name: &str,
+) -> Vec<String> {
+    let Some(repo) = repo else {
+        return raw.to_vec();
+    };
+    // Resolve once: the `-dirty` suffix only applies when the
+    // resolved OID equals current HEAD AND the worktree is
+    // dirty. Both are repo-global properties, so compute them
+    // upfront and reuse across every input. Either probe
+    // failing (no HEAD, no readable tree) collapses
+    // `head_dirty` to false — the documented "treat as clean
+    // on probe failure" policy that the canonical
+    // `repo_is_dirty_local` already encodes.
+    let head_oid: Option<gix::ObjectId> = repo.head_id().ok().map(|id| id.detach());
+    let head_dirty: bool = head_oid
+        .as_ref()
+        .and_then(|_| repo_is_dirty_local(repo))
+        .unwrap_or(false);
+    let format_short = |id: gix::ObjectId| -> String {
+        let short = id.to_hex_with_len(7).to_string();
+        // Dirty-suffix only when (a) the worktree is dirty and
+        // (b) the resolved OID is current HEAD. A historical
+        // commit that happens to be referenced via Include /
+        // ExcludeParents (e.g. an explicit short-hash that
+        // resolves to a non-HEAD object) does NOT get -dirty,
+        // because the operator named that specific commit and
+        // the current worktree state has no bearing on its
+        // identity in the recorded sidecar pool.
+        if head_dirty && head_oid == Some(id) {
+            format!("{short}-dirty")
+        } else {
+            short
+        }
+    };
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for input in raw {
+        match repo.rev_parse(input.as_str()) {
+            Ok(spec) => match spec.detach() {
+                gix::revision::plumbing::Spec::Include(id)
+                | gix::revision::plumbing::Spec::ExcludeParents(id) => {
+                    out.push(format_short(id));
+                }
+                gix::revision::plumbing::Spec::Range { from, to } => {
+                    match repo.rev_walk([to]).with_hidden([from]).all() {
+                        Ok(walk) => {
+                            // `walk.flatten()` silently drops any
+                            // per-element traversal `Err` (a single
+                            // unreadable commit object inside the
+                            // range walk). The cost is one filter
+                            // entry per failure; the alternative —
+                            // bailing on the whole range — would
+                            // discard every successfully-yielded
+                            // sibling commit. Since the filter is
+                            // OR-combined, a missing entry only
+                            // narrows the match set rather than
+                            // producing wrong rows, so silent drop
+                            // is the safe degradation.
+                            //
+                            // Range commits are historical — they
+                            // never get the -dirty suffix even when
+                            // the walk happens to include HEAD,
+                            // because the operator's intent in
+                            // `A..B` is "match every commit in this
+                            // range" which is a content-set, not a
+                            // current-state query. Use raw
+                            // `to_hex_with_len` here (bypass the
+                            // `format_short` closure) to skip the
+                            // dirty-suffix decision.
+                            for info in walk.flatten() {
+                                out.push(info.id.to_hex_with_len(7).to_string());
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "cargo ktstr: --{flag_name} range '{input}' could \
+                                 not be expanded: {err}; using as literal filter",
+                            );
+                            out.push(input.clone());
+                        }
+                    }
+                }
+                gix::revision::plumbing::Spec::Exclude(_)
+                | gix::revision::plumbing::Spec::Merge { .. }
+                | gix::revision::plumbing::Spec::IncludeOnlyParents(_) => {
+                    eprintln!(
+                        "cargo ktstr: --{flag_name} '{input}' uses an unsupported \
+                         revspec form (Exclude/Merge/IncludeOnlyParents); using \
+                         as literal filter",
+                    );
+                    out.push(input.clone());
+                }
+            },
+            Err(_) => {
+                eprintln!(
+                    "cargo ktstr: --{flag_name} '{input}' did not resolve as a \
+                     revspec; using as literal filter",
+                );
+                out.push(input.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Symmetric-sugar resolver for `cargo ktstr stats compare`'s
 /// shared `--X` and per-side `--a-X` / `--b-X` filter flags.
 ///
@@ -1933,6 +2262,12 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
 /// the sugar resolution and returns `(filter_a, filter_b)`. The
 /// struct is unit-testable in isolation so the sugar logic does
 /// not require booting a real comparison.
+///
+/// Project- and kernel-commit fields hold ALREADY-EXPANDED
+/// commit lists: any git revspecs (HEAD~1, tags, branch names,
+/// `A..B` ranges) the user typed are resolved to 7-char short
+/// hashes by [`resolve_commit_specs`] BEFORE construction so
+/// `build()` stays a pure data-shuffler with no repo I/O.
 #[derive(Debug, Clone, Default)]
 struct BuildCompareFilters {
     shared_kernel: Vec<String>,
@@ -6290,5 +6625,287 @@ mod tests {
         ];
         let deduped = dedupe_resolved(resolved);
         assert_eq!(deduped.len(), 1);
+    }
+
+    // -- resolve_commit_specs: revspec resolution --
+
+    /// Build a chain of `n` commits in `dir` and return their
+    /// `ObjectId`s in order (oldest first). Each commit gets a
+    /// fresh tree containing one blob whose contents differ per
+    /// commit so the trees never collide. Mirrors the structure
+    /// of `init_clean_repo_with_file` in `test_support::sidecar`'s
+    /// test mod but extends it to a multi-commit chain.
+    fn init_repo_with_chain(dir: &std::path::Path, n: usize) -> Vec<gix::ObjectId> {
+        let mut repo = gix::init(dir).expect("gix::init");
+        let _ = repo
+            .committer_or_set_generic_fallback()
+            .expect("committer fallback");
+        let mut chain: Vec<gix::ObjectId> = Vec::with_capacity(n);
+        for i in 0..n {
+            let blob_id: gix::ObjectId = repo
+                .write_blob(format!("v{i}\n").as_bytes())
+                .expect("write blob")
+                .detach();
+            let tree = gix::objs::Tree {
+                entries: vec![gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: "file.txt".into(),
+                    oid: blob_id,
+                }],
+            };
+            let tree_id: gix::ObjectId = repo.write_object(&tree).expect("write tree").detach();
+            let parents: Vec<gix::ObjectId> = chain.last().copied().into_iter().collect();
+            let commit_id: gix::ObjectId = repo
+                .commit("HEAD", format!("c{i}"), tree_id, parents)
+                .expect("commit")
+                .detach();
+            chain.push(commit_id);
+        }
+        chain
+    }
+
+    /// `repo: None` (no repo available — cwd outside any git tree
+    /// or `KTSTR_KERNEL` unset / non-git) is a documented contract:
+    /// every input passes through verbatim as a literal. Pins that
+    /// `resolve_commit_specs` does not require a repo to function —
+    /// the bare-string fallback is the load-bearing default for
+    /// stats analysis on a host that's not the original build
+    /// machine.
+    #[test]
+    fn resolve_commit_specs_no_repo_passes_through_literal() {
+        let raw = vec![
+            "abc1234".to_string(),
+            "main".to_string(),
+            "HEAD".to_string(),
+        ];
+        let out = resolve_commit_specs(None, &raw, "test");
+        assert_eq!(out, raw, "no repo → every input lands as-is");
+    }
+
+    /// `HEAD` resolves to the 7-char short hex of the tip commit.
+    /// Pins the `Spec::Include(id)` arm against a real repo: a
+    /// regression that returned the input string verbatim instead
+    /// of the resolved hash would silently break revspec resolution
+    /// even when the repo is available.
+    #[test]
+    fn resolve_commit_specs_head_resolves_to_short_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain = init_repo_with_chain(tmp.path(), 3);
+        let head = *chain.last().unwrap();
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let raw = vec!["HEAD".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec![head.to_hex_with_len(7).to_string()],
+            "HEAD must resolve to the tip commit's 7-char short hex",
+        );
+    }
+
+    /// `HEAD~1` resolves to the parent of HEAD. Pins the navigate-
+    /// up form which is the most common revspec users write when
+    /// pointing at "the prior commit". Same `Spec::Include(id)`
+    /// arm, just driven through a non-trivial revspec.
+    #[test]
+    fn resolve_commit_specs_head_tilde_resolves_to_parent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain = init_repo_with_chain(tmp.path(), 3);
+        // chain[0] is oldest; chain[2] is HEAD; chain[1] is HEAD~1.
+        let head_tilde_1 = chain[1];
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let raw = vec!["HEAD~1".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec![head_tilde_1.to_hex_with_len(7).to_string()],
+            "HEAD~1 must resolve to the parent commit's 7-char short hex",
+        );
+    }
+
+    /// `A..B` (range revspec) expands to every commit reachable
+    /// from B but not from A. With three commits c0→c1→c2 and the
+    /// range `c0..HEAD`, the result must include c1 and c2 (c0 is
+    /// excluded; HEAD is included). Pins the `Spec::Range` arm and
+    /// the `rev_walk([to]).with_hidden([from]).all()` walk.
+    #[test]
+    fn resolve_commit_specs_range_expands_inclusive_of_to() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain = init_repo_with_chain(tmp.path(), 3);
+        let c0 = chain[0];
+        let c1 = chain[1];
+        let c2 = chain[2];
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let raw = vec![format!("{}..HEAD", c0.to_hex_with_len(40))];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        // The walk yields c2 (HEAD) and c1 in some order; c0 is
+        // hidden. Verify membership (order is walk-implementation
+        // dependent and not pinned).
+        assert!(
+            out.contains(&c1.to_hex_with_len(7).to_string()),
+            "range result must include c1 (the parent of HEAD); got {out:?}",
+        );
+        assert!(
+            out.contains(&c2.to_hex_with_len(7).to_string()),
+            "range result must include c2 (HEAD); got {out:?}",
+        );
+        assert!(
+            !out.contains(&c0.to_hex_with_len(7).to_string()),
+            "range result must NOT include c0 (the hidden side); got {out:?}",
+        );
+        assert_eq!(
+            out.len(),
+            2,
+            "range c0..HEAD over 3-commit chain must yield exactly 2 commits; got {out:?}",
+        );
+    }
+
+    /// A non-revspec input round-trips unchanged. Pins the
+    /// literal-fallback arm: the existing exact-match contract
+    /// for hand-typed strings must keep working when the input
+    /// can't be parsed as a revspec at all.
+    /// `gix::Repository::rev_parse` returns an error for any
+    /// input that is neither a known ref nor a valid hex hash
+    /// prefix; that error falls through to `out.push(input
+    /// .clone())`. `"zzzzzzz"` is non-hex (z is outside
+    /// `[0-9a-fA-F]`), so revspec parsing definitionally rejects
+    /// it without needing to consult the object database.
+    #[test]
+    fn resolve_commit_specs_unknown_hash_falls_through_to_literal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_chain(tmp.path(), 1);
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let raw = vec!["zzzzzzz".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec!["zzzzzzz".to_string()],
+            "non-hex input must pass through as literal",
+        );
+    }
+
+    /// A literal `<hash>-dirty` form falls through to the literal
+    /// arm. `gix::Repository::rev_parse` rejects the `-dirty`
+    /// suffix as an invalid revspec; the function lands the input
+    /// unchanged so it matches the `-dirty`-suffixed entries the
+    /// sidecar writer produces. Pins the design contract that
+    /// hand-typed dirty filters keep working alongside revspec
+    /// expansion.
+    #[test]
+    fn resolve_commit_specs_dirty_suffix_falls_through_to_literal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_chain(tmp.path(), 1);
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let raw = vec!["abc1234-dirty".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec!["abc1234-dirty".to_string()],
+            "-dirty-suffixed input must pass through as literal",
+        );
+    }
+
+    /// Empty input → empty output, no work done. Pins the no-op
+    /// pass for the common case where a side has no commit filter
+    /// — the function returns an empty Vec without exercising
+    /// any rev_parse machinery.
+    #[test]
+    fn resolve_commit_specs_empty_input_yields_empty_output() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_chain(tmp.path(), 1);
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let out = resolve_commit_specs(Some(&repo), &[], "test");
+        assert!(out.is_empty(), "empty input must yield empty output");
+    }
+
+    /// Mixed input: some revspecs resolve, some fall through to
+    /// literals, all in the same call. Pins the per-input
+    /// independence — one literal does not poison sibling
+    /// resolutions, and one resolved revspec does not consume the
+    /// literal fallback for its siblings. Mirrors the realistic
+    /// case where a user types `--project-commit HEAD --project-commit
+    /// abc1234-dirty` to combine "current HEAD" with a known dirty
+    /// run from history.
+    #[test]
+    fn resolve_commit_specs_mixed_inputs_resolve_per_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain = init_repo_with_chain(tmp.path(), 1);
+        let head = chain[0];
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let raw = vec!["HEAD".to_string(), "abc1234-dirty".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec![
+                head.to_hex_with_len(7).to_string(),
+                "abc1234-dirty".to_string(),
+            ],
+            "HEAD resolves; -dirty input lands literal; order preserved",
+        );
+    }
+
+    /// `HEAD` against a dirty worktree resolves to
+    /// `<short>-dirty`, mirroring what `detect_project_commit`
+    /// writes at sidecar-write time. Pins the dirty-suffix
+    /// behavior on the Include/ExcludeParents arm: a regression
+    /// that emitted just `<short>` would silently miss every
+    /// sidecar row written from this same dirty worktree, since
+    /// `RowFilter::matches` is strict equality on the
+    /// commit-string field.
+    #[test]
+    fn resolve_commit_specs_head_in_dirty_repo_appends_dirty_suffix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain = init_repo_with_chain(tmp.path(), 1);
+        let head = chain[0];
+        // Mutate the tracked file so index-vs-worktree diverges.
+        // `init_repo_with_chain` writes the blob to ODB but does
+        // not populate a worktree file or index — so create the
+        // index from the tree, write the file, then mutate it.
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let head_tree = repo.head_tree().expect("head_tree").id;
+        let mut idx = repo.index_from_tree(&head_tree).expect("index_from_tree");
+        idx.write(gix::index::write::Options::default())
+            .expect("write index");
+        std::fs::write(tmp.path().join("file.txt"), b"original\n").unwrap();
+        // Now mutate the tracked file to dirty the worktree.
+        std::fs::write(tmp.path().join("file.txt"), b"modified\n").unwrap();
+        let raw = vec!["HEAD".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        let expected_short = head.to_hex_with_len(7).to_string();
+        assert_eq!(
+            out,
+            vec![format!("{expected_short}-dirty")],
+            "HEAD in a dirty repo must resolve to <short>-dirty",
+        );
+    }
+
+    /// A historical commit (HEAD~1 in a 2-commit chain) does NOT
+    /// get the `-dirty` suffix even when the worktree is dirty.
+    /// Pins the team-lead's design constraint: only the resolved
+    /// OID equal to current HEAD reflects worktree state; named
+    /// historical commits keep their plain identity. A regression
+    /// that propagated dirt to non-HEAD resolutions would
+    /// fingerprint historical filters with the current local
+    /// state, mis-matching every sidecar in the pool.
+    #[test]
+    fn resolve_commit_specs_non_head_does_not_get_dirty_suffix_in_dirty_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain = init_repo_with_chain(tmp.path(), 2);
+        let parent = chain[0];
+        // Same dirty-worktree setup as the prior test.
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let head_tree = repo.head_tree().expect("head_tree").id;
+        let mut idx = repo.index_from_tree(&head_tree).expect("index_from_tree");
+        idx.write(gix::index::write::Options::default())
+            .expect("write index");
+        std::fs::write(tmp.path().join("file.txt"), b"v1\n").unwrap();
+        std::fs::write(tmp.path().join("file.txt"), b"modified\n").unwrap();
+        let raw = vec!["HEAD~1".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec![parent.to_hex_with_len(7).to_string()],
+            "HEAD~1 (historical commit) must NOT get -dirty suffix \
+             even when worktree is dirty",
+        );
     }
 }
