@@ -1008,8 +1008,8 @@ pub fn runs_root() -> PathBuf {
 ///
 /// True iff `entry`'s path is a directory AND its filename does
 /// NOT begin with a `.` byte. The dotfile filter excludes the
-/// flock sentinel subdirectory ([`RUN_LOCK_DIR_NAME`] =
-/// `.locks/`) plus any other operator-created or filesystem-
+/// flock sentinel subdirectory ([`crate::flock::LOCK_DIR_NAME`] =
+/// `.locks`) plus any other operator-created or filesystem-
 /// reserved dotfile directories from run-listing walkers
 /// ([`newest_run_dir`] here, `sorted_run_entries` in
 /// `crate::stats`) so the lock infrastructure does not pollute
@@ -2202,18 +2202,6 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
     drop(guard);
 }
 
-/// Subdirectory under [`runs_root`] that holds per-run-key flock
-/// sentinels. Mirrors the cache module's `.locks/` convention
-/// (see `LOCK_DIR_NAME` in `crate::cache`) so the two coordination
-/// surfaces share a layout: `<root>/.locks/<key>.lock`. The
-/// dotfile prefix keeps the lock subdirectory out of run-listing
-/// walks (`is_dir()` filters in [`collect_pool`] and the stats
-/// `sorted_run_entries` walker exclude it implicitly because the
-/// lockfiles inside are regular files, but the dotfile prefix
-/// is also belt-and-suspenders against any future walker that
-/// reaches this level).
-const RUN_LOCK_DIR_NAME: &str = ".locks";
-
 /// Wall-clock timeout for [`acquire_run_dir_flock`] before it gives
 /// up and returns an error. 30 s is generous for the per-write
 /// critical section: each peer writer holds the lock for at most
@@ -2228,19 +2216,14 @@ const RUN_LOCK_DIR_NAME: &str = ".locks";
 /// at most one peer write.
 const RUN_DIR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Poll interval for [`acquire_run_dir_flock`]. Matches the
-/// cache module's `FLOCK_POLL_INTERVAL` constant for consistency
-/// (100 ms balances responsiveness — contention clears in ≤1
-/// poll under normal load — against CPU burn at 10 wakes/s per
-/// waiter).
-const RUN_DIR_LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// Compute the per-run-key flock sentinel path for `dir`.
 ///
 /// Layout: `{dir.parent()}/.locks/{dir.file_name()}.lock`. When
 /// `dir = {runs_root}/{key}` (the production default-path shape),
-/// this resolves to `{runs_root}/.locks/{key}.lock`. The lockfile
-/// shares the cache module's `.locks/` layout convention.
+/// this resolves to `{runs_root}/.locks/{key}.lock`. Sourced from
+/// [`crate::flock::LOCK_DIR_NAME`] so a relocation of the lock
+/// subdirectory updates one place across both this surface and
+/// the cache module.
 ///
 /// Returns `None` when `dir` has no parent (root) or no
 /// `file_name` component (current dir, root) — neither case is
@@ -2252,21 +2235,19 @@ const RUN_DIR_LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::fro
 ///
 /// Pure function over the input path — no I/O. The caller is
 /// responsible for materializing the parent `.locks/`
-/// subdirectory before opening the lockfile (see
-/// [`acquire_run_dir_flock`]).
+/// subdirectory before opening the lockfile —
+/// [`crate::flock::acquire_flock_with_timeout`] handles that
+/// lazily.
 fn run_dir_lock_path(dir: &std::path::Path) -> Option<PathBuf> {
     let parent = dir.parent()?;
     let leaf = dir.file_name()?;
     let mut filename = std::ffi::OsString::from(leaf);
     filename.push(".lock");
-    Some(parent.join(RUN_LOCK_DIR_NAME).join(filename))
+    Some(parent.join(crate::flock::LOCK_DIR_NAME).join(filename))
 }
 
 /// Acquire `LOCK_EX` on the per-run-key flock sentinel for `dir`.
-/// Polls every [`RUN_DIR_LOCK_POLL_INTERVAL`] until either the
-/// lock is held or [`RUN_DIR_LOCK_TIMEOUT`] elapses.
-///
-/// Production wrapper over [`acquire_run_dir_flock_with_timeout`];
+/// Default-timeout wrapper over [`acquire_run_dir_flock_with_timeout`];
 /// see that helper's doc for the full behavior contract. The
 /// timeout split exists so tests can exercise the contention /
 /// timeout path with a sub-second deadline rather than waiting
@@ -2277,25 +2258,22 @@ fn acquire_run_dir_flock(dir: &std::path::Path) -> anyhow::Result<std::os::fd::O
 
 /// Test-parametrizable inner of [`acquire_run_dir_flock`].
 ///
-/// Lockfile path is computed via [`run_dir_lock_path`] (see its
-/// doc for the layout). The parent `.locks/` subdirectory is
-/// created lazily here, mirroring the cache module's
-/// `ensure_lock_dir` semantics so a freshly-resolved
-/// `{runs_root}/{key}` does not need an explicit setup step
-/// before the first write.
+/// Resolves the per-run-key lockfile path via [`run_dir_lock_path`]
+/// then delegates to [`crate::flock::acquire_flock_with_timeout`],
+/// which handles parent-directory creation, the poll loop, the
+/// `tracing::debug!` contention log, and the formatted timeout
+/// error. The `context` argument names the run directory and the
+/// `remediation` argument supplies the operator-facing recovery
+/// hint about peer cargo ktstr test processes that the shared
+/// helper appends to the timeout error.
 ///
 /// Returns `Err` on:
 /// - `run_dir_lock_path(dir)` returning `None` (no parent / no
 ///   file_name — production default path always satisfies both,
 ///   so this is a defensive arm),
-/// - the parent `.locks/` directory failing to materialize
-///   (filesystem error),
-/// - `try_flock` itself surfacing an error (remote-fs rejection,
-///   open failure, unexpected flock errno),
-/// - the wall-clock `timeout` elapsing while a peer continues to
-///   hold an incompatible lock — the error message names the
-///   lockfile path so an operator can grep `/proc/locks` or run
-///   `ktstr locks` to identify the holder.
+/// - any error from [`crate::flock::acquire_flock_with_timeout`]
+///   (parent directory creation failure, `try_flock` error, or
+///   wall-clock `timeout` elapsing).
 ///
 /// Returns `Ok(OwnedFd)` on successful acquire. Caller drops the
 /// fd to release the kernel-side flock; the OFD-bound semantics
@@ -2313,33 +2291,18 @@ fn acquire_run_dir_flock_with_timeout(
             dir.display(),
         )
     })?;
-    if let Some(lock_dir) = lock_path.parent() {
-        std::fs::create_dir_all(lock_dir)
-            .with_context(|| format!("create run-dir lock subdirectory {}", lock_dir.display()))?;
-    }
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)? {
-            Some(fd) => return Ok(fd),
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let holders = crate::flock::read_holders(&lock_path).unwrap_or_default();
-                    anyhow::bail!(
-                        "flock LOCK_EX on run-dir {} timed out after {:?} \
-                         (lockfile {}, holders: {}). A peer cargo ktstr \
-                         test process is writing sidecars to the same \
-                         {{kernel}}-{{project_commit}} directory; wait for \
-                         it to finish or kill it, then retry.",
-                        dir.display(),
-                        timeout,
-                        lock_path.display(),
-                        crate::flock::format_holder_list(&holders),
-                    );
-                }
-                std::thread::sleep(RUN_DIR_LOCK_POLL_INTERVAL);
-            }
-        }
-    }
+    let context = format!("run-dir {}", dir.display());
+    crate::flock::acquire_flock_with_timeout(
+        &lock_path,
+        crate::flock::FlockMode::Exclusive,
+        timeout,
+        &context,
+        Some(
+            "A peer cargo ktstr test process is writing sidecars to the \
+             same {kernel}-{project_commit} directory; wait for it to \
+             finish or kill it, then retry.",
+        ),
+    )
 }
 
 /// Return `active_flags` sorted into canonical
@@ -4161,8 +4124,8 @@ mod tests {
 
     /// `run_dir_lock_path({parent}/{key})` returns
     /// `{parent}/.locks/{key}.lock`. Pins the layout so a future
-    /// edit to `RUN_LOCK_DIR_NAME` or the join shape surfaces here
-    /// rather than as a silent cross-call divergence.
+    /// edit to [`crate::flock::LOCK_DIR_NAME`] or the join shape
+    /// surfaces here rather than as a silent cross-call divergence.
     #[test]
     fn run_dir_lock_path_returns_expected_shape() {
         let dir = std::path::Path::new("/runs-root/6.14.2-deadbee");

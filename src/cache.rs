@@ -56,39 +56,42 @@ use serde::{Deserialize, Serialize};
 /// the three roles — emitter, scanner, validator — cannot drift.
 const TMP_DIR_PREFIX: &str = ".tmp-";
 
-/// Subdirectory name under the cache root that holds per-entry
-/// coordination lockfiles. Files inside are named
-/// `{cache_key}.lock` — full path is
-/// `{cache_root}/.locks/{cache_key}.lock`.
-///
-/// # Why a subdirectory, not a sibling next to the entry
-///
-/// [`CacheDir::store`] installs new entries via
-/// `renameat2(RENAME_EXCHANGE)` on the entry directory itself. Any
-/// lockfile living INSIDE the entry directory would be swapped along
-/// with the entry — reader processes holding the lockfile's flock
-/// keep a stale inode, and the newly installed entry has a different
-/// lockfile inode that fresh readers target instead. The two sides
-/// stop coordinating.
-///
-/// Parking the lockfile outside every entry keeps its inode stable
-/// across swaps. We pick a dedicated subdirectory rather than
-/// sibling-by-prefix (`.lock-{key}`) so the lockfile namespace is
-/// cleanly separated from the entry namespace. Cache-enumeration code
-/// ([`CacheDir::list`], [`clean_orphaned_tmp_dirs`],
-/// [`CacheDir::clean_all`]) walks first-level children looking for
-/// entries — the `.locks/` dotfile subdirectory is skipped by the
-/// dotfile filter in [`CacheDir::list`] and does not match
-/// [`TMP_DIR_PREFIX`] so it bypasses the orphan sweep too. User
-/// cache keys likewise cannot shadow lockfile paths: lockfiles are
-/// children of `.locks/` rather than first-level entries, so no
-/// [`validate_cache_key`] prefix rejection is needed.
-///
-/// The subdirectory is created lazily on first acquire and reused;
-/// `CacheDir` never removes it. Lockfiles inside persist as empty
-/// sentinels between runs — the flock itself releases on process
-/// death, but the file stays for the next acquirer to reuse.
-const LOCK_DIR_NAME: &str = ".locks";
+// Subdirectory under the cache root that holds per-entry
+// coordination lockfiles. Files inside are named
+// `{cache_key}.lock` — full path
+// `{cache_root}/.locks/{cache_key}.lock`. Sourced from
+// [`crate::flock::LOCK_DIR_NAME`] so the cache module and the
+// run-dir flock surface in [`crate::test_support::sidecar`] share
+// one source of truth — a future relocation updates one place.
+//
+// # Why a subdirectory, not a sibling next to the entry
+//
+// [`CacheDir::store`] installs new entries via
+// `renameat2(RENAME_EXCHANGE)` on the entry directory itself. Any
+// lockfile living INSIDE the entry directory would be swapped
+// along with the entry — reader processes holding the lockfile's
+// flock keep a stale inode, and the newly installed entry has a
+// different lockfile inode that fresh readers target instead. The
+// two sides stop coordinating.
+//
+// Parking the lockfile outside every entry keeps its inode stable
+// across swaps. We pick a dedicated subdirectory rather than
+// sibling-by-prefix (`.lock-{key}`) so the lockfile namespace is
+// cleanly separated from the entry namespace. Cache-enumeration
+// code ([`CacheDir::list`], [`clean_orphaned_tmp_dirs`],
+// [`CacheDir::clean_all`]) walks first-level children looking for
+// entries — the `.locks/` dotfile subdirectory is skipped by the
+// dotfile filter in [`CacheDir::list`] and does not match
+// [`TMP_DIR_PREFIX`] so it bypasses the orphan sweep too. User
+// cache keys likewise cannot shadow lockfile paths: lockfiles are
+// children of `.locks/` rather than first-level entries, so no
+// [`validate_cache_key`] prefix rejection is needed.
+//
+// The subdirectory is created lazily on first acquire and reused;
+// `CacheDir` never removes it. Lockfiles inside persist as empty
+// sentinels between runs — the flock itself releases on process
+// death, but the file stays for the next acquirer to reuse.
+use crate::flock::LOCK_DIR_NAME;
 
 // serde(default) is stripped from cache types so an old metadata.json
 // missing a required non-Option field (e.g. has_vmlinux) fails at
@@ -1084,11 +1087,13 @@ impl CacheDir {
     /// `Err` on filesystem errors or timeout.
     pub fn acquire_shared_lock(&self, cache_key: &str) -> anyhow::Result<SharedLockGuard> {
         validate_cache_key(cache_key)?;
-        let fd = acquire_flock_with_timeout(
-            self,
-            cache_key,
+        let path = self.lock_path(cache_key);
+        let fd = crate::flock::acquire_flock_with_timeout(
+            &path,
             FlockMode::Shared,
             SHARED_LOCK_DEFAULT_TIMEOUT,
+            &format!("cache entry {cache_key:?}"),
+            None,
         )?;
         Ok(SharedLockGuard { fd })
     }
@@ -1107,7 +1112,14 @@ impl CacheDir {
         timeout: std::time::Duration,
     ) -> anyhow::Result<ExclusiveLockGuard> {
         validate_cache_key(cache_key)?;
-        let fd = acquire_flock_with_timeout(self, cache_key, FlockMode::Exclusive, timeout)?;
+        let path = self.lock_path(cache_key);
+        let fd = crate::flock::acquire_flock_with_timeout(
+            &path,
+            FlockMode::Exclusive,
+            timeout,
+            &format!("cache entry {cache_key:?}"),
+            None,
+        )?;
         Ok(ExclusiveLockGuard { fd })
     }
 
@@ -1174,13 +1186,6 @@ impl CacheDir {
 /// See module-level rationale block above.
 const SHARED_LOCK_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Internal poll interval for [`acquire_flock_with_timeout`]. flock(2)
-/// has no native timed-wait variant; we emulate one by retrying the
-/// non-blocking form with a short sleep. 100ms balances responsiveness
-/// (contention clears in ≤1 poll under normal load) against CPU burn
-/// (at most 10 wakes/s per waiter).
-const FLOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// Timeout for [`CacheDir::store`]'s internal `LOCK_EX` acquire.
 /// See module-level rationale block above for the reader/writer
 /// asymmetry (10 s vs 60 s).
@@ -1211,57 +1216,6 @@ pub struct SharedLockGuard {
 pub struct ExclusiveLockGuard {
     #[allow(dead_code)]
     fd: std::os::fd::OwnedFd,
-}
-
-/// Poll-acquire an advisory flock with a wall-clock timeout.
-///
-/// `flock(2)` has no native timed-wait form — the blocking variant
-/// cannot be cancelled, so we loop on [`crate::flock::try_flock`]'s
-/// non-blocking operation with [`FLOCK_POLL_INTERVAL`] between
-/// attempts. `try_flock` folds `open(O_CLOEXEC)` + `flock(LOCK_NB)`
-/// and already drops the fd on `Ok(None)`, so stacked
-/// open-file-descriptions cannot build up across iterations.
-///
-/// Creates the `.locks/` subdirectory lazily when missing (matches
-/// [`CacheDir::store`]'s lazy-root semantics for a freshly-resolved
-/// cache path).
-///
-/// Returns `Err` on the wall-clock deadline or on unexpected flock
-/// errors. Timeout errors surface the holder PID list from
-/// `/proc/locks` via [`crate::flock::read_holders`] so operators can
-/// identify the peer holding the lock.
-fn acquire_flock_with_timeout(
-    cache: &CacheDir,
-    cache_key: &str,
-    kind: FlockMode,
-    timeout: std::time::Duration,
-) -> anyhow::Result<std::os::fd::OwnedFd> {
-    cache.ensure_lock_dir()?;
-    let path = cache.lock_path(cache_key);
-
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match crate::flock::try_flock(&path, kind)? {
-            Some(fd) => return Ok(fd),
-            None => {
-                if std::time::Instant::now() >= deadline {
-                    let holders = crate::flock::read_holders(&path).unwrap_or_default();
-                    let kind_str = match kind {
-                        FlockMode::Shared => "LOCK_SH",
-                        FlockMode::Exclusive => "LOCK_EX",
-                    };
-                    anyhow::bail!(
-                        "flock {kind_str} on cache entry {cache_key:?} timed \
-                         out after {timeout:?} (lockfile {lockfile}, \
-                         holders: {holders}).",
-                        lockfile = path.display(),
-                        holders = crate::flock::format_holder_list(&holders),
-                    );
-                }
-                std::thread::sleep(FLOCK_POLL_INTERVAL);
-            }
-        }
-    }
 }
 
 /// Scan `cache_root` for `.tmp-{key}-{pid}` directories whose `{pid}`
