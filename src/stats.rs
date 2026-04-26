@@ -2917,6 +2917,99 @@ fn render_dirty_warning(rows_a: &[GauntletRow], rows_b: &[GauntletRow]) -> Optio
 /// "duplicate pairing keys" error rather than picking one
 /// arbitrarily.
 ///
+/// Render the actionable bail message emitted when one side's filter
+/// matches zero sidecars in the pool.
+///
+/// Beyond the generic "check filters / run `cargo ktstr stats list`"
+/// redirect, this helper inspects WHY the filter matched nothing and
+/// adds two operator-actionable hints when applicable:
+///
+/// 1. **Dirty-form hint**: when the user passed
+///    `--project-commit X` (or per-side / kernel-commit equivalent)
+///    and the pool contains a row whose `commit` (or `kernel_commit`)
+///    is `X-dirty`, append "Did you mean `--project-commit X-dirty`?".
+///    A clean-vs-dirty mismatch is the single most common cause of a
+///    false-zero on the commit dims — `detect_project_commit` /
+///    `detect_kernel_commit` append `-dirty` whenever HEAD-vs-index
+///    or index-vs-worktree changes are observed, so an operator who
+///    expected `abcdef1` but the recorded value is `abcdef1-dirty`
+///    sees no rows match without realizing why.
+///
+/// 2. **list-values redirect for commit dims**: when the user
+///    populated any commit dimension (`project_commits` /
+///    `kernel_commits`), suggest `cargo ktstr stats list-values`
+///    specifically — that command emits the exact distinct values
+///    present per dimension, which is more actionable than the
+///    generic `stats list` which only shows top-level run keys.
+///
+/// `side` is `"A"` or `"B"` for diagnostic context. `filter` is the
+/// per-side `RowFilter`. `rows` is the sidecar-derived row vec
+/// (post-`sidecar_to_row` mapping, pre-filtering). `pool_len` is
+/// the raw pool count for the "(N pooled)" diagnostic context.
+fn zero_match_diagnostic(
+    side: &str,
+    filter: &RowFilter,
+    rows: &[GauntletRow],
+    pool_len: usize,
+) -> String {
+    let mut msg = format!(
+        "stats compare: {side} side filter matched 0 sidecars in \
+         pool ({pool_len} pooled). Check the per-side filters or \
+         confirm the runs exist with `cargo ktstr stats list`."
+    );
+
+    // Dirty-form hint per commit dimension. Only fires when a
+    // populated filter value's `-dirty` form is in the pool.
+    let mut dirty_hints: Vec<String> = Vec::new();
+    for want in &filter.project_commits {
+        let dirty = format!("{want}-dirty");
+        let found = rows
+            .iter()
+            .any(|r| r.commit.as_deref() == Some(dirty.as_str()));
+        if found {
+            dirty_hints.push(format!(
+                "no rows match `--project-commit {want}` but `{dirty}` exists in the pool — \
+                 did you mean `--project-commit {dirty}`?"
+            ));
+        }
+    }
+    for want in &filter.kernel_commits {
+        let dirty = format!("{want}-dirty");
+        let found = rows
+            .iter()
+            .any(|r| r.kernel_commit.as_deref() == Some(dirty.as_str()));
+        if found {
+            dirty_hints.push(format!(
+                "no rows match `--kernel-commit {want}` but `{dirty}` exists in the pool — \
+                 did you mean `--kernel-commit {dirty}`?"
+            ));
+        }
+    }
+    for hint in dirty_hints {
+        msg.push_str("\nhint: ");
+        msg.push_str(&hint);
+    }
+
+    // list-values redirect: only fires when the operator narrowed
+    // on a commit dimension. Generic case (no commit filter) keeps
+    // the existing `stats list` redirect at the top of the message
+    // — `list-values` would emit a long per-dimension dump that
+    // isn't more actionable than `stats list` for a kernel/scheduler
+    // /topology miss.
+    let touched_commit_dim =
+        !filter.project_commits.is_empty() || !filter.kernel_commits.is_empty();
+    if touched_commit_dim {
+        msg.push_str(
+            "\nhint: run `cargo ktstr stats list-values` to see every \
+             distinct commit value present in the pool — the specific \
+             value the filter expected may not have a sidecar yet, or \
+             may differ from what was recorded by \
+             `detect_project_commit` / `detect_kernel_commit`.",
+        );
+    }
+    msg
+}
+
 /// Returns 0 on no regressions, 1 if regressions detected.
 pub fn compare_partitions(
     filter_a: &RowFilter,
@@ -3007,18 +3100,14 @@ pub fn compare_partitions(
     let rows_b = apply_row_filters(&rows, filter_b);
     if rows_a.is_empty() {
         anyhow::bail!(
-            "stats compare: A side filter matched 0 sidecars in \
-             pool ({} pooled). Check the per-side filters or \
-             confirm the runs exist with `cargo ktstr stats list`.",
-            pool.len(),
+            "{}",
+            zero_match_diagnostic("A", filter_a, &rows, pool.len()),
         );
     }
     if rows_b.is_empty() {
         anyhow::bail!(
-            "stats compare: B side filter matched 0 sidecars in \
-             pool ({} pooled). Check the per-side filters or \
-             confirm the runs exist with `cargo ktstr stats list`.",
-            pool.len(),
+            "{}",
+            zero_match_diagnostic("B", filter_b, &rows, pool.len()),
         );
     }
 

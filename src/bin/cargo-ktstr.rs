@@ -924,6 +924,82 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
     use ktstr::kernel_path::KernelId;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
+    // Pre-flight collision detection on cheap-to-label specs.
+    //
+    // Versions, CacheKeys, and Git refs all yield labels through
+    // pure string manipulation (`ver.clone()`,
+    // `cache_key_to_version_label(key)`, `git_kernel_label(url,
+    // ref)`) — no I/O. We can compute and compare the sanitized
+    // forms of those labels BEFORE the parallel resolve fires
+    // any downloads, builds, or git clones. That moves the
+    // collision diagnostic from a multi-minute build cost
+    // ("downloaded 6.14.2, downloaded git+...#main, both rebuilt
+    // their kernel, NOW we tell you they collide") to a sub-
+    // millisecond pre-flight.
+    //
+    // Path and Range specs are intentionally EXCLUDED:
+    // - Path: `path_kernel_label(dir)` requires `dir` to be
+    //   canonicalized first (its hash6 component is over the
+    //   canonical path's UTF-8 bytes). Canonicalization is real
+    //   filesystem I/O — admissible at resolve time but not
+    //   here, where the goal is "fast pre-flight". Path specs
+    //   that collide still surface via the post-resolve
+    //   `detect_label_collisions` call after their canonical
+    //   labels are known.
+    // - Range: expanding a range to its per-version label set
+    //   requires a `releases.json` fetch — admissible at resolve
+    //   time but not pre-flight (and the resolve pipeline already
+    //   does it once; doing it twice is waste). Range-vs-Range
+    //   or Range-vs-Version collisions surface post-resolve.
+    //
+    // Two distinct labels that sanitize to the same nextest
+    // suffix would later route to the wrong cache entry under
+    // the dispatch-side `parse_kernel_list` map (last-write-wins
+    // because the map is keyed on the sanitized label). The
+    // post-resolve `detect_label_collisions` is the unconditional
+    // safety net; this pre-flight is purely a UX win for the
+    // common-case Version/CacheKey/Git input.
+    let mut preflight: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for raw in specs {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = KernelId::parse(trimmed);
+        // Validate inverted ranges and other malformed inputs
+        // BEFORE the network fetch the rayon resolve would
+        // otherwise run — same diagnostic timing the parallel
+        // path preserves at line ~1054.
+        if let Err(e) = id.validate() {
+            return Err(format!("--kernel {id}: {e}"));
+        }
+        let label: Option<String> = match &id {
+            KernelId::Version(v) => Some(v.clone()),
+            KernelId::CacheKey(k) => Some(cache_key_to_version_label(k).to_string()),
+            KernelId::Git { url, git_ref } => Some(git_kernel_label(url, git_ref)),
+            // Path / Range deferred to post-resolve check.
+            KernelId::Path(_) | KernelId::Range { .. } => None,
+        };
+        if let Some(label) = label {
+            let sanitized = ktstr::test_support::sanitize_kernel_label(&label);
+            if let Some(prior) = preflight.insert(sanitized.clone(), label.clone())
+                && prior != label
+            {
+                // Distinct producer-side labels that sanitize to
+                // the same nextest suffix. Bail BEFORE any
+                // download / build / clone runs.
+                return Err(format!(
+                    "--kernel: pre-flight check found collision before any \
+                     download or build started — labels {prior:?} and {label:?} \
+                     both sanitize to {sanitized:?}, which the nextest \
+                     test-name suffix cannot disambiguate. Spell each \
+                     --kernel value distinctly so its sanitized form is \
+                     unique. (Path and Range specs are checked post-resolve.)"
+                ));
+            }
+        }
+    }
+
     // Each spec resolves independently:
     //   - Path → just canonicalize on disk (no network).
     //   - Version / CacheKey → cache lookup → maybe download +
@@ -1025,6 +1101,36 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
         .build()
         .ok();
 
+    // Per-resolve progress feedback. A user passing `--kernel
+    // 6.10..6.20` (10+ versions) sees `cargo ktstr: resolved
+    // kernel "6.10"` lines as each version finishes its
+    // download+build cycle, instead of staring at silence for
+    // the multi-minute resolve. Emitted at the Ok-arm of each
+    // `resolve_one` call so failures still propagate via the
+    // existing fail-fast `collect::<Result<_, _>>?` chain
+    // upstream — only successful resolves print. Single-kernel
+    // runs emit ONE line; that's negligible noise versus the
+    // multi-kernel UX gain. Output is `eprintln!` (stderr) so
+    // it doesn't pollute stdout pipelines that consume the
+    // tool's other output (e.g. shell scripts piping through
+    // jq).
+    //
+    // `tracing::info!` would respect `RUST_LOG`, but the
+    // command spends most of its wall time in
+    // `resolve_kernel_set` and operators expect progress
+    // visibility by default — gating it behind a verbosity
+    // flag would defeat the point. Keep it as unconditional
+    // `eprintln!` matching the pattern other long-running
+    // helpers (`expand_kernel_range`, `kernel_build_pipeline`)
+    // already use.
+    let resolve_one_with_progress = |id: KernelId| -> Result<(String, PathBuf), String> {
+        let result = resolve_one(id);
+        if let Ok((label, _)) = &result {
+            eprintln!("cargo ktstr: resolved kernel {label:?}");
+        }
+        result
+    };
+
     let resolve_in_pool = || -> Result<Vec<(String, PathBuf)>, String> {
         specs
             .into_par_iter()
@@ -1061,7 +1167,7 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
                             Ok(versions) => versions
                                 .into_iter()
                                 .map(|ver| {
-                                    resolve_one(KernelId::Version(ver.clone()))
+                                    resolve_one_with_progress(KernelId::Version(ver.clone()))
                                         .map_err(|e| format!("resolve kernel {ver}: {e}"))
                                 })
                                 .collect::<Vec<_>>()
@@ -1069,7 +1175,7 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
                             Err(e) => vec![Err(format!("{e:#}"))].into_iter(),
                         }
                     }
-                    other => vec![resolve_one(other)].into_iter(),
+                    other => vec![resolve_one_with_progress(other)].into_iter(),
                 }
             })
             .collect::<Result<Vec<_>, _>>()
