@@ -273,7 +273,82 @@ impl Drop for CgroupGuard {
 }
 
 /// Acquire source, configure, build, and cache a kernel image.
+///
+/// `version` accepts `MAJOR.MINOR[.PATCH][-rcN]`, a `MAJOR.MINOR`
+/// prefix (resolves to the latest patch), or `START..END` for a
+/// range that expands against kernel.org's `releases.json` to every
+/// `stable` / `longterm` release inside the inclusive interval. A
+/// range is detected via [`KernelId::parse`] and dispatched here to
+/// [`kernel_build_one`] per resolved version, sharing the
+/// download / cache-lookup / build pipeline that single-version
+/// invocations use. Range mode collects per-version errors as a
+/// best-effort summary: a build failure on one version is reported
+/// and the iteration continues to the next, so a stale endpoint
+/// doesn't block the rest of the range from caching. `--git` and
+/// `--source` paths bypass range expansion (clap's
+/// `conflicts_with` already rejects `version + source` and
+/// `version + git` combinations).
 fn kernel_build(
+    version: Option<String>,
+    source: Option<PathBuf>,
+    git: Option<String>,
+    git_ref: Option<String>,
+    force: bool,
+    clean: bool,
+    cpu_cap: Option<usize>,
+) -> Result<()> {
+    if source.is_none()
+        && git.is_none()
+        && let Some(ref v) = version
+    {
+        use ktstr::kernel_path::KernelId;
+        let id = KernelId::parse(v);
+        // Validate before any I/O so an inverted range surfaces the
+        // "swap the endpoints" diagnostic ahead of any download.
+        id.validate()
+            .map_err(|e| anyhow::anyhow!("--kernel {id}: {e}"))?;
+        if let KernelId::Range { start, end } = id {
+            let versions = ktstr::cli::expand_kernel_range(&start, &end, "ktstr")?;
+            let total = versions.len();
+            let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
+            for (i, ver) in versions.iter().enumerate() {
+                eprintln!("ktstr: [{}/{total}] kernel build {ver}", i + 1);
+                if let Err(e) =
+                    kernel_build_one(Some(ver.clone()), None, None, None, force, clean, cpu_cap)
+                {
+                    eprintln!("ktstr: {ver}: {e:#}");
+                    failures.push((ver.clone(), e));
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "kernel build range {start}..{end}: {failed}/{total} \
+                     version(s) failed: {names}",
+                    failed = failures.len(),
+                    names = failures
+                        .iter()
+                        .map(|(v, _)| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+        } else {
+            kernel_build_one(version, source, git, git_ref, force, clean, cpu_cap)
+        }
+    } else {
+        kernel_build_one(version, source, git, git_ref, force, clean, cpu_cap)
+    }
+}
+
+/// Single-version variant of [`kernel_build`]: handles one tarball,
+/// `--source`, or `--git` invocation. Carries the `kernel_build`
+/// implementation as it stood before range dispatch was wired in;
+/// extracted into a helper so the range loop in `kernel_build` can
+/// reuse the same download + cache + build pipeline per resolved
+/// version without duplicating it.
+fn kernel_build_one(
     version: Option<String>,
     source: Option<PathBuf>,
     git: Option<String>,

@@ -165,8 +165,19 @@ enum KtstrCommand {
         /// Path to pre-built scheduler binary (alternative to --scheduler).
         #[arg(long, conflicts_with = "scheduler")]
         scheduler_bin: Option<PathBuf>,
-        #[arg(long, help = KERNEL_HELP_RAW_OK)]
-        kernel: Option<String>,
+        /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
+        /// (path / version / cache key / range / git source). When
+        /// the resolved set has 2+ entries, the verifier collects
+        /// stats per kernel sequentially and outputs per-kernel
+        /// blocks separated by a header line — there is no
+        /// cross-kernel summary table. Single-kernel runs are
+        /// unchanged. Raw image files are rejected here for the
+        /// same reason as `cargo ktstr test`/`coverage`/`llvm-cov`:
+        /// the verifier needs the cached `vmlinux` and kconfig
+        /// fragment alongside the image, which a bare `bzImage`
+        /// path does not carry.
+        #[arg(long, action = ArgAction::Append, help = KERNEL_HELP_NO_RAW)]
+        kernel: Vec<String>,
         /// Print raw verifier output without formatting.
         #[arg(long)]
         raw: bool,
@@ -1104,7 +1115,101 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
 }
 
 /// Acquire source, configure, build, and cache a kernel image.
+///
+/// `version` accepts `MAJOR.MINOR[.PATCH][-rcN]` for a single tarball,
+/// `MAJOR.MINOR` (a major.minor prefix that resolves to the latest
+/// patch in that series), or `START..END` for a range that expands
+/// against kernel.org's `releases.json` to every `stable` /
+/// `longterm` release inside the inclusive interval. A range is
+/// detected via [`KernelId::parse`] and dispatched here to
+/// [`kernel_build_one`] per resolved version, sharing the
+/// download / cache-lookup / build pipeline that single-version
+/// invocations use. Range mode collects per-version errors as a
+/// best-effort summary: a build failure on one version is reported
+/// and the iteration continues to the next, so a stale endpoint
+/// doesn't block the rest of the range from caching.
+///
+/// `--git` and `--source` paths bypass range expansion (range
+/// applies to tarball downloads only) and forward unchanged to
+/// [`kernel_build_one`].
 fn kernel_build(
+    version: Option<String>,
+    source: Option<PathBuf>,
+    git: Option<String>,
+    git_ref: Option<String>,
+    force: bool,
+    clean: bool,
+    cpu_cap: Option<usize>,
+) -> Result<(), String> {
+    // Range dispatch only applies to tarball mode. `--source` and
+    // `--git` carry their own source-of-truth that ranges don't
+    // overlap with: a path identifies one tree, a git ref names one
+    // commit. A range argument alongside either is undefined input;
+    // clap's existing `conflicts_with` already rejects
+    // `version + source` and `version + git` combinations, so the
+    // range branch only fires when neither --source nor --git is
+    // present.
+    if source.is_none()
+        && git.is_none()
+        && let Some(ref v) = version
+    {
+        use ktstr::kernel_path::KernelId;
+        let id = KernelId::parse(v);
+        // Validate before any I/O: an inverted range surfaces the
+        // "swap the endpoints" diagnostic ahead of any download.
+        id.validate().map_err(|e| format!("--kernel {id}: {e}"))?;
+        if let KernelId::Range { start, end } = id {
+            let versions = ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr")
+                .map_err(|e| format!("{e:#}"))?;
+            let total = versions.len();
+            let mut failures: Vec<(String, String)> = Vec::new();
+            for (i, ver) in versions.iter().enumerate() {
+                eprintln!("cargo ktstr: [{}/{total}] kernel build {ver}", i + 1);
+                if let Err(e) =
+                    kernel_build_one(Some(ver.clone()), None, None, None, force, clean, cpu_cap)
+                {
+                    eprintln!("cargo ktstr: {ver}: {e}");
+                    failures.push((ver.clone(), e));
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                // Surface the failure summary on the way out so an
+                // automated invocation can scrape one log line per
+                // failing version. Continue-on-error is the right
+                // default for ranges (a stale endpoint shouldn't
+                // gate the rest of the build cohort), but a
+                // non-zero exit still flags the cohort as
+                // partial.
+                Err(format!(
+                    "kernel build range {start}..{end}: {failed}/{total} \
+                     version(s) failed: {names}",
+                    start = start,
+                    end = end,
+                    failed = failures.len(),
+                    names = failures
+                        .iter()
+                        .map(|(v, _)| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ))
+            }
+        } else {
+            kernel_build_one(version, source, git, git_ref, force, clean, cpu_cap)
+        }
+    } else {
+        kernel_build_one(version, source, git, git_ref, force, clean, cpu_cap)
+    }
+}
+
+/// Single-version variant of [`kernel_build`]: handles one tarball,
+/// `--source`, or `--git` invocation. Carries the `kernel_build`
+/// implementation as it stood before range dispatch was wired in;
+/// extracted into a helper so the range loop in `kernel_build` can
+/// reuse the same download + cache + build pipeline per resolved
+/// version without duplicating it.
+fn kernel_build_one(
     version: Option<String>,
     source: Option<PathBuf>,
     git: Option<String>,
@@ -1382,7 +1487,7 @@ fn profile_sched_args(
 fn run_verifier(
     scheduler: Option<String>,
     scheduler_bin: Option<PathBuf>,
-    kernel: Option<String>,
+    kernel: Vec<String>,
     raw: bool,
     all_profiles: bool,
     profiles_filter: Vec<String>,
@@ -1407,29 +1512,83 @@ fn run_verifier(
         (Some(_), Some(_)) => unreachable!(),
     };
 
-    let kernel_path = resolve_kernel_image(kernel.as_deref())?;
+    // Resolve --kernel into a flat (label, kernel_dir) list. Empty
+    // input falls through to the single-kernel auto-discovery path
+    // below (`resolve_kernel_image(None)` → `find_kernel`'s
+    // fallback chain), preserving the no-flag behaviour. A
+    // single-entry list is treated identically to the historical
+    // single-kernel path: one verifier run, no kernel-prefixed
+    // output. Two or more entries (multiple `--kernel` flags, OR
+    // a single `--kernel` Range that expanded to multiple
+    // releases) iterate sequentially with per-kernel header lines.
+    let kernel_paths: Vec<(String, PathBuf)> = if kernel.is_empty() {
+        // Auto-discovery: route through `resolve_kernel_image(None)`
+        // so the existing `find_kernel` cascade applies, then label
+        // the result `"auto"` for diagnostic visibility on the rare
+        // path where the user neither passed `--kernel` nor exported
+        // `KTSTR_KERNEL`.
+        let path = resolve_kernel_image(None)?;
+        vec![("auto".to_string(), path)]
+    } else {
+        // Multi-kernel resolution shares its plumbing with the test
+        // path (`run_cargo_sub`'s `resolve_kernel_set` call),
+        // including Range expansion and Git fetch. Each resolved
+        // entry is a built / cached kernel directory; convert it to
+        // a bootable image via `find_image_in_dir` since the
+        // verifier collects stats from a loaded image rather than
+        // a directory.
+        let resolved = resolve_kernel_set(&kernel)?;
+        if resolved.is_empty() {
+            return Err(
+                "--kernel: every supplied value parsed to empty / whitespace; \
+                 omit the flag for auto-discovery, or supply a kernel \
+                 identifier"
+                    .to_string(),
+            );
+        }
+        let mut out: Vec<(String, PathBuf)> = Vec::with_capacity(resolved.len());
+        for (label, dir) in resolved {
+            let image = ktstr::kernel_path::find_image_in_dir(&dir).ok_or_else(|| {
+                format!(
+                    "no kernel image found in {} (resolved from --kernel {label})",
+                    dir.display()
+                )
+            })?;
+            out.push((label, image));
+        }
+        out
+    };
 
     // Build the ktstr init binary.
     let ktstr_bin =
         ktstr::build_and_find_binary("ktstr").map_err(|e| format!("build ktstr: {e:#}"))?;
 
-    if all_profiles || !profiles_filter.is_empty() {
-        return run_verifier_all_profiles(
-            &sched_bin,
-            &ktstr_bin,
-            &kernel_path,
-            raw,
-            &profiles_filter,
-        );
+    let multi_kernel = kernel_paths.len() > 1;
+    for (i, (label, kernel_path)) in kernel_paths.iter().enumerate() {
+        if multi_kernel {
+            eprintln!(
+                "cargo ktstr: [kernel {}/{}] {label}",
+                i + 1,
+                kernel_paths.len(),
+            );
+            // Header on stdout so a redirected `>` capture
+            // separates kernels even when stderr isn't pulled.
+            println!("\n=== kernel: {label} ===");
+        }
+
+        if all_profiles || !profiles_filter.is_empty() {
+            run_verifier_all_profiles(&sched_bin, &ktstr_bin, kernel_path, raw, &profiles_filter)?;
+            continue;
+        }
+
+        eprintln!("cargo ktstr: collecting verifier stats");
+        let result =
+            ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, kernel_path, &[])
+                .map_err(|e| format!("collect verifier output: {e:#}"))?;
+
+        let output = ktstr::verifier::format_verifier_output("verifier", &result, raw);
+        print!("{output}");
     }
-
-    eprintln!("cargo ktstr: collecting verifier stats");
-    let result =
-        ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel_path, &[])
-            .map_err(|e| format!("collect verifier output: {e:#}"))?;
-
-    let output = ktstr::verifier::format_verifier_output("verifier", &result, raw);
-    print!("{output}");
 
     Ok(())
 }
