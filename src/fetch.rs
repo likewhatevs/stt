@@ -22,9 +22,7 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 
 /// Return the process-wide shared [`reqwest::blocking::Client`]. First
 /// call constructs it with `reqwest::blocking::Client::new()`; every
-/// subsequent call returns a reference to the same instance. Call sites
-/// that need fault-injection seams (httpmock-style tests) should
-/// construct a local `Client` directly and pass it to `fetch_*`; this
+/// subsequent call returns a reference to the same instance. This
 /// helper is for top-level CLI entries that want the default client.
 ///
 /// Tests that need to verify a network round-trip (rather than a
@@ -33,9 +31,14 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 /// [`fetch_latest_stable_version`], [`fetch_version_for_prefix`]) —
 /// [`RELEASES_CACHE`] may already be populated by a peer test, in
 /// which case the helper returns cached data and the network is
-/// never touched. Construct a local `Client` instead; the
-/// pointer-equality gate in [`cached_releases_with`] routes it to
-/// the bypass branch.
+/// never touched. Construct a local `Client` and pass it to the
+/// cache-routed helper to skip the cache; the pointer-equality gate
+/// in [`cached_releases_with`] routes a non-singleton client to a
+/// direct [`fetch_releases`] call against [`RELEASES_URL`] (the
+/// production URL — the bypass skips the cache, NOT the URL). For
+/// full URL injection (e.g. localhost mock server testing), call
+/// [`fetch_releases`] directly with the mock URL — see
+/// `fetch_releases_against_localhost_mock_returns_parsed`.
 ///
 /// # Panics
 ///
@@ -118,16 +121,19 @@ fn is_shared_client(client: &Client) -> bool {
 /// Unified cache-aware entry point for `releases.json`. Routes
 /// the process-wide [`shared_client`] singleton through
 /// [`RELEASES_CACHE`]; any other (test-constructed) `Client`
-/// falls through to a direct [`fetch_releases`] call against
-/// whatever endpoint that `Client` is configured for (e.g. an
-/// httpmock-style local mock).
+/// bypasses [`RELEASES_CACHE`] and calls [`fetch_releases`] with
+/// [`RELEASES_URL`] directly — the cache is skipped but the
+/// production URL is used. Tests that need URL injection
+/// (e.g. localhost mock server testing) should call
+/// [`fetch_releases`] directly with their mock URL rather than
+/// route through this helper.
 ///
 /// Used by every in-file caller that already threads a `&Client`
 /// — [`fetch_latest_stable_version`], [`fetch_version_for_prefix`],
 /// [`latest_in_series`] — so production callers reuse
-/// [`RELEASES_CACHE`] and tests still get fault-injection via
-/// the pointer-equality gate. [`cached_releases`] is the
-/// no-`Client` wrapper for top-level CLI entries.
+/// [`RELEASES_CACHE`] and tests still get cache-bypass via the
+/// pointer-equality gate. [`cached_releases`] is the no-`Client`
+/// wrapper for top-level CLI entries.
 ///
 /// Failures are propagated without populating [`RELEASES_CACHE`],
 /// so a transient kernel.org outage on the first call lets the
@@ -148,12 +154,12 @@ fn is_shared_client(client: &Client) -> bool {
 fn cached_releases_with(client: &Client) -> Result<Vec<Release>> {
     // Non-singleton clients bypass the cache (test fault injection).
     if !is_shared_client(client) {
-        return fetch_releases(client);
+        return fetch_releases(client, RELEASES_URL);
     }
     if let Some(cached) = RELEASES_CACHE.get() {
         return Ok(cached.clone());
     }
-    let fresh = fetch_releases(client)?;
+    let fresh = fetch_releases(client, RELEASES_URL)?;
     // Race-loss: `set` returns `Err(clone)` carrying back the
     // clone we passed in; we discard it and return the original
     // `fresh` below. See the rustdoc above for full semantics.
@@ -477,20 +483,23 @@ fn patch_level(version: &str) -> Option<u32> {
     }
 }
 
-/// Fetch releases.json from kernel.org and return a vector of
+/// Production URL for `releases.json`. Tests call [`fetch_releases`] directly with a localhost mock URL.
+pub(crate) const RELEASES_URL: &str = "https://www.kernel.org/releases.json";
+
+/// Fetch `releases.json` from `url` and return a vector of
 /// [`Release`] records. Issues an HTTP GET unconditionally — no
 /// cache consultation.
 ///
 /// Production callers reach this function via
-/// [`cached_releases_with`] (or [`cached_releases`]); the cache
-/// helper only invokes `fetch_releases` on a cache miss for the
-/// singleton path or on the bypass branch for non-singleton
-/// clients. Tests that need to exercise the underlying GET
-/// directly — without the cache layer — call this function with
-/// a locally-constructed `Client` (e.g. pointed at an httpmock-
-/// style local mock server).
-pub(crate) fn fetch_releases(client: &Client) -> Result<Vec<Release>> {
-    let url = "https://www.kernel.org/releases.json";
+/// [`cached_releases_with`] (or [`cached_releases`]) which pass
+/// [`RELEASES_URL`]; the cache helper only invokes
+/// `fetch_releases` on a cache miss for the singleton path or on
+/// the bypass branch for non-singleton clients. Tests that need
+/// to exercise the underlying GET directly — without the cache
+/// layer — call this function with a locally-constructed `Client`
+/// and a localhost URL pointed at a TcpListener-backed mock that
+/// returns canned `releases.json` content.
+pub(crate) fn fetch_releases(client: &Client, url: &str) -> Result<Vec<Release>> {
     let response = client
         .get(url)
         .send()
@@ -1283,9 +1292,16 @@ mod tests {
     ///     [`cached_releases_with`] and selects from the
     ///     synthetic data without touching the network.
     ///
-    /// (d) **Bypass-branch routing**: a non-singleton local
-    ///     [`Client`] passed to [`cached_releases_with`] does
-    ///     NOT consult [`RELEASES_CACHE`] even when populated.
+    /// Bypass-branch routing (`is_shared_client` returning
+    /// `false`) is covered by
+    /// [`is_shared_client_rejects_test_constructed_clients`];
+    /// [`fetch_releases`]'s GET-and-parse mechanics — the same
+    /// function the bypass branch invokes (with [`RELEASES_URL`])
+    /// and that production callers reach on cache miss — are
+    /// covered deterministically by
+    /// [`fetch_releases_against_localhost_mock_returns_parsed`]
+    /// against a TcpListener mock with an injected URL. Neither
+    /// requires a real kernel.org round-trip.
     ///
     /// Cross-test contamination: this test populates the
     /// process-wide [`RELEASES_CACHE`] AND initializes the
@@ -1309,7 +1325,7 @@ mod tests {
     /// [`shared_client`] must run in a separate binary or
     /// accept the synthetic-data side effect.
     #[test]
-    fn cached_releases_routing_singleton_and_bypass() {
+    fn cached_releases_routing_singleton_path() {
         let synthetic = vec![
             Release {
                 moniker: "stable".to_string(),
@@ -1413,37 +1429,128 @@ mod tests {
              stable/longterm entry with patch >= 8 from cached \
              synthetic data; got {latest:?}",
         );
+    }
 
-        // Bypass branch through `cached_releases_with` with a
-        // non-singleton `Client`: the cache must NOT be consulted
-        // even though it is populated above. The 1ms connect
-        // timeout fires before any TCP handshake to kernel.org
-        // can complete on essentially any real network, producing
-        // an `Err`. If a fast-enough route somehow returns Ok,
-        // the response cannot be the synthetic data — proving
-        // routing took the bypass branch either way.
+    /// Spawn a one-shot HTTP/1.1 mock that listens on
+    /// `127.0.0.1:0` (OS-assigned ephemeral port), accepts a
+    /// single connection, reads the request bytes (one read of
+    /// up to 4096 bytes — sufficient for a localhost GET), and
+    /// writes a canned 200 OK response carrying `body`.
+    ///
+    /// Returns `(url, JoinHandle)`: the URL the test passes to
+    /// [`fetch_releases`], and the accept thread's
+    /// `JoinHandle<()>`. The caller MUST join the handle after
+    /// asserting on the parsed response — otherwise an
+    /// `expect`-panic inside the spawned thread (e.g. accept
+    /// returns Err) is silently swallowed by the default thread
+    /// panic policy and the test passes despite the mock having
+    /// crashed. Joining surfaces the inner panic as an outer
+    /// test failure with the original message intact.
+    ///
+    /// Plain HTTP (no TLS) — reqwest's blocking `Client` is fine
+    /// with `http://` URLs and skips its TLS stack entirely.
+    fn spawn_one_shot_releases_mock(body: &str) -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost mock listener");
+        let addr = listener.local_addr().expect("read mock addr");
+        let body = body.to_string();
+        let handle = std::thread::spawn(move || {
+            // accept blocks until the test's `fetch_releases`
+            // call connects. Once we accept, read the request
+            // bytes and write the canned response.
+            let (mut stream, _peer) = listener.accept().expect("accept");
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            // Single read — reqwest's GET is small enough to fit
+            // in one read on localhost. If reqwest's request
+            // somehow split across multiple reads (would not
+            // happen for a default localhost GET), we still
+            // proceed to write the canned response after the
+            // partial read; reqwest would observe ECONNRESET or
+            // a truncated exchange and the failure surfaces as a
+            // test assertion failure on the parent's
+            // `fetch_releases` Result, not a hang. We deliberately
+            // ignore the read result: an Err here is treated
+            // identically to Ok — the response goes out either way.
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body,
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write mock response");
+            stream.flush().expect("flush mock response");
+            // Drop closes the socket; Content-Length above
+            // already framed the body for the client, so the
+            // close signals end-of-connection rather than
+            // end-of-body.
+        });
+        (format!("http://{addr}/releases.json"), handle)
+    }
+
+    /// [`fetch_releases`] issues a real HTTP GET against the
+    /// `url` it's handed, parses the response body as
+    /// `releases.json`, and returns the structured
+    /// `Vec<Release>`. Replaces the prior 1ms-connect-timeout
+    /// bypass-arm assertion that required a real kernel.org
+    /// reach with a deterministic localhost TcpListener mock —
+    /// no real network, no flake on slow connect, exit shape
+    /// pinned to "Ok with synthetic data".
+    ///
+    /// Covers [`fetch_releases`]'s GET-and-parse mechanics — the
+    /// same function [`cached_releases_with`]'s bypass branch
+    /// invokes (with [`RELEASES_URL`]), and the same function
+    /// production callers reach on cache miss. The bypass branch
+    /// itself uses the production URL, not a mock URL; that
+    /// routing decision is verified separately by
+    /// [`is_shared_client_rejects_test_constructed_clients`].
+    #[test]
+    fn fetch_releases_against_localhost_mock_returns_parsed() {
+        // Synthetic releases.json shape — distinct from the
+        // catalog used by `cached_releases_routing_singleton_path`
+        // so a regression that mis-routed to the cache (vs the
+        // mock) would surface as a value mismatch, not a length
+        // collision.
+        let mock_body = r#"{
+            "releases": [
+                { "moniker": "stable",   "version": "9.99.99" },
+                { "moniker": "longterm", "version": "9.98.50" }
+            ]
+        }"#;
+        let (url, handle) = spawn_one_shot_releases_mock(mock_body);
+        // 5s timeout: a hung mock surfaces as a reqwest timeout
+        // error (visible Result::Err) rather than an indefinite
+        // hang waiting for nextest's slow-test cutoff. Default
+        // reqwest blocking::Client has no timeout.
         let local = reqwest::blocking::Client::builder()
-            .connect_timeout(std::time::Duration::from_millis(1))
+            .timeout(std::time::Duration::from_secs(5))
             .build()
-            .expect("build local Client");
-        let bypass_result = super::cached_releases_with(&local);
-        match bypass_result {
-            Err(_) => {
-                // Expected: 1ms timeout fires before the real
-                // network can answer. Bypass branch correctly
-                // delegated to fetch_releases(&local).
-            }
-            Ok(real) => {
-                assert!(
-                    real.len() != synthetic.len()
-                        || real.iter().zip(synthetic.iter()).any(|(got, want)| {
-                            got.version != want.version || got.moniker != want.moniker
-                        },),
-                    "bypass branch returned the synthetic cache contents — \
-                     cache routing leaked across the pointer-equality gate",
-                );
-            }
-        }
+            .expect("build test client");
+        let releases = super::fetch_releases(&local, &url)
+            .expect("fetch_releases must succeed against localhost mock");
+        assert_eq!(
+            releases.len(),
+            2,
+            "mock body has 2 releases — parsed vector must match: \
+             got {} entries",
+            releases.len(),
+        );
+        assert_eq!(releases[0].moniker, "stable");
+        assert_eq!(releases[0].version, "9.99.99");
+        assert_eq!(releases[1].moniker, "longterm");
+        assert_eq!(releases[1].version, "9.98.50");
+        // Join the mock thread so an `expect`-panic inside it
+        // (e.g. accept failed, write_all failed) propagates as
+        // an outer test failure with the original panic message
+        // intact. Without this, a thread-side panic is silently
+        // swallowed by the default thread panic policy.
+        handle.join().expect("mock thread must not panic");
     }
 
     // -- is_shared_client --
@@ -1480,10 +1587,11 @@ mod tests {
     /// `reqwest::blocking::Client::new()` call lives at a
     /// different address from the singleton, so the predicate
     /// returns `false`. This is the bypass branch of
-    /// [`cached_releases_with`] — fault-injection tests that
-    /// build their own `Client` (e.g. for httpmock-style
-    /// scenarios) MUST land here, otherwise their mock would be
-    /// ignored in favor of the cache.
+    /// [`cached_releases_with`] — tests that build their own
+    /// `Client` and route through the cache helper land here,
+    /// skipping [`RELEASES_CACHE`] (the request still goes to
+    /// [`RELEASES_URL`] — URL injection requires calling
+    /// [`fetch_releases`] directly).
     #[test]
     fn is_shared_client_rejects_test_constructed_clients() {
         // Force singleton construction before building local
@@ -1535,6 +1643,137 @@ mod tests {
              the singleton — the address differs even though the \
              inner connection-pool Arc is shared. Always pass \
              shared_client() directly when cache routing is desired.",
+        );
+    }
+
+    /// Subprocess helper for the `None`-branch test below. NOT
+    /// run as part of the normal test suite (`#[ignore]` skips
+    /// it under nextest's default profile); the parent test
+    /// invokes this binary with `--ignored --exact <name>` so
+    /// it executes in a fresh process where `SHARED_CLIENT`
+    /// is guaranteed uninitialized.
+    ///
+    /// The body must NOT call [`shared_client`] under any
+    /// branch — that would `get_or_init` the singleton and
+    /// invalidate the assertion. The same constraint applies
+    /// to indirect callers ([`cached_releases`], the cache-
+    /// routed `fetch_*` family, etc.). Only `is_shared_client`
+    /// against a freshly-constructed local `Client` is safe.
+    ///
+    /// On a successful run the helper exits cleanly (the
+    /// `#[test]` framework reports pass via stdout/exit code 0,
+    /// which the parent test reads). On any panic, exit code
+    /// is non-zero and the parent's `assert!` surfaces the
+    /// failure.
+    #[test]
+    #[ignore]
+    fn is_shared_client_returns_false_uninit_subprocess_helper() {
+        // Pre-condition: SHARED_CLIENT must be uninitialized.
+        // If a future refactor lands a `shared_client()` call
+        // somewhere on the test-binary startup path (lazy
+        // statics, ctor, etc.), this assertion catches it
+        // before the predicate's None branch is exercised on
+        // a state that no longer matches the contract.
+        assert!(
+            super::SHARED_CLIENT.get().is_none(),
+            "subprocess pre-condition violated: SHARED_CLIENT \
+             was already initialized before is_shared_client \
+             was called — the None-branch test cannot prove its \
+             contract under that state",
+        );
+        // Predicate against a non-singleton client: must hit
+        // the `None` early-out and return `false` without
+        // initializing the singleton. This is the optimization
+        // #111 added.
+        let local = reqwest::blocking::Client::new();
+        assert!(
+            !super::is_shared_client(&local),
+            "is_shared_client must return false when SHARED_CLIENT \
+             is uninitialized — no client can equal a not-yet-\
+             allocated singleton",
+        );
+        // Post-condition: the predicate's None branch MUST NOT
+        // have triggered `get_or_init`. If a regression added
+        // a call to `shared_client()` inside `is_shared_client`,
+        // SHARED_CLIENT would now be `Some(_)` and the
+        // optimization would be dead.
+        assert!(
+            super::SHARED_CLIENT.get().is_none(),
+            "is_shared_client's None branch must NOT initialize \
+             SHARED_CLIENT — the optimization in #111 relies on \
+             skipping `get_or_init` when no shared client has \
+             been requested yet",
+        );
+    }
+
+    /// Spawn the helper above as a subprocess (fresh process,
+    /// fresh `SHARED_CLIENT` static) and assert it exits
+    /// cleanly. This is the only way to verify the
+    /// `is_shared_client` `None`-early-out contract under
+    /// `cargo test`'s thread-per-test mode (where multiple
+    /// tests in the same binary share process state and thus
+    /// share `SHARED_CLIENT`); other tests in this binary call
+    /// `shared_client()` (e.g.
+    /// `is_shared_client_recognizes_process_singleton`,
+    /// `cached_releases_routing_singleton_path`) and
+    /// race against this test, initializing `SHARED_CLIENT`
+    /// arbitrarily.
+    ///
+    /// `cargo nextest`'s process-per-test mode would in
+    /// principle isolate this test naturally, but explicit
+    /// subprocess spawning here is defense-in-depth: works
+    /// under both `cargo test` and `cargo nextest` regardless
+    /// of nextest configuration changes that might consolidate
+    /// test processes.
+    ///
+    /// `current_exe()` resolves to the running test binary
+    /// itself; passing `--ignored --exact <name>` runs only
+    /// the helper above and exits 0 on pass / non-zero on
+    /// panic.
+    #[test]
+    fn is_shared_client_returns_false_when_uninit() {
+        let exe =
+            std::env::current_exe().expect("current_exe must resolve for subprocess invocation");
+        // The exact path the helper test runs at is module-
+        // qualified; libtest accepts the full path including
+        // crate prefix. `--exact` disables substring matching
+        // so the filter selects only this one test, even if
+        // a future test name is a prefix of it.
+        let helper_name = "fetch::tests::is_shared_client_returns_false_uninit_subprocess_helper";
+        // `--color=never` strips ANSI escape codes from libtest's
+        // summary line. Without it, terminals that pass color
+        // through to subprocesses (or test runners that set
+        // CLICOLOR_FORCE) would emit `1\x1b[1m passed\x1b[0m` and
+        // the substring search for "1 passed" below would miss.
+        let output = std::process::Command::new(&exe)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("--color=never")
+            .arg(helper_name)
+            .output()
+            .expect("spawn subprocess helper");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "subprocess helper failed (exit status {}): \n\
+             stdout: {}\n\
+             stderr: {}",
+            output.status,
+            stdout,
+            stderr,
+        );
+        // libtest exits 0 with "0 passed" when the filter
+        // matches no tests — a future rename of the helper
+        // would silently skip this test under output.status
+        // alone. Pin "1 passed" so a rename surfaces as a
+        // failure, not a silent green.
+        assert!(
+            stdout.contains("1 passed"),
+            "subprocess must run exactly 1 test (helper rename or \
+             missing #[ignore] attribute would surface here): \n\
+             stdout: {stdout}\n\
+             stderr: {stderr}",
         );
     }
 
