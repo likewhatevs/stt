@@ -11,9 +11,13 @@
 //! the helpers it uses to convert a UNIX-epoch day count into
 //! `(year, month, day)` without pulling in `chrono`.
 //! [`run_id_timestamp`] returns a compact `YYYYMMDDTHHMMSSZ` stamp
-//! captured once per process in a `OnceLock` so every sidecar and
-//! every run-directory name written from one `cargo ktstr test`
-//! invocation share a stable key. [`generate_run_id`] composes
+//! captured once per process in a `OnceLock` so every sidecar's
+//! `run_id` written from one `cargo ktstr test` invocation shares
+//! a stable timestamp prefix. The run-directory name itself does
+//! NOT use this stamp — `sidecar_dir` keys runs on
+//! `{kernel}-{commit}` so two runs at the same project commit
+//! reuse one directory rather than scattering across timestamped
+//! subdirectories. [`generate_run_id`] composes
 //! `{run_id_timestamp}-{counter}`; the counter is a process-local
 //! atomic so concurrent gauntlet variants can't collide on the same
 //! run-ID value.
@@ -79,23 +83,25 @@ pub(crate) fn is_leap(y: u64) -> bool {
 /// Compact process-start UTC timestamp in `YYYYMMDDTHHMMSSZ` form.
 ///
 /// Captured once per process via a `OnceLock` so every sidecar
-/// written from one `cargo ktstr test` invocation — and the
-/// enclosing run directory name — share a single stable key. The
-/// compact form (no dashes, no colons) keeps the string safe for
-/// use as a filename/directory segment on every target filesystem
-/// and sorts lexicographically in chronological order.
+/// written from one `cargo ktstr test` invocation shares a single
+/// stable timestamp. The compact form (no dashes, no colons) keeps
+/// the string safe for use as a filename segment on every target
+/// filesystem and sorts lexicographically in chronological order.
 ///
-/// Two consumers today:
-/// - [`crate::test_support::sidecar_dir`] uses it as the second
-///   segment of the run directory name (`{kernel}-{timestamp}`).
+/// One consumer today:
 /// - [`generate_run_id`] prepends it to a monotonic counter so
 ///   every sidecar's `run_id` field carries the same
 ///   per-invocation prefix.
 ///
+/// The run directory name itself does NOT embed this timestamp —
+/// [`crate::test_support::sidecar_dir`] keys runs on
+/// `{kernel}-{commit}` instead, so two runs of the same kernel
+/// at the same project commit reuse the same directory rather
+/// than scattering across timestamped subdirectories.
+///
 /// A regression that re-sampled the clock on every call would
-/// break both consumers: sidecars written mid-run would scatter
-/// across multiple dirs, and `run_id`s within one run would no
-/// longer share a stable prefix. The `OnceLock` pin is the
+/// break the `run_id` consumer: identifiers within one run would
+/// no longer share a stable prefix. The `OnceLock` pin is the
 /// single-sample guarantee.
 pub(crate) fn run_id_timestamp() -> &'static str {
     use std::sync::OnceLock;
@@ -192,9 +198,12 @@ mod tests {
     /// `run_id_timestamp` is the `YYYYMMDDTHHMMSSZ` compact form:
     /// 16 ASCII chars, no `-` / `:`, trailing `Z`. Pin the shape so
     /// a regression that switched back to the extended form
-    /// (`YYYY-MM-DDTHH:MM:SSZ`) — which contains filesystem-hostile
-    /// `:` — would surface here rather than as a directory-creation
-    /// failure at run time.
+    /// (`YYYY-MM-DDTHH:MM:SSZ`) — which contains parser-hostile
+    /// `:` and `-` separators — would surface here rather than as
+    /// a downstream `run_id`-parsing failure (the stamp feeds
+    /// `generate_run_id`, whose output downstream tooling tokenizes
+    /// on the `-{counter}` boundary; an extended form with embedded
+    /// `-` would shatter that tokenization).
     #[test]
     fn run_id_timestamp_compact_form() {
         let stamp = run_id_timestamp();
@@ -222,8 +231,9 @@ mod tests {
     /// `run_id_timestamp` is a `OnceLock`-backed process-local
     /// value — every call within a single process returns the
     /// same string. A regression that re-sampled the clock would
-    /// cause sidecars written mid-run to scatter across multiple
-    /// directories.
+    /// cause `run_id`s within one run to no longer share a stable
+    /// prefix, breaking the per-invocation grouping consumers rely
+    /// on.
     #[test]
     fn run_id_timestamp_is_stable_across_calls() {
         let a = run_id_timestamp();

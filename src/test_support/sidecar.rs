@@ -25,7 +25,10 @@
 //!   disk; variant-hash the discriminating fields so gauntlet variants
 //!   don't clobber each other.
 //! - [`sidecar_dir`], [`runs_root`], [`newest_run_dir`]: resolve where
-//!   sidecars live (env override, or `{target}/ktstr/{kernel}-{git}`).
+//!   sidecars live (env override, or
+//!   `{target}/ktstr/{kernel}-{commit}` where `{commit}` is the
+//!   project tree's HEAD short hex from [`detect_project_commit`],
+//!   suffixed `-dirty` when the worktree differs).
 //! - [`format_verifier_stats`], [`format_callback_profile`],
 //!   [`format_kvm_stats`]: human-readable summaries from a
 //!   `Vec<SidecarResult>` for CLI output.
@@ -56,7 +59,7 @@ use crate::timeline::StimulusEvent;
 use crate::vmm;
 
 use super::entry::KtstrTestEntry;
-use super::timefmt::{generate_run_id, now_iso8601, run_id_timestamp};
+use super::timefmt::{generate_run_id, now_iso8601};
 
 /// Test result sidecar written to KTSTR_SIDECAR_DIR for post-run analysis.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -241,9 +244,16 @@ pub struct SidecarResult {
     pub kernel_commit: Option<String>,
     /// ISO 8601 timestamp of when this test run started.
     pub timestamp: String,
-    /// Unique identifier for the test run. Derived from the repo commit
-    /// hash and a monotonic counter to distinguish runs within the same
-    /// build.
+    /// Unique identifier for the test run. Composed as
+    /// `{run_id_timestamp}-{counter}` — the `YYYYMMDDTHHMMSSZ`
+    /// process-start stamp followed by a process-local monotonic
+    /// counter. Every sidecar produced in one `cargo ktstr test`
+    /// invocation shares the same timestamp prefix; the counter
+    /// distinguishes concurrent gauntlet variants within that
+    /// invocation. Distinct from the run DIRECTORY name (keyed
+    /// `{kernel}-{commit}`, see [`sidecar_dir`]) — the directory
+    /// groups runs by what they tested, the `run_id` groups
+    /// sidecars by which process emitted them.
     pub run_id: String,
     /// Host context — static-ish runtime state (CPU model,
     /// memory size, THP policy, kernel release, host cmdline,
@@ -668,10 +678,12 @@ pub(crate) fn collect_sidecars_with_errors(
 /// Pool every sidecar JSON under every run directory at `root`.
 ///
 /// Walks each immediate subdirectory of `root` (one per run, named
-/// `{kernel}-{timestamp}` by [`sidecar_dir`]) and concatenates the
-/// sidecars each one yields via [`collect_sidecars`]. The result is
-/// a flat `Vec<SidecarResult>` covering every recorded run on disk
-/// — `cargo ktstr stats compare`'s pool-driven sourcing reads it
+/// `{kernel}-{commit}` by [`sidecar_dir`] where `{commit}` is the
+/// project tree's HEAD short hex with `-dirty` suffix when the
+/// worktree differs from HEAD) and concatenates the sidecars each
+/// one yields via [`collect_sidecars`]. The result is a flat
+/// `Vec<SidecarResult>` covering every recorded run on disk —
+/// `cargo ktstr stats compare`'s pool-driven sourcing reads it
 /// once, applies the typed `--a-*` / `--b-*` filters in memory,
 /// and partitions the survivors into A/B sides.
 ///
@@ -691,7 +703,7 @@ pub(crate) fn collect_sidecars_with_errors(
 /// for the current operator workflow (one comparison per
 /// session) but is taskifyable if it becomes a hot path — a
 /// directory-name fast-path could skip runs whose
-/// `{kernel}-{timestamp}` prefix does not match the active
+/// `{kernel}-{commit}` prefix does not match the active
 /// `--a-kernel` / `--b-kernel` filter.
 pub fn collect_pool(root: &std::path::Path) -> Vec<SidecarResult> {
     let entries = match std::fs::read_dir(root) {
@@ -898,24 +910,61 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 
 /// Resolve the sidecar output directory for the current test process.
 ///
-/// Override: `KTSTR_SIDECAR_DIR` (used as-is when non-empty).
-/// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{timestamp}/`,
+/// Override: `KTSTR_SIDECAR_DIR` (used as-is when non-empty). When
+/// the override is set, `serialize_and_write_sidecar` ALSO skips
+/// the per-directory pre-clear so any pre-existing sidecars in
+/// the operator-chosen directory are preserved verbatim — see
+/// [`sidecar_dir_is_overridden`].
+///
+/// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/`,
 /// where `{kernel}` is the version detected from `KTSTR_KERNEL`'s
 /// metadata (or `"unknown"` when no kernel is set / detection fails)
-/// and `{timestamp}` is the compact `YYYYMMDDTHHMMSSZ` stamp captured
-/// once per process by [`run_id_timestamp`]. Every sidecar written
-/// from the same `cargo ktstr test` invocation lands in the same
-/// directory; successive invocations get distinct directories so the
-/// "runs ARE baselines" archival model retains all runs even when
-/// the same kernel is re-tested.
+/// and `{commit}` is the project-tree HEAD short hex from
+/// [`detect_project_commit`] (with `-dirty` suffix when the worktree
+/// differs from HEAD), or `"unknown"` when the test process is not
+/// running inside a git repository or the probe fails. Every sidecar
+/// written from the same `cargo ktstr test` invocation lands in the
+/// same directory; two runs sharing the same kernel + project commit
+/// (e.g. re-running the same suite without committing changes) reuse
+/// the same directory, with the second run pre-clearing any
+/// `*.ktstr.json` files left by the first via
+/// [`pre_clear_run_dir_once`] — the directory is a last-writer-wins
+/// snapshot keyed on (kernel, project commit), not an append-only
+/// archive of every invocation.
 pub(crate) fn sidecar_dir() -> PathBuf {
     if let Ok(d) = std::env::var("KTSTR_SIDECAR_DIR")
         && !d.is_empty()
     {
         return PathBuf::from(d);
     }
-    let kernel = detect_kernel_version().unwrap_or_else(|| "unknown".to_string());
-    runs_root().join(format!("{kernel}-{}", run_id_timestamp()))
+    let kernel = detect_kernel_version();
+    let commit = detect_project_commit();
+    runs_root().join(format_run_dirname(kernel.as_deref(), commit.as_deref()))
+}
+
+/// Build the run-directory leaf name from optional kernel and commit
+/// components. `None` collapses to the literal `"unknown"` sentinel
+/// in either slot, so a non-git cwd produces `"{kernel}-unknown"`
+/// and a missing kernel produces `"unknown-{commit}"`. Pure
+/// function over the two inputs — no I/O — so unit tests can pin
+/// every shape (clean, dirty, missing-kernel, missing-commit, both
+/// missing) without driving the [`detect_kernel_version`] /
+/// [`detect_project_commit`] OnceLocks.
+///
+/// SENTINEL ASYMMETRY: the on-disk dirname uses `"unknown"` for
+/// missing values, but the in-memory [`SidecarResult::project_commit`]
+/// / [`SidecarResult::kernel_version`] fields stay `None` (`null`
+/// in JSON). `cargo ktstr stats compare --project-commit unknown`
+/// will NOT match a sidecar whose `project_commit` is `None` —
+/// omit the filter to include `None`-commit rows. The asymmetry
+/// is deliberate: the dirname needs a filesystem-safe sentinel,
+/// while the JSON field preserves the original probe outcome for
+/// downstream tooling that distinguishes "no probe ran" from
+/// "probe ran but found nothing."
+fn format_run_dirname(kernel: Option<&str>, commit: Option<&str>) -> String {
+    let kernel = kernel.unwrap_or("unknown");
+    let commit = commit.unwrap_or("unknown");
+    format!("{kernel}-{commit}")
 }
 
 /// Resolve the parent directory that holds all test-run subdirectories.
@@ -935,7 +984,7 @@ pub fn runs_root() -> PathBuf {
 ///
 /// Used by bare `cargo ktstr stats` (no subcommand) when
 /// `KTSTR_SIDECAR_DIR` isn't set: the stats command doesn't itself
-/// run a kernel, so it can't reconstruct the `{kernel}-{timestamp}`
+/// run a kernel, so it can't reconstruct the `{kernel}-{commit}`
 /// key that the test process used. Picking the newest subdirectory by
 /// mtime mirrors "show me the report from my last test run."
 pub fn newest_run_dir() -> Option<PathBuf> {
@@ -1070,10 +1119,12 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// absolute manifest path into the binary's read-only data
 /// segment, leaking the build environment into every published
 /// artifact. Resolving cwd at runtime instead means the recorded
-/// commit reflects the ktstr clone the test was launched FROM —
-/// which is the more accurate semantic anyway, since "what code
-/// produced this sidecar" depends on the cwd at test launch, not
-/// the build host.
+/// commit reflects the project tree the test was launched FROM —
+/// for a scheduler crate using ktstr as a dev-dependency, this is
+/// the scheduler crate's commit, not ktstr's. That is the more
+/// accurate semantic anyway: "what code produced this sidecar"
+/// depends on the cwd at test launch (which crate is exercising
+/// ktstr), not the build host.
 pub(crate) fn detect_project_commit() -> Option<String> {
     // Per-process memoization: the cwd is stable for the lifetime
     // of a test process (no caller mutates it), and the project
@@ -1764,11 +1815,48 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
 /// `sidecar_variant_hash` hashes the discriminating fields into a
 /// short stable suffix so each variant gets its own sidecar file.
 ///
+/// On the first call PER UNIQUE DIRECTORY within a process,
+/// [`pre_clear_run_dir_once`] removes any pre-existing
+/// `*.ktstr.json` files in the resolved directory so the run is a
+/// clean snapshot rather than a mosaic of sidecars carried over
+/// from a prior invocation that shared the same `{kernel}-{commit}`
+/// key (e.g. re-running the suite without committing changes).
+/// Subsequent writes within the same process to the same directory
+/// append into the cleared directory.
+///
+/// Pre-clear is SKIPPED when `KTSTR_SIDECAR_DIR` is set: the
+/// operator chose that directory and owns its contents — silent
+/// data loss is not acceptable on an explicit override. When the
+/// override is unset (the default-path branch),
+/// `std::fs::create_dir_all` materializes the directory BEFORE
+/// pre-clear runs so the helper's canonicalize step always sees
+/// an existing on-disk path; without this ordering, a missing
+/// dir on the very first call would key the cache against the
+/// raw path while a later call (after the dir exists) would key
+/// against the canonicalized absolute path, splitting the cache
+/// and causing the second call to re-fire pre-clear and wipe the
+/// first call's sidecars.
+///
 /// `label` is a caller-supplied noun for the context message ("skip
 /// sidecar" / "sidecar") so the error chain points at the right call
 /// site.
 fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::Result<()> {
     let dir = sidecar_dir();
+    // Materialize the directory FIRST so `pre_clear_run_dir_once`
+    // can canonicalize a path that exists on disk. Without this,
+    // the very first invocation in a process resolves the cache
+    // key against the raw relative path (canonicalize fails on a
+    // missing dir, falls back to raw); subsequent invocations
+    // resolve against the canonicalized absolute path because the
+    // dir now exists. Two distinct keys for the same logical dir
+    // → second invocation re-fires pre-clear and wipes the first
+    // invocation's sidecars. Materializing pre-pre-clear closes
+    // the relative-vs-absolute split.
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create sidecar dir {}", dir.display()))?;
+    if !sidecar_dir_is_overridden() {
+        pre_clear_run_dir_once(&dir);
+    }
     let variant_hash = sidecar_variant_hash(sidecar);
     let path = dir.join(format!(
         "{}-{:016x}.ktstr.json",
@@ -1776,10 +1864,124 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
     ));
     let json = serde_json::to_string_pretty(sidecar)
         .with_context(|| format!("serialize {label} for '{}'", sidecar.test_name))?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create sidecar dir {}", dir.display()))?;
     std::fs::write(&path, json).with_context(|| format!("write {label} {}", path.display()))?;
     Ok(())
+}
+
+/// True when `KTSTR_SIDECAR_DIR` is set non-empty, meaning
+/// [`sidecar_dir`] is returning the operator's override path
+/// rather than the computed `runs_root().join({kernel}-{commit})`
+/// default. Pre-clear gates on this so an operator-chosen
+/// directory is never silently wiped — the override is for users
+/// who want exact control over where sidecars land (test
+/// isolation, archival capture, custom CI layouts), and clobbering
+/// pre-existing files there violates that contract.
+fn sidecar_dir_is_overridden() -> bool {
+    std::env::var("KTSTR_SIDECAR_DIR").is_ok_and(|d| !d.is_empty())
+}
+
+/// Remove any pre-existing `*.ktstr.json` files in the resolved
+/// run directory, exactly once per unique directory per process.
+///
+/// The run-key format is `{kernel}-{commit}` (see [`sidecar_dir`]),
+/// so two `cargo ktstr test` invocations sharing the same kernel
+/// and project commit (the typical "re-run the suite without
+/// committing changes" loop) resolve to the same directory. Without
+/// pre-clearing, each subsequent run would land its sidecars next
+/// to the previous run's, leaving downstream `cargo ktstr stats`
+/// readers to see a mosaic of two distinct test outcomes for the
+/// same variant — the variant-hash suffix on each filename
+/// prevents overwrites within a single run, but ALSO prevents the
+/// next run from naturally clobbering the previous one's files
+/// when the test set or pass/fail mix changes. Wiping
+/// `*.ktstr.json` once at first-write makes each run a clean
+/// snapshot of (kernel, project commit) — the last-writer-wins
+/// semantics the directory naming implies.
+///
+/// PER-DIRECTORY KEYING: the cache is a `Mutex<HashSet<PathBuf>>`
+/// keyed on the canonicalized `dir` (with raw `dir` as fallback
+/// when canonicalize fails — e.g. the directory does not yet
+/// exist). A `OnceLock<()>` would fire once for the FIRST
+/// directory only, leaving subsequent writes to other directories
+/// unprotected. The HashSet ensures every distinct directory the
+/// process writes to gets pre-cleared exactly once, regardless of
+/// ordering. Canonicalization collapses symlink aliases so two
+/// path spellings of the same on-disk dir share one entry.
+///
+/// In production today only the default-path
+/// `runs_root().join({kernel}-{commit})` is fed into this
+/// function (the override path skips pre-clear entirely via
+/// [`sidecar_dir_is_overridden`]), so per-process cache size
+/// stays at exactly 1 entry. The HashSet shape is the
+/// future-proof keying for direct unit-test fixtures (which
+/// rotate tempdir paths through this helper) and any future
+/// production code path that writes default-path sidecars from
+/// multiple distinct (kernel, commit) pairs in one process.
+///
+/// SCOPE: only `*.ktstr.json` files in the immediate directory
+/// are removed. Subdirectories (per-job gauntlet layouts written
+/// by external orchestrators) and non-sidecar files are left
+/// untouched — pre-clear is shallow. Note that `collect_sidecars`
+/// walks one level of subdirectories, so stale sidecars left in
+/// subdirectories from a prior run will still appear in
+/// `cargo ktstr stats` output until the operator removes them.
+/// The function never deletes the directory itself; production
+/// callers (`serialize_and_write_sidecar`) materialize the
+/// directory via `create_dir_all` BEFORE invoking this helper, so
+/// the only file-deletion side effect is the `*.ktstr.json`
+/// wipe inside an existing dir.
+///
+/// CONCURRENT WRITERS: the per-process `Mutex<HashSet>` guards
+/// against multiple writes within a single process re-clearing
+/// the same directory. Two concurrent test processes that both
+/// resolve to the same `{kernel}-{commit}` run dir will both
+/// pre-clear; that race is out of scope here (tracked separately
+/// under the concurrent-write collision protection backlog item)
+/// and would corrupt each other's outputs even without
+/// pre-clearing.
+///
+/// FAILURE: `read_dir` errors are silently ignored — defensive
+/// behavior for direct callers (e.g. unit tests probing the
+/// missing-dir edge); production callers materialize the
+/// directory before invoking this helper, so the missing-dir
+/// branch is unreachable in production today. Metadata probes
+/// must not gate sidecar writes. Per-file `remove_file`
+/// errors are also silently ignored — a partial pre-clear leaves
+/// either an overwrite (when the new run reproduces a stale
+/// file's exact `{test_name}-{variant_hash}.ktstr.json` name —
+/// the desired outcome) or a coexistence (when the new run's
+/// variant set differs from the prior run's, leaving stale
+/// sidecars next to fresh ones — the undesired outcome that
+/// pre-clear was meant to prevent). Coexistence is the acceptable
+/// degradation here: a noisy pre-clear failure should not abort
+/// the test run.
+fn pre_clear_run_dir_once(dir: &std::path::Path) {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    static PRE_CLEARED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    // Canonicalize so two spellings of the same on-disk dir share
+    // one cache entry. Falls back to the raw path when canonicalize
+    // fails (the directory may not exist yet on the very first
+    // write, in which case the raw path keys the entry; subsequent
+    // calls with the same raw path also miss canonicalize the
+    // same way and share the entry).
+    let cache_key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let cache = PRE_CLEARED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if !guard.insert(cache_key) {
+        return;
+    }
+    // First time this directory has been seen — wipe sidecars.
+    drop(guard);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && is_sidecar_filename(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
 }
 
 /// Return `active_flags` sorted into canonical
@@ -1939,7 +2141,9 @@ pub(crate) fn write_skip_sidecar(
 ///
 /// Output goes to the current run's sidecar directory
 /// (`KTSTR_SIDECAR_DIR` override, or
-/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{timestamp}/`).
+/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/`,
+/// where `{commit}` is the project HEAD short hex with `-dirty`
+/// when the worktree differs).
 ///
 /// `payload_metrics` is the accumulated per-invocation output from
 /// `ctx.payload(X).run()` / `.spawn().wait()` calls made in the
@@ -2992,7 +3196,17 @@ mod tests {
         let _env_target = EnvVarGuard::remove("CARGO_TARGET_DIR");
 
         let dir = sidecar_dir();
-        let expected = format!("target/ktstr/unknown-{}", run_id_timestamp());
+        // Expected layout: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}`.
+        // `KTSTR_KERNEL` is unset so kernel resolves to `"unknown"`.
+        // `{commit}` is the project tree's HEAD short hex (with
+        // `-dirty` suffix when the worktree differs); the test
+        // process runs from inside the ktstr repo, so
+        // `detect_project_commit()` returns `Some(...)`. Falling
+        // back to `"unknown"` covers a non-git cwd or probe failure
+        // — the same fallback `sidecar_dir()` itself uses, so the
+        // expected matches the production code path symmetrically.
+        let commit = detect_project_commit().unwrap_or_else(|| "unknown".to_string());
+        let expected = format!("target/ktstr/unknown-{commit}");
         assert_eq!(dir, PathBuf::from(&expected));
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
@@ -3019,13 +3233,14 @@ mod tests {
         let paths = find_sidecars_by_prefix(&dir, "__sidecar_default_dir__-");
         // One call to `write_sidecar` above must produce exactly
         // one sidecar under this test's unique prefix. A count
-        // above 1 exposes a variant-hash collision (two distinct
-        // test_name + variant-hash pairs hashing to the same
-        // filename suffix) or a stale file lingering from a
-        // previous crashed run sharing this exact test_name — the
-        // latter would hide a real collision today. Making the
-        // check loud here (rather than silently wiping every
-        // matching file) surfaces both regressions.
+        // above 1 exposes either a variant-hash collision (two
+        // distinct test_name + variant-hash pairs hashing to the
+        // same filename suffix) or a regression in
+        // `pre_clear_run_dir_once` (which is now keyed per-directory
+        // via `Mutex<HashSet<PathBuf>>` — every distinct dir gets
+        // exactly one pre-clear per process — so a stale file from
+        // a prior crashed run should be wiped on the very first
+        // call into this dir, regardless of which test runs first).
         assert_eq!(
             paths.len(),
             1,
@@ -3033,13 +3248,523 @@ mod tests {
              `__sidecar_default_dir__-` must produce exactly one \
              file; got {} ({paths:?}). If >1, either the variant \
              hash collided for this test's variant-field tuple or \
-             a prior crashed run left a stale sidecar under the \
-             same prefix — investigate before re-running the test.",
+             `pre_clear_run_dir_once`'s per-directory keying failed \
+             to wipe a stale sidecar from a prior crashed run.",
             paths.len(),
         );
         for p in paths {
             let _ = std::fs::remove_file(&p);
         }
+    }
+
+    // -- format_run_dirname (pure function, no OnceLock dependency) --
+
+    /// Clean commit shape: `{kernel}-{hex7}` — the standard happy
+    /// path. Pinning the format here means a regression that adds
+    /// extra punctuation, swaps the order, or drops a component
+    /// surfaces as a unit-test failure rather than as a downstream
+    /// stats-tooling miss.
+    #[test]
+    fn format_run_dirname_clean_commit() {
+        assert_eq!(
+            format_run_dirname(Some("6.14.2"), Some("abc1234")),
+            "6.14.2-abc1234",
+            "clean dirname must be `{{kernel}}-{{commit}}`",
+        );
+    }
+
+    /// Dirty commit shape: the `-dirty` suffix flows through verbatim
+    /// because `format_run_dirname` does not interpret the commit
+    /// string — it simply joins. The suffix is appended upstream by
+    /// `commit_with_dirty_suffix`. This test pins the verbatim
+    /// pass-through.
+    #[test]
+    fn format_run_dirname_dirty_commit() {
+        assert_eq!(
+            format_run_dirname(Some("6.14.2"), Some("abc1234-dirty")),
+            "6.14.2-abc1234-dirty",
+            "dirty dirname must pass the `-dirty` suffix through verbatim",
+        );
+    }
+
+    /// Missing commit (non-git cwd or probe failure) collapses to
+    /// the literal `"unknown"` sentinel in the commit slot, so the
+    /// dirname is `{kernel}-unknown`. This is the documented
+    /// dirname-vs-JSON asymmetry: in-memory the
+    /// `SidecarResult::project_commit` field stays `None`, but the
+    /// dirname uses a filesystem-safe sentinel.
+    #[test]
+    fn format_run_dirname_unknown_commit() {
+        assert_eq!(
+            format_run_dirname(Some("6.14.2"), None),
+            "6.14.2-unknown",
+            "missing commit must collapse to `{{kernel}}-unknown` sentinel",
+        );
+    }
+
+    /// Missing kernel mirrors the missing-commit shape: `unknown-{commit}`.
+    /// Captures the `KTSTR_KERNEL` unset / detection-failed path
+    /// so a regression in the unwrap_or fallback surfaces here.
+    #[test]
+    fn format_run_dirname_unknown_kernel() {
+        assert_eq!(
+            format_run_dirname(None, Some("abc1234")),
+            "unknown-abc1234",
+            "missing kernel must collapse to `unknown-{{commit}}` sentinel",
+        );
+    }
+
+    /// Both components missing: every run from a non-git cwd with no
+    /// `KTSTR_KERNEL` set lands in the same `unknown-unknown`
+    /// directory. Documented collision: the operator must set
+    /// `KTSTR_SIDECAR_DIR` or place the project tree under git to
+    /// disambiguate concurrent test runs.
+    #[test]
+    fn format_run_dirname_both_unknown_collide() {
+        assert_eq!(
+            format_run_dirname(None, None),
+            "unknown-unknown",
+            "both-missing case must produce `unknown-unknown` — the documented \
+             collision the operator must disambiguate via KTSTR_SIDECAR_DIR or git",
+        );
+    }
+
+    // -- pre_clear_run_dir_once tests --
+    //
+    // Pin the four behavioral invariants the doc on
+    // `pre_clear_run_dir_once` claims:
+    // 1. *.ktstr.json files in the immediate dir are removed.
+    // 2. Subdirectories and non-sidecar files are left untouched.
+    // 3. A missing dir is silent (no panic).
+    // 4. Per-directory keying via Mutex<HashSet<PathBuf>>: a second
+    //    call for the SAME dir is a no-op, but a call for a NEW dir
+    //    fires its own pre-clear.
+    //
+    // Each test uses a fresh tempdir so the per-process cache never
+    // collides across tests; tests do NOT need `lock_env` because
+    // they do not touch any environment variable — pre_clear is
+    // env-independent.
+
+    /// `pre_clear_run_dir_once` removes every `*.ktstr.json` file in
+    /// the immediate directory on its first call against that dir.
+    /// Pins the wipe-on-first-call invariant.
+    #[test]
+    fn pre_clear_run_dir_once_wipes_existing_sidecars() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        std::fs::write(tmp.join("test_a-0000.ktstr.json"), b"{}").unwrap();
+        std::fs::write(tmp.join("test_b-1111.ktstr.json"), b"{}").unwrap();
+        assert_eq!(
+            std::fs::read_dir(tmp).unwrap().count(),
+            2,
+            "fixture precondition: tempdir must contain two sidecars",
+        );
+
+        pre_clear_run_dir_once(tmp);
+
+        let remaining: Vec<_> = std::fs::read_dir(tmp)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "every *.ktstr.json file must be wiped; got {remaining:?}",
+        );
+    }
+
+    /// `pre_clear_run_dir_once` does NOT recurse — subdirectories
+    /// and any non-sidecar files in the immediate dir are left
+    /// untouched. Pins the shallow-scope invariant: an external
+    /// orchestrator that writes per-job subdirectories under the
+    /// run dir does not lose its fixture state to a sibling
+    /// invocation's pre-clear.
+    #[test]
+    fn pre_clear_run_dir_once_skips_subdirs_and_non_sidecars() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        // Top-level sidecar: should be wiped.
+        std::fs::write(tmp.join("victim-0000.ktstr.json"), b"{}").unwrap();
+        // Top-level non-sidecar files: should survive.
+        std::fs::write(tmp.join("README.md"), b"keep").unwrap();
+        std::fs::write(tmp.join("other.json"), b"{}").unwrap();
+        std::fs::write(tmp.join("partial.ktstr.json.tmp"), b"{}").unwrap();
+        // Subdirectory with a sidecar inside: subdir AND its
+        // contents should survive (pre-clear does not recurse).
+        let sub = tmp.join("job-1");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("nested-0000.ktstr.json"), b"{}").unwrap();
+
+        pre_clear_run_dir_once(tmp);
+
+        assert!(
+            !tmp.join("victim-0000.ktstr.json").exists(),
+            "top-level *.ktstr.json file must be wiped",
+        );
+        assert!(
+            tmp.join("README.md").exists(),
+            "non-sidecar file must survive",
+        );
+        assert!(
+            tmp.join("other.json").exists(),
+            "bare *.json (no .ktstr. infix) must survive",
+        );
+        assert!(
+            tmp.join("partial.ktstr.json.tmp").exists(),
+            "non-`.json` extension must survive even with .ktstr. infix",
+        );
+        assert!(sub.exists(), "subdirectory must survive");
+        assert!(
+            sub.join("nested-0000.ktstr.json").exists(),
+            "sidecar inside subdirectory must survive (pre-clear is shallow)",
+        );
+    }
+
+    /// `pre_clear_run_dir_once` is silent when the target directory
+    /// does not yet exist — `read_dir` errors are swallowed. Pins
+    /// the helper's API contract that a missing dir is a no-op
+    /// rather than a panic. The production caller
+    /// (`serialize_and_write_sidecar`) materializes the dir via
+    /// `create_dir_all` BEFORE feeding it to this helper, so the
+    /// missing-dir branch is unreachable in production today; the
+    /// invariant is preserved for defensive correctness against
+    /// future direct callers and to keep the helper safe to call
+    /// from unit tests that probe the missing-dir edge.
+    #[test]
+    fn pre_clear_run_dir_once_silent_on_missing_dir() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let nonexistent = tmp_dir.path().join("does_not_exist_yet");
+        assert!(
+            !nonexistent.exists(),
+            "fixture precondition: dir must not exist"
+        );
+
+        // Must not panic. The function returns `()`, so the only
+        // observable failure mode is a panic — the call returning
+        // normally is the test's pass condition.
+        pre_clear_run_dir_once(&nonexistent);
+
+        // Sanity: pre_clear must not have created the dir as a
+        // side effect either. `serialize_and_write_sidecar`'s
+        // create_dir_all is the only path that materializes the
+        // directory.
+        assert!(
+            !nonexistent.exists(),
+            "pre_clear must not create the dir as a side effect",
+        );
+    }
+
+    /// Per-directory keying via `Mutex<HashSet<PathBuf>>`: a second
+    /// call against the SAME dir is a no-op (newly-written sidecars
+    /// after the first pre-clear must NOT be wiped on the second
+    /// call), but a call against a DIFFERENT dir fires its own
+    /// pre-clear. Pins both halves of the per-dir contract:
+    /// idempotent for repeats, fresh for novel paths.
+    ///
+    /// The two tempdirs share a process-global `OnceLock<Mutex<HashSet<...>>>`,
+    /// so the test order is incidental — what matters is that the
+    /// HashSet has separate entries per dir.
+    #[test]
+    fn pre_clear_run_dir_once_keys_per_directory() {
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let tmp_b = tempfile::TempDir::new().unwrap();
+
+        // Phase 1: prime dir A. Populate with a sidecar, call
+        // pre_clear, verify wiped. The HashSet now contains A's
+        // canonicalized path.
+        std::fs::write(tmp_a.path().join("a-0000.ktstr.json"), b"{}").unwrap();
+        pre_clear_run_dir_once(tmp_a.path());
+        assert!(
+            !tmp_a.path().join("a-0000.ktstr.json").exists(),
+            "first call against A must wipe A's sidecar",
+        );
+
+        // Phase 2: write a new sidecar to A (modeling the writer
+        // populating the dir AFTER pre-clear), then call pre_clear
+        // against A again. The cache hit must short-circuit the
+        // wipe — the new sidecar must SURVIVE.
+        std::fs::write(tmp_a.path().join("a-1111.ktstr.json"), b"{}").unwrap();
+        pre_clear_run_dir_once(tmp_a.path());
+        assert!(
+            tmp_a.path().join("a-1111.ktstr.json").exists(),
+            "second call against A must be a no-op (cache hit) — \
+             the post-prime sidecar must survive. A regression to \
+             OnceLock<()> or a HashSet that ignores the key would \
+             leak this assertion.",
+        );
+
+        // Phase 3: prime dir B (new path). The HashSet has no
+        // entry for B yet, so this call must wipe B's sidecar
+        // — proving the cache distinguishes paths rather than
+        // collapsing every call after the first.
+        std::fs::write(tmp_b.path().join("b-0000.ktstr.json"), b"{}").unwrap();
+        pre_clear_run_dir_once(tmp_b.path());
+        assert!(
+            !tmp_b.path().join("b-0000.ktstr.json").exists(),
+            "first call against B must wipe B's sidecar — proves the \
+             per-dir keying distinguishes A from B (a OnceLock<()> \
+             that fired once for A would leak this assertion).",
+        );
+    }
+
+    // -- write_sidecar reuse-dir behavior (fix #5) --
+
+    /// Two `write_sidecar` invocations against the same effective
+    /// run directory (same `KTSTR_SIDECAR_DIR` here, simulating two
+    /// invocations from the same kernel + project commit) must
+    /// produce a directory containing only the second invocation's
+    /// sidecars — the first invocation's outputs are pre-cleared
+    /// before the second writes. Pins the last-writer-wins
+    /// semantics the documented `{kernel}-{commit}` keying implies.
+    ///
+    /// CAVEAT: this test exercises the OVERRIDE path
+    /// (`KTSTR_SIDECAR_DIR` is set), where pre-clear is currently
+    /// SKIPPED per the fix-#2 contract. To exercise pre-clear in
+    /// the env-overridden context, the test directly calls
+    /// `pre_clear_run_dir_once` BETWEEN the two writes — modeling
+    /// what `serialize_and_write_sidecar` does on the default path
+    /// (env unset). Both writes go through the override path so
+    /// the test does not depend on the OnceLock-cached cwd.
+    #[test]
+    fn write_sidecar_same_dir_is_last_writer_wins_after_pre_clear() {
+        let _lock = lock_env();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        // First invocation: write a sidecar for entry A.
+        let entry_a = KtstrTestEntry {
+            name: "__reuse_first_run__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
+        let ok = AssertResult::pass();
+        write_sidecar(&entry_a, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        // Confirm the first invocation's sidecar is on disk.
+        assert_eq!(
+            find_sidecars_by_prefix(tmp, "__reuse_first_run__-").len(),
+            1,
+            "first invocation must write its sidecar",
+        );
+
+        // Simulate the second invocation: pre-clear the dir (which
+        // is what `serialize_and_write_sidecar` does on the default
+        // path), then write a sidecar for entry B.
+        pre_clear_run_dir_once(tmp);
+        // The first invocation's sidecar must be wiped by pre-clear.
+        assert_eq!(
+            find_sidecars_by_prefix(tmp, "__reuse_first_run__-").len(),
+            0,
+            "pre-clear must wipe the first invocation's sidecar before \
+             the second invocation writes — this is the last-writer-wins \
+             contract",
+        );
+
+        // Second invocation: distinct entry name to prove the
+        // dir-state after pre-clear contains ONLY the second
+        // invocation's sidecars.
+        let entry_b = KtstrTestEntry {
+            name: "__reuse_second_run__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        write_sidecar(&entry_b, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+
+        // Final state: only the second invocation's sidecar is
+        // present. The first invocation is gone, the second is
+        // intact.
+        assert_eq!(
+            find_sidecars_by_prefix(tmp, "__reuse_first_run__-").len(),
+            0,
+            "first invocation's sidecar must remain wiped after second invocation writes",
+        );
+        assert_eq!(
+            find_sidecars_by_prefix(tmp, "__reuse_second_run__-").len(),
+            1,
+            "second invocation's sidecar must be the only sidecar in the dir",
+        );
+    }
+
+    // -- KTSTR_SIDECAR_DIR override skips pre-clear (fix #2) --
+
+    /// When `KTSTR_SIDECAR_DIR` is set, `serialize_and_write_sidecar`
+    /// must NOT call `pre_clear_run_dir_once` against the override
+    /// dir. Pins the contract that operator-chosen directories are
+    /// preserved verbatim — silent data loss on an explicit env
+    /// override is unacceptable.
+    ///
+    /// The test populates the override dir with a pre-existing
+    /// sidecar (from a hypothetical sibling run or a manual
+    /// fixture), runs `write_sidecar`, and verifies BOTH the
+    /// pre-existing sidecar AND the newly-written one are present.
+    /// A regression that pre-cleared on the override path would
+    /// leak this assertion (the pre-existing sidecar would be
+    /// wiped).
+    #[test]
+    fn write_sidecar_override_does_not_pre_clear() {
+        let _lock = lock_env();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
+
+        // Pre-existing sidecar in the override dir — modeling a
+        // run the operator wants to preserve.
+        std::fs::write(tmp.join("__preserved__-0000.ktstr.json"), b"{}").unwrap();
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "__override_skips_preclear__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
+        let ok = AssertResult::pass();
+        write_sidecar(&entry, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+
+        // The pre-existing sidecar must still be there. A regression
+        // that fired pre_clear on the override path would have
+        // wiped it.
+        assert!(
+            tmp.join("__preserved__-0000.ktstr.json").exists(),
+            "pre-existing sidecar in override dir must NOT be pre-cleared — \
+             operator-chosen directories are owned by the operator and \
+             must not lose data on `write_sidecar`",
+        );
+        // Sanity: the new sidecar landed too.
+        assert_eq!(
+            find_sidecars_by_prefix(tmp, "__override_skips_preclear__-").len(),
+            1,
+            "new sidecar must be written alongside the preserved one",
+        );
+    }
+
+    // -- B3 regression: relative-path canonicalize cache split (fix #1 in pass 2 ruling) --
+
+    /// Two sequential `write_sidecar` calls in the same process
+    /// against the DEFAULT path (no `KTSTR_SIDECAR_DIR` override)
+    /// must both survive: the second call must NOT wipe the first.
+    ///
+    /// Pins the regression caught in pass-2 review: when
+    /// `serialize_and_write_sidecar` invoked `pre_clear_run_dir_once`
+    /// BEFORE `create_dir_all`, the first call resolved the
+    /// pre-clear cache key against the raw path because
+    /// `canonicalize` failed on a missing dir. The first call then
+    /// created the dir via `create_dir_all` and wrote sidecar 1.
+    /// On the second call, `canonicalize` SUCCEEDED against the
+    /// now-existing dir, producing an absolute path that DIFFERED
+    /// from the cache key inserted by the first call — so the
+    /// second call missed the cache, fired pre-clear, and wiped
+    /// sidecar 1.
+    ///
+    /// The fix moves `create_dir_all` before `pre_clear_run_dir_once`
+    /// so canonicalize sees the same on-disk dir on both calls and
+    /// produces the same canonicalized cache key. With the fix,
+    /// the second call hits the cache and pre-clear is a no-op,
+    /// so sidecar 1 survives.
+    ///
+    /// ISOLATION: the test sets `CARGO_TARGET_DIR` to a unique
+    /// tempdir so the resolved sidecar dir is
+    /// `{tempdir}/ktstr/{kernel}-{commit}/` — uncrossable by
+    /// sibling test processes that share the workspace's
+    /// `target/ktstr/`. Without this isolation, a concurrent
+    /// nextest worker writing to the SAME shared default dir could
+    /// fire pre-clear for that dir, race with this test's writes,
+    /// and surface as a flaky `__b3_first__-` count = 0. The test
+    /// still exercises the REAL default-path flow (sidecar_dir
+    /// computes from runs_root + format_run_dirname,
+    /// serialize_and_write_sidecar runs create_dir_all then
+    /// pre_clear) — the only thing CARGO_TARGET_DIR redirects is
+    /// the runs-root parent.
+    ///
+    /// `KTSTR_KERNEL` and `KTSTR_SIDECAR_DIR` are explicitly
+    /// removed: kernel resolves to `"unknown"` (deterministic),
+    /// override is unset (so the default-path branch runs).
+    /// Project commit comes from the test process's
+    /// OnceLock-cached cwd probe and is shared with every other
+    /// default-path test in the same process — irrelevant here
+    /// since the tempdir-scoped runs-root parent is unique to this
+    /// test, so no other test's pre-clear cache entry collides
+    /// with ours.
+    #[test]
+    fn write_sidecar_default_path_two_writes_both_survive() {
+        let _lock = lock_env();
+        let target_dir = tempfile::TempDir::new().unwrap();
+        let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
+        let _env_sidecar = EnvVarGuard::remove("KTSTR_SIDECAR_DIR");
+        let _env_kernel = EnvVarGuard::remove("KTSTR_KERNEL");
+
+        // Resolve the default dir AFTER the env mutations so it
+        // reflects the tempdir-scoped target. With KTSTR_KERNEL
+        // unset and KTSTR_SIDECAR_DIR unset, this is
+        // `{tempdir}/ktstr/unknown-{cached_project_commit}/`.
+        let dir = sidecar_dir();
+
+        fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry_first = KtstrTestEntry {
+            name: "__b3_first__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let entry_second = KtstrTestEntry {
+            name: "__b3_second__",
+            func: dummy,
+            auto_repro: false,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let vm_result = crate::vmm::VmResult::test_fixture();
+        let ok = AssertResult::pass();
+
+        // First write: under the buggy ordering, this resolved
+        // canonicalize-fails (dir missing) → cache key under raw
+        // path → wipe was a no-op (dir didn't exist) → created
+        // dir → wrote sidecar 1.
+        write_sidecar(&entry_first, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+        // Confirm sidecar 1 lands.
+        assert_eq!(
+            find_sidecars_by_prefix(&dir, "__b3_first__-").len(),
+            1,
+            "first write must produce its sidecar",
+        );
+
+        // Second write: under the buggy ordering, this resolved
+        // canonicalize-succeeds (dir now exists) → cache key under
+        // absolute canonicalized path → DIFFERENT key than first
+        // call → cache MISS → wipe ran → DELETED sidecar 1 → wrote
+        // sidecar 2. Under the fix, create_dir_all runs first on
+        // both calls, both canonicalize against an existing dir,
+        // both produce the same canonicalized key, and the second
+        // call hits the cache → no wipe → both survive.
+        write_sidecar(&entry_second, &vm_result, &[], &ok, "CpuSpin", &[], &[]).unwrap();
+
+        // Both sidecars must be present. A regression to the buggy
+        // ordering would surface here as `__b3_first__-` count = 0.
+        let first_count = find_sidecars_by_prefix(&dir, "__b3_first__-").len();
+        let second_count = find_sidecars_by_prefix(&dir, "__b3_second__-").len();
+        assert_eq!(
+            first_count, 1,
+            "first sidecar must survive the second write — a count of 0 \
+             reveals the canonicalize-cache-split regression: pre-clear \
+             ran a second time and wiped sidecar 1. Move `create_dir_all` \
+             before `pre_clear_run_dir_once` so canonicalize sees the \
+             same dir on both calls.",
+        );
+        assert_eq!(second_count, 1, "second sidecar must land normally",);
+
+        // No explicit cleanup: the TempDir's Drop removes the
+        // entire tempdir tree, including the sidecars and any
+        // pre-clear residue under `{tempdir}/ktstr/`.
     }
 
     #[test]

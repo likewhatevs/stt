@@ -93,8 +93,9 @@ Filter with nextest's `-E 'test(kernel_6_14)'` to pick a single
 kernel from a multi-kernel matrix; nextest's parallelism, retries,
 and `--ignored` flag all apply natively. Sidecars partition per
 kernel: each kernel runs in its own
-`target/ktstr/{kernel}-{timestamp}/` directory keyed on the
-resolved kernel's identity. Coverage profraw does NOT partition
+`target/ktstr/{kernel}-{commit}/` directory keyed on the
+resolved kernel's identity and the project tree's HEAD short hex
+(with `-dirty` suffix when the worktree differs). Coverage profraw does NOT partition
 per kernel — `__llvm_profile_write_buffer` writes flat into
 `target/llvm-cov-target/` with PID-keyed filenames
 (`ktstr-test-{pid}-{counter}.profraw`), and cargo-llvm-cov merges
@@ -174,8 +175,10 @@ Build the kernel (if needed) and run tests with coverage via
 semantics as `test`: `--kernel` is repeatable; multi-kernel runs
 add the kernel suffix to every test name and partition the
 sidecar tree per kernel via
-`target/ktstr/{kernel}-{timestamp}/`. Coverage profraw lands flat
-in `target/llvm-cov-target/` with PID-keyed filenames — it does
+`target/ktstr/{kernel}-{commit}/`, where `{commit}` is the
+project HEAD short hex (with `-dirty` when the worktree
+differs). Coverage profraw lands flat in
+`target/llvm-cov-target/` with PID-keyed filenames — it does
 NOT partition per kernel — and cargo-llvm-cov merges every
 variant's profraw automatically into the single output report.
 
@@ -479,8 +482,25 @@ source directly -- there is no newest-subdirectory walk under it:
 ### list
 
 Print a table of run directories under
-`{CARGO_TARGET_DIR or "target"}/ktstr/` with run key, test count,
-and date.
+`{CARGO_TARGET_DIR or "target"}/ktstr/` with three columns:
+
+- `RUN`: the run-directory leaf name, formatted as
+  `{kernel}-{commit}` per [Runs](runs.md). `list` does NOT
+  consult `KTSTR_SIDECAR_DIR` — that override only affects where
+  the test harness writes sidecars; `list` always enumerates the
+  default runs-root.
+- `TESTS`: number of sidecars in the directory (and one level of
+  subdirectories — `collect_sidecars` walks per-job gauntlet
+  layouts).
+- `DATE`: the earliest sidecar timestamp present in the directory
+  — under last-writer-wins this equals the most recent run's
+  first sidecar timestamp (the prior run's sidecars were
+  pre-cleared at the new run's first write, so only the new
+  run's timestamps remain). See [Runs](runs.md) for the full
+  semantics.
+
+Rows are sorted alphabetically by `RUN` (filename order, not
+mtime).
 
 ### list-metrics
 
@@ -888,12 +908,14 @@ missing and what each absence means.
 Run tests first to generate sidecar JSON files:
 
 ```sh
-cargo nextest run --workspace        # generates target/ktstr/{kernel}-{timestamp}/*.json
+cargo nextest run --workspace        # generates target/ktstr/{kernel}-{commit}/*.json
 cargo ktstr stats                    # reads the newest run
 ```
 
 Set `KTSTR_SIDECAR_DIR` to override the sidecar directory; otherwise
-the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{timestamp}/`.
+the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/`,
+where `{commit}` is the project HEAD short hex (with `-dirty`
+when the worktree differs).
 
 ## show-host
 

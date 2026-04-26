@@ -2345,9 +2345,13 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
 /// List the test-run directories under
 /// `{CARGO_TARGET_DIR or "target"}/ktstr/`.
 ///
-/// Each subdirectory is one run keyed `{kernel}-{timestamp}`. The
-/// sidecar JSON files inside it are the run's results -- there is no
-/// separate "baselines" cache; runs ARE baselines.
+/// Each subdirectory is one run keyed `{kernel}-{commit}` where
+/// `{commit}` is the project HEAD short hex with `-dirty` suffix
+/// when the worktree differs. Two runs sharing the same key reuse
+/// the same directory: the second run pre-clears prior
+/// `*.ktstr.json` files at first write so the directory is a
+/// last-writer-wins snapshot of (kernel, project commit) rather
+/// than an append-only archive of every invocation.
 pub fn list_runs() -> anyhow::Result<()> {
     use std::fs;
     let root = crate::test_support::runs_root();

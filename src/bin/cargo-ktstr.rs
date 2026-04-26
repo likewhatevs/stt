@@ -138,9 +138,13 @@ enum KtstrCommand {
     /// Reads sidecar JSON files from the newest subdirectory under
     /// `{CARGO_TARGET_DIR or "target"}/ktstr/` (overridable with
     /// `KTSTR_SIDECAR_DIR`) and prints gauntlet analysis, BPF
-    /// verifier stats, callback profile, and KVM stats. Each test
-    /// run is its own subdirectory keyed `{kernel}-{timestamp}`;
-    /// the runs ARE the baselines.
+    /// verifier stats, callback profile, and KVM stats. Test runs
+    /// are partitioned into `{kernel}-{commit}` subdirectories,
+    /// where `{commit}` is the project HEAD short hex with
+    /// `-dirty` when the worktree differs; each subdirectory is
+    /// the baseline snapshot of the most recent run at that
+    /// (kernel, project commit) pair (re-running at the same key
+    /// pre-clears prior sidecars before writing the new run).
     ///
     /// Use `list` to see runs; `compare <a> <b>` to diff two.
     Stats {

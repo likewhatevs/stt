@@ -22,17 +22,36 @@ git worktree add ~/opensource/scx-main upstream/main
 ## Collect both runs into a shared run root
 
 Each `cargo nextest run --workspace` writes its sidecars into
-`target/ktstr/{kernel}-{timestamp}/`. The `{timestamp}` half is
-captured once per process at run start (compact
-`YYYYMMDDTHHMMSSZ` form), so successive runs always land in
-distinct directories — two back-to-back runs of the same kernel
-never overwrite each other.
+`target/ktstr/{kernel}-{commit}/`. The `{commit}` half is the
+project tree's HEAD short hex captured at first sidecar write
+(suffixed `-dirty` when the worktree differs from HEAD), so
+two branches with distinct HEADs land in distinct directories.
+Two back-to-back runs of the SAME kernel at the SAME commit
+reuse the same directory — the second run pre-clears any prior
+sidecars at first write, so each directory is a last-writer-wins
+snapshot of (kernel, project commit).
 
-Every sidecar carries its own `project_commit` (read from the
-ktstr workspace's git HEAD at sidecar-write time), so the
-runs from two branches land disjoint values on the `commit`
+> **Warning:** The two worktrees MUST be at distinct commits for
+> A/B comparison to work. If both checkouts share the same HEAD
+> (e.g. baseline branch and feature branch happen to be even),
+> the second run **overwrites** the first via the last-writer-wins
+> pre-clear and the comparison degenerates to "identical pool of
+> sidecars." Confirm distinct commits with `git -C ~/opensource/scx
+> rev-parse HEAD` and `git -C ~/opensource/scx-main rev-parse
+> HEAD` before invoking the second `cargo nextest run`.
+
+Every sidecar also carries its own `project_commit` field (read
+from the project tree's git HEAD at sidecar-write time), so
+the runs from two branches land disjoint values on the `commit`
 dimension regardless of how the directories are named. The
-simplest collection workflow is to merge both branches' run
+project commit is discovered by walking up from the test
+process's **current working directory** to find a `.git` marker
+— so the `cd ~/opensource/scx-main` / `cd ~/opensource/scx`
+steps below are load-bearing, not stylistic. Without them the
+probe would walk up from wherever you happened to invoke
+`cargo`, potentially ending at an entirely different repo and
+recording the wrong commit on every sidecar. The simplest
+collection workflow is to merge both branches' run
 subdirectories under one root and rely on
 `--a-project-commit` / `--b-project-commit` to partition them:
 
@@ -50,9 +69,13 @@ cargo nextest run --workspace
 mv target/ktstr/* ~/opensource/scx-runs/ktstr/
 ```
 
-The `{kernel}-{timestamp}` subdirectory names are unique per
-run, so both branches' run directories coexist under one root
-without collision.
+The `{kernel}-{commit}` subdirectory names are unique per
+(kernel, project commit) pair, so two branches with distinct
+HEADs coexist under one root without collision. Within a single
+branch, two clean back-to-back runs at the same commit reuse
+one directory (last-writer-wins via per-process pre-clear);
+mark one of them as `-dirty` (uncommitted change) or commit /
+amend between runs to land separate directories.
 
 Do **not** set `KTSTR_SIDECAR_DIR`: `cargo ktstr stats list`
 and `cargo ktstr stats compare` walk
@@ -62,11 +85,13 @@ not see runs written to a custom flat directory unless
 
 ## Discover available dimension values
 
-The framework records the ktstr project's git commit on every
-sidecar via `SidecarResult::project_commit`, so two runs from
-different commits land disjoint values on the `commit`
-dimension and `--a-project-commit` / `--b-project-commit`
-slice between them without any per-run directory bookkeeping.
+The framework records the project tree's git commit (discovered
+by walking parents of the test process's cwd to find the
+enclosing `.git`) on every sidecar via
+`SidecarResult::project_commit`, so two runs from different
+commits land disjoint values on the `commit` dimension and
+`--a-project-commit` / `--b-project-commit` slice between them
+without any per-run directory bookkeeping.
 Use
 `cargo ktstr stats list-values --dir DIR` to enumerate the
 distinct values of every filterable dimension (`kernel`,

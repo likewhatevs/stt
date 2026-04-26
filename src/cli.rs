@@ -2120,7 +2120,7 @@ fn build_make_args(nproc: usize) -> Vec<String> {
 ///   `{CARGO_TARGET_DIR or "target"}/ktstr/`.
 ///
 /// `cargo ktstr stats` doesn't itself run a kernel, so it can't
-/// reconstruct the `{kernel}-{timestamp}` key the test process used; the
+/// reconstruct the `{kernel}-{commit}` key the test process used; the
 /// mtime fallback mirrors "show me the report from my last test run."
 ///
 /// Returns `None` with a warning on stderr when no sidecars are found.
@@ -2917,18 +2917,17 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
              joined onto the run-root via `Path::join` and must \
              contain at least one `Normal` path component — i.e. \
              must not be empty, `.`, `..`, or absolute (e.g. a \
-             typical run key shape: `linux-6.14-20260101T120000Z`). \
-             To point at a different pool root, use `--dir`. Run \
-             `cargo ktstr stats list` to enumerate available run \
-             keys.",
+             typical run key shape: `6.14-abc1234` or \
+             `6.14-abc1234-dirty`). To point at a different pool \
+             root, use `--dir`. Run `cargo ktstr stats list` to \
+             enumerate available run keys.",
         );
     }
     // `Path::new(run)`'s `Component` iterator gives a structural
     // view of the input. A bare run-key like
-    // `linux-6.14-20260101T120000Z` only emits `Normal`
-    // components and passes; every other component variant is a
-    // pool-root alias or traversal vector and bails with an
-    // actionable message.
+    // `6.14-abc1234` only emits `Normal` components and passes;
+    // every other component variant is a pool-root alias or
+    // traversal vector and bails with an actionable message.
     for component in std::path::Path::new(run).components() {
         match component {
             std::path::Component::CurDir
@@ -2942,11 +2941,11 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
                      run-root via `Path::join` and must contain only \
                      `Normal` path components — no `.`, `..`, or \
                      absolute prefix (e.g. a typical run key shape: \
-                     `linux-6.14-20260101T120000Z`; multi-component \
-                     paths like `gauntlet/job-1` are also accepted). \
-                     To point at a different pool root, use `--dir`. \
-                     Run `cargo ktstr stats list` to enumerate \
-                     available run keys.",
+                     `6.14-abc1234` or `6.14-abc1234-dirty`; \
+                     multi-component paths like `gauntlet/job-1` are \
+                     also accepted). To point at a different pool \
+                     root, use `--dir`. Run `cargo ktstr stats list` \
+                     to enumerate available run keys.",
                 );
             }
             std::path::Component::Normal(_) => {}
@@ -7163,12 +7162,13 @@ mod tests {
     #[test]
     fn explain_sidecar_accepts_bare_run_key_after_traversal_check() {
         let tmp = tempfile::tempdir().unwrap();
-        // `linux-6.14-20260101T120000Z` is a typical run key
-        // shape (Normal-only components). It does not exist
-        // under tmp, so the call lands in the not-found path —
-        // which is the SECOND validation gate, proving the
-        // traversal check let it through.
-        let err = super::explain_sidecar("linux-6.14-20260101T120000Z", Some(tmp.path()), false)
+        // `6.14-abc1234` is a typical run key shape
+        // (Normal-only components: `{kernel}-{commit}` per
+        // `sidecar_dir`). It does not exist under tmp, so the
+        // call lands in the not-found path — which is the
+        // SECOND validation gate, proving the traversal check
+        // let it through.
+        let err = super::explain_sidecar("6.14-abc1234", Some(tmp.path()), false)
             .expect_err("non-existent run must surface the not-found error");
         let msg = format!("{err:#}");
         assert!(
