@@ -255,6 +255,38 @@ pub struct SidecarResult {
     /// deserialize per the same symmetry rule that governs every other
     /// nullable on this struct.
     pub cleanup_duration_ms: Option<u64>,
+    /// Provenance tag for this sidecar — distinguishes a developer's
+    /// local run from a CI run so cross-environment comparisons in
+    /// `stats compare` can narrow on (or contrast across) the run
+    /// environment without inferring it from `host`.
+    ///
+    /// Recorded by [`detect_run_source`] at sidecar-write time:
+    /// - `Some("ci")` when [`KTSTR_CI_ENV`] is set non-empty (CI runner
+    ///   scripts export it before invoking the test binary; local
+    ///   runs never set it).
+    /// - `Some("local")` otherwise — the default for any sidecar
+    ///   produced by a developer-driven invocation.
+    /// - The third documented value (`"archive"`) is NEVER written
+    ///   here: a sidecar cannot know it will later be archived. The
+    ///   stats CLI applies the `"archive"` tag at LOAD time when its
+    ///   `--dir` flag points at a non-default pool root, overriding
+    ///   whatever was on disk via [`apply_archive_source_override`].
+    ///
+    /// `Option<String>` (rather than an enum) keeps the schema
+    /// extensible without a serde-version bump if a future producer
+    /// wants a new tag (e.g. `"benchmark"`); the consumer side
+    /// treats unknown values the same as known ones — they are
+    /// strings the operator can pass via `--source` to filter on.
+    /// Always emitted (`"source": null` on absence); required on
+    /// deserialize per the same symmetry rule that governs every
+    /// other nullable on this struct. Excluded from
+    /// [`sidecar_variant_hash`] for the same cross-host grouping
+    /// reason `host` is excluded — two runs of the same semantic
+    /// variant from different environments must still bucket
+    /// together so `stats compare` can diff them; `--source` and
+    /// `--a-source` / `--b-source` are the explicit knobs for
+    /// source-aware narrowing.
+    pub source: Option<String>,
 }
 
 #[cfg(test)]
@@ -316,6 +348,7 @@ impl SidecarResult {
             run_id: String::new(),
             host: None,
             cleanup_duration_ms: None,
+            source: None,
         }
     }
 }
@@ -956,6 +989,72 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
     }
 }
 
+/// Environment variable CI runners set to mark sidecars they produce
+/// as `"ci"`-source. Any non-empty value flips the tag; empty string
+/// is treated as unset so a defensively-cleared variable does not
+/// accidentally classify a developer run as CI.
+///
+/// Read at sidecar-write time by [`detect_run_source`]; matches the
+/// `KTSTR_KERNEL` / `KTSTR_CACHE_DIR` env-name convention so the
+/// full set of ktstr-controlled env vars is `KTSTR_*`-prefixed.
+pub const KTSTR_CI_ENV: &str = "KTSTR_CI";
+
+/// Tag value written to [`SidecarResult::source`] for sidecars
+/// produced under [`KTSTR_CI_ENV`].
+pub const SIDECAR_SOURCE_CI: &str = "ci";
+
+/// Tag value written to [`SidecarResult::source`] for sidecars
+/// produced without [`KTSTR_CI_ENV`] — the developer-machine
+/// default.
+pub const SIDECAR_SOURCE_LOCAL: &str = "local";
+
+/// Tag value applied to [`SidecarResult::source`] / [`GauntletRow::source`](crate::stats::GauntletRow::source)
+/// at LOAD time when the consumer pulls sidecars from a non-default
+/// pool root via `cargo ktstr stats compare --dir` /
+/// `cargo ktstr stats list-values --dir`. NEVER written by
+/// [`write_sidecar`] — the writer cannot know the file will later
+/// be moved off-host. See [`apply_archive_source_override`].
+pub const SIDECAR_SOURCE_ARCHIVE: &str = "archive";
+
+/// Read [`KTSTR_CI_ENV`] and classify the run as `"ci"` (when the
+/// env var is set non-empty) or `"local"` (the default for any
+/// developer-driven invocation). Empty-string env values count as
+/// unset — see [`KTSTR_CI_ENV`] for rationale.
+///
+/// Returns `Some(_)` unconditionally because every sidecar producer
+/// is, by construction, either local or CI; an `Option` return
+/// keeps the field shape symmetric with the other nullable
+/// `SidecarResult` fields and reserves room for a future "unknown"
+/// arm without a serde-version bump.
+pub(crate) fn detect_run_source() -> Option<String> {
+    match std::env::var(KTSTR_CI_ENV) {
+        Ok(v) if !v.is_empty() => Some(SIDECAR_SOURCE_CI.to_string()),
+        _ => Some(SIDECAR_SOURCE_LOCAL.to_string()),
+    }
+}
+
+/// Override every sidecar's `source` field to [`SIDECAR_SOURCE_ARCHIVE`]
+/// when the consumer pulled the pool from a non-default root via
+/// `--dir`. Called at the boundary between [`collect_pool`] and the
+/// downstream stats pipeline so on-disk values stay untouched while
+/// the in-memory pool reflects the operator's intent: "these
+/// sidecars were copied off another host; treat them as archives,
+/// not as the local-machine record."
+///
+/// Mutation strategy is in-place rewrite of the entire `source`
+/// field — the `"local"` / `"ci"` distinction is meaningful on the
+/// PRODUCING host but irrelevant once the sidecars have been
+/// moved off, where the only useful classification is "archived
+/// elsewhere." Operators who need to retain the producer-side
+/// distinction inside an archive bucket can keep `--dir`
+/// untargeted (read from the default root) and let the on-disk
+/// values pass through.
+pub(crate) fn apply_archive_source_override(pool: &mut [SidecarResult]) {
+    for sc in pool {
+        sc.source = Some(SIDECAR_SOURCE_ARCHIVE.to_string());
+    }
+}
+
 /// Resolve the kernel source-tree path for [`detect_kernel_commit`]
 /// from the [`crate::KTSTR_KERNEL_ENV`] env var.
 ///
@@ -1025,28 +1124,33 @@ fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
 /// The hash is over test-identity fields (topology, scheduler,
 /// payload, work_type, flags, sysctls, kargs) — NOT over
 /// [`HostContext`], NOT over `scheduler_commit`, NOT over
-/// `project_commit`, and NOT over `kernel_commit`. The
-/// [`HostContext`] exclusion is pinned by
+/// `project_commit`, NOT over `kernel_commit`, and NOT over
+/// `source`. The [`HostContext`] exclusion is pinned by
 /// [`sidecar_variant_hash_excludes_host_context`]; the
 /// `scheduler_commit` exclusion by
 /// [`sidecar_variant_hash_excludes_scheduler_commit`]; the
 /// `project_commit` exclusion by
 /// [`sidecar_variant_hash_excludes_project_commit`]; the
 /// `kernel_commit` exclusion by
-/// [`sidecar_variant_hash_excludes_kernel_commit`]. All four
-/// are deliberate for the same cross-host grouping reason — a
+/// [`sidecar_variant_hash_excludes_kernel_commit`]; the
+/// `source` exclusion by
+/// [`sidecar_variant_hash_excludes_source`]. All five are
+/// deliberate for the same cross-host grouping reason — a
 /// gauntlet rebuilt against a different userspace scheduler
 /// commit, a bumped ktstr checkout, a kernel source tree at a
 /// different HEAD, or a different CI runner / developer
 /// machine must still bucket with the same-named variant so
 /// `compare_runs` can diff two runs of the "same" test without
-/// the commit hash shattering them into one-row-per-commit
-/// islands. Callers that want to detect a commit drift between
-/// two runs inspect [`SidecarResult::scheduler_commit`] /
+/// the commit hash or source tag shattering them into
+/// one-row-per-commit islands. Callers that want to detect a
+/// commit drift or compare across run environments inspect
+/// [`SidecarResult::scheduler_commit`] /
 /// [`SidecarResult::project_commit`] /
-/// [`SidecarResult::kernel_commit`] directly (the latter two
-/// via `--commit` / `--kernel-commit` on `stats compare`); the
-/// filename stays stable across commits by design.
+/// [`SidecarResult::kernel_commit`] / [`SidecarResult::source`]
+/// directly (the latter three via `--commit` /
+/// `--kernel-commit` / `--source` on `stats compare`); the
+/// filename stays stable across commits and run environments by
+/// design.
 ///
 /// The corollary of the HostContext exclusion: if the host's
 /// observable state mutates mid-suite — NUMA hotplug, hugepage
@@ -1363,6 +1467,7 @@ pub(crate) fn write_skip_sidecar(
         // duration is undefined. Emit `null` per the sidecar's
         // symmetric serialize/deserialize contract.
         cleanup_duration_ms: None,
+        source: detect_run_source(),
     };
     serialize_and_write_sidecar(&sidecar, "skip sidecar")
 }
@@ -1422,6 +1527,7 @@ pub(crate) fn write_sidecar(
         run_id: generate_run_id(),
         host: Some(crate::host_context::collect_host_context()),
         cleanup_duration_ms: vm_result.cleanup_duration.map(|d| d.as_millis() as u64),
+        source: detect_run_source(),
     };
     serialize_and_write_sidecar(&sidecar, "sidecar")
 }
@@ -1770,6 +1876,7 @@ mod tests {
             run_id: String::new(),
             host: None,
             cleanup_duration_ms: Some(123),
+            source: Some(SIDECAR_SOURCE_LOCAL.to_string()),
         };
         let json = serde_json::to_string_pretty(&sc).unwrap();
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
@@ -1807,6 +1914,7 @@ mod tests {
             run_id,
             host,
             cleanup_duration_ms,
+            source,
         } = loaded;
         // Hash-participating string fields round-trip verbatim.
         assert_eq!(test_name, "my_test");
@@ -1868,6 +1976,12 @@ mod tests {
             cleanup_duration_ms,
             Some(123),
             "cleanup_duration_ms round-tripped",
+        );
+        assert_eq!(
+            source.as_deref(),
+            Some(SIDECAR_SOURCE_LOCAL),
+            "source must round-trip the literal `local` populated on \
+             the write side, including the absent-vs-populated distinction",
         );
     }
 
@@ -1978,6 +2092,7 @@ mod tests {
                 ..Default::default()
             }),
             cleanup_duration_ms: Some(987),
+            source: Some(SIDECAR_SOURCE_CI.to_string()),
         };
 
         let json = serde_json::to_string(&sc).expect("serialize");
@@ -2052,6 +2167,16 @@ mod tests {
         let host = loaded.host.expect("host round-trips");
         assert_eq!(host.kernel_name.as_deref(), Some("AuditLinux"));
         assert_eq!(loaded.cleanup_duration_ms, Some(987));
+        assert_eq!(
+            loaded.source.as_deref(),
+            Some(SIDECAR_SOURCE_CI),
+            "source must round-trip the literal `ci` populated on \
+             the write side. Audit fixture uses `ci` (vs `local` in \
+             the sibling roundtrip) so a write-vs-read field-swap \
+             regression that mapped one tag onto another would \
+             surface in this audit pass even if the sibling test \
+             did not detect it.",
+        );
     }
 
     #[test]
@@ -3339,6 +3464,7 @@ mod tests {
             run_id: _,
             host,
             cleanup_duration_ms,
+            source,
         } = loaded;
         assert!(payload.is_none());
         assert!(metrics.is_empty());
@@ -3358,6 +3484,12 @@ mod tests {
         assert!(kernel_commit.is_none());
         assert!(host.is_none());
         assert!(cleanup_duration_ms.is_none());
+        assert!(
+            source.is_none(),
+            "absent source must round-trip as None, \
+             matching the symmetric serialize/deserialize \
+             contract enforced for every other nullable field",
+        );
     }
 
     /// Populated `payload` + `metrics` survive round-trip with the
@@ -3802,6 +3934,125 @@ mod tests {
              clean vs `-dirty` of the same hex case (catches a \
              regression that distinguished only the dirty bit)",
         );
+    }
+
+    /// `source` (the run-environment provenance tag) must not
+    /// influence the variant hash. Two runs of the same semantic
+    /// variant — one from a developer machine (`source: "local"`)
+    /// and one from a CI runner (`source: "ci"`) — must produce
+    /// the same sidecar filename so `compare_runs` can diff them
+    /// across the CI/local boundary without the source tag
+    /// shattering them into per-environment buckets. Mirrors the
+    /// commit-exclusion tests: covers `None` vs `Some("local")`,
+    /// `Some("local")` vs `Some("ci")`, and `Some("ci")` vs
+    /// `Some("archive")` so a regression that distinguished only
+    /// one specific tag pair would still be caught.
+    #[test]
+    fn sidecar_variant_hash_excludes_source() {
+        let none = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            source: None,
+            ..SidecarResult::test_fixture()
+        };
+        let local = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            source: Some(SIDECAR_SOURCE_LOCAL.to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&none),
+            sidecar_variant_hash(&local),
+            "source must not influence variant hash — None vs \
+             Some(\"local\") case",
+        );
+
+        let ci = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            source: Some(SIDECAR_SOURCE_CI.to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&local),
+            sidecar_variant_hash(&ci),
+            "source must not influence variant hash — \
+             Some(\"local\") vs Some(\"ci\") case (catches XOR-style \
+             regressions where two specific tags happen to collide)",
+        );
+
+        let archive = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            source: Some(SIDECAR_SOURCE_ARCHIVE.to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&ci),
+            sidecar_variant_hash(&archive),
+            "source must not influence variant hash — \
+             Some(\"ci\") vs Some(\"archive\") case",
+        );
+    }
+
+    /// `detect_run_source` reads `KTSTR_CI` and returns `"ci"`
+    /// when set non-empty, `"local"` otherwise. Empty-string env
+    /// values count as unset so a defensively-cleared variable
+    /// does not accidentally classify a developer run as CI.
+    #[test]
+    fn detect_run_source_routes_on_ktstr_ci_env() {
+        let _lock = lock_env();
+        let _restore = EnvVarGuard::remove(KTSTR_CI_ENV);
+        assert_eq!(
+            detect_run_source(),
+            Some(SIDECAR_SOURCE_LOCAL.to_string()),
+            "unset KTSTR_CI must classify as `local`",
+        );
+        let _set_empty = EnvVarGuard::set(KTSTR_CI_ENV, std::path::Path::new(""));
+        assert_eq!(
+            detect_run_source(),
+            Some(SIDECAR_SOURCE_LOCAL.to_string()),
+            "empty-string KTSTR_CI must classify as `local` so a \
+             defensively-cleared variable does not accidentally \
+             flip the tag",
+        );
+        drop(_set_empty);
+        let _set_one = EnvVarGuard::set(KTSTR_CI_ENV, std::path::Path::new("1"));
+        assert_eq!(
+            detect_run_source(),
+            Some(SIDECAR_SOURCE_CI.to_string()),
+            "non-empty KTSTR_CI must classify as `ci`",
+        );
+    }
+
+    /// `apply_archive_source_override` rewrites every sidecar's
+    /// `source` to `"archive"` regardless of the prior value, so
+    /// that `--dir`-loaded pools surface uniformly under the
+    /// archive bucket. Pin both branches: a populated `source`
+    /// (`"local"` / `"ci"`) is overwritten, and `None` is
+    /// rewritten to `Some("archive")` rather than left as `None`.
+    #[test]
+    fn apply_archive_source_override_rewrites_every_entry() {
+        let mut pool = vec![
+            SidecarResult {
+                source: Some(SIDECAR_SOURCE_LOCAL.to_string()),
+                ..SidecarResult::test_fixture()
+            },
+            SidecarResult {
+                source: Some(SIDECAR_SOURCE_CI.to_string()),
+                ..SidecarResult::test_fixture()
+            },
+            SidecarResult {
+                source: None,
+                ..SidecarResult::test_fixture()
+            },
+        ];
+        apply_archive_source_override(&mut pool);
+        for sc in &pool {
+            assert_eq!(
+                sc.source.as_deref(),
+                Some(SIDECAR_SOURCE_ARCHIVE),
+                "every sidecar in a --dir pool must surface as \
+                 archive after override",
+            );
+        }
     }
 
     /// A `SidecarResult` carrying a fully populated `HostContext`

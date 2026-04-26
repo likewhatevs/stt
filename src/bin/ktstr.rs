@@ -610,7 +610,10 @@ fn main() -> Result<()> {
         Command::Cleanup { parent_cgroup } => cli::cleanup(parent_cgroup)?,
 
         Command::Kernel { command } => match command {
-            KernelCommand::List { json } => cli::kernel_list(json)?,
+            KernelCommand::List { json, range } => match range {
+                Some(r) => cli::kernel_list_range_preview(json, &r)?,
+                None => cli::kernel_list(json)?,
+            },
             KernelCommand::Build {
                 version,
                 source,

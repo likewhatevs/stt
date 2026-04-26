@@ -4927,6 +4927,7 @@ mod tests {
             run_id: String::new(),
             host: None,
             cleanup_duration_ms: None,
+            source: None,
         };
         serde_json::to_string_pretty(&sc).unwrap()
     }

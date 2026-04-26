@@ -618,6 +618,22 @@ pub struct GauntletRow {
     /// lets the substring filter match on flag names too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<String>,
+    /// Run-environment provenance tag carried from
+    /// `SidecarResult::source` (`"local"` for developer runs,
+    /// `"ci"` when [`KTSTR_CI_ENV`](crate::test_support::sidecar::KTSTR_CI_ENV)
+    /// was set at write time, `"archive"` when the consumer pulled
+    /// the pool from a non-default `--dir`). `None` for sidecars
+    /// produced before the field existed (pre-1.0 disposable
+    /// schema; re-running the test regenerates the entry).
+    /// Surfaced via the typed [`RowFilter::sources`] for narrowing —
+    /// when the user passes `--source local` (repeatable), rows
+    /// with `None` are dropped to preserve the operator's intent
+    /// ("only these environments"); a `None`-as-wildcard would
+    /// silently dilute the filtered set, mirroring the
+    /// [`RowFilter::kernels`] / [`RowFilter::commits`] /
+    /// [`RowFilter::kernel_commits`] policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub passed: bool,
     /// True when the run was skipped (topology mismatch, missing
     /// resource). `passed` stays `true` for gate-compat; `skipped`
@@ -783,6 +799,15 @@ pub struct GauntletRow {
 ///   [`crate::test_support::sidecar::detect_kernel_commit`] at
 ///   sidecar-write time. Filters on the kernel HEAD, NOT on the
 ///   kernel release version (`kernels` is the version filter).
+/// - `sources` — repeatable, OR-combined: a row matches iff its
+///   `source` equals ANY entry in `sources`. Same multi-value
+///   semantic as `kernels` / `commits` / `kernel_commits`,
+///   applied to the run-environment provenance tag (`"local"`,
+///   `"ci"`, `"archive"`) recorded by
+///   [`crate::test_support::sidecar::detect_run_source`] at
+///   sidecar-write time, or rewritten to `"archive"` at load
+///   time when the consumer pulled the pool from a non-default
+///   `--dir`.
 /// - `flags` — AND-combined: every entry in the filter must appear
 ///   somewhere in the row's `flags` vec. The row may carry
 ///   additional flags beyond the filter set; the filter pins
@@ -791,8 +816,9 @@ pub struct GauntletRow {
 ///   `kernel_version` is `None` ALWAYS fails (no wildcard semantic)
 ///   — the operator wrote specific versions and a `None`-row would
 ///   silently dilute the set. The same opt-in policy applies to
-///   `commits` against rows with `commit == None`, and to
-///   `kernel_commits` against rows with `kernel_commit == None`.
+///   `commits` against rows with `commit == None`, to
+///   `kernel_commits` against rows with `kernel_commit == None`,
+///   and to `sources` against rows with `source == None`.
 ///
 /// Empty `RowFilter` (every field `None`/empty) is the no-op default
 /// and matches every row. Use [`RowFilter::default()`] to build it.
@@ -823,6 +849,16 @@ pub struct RowFilter {
     /// values represent the same release rebuilt from different
     /// trees (e.g. WIP patches on top, a different remote ref).
     pub kernel_commits: Vec<String>,
+    /// Repeatable run-environment-source filter, OR-combined: a row
+    /// matches iff its `GauntletRow::source` equals ANY entry.
+    /// Empty vec disables the filter ("do not filter on source").
+    /// A row whose `source` is itself `None` (sidecar pre-dates
+    /// the field) never matches a non-empty filter — same opt-in
+    /// semantic as `kernels` / `commits` / `kernel_commits`.
+    /// Typical values: `"local"`, `"ci"`, `"archive"`. The schema
+    /// is open: any string is acceptable so a future producer can
+    /// introduce a new tag without a version bump.
+    pub sources: Vec<String>,
     /// Match against `GauntletRow::scheduler` (strict equality).
     /// `None` here is "do not filter on scheduler".
     pub scheduler: Option<String>,
@@ -900,6 +936,22 @@ impl RowFilter {
                 .kernel_commits
                 .iter()
                 .any(|want| row_kc == Some(want.as_str()));
+            if !any {
+                return false;
+            }
+        }
+        if !self.sources.is_empty() {
+            // OR-combined match against `GauntletRow::source`,
+            // mirroring the `kernels` / `commits` / `kernel_commits`
+            // opt-in policy: a row whose `source` is `None`
+            // (sidecar pre-dates the field) never matches a
+            // populated filter, so a `--source` argument demands a
+            // tagged row rather than acting as a wildcard.
+            let row_source = row.source.as_deref();
+            let any = self
+                .sources
+                .iter()
+                .any(|want| row_source == Some(want.as_str()));
             if !any {
                 return false;
             }
@@ -991,10 +1043,10 @@ fn is_major_minor_prefix(s: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// One of the seven dimensions that compose a [`GauntletRow`]'s
+/// One of the eight dimensions that compose a [`GauntletRow`]'s
 /// identity in the comparison pipeline: `kernel`, `scheduler`,
-/// `topology`, `work_type`, `commit`, `kernel_commit`, `flags`.
-/// Each maps to the corresponding `RowFilter` field and
+/// `topology`, `work_type`, `commit`, `kernel_commit`, `source`,
+/// `flags`. Each maps to the corresponding `RowFilter` field and
 /// `GauntletRow` field; the dimension model lets
 /// [`compare_partitions`] derive its slicing dims and dynamic
 /// pairing key without hardcoding the dimension list at every
@@ -1007,9 +1059,9 @@ fn is_major_minor_prefix(s: &str) -> bool {
 /// Iteration order via [`Dimension::ALL`] is deterministic and
 /// matches the order operators read in the CLI flags
 /// (`--kernel` / `--scheduler` / `--topology` / `--work-type` /
-/// `--commit` / `--kernel-commit` / `--flag`), so generated
-/// labels and error messages list dims in a stable, predictable
-/// order.
+/// `--commit` / `--kernel-commit` / `--source` / `--flag`), so
+/// generated labels and error messages list dims in a stable,
+/// predictable order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dimension {
     Kernel,
@@ -1018,6 +1070,7 @@ pub enum Dimension {
     WorkType,
     Commit,
     KernelCommit,
+    Source,
     Flags,
 }
 
@@ -1033,6 +1086,7 @@ impl Dimension {
         Dimension::WorkType,
         Dimension::Commit,
         Dimension::KernelCommit,
+        Dimension::Source,
         Dimension::Flags,
     ];
 
@@ -1063,6 +1117,7 @@ impl Dimension {
             Dimension::WorkType => "work-type",
             Dimension::Commit => "commit",
             Dimension::KernelCommit => "kernel-commit",
+            Dimension::Source => "source",
             Dimension::Flags => "flags",
         }
     }
@@ -1087,11 +1142,11 @@ pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] =
 /// [`compare_rows`] to join A-side rows against B-side rows.
 ///
 /// Comparison shape per dimension:
-/// - `Kernel` / `Commit` / `KernelCommit` / `Flags`: a slicing
-///   dim iff the two sides' filter vecs differ as SORTED-DEDUPED
-///   `Vec<&str>`. Order does not matter (`--a-kernel 6.14
-///   --a-kernel 6.15` and `--b-kernel 6.15 --b-kernel 6.14` are
-///   NOT a slice).
+/// - `Kernel` / `Commit` / `KernelCommit` / `Source` / `Flags`: a
+///   slicing dim iff the two sides' filter vecs differ as
+///   SORTED-DEDUPED `Vec<&str>`. Order does not matter
+///   (`--a-kernel 6.14 --a-kernel 6.15` and `--b-kernel 6.15
+///   --b-kernel 6.14` are NOT a slice).
 /// - `Scheduler` / `Topology` / `WorkType`: a slicing dim iff the
 ///   two `Option<String>` filters differ. `Some("foo") != None`
 ///   counts as a differ.
@@ -1111,6 +1166,7 @@ pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Di
             Dimension::KernelCommit => {
                 sorted_dedup(&filter_a.kernel_commits) != sorted_dedup(&filter_b.kernel_commits)
             }
+            Dimension::Source => sorted_dedup(&filter_a.sources) != sorted_dedup(&filter_b.sources),
             Dimension::Flags => sorted_dedup(&filter_a.flags) != sorted_dedup(&filter_b.flags),
         };
         if differs {
@@ -1168,6 +1224,7 @@ pub(crate) fn render_side_label(
                 .unwrap_or_else(|| bare_label.to_string()),
             Dimension::Commit => render_vec_dim(&filter.commits, bare_label),
             Dimension::KernelCommit => render_vec_dim(&filter.kernel_commits, bare_label),
+            Dimension::Source => render_vec_dim(&filter.sources, bare_label),
             Dimension::Flags => render_vec_dim(&filter.flags, bare_label),
         };
         parts.push(part);
@@ -1224,6 +1281,7 @@ impl PairingKey {
                 Dimension::WorkType => row.work_type.clone(),
                 Dimension::Commit => row.commit.clone().unwrap_or_default(),
                 Dimension::KernelCommit => row.kernel_commit.clone().unwrap_or_default(),
+                Dimension::Source => row.source.clone().unwrap_or_default(),
                 Dimension::Flags => {
                     let mut sorted: Vec<&str> = row.flags.iter().map(String::as_str).collect();
                     sorted.sort_unstable();
@@ -1495,6 +1553,7 @@ pub fn group_and_average_by(
             kernel_version: acc.first.kernel_version.clone(),
             commit: acc.first.commit.clone(),
             kernel_commit: acc.first.kernel_commit.clone(),
+            source: acc.first.source.clone(),
             flags: acc.first.flags.clone(),
             // ALL must pass: any failed or skipped contributor
             // flips the aggregate. A group with zero
@@ -1601,6 +1660,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         commit: sc.project_commit.clone(),
         kernel_commit: sc.kernel_commit.clone(),
         flags: sc.active_flags.clone(),
+        source: sc.source.clone(),
         passed: sc.passed,
         skipped: sc.skipped,
         spread: finite_or_zero("spread", sc.stats.worst_spread),
@@ -2139,15 +2199,23 @@ pub fn list_runs() -> anyhow::Result<()> {
 pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<String> {
     use std::collections::BTreeSet;
 
-    let root: std::path::PathBuf = match dir {
-        Some(d) => d.to_path_buf(),
-        None => crate::test_support::runs_root(),
+    let (root, override_archive) = match dir {
+        Some(d) => (d.to_path_buf(), true),
+        None => (crate::test_support::runs_root(), false),
     };
-    let pool = crate::test_support::collect_pool(&root);
+    let mut pool = crate::test_support::collect_pool(&root);
+    if override_archive {
+        // `--dir` points at a non-default pool root. Stats tooling
+        // treats those sidecars as `"archive"` regardless of the
+        // tag they were written with — see
+        // `apply_archive_source_override` for the rewrite contract.
+        crate::test_support::apply_archive_source_override(&mut pool);
+    }
 
     let mut kernels: BTreeSet<Option<String>> = BTreeSet::new();
     let mut commits: BTreeSet<Option<String>> = BTreeSet::new();
     let mut kernel_commits: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut sources: BTreeSet<Option<String>> = BTreeSet::new();
     let mut schedulers: BTreeSet<String> = BTreeSet::new();
     let mut topologies: BTreeSet<String> = BTreeSet::new();
     let mut work_types: BTreeSet<String> = BTreeSet::new();
@@ -2157,6 +2225,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
         kernels.insert(sc.kernel_version.clone());
         commits.insert(sc.project_commit.clone());
         kernel_commits.insert(sc.kernel_commit.clone());
+        sources.insert(sc.source.clone());
         schedulers.insert(sc.scheduler.clone());
         topologies.insert(sc.topology.clone());
         work_types.insert(sc.work_type.clone());
@@ -2187,10 +2256,18 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
                 None => serde_json::Value::Null,
             })
             .collect();
+        let sources_json: Vec<serde_json::Value> = sources
+            .iter()
+            .map(|opt| match opt {
+                Some(s) => serde_json::Value::String(s.clone()),
+                None => serde_json::Value::Null,
+            })
+            .collect();
         let payload = serde_json::json!({
             "kernel": kernels_json,
             "commit": commits_json,
             "kernel_commit": kernel_commits_json,
+            "source": sources_json,
             "scheduler": schedulers.iter().collect::<Vec<_>>(),
             "topology": topologies.iter().collect::<Vec<_>>(),
             "work_type": work_types.iter().collect::<Vec<_>>(),
@@ -2241,6 +2318,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     render_opt_set(&mut out, "kernel:", &kernels);
     render_opt_set(&mut out, "commit:", &commits);
     render_opt_set(&mut out, "kernel_commit:", &kernel_commits);
+    render_opt_set(&mut out, "source:", &sources);
     render_str_set(&mut out, "scheduler:", &schedulers);
     render_str_set(&mut out, "topology:", &topologies);
     render_str_set(&mut out, "work_type:", &work_types);
@@ -2825,13 +2903,25 @@ pub fn compare_partitions(
     // Pool every sidecar under the runs root (or the operator's
     // --dir override) and convert to rows. The full-scan cost
     // is acceptable for the single-comparison-per-session
-    // workflow; #124 tracks parallelisation for the cache-miss
-    // case if it becomes a hot path.
-    let root: std::path::PathBuf = match dir {
-        Some(d) => d.to_path_buf(),
-        None => crate::test_support::runs_root(),
+    // workflow.
+    //
+    // `--dir`-loaded sidecars get their `source` field rewritten
+    // to `"archive"` via `apply_archive_source_override` before
+    // row conversion. The producer-side `"local"` / `"ci"`
+    // distinction is meaningful on the host that wrote the
+    // sidecars; once the files have been copied off, the only
+    // useful classification is "this came from elsewhere", which
+    // is what `--source archive` queries for. Operators who need
+    // to retain the producer-side distinction read from the
+    // default root (no `--dir`) so values pass through untouched.
+    let (root, override_archive) = match dir {
+        Some(d) => (d.to_path_buf(), true),
+        None => (crate::test_support::runs_root(), false),
     };
-    let pool = crate::test_support::collect_pool(&root);
+    let mut pool = crate::test_support::collect_pool(&root);
+    if override_archive {
+        crate::test_support::apply_archive_source_override(&mut pool);
+    }
     if pool.is_empty() {
         anyhow::bail!(
             "stats compare: no sidecar data found under {}. \
@@ -3205,6 +3295,7 @@ mod tests {
             kernel_version: None,
             commit: None,
             kernel_commit: None,
+            source: None,
             flags: Vec::new(),
             skipped: false,
             passed,
@@ -4056,6 +4147,7 @@ mod tests {
             "kernel:",
             "commit:",
             "kernel_commit:",
+            "source:",
             "scheduler:",
             "topology:",
             "work_type:",
@@ -4066,15 +4158,16 @@ mod tests {
                 "text output must include heading for {dim}: {out}",
             );
         }
-        // Each dim should report the empty-pool sentinel exactly seven
+        // Each dim should report the empty-pool sentinel exactly eight
         // times — one per dim — so a regression that dropped the
         // sentinel for one dim falls out as a count mismatch.
         let sentinel_count = out.matches("(no sidecars in pool)").count();
         assert_eq!(
-            sentinel_count, 7,
+            sentinel_count, 8,
             "empty pool must surface the no-sidecars sentinel under every \
-             one of the 7 dims (kernel/commit/kernel_commit/scheduler/topology/\
-             work_type/flags); got {sentinel_count} occurrences in:\n{out}",
+             one of the 8 dims (kernel/commit/kernel_commit/source/\
+             scheduler/topology/work_type/flags); got {sentinel_count} \
+             occurrences in:\n{out}",
         );
     }
 
@@ -4090,6 +4183,7 @@ mod tests {
             "kernel",
             "commit",
             "kernel_commit",
+            "source",
             "scheduler",
             "topology",
             "work_type",
@@ -5793,6 +5887,7 @@ mod tests {
             kernel_version: kernel_version.map(str::to_owned),
             commit: None,
             kernel_commit: None,
+            source: None,
             flags: flags.iter().map(|s| (*s).to_owned()).collect(),
             passed: true,
             skipped: false,
@@ -6849,6 +6944,7 @@ mod tests {
                 Dimension::WorkType,
                 Dimension::Commit,
                 Dimension::KernelCommit,
+                Dimension::Source,
                 Dimension::Flags,
             ],
         );
@@ -6868,6 +6964,7 @@ mod tests {
                 Dimension::Topology,
                 Dimension::WorkType,
                 Dimension::KernelCommit,
+                Dimension::Source,
                 Dimension::Flags,
             ],
         );

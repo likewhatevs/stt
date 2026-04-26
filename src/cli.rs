@@ -47,12 +47,43 @@ pub use crate::stats::{Dimension, derive_slicing_dims};
 /// construction.
 #[derive(Subcommand, Debug)]
 pub enum KernelCommand {
-    /// List cached kernel images.
+    /// List cached kernel images, or preview a range expansion
+    /// without downloading or building.
+    ///
+    /// Default mode (no `--range`): walks the local cache and
+    /// reports every cached kernel image. `--range START..END`
+    /// switches to PREVIEW mode: fetches kernel.org's
+    /// `releases.json`, expands the inclusive range against the
+    /// `stable` / `longterm` releases, and prints the resulting
+    /// version list. Preview mode performs no downloads or builds
+    /// and ignores the local cache — operators can use it to
+    /// answer "what does `--kernel 6.12..6.16` actually cover?"
+    /// before paying the network or cache-store cost of a real
+    /// resolve.
     #[command(long_about = KERNEL_LIST_LONG_ABOUT)]
     List {
         /// Output in JSON format for CI scripting.
         #[arg(long)]
         json: bool,
+        /// Range preview. When supplied, switches the subcommand
+        /// from "list cached kernels" to "fetch releases.json and
+        /// print the versions a `START..END` range expands to."
+        /// Format: `MAJOR.MINOR[.PATCH][-rcN]..MAJOR.MINOR[.PATCH][-rcN]`,
+        /// matching [`crate::kernel_path::KernelId::Range`].
+        /// Example: `--range 6.12..6.14` → every stable/longterm
+        /// release in `[6.12, 6.14]` inclusive.
+        ///
+        /// In preview mode the subcommand performs no cache
+        /// reads or kernel.org tarball downloads — only the
+        /// single `releases.json` fetch that
+        /// [`crate::cli::expand_kernel_range`] already runs for
+        /// real range resolves. `--json` (when also supplied)
+        /// emits a JSON object with the literal range string and
+        /// the expanded version array; without `--json` the
+        /// versions are written one per line to stdout for shell
+        /// pipelines.
+        #[arg(long)]
+        range: Option<String>,
     },
     /// Download, build, and cache a kernel image.
     Build {
@@ -743,6 +774,32 @@ pub fn format_entry_row(
 ///   See [`crate::cache::ListedEntry::error_kind`] for the
 ///   classifier contract.
 pub fn kernel_list(json: bool) -> Result<()> {
+    kernel_list_inner(json, None)
+}
+
+/// Range-preview variant of [`kernel_list`].
+///
+/// Routes through [`kernel_list_inner`] with `range = Some(spec)`,
+/// switching the subcommand from "walk the cache and list local
+/// entries" to "fetch releases.json once and print the versions
+/// `spec` expands to." See the `range` arg's doc on
+/// [`KernelCommand::List`] for operator-facing semantics.
+///
+/// Surfaced as a thin wrapper because the binary dispatch sites
+/// (`ktstr::kernel kernel list --range R` /
+/// `cargo ktstr kernel list --range R`) read more naturally as
+/// `cli::kernel_list_range_preview(json, R)` than as
+/// `cli::kernel_list_inner(json, Some(R))`. The shared inner
+/// function keeps a single `--json` formatter and a single test
+/// surface.
+pub fn kernel_list_range_preview(json: bool, range: &str) -> Result<()> {
+    kernel_list_inner(json, Some(range))
+}
+
+fn kernel_list_inner(json: bool, range: Option<&str>) -> Result<()> {
+    if let Some(spec) = range {
+        return run_kernel_list_range(json, spec);
+    }
     let cache = CacheDir::new()?;
     let entries = cache.list()?;
     let kconfig_hash = embedded_kconfig_hash();
@@ -911,6 +968,72 @@ pub fn kernel_list(json: bool) -> Result<()> {
     }
     if let Some(footer) = corrupt_footer_if_any(corrupt_count, cache.root()) {
         eprintln!("{footer}");
+    }
+    Ok(())
+}
+
+/// Render a `kernel list --range START..END` preview by parsing
+/// `spec` as a [`crate::kernel_path::KernelId::Range`], expanding
+/// it via [`expand_kernel_range`], and printing the resulting
+/// version list.
+///
+/// Performs no cache reads or builds — only the single
+/// `releases.json` fetch [`expand_kernel_range`] already runs for
+/// real range resolves. Bails when:
+/// - `spec` does not parse as a `Range` (passes through
+///   `KernelId::parse` and rejects non-Range variants with an
+///   actionable diagnostic naming the expected shape);
+/// - `KernelId::Range::validate` rejects the endpoints (inverted
+///   range, malformed version components — same diagnostics the
+///   real resolver emits);
+/// - the network fetch fails or the range expands to zero
+///   versions (the same hard-error contract documented on
+///   [`expand_kernel_range`]).
+///
+/// Output shape mirrors `kernel list`:
+/// - text: one version per line on stdout, prefixed with the
+///   parsed range and version count on stderr so shell pipelines
+///   (`| awk`, `| grep`) see clean stdout.
+/// - JSON: a single object with the literal range, the parsed
+///   start / end strings, and the expanded version array.
+fn run_kernel_list_range(json: bool, spec: &str) -> Result<()> {
+    use crate::kernel_path::KernelId;
+
+    let id = KernelId::parse(spec);
+    let (start, end) = match &id {
+        KernelId::Range { start, end } => (start.clone(), end.clone()),
+        _ => {
+            bail!(
+                "kernel list --range: `{spec}` does not parse as a \
+                 `START..END` range. Expected `MAJOR.MINOR[.PATCH][-rcN]..\
+                 MAJOR.MINOR[.PATCH][-rcN]` (e.g. `6.12..6.14`)."
+            );
+        }
+    };
+    id.validate()
+        .map_err(|e| anyhow::anyhow!("kernel list --range {spec}: {e}"))?;
+
+    let versions = expand_kernel_range(&start, &end, "kernel list")?;
+
+    if json {
+        let payload = serde_json::json!({
+            "range": spec,
+            "start": start,
+            "end": end,
+            "versions": versions,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    // Text output: versions on stdout (one per line) so
+    // `kernel list --range R | xargs -I{} kernel build {}`
+    // works without tearing on legend lines. The header on
+    // stderr matches `expand_kernel_range`'s own status output
+    // shape so the operator gets the same "expanded to N
+    // kernel(s)" context they would see during a real resolve.
+    for v in &versions {
+        println!("{v}");
     }
     Ok(())
 }
@@ -7381,6 +7504,44 @@ mod tests {
         assert!(
             msg.contains("kernel range end `garbage`"),
             "error must cite the bad endpoint, got: {msg}"
+        );
+    }
+
+    /// `kernel list --range R` with a non-Range spec must reject
+    /// at parse time with a diagnostic naming the expected shape,
+    /// before any network fetch. A bare version `6.14.2` parses
+    /// as `KernelId::Version`, NOT `KernelId::Range`, so the
+    /// preview path must surface a parse error rather than fall
+    /// through into `expand_kernel_range` with synthesized
+    /// endpoints.
+    #[test]
+    fn kernel_list_range_preview_rejects_non_range_spec() {
+        let err = run_kernel_list_range(false, "6.14.2")
+            .expect_err("bare version must not parse as a Range");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not parse as a `START..END` range"),
+            "error must name the expected range shape, got: {msg}"
+        );
+        assert!(
+            msg.contains("`6.14.2`"),
+            "error must cite the bad input verbatim, got: {msg}"
+        );
+    }
+
+    /// `kernel list --range` with an inverted range must surface
+    /// the `validate()` diagnostic ("swap the endpoints") rather
+    /// than trying to fetch and silently expanding to zero
+    /// versions. The preview path must run the same validation
+    /// gate every real resolver runs.
+    #[test]
+    fn kernel_list_range_preview_rejects_inverted_range() {
+        let err = run_kernel_list_range(false, "6.16..6.12")
+            .expect_err("inverted range must not be accepted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("kernel list --range 6.16..6.12"),
+            "error must cite the operator-supplied range, got: {msg}"
         );
     }
 }

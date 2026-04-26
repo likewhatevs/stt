@@ -240,23 +240,38 @@ Manage cached kernel images. Three subcommands: `list`, `build`,
 
 ### kernel list
 
-List cached kernel images, sorted newest first.
+List cached kernel images, sorted newest first. With `--range`,
+switches to PREVIEW MODE: prints the versions a `START..END` range
+expands to without performing any download or build.
 
 ```sh
 cargo ktstr kernel list
-cargo ktstr kernel list --json       # JSON output for CI scripting
+cargo ktstr kernel list --json                    # JSON output for CI scripting
+cargo ktstr kernel list --range 6.12..6.14        # preview range expansion
+cargo ktstr kernel list --range 6.12..6.14 --json # preview as JSON
 ```
 
-Human-readable output shows key, version, source type, arch, and
-build timestamp. Entries built with a different `ktstr.kconfig` are
-marked `(stale kconfig)`. Entries whose major.minor version is no
-longer in kernel.org's active releases list are marked `(EOL)`;
-prefix lookups for EOL series fall back to probing cdn.kernel.org
-for the latest patch release.
+Default mode walks the local cache. Human-readable output shows
+key, version, source type, arch, and build timestamp. Entries built
+with a different `ktstr.kconfig` are marked `(stale kconfig)`.
+Entries whose major.minor version is no longer in kernel.org's
+active releases list are marked `(EOL)`; prefix lookups for EOL
+series fall back to probing cdn.kernel.org for the latest patch
+release.
+
+`--range` mode performs no cache reads: it fetches kernel.org's
+`releases.json` once, expands the inclusive range against the
+`stable` and `longterm` releases (mainline / linux-next dropped),
+and prints one version per line on stdout. Use this to answer
+"what does `--kernel 6.12..6.16` actually cover?" before paying
+the build cost — no kernel is downloaded or compiled. With
+`--json`, emits a JSON object carrying the literal range, the
+parsed start / end, and the expanded `versions` array.
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Output in JSON format. Each entry includes a boolean `eol` field (computed at list time by fetching kernel.org's `releases.json`) alongside the cached metadata. |
+| `--json` | Output in JSON format. Each entry includes a boolean `eol` field (computed at list time by fetching kernel.org's `releases.json`) alongside the cached metadata. With `--range`, emits a single object `{range, start, end, versions}` instead. |
+| `--range START..END` | Switch to range-preview mode. Format: `MAJOR.MINOR[.PATCH][-rcN]..MAJOR.MINOR[.PATCH][-rcN]`. Performs the single `releases.json` fetch a real range resolve does, expands inclusively, and prints the version list — no downloads, no builds, no cache lookups. |
 
 ### kernel build
 

@@ -594,6 +594,25 @@ enum StatsCommand {
         /// `doc/guide/src/concepts/work-types.md`.
         #[arg(long)]
         work_type: Option<String>,
+        /// Strict equality match against the sidecar's `source`
+        /// field (e.g. `--source local`, `--source ci`,
+        /// `--source archive`). Repeatable: `--source A --source
+        /// B` keeps rows whose `source` equals A OR B. Rows whose
+        /// `source` is `None` (sidecar pre-dates the field) NEVER
+        /// match a populated filter — same opt-in policy as
+        /// `--kernel` / `--commit` / `--kernel-commit`.
+        ///
+        /// Filters on the run-environment provenance recorded by
+        /// `detect_run_source` at sidecar-write time (`"local"`
+        /// for developer runs, `"ci"` when `KTSTR_CI` was set),
+        /// or rewritten to `"archive"` at load time when this
+        /// command's `--dir` flag points at a non-default pool
+        /// root. Combine with `--a-source` / `--b-source` to
+        /// contrast across run environments (e.g. `--a-source ci
+        /// --b-source local` to diff CI runs against developer
+        /// runs of the same scenarios).
+        #[arg(long, action = ArgAction::Append)]
+        source: Vec<String>,
         /// Repeatable AND-combined flag filter (e.g.
         /// `--flag llc --flag rusty_balance`). Every flag listed
         /// must be present in the sidecar's `active_flags`; the row
@@ -610,6 +629,8 @@ enum StatsCommand {
         a_commit: Vec<String>,
         #[arg(long = "a-kernel-commit", action = ArgAction::Append)]
         a_kernel_commit: Vec<String>,
+        #[arg(long = "a-source", action = ArgAction::Append)]
+        a_source: Vec<String>,
         #[arg(long = "a-scheduler")]
         a_scheduler: Option<String>,
         #[arg(long = "a-topology")]
@@ -628,6 +649,8 @@ enum StatsCommand {
         b_commit: Vec<String>,
         #[arg(long = "b-kernel-commit", action = ArgAction::Append)]
         b_kernel_commit: Vec<String>,
+        #[arg(long = "b-source", action = ArgAction::Append)]
+        b_source: Vec<String>,
         #[arg(long = "b-scheduler")]
         b_scheduler: Option<String>,
         #[arg(long = "b-topology")]
@@ -774,80 +797,174 @@ fn canonicalize_cache_dir(cache_dir: PathBuf) -> PathBuf {
 /// [`crate::test_support::dispatch`] applies the `kernel_` prefix
 /// and `[a-z0-9_]+` normalisation; this label is the human-meaningful
 /// payload it operates on.
-fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+/// Resolve one already-validated [`KernelId`] (NOT `Range` — the
+/// caller fans Range out to per-version `Version` ids before
+/// calling here) to a `(label, dir)` tuple.
+///
+/// Extracted from `resolve_kernel_set`'s rayon body so the per-
+/// spec match arm is one function call rather than five inline
+/// arms duplicated across the parallel and sequential paths.
+/// Each non-Range arm here mirrors what the original sequential
+/// loop did.
+///
+/// Range fan-out lives on the caller because the
+/// `expand_kernel_range` step yields a `Vec<String>` that has to
+/// be expanded into the same parallel pool — `flat_map_iter` is
+/// the wrong shape for "fan out N items into the parent
+/// iterator." See the parallel comment block in
+/// [`resolve_kernel_set`] for the full strategy.
+fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, PathBuf), String> {
     use ktstr::kernel_path::KernelId;
-
-    let mut resolved: Vec<(String, PathBuf)> = Vec::new();
-    for raw in specs {
-        // Each `--kernel` argument is parsed as a single
-        // `KernelId`. Multi-kernel runs use repeated `--kernel`
-        // flags rather than comma-separated lists — clap's
-        // `ArgAction::Append` collects them into the `Vec<String>`
-        // that arrives here. A `Range` variant inside one
-        // argument expands to multiple resolved kernels via
-        // [`crate::cli::expand_kernel_range`]; that's the only
-        // mechanism by which a single `--kernel` produces
-        // multiple entries.
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
+    match id {
+        KernelId::Path(p) => {
+            let dir = resolve_path_kernel(&p)?;
+            let label = path_kernel_label(&dir);
+            Ok((label, dir))
         }
-        let id = KernelId::parse(trimmed);
-        // Validate before any I/O so an inverted Range surfaces
-        // the "swap the endpoints" diagnostic ahead of any
-        // download attempt.
-        id.validate().map_err(|e| format!("--kernel {id}: {e}"))?;
-
-        match id {
-            KernelId::Path(p) => {
-                let dir = resolve_path_kernel(&p)?;
-                let label = path_kernel_label(&dir);
-                resolved.push((label, dir));
-            }
-            KernelId::Version(ref ver) => {
-                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
-                    .map_err(|e| format!("{e:#}"))?;
-                let dir = canonicalize_cache_dir(cache_dir);
-                resolved.push((ver.clone(), dir));
-            }
-            KernelId::CacheKey(ref key) => {
-                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
-                    .map_err(|e| format!("{e:#}"))?;
-                let dir = canonicalize_cache_dir(cache_dir);
-                // Extract the version prefix from the cache key —
-                // `6.14.2-tarball-x86_64-kc...` → `6.14.2`. The
-                // prefix is the part before the first known
-                // source-tag suffix (`-tarball-`, `-git-`,
-                // `-local-`). Falls back to the full key if no
-                // recognised suffix is present.
-                let label = cache_key_to_version_label(key).to_string();
-                resolved.push((label, dir));
-            }
-            KernelId::Range { ref start, ref end } => {
-                let versions = ktstr::cli::expand_kernel_range(start, end, "cargo ktstr")
-                    .map_err(|e| format!("{e:#}"))?;
-                for ver in versions {
-                    let cache_dir = ktstr::cli::resolve_cached_kernel(
-                        &KernelId::Version(ver.clone()),
-                        "cargo ktstr",
-                    )
-                    .map_err(|e| format!("resolve kernel {ver}: {e:#}"))?;
-                    let dir = canonicalize_cache_dir(cache_dir);
-                    resolved.push((ver, dir));
-                }
-            }
-            KernelId::Git {
-                ref url,
-                ref git_ref,
-            } => {
-                let cache_dir = ktstr::cli::resolve_git_kernel(url, git_ref, "cargo ktstr")
-                    .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
-                let dir = canonicalize_cache_dir(cache_dir);
-                let label = git_kernel_label(url, git_ref);
-                resolved.push((label, dir));
-            }
+        KernelId::Version(ref ver) => {
+            let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
+                .map_err(|e| format!("{e:#}"))?;
+            let dir = canonicalize_cache_dir(cache_dir);
+            Ok((ver.clone(), dir))
+        }
+        KernelId::CacheKey(ref key) => {
+            let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
+                .map_err(|e| format!("{e:#}"))?;
+            let dir = canonicalize_cache_dir(cache_dir);
+            // Extract the version prefix from the cache key —
+            // `6.14.2-tarball-x86_64-kc...` → `6.14.2`. Falls back
+            // to the full key if no recognised suffix is present.
+            let label = cache_key_to_version_label(key).to_string();
+            Ok((label, dir))
+        }
+        KernelId::Git {
+            ref url,
+            ref git_ref,
+        } => {
+            let cache_dir = ktstr::cli::resolve_git_kernel(url, git_ref, "cargo ktstr")
+                .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
+            let dir = canonicalize_cache_dir(cache_dir);
+            let label = git_kernel_label(url, git_ref);
+            Ok((label, dir))
+        }
+        KernelId::Range { start, end } => {
+            // Defensive: the caller fans Range out to per-version
+            // Version ids before calling here. This arm exists
+            // only so the compiler accepts the exhaustive match;
+            // hitting it indicates a programming error in the
+            // caller's flat-map shape rather than a user-visible
+            // condition, so the diagnostic is descriptive enough
+            // to point a developer at the wrong call site.
+            Err(format!(
+                "internal: resolve_one called with Range {start}..{end}; \
+                 caller must expand Range via `expand_kernel_range` and \
+                 call `resolve_one` per version"
+            ))
         }
     }
+}
+
+fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+    use ktstr::kernel_path::KernelId;
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    // Each spec resolves independently:
+    //   - Path → just canonicalize on disk (no network).
+    //   - Version / CacheKey → cache lookup → maybe download +
+    //     build.
+    //   - Range → fetch releases.json once, then per-version
+    //     cache lookup → maybe download + build for each
+    //     expanded version.
+    //   - Git → shallow clone → cache lookup → maybe build.
+    //
+    // Two phases of work happen behind the per-spec resolvers:
+    // (1) network I/O — kernel.org tarball download or
+    //     `git_clone` shallow fetch — which is independent
+    //     across specs and overlaps freely.
+    // (2) build — `make -j$(nproc)` invoked under an LLC flock
+    //     plus a cgroup v2 sandbox (`acquire_build_reservation`
+    //     in `kernel_build_pipeline`). The flock serializes
+    //     concurrent builders against each other, so parallel
+    //     resolvers queue at the LLC level even when their
+    //     downloads overlapped.
+    //
+    // Net effect: parallelizing `resolve_kernel_set` overlaps
+    // every download / clone phase, while the build phase
+    // remains serialized via the LLC flock the build pipeline
+    // already holds. `make -j$(nproc)` inside a single build
+    // saturates CPU on its own — running multiple builds
+    // concurrently would only contend with the active build's
+    // reserved LLCs, so the flock-driven serialization is the
+    // correct ceiling. The cache-store path is also flock-
+    // protected (`store_succeeds_under_internal_exclusive_lock`
+    // in `cache.rs`) so concurrent stores against different
+    // cache keys are safe.
+    //
+    // Concurrent resolves of the SAME spec (e.g. a duplicated
+    // `--kernel 6.14.2` flag) racing on the same cache key are
+    // also safe — the cache's exclusive store lock means the
+    // second resolver re-checks the cache after acquiring its
+    // own lock and finds the just-written entry, skipping the
+    // redundant build.
+    //
+    // `flat_map_iter` flattens Range expansion into the same
+    // parallel pool: a 5-version range from a single spec
+    // contributes 5 independent download-and-build futures
+    // alongside any peer specs, rather than serializing the
+    // range against itself the way the prior loop body did.
+    //
+    // Result-collecting fail-fast: rayon's `collect` on
+    // `Result<_, _>` short-circuits on the first error, so a
+    // single failed spec aborts the rest. This matches the
+    // pre-parallel loop's `?` propagation; the operator sees
+    // the first failure even though peers may still be in
+    // flight (their cleanup is owned by their tempdirs going
+    // out of scope, see `download_and_cache_version` /
+    // `resolve_git_kernel` for the `tempfile::TempDir`-driven
+    // teardown).
+    let resolved: Vec<(String, PathBuf)> = specs
+        .into_par_iter()
+        .filter_map(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .flat_map_iter(|trimmed| {
+            // `flat_map_iter` returns an iterator per input, so a
+            // Range spec contributes N items to the parallel
+            // pool. Each yielded item is an opaque
+            // `Result<(String, PathBuf), String>` driven by the
+            // shared `resolve_one` helper; rayon's `collect` on
+            // `Result` short-circuits on the first error.
+            //
+            // Validation runs first so an inverted Range bails
+            // before any I/O — same diagnostic timing the
+            // sequential loop preserved.
+            let id = KernelId::parse(&trimmed);
+            if let Err(e) = id.validate() {
+                return vec![Err(format!("--kernel {id}: {e}"))].into_iter();
+            }
+            match id {
+                KernelId::Range { start, end } => {
+                    match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr") {
+                        Ok(versions) => versions
+                            .into_iter()
+                            .map(|ver| {
+                                resolve_one(KernelId::Version(ver.clone()))
+                                    .map_err(|e| format!("resolve kernel {ver}: {e}"))
+                            })
+                            .collect::<Vec<_>>()
+                            .into_iter(),
+                        Err(e) => vec![Err(format!("{e:#}"))].into_iter(),
+                    }
+                }
+                other => vec![resolve_one(other)].into_iter(),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Detect sanitization collisions: two distinct producer-side
     // labels that normalize to the same nextest identifier via
@@ -1204,6 +1321,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             kernel,
             commit,
             kernel_commit,
+            source,
             scheduler,
             topology,
             work_type,
@@ -1211,6 +1329,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             a_kernel,
             a_commit,
             a_kernel_commit,
+            a_source,
             a_scheduler,
             a_topology,
             a_work_type,
@@ -1218,6 +1337,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             b_kernel,
             b_commit,
             b_kernel_commit,
+            b_source,
             b_scheduler,
             b_topology,
             b_work_type,
@@ -1264,6 +1384,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 shared_kernel: kernel.clone(),
                 shared_commit: commit.clone(),
                 shared_kernel_commit: kernel_commit.clone(),
+                shared_source: source.clone(),
                 shared_scheduler: scheduler.clone(),
                 shared_topology: topology.clone(),
                 shared_work_type: work_type.clone(),
@@ -1271,6 +1392,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 a_kernel: a_kernel.clone(),
                 a_commit: a_commit.clone(),
                 a_kernel_commit: a_kernel_commit.clone(),
+                a_source: a_source.clone(),
                 a_scheduler: a_scheduler.clone(),
                 a_topology: a_topology.clone(),
                 a_work_type: a_work_type.clone(),
@@ -1278,6 +1400,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 b_kernel: b_kernel.clone(),
                 b_commit: b_commit.clone(),
                 b_kernel_commit: b_kernel_commit.clone(),
+                b_source: b_source.clone(),
                 b_scheduler: b_scheduler.clone(),
                 b_topology: b_topology.clone(),
                 b_work_type: b_work_type.clone(),
@@ -1323,6 +1446,7 @@ struct BuildCompareFilters {
     shared_kernel: Vec<String>,
     shared_commit: Vec<String>,
     shared_kernel_commit: Vec<String>,
+    shared_source: Vec<String>,
     shared_scheduler: Option<String>,
     shared_topology: Option<String>,
     shared_work_type: Option<String>,
@@ -1330,6 +1454,7 @@ struct BuildCompareFilters {
     a_kernel: Vec<String>,
     a_commit: Vec<String>,
     a_kernel_commit: Vec<String>,
+    a_source: Vec<String>,
     a_scheduler: Option<String>,
     a_topology: Option<String>,
     a_work_type: Option<String>,
@@ -1337,6 +1462,7 @@ struct BuildCompareFilters {
     b_kernel: Vec<String>,
     b_commit: Vec<String>,
     b_kernel_commit: Vec<String>,
+    b_source: Vec<String>,
     b_scheduler: Option<String>,
     b_topology: Option<String>,
     b_work_type: Option<String>,
@@ -1364,6 +1490,7 @@ impl BuildCompareFilters {
             kernels: pick_vec(&self.a_kernel, &self.shared_kernel),
             commits: pick_vec(&self.a_commit, &self.shared_commit),
             kernel_commits: pick_vec(&self.a_kernel_commit, &self.shared_kernel_commit),
+            sources: pick_vec(&self.a_source, &self.shared_source),
             scheduler: pick_opt(&self.a_scheduler, &self.shared_scheduler),
             topology: pick_opt(&self.a_topology, &self.shared_topology),
             work_type: pick_opt(&self.a_work_type, &self.shared_work_type),
@@ -1373,6 +1500,7 @@ impl BuildCompareFilters {
             kernels: pick_vec(&self.b_kernel, &self.shared_kernel),
             commits: pick_vec(&self.b_commit, &self.shared_commit),
             kernel_commits: pick_vec(&self.b_kernel_commit, &self.shared_kernel_commit),
+            sources: pick_vec(&self.b_source, &self.shared_source),
             scheduler: pick_opt(&self.b_scheduler, &self.shared_scheduler),
             topology: pick_opt(&self.b_topology, &self.shared_topology),
             work_type: pick_opt(&self.b_work_type, &self.shared_work_type),
@@ -2142,7 +2270,10 @@ fn main() {
         } => run_llvm_cov(kernel, no_perf_mode, args),
         KtstrCommand::Stats { ref command } => run_stats(command),
         KtstrCommand::Kernel { command } => match command {
-            KernelCommand::List { json } => cli::kernel_list(json).map_err(|e| format!("{e:#}")),
+            KernelCommand::List { json, range } => match range {
+                Some(r) => cli::kernel_list_range_preview(json, &r).map_err(|e| format!("{e:#}")),
+                None => cli::kernel_list(json).map_err(|e| format!("{e:#}")),
+            },
             KernelCommand::Build {
                 version,
                 source,
@@ -3584,6 +3715,160 @@ mod tests {
     fn parse_kernel_list_json() {
         let m = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "list", "--json"]);
         assert!(m.is_ok(), "{}", m.err().unwrap());
+    }
+
+    /// `kernel list --range R` round-trips to
+    /// `KernelCommand::List { range: Some(R), .. }` so the
+    /// dispatch site routes through `kernel_list_range_preview`
+    /// rather than the cache-walk path. Pins the clap binding
+    /// for the new `--range` flag — a regression that dropped
+    /// the `range` field from the Subcommand enum would surface
+    /// here as a parse rejection.
+    #[test]
+    fn parse_kernel_list_range() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "kernel", "list", "--range", "6.12..6.14"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Kernel { command } => match command {
+                KernelCommand::List { json, range } => {
+                    assert!(!json, "bare --range must not enable --json");
+                    assert_eq!(
+                        range.as_deref(),
+                        Some("6.12..6.14"),
+                        "--range must round-trip the literal spec for \
+                         dispatch to pass to `expand_kernel_range`",
+                    );
+                }
+                other => panic!("expected KernelCommand::List, got {other:?}"),
+            },
+            _ => panic!("expected Kernel"),
+        }
+    }
+
+    /// `kernel list --range R --json` round-trips both flags.
+    /// Pins the JSON-output mode is reachable on the range-preview
+    /// path (a regression that wired `--range` only on the text
+    /// path would surface here).
+    #[test]
+    fn parse_kernel_list_range_with_json() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "kernel",
+            "list",
+            "--range",
+            "6.12..6.14",
+            "--json",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Kernel { command } => match command {
+                KernelCommand::List { json, range } => {
+                    assert!(json, "--json must round-trip alongside --range");
+                    assert_eq!(range.as_deref(), Some("6.12..6.14"));
+                }
+                other => panic!("expected KernelCommand::List, got {other:?}"),
+            },
+            _ => panic!("expected Kernel"),
+        }
+    }
+
+    /// `--source V` round-trips to `Compare { source: vec![V], .. }`.
+    /// Pins the clap binding for the shared `--source` filter.
+    /// Mirrors `parse_stats_compare_with_commit_single` for the
+    /// new dimension; per-side `--a-source` / `--b-source` are
+    /// covered by the `_per_side` sibling below.
+    #[test]
+    fn parse_stats_compare_with_source_single() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+            "--source",
+            "ci",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command:
+                    Some(StatsCommand::Compare {
+                        source,
+                        a_source,
+                        b_source,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(
+                    source,
+                    vec!["ci".to_string()],
+                    "shared --source must populate the shared vec",
+                );
+                assert!(
+                    a_source.is_empty(),
+                    "shared --source must not populate --a-source",
+                );
+                assert!(
+                    b_source.is_empty(),
+                    "shared --source must not populate --b-source",
+                );
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    /// `--a-source A --b-source B` round-trips to populated
+    /// per-side vecs with the shared `source` left empty. Pins
+    /// the per-side override path that
+    /// `BuildCompareFilters::build` consumes — a regression that
+    /// merged shared and per-side into one bucket would surface
+    /// here.
+    #[test]
+    fn parse_stats_compare_with_source_per_side() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--a-source",
+            "ci",
+            "--b-source",
+            "local",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command:
+                    Some(StatsCommand::Compare {
+                        source,
+                        a_source,
+                        b_source,
+                        ..
+                    }),
+                ..
+            } => {
+                assert!(
+                    source.is_empty(),
+                    "per-side flags must not populate the shared --source vec",
+                );
+                assert_eq!(a_source, vec!["ci".to_string()]);
+                assert_eq!(b_source, vec!["local".to_string()]);
+            }
+            _ => panic!("expected Stats Compare"),
+        }
     }
 
     // -- try_get_matches_from: kernel build --
