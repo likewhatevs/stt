@@ -546,10 +546,10 @@ pub struct GauntletRow {
     /// writer could not extract a version (e.g. a raw kernel image
     /// path with no metadata.json sibling, or a dirty source tree
     /// where HEAD does not describe the build). Surfaced via the
-    /// typed [`RowFilter::kernel_version`] for narrowing — when the
-    /// user passes `--kernel-version 6.14.2`, rows with `None` are
-    /// dropped to preserve the operator's intent ("only this
-    /// kernel"); a `None`-as-wildcard would silently dilute the
+    /// typed [`RowFilter::kernels`] for narrowing — when the user
+    /// passes `--kernel 6.14.2` (repeatable), rows with `None` are
+    /// dropped to preserve the operator's intent ("only these
+    /// kernels"); a `None`-as-wildcard would silently dilute the
     /// filtered set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_version: Option<String>,
@@ -703,36 +703,41 @@ pub struct GauntletRow {
 
 /// Typed-field filter set for narrowing [`GauntletRow`] sets in the
 /// `cargo ktstr stats compare` pipeline. Every field is `None` /
-/// empty by default; populated fields are AND-combined and applied
-/// via [`apply_row_filters`] in `compare_runs` before the rows reach
-/// `compare_rows`.
+/// empty by default; populated fields are AND-combined ACROSS
+/// fields, with field-internal OR/AND semantics described per-field
+/// below. Applied via [`apply_row_filters`] in `compare_runs` before
+/// the rows reach `compare_rows`.
 ///
 /// Match semantics:
-/// - `kernel_version` / `scheduler` / `topology` / `work_type` —
-///   STRICT EQUALITY against the row's corresponding field. The
-///   sibling substring filter on [`compare_rows`] (`-E`) stays as
-///   the only fuzzy-match knob; typed fields are exact so a
-///   `--scheduler scx_rusty` filter does NOT spuriously match
-///   `scx_rusty_alt`.
+/// - `scheduler` / `topology` / `work_type` — STRICT EQUALITY against
+///   the row's corresponding field. The sibling substring filter on
+///   [`compare_rows`] (`-E`) stays as the only fuzzy-match knob;
+///   typed fields are exact so a `--scheduler scx_rusty` filter does
+///   NOT spuriously match `scx_rusty_alt`.
+/// - `kernels` — repeatable, OR-combined: a row matches iff its
+///   `kernel_version` equals ANY entry in `kernels`. Mirrors the
+///   `--kernel` flag on `cargo ktstr test`/`coverage`/`llvm-cov`
+///   so the same flag name carries the same multi-value semantic
+///   across every subcommand.
 /// - `flags` — AND-combined: every entry in the filter must appear
 ///   somewhere in the row's `flags` vec. The row may carry
 ///   additional flags beyond the filter set; the filter pins
 ///   "at-least-these-flags-are-active", not "exactly-these".
-/// - `kernel_version` against a row whose `kernel_version` is `None`
-///   ALWAYS fails (no wildcard semantic) — the operator wrote a
-///   specific version and a `None`-row would silently dilute the
-///   set.
+/// - A `kernels`-populated filter against a row whose
+///   `kernel_version` is `None` ALWAYS fails (no wildcard semantic)
+///   — the operator wrote specific versions and a `None`-row would
+///   silently dilute the set.
 ///
 /// Empty `RowFilter` (every field `None`/empty) is the no-op default
 /// and matches every row. Use [`RowFilter::default()`] to build it.
 #[derive(Clone, Debug, Default)]
 pub struct RowFilter {
-    /// Match against `GauntletRow::kernel_version`. `None` here means
-    /// "do not filter on kernel version"; `Some("6.14.2")` requires
-    /// the row's kernel version to equal `"6.14.2"`. A row whose
-    /// kernel_version is itself `None` never matches a `Some`
-    /// filter.
-    pub kernel_version: Option<String>,
+    /// Repeatable kernel-version filter, OR-combined: a row matches
+    /// iff its `GauntletRow::kernel_version` equals ANY entry. Empty
+    /// vec disables the filter ("do not filter on kernel"). A row
+    /// whose `kernel_version` is itself `None` never matches a
+    /// non-empty filter.
+    pub kernels: Vec<String>,
     /// Match against `GauntletRow::scheduler` (strict equality).
     /// `None` here is "do not filter on scheduler".
     pub scheduler: Option<String>,
@@ -753,10 +758,19 @@ impl RowFilter {
     /// row. The empty `RowFilter` (default) returns true for every
     /// row — it's the identity filter.
     pub fn matches(&self, row: &GauntletRow) -> bool {
-        if let Some(want) = &self.kernel_version
-            && row.kernel_version.as_deref() != Some(want.as_str())
-        {
-            return false;
+        if !self.kernels.is_empty() {
+            // OR-combined: the row matches iff its kernel version
+            // equals ANY listed kernel. A row with `None` kernel_version
+            // never satisfies a non-empty filter — same opt-in
+            // semantic the original `Option<String>` field carried.
+            let row_kernel = row.kernel_version.as_deref();
+            let any = self
+                .kernels
+                .iter()
+                .any(|want| row_kernel == Some(want.as_str()));
+            if !any {
+                return false;
+            }
         }
         if let Some(want) = &self.scheduler
             && row.scheduler != *want
@@ -807,8 +821,8 @@ pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<Gauntl
 /// shares the identity tuple by construction (it IS the group key
 /// for the first four fields, and `scheduler` / `kernel_version`
 /// are typed-filter-narrowed at the call site, so they can only
-/// vary if the operator passed no `--scheduler` /
-/// `--kernel-version` filter).
+/// vary if the operator passed no `--scheduler` / `--kernel`
+/// filter).
 ///
 /// `passed` on `row` is the AND across every contributor: a single
 /// failing contributor in the group flips the aggregated row to
@@ -2051,13 +2065,13 @@ pub fn compare_runs(
     let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
     let rows_b: Vec<GauntletRow> = sidecars_b.iter().map(sidecar_to_row).collect();
 
-    // Apply typed filters (--kernel-version / --scheduler / --topology
-    // / --work-type / --flag) before the substring filter inside
+    // Apply typed filters (--kernel / --scheduler / --topology /
+    // --work-type / --flag) before the substring filter inside
     // `compare_rows`. Typed filters are strict-equality / AND-combined
-    // and run cheaply over the row vectors here; the substring
-    // filter stays inside `compare_rows` because it joins the row's
-    // fields into a search string and reuses that join across the
-    // comparison loop.
+    // (with --kernel OR-combined within the kernels vec) and run
+    // cheaply over the row vectors here; the substring filter stays
+    // inside `compare_rows` because it joins the row's fields into a
+    // search string and reuses that join across the comparison loop.
     let rows_a = apply_row_filters(&rows_a, row_filter);
     let rows_b = apply_row_filters(&rows_b, row_filter);
 
@@ -4478,45 +4492,64 @@ mod tests {
         assert!(filter.matches(&row));
     }
 
-    /// `--kernel-version 6.14.2` against a row whose
-    /// kernel_version is None must NOT match — the operator
-    /// opted in to a specific kernel and a None-row would
-    /// silently dilute the filtered set.
+    /// `--kernel 6.14.2` against a row whose `kernel_version` is
+    /// `None` must NOT match — the operator opted in to a specific
+    /// kernel and a None-row would silently dilute the filtered set.
     #[test]
-    fn row_filter_kernel_version_none_row_never_matches_some_filter() {
+    fn row_filter_kernel_none_row_never_matches_populated_filter() {
         let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
         let filter = RowFilter {
-            kernel_version: Some("6.14.2".to_string()),
+            kernels: vec!["6.14.2".to_string()],
             ..RowFilter::default()
         };
         assert!(
             !filter.matches(&row),
-            "None-row must not match Some-filter; got dilution",
+            "None-row must not match populated filter; got dilution",
         );
     }
 
-    /// `--kernel-version 6.14.2` against a row whose
-    /// kernel_version is `Some("6.14.2")` matches.
+    /// `--kernel 6.14.2` against a row whose `kernel_version` is
+    /// `Some("6.14.2")` matches.
     #[test]
-    fn row_filter_kernel_version_exact_match() {
+    fn row_filter_kernel_exact_match() {
         let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.2"), &[]);
         let filter = RowFilter {
-            kernel_version: Some("6.14.2".to_string()),
+            kernels: vec!["6.14.2".to_string()],
             ..RowFilter::default()
         };
         assert!(filter.matches(&row));
     }
 
-    /// `--kernel-version 6.14.2` against a row whose
-    /// kernel_version is `Some("6.14.3")` rejects.
+    /// `--kernel 6.14.2` against a row whose `kernel_version` is
+    /// `Some("6.14.3")` rejects.
     #[test]
-    fn row_filter_kernel_version_mismatch_rejects() {
+    fn row_filter_kernel_mismatch_rejects() {
         let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.3"), &[]);
         let filter = RowFilter {
-            kernel_version: Some("6.14.2".to_string()),
+            kernels: vec!["6.14.2".to_string()],
             ..RowFilter::default()
         };
         assert!(!filter.matches(&row));
+    }
+
+    /// Repeatable `--kernel A --kernel B` is OR-combined: a row
+    /// matches iff its `kernel_version` equals ANY listed entry.
+    /// Pins the multi-value semantic.
+    #[test]
+    fn row_filter_kernels_or_combined_matches_any_listed() {
+        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.2"), &[]);
+        let row_b = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.15.0"), &[]);
+        let row_c = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.16.0"), &[]);
+        let filter = RowFilter {
+            kernels: vec!["6.14.2".to_string(), "6.15.0".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(filter.matches(&row_a), "first listed kernel must match");
+        assert!(filter.matches(&row_b), "second listed kernel must match");
+        assert!(
+            !filter.matches(&row_c),
+            "kernel outside the listed set must reject",
+        );
     }
 
     /// `--topology 1n2l4c1t` strict-equal against the row's
@@ -4594,12 +4627,12 @@ mod tests {
             Some("6.14.2"),
             &["llc"],
         );
-        // 3 of 4 typed fields match (scheduler, topology, kernel_version);
+        // 3 of 4 typed fields match (scheduler, topology, kernels);
         // work_type mismatches. Whole filter must reject.
         let filter = RowFilter {
             scheduler: Some("scx_a".to_string()),
             topology: Some("1n2l4c1t".to_string()),
-            kernel_version: Some("6.14.2".to_string()),
+            kernels: vec!["6.14.2".to_string()],
             work_type: Some("YieldHeavy".to_string()),
             ..RowFilter::default()
         };

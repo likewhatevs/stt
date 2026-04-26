@@ -271,8 +271,10 @@ fn _is_version_string(s: &str) -> bool {
 ///   resolves ties on the leading three components.
 ///
 /// Used by [`KernelId::validate`] to detect inverted ranges
-/// (`6.16..6.12`, `6.10..6.10-rc3`, `7.0..6.99`).
-fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u64)> {
+/// (`6.16..6.12`, `6.10..6.10-rc3`, `7.0..6.99`), and by
+/// [`crate::cli`]'s range-expansion helper to filter and sort
+/// kernel.org release rows that fall inside a `start..end` interval.
+pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u64)> {
     let (version_part, rc_part) = match s.split_once("-rc") {
         Some((v, rc)) => (v, Some(rc)),
         None => (s, None),

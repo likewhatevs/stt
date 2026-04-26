@@ -16,22 +16,100 @@ cargo ktstr test                                               # auto-discover k
 cargo ktstr test --kernel ../linux                             # local source tree
 cargo ktstr test --kernel 6.14.2                               # version (auto-downloads on miss)
 cargo ktstr test --kernel 6.14.2-tarball-x86_64-kc...          # cache key (from kernel list)
+cargo ktstr test --kernel 6.12..6.14                           # range: every stable+longterm release in [6.12, 6.14]
+cargo ktstr test --kernel git+https://example.com/r.git#v6.14  # git URL + ref (tag/branch)
+cargo ktstr test --kernel git+https://example.com/r.git#deadbeef1234  # specific commit
+cargo ktstr test --kernel 6.14.2 --kernel 6.15.0               # multi-kernel: repeatable
 cargo ktstr test --release                                     # release profile (stricter assertions)
 ```
 
-`--kernel` accepts a path, version string, or cache key. When absent,
-the test framework discovers a kernel from `KTSTR_TEST_KERNEL`, then
-`KTSTR_KERNEL`, then falls back to cache and filesystem lookup.
-When `--kernel` is a path,
+`--kernel` is **repeatable** and accepts a path, version string,
+cache key, version range (`START..END`), or git source
+(`git+URL#REF`). When absent, the test framework discovers a kernel
+from `KTSTR_TEST_KERNEL`, then `KTSTR_KERNEL`, then falls back to
+cache and filesystem lookup. When `--kernel` is a path,
 cargo-ktstr configures and builds the kernel before running tests.
-Version strings auto-download and build on cache miss (both explicit
-patch versions like `6.14.2` and major.minor prefixes like `6.14`).
-Cache keys resolve from the cache only — they error if not cached
-(run `cargo ktstr kernel list` to see available keys).
+Version strings auto-download and build on cache miss (both
+explicit patch versions like `6.14.2` and major.minor prefixes like
+`6.14`). Cache keys resolve from the cache only — they error if not
+cached (run `cargo ktstr kernel list` to see available keys).
+
+Ranges (`START..END`) expand against kernel.org's `releases.json`
+to every `stable` and `longterm` release whose version sits inside
+`[START, END]` inclusive (mainline / linux-next rows are dropped).
+The endpoints themselves do NOT need to appear in `releases.json` —
+`6.10..6.16` brackets the surviving releases even if `6.10` and
+`6.16` have aged out.
+
+Git sources (`git+URL#REF`) clone the repo shallow at the given
+ref, build, and cache the result. A repeat invocation against an
+unchanged branch tip lands a cache hit; a moved tip rebuilds.
+
+### Multi-kernel: kernel as a gauntlet dimension
+
+When `--kernel` resolves to **two or more kernels** (multiple
+`--kernel` flags, or a single `--kernel START..END` range that
+expands to several releases), cargo-ktstr resolves all kernels
+upfront and exports the resolved set to `cargo nextest` via the
+`KTSTR_KERNEL_LIST` env var. The test binary's gauntlet expansion
+adds the kernel as an additional dimension to the gauntlet
+cross-product, so each `(test × scenario × topology × flags × kernel)`
+tuple becomes a distinct nextest test case. Two name shapes carry
+the kernel suffix:
+
+- **Base tests**: `ktstr/{name}/{kernel_label}` — one variant per
+  registered `#[ktstr_test]` per kernel.
+- **Gauntlet variants**: `gauntlet/{name}/{preset}/{profile}/{kernel_label}` —
+  one variant per (test × topology preset × flag profile × kernel).
+
+Single-kernel runs (zero or one resolved kernel) keep the
+historical name shapes `ktstr/{name}` and
+`gauntlet/{name}/{preset}/{profile}` with no kernel suffix, so
+existing CI baselines and per-test config overrides keep matching.
+
+Kernel labels are semantic, operator-readable identifiers
+sanitized to `kernel_[a-z0-9_]+`:
+
+- Version / range expansion → `kernel_6_14_2`, `kernel_6_15_rc3`
+- Cache key → version prefix only (`kernel_6_14_2` from
+  `6.14.2-tarball-x86_64-kc<hash>`)
+- Git source → `kernel_git_{owner}_{repo}_{ref}` (e.g.
+  `kernel_git_tj_sched_ext_for_next` from
+  `git+https://github.com/tj/sched_ext#for-next`)
+- Path → `kernel_path_{basename}_{hash6}` (e.g.
+  `kernel_path_linux_a3f2b1`); the 6-char crc32 of the canonical
+  path disambiguates two `linux` directories under different
+  parents.
+
+Filter with nextest's `-E 'test(kernel_6_14)'` to pick a single
+kernel from a multi-kernel matrix; nextest's parallelism, retries,
+and `--ignored` flag all apply natively. Sidecars partition per
+kernel: each kernel runs in its own
+`target/ktstr/{kernel}-{timestamp}/` directory keyed on the
+resolved kernel's identity. Coverage profraw does NOT partition
+per kernel — `__llvm_profile_write_buffer` writes flat into
+`target/llvm-cov-target/` with PID-keyed filenames
+(`ktstr-test-{pid}-{counter}.profraw`), and cargo-llvm-cov merges
+every variant's profraw automatically into the single output
+report.
+
+Build / download / clone failures abort BEFORE any test runs — a
+missing kernel can't be tested, and continuing would mask which
+kernel was requested-but-unavailable in the operator-visible error
+stream. Test failures within a kernel are nextest-handled
+normally.
+
+**`host_only` tests under multi-kernel**: tests marked
+`host_only` (those that run on the host without booting a VM)
+currently still expand across the kernel dimension and run N
+times for N kernels — N copies of identical work, since the test
+never observes the kernel directory. A future change will skip
+the kernel suffix for `host_only` entries so they list and run
+once regardless of `KTSTR_KERNEL_LIST` cardinality.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kernel ID` | auto | Kernel identifier: path, version, or cache key. |
+| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Repeatable; a multi-kernel set fans the gauntlet across kernels. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--release` | off | Build and run tests with the release profile (`--cargo-profile release` to nextest). Release mode applies **stricter assertion thresholds** (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct` 15% vs debug's 35%) — tests that barely pass in debug may fail under `--release`. `catch_unwind`-based tests and tests gated on `#[cfg(debug_assertions)]` are skipped. |
 
@@ -40,6 +118,14 @@ Cache keys resolve from the cache only — they error if not cached
 These steps run only when `--kernel` is a source directory path.
 Cached version and cache-key identifiers skip to step 5; uncached
 version identifiers run through download + configure + build first.
+Ranges fan out to per-version resolution (every release downloads
++ builds + caches independently if not already present) before
+reaching step 5; git sources clone shallow at the ref, build, and
+cache the result. Multi-kernel resolution finishes for every
+requested kernel BEFORE step 5 — the cargo-nextest invocation in
+step 5 sees the complete kernel set as a single `KTSTR_KERNEL_LIST`
+export, so nextest fans the gauntlet across kernels in a single
+run.
 
 1. **Config check** -- reads `<kernel>/.config` for
    `CONFIG_SCHED_CLASS_EXT=y`.
@@ -51,8 +137,14 @@ version identifiers run through download + configure + build first.
    is already built.
 4. **compile_commands.json** -- runs `make compile_commands.json` to
    generate the compilation database for clangd / LSP.
-5. **Test execution** -- execs `cargo nextest run` with `KTSTR_KERNEL`
-   set in the environment for test kernel discovery.
+5. **Test execution** -- execs `cargo nextest run` once with
+   `KTSTR_KERNEL` set in the environment (single-kernel) or with
+   both `KTSTR_KERNEL` and `KTSTR_KERNEL_LIST` (multi-kernel; the
+   latter encodes the resolved kernel set as
+   `label1=path1;label2=path2;…`). The test binary's gauntlet
+   expansion adds the kernel as a fifth dimension when the list
+   carries 2+ entries; nextest's parallelism, retries, and `-E`
+   filtering apply natively to every (test × kernel) variant.
 
 ### Passing nextest arguments
 
@@ -67,19 +159,27 @@ cargo ktstr test -- --retries 2               # nextest retries
 ## coverage
 
 Build the kernel (if needed) and run tests with coverage via
-`cargo llvm-cov nextest`. Same kernel resolution as `test`.
+`cargo llvm-cov nextest`. Same kernel resolution and multi-kernel
+semantics as `test`: `--kernel` is repeatable; multi-kernel runs
+add the kernel suffix to every test name and partition the
+sidecar tree per kernel via
+`target/ktstr/{kernel}-{timestamp}/`. Coverage profraw lands flat
+in `target/llvm-cov-target/` with PID-keyed filenames — it does
+NOT partition per kernel — and cargo-llvm-cov merges every
+variant's profraw automatically into the single output report.
 
 ```sh
 cargo ktstr coverage                                               # auto-discover kernel
 cargo ktstr coverage --kernel ../linux                             # local source tree
 cargo ktstr coverage --kernel 6.14.2                               # version (auto-downloads on miss)
+cargo ktstr coverage --kernel 6.14.2 --kernel 6.15.0               # multi-kernel coverage matrix
 cargo ktstr coverage --release                                     # release profile (stricter assertions)
 cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kernel ID` | auto | Kernel identifier: path, version, or cache key. |
+| `--kernel ID` (repeatable) | auto | Same shapes and multi-kernel semantics as `cargo ktstr test --kernel`: each (test × kernel) variant runs as its own nextest subprocess so cargo-llvm-cov merges every variant's profraw automatically. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 | `--release` | off | Collect coverage with the release profile (`--cargo-profile release` to llvm-cov nextest). Same stricter-threshold caveats as `test --release` — release mode applies `gap_threshold_ms=2000` / `spread_threshold_pct=15%`, and skips `catch_unwind`-based tests along with `#[cfg(debug_assertions)]`-gated tests. |
 
@@ -120,7 +220,7 @@ cargo ktstr llvm-cov --kernel ../linux report                  # pin kernel + pa
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kernel ID` | auto | Kernel identifier: path, version, or cache key. Same resolution as `test` and `coverage`. |
+| `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Same multi-kernel semantics as `cargo ktstr test --kernel`. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
 
 Note: a bare `cargo ktstr llvm-cov` (no trailing subcommand)
@@ -364,7 +464,7 @@ thresholds from the unified metric registry, and print colored output
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-E FILTER` | -- | Substring filter applied to `scenario topology scheduler work_type`. The scheduler is searchable via the filter but is not part of the pairing key, so the same `(scenario, topology, work_type)` pair still compares across different scheduler binaries when the filter does not constrain it. |
-| `--kernel-version VER` | -- | Strict equality match against the sidecar's `kernel_version` field (e.g. `--kernel-version 6.14.2`). Rows with no recorded kernel version never match. |
+| `--kernel VER` (repeatable) | -- | Strict equality match against the sidecar's `kernel_version` field (e.g. `--kernel 6.14.2 --kernel 6.15.0` keeps rows whose kernel is 6.14.2 OR 6.15.0). Rows with no recorded kernel version never match a populated filter. Same flag name as on `cargo ktstr test`/`coverage`/`llvm-cov` for consistency across subcommands. |
 | `--scheduler NAME` | -- | Strict equality match against the sidecar's `scheduler` field (e.g. `--scheduler scx_rusty`). Unlike `-E`, which matches a substring across joined fields, this pins a specific scheduler. |
 | `--topology LABEL` | -- | Strict equality match against the rendered topology label (e.g. `--topology 1n2l4c2t`). The label is what `Topology::Display` produces; `cargo ktstr stats list` shows the form per-row. |
 | `--work-type TYPE` | -- | Strict equality match against the sidecar's `work_type` field (e.g. `--work-type CpuSpin`). Valid names are the PascalCase variants of `WorkType`; see `WorkType::ALL_NAMES` for the canonical variant list, or [Work types](../concepts/work-types.md). |

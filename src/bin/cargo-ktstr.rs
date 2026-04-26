@@ -36,8 +36,15 @@ enum KtstrCommand {
     /// Build the kernel (if needed) and run tests via cargo nextest.
     #[command(visible_alias = "nextest")]
     Test {
-        #[arg(long, help = KERNEL_HELP_NO_RAW)]
-        kernel: Option<String>,
+        /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
+        /// (path, version, cache key, range `START..END`, git source
+        /// `git+URL#REF`). Multiple `--kernel` flags fan out the
+        /// gauntlet across kernels: each `(test × scenario × topology
+        /// × flags × kernel)` tuple becomes a distinct nextest test
+        /// case so nextest's parallelism, retries, and `-E`
+        /// filtering all apply natively.
+        #[arg(long, action = ArgAction::Append, help = KERNEL_HELP_NO_RAW)]
+        kernel: Vec<String>,
         /// Disable all performance mode features (flock, pinning, RT
         /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
         /// For shared runners or unprivileged containers.
@@ -64,8 +71,12 @@ enum KtstrCommand {
     /// cargo llvm-cov nextest. For other llvm-cov subcommands
     /// (`report`, `clean`, `show-env`), use `cargo ktstr llvm-cov`.
     Coverage {
-        #[arg(long, help = KERNEL_HELP_NO_RAW)]
-        kernel: Option<String>,
+        /// Repeatable. Same shapes and multi-kernel semantics as
+        /// `cargo ktstr test --kernel`: each (test × kernel) variant
+        /// runs as its own nextest subprocess so cargo-llvm-cov
+        /// merges every variant's profraw automatically.
+        #[arg(long, action = ArgAction::Append, help = KERNEL_HELP_NO_RAW)]
+        kernel: Vec<String>,
         /// Disable all performance mode features (flock, pinning, RT
         /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
         /// For shared runners or unprivileged containers.
@@ -97,8 +108,13 @@ enum KtstrCommand {
     /// to `cargo llvm-cov` which runs `cargo test` — not useful for
     /// ktstr tests. Always pass a subcommand.
     LlvmCov {
-        #[arg(long, help = KERNEL_HELP_NO_RAW)]
-        kernel: Option<String>,
+        /// Repeatable. Same shapes and multi-kernel semantics as
+        /// `cargo ktstr test --kernel`. Profraw aggregation across
+        /// kernel variants happens inside cargo-llvm-cov; this raw-
+        /// passthrough hands every other argument to the user's
+        /// chosen llvm-cov subcommand.
+        #[arg(long, action = ArgAction::Append, help = KERNEL_HELP_NO_RAW)]
+        kernel: Vec<String>,
         /// Disable all performance mode features (flock, pinning, RT
         /// scheduling, hugepages, NUMA mbind, KVM exit suppression).
         /// For shared runners or unprivileged containers.
@@ -434,13 +450,18 @@ enum StatsCommand {
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
         /// Strict equality match against the sidecar's
-        /// `kernel_version` field (e.g. `--kernel-version 6.14.2`).
-        /// Rows whose `kernel_version` is `None` (sidecar writer
-        /// could not extract a version) NEVER match a `Some` filter
-        /// — passing `--kernel-version` is an opt-in that demands a
-        /// known-version row.
-        #[arg(long)]
-        kernel_version: Option<String>,
+        /// `kernel_version` field (e.g. `--kernel 6.14.2`).
+        /// Repeatable: `--kernel A --kernel B` keeps rows whose
+        /// `kernel_version` equals A OR B. Rows whose
+        /// `kernel_version` is `None` (sidecar writer could not
+        /// extract a version) NEVER match a populated filter —
+        /// passing `--kernel` is an opt-in that demands a
+        /// known-version row. Same flag name as on `cargo ktstr
+        /// test`/`coverage`/`llvm-cov` for consistency: every
+        /// subcommand that accepts a kernel filter spells it
+        /// `--kernel`.
+        #[arg(long, action = ArgAction::Append)]
+        kernel: Vec<String>,
         /// Strict equality match against the sidecar's `scheduler`
         /// field (e.g. `--scheduler scx_rusty`). Distinct from `-E`,
         /// which matches a substring across the joined fields. Use
@@ -529,18 +550,312 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve a `KernelId::Path` to a canonicalized, ready-to-build
+/// directory and trigger the auto-build pipeline. Returns the
+/// canonical path suitable for export via [`ktstr::KTSTR_KERNEL_ENV`].
+///
+/// The previous inline `unwrap_or_else(|_| PathBuf::from(&p))`
+/// silently fell back to the raw string on canonicalize failure —
+/// that behaviour is preserved here as a hard error so a typo can't
+/// exec into a successful-looking run that silently picks up a
+/// different kernel via `find_kernel`'s fallback chain.
+fn resolve_path_kernel(p: &Path) -> Result<PathBuf, String> {
+    let dir = std::fs::canonicalize(p).map_err(|e| {
+        format!(
+            "--kernel {}: path does not exist or cannot be \
+             canonicalized ({e:#}). {hint}",
+            p.display(),
+            hint = ktstr::KTSTR_KERNEL_HINT,
+        )
+    })?;
+    // Boundary bridge: `build_kernel` returns `anyhow::Result<()>`
+    // while this function returns `Result<_, String>`, so we
+    // stringify at the call site. A broader anyhow migration across
+    // cargo-ktstr.rs is pending and would drop this last bridge.
+    build_kernel(&dir, false).map_err(|e| format!("{e:#}"))?;
+    Ok(dir)
+}
+
+/// Canonicalize a cache-entry directory before exporting it via
+/// [`ktstr::KTSTR_KERNEL_ENV`] / [`ktstr::KTSTR_KERNEL_LIST_ENV`].
+/// `CacheDir` roots at the XDG cache home (or `KTSTR_CACHE_DIR`),
+/// both typically absolute — but an operator-supplied
+/// `KTSTR_CACHE_DIR=./cache` would produce a relative path here and
+/// reach the same cwd-divergence bug the `Path` branch defends
+/// against. `canonicalize` resolves that from the parent's cwd; a
+/// failure means the cache dir was removed between lookup and
+/// export (rare race), in which case we fall back to the original
+/// path rather than bailing — the child will re-enter its own cache
+/// lookup and surface the real missing-entry error.
+fn canonicalize_cache_dir(cache_dir: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir)
+}
+
+/// Resolve every `--kernel` spec to a flat list of `(kernel_label,
+/// kernel_dir)` pairs. Each Range expands to one entry per release
+/// in the interval; each Path / Version / CacheKey / Git produces
+/// exactly one entry.
+///
+/// The flat list is what `cargo ktstr test` (and `coverage` /
+/// `llvm-cov`) hand to the test binary as the kernel dimension of
+/// the gauntlet expansion: every (test × scenario × topology ×
+/// flags × kernel) tuple becomes a distinct nextest test case so
+/// nextest's parallelism, retries, and `-E` filtering apply
+/// natively. A single `cargo nextest run` (or `cargo llvm-cov
+/// nextest`) invocation services every variant; profraw lands per-
+/// child so cargo-llvm-cov merges all of them automatically.
+///
+/// Build / download / clone failures abort the resolution before
+/// any test runs — there's no useful state to continue from
+/// (a missing kernel can't be tested, and continuing would mask
+/// which kernel was requested-but-unavailable in the operator-
+/// visible error stream).
+///
+/// `kernel_label` for each entry is a semantic, operator-readable
+/// identity:
+/// - Path → `path_{basename}_{hash6}` (basename + 6-char hash of the
+///   canonical path so two distinct directories with the same name
+///   don't collide).
+/// - Version / Range expansion → the version string verbatim
+///   (e.g. `6.14.2`, `6.15-rc3`).
+/// - CacheKey → the version prefix (everything before the first
+///   `-tarball-` / `-git-` / `-local-` component).
+/// - Git → `git_{owner}_{repo}_{ref}` extracted from the URL +
+///   git ref.
+///
+/// The downstream `sanitize_kernel_label` in
+/// [`crate::test_support::dispatch`] applies the `kernel_` prefix
+/// and `[a-z0-9_]+` normalisation; this label is the human-meaningful
+/// payload it operates on.
+fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+    use ktstr::kernel_path::KernelId;
+
+    let mut resolved: Vec<(String, PathBuf)> = Vec::new();
+    for raw in specs {
+        // Each `--kernel` argument is parsed as a single
+        // `KernelId`. Multi-kernel runs use repeated `--kernel`
+        // flags rather than comma-separated lists — clap's
+        // `ArgAction::Append` collects them into the `Vec<String>`
+        // that arrives here. A `Range` variant inside one
+        // argument expands to multiple resolved kernels via
+        // [`crate::cli::expand_kernel_range`]; that's the only
+        // mechanism by which a single `--kernel` produces
+        // multiple entries.
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = KernelId::parse(trimmed);
+        // Validate before any I/O so an inverted Range surfaces
+        // the "swap the endpoints" diagnostic ahead of any
+        // download attempt.
+        id.validate().map_err(|e| format!("--kernel {id}: {e}"))?;
+
+        match id {
+            KernelId::Path(p) => {
+                let dir = resolve_path_kernel(&p)?;
+                let label = path_kernel_label(&dir);
+                resolved.push((label, dir));
+            }
+            KernelId::Version(ref ver) => {
+                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
+                    .map_err(|e| format!("{e:#}"))?;
+                let dir = canonicalize_cache_dir(cache_dir);
+                resolved.push((ver.clone(), dir));
+            }
+            KernelId::CacheKey(ref key) => {
+                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
+                    .map_err(|e| format!("{e:#}"))?;
+                let dir = canonicalize_cache_dir(cache_dir);
+                // Extract the version prefix from the cache key —
+                // `6.14.2-tarball-x86_64-kc...` → `6.14.2`. The
+                // prefix is the part before the first known
+                // source-tag suffix (`-tarball-`, `-git-`,
+                // `-local-`). Falls back to the full key if no
+                // recognised suffix is present.
+                let label = cache_key_to_version_label(key).to_string();
+                resolved.push((label, dir));
+            }
+            KernelId::Range { ref start, ref end } => {
+                let versions = ktstr::cli::expand_kernel_range(start, end, "cargo ktstr")
+                    .map_err(|e| format!("{e:#}"))?;
+                for ver in versions {
+                    let cache_dir = ktstr::cli::resolve_cached_kernel(
+                        &KernelId::Version(ver.clone()),
+                        "cargo ktstr",
+                    )
+                    .map_err(|e| format!("resolve kernel {ver}: {e:#}"))?;
+                    let dir = canonicalize_cache_dir(cache_dir);
+                    resolved.push((ver, dir));
+                }
+            }
+            KernelId::Git {
+                ref url,
+                ref git_ref,
+            } => {
+                let cache_dir = ktstr::cli::resolve_git_kernel(url, git_ref, "cargo ktstr")
+                    .map_err(|e| format!("resolve git+{url}#{git_ref}: {e:#}"))?;
+                let dir = canonicalize_cache_dir(cache_dir);
+                let label = git_kernel_label(url, git_ref);
+                resolved.push((label, dir));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Build the `path_{basename}_{hash6}` label for a `Path`-resolved
+/// kernel. The basename keeps the label operator-readable; the 6-char
+/// hex hash of the canonical path's UTF-8 bytes disambiguates two
+/// `linux` directories under different parents. `crc32fast` is
+/// already a workspace dep (see `cli::kernel_build_pipeline` for the
+/// existing consumer), so re-using it costs nothing extra.
+fn path_kernel_label(dir: &Path) -> String {
+    let basename = dir.file_name().and_then(|n| n.to_str()).unwrap_or("kernel");
+    let hash = crc32fast::hash(dir.display().to_string().as_bytes());
+    // `{:08x}` would emit 8 hex digits; ruling specifies a 6-char
+    // hash prefix. Truncating to the leading 6 is sufficient
+    // disambiguation for the operator's purpose (collision risk is
+    // only a UI nuisance, not a correctness issue — the kernel_dir
+    // path itself is the actual identity).
+    format!("path_{basename}_{:06x}", hash & 0x00ff_ffff)
+}
+
+/// Extract the version prefix from a cache-entry key.
+///
+/// Cache keys follow two shapes:
+/// - tarball / git: `{version-or-ref}-{source}-{arch}-kc{hash}`
+///   where `{source}` is `tarball` or `git`. The version / ref is a
+///   PROPER PREFIX with the source as an INFIX tag — e.g.
+///   `6.14.2-tarball-x86_64-kcabc` → `6.14.2`,
+///   `for-next-git-deadbee-x86_64-kcabc` → `for-next`.
+/// - local: `local-{hash}-{arch}-kc{hash}` — the `local-` PREFIX
+///   IS the source tag, with NO version segment ahead of it. The
+///   label collapses to `"local"` since there is no source-tree
+///   version to surface (the hash is implementation detail and
+///   carries no operator-meaningful identity).
+///
+/// Falls back to the full key if no recognised tag is present — a
+/// future cache-key shape with an unknown tag still produces a
+/// non-empty label rather than a panic.
+fn cache_key_to_version_label(key: &str) -> &str {
+    // Local prefix has no preceding version segment — the source
+    // tag is the leading token. Match the prefix shape directly.
+    if key == "local" || key.starts_with("local-") {
+        return "local";
+    }
+    for tag in &["-tarball-", "-git-"] {
+        if let Some(prefix_end) = key.find(tag) {
+            return &key[..prefix_end];
+        }
+    }
+    key
+}
+
+/// Build the `git_{owner}_{repo}_{ref}` label for a `Git`-resolved
+/// kernel. Extracts the `owner` and `repo` segments from the URL's
+/// path component, drops the scheme/host, strips a trailing `.git`,
+/// and pairs them with the operator-supplied git ref.
+///
+/// Examples:
+/// - `git+https://github.com/tj/sched_ext#for-next` →
+///   `git_tj_sched_ext_for-next`
+/// - `git+https://gitlab.com/foo/bar.git#v6.14` →
+///   `git_foo_bar_v6.14`
+/// - URL without a recognisable owner/repo (path with only one
+///   segment, e.g. a local mirror `/srv/linux.git`) → `git_<first
+///   non-empty segment>_<ref>` (defensively avoids producing an
+///   ambiguous `git_` prefix on its own).
+fn git_kernel_label(url: &str, git_ref: &str) -> String {
+    // Strip scheme: everything up to and including `://`.
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    // Strip user@host: split off the leading host segment by
+    // dropping everything before the FIRST `/` in the post-scheme
+    // remainder, leaving the path component.
+    let path = after_scheme
+        .split_once('/')
+        .map(|(_, rest)| rest)
+        .unwrap_or(after_scheme);
+    // Trim leading `/`, drop trailing `.git`, then pull the last
+    // two non-empty segments as `(owner, repo)`. A single-segment
+    // path (e.g. local mirror) gives `(segment, "")` which we
+    // collapse to `git_{segment}_{ref}`.
+    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let mut segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    let repo = segments.pop().unwrap_or("repo");
+    let owner = segments.pop().unwrap_or("");
+    if owner.is_empty() {
+        format!("git_{repo}_{git_ref}")
+    } else {
+        format!("git_{owner}_{repo}_{git_ref}")
+    }
+}
+
+/// Encode a flat `(label, kernel_dir)` list into the wire format that
+/// the test binary's [`ktstr::KTSTR_KERNEL_LIST_ENV`] reader parses:
+/// `label1=path1;label2=path2;...`. Semicolon is the entry separator
+/// (paths can contain `:` on POSIX); `=` separates the label from the
+/// path. Empty input returns an empty string so the env var is
+/// idempotent — an empty value means "no list, single-kernel mode."
+///
+/// The label is encoded verbatim — sanitization into nextest-safe
+/// `[a-z0-9_]+` identifiers happens on the test-binary side via
+/// `dispatch::sanitize_kernel_label`. The producer-side label is
+/// already a semantic, operator-readable identifier (a version
+/// string like `6.14.2`, `git_owner_repo_ref`, `path_basename_hash6`,
+/// or `local`), so the env var inspected directly via `printenv
+/// KTSTR_KERNEL_LIST` reads as a meaningful kernel→path map rather
+/// than as raw cache-key plumbing.
+fn encode_kernel_list(resolved: &[(String, PathBuf)]) -> String {
+    let mut out = String::new();
+    for (i, (label, dir)) in resolved.iter().enumerate() {
+        if i > 0 {
+            out.push(';');
+        }
+        out.push_str(label);
+        out.push('=');
+        out.push_str(&dir.display().to_string());
+    }
+    out
+}
+
 /// Shared runner for `cargo ktstr test`, `cargo ktstr coverage`, and
 /// `cargo ktstr llvm-cov`.
 ///
-/// All three subcommands have the same plumbing: resolve `--kernel` to
-/// a cache entry or source-tree build, propagate `--no-perf-mode` via
-/// an env var, optionally prepend `--cargo-profile release`, append
-/// the user's trailing args, and `exec` into the chosen cargo
-/// subcommand. The only differences are the cargo subcommand name
-/// (`["nextest","run"]` vs `["llvm-cov","nextest"]` vs `["llvm-cov"]`)
-/// and the log / error-message prefix. Consolidating here ensures all
-/// flows evolve together — a kernel-resolution fix in one used to
-/// drift against the others.
+/// All three subcommands share the same plumbing: resolve `--kernel`
+/// to a flat `(label, kernel_dir)` set, propagate `--no-perf-mode`
+/// via an env var, optionally prepend `--cargo-profile release`,
+/// append the user's trailing args, and `cmd.exec()` once. The
+/// cargo subcommand name (`["nextest","run"]` vs `["llvm-cov",
+/// "nextest"]` vs `["llvm-cov"]`) and the log / error-message
+/// prefix are the only static differences.
+///
+/// Multi-kernel fan-out lives entirely in the test binary's
+/// gauntlet expansion (`src/test_support/dispatch.rs`): when the
+/// resolved set has more than one entry, the test binary's
+/// `--list` handler prints `gauntlet/{name}/{preset}/{profile}/
+/// {kernel_label}` for every kernel and the `--exact` handler
+/// strips the kernel suffix and re-exports `KTSTR_KERNEL` to that
+/// kernel's directory before booting the VM. `cargo nextest`
+/// already handles parallelism, retries, and `-E` filtering;
+/// cargo-ktstr never spawns its own loop.
+///
+/// Empty `--kernel` (the default): no `KTSTR_KERNEL` /
+/// `KTSTR_KERNEL_LIST` export — the test binary resolves its own
+/// kernel via the existing `find_kernel` chain.
+///
+/// Single-entry `--kernel` (one Path / Version / CacheKey / Git, OR a
+/// Range that expanded to exactly one release): export
+/// `KTSTR_KERNEL` only. Test names stay backward-compatible — no
+/// kernel suffix is appended in `--list` output.
+///
+/// Multi-entry `--kernel` (≥ 2 entries after expansion): export
+/// `KTSTR_KERNEL_LIST` AND set `KTSTR_KERNEL` to the first entry so
+/// downstream code that reads `KTSTR_KERNEL` directly (e.g. budget
+/// listing in dispatch.rs that needs ANY kernel for vmlinux probe)
+/// still gets a valid path. The test binary's `--list` / `--exact`
+/// handlers prefer `KTSTR_KERNEL_LIST` when set.
 ///
 /// `release` is always `false` for the raw `llvm-cov` passthrough —
 /// that subcommand hands every argument to the user, so the profile
@@ -549,13 +864,11 @@ fn build_kernel(kernel_dir: &Path, clean: bool) -> anyhow::Result<()> {
 fn run_cargo_sub(
     sub_argv: &[&str],
     label: &str,
-    kernel: Option<String>,
+    kernel: Vec<String>,
     no_perf_mode: bool,
     release: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
-    use ktstr::kernel_path::KernelId;
-
     let mut cmd = Command::new("cargo");
     cmd.args(sub_argv);
     if release {
@@ -569,87 +882,42 @@ fn run_cargo_sub(
         cmd.args(["--cargo-profile", "release"]);
     }
     cmd.args(&args);
-
     if no_perf_mode {
         cmd.env("KTSTR_NO_PERF_MODE", "1");
     }
 
-    if let Some(ref val) = kernel {
-        match KernelId::parse(val) {
-            KernelId::Path(p) => {
-                // Canonicalize BEFORE export. The exec'd cargo
-                // subcommand changes cwd to the workspace root (or
-                // wherever `cargo` itself runs from), so a relative
-                // path like `../linux` interpreted from cargo-ktstr's
-                // cwd and the same string interpreted from the child's
-                // cwd resolve to different directories. `canonicalize`
-                // pins the string to an absolute realpath at the
-                // parent's cwd so every downstream reader
-                // (`find_kernel` in the child, `detect_kernel_version`
-                // in the sidecar writer, `find_test_vmlinux` in any
-                // nested probe) sees the same directory. The previous
-                // `unwrap_or_else(|_| PathBuf::from(&p))` silently
-                // fell back to the raw string on canonicalize failure
-                // — bail loudly instead so a typo doesn't exec into a
-                // successful-looking run that silently picks up a
-                // different kernel via `find_kernel`'s fallback chain.
-                let dir = std::fs::canonicalize(&p).map_err(|e| {
-                    format!(
-                        "--kernel {}: path does not exist or cannot be \
-                         canonicalized ({e:#}). {hint}",
-                        p.display(),
-                        hint = ktstr::KTSTR_KERNEL_HINT,
-                    )
-                })?;
-                // Boundary bridge: `build_kernel` returns
-                // `anyhow::Result<()>` while this function still
-                // returns `Result<(), String>`, so we stringify at
-                // the call site. A broader anyhow migration across
-                // cargo-ktstr.rs is pending and would drop this
-                // last bridge.
-                build_kernel(&dir, false).map_err(|e| format!("{e:#}"))?;
-                cmd.env(ktstr::KTSTR_KERNEL_ENV, &dir);
-            }
-            id @ (KernelId::Version(_) | KernelId::CacheKey(_)) => {
-                let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
-                    .map_err(|e| format!("{e:#}"))?;
-                // Canonicalize the cache dir defensively. `CacheDir`
-                // roots at the XDG cache home (or `KTSTR_CACHE_DIR`),
-                // both of which are typically absolute — but an
-                // operator-supplied `KTSTR_CACHE_DIR=./cache` would
-                // produce a relative path here and reach the same
-                // cwd-divergence bug the Path branch defends against.
-                // `canonicalize` resolves that from the parent's cwd;
-                // a failure means the cache dir was removed between
-                // lookup and export (rare race), in which case we
-                // fall back to the original path rather than bailing
-                // — the child will re-enter its own cache lookup and
-                // surface the real missing-entry error.
-                let dir = std::fs::canonicalize(&cache_dir).unwrap_or(cache_dir);
-                eprintln!("cargo ktstr: using kernel {}", dir.display());
-                cmd.env(ktstr::KTSTR_KERNEL_ENV, &dir);
-            }
-            // Multi-kernel specs cannot resolve to a single
-            // KTSTR_KERNEL export here. The dispatch loop that fans
-            // out range expansion and git fetch will land at this
-            // call site in a follow-up stage; for now, surface an
-            // actionable error so the user knows the spec parsed
-            // correctly but the calling subcommand hasn't wired up
-            // the multi-kernel pipeline yet.
-            //
-            // Run `validate()` first so an inverted range surfaces
-            // the specific "swap the endpoints" diagnostic before
-            // the generic "not yet supported" redirect masks it,
-            // matching the pattern in `cli::resolve_kernel_image`
-            // and `cli::resolve_cached_kernel`.
-            id @ (KernelId::Range { .. } | KernelId::Git { .. }) => {
-                id.validate().map_err(|e| format!("--kernel {val}: {e}"))?;
-                return Err(format!(
-                    "--kernel {val}: kernel ranges and git sources are \
-                     not yet supported in this context — use a single \
-                     kernel version, cache key, or path"
-                ));
-            }
+    if !kernel.is_empty() {
+        let resolved = resolve_kernel_set(&kernel)?;
+        if resolved.is_empty() {
+            // `resolve_kernel_set` skips arguments that trim to
+            // empty, so `--kernel ""` or `--kernel "  "` reach
+            // here without ever entering the per-spec resolve
+            // branch. Bail with an actionable error rather than
+            // letting the child reach for `find_kernel` as if
+            // `--kernel` had never been passed (which would mask
+            // the operator's intent).
+            return Err(
+                "--kernel: every supplied value parsed to empty / whitespace; \
+                 omit the flag for auto-discovery, or supply a kernel \
+                 identifier"
+                    .to_string(),
+            );
+        }
+        // `KTSTR_KERNEL` always points at the first resolved entry
+        // so downstream code that inspects the env directly (e.g.
+        // budget listing's vmlinux probe in `dispatch.rs`) sees a
+        // valid kernel even when running under multi-kernel.
+        let first_dir = &resolved[0].1;
+        eprintln!("cargo ktstr: using kernel {}", first_dir.display());
+        cmd.env(ktstr::KTSTR_KERNEL_ENV, first_dir);
+
+        if resolved.len() > 1 {
+            let encoded = encode_kernel_list(&resolved);
+            eprintln!(
+                "cargo ktstr: fanning gauntlet across {n} kernels",
+                n = resolved.len(),
+            );
+            cmd.env(ktstr::KTSTR_KERNEL_LIST_ENV, encoded);
         }
     }
 
@@ -671,7 +939,7 @@ const COVERAGE_SUB_ARGV: &[&str] = &["llvm-cov", "nextest"];
 const LLVM_COV_SUB_ARGV: &[&str] = &["llvm-cov"];
 
 fn run_test(
-    kernel: Option<String>,
+    kernel: Vec<String>,
     no_perf_mode: bool,
     release: bool,
     args: Vec<String>,
@@ -680,7 +948,7 @@ fn run_test(
 }
 
 fn run_coverage(
-    kernel: Option<String>,
+    kernel: Vec<String>,
     no_perf_mode: bool,
     release: bool,
     args: Vec<String>,
@@ -695,11 +963,7 @@ fn run_coverage(
     )
 }
 
-fn run_llvm_cov(
-    kernel: Option<String>,
-    no_perf_mode: bool,
-    args: Vec<String>,
-) -> Result<(), String> {
+fn run_llvm_cov(kernel: Vec<String>, no_perf_mode: bool, args: Vec<String>) -> Result<(), String> {
     // `llvm-cov` is raw passthrough — the user supplies every
     // argument after the subcommand name, including any profile
     // selection. `release: false` here means "don't inject a profile
@@ -746,7 +1010,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             threshold,
             policy,
             dir,
-            kernel_version,
+            kernel,
             scheduler,
             topology,
             work_type,
@@ -789,7 +1053,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             // the surviving set inside `compare_rows`. See
             // `RowFilter` doc for the full match-semantics contract.
             let row_filter = ktstr::cli::RowFilter {
-                kernel_version: kernel_version.clone(),
+                kernels: kernel.clone(),
                 scheduler: scheduler.clone(),
                 topology: topology.clone(),
                 work_type: work_type.clone(),
@@ -1649,7 +1913,7 @@ mod tests {
                 release,
                 args,
             } => {
-                assert_eq!(kernel.as_deref(), Some("6.14.2"));
+                assert_eq!(kernel, vec!["6.14.2".to_string()]);
                 assert!(no_perf_mode);
                 assert!(!release, "bare invocation must default --release to false");
                 assert!(args.is_empty());
@@ -1746,7 +2010,7 @@ mod tests {
                 release,
                 args,
             } => {
-                assert_eq!(kernel.as_deref(), Some("6.14.2"));
+                assert_eq!(kernel, vec!["6.14.2".to_string()]);
                 assert!(no_perf_mode);
                 assert!(!release, "bare invocation must default --release to false");
                 assert_eq!(args, vec!["--workspace"]);
@@ -1771,7 +2035,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::LlvmCov { kernel, .. } => {
-                assert_eq!(kernel.as_deref(), Some("6.14.2"));
+                assert_eq!(kernel, vec!["6.14.2".to_string()]);
             }
             _ => panic!("expected LlvmCov"),
         }
@@ -1826,7 +2090,7 @@ mod tests {
                 no_perf_mode,
                 args,
             } => {
-                assert_eq!(kernel.as_deref(), Some("6.14.2"));
+                assert_eq!(kernel, vec!["6.14.2".to_string()]);
                 assert!(no_perf_mode);
                 assert_eq!(args, vec!["report", "--lcov"]);
             }
@@ -3139,5 +3403,157 @@ mod tests {
             }
             _ => panic!("expected Shell"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Kernel label encoding for the multi-kernel test-name suffix
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cache_key_to_version_label_tarball() {
+        assert_eq!(
+            cache_key_to_version_label("6.14.2-tarball-x86_64-kcabc1234"),
+            "6.14.2",
+        );
+    }
+
+    #[test]
+    fn cache_key_to_version_label_rc_tarball() {
+        assert_eq!(
+            cache_key_to_version_label("6.15-rc3-tarball-x86_64-kcabc"),
+            "6.15-rc3",
+        );
+    }
+
+    #[test]
+    fn cache_key_to_version_label_git() {
+        // Git keys carry the git ref as the prefix; the label
+        // captures the ref, not the post-`-git-` short hash.
+        assert_eq!(
+            cache_key_to_version_label("for-next-git-deadbee-x86_64-kcabc"),
+            "for-next",
+        );
+    }
+
+    #[test]
+    fn cache_key_to_version_label_local() {
+        assert_eq!(
+            cache_key_to_version_label("local-deadbee-x86_64-kcabc"),
+            "local",
+        );
+    }
+
+    #[test]
+    fn cache_key_to_version_label_unknown_tag_falls_through() {
+        // A future cache-key shape with an unrecognised source
+        // tag must still produce a non-empty label rather than
+        // panicking. Operator can read the raw key in the test
+        // name and infer.
+        assert_eq!(
+            cache_key_to_version_label("6.14.2-novel-tag-kcabc"),
+            "6.14.2-novel-tag-kcabc",
+        );
+    }
+
+    #[test]
+    fn git_kernel_label_github_https() {
+        assert_eq!(
+            git_kernel_label("https://github.com/tj/sched_ext", "for-next"),
+            "git_tj_sched_ext_for-next",
+        );
+    }
+
+    #[test]
+    fn git_kernel_label_github_https_with_dot_git() {
+        assert_eq!(
+            git_kernel_label("https://github.com/tj/sched_ext.git", "for-next"),
+            "git_tj_sched_ext_for-next",
+        );
+    }
+
+    #[test]
+    fn git_kernel_label_gitlab_with_ref_tag() {
+        assert_eq!(
+            git_kernel_label("https://gitlab.com/foo/bar.git", "v6.14"),
+            "git_foo_bar_v6.14",
+        );
+    }
+
+    #[test]
+    fn git_kernel_label_local_mirror_two_segment_path() {
+        // Two-segment path (`/srv/linux.git`) renders as
+        // `git_{owner}_{repo}_{ref}` even when the "owner" is just
+        // a parent directory — the helper does not heuristically
+        // distinguish "meaningful" ownership from filesystem
+        // hierarchy. Deterministic and unique-per-URL is good
+        // enough; over-cleverness would risk silently colliding
+        // labels across distinct mirrors.
+        assert_eq!(
+            git_kernel_label("file:///srv/linux.git", "v6.14"),
+            "git_srv_linux_v6.14",
+        );
+    }
+
+    #[test]
+    fn git_kernel_label_truly_single_segment_path() {
+        // True single-segment path (just one component after the
+        // host strip) — e.g. a bare hostname-rooted URL like
+        // `file://linux.git` (no `/` after the scheme). The
+        // helper's host-strip splits on `://` and takes everything
+        // after the first `/` post-scheme; with no `/` to split
+        // on, the entire post-scheme string IS the path. After
+        // `.git` strip we have one segment, owner pops empty, and
+        // the helper falls back to `git_{repo}_{ref}` to avoid
+        // emitting `git__{ref}`.
+        assert_eq!(
+            git_kernel_label("file://linux.git", "v6.14"),
+            "git_linux_v6.14",
+        );
+    }
+
+    #[test]
+    fn git_kernel_label_ssh_style_url() {
+        // `git+ssh://git@github.com/tj/sched_ext` — the helper's
+        // scheme-strip splits on `://`, then the first `/` after
+        // the host, yielding the same `tj/sched_ext` path
+        // component as the https variant.
+        assert_eq!(
+            git_kernel_label("ssh://git@github.com/tj/sched_ext", "main"),
+            "git_tj_sched_ext_main",
+        );
+    }
+
+    #[test]
+    fn path_kernel_label_includes_basename_and_hash() {
+        // `path_kernel_label` builds `path_{basename}_{hash6}`.
+        // We don't pin the exact hash (it's a CRC32 of the path)
+        // but assert the shape: prefix + basename + 6 hex chars.
+        let p = std::path::Path::new("/tmp/somewhere/linux");
+        let label = path_kernel_label(p);
+        assert!(
+            label.starts_with("path_linux_"),
+            "label must start with `path_<basename>_`, got: {label}"
+        );
+        let hash_part = label.strip_prefix("path_linux_").unwrap();
+        assert_eq!(hash_part.len(), 6, "hash suffix must be 6 chars: {label}");
+        assert!(
+            hash_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash suffix must be hex: {label}"
+        );
+    }
+
+    #[test]
+    fn path_kernel_label_distinguishes_paths_sharing_basename() {
+        // Two different parent directories with the same `linux`
+        // basename must produce DIFFERENT labels (the hash
+        // disambiguates them). Pins the "collision risk is only a
+        // UI nuisance" claim in the doc.
+        let a = std::path::Path::new("/srv/a/linux");
+        let b = std::path::Path::new("/srv/b/linux");
+        assert_ne!(
+            path_kernel_label(a),
+            path_kernel_label(b),
+            "distinct path parents must produce distinct labels",
+        );
     }
 }

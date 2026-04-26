@@ -19,6 +19,8 @@
 //! `sidecar` (per-run JSON), `probe` (auto-repro + BPF probe pipeline),
 //! `args` (CLI extraction), and the [`crate::vmm`] VM launcher.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 
 use crate::assert::AssertResult;
@@ -30,6 +32,117 @@ use super::{
     propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
     run_ktstr_test_inner, sidecar_dir, try_flush_profraw, validate_entry_flags,
 };
+
+/// One resolved kernel entry from `KTSTR_KERNEL_LIST` (the multi-
+/// kernel fan-out wire format that `cargo ktstr test --kernel A
+/// --kernel B` exports before exec'ing into `cargo nextest`).
+///
+/// `sanitized` is the nextest-safe identifier appended to test names
+/// so `cargo nextest run -E 'test(kernel_6_14_2)'` filters work
+/// natively. The producer-side encoder in `cargo-ktstr` emits a
+/// semantic, operator-readable label per kernel:
+/// - Version / Range expansion: the version string verbatim
+///   (`6.14.2`, `6.15-rc3`).
+/// - CacheKey: the version prefix (everything before the
+///   `-tarball-` / `-git-` source tag).
+/// - Git: `git_{owner}_{repo}_{ref}` extracted from the URL.
+/// - Path: `path_{basename}_{hash6}` — basename + 6-char crc32 of
+///   the canonical path, disambiguating two `linux` directories
+///   under different parents.
+///
+/// [`sanitize_kernel_label`] applies the `kernel_` prefix and
+/// `[a-z0-9_]+` normalization downstream.
+///
+/// `kernel_dir` is the canonical absolute path to the kernel-build
+/// directory the per-variant subprocess re-exports as
+/// `KTSTR_KERNEL`.
+#[derive(Clone, Debug)]
+pub(crate) struct KernelEntry {
+    pub(crate) sanitized: String,
+    pub(crate) kernel_dir: PathBuf,
+}
+
+/// Parse the multi-kernel wire format `KTSTR_KERNEL_LIST` into a
+/// `Vec<KernelEntry>`. Format: `label1=path1;label2=path2;...`,
+/// semicolon-separated entries, `=` separating label from path. Empty
+/// / unset env returns an empty vec — callers treat that as
+/// "single-kernel mode" and fall through to `KTSTR_KERNEL`.
+///
+/// Malformed entries (missing `=`, empty label, empty path) are
+/// dropped silently — the producer is `cargo ktstr` which encodes
+/// the format under our control, so a malformed entry indicates a
+/// regression in the producer rather than operator input that
+/// deserves a clear error. Silent drop preserves the `len() <= 1` →
+/// "treat as single-kernel" invariant in the readers downstream.
+pub(crate) fn parse_kernel_list(raw: &str) -> Vec<KernelEntry> {
+    raw.split(';')
+        .filter_map(|seg| {
+            let seg = seg.trim();
+            if seg.is_empty() {
+                return None;
+            }
+            let (label, path) = seg.split_once('=')?;
+            let label = label.trim();
+            let path = path.trim();
+            if label.is_empty() || path.is_empty() {
+                return None;
+            }
+            Some(KernelEntry {
+                sanitized: sanitize_kernel_label(label),
+                kernel_dir: PathBuf::from(path),
+            })
+        })
+        .collect()
+}
+
+/// Read [`crate::KTSTR_KERNEL_LIST_ENV`] and parse it into a
+/// `Vec<KernelEntry>`. Empty / unset / malformed → empty vec
+/// (single-kernel mode at the call site).
+pub(crate) fn read_kernel_list() -> Vec<KernelEntry> {
+    std::env::var(crate::KTSTR_KERNEL_LIST_ENV)
+        .ok()
+        .map(|v| parse_kernel_list(&v))
+        .unwrap_or_default()
+}
+
+/// Sanitise a kernel label (the producer-side identity emitted by
+/// `cargo ktstr`'s resolver) into a nextest-safe identifier of the
+/// shape `kernel_[a-z0-9_]+`.
+///
+/// Replaces every `[^A-Za-z0-9]` byte with `_`, lowercases, collapses
+/// runs of `_`, and prefixes with `kernel_`. Empty / pathologically-
+/// short input collapses to `kernel_` alone, which the parser
+/// downstream still recognises as a valid suffix (the empty
+/// `sanitized` marker just won't disambiguate two kernels — but the
+/// producer side guarantees non-empty labels, so the empty case is
+/// defensive only).
+///
+/// Example mappings:
+/// - `6.14.2` → `kernel_6_14_2`
+/// - `6.15-rc3` → `kernel_6_15_rc3`
+/// - `git_tj_sched_ext_for-next` → `kernel_git_tj_sched_ext_for_next`
+/// - `path_linux_a3f2b1` → `kernel_path_linux_a3f2b1`
+fn sanitize_kernel_label(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 7);
+    out.push_str("kernel_");
+    let mut last_underscore = true; // suppress leading `_` after `kernel_`
+    for ch in raw.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            last_underscore = false;
+        } else if !last_underscore {
+            out.push('_');
+            last_underscore = true;
+        }
+    }
+    // Strip a trailing `_` so a label like `for-next-` doesn't
+    // produce a dangling separator.
+    if out.ends_with('_') && out.len() > "kernel_".len() {
+        out.pop();
+    }
+    out
+}
 
 /// Early dispatch for `#[ktstr_test]` test execution.
 ///
@@ -381,6 +494,15 @@ fn for_each_gauntlet_variant<F>(
 }
 
 /// List all tests without budget filtering.
+///
+/// When `KTSTR_KERNEL_LIST` carries 2 or more entries, every test
+/// name carries an extra `/{sanitized_kernel_label}` suffix so each
+/// (test × kernel) pair becomes a distinct nextest test case;
+/// nextest's parallelism, retries, and `-E` filtering all apply
+/// natively. Single-kernel mode (0 or 1 entries) preserves the
+/// historical `gauntlet/{name}/{preset}/{profile}` shape so existing
+/// CI baselines, test-name filters, and per-test config overrides
+/// keep matching.
 fn list_tests_all(ignored_only: bool) {
     let presets = crate::vm::gauntlet_presets();
     let has_vmlinux = resolve_test_kernel()
@@ -388,6 +510,20 @@ fn list_tests_all(ignored_only: bool) {
         .and_then(|k| crate::vmm::find_vmlinux(&k))
         .is_some();
     let (host_cpus, host_llcs, host_max_cpus_per_llc) = host_capacity();
+
+    let kernel_list = read_kernel_list();
+    let multi_kernel = kernel_list.len() > 1;
+    // Single-kernel mode (no list, or list has exactly one entry)
+    // emits one variant per (test × preset × profile) tuple with no
+    // kernel suffix. Multi-kernel mode iterates every kernel as an
+    // outer loop and appends `/{sanitized}` per variant. The empty-
+    // suffix sentinel below is what the single-kernel branch passes
+    // to keep the print path uniform.
+    let kernel_suffixes: Vec<&str> = if multi_kernel {
+        kernel_list.iter().map(|k| k.sanitized.as_str()).collect()
+    } else {
+        vec![""]
+    };
 
     for entry in KTSTR_TESTS.iter() {
         validate_entry_flags(entry);
@@ -400,7 +536,13 @@ fn list_tests_all(ignored_only: bool) {
         }
 
         if !ignored_only || is_ignored(entry) {
-            println!("ktstr/{}: test", entry.name);
+            for suffix in &kernel_suffixes {
+                if suffix.is_empty() {
+                    println!("ktstr/{}: test", entry.name);
+                } else {
+                    println!("ktstr/{}/{suffix}: test", entry.name);
+                }
+            }
         }
 
         // Host-only tests run on the host without a VM -- gauntlet
@@ -419,12 +561,23 @@ fn list_tests_all(ignored_only: bool) {
             host_llcs,
             host_max_cpus_per_llc,
             |preset, profile| {
-                println!(
-                    "gauntlet/{}/{}/{}: test",
-                    entry.name,
-                    preset.name,
-                    profile.name()
-                );
+                for suffix in &kernel_suffixes {
+                    if suffix.is_empty() {
+                        println!(
+                            "gauntlet/{}/{}/{}: test",
+                            entry.name,
+                            preset.name,
+                            profile.name()
+                        );
+                    } else {
+                        println!(
+                            "gauntlet/{}/{}/{}/{suffix}: test",
+                            entry.name,
+                            preset.name,
+                            profile.name()
+                        );
+                    }
+                }
             },
         );
     }
@@ -433,7 +586,9 @@ fn list_tests_all(ignored_only: bool) {
 /// List tests with budget-based coverage maximization.
 ///
 /// Collects all eligible tests as candidates, runs greedy selection,
-/// and prints only the selected subset.
+/// and prints only the selected subset. Multi-kernel mode adds the
+/// kernel suffix as a feature dimension so the budget selector
+/// picks per-kernel coverage; single-kernel mode is unchanged.
 fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     use crate::budget::{TestCandidate, estimate_duration, extract_features, select};
 
@@ -444,6 +599,14 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
         .is_some();
     let (host_cpus, host_llcs, host_max_cpus_per_llc) = host_capacity();
     let mut candidates: Vec<TestCandidate> = Vec::new();
+
+    let kernel_list = read_kernel_list();
+    let multi_kernel = kernel_list.len() > 1;
+    let kernel_suffixes: Vec<&str> = if multi_kernel {
+        kernel_list.iter().map(|k| k.sanitized.as_str()).collect()
+    } else {
+        vec![""]
+    };
 
     for entry in KTSTR_TESTS.iter() {
         validate_entry_flags(entry);
@@ -457,11 +620,18 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
 
         // Base test
         if !ignored_only || base_ignored {
-            candidates.push(TestCandidate {
-                name: format!("ktstr/{}: test", entry.name),
-                features: extract_features(entry, &base_topo, &[], false, entry.name),
-                estimated_secs: estimate_duration(entry, &base_topo),
-            });
+            for suffix in &kernel_suffixes {
+                let name = if suffix.is_empty() {
+                    format!("ktstr/{}: test", entry.name)
+                } else {
+                    format!("ktstr/{}/{suffix}: test", entry.name)
+                };
+                candidates.push(TestCandidate {
+                    name,
+                    features: extract_features(entry, &base_topo, &[], false, entry.name),
+                    estimated_secs: estimate_duration(entry, &base_topo),
+                });
+            }
         }
 
         if entry.host_only {
@@ -475,19 +645,29 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
             host_llcs,
             host_max_cpus_per_llc,
             |preset, profile| {
-                let test_name =
-                    format!("gauntlet/{}/{}/{}", entry.name, preset.name, profile.name());
-                candidates.push(TestCandidate {
-                    name: format!("{test_name}: test"),
-                    features: extract_features(
-                        entry,
-                        &preset.topology,
-                        &profile.flags,
-                        true,
-                        &test_name,
-                    ),
-                    estimated_secs: estimate_duration(entry, &preset.topology),
-                });
+                for suffix in &kernel_suffixes {
+                    let test_name = if suffix.is_empty() {
+                        format!("gauntlet/{}/{}/{}", entry.name, preset.name, profile.name())
+                    } else {
+                        format!(
+                            "gauntlet/{}/{}/{}/{suffix}",
+                            entry.name,
+                            preset.name,
+                            profile.name(),
+                        )
+                    };
+                    candidates.push(TestCandidate {
+                        name: format!("{test_name}: test"),
+                        features: extract_features(
+                            entry,
+                            &preset.topology,
+                            &profile.flags,
+                            true,
+                            &test_name,
+                        ),
+                        estimated_secs: estimate_duration(entry, &preset.topology),
+                    });
+                }
             },
         );
     }
@@ -509,12 +689,96 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     );
 }
 
+/// Strip an optional `/{sanitized_kernel_label}` suffix from `name`,
+/// look up the matching [`KernelEntry`] in the multi-kernel list,
+/// and re-export `KTSTR_KERNEL` to that entry's directory. Returns
+/// the prefix-only name for the dispatch caller.
+///
+/// When `KTSTR_KERNEL_LIST` is unset / single-entry, the function
+/// is a no-op pass-through: returns `(name, None)` and does not
+/// touch the env. When the list has 2+ entries, the suffix is
+/// REQUIRED and missing it surfaces as `Err` (the early-dispatch
+/// caller turns that into exit code 1 with an actionable message)
+/// — the suffix is part of every test name `--list` emitted, so a
+/// `--exact` invocation that omits it can only come from operator
+/// hand-construction or tooling that hasn't been taught the
+/// multi-kernel naming.
+fn strip_kernel_suffix<'a>(
+    name: &'a str,
+    kernel_list: &'a [KernelEntry],
+) -> Result<(&'a str, Option<&'a KernelEntry>), String> {
+    if kernel_list.len() <= 1 {
+        return Ok((name, None));
+    }
+    // Multi-kernel: every test name carries `/kernel_…` as its
+    // final segment. Iterate the labels rather than splitting on
+    // `/` — the suffix always has exactly one extra `/` separator
+    // before `kernel_…`, but the body of the test name CAN contain
+    // `/` (gauntlet variants already do), so a naive
+    // `rsplit_once('/')` would accidentally peel the gauntlet's
+    // profile segment instead.
+    //
+    // Distinct kernels in the same `KTSTR_KERNEL_LIST` produce
+    // distinct sanitized labels in practice — the producer emits
+    // semantic identifiers (version strings, git owner/repo/ref,
+    // path basename + 6-char hash) that don't share suffixes
+    // among the resolved set. If a future regression DID produce
+    // labels where one is a strict suffix of another (e.g.
+    // `kernel_6_14` vs `kernel_x_kernel_6_14`), the iterate-and-
+    // first-match below would pick whichever appears first in
+    // the kernel_list — deterministic but potentially wrong.
+    // Producer-side regression detection (#123) would catch that
+    // class of collision before it reaches this peeler.
+    for entry in kernel_list {
+        let needle = format!("/{}", entry.sanitized);
+        if let Some(stripped) = name.strip_suffix(&needle) {
+            return Ok((stripped, Some(entry)));
+        }
+    }
+    Err(format!(
+        "test name {name:?} has no recognised kernel suffix (KTSTR_KERNEL_LIST \
+         carries {n} kernels — every test name must end with `/kernel_…`)",
+        n = kernel_list.len(),
+    ))
+}
+
+/// Re-export `KTSTR_KERNEL` to the kernel directory carried by a
+/// resolved [`KernelEntry`]. Called when a multi-kernel `--exact`
+/// dispatch peels off the per-test kernel suffix.
+///
+/// SAFETY: nextest invokes the test binary's `--exact` handler in a
+/// single-threaded context — there are no other readers of the env
+/// at this point. The eventual VM-launch site reads `KTSTR_KERNEL`
+/// via `find_kernel` after this returns; that read is sequenced
+/// after the write per the program order.
+fn export_kernel_for_variant(entry: &KernelEntry) {
+    // SAFETY: see fn-level doc — single-threaded ctor / nextest
+    // dispatch context.
+    unsafe { std::env::set_var(crate::KTSTR_KERNEL_ENV, &entry.kernel_dir) };
+}
+
 /// Parse a nextest-style test name and run it.
 ///
 /// Handles base tests (`ktstr/{name}`), gauntlet variants
 /// (`gauntlet/{name}/{preset}/{profile}`), and bare names
-/// (backward compat). Returns an exit code.
+/// (backward compat). When `KTSTR_KERNEL_LIST` carries 2+ kernels,
+/// every test name additionally ends with `/{sanitized_kernel_label}`
+/// — that suffix is peeled here and the matching kernel directory
+/// is re-exported via [`KTSTR_KERNEL_ENV`] before the dispatch
+/// continues. Returns an exit code.
 pub(crate) fn run_named_test(test_name: &str) -> i32 {
+    let kernel_list = read_kernel_list();
+    let (test_name, kernel_entry) = match strip_kernel_suffix(test_name, &kernel_list) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    if let Some(entry) = kernel_entry {
+        export_kernel_for_variant(entry);
+    }
+
     if let Some(rest) = test_name.strip_prefix("gauntlet/") {
         return run_gauntlet_test(rest);
     }
@@ -981,5 +1245,221 @@ mod tests {
              visits, loose=(u32::MAX,u32::MAX) yielded {loose}; loose \
              must admit at least as many presets as tight",
         );
+    }
+
+    // ---------------------------------------------------------------
+    // KTSTR_KERNEL_LIST parsing + sanitization + suffix dispatch
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_kernel_list_empty_returns_empty() {
+        assert!(parse_kernel_list("").is_empty());
+        assert!(parse_kernel_list(";").is_empty());
+        assert!(parse_kernel_list(";;;").is_empty());
+        assert!(parse_kernel_list("   ").is_empty());
+    }
+
+    #[test]
+    fn parse_kernel_list_basic_pair() {
+        // Producer emits semantic labels (the version string for
+        // Version specs); the parser is shape-agnostic and just
+        // splits on `;` and `=` then sanitizes. A version-only
+        // label sanitizes to `kernel_6_14_2`.
+        let entries = parse_kernel_list("6.14.2=/cache/foo");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kernel_dir, PathBuf::from("/cache/foo"));
+        assert_eq!(entries[0].sanitized, "kernel_6_14_2");
+    }
+
+    #[test]
+    fn parse_kernel_list_two_entries() {
+        let entries = parse_kernel_list("6.14.2=/a;6.15.0=/b");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kernel_dir, PathBuf::from("/a"));
+        assert_eq!(entries[0].sanitized, "kernel_6_14_2");
+        assert_eq!(entries[1].kernel_dir, PathBuf::from("/b"));
+        assert_eq!(entries[1].sanitized, "kernel_6_15_0");
+    }
+
+    #[test]
+    fn parse_kernel_list_drops_malformed() {
+        // Missing `=`, empty label, empty path — all silently
+        // dropped. Producer is `cargo ktstr` which encodes the
+        // format under our control; a malformed entry indicates a
+        // regression in the producer rather than operator input
+        // that deserves a clear error.
+        let entries = parse_kernel_list("noeq;=onlypath;onlylabel=;valid=/foo");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kernel_dir, PathBuf::from("/foo"));
+    }
+
+    #[test]
+    fn parse_kernel_list_trims_whitespace() {
+        let entries = parse_kernel_list("  6.14.2=/a  ;  6.15.0=/b  ");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sanitized, "kernel_6_14_2");
+        assert_eq!(entries[1].sanitized, "kernel_6_15_0");
+    }
+
+    #[test]
+    fn sanitize_kernel_label_pure_version() {
+        assert_eq!(sanitize_kernel_label("6.14.2"), "kernel_6_14_2");
+    }
+
+    #[test]
+    fn sanitize_kernel_label_rc_suffix() {
+        assert_eq!(sanitize_kernel_label("6.15-rc3"), "kernel_6_15_rc3");
+    }
+
+    /// The sanitizer is shape-agnostic — it normalizes any input
+    /// that happens to flow in. The producer-side encoder now
+    /// emits semantic labels, but a future regression that
+    /// surfaced a raw cache-key basename would still produce a
+    /// valid (if uglier) nextest identifier rather than crashing.
+    /// Pinned via a synthetic full-cache-key input.
+    #[test]
+    fn sanitize_kernel_label_handles_full_cache_key_shape() {
+        assert_eq!(
+            sanitize_kernel_label("6.14.2-tarball-x86_64-kcabc1234"),
+            "kernel_6_14_2_tarball_x86_64_kcabc1234",
+        );
+    }
+
+    /// Git-source semantic label `git_tj_sched_ext_for-next` from
+    /// the producer-side encoder maps to the dash-stripped form
+    /// the sanitizer produces.
+    #[test]
+    fn sanitize_kernel_label_git_semantic_label() {
+        assert_eq!(
+            sanitize_kernel_label("git_tj_sched_ext_for-next"),
+            "kernel_git_tj_sched_ext_for_next",
+        );
+    }
+
+    /// Path-source semantic label `path_linux_a3f2b1` is already
+    /// `[a-z0-9_]+` so the sanitizer only adds the `kernel_`
+    /// prefix.
+    #[test]
+    fn sanitize_kernel_label_path_semantic_label() {
+        assert_eq!(
+            sanitize_kernel_label("path_linux_a3f2b1"),
+            "kernel_path_linux_a3f2b1",
+        );
+    }
+
+    #[test]
+    fn sanitize_kernel_label_lowercases() {
+        assert_eq!(sanitize_kernel_label("ABC-DEF"), "kernel_abc_def");
+    }
+
+    #[test]
+    fn sanitize_kernel_label_collapses_repeated_separators() {
+        assert_eq!(sanitize_kernel_label("a..b...c"), "kernel_a_b_c");
+    }
+
+    #[test]
+    fn sanitize_kernel_label_strips_trailing_underscore() {
+        assert_eq!(sanitize_kernel_label("for-next-"), "kernel_for_next");
+    }
+
+    #[test]
+    fn sanitize_kernel_label_empty_input() {
+        assert_eq!(sanitize_kernel_label(""), "kernel_");
+    }
+
+    /// `strip_kernel_suffix` is a no-op for single-kernel mode (0 or
+    /// 1 entries) — returns the input verbatim and signals "no
+    /// kernel override needed."
+    #[test]
+    fn strip_kernel_suffix_single_kernel_passthrough() {
+        let kernel_list = vec![KernelEntry {
+            sanitized: "kernel_6_14_2".to_string(),
+            kernel_dir: PathBuf::from("/a"),
+        }];
+        let (stripped, entry) =
+            strip_kernel_suffix("gauntlet/eevdf/2llc/default", &kernel_list).unwrap();
+        assert_eq!(stripped, "gauntlet/eevdf/2llc/default");
+        assert!(entry.is_none());
+
+        let (stripped, entry) = strip_kernel_suffix("ktstr/eevdf", &[]).unwrap();
+        assert_eq!(stripped, "ktstr/eevdf");
+        assert!(entry.is_none());
+    }
+
+    /// In multi-kernel mode (2+ entries), the suffix is required and
+    /// peeled off. The matching `KernelEntry` is returned.
+    #[test]
+    fn strip_kernel_suffix_multi_kernel_peels_suffix() {
+        let kernel_list = vec![
+            KernelEntry {
+                sanitized: "kernel_6_14_2".to_string(),
+                kernel_dir: PathBuf::from("/a"),
+            },
+            KernelEntry {
+                sanitized: "kernel_6_15_0".to_string(),
+                kernel_dir: PathBuf::from("/b"),
+            },
+        ];
+        let (stripped, entry) =
+            strip_kernel_suffix("gauntlet/eevdf/2llc/default/kernel_6_14_2", &kernel_list).unwrap();
+        assert_eq!(stripped, "gauntlet/eevdf/2llc/default");
+        assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/a"));
+
+        let (stripped, entry) =
+            strip_kernel_suffix("gauntlet/eevdf/2llc/default/kernel_6_15_0", &kernel_list).unwrap();
+        assert_eq!(stripped, "gauntlet/eevdf/2llc/default");
+        assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/b"));
+    }
+
+    /// In multi-kernel mode, a test name that lacks the kernel
+    /// suffix surfaces an actionable error rather than silently
+    /// using the first kernel — the suffix is part of every test
+    /// name `--list` emitted, so a missing suffix indicates
+    /// operator hand-construction or stale tooling.
+    #[test]
+    fn strip_kernel_suffix_multi_kernel_missing_suffix_errors() {
+        let kernel_list = vec![
+            KernelEntry {
+                sanitized: "kernel_6_14_2".to_string(),
+                kernel_dir: PathBuf::from("/a"),
+            },
+            KernelEntry {
+                sanitized: "kernel_6_15_0".to_string(),
+                kernel_dir: PathBuf::from("/b"),
+            },
+        ];
+        let err = strip_kernel_suffix("gauntlet/eevdf/2llc/default", &kernel_list)
+            .expect_err("missing suffix in multi-kernel mode must error");
+        assert!(
+            err.contains("no recognised kernel suffix"),
+            "error must mention missing suffix, got: {err}",
+        );
+    }
+
+    /// Suffix peeling is anchored at the end of the test name —
+    /// gauntlet variants whose body contains `/` (the preset /
+    /// profile separator) are not accidentally peeled. A naive
+    /// `rsplit_once('/')` would peel the profile segment instead.
+    #[test]
+    fn strip_kernel_suffix_does_not_peel_profile_segment() {
+        let kernel_list = vec![
+            KernelEntry {
+                sanitized: "kernel_6_14_2".to_string(),
+                kernel_dir: PathBuf::from("/a"),
+            },
+            KernelEntry {
+                sanitized: "kernel_6_15_0".to_string(),
+                kernel_dir: PathBuf::from("/b"),
+            },
+        ];
+        // The profile name is `default`, NOT `kernel_6_14_2` — the
+        // peeler must require an EXACT match against a known
+        // sanitized label, not just any `/<word>` ending.
+        let (stripped, entry) =
+            strip_kernel_suffix("gauntlet/eevdf/2llc/default/kernel_6_14_2", &kernel_list).unwrap();
+        // Stripped name still contains all three of the original
+        // path segments (eevdf, 2llc, default).
+        assert_eq!(stripped, "gauntlet/eevdf/2llc/default");
+        assert!(entry.is_some());
     }
 }

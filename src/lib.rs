@@ -461,6 +461,38 @@ pub mod prelude {
 /// every call site.
 pub const KTSTR_KERNEL_ENV: &str = "KTSTR_KERNEL";
 
+/// Name of the environment variable that carries the multi-kernel
+/// fan-out list across the `cargo ktstr` → `cargo nextest` → test-
+/// binary boundary. Format: `label1=path1;label2=path2;…` (semicolon
+/// entry separator, `=` separates label from absolute kernel-dir
+/// path). Empty / unset means "single-kernel mode" — the test binary
+/// honours `KTSTR_KERNEL_ENV` directly.
+///
+/// Set by `cargo ktstr test --kernel A --kernel B` (or any
+/// `--kernel` value that expands to ≥ 2 entries — repeated
+/// `--kernel` flags, or a single `--kernel START..END` range that
+/// expands to multiple stable releases via
+/// [`crate::kernel_path::KernelId::Range`]) before the `exec` into
+/// `cargo nextest`. Read by the test binary's `--list` /
+/// `--exact` handlers in [`crate::test_support::dispatch`] to fan
+/// the gauntlet across kernels: each (test × scenario × topology ×
+/// flags × kernel) tuple becomes a distinct nextest test case so
+/// nextest's parallelism, retries, and `-E` filtering work
+/// natively. Per-variant subprocesses re-export `KTSTR_KERNEL` to
+/// the kernel directory selected by the test name's `kernel_…`
+/// suffix.
+///
+/// `KTSTR_KERNEL_ENV` is always set in tandem (to the first entry's
+/// path) so downstream code that reads `KTSTR_KERNEL` directly —
+/// budget-listing's vmlinux probe in `dispatch.rs` for example —
+/// still observes a valid kernel even when running under multi-
+/// kernel mode.
+///
+/// Single source of truth so the name is not spelled by hand at
+/// each reader; if the name ever changes, the change lands in one
+/// place instead of fanning out to every call site.
+pub const KTSTR_KERNEL_LIST_ENV: &str = "KTSTR_KERNEL_LIST";
+
 /// Shared skip / error hint for call sites that cannot proceed
 /// without a resolvable kernel. Phrased so the user sees the same
 /// wording regardless of which layer surfaced the failure — tests,

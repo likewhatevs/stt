@@ -102,8 +102,9 @@ pub enum KernelCommand {
 }
 
 /// Help text for `--kernel` in contexts that reject raw image files:
-/// `cargo ktstr test`, `cargo ktstr coverage`, and `ktstr shell`.
-/// Matches `KernelResolvePolicy { accept_raw_image: false, .. }`.
+/// `cargo ktstr test`, `cargo ktstr coverage`, `cargo ktstr llvm-cov`,
+/// and `ktstr shell`. Matches
+/// `KernelResolvePolicy { accept_raw_image: false, .. }`.
 ///
 /// Raw images are rejected here because these commands depend on a
 /// matching `vmlinux` and the cached kconfig fragment alongside the
@@ -115,10 +116,19 @@ pub enum KernelCommand {
 /// need that companion metadata; see [`KERNEL_HELP_RAW_OK`].
 pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      path (e.g. `../linux`), a version (`6.14.2`, or major.minor prefix \
-     `6.14` for latest patch), or a cache key (see `kernel list`). Raw \
+     `6.14` for latest patch), a cache key (see `kernel list`), a \
+     version range (`6.12..6.14`), or a git source (`git+URL#REF`). Raw \
      image files are rejected. Source directories auto-build (can be slow \
      on a fresh tree); versions auto-download from kernel.org on cache \
-     miss.";
+     miss. The flag is REPEATABLE on `test`, `coverage`, and `llvm-cov` \
+     — passing multiple `--kernel` flags fans the gauntlet across every \
+     resolved kernel; each (test × scenario × topology × flags × kernel) \
+     tuple becomes a distinct nextest test case so nextest's parallelism, \
+     retries, and `-E` filtering work natively. Ranges expand to every \
+     `stable` and `longterm` release inside `[START, END]` inclusive \
+     (mainline / linux-next dropped). Git sources clone shallow at the \
+     ref and build once. In contrast, `ktstr shell` accepts a single \
+     kernel only — pass exactly one `--kernel`.";
 
 /// Help text for `--kernel` in contexts that accept raw image files:
 /// `cargo ktstr verifier` and `cargo ktstr shell`. Matches
@@ -131,7 +141,9 @@ pub const KERNEL_HELP_RAW_OK: &str = "Kernel identifier: a source directory \
      or a cache key (see `kernel list`). Source directories auto-build \
      (can be slow on a fresh tree); versions auto-download from kernel.org \
      on cache miss. When absent, resolves via cache then filesystem, \
-     falling back to downloading the latest stable kernel.";
+     falling back to downloading the latest stable kernel. Ranges \
+     (`START..END`) and git sources (`git+URL#REF`) are not supported \
+     in this context; pass a single kernel.";
 
 /// Help text for the `--cpu-cap N` flag. Shared across `ktstr kernel build`,
 /// `cargo ktstr kernel build`, and `ktstr shell` so the operator-facing
@@ -2639,6 +2651,169 @@ pub fn download_and_cache_version(
         Some(entry) => Ok(entry.path),
         None => bail!(
             "kernel built but cache store failed — cannot return image from temporary directory"
+        ),
+    }
+}
+
+/// Expand a kernel-version range to the list of stable / longterm
+/// releases that fall inside `[start, end]` inclusive.
+///
+/// Fetches kernel.org's `releases.json` once via
+/// [`crate::fetch::fetch_releases`], filters to rows whose `moniker`
+/// is `stable` or `longterm` (matching the policy
+/// [`crate::fetch::fetch_latest_stable_version`] uses for "is this a
+/// production release we want to test against"), drops any version
+/// outside the inclusive interval, and returns the surviving versions
+/// sorted ascending by `(major, minor, patch, rc)` tuple. Empty result
+/// is a hard error — an empty range either reflects a typo (start/end
+/// don't bracket any active series) or releases.json missing rows
+/// the operator expected, and silently iterating over zero kernels
+/// would mask both. The `KernelId::Range` doc comment promises "every
+/// release in the range" which a quiet no-op contradicts.
+///
+/// Range endpoints are NOT required to appear in releases.json — the
+/// interval is half-the-numeric, half-presence: `6.10..6.16` selects
+/// every stable release strictly inside that span, regardless of
+/// whether `6.10` and `6.16` themselves are still listed (e.g. one
+/// has been pruned from active maintenance). This matches the
+/// inclusive-numeric-comparison semantics in
+/// [`crate::kernel_path::KernelId::validate`] and lets a range from
+/// an EOL series survive even after the endpoint version itself
+/// becomes unavailable.
+///
+/// `cli_label` prefixes the kernel.org-fetch status line so the
+/// diagnostic matches the binary that triggered the lookup
+/// (`"ktstr"` vs `"cargo ktstr"`).
+///
+/// Pre-release filter: `mainline` and `linux-next` rows are
+/// excluded by the moniker filter; rc tags carrying a stable
+/// moniker would also be excluded but kernel.org publishes rcs
+/// under `mainline`, so the filter is double-coverage in practice.
+/// Operators who want to test against an rc spell it out as a
+/// single `--kernel 6.16-rc3` rather than expecting the range
+/// expansion to surface it.
+pub fn expand_kernel_range(start: &str, end: &str, cli_label: &str) -> Result<Vec<String>> {
+    use crate::kernel_path::decompose_version_for_compare;
+
+    let start_key = decompose_version_for_compare(start).ok_or_else(|| {
+        anyhow!(
+            "kernel range start `{start}` is not a parseable version. \
+             Endpoints must match `MAJOR.MINOR[.PATCH][-rcN]`."
+        )
+    })?;
+    let end_key = decompose_version_for_compare(end).ok_or_else(|| {
+        anyhow!(
+            "kernel range end `{end}` is not a parseable version. \
+             Endpoints must match `MAJOR.MINOR[.PATCH][-rcN]`."
+        )
+    })?;
+
+    eprintln!("{cli_label}: expanding kernel range {start}..{end}");
+    let releases = crate::fetch::fetch_releases(crate::fetch::shared_client())?;
+
+    let versions = filter_and_sort_range(&releases, start_key, end_key);
+    if versions.is_empty() {
+        bail!(
+            "kernel range {start}..{end} expanded to 0 stable releases. \
+             releases.json has no `stable` or `longterm` rows in this \
+             interval — verify the endpoints, or use a single \
+             `--kernel <version>` if you want a pre-release or \
+             archived version."
+        );
+    }
+
+    eprintln!(
+        "{cli_label}: range expanded to {n} kernel(s): {list}",
+        n = versions.len(),
+        list = versions.join(", "),
+    );
+    Ok(versions)
+}
+
+/// Filter [`Release`](crate::fetch::Release) rows to stable+longterm
+/// versions inside `[start_key, end_key]` and return them sorted
+/// ascending by version tuple.
+///
+/// Separated from [`expand_kernel_range`] so the pure filter+sort
+/// logic — moniker rejection, version-tuple bounds check, sort
+/// order — is testable without hitting the network. The wrapper is
+/// a thin adapter that fetches `releases.json` and reports the
+/// outcome to stderr; this helper carries no I/O. Mirrors the
+/// `active_prefixes_from_releases` split applied above.
+fn filter_and_sort_range(
+    releases: &[crate::fetch::Release],
+    start_key: (u64, u64, u64, u64),
+    end_key: (u64, u64, u64, u64),
+) -> Vec<String> {
+    use crate::kernel_path::decompose_version_for_compare;
+
+    let mut selected: Vec<(String, (u64, u64, u64, u64))> = Vec::new();
+    for r in releases {
+        if r.moniker != "stable" && r.moniker != "longterm" {
+            continue;
+        }
+        let Some(key) = decompose_version_for_compare(&r.version) else {
+            continue;
+        };
+        if key < start_key || key > end_key {
+            continue;
+        }
+        selected.push((r.version.clone(), key));
+    }
+    selected.sort_by_key(|s| s.1);
+    selected.into_iter().map(|(v, _)| v).collect()
+}
+
+/// Resolve a `git+URL#REF` kernel spec to a cache-entry directory.
+///
+/// Mirrors [`download_and_cache_version`] for the git source path:
+/// shallow-clones the repo into a temp directory via
+/// [`crate::fetch::git_clone`], checks the resulting cache key for an
+/// existing entry (so two consecutive `cargo ktstr test --kernel
+/// git+URL#main` invocations against an unchanged tip skip the rebuild),
+/// and on miss delegates to [`kernel_build_pipeline`] for
+/// configure/build/validate/cache. Returns the cache entry directory
+/// path — the same shape `download_and_cache_version` returns and the
+/// same shape callers feed into the [`crate::KTSTR_KERNEL_ENV`] export.
+///
+/// Branches resolve at clone time (the shallow fetch lands on the
+/// branch's current tip; the resulting `short_hash` is what the cache
+/// key embeds). Two operators cloning `git+URL#main` at different
+/// times produce different cache keys when the branch tip has moved
+/// — that is intentional for this stage. A future Stage 3 ls-remote
+/// pre-resolution would collapse identical-sha-different-spelling
+/// invocations to one cache entry; until then the doc comment on
+/// [`crate::kernel_path::KernelId::Git`] tracks that as future work.
+///
+/// `cli_label` matches the contract the sibling helpers
+/// (`download_and_cache_version`, `resolve_kernel_dir`) use:
+/// it prefixes diagnostic status output and is threaded into
+/// [`kernel_build_pipeline`].
+pub fn resolve_git_kernel(url: &str, git_ref: &str, cli_label: &str) -> Result<std::path::PathBuf> {
+    let tmp_dir = tempfile::TempDir::new()?;
+
+    let acquired = crate::fetch::git_clone(url, git_ref, tmp_dir.path(), cli_label)?;
+
+    // Open cache once, reuse for both lookup (post-clone cache_key
+    // embeds the resolved short_hash, so a repeat invocation against
+    // an unchanged branch tip skips the rebuild) and the build
+    // pipeline below on miss.
+    let cache = crate::cache::CacheDir::new()?;
+    if let Some(entry) = cache_lookup(&cache, &acquired.cache_key, cli_label) {
+        return Ok(entry.path);
+    }
+
+    // is_local_source = false: a freshly cloned tree is treated the
+    // same as a tarball download — no `make mrproper` skip-warning,
+    // no compile_commands.json generation (acquired.is_temp gates
+    // that inside the pipeline).
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, false, None)?;
+
+    match result.entry {
+        Some(entry) => Ok(entry.path),
+        None => bail!(
+            "kernel built from git+{url}#{git_ref} but cache store failed — \
+             cannot return image from temporary directory"
         ),
     }
 }
@@ -6975,6 +7150,212 @@ mod tests {
         assert!(
             !msg.contains("not yet supported in this context"),
             "validate() must short-circuit before the generic bail; got: {msg}",
+        );
+    }
+
+    // -- expand_kernel_range / filter_and_sort_range --
+
+    fn release(moniker: &str, version: &str) -> crate::fetch::Release {
+        crate::fetch::Release {
+            moniker: moniker.to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    /// Stable+longterm rows inside the interval are kept; mainline,
+    /// linux-next, and rows outside the interval are dropped. The
+    /// surviving versions sort ascending by `(major, minor, patch,
+    /// rc)` regardless of input order, so a regression that left
+    /// the releases.json order leaking through (newest-first instead
+    /// of oldest-first per the coordinator's ascending ruling) lands
+    /// here.
+    #[test]
+    fn filter_and_sort_range_basic() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let releases = vec![
+            release("mainline", "6.18-rc2"),
+            release("stable", "6.16.5"),
+            release("longterm", "6.12.40"),
+            release("linux-next", "6.18-rc2-next-20260420"),
+            release("longterm", "6.6.99"),
+            release("stable", "6.14.10"),
+            release("stable", "6.10.0"),
+        ];
+        let start_key = decompose_version_for_compare("6.12").unwrap();
+        let end_key = decompose_version_for_compare("6.16.5").unwrap();
+        let out = filter_and_sort_range(&releases, start_key, end_key);
+        assert_eq!(
+            out,
+            vec![
+                "6.12.40".to_string(),
+                "6.14.10".to_string(),
+                "6.16.5".to_string(),
+            ],
+            "stable+longterm only, ascending, [start, end] inclusive",
+        );
+    }
+
+    /// Endpoints that are absent from releases.json still bracket the
+    /// surviving versions correctly. `6.10..6.16` brackets `6.12`,
+    /// `6.14`, and `6.15` even when none of `6.10` / `6.16` themselves
+    /// appear as rows. Pins the "interval is half-the-numeric, half-
+    /// presence" semantics documented on `expand_kernel_range`.
+    #[test]
+    fn filter_and_sort_range_endpoints_absent_from_releases() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let releases = vec![
+            release("stable", "6.12.5"),
+            release("stable", "6.14.2"),
+            release("stable", "6.15.0"),
+        ];
+        let start_key = decompose_version_for_compare("6.10").unwrap();
+        let end_key = decompose_version_for_compare("6.16").unwrap();
+        let out = filter_and_sort_range(&releases, start_key, end_key);
+        assert_eq!(
+            out,
+            vec![
+                "6.12.5".to_string(),
+                "6.14.2".to_string(),
+                "6.15.0".to_string(),
+            ],
+        );
+    }
+
+    /// Inclusive endpoint comparison: `6.12.5..6.14.2` keeps the
+    /// versions matching either endpoint exactly. A regression to
+    /// strict inequality (`<` / `>`) would silently drop both
+    /// endpoints from the result and land here.
+    #[test]
+    fn filter_and_sort_range_inclusive_both_endpoints() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let releases = vec![
+            release("stable", "6.12.5"),
+            release("stable", "6.13.0"),
+            release("stable", "6.14.2"),
+        ];
+        let start_key = decompose_version_for_compare("6.12.5").unwrap();
+        let end_key = decompose_version_for_compare("6.14.2").unwrap();
+        let out = filter_and_sort_range(&releases, start_key, end_key);
+        assert_eq!(
+            out,
+            vec![
+                "6.12.5".to_string(),
+                "6.13.0".to_string(),
+                "6.14.2".to_string(),
+            ],
+        );
+    }
+
+    /// rc-tagged rows under stable/longterm monikers (kernel.org
+    /// publishes rcs under `mainline` so this is a synthetic input)
+    /// are still kept by the moniker filter — but ordering relative
+    /// to non-rc versions follows the rc-as-MAX rule from
+    /// `decompose_version_for_compare`. Synthetic case to pin the
+    /// ordering invariant in case kernel.org ever ships an rc under
+    /// a stable moniker.
+    #[test]
+    fn filter_and_sort_range_rc_under_stable_moniker_orders_after_release() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let releases = vec![
+            release("stable", "6.14.0-rc3"),
+            release("stable", "6.14.0"),
+            release("stable", "6.13.0"),
+        ];
+        let start_key = decompose_version_for_compare("6.13").unwrap();
+        let end_key = decompose_version_for_compare("6.15").unwrap();
+        let out = filter_and_sort_range(&releases, start_key, end_key);
+        // rc-as-MAX: `6.14.0` (rc=MAX) sorts STRICTLY ABOVE
+        // `6.14.0-rc3` (rc=3). Operators expecting "rc before final"
+        // must read the comment on `decompose_version_for_compare`.
+        assert_eq!(
+            out,
+            vec![
+                "6.13.0".to_string(),
+                "6.14.0-rc3".to_string(),
+                "6.14.0".to_string(),
+            ],
+        );
+    }
+
+    /// Empty interval (no stable+longterm rows fall inside the
+    /// bounds) returns an empty vec from the pure helper. The
+    /// network-touching `expand_kernel_range` wrapper translates that
+    /// into the actionable "expanded to 0 stable releases" bail; this
+    /// pure layer just reports nothing matched, leaving the bail
+    /// decision to the outer layer.
+    #[test]
+    fn filter_and_sort_range_empty_when_no_overlap() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let releases = vec![release("stable", "5.10.0"), release("stable", "5.15.0")];
+        let start_key = decompose_version_for_compare("6.10").unwrap();
+        let end_key = decompose_version_for_compare("6.16").unwrap();
+        let out = filter_and_sort_range(&releases, start_key, end_key);
+        assert!(out.is_empty(), "no overlap → empty result, got {out:?}");
+    }
+
+    /// Mainline/linux-next/etc. monikers are dropped even when they
+    /// fall inside the interval. Pins the stable+longterm-only filter
+    /// the coordinator's ruling A specified.
+    #[test]
+    fn filter_and_sort_range_drops_non_stable_monikers() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let releases = vec![
+            release("mainline", "6.14.0"),
+            release("linux-next", "6.14.0-next-20260420"),
+            release("stable", "6.14.5"),
+        ];
+        let start_key = decompose_version_for_compare("6.14").unwrap();
+        let end_key = decompose_version_for_compare("6.15").unwrap();
+        let out = filter_and_sort_range(&releases, start_key, end_key);
+        assert_eq!(
+            out,
+            vec!["6.14.5".to_string()],
+            "only stable/longterm survive the filter"
+        );
+    }
+
+    /// Unparseable version strings (a kernel.org row whose `version`
+    /// field doesn't match the major.minor[.patch][-rcN] grammar) are
+    /// dropped silently rather than aborting the whole expansion. A
+    /// future kernel.org schema change that introduced a new format
+    /// (e.g. an embargoed CVE patch tag) would land here as one
+    /// untestable row, not a hard failure for the entire run.
+    #[test]
+    fn filter_and_sort_range_drops_unparseable_versions() {
+        use crate::kernel_path::decompose_version_for_compare;
+        let releases = vec![
+            release("stable", "6.14.0"),
+            release("stable", "embargoed-cve-tag"),
+            release("stable", "6.14.5"),
+        ];
+        let start_key = decompose_version_for_compare("6.14").unwrap();
+        let end_key = decompose_version_for_compare("6.15").unwrap();
+        let out = filter_and_sort_range(&releases, start_key, end_key);
+        assert_eq!(out, vec!["6.14.0".to_string(), "6.14.5".to_string()],);
+    }
+
+    /// The wrapper `expand_kernel_range` rejects unparseable range
+    /// endpoints up front before any network call. Pins the
+    /// validation gate at the public API surface.
+    #[test]
+    fn expand_kernel_range_rejects_unparseable_start() {
+        let err = expand_kernel_range("garbage", "6.14", "ktstr-test")
+            .expect_err("unparseable start must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("kernel range start `garbage`"),
+            "error must cite the bad endpoint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn expand_kernel_range_rejects_unparseable_end() {
+        let err = expand_kernel_range("6.10", "garbage", "ktstr-test")
+            .expect_err("unparseable end must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("kernel range end `garbage`"),
+            "error must cite the bad endpoint, got: {msg}"
         );
     }
 }
