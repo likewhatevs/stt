@@ -2654,12 +2654,39 @@ fn project_optional_fields(sc: &crate::test_support::SidecarResult) -> [(&'stati
 /// for grep-friendly parse-error tracking AND the enriched
 /// prose for human-facing remediation.
 ///
-/// Every predicate-matching file lands in exactly one of
-/// `valid` (parsed OK), `errors` (read OK, parse failed), or
-/// `io_errors` (read failed) — so
-/// `walked == valid + errors.len() + io_errors.len()` by
-/// construction. The previous "implicit silent-drop count"
-/// (where IO failures vanished from every channel) is gone.
+/// In the steady state, every predicate-matching file lands
+/// in exactly one of `valid` (parsed OK), `errors` (read OK,
+/// parse failed), or `io_errors` (read failed) — so
+/// `walked == valid + errors.len() + io_errors.len()`. The
+/// previous "implicit silent-drop count" (where IO failures
+/// vanished from every channel) is gone.
+///
+/// This invariant holds when the run directory is stable for
+/// the duration of [`explain_sidecar`]. It is NOT enforced by
+/// a single atomic walk: `walked` is computed by
+/// [`count_sidecar_files`] in a separate `read_dir` pass from
+/// the parse-and-load pass in
+/// [`crate::test_support::collect_sidecars_with_errors`].
+/// Filesystem mutations between the two passes can perturb
+/// the equality:
+/// - A file appearing between passes lands in `valid` /
+///   `errors` / `io_errors` but was not in `walked` —
+///   `walked < valid + errors + io_errors`.
+/// - A file disappearing between passes was in `walked` but
+///   never reaches a parse outcome — `walked > valid + errors
+///   + io_errors`.
+/// - A path's type changing between passes (e.g.
+///   delete+recreate as a different kind — file→dir or
+///   dir→file; POSIX does not support in-place type flips,
+///   so the mechanism is always unlink-then-create) can
+///   shift it across categories.
+///
+/// Operators driving `explain-sidecar` against a quiescent
+/// archive directory will not observe these effects; the
+/// invariant is documented as steady-state because that's
+/// the supported use case. CI consumers that need a hard
+/// invariant should drain in-flight writes (or copy to a
+/// snapshot) before invoking explain-sidecar.
 ///
 /// `errors` and `io_errors` surface in both render paths: text
 /// appends a `corrupt sidecars` block (parse failures, optional
@@ -2780,9 +2807,11 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 /// entries covering every IO failure (file matched the
 /// predicate but `read_to_string` failed before parsing — e.g.
 /// permission denied, mid-rotate truncation). With both arrays,
-/// `walked == valid + errors.len() + io_errors.len()` by
-/// construction — every predicate-matching file lands in
-/// exactly one bucket. `"fields"` is a map keyed by
+/// `walked == valid + errors.len() + io_errors.len()` in the
+/// steady state — every predicate-matching file lands in
+/// exactly one bucket when the run directory is stable across
+/// the count and load passes (see [`WalkStats`] for the
+/// filesystem-race caveat). `"fields"` is a map keyed by
 /// [`SIDECAR_NONE_CATALOG`] field name where each value is
 /// `{ "none_count": N, "some_count": M, "classification": "...",
 /// "causes": [...], "fix": "..." }`). `none_count` and
@@ -2798,25 +2827,48 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 /// `corrupt sidecars` (parse failures) and `io errors` (IO
 /// failures) blocks when either occurred.
 ///
-/// All-corrupt runs (every file failed to parse) are NOT a
-/// hard error — both renderers fall through with `valid = 0`,
-/// no per-sidecar blocks (none parsed), the per-field `fields`
-/// entries reporting zero counts, and the full
-/// `_walk.errors` / corrupt-sidecars block listing every
-/// parse failure. This gives dashboard consumers structured
-/// per-file visibility into total-parse-failure runs rather
-/// than a single-line bail.
+/// All-corrupt and all-IO-failure runs (every predicate-
+/// matching file failed to parse, or every one failed to
+/// read) are NOT a hard error — both renderers fall through
+/// with `valid = 0`, no per-sidecar blocks (none parsed),
+/// the per-field `fields` entries reporting zero counts, and
+/// the relevant trailing block(s): `_walk.errors` /
+/// corrupt-sidecars block for parse failures,
+/// `_walk.io_errors` / io-errors block for IO failures, both
+/// when failures of both classes occurred. This gives
+/// dashboard consumers structured per-file visibility into
+/// total-failure runs of either class rather than a
+/// single-line bail.
 ///
 /// Exit-code contract: this command exits 0 even when every
-/// sidecar in the run failed to parse — the diagnostic
-/// surface is the structured `_walk.errors` array (or the
-/// trailing `corrupt sidecars` text block), not the process
-/// exit code. CI scripts that need to fail on parse failures
-/// MUST gate on `_walk.valid > 0` or `_walk.errors.len() == 0`
-/// rather than relying on exit code. The only exit-code
-/// failures are the two errors documented below: missing run
-/// directory and zero `.ktstr.json` files (an empty run, not
-/// a corrupt one).
+/// sidecar in the run failed to parse OR failed to read —
+/// the diagnostic surface is the structured `_walk.errors`
+/// and `_walk.io_errors` arrays (or the trailing
+/// `corrupt sidecars` / `io errors` text blocks), not the
+/// process exit code. CI scripts must inspect the JSON
+/// channel for failure detection rather than relying on exit
+/// code; two distinct gating policies cover different
+/// operational stances:
+///
+/// - **Lenient** (treat partial failures as warnings):
+///   `_walk.valid > 0`. Accepts any run with at least one
+///   parsed sidecar; per-file failures still surface in the
+///   JSON arrays for triage but do not fail the gate.
+/// - **Strict** (fail on any sidecar failure):
+///   `_walk.errors.len() == 0 && _walk.io_errors.len() == 0`.
+///   Requires every predicate-matching file to parse cleanly.
+///   Both checks are required because the two arrays cover
+///   disjoint failure classes (parse vs read).
+///
+/// The two policies are NOT equivalent: a run with one valid
+/// and one corrupt sidecar passes lenient (`valid == 1 > 0`)
+/// but fails strict (`errors.len() == 1 > 0`). Consumers
+/// pick the policy that matches their operational tolerance
+/// for partial data.
+///
+/// The only exit-code failures are the two errors documented
+/// below: missing run directory and zero predicate-matching
+/// files (an empty run, not a corrupt or unreadable one).
 ///
 /// # Errors
 ///
@@ -2831,8 +2883,17 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 ///   operators to name the run they want.
 /// - The run directory does not exist.
 /// - The run directory exists but the walker found zero
-///   `.ktstr.json` files at all (empty or read-permission
-///   failure on the directory itself).
+///   `.ktstr.json` files at all. This case covers an empty
+///   run directory AND a directory whose top-level
+///   `read_dir` itself failed (e.g. read-permission denied
+///   on the run directory). Per-file read-permission
+///   failures DO NOT bail here — they surface through
+///   `WalkStats::io_errors` and the renderers' `io errors`
+///   block, returning Ok(...) with `valid = 0` and the IO
+///   failures structured. Distinguishing the two: a
+///   directory-level failure produces `walked = 0` and
+///   bails; a per-file failure produces `walked > 0` and
+///   renders.
 pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<String> {
     // Reject pool-root-aliasing and path-traversal inputs BEFORE
     // joining onto `root`. The `Path::join` rules that matter:
@@ -2852,11 +2913,14 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
     // and would silently pass an iterate-and-reject validator.
     if run.is_empty() {
         bail!(
-            "run argument must not be empty. The run argument must \
-             be a bare run key under the run-root (e.g. \
-             `linux-6.14-20260101T120000Z`); to point at a different \
-             pool root, use `--dir`. Run `cargo ktstr stats list` to \
-             enumerate available run keys.",
+            "run argument must not be empty. The run argument is \
+             joined onto the run-root via `Path::join` and must \
+             contain at least one `Normal` path component — i.e. \
+             must not be empty, `.`, `..`, or absolute (e.g. a \
+             typical run key shape: `linux-6.14-20260101T120000Z`). \
+             To point at a different pool root, use `--dir`. Run \
+             `cargo ktstr stats list` to enumerate available run \
+             keys.",
         );
     }
     // `Path::new(run)`'s `Component` iterator gives a structural
@@ -2874,12 +2938,15 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
                 bail!(
                     "run '{run}' contains pool-root-aliasing or \
                      path-traversal components (`.`, `..`, or absolute \
-                     path). The run argument must be a bare run key \
-                     under the run-root (e.g. \
-                     `linux-6.14-20260101T120000Z`); to point at a \
-                     different pool root, use `--dir`. Run \
-                     `cargo ktstr stats list` to enumerate available \
-                     run keys.",
+                     path). The run argument is joined onto the \
+                     run-root via `Path::join` and must contain only \
+                     `Normal` path components — no `.`, `..`, or \
+                     absolute prefix (e.g. a typical run key shape: \
+                     `linux-6.14-20260101T120000Z`; multi-component \
+                     paths like `gauntlet/job-1` are also accepted). \
+                     To point at a different pool root, use `--dir`. \
+                     Run `cargo ktstr stats list` to enumerate \
+                     available run keys.",
                 );
             }
             std::path::Component::Normal(_) => {}

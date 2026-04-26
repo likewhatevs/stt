@@ -629,23 +629,56 @@ error message indented as `error: ...`, optionally
 followed by an `enriched: ...` line with operator-facing
 remediation prose when the parse failure matches a known
 schema-drift case (currently the `host` missing-field
-case). The block is suppressed when every sidecar parsed
-cleanly.
+case). When the walk encounters IO failures (file matched
+the predicate but `read_to_string` failed before parsing
+could begin — permission denied, mid-rotate truncation,
+broken symlink, EISDIR), the text output appends a parallel
+`io errors (N):` block, structured the same way (path on
+its own line, `error: ...` line below) but carrying
+`std::io::Error::Display` rather than serde-error text. IO
+errors do NOT carry `enriched:` lines — there is no
+schema-drift catalog for filesystem incidents; the raw
+`std::io::Error` Display is the remediation surface.
+Each block is suppressed independently when its source
+vec is empty.
 
-All-corrupt runs (every file failed to parse) are NOT a
-hard error — text output renders the header (`walked N
-sidecar file(s), parsed 0 valid`) followed directly by the
-`corrupt sidecars (N):` block, skipping the per-sidecar
+All-corrupt and all-IO-failure runs (every predicate-
+matching file failed to parse, or every one failed to
+read) are NOT a hard error — text output renders the
+header (`walked N sidecar file(s), parsed 0 valid`)
+followed directly by the `corrupt sidecars (N):` and/or
+`io errors (N):` block(s), skipping the per-sidecar
 breakdown that has nothing to render. JSON output mirrors
-this with `valid: 0`, `_walk.errors` populated, and per-
-field counts at zero. This preserves structured per-file
-visibility for dashboard consumers facing total parse-
-failure runs.
+this with `valid: 0`, `_walk.errors` and/or
+`_walk.io_errors` populated, and per-field counts at zero.
+This preserves structured per-file visibility for
+dashboard consumers facing total-failure runs of either
+class.
 
-All-corrupt runs exit 0 (not a hard error); CI scripts
-should gate on `_walk.valid > 0` or check `_walk.errors`
-length for failure detection rather than relying on exit
-code.
+All-corrupt and all-IO-failure runs exit 0 (not a hard
+error); CI scripts must inspect the JSON channel for
+failure detection rather than relying on exit code. Two
+common gating policies, each appropriate for different
+operational stances:
+
+- **Lenient** (treat partial failures as warnings):
+  `_walk.valid > 0`. Accepts any run with at least one
+  successfully-parsed sidecar; per-file parse or IO
+  failures surface in the JSON arrays for triage but do
+  not fail the gate.
+- **Strict** (fail on any sidecar failure):
+  `_walk.errors.len() == 0 && _walk.io_errors.len() == 0`.
+  Requires every predicate-matching file to parse cleanly.
+  Both checks are required because the two arrays cover
+  disjoint failure classes (parse vs read) — a run with
+  zero parse errors but one IO error still has a missing
+  sidecar.
+
+The two policies are NOT equivalent: a run with one valid
+and one corrupt sidecar passes lenient (`valid == 1 > 0`)
+but fails strict (`errors.len() == 1 > 0`). Pick the
+policy that matches the operational tolerance for partial
+data.
 
 `--json` emits a single object with three top-level keys:
 `_schema_version` (a string version stamp — currently
@@ -654,11 +687,22 @@ changes), `_walk` (an envelope carrying `walked` / `valid`
 counts — same numbers the text header reports under "walked
 N sidecar file(s), parsed M valid" — plus an `errors` array
 of `{path, error, enriched_message}` entries covering every
-parse failure; `enriched_message` is a human-facing
+parse failure (`enriched_message` is a human-facing
 remediation string when a known schema-drift case matches,
-JSON null otherwise), and `fields`. Each entry under
-`fields` carries `none_count` and `some_count` (counts
-across all valid sidecars in the run, summing to
+JSON null otherwise) AND an `io_errors` array of
+`{path, error}` entries covering every IO failure (file
+matched the predicate but `read_to_string` failed; `error`
+carries the raw `std::io::Error` Display). Both arrays
+emit on every render — empty array when no failures of
+that class occurred — so dashboard consumers see a uniform
+shape without `contains_key` branching. With both arrays,
+`walked == valid + errors.len() + io_errors.len()` by
+construction in the steady state — every predicate-matching
+file lands in exactly one bucket. (Filesystem races between
+the count and load passes can perturb this; see the rustdoc
+on `WalkStats` for the full caveat.) Then `fields`. Each
+entry under `fields` carries `none_count` and `some_count`
+(counts across all valid sidecars in the run, summing to
 `_walk.valid`), `classification`, `causes`, and `fix`
 (string when a remediation applies, JSON null otherwise).
 
