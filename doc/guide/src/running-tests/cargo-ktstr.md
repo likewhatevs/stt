@@ -93,7 +93,7 @@ Filter with nextest's `-E 'test(kernel_6_14)'` to pick a single
 kernel from a multi-kernel matrix; nextest's parallelism, retries,
 and `--ignored` flag all apply natively. Sidecars partition per
 kernel: each kernel runs in its own
-`target/ktstr/{kernel}-{commit}/` directory keyed on the
+`target/ktstr/{kernel}-{project_commit}/` directory keyed on the
 resolved kernel's identity and the project tree's HEAD short hex
 (with `-dirty` suffix when the worktree differs). Coverage profraw does NOT partition
 per kernel — `__llvm_profile_write_buffer` writes flat into
@@ -175,8 +175,8 @@ Build the kernel (if needed) and run tests with coverage via
 semantics as `test`: `--kernel` is repeatable; multi-kernel runs
 add the kernel suffix to every test name and partition the
 sidecar tree per kernel via
-`target/ktstr/{kernel}-{commit}/`, where `{commit}` is the
-project HEAD short hex (with `-dirty` when the worktree
+`target/ktstr/{kernel}-{project_commit}/`, where `{project_commit}`
+is the project HEAD short hex (with `-dirty` when the worktree
 differs). Coverage profraw lands flat in
 `target/llvm-cov-target/` with PID-keyed filenames — it does
 NOT partition per kernel — and cargo-llvm-cov merges every
@@ -485,7 +485,7 @@ Print a table of run directories under
 `{CARGO_TARGET_DIR or "target"}/ktstr/` with three columns:
 
 - `RUN`: the run-directory leaf name, formatted as
-  `{kernel}-{commit}` per [Runs](runs.md). `list` does NOT
+  `{kernel}-{project_commit}` per [Runs](runs.md). `list` does NOT
   consult `KTSTR_SIDECAR_DIR` — that override only affects where
   the test harness writes sidecars; `list` always enumerates the
   default runs-root.
@@ -601,7 +601,7 @@ returning empty output.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--run ID` | required | Run key (from `cargo ktstr stats list`). |
+| `--run ID` | required | Run key (e.g. `6.14-abc1234` or `6.14-abc1234-dirty`; from `cargo ktstr stats list`). |
 | `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`: useful for archived sidecar trees copied off a CI host. |
 
 ### explain-sidecar
@@ -754,7 +754,7 @@ cargo ktstr stats explain-sidecar --run RUN_ID --dir /path/archive    # diagnose
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--run ID` | required | Run key (from `cargo ktstr stats list`). |
+| `--run ID` | required | Run key (e.g. `6.14-abc1234` or `6.14-abc1234-dirty`; from `cargo ktstr stats list`). |
 | `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`. |
 | `--json` | off | Emit aggregate JSON instead of per-sidecar text. |
 
@@ -910,13 +910,13 @@ missing and what each absence means.
 Run tests first to generate sidecar JSON files:
 
 ```sh
-cargo nextest run --workspace        # generates target/ktstr/{kernel}-{commit}/*.json
+cargo nextest run --workspace        # generates target/ktstr/{kernel}-{project_commit}/*.json
 cargo ktstr stats                    # reads the newest run
 ```
 
 Set `KTSTR_SIDECAR_DIR` to override the sidecar directory; otherwise
-the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/`,
-where `{commit}` is the project HEAD short hex (with `-dirty`
+the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`,
+where `{project_commit}` is the project HEAD short hex (with `-dirty`
 when the worktree differs).
 
 ## show-host

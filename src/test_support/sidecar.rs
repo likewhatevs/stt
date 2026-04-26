@@ -26,9 +26,10 @@
 //!   don't clobber each other.
 //! - [`sidecar_dir`], [`runs_root`], [`newest_run_dir`]: resolve where
 //!   sidecars live (env override, or
-//!   `{target}/ktstr/{kernel}-{commit}` where `{commit}` is the
-//!   project tree's HEAD short hex from [`detect_project_commit`],
-//!   suffixed `-dirty` when the worktree differs).
+//!   `{target}/ktstr/{kernel}-{project_commit}` where
+//!   `{project_commit}` is the project tree's HEAD short hex from
+//!   [`detect_project_commit`], suffixed `-dirty` when the
+//!   worktree differs).
 //! - [`format_verifier_stats`], [`format_callback_profile`],
 //!   [`format_kvm_stats`]: human-readable summaries from a
 //!   `Vec<SidecarResult>` for CLI output.
@@ -251,9 +252,9 @@ pub struct SidecarResult {
     /// invocation shares the same timestamp prefix; the counter
     /// distinguishes concurrent gauntlet variants within that
     /// invocation. Distinct from the run DIRECTORY name (keyed
-    /// `{kernel}-{commit}`, see [`sidecar_dir`]) — the directory
-    /// groups runs by what they tested, the `run_id` groups
-    /// sidecars by which process emitted them.
+    /// `{kernel}-{project_commit}`, see [`sidecar_dir`]) — the
+    /// directory groups runs by what they tested, the `run_id`
+    /// groups sidecars by which process emitted them.
     pub run_id: String,
     /// Host context — static-ish runtime state (CPU model,
     /// memory size, THP policy, kernel release, host cmdline,
@@ -678,9 +679,10 @@ pub(crate) fn collect_sidecars_with_errors(
 /// Pool every sidecar JSON under every run directory at `root`.
 ///
 /// Walks each immediate subdirectory of `root` (one per run, named
-/// `{kernel}-{commit}` by [`sidecar_dir`] where `{commit}` is the
-/// project tree's HEAD short hex with `-dirty` suffix when the
-/// worktree differs from HEAD) and concatenates the sidecars each
+/// `{kernel}-{project_commit}` by [`sidecar_dir`] where
+/// `{project_commit}` is the project tree's HEAD short hex with
+/// `-dirty` suffix when the worktree differs from HEAD) and
+/// concatenates the sidecars each
 /// one yields via [`collect_sidecars`]. The result is a flat
 /// `Vec<SidecarResult>` covering every recorded run on disk —
 /// `cargo ktstr stats compare`'s pool-driven sourcing reads it
@@ -703,7 +705,7 @@ pub(crate) fn collect_sidecars_with_errors(
 /// for the current operator workflow (one comparison per
 /// session) but is taskifyable if it becomes a hot path — a
 /// directory-name fast-path could skip runs whose
-/// `{kernel}-{commit}` prefix does not match the active
+/// `{kernel}-{project_commit}` prefix does not match the active
 /// `--a-kernel` / `--b-kernel` filter.
 pub fn collect_pool(root: &std::path::Path) -> Vec<SidecarResult> {
     let entries = match std::fs::read_dir(root) {
@@ -916,10 +918,10 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// the operator-chosen directory are preserved verbatim — see
 /// [`sidecar_dir_override`].
 ///
-/// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/`,
+/// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`,
 /// where `{kernel}` is the version detected from `KTSTR_KERNEL`'s
 /// metadata (or `"unknown"` when no kernel is set / detection fails)
-/// and `{commit}` is the project-tree HEAD short hex from
+/// and `{project_commit}` is the project-tree HEAD short hex from
 /// [`detect_project_commit`] (with `-dirty` suffix when the worktree
 /// differs from HEAD), or `"unknown"` when the test process is not
 /// running inside a git repository or the probe fails. Every sidecar
@@ -946,7 +948,7 @@ pub(crate) fn sidecar_dir() -> PathBuf {
 /// Build the run-directory leaf name from optional kernel and commit
 /// components. `None` collapses to the literal `"unknown"` sentinel
 /// in either slot, so a non-git cwd produces `"{kernel}-unknown"`
-/// and a missing kernel produces `"unknown-{commit}"`. Pure
+/// and a missing kernel produces `"unknown-{project_commit}"`. Pure
 /// function over the two inputs — no I/O — so unit tests can pin
 /// every shape (clean, dirty, missing-kernel, missing-commit, both
 /// missing) without driving the [`detect_kernel_version`] /
@@ -985,9 +987,10 @@ pub fn runs_root() -> PathBuf {
 ///
 /// Used by bare `cargo ktstr stats` (no subcommand) when
 /// `KTSTR_SIDECAR_DIR` isn't set: the stats command doesn't itself
-/// run a kernel, so it can't reconstruct the `{kernel}-{commit}`
-/// key that the test process used. Picking the newest subdirectory by
-/// mtime mirrors "show me the report from my last test run."
+/// run a kernel, so it can't reconstruct the
+/// `{kernel}-{project_commit}` key that the test process used.
+/// Picking the newest subdirectory by mtime mirrors "show me the
+/// report from my last test run."
 pub fn newest_run_dir() -> Option<PathBuf> {
     let root = runs_root();
     let entries = std::fs::read_dir(&root).ok()?;
@@ -1820,8 +1823,9 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
 /// [`pre_clear_run_dir_once`] removes any pre-existing
 /// `*.ktstr.json` files in the resolved directory so the run is a
 /// clean snapshot rather than a mosaic of sidecars carried over
-/// from a prior invocation that shared the same `{kernel}-{commit}`
-/// key (e.g. re-running the suite without committing changes).
+/// from a prior invocation that shared the same
+/// `{kernel}-{project_commit}` key (e.g. re-running the suite
+/// without committing changes).
 /// Subsequent writes within the same process to the same directory
 /// append into the cleared directory.
 ///
@@ -1901,10 +1905,10 @@ fn sidecar_dir_override() -> Option<PathBuf> {
 /// Emit a one-shot stderr warning when [`detect_project_commit`]
 /// resolves to `None` and the run directory therefore lands at
 /// `{kernel}-unknown`. Operators in this state lose the
-/// `{commit}` discriminator on the run-directory name — every
-/// non-git invocation at the same kernel collides on a single
-/// directory, with the latest run pre-clearing the previous
-/// one's sidecars. The warning surfaces this loss-of-isolation
+/// `{project_commit}` discriminator on the run-directory name —
+/// every non-git invocation at the same kernel collides on a
+/// single directory, with the latest run pre-clearing the
+/// previous one's sidecars. The warning surfaces this loss-of-isolation
 /// risk so the operator can either set `KTSTR_SIDECAR_DIR` to
 /// disambiguate per-run, or place the project tree under git
 /// so each run carries its own commit hash.
@@ -1935,10 +1939,11 @@ fn warn_unknown_project_commit_once() {
 /// Remove any pre-existing `*.ktstr.json` files in the resolved
 /// run directory, exactly once per unique directory per process.
 ///
-/// The run-key format is `{kernel}-{commit}` (see [`sidecar_dir`]),
-/// so two `cargo ktstr test` invocations sharing the same kernel
-/// and project commit (the typical "re-run the suite without
-/// committing changes" loop) resolve to the same directory. Without
+/// The run-key format is `{kernel}-{project_commit}` (see
+/// [`sidecar_dir`]), so two `cargo ktstr test` invocations sharing
+/// the same kernel and project commit (the typical "re-run the
+/// suite without committing changes" loop) resolve to the same
+/// directory. Without
 /// pre-clearing, each subsequent run would land its sidecars next
 /// to the previous run's, leaving downstream `cargo ktstr stats`
 /// readers to see a mosaic of two distinct test outcomes for the
@@ -1961,7 +1966,7 @@ fn warn_unknown_project_commit_once() {
 /// path spellings of the same on-disk dir share one entry.
 ///
 /// In production today only the default-path
-/// `runs_root().join({kernel}-{commit})` is fed into this
+/// `runs_root().join({kernel}-{project_commit})` is fed into this
 /// function (the override path skips pre-clear entirely via
 /// [`sidecar_dir_override`]), so per-process cache size
 /// stays at exactly 1 entry. The HashSet shape is the
@@ -1986,8 +1991,8 @@ fn warn_unknown_project_commit_once() {
 /// CONCURRENT WRITERS: the per-process `Mutex<HashSet>` guards
 /// against multiple writes within a single process re-clearing
 /// the same directory. Two concurrent test processes that both
-/// resolve to the same `{kernel}-{commit}` run dir will both
-/// pre-clear; that race is out of scope here (tracked separately
+/// resolve to the same `{kernel}-{project_commit}` run dir will
+/// both pre-clear; that race is out of scope here (tracked separately
 /// under the concurrent-write collision protection backlog item)
 /// and would corrupt each other's outputs even without
 /// pre-clearing.
@@ -2193,9 +2198,9 @@ pub(crate) fn write_skip_sidecar(
 ///
 /// Output goes to the current run's sidecar directory
 /// (`KTSTR_SIDECAR_DIR` override, or
-/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/`,
-/// where `{commit}` is the project HEAD short hex with `-dirty`
-/// when the worktree differs).
+/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`,
+/// where `{project_commit}` is the project HEAD short hex with
+/// `-dirty` when the worktree differs).
 ///
 /// `payload_metrics` is the accumulated per-invocation output from
 /// `ctx.payload(X).run()` / `.spawn().wait()` calls made in the
@@ -3248,10 +3253,10 @@ mod tests {
         let _env_target = EnvVarGuard::remove("CARGO_TARGET_DIR");
 
         let dir = sidecar_dir();
-        // Expected layout: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}`.
+        // Expected layout: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}`.
         // `KTSTR_KERNEL` is unset so kernel resolves to `"unknown"`.
-        // `{commit}` is the project tree's HEAD short hex (with
-        // `-dirty` suffix when the worktree differs); the test
+        // `{project_commit}` is the project tree's HEAD short hex
+        // (with `-dirty` suffix when the worktree differs); the test
         // process runs from inside the ktstr repo, so
         // `detect_project_commit()` returns `Some(...)`. Falling
         // back to `"unknown"` covers a non-git cwd or probe failure
@@ -3313,8 +3318,9 @@ mod tests {
 
     /// `KTSTR_SIDECAR_DIR=""` (defensively-cleared empty string)
     /// must NOT activate the override branch — `sidecar_dir`
-    /// must compute the default `runs_root().join({kernel}-{commit})`
-    /// path instead of returning an empty path. Pins the
+    /// must compute the default
+    /// `runs_root().join({kernel}-{project_commit})` path instead
+    /// of returning an empty path. Pins the
     /// `is_empty()` filter on the override read in
     /// [`sidecar_dir_override`]: a regression that dropped the
     /// filter (e.g. simplified to `std::env::var("...").ok().map(PathBuf::from)`)
@@ -3378,7 +3384,7 @@ mod tests {
         assert_eq!(
             format_run_dirname(Some("6.14.2"), Some("abc1234")),
             "6.14.2-abc1234",
-            "clean dirname must be `{{kernel}}-{{commit}}`",
+            "clean dirname must be `{{kernel}}-{{project_commit}}`",
         );
     }
 
@@ -3411,7 +3417,7 @@ mod tests {
         );
     }
 
-    /// Missing kernel mirrors the missing-commit shape: `unknown-{commit}`.
+    /// Missing kernel mirrors the missing-commit shape: `unknown-{project_commit}`.
     /// Captures the `KTSTR_KERNEL` unset / detection-failed path
     /// so a regression in the unwrap_or fallback surfaces here.
     #[test]
@@ -3419,7 +3425,7 @@ mod tests {
         assert_eq!(
             format_run_dirname(None, Some("abc1234")),
             "unknown-abc1234",
-            "missing kernel must collapse to `unknown-{{commit}}` sentinel",
+            "missing kernel must collapse to `unknown-{{project_commit}}` sentinel",
         );
     }
 
@@ -3624,7 +3630,7 @@ mod tests {
     /// produce a directory containing only the second invocation's
     /// sidecars — the first invocation's outputs are pre-cleared
     /// before the second writes. Pins the last-writer-wins
-    /// semantics the documented `{kernel}-{commit}` keying implies.
+    /// semantics the documented `{kernel}-{project_commit}` keying implies.
     ///
     /// CAVEAT: this test exercises the OVERRIDE path
     /// (`KTSTR_SIDECAR_DIR` is set), where pre-clear is currently
@@ -3782,7 +3788,7 @@ mod tests {
     ///
     /// ISOLATION: the test sets `CARGO_TARGET_DIR` to a unique
     /// tempdir so the resolved sidecar dir is
-    /// `{tempdir}/ktstr/{kernel}-{commit}/` — uncrossable by
+    /// `{tempdir}/ktstr/{kernel}-{project_commit}/` — uncrossable by
     /// sibling test processes that share the workspace's
     /// `target/ktstr/`. Without this isolation, a concurrent
     /// nextest worker writing to the SAME shared default dir could

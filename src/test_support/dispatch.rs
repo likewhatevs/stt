@@ -1081,9 +1081,9 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
 ///
 /// When `dir` is `Some`, reads sidecars from that directory. Otherwise
 /// uses the default sidecar directory (`KTSTR_SIDECAR_DIR` override, or
-/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/`,
-/// where `{commit}` is the project HEAD short hex with `-dirty`
-/// when the worktree differs).
+/// `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`,
+/// where `{project_commit}` is the project HEAD short hex with
+/// `-dirty` when the worktree differs).
 ///
 /// Returns the concatenated output of `analyze_rows`, verifier stats,
 /// callback profile, and KVM stats. Returns an empty string when no

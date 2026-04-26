@@ -402,7 +402,7 @@ EXAMPLES:
 
   Enrich an existing ktstr sidecar with probe metrics:
     ktstr-jemalloc-probe --pid 12345 --sidecar \\
-      target/ktstr/{kernel}-{commit}/{test}-{hash}.ktstr.json\
+      target/ktstr/{kernel}-{project_commit}/{test}-{hash}.ktstr.json\
 ",
     long_about = "Reads jemalloc's per-thread `thread_allocated` / `thread_deallocated` TLS \
                   counters out of a running process via ptrace + process_vm_readv. Counters are \
@@ -440,7 +440,7 @@ struct Cli {
     #[arg(long)]
     json: bool,
     /// Append probe output to an existing ktstr sidecar JSON file
-    /// (`target/ktstr/{kernel}-{commit}/{test_name}-{hash}.ktstr.json`).
+    /// (`target/ktstr/{kernel}-{project_commit}/{test_name}-{hash}.ktstr.json`).
     /// The probe reads the existing [`SidecarResult`], synthesizes a
     /// [`PayloadMetrics`] entry from its own output (walking
     /// numeric JSON leaves into `name: value` [`Metric`] records),

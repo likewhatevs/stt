@@ -15,9 +15,9 @@
 //! `run_id` written from one `cargo ktstr test` invocation shares
 //! a stable timestamp prefix. The run-directory name itself does
 //! NOT use this stamp — `sidecar_dir` keys runs on
-//! `{kernel}-{commit}` so two runs at the same project commit
-//! reuse one directory rather than scattering across timestamped
-//! subdirectories. [`generate_run_id`] composes
+//! `{kernel}-{project_commit}` so two runs at the same project
+//! commit reuse one directory rather than scattering across
+//! timestamped subdirectories. [`generate_run_id`] composes
 //! `{run_id_timestamp}-{counter}`; the counter is a process-local
 //! atomic so concurrent gauntlet variants can't collide on the same
 //! run-ID value.
@@ -95,9 +95,9 @@ pub(crate) fn is_leap(y: u64) -> bool {
 ///
 /// The run directory name itself does NOT embed this timestamp —
 /// [`crate::test_support::sidecar_dir`] keys runs on
-/// `{kernel}-{commit}` instead, so two runs of the same kernel
-/// at the same project commit reuse the same directory rather
-/// than scattering across timestamped subdirectories.
+/// `{kernel}-{project_commit}` instead, so two runs of the same
+/// kernel at the same project commit reuse the same directory
+/// rather than scattering across timestamped subdirectories.
 ///
 /// A regression that re-sampled the clock on every call would
 /// break the `run_id` consumer: identifiers within one run would

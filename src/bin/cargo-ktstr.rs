@@ -139,8 +139,8 @@ enum KtstrCommand {
     /// `{CARGO_TARGET_DIR or "target"}/ktstr/` (overridable with
     /// `KTSTR_SIDECAR_DIR`) and prints gauntlet analysis, BPF
     /// verifier stats, callback profile, and KVM stats. Test runs
-    /// are partitioned into `{kernel}-{commit}` subdirectories,
-    /// where `{commit}` is the project HEAD short hex with
+    /// are partitioned into `{kernel}-{project_commit}` subdirectories,
+    /// where `{project_commit}` is the project HEAD short hex with
     /// `-dirty` when the worktree differs; each subdirectory is
     /// the baseline snapshot of the most recent run at that
     /// (kernel, project commit) pair (re-running at the same key
@@ -440,7 +440,8 @@ enum StatsCommand {
     /// error naming the likely cause (pre-enrichment run) rather
     /// than silently returning empty output.
     ShowHost {
-        /// Run key (from `cargo ktstr stats list`).
+        /// Run key (e.g. `6.14-abc1234` or `6.14-abc1234-dirty`;
+        /// from `cargo ktstr stats list`).
         #[arg(long)]
         run: String,
         /// Alternate run root to resolve `--run` against. Defaults
@@ -519,7 +520,8 @@ enum StatsCommand {
     /// The only non-zero exits are missing-run-directory and
     /// empty-run (zero `.ktstr.json` files).
     ExplainSidecar {
-        /// Run key (from `cargo ktstr stats list`).
+        /// Run key (e.g. `6.14-abc1234` or `6.14-abc1234-dirty`;
+        /// from `cargo ktstr stats list`).
         #[arg(long)]
         run: String,
         /// Alternate run root to resolve `--run` against.

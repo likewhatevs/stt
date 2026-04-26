@@ -2120,8 +2120,9 @@ fn build_make_args(nproc: usize) -> Vec<String> {
 ///   `{CARGO_TARGET_DIR or "target"}/ktstr/`.
 ///
 /// `cargo ktstr stats` doesn't itself run a kernel, so it can't
-/// reconstruct the `{kernel}-{commit}` key the test process used; the
-/// mtime fallback mirrors "show me the report from my last test run."
+/// reconstruct the `{kernel}-{project_commit}` key the test process
+/// used; the mtime fallback mirrors "show me the report from my
+/// last test run."
 ///
 /// Returns `None` with a warning on stderr when no sidecars are found.
 /// This is not an error -- regular test runs that skip gauntlet tests
@@ -2241,6 +2242,55 @@ pub fn restore_sigpipe_default() {
     }
 }
 
+/// Return the run-directory leaf name under `root` whose Levenshtein
+/// edit distance from `query` is smallest AND within the closeness
+/// threshold, or `None` if no candidate is close enough (or if
+/// `root` cannot be enumerated).
+///
+/// Threshold is `max(3, query.len() / 3)` — same shape as
+/// [`suggest_closest_test_name`] / [`suggest_closest_scenario_name`]
+/// so the "did you mean?" UX stays uniform across the test-name,
+/// scenario-name, and run-key surfaces. The absolute-3 floor lets
+/// short keys (e.g. `6.14`) tolerate small typos while the
+/// proportional `len/3` lets longer keys (e.g.
+/// `6.14-abcdef1-dirty`) tolerate roughly one bit-flip per 3
+/// chars.
+///
+/// Ties resolve to the FIRST name encountered in `read_dir`
+/// iteration order — non-deterministic across filesystems but
+/// consistent within a single invocation. The returned `String`
+/// owns the leaf name (heap allocation per match) because
+/// `read_dir` yields `OsString` filenames that the suggestion
+/// outlives.
+///
+/// `read_dir` failure (root doesn't exist, permission denied)
+/// silently degrades to `None` — the caller's primary diagnostic
+/// is "run not found"; the "did you mean?" hint is best-effort
+/// gravy and must not gate the bail path.
+fn suggest_closest_run_key(query: &str, root: &Path) -> Option<String> {
+    let threshold = std::cmp::max(3, query.len() / 3);
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = match entry.file_name().to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let d = strsim::levenshtein(query, &name);
+        if d > threshold {
+            continue;
+        }
+        match best {
+            Some((best_d, _)) if best_d <= d => continue,
+            _ => best = Some((d, name)),
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
 /// Render the archived host context for the named run, resolved
 /// against `dir` (or `test_support::runs_root()` when `dir` is
 /// `None`). Loads sidecars under the run directory and returns the
@@ -2269,8 +2319,16 @@ pub fn show_run_host(run: &str, dir: Option<&Path>) -> Result<String> {
         // enumeration surface. `cargo ktstr stats list` is the
         // authoritative run-key directory — see
         // [`StatsCommand::List`] wiring in src/bin/cargo-ktstr.rs.
+        // Pair the discovery hint with a "did you mean?"
+        // suggestion (when one is close enough) so the operator
+        // doesn't have to retype the whole key — a Levenshtein
+        // probe over the run-dir leaves catches one-character
+        // typos directly in the error.
+        let suggestion = suggest_closest_run_key(run, &root)
+            .map(|name| format!(" Did you mean `{name}`?"))
+            .unwrap_or_default();
         bail!(
-            "run '{run}' not found under {}. \
+            "run '{run}' not found under {}.{suggestion} \
              Run `cargo ktstr stats list` to enumerate available run keys.",
             root.display(),
         );
@@ -2957,8 +3015,11 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
     };
     let run_dir = root.join(run);
     if !run_dir.exists() {
+        let suggestion = suggest_closest_run_key(run, &root)
+            .map(|name| format!(" Did you mean `{name}`?"))
+            .unwrap_or_default();
         bail!(
-            "run '{run}' not found under {}. \
+            "run '{run}' not found under {}.{suggestion} \
              Run `cargo ktstr stats list` to enumerate available run keys.",
             root.display(),
         );
@@ -7163,9 +7224,9 @@ mod tests {
     fn explain_sidecar_accepts_bare_run_key_after_traversal_check() {
         let tmp = tempfile::tempdir().unwrap();
         // `6.14-abc1234` is a typical run key shape
-        // (Normal-only components: `{kernel}-{commit}` per
-        // `sidecar_dir`). It does not exist under tmp, so the
-        // call lands in the not-found path — which is the
+        // (Normal-only components: `{kernel}-{project_commit}`
+        // per `sidecar_dir`). It does not exist under tmp, so
+        // the call lands in the not-found path — which is the
         // SECOND validation gate, proving the traversal check
         // let it through.
         let err = super::explain_sidecar("6.14-abc1234", Some(tmp.path()), false)
@@ -9859,6 +9920,97 @@ mod tests {
         assert!(
             !suggestion.is_empty(),
             "boundary-distance query must yield a non-empty suggestion",
+        );
+    }
+
+    /// `suggest_closest_run_key` — positive case: a query that is
+    /// a one-character typo of an actual run-directory leaf
+    /// returns that leaf. Plants `6.14-abc1234` under a tempdir,
+    /// queries `6.14-abc1235` (final byte flipped — edit distance
+    /// 1), and asserts the planted name is returned. The query
+    /// length (12 chars) gives a threshold of `max(3, 12/3) = 4`,
+    /// so distance-1 is well inside.
+    ///
+    /// Sibling of `suggest_closest_test_name_finds_near_match` —
+    /// same shape, different registry source (filesystem
+    /// `read_dir` vs static slice).
+    #[test]
+    fn suggest_closest_run_key_finds_near_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("6.14-abc1234")).expect("plant run dir");
+
+        let suggestion = suggest_closest_run_key("6.14-abc1235", tmp.path())
+            .expect("distance-1 typo on a planted run dir must yield a suggestion");
+        assert_eq!(
+            suggestion, "6.14-abc1234",
+            "a single-character typo must suggest the planted dir name",
+        );
+    }
+
+    /// `suggest_closest_run_key` — negative case: a query whose
+    /// edit distance from every candidate exceeds the threshold
+    /// returns `None` rather than over-suggesting a distant match.
+    /// A 13-char string of `x` against a `6.14-abc1234` candidate
+    /// has Levenshtein distance >= 12 (every char differs); the
+    /// threshold for a 13-char query is `max(3, 13/3) = 4`, so the
+    /// candidate is correctly rejected.
+    #[test]
+    fn suggest_closest_run_key_returns_none_for_distant_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("6.14-abc1234")).expect("plant run dir");
+        assert_eq!(
+            suggest_closest_run_key("xxxxxxxxxxxxx", tmp.path()),
+            None,
+            "a query with no lexical relationship to any planted run \
+             dir must yield no suggestion",
+        );
+    }
+
+    /// `suggest_closest_run_key` — empty root: the helper returns
+    /// `None` when `read_dir` succeeds but yields zero
+    /// subdirectories. Pins the no-candidates path. Operators
+    /// hitting a typo on a freshly-created runs-root see the bare
+    /// bail message without a misleading near-match suggestion.
+    #[test]
+    fn suggest_closest_run_key_returns_none_for_empty_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        // tempdir is fresh and contains no entries; read_dir succeeds
+        // and yields zero candidates, so the helper returns None.
+        assert_eq!(
+            suggest_closest_run_key("6.14-abc1234", tmp.path()),
+            None,
+            "empty root must yield None — no candidates to match against",
+        );
+    }
+
+    /// `suggest_closest_run_key` — file entries are skipped, and
+    /// when both a FILE and a DIR with similar names exist, only
+    /// the directory is considered a candidate. Plants
+    /// `6.14-abc1234` as a regular file AND `6.14-abc1235` as a
+    /// directory under one tempdir, then queries `6.14-abc1234`
+    /// (the FILE's exact name). The helper must return
+    /// `Some("6.14-abc1235")` — the DIRECTORY at distance 1 — and
+    /// must NOT return the file at distance 0 because the file
+    /// fails the `is_dir()` filter.
+    ///
+    /// Catches a regression that drops the `is_dir()` filter and
+    /// allows files to leak into the suggestion surface.
+    #[test]
+    fn suggest_closest_run_key_skips_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // File: distance 0 against the query but is NOT a dir → must be skipped.
+        std::fs::write(tmp.path().join("6.14-abc1234"), b"not a dir").expect("plant file");
+        // Dir: distance 1 against the query → must win because the
+        // file at distance 0 is filtered out.
+        std::fs::create_dir(tmp.path().join("6.14-abc1235")).expect("plant dir");
+
+        let suggestion = suggest_closest_run_key("6.14-abc1234", tmp.path())
+            .expect("the planted directory must yield a suggestion despite the same-name file");
+        assert_eq!(
+            suggestion, "6.14-abc1235",
+            "a regression that drops the is_dir() filter would surface \
+             here as `Some(\"6.14-abc1234\")` (the file at distance 0) \
+             instead of `Some(\"6.14-abc1235\")` (the dir at distance 1)",
         );
     }
 

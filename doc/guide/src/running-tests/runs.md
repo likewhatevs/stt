@@ -28,15 +28,16 @@ target/
         └── test_b.ktstr.json
 ```
 
-Each subdirectory is keyed `{kernel}-{commit}`, where `{kernel}`
-is the kernel version resolved from the directory `KTSTR_KERNEL`
-points at — first the `version` field in its `metadata.json`, else
-the content of `include/config/kernel.release`, else `unknown` (when
+Each subdirectory is keyed `{kernel}-{project_commit}`, where
+`{kernel}` is the kernel version resolved from the directory
+`KTSTR_KERNEL` points at — first the `version` field in its
+`metadata.json`, else the content of
+`include/config/kernel.release`, else `unknown` (when
 `KTSTR_KERNEL` is unset or neither file yields a version) — and
-`{commit}` is the project tree's HEAD short hex (7 chars), suffixed
-`-dirty` when the worktree differs from HEAD, or the literal
-`unknown` when the test process is not running inside a git
-repository.
+`{project_commit}` is the project tree's HEAD short hex (7 chars),
+suffixed `-dirty` when the worktree differs from HEAD, or the
+literal `unknown` when the test process is not running inside a
+git repository.
 
 The commit is discovered by walking parents of the test process's
 working directory until a `.git` marker is found — for a scheduler

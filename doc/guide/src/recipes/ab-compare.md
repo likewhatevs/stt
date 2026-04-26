@@ -22,10 +22,11 @@ git worktree add ~/opensource/scx-main upstream/main
 ## Collect both runs into a shared run root
 
 Each `cargo nextest run --workspace` writes its sidecars into
-`target/ktstr/{kernel}-{commit}/`. The `{commit}` half is the
-project tree's HEAD short hex captured at first sidecar write
-(suffixed `-dirty` when the worktree differs from HEAD), so
-two branches with distinct HEADs land in distinct directories.
+`target/ktstr/{kernel}-{project_commit}/`. The `{project_commit}`
+half is the project tree's HEAD short hex captured at first
+sidecar write (suffixed `-dirty` when the worktree differs from
+HEAD), so two branches with distinct HEADs land in distinct
+directories.
 Two back-to-back runs of the SAME kernel at the SAME commit
 reuse the same directory — the second run pre-clears any prior
 sidecars at first write, so each directory is a last-writer-wins
@@ -69,7 +70,7 @@ cargo nextest run --workspace
 mv target/ktstr/* ~/opensource/scx-runs/ktstr/
 ```
 
-The `{kernel}-{commit}` subdirectory names are unique per
+The `{kernel}-{project_commit}` subdirectory names are unique per
 (kernel, project commit) pair, so two branches with distinct
 HEADs coexist under one root without collision. Within a single
 branch, two clean back-to-back runs at the same commit reuse
