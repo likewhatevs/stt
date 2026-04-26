@@ -12,13 +12,12 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 
-/// Process-wide [`reqwest::blocking::Client`] lazily initialized on first
-/// access via [`shared_client`]. Keeping a single Client instance across
-/// the fetch-family reuses its TCP connection pool and TLS session cache
-/// across repeated calls to the same host within a CLI run — the design
-/// intent the doc on [`fetch_releases`] describes. Cross-host fetches
-/// in the same run still re-handshake because reqwest's connection pool
-/// keys on host.
+/// Process-wide [`reqwest::blocking::Client`] lazily initialized on
+/// first access via [`shared_client`]. Keeping a single `Client`
+/// instance across the fetch-family reuses its TCP connection pool
+/// and TLS session cache across repeated calls to the same host
+/// within a CLI run. Cross-host fetches in the same run still
+/// re-handshake because reqwest's connection pool keys on host.
 static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 
 /// Return the process-wide shared [`reqwest::blocking::Client`]. First
@@ -27,6 +26,16 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 /// that need fault-injection seams (httpmock-style tests) should
 /// construct a local `Client` directly and pass it to `fetch_*`; this
 /// helper is for top-level CLI entries that want the default client.
+///
+/// Tests that need to verify a network round-trip (rather than a
+/// cache hit) must NOT pass `shared_client()` to a cache-routed
+/// helper (`cached_releases`, `cached_releases_with`,
+/// [`fetch_latest_stable_version`], [`fetch_version_for_prefix`]) —
+/// [`RELEASES_CACHE`] may already be populated by a peer test, in
+/// which case the helper returns cached data and the network is
+/// never touched. Construct a local `Client` instead; the
+/// pointer-equality gate in [`cached_releases_with`] routes it to
+/// the bypass branch.
 ///
 /// # Panics
 ///
@@ -42,12 +51,12 @@ pub fn shared_client() -> &'static Client {
 }
 
 /// Process-wide cache of the parsed `releases.json` payload.
-/// Populated by [`cached_releases`] on its first successful fetch;
-/// every subsequent call returns a clone of the cached vector
-/// without re-issuing the HTTP request. Lifetime matches the
-/// process — `releases.json` does not change underneath a single
-/// CLI invocation, so a per-process cache cannot serve stale data
-/// in any way the user would notice.
+/// Populated by [`cached_releases_with`] on its first successful
+/// singleton-path fetch; every subsequent singleton call returns a
+/// clone of the cached vector without re-issuing the HTTP request.
+/// Lifetime matches the process — `releases.json` does not change
+/// underneath a single CLI invocation, so a per-process cache
+/// cannot serve stale data in any way the user would notice.
 ///
 /// Failures are NOT cached: a transient kernel.org outage that
 /// errors the first call must allow a later caller to retry, since
@@ -66,49 +75,83 @@ pub fn shared_client() -> &'static Client {
 /// and skips the network entirely.
 static RELEASES_CACHE: OnceLock<Vec<Release>> = OnceLock::new();
 
-/// Fetch and cache `releases.json` via the process-wide
-/// [`shared_client`].
+/// Fetch `releases.json` via the process-wide [`shared_client`],
+/// routing through [`RELEASES_CACHE`].
 ///
-/// First successful call populates [`RELEASES_CACHE`]; subsequent
-/// calls clone the cached vector without re-issuing the HTTP
-/// request. A failed first call is NOT cached — the next caller
-/// re-attempts the network, so a transient kernel.org outage
-/// does not poison the cache for the rest of the process.
-///
-/// Top-level CLI flows that fan out to multiple consumers of
-/// `releases.json` (the rayon-driven `cargo ktstr` resolve
-/// pipeline that calls [`crate::cli::expand_kernel_range`] once
-/// per Range spec; the EOL-annotation pass in
-/// [`crate::cli::fetch_active_prefixes`]) should call this
-/// helper rather than [`fetch_releases`] directly so the
-/// network round-trip is paid at most once per process. Tests
-/// that need fault injection still call [`fetch_releases`] with
-/// a mock client to bypass the cache and exercise the underlying
-/// fetch path.
-///
-/// Two callers populating the cache concurrently is safe — the
-/// loser's `set` is silently discarded via `let _ = …` and they
-/// return their own freshly-fetched vector via `Ok(fresh)`.
-/// Both winner and loser return content-equivalent data since
-/// both fetched the same `releases.json`. Subsequent calls hit
-/// the cache via the leading `get` fast-path. Worst case under
-/// concurrent first calls: both callers do the network round-
-/// trip, but only one populates the cache; every later call —
-/// from any thread — observes the populated slot and skips the
-/// network entirely.
+/// Thin wrapper for callers that don't already thread a `&Client`
+/// — top-level CLI entries like [`crate::cli::expand_kernel_range`]
+/// (under the rayon-driven `cargo ktstr` resolve pipeline) and
+/// [`crate::cli::fetch_active_prefixes`] (the EOL-annotation pass).
+/// Caching, race semantics, and fault-injection routing are all
+/// documented on [`cached_releases_with`].
 pub(crate) fn cached_releases() -> Result<Vec<Release>> {
+    cached_releases_with(shared_client())
+}
+
+/// Pointer-equality against the [`OnceLock`]-backed
+/// [`shared_client`] singleton is the correct predicate because
+/// `shared_client()` returns a stable `&'static Client` address.
+/// The [`cached_releases_with`] gate uses this predicate to
+/// decide whether to consult [`RELEASES_CACHE`]: the singleton
+/// hits the cache, every other (test-constructed) `Client`
+/// bypasses it and exercises the underlying [`fetch_releases`]
+/// path.
+///
+/// Caveat: `shared_client().clone()` produces a distinct
+/// `Client` at a different address even though it shares the
+/// singleton's connection pool via the inner `Arc`, so the
+/// clone bypasses the cache. Always pass `shared_client()`
+/// directly — never a clone — when cache routing is desired.
+///
+/// Note: evaluating this predicate initializes [`SHARED_CLIENT`]
+/// if not already populated, because `shared_client()` calls
+/// `get_or_init`.
+fn is_shared_client(client: &Client) -> bool {
+    std::ptr::eq(client, shared_client())
+}
+
+/// Unified cache-aware entry point for `releases.json`. Routes
+/// the process-wide [`shared_client`] singleton through
+/// [`RELEASES_CACHE`]; any other (test-constructed) `Client`
+/// falls through to a direct [`fetch_releases`] call against
+/// whatever endpoint that `Client` is configured for (e.g. an
+/// httpmock-style local mock).
+///
+/// Used by every in-file caller that already threads a `&Client`
+/// — [`fetch_latest_stable_version`], [`fetch_version_for_prefix`],
+/// [`latest_in_series`] — so production callers reuse
+/// [`RELEASES_CACHE`] and tests still get fault-injection via
+/// the pointer-equality gate. [`cached_releases`] is the
+/// no-`Client` wrapper for top-level CLI entries.
+///
+/// Failures are propagated without populating [`RELEASES_CACHE`],
+/// so a transient kernel.org outage on the first call lets the
+/// next caller retry. Storing `Vec<Release>` (not
+/// `Result<Vec<Release>>`) enforces this at the type level.
+///
+/// Concurrent population on the singleton path is safe via the
+/// `OnceLock::set` race: the loser's `set` returns `Err(clone)`
+/// (the cloned vector that was passed in is moved back), the
+/// returned `Err` is discarded via `let _ = …`, and the loser
+/// returns its own original `fresh` vector. Both winner and
+/// loser return content-equivalent data since both fetched the
+/// same `releases.json`. Worst case under concurrent first
+/// calls: both callers issue the network round-trip, only one
+/// populates [`RELEASES_CACHE`]; every later call — from any
+/// thread — observes the populated slot via the `get` fast-path
+/// and skips the network.
+fn cached_releases_with(client: &Client) -> Result<Vec<Release>> {
+    // Non-singleton clients bypass the cache (test fault injection).
+    if !is_shared_client(client) {
+        return fetch_releases(client);
+    }
     if let Some(cached) = RELEASES_CACHE.get() {
         return Ok(cached.clone());
     }
-    let fresh = fetch_releases(shared_client())?;
-    // `set` returns `Err(value)` if another thread populated the
-    // slot first; in that case the loser's `set` is silently
-    // discarded via `let _ = …` and they return their own
-    // freshly-fetched vector via `Ok(fresh)` below. Both winner
-    // and loser return content-equivalent data since both
-    // fetched the same `releases.json` from kernel.org.
-    // Subsequent calls hit the cache via the leading `get`
-    // fast-path at the top of this function.
+    let fresh = fetch_releases(client)?;
+    // Race-loss: `set` returns `Err(clone)` carrying back the
+    // clone we passed in; we discard it and return the original
+    // `fresh` below. See the rustdoc above for full semantics.
     let _ = RELEASES_CACHE.set(fresh.clone());
     Ok(fresh)
 }
@@ -245,7 +288,9 @@ fn latest_in_series(client: &Client, version: &str) -> Option<String> {
         }
     };
 
-    let releases = fetch_releases(client).ok()?;
+    // Routes through [`RELEASES_CACHE`] for the singleton; see
+    // [`cached_releases_with`] for the bypass gate.
+    let releases = cached_releases_with(client).ok()?;
     let mut best: Option<(String, (u32, u32, u32))> = None;
     for r in &releases {
         if is_skippable_release_moniker(&r.moniker) {
@@ -428,16 +473,17 @@ fn patch_level(version: &str) -> Option<u32> {
 }
 
 /// Fetch releases.json from kernel.org and return a vector of
-/// [`Release`] records.
+/// [`Release`] records. Issues an HTTP GET unconditionally — no
+/// cache consultation.
 ///
-/// `client` is the HTTP client to use. Top-level CLI entries pass
-/// [`shared_client`] to reuse the process-wide singleton so connection
-/// pooling and TLS handshake cost is amortized across repeated calls
-/// to the same host (kernel.org here) within a single run — reqwest's
-/// connection pool keys on host, so cross-host fetches in the same
-/// run re-handshake anyway. Tests pass a locally-constructed `Client`
-/// for fault injection (e.g. point the client at an httpmock-style
-/// local mock server).
+/// Production callers reach this function via
+/// [`cached_releases_with`] (or [`cached_releases`]); the cache
+/// helper only invokes `fetch_releases` on a cache miss for the
+/// singleton path or on the bypass branch for non-singleton
+/// clients. Tests that need to exercise the underlying GET
+/// directly — without the cache layer — call this function with
+/// a locally-constructed `Client` (e.g. pointed at an httpmock-
+/// style local mock server).
 pub(crate) fn fetch_releases(client: &Client) -> Result<Vec<Release>> {
     let url = "https://www.kernel.org/releases.json";
     let response = client
@@ -473,11 +519,16 @@ pub(crate) fn fetch_releases(client: &Client) -> Result<Vec<Release>> {
 /// requiring patch version >= 8 to avoid brand-new major versions
 /// that may have build issues on CI runners.
 ///
+/// When `client` is the process-wide [`shared_client`] singleton,
+/// routes through [`RELEASES_CACHE`]; other clients bypass the
+/// cache via pointer-equality and exercise [`fetch_releases`]
+/// directly — see [`cached_releases_with`] for details.
+///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 pub fn fetch_latest_stable_version(client: &Client, cli_label: &str) -> Result<String> {
     eprintln!("{cli_label}: fetching latest kernel version");
-    let releases = fetch_releases(client)?;
+    let releases = cached_releases_with(client)?;
 
     let mut best: Option<&str> = None;
     for r in &releases {
@@ -540,11 +591,18 @@ pub fn is_major_minor_prefix(s: &str) -> bool {
 /// match is found (EOL series), probes cdn.kernel.org with HEAD
 /// requests to find the highest patch version with a tarball.
 ///
+/// When `client` is the process-wide [`shared_client`] singleton,
+/// routes through [`RELEASES_CACHE`]; other clients bypass the
+/// cache via pointer-equality and exercise [`fetch_releases`]
+/// directly — see [`cached_releases_with`] for details. Cache
+/// scope is releases.json only; the EOL-series HEAD-probe
+/// fallback in [`probe_latest_patch`] always hits the network.
+///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) -> Result<String> {
     eprintln!("{cli_label}: fetching latest {prefix}.x kernel version");
-    let releases = fetch_releases(client)?;
+    let releases = cached_releases_with(client)?;
 
     let mut best: Option<(&str, (u32, u32, u32))> = None;
     for r in &releases {
@@ -1214,12 +1272,17 @@ mod tests {
     ///
     /// Cross-test contamination note: this test populates the
     /// process-wide `RELEASES_CACHE` static. No other test in
-    /// this binary calls `cached_releases()` end-to-end (the
-    /// `expand_kernel_range`-shaped tests in `cli.rs` all bypass
-    /// the network by calling the pure `filter_and_sort_range`
-    /// directly with synthetic releases), so the populated cache
-    /// does not leak into peer tests. If a future test calls
-    /// `cached_releases()` for real, it must run in a separate
+    /// this binary calls `cached_releases()` or any of the
+    /// cache-routed `fetch_*` family
+    /// ([`fetch_latest_stable_version`],
+    /// [`fetch_version_for_prefix`], `latest_in_series`) with
+    /// `shared_client()` — the `expand_kernel_range`-shaped
+    /// tests in `cli.rs` all bypass the network by calling the
+    /// pure `filter_and_sort_range` directly with synthetic
+    /// releases, and no test passes the singleton to a cache-
+    /// routed entry. The populated cache does not leak into
+    /// peer tests. If a future test calls any cache-routed
+    /// entry with `shared_client()`, it must run in a separate
     /// binary or accept the synthetic-data side effect.
     ///
     /// Single test (no per-call iteration) because the OnceLock
@@ -1251,11 +1314,12 @@ mod tests {
         // the cache contract because we'd be reading the prior
         // value instead. The static is initialized fresh per
         // process and no other test in this binary populates it
-        // (verified via grep on the production callsites — only
-        // `expand_kernel_range` and `fetch_active_prefixes` call
-        // through, and neither runs in the unit-test binary).
-        // If the precondition fails, the assertion below catches
-        // it loudly rather than silently passing.
+        // — `cli.rs`'s `expand_kernel_range`-shaped tests bypass
+        // the network entirely and no test passes
+        // `shared_client()` into the cache-routed `fetch_*`
+        // family. If a future test breaks that invariant, the
+        // assertion below catches it loudly rather than
+        // silently passing.
         let set_result = super::RELEASES_CACHE.set(synthetic.clone());
         assert!(
             set_result.is_ok(),
@@ -1313,6 +1377,95 @@ mod tests {
             assert_eq!(got.moniker, want.moniker);
             assert_eq!(got.version, want.version);
         }
+    }
+
+    // -- is_shared_client --
+
+    /// `is_shared_client` recognizes the process-wide singleton:
+    /// the [`shared_client`] address is stable across every call
+    /// within a process (`OnceLock::get_or_init` returns the same
+    /// pointer), so passing it to the predicate must yield `true`.
+    /// This is the cache-routing branch of [`cached_releases_with`].
+    #[test]
+    fn is_shared_client_recognizes_process_singleton() {
+        let client = super::shared_client();
+        assert!(
+            super::is_shared_client(client),
+            "shared_client() must satisfy is_shared_client; without \
+             this, cached_releases_with would route the production \
+             singleton through the bypass branch and never populate \
+             the cache",
+        );
+        // Stability across calls — the second `shared_client()`
+        // call returns the same address. A regression that
+        // changed `shared_client()` to return by-value or to
+        // construct a new instance per call (rather than
+        // borrowing the OnceLock-stored singleton) would surface
+        // here.
+        assert!(
+            super::is_shared_client(super::shared_client()),
+            "shared_client() must return a stable pointer across \
+             repeated calls; the OnceLock contract guarantees this",
+        );
+    }
+
+    /// `is_shared_client` rejects test-constructed clients: a
+    /// `reqwest::blocking::Client::new()` call lives at a
+    /// different address from the singleton, so the predicate
+    /// returns `false`. This is the bypass branch of
+    /// [`cached_releases_with`] — fault-injection tests that
+    /// build their own `Client` (e.g. for httpmock-style
+    /// scenarios) MUST land here, otherwise their mock would be
+    /// ignored in favor of the cache.
+    #[test]
+    fn is_shared_client_rejects_test_constructed_clients() {
+        // Force the singleton's `OnceLock::get_or_init` to run
+        // BEFORE we construct any local clients. Without this,
+        // pointer disambiguation depends on implicit allocation
+        // ordering — locals built first might happen to land at
+        // a lower address than the not-yet-initialized singleton.
+        // Forcing the init order makes the test's intent explicit
+        // and the comparison address-stable regardless of
+        // surrounding allocator state.
+        let _ = super::shared_client();
+        let local = reqwest::blocking::Client::new();
+        assert!(
+            !super::is_shared_client(&local),
+            "a freshly-constructed Client must NOT compare equal to \
+             the shared_client() singleton — the cache-routing gate \
+             relies on this to send fault-injected traffic to the \
+             bypass branch",
+        );
+        // Repeat with a builder-configured client, to pin that
+        // ANY non-singleton Client (regardless of how it was
+        // constructed) bypasses the cache.
+        let configured = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("build local Client");
+        assert!(
+            !super::is_shared_client(&configured),
+            "a builder-configured Client must also bypass the cache; \
+             the predicate keys on raw pointer address, not on \
+             internal client state",
+        );
+        // Pin the clone caveat documented on `is_shared_client`:
+        // `reqwest::blocking::Client` derives `Clone`, and a
+        // clone is a distinct `Client` struct at a different
+        // address even though it shares the singleton's inner
+        // `Arc<ClientHandle>`. A clone of `shared_client()`
+        // must therefore bypass the cache. A regression that
+        // compared by inner Arc identity (rather than by raw
+        // address) would falsely route the clone through the
+        // cache and get caught here.
+        let cloned = super::shared_client().clone();
+        assert!(
+            !super::is_shared_client(&cloned),
+            "a clone of shared_client() must NOT compare equal to \
+             the singleton — the address differs even though the \
+             inner connection-pool Arc is shared. Always pass \
+             shared_client() directly when cache routing is desired.",
+        );
     }
 
     // -- proptest --
