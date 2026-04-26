@@ -222,14 +222,38 @@ pub(crate) fn write_profraw(data: &[u8]) -> Result<()> {
 }
 
 /// Resolve the llvm-cov-target directory for profraw output.
-pub(crate) fn target_dir() -> PathBuf {
+///
+/// Cascade:
+/// 1. `LLVM_COV_TARGET_DIR` — explicit operator override.
+/// 2. `LLVM_PROFILE_FILE`'s parent directory — when an outer harness
+///    (cargo-llvm-cov, or the cargo-ktstr `LLVM_PROFILE_FILE` injection
+///    that prevents host-side `default.profraw` leakage from the
+///    `cargo ktstr test` path) has already pinned the output location.
+/// 3. `<current_exe parent>/llvm-cov-target/` — workspace-local
+///    fallback so an instrumented binary invoked without any
+///    coordination still drops profraw next to the build output
+///    rather than in cwd.
+///
+/// `pub` rather than `pub(crate)` so the cargo-ktstr binary can
+/// resolve the same directory before exec-ing `cargo nextest run`,
+/// keeping host-side and guest-side profraw output co-located in
+/// one tree without cargo-ktstr re-implementing the cascade.
+pub fn target_dir() -> PathBuf {
     if let Ok(d) = std::env::var("LLVM_COV_TARGET_DIR") {
         return PathBuf::from(d);
     }
+    // `LLVM_PROFILE_FILE` may be a bare filename (e.g. `default.profraw`)
+    // — `Path::parent` returns `Some("")` in that shape, which would
+    // otherwise propagate a structurally-empty `PathBuf` through the
+    // cascade and surface as an unusable target dir downstream
+    // (`std::fs::create_dir_all("")` errors with EINVAL on Linux).
+    // The empty-os-str filter forces those bare-filename cases to fall
+    // through to the `current_exe`-relative fallback below.
     if let Some(parent) = std::env::var("LLVM_PROFILE_FILE")
         .ok()
         .as_ref()
         .and_then(|p| Path::new(p).parent())
+        .filter(|p| !p.as_os_str().is_empty())
     {
         return parent.to_path_buf();
     }
@@ -350,6 +374,33 @@ mod tests {
             dir.ends_with("llvm-cov-target"),
             "expected path ending in llvm-cov-target, got: {}",
             dir.display()
+        );
+    }
+
+    /// `LLVM_PROFILE_FILE` set to a bare filename (no parent
+    /// directory component, e.g. `default.profraw`) must fall
+    /// through to the `current_exe`-relative fallback rather than
+    /// surfacing a structurally-empty `PathBuf` through the
+    /// cascade. `Path::new("default.profraw").parent()` returns
+    /// `Some("")`; without the empty-os-str filter,
+    /// `target_dir` would return `PathBuf::from("")` and downstream
+    /// `create_dir_all` calls fail with EINVAL.
+    #[test]
+    fn target_dir_bare_filename_llvm_profile_file_falls_through() {
+        let _lock = lock_env();
+        let _g_cov = EnvVarGuard::remove("LLVM_COV_TARGET_DIR");
+        let _g_prof = EnvVarGuard::set("LLVM_PROFILE_FILE", "default.profraw");
+        let dir = target_dir();
+        assert!(
+            !dir.as_os_str().is_empty(),
+            "bare-filename LLVM_PROFILE_FILE must fall through to the \
+             current_exe fallback, not return an empty PathBuf",
+        );
+        assert!(
+            dir.ends_with("llvm-cov-target"),
+            "fallback must land at the current_exe-relative llvm-cov-target \
+             dir, got: {}",
+            dir.display(),
         );
     }
 

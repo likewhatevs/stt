@@ -2161,6 +2161,97 @@ fn resolve_cache_root() -> anyhow::Result<PathBuf> {
     resolve_cache_root_with_suffix("kernels")
 }
 
+/// Is `p` (a file path) located inside the kernel cache root?
+///
+/// Used by callers that derive sibling artifacts next to a vmlinux on
+/// disk (currently [`crate::monitor::btf_offsets::load_btf_from_path`]'s
+/// `<vmlinux>.btf` sidecar) to avoid writing into directories the
+/// cache does not own — most importantly, kernel source trees and
+/// distro-installed debug paths supplied via [`crate::vmm::find_vmlinux`]
+/// fallbacks. A bare textual prefix would misclassify paths whose
+/// parent directory contains a symlink component, or paths spelled
+/// with `..`/`.` segments, so this canonicalizes both the cache
+/// root and `p`'s parent directory before comparing them with
+/// [`Path::starts_with`] (component-based, robust against trailing
+/// slash differences).
+///
+/// `p` ITSELF is NOT canonicalized. Only `p.parent()` is resolved
+/// through the symlink layer. Callers that need symlink-following
+/// semantics on `p` itself — e.g. `p` is a symlink whose target
+/// lives in a different membership bucket than its lexical parent —
+/// MUST canonicalize `p` before calling this helper.
+/// [`crate::monitor::btf_offsets::load_btf_from_path`] does exactly
+/// that and is the canonical example.
+///
+/// Both canonicalizations must succeed — any error (cache root
+/// unset, HOME unresolvable, parent missing, EACCES, etc.) returns
+/// `false` so that downstream sidecar writes are suppressed rather
+/// than landing in an unintended directory. The skip is logged at
+/// `tracing::debug` so an operator debugging "why is BTF
+/// re-extracted every load?" sees the cause without surfacing
+/// noise on the steady-state path.
+///
+/// Resolution is performed fresh on every call — `KTSTR_CACHE_DIR`
+/// can change between test invocations and during process lifetime,
+/// so caching the resolved root would surface stale answers.
+pub(crate) fn path_inside_cache_root(p: &Path) -> bool {
+    let root = match resolve_cache_root() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(
+                err = %e,
+                "cache root unresolvable; treating path as outside cache",
+            );
+            return false;
+        }
+    };
+    let canon_root = match fs::canonicalize(&root) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(
+                root = %root.display(),
+                err = %e,
+                "cache root canonicalize failed; treating path as outside cache",
+            );
+            return false;
+        }
+    };
+    // Canonicalize the parent directory and compare against the
+    // canonical cache root. The PARENT's canonical form is what the
+    // membership decision is based on — a symlinked parent that
+    // resolves into the cache classifies as in-cache, and vice
+    // versa.
+    //
+    // Note: this helper does NOT canonicalize `p` itself. If `p`
+    // is a regular file under a real (non-symlink) parent, the
+    // parent's canonical form fully determines the answer. If `p`
+    // IS a symlink (e.g. `/source-tree/vmlinux` ->
+    // `/cache/entry/vmlinux`), the helper would classify based on
+    // the lexical parent (`/source-tree`), which is NOT what
+    // callers usually want. Callers that need symlink-following
+    // semantics on `p` itself must canonicalize `p` before
+    // calling — see [`crate::monitor::btf_offsets::load_btf_from_path`]
+    // for an example.
+    let parent = match p.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        // Bare filename or filesystem root — neither can sit "inside"
+        // the cache by construction.
+        _ => return false,
+    };
+    let canon_parent = match fs::canonicalize(parent) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(
+                parent = %parent.display(),
+                err = %e,
+                "input path parent canonicalize failed; treating as outside cache",
+            );
+            return false;
+        }
+    };
+    canon_parent.starts_with(&canon_root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3456,6 +3547,243 @@ mod tests {
             "error must name a remediation (UTF-8 replacement or unset), \
              got: {msg}",
         );
+    }
+
+    // -- path_inside_cache_root direct unit tests --
+    //
+    // `path_inside_cache_root` is the gate that prevents
+    // `<vmlinux>.btf` sidecar writes from polluting kernel source
+    // trees and other directories the cache does not own (see
+    // `monitor::btf_offsets::load_btf_from_path`). The tests below
+    // exercise the helper directly so a regression in the
+    // membership logic surfaces against this dedicated entry point
+    // as well as the integration paths in btf_offsets.rs.
+    //
+    // Every test holds `lock_env()` because the helper reads
+    // KTSTR_CACHE_DIR / XDG_CACHE_HOME / HOME from the process
+    // environment.
+
+    /// Sibling path that lives directly under the cache root resolves
+    /// as in-cache. The canonical case the gate must accept.
+    #[test]
+    fn path_inside_cache_root_accepts_path_inside() {
+        let _lock = lock_env();
+        let tmp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+        let entry = tmp.path().join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let vmlinux = entry.join("vmlinux");
+        std::fs::write(&vmlinux, b"placeholder").unwrap();
+        assert!(
+            path_inside_cache_root(&vmlinux),
+            "vmlinux directly under cache root must be classified as in-cache",
+        );
+    }
+
+    /// Path that lives in a sibling tempdir (modeling a kernel source
+    /// tree) must NOT classify as in-cache — the source-tree pollution
+    /// scenario this helper exists to prevent.
+    #[test]
+    fn path_inside_cache_root_rejects_path_outside() {
+        let _lock = lock_env();
+        let cache_root = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.path());
+        let source_tree = TempDir::new().unwrap();
+        let vmlinux = source_tree.path().join("vmlinux");
+        std::fs::write(&vmlinux, b"placeholder").unwrap();
+        assert!(
+            !path_inside_cache_root(&vmlinux),
+            "vmlinux in a sibling tempdir must NOT be classified as in-cache",
+        );
+    }
+
+    /// Bare filename has no parent component (`Path::parent` returns
+    /// `Some("")`). Treating an empty parent as "in cache" would let
+    /// any process invoking `path_inside_cache_root("vmlinux")` pass
+    /// when its CWD happens to be the cache root — surprising
+    /// semantics for what is otherwise a structural check. The
+    /// helper short-circuits to false.
+    #[test]
+    fn path_inside_cache_root_rejects_bare_filename() {
+        let _lock = lock_env();
+        let tmp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+        let bare = std::path::Path::new("vmlinux");
+        assert!(
+            !path_inside_cache_root(bare),
+            "bare filename (no parent) must short-circuit to false",
+        );
+    }
+
+    /// With every cascade variable removed (`KTSTR_CACHE_DIR`,
+    /// `XDG_CACHE_HOME`, `HOME`), `resolve_cache_root` errors out and
+    /// `path_inside_cache_root` falls through to `false`. A real
+    /// vmlinux on disk under those conditions is "outside the cache"
+    /// because no cache root exists.
+    #[test]
+    fn path_inside_cache_root_false_when_unresolvable() {
+        let _lock = lock_env();
+        let _g1 = EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _g2 = EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _g3 = EnvVarGuard::remove("HOME");
+        // Use a real file so `Path::parent` is non-empty; the
+        // unresolvable cache root is the part being tested.
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("vmlinux");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(
+            !path_inside_cache_root(&f),
+            "unresolvable cache root must classify as outside-cache (false)",
+        );
+    }
+
+    /// Parent that does not exist on disk: `fs::canonicalize(parent)`
+    /// fails with ENOENT, and the helper safely returns false.
+    /// Models a caller passing a path whose ancestor was rmdir'd
+    /// between path construction and the membership check.
+    #[test]
+    fn path_inside_cache_root_false_when_parent_canonicalize_fails() {
+        let _lock = lock_env();
+        let tmp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", tmp.path());
+        // Construct a path whose parent does not exist on disk.
+        let nonexistent = std::path::Path::new("/this/parent/should/not/exist/vmlinux");
+        assert!(
+            !nonexistent.parent().unwrap().exists(),
+            "precondition: parent must not exist for the canonicalize \
+             failure path to be exercised",
+        );
+        assert!(
+            !path_inside_cache_root(nonexistent),
+            "nonexistent parent must surface as outside-cache, not panic",
+        );
+    }
+
+    /// Symlink whose parent's canonical form lands INSIDE the cache
+    /// root: classified as in-cache, even though the symlink itself
+    /// lives outside. This is the desired semantic for callers that
+    /// follow `find_vmlinux`-style fallbacks where the resolved
+    /// target is what matters.
+    #[test]
+    #[cfg(unix)]
+    fn path_inside_cache_root_follows_symlink_into_cache() {
+        let _lock = lock_env();
+        let cache_root = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.path());
+        // Real vmlinux inside the cache.
+        let entry = cache_root.path().join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let real = entry.join("vmlinux");
+        std::fs::write(&real, b"placeholder").unwrap();
+        // Symlink whose PARENT (an outside-cache tempdir) holds a
+        // link to the in-cache real file. `path.parent()` is the
+        // outside-cache dir, but `fs::canonicalize(parent)`
+        // resolves... the parent itself, not the symlink target.
+        // To exercise the "symlink resolving INTO cache" semantics
+        // we need a parent that IS itself a symlink into the
+        // cache. Use a directory symlink for that.
+        let outside = TempDir::new().unwrap();
+        let alias_parent = outside.path().join("alias");
+        std::os::unix::fs::symlink(&entry, &alias_parent).unwrap();
+        let through_alias = alias_parent.join("vmlinux");
+        assert!(
+            through_alias.exists(),
+            "precondition: path through symlinked parent must be reachable",
+        );
+        assert!(
+            path_inside_cache_root(&through_alias),
+            "path whose parent symlink resolves into cache must classify as in-cache",
+        );
+    }
+
+    /// Symlink whose parent's canonical form lands OUTSIDE the cache
+    /// root: classified as outside-cache. The opposite of
+    /// `path_inside_cache_root_follows_symlink_into_cache` — together
+    /// the two pin the canonicalize-then-compare contract.
+    #[test]
+    #[cfg(unix)]
+    fn path_inside_cache_root_follows_symlink_out_of_cache() {
+        let _lock = lock_env();
+        let cache_root = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_root.path());
+        // Real vmlinux outside the cache.
+        let outside = TempDir::new().unwrap();
+        let real = outside.path().join("vmlinux");
+        std::fs::write(&real, b"placeholder").unwrap();
+        // Symlink directory IN cache pointing at the outside parent.
+        let alias_parent = cache_root.path().join("alias");
+        std::os::unix::fs::symlink(outside.path(), &alias_parent).unwrap();
+        let through_alias = alias_parent.join("vmlinux");
+        assert!(
+            through_alias.exists(),
+            "precondition: path through symlinked parent must be reachable",
+        );
+        assert!(
+            !path_inside_cache_root(&through_alias),
+            "path whose parent symlink resolves OUT of cache must classify as outside-cache",
+        );
+    }
+
+    /// Empty `KTSTR_CACHE_DIR` falls through the cascade per
+    /// `resolve_cache_root_with_suffix`'s `Ok(_) => fall through`
+    /// arm; the helper then resolves through XDG/HOME like any
+    /// other call. With XDG and HOME pointed at a tempdir, a path
+    /// inside that tempdir's `ktstr/kernels/` subtree must classify
+    /// as in-cache; a sibling outside it must not.
+    #[test]
+    fn path_inside_cache_root_empty_ktstr_cache_dir_falls_through() {
+        let _lock = lock_env();
+        let tmp = TempDir::new().unwrap();
+        let _g1 = EnvVarGuard::set("KTSTR_CACHE_DIR", "");
+        let _g2 = EnvVarGuard::set("XDG_CACHE_HOME", tmp.path());
+        // resolve_cache_root with empty KTSTR_CACHE_DIR + XDG set →
+        // root = <tmp>/ktstr/kernels. Stage a vmlinux inside that
+        // resolved root.
+        let resolved = tmp.path().join("ktstr").join("kernels");
+        let entry = resolved.join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let vmlinux = entry.join("vmlinux");
+        std::fs::write(&vmlinux, b"placeholder").unwrap();
+        assert!(
+            path_inside_cache_root(&vmlinux),
+            "with empty KTSTR_CACHE_DIR, the cascade must resolve via \
+             XDG_CACHE_HOME and accept paths inside that resolved root",
+        );
+    }
+
+    /// Resolution is performed fresh on every call: changing
+    /// `KTSTR_CACHE_DIR` between two invocations must yield
+    /// different membership decisions for the same input path.
+    /// Memoization would surface here as a stale `true` after the
+    /// pointer moves away from the path's parent.
+    #[test]
+    fn path_inside_cache_root_fresh_resolution_per_call() {
+        let _lock = lock_env();
+        let cache_a = TempDir::new().unwrap();
+        let cache_b = TempDir::new().unwrap();
+        // Stage a vmlinux inside cache_a.
+        let entry_a = cache_a.path().join("kentry");
+        std::fs::create_dir_all(&entry_a).unwrap();
+        let vmlinux_a = entry_a.join("vmlinux");
+        std::fs::write(&vmlinux_a, b"placeholder").unwrap();
+        // First call: KTSTR_CACHE_DIR points at cache_a → in-cache.
+        {
+            let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_a.path());
+            assert!(
+                path_inside_cache_root(&vmlinux_a),
+                "first call: vmlinux is inside cache_a (the active root)",
+            );
+        }
+        // Second call: KTSTR_CACHE_DIR moved to cache_b. Same input
+        // path is now outside the active root.
+        {
+            let _guard = EnvVarGuard::set("KTSTR_CACHE_DIR", cache_b.path());
+            assert!(
+                !path_inside_cache_root(&vmlinux_a),
+                "second call: KTSTR_CACHE_DIR has moved to cache_b, so the \
+                 vmlinux (still under cache_a) must be classified outside",
+            );
+        }
     }
 
     // -- clean_orphaned_tmp_dirs unit tests --

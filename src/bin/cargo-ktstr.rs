@@ -1698,6 +1698,52 @@ fn encode_kernel_list(resolved: &[(String, PathBuf)]) -> Result<String, String> 
 /// still gets a valid path. The test binary's `--list` / `--exact`
 /// handlers prefer `KTSTR_KERNEL_LIST` when set.
 ///
+/// Decide whether to inject `LLVM_PROFILE_FILE` for a given cargo
+/// sub-invocation, returning the pattern to set or `None` to leave
+/// the env untouched.
+///
+/// When the user invokes `cargo ktstr test` from inside a kernel
+/// source tree, every link in the spawn chain (cargo-ktstr ->
+/// cargo nextest -> test binary) inherits the shell's cwd. A
+/// coverage-instrumented test binary would then drop
+/// `default.profraw` directly in the kernel tree at exit because
+/// the LLVM runtime defaults to writing in cwd when
+/// `LLVM_PROFILE_FILE` is unset. Injecting a workspace-local
+/// pattern here keeps the host's profraw next to the build output
+/// regardless of cwd. `%p` (process id) and `%m` (binary hash) are
+/// LLVM runtime expansions that keep parallel-test output files
+/// distinct.
+///
+/// Returns `Some(pattern)` only when both:
+///   - `sub_argv` selects the bare `nextest` path (the `test`
+///     subcommand). The `coverage` path execs `cargo llvm-cov
+///     nextest`, which manages `LLVM_PROFILE_FILE` itself for its
+///     profraw collection pipeline; pre-setting the env here would
+///     race that pipeline. The `llvm-cov` raw-passthrough path is
+///     user-controlled by contract and must not be touched.
+///   - `existing_env` is `None`. An operator who has already
+///     exported `LLVM_PROFILE_FILE` keeps that value — we only set
+///     when the env is currently absent, so an explicit override
+///     stays authoritative. Operators who want a different
+///     workspace-local target without touching `LLVM_PROFILE_FILE`
+///     can set `LLVM_COV_TARGET_DIR` instead, which
+///     [`ktstr::test_support::profraw_target_dir`] honors as the
+///     highest-precedence entry in its cascade.
+///
+/// Pure with respect to its arguments — does no env read of its
+/// own — so callers can drive the gate from a unit test by
+/// supplying the env probe explicitly.
+fn profraw_inject_for(
+    sub_argv: &[&str],
+    existing_env: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if sub_argv != TEST_SUB_ARGV || existing_env.is_some() {
+        return None;
+    }
+    let dir = ktstr::test_support::profraw_target_dir();
+    Some(dir.join("default-%p-%m.profraw"))
+}
+
 /// `release` is always `false` for the raw `llvm-cov` passthrough —
 /// that subcommand hands every argument to the user, so the profile
 /// is set via the user's trailing args (or not at all). `test` and
@@ -1725,6 +1771,10 @@ fn run_cargo_sub(
     cmd.args(&args);
     if no_perf_mode {
         cmd.env("KTSTR_NO_PERF_MODE", "1");
+    }
+
+    if let Some(pat) = profraw_inject_for(sub_argv, std::env::var_os("LLVM_PROFILE_FILE")) {
+        cmd.env("LLVM_PROFILE_FILE", pat);
     }
 
     if !kernel.is_empty() {
@@ -5329,6 +5379,64 @@ mod tests {
         assert_eq!(LLVM_COV_SUB_ARGV, &["llvm-cov"]);
     }
 
+    // -- profraw_inject_for --
+    //
+    // The injection must fire for `test` (so an instrumented test
+    // binary cannot drop `default.profraw` in cwd), and must NOT
+    // fire for `coverage` (cargo-llvm-cov manages
+    // `LLVM_PROFILE_FILE` itself) or `llvm-cov` (raw passthrough,
+    // user-controlled). An operator-supplied `LLVM_PROFILE_FILE`
+    // must always win.
+
+    /// `test` path with no operator override: returns a workspace-
+    /// relative pattern ending in the `default-%p-%m.profraw`
+    /// expansion tokens.
+    #[test]
+    fn profraw_inject_for_test_path_returns_pattern() {
+        let pat = profraw_inject_for(TEST_SUB_ARGV, None)
+            .expect("test path without LLVM_PROFILE_FILE must inject");
+        assert!(
+            pat.ends_with("default-%p-%m.profraw"),
+            "injected pattern must end with default-%%p-%%m.profraw, got {}",
+            pat.display(),
+        );
+        assert_ne!(
+            pat.as_os_str(),
+            "default-%p-%m.profraw",
+            "pattern must be absolute (carry a target dir prefix), \
+             not bare so the LLVM runtime never falls back to cwd",
+        );
+    }
+
+    /// `coverage` path: cargo-llvm-cov manages the env itself.
+    #[test]
+    fn profraw_inject_for_coverage_path_skips() {
+        assert!(
+            profraw_inject_for(COVERAGE_SUB_ARGV, None).is_none(),
+            "coverage path must not inject — cargo-llvm-cov owns LLVM_PROFILE_FILE",
+        );
+    }
+
+    /// `llvm-cov` raw passthrough: user-controlled by contract.
+    #[test]
+    fn profraw_inject_for_llvm_cov_path_skips() {
+        assert!(
+            profraw_inject_for(LLVM_COV_SUB_ARGV, None).is_none(),
+            "llvm-cov passthrough path must not inject — user owns env decisions",
+        );
+    }
+
+    /// Operator already exported `LLVM_PROFILE_FILE` — explicit
+    /// override stays authoritative even on the `test` path.
+    #[test]
+    fn profraw_inject_for_respects_operator_override() {
+        let existing = std::ffi::OsString::from("/tmp/operator-pinned-%p.profraw");
+        assert!(
+            profraw_inject_for(TEST_SUB_ARGV, Some(existing)).is_none(),
+            "an operator-set LLVM_PROFILE_FILE must not be overridden",
+        );
+    }
+
     // -- generate_flag_profiles --
 
     #[test]
@@ -6667,11 +6775,39 @@ mod tests {
     /// commit so the trees never collide. Mirrors the structure
     /// of `init_clean_repo_with_file` in `test_support::sidecar`'s
     /// test mod but extends it to a multi-commit chain.
+    ///
+    /// `gix::Repository::commit` requires both an author and a
+    /// committer signature. `committer_or_set_generic_fallback`
+    /// only writes the committer fallback; without `user.name`/
+    /// `user.email` in the runner's git config, the author cascade
+    /// (author -> user) yields `None` and `commit` bails with
+    /// `AuthorMissing`. CI runners that do not pre-seed `user.name`
+    /// hit this. Plant `gitoxide.author.nameFallback` /
+    /// `emailFallback` directly so the author cascade has a value
+    /// regardless of ambient git config — same shape gix uses for
+    /// the committer fallback in `committer_or_set_generic_fallback`
+    /// (see `gix::config::tree::gitoxide::Author` for the keys).
     fn init_repo_with_chain(dir: &std::path::Path, n: usize) -> Vec<gix::ObjectId> {
         let mut repo = gix::init(dir).expect("gix::init");
         let _ = repo
             .committer_or_set_generic_fallback()
             .expect("committer fallback");
+        // Author fallback: mirror the committer-fallback pattern from
+        // gix-0.81 `committer_or_set_generic_fallback` against the
+        // Author keys.
+        {
+            use gix::config::tree::gitoxide;
+            let mut cfg = gix::config::File::new(gix::config::file::Metadata::api());
+            cfg.set_raw_value(&gitoxide::Author::NAME_FALLBACK, "ktstr-test")
+                .expect("set author name fallback");
+            cfg.set_raw_value(
+                &gitoxide::Author::EMAIL_FALLBACK,
+                "ktstr-test@example.invalid",
+            )
+            .expect("set author email fallback");
+            let mut snap = repo.config_snapshot_mut();
+            snap.append(cfg);
+        }
         let mut chain: Vec<gix::ObjectId> = Vec::with_capacity(n);
         for i in 0..n {
             let blob_id: gix::ObjectId = repo

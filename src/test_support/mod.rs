@@ -116,6 +116,7 @@ pub use probe_metrics::{
     flat_metrics_dump, has_metric, lookup_thread, snapshot_count, snapshot_worker_allocated,
     thread_count,
 };
+pub use profraw::target_dir as profraw_target_dir;
 pub(crate) use profraw::try_flush_profraw;
 pub(crate) use timefmt::now_iso8601;
 pub(crate) use topo::{TopoOverride, parse_topo_string};

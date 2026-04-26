@@ -6321,22 +6321,62 @@ mod tests {
     // — no `git` shell-out — so the tests reflect the same library the
     // production probe uses.
 
+    /// Plant author NAME/EMAIL fallbacks on `repo`'s in-memory config
+    /// snapshot.
+    ///
+    /// `gix::Repository::commit` requires both an author and a
+    /// committer signature. `committer_or_set_generic_fallback` only
+    /// writes the committer fallback (gix-0.81 has no equivalent
+    /// `author_or_set_generic_fallback`); the author cascade reads
+    /// `author -> user`, so without `user.name`/`user.email` in the
+    /// runner's git config the author is `None` and `commit` bails
+    /// with `AuthorMissing`. CI runners that do not pre-seed
+    /// `user.name`/`user.email` hit this. Plant
+    /// `gitoxide.author.nameFallback` / `emailFallback` directly so
+    /// the author cascade has a value regardless of ambient git
+    /// config — same shape gix uses for the committer fallback in
+    /// `committer_or_set_generic_fallback`.
+    ///
+    /// Call this AFTER `committer_or_set_generic_fallback` so both
+    /// fallbacks land in the same config-snapshot append window;
+    /// either order works in principle, but pairing them next to
+    /// each other in callers keeps the "we set both" intent
+    /// readable.
+    fn set_test_author_fallback(repo: &mut gix::Repository) {
+        use gix::config::tree::gitoxide;
+        let mut cfg = gix::config::File::new(gix::config::file::Metadata::api());
+        cfg.set_raw_value(&gitoxide::Author::NAME_FALLBACK, "ktstr-test")
+            .expect("set author name fallback");
+        cfg.set_raw_value(
+            &gitoxide::Author::EMAIL_FALLBACK,
+            "ktstr-test@example.invalid",
+        )
+        .expect("set author email fallback");
+        let mut snap = repo.config_snapshot_mut();
+        snap.append(cfg);
+    }
+
     /// Construct a single-blob tree at `dir`, populate the index from it,
     /// write the file content into the worktree, and return the new
     /// HEAD commit's id. After this helper the repo is fully clean:
     /// HEAD-tree == index == worktree.
     ///
-    /// `committer_or_set_generic_fallback` is invoked because the test
+    /// `committer_or_set_generic_fallback` plus
+    /// [`set_test_author_fallback`] are both invoked because the test
     /// process inherits no `user.name|email` git config and the
-    /// commit/ref-edit path requires a non-empty signature; the
-    /// fallback writes "no name configured" / "noEmailAvailable@…"
-    /// into the in-memory config snapshot, which is sufficient to
-    /// produce a syntactically valid commit object.
+    /// commit/ref-edit path requires a non-empty signature for both
+    /// committer and author. The committer fallback writes
+    /// "no name configured" / "noEmailAvailable@…" via gix's
+    /// built-in helper; the author fallback plants the matching
+    /// `gitoxide.author.nameFallback` / `emailFallback` keys so
+    /// `gix::Repository::commit` succeeds on CI runners with no
+    /// ambient git identity.
     fn init_clean_repo_with_file(dir: &std::path::Path) -> gix::ObjectId {
         let mut repo = gix::init(dir).expect("gix::init");
         let _ = repo
             .committer_or_set_generic_fallback()
             .expect("committer fallback");
+        set_test_author_fallback(&mut repo);
         let blob_id: gix::ObjectId = repo.write_blob(b"original\n").expect("write blob").detach();
         let tree = gix::objs::Tree {
             entries: vec![gix::objs::tree::Entry {
@@ -6548,6 +6588,7 @@ mod tests {
         let _ = repo
             .committer_or_set_generic_fallback()
             .expect("committer fallback");
+        set_test_author_fallback(&mut repo);
 
         // A submodule reference needs both a `.gitmodules` registration
         // (so gix recognises the gitlinks entry as a submodule, not a
@@ -6732,6 +6773,7 @@ mod tests {
         let _ = repo
             .committer_or_set_generic_fallback()
             .expect("committer fallback");
+        set_test_author_fallback(&mut repo);
 
         let gitmodules_content = b"\
 [submodule \"submod\"]\n\
@@ -6890,6 +6932,7 @@ mod tests {
         let _ = repo_b
             .committer_or_set_generic_fallback()
             .expect("committer fallback B");
+        set_test_author_fallback(&mut repo_b);
         let blob_id_b: gix::ObjectId = repo_b
             .write_blob(b"different\n")
             .expect("write blob B")

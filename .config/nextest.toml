@@ -50,6 +50,23 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 filter = "test(compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 
+# cached_releases bypass test: drives a localhost mock through the
+# fetch.rs URL-injection seam. Observed exhausting the ci profile's
+# 270s slow-timeout budget (90s × 3) on ARM64 runners. The test
+# itself is bounded by a 5s reqwest timeout per attempt, so the only
+# way to hit 270s is repeated retries — each retry replays the same
+# RELEASES_CACHE OnceLock state and the same TcpListener::bind path,
+# so a failure is never transient. retries=0 keeps a single attempt
+# and surfaces any genuine regression as a fast failure rather than
+# letting the retry storm consume the timeout budget. The 240s × 2
+# slow-timeout matches the boot_kernel ceiling and gives the slowest
+# observed ARM64 runner room to complete the bind+accept+request
+# round-trip without nextest pre-empting it.
+[[profile.default.overrides]]
+filter = "test(cached_releases_with_non_singleton_bypasses_cache)"
+slow-timeout = { period = "240s", terminate-after = 2 }
+retries = 0
+
 # EEVDF tests: no sched_ext scheduler attached, so VM lifecycle is
 # bounded by the 60s host watchdog at `runtime.rs::KTSTR_VM_TIMEOUT`
 # plus VM setup overhead. 75s gives a margin above that ceiling so

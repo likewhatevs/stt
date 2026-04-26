@@ -29,27 +29,35 @@ use btf_rs::{Btf, Type};
 ///
 /// # BTF sidecar cache
 ///
-/// For ELF inputs only, the extracted `.BTF` section bytes are cached
-/// as a sibling file at `<path>.btf` (e.g. `vmlinux` →
-/// `vmlinux.btf`). On subsequent loads, if the sidecar exists and
-/// its mtime is greater than or equal to the vmlinux mtime, the
-/// cached bytes are read and parsed directly, skipping the goblin
-/// ELF parse + `.BTF` section extraction (the slow path on a
-/// multi-hundred-MB vmlinux).
+/// For ELF inputs whose path lies inside the ktstr kernel cache root
+/// (see [`crate::cache::path_inside_cache_root`]), the extracted
+/// `.BTF` section bytes are cached as a sibling file at `<path>.btf`
+/// (e.g. `vmlinux` → `vmlinux.btf`). On subsequent loads, if the
+/// sidecar exists and its mtime is greater than or equal to the
+/// vmlinux mtime, the cached bytes are read and parsed directly,
+/// skipping the goblin ELF parse + `.BTF` section extraction.
 ///
-/// The sidecar is written lazily on first load after a cache miss.
-/// Write failures (e.g. read-only directory) are logged at
-/// `tracing::warn` level and do not fail the load — the function
-/// falls through with the freshly-parsed BTF. Raw-BTF inputs never
-/// write a sidecar: the input file IS the BTF blob and a sidecar
-/// would just be a redundant copy of itself.
+/// The sidecar is written lazily on first load after a cache miss,
+/// gated on the same membership check. Write failures (e.g. read-only
+/// directory) are logged at `tracing::warn` level and do not fail
+/// the load — the function falls through with the freshly-parsed
+/// BTF. Raw-BTF inputs never write a sidecar: the input file IS the
+/// BTF blob and a sidecar would just be a redundant copy of itself.
+///
+/// Vmlinuxes resolved from outside the cache — kernel source trees
+/// (the `<root>/vmlinux` walk-up in [`crate::vmm::find_vmlinux`])
+/// and distro debug paths (`/usr/lib/debug/boot/...`,
+/// `/lib/modules/<v>/build/vmlinux`) — get neither sidecar reads nor
+/// writes. The BTF is re-extracted from ELF on every load. Caching
+/// would otherwise pollute directories the cache does not own; a
+/// repeated extract is fast relative to VM boot times so the cost
+/// is acceptable.
 ///
 /// Staleness: mtime-based, no content hash. `CacheDir::store`'s
 /// atomic rename path bumps vmlinux mtime when an entry is replaced,
 /// so a previously-written sidecar next to the old vmlinux surfaces
 /// as stale (`mtime(sidecar) < mtime(vmlinux)`) and the bytes are
-/// re-extracted + re-written on the next load. Source-tree
-/// vmlinuxes rebuilt in place bump mtime the same way.
+/// re-extracted + re-written on the next load.
 pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
     let data = std::fs::read(path).context("read file")?;
     // Raw BTF: first 2 bytes are the 0x9FEB magic. Parse directly;
@@ -58,40 +66,97 @@ pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
         return Btf::from_bytes(&data).map_err(|e| anyhow::anyhow!("{e}"));
     }
 
-    // ELF path: try the BTF sidecar cache before re-parsing ELF.
-    let sidecar = btf_sidecar_path(path);
-    if sidecar_fresh(&sidecar, path) {
-        match std::fs::read(&sidecar) {
-            Ok(cached) if is_raw_btf(&cached) => {
-                match Btf::from_bytes(&cached) {
-                    Ok(btf) => return Ok(btf),
-                    Err(e) => {
-                        // Parse failure on a fresh-looking sidecar:
-                        // treat as corrupt and fall through to ELF
-                        // extraction. The subsequent write overwrites
-                        // the corrupt file.
-                        tracing::warn!(
-                            path = %sidecar.display(),
-                            err = %e,
-                            "btf sidecar parse failed; falling back to ELF extraction",
-                        );
+    // Canonicalize the input path before deriving sidecar artifacts.
+    // Both flows that the membership gate must handle correctly
+    // depend on this normalization:
+    //   (a) Symlink in cache pointing to a source-tree real file
+    //       (`/cache/entry/vmlinux` -> `/source-tree/vmlinux`)
+    //       would otherwise pass the lexical membership check (the
+    //       cache-side parent canonicalizes into the cache) and
+    //       deposit a stale-prone sidecar at
+    //       `/cache/entry/vmlinux.btf`. The sidecar's mtime tracks
+    //       the symlink's target, so an in-place rebuild of the
+    //       source-tree real file silently desynchronizes the
+    //       cached sidecar.
+    //   (b) Symlink in source tree pointing into cache
+    //       (`/source-tree/vmlinux` -> `/cache/entry/vmlinux`)
+    //       would otherwise fail the membership check (the
+    //       source-tree parent canonicalizes outside the cache)
+    //       and miss the sidecar cache for what is, after
+    //       resolution, a genuine cache entry.
+    // Canonicalize-at-top normalizes both flows to use the real
+    // file's path: (a) collapses to "outside cache" and suppresses
+    // the sidecar; (b) collapses to "inside cache" and writes the
+    // sidecar next to the real file in the cache.
+    //
+    // The fs::read above proves the file is reachable; canonicalize
+    // can still fail under EACCES on a parent component or a race
+    // with a disappearing symlink target. Any canonicalize failure
+    // suppresses the sidecar entirely — without a canonical path
+    // there is no way to prove the input is inside the cache, and
+    // writing a `<lexical-path>.btf` next to an unresolvable input
+    // is exactly the source-tree pollution the gate exists to
+    // prevent.
+    let (canon_path, sidecar_allowed) = match std::fs::canonicalize(path) {
+        Ok(c) => {
+            let inside = crate::cache::path_inside_cache_root(&c);
+            (c, inside)
+        }
+        Err(e) => {
+            tracing::debug!(
+                path = %path.display(),
+                err = %e,
+                "btf input path canonicalize failed; sidecar suppressed for this load",
+            );
+            (path.to_path_buf(), false)
+        }
+    };
+    // Sidecar reads and writes are gated on cache-root membership:
+    // source trees, distro debug paths, and other non-cache inputs
+    // get neither, ensuring ktstr never deposits sibling artifacts
+    // in directories it does not own. Resolved on every call so a
+    // mid-process `KTSTR_CACHE_DIR` change is honored.
+    let sidecar = btf_sidecar_path(&canon_path);
+
+    if sidecar_allowed {
+        if sidecar_fresh(&sidecar, &canon_path) {
+            match std::fs::read(&sidecar) {
+                Ok(cached) if is_raw_btf(&cached) => {
+                    match Btf::from_bytes(&cached) {
+                        Ok(btf) => return Ok(btf),
+                        Err(e) => {
+                            // Parse failure on a fresh-looking sidecar:
+                            // treat as corrupt and fall through to ELF
+                            // extraction. The subsequent write overwrites
+                            // the corrupt file.
+                            tracing::warn!(
+                                path = %sidecar.display(),
+                                err = %e,
+                                "btf sidecar parse failed; falling back to ELF extraction",
+                            );
+                        }
                     }
                 }
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    path = %sidecar.display(),
-                    "btf sidecar lacks 0x9FEB magic; falling back to ELF extraction",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %sidecar.display(),
-                    err = %e,
-                    "btf sidecar read failed; falling back to ELF extraction",
-                );
+                Ok(_) => {
+                    tracing::warn!(
+                        path = %sidecar.display(),
+                        "btf sidecar lacks 0x9FEB magic; falling back to ELF extraction",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %sidecar.display(),
+                        err = %e,
+                        "btf sidecar read failed; falling back to ELF extraction",
+                    );
+                }
             }
         }
+    } else {
+        tracing::debug!(
+            path = %canon_path.display(),
+            "btf sidecar suppressed: vmlinux path is outside the cache root",
+        );
     }
 
     // Fallback: parse ELF, extract `.BTF` section bytes.
@@ -116,9 +181,12 @@ pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
         .context(".BTF section data out of bounds")?;
     let btf = Btf::from_bytes(btf_data).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Write sidecar on successful parse. Errors are non-fatal — the
-    // load succeeds regardless, we just miss the cache on future loads.
-    if let Err(e) = write_btf_sidecar(&sidecar, btf_data) {
+    // Write sidecar on successful parse, gated on cache-root
+    // membership. Errors are non-fatal — the load succeeds
+    // regardless, we just miss the cache on future loads. Outside
+    // the cache the write is suppressed so source-tree and distro
+    // paths remain pristine.
+    if sidecar_allowed && let Err(e) = write_btf_sidecar(&sidecar, btf_data) {
         tracing::warn!(
             path = %sidecar.display(),
             err = %e,
@@ -1409,10 +1477,14 @@ mod tests {
 
     // -- BTF sidecar cache --
     //
-    // These tests exercise the `<path>.btf` sidecar pipeline: pure
-    // helper functions (path derivation, magic check, freshness)
-    // directly, plus end-to-end load_btf_from_path behavior against a
-    // real-ELF fixture when one is available on the host.
+    // These tests exercise the `<path>.btf` sidecar pipeline:
+    //   * pure helpers (path derivation, magic check, freshness)
+    //     directly;
+    //   * end-to-end `load_btf_from_path` behavior against a real-ELF
+    //     fixture when one is available on the host;
+    //   * the cache-root membership guard that suppresses sidecar
+    //     reads/writes for vmlinux paths outside the cache, including
+    //     symlink-resolution semantics and relative-path handling.
 
     #[test]
     fn btf_sidecar_path_appends_dot_btf() {
@@ -1481,6 +1553,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Vmlinux staged inside a private cache root for sidecar tests.
+    ///
+    /// Field declaration order pins drop order — Rust drops struct
+    /// fields top-to-bottom. `_cache_env` (the `KTSTR_CACHE_DIR`
+    /// `EnvVarGuard`) is declared first so it drops first, restoring
+    /// the env BEFORE `_root` drops and removes the temporary
+    /// directory. Without that ordering, `KTSTR_CACHE_DIR` would
+    /// transiently point at a deleted directory while the next test
+    /// runs — a dangling-env-ref hazard.
+    ///
+    /// `entry_dir` and `vmlinux` are simple `PathBuf`s with no
+    /// drop side effects, so their position only documents intent.
+    struct CacheStagedVmlinux {
+        _cache_env: crate::test_support::test_helpers::EnvVarGuard,
+        entry_dir: std::path::PathBuf,
+        vmlinux: std::path::PathBuf,
+        _root: tempfile::TempDir,
+    }
+
+    /// Stage a vmlinux copy at `<cache_root>/<entry>/vmlinux` so the
+    /// sidecar guard treats writes as in-cache, and point
+    /// `KTSTR_CACHE_DIR` at the cache root for the returned value's
+    /// lifetime. See [`CacheStagedVmlinux`] for drop semantics.
+    fn stage_in_cache(src: &std::path::Path) -> CacheStagedVmlinux {
+        let root = tempfile::TempDir::new().expect("cache-root tempdir");
+        let entry_dir = root.path().join("kentry");
+        std::fs::create_dir_all(&entry_dir).expect("create cache entry dir");
+        let vmlinux = entry_dir.join("vmlinux");
+        std::fs::copy(src, &vmlinux).expect("copy vmlinux into cache-staged dir");
+        let _cache_env =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", root.path());
+        CacheStagedVmlinux {
+            _cache_env,
+            entry_dir,
+            vmlinux,
+            _root: root,
+        }
+    }
+
     /// End-to-end: first load extracts BTF from ELF vmlinux and
     /// writes the sidecar; second load reads the sidecar bytes
     /// directly and parses them. Exercises both branches of
@@ -1501,16 +1612,13 @@ mod tests {
             return;
         }
 
-        // Run against a fresh temp copy so the test does not mutate
-        // the shared kernel cache or source tree. The copy shares
-        // the same directory so the sidecar's tempfile+rename lands
-        // on the same filesystem.
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-btf-sidecar-e2e-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let vmlinux = dir.join("vmlinux");
-        std::fs::copy(&path, &vmlinux).unwrap();
-        let sidecar = dir.join("vmlinux.btf");
+        // Stage the vmlinux inside a private KTSTR_CACHE_DIR so the
+        // sidecar membership guard permits the write. lock_env held
+        // for the test's lifetime — KTSTR_CACHE_DIR is process-wide.
+        let _env = crate::test_support::test_helpers::lock_env();
+        let staged = stage_in_cache(&path);
+        let vmlinux = staged.vmlinux.as_path();
+        let sidecar = btf_sidecar_path(vmlinux);
         // Ensure vmlinux mtime is strictly less than whatever the
         // sidecar write will stamp — avoids a same-second tie that
         // could false-pass the freshness check on low-resolution
@@ -1524,7 +1632,7 @@ mod tests {
         );
 
         // First load: extract + write sidecar.
-        let btf1 = load_btf_from_path(&vmlinux).expect("first load must succeed");
+        let btf1 = load_btf_from_path(vmlinux).expect("first load must succeed");
         // Consume btf1 so the optimizer cannot elide the parse.
         let _ = format!("{:?}", btf1.resolve_types_by_name("task_struct").is_ok());
         assert!(
@@ -1541,7 +1649,7 @@ mod tests {
         // Sanity: sidecar mtime is at/after vmlinux mtime so the
         // freshness check on the second load picks it up.
         assert!(
-            sidecar_fresh(&sidecar, &vmlinux),
+            sidecar_fresh(&sidecar, vmlinux),
             "sidecar mtime must be ≥ vmlinux mtime after first load",
         );
 
@@ -1557,7 +1665,7 @@ mod tests {
         // Sleep a bit so a spurious sidecar rewrite would be
         // detectable via an mtime bump.
         std::thread::sleep(Duration::from_millis(50));
-        let btf2 = load_btf_from_path(&vmlinux).expect("second load must succeed");
+        let btf2 = load_btf_from_path(vmlinux).expect("second load must succeed");
         let _ = format!("{:?}", btf2.resolve_types_by_name("task_struct").is_ok());
         let sidecar_mtime_after = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
         assert_eq!(
@@ -1565,8 +1673,6 @@ mod tests {
             "second load must hit sidecar cache — mtime bump proves a \
              redundant rewrite",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Simulating a stale sidecar by making its mtime older than
@@ -1584,12 +1690,10 @@ mod tests {
             return;
         }
 
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-btf-sidecar-stale-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let vmlinux = dir.join("vmlinux");
-        std::fs::copy(&path, &vmlinux).unwrap();
-        let sidecar = dir.join("vmlinux.btf");
+        let _env = crate::test_support::test_helpers::lock_env();
+        let staged = stage_in_cache(&path);
+        let vmlinux = staged.vmlinux.as_path();
+        let sidecar = btf_sidecar_path(vmlinux);
 
         // Plant a sidecar that predates vmlinux by writing garbage
         // and stamping its mtime into the past. `set_times` is the
@@ -1602,11 +1706,11 @@ mod tests {
 
         // Precondition: sidecar is older than vmlinux.
         assert!(
-            !sidecar_fresh(&sidecar, &vmlinux),
+            !sidecar_fresh(&sidecar, vmlinux),
             "precondition: planted sidecar must be stale",
         );
 
-        let btf = load_btf_from_path(&vmlinux)
+        let btf = load_btf_from_path(vmlinux)
             .expect("load must succeed via ELF fallback despite stale sidecar");
         let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
 
@@ -1619,11 +1723,9 @@ mod tests {
             "load must overwrite stale sidecar with fresh BTF bytes",
         );
         assert!(
-            sidecar_fresh(&sidecar, &vmlinux),
+            sidecar_fresh(&sidecar, vmlinux),
             "sidecar must be fresh again after re-extraction",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Sidecar with correct mtime but garbage contents (no 0x9FEB
@@ -1640,21 +1742,19 @@ mod tests {
             return;
         }
 
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-btf-sidecar-corrupt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let vmlinux = dir.join("vmlinux");
-        std::fs::copy(&path, &vmlinux).unwrap();
-        let sidecar = dir.join("vmlinux.btf");
+        let _env = crate::test_support::test_helpers::lock_env();
+        let staged = stage_in_cache(&path);
+        let vmlinux = staged.vmlinux.as_path();
+        let sidecar = btf_sidecar_path(vmlinux);
         // Plant a sidecar that is newer than vmlinux but whose
         // contents do not carry the BTF magic.
         std::fs::write(&sidecar, b"not-btf-bytes").unwrap();
         assert!(
-            sidecar_fresh(&sidecar, &vmlinux),
+            sidecar_fresh(&sidecar, vmlinux),
             "precondition: planted sidecar must be mtime-fresh",
         );
 
-        let btf = load_btf_from_path(&vmlinux)
+        let btf = load_btf_from_path(vmlinux)
             .expect("load must recover when sidecar is fresh-but-corrupt");
         let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
 
@@ -1664,14 +1764,15 @@ mod tests {
             is_raw_btf(&sidecar_bytes),
             "corrupt sidecar must be overwritten on next load",
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// When the sidecar would be written to a read-only directory,
     /// the load must still succeed — sidecar writes are
     /// best-effort and never surface as errors. Exercises the
-    /// tracing::warn fallback in `write_btf_sidecar`'s error path.
+    /// tracing::warn fallback in `write_btf_sidecar`'s error path
+    /// while the path IS inside the cache root, so the
+    /// membership-guard skip cannot be the reason no sidecar
+    /// appears.
     #[test]
     #[cfg(unix)]
     fn load_btf_survives_readonly_sidecar_dir() {
@@ -1693,28 +1794,31 @@ mod tests {
             return;
         }
 
-        let dir = std::env::temp_dir().join(format!("ktstr-btf-sidecar-ro-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let vmlinux = dir.join("vmlinux");
-        std::fs::copy(&path, &vmlinux).unwrap();
-        // Mark directory read-only after the vmlinux is in place.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _env = crate::test_support::test_helpers::lock_env();
+        let staged = stage_in_cache(&path);
+        let vmlinux = staged.vmlinux.as_path();
+        let entry_dir = staged.entry_dir.as_path();
+        // Mark entry dir read-only after the vmlinux is in place so
+        // the sidecar's tempfile+rename within `write_btf_sidecar`
+        // fails on tempfile creation.
+        std::fs::set_permissions(entry_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         // Load must succeed despite the sidecar write failing.
-        let btf = load_btf_from_path(&vmlinux)
+        let btf = load_btf_from_path(vmlinux)
             .expect("load must succeed even when sidecar dir is read-only");
         let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
 
-        // Sidecar must not exist — write should have failed.
-        let sidecar = dir.join("vmlinux.btf");
+        // Sidecar must not exist — write should have failed at the
+        // best-effort layer, not at the membership guard.
+        let sidecar = btf_sidecar_path(vmlinux);
         assert!(
             !sidecar.exists(),
             "sidecar must not exist after write to read-only dir",
         );
 
-        // Restore permissions for cleanup.
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Restore permissions so the tempdir cleanup (TempDir drop)
+        // can recurse into the entry dir.
+        let _ = std::fs::set_permissions(entry_dir, std::fs::Permissions::from_mode(0o755));
     }
 
     /// Raw-BTF inputs (files that already carry 0x9FEB magic) must
@@ -1782,5 +1886,417 @@ mod tests {
         // not writable — we cannot assert much here beyond "load
         // must succeed," which the pre-existing tests already
         // cover.
+    }
+
+    /// A vmlinux that lives outside the configured cache root must
+    /// never have a sidecar written next to it. Models the
+    /// kernel-source-tree pollution shape that motivated the guard:
+    /// `KTSTR_CACHE_DIR` points at one tempdir, the vmlinux lives
+    /// in a sibling tempdir (the "source tree"), and the load must
+    /// produce parsed BTF without touching the source-tree
+    /// directory.
+    #[test]
+    fn sidecar_skipped_when_path_outside_cache_root() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let _env = crate::test_support::test_helpers::lock_env();
+        // KTSTR_CACHE_DIR points at one tempdir.
+        let cache_root = tempfile::TempDir::new().expect("cache root tempdir");
+        let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            cache_root.path(),
+        );
+        // vmlinux lives in a sibling tempdir — outside the cache
+        // root, simulating a kernel source tree.
+        let source_tree = tempfile::TempDir::new().expect("source-tree tempdir");
+        let vmlinux = source_tree.path().join("vmlinux");
+        std::fs::copy(&path, &vmlinux).expect("copy vmlinux into source-tree dir");
+
+        let btf = load_btf_from_path(&vmlinux)
+            .expect("load must succeed even when sidecar is suppressed");
+        let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+
+        let sidecar = btf_sidecar_path(&vmlinux);
+        assert!(
+            !sidecar.exists(),
+            "sidecar must not be written when vmlinux path is outside cache root, got {}",
+            sidecar.display(),
+        );
+    }
+
+    /// A vmlinux that lives inside the configured cache root must
+    /// have its sidecar written. Sibling assertion to
+    /// `sidecar_skipped_when_path_outside_cache_root`: the guard
+    /// must not be a blanket suppression, only an out-of-cache
+    /// suppression.
+    #[test]
+    fn sidecar_written_when_path_inside_cache_root() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let _env = crate::test_support::test_helpers::lock_env();
+        let staged = stage_in_cache(&path);
+        let vmlinux = staged.vmlinux.as_path();
+
+        let sidecar = btf_sidecar_path(vmlinux);
+        assert!(
+            !sidecar.exists(),
+            "precondition: sidecar must not exist before the load — \
+             a leftover from a prior test would falsely pass the post-load \
+             existence check",
+        );
+
+        let btf = load_btf_from_path(vmlinux).expect("load must succeed inside cache root");
+        let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+
+        assert!(
+            sidecar.exists(),
+            "sidecar must be written when vmlinux path is inside cache root, expected at {}",
+            sidecar.display(),
+        );
+        let bytes = std::fs::read(&sidecar).unwrap();
+        assert!(
+            is_raw_btf(&bytes),
+            "sidecar must contain raw BTF (0x9FEB magic) when written inside cache root",
+        );
+    }
+
+    /// Cache root that cannot be resolved (every cascade variable
+    /// removed) must produce `path_inside_cache_root == false` and
+    /// suppress the sidecar. The load itself must still succeed —
+    /// "no cache root" is not a failure mode for BTF resolution,
+    /// just for sidecar caching.
+    #[test]
+    fn sidecar_skipped_when_cache_root_unresolvable() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let _env = crate::test_support::test_helpers::lock_env();
+        // Strip every variable in the resolution cascade so
+        // resolve_cache_root_with_suffix has nothing to walk.
+        let _no_ktstr = crate::test_support::test_helpers::EnvVarGuard::remove("KTSTR_CACHE_DIR");
+        let _no_xdg = crate::test_support::test_helpers::EnvVarGuard::remove("XDG_CACHE_HOME");
+        let _no_home = crate::test_support::test_helpers::EnvVarGuard::remove("HOME");
+
+        let source_tree = tempfile::TempDir::new().expect("source-tree tempdir");
+        let vmlinux = source_tree.path().join("vmlinux");
+        std::fs::copy(&path, &vmlinux).expect("copy vmlinux");
+
+        let btf = load_btf_from_path(&vmlinux)
+            .expect("load must succeed when cache root is unresolvable");
+        let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+
+        let sidecar = btf_sidecar_path(&vmlinux);
+        assert!(
+            !sidecar.exists(),
+            "sidecar must not be written when cache root is unresolvable, got {}",
+            sidecar.display(),
+        );
+    }
+
+    /// Symlink E2E: real vmlinux LIVES in the cache, a symlink to
+    /// it lives in a source tree. Loading via the symlink path
+    /// must canonicalize through to the cache and write the
+    /// sidecar NEXT TO THE REAL FILE — not next to the symlink.
+    /// The sidecar derivation MUST track the same canonical path
+    /// as the membership check.
+    #[test]
+    #[cfg(unix)]
+    fn load_btf_symlink_into_cache_writes_sidecar_in_cache_only() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let _env = crate::test_support::test_helpers::lock_env();
+        let staged = stage_in_cache(&path);
+        let real_vmlinux = staged.vmlinux.as_path();
+        let real_sidecar = btf_sidecar_path(real_vmlinux);
+        assert!(
+            !real_sidecar.exists(),
+            "precondition: real sidecar must not exist before the load",
+        );
+
+        // Symlink in a sibling tempdir (the "source tree") pointing
+        // at the real cached vmlinux.
+        let source_tree = tempfile::TempDir::new().expect("source-tree tempdir");
+        let symlink_path = source_tree.path().join("vmlinux");
+        std::os::unix::fs::symlink(real_vmlinux, &symlink_path)
+            .expect("create symlink to real vmlinux");
+        let lexical_sidecar = btf_sidecar_path(&symlink_path);
+
+        // Load via the symlink path. Post-fix, canonicalize at the
+        // top of load_btf_from_path resolves the symlink so the
+        // sidecar writes to <cache>/kentry/vmlinux.btf next to the
+        // real file. Pre-fix this flow missed the cache entirely:
+        // lexical parent (<source-tree>) canonicalizes outside the
+        // cache, the membership gate returns false, and the sidecar
+        // is suppressed for what is, after symlink resolution, a
+        // genuine cache entry.
+        let btf = load_btf_from_path(&symlink_path)
+            .expect("load via symlink must succeed and resolve the target");
+        let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+
+        assert!(
+            real_sidecar.exists(),
+            "sidecar must land at the canonical path inside cache, expected {}",
+            real_sidecar.display(),
+        );
+        assert!(
+            !lexical_sidecar.exists(),
+            "sidecar must NOT land next to the symlink in the source tree, \
+             got pollution at {}",
+            lexical_sidecar.display(),
+        );
+    }
+
+    /// Symlink E2E inverse: real vmlinux lives in a source tree,
+    /// symlink to it lives in the cache. Loading via the symlink
+    /// path must canonicalize through to the source-tree real file
+    /// — and the membership check on the canonical path returns
+    /// false, so NO sidecar is written anywhere. The cache
+    /// directory must remain free of sidecar files for symlinks
+    /// pointing OUT.
+    #[test]
+    #[cfg(unix)]
+    fn load_btf_symlink_out_of_cache_writes_no_sidecar() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let _env = crate::test_support::test_helpers::lock_env();
+        // Cache root with no real vmlinux inside it.
+        let cache_root = tempfile::TempDir::new().expect("cache-root tempdir");
+        let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            cache_root.path(),
+        );
+        // Real vmlinux in source tree (outside cache).
+        let source_tree = tempfile::TempDir::new().expect("source-tree tempdir");
+        let real_vmlinux = source_tree.path().join("vmlinux");
+        std::fs::copy(&path, &real_vmlinux).expect("copy vmlinux into source tree");
+        // Symlink in cache pointing at the real source-tree vmlinux.
+        let symlink_in_cache = cache_root.path().join("vmlinux");
+        std::os::unix::fs::symlink(&real_vmlinux, &symlink_in_cache)
+            .expect("create symlink to source-tree vmlinux");
+
+        let btf = load_btf_from_path(&symlink_in_cache).expect("load via symlink must succeed");
+        let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+
+        let real_sidecar = btf_sidecar_path(&real_vmlinux);
+        let lexical_sidecar = btf_sidecar_path(&symlink_in_cache);
+        assert!(
+            !real_sidecar.exists(),
+            "sidecar must not land in source tree (outside cache), got {}",
+            real_sidecar.display(),
+        );
+        assert!(
+            !lexical_sidecar.exists(),
+            "sidecar must not land at the symlink path in cache either — \
+             canonicalize-at-top resolves to the source-tree real file, \
+             which is outside the cache",
+        );
+    }
+
+    /// Relative path: pass a path that does not start with `/`,
+    /// confirm no sidecar lands at either the lexical relative
+    /// path's location or the absolute target.
+    ///
+    /// Production callers reach `load_btf_from_path` exclusively
+    /// through `find_vmlinux`, which returns absolute paths. A
+    /// relative-path invocation is unusual, and its semantics
+    /// depend on the test process's CWD: if CWD is unrelated to
+    /// the relative path's parent (the typical case during a test
+    /// run), the initial `fs::read` fails and the function returns
+    /// Err before reaching any sidecar branch. This pins:
+    ///
+    ///   * the function does not panic on a relative input;
+    ///   * no sidecar is written at the lexical relative-path
+    ///     location, so a CWD-relative pollution shape cannot leak
+    ///     past the membership gate even when canonicalize would
+    ///     otherwise have reached the cache;
+    ///   * no sidecar is written at the absolute target either —
+    ///     the read step never resolves to it.
+    #[test]
+    fn load_btf_relative_path_suppresses_sidecar() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let _env = crate::test_support::test_helpers::lock_env();
+        // Point KTSTR_CACHE_DIR somewhere isolated. The cache root
+        // is irrelevant for the assertion — we just want the load
+        // path to NOT be inside whatever it points at.
+        let cache_root = tempfile::TempDir::new().expect("cache-root tempdir");
+        let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            cache_root.path(),
+        );
+        // Stage a real vmlinux in a tempdir, then build a relative
+        // path referring to it. The relative path is constructed
+        // by stripping the leading `/` from the absolute path; from
+        // the test process's CWD (the cargo workspace root), this
+        // relative path will not resolve to a file, so the load's
+        // initial `fs::read` step fails and the function returns
+        // Err. The point of the test is the post-condition: NO
+        // sidecar appears anywhere as a side effect.
+        let outside = tempfile::TempDir::new().expect("outside tempdir");
+        let abs_vmlinux = outside.path().join("vmlinux");
+        std::fs::copy(&path, &abs_vmlinux).expect("copy vmlinux into outside dir");
+        let rel_str = abs_vmlinux
+            .to_str()
+            .expect("test vmlinux path must be UTF-8")
+            .strip_prefix('/')
+            .expect("absolute path expected to start with /");
+        let rel = std::path::Path::new(rel_str);
+        assert!(
+            !rel.is_absolute(),
+            "precondition: constructed path must be relative, got {}",
+            rel.display(),
+        );
+
+        let _ = load_btf_from_path(rel);
+        let abs_sidecar = btf_sidecar_path(&abs_vmlinux);
+        let rel_sidecar = btf_sidecar_path(rel);
+        assert!(
+            !abs_sidecar.exists(),
+            "sidecar must not appear at the absolute target, got {}",
+            abs_sidecar.display(),
+        );
+        assert!(
+            !rel_sidecar.exists(),
+            "sidecar must not appear at the relative path's lexical \
+             location, got {}",
+            rel_sidecar.display(),
+        );
+    }
+
+    /// Empty `KTSTR_CACHE_DIR=""` falls through the cascade per
+    /// `resolve_cache_root_with_suffix`. With the rest of the
+    /// cascade pointed at an isolated tempdir, the membership
+    /// check succeeds for paths inside the resolved root. Models
+    /// the operator who clears KTSTR_CACHE_DIR expecting
+    /// XDG/HOME to take over.
+    #[test]
+    fn load_btf_empty_ktstr_cache_dir_falls_through() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let _env = crate::test_support::test_helpers::lock_env();
+        let xdg = tempfile::TempDir::new().expect("xdg tempdir");
+        let _g_ktstr = crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_CACHE_DIR", "");
+        let _g_xdg =
+            crate::test_support::test_helpers::EnvVarGuard::set("XDG_CACHE_HOME", xdg.path());
+        // Resolved root: <xdg>/ktstr/kernels.
+        let resolved_root = xdg.path().join("ktstr").join("kernels");
+        let entry = resolved_root.join("kentry");
+        std::fs::create_dir_all(&entry).expect("create cache entry under XDG fallback");
+        let vmlinux = entry.join("vmlinux");
+        std::fs::copy(&path, &vmlinux).expect("copy vmlinux into XDG-derived cache");
+        let sidecar = btf_sidecar_path(&vmlinux);
+        assert!(
+            !sidecar.exists(),
+            "precondition: sidecar must not pre-exist",
+        );
+
+        let btf =
+            load_btf_from_path(&vmlinux).expect("load must succeed inside XDG-derived cache root");
+        let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+
+        assert!(
+            sidecar.exists(),
+            "sidecar must be written even when cascade resolves via XDG_CACHE_HOME \
+             (KTSTR_CACHE_DIR=\"\")",
+        );
+    }
+
+    /// Mid-process `KTSTR_CACHE_DIR` change: a load that wrote a
+    /// sidecar under cache_a must produce no sidecar under cache_b
+    /// for the same vmlinux on the next call after the env points
+    /// at cache_b. Pins that membership resolution does not stick
+    /// to a memoized first-call answer.
+    #[test]
+    fn load_btf_fresh_resolution_per_call() {
+        let Some(path) = crate::monitor::find_test_vmlinux() else {
+            return;
+        };
+        if path.starts_with("/sys/") {
+            return;
+        }
+
+        let _env = crate::test_support::test_helpers::lock_env();
+        // Two cache roots; vmlinux always sits inside cache_a.
+        let cache_a = tempfile::TempDir::new().expect("cache_a tempdir");
+        let cache_b = tempfile::TempDir::new().expect("cache_b tempdir");
+        let entry_a = cache_a.path().join("kentry");
+        std::fs::create_dir_all(&entry_a).expect("create cache_a entry");
+        let vmlinux = entry_a.join("vmlinux");
+        std::fs::copy(&path, &vmlinux).expect("copy vmlinux into cache_a");
+        let sidecar = btf_sidecar_path(&vmlinux);
+
+        // First call: KTSTR_CACHE_DIR points at cache_a → in-cache,
+        // sidecar written.
+        {
+            let _g = crate::test_support::test_helpers::EnvVarGuard::set(
+                "KTSTR_CACHE_DIR",
+                cache_a.path(),
+            );
+            assert!(
+                !sidecar.exists(),
+                "precondition: sidecar must not pre-exist"
+            );
+            let btf = load_btf_from_path(&vmlinux).expect("first load must succeed");
+            let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+            assert!(
+                sidecar.exists(),
+                "first load (KTSTR_CACHE_DIR=cache_a) must write sidecar",
+            );
+            // Wipe sidecar so the second call's outcome is unambiguous.
+            std::fs::remove_file(&sidecar).expect("remove sidecar between calls");
+        }
+
+        // Second call: KTSTR_CACHE_DIR moved to cache_b. The vmlinux
+        // is still under cache_a, so it is now outside the active
+        // cache → no sidecar should be written. A memoized cache
+        // root resolution would surface here as a stale `true` and
+        // the sidecar would reappear.
+        {
+            let _g = crate::test_support::test_helpers::EnvVarGuard::set(
+                "KTSTR_CACHE_DIR",
+                cache_b.path(),
+            );
+            let btf = load_btf_from_path(&vmlinux).expect("second load must succeed");
+            let _ = format!("{:?}", btf.resolve_types_by_name("task_struct").is_ok());
+            assert!(
+                !sidecar.exists(),
+                "second load (KTSTR_CACHE_DIR=cache_b) must NOT write sidecar — \
+                 the vmlinux is now outside the active cache root",
+            );
+        }
     }
 }
