@@ -617,7 +617,7 @@ pub(crate) fn entry_is_eol(entry: &CacheEntry, active_prefixes: &[String]) -> bo
 ///
 /// Returns major.minor prefixes for every stable/longterm/mainline
 /// entry on success. Propagates the underlying
-/// [`crate::fetch::fetch_releases`] error on failure (network error,
+/// [`crate::fetch::cached_releases`] error on failure (network error,
 /// HTTP status, JSON parse failure, missing releases array) so
 /// callers can distinguish "fetched and empty" (kernel.org shipped
 /// no active series — a violated assumption) from "fetch failed"
@@ -625,7 +625,14 @@ pub(crate) fn entry_is_eol(entry: &CacheEntry, active_prefixes: &[String]) -> bo
 ///
 /// See [`is_eol`]'s empty-slice guard for the recommended fallback pattern.
 pub(crate) fn fetch_active_prefixes() -> anyhow::Result<Vec<String>> {
-    let releases = crate::fetch::fetch_releases(crate::fetch::shared_client())?;
+    // Route through the process-wide releases.json cache so the
+    // EOL-annotation pass shares its fetch with the rayon-driven
+    // resolve pipeline that calls [`expand_kernel_range`] under
+    // `cargo ktstr`'s `resolve_kernel_set`. First caller across
+    // the whole process pays the network cost; every subsequent
+    // caller (within this command or peer Range/active-prefix
+    // consumers) clones the cached vector.
+    let releases = crate::fetch::cached_releases()?;
     Ok(active_prefixes_from_releases(&releases))
 }
 
@@ -2983,7 +2990,7 @@ pub fn download_and_cache_version(
 /// releases that fall inside `[start, end]` inclusive.
 ///
 /// Fetches kernel.org's `releases.json` once via
-/// [`crate::fetch::fetch_releases`], filters to rows whose `moniker`
+/// [`crate::fetch::cached_releases`], filters to rows whose `moniker`
 /// is `stable` or `longterm` (matching the policy
 /// [`crate::fetch::fetch_latest_stable_version`] uses for "is this a
 /// production release we want to test against"), drops any version
@@ -3033,7 +3040,16 @@ pub fn expand_kernel_range(start: &str, end: &str, cli_label: &str) -> Result<Ve
     })?;
 
     eprintln!("{cli_label}: expanding kernel range {start}..{end}");
-    let releases = crate::fetch::fetch_releases(crate::fetch::shared_client())?;
+    // Cached fetch: peer Range specs running in parallel under
+    // `cargo ktstr`'s `resolve_kernel_set` rayon pipeline share
+    // one network round-trip. The first Range to reach this
+    // helper populates [`crate::fetch::RELEASES_CACHE`]; every
+    // subsequent `--kernel A..B` call clones the cached vector
+    // and skips the kernel.org GET. A transient outage on the
+    // first call returns Err and leaves the cache un-populated,
+    // so the next caller re-attempts the network — failures
+    // never poison the cache.
+    let releases = crate::fetch::cached_releases()?;
 
     let versions = filter_and_sort_range(&releases, start_key, end_key);
     if versions.is_empty() {

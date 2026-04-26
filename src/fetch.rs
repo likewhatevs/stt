@@ -41,6 +41,78 @@ pub fn shared_client() -> &'static Client {
     SHARED_CLIENT.get_or_init(Client::new)
 }
 
+/// Process-wide cache of the parsed `releases.json` payload.
+/// Populated by [`cached_releases`] on its first successful fetch;
+/// every subsequent call returns a clone of the cached vector
+/// without re-issuing the HTTP request. Lifetime matches the
+/// process — `releases.json` does not change underneath a single
+/// CLI invocation, so a per-process cache cannot serve stale data
+/// in any way the user would notice.
+///
+/// Failures are NOT cached: a transient kernel.org outage that
+/// errors the first call must allow a later caller to retry, since
+/// the underlying network condition may have cleared. Storing
+/// `Vec<Release>` rather than `Result<Vec<Release>>` enforces this
+/// at the type level — there's no way to populate the cache with
+/// a failure.
+///
+/// Companion to [`SHARED_CLIENT`]: both amortize per-invocation
+/// network cost across the resolve pipeline. Without this cache,
+/// `cargo ktstr test --kernel 6.10..6.12 --kernel 6.14..6.16`
+/// fetches `releases.json` twice — once per Range spec — under
+/// the rayon par_iter that drives `resolve_kernel_set`. With
+/// the cache the first Range to reach `expand_kernel_range`
+/// populates the slot; the second observes the populated slot
+/// and skips the network entirely.
+static RELEASES_CACHE: OnceLock<Vec<Release>> = OnceLock::new();
+
+/// Fetch and cache `releases.json` via the process-wide
+/// [`shared_client`].
+///
+/// First successful call populates [`RELEASES_CACHE`]; subsequent
+/// calls clone the cached vector without re-issuing the HTTP
+/// request. A failed first call is NOT cached — the next caller
+/// re-attempts the network, so a transient kernel.org outage
+/// does not poison the cache for the rest of the process.
+///
+/// Top-level CLI flows that fan out to multiple consumers of
+/// `releases.json` (the rayon-driven `cargo ktstr` resolve
+/// pipeline that calls [`crate::cli::expand_kernel_range`] once
+/// per Range spec; the EOL-annotation pass in
+/// [`crate::cli::fetch_active_prefixes`]) should call this
+/// helper rather than [`fetch_releases`] directly so the
+/// network round-trip is paid at most once per process. Tests
+/// that need fault injection still call [`fetch_releases`] with
+/// a mock client to bypass the cache and exercise the underlying
+/// fetch path.
+///
+/// Two callers populating the cache concurrently is safe — the
+/// loser's `set` is silently discarded via `let _ = …` and they
+/// return their own freshly-fetched vector via `Ok(fresh)`.
+/// Both winner and loser return content-equivalent data since
+/// both fetched the same `releases.json`. Subsequent calls hit
+/// the cache via the leading `get` fast-path. Worst case under
+/// concurrent first calls: both callers do the network round-
+/// trip, but only one populates the cache; every later call —
+/// from any thread — observes the populated slot and skips the
+/// network entirely.
+pub(crate) fn cached_releases() -> Result<Vec<Release>> {
+    if let Some(cached) = RELEASES_CACHE.get() {
+        return Ok(cached.clone());
+    }
+    let fresh = fetch_releases(shared_client())?;
+    // `set` returns `Err(value)` if another thread populated the
+    // slot first; in that case the loser's `set` is silently
+    // discarded via `let _ = …` and they return their own
+    // freshly-fetched vector via `Ok(fresh)` below. Both winner
+    // and loser return content-equivalent data since both
+    // fetched the same `releases.json` from kernel.org.
+    // Subsequent calls hit the cache via the leading `get`
+    // fast-path at the top of this function.
+    let _ = RELEASES_CACHE.set(fresh.clone());
+    Ok(fresh)
+}
+
 /// Downloaded/cloned kernel source ready for building.
 #[non_exhaustive]
 pub struct AcquiredSource {
@@ -1123,6 +1195,124 @@ mod tests {
             "non-git cache_key must use local-unknown prefix, got {}",
             acquired.cache_key
         );
+    }
+
+    // -- cached_releases --
+
+    /// `cached_releases` returns a clone of [`RELEASES_CACHE`]
+    /// when the slot is already populated, without issuing any
+    /// network request. Pre-populating the OnceLock from the
+    /// test side bypasses the kernel.org GET entirely; the
+    /// helper's `if let Some(cached) = RELEASES_CACHE.get()`
+    /// fast-path returns the synthetic data verbatim.
+    ///
+    /// This test is the load-bearing proof that the cache works
+    /// at all — without it, every `cached_releases()` call would
+    /// re-fetch and the `OnceLock` would be dead code. The
+    /// vector returned must equal the synthetic input exactly,
+    /// proving the cache's `get()` path is wired through.
+    ///
+    /// Cross-test contamination note: this test populates the
+    /// process-wide `RELEASES_CACHE` static. No other test in
+    /// this binary calls `cached_releases()` end-to-end (the
+    /// `expand_kernel_range`-shaped tests in `cli.rs` all bypass
+    /// the network by calling the pure `filter_and_sort_range`
+    /// directly with synthetic releases), so the populated cache
+    /// does not leak into peer tests. If a future test calls
+    /// `cached_releases()` for real, it must run in a separate
+    /// binary or accept the synthetic-data side effect.
+    ///
+    /// Single test (no per-call iteration) because the OnceLock
+    /// only allows ONE populating set per process — re-running
+    /// the populate step in a second test method would either
+    /// silently drop on `set` or confuse the order-of-test-
+    /// execution dependency. Pinning the cache contract in one
+    /// test keeps the side effect localized and deterministic.
+    #[test]
+    fn cached_releases_returns_populated_cache_without_fetching() {
+        let synthetic = vec![
+            Release {
+                moniker: "stable".to_string(),
+                version: "6.14.2".to_string(),
+            },
+            Release {
+                moniker: "longterm".to_string(),
+                version: "6.12.81".to_string(),
+            },
+            Release {
+                moniker: "mainline".to_string(),
+                version: "6.16-rc3".to_string(),
+            },
+        ];
+
+        // Pre-populate the cache. `set` returns `Err(value)` if
+        // the slot was already populated by an earlier test in
+        // the same binary; in that case our test cannot prove
+        // the cache contract because we'd be reading the prior
+        // value instead. The static is initialized fresh per
+        // process and no other test in this binary populates it
+        // (verified via grep on the production callsites — only
+        // `expand_kernel_range` and `fetch_active_prefixes` call
+        // through, and neither runs in the unit-test binary).
+        // If the precondition fails, the assertion below catches
+        // it loudly rather than silently passing.
+        let set_result = super::RELEASES_CACHE.set(synthetic.clone());
+        assert!(
+            set_result.is_ok(),
+            "test precondition: RELEASES_CACHE must be empty before \
+             this test runs — a peer test populated it, breaking the \
+             cache-hit assertion below. nextest runs all unit tests \
+             of this crate in one process; reorder or split the \
+             offending test into a separate binary.",
+        );
+
+        // Cache hit: should return the synthetic data verbatim
+        // without any network round-trip. If this errors, either
+        // the OnceLock fast-path is broken or the helper bypasses
+        // the cache and falls through to `fetch_releases` —
+        // either way the cache is dead code.
+        let result = super::cached_releases().expect(
+            "cache hit must return Ok — a network attempt indicates \
+             the OnceLock fast-path is bypassed",
+        );
+        assert_eq!(
+            result.len(),
+            synthetic.len(),
+            "cached vector length must match populated value; got \
+             {} entries, populated {}",
+            result.len(),
+            synthetic.len(),
+        );
+        for (got, want) in result.iter().zip(synthetic.iter()) {
+            assert_eq!(
+                got.moniker, want.moniker,
+                "cached entry moniker must match populated value",
+            );
+            assert_eq!(
+                got.version, want.version,
+                "cached entry version must match populated value",
+            );
+        }
+
+        // Idempotency: a second call must return the same data.
+        // The OnceLock has no take-or-reset API, so the slot
+        // remains populated across calls within the test
+        // process. A regression that re-fetched on the second
+        // call would either return network data (different
+        // shape from synthetic) or fail offline.
+        let second = super::cached_releases().expect(
+            "second cache hit must also return Ok — a regression that \
+             cleared the cache between calls would surface here",
+        );
+        assert_eq!(
+            second.len(),
+            synthetic.len(),
+            "second call must return the same length as the first",
+        );
+        for (got, want) in second.iter().zip(synthetic.iter()) {
+            assert_eq!(got.moniker, want.moniker);
+            assert_eq!(got.version, want.version);
+        }
     }
 
     // -- proptest --
