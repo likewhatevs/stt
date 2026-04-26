@@ -64,12 +64,20 @@ This is all test authors need -- run with
 The `anyhow::Result` referenced in examples below is re-exported
 through `ktstr::prelude`; no separate `anyhow` dev-dependency needed.
 
-**Optional CLI tools** (`cargo install --locked ktstr`) installs two binaries:
+**Optional CLI tools** (`cargo install --locked ktstr`) installs
+the two user-facing binaries:
 
 - `ktstr` -- host-side CLI for running scenarios outside VMs and
   managing cached kernel images
 - `cargo-ktstr` -- wraps `cargo nextest run` with kernel resolution,
   coverage, verifier stats, and shell access
+
+The workspace defines two additional `[[bin]]` targets —
+`ktstr-jemalloc-probe` and `ktstr-jemalloc-alloc-worker` — but
+these are test-fixture binaries spawned by integration tests
+(`tests/jemalloc_probe_tests.rs`), not commands operators run
+directly; the `cargo install` flow does not surface them as
+user-facing entry points.
 
 `scx-ktstr` (the test fixture scheduler) is built automatically
 by the workspace and does not need a separate install.
@@ -177,12 +185,22 @@ numa_nodes = 1`. Unset dimensions inherit from the scheduler's
 topology. For non-uniform NUMA, see `Topology::with_nodes()` in the
 [topology guide](https://likewhatevs.github.io/ktstr/guide/concepts/topology.html).
 
-This generates a `const MY_SCHED: Scheduler` and per-variant flag
-constants. Tests referencing `MY_SCHED` inherit its topology and
-flags. Add `scheduler = MY_SCHED` to `#[ktstr_test]` to use it:
+This generates two consts and per-variant flag constants:
+
+- `const MY_SCHED: Scheduler` — the scheduler definition itself,
+  for use in builder chains and library code that needs the bare
+  `Scheduler` type.
+- `const MY_SCHED_PAYLOAD: Payload` — a `&'static Payload`
+  wrapper around `MY_SCHED` (kind: `PayloadKind::Scheduler`), used
+  wherever a `Payload` reference is expected. The `scheduler =`
+  slot on `#[ktstr_test]` is one such site; pass the
+  `_PAYLOAD` form, not the bare `Scheduler` form.
+
+Tests referencing `MY_SCHED_PAYLOAD` inherit its topology and
+flags. Add `scheduler = MY_SCHED_PAYLOAD` to `#[ktstr_test]` to use it:
 
 ```rust
-#[ktstr_test(scheduler = MY_SCHED)]
+#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
 fn sched_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("cg_0").workers(2),
@@ -203,7 +221,7 @@ For dynamic topology changes, use `execute_steps` with `Step` and
 ```rust
 use ktstr::prelude::*;
 
-#[ktstr_test(scheduler = MY_SCHED, llcs = 1, cores = 4, threads = 1)]
+#[ktstr_test(scheduler = MY_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1)]
 fn cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
@@ -215,6 +233,28 @@ fn cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 ```
+
+### Run a binary payload
+
+To run a binary workload (`schbench`, `fio`, `stress-ng`,
+anything else) as part of a test, declare a `Payload` and
+reference it via `payload = ...` (primary slot) or
+`workloads = [...]` (additional slots):
+
+```rust
+#[ktstr_test(scheduler = MY_SCHED_PAYLOAD, payload = SCHBENCH)]
+fn schbench_under_my_sched(ctx: &Ctx) -> Result<AssertResult> {
+    let report = ctx.payload(&SCHBENCH).run()?;
+    Ok(AssertResult::from(report))
+}
+```
+
+See
+[Payload Definitions](https://likewhatevs.github.io/ktstr/guide/writing-tests/scheduler-definitions.html#derive-payload)
+for the `#[derive(Payload)]` macro and the full field surface
+(`default_args`, `default_checks`, `metrics`, `include_files`).
+`tests/common/fixtures.rs` carries reusable examples
+(`SCHBENCH`, `SCHBENCH_HINTED`, `SCHBENCH_JSON`).
 
 ### Run
 

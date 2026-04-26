@@ -330,6 +330,44 @@ cargo ktstr kernel clean --corrupt-only --force   # remove only corrupt entries
 | `--force` | Skip confirmation prompt. Required in non-interactive contexts. |
 | `--corrupt-only` | Remove only corrupt cache entries (metadata missing or unparseable, image file absent). Valid entries are left untouched regardless of `--force`. Useful for clearing broken entries after an interrupted build without risking the curated set of good kernels. Mutually exclusive with `--keep`. |
 
+## model
+
+Manage the LLM model cache used by `OutputFormat::LlmExtract`
+payloads. `fetch` downloads the default pinned model into the
+ktstr model cache; `status` reports whether a SHA-checked copy
+is already cached.
+
+```sh
+cargo ktstr model fetch                          # download + SHA-check (no-op if cached)
+cargo ktstr model status                         # report cache path + verdict
+```
+
+`fetch` is a no-op when the cache already holds a SHA-checked
+copy. Respects `KTSTR_MODEL_OFFLINE=1` — set to refuse network
+fetches. Cache root resolution: `KTSTR_CACHE_DIR` (if set),
+then `$XDG_CACHE_HOME/ktstr/models/`, then
+`$HOME/.cache/ktstr/models/`.
+
+`status` prints four fields and adds a one-line annotation
+when the verdict is anything other than `Matches` (a clean
+hit gets no annotation):
+
+| Field | Description |
+|---|---|
+| `model:` | Model file name (the pinned default; e.g. `Qwen3-4B-Instruct.Q5_K_M.gguf`). |
+| `path:` | Absolute cache path (`{cache_root}/models/{file}`) the producer reads at LlmExtract time. |
+| `cached:` | `true` if an entry exists at `path:`, `false` otherwise. |
+| `checked:` | `true` if the cached entry's SHA-256 matches the pinned digest. |
+
+The annotation distinguishes four verdicts: `NotCached` (no
+entry — emit a `cargo ktstr model fetch` hint plus the
+expected download size), `CheckFailed` (cached entry could
+not be SHA-checked due to an I/O error — re-fetch),
+`Mismatches` (cached entry hash does not match the pinned
+digest — re-fetch), `Matches` (silent — the all-clear path).
+Re-fetch is the shared remediation tail for every cached-but-
+not-Matches branch.
+
 ## verifier
 
 Collect BPF verifier statistics for a scheduler. Builds the
@@ -670,6 +708,116 @@ cargo ktstr stats                    # reads the newest run
 
 Set `KTSTR_SIDECAR_DIR` to override the sidecar directory; otherwise
 the default is `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{timestamp}/`.
+
+## show-host
+
+Print the **live** host context used by the sidecar collector:
+CPU identity, memory/hugepage config, transparent-hugepage
+policy, NUMA node count, kernel uname triple
+(sysname / release / machine), kernel cmdline, and every
+`/proc/sys/kernel/sched_*` tunable. Useful for diagnosing
+cross-run regressions that trace back to host-context drift
+(sysctl change, THP policy flip, hugepage reservation) or for
+confirming what `cargo ktstr stats compare` would record on
+the next run produced here.
+
+```sh
+cargo ktstr show-host
+```
+
+This is a **live** snapshot (reads `/proc`, `/sys`, and
+`uname()` at invocation time). For the **archived** host
+context captured at sidecar-write time for a past run, use
+[`cargo ktstr stats show-host --run RUN_ID`](#show-host)
+instead — same `HostContext::format_human` formatter so the
+two outputs are byte-for-byte comparable when the host is
+unchanged.
+
+For historical drift between archived runs (host-side diff
+across two run partitions), use
+[`cargo ktstr stats compare`](#compare) — its host-delta
+section reports which host-context fields changed between
+side A and side B using the same `HostContext::diff` logic.
+
+## show-thresholds
+
+Print the resolved assertion thresholds for the named test —
+the same merged `Assert` value `run_ktstr_test_inner` evaluates
+against worker reports, produced by the runtime merge chain
+`Assert::default_checks().merge(entry.scheduler.assert()).merge(&entry.assert)`.
+Surfaces every threshold field (or `none` when inherited or
+unset) so an operator can see what the test will actually
+check against without reading source or guessing which layer
+contributed each bound.
+
+```sh
+cargo ktstr show-thresholds preempt_regression_fault_under_load
+```
+
+| Arg | Description |
+|------|-------------|
+| `TEST` | Function-name-only test identifier as registered in `#[ktstr_test]` (e.g. `preempt_regression_fault_under_load`). Use `cargo nextest list` to enumerate test names — then strip the `<binary>::` prefix that nextest prepends to each line before passing the name here. The `#[ktstr_test]` registry keys on the bare function name, so a name like `ktstr::my_test` (as printed by nextest) must be trimmed to `my_test` before it resolves. |
+
+Fails with an actionable message when no registered test
+matches the given name; the diagnostic includes a `Did you
+mean ...?` Levenshtein suggestion when a near match exists.
+
+## cleanup
+
+Clean up leftover ktstr cgroups. With no flags, scans
+`/sys/fs/cgroup` for the default ktstr parents — `ktstr/`
+(used by the in-process test harness) and every
+`ktstr-<pid>/` left behind by `ktstr run` instances — and
+rmdirs each. `ktstr-<pid>` directories whose `<pid>` still
+owns a live `ktstr` or `cargo-ktstr` process are skipped, so
+a concurrent cleanup run does not yank an active run's
+cgroup; each skip emits a `ktstr: skipping <path> (live
+process)` line on stderr.
+
+```sh
+cargo ktstr cleanup                               # scan defaults
+cargo ktstr cleanup --parent-cgroup /sys/fs/cgroup/ktstr-12345  # explicit path
+```
+
+| Flag | Description |
+|------|-------------|
+| `--parent-cgroup PATH` | Clean only this explicit path and leave the parent directory in place. No live-process check is performed. When omitted, the default scan path runs. |
+
+## locks
+
+Enumerate every ktstr flock held on this host — read-only,
+does NOT attempt any flock acquire. Troubleshooting companion
+for `--cpu-cap` contention: when a build or test is stalled
+behind a peer's reservation, `cargo ktstr locks` names the
+peer (PID + cmdline) without disturbing any of its flocks.
+
+Scans three lock-file roots:
+
+- `/tmp/ktstr-llc-*.lock` — per-LLC reservations held by
+  perf-mode test runs and `--cpu-cap`-bounded builds.
+- `/tmp/ktstr-cpu-*.lock` — per-CPU reservations from the
+  same flow.
+- `{cache_root}/.locks/*.lock` — cache-entry locks held
+  during `kernel build` writes.
+
+Each lock is cross-referenced against `/proc/locks` to name
+the holder PID and cmdline.
+
+```sh
+cargo ktstr locks                       # one-shot snapshot
+cargo ktstr locks --json                # JSON snapshot
+cargo ktstr locks --watch 1s            # redraw every second until SIGINT
+cargo ktstr locks --watch 1s --json     # ndjson stream, one object per interval
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--json` | off | Emit the snapshot as JSON. Pretty-printed in one-shot mode; compact (one object per line, ndjson-style) under `--watch`. Stable field names — schema documented on `ktstr::cli::list_locks`. |
+| `--watch DURATION` | unset | Redraw the snapshot at the given interval until SIGINT. Value is parsed by `humantime`: `100ms`, `1s`, `5m`, `1h`. Human output clears and redraws in place; `--json` emits one line-terminated object per interval. |
+
+The same subcommand is available as
+[`ktstr locks`](ktstr.md#locks) with identical flag
+semantics.
 
 ## Install
 

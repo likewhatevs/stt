@@ -24,9 +24,15 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     //            numa, llcs, cores/llc, threads/core
     .topology(1, 2, 4, 1);
 
-#[ktstr_test(scheduler = MY_SCHED)]
+// Wrap the bare `Scheduler` const in a `Payload` so it fits the
+// `scheduler =` slot's `&'static Payload` shape. `#[derive(Scheduler)]`
+// emits the wrapper as `{NAME}_PAYLOAD` automatically; the manual
+// builder path uses `Payload::from_scheduler` to do the same thing.
+const MY_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&MY_SCHED);
+
+#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
 fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1n2l4c1t from MY_SCHED
+    // Inherits 1n2l4c1t from MY_SCHED_PAYLOAD
     Ok(AssertResult::pass())
 }
 ```
@@ -68,7 +74,7 @@ so most tests do not need to set `numa_nodes`. See
 
 | Attribute | Default | Description |
 |---|---|---|
-| `scheduler = CONST` | `Scheduler::EEVDF` | Rust const path to a `Scheduler` definition |
+| `scheduler = CONST` | `&Payload::KERNEL_DEFAULT` | Rust const path to a `&'static Payload` whose kind is `PayloadKind::Scheduler`. The `_PAYLOAD` wrapper emitted by `#[derive(Scheduler)]` (e.g. `MY_SCHED_PAYLOAD`) is the expected form here; the bare `Scheduler` const will not type-check. The default `Payload::KERNEL_DEFAULT` wraps `Scheduler::EEVDF` (the kernel's default scheduler — EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
 | `watchdog_timeout_s` | 4 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 
@@ -203,16 +209,22 @@ enum MySchedFlag {
 }
 
 #[ktstr_test(
-    scheduler = MY_SCHED,
+    scheduler = MY_SCHED_PAYLOAD,
     not_starved = true,
     max_gap_ms = 5000,
     required_flags = [MySchedFlag::LLC],
 )]
 fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1n2l4c1t from MY_SCHED
+    // Inherits 1n2l4c1t from MY_SCHED_PAYLOAD
     Ok(AssertResult::pass())
 }
 ```
+
+`#[derive(Scheduler)]` emits two consts — the bare `MY_SCHED:
+Scheduler` (for builder composition) and `MY_SCHED_PAYLOAD:
+Payload` (for the `scheduler =` slot here). See
+[Scheduler Definitions](scheduler-definitions.md#defining-a-scheduler)
+for the full derive output.
 
 For the manual `FlagDecl` + builder pattern, see
 [Scheduler Definitions: Manual definition](scheduler-definitions.md#manual-definition).

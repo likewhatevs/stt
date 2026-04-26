@@ -22,7 +22,7 @@ stay compatible across ktstr version bumps that add new variants:
 | `SetAffinity` | Set worker affinity via `AffinityKind` |
 | `SpawnHost` | Spawn workers in the parent cgroup |
 | `MoveAllTasks` | Move all tasks from one cgroup to another |
-| `RunPayload` | Spawn a binary-kind `Payload` in the background and track its `PayloadHandle` under the step's payload set. Subsequent `WaitPayload` / `KillPayload` address it by `(payload.name, cgroup)`. Scheduler-kind payloads are rejected at apply time. |
+| `RunPayload` | Spawn a binary-kind [`Payload`](../writing-tests/scheduler-definitions.md#derive-payload) in the background and track its `PayloadHandle` under the step's payload set. Subsequent `WaitPayload` / `KillPayload` address it by `(payload.name, cgroup)`. Scheduler-kind payloads are rejected at apply time. |
 | `WaitPayload` | Block until the named payload exits naturally, evaluate its checks, and record metrics to the per-test sidecar. Target lookup is by `(name, cgroup)` composite key; `cgroup: None` resolves to the unique live copy. No timeout — pair with a bounded `HoldSpec` or the payload's own `--runtime` for time-boxed runs. |
 | `KillPayload` | SIGKILL the named payload, reap the child, evaluate checks, and record metrics. Same `(name, cgroup)` lookup rules as `WaitPayload`. Mirrors step-teardown drain for an explicitly-targeted payload. |
 
@@ -168,9 +168,20 @@ to an existing topology.
 setup and a hold period. The primary constructor for steps that
 create cgroups with workers.
 
-**`Step::with_ops(self, ops)`** -- replaces the ops on a step
+**`Step::set_ops(self, ops)`** -- REPLACES the ops on a step
 (builder method). Chain after `with_defs` to add dynamic operations
 to a step that also creates cgroups.
+
+> **Naming asymmetry:** `Step::set_ops` REPLACES; the sibling
+> `Backdrop::with_ops` APPENDS. The two methods deliberately use
+> different verbs to signal the different semantics. A
+> `Step::new(ops).set_ops(more)` chain produces a step whose ops
+> vec is exactly `more` (the original `ops` is dropped); a
+> `Backdrop::new().with_ops(ops_a).with_ops(ops_b)` chain
+> produces a backdrop whose ops vec is `ops_a + ops_b`. If you
+> need to extend a step's ops vec, build the combined `Vec<Op>`
+> at the call site and pass it to `set_ops`, or compose at the
+> `Backdrop` layer instead.
 
 ## HoldSpec
 

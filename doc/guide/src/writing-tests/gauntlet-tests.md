@@ -82,9 +82,16 @@ expands the gauntlet across kernels). See
 ## Tests that skip gauntlet
 
 - Entries with `host_only = true` never produce gauntlet variants
-  (no VM to vary topology on). See
-  [`host_only`](ktstr-test-macro.md#execution) for how that flag is
-  set.
+  (no VM to vary topology on). They also skip the kernel-dim
+  multiplication under multi-kernel runs: a `host_only` test
+  lists and runs **once** regardless of `KTSTR_KERNEL_LIST`
+  cardinality, since a host-side test never observes the kernel
+  directory and N copies of identical work would carry no
+  signal. See
+  [`host_only`](ktstr-test-macro.md#execution) for how that flag
+  is set, and
+  [Multi-kernel: kernel as a gauntlet dimension](../running-tests/cargo-ktstr.md#multi-kernel-kernel-as-a-gauntlet-dimension)
+  for the kernel-suffix dispatch contract.
 - Tests whose names start with `demo_` are ignored by default. Their
   gauntlet variants are also ignored (all gauntlet variants are
   ignored).

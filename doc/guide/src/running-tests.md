@@ -56,13 +56,30 @@ When `KTSTR_BUDGET_SECS` is not set, all tests are listed as usual.
 ## Custom scheduler
 
 Define a `Scheduler` with `SchedulerSpec::Discover` or
-`SchedulerSpec::Path` to test a pre-built scheduler binary:
+`SchedulerSpec::Path` to test a pre-built scheduler binary, then
+wrap it in a `Payload` so the `#[ktstr_test(scheduler = ...)]`
+slot accepts it:
 
 ```rust,ignore
 const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     .binary(SchedulerSpec::Discover("scx_my_sched"));
+
+// Wrap the bare `Scheduler` const in a `Payload` so it fits the
+// `scheduler =` slot's `&'static Payload` shape. Mirrors what
+// `#[derive(Scheduler)]` emits as `{NAME}_PAYLOAD` for the derive
+// path; the manual builder uses `Payload::from_scheduler`.
+const MY_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&MY_SCHED);
+
+#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
+fn my_sched_test(ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
 ```
 
 The binary is injected into the VM's initramfs and started before
 scenarios run. See [Test a New Scheduler](recipes/test-new-scheduler.md)
-for the full end-to-end workflow.
+for the full end-to-end workflow, and
+[Payload Definitions](writing-tests/scheduler-definitions.md#derive-payload)
+for the `Payload::from_scheduler` constructor and the
+`#[derive(Payload)]` macro that handles binary-kind workloads
+(`schbench`, `fio`, etc.).

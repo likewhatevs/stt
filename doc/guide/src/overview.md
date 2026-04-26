@@ -48,6 +48,15 @@ The prelude also exports low-level types (`CgroupGroup`,
 management, `Assert` for composable assertion config, and
 `WorkerReport` for telemetry access.
 
+For binary workloads (running `schbench`, `fio`, or any external
+executable as part of a test), see
+[Payload Definitions](writing-tests/scheduler-definitions.md#derive-payload).
+A `Payload` is the unified type for both binary workloads and the
+scheduler under test — `#[ktstr_test(payload = FIXTURE)]` runs a
+binary-kind payload alongside the cgroup workers, and the
+`scheduler =` slot accepts the scheduler-kind `_PAYLOAD` wrapper
+that `#[derive(Scheduler)]` emits.
+
 ## What it tests
 
 - **Fair scheduling** -- workers get CPU time without starvation or
@@ -98,13 +107,18 @@ scenario with BPF probes attached to the crash-path functions. See
 | Component | Purpose |
 |---|---|
 | `ktstr` (lib) | Core library |
-| `ktstr-macros` | `#[ktstr_test]` and `#[derive(Scheduler)]` proc macros |
+| `ktstr-macros` | `#[ktstr_test]`, `#[derive(Scheduler)]`, and `#[derive(Payload)]` proc macros |
 | `ktstr` (bin) | Host-side CLI |
 | `cargo-ktstr` (bin) | Cargo-integrated workflow: test, coverage, llvm-cov, kernel mgmt, verifier analysis, stats, interactive shell |
 | `scx-ktstr` | Minimal BPF scheduler for testing |
 
-Both `ktstr` and `cargo-ktstr` are `[[bin]]` targets in the same
-crate, so `cargo install --locked ktstr` installs both.
+`ktstr` and `cargo-ktstr` are the two user-facing `[[bin]]`
+targets in the crate; `cargo install --locked ktstr` installs
+both. The crate also defines two test-fixture `[[bin]]`
+targets — `ktstr-jemalloc-probe` and
+`ktstr-jemalloc-alloc-worker` — used by the
+`tests/jemalloc_probe_tests.rs` integration tests; those are
+not surfaced as operator-facing commands.
 
 ## Kernel config
 

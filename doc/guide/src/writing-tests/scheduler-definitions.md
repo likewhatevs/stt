@@ -104,13 +104,23 @@ This generates:
 
 - `static` `FlagDecl` entries for each variant
 - A `&[&FlagDecl]` flags array
-- `const MY_SCHED: Scheduler` with all builder methods applied
+- `const MY_SCHED: Scheduler` with all builder methods applied —
+  the bare `Scheduler` form, suitable for library code that
+  composes `Scheduler` builders directly.
+- `const MY_SCHED_PAYLOAD: Payload` — a `Payload` wrapper around
+  `MY_SCHED` (kind: `PayloadKind::Scheduler(&MY_SCHED)`). This
+  is the form that `#[ktstr_test(scheduler = ...)]` expects: the
+  test entry's scheduler slot is `&'static Payload`, not
+  `&'static Scheduler`. Pass `MY_SCHED_PAYLOAD` to that slot;
+  the bare `MY_SCHED` form will not type-check.
 - `impl MySchedFlag` with `&'static str` constants for each variant's
   kebab-case name (e.g. `MySchedFlag::LLC`, `MySchedFlag::STEAL`)
 
-The const name is derived from the enum name by stripping a trailing
-`Flag`/`Flags` suffix and converting to SCREAMING_SNAKE_CASE:
-`MySchedFlag` -> `MY_SCHED`, `EevdfFlags` -> `EEVDF`.
+The const name stem is derived from the enum name by stripping a
+trailing `Flag`/`Flags` suffix and converting to SCREAMING_SNAKE_CASE:
+`MySchedFlag` -> `MY_SCHED`, `EevdfFlags` -> `EEVDF`. The
+`Scheduler` const uses the stem verbatim; the `Payload` wrapper
+appends `_PAYLOAD` (so `MY_SCHED` + `MY_SCHED_PAYLOAD`).
 
 Variant names are converted to kebab-case for the flag name:
 `RejectPin` -> `"reject-pin"`, `NoCtrl` -> `"no-ctrl"`.

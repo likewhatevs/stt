@@ -144,6 +144,7 @@ on all exit paths.
 | `--dmesg` | off | Forward kernel console (COM1/dmesg) to stderr in real-time. Sets loglevel=7 for verbose kernel output. |
 | `--exec CMD` | -- | Run a command in the VM instead of an interactive shell. The VM exits after the command completes. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
+| `--cpu-cap N` | unset | Reserve only N host CPUs for the shell VM (integer ≥ 1). **Requires `--no-perf-mode`** — perf-mode already holds every LLC exclusively, so capping under perf-mode would double-reserve. The planner walks whole LLCs in consolidation- and NUMA-aware order, partial-taking the last LLC so `plan.cpus.len() == N` exactly. Mutually exclusive with `KTSTR_BYPASS_LLC_LOCKS=1`. Also settable via `KTSTR_CPU_CAP` env var (CLI flag wins when both are present). |
 
 `cargo ktstr shell` runs the same VM boot flow and differs in one
 respect: it accepts raw image file paths for `--kernel` (e.g.
@@ -195,6 +196,41 @@ time.
 |------|-------------|
 | `BASELINE` | Path to the baseline `.hst.zst` snapshot. |
 | `CANDIDATE` | Path to the candidate `.hst.zst` snapshot. |
+
+### locks
+
+Enumerate every ktstr flock held on this host. Read-only —
+does NOT attempt any flock acquire. Useful as a troubleshooting
+companion for `--cpu-cap` contention: when a build or test is
+stalled behind a peer's reservation, `ktstr locks` names the
+peer (PID + cmdline) without disturbing any of its flocks.
+
+Scans three lock-file roots:
+
+- `/tmp/ktstr-llc-*.lock` — per-LLC reservations held by
+  perf-mode test runs and `--cpu-cap`-bounded builds.
+- `/tmp/ktstr-cpu-*.lock` — per-CPU reservations from the
+  same flow.
+- `{cache_root}/.locks/*.lock` — cache-entry locks held
+  during `kernel build` writes.
+
+Each lock is cross-referenced against `/proc/locks` to name the
+holder PID and cmdline.
+
+```sh
+ktstr locks                       # one-shot snapshot
+ktstr locks --json                # JSON snapshot
+ktstr locks --watch 1s            # redraw every second until SIGINT
+ktstr locks --watch 1s --json     # ndjson stream, one object per interval
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--json` | off | Emit the snapshot as JSON. Pretty-printed in one-shot mode; compact (one object per line, ndjson-style) under `--watch`. Stable field names — schema documented on `ktstr::cli::list_locks`. |
+| `--watch DURATION` | unset | Redraw the snapshot at the given interval until SIGINT. Value is parsed by `humantime`: `100ms`, `1s`, `5m`, `1h`. Human output clears and redraws in place; `--json` emits one line-terminated object per interval. |
+
+The same subcommand is available as `cargo ktstr locks` with
+identical flag semantics.
 
 ### completions
 
