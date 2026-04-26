@@ -103,11 +103,16 @@ pub(crate) fn cached_releases() -> Result<Vec<Release>> {
 /// clone bypasses the cache. Always pass `shared_client()`
 /// directly — never a clone — when cache routing is desired.
 ///
-/// Note: evaluating this predicate initializes [`SHARED_CLIENT`]
-/// if not already populated, because `shared_client()` calls
-/// `get_or_init`.
+/// Side-effect-free when [`SHARED_CLIENT`] is uninitialized:
+/// no client can equal a not-yet-allocated singleton, so we
+/// return `false` without triggering `get_or_init` — tests
+/// that pass a local `Client` before any production code path
+/// has touched the singleton skip the construction entirely.
 fn is_shared_client(client: &Client) -> bool {
-    std::ptr::eq(client, shared_client())
+    match SHARED_CLIENT.get() {
+        Some(singleton) => std::ptr::eq(client, singleton),
+        None => false,
+    }
 }
 
 /// Unified cache-aware entry point for `releases.json`. Routes
@@ -1257,42 +1262,54 @@ mod tests {
 
     // -- cached_releases --
 
-    /// `cached_releases` returns a clone of [`RELEASES_CACHE`]
-    /// when the slot is already populated, without issuing any
-    /// network request. Pre-populating the OnceLock from the
-    /// test side bypasses the kernel.org GET entirely; the
-    /// helper's `if let Some(cached) = RELEASES_CACHE.get()`
-    /// fast-path returns the synthetic data verbatim.
+    /// Pin every routing property of [`cached_releases_with`]
+    /// in one test, since the underlying [`RELEASES_CACHE`]
+    /// `OnceLock` only allows one populating `set` per process.
+    /// Each block below is a distinct assertion:
     ///
-    /// This test is the load-bearing proof that the cache works
-    /// at all — without it, every `cached_releases()` call would
-    /// re-fetch and the `OnceLock` would be dead code. The
-    /// vector returned must equal the synthetic input exactly,
-    /// proving the cache's `get()` path is wired through.
+    /// (a) **Cache-hit fast-path**: pre-populating
+    ///     [`RELEASES_CACHE`] with synthetic data and calling
+    ///     [`cached_releases`] returns the synthetic vector
+    ///     verbatim — the `if let Some(cached) = ... .get()`
+    ///     path is exercised, not [`fetch_releases`].
     ///
-    /// Cross-test contamination note: this test populates the
-    /// process-wide `RELEASES_CACHE` static. No other test in
-    /// this binary calls `cached_releases()` or any of the
-    /// cache-routed `fetch_*` family
+    /// (b) **Idempotency**: a second [`cached_releases`] call
+    ///     returns the same data — the slot remains populated
+    ///     across calls within the process.
+    ///
+    /// (c) **Singleton-path public-fn routing**:
+    ///     [`fetch_latest_stable_version`] called with
+    ///     [`shared_client`] reaches [`RELEASES_CACHE`] via
+    ///     [`cached_releases_with`] and selects from the
+    ///     synthetic data without touching the network.
+    ///
+    /// (d) **Bypass-branch routing**: a non-singleton local
+    ///     [`Client`] passed to [`cached_releases_with`] does
+    ///     NOT consult [`RELEASES_CACHE`] even when populated.
+    ///
+    /// Cross-test contamination: this test populates the
+    /// process-wide [`RELEASES_CACHE`] AND initializes the
+    /// process-wide [`SHARED_CLIENT`] (via the
+    /// [`shared_client`] call in block (c)). Both are
+    /// `OnceLock` statics — peer tests in the same binary
+    /// observe both as populated/initialized after this test
+    /// runs. No other test in this binary calls
+    /// [`cached_releases`] or any cache-routed `fetch_*` entry
     /// ([`fetch_latest_stable_version`],
     /// [`fetch_version_for_prefix`], `latest_in_series`) with
-    /// `shared_client()` — the `expand_kernel_range`-shaped
-    /// tests in `cli.rs` all bypass the network by calling the
-    /// pure `filter_and_sort_range` directly with synthetic
-    /// releases, and no test passes the singleton to a cache-
-    /// routed entry. The populated cache does not leak into
-    /// peer tests. If a future test calls any cache-routed
-    /// entry with `shared_client()`, it must run in a separate
-    /// binary or accept the synthetic-data side effect.
-    ///
-    /// Single test (no per-call iteration) because the OnceLock
-    /// only allows ONE populating set per process — re-running
-    /// the populate step in a second test method would either
-    /// silently drop on `set` or confuse the order-of-test-
-    /// execution dependency. Pinning the cache contract in one
-    /// test keeps the side effect localized and deterministic.
+    /// [`shared_client`] — the `expand_kernel_range`-shaped
+    /// tests in `cli.rs` bypass the network by calling
+    /// `filter_and_sort_range` directly with synthetic
+    /// releases. The
+    /// `is_shared_client_recognizes_process_singleton` and
+    /// `is_shared_client_rejects_test_constructed_clients`
+    /// tests touch [`SHARED_CLIENT`] but not
+    /// [`RELEASES_CACHE`], so they coexist with this test. A
+    /// future test that calls any cache-routed entry with
+    /// [`shared_client`] must run in a separate binary or
+    /// accept the synthetic-data side effect.
     #[test]
-    fn cached_releases_returns_populated_cache_without_fetching() {
+    fn cached_releases_routing_singleton_and_bypass() {
         let synthetic = vec![
             Release {
                 moniker: "stable".to_string(),
@@ -1377,6 +1394,56 @@ mod tests {
             assert_eq!(got.moniker, want.moniker);
             assert_eq!(got.version, want.version);
         }
+
+        // End-to-end singleton path through a public fetch
+        // function: `fetch_latest_stable_version(shared_client(),
+        // ...)` must consult `RELEASES_CACHE` via
+        // `cached_releases_with` and return "6.12.81" without
+        // issuing any network request. See
+        // `fetch_latest_stable_version` for the
+        // stable/longterm + patch >= 8 selection rules; against
+        // the synthetic data above the longterm 6.12.81 entry
+        // is the first match. A regression that bypassed the
+        // cache would attempt a real kernel.org fetch.
+        let latest = super::fetch_latest_stable_version(super::shared_client(), "test")
+            .expect("public-fn singleton path must reach cache");
+        assert_eq!(
+            latest, "6.12.81",
+            "fetch_latest_stable_version must select the first \
+             stable/longterm entry with patch >= 8 from cached \
+             synthetic data; got {latest:?}",
+        );
+
+        // Bypass branch through `cached_releases_with` with a
+        // non-singleton `Client`: the cache must NOT be consulted
+        // even though it is populated above. The 1ms connect
+        // timeout fires before any TCP handshake to kernel.org
+        // can complete on essentially any real network, producing
+        // an `Err`. If a fast-enough route somehow returns Ok,
+        // the response cannot be the synthetic data — proving
+        // routing took the bypass branch either way.
+        let local = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(1))
+            .build()
+            .expect("build local Client");
+        let bypass_result = super::cached_releases_with(&local);
+        match bypass_result {
+            Err(_) => {
+                // Expected: 1ms timeout fires before the real
+                // network can answer. Bypass branch correctly
+                // delegated to fetch_releases(&local).
+            }
+            Ok(real) => {
+                assert!(
+                    real.len() != synthetic.len()
+                        || real.iter().zip(synthetic.iter()).any(|(got, want)| {
+                            got.version != want.version || got.moniker != want.moniker
+                        },),
+                    "bypass branch returned the synthetic cache contents — \
+                     cache routing leaked across the pointer-equality gate",
+                );
+            }
+        }
     }
 
     // -- is_shared_client --
@@ -1419,14 +1486,17 @@ mod tests {
     /// ignored in favor of the cache.
     #[test]
     fn is_shared_client_rejects_test_constructed_clients() {
-        // Force the singleton's `OnceLock::get_or_init` to run
-        // BEFORE we construct any local clients. Without this,
-        // pointer disambiguation depends on implicit allocation
-        // ordering — locals built first might happen to land at
-        // a lower address than the not-yet-initialized singleton.
-        // Forcing the init order makes the test's intent explicit
-        // and the comparison address-stable regardless of
-        // surrounding allocator state.
+        // Force singleton construction before building local
+        // clients so the test exercises the production-path
+        // `ptr::eq` arm of `is_shared_client`, not just the
+        // uninitialized-`SHARED_CLIENT` early-out. Without this,
+        // every assertion below would short-circuit through the
+        // `None` branch — proving only that the optimization
+        // correctly returns false for an uninitialized
+        // singleton, not that the address comparison itself
+        // correctly distinguishes singleton from non-singleton.
+        // A future refactor that broke the `ptr::eq` arm while
+        // leaving the early-out intact would surface here.
         let _ = super::shared_client();
         let local = reqwest::blocking::Client::new();
         assert!(
