@@ -70,7 +70,7 @@ pub(crate) use args::{
     extract_flags_arg, extract_probe_stack_arg, extract_test_fn_arg, extract_topo_arg,
     extract_work_type_arg,
 };
-pub use sidecar::{SidecarResult, newest_run_dir, runs_root};
+pub use sidecar::{SidecarResult, collect_pool, newest_run_dir, runs_root};
 pub(crate) use sidecar::{
     collect_sidecars, format_callback_profile, format_kvm_stats, format_verifier_stats, sidecar_dir,
 };

@@ -383,12 +383,11 @@ Sidecar analysis and run-to-run comparison. See
 cargo ktstr stats                                             # print analysis of newest run
 cargo ktstr stats list                                        # list runs
 cargo ktstr stats list-metrics                                # list registered regression metrics
-cargo ktstr stats compare <a> <b>                             # compare two runs
-cargo ktstr stats compare <a> <b> -E filt                     # substring filter
-cargo ktstr stats compare <a> <b> --scheduler scx_rusty       # pin scheduler
-cargo ktstr stats compare <a> <b> --work-type CpuSpin         # pin work type
-cargo ktstr stats compare <a> <b> --commit abcdef1            # pin ktstr commit
-cargo ktstr stats compare <a> <b> --average                   # average across trials
+cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15     # slice on kernel
+cargo ktstr stats compare --a-scheduler scx_rusty --b-scheduler scx_alpha  # slice on scheduler
+cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 --scheduler scx_rusty  # slice on kernel, pin scheduler on both sides
+cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 -E cgroup_steady       # add substring filter
+cargo ktstr stats compare --a-commit abcdef1 --b-commit fedcba2 --no-average     # opt out of trial averaging
 ```
 
 When invoked without a subcommand, prints gauntlet analysis from
@@ -457,24 +456,100 @@ returning empty output.
 
 ### compare
 
-Load two run directories, join on (scenario, topology, work_type),
-compute per-metric deltas using `MetricDef` polarity and
-thresholds from the unified metric registry, and print colored output
-(red = regression, green = improvement). Exits non-zero on regression.
+Pool every sidecar under `target/ktstr/` (or `--dir`), partition
+the rows into A and B sides via per-side filter flags, average
+each side's matching sidecars per pairing key (or pass through
+distinct sidecars under `--no-average`), and report regressions
+on the A→B delta. Exits non-zero on regression.
+
+The dimensions on which the A and B filters DIFFER are the
+SLICING dimensions — the axes of the A/B contrast. Every other
+dimension is part of the dynamic PAIRING key the comparison
+joins on. Slicing dims are derived automatically from the
+filters:
+
+```sh
+# Slice on kernel: A is 6.14, B is 6.15. Pair on every other dim.
+cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15
+
+# Slice on kernel AND scheduler simultaneously.
+cargo ktstr stats compare \
+    --a-kernel 6.14 --a-scheduler scx_rusty \
+    --b-kernel 6.15 --b-scheduler scx_alpha
+
+# Slice on commit, narrow both sides to one scheduler+kernel.
+cargo ktstr stats compare \
+    --a-commit abcdef1 --b-commit fedcba2 \
+    --kernel 6.14 --scheduler scx_rusty
+```
+
+**Symmetric sugar.** Shared `--X` flags (`--kernel`, `--scheduler`,
+`--topology`, `--work-type`, `--commit`, `--flag`) pin BOTH
+sides to the same value(s). Per-side `--a-X` / `--b-X` flags
+REPLACE the corresponding shared `--X` value for that side
+only — "more-specific replaces" semantics. So
+`--kernel 6.14 --a-kernel 6.13` puts A on 6.13 and B on 6.14.
+
+**Validation.** The dispatch site rejects two cases up front:
+- **Empty slicing**: no `--a-X` / `--b-X` at all, OR the per-side
+  flags resolve to identical effective filters. Bails with
+  "specify at least one per-side filter (e.g. `--a-kernel 6.14
+  --b-kernel 6.15`) to define what dimension separates the two
+  sides."
+- **Multi-dim slicing**: slicing on more than one dimension
+  prints a warning to stderr ("warning: slicing on N
+  dimensions; results compress multiple axes into a single A/B
+  contrast") but continues — multi-dim contrasts are a
+  deliberate feature for cohort sweeps.
+
+**Averaging.** By default the comparison aggregates every
+matching sidecar within each side into a single arithmetic-mean
+row per pairing key, smoothing run-to-run jitter. Failing /
+skipped contributors are excluded from the metric mean; the
+aggregated row's `passed` is the AND across every contributor.
+A header line above the comparison table reads `averaged across
+N runs (A) and M runs (B)` and a per-group
+`passes_observed/total_observed` block prints below the summary.
+
+`--no-average` keeps each sidecar distinct. If multiple sidecars
+on the same side share the same pairing key under `--no-average`,
+the comparison bails with "duplicate pairing keys" — pairing
+across A/B sides is ambiguous when one A-row could match many
+B-rows. Either drop `--no-average` to average them, or add
+another per-side filter to disambiguate.
+
+**Kernel match shape.** A `--kernel 6.12` filter (two-segment
+major.minor) PREFIX-matches every patch release in that series:
+`6.12`, `6.12.0`, `6.12.5` all match. A three-or-more-segment
+filter (`--kernel 6.14.2`, `--kernel 6.15-rc3`) is strict
+equality — `6.14.2` does NOT match `6.14.20`. The same shape
+applies to `--a-kernel` / `--b-kernel`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-E FILTER` | -- | Substring filter applied to `scenario topology scheduler work_type`. The scheduler is searchable via the filter but is not part of the pairing key, so the same `(scenario, topology, work_type)` pair still compares across different scheduler binaries when the filter does not constrain it. |
-| `--kernel VER` (repeatable) | -- | Strict equality match against the sidecar's `kernel_version` field (e.g. `--kernel 6.14.2 --kernel 6.15.0` keeps rows whose kernel is 6.14.2 OR 6.15.0). Rows with no recorded kernel version never match a populated filter. Same flag name as on `cargo ktstr test`/`coverage`/`llvm-cov` for consistency across subcommands. |
-| `--commit HASH` (repeatable) | -- | Strict equality match against the sidecar's `project_commit` field (7-char hex, optional `-dirty` suffix). Repeatable: `--commit A --commit B` keeps rows whose `project_commit` equals A OR B. Rows with no recorded commit never match a populated filter. Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. |
-| `--scheduler NAME` | -- | Strict equality match against the sidecar's `scheduler` field (e.g. `--scheduler scx_rusty`). Unlike `-E`, which matches a substring across joined fields, this pins a specific scheduler. |
-| `--topology LABEL` | -- | Strict equality match against the rendered topology label (e.g. `--topology 1n2l4c2t`). The label is what `Topology::Display` produces; `cargo ktstr stats list` shows the form per-row. |
-| `--work-type TYPE` | -- | Strict equality match against the sidecar's `work_type` field (e.g. `--work-type CpuSpin`). Valid names are the PascalCase variants of `WorkType`; see `WorkType::ALL_NAMES` for the canonical variant list, or [Work types](../concepts/work-types.md). |
-| `--flag NAME` | -- | Repeatable AND-combined flag filter (e.g. `--flag llc --flag rusty_balance`). Every listed flag must be present in the row's `active_flags`; the row may carry additional flags beyond the filter set. |
-| `--average` | off | Aggregate every (scenario, topology, work_type, flags) group into a single row carrying the arithmetic mean of its passing contributors' metrics. Smooths run-to-run jitter when each side carries multiple trials per key. A header line above the comparison table reads `averaged across N runs (A) and M runs (B)`; a per-group `passes_observed/total_observed` block prints below the summary, naming each side independently (`-` for sides that lack the group entirely). Failing and skipped contributors are excluded from the metric mean; the aggregated row's `passed` is the AND across every contributor (a single failure flips the aggregate to `failed`, which routes the pair through `compare_rows`' `skipped_failed` gate). |
-| `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy` — use `--threshold` for a uniform bound, `--policy` when per-metric overrides are needed. |
-| `--policy FILE` | -- | Path to a JSON `ComparisonPolicy` file with per-metric thresholds. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }`. Priority is per-metric override → `default_percent` → each metric's registry `default_rel`. Per-metric keys are rejected at load time if they do not match a metric in the `METRICS` registry (catches typos). Mutually exclusive with `--threshold`. |
-| `--dir DIR` | `target/ktstr/` | Alternate run root to resolve `a` / `b` against. Defaults to `test_support::runs_root()` (typically `target/ktstr/`). Useful when comparing archived sidecar trees copied off a CI host. |
+| `-E FILTER` | -- | Substring filter applied to the joined `scenario topology scheduler work_type flags` string. Composes with the typed dimension filters: typed narrows happen first, substring runs over the surviving set. |
+| `--kernel VER` (repeatable) | -- | Pin BOTH sides to the listed kernel version(s). Sugar for `--a-kernel V1 --a-kernel V2 --b-kernel V1 --b-kernel V2`. Per-side `--a-kernel` / `--b-kernel` REPLACES this shared value for that side only. Major.minor (`6.12`) prefix-matches; three-segment (`6.14.2`) is strict. |
+| `--scheduler NAME` | -- | Pin BOTH sides to one scheduler. Sugar for `--a-scheduler N --b-scheduler N`. Strict equality. |
+| `--topology LABEL` | -- | Pin BOTH sides to one rendered topology label (e.g. `1n2l4c2t`). Strict equality. |
+| `--work-type TYPE` | -- | Pin BOTH sides to one work_type (PascalCase variant of `WorkType`, e.g. `CpuSpin`). See [Work types](../concepts/work-types.md). |
+| `--commit HASH` (repeatable) | -- | Pin BOTH sides to listed `project_commit` value(s) (7-char hex, optional `-dirty` suffix). Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. |
+| `--flag NAME` | -- | Repeatable AND-combined flag filter pinning BOTH sides. Every listed flag must appear in `active_flags`; rows may carry additional flags. |
+| `--a-kernel VER` (repeatable) | -- | A-side kernel filter. Replaces the shared `--kernel` for the A side only. |
+| `--a-scheduler NAME` | -- | A-side scheduler filter. Replaces the shared `--scheduler` for the A side only. |
+| `--a-topology LABEL` | -- | A-side topology filter. Replaces the shared `--topology` for the A side only. |
+| `--a-work-type TYPE` | -- | A-side work_type filter. Replaces the shared `--work-type` for the A side only. |
+| `--a-commit HASH` (repeatable) | -- | A-side commit filter. Replaces the shared `--commit` for the A side only. |
+| `--a-flag NAME` (repeatable) | -- | A-side flag filter. Replaces the shared `--flag` for the A side only. |
+| `--b-kernel VER` (repeatable) | -- | B-side kernel filter. Replaces the shared `--kernel` for the B side only. |
+| `--b-scheduler NAME` | -- | B-side scheduler filter. Replaces the shared `--scheduler` for the B side only. |
+| `--b-topology LABEL` | -- | B-side topology filter. Replaces the shared `--topology` for the B side only. |
+| `--b-work-type TYPE` | -- | B-side work_type filter. Replaces the shared `--work-type` for the B side only. |
+| `--b-commit HASH` (repeatable) | -- | B-side commit filter. Replaces the shared `--commit` for the B side only. |
+| `--b-flag NAME` (repeatable) | -- | B-side flag filter. Replaces the shared `--flag` for the B side only. |
+| `--no-average` | off | Disable averaging. Each sidecar stays distinct; bails with an actionable error when multiple sidecars on the same side share the same pairing key (since pairing across sides becomes ambiguous). |
+| `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy`. |
+| `--policy FILE` | -- | Path to a JSON `ComparisonPolicy` file with per-metric thresholds. Schema: `{ "default_percent": N, "per_metric_percent": { "worst_spread": 5.0, ... } }`. Priority is per-metric override → `default_percent` → each metric's registry `default_rel`. Per-metric keys are rejected at load time if they do not match a metric in the `METRICS` registry. Mutually exclusive with `--threshold`. |
+| `--dir DIR` | `target/ktstr/` | Alternate runs root for pool collection. Defaults to `test_support::runs_root()` (typically `target/ktstr/`). Useful when comparing archived sidecar trees copied off a CI host. |
 
 ### Prerequisites
 

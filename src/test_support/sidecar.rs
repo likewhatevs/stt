@@ -341,6 +341,54 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
     sidecars
 }
 
+/// Pool every sidecar JSON under every run directory at `root`.
+///
+/// Walks each immediate subdirectory of `root` (one per run, named
+/// `{kernel}-{timestamp}` by [`sidecar_dir`]) and concatenates the
+/// sidecars each one yields via [`collect_sidecars`]. The result is
+/// a flat `Vec<SidecarResult>` covering every recorded run on disk
+/// — `cargo ktstr stats compare`'s pool-driven sourcing reads it
+/// once, applies the typed `--a-*` / `--b-*` filters in memory,
+/// and partitions the survivors into A/B sides.
+///
+/// `root` is typically [`runs_root`]; pass an alternate path when
+/// comparing archived sidecar trees copied off a CI host (the
+/// `--dir` escape hatch on `stats compare`).
+///
+/// Returns an empty Vec when `root` does not exist or contains no
+/// run directories. Per-run failure (a corrupt sidecar, a partial
+/// directory) prints a per-file `eprintln!` from
+/// [`collect_sidecars`] and continues — pool-collection never
+/// aborts on a single bad file.
+///
+/// Performance: this is a full filesystem walk over `root`. On a
+/// host with many archived runs (dozens to hundreds), each
+/// invocation re-reads every sidecar JSON. The cost is acceptable
+/// for the current operator workflow (one comparison per
+/// session) but is taskifyable if it becomes a hot path — a
+/// directory-name fast-path could skip runs whose
+/// `{kernel}-{timestamp}` prefix does not match the active
+/// `--a-kernel` / `--b-kernel` filter.
+pub fn collect_pool(root: &std::path::Path) -> Vec<SidecarResult> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut pool = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // `collect_sidecars` already handles "one level of
+            // subdirectories for per-job gauntlet layouts" inside
+            // each run directory, so the two-level
+            // `{root}/{run_dir}/{job_subdir}` shape works without
+            // a third walker level.
+            pool.extend(collect_sidecars(&path));
+        }
+    }
+    pool
+}
+
 /// BPF verifier complexity limit (BPF_COMPLEXITY_LIMIT_INSNS).
 const VERIFIER_INSN_LIMIT: u32 = 1_000_000;
 

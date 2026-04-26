@@ -26,6 +26,19 @@ use crate::workload::WorkType;
 /// the VMM internals.
 pub use crate::vmm::host_topology::CpuCap;
 
+/// Re-exports of the dimensional-slicing types used by
+/// `cargo-ktstr`'s `BuildCompareFilters::build()` plumbing. The
+/// `stats` module is `pub(crate)` (its tabular reporting types
+/// have no stable surface yet), but the `cargo-ktstr` binary needs
+/// `Dimension` and `derive_slicing_dims` to construct compare
+/// requests and to unit-test the filter-builder shape. Same
+/// pattern as `CpuCap` above: keep the canonical definitions in
+/// `stats` (where the comparison plumbing consumes them
+/// internally) and re-export the slim slicing surface through
+/// `cli` so the binaries reach them through the public `cli`
+/// module.
+pub use crate::stats::{Dimension, derive_slicing_dims};
+
 /// Shared `kernel` subcommand tree used by both `ktstr` and
 /// `cargo ktstr`. The two binaries embed this as
 /// `ktstr kernel <subcmd>` / `cargo ktstr kernel <subcmd>` and
@@ -1880,17 +1893,18 @@ pub fn list_metrics(json: bool) -> Result<String> {
     crate::stats::list_metrics(json)
 }
 
-/// Compare two test runs and report regressions.
-pub fn compare_runs(
-    a: &str,
-    b: &str,
+/// Compare two filter-defined partitions of the sidecar pool and
+/// report regressions across slicing dimensions. See
+/// [`crate::stats::compare_partitions`] for the full contract.
+pub fn compare_partitions(
+    filter_a: &RowFilter,
+    filter_b: &RowFilter,
     filter: Option<&str>,
-    row_filter: &RowFilter,
     policy: &ComparisonPolicy,
     dir: Option<&Path>,
-    average: bool,
+    no_average: bool,
 ) -> Result<i32> {
-    crate::stats::compare_runs(a, b, filter, row_filter, policy, dir, average)
+    crate::stats::compare_partitions(filter_a, filter_b, filter, policy, dir, no_average)
 }
 
 /// Re-export the comparison-policy type so downstream crates using

@@ -31,6 +31,14 @@ struct Ktstr {
     command: KtstrCommand,
 }
 
+// Same rationale as `StatsCommand`'s sibling `#[allow]` — clap's
+// derive expands every variant into a struct of `Option<T>` /
+// `Vec<T>` per CLI flag, which after #117's per-side slicing
+// flags pushes the Stats-via-Compare variant past clippy's
+// large-variant heuristic. The enum is constructed once per CLI
+// invocation and dispatched immediately; boxing every variant
+// would distort the match ergonomics without measurable benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum KtstrCommand {
     /// Build the kernel (if needed) and run tests via cargo nextest.
@@ -401,12 +409,18 @@ enum StatsCommand {
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
     },
-    /// Compare two test runs and report regressions.
+    /// Compare two filter-defined partitions of the sidecar pool
+    /// and report regressions across slicing dimensions.
+    ///
+    /// Each `--a-X` / `--b-X` pair pins a different value on
+    /// dimension `X` for the A and B sides; the dimensions on
+    /// which A and B differ are the SLICING dimensions, the
+    /// dimensions on which they agree are the PAIRING dimensions
+    /// the comparison joins on. Shared `--X` flags pin BOTH sides
+    /// to the same value (sugar that narrows pre-slicing scope).
+    /// Per-side `--a-X` / `--b-X` flags REPLACE the corresponding
+    /// shared `--X` value for that side — "more-specific replaces."
     Compare {
-        /// Run key A (from `cargo ktstr stats list`).
-        a: String,
-        /// Run key B (from `cargo ktstr stats list`).
-        b: String,
         /// Substring filter. Matches against scenario, topology,
         /// scheduler, work_type.
         #[arg(short = 'E', long)]
@@ -524,25 +538,56 @@ enum StatsCommand {
         /// repeats are rejected by clap (zero-width match).
         #[arg(long = "flag")]
         flags: Vec<String>,
-        /// Aggregate every (scenario, topology, work_type, flags)
-        /// group into a single row carrying the arithmetic mean
-        /// of its passing contributors' metrics. Smooths run-to-
-        /// run jitter when each side carries multiple trials per
-        /// key. A header line above the comparison table reads
-        /// `averaged across N runs (A) and M runs (B)`; a per-
-        /// group `passes_observed/total_observed` block prints
-        /// below the summary, naming each side independently
-        /// (`-` for sides that lack the group entirely).
+        /// A-side overrides: replace the corresponding shared
+        /// `--X` value for the A side only. See the per-side
+        /// semantics on each `--X` flag's doc.
+        #[arg(long = "a-kernel", action = ArgAction::Append)]
+        a_kernel: Vec<String>,
+        #[arg(long = "a-commit", action = ArgAction::Append)]
+        a_commit: Vec<String>,
+        #[arg(long = "a-scheduler")]
+        a_scheduler: Option<String>,
+        #[arg(long = "a-topology")]
+        a_topology: Option<String>,
+        #[arg(long = "a-work-type")]
+        a_work_type: Option<String>,
+        #[arg(long = "a-flag")]
+        a_flags: Vec<String>,
+
+        /// B-side overrides: replace the corresponding shared
+        /// `--X` value for the B side only. See the per-side
+        /// semantics on each `--X` flag's doc.
+        #[arg(long = "b-kernel", action = ArgAction::Append)]
+        b_kernel: Vec<String>,
+        #[arg(long = "b-commit", action = ArgAction::Append)]
+        b_commit: Vec<String>,
+        #[arg(long = "b-scheduler")]
+        b_scheduler: Option<String>,
+        #[arg(long = "b-topology")]
+        b_topology: Option<String>,
+        #[arg(long = "b-work-type")]
+        b_work_type: Option<String>,
+        #[arg(long = "b-flag")]
+        b_flags: Vec<String>,
+
+        /// Disable averaging. By default the comparison folds
+        /// every matching sidecar within each side into a single
+        /// arithmetic-mean row per pairing key; `--no-average`
+        /// keeps each sidecar distinct and bails with an
+        /// actionable diagnostic if multiple sidecars on the
+        /// same side share the same pairing key (otherwise
+        /// pairing across A/B sides is ambiguous).
         ///
-        /// Aggregation rules: failing/skipped contributors are
-        /// excluded from the metric mean (they would carry
-        /// failure-mode telemetry, not scheduler behaviour); the
-        /// aggregated row's `passed` is the AND across every
-        /// contributor (a single failure flips the aggregate to
-        /// `failed`, which routes the pair through `compare_rows`'
+        /// Aggregation rules under the default (averaging-on)
+        /// path: failing/skipped contributors are excluded from
+        /// the metric mean (they carry failure-mode telemetry,
+        /// not scheduler behaviour); the aggregated row's
+        /// `passed` is the AND across every contributor (a
+        /// single failure flips the aggregate to `failed`,
+        /// which routes the pair through `compare_rows`'
         /// `skipped_failed` gate).
-        #[arg(long)]
-        average: bool,
+        #[arg(long = "no-average")]
+        no_average: bool,
     },
 }
 
@@ -1039,8 +1084,6 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             }
         }
         Some(StatsCommand::Compare {
-            a,
-            b,
             filter,
             threshold,
             policy,
@@ -1051,7 +1094,19 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             topology,
             work_type,
             flags,
-            average,
+            a_kernel,
+            a_commit,
+            a_scheduler,
+            a_topology,
+            a_work_type,
+            a_flags,
+            b_kernel,
+            b_commit,
+            b_scheduler,
+            b_topology,
+            b_work_type,
+            b_flags,
+            no_average,
         }) => {
             // Resolve `--threshold N` / `--policy PATH` / neither
             // into a single `ComparisonPolicy`. Clap's
@@ -1083,27 +1138,40 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                     );
                 }
             };
-            // Typed filters compose with the substring `-E` filter:
-            // typed narrows happen first inside `compare_runs` (strict
-            // equality / AND-combined), then the substring runs over
-            // the surviving set inside `compare_rows`. See
-            // `RowFilter` doc for the full match-semantics contract.
-            let row_filter = ktstr::cli::RowFilter {
-                kernels: kernel.clone(),
-                commits: commit.clone(),
-                scheduler: scheduler.clone(),
-                topology: topology.clone(),
-                work_type: work_type.clone(),
-                flags: flags.clone(),
+            // Construct the BuildCompareFilters from the raw CLI
+            // inputs. Sugar logic (shared `--X` pins both sides;
+            // per-side `--a-X` / `--b-X` REPLACES the shared value
+            // for that side) lives inside `build()` so it's
+            // unit-testable in isolation. The dispatch site stays
+            // a dumb data carrier.
+            let build = BuildCompareFilters {
+                shared_kernel: kernel.clone(),
+                shared_commit: commit.clone(),
+                shared_scheduler: scheduler.clone(),
+                shared_topology: topology.clone(),
+                shared_work_type: work_type.clone(),
+                shared_flags: flags.clone(),
+                a_kernel: a_kernel.clone(),
+                a_commit: a_commit.clone(),
+                a_scheduler: a_scheduler.clone(),
+                a_topology: a_topology.clone(),
+                a_work_type: a_work_type.clone(),
+                a_flags: a_flags.clone(),
+                b_kernel: b_kernel.clone(),
+                b_commit: b_commit.clone(),
+                b_scheduler: b_scheduler.clone(),
+                b_topology: b_topology.clone(),
+                b_work_type: b_work_type.clone(),
+                b_flags: b_flags.clone(),
             };
-            let exit = cli::compare_runs(
-                a,
-                b,
+            let (filter_a, filter_b) = build.build();
+            let exit = cli::compare_partitions(
+                &filter_a,
+                &filter_b,
                 filter.as_deref(),
-                &row_filter,
                 &resolved_policy,
                 dir.as_deref(),
-                *average,
+                *no_average,
             )
             .map_err(|e| format!("{e:#}"))?;
             if exit != 0 {
@@ -1111,6 +1179,82 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             }
             Ok(())
         }
+    }
+}
+
+/// Symmetric-sugar resolver for `cargo ktstr stats compare`'s
+/// shared `--X` and per-side `--a-X` / `--b-X` filter flags.
+///
+/// CLI flag semantics:
+/// - Shared `--X` pins BOTH sides to the same value(s). E.g.
+///   `--kernel 6.14` is equivalent to
+///   `--a-kernel 6.14 --b-kernel 6.14`.
+/// - Per-side `--a-X` REPLACES the shared `--X` value for the A
+///   side only (and `--b-X` replaces for B only). "More-specific
+///   replaces" — the per-side flag takes precedence over the
+///   shared default for that side, but does not affect the
+///   other side.
+///
+/// Constructed from the raw clap-parsed values; `build()` does
+/// the sugar resolution and returns `(filter_a, filter_b)`. The
+/// struct is unit-testable in isolation so the sugar logic does
+/// not require booting a real comparison.
+#[derive(Debug, Clone, Default)]
+struct BuildCompareFilters {
+    shared_kernel: Vec<String>,
+    shared_commit: Vec<String>,
+    shared_scheduler: Option<String>,
+    shared_topology: Option<String>,
+    shared_work_type: Option<String>,
+    shared_flags: Vec<String>,
+    a_kernel: Vec<String>,
+    a_commit: Vec<String>,
+    a_scheduler: Option<String>,
+    a_topology: Option<String>,
+    a_work_type: Option<String>,
+    a_flags: Vec<String>,
+    b_kernel: Vec<String>,
+    b_commit: Vec<String>,
+    b_scheduler: Option<String>,
+    b_topology: Option<String>,
+    b_work_type: Option<String>,
+    b_flags: Vec<String>,
+}
+
+impl BuildCompareFilters {
+    /// Resolve sugar into per-side `RowFilter` instances.
+    /// "More-specific replaces": a per-side Vec is applied
+    /// verbatim when non-empty, otherwise the shared Vec is
+    /// used; a per-side Option is `Some(_).or(shared)` —
+    /// per-side Some wins, per-side None defers to shared.
+    fn build(&self) -> (ktstr::cli::RowFilter, ktstr::cli::RowFilter) {
+        let pick_vec = |a: &[String], shared: &[String]| -> Vec<String> {
+            if a.is_empty() {
+                shared.to_vec()
+            } else {
+                a.to_vec()
+            }
+        };
+        let pick_opt = |a: &Option<String>, shared: &Option<String>| -> Option<String> {
+            a.clone().or_else(|| shared.clone())
+        };
+        let filter_a = ktstr::cli::RowFilter {
+            kernels: pick_vec(&self.a_kernel, &self.shared_kernel),
+            commits: pick_vec(&self.a_commit, &self.shared_commit),
+            scheduler: pick_opt(&self.a_scheduler, &self.shared_scheduler),
+            topology: pick_opt(&self.a_topology, &self.shared_topology),
+            work_type: pick_opt(&self.a_work_type, &self.shared_work_type),
+            flags: pick_vec(&self.a_flags, &self.shared_flags),
+        };
+        let filter_b = ktstr::cli::RowFilter {
+            kernels: pick_vec(&self.b_kernel, &self.shared_kernel),
+            commits: pick_vec(&self.b_commit, &self.shared_commit),
+            scheduler: pick_opt(&self.b_scheduler, &self.shared_scheduler),
+            topology: pick_opt(&self.b_topology, &self.shared_topology),
+            work_type: pick_opt(&self.b_work_type, &self.shared_work_type),
+            flags: pick_vec(&self.b_flags, &self.shared_flags),
+        };
+        (filter_a, filter_b)
     }
 }
 
@@ -2422,8 +2566,22 @@ mod tests {
 
     #[test]
     fn parse_stats_compare() {
-        let m =
-            Cargo::try_parse_from(["cargo", "ktstr", "stats", "compare", "6.14-abc", "6.15-def"]);
+        // Minimal partition shape: --a-kernel + --b-kernel define
+        // the slicing dimension. The dispatch site rejects empty
+        // slicing dims, so a bare `cargo ktstr stats compare`
+        // would fail at run time — but the CLI parser accepts
+        // it (validation belongs in `compare_partitions`, not
+        // clap). This test pins the parse layer only.
+        let m = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ]);
         assert!(m.is_ok(), "{}", m.err().unwrap());
     }
 
@@ -2436,8 +2594,10 @@ mod tests {
             "ktstr",
             "stats",
             "compare",
-            "a",
-            "b",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
             "-E",
             "cgroup_steady",
         ])
@@ -2446,18 +2606,18 @@ mod tests {
             KtstrCommand::Stats {
                 command:
                     Some(StatsCommand::Compare {
-                        a,
-                        b,
                         filter,
                         threshold,
                         policy,
                         dir,
+                        a_kernel,
+                        b_kernel,
                         ..
                     }),
                 ..
             } => {
-                assert_eq!(a, "a");
-                assert_eq!(b, "b");
+                assert_eq!(a_kernel, vec!["6.14"]);
+                assert_eq!(b_kernel, vec!["6.15"]);
                 assert_eq!(filter.as_deref(), Some("cgroup_steady"));
                 assert!(threshold.is_none());
                 assert!(policy.is_none());
@@ -2476,8 +2636,10 @@ mod tests {
             "ktstr",
             "stats",
             "compare",
-            "a",
-            "b",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
             "--threshold",
             "5.0",
         ])
@@ -2518,8 +2680,10 @@ mod tests {
             "ktstr",
             "stats",
             "compare",
-            "a",
-            "b",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
             "--dir",
             "/tmp/archived-runs",
         ])
@@ -2528,8 +2692,6 @@ mod tests {
             KtstrCommand::Stats {
                 command:
                     Some(StatsCommand::Compare {
-                        a,
-                        b,
                         filter,
                         threshold,
                         policy,
@@ -2538,14 +2700,12 @@ mod tests {
                     }),
                 ..
             } => {
-                assert_eq!(a, "a");
-                assert_eq!(b, "b");
                 assert_eq!(
                     dir.as_deref(),
                     Some(std::path::Path::new("/tmp/archived-runs")),
                     "--dir must round-trip to Some(PathBuf); \
                      parse-scope only — resolver coverage lives \
-                     with stats::compare_runs' own tests",
+                     with compare_partitions' own tests",
                 );
                 assert!(
                     filter.is_none(),
@@ -2580,8 +2740,10 @@ mod tests {
             "ktstr",
             "stats",
             "compare",
-            "a",
-            "b",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
             "--policy",
             "/tmp/policy.json",
         ])
@@ -2629,8 +2791,10 @@ mod tests {
             "ktstr",
             "stats",
             "compare",
-            "a",
-            "b",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
             "--threshold",
             "5.0",
             "--policy",
@@ -2654,46 +2818,67 @@ mod tests {
         );
     }
 
-    /// Bare `compare` defaults `--average` to `false` — the
-    /// aggregation path must be opt-in so existing CLI invocations
-    /// retain their per-trial-row comparison semantics.
+    /// Bare `compare` defaults `--no-average` to `false` —
+    /// averaging is the default since #117. `--no-average`
+    /// must be opt-in for "keep each sidecar distinct"
+    /// semantics.
     #[test]
-    fn parse_stats_compare_average_default_false() {
+    fn parse_stats_compare_no_average_default_false() {
         let Cargo {
             command: CargoSub::Ktstr(k),
-        } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "compare", "a", "b"])
-            .unwrap_or_else(|e| panic!("{e}"));
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::Stats {
-                command: Some(StatsCommand::Compare { average, .. }),
+                command: Some(StatsCommand::Compare { no_average, .. }),
                 ..
             } => {
                 assert!(
-                    !average,
-                    "bare compare must default --average to false so \
-                     existing scripts retain per-trial-row semantics",
+                    !no_average,
+                    "bare compare must default --no-average to false so \
+                     averaging-on remains the default — operators get \
+                     trial-set folding without an explicit flag.",
                 );
             }
             _ => panic!("expected Stats Compare"),
         }
     }
 
-    /// `--average` parses as a bare flag (no value) and lifts the
-    /// `average: bool` field on `StatsCommand::Compare` to true.
-    /// Pins the clap binding so a regression that dropped the
-    /// derive arg, renamed the flag, or accidentally made it
-    /// take a value lands at parse time.
+    /// `--no-average` parses as a bare flag (no value) and lifts
+    /// the `no_average: bool` field on `StatsCommand::Compare`
+    /// to true. Pins the clap binding so a regression that
+    /// dropped the derive arg, renamed the flag, or accidentally
+    /// made it take a value lands at parse time.
     #[test]
-    fn parse_stats_compare_with_average() {
+    fn parse_stats_compare_with_no_average() {
         let Cargo {
             command: CargoSub::Ktstr(k),
-        } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "compare", "a", "b", "--average"])
-            .unwrap_or_else(|e| panic!("{e}"));
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+            "--no-average",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::Stats {
                 command:
                     Some(StatsCommand::Compare {
-                        average,
+                        no_average,
                         threshold,
                         policy,
                         dir,
@@ -2701,22 +2886,148 @@ mod tests {
                     }),
                 ..
             } => {
-                assert!(average, "--average must lift the flag to true");
+                assert!(no_average, "--no-average must lift the flag to true");
                 assert!(
                     threshold.is_none(),
-                    "bare --average must not spuriously populate --threshold",
+                    "bare --no-average must not spuriously populate --threshold",
                 );
                 assert!(
                     policy.is_none(),
-                    "bare --average must not spuriously populate --policy",
+                    "bare --no-average must not spuriously populate --policy",
                 );
                 assert!(
                     dir.is_none(),
-                    "bare --average must not spuriously populate --dir",
+                    "bare --no-average must not spuriously populate --dir",
                 );
             }
             _ => panic!("expected Stats Compare"),
         }
+    }
+
+    // -- BuildCompareFilters: symmetric sugar resolution --
+
+    /// Empty input → both sides default. No filters populated
+    /// anywhere; the dispatch site rejects this with the
+    /// "specify at least one --a-X" error, but the builder
+    /// itself just returns two empty filters.
+    #[test]
+    fn build_compare_filters_empty_yields_default_default() {
+        let b = BuildCompareFilters::default();
+        let (fa, fb) = b.build();
+        assert!(fa.kernels.is_empty());
+        assert!(fa.commits.is_empty());
+        assert!(fa.scheduler.is_none());
+        assert!(fa.topology.is_none());
+        assert!(fa.work_type.is_none());
+        assert!(fa.flags.is_empty());
+        assert_eq!(fa.kernels, fb.kernels);
+        assert_eq!(fa.scheduler, fb.scheduler);
+    }
+
+    /// Shared `--kernel V` pins BOTH sides to the same vec.
+    /// Sugar for `--a-kernel V --b-kernel V`.
+    #[test]
+    fn build_compare_filters_shared_kernel_pins_both_sides() {
+        let b = BuildCompareFilters {
+            shared_kernel: vec!["6.14".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.kernels, vec!["6.14"]);
+        assert_eq!(fb.kernels, vec!["6.14"]);
+    }
+
+    /// Per-side `--a-kernel` overrides shared `--kernel` for A
+    /// only; B retains the shared value. "More-specific
+    /// replaces" semantics.
+    #[test]
+    fn build_compare_filters_per_side_overrides_shared_for_that_side_only() {
+        let b = BuildCompareFilters {
+            shared_kernel: vec!["6.14".to_string(), "6.15".to_string()],
+            a_kernel: vec!["6.13".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.kernels, vec!["6.13"], "A overrides shared");
+        assert_eq!(fb.kernels, vec!["6.14", "6.15"], "B retains shared default",);
+    }
+
+    /// Per-side overrides on the SAME dimension on BOTH sides
+    /// produce the disjoint per-side filters the dispatch
+    /// expects. This is the typical "slice on kernel" call shape:
+    /// `--a-kernel A --b-kernel B`.
+    #[test]
+    fn build_compare_filters_disjoint_per_side_kernel_yields_two_filters() {
+        let b = BuildCompareFilters {
+            a_kernel: vec!["6.14".to_string()],
+            b_kernel: vec!["6.15".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.kernels, vec!["6.14"]);
+        assert_eq!(fb.kernels, vec!["6.15"]);
+    }
+
+    /// Per-side `--a-scheduler` (Option) overrides shared
+    /// `--scheduler` for A only. Sibling test for the
+    /// Option-typed override path.
+    #[test]
+    fn build_compare_filters_per_side_option_dim_override() {
+        let b = BuildCompareFilters {
+            shared_scheduler: Some("scx_default".to_string()),
+            a_scheduler: Some("scx_alpha".to_string()),
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.scheduler.as_deref(), Some("scx_alpha"));
+        assert_eq!(
+            fb.scheduler.as_deref(),
+            Some("scx_default"),
+            "B retains the shared scheduler when only --a-scheduler overrides",
+        );
+    }
+
+    /// Multi-dim sugar: shared `--kernel` pins both sides AND
+    /// per-side `--a-scheduler` / `--b-scheduler` slice on
+    /// scheduler. The resulting filters share kernel but slice
+    /// on scheduler — exactly what the
+    /// "narrow scope, slice on one axis" workflow needs.
+    #[test]
+    fn build_compare_filters_shared_pin_plus_per_side_slice() {
+        let b = BuildCompareFilters {
+            shared_kernel: vec!["6.14".to_string()],
+            a_scheduler: Some("scx_alpha".to_string()),
+            b_scheduler: Some("scx_beta".to_string()),
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.kernels, vec!["6.14"]);
+        assert_eq!(fb.kernels, vec!["6.14"]);
+        assert_eq!(fa.scheduler.as_deref(), Some("scx_alpha"));
+        assert_eq!(fb.scheduler.as_deref(), Some("scx_beta"));
+        // The slicing-dim derivation for these two filters
+        // returns just [Scheduler] — kernel pins both sides
+        // so the comparison joins on kernel and contrasts on
+        // scheduler.
+        let slicing = ktstr::cli::derive_slicing_dims(&fa, &fb);
+        assert_eq!(slicing, vec![ktstr::cli::Dimension::Scheduler]);
+    }
+
+    /// `--a-flag` / `--b-flag` (AND-combined Vec) compose the
+    /// same way as `--a-kernel` / `--b-kernel` (OR-combined
+    /// Vec) — per-side empty defers to shared, per-side non-
+    /// empty replaces. Pin the shape for the AND-combined dim
+    /// to ensure no accidental special-case for OR-vs-AND.
+    #[test]
+    fn build_compare_filters_per_side_flag_overrides_shared() {
+        let b = BuildCompareFilters {
+            shared_flags: vec!["llc".to_string()],
+            a_flags: vec!["steal".to_string(), "borrow".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.flags, vec!["steal", "borrow"]);
+        assert_eq!(fb.flags, vec!["llc"]);
     }
 
     /// `cargo ktstr stats show-host --run X` parses to

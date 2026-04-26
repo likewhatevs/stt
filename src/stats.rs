@@ -795,14 +795,28 @@ impl RowFilter {
     pub fn matches(&self, row: &GauntletRow) -> bool {
         if !self.kernels.is_empty() {
             // OR-combined: the row matches iff its kernel version
-            // equals ANY listed kernel. A row with `None` kernel_version
-            // never satisfies a non-empty filter — same opt-in
-            // semantic the original `Option<String>` field carried.
+            // matches ANY listed kernel. A row with `None`
+            // kernel_version never satisfies a non-empty filter —
+            // same opt-in semantic the original `Option<String>`
+            // field carried.
+            //
+            // Match shape: a filter value with two dot-separated
+            // segments (e.g. `6.12`) is a major.minor PREFIX —
+            // the row matches if its `kernel_version` starts with
+            // `6.12.` OR equals `6.12` exactly. A filter with three
+            // or more segments (e.g. `6.14.2`, `6.15-rc3`) is
+            // strict equality. The two-segment cutoff matches the
+            // shape of `MAJOR.MINOR` versus `MAJOR.MINOR.PATCH` /
+            // `MAJOR.MINOR-rcN` — there is no shorter form on the
+            // sidecar producer side worth treating as a prefix
+            // (`6` alone would match every 6.x release, which is
+            // a less useful cohort than the per-stable-series
+            // narrowing the operator usually wants).
             let row_kernel = row.kernel_version.as_deref();
-            let any = self
-                .kernels
-                .iter()
-                .any(|want| row_kernel == Some(want.as_str()));
+            let any = self.kernels.iter().any(|want| match row_kernel {
+                Some(rk) => kernel_filter_matches(want, rk),
+                None => false,
+            });
             if !any {
                 return false;
             }
@@ -852,12 +866,295 @@ impl RowFilter {
 /// order. The caller is responsible for any further dedup or
 /// aggregation; this helper preserves duplicates as written.
 ///
-/// Used by [`compare_runs`] before the surviving rows reach
+/// Used by [`compare_partitions`] before the surviving rows reach
 /// [`compare_rows`], so the substring-`-E` filter and the typed
 /// filters compose: typed narrows happen first, substring runs over
 /// the surviving set.
 pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<GauntletRow> {
     rows.iter().filter(|r| filter.matches(r)).cloned().collect()
+}
+
+/// Match a single `--kernel` filter value against a row's
+/// `kernel_version`. Major.minor (two-segment) filter values match
+/// any patch release in that series via prefix; longer filter
+/// values use strict equality.
+///
+/// `want` is the user-supplied filter value (e.g. `6.12`,
+/// `6.14.2`, `6.15-rc3`). `row_kernel` is the sidecar-recorded
+/// kernel version (e.g. `6.12.5`). The two-segment cutoff matches
+/// the natural shape of `MAJOR.MINOR` versus
+/// `MAJOR.MINOR.PATCH` / `MAJOR.MINOR-rcN` — `6.12.` is a
+/// stable-series prefix; `6.14.2` is one specific release.
+///
+/// Examples:
+/// - `kernel_filter_matches("6.12", "6.12.5")` → true (prefix)
+/// - `kernel_filter_matches("6.12", "6.12")` → true (exact equal)
+/// - `kernel_filter_matches("6.12", "6.13.0")` → false
+/// - `kernel_filter_matches("6.14.2", "6.14.2")` → true
+/// - `kernel_filter_matches("6.14.2", "6.14.20")` → false
+///   (strict equality on three-segment filter — without the
+///   strict path, `6.14.2` would also match `6.14.20`,
+///   `6.14.21`, ..., which is not what the operator asked for)
+pub(crate) fn kernel_filter_matches(want: &str, row_kernel: &str) -> bool {
+    if is_major_minor_prefix(want) {
+        // Exact match OR prefix-with-trailing-dot match. The
+        // trailing dot prevents `6.1` from spuriously matching
+        // `6.10.0` (`6.10.0`.starts_with("6.1") is true; the
+        // trailing-dot variant rejects it because `6.10` does not
+        // start with `6.1.`). The exact-equal arm covers the case
+        // where the row's recorded version IS the major.minor
+        // string itself (no patch component).
+        row_kernel == want || row_kernel.starts_with(&format!("{want}."))
+    } else {
+        row_kernel == want
+    }
+}
+
+/// Whether a filter value looks like a major.minor PREFIX. Two
+/// non-empty dot-separated digit segments and nothing else
+/// (no `-rcN`, no third dot). Conservative: anything outside the
+/// `MAJOR.MINOR` shape falls through to strict equality so a typo
+/// like `6.14.2.` or `6.14-something` does not silently turn into
+/// a wildcard.
+fn is_major_minor_prefix(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 2
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// One of the six dimensions that compose a [`GauntletRow`]'s
+/// identity in the comparison pipeline: `kernel`, `scheduler`,
+/// `topology`, `work_type`, `commit`, `flags`. Each maps to the
+/// corresponding `RowFilter` field and `GauntletRow` field; the
+/// dimension model lets [`compare_partitions`] derive its slicing
+/// dims and dynamic pairing key without hardcoding the dimension
+/// list at every call site.
+///
+/// `scenario` is NOT a dimension — it is the test name and is
+/// always part of the pairing key (you can't compare scenario A
+/// against scenario B; that would compare unrelated tests).
+///
+/// Iteration order via [`Dimension::ALL`] is deterministic and
+/// matches the order operators read in the CLI flags
+/// (`--kernel` / `--scheduler` / `--topology` / `--work-type` /
+/// `--commit` / `--flag`), so generated labels and error
+/// messages list dims in a stable, predictable order.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Dimension {
+    Kernel,
+    Scheduler,
+    Topology,
+    WorkType,
+    Commit,
+    Flags,
+}
+
+impl Dimension {
+    /// Every dimension in CLI-flag order. Used by
+    /// [`derive_slicing_dims`] to walk the dimension space and by
+    /// [`compare_partitions`] to compute the pairing-dim
+    /// complement set (all dims minus slicing dims).
+    pub const ALL: &'static [Dimension] = &[
+        Dimension::Kernel,
+        Dimension::Scheduler,
+        Dimension::Topology,
+        Dimension::WorkType,
+        Dimension::Commit,
+        Dimension::Flags,
+    ];
+
+    /// Compute pairing dims from a slicing-dim set: every
+    /// dimension in [`Dimension::ALL`] that is NOT in `slicing`,
+    /// in canonical order. This is the dynamic key derivation the
+    /// comparison pipeline uses everywhere — slicing dims define
+    /// the contrast (different on A vs B), pairing dims define
+    /// the join (same across A and B).
+    pub fn pairing_dims(slicing: &[Dimension]) -> Vec<Dimension> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|d| !slicing.contains(d))
+            .collect()
+    }
+
+    /// Operator-readable name for diagnostic and table output.
+    /// Matches the CLI flag suffix (e.g. `--kernel` →
+    /// `"kernel"`, `--work-type` → `"work-type"`). Used in the
+    /// "slicing dimensions: ..." / "pairing on: ..." header
+    /// lines and in the "A and B select identical rows" error.
+    pub fn name(self) -> &'static str {
+        match self {
+            Dimension::Kernel => "kernel",
+            Dimension::Scheduler => "scheduler",
+            Dimension::Topology => "topology",
+            Dimension::WorkType => "work-type",
+            Dimension::Commit => "commit",
+            Dimension::Flags => "flags",
+        }
+    }
+}
+
+/// Legacy pairing-dim set used by tests that pre-date the
+/// dimensional-slicing refactor. Equivalent to the historical
+/// hardcoded 4-tuple `(scenario, topology, work_type, flags)` —
+/// scenario is always implicit in [`PairingKey::from_row`] and
+/// the remaining three dimensions are listed here. Production
+/// callers (`compare_partitions`) compute pairing dims via
+/// [`Dimension::pairing_dims`] from the slicing-dim derivation;
+/// only test fixtures use this constant directly.
+pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] =
+    &[Dimension::Topology, Dimension::WorkType, Dimension::Flags];
+
+/// Derive the set of dimensions on which `filter_a` and
+/// `filter_b` differ. These are the SLICING dimensions —
+/// dimensions on which the two sides select disjoint cohorts and
+/// therefore form the A/B contrast. The complement (every other
+/// dimension) is the PAIRING-key dimension set used by
+/// [`compare_rows`] to join A-side rows against B-side rows.
+///
+/// Comparison shape per dimension:
+/// - `Kernel` / `Commit` / `Flags`: a slicing dim iff the two
+///   sides' filter vecs differ as SORTED-DEDUPED `Vec<&str>`.
+///   Order does not matter (`--a-kernel 6.14 --a-kernel 6.15` and
+///   `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice).
+/// - `Scheduler` / `Topology` / `WorkType`: a slicing dim iff the
+///   two `Option<String>` filters differ. `Some("foo") != None`
+///   counts as a differ.
+///
+/// Returns dimensions in [`Dimension::ALL`] order so callers
+/// (header lines, error messages, side labels) get a stable
+/// presentation.
+pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Dimension> {
+    let mut out = Vec::new();
+    for &dim in Dimension::ALL {
+        let differs = match dim {
+            Dimension::Kernel => sorted_dedup(&filter_a.kernels) != sorted_dedup(&filter_b.kernels),
+            Dimension::Scheduler => filter_a.scheduler != filter_b.scheduler,
+            Dimension::Topology => filter_a.topology != filter_b.topology,
+            Dimension::WorkType => filter_a.work_type != filter_b.work_type,
+            Dimension::Commit => sorted_dedup(&filter_a.commits) != sorted_dedup(&filter_b.commits),
+            Dimension::Flags => sorted_dedup(&filter_a.flags) != sorted_dedup(&filter_b.flags),
+        };
+        if differs {
+            out.push(dim);
+        }
+    }
+    out
+}
+
+fn sorted_dedup(v: &[String]) -> Vec<&str> {
+    let mut s: Vec<&str> = v.iter().map(String::as_str).collect();
+    s.sort_unstable();
+    s.dedup();
+    s
+}
+
+/// Render a side's filter values into a column-header label for
+/// the comparison table. `dims` is the slicing-dimension set —
+/// the only dims whose values vary between A and B. The label
+/// concatenates each dim's per-side filter value(s) with `:`
+/// between dim values (e.g. `"6.14.2:scx_rusty"` when both
+/// `kernel` and `scheduler` slice). For multi-value Vec filters
+/// (kernels, commits, flags) the values join with `|` when there
+/// are ≤3; longer lists collapse to `"A"` or `"B"` (the bare
+/// side label) to keep the column header readable.
+///
+/// `bare_label` is `"A"` / `"B"`, used as the fallback when a
+/// slicing dim's filter has more than 3 values OR the slicing
+/// dim's filter is empty on this side (the slice exists because
+/// the OTHER side populated the filter — the empty-side label is
+/// the bare letter).
+pub(crate) fn render_side_label(
+    filter: &RowFilter,
+    dims: &[Dimension],
+    bare_label: &str,
+) -> String {
+    if dims.is_empty() {
+        return bare_label.to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for &dim in dims {
+        let part = match dim {
+            Dimension::Kernel => render_vec_dim(&filter.kernels, bare_label),
+            Dimension::Scheduler => filter
+                .scheduler
+                .clone()
+                .unwrap_or_else(|| bare_label.to_string()),
+            Dimension::Topology => filter
+                .topology
+                .clone()
+                .unwrap_or_else(|| bare_label.to_string()),
+            Dimension::WorkType => filter
+                .work_type
+                .clone()
+                .unwrap_or_else(|| bare_label.to_string()),
+            Dimension::Commit => render_vec_dim(&filter.commits, bare_label),
+            Dimension::Flags => render_vec_dim(&filter.flags, bare_label),
+        };
+        parts.push(part);
+    }
+    parts.join(":")
+}
+
+/// `≤3` values: join with `|`. `>3` values: collapse to
+/// `bare_label`. Empty Vec: also bare label (slicing exists
+/// because the OTHER side populated the same dim).
+fn render_vec_dim(values: &[String], bare_label: &str) -> String {
+    if values.is_empty() || values.len() > 3 {
+        bare_label.to_string()
+    } else {
+        let mut sorted: Vec<&str> = values.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        sorted.join("|")
+    }
+}
+
+/// Dynamic pairing key for [`compare_rows`] — the tuple of
+/// values on every NON-slicing dimension, plus the always-pinned
+/// `scenario`. Two rows pair iff their dynamic keys match.
+///
+/// Stored as a `Vec<String>` so the same struct shape works for
+/// any `pairing_dims` slice (the alternative — a tuple of
+/// `Option<&str>` per dim — would force every consumer to know
+/// the dim list at compile time, defeating the point of
+/// dimension-set parametrisation).
+///
+/// First element is always `scenario`; subsequent elements
+/// follow `pairing_dims` order (which is itself
+/// [`Dimension::ALL`] order minus the slicing dims).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+pub(crate) struct PairingKey(pub Vec<String>);
+
+impl PairingKey {
+    /// Extract the pairing key for `row` given the list of
+    /// dimensions to include. The scenario is ALWAYS the first
+    /// component; the `pairing_dims` list controls the rest.
+    /// Each non-scenario dim contributes a single string slot:
+    /// `Option<String>` fields render `None` as the empty
+    /// string, `Vec<String>` fields render as a sorted-deduped
+    /// `|`-joined string so the same set produces the same key
+    /// regardless of input order.
+    pub fn from_row(row: &GauntletRow, pairing_dims: &[Dimension]) -> Self {
+        let mut parts = Vec::with_capacity(1 + pairing_dims.len());
+        parts.push(row.scenario.clone());
+        for &dim in pairing_dims {
+            parts.push(match dim {
+                Dimension::Kernel => row.kernel_version.clone().unwrap_or_default(),
+                Dimension::Scheduler => row.scheduler.clone(),
+                Dimension::Topology => row.topology.clone(),
+                Dimension::WorkType => row.work_type.clone(),
+                Dimension::Commit => row.commit.clone().unwrap_or_default(),
+                Dimension::Flags => {
+                    let mut sorted: Vec<&str> = row.flags.iter().map(String::as_str).collect();
+                    sorted.sort_unstable();
+                    sorted.join("|")
+                }
+            });
+        }
+        PairingKey(parts)
+    }
 }
 
 /// One aggregated [`GauntletRow`] produced by [`group_and_average`],
@@ -960,8 +1257,34 @@ pub struct AveragedGroup {
 /// order) so we maintain a parallel `Vec<key>` to preserve
 /// first-seen ordering. Stable order keeps test fixtures
 /// deterministic across runs.
+/// Backward-compatible wrapper that uses [`LEGACY_PAIRING_DIMS`]
+/// (topology, work-type, flags). New code that participates in
+/// the dimensional-slicing pipeline should call
+/// [`group_and_average_by`] directly with the dynamic pairing
+/// dims derived from `derive_slicing_dims`.
 pub fn group_and_average(rows: &[GauntletRow]) -> Vec<AveragedGroup> {
-    type Key<'a> = (&'a str, &'a str, &'a str, &'a [String]);
+    group_and_average_by(rows, LEGACY_PAIRING_DIMS)
+}
+
+/// Group rows by the dynamic pairing key (`scenario` plus every
+/// dimension in `pairing_dims`) and return one [`AveragedGroup`]
+/// per distinct key. The pairing-dim model lets the comparison
+/// pipeline parametrise grouping without hardcoding a fixed
+/// tuple — slicing dims are EXCLUDED from the key (rows on the
+/// A/B sides differ on them by design), pairing dims are
+/// INCLUDED.
+pub fn group_and_average_by(
+    rows: &[GauntletRow],
+    pairing_dims: &[Dimension],
+) -> Vec<AveragedGroup> {
+    // Dynamic pairing key — scenario + every NON-slicing
+    // dimension's value, in [`Dimension::ALL`] order. The
+    // `PairingKey` newtype is owned (`Vec<String>`) so the
+    // BTreeMap can hold keys without lifetime gymnastics; the
+    // alternative — borrowing slices into `rows` — would force
+    // every consumer to keep `rows` alive for the duration of
+    // the map.
+    type Key = PairingKey;
 
     struct Accumulator<'a> {
         first: &'a GauntletRow,
@@ -996,17 +1319,12 @@ pub fn group_and_average(rows: &[GauntletRow]) -> Vec<AveragedGroup> {
         ext_sums: BTreeMap<String, (f64, u32)>,
     }
 
-    let mut order: Vec<Key<'_>> = Vec::new();
-    let mut groups: BTreeMap<Key<'_>, Accumulator<'_>> = BTreeMap::new();
+    let mut order: Vec<Key> = Vec::new();
+    let mut groups: BTreeMap<Key, Accumulator<'_>> = BTreeMap::new();
 
     for row in rows {
-        let key: Key<'_> = (
-            row.scenario.as_str(),
-            row.topology.as_str(),
-            row.work_type.as_str(),
-            row.flags.as_slice(),
-        );
-        let acc = groups.entry(key).or_insert_with(|| {
+        let key = PairingKey::from_row(row, pairing_dims);
+        let acc = groups.entry(key.clone()).or_insert_with(|| {
             order.push(key);
             Accumulator {
                 first: row,
@@ -1702,17 +2020,25 @@ pub fn list_runs() -> anyhow::Result<()> {
 
 /// One significant per-metric finding produced by [`compare_rows`].
 ///
-/// Each finding represents a single (scenario, topology, work_type,
-/// metric) tuple whose A/B delta cleared both the absolute and
-/// relative gates. The pairing key inside [`compare_rows`] is
-/// `(scenario, topology, work_type)`; carrying `work_type` here lets
-/// consumers disambiguate two findings that share scenario+topology
-/// but were measured under different workloads. `metric` is the
-/// registry entry the comparison ran against; consumers read
-/// polarity, display unit, and name through it directly without
-/// re-looking up [`metric_def`].
+/// `pairing_key` carries the dynamic identity the row pair joined
+/// on — `scenario` plus every NON-slicing dimension's value. The
+/// table renderer in [`compare_partitions`] decodes the key against
+/// the slicing-dim list to produce a label like
+/// `scenario/topology/work_type` (when topology + work_type are
+/// pairing dims) or just `scenario` (when every other dim slices).
+///
+/// The `scenario` / `topology` / `work_type` fields carry the
+/// matched row's values verbatim for legacy-shape consumers and
+/// test fixtures that pre-date the dimensional-slicing refactor.
+/// New code should read [`Finding::pairing_key`] directly so the
+/// slicing-dim variation stays visible.
+///
+/// `metric` is the registry entry the comparison ran against;
+/// consumers read polarity, display unit, and name through it
+/// directly without re-looking up [`metric_def`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Finding {
+    pub pairing_key: PairingKey,
     pub scenario: String,
     pub topology: String,
     pub work_type: String,
@@ -1931,32 +2257,55 @@ impl ComparisonPolicy {
 /// override → `default_percent` → registry `default_rel`. The
 /// absolute gate always uses the metric's `default_abs`. A delta
 /// must clear both gates to count as significant.
+/// Backward-compatible wrapper that uses [`LEGACY_PAIRING_DIMS`]
+/// (topology, work-type, flags) for pairing. New code that
+/// participates in the dimensional-slicing pipeline should call
+/// [`compare_rows_by`] with the dynamic pairing dims derived
+/// from `derive_slicing_dims`. Production callers all route
+/// through [`compare_partitions`] which calls `_by` directly;
+/// only test fixtures still call this wrapper, and they keep it
+/// alive without a `cfg(test)` gate so the API surface stays
+/// uniform between debug and release builds.
+#[allow(dead_code)]
 pub(crate) fn compare_rows(
     rows_a: &[GauntletRow],
     rows_b: &[GauntletRow],
     filter: Option<&str>,
     policy: &ComparisonPolicy,
 ) -> CompareReport {
+    compare_rows_by(rows_a, rows_b, LEGACY_PAIRING_DIMS, filter, policy)
+}
+
+/// Pair-by-key comparison parametrised on `pairing_dims`. Two
+/// rows pair iff their [`PairingKey`] (scenario + every value
+/// for each dimension in `pairing_dims`) is equal. This is the
+/// dimensional-slicing pipeline's join primitive — the slicing
+/// dims are EXCLUDED from `pairing_dims` so rows on the A/B
+/// sides that differ on those dims still pair as long as they
+/// agree on every non-slicing dim.
+pub(crate) fn compare_rows_by(
+    rows_a: &[GauntletRow],
+    rows_b: &[GauntletRow],
+    pairing_dims: &[Dimension],
+    filter: Option<&str>,
+    policy: &ComparisonPolicy,
+) -> CompareReport {
     let mut report = CompareReport::default();
 
     for row_b in rows_b {
-        // Identity key includes `flags` so two rows that share
-        // (scenario, topology, work_type) but run under different
-        // flag sets do not collide into the same A/B pair. Earlier
-        // the key was a 3-tuple, so a scheduler with N flag profiles
-        // produced N rows per (scenario, topology, work_type) and
-        // compare_rows would pick arbitrarily whichever rows_a entry
-        // happened to be first — making regression math match a
-        // baseline against an unrelated flag profile.
-        let key_b = (
-            &row_b.scenario,
-            &row_b.topology,
-            &row_b.work_type,
-            &row_b.flags,
-        );
+        // Dynamic pairing key: scenario + every NON-slicing
+        // dimension's value. Two rows pair iff their dynamic keys
+        // match. The flag-set component is sorted-deduped inside
+        // `PairingKey::from_row` so order-of-accumulation noise
+        // doesn't shatter pairs (matching the canonicalize-on-write
+        // contract documented on `canonicalize_active_flags`).
+        let key_b = PairingKey::from_row(row_b, pairing_dims);
         if let Some(f) = filter {
-            // Include `flags` in the filterable join so the substring
-            // filter can narrow by flag name (e.g. `-E llc`).
+            // Substring filter joins all identity-bearing fields —
+            // including the SLICING dim values — so an operator
+            // can narrow by any visible field via `-E`. The
+            // canonical `flags` rendering matches what the table
+            // shows.
             let joined = format!(
                 "{} {} {} {} {}",
                 row_b.scenario,
@@ -1971,7 +2320,7 @@ pub(crate) fn compare_rows(
         }
         let row_a = rows_a
             .iter()
-            .find(|r| (&r.scenario, &r.topology, &r.work_type, &r.flags) == key_b);
+            .find(|r| PairingKey::from_row(r, pairing_dims) == key_b);
         let Some(row_a) = row_a else {
             report.new_in_b += 1;
             continue;
@@ -2020,6 +2369,7 @@ pub(crate) fn compare_rows(
                 report.improvements += 1;
             }
             report.findings.push(Finding {
+                pairing_key: key_b.clone(),
                 scenario: row_b.scenario.clone(),
                 topology: row_b.topology.clone(),
                 work_type: row_b.work_type.clone(),
@@ -2036,14 +2386,7 @@ pub(crate) fn compare_rows(
     // Filter applies here too, so rows excluded by the filter never
     // count as removed.
     for row_a in rows_a {
-        // Same 4-tuple identity key as the first pass — see that
-        // loop's comment for the flag-profile collision rationale.
-        let key_a = (
-            &row_a.scenario,
-            &row_a.topology,
-            &row_a.work_type,
-            &row_a.flags,
-        );
+        let key_a = PairingKey::from_row(row_a, pairing_dims);
         if let Some(f) = filter {
             let joined = format!(
                 "{} {} {} {} {}",
@@ -2059,7 +2402,7 @@ pub(crate) fn compare_rows(
         }
         let exists_in_b = rows_b
             .iter()
-            .any(|r| (&r.scenario, &r.topology, &r.work_type, &r.flags) == key_a);
+            .any(|r| PairingKey::from_row(r, pairing_dims) == key_a);
         if !exists_in_b {
             report.removed_from_a += 1;
         }
@@ -2068,116 +2411,221 @@ pub(crate) fn compare_rows(
     report
 }
 
-/// Compare two test runs and report regressions.
+/// Compare two filter-defined partitions of the sidecar pool and
+/// report regressions across slicing dimensions.
 ///
-/// `a` and `b` are run keys (subdirectory names under
-/// `{CARGO_TARGET_DIR or "target"}/ktstr/`) -- the same keys printed by
-/// [`list_runs`]. Resolves run directories, loads sidecars, converts
-/// to rows, and delegates dual-gate comparison to [`compare_rows`].
-/// Prints a per-delta table and a summary line.
+/// `filter_a` and `filter_b` are the per-side row filters that
+/// define the A/B contrast. The dimensions on which the two
+/// filters DIFFER are the SLICING dimensions; the dimensions on
+/// which they AGREE (or on which both are unconstrained) are the
+/// PAIRING dimensions. Two rows pair across the A/B sides iff
+/// their dynamic [`PairingKey`] (scenario plus every pairing-dim
+/// value) is equal — so the comparison naturally ignores
+/// differences on the slicing axes (those ARE the contrast) and
+/// joins on everything else.
+///
+/// `dir` overrides the default `runs_root()` for pool collection.
+/// Pass `Some(path)` to compare archived sidecar trees copied off
+/// a CI host; pass `None` to walk `target/ktstr/` (or
+/// `CARGO_TARGET_DIR/ktstr/`).
+///
+/// Validation:
+/// - Empty slicing-dim set (every dimension is identical between
+///   A and B): bail with "specify at least one --a-X / --b-X to
+///   define what to compare". This includes the no-flags-at-all
+///   case (both filters are the empty default).
+/// - Identical effective filters with at least one slicing dim is
+///   a contradiction caught by clap-level construction; the
+///   downstream check is "every value in filter_a appears in
+///   filter_b on the same dim and vice versa." We catch that as
+///   "A and B select identical rows" — symmetric to the empty
+///   case.
+/// - More than one slicing dimension prints a warning to stderr
+///   ("warning: slicing on N dimensions; results compress
+///   multiple axes into a single A/B contrast") but does NOT
+///   bail — multi-dim slicing is a deliberate feature for
+///   comparing e.g. (kernel A + scheduler A) against (kernel B +
+///   scheduler B).
+///
+/// `no_average = false` (the default) groups every matching
+/// sidecar within each side by pairing key and averages the
+/// metrics across the group. `no_average = true` keeps each
+/// sidecar row distinct; if multiple rows on one side share the
+/// same pairing key the function bails with an actionable
+/// "duplicate pairing keys" error rather than picking one
+/// arbitrarily.
 ///
 /// Returns 0 on no regressions, 1 if regressions detected.
-pub fn compare_runs(
-    a: &str,
-    b: &str,
+pub fn compare_partitions(
+    filter_a: &RowFilter,
+    filter_b: &RowFilter,
     filter: Option<&str>,
-    row_filter: &RowFilter,
     policy: &ComparisonPolicy,
     dir: Option<&std::path::Path>,
-    average: bool,
+    no_average: bool,
 ) -> anyhow::Result<i32> {
-    // `--dir` overrides the default runs root. Earlier versions of
-    // this function accepted the flag through the CLI but never
-    // threaded it through to the sidecar lookup, so the value was
-    // silently ignored and every comparison ran against
-    // `runs_root()` regardless — the user could see their runs via
-    // `cargo ktstr stats list --dir X` but `compare` quietly looked
-    // in the default location. Accepting `Option<&Path>` here keeps
-    // `--dir` load-bearing.
+    // Validation gate 1: there must be at least one dimension
+    // on which filter_a differs from filter_b — otherwise the
+    // operator hasn't expressed a contrast and the function has
+    // nothing to compare. Empty slicing dims OR identical filters
+    // are both rejected here with actionable diagnostics so the
+    // user knows which knob to turn.
+    let slicing_dims = derive_slicing_dims(filter_a, filter_b);
+    if slicing_dims.is_empty() {
+        anyhow::bail!(
+            "stats compare: A and B select identical rows. \
+             Specify at least one per-side filter (e.g. \
+             --a-kernel 6.14 --b-kernel 6.15) to define what \
+             dimension separates the two sides."
+        );
+    }
+
+    // Validation gate 2: warn (not error) when slicing on
+    // multiple dimensions. The result is still well-defined —
+    // the comparison joins on remaining pairing dims and
+    // collapses the slicing-dim cross-product into a single
+    // A/B contrast — but the operator is asking for a multi-axis
+    // delta which is harder to interpret. The warning surfaces
+    // the dim list so they can confirm the cohort shape.
+    if slicing_dims.len() > 1 {
+        let dim_names: Vec<&str> = slicing_dims.iter().map(|d| d.name()).collect();
+        eprintln!(
+            "warning: stats compare: slicing on {n} dimensions [{dims}]; \
+             results compress multiple axes into a single A/B contrast.",
+            n = slicing_dims.len(),
+            dims = dim_names.join(", "),
+        );
+    }
+
+    // Pairing dims = every dimension NOT in the slicing-dim set,
+    // in canonical [`Dimension::ALL`] order. The dynamic key
+    // shape `(scenario, *pairing_dims)` matches whatever
+    // dimensions are currently NOT being contrasted across A
+    // and B.
+    let pairing_dims = Dimension::pairing_dims(&slicing_dims);
+
+    // Pool every sidecar under the runs root (or the operator's
+    // --dir override) and convert to rows. The full-scan cost
+    // is acceptable for the single-comparison-per-session
+    // workflow; #124 tracks parallelisation for the cache-miss
+    // case if it becomes a hot path.
     let root: std::path::PathBuf = match dir {
         Some(d) => d.to_path_buf(),
         None => crate::test_support::runs_root(),
     };
-    let dir_a = root.join(a);
-    let dir_b = root.join(b);
-    if !dir_a.exists() {
-        anyhow::bail!("run '{a}' not found under {}", root.display());
+    let pool = crate::test_support::collect_pool(&root);
+    if pool.is_empty() {
+        anyhow::bail!(
+            "stats compare: no sidecar data found under {}. \
+             Run `cargo ktstr test` to generate runs, or pass \
+             --dir to point at an archived sidecar tree.",
+            root.display(),
+        );
     }
-    if !dir_b.exists() {
-        anyhow::bail!("run '{b}' not found under {}", root.display());
+    let rows: Vec<GauntletRow> = pool.iter().map(sidecar_to_row).collect();
+
+    // Partition: apply each side's filter to the same pool. A
+    // row may match both sides (e.g. when scheduler is the
+    // slicing dim and kernel is unconstrained on both, a row
+    // with scheduler == filter_a.scheduler matches A but NOT B
+    // unless B's scheduler matches too — typically not).
+    let rows_a = apply_row_filters(&rows, filter_a);
+    let rows_b = apply_row_filters(&rows, filter_b);
+    if rows_a.is_empty() {
+        anyhow::bail!(
+            "stats compare: A side filter matched 0 sidecars in \
+             pool ({} pooled). Check the per-side filters or \
+             confirm the runs exist with `cargo ktstr stats list`.",
+            pool.len(),
+        );
     }
-    let sidecars_a = crate::test_support::collect_sidecars(&dir_a);
-    let sidecars_b = crate::test_support::collect_sidecars(&dir_b);
-    if sidecars_a.is_empty() {
-        anyhow::bail!("run '{a}' has no sidecar data");
-    }
-    if sidecars_b.is_empty() {
-        anyhow::bail!("run '{b}' has no sidecar data");
+    if rows_b.is_empty() {
+        anyhow::bail!(
+            "stats compare: B side filter matched 0 sidecars in \
+             pool ({} pooled). Check the per-side filters or \
+             confirm the runs exist with `cargo ktstr stats list`.",
+            pool.len(),
+        );
     }
 
-    let rows_a: Vec<GauntletRow> = sidecars_a.iter().map(sidecar_to_row).collect();
-    let rows_b: Vec<GauntletRow> = sidecars_b.iter().map(sidecar_to_row).collect();
-
-    // Apply typed filters (--kernel / --scheduler / --topology /
-    // --work-type / --flag) before the substring filter inside
-    // `compare_rows`. Typed filters are strict-equality / AND-combined
-    // (with --kernel OR-combined within the kernels vec) and run
-    // cheaply over the row vectors here; the substring filter stays
-    // inside `compare_rows` because it joins the row's fields into a
-    // search string and reuses that join across the comparison loop.
-    let rows_a = apply_row_filters(&rows_a, row_filter);
-    let rows_b = apply_row_filters(&rows_b, row_filter);
-
-    // When `--average` is active, fold every (scenario, topology,
-    // work_type, flags) group into a single row carrying
-    // arithmetic-mean metric values across the group's passing
-    // contributors. The pairing key inside `compare_rows` matches
-    // [`group_and_average`]' grouping key, so the post-aggregation row
-    // vec joins cleanly across A/B sides without duplicate-key
-    // collisions. The averaged side-tables (`avg_a` / `avg_b`)
-    // carry the per-group `passes_observed` / `total_observed` for
-    // the `N/M` summary block printed below the comparison table.
-    //
-    // The pre-aggregation row counts (`pre_agg_a` / `pre_agg_b`)
-    // are captured before the `rows_*` vectors are moved into the
-    // `if average` arm so the header line below can report
-    // contributor counts (the operator's intuition for "how many
-    // trials feed each aggregate") rather than unique-key counts.
     let pre_agg_a = rows_a.len();
     let pre_agg_b = rows_b.len();
-    let (rows_a_for_compare, rows_b_for_compare, avg_a, avg_b) = if average {
-        let avg_a = group_and_average(&rows_a);
-        let avg_b = group_and_average(&rows_b);
+
+    // Average by default: fold same-pairing-key rows on each
+    // side into one mean row. `--no-average` keeps every
+    // sidecar distinct but still rejects duplicate pairing keys
+    // because compare_rows can't pair an A-row against multiple
+    // B-rows with the same key.
+    let (rows_a_for_compare, rows_b_for_compare, avg_a, avg_b) = if !no_average {
+        let avg_a = group_and_average_by(&rows_a, &pairing_dims);
+        let avg_b = group_and_average_by(&rows_b, &pairing_dims);
         let a_rows: Vec<GauntletRow> = avg_a.iter().map(|r| r.row.clone()).collect();
         let b_rows: Vec<GauntletRow> = avg_b.iter().map(|r| r.row.clone()).collect();
         (a_rows, b_rows, Some(avg_a), Some(avg_b))
     } else {
+        // Detect duplicates manually so the error names the key
+        // rather than letting compare_rows silently latch onto
+        // the first match.
+        check_no_duplicate_pairing_keys(&rows_a, &pairing_dims, "A")?;
+        check_no_duplicate_pairing_keys(&rows_b, &pairing_dims, "B")?;
         (rows_a, rows_b, None, None)
     };
 
-    let report = compare_rows(&rows_a_for_compare, &rows_b_for_compare, filter, policy);
+    let report = compare_rows_by(
+        &rows_a_for_compare,
+        &rows_b_for_compare,
+        &pairing_dims,
+        filter,
+        policy,
+    );
 
-    if average {
-        // Header line above the comparison table announcing the
-        // pre-aggregation contributor counts. Distinct from the
-        // table itself so the table preset (`new_table`) can keep
-        // using its bare `set_header(...)` row form without
-        // building a multi-row title cell. Construction is
-        // factored out to [`format_average_header`] so the
-        // exact-string contract can be unit-tested.
-        println!("{}", format_average_header(pre_agg_a, pre_agg_b, a, b));
+    // Side labels derive from the slicing dims' filter values.
+    // Single slicing dim: e.g. "6.14.2" / "6.15.0". Multi: e.g.
+    // "6.14.2:scx_rusty" / "6.15.0:scx_alpha". >3 values per dim:
+    // collapse to "A"/"B" to keep column headers readable.
+    let label_a = render_side_label(filter_a, &slicing_dims, "A");
+    let label_b = render_side_label(filter_b, &slicing_dims, "B");
+
+    // Header lines: name the slicing and pairing axes so the
+    // operator can confirm the comparison shape at a glance.
+    let slice_names: Vec<&str> = slicing_dims.iter().map(|d| d.name()).collect();
+    let pair_names: Vec<&str> = pairing_dims.iter().map(|d| d.name()).collect();
+    println!("slicing dimensions: {}", slice_names.join(", "));
+    println!(
+        "pairing on: scenario{}{}",
+        if pair_names.is_empty() { "" } else { ", " },
+        pair_names.join(", "),
+    );
+
+    if !no_average {
+        println!(
+            "{}",
+            format_average_header(pre_agg_a, pre_agg_b, &label_a, &label_b)
+        );
     }
 
     use comfy_table::{Cell, Color};
     let mut table = crate::cli::new_table();
-    table.set_header(vec!["TEST", "METRIC", a, b, "DELTA", "VERDICT"]);
+    table.set_header(vec![
+        "TEST", "METRIC", &label_a, &label_b, "DELTA", "VERDICT",
+    ]);
     for f in &report.findings {
         let (verdict_text, verdict_color) = if f.is_regression {
             ("REGRESSION", Color::Red)
         } else {
             ("improvement", Color::Green)
         };
-        let label = format!("{}/{}/{}", f.scenario, f.topology, f.work_type);
+        // PairingKey's first slot is scenario; subsequent slots
+        // are the pairing-dim values in canonical order. Joining
+        // with `/` produces a label whose shape mirrors the
+        // pairing-dim count — so a comparison that pairs on
+        // (topology, work_type, flags) renders the historical
+        // `scenario/topology/work_type/flags` label, while a
+        // comparison that slices on most dims renders a shorter
+        // identifier. The operator can always cross-reference
+        // the "pairing on:" header line above to see what each
+        // segment means.
+        let label = f.pairing_key.0.join("/");
         table.add_row(vec![
             Cell::new(label),
             Cell::new(f.metric.name),
@@ -2196,13 +2644,12 @@ pub fn compare_runs(
     );
     if report.skipped_failed > 0 {
         println!(
-            "  {} (scenario, topology, work_type) row pair(s) skipped \
-             because one or both runs failed",
+            "  {} pairing-key row pair(s) skipped because one or both sides failed",
             report.skipped_failed,
         );
     }
     if let (Some(avg_a), Some(avg_b)) = (&avg_a, &avg_b) {
-        let block = format_per_group_pass_counts(avg_a, avg_b, a, b);
+        let block = format_per_group_pass_counts(avg_a, avg_b, &label_a, &label_b);
         if !block.is_empty() {
             print!("{block}");
         }
@@ -2210,33 +2657,63 @@ pub fn compare_runs(
     if report.new_in_b > 0 {
         println!(
             "  {} row(s) new in '{}' (no matching key in '{}')",
-            report.new_in_b, b, a,
+            report.new_in_b, label_b, label_a,
         );
     }
     if report.removed_from_a > 0 {
         println!(
             "  {} row(s) removed from '{}' (no matching key in '{}')",
-            report.removed_from_a, a, b,
+            report.removed_from_a, label_a, label_b,
         );
     }
 
-    // Host-context delta. Static fields (uname triple, CPU
-    // identity, total memory, hugepage size, NUMA count) are
-    // memoized once per process in [`host_context`]'s
-    // `STATIC_HOST_INFO`, so every sidecar in a run carries
-    // identical values for them. Dynamic fields (sched_tunables,
-    // hugepages_{total,free}, thp_enabled, thp_defrag, kernel_cmdline)
-    // are re-read on every `collect_host_context` call, so an
-    // operator who flips a sysctl or reserves hugepages
-    // mid-run will see drift across sidecars within the same
-    // run. Picking the first `Some(host)` we encounter is a
-    // representative baseline, not a replay of every sample.
-    // For full timeseries, inspect individual sidecar JSON files.
+    // Host-context delta. Same first-Some(host) baseline as the
+    // legacy `compare_runs` flow — picking representative hosts
+    // off the partitioned sidecars rather than the full pool so
+    // the delta reflects what actually fed the comparison.
+    let sidecars_a: Vec<&crate::test_support::SidecarResult> = pool
+        .iter()
+        .filter(|s| filter_a.matches(&sidecar_to_row(s)))
+        .collect();
+    let sidecars_b: Vec<&crate::test_support::SidecarResult> = pool
+        .iter()
+        .filter(|s| filter_b.matches(&sidecar_to_row(s)))
+        .collect();
     let host_a = sidecars_a.iter().find_map(|s| s.host.as_ref());
     let host_b = sidecars_b.iter().find_map(|s| s.host.as_ref());
-    print!("{}", format_host_delta(host_a, host_b, a, b));
+    print!("{}", format_host_delta(host_a, host_b, &label_a, &label_b));
 
     Ok(if report.regressions > 0 { 1 } else { 0 })
+}
+
+/// Bail when `rows` contains two or more entries with the same
+/// pairing key — only relevant under `--no-average`, where each
+/// sidecar row stays distinct and `compare_rows_by` would
+/// silently latch onto whichever entry happened to be first in
+/// iteration order. Names the offending key in the diagnostic
+/// so the operator can choose to either drop `--no-average` or
+/// add another per-side filter to disambiguate.
+fn check_no_duplicate_pairing_keys(
+    rows: &[GauntletRow],
+    pairing_dims: &[Dimension],
+    side_label: &str,
+) -> anyhow::Result<()> {
+    let mut seen: BTreeMap<PairingKey, usize> = BTreeMap::new();
+    for row in rows {
+        let key = PairingKey::from_row(row, pairing_dims);
+        *seen.entry(key).or_insert(0) += 1;
+    }
+    if let Some((dup_key, count)) = seen.iter().find(|&(_, &c)| c > 1) {
+        anyhow::bail!(
+            "stats compare --no-average: side {side_label} has {count} \
+             sidecars with the same pairing key {key:?}. Either drop \
+             --no-average to average them, or add another --{side}-X \
+             filter to disambiguate.",
+            key = dup_key.0,
+            side = side_label.to_lowercase(),
+        );
+    }
+    Ok(())
 }
 
 /// Render the host-context delta section of `stats compare --runs`
@@ -4373,147 +4850,75 @@ mod tests {
         assert_eq!(back, row);
     }
 
-    /// Pins that `compare_runs(..., dir = Some(alt_root))` actually
-    /// resolves `a` / `b` against `alt_root`, not the default
-    /// [`crate::test_support::runs_root`].
+    /// `compare_partitions` honours the `--dir` override —
+    /// pool-collection walks the override path rather than the
+    /// default [`crate::test_support::runs_root`]. Pool source-of-
+    /// truth threading regressed silently in earlier versions
+    /// (`--dir` was parsed but ignored), so this test pins the
+    /// load-bearing wire from CLI arg through `compare_partitions`
+    /// down to `collect_pool`.
     ///
-    /// Sibling `parse_stats_compare_with_dir`
-    /// (src/bin/cargo-ktstr.rs) pins the clap-binding half of the
-    /// `--dir` wiring: a CLI invocation `stats compare a b --dir
-    /// PATH` parses into `StatsCommand::Compare { dir: Some(PATH),
-    /// ... }`. That test stops at the parsed struct — it cannot
-    /// prove that the resolved `Option<&Path>` is then threaded
-    /// through to `compare_runs`'s root-resolution site
-    /// (stats.rs:`let root = match dir { Some(d) => ..., None =>
-    /// runs_root() }`). A regression that re-parsed `--dir`
-    /// correctly but dropped the field on the way to
-    /// `compare_runs` would pass the parse test yet silently read
-    /// from `runs_root()` — exactly the bug a reader of the
-    /// existing comment at the top of [`compare_runs`] is warned
-    /// about as "earlier versions."
-    ///
-    /// Fixture shape: two unique-named run subdirectories under a
-    /// freshly-created tempdir, each containing one valid
-    /// `*.ktstr.json` sidecar (built from
-    /// [`SidecarResult::test_fixture`] with a distinct run-specific
-    /// test_name). Calling `compare_runs` with `dir =
-    /// Some(alt_root.path())` reads those sidecars and returns
-    /// `Ok(exit_code)`. The unique-name choice (`__dir_thread_a__`
-    /// / `__dir_thread_b__`) insulates the test from any ambient
-    /// sidecar tree under `runs_root()`: if `--dir` threading
-    /// silently broke and the function fell back to `runs_root()`,
-    /// it would bail with "run '__dir_thread_a__' not found under
-    /// {runs_root}" rather than succeed. Success therefore
-    /// implies the alt-root path was honoured.
-    ///
-    /// Companion assertion: calling `compare_runs` WITHOUT `--dir`
-    /// (dir = None) against the same unique names must produce an
-    /// error whose message names `runs_root()` — proving the
-    /// fallback path points where we expect and reinforcing that
-    /// the success above used `alt_root`. Ensures a broken
-    /// threading regression cannot pass this test by "sort of
-    /// working" (e.g. some parent-directory bug that happens to
-    /// include our tempdir).
+    /// Fixture: a tempdir alt-root with two run subdirectories,
+    /// each holding one sidecar. The two sidecars differ on
+    /// `scheduler` so the slicing-dim is `scheduler` and
+    /// `compare_partitions` has a well-defined contrast. Calling
+    /// `compare_partitions` with `dir = Some(alt_root)` finds the
+    /// pooled fixtures and returns Ok; calling without `--dir`
+    /// against runs_root (which doesn't contain these private
+    /// fixtures) fails with a "no sidecar data" diagnostic.
     #[test]
-    fn compare_runs_threads_dir_through_to_sidecar_resolution() {
+    fn compare_partitions_threads_dir_through_to_pool_collection() {
         use crate::test_support::SidecarResult;
 
         let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
-        // Distinctive test-only names that must not collide with
-        // any pre-existing run directory under the ambient
-        // `runs_root()`.
-        let run_a = "__dir_thread_a__";
-        let run_b = "__dir_thread_b__";
-
-        // Set up two run directories each with one valid sidecar.
-        // Using `test_fixture()` keeps the fields defaulted;
-        // overriding `test_name` per run gives the two runs
-        // distinct rows so compare_runs has something to report
-        // without tripping the empty-sidecars bail.
-        for (name, run_key) in [
-            ("dir_thread_fixture_a", run_a),
-            ("dir_thread_fixture_b", run_b),
+        // Two run subdirs; each holds one sidecar. The sidecars
+        // differ on scheduler so the slicing-dim derivation has
+        // a non-empty result.
+        for (run_key, sched) in [
+            ("__dir_thread_a__", "scx_alpha"),
+            ("__dir_thread_b__", "scx_beta"),
         ] {
             let run_dir = alt_root.path().join(run_key);
             std::fs::create_dir_all(&run_dir).expect("create run dir");
             let sidecar = SidecarResult {
-                test_name: name.to_string(),
+                test_name: "dir_thread_fixture".to_string(),
+                scheduler: sched.to_string(),
                 ..SidecarResult::test_fixture()
             };
             let json = serde_json::to_string(&sidecar).expect("serialize fixture sidecar");
-            let sidecar_path = run_dir.join(format!("{name}.ktstr.json"));
+            let sidecar_path = run_dir.join(format!("{run_key}.ktstr.json"));
             std::fs::write(&sidecar_path, json).expect("write fixture sidecar");
         }
 
-        // Positive: with `dir = Some(alt_root)` the resolver must
-        // find the fixtures we just laid down and return Ok. A
-        // broken threading would fall back to `runs_root()`, fail
-        // to find `runs_root()/__dir_thread_a__`, and bail.
-        let exit = compare_runs(
-            run_a,
-            run_b,
+        let filter_a = RowFilter {
+            scheduler: Some("scx_alpha".to_string()),
+            ..RowFilter::default()
+        };
+        let filter_b = RowFilter {
+            scheduler: Some("scx_beta".to_string()),
+            ..RowFilter::default()
+        };
+
+        // Positive: --dir threads to collect_pool; the two
+        // partitions resolve and the comparison runs without
+        // bailing. Identical metric values mean exit 0 (no
+        // regressions); we only care that the call succeeds.
+        let exit = compare_partitions(
+            &filter_a,
+            &filter_b,
             None,
-            &RowFilter::default(),
             &ComparisonPolicy::default(),
             Some(alt_root.path()),
             false,
         )
-        .expect("compare_runs must resolve runs under the dir arg");
+        .expect("compare_partitions must pool sidecars under --dir override");
         assert_eq!(
             exit, 0,
-            "both fixtures are byte-identical copies of \
-             SidecarResult::test_fixture() modulo test_name — \
-             comparing them against each other must yield zero \
-             regressions (exit 0). A non-zero exit here means \
-             either compare_rows regressed on identical inputs \
-             or the resolver loaded different data than the \
-             fixtures written above.",
-        );
-
-        // Companion: without `--dir`, the same unique names cannot
-        // exist under the ambient `runs_root()` (they're
-        // test-private fixtures we just created under a tempdir),
-        // so compare_runs must Err with a message that names the
-        // fallback root. This proves the dir-resolution branch
-        // above actually went through the Some(d) arm rather than
-        // happening to work because runs_root() also had these
-        // names.
-        let err = compare_runs(
-            run_a,
-            run_b,
-            None,
-            &RowFilter::default(),
-            &ComparisonPolicy::default(),
-            None,
-            false,
-        )
-        .expect_err("compare_runs without --dir must fail on missing unique fixtures");
-        let rendered = format!("{err:#}");
-        assert!(
-            rendered.contains(run_a),
-            "fallback error must name the missing run; got: {rendered}",
-        );
-        let fallback_root = crate::test_support::runs_root();
-        let fallback_display = fallback_root.display().to_string();
-        assert!(
-            rendered.contains(&fallback_display),
-            "fallback error must name runs_root() ({fallback_display:?}) so the \
-             dir=None branch is proven to resolve against the fallback; got: \
-             {rendered}",
-        );
-        // Defensive: the fallback root must NOT equal our alt
-        // root. If it did, the positive assertion above is
-        // circular (alt_root ≡ runs_root()) and proves nothing
-        // about threading. Tempdir names are randomized per run,
-        // so this is effectively always true, but assert anyway
-        // to rule out a regression that changed `runs_root()` to
-        // return the first-argument dir.
-        assert_ne!(
-            fallback_root.as_path(),
-            alt_root.path(),
-            "runs_root() must differ from the alt-root tempdir, \
-             otherwise this test cannot distinguish threading \
-             from fallback",
+            "byte-identical metrics across the two scheduler \
+             partitions must yield zero regressions (exit 0). \
+             A non-zero exit means either the partitions loaded \
+             different data than written above or compare_rows \
+             regressed on identical inputs.",
         );
     }
 
@@ -5215,21 +5620,21 @@ mod tests {
         assert_eq!(spread.delta, 18.0);
     }
 
-    /// `compare_runs` with `average=true` must thread the
-    /// aggregation step into the comparison and return the
-    /// expected exit code. End-to-end pin against on-disk
-    /// fixtures so a regression in the aggregation→compare wiring
-    /// (e.g. forgetting to pass the aggregated rows down) lands
-    /// here.
+    /// `compare_partitions` with the default (averaging-on)
+    /// path must aggregate every matching sidecar within each
+    /// side and detect regressions on the aggregated means.
+    /// End-to-end pin against on-disk fixtures so a regression
+    /// in the aggregation → compare wiring lands here.
     ///
-    /// Fixture: two runs each carrying three sidecars under the
-    /// same (scenario, topology, work_type) key. Side A's three
-    /// trials cluster around `worst_spread = 10` (mean 12); side
-    /// B's three cluster around `worst_spread = 30` (mean 30).
-    /// The 18-unit delta clears the default dual gate, so
-    /// `compare_runs` returns exit code 1 (regressions detected).
+    /// Fixture: two runs each carrying three sidecars that
+    /// differ on `scheduler` (the slicing dim). Side A's three
+    /// trials cluster around `worst_spread = 10` (mean 12);
+    /// side B's three cluster around `worst_spread = 30` (mean
+    /// 30). The 18-unit delta clears the default dual gate, so
+    /// `compare_partitions` returns exit code 1 (regressions
+    /// detected).
     #[test]
-    fn compare_runs_with_average_flag_produces_regression_on_aggregated_means() {
+    fn compare_partitions_with_average_default_produces_regression_on_aggregated_means() {
         use crate::test_support::SidecarResult;
 
         let alt_root = tempfile::TempDir::new().expect("create alt-root tempdir");
@@ -5244,7 +5649,17 @@ mod tests {
         let trials_a = [(10.0, 100), (12.0, 120), (14.0, 140)];
         let trials_b = [(28.0, 280), (30.0, 300), (32.0, 320)];
 
-        for (run_key, trials) in [(run_a, &trials_a), (run_b, &trials_b)] {
+        // Scheduler is the slicing dim: side A's three trials
+        // run under "scx_alpha", side B's under "scx_beta". The
+        // pairing dims are everything else (kernel/topology/
+        // work_type/commit/flags) which match across both runs,
+        // so the three trials on each side aggregate into one
+        // mean row keyed by `(scenario, topology, work_type,
+        // flags)` plus the matching kernel/commit values.
+        for (run_key, trials, sched) in [
+            (run_a, &trials_a, "scx_alpha"),
+            (run_b, &trials_b, "scx_beta"),
+        ] {
             let run_dir = alt_root.path().join(run_key);
             std::fs::create_dir_all(&run_dir).expect("create run dir");
             for (i, (spread, gap_ms)) in trials.iter().enumerate() {
@@ -5252,6 +5667,7 @@ mod tests {
                 let mut sidecar = SidecarResult {
                     test_name: "avg_test".to_string(),
                     topology: "1n2l4c1t".to_string(),
+                    scheduler: sched.to_string(),
                     work_type: "CpuSpin".to_string(),
                     ..SidecarResult::test_fixture()
                 };
@@ -5265,21 +5681,29 @@ mod tests {
             }
         }
 
-        // Without --average: three sidecars per side share one
-        // join key, so each B-side row's first A-side match wins
-        // (per-row regression). The point of THIS test is the
-        // average-path branch, so we only check the
-        // average=true exit code.
-        let exit = compare_runs(
-            run_a,
-            run_b,
+        let filter_a = RowFilter {
+            scheduler: Some("scx_alpha".to_string()),
+            ..RowFilter::default()
+        };
+        let filter_b = RowFilter {
+            scheduler: Some("scx_beta".to_string()),
+            ..RowFilter::default()
+        };
+
+        // Default (averaging-on) path: three sidecars per side
+        // share one pairing key, so each side aggregates to a
+        // single mean row. The 18-unit worst_spread delta on
+        // those means (12 vs 30) clears the default dual gate
+        // and surfaces exit code 1.
+        let exit = compare_partitions(
+            &filter_a,
+            &filter_b,
             None,
-            &RowFilter::default(),
             &ComparisonPolicy::default(),
             Some(alt_root.path()),
-            true,
+            false, // no_average=false → averaging is ON
         )
-        .expect("compare_runs with --average must succeed against valid fixtures");
+        .expect("compare_partitions must succeed against valid fixtures");
         assert_eq!(
             exit, 1,
             "an 18-unit worst_spread regression on the aggregated mean \
@@ -5437,6 +5861,317 @@ mod tests {
         assert_eq!(
             occurrences, 2,
             "two flag profiles must render as two separate lines; got: {out:?}",
+        );
+    }
+
+    // -- Dimension / derive_slicing_dims / pairing dims --
+
+    /// `Dimension::ALL` lists all six dims in canonical order.
+    /// Order matters for [`PairingKey::from_row`] and for header
+    /// rendering — a regression that reordered the slice would
+    /// silently shift every dynamic key, splitting previously-
+    /// paired rows. Pin the literal order.
+    #[test]
+    fn dimension_all_canonical_order() {
+        assert_eq!(
+            Dimension::ALL,
+            &[
+                Dimension::Kernel,
+                Dimension::Scheduler,
+                Dimension::Topology,
+                Dimension::WorkType,
+                Dimension::Commit,
+                Dimension::Flags,
+            ],
+        );
+    }
+
+    /// `Dimension::pairing_dims` returns every dim NOT in the
+    /// slicing set, preserving canonical order. Two slicing
+    /// orderings produce the same pairing-dim list (the function
+    /// iterates `ALL`, not `slicing`).
+    #[test]
+    fn dimension_pairing_dims_complements_slicing() {
+        let pair = Dimension::pairing_dims(&[Dimension::Kernel, Dimension::Commit]);
+        assert_eq!(
+            pair,
+            vec![
+                Dimension::Scheduler,
+                Dimension::Topology,
+                Dimension::WorkType,
+                Dimension::Flags,
+            ],
+        );
+        // Order of slicing input doesn't change the output —
+        // the function iterates ALL and filters.
+        let pair_reversed = Dimension::pairing_dims(&[Dimension::Commit, Dimension::Kernel]);
+        assert_eq!(pair, pair_reversed);
+    }
+
+    /// Empty slicing set → every dim is a pairing dim.
+    #[test]
+    fn dimension_pairing_dims_empty_slicing_yields_all() {
+        let pair = Dimension::pairing_dims(&[]);
+        assert_eq!(pair, Dimension::ALL.to_vec());
+    }
+
+    /// `derive_slicing_dims` returns every dimension on which
+    /// filter_a and filter_b differ. Equal filters → empty
+    /// slicing.
+    #[test]
+    fn derive_slicing_dims_identical_filters_yields_empty() {
+        let f = RowFilter {
+            scheduler: Some("scx_alpha".to_string()),
+            ..RowFilter::default()
+        };
+        assert!(derive_slicing_dims(&f, &f).is_empty());
+    }
+
+    /// One-dim diff: only the differing dimension is reported.
+    #[test]
+    fn derive_slicing_dims_single_dim_diff() {
+        let f_a = RowFilter {
+            scheduler: Some("scx_alpha".to_string()),
+            ..RowFilter::default()
+        };
+        let f_b = RowFilter {
+            scheduler: Some("scx_beta".to_string()),
+            ..RowFilter::default()
+        };
+        assert_eq!(derive_slicing_dims(&f_a, &f_b), vec![Dimension::Scheduler]);
+    }
+
+    /// Vec dims (kernels/commits/flags) compare as sorted-deduped
+    /// sets — order and duplicates inside the filter don't shift
+    /// the slicing-dim derivation.
+    #[test]
+    fn derive_slicing_dims_vec_compares_as_set() {
+        let f_a = RowFilter {
+            kernels: vec!["6.14".to_string(), "6.15".to_string()],
+            ..RowFilter::default()
+        };
+        let f_b = RowFilter {
+            kernels: vec!["6.15".to_string(), "6.14".to_string(), "6.14".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            derive_slicing_dims(&f_a, &f_b).is_empty(),
+            "same set in different order/multiplicity must NOT slice",
+        );
+    }
+
+    /// Multi-dim diff: every differing dimension is reported, in
+    /// canonical [`Dimension::ALL`] order.
+    #[test]
+    fn derive_slicing_dims_multi_dim_diff_in_canonical_order() {
+        let f_a = RowFilter {
+            kernels: vec!["6.14".to_string()],
+            scheduler: Some("scx_alpha".to_string()),
+            ..RowFilter::default()
+        };
+        let f_b = RowFilter {
+            kernels: vec!["6.15".to_string()],
+            scheduler: Some("scx_beta".to_string()),
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            derive_slicing_dims(&f_a, &f_b),
+            vec![Dimension::Kernel, Dimension::Scheduler],
+        );
+    }
+
+    /// `kernel_filter_matches`: major.minor (`6.12`) prefix
+    /// matches every patch in the series via the
+    /// `starts_with("6.12.")` arm, and ALSO matches `6.12`
+    /// exactly. Three-segment-or-longer filters are strict.
+    #[test]
+    fn kernel_filter_matches_major_minor_prefix() {
+        // Two-segment filter: prefix matches.
+        assert!(kernel_filter_matches("6.12", "6.12"));
+        assert!(kernel_filter_matches("6.12", "6.12.0"));
+        assert!(kernel_filter_matches("6.12", "6.12.5"));
+        assert!(!kernel_filter_matches("6.12", "6.13.0"));
+        // Critically: `6.1` must not match `6.10.0` — the
+        // trailing-dot in the prefix path prevents the
+        // accidental wildcard.
+        assert!(!kernel_filter_matches("6.1", "6.10.0"));
+    }
+
+    /// `kernel_filter_matches`: three-segment+ filters are strict
+    /// equality.
+    #[test]
+    fn kernel_filter_matches_strict_for_three_plus_segments() {
+        assert!(kernel_filter_matches("6.14.2", "6.14.2"));
+        // Critically: `6.14.2` must NOT match `6.14.20` — the
+        // strict-equality arm prevents the patch-level prefix
+        // wildcarding.
+        assert!(!kernel_filter_matches("6.14.2", "6.14.20"));
+        assert!(!kernel_filter_matches("6.14.2", "6.14.21"));
+        // RC suffixes are also strict.
+        assert!(kernel_filter_matches("6.15-rc3", "6.15-rc3"));
+        assert!(!kernel_filter_matches("6.15-rc3", "6.15-rc30"));
+    }
+
+    /// `RowFilter::matches` with a major.minor `--kernel` filter
+    /// admits the row whose `kernel_version` is a patch in that
+    /// series.
+    #[test]
+    fn row_filter_kernel_major_minor_prefix_admits_patch_version() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.12.5"), &[]);
+        let filter = RowFilter {
+            kernels: vec!["6.12".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            filter.matches(&row),
+            "major.minor filter `6.12` must admit row with kernel_version `6.12.5`",
+        );
+    }
+
+    // -- PairingKey --
+
+    /// `PairingKey::from_row` always puts `scenario` first, then
+    /// the requested dims in canonical order. Two rows with the
+    /// same scenario+dims agree; one with a different topology
+    /// (when topology IS a pairing dim) does not.
+    #[test]
+    fn pairing_key_from_row_basic() {
+        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let row_b = make_filter_row("scenA", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let row_c = make_filter_row("scenA", "scx_a", "2n2l", "CpuSpin", Some("6.14"), &[]);
+        let dims = &[Dimension::Topology, Dimension::WorkType];
+        assert_eq!(
+            PairingKey::from_row(&row_a, dims),
+            PairingKey::from_row(&row_b, dims),
+        );
+        assert_ne!(
+            PairingKey::from_row(&row_a, dims),
+            PairingKey::from_row(&row_c, dims),
+            "different topology must distinguish the keys when topology is a pairing dim",
+        );
+    }
+
+    /// Slicing on topology means topology is NOT in the pairing
+    /// dim set — so two rows that differ ONLY on topology pair
+    /// to the same key, allowing the comparison to contrast
+    /// them across A/B sides.
+    #[test]
+    fn pairing_key_excludes_slicing_dim() {
+        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        let row_b = make_filter_row("scenA", "scx_a", "2n2l", "CpuSpin", Some("6.14"), &[]);
+        // Pairing dims = ALL minus Topology. So these two rows
+        // pair iff they agree on everything BUT topology.
+        let pair_dims = Dimension::pairing_dims(&[Dimension::Topology]);
+        assert_eq!(
+            PairingKey::from_row(&row_a, &pair_dims),
+            PairingKey::from_row(&row_b, &pair_dims),
+            "rows differing only on a slicing dim must produce equal pairing keys",
+        );
+    }
+
+    /// `PairingKey::from_row` first slot is always scenario;
+    /// rendering via `parts.join("/")` reproduces the historical
+    /// `scenario/topology/work_type/flags` shape when those dims
+    /// are pairing dims.
+    #[test]
+    fn pairing_key_join_renders_legacy_shape() {
+        let mut row = make_filter_row("test_a", "scx_a", "1n2l", "CpuSpin", Some("6.14"), &[]);
+        row.flags = vec!["llc".to_string(), "steal".to_string()];
+        let key = PairingKey::from_row(&row, LEGACY_PAIRING_DIMS);
+        assert_eq!(
+            key.0.join("/"),
+            "test_a/1n2l/CpuSpin/llc|steal",
+            "legacy-shape join must render the four-segment label \
+             with flags sorted+deduped via `|`",
+        );
+    }
+
+    // -- render_side_label --
+
+    /// Empty slicing dims → the bare label is returned.
+    #[test]
+    fn render_side_label_empty_dims_yields_bare() {
+        let f = RowFilter::default();
+        assert_eq!(render_side_label(&f, &[], "A"), "A");
+    }
+
+    /// Single-dim Option scheduler renders the value verbatim.
+    #[test]
+    fn render_side_label_single_option_dim() {
+        let f = RowFilter {
+            scheduler: Some("scx_rusty".to_string()),
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f, &[Dimension::Scheduler], "A"),
+            "scx_rusty",
+        );
+    }
+
+    /// Vec dim with ≤3 entries joins with `|` (sorted).
+    #[test]
+    fn render_side_label_vec_dim_short_joins_with_pipe() {
+        let f = RowFilter {
+            kernels: vec!["6.15".to_string(), "6.14".to_string()],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f, &[Dimension::Kernel], "A"),
+            "6.14|6.15",
+            "≤3 values must join sorted with `|`",
+        );
+    }
+
+    /// Vec dim with >3 entries collapses to the bare label.
+    #[test]
+    fn render_side_label_vec_dim_long_collapses_to_bare() {
+        let f = RowFilter {
+            kernels: vec![
+                "6.10".to_string(),
+                "6.11".to_string(),
+                "6.12".to_string(),
+                "6.13".to_string(),
+                "6.14".to_string(),
+            ],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f, &[Dimension::Kernel], "A"),
+            "A",
+            ">3 values must collapse to the bare letter so the \
+             column header stays readable",
+        );
+    }
+
+    /// Multi-dim slicing joins per-dim parts with `:`.
+    #[test]
+    fn render_side_label_multi_dim_joins_with_colon() {
+        let f = RowFilter {
+            kernels: vec!["6.14".to_string()],
+            scheduler: Some("scx_rusty".to_string()),
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f, &[Dimension::Kernel, Dimension::Scheduler], "A"),
+            "6.14:scx_rusty",
+        );
+    }
+
+    /// Empty per-side filter on a slicing dim falls back to the
+    /// bare label (the slice exists because the OTHER side
+    /// populated the dim).
+    #[test]
+    fn render_side_label_empty_dim_value_uses_bare() {
+        let f = RowFilter::default();
+        assert_eq!(
+            render_side_label(&f, &[Dimension::Kernel], "B"),
+            "B",
+            "empty Vec dim must fall back to the bare letter",
+        );
+        assert_eq!(
+            render_side_label(&f, &[Dimension::Scheduler], "B"),
+            "B",
+            "None Option dim must fall back to the bare letter",
         );
     }
 }
