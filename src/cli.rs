@@ -2638,31 +2638,41 @@ fn project_optional_fields(sc: &crate::test_support::SidecarResult) -> [(&'stati
 /// into a [`crate::test_support::SidecarResult`]; `errors`
 /// carries the per-file parse failures as
 /// [`crate::test_support::SidecarParseError`] records (named
-/// fields: `path`, `raw_error`, `enriched_message`) sourced
-/// from [`crate::test_support::collect_sidecars_with_errors`].
+/// fields: `path`, `raw_error`, `enriched_message`); `io_errors`
+/// carries the per-file IO failures as
+/// [`crate::test_support::SidecarIoError`] records (named fields:
+/// `path`, `raw_error`) — files whose `read_to_string` failed
+/// before parsing could begin (permission denied, mid-rotate
+/// truncation, broken symlink). All three vecs are sourced from
+/// [`crate::test_support::collect_sidecars_with_errors`].
 ///
-/// The enrichment field is `Some(prose)` for parse failures
-/// where a known schema-drift remediation applies (currently
-/// the `host` missing-field case) and `None` otherwise. Both
-/// channels are exposed so JSON consumers can render the raw
-/// serde message for grep-friendly parse-error tracking AND
-/// the enriched prose for human-facing remediation.
+/// The `enriched_message` field on parse errors is
+/// `Some(prose)` for failures where a known schema-drift
+/// remediation applies (currently the `host` missing-field
+/// case) and `None` otherwise. Both raw and enriched are
+/// exposed so JSON consumers can render the raw serde message
+/// for grep-friendly parse-error tracking AND the enriched
+/// prose for human-facing remediation.
 ///
-/// Files whose `read_to_string` fails (permission denied,
-/// mid-rotate truncation, etc.) silently drop from both
-/// `valid` and `errors` — they count in `walked` but appear
-/// in neither output channel. `walked - valid - errors.len()`
-/// is the implicit silent-drop count, zero in a clean run.
+/// Every predicate-matching file lands in exactly one of
+/// `valid` (parsed OK), `errors` (read OK, parse failed), or
+/// `io_errors` (read failed) — so
+/// `walked == valid + errors.len() + io_errors.len()` by
+/// construction. The previous "implicit silent-drop count"
+/// (where IO failures vanished from every channel) is gone.
 ///
-/// `errors` surfaces in both render paths: text appends a
-/// trailing block listing corrupt paths and (when present)
-/// the enriched prose, JSON exposes them under `_walk.errors`
-/// as `{path, error, enriched_message}` entries so dashboard
+/// `errors` and `io_errors` surface in both render paths: text
+/// appends a `corrupt sidecars` block (parse failures, optional
+/// enriched prose) and an `io errors` block (IO failures, raw
+/// `std::io::Error` Display); JSON exposes them under
+/// `_walk.errors` as `{path, error, enriched_message}` entries
+/// and `_walk.io_errors` as `{path, error}` entries. Dashboard
 /// consumers can surface them without parsing prose.
 struct WalkStats {
     walked: usize,
     valid: usize,
     errors: Vec<crate::test_support::SidecarParseError>,
+    io_errors: Vec<crate::test_support::SidecarIoError>,
 }
 
 /// Count `.ktstr.json` files under `run_dir` using
@@ -2708,20 +2718,23 @@ fn count_sidecar_files(run_dir: &Path) -> usize {
 ///
 /// Delegates parsing to
 /// [`crate::test_support::collect_sidecars_with_errors`] — that
-/// helper emits per-file `eprintln!` hints on parse failure
-/// (surfacing the actionable schema-drift message to the
-/// operator) AND returns a structured
+/// helper emits per-file `eprintln!` hints on every failure
+/// (parse: actionable schema-drift message; IO: raw error
+/// string) AND returns two structured vecs:
 /// `Vec<`[`crate::test_support::SidecarParseError`]`>` (each
-/// record carries `path`, `raw_error`, and
-/// `enriched_message`) that flows into [`WalkStats::errors`] for
-/// the JSON / text renderers to surface alongside the per-field
-/// breakdown. The `walked` count is derived independently via
-/// [`count_sidecar_files`] so the diagnostic header reports total
-/// `.ktstr.json` files visited (corrupt + valid), independent of
-/// any parse-failure short-circuit.
+/// record carries `path`, `raw_error`, and `enriched_message`)
+/// that flows into [`WalkStats::errors`], and
+/// `Vec<`[`crate::test_support::SidecarIoError`]`>` (each record
+/// carries `path` and `raw_error`) that flows into
+/// [`WalkStats::io_errors`]. Both feed the JSON / text
+/// renderers alongside the per-field breakdown. The `walked`
+/// count is derived independently via [`count_sidecar_files`]
+/// so the diagnostic header reports total `.ktstr.json` files
+/// visited (every predicate-matching file), independent of any
+/// parse-failure or IO-failure short-circuit.
 fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResult>, WalkStats) {
     let walked = count_sidecar_files(run_dir);
-    let (sidecars, errors) = crate::test_support::collect_sidecars_with_errors(run_dir);
+    let (sidecars, errors, io_errors) = crate::test_support::collect_sidecars_with_errors(run_dir);
     let valid = sidecars.len();
     (
         sidecars,
@@ -2729,6 +2742,7 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
             walked,
             valid,
             errors,
+            io_errors,
         },
     )
 }
@@ -2760,9 +2774,15 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 /// changes), `"_walk"` (an envelope carrying `walked` / `valid`
 /// counts — the same numbers the text header reports — plus an
 /// `errors` array of `{path, error, enriched_message}` entries
-/// covering every parse failure; `enriched_message` is a
+/// covering every parse failure (`enriched_message` is a
 /// human-facing remediation string when one applies, JSON null
-/// otherwise), and `"fields"` (a map keyed by
+/// otherwise) AND an `io_errors` array of `{path, error}`
+/// entries covering every IO failure (file matched the
+/// predicate but `read_to_string` failed before parsing — e.g.
+/// permission denied, mid-rotate truncation). With both arrays,
+/// `walked == valid + errors.len() + io_errors.len()` by
+/// construction — every predicate-matching file lands in
+/// exactly one bucket. `"fields"` is a map keyed by
 /// [`SIDECAR_NONE_CATALOG`] field name where each value is
 /// `{ "none_count": N, "some_count": M, "classification": "...",
 /// "causes": [...], "fix": "..." }`). `none_count` and
@@ -2774,8 +2794,9 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 /// one applies, or JSON null otherwise. This shape is
 /// dashboard-friendly: a CI consumer can ingest the JSON
 /// without parsing per-sidecar prose. The text form retains
-/// per-sidecar detail for human triage and appends a trailing
-/// "corrupt sidecars" block when parse errors occurred.
+/// per-sidecar detail for human triage and appends trailing
+/// `corrupt sidecars` (parse failures) and `io errors` (IO
+/// failures) blocks when either occurred.
 ///
 /// All-corrupt runs (every file failed to parse) are NOT a
 /// hard error — both renderers fall through with `valid = 0`,
@@ -2799,11 +2820,71 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 ///
 /// # Errors
 ///
+/// - The `run` argument is empty, equals `.`, escapes the
+///   run-root via `..` segments, or is absolute — rejected
+///   before path resolution to keep `--dir` (which an operator
+///   may point at a shared archive pool) from being used to
+///   read arbitrary filesystem locations under
+///   attacker-controlled input. Empty and `.` both resolve via
+///   `Path::join` to the unmodified pool root, which would
+///   walk every archived run; explicitly rejecting these forces
+///   operators to name the run they want.
 /// - The run directory does not exist.
 /// - The run directory exists but the walker found zero
 ///   `.ktstr.json` files at all (empty or read-permission
 ///   failure on the directory itself).
 pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<String> {
+    // Reject pool-root-aliasing and path-traversal inputs BEFORE
+    // joining onto `root`. The `Path::join` rules that matter:
+    // joining an empty string is a no-op; joining `.` is a no-op;
+    // joining an absolute path REPLACES `root` with the absolute
+    // argument. Each shape would let `--run` resolve outside the
+    // intended single-run scope:
+    //
+    // - `""` and `.` both alias the pool root, walking every
+    //   archived run instead of the requested one.
+    // - `..` escapes upward toward arbitrary filesystem locations.
+    // - `/` (RootDir) and Windows `Prefix` produce absolute paths
+    //   that bypass `root` entirely.
+    //
+    // The empty-string case is checked before the component loop
+    // because `Path::new("").components()` yields ZERO components
+    // and would silently pass an iterate-and-reject validator.
+    if run.is_empty() {
+        bail!(
+            "run argument must not be empty. The run argument must \
+             be a bare run key under the run-root (e.g. \
+             `linux-6.14-20260101T120000Z`); to point at a different \
+             pool root, use `--dir`. Run `cargo ktstr stats list` to \
+             enumerate available run keys.",
+        );
+    }
+    // `Path::new(run)`'s `Component` iterator gives a structural
+    // view of the input. A bare run-key like
+    // `linux-6.14-20260101T120000Z` only emits `Normal`
+    // components and passes; every other component variant is a
+    // pool-root alias or traversal vector and bails with an
+    // actionable message.
+    for component in std::path::Path::new(run).components() {
+        match component {
+            std::path::Component::CurDir
+            | std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                bail!(
+                    "run '{run}' contains pool-root-aliasing or \
+                     path-traversal components (`.`, `..`, or absolute \
+                     path). The run argument must be a bare run key \
+                     under the run-root (e.g. \
+                     `linux-6.14-20260101T120000Z`); to point at a \
+                     different pool root, use `--dir`. Run \
+                     `cargo ktstr stats list` to enumerate available \
+                     run keys.",
+                );
+            }
+            std::path::Component::Normal(_) => {}
+        }
+    }
     let root: std::path::PathBuf = match dir {
         Some(d) => d.to_path_buf(),
         None => crate::test_support::runs_root(),
@@ -2853,8 +2934,12 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
 /// followed by `raw_error` and (when present) `enriched_message`
 /// — so operators see parse failures alongside the per-sidecar
 /// breakdown rather than relying on the eprintln-only stderr
-/// path. Block emits only when errors exist — the common
-/// all-valid case stays unchanged.
+/// path. When `walk_stats.io_errors` is non-empty, a parallel
+/// "io errors (N):" block lists each
+/// [`crate::test_support::SidecarIoError`] entry — `path` and
+/// `raw_error` (Display of `std::io::Error`). Each block emits
+/// independently and only when its source vec is non-empty —
+/// the common all-valid case stays unchanged.
 fn render_explain_sidecar_text(
     sidecars: &[crate::test_support::SidecarResult],
     walk_stats: &WalkStats,
@@ -2948,6 +3033,14 @@ fn render_explain_sidecar_text(
         }
         out.push('\n');
     }
+    if !walk_stats.io_errors.is_empty() {
+        let _ = writeln!(out, "io errors ({}):", walk_stats.io_errors.len());
+        for err in &walk_stats.io_errors {
+            let _ = writeln!(out, "  {}", err.path.display());
+            let _ = writeln!(out, "    error: {}", err.raw_error);
+        }
+        out.push('\n');
+    }
     out
 }
 
@@ -3000,17 +3093,25 @@ struct ExplainOutput<'a> {
 
 /// Walk-statistics envelope under
 /// [`ExplainOutput::_walk`]. Mirrors [`WalkStats`] in shape and
-/// holds a freshly built `Vec<WalkError>` populated from the
-/// source [`WalkStats::errors`] — paths are rendered via
+/// holds two freshly built error vecs: `errors`
+/// (`Vec<WalkError>`) sourced from [`WalkStats::errors`] for
+/// parse failures, and `io_errors` (`Vec<WalkIoError>`) sourced
+/// from [`WalkStats::io_errors`] for files that matched the
+/// sidecar predicate but failed to read. Paths are rendered via
 /// `Path::display()` (a `String` allocation per entry, required
 /// because `PathBuf` has no stable JSON-string `Serialize`
-/// surface across platforms), but the error message is borrowed
+/// surface across platforms), but error messages are borrowed
 /// as `&'a str` to avoid cloning.
+///
+/// `walked == valid + errors.len() + io_errors.len()` by
+/// construction — every predicate-matching file lands in
+/// exactly one of the three buckets.
 #[derive(serde::Serialize)]
 struct WalkStatsJson<'a> {
     walked: usize,
     valid: usize,
     errors: Vec<WalkError<'a>>,
+    io_errors: Vec<WalkIoError<'a>>,
 }
 
 /// Per-file parse-failure entry for
@@ -3031,6 +3132,21 @@ struct WalkError<'a> {
     path: String,
     error: &'a str,
     enriched_message: Option<&'a str>,
+}
+
+/// Per-file IO-failure entry for
+/// [`WalkStatsJson::io_errors`]. Mirrors [`WalkError`]'s `path`
+/// encoding (owned `String` via `Path::display().to_string()`)
+/// and `error` borrowing (`&'a str` from
+/// [`crate::test_support::SidecarIoError::raw_error`]). No
+/// `enriched_message` — IO failures have no schema-drift
+/// remediation catalog (causes vary per host: fix permissions,
+/// fix the filesystem, retry the test); the raw message is the
+/// remediation surface.
+#[derive(serde::Serialize)]
+struct WalkIoError<'a> {
+    path: String,
+    error: &'a str,
 }
 
 /// Per-field diagnostic entry under [`ExplainOutput::fields`].
@@ -3110,18 +3226,27 @@ fn render_explain_sidecar_json(
             enriched_message: err.enriched_message.as_deref(),
         })
         .collect();
+    let io_errors: Vec<WalkIoError<'_>> = walk_stats
+        .io_errors
+        .iter()
+        .map(|err| WalkIoError {
+            path: err.path.display().to_string(),
+            error: &err.raw_error,
+        })
+        .collect();
     let output = ExplainOutput {
         _schema_version: EXPLAIN_SIDECAR_SCHEMA_VERSION,
         _walk: WalkStatsJson {
             walked: walk_stats.walked,
             valid: walk_stats.valid,
             errors,
+            io_errors,
         },
         fields,
     };
     serde_json::to_string_pretty(&output).expect(
         "static-shape JSON serialization is infallible — every \
-         field in ExplainOutput / WalkStatsJson / WalkError / \
+         field in ExplainOutput / WalkStatsJson / WalkError / WalkIoError / \
          FieldDiagnostic is a primitive, &str, or Vec/BTreeMap \
          of those — no NaN, no non-string keys, no unsupported \
          types",
@@ -6318,6 +6443,316 @@ mod tests {
                  {expected:?}, got {actual:?}",
             );
         }
+    }
+
+    // -- explain_sidecar IO-error surface (#124) --
+
+    /// IO failures (file matched the sidecar predicate but
+    /// `read_to_string` failed before parsing) surface as a
+    /// distinct `io errors` block in text output and as a distinct
+    /// `_walk.io_errors` array in JSON output. Trigger: a SUBDIR
+    /// child whose name matches the sidecar predicate but is
+    /// itself a directory — `read_to_string` returns EISDIR.
+    /// `collect_sidecars_with_errors`'s subdir-recursion loop
+    /// passes every child to `try_load` without filtering on
+    /// `is_dir()`, so a directory named `foo.ktstr.json` reaches
+    /// the read step and fails. Walked counts the file via
+    /// `count_sidecar_files`'s identical predicate; the IO error
+    /// lands in `io_errors`; per-field counts at zero (no parsed
+    /// sidecar exists).
+    ///
+    /// Exit-code contract: explain-sidecar still returns Ok(...)
+    /// — IO failures are diagnostic surface, not bail conditions
+    /// (matches the parse-failure all-corrupt test at
+    /// `explain_sidecar_all_corrupt_renders_structured_diagnostic`).
+    #[test]
+    fn explain_sidecar_io_errors_surface_in_text_block_and_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-io-err");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sub = run_dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        // Directory named like a sidecar: predicate matches,
+        // read_to_string returns EISDIR, IO error captured.
+        std::fs::create_dir(sub.join("eisdir.ktstr.json")).unwrap();
+
+        // Text channel: trailing `io errors (N):` block lists
+        // the path; per-sidecar blocks empty (zero parsed).
+        let text_out = super::explain_sidecar("run-io-err", Some(tmp.path()), false).unwrap();
+        assert!(
+            text_out.contains("walked 1"),
+            "predicate-matching dir must count as walked: {text_out}",
+        );
+        assert!(
+            text_out.contains("parsed 0 valid"),
+            "no parsed sidecar — header must report 0 valid: {text_out}",
+        );
+        assert!(
+            text_out.contains("io errors (1):"),
+            "IO failure must surface in the trailing io-errors block: {text_out}",
+        );
+        assert!(
+            text_out.contains("eisdir.ktstr.json"),
+            "io-errors block must name the failing path: {text_out}",
+        );
+        assert!(
+            !text_out.contains("corrupt sidecars"),
+            "no parse failures — corrupt-sidecars block must be \
+             absent (IO and parse channels are distinct): {text_out}",
+        );
+
+        // JSON channel: `_walk.io_errors` populated, `_walk.errors`
+        // empty, walked / valid agree with text.
+        let json_out = super::explain_sidecar("run-io-err", Some(tmp.path()), true).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_out).expect("json output must round-trip parse");
+        let walk = parsed.get("_walk").expect("must have _walk");
+        assert_eq!(walk.get("walked").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(walk.get("valid").and_then(|v| v.as_u64()), Some(0));
+        let parse_errs = walk
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .expect("_walk.errors must be present as array");
+        assert!(
+            parse_errs.is_empty(),
+            "no parse failures — _walk.errors must be empty: {json_out}",
+        );
+        let io_errs = walk
+            .get("io_errors")
+            .and_then(|e| e.as_array())
+            .expect("_walk.io_errors must be present as array (#124)");
+        assert_eq!(
+            io_errs.len(),
+            1,
+            "exactly one IO failure expected: {json_out}",
+        );
+        let entry = &io_errs[0];
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("each io-error entry must carry a string `path`");
+        assert!(
+            path.ends_with("eisdir.ktstr.json"),
+            "io-error path must name the failing file: got {path}",
+        );
+        let error = entry
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("each io-error entry must carry a string `error`");
+        assert!(
+            !error.is_empty(),
+            "io-error message must not be empty: {json_out}",
+        );
+        // io-error entries do NOT carry `enriched_message` —
+        // distinct from parse-error entries (no schema-drift
+        // catalog applies to filesystem incidents). Pin the
+        // shape difference so a future implementer doesn't
+        // accidentally add the field expecting symmetry.
+        assert!(
+            entry.get("enriched_message").is_none(),
+            "io-error entries must NOT have enriched_message: {json_out}",
+        );
+    }
+
+    /// `walked == valid + errors.len() + io_errors.len()` by
+    /// construction — every predicate-matching file lands in
+    /// exactly one of the three buckets. Mixed-failure run
+    /// (one valid + one parse-fail + one io-fail) pins the
+    /// invariant against future regressions where a class of
+    /// failure might be silently dropped.
+    #[test]
+    fn explain_sidecar_walk_counts_reconcile_across_outcomes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-mixed-outcomes");
+        std::fs::create_dir(&run_dir).unwrap();
+        // Valid sidecar.
+        let valid = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("a-0000000000000000.ktstr.json"),
+            serde_json::to_string(&valid).unwrap(),
+        )
+        .unwrap();
+        // Parse-failing sidecar.
+        std::fs::write(run_dir.join("b-0000000000000000.ktstr.json"), "garbage{").unwrap();
+        // IO-failing entry: directory named like a sidecar inside
+        // a level-1 subdir.
+        let sub = run_dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::create_dir(sub.join("c-0000000000000000.ktstr.json")).unwrap();
+
+        let json_out =
+            super::explain_sidecar("run-mixed-outcomes", Some(tmp.path()), true).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json_out).expect("json output must round-trip parse");
+        let walk = parsed.get("_walk").expect("must have _walk");
+        let walked = walk.get("walked").and_then(|v| v.as_u64()).unwrap();
+        let valid_n = walk.get("valid").and_then(|v| v.as_u64()).unwrap();
+        let parse_errs = walk.get("errors").and_then(|e| e.as_array()).unwrap().len() as u64;
+        let io_errs = walk
+            .get("io_errors")
+            .and_then(|e| e.as_array())
+            .unwrap()
+            .len() as u64;
+        assert_eq!(
+            walked,
+            valid_n + parse_errs + io_errs,
+            "walked must equal valid + errors + io_errors — every \
+             predicate-matching file lands in exactly one bucket. \
+             walked={walked}, valid={valid_n}, errors={parse_errs}, \
+             io_errors={io_errs}: {json_out}",
+        );
+        assert_eq!(walked, 3, "three predicate-matching entries");
+        assert_eq!(valid_n, 1, "one valid sidecar");
+        assert_eq!(parse_errs, 1, "one parse failure");
+        assert_eq!(io_errs, 1, "one io failure");
+    }
+
+    /// `_walk.io_errors` is an empty array on the all-clean
+    /// happy path. Pins the uniform-shape contract (key always
+    /// emits) so dashboard consumers don't need `contains_key`
+    /// branching.
+    #[test]
+    fn explain_sidecar_json_walk_io_errors_empty_when_no_io_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-clean-io");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-clean-io", Some(tmp.path()), true).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("json output must round-trip parse");
+        let io_errs = parsed
+            .get("_walk")
+            .and_then(|w| w.get("io_errors"))
+            .and_then(|e| e.as_array())
+            .expect("_walk.io_errors must be present as array even when empty");
+        assert!(
+            io_errs.is_empty(),
+            "no IO failures — _walk.io_errors must be empty: {out}",
+        );
+    }
+
+    // -- explain_sidecar path-traversal rejection (#135) --
+
+    /// `--run` containing `..` segments must bail before any
+    /// path resolution — operators using `--dir` to point at a
+    /// shared archive pool should not be able to read arbitrary
+    /// filesystem locations under attacker-controlled `--run`
+    /// values. Tests both the leading `..` form and a mid-path
+    /// `..` form so the validator does not depend on prefix
+    /// matching.
+    #[test]
+    fn explain_sidecar_rejects_parent_dir_traversal_in_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        for traversal in ["../escape", "subdir/../../escape"] {
+            let err = super::explain_sidecar(traversal, Some(tmp.path()), false).expect_err(
+                "path-traversal `..` in --run must be rejected before \
+                     resolution",
+            );
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("path-traversal"),
+                "rejection message must name the cause for {traversal}: \
+                 {msg}",
+            );
+            assert!(
+                msg.contains(traversal),
+                "rejection message must include the offending input \
+                 ({traversal}): {msg}",
+            );
+        }
+    }
+
+    /// Absolute paths in `--run` must also bail. Without this
+    /// guard, `--run /etc/passwd` would resolve via `root.join`
+    /// to `/etc/passwd` (Rust's `PathBuf::join` replaces with
+    /// the absolute argument when given one), leaking arbitrary
+    /// filesystem reads. The validator rejects every component
+    /// variant except `Normal`, so the bail message uses the
+    /// "pool-root-aliasing or path-traversal" wording —
+    /// asserting on the substring `"path-traversal"` matches
+    /// the absolute-path case too.
+    #[test]
+    fn explain_sidecar_rejects_absolute_path_in_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = super::explain_sidecar("/etc/passwd", Some(tmp.path()), false)
+            .expect_err("absolute path in --run must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("path-traversal"),
+            "absolute-path rejection must name the cause: {msg}",
+        );
+    }
+
+    /// Empty `--run` must bail. `Path::new("").components()`
+    /// yields zero components, so an iterate-and-reject
+    /// validator silently accepts the input; `Path::join("")`
+    /// then returns the pool root unchanged, walking every
+    /// archived run instead of the requested one. The
+    /// explicit empty-string check before the component loop
+    /// is the gate that catches this — pin its bail behavior
+    /// here so the gate cannot regress.
+    #[test]
+    fn explain_sidecar_rejects_empty_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = super::explain_sidecar("", Some(tmp.path()), false)
+            .expect_err("empty --run must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must not be empty"),
+            "empty-string rejection must name the cause: {msg}",
+        );
+    }
+
+    /// `--run .` must bail. `Path::new(".")` yields one
+    /// `Component::CurDir`, which `Path::join(".")` treats as
+    /// a no-op — so the unmodified pool root would be walked,
+    /// aliasing every archived run. Rejecting `CurDir` in the
+    /// component-match arm is the gate; this test pins it.
+    /// Symmetric with the empty-string test: both inputs are
+    /// pool-root aliases.
+    #[test]
+    fn explain_sidecar_rejects_curdir_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = super::explain_sidecar(".", Some(tmp.path()), false)
+            .expect_err("`.` --run must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("path-traversal"),
+            "`.` rejection must surface the pool-root-aliasing \
+             cause: {msg}",
+        );
+    }
+
+    /// Bare run keys with `Normal`-only components must pass
+    /// the traversal validator and proceed to the normal
+    /// not-found / empty-run paths. Pins that the validator
+    /// does not over-reject legitimate inputs after the
+    /// `CurDir`-rejection tightening.
+    #[test]
+    fn explain_sidecar_accepts_bare_run_key_after_traversal_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `linux-6.14-20260101T120000Z` is a typical run key
+        // shape (Normal-only components). It does not exist
+        // under tmp, so the call lands in the not-found path —
+        // which is the SECOND validation gate, proving the
+        // traversal check let it through.
+        let err = super::explain_sidecar("linux-6.14-20260101T120000Z", Some(tmp.path()), false)
+            .expect_err("non-existent run must surface the not-found error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not found"),
+            "bare run key must reach the not-found gate, not the \
+             traversal gate: {msg}",
+        );
+        assert!(
+            !msg.contains("path-traversal"),
+            "bare run key must NOT trip the traversal check: {msg}",
+        );
     }
 
     // -- Spinner Drop --

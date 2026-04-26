@@ -2007,74 +2007,34 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
     }
 }
 
-/// Probe whether `repo`'s worktree differs from its HEAD
-/// commit, ignoring submodules. Returns `Some(true)` when the
-/// index differs from the HEAD tree or the worktree differs
-/// from the index for any tracked file; `Some(false)` when
-/// neither leg observed a difference; `None` when the HEAD-tree
-/// peel itself failed (HEAD points at something that cannot be
-/// read as a tree).
+/// Match the on-disk `project_commit` / `kernel_commit` shape:
+/// `^[0-9a-f]{7,40}(-dirty)?$`. Used to gate the rev_parse-Err
+/// warning in [`resolve_commit_specs`] so legitimate literal
+/// hashes (the common case for `--project-commit abc1234`) do
+/// not produce noisy "did not resolve as a revspec" lines.
 ///
-/// MIRROR of [`crate::test_support::sidecar::repo_is_dirty`]
-/// (private to that module — the binary crate cannot reach
-/// pub(crate) items in the lib crate). The two implementations
-/// MUST stay aligned: the canonical version lives in sidecar.rs
-/// and is what the sidecar writer applies when emitting the
-/// `-dirty` suffix at run time. Drift here would cause
-/// `--project-commit HEAD` to resolve to `<hash>` while the
-/// pool contains `<hash>-dirty`, missing every target row.
+/// SHAPE rationale: `detect_project_commit` /
+/// `detect_kernel_commit` write `to_hex_with_len(7)` (7-char
+/// short hash) optionally followed by `-dirty`. A 40-char
+/// upper bound matches the SHA-1 width gix uses. Anything
+/// outside this shape — `HEAD`, `HEAD~1`, branch/tag names,
+/// `..`-ranges, mixed-case, longer than 40 chars — is
+/// considered an attempted revspec and warrants the warning.
 ///
-/// PROBE LEGS (matching the canonical version):
-/// - tree-vs-index: peel HEAD to its tree, then `tree_index_status`
-///   diff against the on-disk index.
-/// - index-vs-worktree: `repo.status()` configured with
-///   `Submodule::Given { ignore: All }` so submodule worktree
-///   state is skipped. Short-circuited when the tree-vs-index
-///   leg already flipped dirty.
-///
-/// FAILURE DEGRADATION: any individual leg failure silently
-/// degrades to "no signal"; only HEAD-tree peel failure returns
-/// `None`. Callers degrade `None` via `unwrap_or(false)` so the
-/// dirty-suffix only fires on a positive signal.
-fn repo_is_dirty_local(repo: &gix::Repository) -> Option<bool> {
-    let head_tree_id = repo.head_tree().ok()?.id;
-
-    let mut index_dirty = false;
-    if let Ok(index) = repo.index() {
-        let _ = repo.tree_index_status(
-            &head_tree_id,
-            &index,
-            None,
-            gix::status::tree_index::TrackRenames::Disabled,
-            |_, _, _| {
-                index_dirty = true;
-                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
-            },
-        );
+/// Case-sensitive lower-hex only: `detect_*_commit`'s
+/// `to_hex_with_len` produces lowercase, and the sidecar pool
+/// stores lowercase, so an uppercase input like `ABC1234`
+/// would not match a row anyway — but it might also be a
+/// branch name a user expects to resolve. Warning is the safe
+/// default for that ambiguous shape.
+fn looks_like_literal_hash(input: &str) -> bool {
+    let core = input.strip_suffix("-dirty").unwrap_or(input);
+    let len = core.len();
+    if !(7..=40).contains(&len) {
+        return false;
     }
-
-    let worktree_dirty = if index_dirty {
-        false
-    } else {
-        repo.status(gix::progress::Discard)
-            .ok()
-            .and_then(|s| {
-                s.index_worktree_rewrites(None)
-                    .index_worktree_submodules(gix::status::Submodule::Given {
-                        ignore: gix::submodule::config::Ignore::All,
-                        check_dirty: false,
-                    })
-                    .index_worktree_options_mut(|opts| {
-                        opts.dirwalk_options = None;
-                    })
-                    .into_index_worktree_iter(Vec::new())
-                    .ok()
-                    .map(|mut iter| iter.next().is_some())
-            })
-            .unwrap_or(false)
-    };
-
-    Some(index_dirty || worktree_dirty)
+    core.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Resolve git revspecs (HEAD~1, tags, branch names, ranges
@@ -2120,16 +2080,16 @@ fn repo_is_dirty_local(repo: &gix::Repository) -> Option<bool> {
 ///   stderr warning is emitted so the operator notices that the
 ///   input was not expanded.
 /// - `repo.rev_parse(input)` returns `Err`: push the input
-///   unchanged (literal fallback) and emit a stderr warning.
-///   This preserves the existing exact-match contract for
-///   hand-typed short hashes — a `--project-commit abc1234-dirty`
-///   argument never resolves as a revspec (revspec parsing
-///   rejects the `-dirty` suffix) and lands as a literal,
-///   matching the `-dirty`-suffixed entries in the sidecar
-///   pool. The warning is unconditional on this arm so a
-///   typo'd revspec ("HEAD~XYZ") surfaces visibly; legitimate
-///   literal hashes also produce a (harmless) line, which is
-///   the documented tradeoff for catching typos at parse time.
+///   unchanged (literal fallback). This preserves the existing
+///   exact-match contract for hand-typed short hashes — a
+///   `--project-commit abc1234-dirty` argument never resolves
+///   as a revspec (revspec parsing rejects the `-dirty`
+///   suffix) and lands as a literal, matching the `-dirty`-
+///   suffixed entries in the sidecar pool. The warning fires
+///   only when [`looks_like_literal_hash`] returns false —
+///   legitimate `<hex>` and `<hex>-dirty` shapes pass through
+///   silently, while revspec-shaped inputs that failed
+///   resolution surface a diagnostic.
 ///
 /// Resolution happens BEFORE [`BuildCompareFilters`]
 /// construction so the sugar logic in `build()` operates on
@@ -2153,11 +2113,13 @@ fn resolve_commit_specs(
     // failing (no HEAD, no readable tree) collapses
     // `head_dirty` to false — the documented "treat as clean
     // on probe failure" policy that the canonical
-    // `repo_is_dirty_local` already encodes.
+    // [`ktstr::test_support::repo_is_dirty`] already encodes,
+    // matching what the sidecar writer applies at sidecar-write
+    // time so the filter shape lines up with pool entries.
     let head_oid: Option<gix::ObjectId> = repo.head_id().ok().map(|id| id.detach());
     let head_dirty: bool = head_oid
         .as_ref()
-        .and_then(|_| repo_is_dirty_local(repo))
+        .and_then(|_| ktstr::test_support::repo_is_dirty(repo))
         .unwrap_or(false);
     let format_short = |id: gix::ObjectId| -> String {
         let short = id.to_hex_with_len(7).to_string();
@@ -2234,10 +2196,24 @@ fn resolve_commit_specs(
                 }
             },
             Err(_) => {
-                eprintln!(
-                    "cargo ktstr: --{flag_name} '{input}' did not resolve as a \
-                     revspec; using as literal filter",
-                );
+                // Suppress the warning when `input` already looks
+                // like a literal hash (`^[0-9a-f]{7,40}(-dirty)?$`).
+                // Those are the SHAPE the sidecar writer produces,
+                // and the operator typing them at the CLI is the
+                // common case — emitting "did not resolve as a
+                // revspec" on every legitimate `--project-commit
+                // abc1234` invocation is pure noise. Only warn for
+                // inputs that look like an attempted revspec
+                // (alpha beyond hex, ~, .., ^, longer than 40
+                // chars, or other non-hash shapes) so a typo'd
+                // revspec ("HEAD~XYZ", "main") still surfaces a
+                // diagnostic.
+                if !looks_like_literal_hash(input) {
+                    eprintln!(
+                        "cargo ktstr: --{flag_name} '{input}' did not resolve as \
+                         a revspec; using as literal filter",
+                    );
+                }
                 out.push(input.clone());
             }
         }
@@ -6907,5 +6883,186 @@ mod tests {
             "HEAD~1 (historical commit) must NOT get -dirty suffix \
              even when worktree is dirty",
         );
+    }
+
+    /// `<oid>^!` (ExcludeParents revspec, "this commit
+    /// specifically") resolves to the commit's own 7-char short
+    /// hex. gix maps `^!` to `Spec::ExcludeParents(id)`; the
+    /// resolver groups it with `Spec::Include(id)` because both
+    /// arms describe a single object the operator named directly.
+    /// Pins the second arm of the Include/ExcludeParents match
+    /// branch; without this test the branch could collapse to
+    /// "Include only" without anyone noticing.
+    #[test]
+    fn resolve_commit_specs_exclude_parents_resolves_like_include() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain = init_repo_with_chain(tmp.path(), 2);
+        let head = chain[1];
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let raw = vec![format!("{}^!", head.to_hex_with_len(40))];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec![head.to_hex_with_len(7).to_string()],
+            "<oid>^! must resolve to the same 7-char short hex as <oid>",
+        );
+    }
+
+    /// A branch name resolves to the commit it points at. Pins
+    /// that the resolver accepts ref-name inputs (not just OIDs)
+    /// — without this test the branch-creation API change in a
+    /// future gix version could silently drop branch resolution.
+    #[test]
+    fn resolve_commit_specs_branch_name_resolves_to_tip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain = init_repo_with_chain(tmp.path(), 2);
+        let parent = chain[0];
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        // Create `refs/heads/feature` pointing at the parent
+        // commit (chain[0]) so the test can distinguish it from
+        // HEAD (chain[1]).
+        repo.reference(
+            "refs/heads/feature",
+            parent,
+            gix::refs::transaction::PreviousValue::MustNotExist,
+            "create feature branch for test",
+        )
+        .expect("create branch");
+        let raw = vec!["feature".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec![parent.to_hex_with_len(7).to_string()],
+            "branch name must resolve to its tip commit",
+        );
+    }
+
+    /// A tag name resolves to the commit it points at. Same
+    /// shape as the branch test, against `refs/tags/<name>` —
+    /// gix `rev_parse` looks up tags through the same ref-name
+    /// resolver, so this exercises the ref-resolution code path
+    /// for the tag namespace specifically.
+    #[test]
+    fn resolve_commit_specs_tag_name_resolves_to_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chain = init_repo_with_chain(tmp.path(), 2);
+        let parent = chain[0];
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        // Lightweight tag (a ref under `refs/tags/`) pointing at
+        // the parent commit. Distinct from an annotated tag
+        // (which is its own object kind); rev_parse handles both
+        // by peeling, but lightweight tags are simpler to set up
+        // in a fixture without writing a Tag object.
+        repo.reference(
+            "refs/tags/v0",
+            parent,
+            gix::refs::transaction::PreviousValue::MustNotExist,
+            "create v0 tag for test",
+        )
+        .expect("create tag");
+        let raw = vec!["v0".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec![parent.to_hex_with_len(7).to_string()],
+            "tag name must resolve to its target commit",
+        );
+    }
+
+    /// `HEAD..HEAD` (empty range — `from == to`) yields zero
+    /// commits because the walk hides every reachable commit
+    /// from `from` and there are no remaining commits in the
+    /// `to`-side. Pins that an empty range lands as an empty
+    /// expansion (not a literal fallback), so a downstream
+    /// filter built from this Vec excludes every row — which
+    /// matches the operator's intent ("commits in `HEAD..HEAD`"
+    /// is the empty set).
+    #[test]
+    fn resolve_commit_specs_empty_range_yields_no_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_chain(tmp.path(), 2);
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let raw = vec!["HEAD..HEAD".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert!(
+            out.is_empty(),
+            "HEAD..HEAD must expand to zero commits; got {out:?}",
+        );
+    }
+
+    /// A valid-hex 7-char prefix that does not match any commit
+    /// in the repo (`deadbee`) falls through to literal. Pins
+    /// the rev_parse-Err arm against a hex-shaped input —
+    /// distinct from the prior `zzzzzzz` non-hex case, this one
+    /// reaches the object-database lookup before failing, so it
+    /// exercises a deeper rev_parse code path. The literal
+    /// `deadbee` lands in the output because the warning is
+    /// suppressed by [`looks_like_literal_hash`]; either way
+    /// the value passes through.
+    #[test]
+    fn resolve_commit_specs_valid_hex_nonexistent_prefix_falls_through_to_literal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_chain(tmp.path(), 1);
+        let repo = gix::open(tmp.path()).expect("gix::open");
+        let raw = vec!["deadbee".to_string()];
+        let out = resolve_commit_specs(Some(&repo), &raw, "test");
+        assert_eq!(
+            out,
+            vec!["deadbee".to_string()],
+            "valid-hex non-existent prefix must pass through as literal",
+        );
+    }
+
+    /// `looks_like_literal_hash` accepts the on-disk shape that
+    /// `detect_*_commit` writes: 7..=40 lowercase hex chars,
+    /// optionally followed by `-dirty`. Pins the gating predicate
+    /// against the canonical writer's output so a regression that
+    /// tightened the predicate (e.g. 7-only, no -dirty) would
+    /// surface noisy warnings on legitimate inputs.
+    #[test]
+    fn looks_like_literal_hash_accepts_canonical_shapes() {
+        // Bare 7-char hash (the most common operator-typed shape).
+        assert!(looks_like_literal_hash("abc1234"));
+        // 40-char full hash (upper bound).
+        assert!(looks_like_literal_hash(
+            "abcdef0123456789abcdef0123456789abcdef01"
+        ));
+        // 7-char + -dirty (the dirty-suffixed sidecar entry).
+        assert!(looks_like_literal_hash("abc1234-dirty"));
+        // 40-char + -dirty.
+        assert!(looks_like_literal_hash(
+            "abcdef0123456789abcdef0123456789abcdef01-dirty"
+        ));
+    }
+
+    /// `looks_like_literal_hash` rejects revspec-shaped inputs
+    /// so the gated rev_parse-Err warning still fires for them.
+    /// Pins the negative side of the predicate against every
+    /// shape the team-lead's gating spec calls out: alpha beyond
+    /// hex, ~, .., ^, mixed-case, and out-of-bound lengths.
+    #[test]
+    fn looks_like_literal_hash_rejects_revspec_shapes() {
+        // Alpha beyond hex.
+        assert!(!looks_like_literal_hash("HEAD"));
+        assert!(!looks_like_literal_hash("main"));
+        // Tilde-form revspec.
+        assert!(!looks_like_literal_hash("HEAD~1"));
+        // Range form.
+        assert!(!looks_like_literal_hash("HEAD~3..HEAD"));
+        // Caret form.
+        assert!(!looks_like_literal_hash("HEAD^"));
+        // Mixed-case rejection (sidecar writer is lowercase-only).
+        assert!(!looks_like_literal_hash("ABC1234"));
+        // Below 7-char minimum.
+        assert!(!looks_like_literal_hash("abc123"));
+        // Above 40-char maximum (e.g. SHA-256 prefix or paste of
+        // a longer string).
+        assert!(!looks_like_literal_hash(
+            "abcdef0123456789abcdef0123456789abcdef0123"
+        ));
+        // Empty input.
+        assert!(!looks_like_literal_hash(""));
+        // -dirty without enough hex prefix.
+        assert!(!looks_like_literal_hash("abc-dirty"));
     }
 }

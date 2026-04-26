@@ -73,11 +73,11 @@ pub(crate) use args::{
 #[cfg(test)]
 pub(crate) use sidecar::enriched_parse_error_message_for_test;
 pub(crate) use sidecar::{
-    SidecarParseError, apply_archive_source_override, collect_sidecars,
+    SidecarIoError, SidecarParseError, apply_archive_source_override, collect_sidecars,
     collect_sidecars_with_errors, format_callback_profile, format_kvm_stats, format_verifier_stats,
     is_sidecar_filename, sidecar_dir,
 };
-pub use sidecar::{SidecarResult, collect_pool, newest_run_dir, runs_root};
+pub use sidecar::{SidecarResult, collect_pool, newest_run_dir, repo_is_dirty, runs_root};
 
 pub use dispatch::{
     analyze_sidecars, ktstr_main, ktstr_test_early_dispatch, run_ktstr_test, sanitize_kernel_label,

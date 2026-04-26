@@ -481,6 +481,34 @@ pub(crate) struct SidecarParseError {
     pub enriched_message: Option<String>,
 }
 
+/// Per-file IO-failure record returned by
+/// [`collect_sidecars_with_errors`] and threaded through
+/// [`crate::cli::WalkStats::io_errors`] to the renderers.
+///
+/// Captures files where the filename predicate matched but
+/// `std::fs::read_to_string` failed before parsing could begin —
+/// permission denied, mid-rotate truncation, broken symlink,
+/// etc. Distinct from [`SidecarParseError`] (which represents
+/// "file read OK but JSON parse failed"); separating the two
+/// lets dashboard consumers triage filesystem incidents apart
+/// from schema drift.
+///
+/// Named-field struct mirroring [`SidecarParseError`]'s shape so
+/// the renderer side can iterate by field name without tuple-
+/// position fragility. No `enriched_message` field — there is no
+/// remediation catalog for IO failures (causes vary per host:
+/// fix permissions, fix the filesystem, retry the test).
+pub(crate) struct SidecarIoError {
+    /// On-disk path the predicate matched as a sidecar candidate.
+    pub path: std::path::PathBuf,
+    /// Verbatim `std::io::Error` Display string. Surfaced through
+    /// the JSON channel as the `error` key on
+    /// [`crate::cli::WalkIoError`] entries and through the text
+    /// channel as the `error: ...` line under the `io errors`
+    /// trailing block.
+    pub raw_error: String,
+}
+
 /// Test-only re-export of [`enriched_parse_error_message`] so
 /// `cli::tests` can verify the enrichment-pattern logic
 /// directly against synthetic error strings. The helper itself
@@ -524,46 +552,74 @@ fn enriched_parse_error_message(path: &std::path::Path, raw_error: &str) -> Opti
     }
 }
 
-/// Scan a directory for ktstr sidecar JSON files, returning both
-/// the parsed sidecars and a [`SidecarParseError`] record (named
-/// fields `path`, `raw_error`, `enriched_message`) for every file
-/// that failed to deserialize. Recurses one level into
-/// subdirectories to handle per-job gauntlet layouts.
+/// Scan a directory for ktstr sidecar JSON files, returning the
+/// parsed sidecars, a [`SidecarParseError`] record (named fields
+/// `path`, `raw_error`, `enriched_message`) for every file that
+/// passed the filename predicate but failed to deserialize, and a
+/// [`SidecarIoError`] record (named fields `path`, `raw_error`)
+/// for every file that passed the predicate but whose
+/// `read_to_string` failed before parsing could begin. Recurses
+/// one level into subdirectories to handle per-job gauntlet
+/// layouts.
 ///
 /// Surfaces parse failures in two channels:
 /// - `eprintln!` to stderr (preserved for the operator-facing
 ///   pre-1.0 disposable-sidecar diagnostic — emits the enriched
 ///   prose for the host-missing schema-drift case, the raw serde
 ///   message otherwise).
-/// - The returned errors vec, capturing a [`SidecarParseError`]
-///   record (named fields `path`, `raw_error`, `enriched_message`)
-///   for structured callers (`explain-sidecar`'s walker output).
-///   Both raw and enriched are exposed so dashboard consumers can
-///   pick: raw for parse-error grepping, enriched for human-facing
-///   remediation prose.
+/// - The returned parse-errors vec, capturing a
+///   [`SidecarParseError`] record (named fields `path`,
+///   `raw_error`, `enriched_message`) for structured callers
+///   (`explain-sidecar`'s walker output). Both raw and enriched
+///   are exposed so dashboard consumers can pick: raw for
+///   parse-error grepping, enriched for human-facing remediation
+///   prose.
 ///
-/// Both channels surface every parse failure — the eprintln path
-/// is informational, the returned vec is structured. Callers that
-/// don't need structured errors should use [`collect_sidecars`].
+/// IO failures (third return) get a single eprintln line plus a
+/// structured [`SidecarIoError`] record. Distinguished from
+/// parse failures so dashboard consumers can triage filesystem
+/// incidents (permission denied, mid-rotate truncation, broken
+/// symlink) apart from schema drift. With this third channel,
+/// every predicate-matching file lands in exactly one of the
+/// three returned vecs — the prior implicit
+/// `walked - valid - parse_errors.len()` silent-drop count is
+/// now zero by construction.
+///
+/// Callers that don't need structured errors should use
+/// [`collect_sidecars`].
 pub(crate) fn collect_sidecars_with_errors(
     dir: &std::path::Path,
-) -> (Vec<SidecarResult>, Vec<SidecarParseError>) {
+) -> (
+    Vec<SidecarResult>,
+    Vec<SidecarParseError>,
+    Vec<SidecarIoError>,
+) {
     let mut sidecars = Vec::new();
-    let mut errors: Vec<SidecarParseError> = Vec::new();
+    let mut parse_errors: Vec<SidecarParseError> = Vec::new();
+    let mut io_errors: Vec<SidecarIoError> = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return (sidecars, errors),
+        Err(_) => return (sidecars, parse_errors, io_errors),
     };
     let mut subdirs = Vec::new();
     let try_load = |path: &std::path::Path,
                     out: &mut Vec<SidecarResult>,
-                    errs: &mut Vec<SidecarParseError>| {
+                    parse_errs: &mut Vec<SidecarParseError>,
+                    io_errs: &mut Vec<SidecarIoError>| {
         if !is_sidecar_filename(path) {
             return;
         }
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
-            Err(_) => return,
+            Err(e) => {
+                let raw = e.to_string();
+                eprintln!("ktstr_test: cannot read {}: {raw}", path.display());
+                io_errs.push(SidecarIoError {
+                    path: path.to_path_buf(),
+                    raw_error: raw,
+                });
+                return;
+            }
         };
         match serde_json::from_str::<SidecarResult>(&data) {
             Ok(sc) => out.push(sc),
@@ -578,7 +634,7 @@ pub(crate) fn collect_sidecars_with_errors(
                     Some(prose) => eprintln!("{prose}"),
                     None => eprintln!("ktstr_test: skipping {}: {raw}", path.display()),
                 }
-                errs.push(SidecarParseError {
+                parse_errs.push(SidecarParseError {
                     path: path.to_path_buf(),
                     raw_error: raw,
                     enriched_message: enriched,
@@ -592,16 +648,21 @@ pub(crate) fn collect_sidecars_with_errors(
             subdirs.push(path);
             continue;
         }
-        try_load(&path, &mut sidecars, &mut errors);
+        try_load(&path, &mut sidecars, &mut parse_errors, &mut io_errors);
     }
     for sub in subdirs {
         if let Ok(entries) = std::fs::read_dir(&sub) {
             for entry in entries.flatten() {
-                try_load(&entry.path(), &mut sidecars, &mut errors);
+                try_load(
+                    &entry.path(),
+                    &mut sidecars,
+                    &mut parse_errors,
+                    &mut io_errors,
+                );
             }
         }
     }
-    (sidecars, errors)
+    (sidecars, parse_errors, io_errors)
 }
 
 /// Pool every sidecar JSON under every run directory at `root`.
@@ -1138,7 +1199,17 @@ fn commit_with_dirty_suffix(repo: &gix::Repository) -> Option<String> {
 /// silently degrades that leg to "no signal" rather than aborting.
 /// The function only returns `None` when the HEAD-tree peel
 /// fails, because at that point neither leg can run at all.
-fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
+///
+/// `pub` (not `pub(crate)`) because `cargo-ktstr.rs` is a
+/// separate `[[bin]]` crate that consumes `ktstr` as an
+/// external dependency and needs this helper to compute the
+/// `-dirty` suffix in
+/// `cargo ktstr stats compare --project-commit HEAD`. Hidden
+/// from rustdoc via `#[doc(hidden)]` because it is a probe-
+/// style helper without a stable API contract — external
+/// consumers should not depend on it.
+#[doc(hidden)]
+pub fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
     let head_tree_id = repo.head_tree().ok()?.id;
 
     let mut index_dirty = false;
