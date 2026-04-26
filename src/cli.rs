@@ -5799,6 +5799,280 @@ mod tests {
         );
     }
 
+    /// `Vec` fields on `SidecarResult` (metrics, stimulus_events,
+    /// active_flags, verifier_stats, sysctls, kargs) are
+    /// hard-required and serialize as `[]` when empty; they are NOT
+    /// `Option<T>`. Catalog only covers the 10 `Option` fields, so
+    /// the diagnostic must NEVER name a Vec field — neither under
+    /// "populated optional fields" nor under "none fields".
+    /// Construct a fixture with all 10 Options Some + every Vec
+    /// empty and assert the report says "none fields: <all
+    /// populated>" with zero mentions of any Vec field name.
+    /// Guards against a future refactor that confuses Option-None
+    /// with Vec-empty.
+    #[test]
+    fn explain_sidecar_does_not_flag_empty_vec_fields_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-vecs");
+        std::fs::create_dir(&run_dir).unwrap();
+        let mut sc = crate::test_support::SidecarResult::test_fixture();
+        // Populate every Option<_> so "none fields" should be empty.
+        sc.scheduler_commit = Some("aaaa111".to_string());
+        sc.project_commit = Some("bbbb222".to_string());
+        sc.payload = Some("payload".to_string());
+        sc.kernel_version = Some("6.14.2".to_string());
+        sc.kernel_commit = Some("cccc333".to_string());
+        sc.cleanup_duration_ms = Some(123);
+        sc.run_source = Some("local".to_string());
+        sc.monitor = Some(crate::monitor::MonitorSummary::default());
+        sc.kvm_stats = Some(crate::vmm::KvmStatsTotals::default());
+        sc.host = Some(crate::host_context::HostContext::test_fixture());
+        // Vec fields stay empty (test_fixture defaults).
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-vecs", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("none fields: <all populated>"),
+            "all Options populated — must report no None fields: {out}",
+        );
+        // Six Vec field names — none must appear anywhere as a
+        // diagnosed field. Substring match is safe: these are
+        // distinctive snake_case identifiers, no false positives in
+        // the rendered output.
+        for vec_field in [
+            "metrics",
+            "stimulus_events",
+            "active_flags",
+            "verifier_stats",
+            "sysctls",
+            "kargs",
+        ] {
+            assert!(
+                !out.contains(vec_field),
+                "Vec field '{vec_field}' is hard-required (not Option) and \
+                 must never appear in explain-sidecar output: {out}",
+            );
+        }
+    }
+
+    /// Pre-rename archives carry the on-disk key `"source"`; the
+    /// current schema reads `"run_source"`. With the old key
+    /// present, serde's tolerate-absence rule populates
+    /// `run_source: None`, and the diagnostic must surface that
+    /// None with the catalog's `run_source` cause prose mentioning
+    /// the rename. Guards the diagnostic value of the
+    /// pre-rename detection path.
+    #[test]
+    fn explain_sidecar_handles_old_source_key_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-old-source-key");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        // Serialize then mutate the JSON to drop `run_source` and
+        // inject `source` — emulates a pre-rename archive on disk.
+        let mut value = serde_json::to_value(&sc).expect("fixture must serialize");
+        let obj = value.as_object_mut().expect("fixture is an Object");
+        obj.remove("run_source");
+        obj.insert(
+            "source".to_string(),
+            serde_json::Value::String("archive".to_string()),
+        );
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-old-source-key", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("run_source"),
+            "explain-sidecar must surface run_source as None for \
+             pre-rename archive: {out}",
+        );
+        // Catalog's run_source cause prose says "tolerate-absence"
+        // and "rename"; a regression that drops the rename
+        // diagnostic prose would lose the actionable context.
+        assert!(
+            out.contains("rename"),
+            "run_source None cause must mention the rename: {out}",
+        );
+    }
+
+    /// `dir=None` defaults to [`crate::test_support::runs_root`],
+    /// which derives `{CARGO_TARGET_DIR or "target"}/ktstr/`. Pin
+    /// the env to a tempdir, write a sidecar under
+    /// `<tmp>/ktstr/<run-key>/`, and call `explain_sidecar(run,
+    /// None, false)`. Covers the implicit-root resolution path
+    /// that all prior tests skip via explicit `Some(tmp.path())`.
+    /// `lock_env()` serializes against any other env-touching
+    /// test in this binary.
+    #[test]
+    fn explain_sidecar_resolves_dir_default_to_runs_root() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", tmp.path());
+        let _env_sidecar = EnvVarGuard::remove("KTSTR_SIDECAR_DIR");
+        // runs_root is `<CARGO_TARGET_DIR>/ktstr` — create the run
+        // directory under that path and write a sidecar inside.
+        let runs_root = tmp.path().join("ktstr");
+        let run_dir = runs_root.join("run-default-root");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        // dir=None — explain_sidecar must resolve runs_root via
+        // CARGO_TARGET_DIR and find the sidecar.
+        let out = super::explain_sidecar("run-default-root", None, false)
+            .expect("dir=None must resolve via runs_root() and succeed");
+        assert!(
+            out.contains("walked 1"),
+            "default-dir resolution must walk into the run dir: {out}",
+        );
+        assert!(
+            out.contains("parsed 1 valid"),
+            "default-dir resolution must parse the sidecar: {out}",
+        );
+    }
+
+    /// A 0-byte `.ktstr.json` file is a parse failure (serde_json
+    /// rejects empty input), not a silent skip. The walker counts
+    /// it in `walked` and emits a parse error; the valid sibling
+    /// still parses and renders. Guards the empty-file edge that
+    /// could regress to "treat as missing" if `read_to_string` ever
+    /// short-circuits on length-zero input.
+    #[test]
+    fn explain_sidecar_handles_zero_byte_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-zero-byte");
+        std::fs::create_dir(&run_dir).unwrap();
+        let valid = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("a-0000000000000000.ktstr.json"),
+            serde_json::to_string(&valid).unwrap(),
+        )
+        .unwrap();
+        // Zero-byte file: empty string parses as a serde_json
+        // error, not as a successful Object.
+        std::fs::write(run_dir.join("b-0000000000000000.ktstr.json"), "").unwrap();
+        let out = super::explain_sidecar("run-zero-byte", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("walked 2"),
+            "walker must visit both files (valid + zero-byte): {out}",
+        );
+        assert!(
+            out.contains("parsed 1"),
+            "only the valid file parses; zero-byte is a parse \
+             failure: {out}",
+        );
+        assert!(
+            out.contains("corrupt sidecars (1):"),
+            "zero-byte file must surface in the corrupt-sidecars \
+             block as a parse failure, not be silently dropped: {out}",
+        );
+    }
+
+    /// `SidecarResult` does NOT set `#[serde(deny_unknown_fields)]`,
+    /// so a future-schema sidecar that adds a key serde does not
+    /// recognize must still deserialize cleanly. Forward-compat
+    /// invariant: a CI consumer running an older ktstr binary
+    /// against a sidecar from a newer one must NOT lose the run.
+    #[test]
+    fn explain_sidecar_tolerates_unknown_extra_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-extra-fields");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        // Serialize then inject an extra key serde_json doesn't know.
+        let mut value = serde_json::to_value(&sc).expect("fixture must serialize");
+        let obj = value.as_object_mut().expect("fixture is an Object");
+        obj.insert(
+            "future_field".to_string(),
+            serde_json::Value::String("hypothetical".to_string()),
+        );
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-extra-fields", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("walked 1"),
+            "walker must visit the file: {out}",
+        );
+        assert!(
+            out.contains("parsed 1 valid"),
+            "extra `future_field` key must NOT block deserialize \
+             (SidecarResult does not deny_unknown_fields): {out}",
+        );
+        // Also confirm the sidecar is named in the output — i.e.
+        // the parsed value reaches the renderer, not just the
+        // count.
+        assert!(
+            out.contains("test: t"),
+            "parsed sidecar must render its test_name: {out}",
+        );
+    }
+
+    /// Catalog classification per field is operator-visible as a
+    /// stable tag (`expected` vs `actionable`). A typo regression
+    /// flipping any field's classification would silently mislead
+    /// dashboards and triage. Pin the exact mapping per the
+    /// catalog's documented design ruling.
+    #[test]
+    fn explain_sidecar_classification_accuracy_per_field() {
+        let by_field: std::collections::HashMap<&'static str, super::NoneClassification> =
+            super::SIDECAR_NONE_CATALOG
+                .iter()
+                .map(|e| (e.field, e.classification))
+                .collect();
+        // Per-field expected classification — pinned from the
+        // catalog's documented design ruling. Two Expected
+        // (steady-state None with no operator action), eight
+        // Actionable (operator can recover or environment is
+        // wrong).
+        let expected_pairs: &[(&str, super::NoneClassification)] = &[
+            ("scheduler_commit", super::NoneClassification::Expected),
+            ("payload", super::NoneClassification::Expected),
+            ("project_commit", super::NoneClassification::Actionable),
+            ("monitor", super::NoneClassification::Actionable),
+            ("kvm_stats", super::NoneClassification::Actionable),
+            ("kernel_version", super::NoneClassification::Actionable),
+            ("kernel_commit", super::NoneClassification::Actionable),
+            ("host", super::NoneClassification::Actionable),
+            ("cleanup_duration_ms", super::NoneClassification::Actionable),
+            ("run_source", super::NoneClassification::Actionable),
+        ];
+        // Total-count guard: every catalog entry must be pinned
+        // here. A future Option field added to SidecarResult that
+        // lands in the catalog without a pinned classification
+        // would silently slip past this assertion otherwise.
+        assert_eq!(
+            expected_pairs.len(),
+            super::SIDECAR_NONE_CATALOG.len(),
+            "every catalog entry must have a pinned classification \
+             in this test (catalog len {}, pinned len {})",
+            super::SIDECAR_NONE_CATALOG.len(),
+            expected_pairs.len(),
+        );
+        for (field, expected) in expected_pairs {
+            let actual = by_field
+                .get(field)
+                .copied()
+                .unwrap_or_else(|| panic!("catalog must contain field {field}"));
+            assert_eq!(
+                actual, *expected,
+                "field {field}: classification mismatch — expected \
+                 {expected:?}, got {actual:?}",
+            );
+        }
+    }
+
     // -- Spinner Drop --
 
     #[test]
