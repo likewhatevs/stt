@@ -1230,19 +1230,63 @@ pub fn kernel_clean(keep: Option<usize>, force: bool, corrupt_only: bool) -> Res
 /// and reaped before bailing so no zombie outlives the function.
 pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
     const RUN_MAKE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+    // Production poll cadence: small enough that a completed
+    // make is reaped within one tick, large enough that the
+    // polling itself is not measurable load. Tests pass a
+    // sub-millisecond override directly to
+    // [`poll_child_with_timeout`] so timeout-fires-and-reaps
+    // assertions complete quickly.
     const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-    let mut child = std::process::Command::new("make")
+    let child = std::process::Command::new("make")
         .args(args)
         .current_dir(kernel_dir)
         .spawn()
         .with_context(|| format!("spawn make {}", args.join(" ")))?;
 
-    let deadline = std::time::Instant::now() + RUN_MAKE_TIMEOUT;
+    poll_child_with_timeout(
+        child,
+        RUN_MAKE_TIMEOUT,
+        POLL_INTERVAL,
+        &format!("make {}", args.join(" ")),
+    )
+}
+
+/// Polling-loop body extracted from [`run_make`] so the timeout
+/// mechanics can be exercised against synthetic [`std::process::Child`]
+/// fixtures with sub-second deadlines (real `make` invocations
+/// would burn the full 30-minute production timeout). Production
+/// callers funnel through [`run_make`] which spawns `make`,
+/// constructs the production deadline, and delegates here.
+///
+/// `label` is the human-facing name embedded in error messages
+/// (e.g. `"make defconfig"`) — pinning a synthetic label in the
+/// test surface lets the assertion match the bail wording without
+/// depending on `make` being installed on the runner.
+///
+/// `timeout` is the wall-clock budget AFTER `child` has already
+/// spawned (the deadline is computed inside the helper relative
+/// to the call instant). `poll_interval` controls the
+/// `try_wait` polling cadence — small enough that a completed
+/// child is reaped within one tick, large enough that polling
+/// itself is not measurable load. Production uses 100ms; tests
+/// use 1ms so a sub-second timeout assertion completes quickly.
+///
+/// On timeout: kill + reap before bailing so no zombie outlives
+/// the function. On a `try_wait` error: same kill+reap cleanup
+/// before propagating, so a transient probe failure doesn't leak
+/// the child.
+fn poll_child_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+    poll_interval: Duration,
+    label: &str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                anyhow::ensure!(status.success(), "make {} failed", args.join(" "));
+                anyhow::ensure!(status.success(), "{label} failed");
                 return Ok(());
             }
             Ok(None) => {
@@ -1251,19 +1295,16 @@ pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
                     // zombie persists after we return Err.
                     let _ = child.kill();
                     let _ = child.wait();
-                    bail!(
-                        "make {} timed out after {RUN_MAKE_TIMEOUT:?}; child killed",
-                        args.join(" "),
-                    );
+                    bail!("{label} timed out after {timeout:?}; child killed");
                 }
-                std::thread::sleep(POLL_INTERVAL);
+                std::thread::sleep(poll_interval);
             }
             Err(e) => {
                 // Reap before propagating so a transient try_wait
                 // failure doesn't leak the child.
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(e).with_context(|| format!("wait on make {}", args.join(" ")));
+                return Err(e).with_context(|| format!("wait on {label}"));
             }
         }
     }
@@ -2504,6 +2545,46 @@ pub fn cleanup(parent_cgroup: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve the rayon pool width for `cargo ktstr`'s
+/// `resolve_kernel_set` per-spec fan-out.
+///
+/// Reads [`crate::KTSTR_KERNEL_PARALLELISM_ENV`] first; if the env
+/// var is set to a non-zero, parseable `usize`, that value wins.
+/// Otherwise falls back to [`std::thread::available_parallelism`]
+/// — the host's logical CPU count, the right ceiling for
+/// download-bound work that should not outnumber the threads the
+/// host can drive without thrashing the local network. Final
+/// fallback is `1` if `available_parallelism` errors (a sandboxed
+/// or container-limited host), preserving forward progress.
+///
+/// Sentinel handling: `0` and unparseable values fall through
+/// (`from_str` errs on non-digits, and the explicit `n > 0`
+/// guard rejects the parsed-zero case). A typoed export
+/// (`KTSTR_KERNEL_PARALLELISM=abc` or `=0`) silently degrades to
+/// the host-CPU default rather than disabling parallelism — a
+/// disabled-pool resolve would serialize multi-spec invocations
+/// with no observable signal that the env var was the cause.
+///
+/// Extracted from cargo-ktstr's `resolve_kernel_set` so the
+/// parsing rules live in one place; the cargo-ktstr binary
+/// invokes this and feeds the result into
+/// [`rayon::ThreadPoolBuilder::num_threads`]. Lives here in
+/// `cli.rs` rather than in the binary so it's reachable from
+/// rustdoc and from the lib's unit-test harness.
+pub fn resolve_kernel_parallelism() -> usize {
+    if let Ok(raw) = std::env::var(crate::KTSTR_KERNEL_PARALLELISM_ENV) {
+        let trimmed = raw.trim();
+        if let Ok(n) = trimmed.parse::<usize>()
+            && n > 0
+        {
+            return n;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Search PATH for a bare executable name.
@@ -4643,6 +4724,249 @@ mod tests {
         );
     }
 
+    // -- poll_child_with_timeout --
+
+    /// Helper: spawn a long-sleeping child via `sh -c`. `sh` is in
+    /// PATH on every supported platform, and the `sleep N` command
+    /// is a coreutils builtin reachable from `sh`. The child PID
+    /// is returned alongside the `Child` so the test can verify
+    /// reaping at the OS layer.
+    ///
+    /// Lives in this test module rather than a shared helper file
+    /// because every caller needs the PID-extraction line as well,
+    /// and the inlined helper keeps the assertion-pid-check pair
+    /// in one readable block.
+    fn spawn_sleeping_child(seconds: u64) -> (std::process::Child, u32) {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep {seconds}"))
+            .spawn()
+            .expect("spawn sh -c sleep N");
+        let pid = child.id();
+        (child, pid)
+    }
+
+    /// Helper: probe whether `pid` is still a live process via
+    /// `kill -0` semantics through `nix`. Returns `true` while the
+    /// process is alive (or in zombie state — the kernel keeps the
+    /// PID slot reserved until the parent reaps), `false` once
+    /// the slot is fully released after reap. The helper exists
+    /// to confirm the timeout path's `child.wait()` actually
+    /// reaps; without the wait, the child would linger as a
+    /// zombie and `kill -0` would still return Ok.
+    ///
+    /// Lifecycle vs zombie: `kill -0` can NOT distinguish "alive"
+    /// from "zombie" — both return Ok because the PID slot is
+    /// still allocated until the parent reaps. The test must
+    /// instead rely on `child.try_wait`'s contract via the helper's
+    /// own reap-on-timeout path: after the helper returns, the
+    /// `Child` value has been moved into the helper and dropped,
+    /// and the helper's explicit `child.wait()` (called before
+    /// `bail!`) reaps the zombie. The kernel then reclaims the
+    /// PID slot. After that point, `kill -0 pid` returns ESRCH
+    /// (the helper returns false). ESRCH may take a brief moment
+    /// to propagate; the assertion polls with a short timeout
+    /// rather than asserting immediately.
+    ///
+    /// Caveat: PID reuse can theoretically cause a false-positive
+    /// (the kernel reassigned the slot to an unrelated process),
+    /// but on Linux the PID space is large (32k by default,
+    /// 4M with the kernel.pid_max sysctl) and the test runs for
+    /// ~50ms total — collision is astronomically unlikely.
+    fn pid_is_alive(pid: u32) -> bool {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        // signal=None means "send no signal, just probe" — kill(2)
+        // with sig=0 is the canonical liveness probe.
+        kill(Pid::from_raw(pid as i32), None).is_ok()
+    }
+
+    /// Timeout fires when the child outlives the deadline; the
+    /// helper bails with the labeled timeout error AND reaps the
+    /// child (no zombie persists past the helper return). Three
+    /// invariants:
+    ///
+    /// 1. **Bail wording.** The error must include the `label`
+    ///    parameter and the literal `"timed out after"` phrase
+    ///    so operators can pattern-match a wedged-make scenario
+    ///    in CI logs. A regression that dropped the label or
+    ///    re-worded the timeout substring would surface here.
+    ///
+    /// 2. **Wall-clock budget.** The helper must return within a
+    ///    small multiple of the configured timeout — not block
+    ///    indefinitely. The 1ms poll-interval ensures the loop
+    ///    notices the deadline within one tick of expiry.
+    ///
+    /// 3. **No zombie.** After the helper returns, the child's
+    ///    PID must be reclaimed by the kernel (no zombie left
+    ///    over). Probed via `kill(pid, 0)` returning ESRCH after
+    ///    a short propagation poll. A regression that dropped the
+    ///    `child.wait()` after `child.kill()` would leak a
+    ///    zombie that this assertion catches.
+    ///
+    /// `sh` is in PATH on every supported runner; if it is not,
+    /// the helper bails on spawn and the test fails — that's the
+    /// correct signal because every other test in this module
+    /// relies on `sh` being available too.
+    #[test]
+    fn poll_child_with_timeout_bails_and_reaps_on_timeout() {
+        // Spawn a child that will outlive the timeout by orders
+        // of magnitude (60s > 100ms timeout × 600x margin).
+        let (child, pid) = spawn_sleeping_child(60);
+        assert!(
+            pid_is_alive(pid),
+            "fixture precondition: spawned child pid {pid} must be \
+             alive before the helper runs",
+        );
+
+        let start = std::time::Instant::now();
+        let result = super::poll_child_with_timeout(
+            child,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            "make wedged-target",
+        );
+        let elapsed = start.elapsed();
+
+        // Invariant 1: bail wording carries label + timeout phrase.
+        let err = result.expect_err("timed-out child must surface as Err");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("make wedged-target"),
+            "timeout bail must include the label parameter; got: {rendered}",
+        );
+        assert!(
+            rendered.contains("timed out after"),
+            "timeout bail must include the literal `timed out after` \
+             phrase so CI log scrapers can pattern-match wedged builds; \
+             got: {rendered}",
+        );
+
+        // Invariant 2: wall-clock budget. The 100ms timeout +
+        // ~1ms poll interval should fire within ~150ms; allow
+        // 5s of slack for slow CI runners and tempfile churn.
+        // A regression that ignored the deadline would block
+        // for the full 60-second sleep.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "helper must return within a small multiple of the \
+             configured timeout (100ms); took {elapsed:?} which \
+             suggests the deadline check is broken",
+        );
+
+        // Invariant 3: no zombie. The helper's explicit
+        // `child.wait()` after `child.kill()` reaps the child.
+        // Poll briefly to give the kernel time to propagate the
+        // ESRCH state — most systems clear the PID slot within
+        // a few milliseconds of the wait, but a slow CI runner
+        // may take longer. Bound the poll at 1s so a regression
+        // that leaked the zombie surfaces clearly.
+        let zombie_check_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if !pid_is_alive(pid) {
+                break;
+            }
+            if std::time::Instant::now() >= zombie_check_deadline {
+                panic!(
+                    "child pid {pid} still alive 1s after helper returned — \
+                     timeout path leaked a zombie (missing child.wait() \
+                     after child.kill()?)",
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Successful exit before the deadline: the helper observes
+    /// `Ok(Some(status))` with a successful status, returns Ok,
+    /// and reaps via the natural process-exit path (no kill
+    /// needed). Pins that the timeout machinery does not
+    /// false-fire on a fast-exiting child.
+    ///
+    /// `true` exits 0 immediately; the helper's first `try_wait`
+    /// tick should see the completed status. The 5s timeout is
+    /// a wide margin so a slow CI runner does not flake the
+    /// test on a transient scheduling delay.
+    #[test]
+    fn poll_child_with_timeout_succeeds_when_child_exits_clean() {
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+
+        let result = super::poll_child_with_timeout(
+            child,
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            "make happy-target",
+        );
+        assert!(
+            result.is_ok(),
+            "child that exits 0 must surface as Ok; got: {result:?}",
+        );
+        // Cleanup invariant: a successful exit also reaps via
+        // the `Ok(Some(status))` arm's implicit Drop of `child`.
+        // Verify the PID slot was freed.
+        let zombie_check_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if !pid_is_alive(pid) {
+                break;
+            }
+            if std::time::Instant::now() >= zombie_check_deadline {
+                panic!(
+                    "child pid {pid} still alive 1s after Ok return — \
+                     successful-exit path leaked a zombie",
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Failed exit before the deadline: the helper observes
+    /// `Ok(Some(status))` with an unsuccessful status and
+    /// surfaces as Err with the `{label} failed` wording.
+    /// Distinct from the timeout case because the bail message
+    /// shape differs (`failed` vs `timed out after`); CI log
+    /// scrapers must distinguish the two so wedged-make
+    /// (operations issue) is not confused with build-failed
+    /// (code issue).
+    ///
+    /// `false` exits 1 immediately; the assertion pins both the
+    /// label propagation AND the `failed` wording.
+    #[test]
+    fn poll_child_with_timeout_surfaces_nonzero_exit_as_err() {
+        let child = std::process::Command::new("false")
+            .spawn()
+            .expect("spawn false");
+        let result = super::poll_child_with_timeout(
+            child,
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            "make broken-target",
+        );
+        let err = result.expect_err("child that exits non-zero must surface as Err");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("make broken-target"),
+            "non-zero-exit bail must include the label; got: {rendered}",
+        );
+        assert!(
+            rendered.contains("failed"),
+            "non-zero-exit bail must use the `failed` wording so it is \
+             distinguishable from the timeout-path's `timed out after`; \
+             got: {rendered}",
+        );
+        // Negative pin: a non-zero exit is NOT a timeout, so the
+        // bail message must NOT contain `timed out`. A regression
+        // that conflated the two error paths would cross-wire
+        // the wording and break CI log triage.
+        assert!(
+            !rendered.contains("timed out"),
+            "non-zero-exit bail must NOT contain `timed out` — that \
+             phrase belongs to the deadline-fired path only; got: {rendered}",
+        );
+    }
+
     // -- resolve_flags --
 
     #[test]
@@ -5006,6 +5330,60 @@ mod tests {
         assert!(validate_kernel_config(dir.path()).is_err());
     }
 
+    /// Pin the per-line `str::trim` semantics in
+    /// [`validate_kernel_config`]. The function builds its
+    /// presence-check `HashSet` from `config.lines().map(str::trim)`,
+    /// so a `.config` carrying CRLF line endings (`\r\n` from a
+    /// Windows-edited file or a configure step that wrote with
+    /// the wrong newline) and trailing-space lines must STILL
+    /// validate when the option-after-trim equals the expected
+    /// `CONFIG_X=y` form.
+    ///
+    /// A regression that dropped `.map(str::trim)` would cause
+    /// `lines()` to yield `"CONFIG_SCHED_CLASS_EXT=y\r"` (the
+    /// `\r` survives `lines()` per `str::lines` semantics —
+    /// `lines` splits on `\n` and on `\r\n` strips ONLY the
+    /// final `\n`, leaving the `\r`). The HashSet's contains
+    /// check against the bare `CONFIG_X=y` would miss, every
+    /// critical option would surface as missing, and CI on
+    /// Windows-edited fragments would break silently.
+    /// Independently, a trailing-space line like `"CONFIG_X=y "`
+    /// without trim would also miss against the bare
+    /// `CONFIG_X=y` lookup.
+    ///
+    /// Mixes BOTH whitespace shapes in one fixture so a
+    /// regression that handled one but not the other surfaces
+    /// here as a missing-options error message.
+    #[test]
+    fn validate_kernel_config_trim_handles_crlf_and_trailing_whitespace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Mix CRLF-terminated lines and trailing-space lines so
+        // both whitespace forms are exercised. Every entry in
+        // VALIDATE_CONFIG_CRITICAL appears once with one of the
+        // two whitespace shapes; trim must collapse both back
+        // to the bare `CONFIG_X=y` form for the HashSet probe.
+        std::fs::write(
+            dir.path().join(".config"),
+            "CONFIG_SCHED_CLASS_EXT=y\r\n\
+             CONFIG_DEBUG_INFO_BTF=y \n\
+             CONFIG_BPF_SYSCALL=y\r\n\
+             CONFIG_FTRACE=y \n\
+             CONFIG_KPROBE_EVENTS=y\r\n\
+             CONFIG_BPF_EVENTS=y \n",
+        )
+        .unwrap();
+        let result = validate_kernel_config(dir.path());
+        assert!(
+            result.is_ok(),
+            "validate_kernel_config must trim per-line whitespace \
+             before the HashSet probe — a regression dropping \
+             `.map(str::trim)` would treat \\r-suffixed and \
+             trailing-space lines as distinct from the bare \
+             `CONFIG_X=y` form and report every option as \
+             missing; got: {result:?}",
+        );
+    }
+
     // -- configure_kernel --
 
     #[test]
@@ -5101,6 +5479,132 @@ mod tests {
         // Truly empty lines in the fragment carry no kconfig state.
         let config = "CONFIG_FOO=y\n";
         assert!(all_fragment_lines_present("\n\nCONFIG_FOO=y\n\n", config));
+    }
+
+    // -- resolve_kernel_parallelism --
+
+    /// Unset env: returns the host-CPU fallback, never zero. The
+    /// fallback chain is `available_parallelism() → 1`, so the
+    /// result is always ≥ 1 — a zero return would set the rayon
+    /// pool width to zero, which `ThreadPoolBuilder::build`
+    /// rejects, defeating the entire fan-out pipeline.
+    #[test]
+    fn resolve_kernel_parallelism_unset_returns_host_default() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::remove(crate::KTSTR_KERNEL_PARALLELISM_ENV);
+        let n = super::resolve_kernel_parallelism();
+        assert!(
+            n >= 1,
+            "fallback must yield at least 1; got {n} which would defeat \
+             ThreadPoolBuilder::num_threads",
+        );
+    }
+
+    /// Valid usize override: env-supplied value wins over the
+    /// host-CPU default. `KTSTR_KERNEL_PARALLELISM=4` must
+    /// produce `4` regardless of the host's logical CPU count.
+    #[test]
+    fn resolve_kernel_parallelism_valid_override_wins() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set(crate::KTSTR_KERNEL_PARALLELISM_ENV, "4");
+        assert_eq!(
+            super::resolve_kernel_parallelism(),
+            4,
+            "valid usize env value must override the host-CPU default; \
+             a regression that ignored the env var would yield \
+             available_parallelism() instead",
+        );
+    }
+
+    /// `KTSTR_KERNEL_PARALLELISM=0`: zero is a sentinel meaning
+    /// "ignore me" rather than "disable parallelism." A
+    /// num_threads(0) ThreadPool would silently fall through to
+    /// the global rayon default (rayon's documented behavior),
+    /// which would defeat the cap entirely; the explicit `n > 0`
+    /// guard in `resolve_kernel_parallelism` rejects the parsed
+    /// zero so the host-CPU default takes over.
+    #[test]
+    fn resolve_kernel_parallelism_zero_falls_through_to_default() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set(crate::KTSTR_KERNEL_PARALLELISM_ENV, "0");
+        let n = super::resolve_kernel_parallelism();
+        assert!(
+            n >= 1,
+            "zero env value must fall through to host-CPU default \
+             (always ≥ 1); got {n} which would crash the pool builder",
+        );
+    }
+
+    /// Unparseable value: a typoed export
+    /// (`KTSTR_KERNEL_PARALLELISM=abc`) silently degrades to the
+    /// default cap rather than propagating the parse error or
+    /// disabling parallelism. The user gets host-CPU width with
+    /// no observable signal that the env var was wrong; the
+    /// alternative (bail) would block resolves on a typo, and
+    /// the alternative (silently disable) would serialize
+    /// multi-spec invocations with no visible cause.
+    #[test]
+    fn resolve_kernel_parallelism_unparseable_falls_through_to_default() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set(crate::KTSTR_KERNEL_PARALLELISM_ENV, "abc");
+        let n = super::resolve_kernel_parallelism();
+        assert!(
+            n >= 1,
+            "unparseable env value must fall through to host-CPU \
+             default (always ≥ 1); got {n}",
+        );
+    }
+
+    /// Negative value: `usize::from_str` rejects the leading `-`,
+    /// so the parse fails and the fallback fires. Distinct from
+    /// the alphabetic-typo case because `-1` is the more likely
+    /// "I expected a signed integer" mistake.
+    #[test]
+    fn resolve_kernel_parallelism_negative_falls_through_to_default() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set(crate::KTSTR_KERNEL_PARALLELISM_ENV, "-1");
+        let n = super::resolve_kernel_parallelism();
+        assert!(
+            n >= 1,
+            "negative env value must fall through to host-CPU \
+             default (usize::from_str rejects leading `-`); got {n}",
+        );
+    }
+
+    /// Surrounding whitespace: a shell-quoted
+    /// `KTSTR_KERNEL_PARALLELISM=" 8 "` parses as 8. Matches the
+    /// trim-tolerant convention used by every other KTSTR_*
+    /// reader (see `ktstr_kernel_env`'s whitespace-tolerance
+    /// tests in `lib.rs`).
+    #[test]
+    fn resolve_kernel_parallelism_trims_surrounding_whitespace() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set(crate::KTSTR_KERNEL_PARALLELISM_ENV, "  8  ");
+        assert_eq!(
+            super::resolve_kernel_parallelism(),
+            8,
+            "trimmed env value must parse; whitespace tolerance \
+             matches the rest of the KTSTR_* env-reading suite",
+        );
+    }
+
+    /// Pin the literal env-var name. A future rename must update
+    /// every reader in lockstep (the constant is the single
+    /// source of truth, but if this test fails alongside an
+    /// unrelated change, it surfaces the rename to the team
+    /// reviewer).
+    #[test]
+    fn ktstr_kernel_parallelism_env_const_matches_literal() {
+        assert_eq!(
+            crate::KTSTR_KERNEL_PARALLELISM_ENV,
+            "KTSTR_KERNEL_PARALLELISM",
+        );
     }
 
     // -- resolve_in_path --

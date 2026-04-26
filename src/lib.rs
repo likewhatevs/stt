@@ -493,6 +493,37 @@ pub const KTSTR_KERNEL_ENV: &str = "KTSTR_KERNEL";
 /// place instead of fanning out to every call site.
 pub const KTSTR_KERNEL_LIST_ENV: &str = "KTSTR_KERNEL_LIST";
 
+/// Name of the environment variable that overrides the rayon
+/// pool width used by `cargo ktstr`'s `resolve_kernel_set` to
+/// fan out per-spec kernel resolves (download / git-clone /
+/// build) in parallel. Default cap is `available_parallelism()`
+/// — the host's logical CPU count — chosen so download streams
+/// do not outnumber threads the host can drive without
+/// thrashing a contended local network (kernel.org CDN
+/// per-IP throttle, developer ISP, CI shared NIC).
+///
+/// Operators override when the default is wrong for their
+/// environment: a fast NIC + slow CPU benefits from raising
+/// the cap above logical-CPU count to keep more downloads
+/// in flight; a contended CI runner with concurrent jobs
+/// benefits from lowering it to 1 or 2 to leave bandwidth
+/// for siblings; a multi-version `--kernel A..Z` resolve on
+/// a workstation may want a hand-tuned middle value to
+/// balance throughput against background load.
+///
+/// Parsed as `usize`; 0 and unparseable values fall through
+/// to the default cap so a typoed export does not silently
+/// disable parallelism. Read by
+/// [`crate::cli::resolve_kernel_parallelism`] (the helper
+/// that combines this env value with the
+/// `available_parallelism()` fallback) so the parsing rules
+/// live in one place.
+///
+/// Single source of truth so the name is not spelled by hand at
+/// each reader; if the name ever changes, the change lands in one
+/// place instead of fanning out to every call site.
+pub const KTSTR_KERNEL_PARALLELISM_ENV: &str = "KTSTR_KERNEL_PARALLELISM";
+
 /// Shared skip / error hint for call sites that cannot proceed
 /// without a resolvable kernel. Phrased so the user sees the same
 /// wording regardless of which layer surfaced the failure — tests,

@@ -7394,6 +7394,76 @@ mod tests {
         );
     }
 
+    /// Failed contributor pin: a passing-clean row paired with a
+    /// FAILING-dirty row (`passed=false`, `skipped=false`) must
+    /// still flip the cohort's mixed-dirty flag and render
+    /// `+mixed` on the aggregate's commit field. The
+    /// `update_dirty_tracking` call site executes BEFORE the
+    /// `if !row.passed { continue; }` short-circuit, which is
+    /// the load-bearing ordering: dirty-status is per-row
+    /// metadata about the producer's working tree, NOT a metric
+    /// outcome, so failed contributors must carry their dirty
+    /// flag forward even though their metrics are excluded from
+    /// the mean. A regression that moved `update_dirty_tracking`
+    /// below the failed-skip continue would silently drop the
+    /// failed row's dirty status and the cohort would render the
+    /// clean form — hiding WIP-vs-committed disagreement that
+    /// the operator needs to see.
+    ///
+    /// Distinct from
+    /// `group_and_average_mixed_dirty_tracking_includes_skipped_and_failed`
+    /// which exercises the SKIPPED arm only (`passed=true,
+    /// skipped=true`). The two arms have separate `continue`
+    /// statements and one could regress without the other; this
+    /// test pins the FAILED arm specifically.
+    #[test]
+    fn group_and_average_mixed_dirty_tracking_includes_failed_contributors() {
+        let mut clean_pass = make_row("t", "tiny-1llc", true, 0.0);
+        clean_pass.commit = Some("abc1234".to_string());
+        let mut dirty_fail = make_row("t", "tiny-1llc", false, 0.0);
+        dirty_fail.commit = Some("abc1234-dirty".to_string());
+
+        let out = group_and_average(&[clean_pass, dirty_fail]);
+        assert_eq!(out.len(), 1, "single cohort key must produce one aggregate");
+        assert_eq!(
+            out[0].row.commit.as_deref(),
+            Some("abc1234+mixed"),
+            "failed contributor's `-dirty` flag must still flip the \
+             cohort's dirty-tracking — cohort metadata is independent \
+             of metric outcome. A regression moving update_dirty_tracking \
+             below the `if !row.passed` continue would drop the failed \
+             row's dirty status and render `abc1234` instead",
+        );
+        // Symmetric arm: passing-dirty + failing-clean. The
+        // dirty-tracking flip on the failing contributor's clean
+        // form must register as well — `any_clean` is the
+        // counterpart flag, and the same code path executes for
+        // both `Some(hex)` and `Some(hex-dirty)` values.
+        let mut dirty_pass = make_row("t", "tiny-1llc", true, 0.0);
+        dirty_pass.commit = Some("def5678-dirty".to_string());
+        let mut clean_fail = make_row("t", "tiny-1llc", false, 0.0);
+        clean_fail.commit = Some("def5678".to_string());
+
+        let out = group_and_average(&[dirty_pass, clean_fail]);
+        assert_eq!(
+            out[0].row.commit.as_deref(),
+            Some("def5678+mixed"),
+            "failed contributor's CLEAN form must also flip the \
+             cohort's any_clean flag — symmetric to the dirty arm",
+        );
+        // Failed contributor's `passed=false` still flips the
+        // aggregate's `passed` flag (logical-AND across all
+        // contributors). This sanity-checks that the new test
+        // doesn't accidentally exercise an aggregate-passes path
+        // — failed rows are correctly being excluded from the
+        // metric mean while contributing to dirty tracking.
+        assert!(
+            !out[0].row.passed,
+            "any failing contributor must flip the aggregate to \
+             passed=false, regardless of dirty-tracking semantics",
+        );
+    }
+
     /// Mixed-dirty marker uses canonical un-suffixed hex even
     /// when `acc.first` is the dirty form. Pin: first contributor
     /// is `abc1234-dirty`, second is `abc1234`; rendered form is

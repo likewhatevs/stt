@@ -1009,14 +1009,25 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
     // ISP, a CI runner's shared NIC) degrades when too many
     // streams overlap.
     //
-    // The cap is `available_parallelism()` — the host's logical
-    // CPU count, std-lib provided so no extra dependency is
-    // pulled in. Saturating local parallelism is the right
+    // The cap defaults to `available_parallelism()` — the host's
+    // logical CPU count, std-lib provided so no extra dependency
+    // is pulled in. Saturating local parallelism is the right
     // ceiling: download streams shouldn't outnumber the threads
     // the host can drive without thrashing, and the build phase
     // is already serialized at the LLC-flock layer (see comment
     // above) so additional download fan-out wouldn't accelerate
     // builds anyway.
+    //
+    // Operators can override the cap via the
+    // `KTSTR_KERNEL_PARALLELISM` env var (see
+    // [`ktstr::KTSTR_KERNEL_PARALLELISM_ENV`]) — useful when the
+    // default is wrong for the host: a fast NIC + slow CPU
+    // benefits from more in-flight downloads; a contended CI
+    // runner with concurrent jobs benefits from a lower cap to
+    // leave bandwidth for siblings. Parsing rules and fallback
+    // behavior live in [`ktstr::cli::resolve_kernel_parallelism`]
+    // so a typoed export (`=abc`, `=0`) silently degrades to the
+    // host-CPU default rather than disabling parallelism.
     //
     // Bounded ThreadPool via `pool.install(|| ...)` scopes the
     // cap to this pipeline only — the global rayon pool is
@@ -1028,9 +1039,7 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
     // to run the resolve under the default global pool than
     // bail with a cap-construction error that has nothing to
     // do with the user's `--kernel` input.
-    let max_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let max_threads = ktstr::cli::resolve_kernel_parallelism();
     let bounded_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(max_threads)
         .build()

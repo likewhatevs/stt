@@ -1129,9 +1129,25 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
     static KERNEL_COMMIT_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+    // Canonicalize the cache key so two paths that resolve to the
+    // same on-disk directory share one entry. Without this, a
+    // symlinked alias (`./linux` symlinked to `/abs/.../linux`)
+    // and the resolved target would each populate their own slot,
+    // re-running the gix-open + dirt-walk on every alias and
+    // defeating the memoization. `canonicalize` resolves symlinks,
+    // collapses `..` / `.`, and yields the absolute path the
+    // kernel actually lives at. Falls back to the raw path on
+    // canonicalize failure (e.g. caller passed a non-existent
+    // `kernel_dir`) — gix::open will fail downstream and the
+    // cache entry will memoize the `None` result against the raw
+    // path, which is the correct behavior for a path that doesn't
+    // exist (no symlink alias is possible).
+    let cache_key = kernel_dir
+        .canonicalize()
+        .unwrap_or_else(|_| kernel_dir.to_path_buf());
     let cache = KERNEL_COMMIT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = guard.get(kernel_dir) {
+    if let Some(cached) = guard.get(&cache_key) {
         return cached.clone();
     }
     // `gix::open` (NOT `gix::discover`) — `kernel_dir` must BE the
@@ -1142,10 +1158,17 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
     // this function and [`detect_commit_at`]; the post-open
     // "read HEAD, format short hex, append `-dirty` on dirt" body
     // lives in the shared [`commit_with_dirty_suffix`] helper.
+    //
+    // Open against `kernel_dir` (the caller-supplied path) rather
+    // than `cache_key`. The two paths point at the same on-disk
+    // repo by construction (canonicalize resolves to the same
+    // place), so gix opens the same repository either way; passing
+    // the original keeps any user-facing diagnostics (gix's
+    // internal error chain) consistent with the input shape.
     let result = gix::open(kernel_dir)
         .ok()
         .and_then(|repo| commit_with_dirty_suffix(&repo));
-    guard.insert(kernel_dir.to_path_buf(), result.clone());
+    guard.insert(cache_key, result.clone());
     result
 }
 
@@ -2535,6 +2558,105 @@ mod tests {
                 "missing-field error for `{field}` must name the field; got: {msg}",
             );
         }
+    }
+
+    /// Rename contract pin for the `source` → `run_source`
+    /// schema change. Per the doc on
+    /// [`SidecarResult::run_source`], no `#[serde(alias =
+    /// "source")]` is in place, so an archived sidecar carrying
+    /// the old `"source": "ci"` key deserializes to
+    /// `run_source: None` (serde silently drops the unknown
+    /// `"source"` field, then `Option<T>`'s "tolerate absence"
+    /// rule fires for the missing `"run_source"` key).
+    ///
+    /// This is the documented data-loss behavior — pre-1.0
+    /// disposable schema, re-running the test regenerates the
+    /// sidecar under the new key. The test pins:
+    ///
+    /// 1. Old key (`"source": "ci"`) → `run_source: None` (the
+    ///    payload IS dropped, not preserved). A regression that
+    ///    added `#[serde(alias = "source")]` would surface here
+    ///    as `Some("ci")`.
+    /// 2. New key (`"run_source": "ci"`) → `Some("ci")` (the
+    ///    canonical deserialize path under the post-rename
+    ///    schema). A regression that broke the new-key path
+    ///    would surface here as `None`.
+    /// 3. Old key + new key both present → new key wins (sanity
+    ///    check that the rename did not silently route the new
+    ///    key through the old field's deserialize logic). Pins
+    ///    the post-rename canonical-key precedence.
+    #[test]
+    fn sidecar_result_rename_contract_old_source_key_lands_run_source_none() {
+        let fixture = SidecarResult::test_fixture();
+        let full = match serde_json::to_value(&fixture).unwrap() {
+            serde_json::Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+
+        // Arm 1: old `"source"` key only — the new schema has
+        // no alias, so this is the documented data-loss path.
+        let mut obj_old = full.clone();
+        obj_old.remove("run_source");
+        obj_old.insert(
+            "source".to_string(),
+            serde_json::Value::String("ci".to_string()),
+        );
+        let json_old = serde_json::Value::Object(obj_old).to_string();
+        let parsed_old: SidecarResult = serde_json::from_str(&json_old).expect(
+            "old-key sidecar must still deserialize — \
+             SidecarResult does not set deny_unknown_fields, \
+             so the unrecognised `\"source\"` key is silently dropped",
+        );
+        assert_eq!(
+            parsed_old.run_source, None,
+            "old `\"source\": \"ci\"` key must land run_source = None \
+             per the documented data-loss contract; a regression that \
+             added `#[serde(alias = \"source\")]` would yield Some(\"ci\") here",
+        );
+
+        // Arm 2: new `"run_source"` key only — the canonical
+        // post-rename deserialize path.
+        let mut obj_new = full.clone();
+        obj_new.insert(
+            "run_source".to_string(),
+            serde_json::Value::String("ci".to_string()),
+        );
+        let json_new = serde_json::Value::Object(obj_new).to_string();
+        let parsed_new: SidecarResult =
+            serde_json::from_str(&json_new).expect("new-key sidecar must deserialize cleanly");
+        assert_eq!(
+            parsed_new.run_source.as_deref(),
+            Some("ci"),
+            "new `\"run_source\": \"ci\"` key must populate \
+             run_source — a regression breaking the new-key path \
+             would yield None here",
+        );
+
+        // Arm 3: BOTH keys present — the new key wins because
+        // the old `"source"` is unknown and silently dropped.
+        // Pins that the rename did not accidentally route the
+        // new key through the old field's logic (which would
+        // make this case ambiguous).
+        let mut obj_both = full.clone();
+        obj_both.insert(
+            "run_source".to_string(),
+            serde_json::Value::String("ci".to_string()),
+        );
+        obj_both.insert(
+            "source".to_string(),
+            serde_json::Value::String("local".to_string()),
+        );
+        let json_both = serde_json::Value::Object(obj_both).to_string();
+        let parsed_both: SidecarResult =
+            serde_json::from_str(&json_both).expect("both-keys sidecar must deserialize cleanly");
+        assert_eq!(
+            parsed_both.run_source.as_deref(),
+            Some("ci"),
+            "with both keys present, new `\"run_source\"` must win \
+             — the old `\"source\"` is silently dropped, NOT used \
+             as a fallback. A regression that processed `\"source\"` \
+             as an alias would surface here as Some(\"local\")",
+        );
     }
 
     // -- collect_sidecars tests --
@@ -5133,6 +5255,80 @@ mod tests {
             "after interleaved calls, A and B must STILL hold \
              distinct values — a regression that lost per-key \
              distinction would equate them; got a2={a2:?}, b2={b2:?}",
+        );
+    }
+
+    /// `detect_kernel_commit` canonicalizes its cache key so two
+    /// path spellings that resolve to the same on-disk repo share
+    /// one cache entry. Without canonicalization a symlink alias
+    /// would re-run the gix-open + dirt-walk on every call,
+    /// defeating the memoization the cache exists to provide.
+    ///
+    /// Behavioral proof: prime the cache against the canonical
+    /// (real) path of a CLEAN repo, then mutate the worktree so a
+    /// re-probe would surface `-dirty`, then call via a symlink
+    /// alias. With canonicalization the alias canonicalizes to
+    /// the real path, hits the cached CLEAN entry, and returns
+    /// the no-`-dirty` value. Without canonicalization the alias
+    /// keys the cache under its literal path, misses, re-probes,
+    /// and surfaces the new dirt as `*-dirty`.
+    ///
+    /// The cache deliberately does NOT invalidate mid-process
+    /// (per the `KERNEL_COMMIT_CACHE` doc-comment); the
+    /// stale-on-purpose cached return is the load-bearing signal
+    /// that proves the symlink hit the canonicalized entry.
+    ///
+    /// Unix-only — `std::os::unix::fs::symlink` is gated.
+    #[cfg(unix)]
+    #[test]
+    fn detect_kernel_commit_canonicalizes_symlink_aliases() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir real");
+        let head = init_clean_repo_with_file(&real);
+
+        // Sibling symlink pointing at `real`. Both paths live
+        // inside `tmp` so TempDir's drop cleans up everything.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink alias -> real");
+
+        // Prime the cache via the canonical path. The entry is
+        // now memoized under `real.canonicalize()` with the clean
+        // short hash.
+        let real_clean =
+            super::detect_kernel_commit(&real).expect("clean canonical-path probe must yield Some");
+        assert_eq!(
+            real_clean,
+            head.to_hex_with_len(7).to_string(),
+            "fixture precondition: canonical-path probe must return \
+             the clean 7-char head hash; got {real_clean:?}",
+        );
+
+        // Introduce dirt — any cache-bypass re-probe would now
+        // observe `-dirty`. The cached entry deliberately does
+        // not invalidate, so the symlink call (if it canonicalizes
+        // correctly) returns the stale clean value.
+        std::fs::write(real.join("file.txt"), b"modified-after-prime\n")
+            .expect("dirty the worktree");
+
+        // Call via the symlink alias. With canonicalization, the
+        // alias canonicalizes to the real path and hits the
+        // cached clean entry. Without it, the alias misses, re-
+        // probes, and surfaces the new dirt as `*-dirty`.
+        let alias_result =
+            super::detect_kernel_commit(&alias).expect("alias-path probe must yield Some");
+        assert!(
+            !alias_result.ends_with("-dirty"),
+            "alias call must hit the cached pre-dirt entry — a \
+             `-dirty` suffix proves the alias bypassed the cache \
+             and re-probed the now-dirty repo, which is the \
+             regression this test guards against. got {alias_result:?}",
+        );
+        assert_eq!(
+            alias_result, real_clean,
+            "alias call must return the EXACT cached clean value \
+             from the canonical-path probe; got alias={alias_result:?}, \
+             cached={real_clean:?}",
         );
     }
 
