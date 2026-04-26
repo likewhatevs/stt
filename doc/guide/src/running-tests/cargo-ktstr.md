@@ -364,7 +364,7 @@ hit gets no annotation):
 
 | Field | Description |
 |---|---|
-| `model:` | Model file name (the pinned default; e.g. `Qwen3-4B-Instruct.Q5_K_M.gguf`). |
+| `model:` | Model file name (the pinned default; e.g. `Qwen3-4B-Q4_K_M.gguf`). |
 | `path:` | Absolute cache path (`{cache_root}/models/{file}`) the producer reads at LlmExtract time. |
 | `cached:` | `true` if an entry exists at `path:`, `false` otherwise. |
 | `checked:` | `true` if the cached entry's SHA-256 matches the pinned digest. |
@@ -482,7 +482,7 @@ source directly -- there is no newest-subdirectory walk under it:
 ### list
 
 Print a table of run directories under
-`{CARGO_TARGET_DIR or "target"}/ktstr/` with three columns:
+`{CARGO_TARGET_DIR or "target"}/ktstr/` with four columns:
 
 - `RUN`: the run-directory leaf name, formatted as
   `{kernel}-{project_commit}` per [Runs](runs.md). `list` does NOT
@@ -498,6 +498,11 @@ Print a table of run directories under
   pre-cleared at the new run's first write, so only the new
   run's timestamps remain). See [Runs](runs.md) for the full
   semantics.
+- `ARCH`: the `host.arch` value from the run's first sidecar
+  (e.g. `x86_64`, `aarch64`). Renders as `-` when no sidecar in
+  the directory carries a populated host context — pre-host-
+  context archives and host-only test stubs that never populate
+  the field land in this bucket.
 
 Rows are sorted by directory mtime, **most recent first**, so the
 latest run lands at the top — the operator's usual interest.

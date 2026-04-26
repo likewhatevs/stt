@@ -2267,12 +2267,19 @@ pub fn restore_sigpipe_default() {
 /// silently degrades to `None` — the caller's primary diagnostic
 /// is "run not found"; the "did you mean?" hint is best-effort
 /// gravy and must not gate the bail path.
+///
+/// Filters via [`crate::test_support::is_run_directory`] so the
+/// flock sentinel subdirectory (`.locks/`) and any other
+/// dotfile-prefixed entry under [`runs_root`] cannot surface as
+/// a "did you mean?" suggestion — the same predicate that
+/// [`newest_run_dir`] and `sorted_run_entries` use, so all three
+/// run-listing surfaces agree on what counts as a run dir.
 fn suggest_closest_run_key(query: &str, root: &Path) -> Option<String> {
     let threshold = std::cmp::max(3, query.len() / 3);
     let entries = std::fs::read_dir(root).ok()?;
     let mut best: Option<(usize, String)> = None;
     for entry in entries.flatten() {
-        if !entry.path().is_dir() {
+        if !crate::test_support::is_run_directory(&entry) {
             continue;
         }
         let name = match entry.file_name().to_str() {
@@ -3089,6 +3096,17 @@ fn render_explain_sidecar_text(
         let _ = writeln!(out, "  topology: {}", sc.topology);
         let _ = writeln!(out, "  scheduler: {}", sc.scheduler);
         let _ = writeln!(out, "  run_id: {}", sc.run_id);
+        // Arch is sourced from `host.arch`; renders as `-` when
+        // either `host` is `None` (pre-host-context-landing archive
+        // or host-only-stub) or `arch` is `None` (arch probe
+        // failed) so the line reads consistently regardless of
+        // which leg of the option chain dropped.
+        let arch = sc
+            .host
+            .as_ref()
+            .and_then(|h| h.arch.as_deref())
+            .unwrap_or("-");
+        let _ = writeln!(out, "  arch: {arch}");
         let projected = project_optional_fields(sc);
         let populated: Vec<&'static str> = projected
             .iter()
@@ -5877,6 +5895,58 @@ mod tests {
             "populated `payload` must appear: {out}",
         );
         assert!(out.contains("none fields (7)"), "must report 7 None: {out}",);
+    }
+
+    /// Per-sidecar text output: the `arch:` line surfaces under
+    /// each sidecar's block, sourced from `host.arch`. Pins
+    /// GAP-B: a sidecar with `host: Some(arch=x86_64)` must
+    /// surface `arch: x86_64`; a sidecar with `host: None`
+    /// must surface `arch: -` so the line is present whether
+    /// or not host context was captured (uniform shape across
+    /// host-populated and host-absent sidecars makes the line
+    /// scriptable without conditional grep).
+    #[test]
+    fn explain_sidecar_text_renders_arch_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-arch");
+        std::fs::create_dir(&run_dir).unwrap();
+        let mut sc = crate::test_support::SidecarResult::test_fixture();
+        sc.host = Some(crate::host_context::HostContext::test_fixture());
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-arch", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("arch: x86_64"),
+            "host-populated sidecar must surface `arch: x86_64` per the \
+             test_fixture default: {out}",
+        );
+    }
+
+    /// Per-sidecar text output: when `host` is `None`, the
+    /// `arch:` line still emits with the `-` sentinel so the
+    /// line is uniform across host-populated and host-absent
+    /// sidecars. Pins the fallback rendering arm of GAP-B.
+    #[test]
+    fn explain_sidecar_text_arch_line_falls_back_to_dash_when_host_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-arch-none");
+        std::fs::create_dir(&run_dir).unwrap();
+        // SidecarResult::test_fixture defaults host: None.
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-arch-none", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("arch: -"),
+            "host-None sidecar must surface `arch: -` (consistent \
+             sentinel with `list_runs`'s arch column): {out}",
+        );
     }
 
     /// Per-sidecar text output: two sidecars in the same run
@@ -9991,9 +10061,11 @@ mod tests {
     /// (the FILE's exact name). The helper must return
     /// `Some("6.14-abc1235")` — the DIRECTORY at distance 1 — and
     /// must NOT return the file at distance 0 because the file
-    /// fails the `is_dir()` filter.
+    /// fails [`crate::test_support::is_run_directory`]'s
+    /// `is_dir()` short-circuit.
     ///
-    /// Catches a regression that drops the `is_dir()` filter and
+    /// Catches a regression that drops the
+    /// [`crate::test_support::is_run_directory`] filter and
     /// allows files to leak into the suggestion surface.
     #[test]
     fn suggest_closest_run_key_skips_files() {
