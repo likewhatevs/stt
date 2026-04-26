@@ -535,15 +535,16 @@ enum StatsCommand {
         /// `--b-kernel` carry the same match-shape rule.
         #[arg(long, action = ArgAction::Append)]
         kernel: Vec<String>,
-        /// Strict equality match against the sidecar's
+        /// Repeatable OR-combined filter on the sidecar's
         /// `project_commit` field (e.g. `--project-commit abcdef1`
-        /// or `--project-commit abcdef1-dirty`). Repeatable:
+        /// or `--project-commit abcdef1-dirty`).
         /// `--project-commit A --project-commit B` keeps rows
-        /// whose `project_commit` equals A OR B. Rows whose
-        /// `project_commit` is `None` (sidecar writer's gix probe
-        /// failed, or cwd was outside any git repo at write time)
-        /// NEVER match a populated filter — same opt-in policy as
-        /// `--kernel`.
+        /// whose `project_commit` equals A OR B; each entry uses
+        /// strict equality (no prefix matching — `abcdef1` does
+        /// not match `abcdef10`). Rows whose `project_commit` is
+        /// `None` (sidecar writer's gix probe failed, or cwd was
+        /// outside any git repo at write time) NEVER match a
+        /// populated filter — same opt-in policy as `--kernel`.
         ///
         /// Filters on the ktstr framework commit
         /// (`SidecarResult::project_commit`); the scheduler
@@ -564,17 +565,18 @@ enum StatsCommand {
         /// operator narrow on either or both commit dimensions.
         #[arg(long = "project-commit", action = ArgAction::Append)]
         project_commit: Vec<String>,
-        /// Strict equality match against the sidecar's
+        /// Repeatable OR-combined filter on the sidecar's
         /// `kernel_commit` field (e.g. `--kernel-commit abcdef1`
-        /// or `--kernel-commit abcdef1-dirty`). Repeatable:
+        /// or `--kernel-commit abcdef1-dirty`).
         /// `--kernel-commit A --kernel-commit B` keeps rows whose
-        /// `kernel_commit` equals A OR B. Rows whose
-        /// `kernel_commit` is `None` (KTSTR_KERNEL pointed at a
-        /// non-git path, the underlying source was Tarball / Git
-        /// rather than a `Local` tree, or
-        /// `detect_kernel_commit`'s gix probe failed) NEVER match
-        /// a populated filter — same opt-in policy as
-        /// `--project-commit` / `--kernel`.
+        /// `kernel_commit` equals A OR B; each entry uses strict
+        /// equality (no prefix matching — `abcdef1` does not
+        /// match `abcdef10`). Rows whose `kernel_commit` is
+        /// `None` (KTSTR_KERNEL pointed at a non-git path, the
+        /// underlying source was Tarball / Git rather than a
+        /// `Local` tree, or `detect_kernel_commit`'s gix probe
+        /// failed) NEVER match a populated filter — same opt-in
+        /// policy as `--project-commit` / `--kernel`.
         ///
         /// Filters on the kernel SOURCE TREE commit
         /// (`SidecarResult::kernel_commit`), NOT on the kernel
@@ -596,10 +598,11 @@ enum StatsCommand {
         /// separately under this filter.
         #[arg(long, action = ArgAction::Append)]
         kernel_commit: Vec<String>,
-        /// Strict equality match against the sidecar's `scheduler`
-        /// field (e.g. `--scheduler scx_rusty`). Repeatable:
+        /// Repeatable OR-combined filter on the sidecar's
+        /// `scheduler` field (e.g. `--scheduler scx_rusty`).
         /// `--scheduler A --scheduler B` keeps rows whose
-        /// `scheduler` equals A OR B (OR-combined like `--kernel`).
+        /// `scheduler` equals A OR B; each entry uses strict
+        /// equality (no prefix matching).
         /// Distinct from `-E`, which matches a substring across
         /// the joined fields. Use this when the operator wants to
         /// pin specific schedulers rather than narrow on a
@@ -607,32 +610,34 @@ enum StatsCommand {
         /// default and matches every row's scheduler.
         #[arg(long, action = ArgAction::Append)]
         scheduler: Vec<String>,
-        /// Strict equality match against the rendered topology label
-        /// (e.g. `--topology 1n2l4c2t`). The label is what
+        /// Repeatable OR-combined filter on the rendered topology
+        /// label (e.g. `--topology 1n2l4c2t`). The label is what
         /// `Topology::Display` produces; `cargo ktstr stats list`
-        /// shows the form per-row. Repeatable: `--topology A
-        /// --topology B` keeps rows whose `topology` equals A OR B
-        /// (OR-combined like `--kernel`). Empty is the no-op
-        /// default.
+        /// shows the form per-row. `--topology A --topology B`
+        /// keeps rows whose `topology` equals A OR B; each entry
+        /// uses strict equality (no prefix matching). Empty is
+        /// the no-op default.
         #[arg(long, action = ArgAction::Append)]
         topology: Vec<String>,
-        /// Strict equality match against the sidecar's `work_type`
-        /// field (e.g. `--work-type CpuSpin`). Valid names are the
-        /// PascalCase variants of `WorkType`. See
+        /// Repeatable OR-combined filter on the sidecar's
+        /// `work_type` field (e.g. `--work-type CpuSpin`). Valid
+        /// names are the PascalCase variants of `WorkType`. See
         /// `WorkType::ALL_NAMES` for the canonical variant list, or
-        /// `doc/guide/src/concepts/work-types.md`. Repeatable:
-        /// `--work-type A --work-type B` keeps rows whose
-        /// `work_type` equals A OR B (OR-combined like `--kernel`).
-        /// Empty is the no-op default.
+        /// `doc/guide/src/concepts/work-types.md`. `--work-type A
+        /// --work-type B` keeps rows whose `work_type` equals A OR
+        /// B; each entry uses strict equality (no prefix
+        /// matching). Empty is the no-op default.
         #[arg(long = "work-type", action = ArgAction::Append)]
         work_type: Vec<String>,
-        /// Strict equality match against the sidecar's `run_source`
-        /// field (e.g. `--run-source local`, `--run-source ci`,
-        /// `--run-source archive`). Repeatable: `--run-source A
-        /// --run-source B` keeps rows whose `run_source` equals A
-        /// OR B. Rows whose `run_source` is `None` (sidecar
-        /// pre-dates the field) NEVER match a populated filter —
-        /// same opt-in policy as `--kernel` / `--project-commit` /
+        /// Repeatable OR-combined filter on the sidecar's
+        /// `run_source` field (e.g. `--run-source local`,
+        /// `--run-source ci`, `--run-source archive`).
+        /// `--run-source A --run-source B` keeps rows whose
+        /// `run_source` equals A OR B; each entry uses strict
+        /// equality (case-sensitive, no prefix matching). Rows
+        /// whose `run_source` is `None` (sidecar pre-dates the
+        /// field) NEVER match a populated filter — same opt-in
+        /// policy as `--kernel` / `--project-commit` /
         /// `--kernel-commit`.
         ///
         /// Filters on the run-environment provenance recorded by
@@ -887,9 +892,13 @@ fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, PathBuf), St
             let cache_dir = ktstr::cli::resolve_cached_kernel(&id, "cargo ktstr")
                 .map_err(|e| format!("{e:#}"))?;
             let dir = canonicalize_cache_dir(cache_dir);
-            // Extract the version prefix from the cache key —
-            // `6.14.2-tarball-x86_64-kc...` → `6.14.2`. Falls back
-            // to the full key if no recognised suffix is present.
+            // Extract a discriminating label from the cache key —
+            // tarball keys yield the version prefix
+            // (`6.14.2-tarball-…` → `6.14.2`), git keys yield the
+            // ref (`for-next-git-…` → `for-next`), local keys yield
+            // `local_{hash6}` (or `local_unknown` for non-git
+            // trees). See [`cache_key_to_version_label`] for the
+            // full per-shape contract and fallback behavior.
             let label = cache_key_to_version_label(key).to_string();
             Ok((label, dir))
         }
@@ -924,81 +933,7 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
     use ktstr::kernel_path::KernelId;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-    // Pre-flight collision detection on cheap-to-label specs.
-    //
-    // Versions, CacheKeys, and Git refs all yield labels through
-    // pure string manipulation (`ver.clone()`,
-    // `cache_key_to_version_label(key)`, `git_kernel_label(url,
-    // ref)`) — no I/O. We can compute and compare the sanitized
-    // forms of those labels BEFORE the parallel resolve fires
-    // any downloads, builds, or git clones. That moves the
-    // collision diagnostic from a multi-minute build cost
-    // ("downloaded 6.14.2, downloaded git+...#main, both rebuilt
-    // their kernel, NOW we tell you they collide") to a sub-
-    // millisecond pre-flight.
-    //
-    // Path and Range specs are intentionally EXCLUDED:
-    // - Path: `path_kernel_label(dir)` requires `dir` to be
-    //   canonicalized first (its hash6 component is over the
-    //   canonical path's UTF-8 bytes). Canonicalization is real
-    //   filesystem I/O — admissible at resolve time but not
-    //   here, where the goal is "fast pre-flight". Path specs
-    //   that collide still surface via the post-resolve
-    //   `detect_label_collisions` call after their canonical
-    //   labels are known.
-    // - Range: expanding a range to its per-version label set
-    //   requires a `releases.json` fetch — admissible at resolve
-    //   time but not pre-flight (and the resolve pipeline already
-    //   does it once; doing it twice is waste). Range-vs-Range
-    //   or Range-vs-Version collisions surface post-resolve.
-    //
-    // Two distinct labels that sanitize to the same nextest
-    // suffix would later route to the wrong cache entry under
-    // the dispatch-side `parse_kernel_list` map (last-write-wins
-    // because the map is keyed on the sanitized label). The
-    // post-resolve `detect_label_collisions` is the unconditional
-    // safety net; this pre-flight is purely a UX win for the
-    // common-case Version/CacheKey/Git input.
-    let mut preflight: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for raw in specs {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let id = KernelId::parse(trimmed);
-        // Validate inverted ranges and other malformed inputs
-        // BEFORE the network fetch the rayon resolve would
-        // otherwise run — same diagnostic timing the parallel
-        // path preserves at line ~1054.
-        if let Err(e) = id.validate() {
-            return Err(format!("--kernel {id}: {e}"));
-        }
-        let label: Option<String> = match &id {
-            KernelId::Version(v) => Some(v.clone()),
-            KernelId::CacheKey(k) => Some(cache_key_to_version_label(k).to_string()),
-            KernelId::Git { url, git_ref } => Some(git_kernel_label(url, git_ref)),
-            // Path / Range deferred to post-resolve check.
-            KernelId::Path(_) | KernelId::Range { .. } => None,
-        };
-        if let Some(label) = label {
-            let sanitized = ktstr::test_support::sanitize_kernel_label(&label);
-            if let Some(prior) = preflight.insert(sanitized.clone(), label.clone())
-                && prior != label
-            {
-                // Distinct producer-side labels that sanitize to
-                // the same nextest suffix. Bail BEFORE any
-                // download / build / clone runs.
-                return Err(format!(
-                    "--kernel: pre-flight check found collision before any \
-                     download or build started — labels {prior:?} and {label:?} \
-                     both sanitize to {sanitized:?}, which the nextest \
-                     test-name suffix cannot disambiguate. Spell each \
-                     --kernel value distinctly so its sanitized form is \
-                     unique. (Path and Range specs are checked post-resolve.)"
-                ));
-            }
-        }
-    }
+    preflight_collision_check(specs)?;
 
     // Each spec resolves independently:
     //   - Path → just canonicalize on disk (no network).
@@ -1185,28 +1120,123 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
         None => resolve_in_pool()?,
     };
 
-    // Dedupe identical (label, path) tuples before collision
-    // detection: two `--kernel 6.14.2` specs (or a Range that
-    // overlaps a separate Version spec) resolve to the same
-    // (label, path) pair by construction — `resolve_one` is
-    // deterministic per spec, so identical inputs produce
-    // identical outputs. Letting the duplicate flow into
-    // `detect_label_collisions` would trip its same-label
-    // diagnostic on a fundamentally benign input. Tuple-level
-    // dedup keeps the intent ("dedupe identical specs") narrow:
-    // two specs that produce the SAME label but DIFFERENT paths
-    // represent a real cache-key collision that
-    // `detect_label_collisions` must still catch — those rows
-    // survive dedup because their tuples differ on the path.
-    //
-    // Order-preserving dedup via a sequential first-seen pass:
-    // the rayon pipeline upstream may have shuffled the input
-    // order, so we honor whatever order arrived (the downstream
-    // wire format is `;`-separated and order-insensitive at the
-    // dispatch layer; preserving order keeps stderr diagnostics
-    // operator-readable). HashSet membership check + Vec push
-    // is O(n) — acceptable on the ~10s-of-kernels scale this
-    // function targets.
+    let resolved = dedupe_resolved(resolved);
+
+    detect_label_collisions(&resolved)?;
+    Ok(resolved)
+}
+
+/// Pre-flight collision detection on cheap-to-label kernel specs
+/// (Version / CacheKey / Git refs). Returns `Err(message)` when
+/// two distinct producer-side labels sanitize to the same nextest
+/// identifier; `Ok(())` otherwise.
+///
+/// Versions, CacheKeys, and Git refs all yield labels through
+/// pure string manipulation (`ver.clone()`,
+/// `cache_key_to_version_label(key)`, `git_kernel_label(url,
+/// ref)`) — no I/O. We can compute and compare the sanitized
+/// forms of those labels BEFORE the parallel resolve fires any
+/// downloads, builds, or git clones. That moves the collision
+/// diagnostic from a multi-minute build cost ("downloaded 6.14.2,
+/// downloaded git+...#main, both rebuilt their kernel, NOW we
+/// tell you they collide") to a sub-millisecond pre-flight.
+///
+/// Path and Range specs are intentionally EXCLUDED:
+/// - Path: `path_kernel_label(dir)` requires `dir` to be
+///   canonicalized first (its hash6 component is over the
+///   canonical path's UTF-8 bytes). Canonicalization is real
+///   filesystem I/O — admissible at resolve time but not here,
+///   where the goal is "fast pre-flight". Path specs that
+///   collide still surface via the post-resolve
+///   `detect_label_collisions` call after their canonical labels
+///   are known.
+/// - Range: expanding a range to its per-version label set
+///   requires a `releases.json` fetch — admissible at resolve
+///   time but not pre-flight (and the resolve pipeline already
+///   does it once; doing it twice is waste). Range-vs-Range or
+///   Range-vs-Version collisions surface post-resolve.
+///
+/// Identical labels appearing twice are NOT a collision under
+/// this check (the `prior != label` guard on the same-label
+/// case). Two `--kernel 6.14.2` specs resolve to the same
+/// `(label, path)` post-resolve, get folded by `dedupe_resolved`,
+/// and reach `detect_label_collisions` as a single entry.
+///
+/// Inverted ranges and other malformed inputs fail validation
+/// here, BEFORE the network fetch the rayon resolve would
+/// otherwise run — preserves the same diagnostic timing the
+/// parallel path would produce on its own.
+///
+/// Extracted from `resolve_kernel_set` so the pre-flight
+/// algorithm is unit-testable on contrived inputs without driving
+/// the rayon resolve pipeline (every `resolve_one` arm performs
+/// real I/O — canonicalize+build for Path, cache lookup+download
+/// for Version/CacheKey, shallow git clone for Git).
+fn preflight_collision_check(specs: &[String]) -> Result<(), String> {
+    use ktstr::kernel_path::KernelId;
+    let mut preflight: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for raw in specs {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = KernelId::parse(trimmed);
+        if let Err(e) = id.validate() {
+            return Err(format!("--kernel {id}: {e}"));
+        }
+        let label: Option<String> = match &id {
+            KernelId::Version(v) => Some(v.clone()),
+            KernelId::CacheKey(k) => Some(cache_key_to_version_label(k).to_string()),
+            KernelId::Git { url, git_ref } => Some(git_kernel_label(url, git_ref)),
+            // Path / Range deferred to post-resolve check.
+            KernelId::Path(_) | KernelId::Range { .. } => None,
+        };
+        if let Some(label) = label {
+            let sanitized = ktstr::test_support::sanitize_kernel_label(&label);
+            if let Some(prior) = preflight.insert(sanitized.clone(), label.clone())
+                && prior != label
+            {
+                return Err(format!(
+                    "--kernel: pre-flight check found collision before any \
+                     download or build started — labels {prior:?} and {label:?} \
+                     both sanitize to {sanitized:?}, which the nextest \
+                     test-name suffix cannot disambiguate. Spell each \
+                     --kernel value distinctly so its sanitized form is \
+                     unique. (Path and Range specs are checked post-resolve.)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dedupe identical `(label, path)` tuples before
+/// `detect_label_collisions` fires.
+///
+/// Two `--kernel 6.14.2` specs (or a Range that overlaps a
+/// separate Version spec) resolve to the same `(label, path)`
+/// pair by construction — `resolve_one` is deterministic per
+/// spec, so identical inputs produce identical outputs. Letting
+/// the duplicate flow into `detect_label_collisions` would trip
+/// its same-label diagnostic on a fundamentally benign input.
+/// Tuple-level dedup keeps the intent ("dedupe identical
+/// specs") narrow: two specs that produce the SAME label but
+/// DIFFERENT paths represent a real cache-key collision that
+/// `detect_label_collisions` must still catch — those rows
+/// survive dedup because their tuples differ on the path.
+///
+/// Order-preserving dedup via a sequential first-seen pass: the
+/// rayon pipeline upstream may have shuffled the input order, so
+/// we honor whatever order arrived (the downstream wire format
+/// is `;`-separated and order-insensitive at the dispatch layer;
+/// preserving order keeps stderr diagnostics operator-readable).
+/// HashSet membership check + Vec push is O(n) — acceptable on
+/// the ~10s-of-kernels scale this function targets.
+///
+/// Extracted from `resolve_kernel_set` so the dedupe algorithm
+/// is unit-testable on contrived inputs without driving the
+/// rayon resolve pipeline.
+fn dedupe_resolved(resolved: Vec<(String, PathBuf)>) -> Vec<(String, PathBuf)> {
     let mut seen: std::collections::HashSet<(String, PathBuf)> =
         std::collections::HashSet::with_capacity(resolved.len());
     let mut deduped: Vec<(String, PathBuf)> = Vec::with_capacity(resolved.len());
@@ -1215,10 +1245,7 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
             deduped.push(entry);
         }
     }
-    let resolved = deduped;
-
-    detect_label_collisions(&resolved)?;
-    Ok(resolved)
+    deduped
 }
 
 /// Detect two distinct producer-side labels that normalize to the
@@ -1285,35 +1312,83 @@ fn path_kernel_label(dir: &Path) -> String {
     format!("path_{basename}_{:06x}", hash & 0x00ff_ffff)
 }
 
-/// Extract the version prefix from a cache-entry key.
+/// Extract a discriminating label from a cache-entry key.
 ///
-/// Cache keys follow two shapes:
-/// - tarball / git: `{version-or-ref}-{source}-{arch}-kc{hash}`
-///   where `{source}` is `tarball` or `git`. The version / ref is a
-///   PROPER PREFIX with the source as an INFIX tag — e.g.
-///   `6.14.2-tarball-x86_64-kcabc` → `6.14.2`,
-///   `for-next-git-deadbee-x86_64-kcabc` → `for-next`.
-/// - local: `local-{hash}-{arch}-kc{hash}` — the `local-` PREFIX
-///   IS the source tag, with NO version segment ahead of it. The
-///   label collapses to `"local"` since there is no source-tree
-///   version to surface (the hash is implementation detail and
-///   carries no operator-meaningful identity).
+/// Cache keys follow three shapes:
+/// - tarball: `{version}-tarball-{arch}-kc{hash}` — version is a
+///   PROPER PREFIX, e.g. `6.14.2-tarball-x86_64-kcabc` → `6.14.2`.
+/// - git: `{ref}-git-{short_hash}-{arch}-kc{hash}` — ref is a
+///   PROPER PREFIX, e.g. `for-next-git-deadbee-x86_64-kcabc` →
+///   `for-next`.
+/// - local: `local-{discriminator}-{arch}-kc{hash}` — the `local-`
+///   PREFIX is the source tag, with `{discriminator}` being the
+///   git short_hash of the source tree (or the literal `unknown`
+///   when the tree is not a git repo, see
+///   `crate::fetch::local_source`). Label is `local_{hash6}`,
+///   where `{hash6}` is the 6-char prefix of the discriminator —
+///   collapsing every local entry to bare `"local"` would erase
+///   distinct local trees from the operator-visible label and
+///   cause two different `--kernel /path/A` and `--kernel /path/B`
+///   builds to render identically in `kernel list` /
+///   `--a-kernel` / `--b-kernel` outputs. The hash6 disambiguates
+///   without leaking the full short_hash (which is meaningful at
+///   the git layer but redundant in the operator-facing label).
+///   For `local-unknown-...` (non-git tree), the label is
+///   `local_unknown` — a single shared bucket is the correct
+///   render because non-git trees lack a discriminator entirely.
 ///
-/// Falls back to the full key if no recognised tag is present — a
-/// future cache-key shape with an unknown tag still produces a
-/// non-empty label rather than a panic.
-fn cache_key_to_version_label(key: &str) -> &str {
+/// Returns `Cow<str>` because the local arm builds an owned label
+/// (`local_{hash6}` requires a fresh allocation), while the
+/// tarball/git arms return a borrow into the input.
+///
+/// Falls back to the full key (borrowed) if no recognised tag is
+/// present — a future cache-key shape with an unknown tag still
+/// produces a non-empty label rather than a panic.
+fn cache_key_to_version_label(key: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     // Local prefix has no preceding version segment — the source
-    // tag is the leading token. Match the prefix shape directly.
-    if key == "local" || key.starts_with("local-") {
-        return "local";
+    // tag is the leading token. Match the prefix shape and pull
+    // the discriminator (git short_hash or `unknown`) for
+    // labelling.
+    if key == "local" {
+        return Cow::Borrowed("local");
+    }
+    if let Some(rest) = key.strip_prefix("local-") {
+        // `rest` shape: `{discriminator}-{arch}-kc{hash}`. Take the
+        // first segment as the discriminator. Empty discriminator
+        // (e.g. `local--x86_64-...`, malformed) collapses to bare
+        // `local` — defensive, never produced by `fetch::local_source`.
+        let discriminator = rest.split('-').next().unwrap_or("");
+        if discriminator.is_empty() {
+            return Cow::Borrowed("local");
+        }
+        // Truncate to 6 chars. `unknown` (7 chars) collapses to
+        // `unknow` if truncated mid-word, which is unhelpful — keep
+        // the special-case literal that `fetch::local_source` emits
+        // at full length so non-git trees render as
+        // `local_unknown`.
+        let suffix: String = if discriminator == "unknown" {
+            "unknown".to_string()
+        } else {
+            // Truncate to 6 chars via `chars().take(6)` to avoid
+            // panicking on a non-UTF-8-aligned byte slice. Today's
+            // `fetch::local_source` only emits ASCII hex
+            // discriminators, but a future producer that synthesizes
+            // a non-ASCII discriminator (or a malformed cache key
+            // hand-typed via `KTSTR_KERNEL=local-…`) would crash
+            // under `&discriminator[..6]` byte-slicing if the 6th
+            // byte fell mid-char. `chars().take(6)` is UTF-8 safe by
+            // construction.
+            discriminator.chars().take(6).collect::<String>()
+        };
+        return Cow::Owned(format!("local_{suffix}"));
     }
     for tag in &["-tarball-", "-git-"] {
         if let Some(prefix_end) = key.find(tag) {
-            return &key[..prefix_end];
+            return Cow::Borrowed(&key[..prefix_end]);
         }
     }
-    key
+    Cow::Borrowed(key)
 }
 
 /// Build the `git_{owner}_{repo}_{ref}` label for a `Git`-resolved
@@ -3737,6 +3812,118 @@ mod tests {
         }
     }
 
+    /// `--scheduler A --scheduler B` produces a Vec with two
+    /// entries — the flag is `ArgAction::Append` (Vec, not
+    /// Option), so multiple occurrences accumulate into the
+    /// OR-combined filter the dispatch applies. Mirrors
+    /// `parse_stats_compare_with_project_commit_repeatable` for
+    /// the scheduler dimension. A regression that reverted
+    /// `scheduler` to `Option<String>` (the pre-#13 shape) would
+    /// fail this test at parse time — clap's `Option` derive
+    /// rejects multiple occurrences with a "supplied more than
+    /// once" diagnostic.
+    #[test]
+    fn parse_stats_compare_with_scheduler_repeatable() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--scheduler",
+            "scx_alpha",
+            "--scheduler",
+            "scx_beta",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::Compare { scheduler, .. }),
+                ..
+            } => {
+                assert_eq!(scheduler, vec!["scx_alpha", "scx_beta"]);
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    /// `--topology A --topology B` produces a Vec with two
+    /// entries via `ArgAction::Append`. Mirrors the scheduler
+    /// sibling above for the topology dimension. The Display form
+    /// of `Topology` (e.g. `1n2l4c2t`) is the operator-visible
+    /// label that flows verbatim through clap into this Vec.
+    #[test]
+    fn parse_stats_compare_with_topology_repeatable() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--topology",
+            "1n2l4c2t",
+            "--topology",
+            "1n4l2c1t",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::Compare { topology, .. }),
+                ..
+            } => {
+                assert_eq!(topology, vec!["1n2l4c2t", "1n4l2c1t"]);
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    /// `--work-type A --work-type B` produces a Vec with two
+    /// entries via `ArgAction::Append`. Mirrors the scheduler /
+    /// topology siblings above for the work_type dimension.
+    /// Hyphenated CLI flag (`--work-type`) maps to underscored
+    /// field name (`work_type`) per clap's default kebab-case
+    /// rename — pin the field-vs-flag mapping by reading from the
+    /// underscored field after a hyphenated invocation.
+    #[test]
+    fn parse_stats_compare_with_work_type_repeatable() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--work-type",
+            "CpuSpin",
+            "--work-type",
+            "PageFaultChurn",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::Compare { work_type, .. }),
+                ..
+            } => {
+                assert_eq!(work_type, vec!["CpuSpin", "PageFaultChurn"]);
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
     /// `--a-kernel-commit X --b-kernel-commit Y` populates the
     /// per-side fields without touching the shared
     /// `kernel_commit`. Pins the clap binding for the per-side
@@ -5115,11 +5302,57 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_to_version_label_local() {
+    fn cache_key_to_version_label_local_emits_hash6_disambiguator() {
+        // Local cache keys carry the source tree's git short_hash
+        // as the discriminator after `local-`. The label preserves
+        // the first 6 chars so two distinct local builds (different
+        // source trees, different short_hashes) render with
+        // distinct labels in `kernel list` / per-side filter
+        // outputs. Truncating to 6 keeps the label compact while
+        // still disambiguating against the typical 7-char git
+        // short_hash space.
         assert_eq!(
             cache_key_to_version_label("local-deadbee-x86_64-kcabc"),
-            "local",
+            "local_deadbe",
+            "must emit `local_{{first 6 chars of discriminator}}` so \
+             distinct local trees do not collide on label",
         );
+    }
+
+    #[test]
+    fn cache_key_to_version_label_local_distinct_hashes_render_distinct_labels() {
+        // Anti-collision pin: two local cache keys with different
+        // discriminators must produce different labels. Bare
+        // `"local"` for both would erase the distinction in the
+        // operator UI.
+        let a = cache_key_to_version_label("local-aaaaaa1-x86_64-kcabc");
+        let b = cache_key_to_version_label("local-bbbbbb2-x86_64-kcabc");
+        assert_ne!(
+            a, b,
+            "distinct local discriminators must render distinct labels"
+        );
+        assert_eq!(a, "local_aaaaaa");
+        assert_eq!(b, "local_bbbbbb");
+    }
+
+    #[test]
+    fn cache_key_to_version_label_local_unknown_renders_local_unknown() {
+        // `local-unknown-...` is the literal `fetch::local_source`
+        // emits when the source tree is not a git repo (no commit
+        // hash to discriminate on). The label uses the full
+        // `unknown` literal rather than truncating to `unknow`.
+        assert_eq!(
+            cache_key_to_version_label("local-unknown-x86_64-kcabc"),
+            "local_unknown",
+        );
+    }
+
+    #[test]
+    fn cache_key_to_version_label_local_bare_yields_bare_local() {
+        // Defensive: bare `local` (no trailing segments) yields
+        // bare `"local"`. Not produced by `fetch::local_source`,
+        // but the function must not panic on it.
+        assert_eq!(cache_key_to_version_label("local"), "local");
     }
 
     #[test]
@@ -5564,5 +5797,325 @@ mod tests {
         assert!(err.contains("6.14.2"), "earlier (prior) label must appear");
         assert!(err.contains("6-14-2"), "later label must appear");
         assert!(err.contains("kernel_6_14_2"));
+    }
+
+    // ---------------------------------------------------------------
+    // KERNEL_LIST_LONG_ABOUT — range-mode JSON schema discoverability
+    // ---------------------------------------------------------------
+    //
+    // `cargo ktstr kernel list --range R --json` emits a
+    // structurally-different JSON shape from the cache-walk mode:
+    // four top-level fields (`range`, `start`, `end`, `versions`)
+    // with no cache metadata. The help copy is the
+    // discoverability contract for scripted consumers — without a
+    // unit-test pin, a JSON emitter that adds, renames, or removes
+    // a range-mode field could ship without a matching help update
+    // and silently break dispatch-on-key consumers. The sibling
+    // `kernel_list_long_about_exposes_json_schema` test in
+    // `src/cli.rs` covers cache-walk mode; this companion fills
+    // the range-mode gap from the cargo-ktstr binary's perspective
+    // and exercises the same `pub const` re-exported through
+    // `ktstr::cli::KERNEL_LIST_LONG_ABOUT`.
+
+    /// Pins that every range-mode JSON top-level field name appears
+    /// in the help copy by exact substring. Range-mode emits
+    /// `{ range, start, end, versions }` per the schema block at
+    /// `cli.rs:337-346`. Bare-word substring match is sufficient
+    /// because the help copy embeds the field names in column-
+    /// aligned table form (e.g. `  range     literal range string`)
+    /// — distinct from the cache-walk schema's nullable-marker
+    /// pattern which uses `{field} (nullable)` substrings.
+    #[test]
+    fn kernel_list_long_about_exposes_range_mode_json_keys() {
+        let about = ktstr::cli::KERNEL_LIST_LONG_ABOUT;
+        for range_field in ["range", "start", "end", "versions"] {
+            assert!(
+                about.contains(range_field),
+                "KERNEL_LIST_LONG_ABOUT must mention range-mode JSON \
+                 field `{range_field}` so scripted consumers discover \
+                 the schema without `cargo doc`; got: {about:?}",
+            );
+        }
+        // Stronger pin: the help copy must explicitly distinguish
+        // range-mode from cache-walk-mode by mentioning that the
+        // range-mode shape "never carries cache metadata" (the
+        // dispatch-on-key contract). A regression that dropped the
+        // range-mode block entirely while keeping the cache-walk
+        // block (or vice versa) would pass the bare-word checks
+        // above (`start` / `end` could match unrelated copy) but
+        // fail this one.
+        assert!(
+            about.contains("--range"),
+            "KERNEL_LIST_LONG_ABOUT must reference the `--range` flag \
+             so a `kernel list --help` reader sees the range-mode \
+             entry point: got: {about:?}",
+        );
+        assert!(
+            about.contains("range-preview") || about.contains("range mode"),
+            "KERNEL_LIST_LONG_ABOUT must explain that --range switches \
+             to a structurally-different output shape so scripted \
+             consumers know to dispatch on the presence of the \
+             `range` key: got: {about:?}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // preflight_collision_check — pre-resolve fast-fail
+    // ---------------------------------------------------------------
+    //
+    // Pre-flight runs BEFORE the rayon resolve pipeline so a
+    // colliding pair of cheap-to-label specs (Version / CacheKey /
+    // Git) bails sub-millisecond rather than after a multi-minute
+    // download + build cycle. Path and Range specs are intentionally
+    // deferred to the post-resolve `detect_label_collisions` because
+    // their labels require I/O (canonicalization for Path, a
+    // releases.json fetch for Range).
+
+    #[test]
+    fn preflight_collision_check_empty_input_succeeds() {
+        // Empty spec set has no pairs to compare; the helper must
+        // return Ok without iterating anything.
+        preflight_collision_check(&[]).expect("empty input must succeed");
+    }
+
+    #[test]
+    fn preflight_collision_check_unique_versions_succeed() {
+        // Two distinct Version specs that sanitize to distinct
+        // identifiers — no collision, no error.
+        let specs = vec!["6.14.2".to_string(), "6.15.0".to_string()];
+        preflight_collision_check(&specs)
+            .expect("distinct sanitized identifiers must succeed at pre-flight");
+    }
+
+    #[test]
+    fn preflight_collision_check_period_vs_dash_collides() {
+        // The canonical collision shape: `6.14.2` parses as
+        // KernelId::Version (label = "6.14.2"); `6-14-2` parses as
+        // KernelId::CacheKey (no `.` → fails version-string check)
+        // and its `cache_key_to_version_label` falls through to the
+        // raw key "6-14-2" because no `-tarball-` / `-git-` /
+        // `local-` tag matches. Both labels sanitize to
+        // `kernel_6_14_2`. Pre-flight must bail with both labels and
+        // the shared sanitized form named.
+        let specs = vec!["6.14.2".to_string(), "6-14-2".to_string()];
+        let err = preflight_collision_check(&specs)
+            .expect_err("colliding labels must surface a pre-flight error");
+        assert!(err.contains("6.14.2"), "error must name first label: {err}");
+        assert!(
+            err.contains("6-14-2"),
+            "error must name second label: {err}"
+        );
+        assert!(
+            err.contains("kernel_6_14_2"),
+            "error must include the shared sanitized identifier: {err}",
+        );
+        // Pre-flight diagnostic distinguishes itself from the
+        // post-resolve `detect_label_collisions` error by prefixing
+        // with "pre-flight check found collision before any
+        // download or build started" — the two diagnostics are
+        // distinct so an operator can tell which gate fired.
+        assert!(
+            err.contains("pre-flight check found collision"),
+            "error must be the pre-flight diagnostic, not the post-resolve one: {err}",
+        );
+    }
+
+    #[test]
+    fn preflight_collision_check_identical_versions_succeed() {
+        // Two identical `--kernel 6.14.2` specs sanitize to the same
+        // identifier but the `prior != label` guard inside
+        // `preflight_collision_check` skips the bail on identical
+        // labels — those folder into a single entry by
+        // `dedupe_resolved` post-resolve. Pins that the helper does
+        // NOT confuse "operator passed the same spec twice" with
+        // "two distinct specs that collide".
+        let specs = vec!["6.14.2".to_string(), "6.14.2".to_string()];
+        preflight_collision_check(&specs)
+            .expect("identical specs must NOT bail at pre-flight (handled by dedupe post-resolve)");
+    }
+
+    #[test]
+    fn preflight_collision_check_skips_path_and_range_specs() {
+        // Path specs (recognized by `/` prefix per
+        // `KernelId::parse`) and Range specs (`A..B` shape) are
+        // EXCLUDED from pre-flight because their labels require
+        // I/O. Two paths that would collide on their `path_basename
+        // _hash6` labels must NOT bail at pre-flight — they reach
+        // post-resolve `detect_label_collisions` after
+        // canonicalization. Pin the deferred branch by passing two
+        // Path specs that, sans I/O, cannot have their labels
+        // computed at pre-flight time.
+        let specs = vec![
+            "/tmp/kernel-a".to_string(),
+            "/tmp/kernel-b".to_string(),
+            "6.14.2..6.14.4".to_string(),
+        ];
+        preflight_collision_check(&specs).expect(
+            "Path and Range specs must skip pre-flight — their labels are deferred to post-resolve",
+        );
+    }
+
+    #[test]
+    fn preflight_collision_check_skips_empty_and_whitespace_specs() {
+        // `resolve_kernel_set` skips trim()-empty specs at the
+        // parallel iterator (filter_map). The pre-flight loop
+        // applies the same trim+empty skip so a spurious blank
+        // `--kernel ""` doesn't reach `KernelId::parse` (which
+        // would parse `""` as KernelId::CacheKey("") and produce
+        // `sanitize_kernel_label("") == "kernel_"` — a real but
+        // useless collision risk). Pin the upstream filter so a
+        // regression that dropped the empty-skip guard surfaces
+        // as a behavior change.
+        let specs = vec!["".to_string(), "   ".to_string(), "6.14.2".to_string()];
+        preflight_collision_check(&specs)
+            .expect("blank / whitespace-only specs must be silently skipped");
+    }
+
+    #[test]
+    fn preflight_collision_check_inverted_range_fails_validation() {
+        // An inverted Range (`6.15..6.14`) fails `KernelId::validate`
+        // pre-resolve. Pre-flight surfaces the inversion diagnostic
+        // BEFORE the rayon resolve fires — matches the timing the
+        // parallel pipeline preserved on its own pre-extraction.
+        let specs = vec!["6.15..6.14".to_string()];
+        let err = preflight_collision_check(&specs)
+            .expect_err("inverted range must fail pre-flight validation");
+        assert!(
+            err.contains("inverted kernel range") || err.contains("--kernel"),
+            "error must surface the inversion diagnostic with --kernel framing: {err}",
+        );
+    }
+
+    #[test]
+    fn preflight_collision_check_git_url_collision() {
+        // Two distinct `git+URL#REF` specs that produce
+        // `git_owner_repo_ref`-shape labels can collide if they
+        // share owner/repo/ref segments. Construct two URLs whose
+        // git_kernel_label outputs differ only in `.` vs `-`
+        // characters that sanitize to `_`.
+        // - `git+ssh://h/foo/bar#v6.14` → `git_foo_bar_v6.14`
+        //   sanitizes to `kernel_git_foo_bar_v6_14`.
+        // - `git+ssh://h/foo/bar#v6-14` → `git_foo_bar_v6-14`
+        //   sanitizes to the same `kernel_git_foo_bar_v6_14`.
+        let specs = vec![
+            "git+ssh://host/foo/bar#v6.14".to_string(),
+            "git+ssh://host/foo/bar#v6-14".to_string(),
+        ];
+        let err = preflight_collision_check(&specs)
+            .expect_err("colliding git refs must surface a pre-flight error");
+        assert!(err.contains("git_foo_bar_v6.14") || err.contains("git_foo_bar_v6-14"));
+        assert!(err.contains("kernel_git_foo_bar_v6_14"));
+    }
+
+    // ---------------------------------------------------------------
+    // dedupe_resolved — order-preserving tuple-level dedup
+    // ---------------------------------------------------------------
+    //
+    // Identical `(label, path)` tuples are folded into one row so
+    // `detect_label_collisions` does NOT trip on a benign duplicate
+    // input. Tuples that share a label but DIFFER on the path are a
+    // real cache-key collision and survive dedup intact.
+
+    #[test]
+    fn dedupe_resolved_empty_input_returns_empty() {
+        let resolved: Vec<(String, PathBuf)> = Vec::new();
+        let deduped = dedupe_resolved(resolved);
+        assert!(deduped.is_empty());
+    }
+
+    #[test]
+    fn dedupe_resolved_unique_inputs_pass_through() {
+        // No duplicates → output identical to input, in order.
+        let resolved = vec![
+            ("a".to_string(), PathBuf::from("/cache/a")),
+            ("b".to_string(), PathBuf::from("/cache/b")),
+            ("c".to_string(), PathBuf::from("/cache/c")),
+        ];
+        let deduped = dedupe_resolved(resolved.clone());
+        assert_eq!(deduped, resolved);
+    }
+
+    #[test]
+    fn dedupe_resolved_two_identical_tuples_collapse_to_one() {
+        // The canonical dedupe case: two `--kernel 6.14.2` specs
+        // resolve to the same `(label, path)` tuple. Output must be
+        // a single entry.
+        let resolved = vec![
+            ("6.14.2".to_string(), PathBuf::from("/cache/v")),
+            ("6.14.2".to_string(), PathBuf::from("/cache/v")),
+        ];
+        let deduped = dedupe_resolved(resolved);
+        assert_eq!(
+            deduped.len(),
+            1,
+            "identical tuples must collapse to one entry"
+        );
+        assert_eq!(deduped[0].0, "6.14.2");
+        assert_eq!(deduped[0].1, PathBuf::from("/cache/v"));
+    }
+
+    #[test]
+    fn dedupe_resolved_same_label_different_paths_both_survive() {
+        // CRITICAL: two specs that resolve to the SAME label but
+        // DIFFERENT paths represent a real cache-key collision.
+        // Tuple-level dedup must NOT fold them — both rows must
+        // survive so the post-dedupe `detect_label_collisions`
+        // catches the same-label collision.
+        let resolved = vec![
+            ("6.14.2".to_string(), PathBuf::from("/cache/a")),
+            ("6.14.2".to_string(), PathBuf::from("/cache/b")),
+        ];
+        let deduped = dedupe_resolved(resolved);
+        assert_eq!(
+            deduped.len(),
+            2,
+            "same label + different paths must NOT dedupe — \
+             this is a real cache-key collision that detect_label_collisions \
+             must still catch downstream",
+        );
+    }
+
+    #[test]
+    fn dedupe_resolved_preserves_input_order() {
+        // The downstream wire format is `;`-separated and
+        // order-insensitive at the dispatch layer, but stderr
+        // diagnostics list kernels in the order the operator passed
+        // them — the order-preserving dedup keeps that mapping
+        // intact across the rayon shuffle. Pin the order via a
+        // first-seen pass on a 4-entry input where the duplicate
+        // sits between two other unique entries.
+        let resolved = vec![
+            ("a".to_string(), PathBuf::from("/cache/a")),
+            ("b".to_string(), PathBuf::from("/cache/b")),
+            ("a".to_string(), PathBuf::from("/cache/a")),
+            ("c".to_string(), PathBuf::from("/cache/c")),
+        ];
+        let deduped = dedupe_resolved(resolved);
+        // Output: a, b, c — `a` first-seen at index 0, second
+        // occurrence at index 2 dropped.
+        assert_eq!(
+            deduped,
+            vec![
+                ("a".to_string(), PathBuf::from("/cache/a")),
+                ("b".to_string(), PathBuf::from("/cache/b")),
+                ("c".to_string(), PathBuf::from("/cache/c")),
+            ],
+        );
+    }
+
+    #[test]
+    fn dedupe_resolved_three_identical_tuples_collapse_to_one() {
+        // Larger duplicate count: three identical tuples fold to
+        // one. Pins that the dedupe is set-membership, not
+        // pairwise — a regression that compared adjacent entries
+        // only would still pass for two duplicates but produce
+        // two outputs for three identical inputs.
+        let resolved = vec![
+            ("v".to_string(), PathBuf::from("/cache/v")),
+            ("v".to_string(), PathBuf::from("/cache/v")),
+            ("v".to_string(), PathBuf::from("/cache/v")),
+        ];
+        let deduped = dedupe_resolved(resolved);
+        assert_eq!(deduped.len(), 1);
     }
 }

@@ -1519,6 +1519,107 @@ mod tests {
         assert_eq!(sanitize_kernel_label(""), "kernel_");
     }
 
+    // ---------------------------------------------------------------
+    // SanitizedKernelLabel — newtype invariants
+    // ---------------------------------------------------------------
+    //
+    // `SanitizedKernelLabel::new(raw)` is the only production
+    // path that yields a value of the type, and it always routes
+    // through `sanitize_kernel_label`. The tests below pin each
+    // surface (constructor, accessors, `PartialEq` impls) directly
+    // so a regression that bypassed the sanitizer (e.g. a future
+    // `From<String>` impl that wraps verbatim) or dropped one of
+    // the comparison-ergonomics impls would surface as a unit-test
+    // failure rather than as a downstream filter mismatch.
+
+    /// `SanitizedKernelLabel::new(raw)` yields a value whose
+    /// `as_str()` equals `sanitize_kernel_label(raw)` byte-for-
+    /// byte. Pins the constructor's "always sanitize" contract:
+    /// the only path that builds a `SanitizedKernelLabel` MUST run
+    /// `sanitize_kernel_label`, otherwise a future caller could
+    /// stuff a raw label into the field via a regression that
+    /// forgot to invoke the sanitizer. Multiple inputs covered to
+    /// distinguish "happens to match" from "truly routes through
+    /// the sanitizer" — version, RC suffix, mixed case, embedded
+    /// dots-vs-dashes.
+    #[test]
+    fn sanitized_kernel_label_new_runs_sanitizer() {
+        for raw in [
+            "6.14.2",
+            "6.15-rc3",
+            "ABC-DEF",
+            "git_tj_sched_ext_for-next",
+            "",
+        ] {
+            let label = SanitizedKernelLabel::new(raw);
+            assert_eq!(
+                label.as_str(),
+                sanitize_kernel_label(raw),
+                "SanitizedKernelLabel::new({raw:?}).as_str() must equal \
+                 sanitize_kernel_label({raw:?}); a regression that wrapped \
+                 raw input verbatim would surface here",
+            );
+        }
+    }
+
+    /// `as_str()` returns the sanitized inner string, NOT the raw
+    /// input. Round-trip through `as_str()` matches what the
+    /// sanitizer produced — distinct from
+    /// `sanitized_kernel_label_new_runs_sanitizer` which checks
+    /// the constructor wires through; this checks that read-side
+    /// access exposes the SAME bytes the constructor wrote.
+    #[test]
+    fn sanitized_kernel_label_as_str_returns_sanitized_form() {
+        let label = SanitizedKernelLabel::new("6.14.2");
+        assert_eq!(label.as_str(), "kernel_6_14_2");
+        // A regression that returned the raw input from `as_str()`
+        // would surface here because the raw input contains `.`
+        // which is `_` after sanitization.
+        assert_ne!(label.as_str(), "6.14.2");
+    }
+
+    /// `PartialEq<&str>` lets `assert_eq!(label, "kernel_6_14_2")`
+    /// stay readable at every consumer (and is what
+    /// `parse_kernel_list_*` tests already use). A regression that
+    /// dropped or narrowed the impl (e.g. switched to `PartialEq<
+    /// String>` only) would force every consumer to chain
+    /// `.as_str()` and break the existing test suite.
+    #[test]
+    fn sanitized_kernel_label_partial_eq_with_str_ref() {
+        let label = SanitizedKernelLabel::new("6.14.2");
+        let want: &str = "kernel_6_14_2";
+        assert_eq!(label, want);
+        // Symmetric inequality: distinct sanitization output must
+        // NOT compare equal to a different `&str`.
+        let other: &str = "kernel_6_15_0";
+        assert_ne!(label, other);
+    }
+
+    /// `PartialEq<str>` covers the unsized-`str` comparison path
+    /// (e.g. dereferenced `String` slice) distinct from the
+    /// `&str` path above. Both impls are explicit because Rust's
+    /// auto-deref to `&str` does not bridge the `PartialEq<str>`
+    /// case for some assert macros / generic comparators. A
+    /// regression that dropped just the `PartialEq<str>` impl
+    /// would compile most consumer sites but break callers that
+    /// land on the unsized form.
+    #[test]
+    fn sanitized_kernel_label_partial_eq_with_str_unsized() {
+        let label = SanitizedKernelLabel::new("6.14.2");
+        let owned: String = "kernel_6_14_2".to_string();
+        // `*owned` is `str` (unsized) — exercises `PartialEq<str>`
+        // rather than `PartialEq<&str>`. Wrap with `&` to satisfy
+        // `PartialEq::eq`'s `&Self`-vs-`&Other` shape; the impl
+        // body still operates on the unsized `str`.
+        assert!(
+            label == *owned.as_str(),
+            "PartialEq<str> impl missing — assert against unsized str failed",
+        );
+        // Symmetric inequality for the unsized path.
+        let other: String = "kernel_6_15_0".to_string();
+        assert!(label != *other.as_str());
+    }
+
     /// `strip_kernel_suffix` is a no-op for single-kernel mode (0 or
     /// 1 entries) — returns the input verbatim and signals "no
     /// kernel override needed."

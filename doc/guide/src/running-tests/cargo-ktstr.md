@@ -81,6 +81,13 @@ sanitized to `kernel_[a-z0-9_]+`:
   `kernel_path_linux_a3f2b1`); the 6-char crc32 of the canonical
   path disambiguates two `linux` directories under different
   parents.
+- Local cache entry → `kernel_local_{hash6}` (first 6 chars of
+  the source tree's git short_hash, captured at cache-store
+  time) or `kernel_local_unknown` for non-git trees. The
+  hash6 keeps two distinct local trees from collapsing to the
+  same label; the `unknown` literal is the shared bucket for
+  every non-git tree (no discriminator exists at the cache
+  layer to spread them apart).
 
 Filter with nextest's `-E 'test(kernel_6_14)'` to pick a single
 kernel from a multi-kernel matrix; nextest's parallelism, retries,
@@ -639,6 +646,24 @@ A header line above the comparison table reads `averaged across
 N runs (A) and M runs (B)` and a per-group
 `passes_observed/total_observed` block prints below the summary.
 
+**`+mixed` commit marker.** When contributors to an averaged
+group disagree on the `-dirty` suffix for the same canonical
+hex (some clean, some `-dirty`), the rendered `commit` and
+`kernel_commit` columns show `{hex}+mixed` for that group.
+`+mixed` is a COHORT-level marker (distinct from `-dirty`,
+which is a per-record property of one sidecar): it indicates
+mixed working-tree state across the group's contributors.
+Mixed-dirty tracking spans EVERY contributor (passing,
+failing, skipped) so WIP-vs-committed disagreement surfaces
+in the averaged row even when one of the two states only
+appears on a failing run. The marker is rendered against the
+canonical un-suffixed hex, so a `abc1234` clean entry plus an
+`abc1234-dirty` entry render as `abc1234+mixed` regardless of
+which contributor was scanned first. Homogeneous cohorts
+(every contributor clean, every contributor dirty, or every
+contributor `None`) preserve the first-seen value verbatim
+and never get the `+mixed` marker.
+
 `--no-average` keeps each sidecar distinct. If multiple sidecars
 on the same side share the same pairing key under `--no-average`,
 the comparison bails with "duplicate pairing keys" — pairing
@@ -669,25 +694,25 @@ to the per-side filter flags `--project-commit` and
 |------|---------|-------------|
 | `-E FILTER` | -- | Substring filter applied to the joined `scenario topology scheduler work_type flags` string. **Scope is limited**: `-E` does NOT match against `kernel`, `project_commit`, `kernel_commit`, or `run_source` — those are typed dimensions reachable only via the dedicated `--kernel` / `--project-commit` / `--kernel-commit` / `--run-source` flags. To narrow on those, use the typed flags. Composes with the typed dimension filters: typed narrows happen first, substring runs over the surviving set. |
 | `--kernel VER` (repeatable) | -- | Pin BOTH sides to the listed kernel version(s). Sugar for `--a-kernel V1 --a-kernel V2 --b-kernel V1 --b-kernel V2`. Per-side `--a-kernel` / `--b-kernel` REPLACES this shared value for that side only. Major.minor (`6.12`) prefix-matches; three-segment (`6.14.2`) is strict. |
-| `--scheduler NAME` | -- | Pin BOTH sides to one scheduler. Sugar for `--a-scheduler N --b-scheduler N`. Strict equality. |
-| `--topology LABEL` | -- | Pin BOTH sides to one rendered topology label (e.g. `1n2l4c2t`). Strict equality. |
-| `--work-type TYPE` | -- | Pin BOTH sides to one work_type (PascalCase variant of `WorkType`, e.g. `CpuSpin`). See [Work types](../concepts/work-types.md). |
+| `--scheduler NAME` (repeatable) | -- | Pin BOTH sides to the listed scheduler(s). Sugar for `--a-scheduler N1 --a-scheduler N2 --b-scheduler N1 --b-scheduler N2`. Per-side `--a-scheduler` / `--b-scheduler` REPLACES this shared value for that side only. OR-combined: a row matches iff its `scheduler` field equals ANY listed entry. Strict equality per entry. |
+| `--topology LABEL` (repeatable) | -- | Pin BOTH sides to the listed rendered topology label(s) (e.g. `1n2l4c2t`). Sugar for `--a-topology L1 --a-topology L2 --b-topology L1 --b-topology L2`. Per-side `--a-topology` / `--b-topology` REPLACES this shared value for that side only. OR-combined: a row matches iff its rendered topology label equals ANY listed entry. Strict equality per entry. |
+| `--work-type TYPE` (repeatable) | -- | Pin BOTH sides to the listed work_type(s) (PascalCase variants of `WorkType`, e.g. `CpuSpin`). Sugar for `--a-work-type T1 --a-work-type T2 --b-work-type T1 --b-work-type T2`. Per-side `--a-work-type` / `--b-work-type` REPLACES this shared value for that side only. OR-combined: a row matches iff its `work_type` field equals ANY listed entry. Strict equality per entry. See [Work types](../concepts/work-types.md). |
 | `--project-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `project_commit` value(s) (7-char hex, optional `-dirty` suffix). Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. Renamed from `--commit` for naming symmetry with `--kernel-commit`. |
 | `--kernel-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `kernel_commit` value(s) (7-char hex, optional `-dirty` suffix). Filters the kernel SOURCE TREE commit (`SidecarResult::kernel_commit`), distinct from the kernel release version (`--kernel`): two runs of the same `kernel_version` with different `kernel_commit` values represent the same release rebuilt from different trees. Rows whose `kernel_commit` is `None` (KTSTR_KERNEL pointed at a non-git path, the underlying source was Tarball / Git rather than a `Local` tree, or the gix probe failed) NEVER match a populated filter. |
 | `--run-source NAME` (repeatable) | -- | Pin BOTH sides to listed run-environment source(s). Filters `SidecarResult::run_source` set by `detect_run_source` at sidecar-write time: `"local"` for developer runs, `"ci"` when `KTSTR_CI` was set, or rewritten to `"archive"` at load time when `--dir` points at a non-default pool root. Rows whose `run_source` is `None` (sidecar pre-dates the field) NEVER match a populated filter — same opt-in policy as `--kernel` / `--project-commit` / `--kernel-commit`. Combine per-side `--a-run-source ci --b-run-source local` to contrast CI runs against developer runs of the same scenarios. |
 | `--flag NAME` | -- | Repeatable AND-combined flag filter pinning BOTH sides. Every listed flag must appear in `active_flags`; rows may carry additional flags. |
 | `--a-kernel VER` (repeatable) | -- | A-side kernel filter. Replaces the shared `--kernel` for the A side only. |
-| `--a-scheduler NAME` | -- | A-side scheduler filter. Replaces the shared `--scheduler` for the A side only. |
-| `--a-topology LABEL` | -- | A-side topology filter. Replaces the shared `--topology` for the A side only. |
-| `--a-work-type TYPE` | -- | A-side work_type filter. Replaces the shared `--work-type` for the A side only. |
+| `--a-scheduler NAME` (repeatable) | -- | A-side scheduler filter, OR-combined. Replaces the shared `--scheduler` value for the A side only. |
+| `--a-topology LABEL` (repeatable) | -- | A-side topology filter, OR-combined. Replaces the shared `--topology` value for the A side only. |
+| `--a-work-type TYPE` (repeatable) | -- | A-side work_type filter, OR-combined. Replaces the shared `--work-type` value for the A side only. |
 | `--a-project-commit HASH` (repeatable) | -- | A-side project-commit filter. Replaces the shared `--project-commit` for the A side only. |
 | `--a-kernel-commit HASH` (repeatable) | -- | A-side kernel-commit filter. Replaces the shared `--kernel-commit` for the A side only. |
 | `--a-run-source NAME` (repeatable) | -- | A-side run-source filter. Replaces the shared `--run-source` for the A side only. |
 | `--a-flag NAME` (repeatable) | -- | A-side flag filter. Replaces the shared `--flag` for the A side only. |
 | `--b-kernel VER` (repeatable) | -- | B-side kernel filter. Replaces the shared `--kernel` for the B side only. |
-| `--b-scheduler NAME` | -- | B-side scheduler filter. Replaces the shared `--scheduler` for the B side only. |
-| `--b-topology LABEL` | -- | B-side topology filter. Replaces the shared `--topology` for the B side only. |
-| `--b-work-type TYPE` | -- | B-side work_type filter. Replaces the shared `--work-type` for the B side only. |
+| `--b-scheduler NAME` (repeatable) | -- | B-side scheduler filter, OR-combined. Replaces the shared `--scheduler` value for the B side only. |
+| `--b-topology LABEL` (repeatable) | -- | B-side topology filter, OR-combined. Replaces the shared `--topology` value for the B side only. |
+| `--b-work-type TYPE` (repeatable) | -- | B-side work_type filter, OR-combined. Replaces the shared `--work-type` value for the B side only. |
 | `--b-project-commit HASH` (repeatable) | -- | B-side project-commit filter. Replaces the shared `--project-commit` for the B side only. |
 | `--b-kernel-commit HASH` (repeatable) | -- | B-side kernel-commit filter. Replaces the shared `--kernel-commit` for the B side only. |
 | `--b-run-source NAME` (repeatable) | -- | B-side run-source filter. Replaces the shared `--run-source` for the B side only. |

@@ -1310,6 +1310,20 @@ impl PairingKey {
     /// string, `Vec<String>` fields render as a sorted-deduped
     /// `|`-joined string so the same set produces the same key
     /// regardless of input order.
+    ///
+    /// Commit dimensions (`Commit`, `KernelCommit`) strip the
+    /// trailing `-dirty` suffix before contributing to the key.
+    /// Without the strip, a clean run at HEAD `abc1234` and a
+    /// dirty run at the same HEAD (`abc1234-dirty`) would shatter
+    /// into two separate pairing buckets, defeating
+    /// [`group_and_average_by`]'s `+mixed` cohort detection — that
+    /// helper can only surface "this aggregate has both clean and
+    /// dirty contributors" when the two contributors actually land
+    /// in the same group. Stripping at the key level pairs them by
+    /// canonical hex; the per-row `-dirty` distinction is preserved
+    /// downstream in the aggregate's `commit` / `kernel_commit`
+    /// field via the `+mixed` marker in
+    /// [`group_and_average_by::render_mixed_dirty`].
     pub fn from_row(row: &GauntletRow, pairing_dims: &[Dimension]) -> Self {
         let mut parts = Vec::with_capacity(1 + pairing_dims.len());
         parts.push(row.scenario.clone());
@@ -1319,8 +1333,8 @@ impl PairingKey {
                 Dimension::Scheduler => row.scheduler.clone(),
                 Dimension::Topology => row.topology.clone(),
                 Dimension::WorkType => row.work_type.clone(),
-                Dimension::Commit => row.commit.clone().unwrap_or_default(),
-                Dimension::KernelCommit => row.kernel_commit.clone().unwrap_or_default(),
+                Dimension::Commit => commit_pairing_key_part(&row.commit),
+                Dimension::KernelCommit => commit_pairing_key_part(&row.kernel_commit),
                 Dimension::Source => row.run_source.clone().unwrap_or_default(),
                 Dimension::Flags => {
                     let mut sorted: Vec<&str> = row.flags.iter().map(String::as_str).collect();
@@ -1331,6 +1345,24 @@ impl PairingKey {
         }
         PairingKey(parts)
     }
+}
+
+/// Strip the trailing `-dirty` suffix from a commit dimension's
+/// value before it contributes to a [`PairingKey`]. `None` and
+/// already-clean values pass through unchanged (`None` → empty
+/// string; `Some("abc1234")` → `"abc1234"`); a dirty value
+/// (`Some("abc1234-dirty")`) is canonicalized to `"abc1234"` so
+/// it pairs with its clean sibling.
+///
+/// Used by [`PairingKey::from_row`] for both the `Commit` and
+/// `KernelCommit` arms; the per-row `-dirty` distinction is
+/// preserved separately by [`group_and_average_by`] via its
+/// dirty-tracking accumulator and `+mixed` marker.
+fn commit_pairing_key_part(value: &Option<String>) -> String {
+    let Some(s) = value.as_deref() else {
+        return String::new();
+    };
+    s.strip_suffix("-dirty").unwrap_or(s).to_string()
 }
 
 /// One aggregated [`GauntletRow`] produced by [`group_and_average`],
@@ -1381,6 +1413,71 @@ pub struct AveragedGroup {
     pub total_observed: u32,
 }
 
+/// Per-row dirty-status update used by [`group_and_average_by`] to
+/// detect when a group's contributors disagree on the `-dirty`
+/// suffix for a commit dimension. `value` is `Some(hex)` /
+/// `Some(hex-dirty)` / `None`; the function flips `any_clean` if
+/// the value lacks the `-dirty` suffix and `any_dirty` if it
+/// carries one. `first_base` records the first un-suffixed form
+/// seen (used to render the `+mixed` marker against a canonical
+/// hex even when `acc.first` happens to be the dirty form).
+///
+/// Per-row scope spans EVERY contributor (passing, failing,
+/// skipped). Mixed-dirty is metadata about the cohort's working-
+/// tree state, not about which contributors succeeded — surfacing
+/// it only across passes would hide WIP-vs-committed disagreement
+/// that the operator needs to know about. `None` values do not
+/// flip either flag and do not seed `first_base`.
+fn update_dirty_tracking(
+    value: &Option<String>,
+    any_clean: &mut bool,
+    any_dirty: &mut bool,
+    first_base: &mut Option<String>,
+) {
+    let Some(s) = value.as_deref() else { return };
+    let (base, is_dirty) = match s.strip_suffix("-dirty") {
+        Some(base) => (base, true),
+        None => (s, false),
+    };
+    if is_dirty {
+        *any_dirty = true;
+    } else {
+        *any_clean = true;
+    }
+    if first_base.is_none() {
+        *first_base = Some(base.to_string());
+    }
+}
+
+/// Render the aggregate's commit string for one dimension
+/// (project_commit or kernel_commit) given the cohort-wide
+/// dirty/clean tracking state. When `any_clean && any_dirty` for
+/// the same un-suffixed hex, the rendered form is
+/// `Some("{first_base}+mixed")`; otherwise the function returns
+/// `acc.first.commit` (or `acc.first.kernel_commit`) verbatim,
+/// preserving the existing first-seen behaviour for homogeneous
+/// cohorts (every contributor clean, every contributor dirty, or
+/// every contributor `None`).
+///
+/// `first_base` is the canonical un-suffixed hex captured by
+/// [`update_dirty_tracking`]; using it (rather than stripping
+/// `acc.first.commit`) ensures the rendered form is `abc1234+mixed`
+/// regardless of whether the first contributor was clean or dirty.
+fn render_mixed_dirty(
+    any_clean: bool,
+    any_dirty: bool,
+    first_base: &Option<String>,
+    first_commit: &Option<String>,
+) -> Option<String> {
+    if any_clean
+        && any_dirty
+        && let Some(base) = first_base
+    {
+        return Some(format!("{base}+mixed"));
+    }
+    first_commit.clone()
+}
+
 /// Group `rows` by `(scenario, topology, work_type, flags)` and
 /// arithmetic-mean their metric fields, returning one
 /// [`AveragedGroup`] per distinct key.
@@ -1427,6 +1524,16 @@ pub struct AveragedGroup {
 ///   carries the first contributor's value in any case — the join
 ///   downstream uses the four-tuple, so scheduler/version on the
 ///   aggregate is metadata, not a join key.
+/// - Commit dimensions (`commit`, `kernel_commit`) follow a
+///   first-seen rule with one exception: when contributors disagree
+///   on the `-dirty` suffix for the same canonical hex (some clean,
+///   some dirty), the rendered form becomes `{hex}+mixed` so the
+///   working-tree disagreement is surfaced rather than hidden by
+///   first-seen. `+mixed` (not `-mixed`) is intentional —
+///   `-dirty` is a per-record property of one sidecar, `+mixed`
+///   is a cohort-level property of the average. Mixed-dirty
+///   tracking spans EVERY contributor (passing, failing, skipped)
+///   because the cohort's WIP state is metadata, not a metric.
 ///
 /// Group iteration order matches the order of FIRST appearance of
 /// each key in `rows`; `BTreeMap` ordering is by key (not iteration
@@ -1468,6 +1575,31 @@ pub fn group_and_average_by(
         passes_observed: u32,
         any_skipped: bool,
         any_failed: bool,
+        // Tracks whether contributors disagree on the `-dirty`
+        // suffix for the project_commit / kernel_commit dimensions.
+        // `any_*_clean` is true if any contributor's value is the
+        // un-suffixed form; `any_*_dirty` is true if any contributor
+        // ends in `-dirty`. When BOTH are true the aggregate is
+        // mixed-dirty and the rendered `commit` / `kernel_commit`
+        // gets a `+mixed` marker so downstream readers don't see a
+        // single arbitrary contributor's status. Tracked across
+        // EVERY contributor (passing, failing, skipped) — a mixed
+        // working-tree state is metadata about the cohort, not
+        // about the metric mean. Empty / `None` values are ignored
+        // and do not flip either flag.
+        any_project_clean: bool,
+        any_project_dirty: bool,
+        any_kernel_clean: bool,
+        any_kernel_dirty: bool,
+        // First-seen un-suffixed (clean-form) project / kernel
+        // commit string. Held separately from `first` because
+        // `first.commit` may be `Some("abc1234-dirty")` when the
+        // first contributor was dirty but later contributors carry
+        // the clean form — the rendered `+mixed` marker should
+        // still attach to the canonical un-suffixed hex so the
+        // operator sees `abc1234+mixed` not `abc1234-dirty+mixed`.
+        first_project_base: Option<String>,
+        first_kernel_base: Option<String>,
         // Sums across passing+non-skipped contributors only.
         // Counts are tracked per ext_metric key separately because
         // a key may be absent from some contributors.
@@ -1508,6 +1640,12 @@ pub fn group_and_average_by(
                 passes_observed: 0,
                 any_skipped: false,
                 any_failed: false,
+                any_project_clean: false,
+                any_project_dirty: false,
+                any_kernel_clean: false,
+                any_kernel_dirty: false,
+                first_project_base: None,
+                first_kernel_base: None,
                 sum_spread: 0.0,
                 sum_gap_ms: 0,
                 sum_migrations: 0,
@@ -1531,6 +1669,24 @@ pub fn group_and_average_by(
             }
         });
         acc.total_observed += 1;
+        // Dirty-status tracking spans ALL contributors. Same hex
+        // with mixed dirty/clean across the cohort is the case the
+        // `+mixed` marker exists to surface — the per-row scope
+        // (passing, failing, skipped) is irrelevant since the
+        // marker describes WIP-vs-committed disagreement among the
+        // contributors, not their metric outcomes.
+        update_dirty_tracking(
+            &row.commit,
+            &mut acc.any_project_clean,
+            &mut acc.any_project_dirty,
+            &mut acc.first_project_base,
+        );
+        update_dirty_tracking(
+            &row.kernel_commit,
+            &mut acc.any_kernel_clean,
+            &mut acc.any_kernel_dirty,
+            &mut acc.first_kernel_base,
+        );
         if row.skipped {
             acc.any_skipped = true;
             continue;
@@ -1585,14 +1741,41 @@ pub fn group_and_average_by(
         let round_i64 = |sum: i64| -> i64 { (sum as f64 / denom).round() as i64 };
         let round_usize = |sum: usize| -> usize { (sum as f64 / denom).round() as usize };
 
+        // Mixed-dirty markers. When the cohort contains both a
+        // clean-form and dirty-form contributor for the same hex
+        // (e.g. some sidecars from a clean tree, others from a
+        // -dirty WIP), the rendered commit field carries `+mixed`
+        // appended to the canonical un-suffixed hex. The
+        // alternative — taking `acc.first.commit` verbatim — would
+        // hide WIP-vs-committed disagreement, presenting `abc1234`
+        // when half the contributors actually came from a dirty
+        // tree (or `abc1234-dirty` when half came from a clean
+        // tree). Operators reading averaged stats need to know the
+        // cohort spanned a working-tree state change, since that
+        // changes the meaning of the metric mean. `+mixed` is the
+        // chosen separator (not `-mixed`) so it cannot be confused
+        // with the existing `-dirty` suffix grammar — `dirty` is a
+        // per-record property, `mixed` is a cohort-level property.
+        let project_commit_rendered = render_mixed_dirty(
+            acc.any_project_clean,
+            acc.any_project_dirty,
+            &acc.first_project_base,
+            &acc.first.commit,
+        );
+        let kernel_commit_rendered = render_mixed_dirty(
+            acc.any_kernel_clean,
+            acc.any_kernel_dirty,
+            &acc.first_kernel_base,
+            &acc.first.kernel_commit,
+        );
         let aggregated = GauntletRow {
             scenario: acc.first.scenario.clone(),
             topology: acc.first.topology.clone(),
             work_type: acc.first.work_type.clone(),
             scheduler: acc.first.scheduler.clone(),
             kernel_version: acc.first.kernel_version.clone(),
-            commit: acc.first.commit.clone(),
-            kernel_commit: acc.first.kernel_commit.clone(),
+            commit: project_commit_rendered,
+            kernel_commit: kernel_commit_rendered,
             run_source: acc.first.run_source.clone(),
             flags: acc.first.flags.clone(),
             // ALL must pass: any failed or skipped contributor
@@ -2873,56 +3056,12 @@ fn render_dirty_warning(rows_a: &[GauntletRow], rows_b: &[GauntletRow]) -> Optio
     Some(out)
 }
 
-/// Compare two filter-defined partitions of the sidecar pool and
-/// report regressions across slicing dimensions.
-///
-/// `filter_a` and `filter_b` are the per-side row filters that
-/// define the A/B contrast. The dimensions on which the two
-/// filters DIFFER are the SLICING dimensions; the dimensions on
-/// which they AGREE (or on which both are unconstrained) are the
-/// PAIRING dimensions. Two rows pair across the A/B sides iff
-/// their dynamic [`PairingKey`] (scenario plus every pairing-dim
-/// value) is equal — so the comparison naturally ignores
-/// differences on the slicing axes (those ARE the contrast) and
-/// joins on everything else.
-///
-/// `dir` overrides the default `runs_root()` for pool collection.
-/// Pass `Some(path)` to compare archived sidecar trees copied off
-/// a CI host; pass `None` to walk `target/ktstr/` (or
-/// `CARGO_TARGET_DIR/ktstr/`).
-///
-/// Validation:
-/// - Empty slicing-dim set (every dimension is identical between
-///   A and B): bail with "specify at least one --a-X / --b-X to
-///   define what to compare". This includes the no-flags-at-all
-///   case (both filters are the empty default).
-/// - Identical effective filters with at least one slicing dim is
-///   a contradiction caught by clap-level construction; the
-///   downstream check is "every value in filter_a appears in
-///   filter_b on the same dim and vice versa." We catch that as
-///   "A and B select identical rows" — symmetric to the empty
-///   case.
-/// - More than one slicing dimension prints a warning to stderr
-///   ("warning: slicing on N dimensions; results compress
-///   multiple axes into a single A/B contrast") but does NOT
-///   bail — multi-dim slicing is a deliberate feature for
-///   comparing e.g. (kernel A + scheduler A) against (kernel B +
-///   scheduler B).
-///
-/// `no_average = false` (the default) groups every matching
-/// sidecar within each side by pairing key and averages the
-/// metrics across the group. `no_average = true` keeps each
-/// sidecar row distinct; if multiple rows on one side share the
-/// same pairing key the function bails with an actionable
-/// "duplicate pairing keys" error rather than picking one
-/// arbitrarily.
-///
 /// Render the actionable bail message emitted when one side's filter
 /// matches zero sidecars in the pool.
 ///
 /// Beyond the generic "check filters / run `cargo ktstr stats list`"
 /// redirect, this helper inspects WHY the filter matched nothing and
-/// adds two operator-actionable hints when applicable:
+/// adds three operator-actionable hints when applicable:
 ///
 /// 1. **Dirty-form hint**: when the user passed
 ///    `--project-commit X` (or per-side / kernel-commit equivalent)
@@ -2935,7 +3074,19 @@ fn render_dirty_warning(rows_a: &[GauntletRow], rows_b: &[GauntletRow]) -> Optio
 ///    expected `abcdef1` but the recorded value is `abcdef1-dirty`
 ///    sees no rows match without realizing why.
 ///
-/// 2. **list-values redirect for commit dims**: when the user
+/// 2. **Unknown run-source hint**: when the user passed
+///    `--run-source X` (or per-side equivalent) and `X` is NOT
+///    among the distinct `run_source` values present in the pool,
+///    append a hint listing the actual values seen. The schema is
+///    deliberately extensible (`"benchmark"` and other future tags
+///    are valid), so this is a hint rather than a hard validator —
+///    but a typo (`--run-source loca` for `local`, or `--run-source CI`
+///    for `ci` since the values are case-sensitive) is the most
+///    common cause of a false-zero on the source dim, and listing
+///    the distinct values present is more actionable than asking
+///    the operator to consult the schema doc.
+///
+/// 3. **list-values redirect for commit dims**: when the user
 ///    populated any commit dimension (`project_commits` /
 ///    `kernel_commits`), suggest `cargo ktstr stats list-values`
 ///    specifically — that command emits the exact distinct values
@@ -2990,6 +3141,49 @@ fn zero_match_diagnostic(
         msg.push_str(&hint);
     }
 
+    // Unknown-run-source hint. Fires when a `--run-source X` value
+    // is not present in the pool — typo / wrong casing is the most
+    // common cause. Schema is intentionally extensible (operators
+    // can write `"benchmark"` etc.), so this is a hint not a hard
+    // validator: the bail still fires, the operator still sees the
+    // distinct values present, and the producer side is free to
+    // emit any tag.
+    if !filter.run_sources.is_empty() {
+        let pool_run_sources: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .filter_map(|r| r.run_source.as_deref())
+            .collect();
+        let unknowns: Vec<&str> = filter
+            .run_sources
+            .iter()
+            .map(String::as_str)
+            .filter(|want| !pool_run_sources.contains(*want))
+            .collect();
+        if !unknowns.is_empty() {
+            let mut present: Vec<&str> = pool_run_sources.iter().copied().collect();
+            present.sort_unstable();
+            let unknown_list = unknowns
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let present_list = if present.is_empty() {
+                "(none — every row has `run_source: null`)".to_string()
+            } else {
+                present
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            msg.push_str(&format!(
+                "\nhint: --run-source {unknown_list} not found in pool; \
+                 distinct values present: {present_list}. Values are \
+                 case-sensitive (`ci` ≠ `CI`)."
+            ));
+        }
+    }
+
     // list-values redirect: only fires when the operator narrowed
     // on a commit dimension. Generic case (no commit filter) keeps
     // the existing `stats list` redirect at the top of the message
@@ -3010,6 +3204,50 @@ fn zero_match_diagnostic(
     msg
 }
 
+/// Compare two filter-defined partitions of the sidecar pool and
+/// report regressions across slicing dimensions.
+///
+/// `filter_a` and `filter_b` are the per-side row filters that
+/// define the A/B contrast. The dimensions on which the two
+/// filters DIFFER are the SLICING dimensions; the dimensions on
+/// which they AGREE (or on which both are unconstrained) are the
+/// PAIRING dimensions. Two rows pair across the A/B sides iff
+/// their dynamic [`PairingKey`] (scenario plus every pairing-dim
+/// value) is equal — so the comparison naturally ignores
+/// differences on the slicing axes (those ARE the contrast) and
+/// joins on everything else.
+///
+/// `dir` overrides the default `runs_root()` for pool collection.
+/// Pass `Some(path)` to compare archived sidecar trees copied off
+/// a CI host; pass `None` to walk `target/ktstr/` (or
+/// `CARGO_TARGET_DIR/ktstr/`).
+///
+/// Validation:
+/// - Empty slicing-dim set (every dimension is identical between
+///   A and B): bail with "specify at least one --a-X / --b-X to
+///   define what to compare". This includes the no-flags-at-all
+///   case (both filters are the empty default).
+/// - Identical effective filters with at least one slicing dim is
+///   a contradiction caught by clap-level construction; the
+///   downstream check is "every value in filter_a appears in
+///   filter_b on the same dim and vice versa." We catch that as
+///   "A and B select identical rows" — symmetric to the empty
+///   case.
+/// - More than one slicing dimension prints a warning to stderr
+///   ("warning: slicing on N dimensions; results compress
+///   multiple axes into a single A/B contrast") but does NOT
+///   bail — multi-dim slicing is a deliberate feature for
+///   comparing e.g. (kernel A + scheduler A) against (kernel B +
+///   scheduler B).
+///
+/// `no_average = false` (the default) groups every matching
+/// sidecar within each side by pairing key and averages the
+/// metrics across the group. `no_average = true` keeps each
+/// sidecar row distinct; if multiple rows on one side share the
+/// same pairing key the function bails with an actionable
+/// "duplicate pairing keys" error rather than picking one
+/// arbitrarily.
+///
 /// Returns 0 on no regressions, 1 if regressions detected.
 pub fn compare_partitions(
     filter_a: &RowFilter,
@@ -3094,8 +3332,9 @@ pub fn compare_partitions(
     // Partition: apply each side's filter to the same pool. A
     // row may match both sides (e.g. when scheduler is the
     // slicing dim and kernel is unconstrained on both, a row
-    // with scheduler == filter_a.scheduler matches A but NOT B
-    // unless B's scheduler matches too — typically not).
+    // whose `scheduler` is in `filter_a.schedulers` matches A
+    // but NOT B unless `filter_b.schedulers` also contains it —
+    // typically not when scheduler is the slicing axis).
     let rows_a = apply_row_filters(&rows, filter_a);
     let rows_b = apply_row_filters(&rows, filter_b);
     if rows_a.is_empty() {
@@ -4513,6 +4752,18 @@ mod tests {
         // at its `test_fixture` default (None), so the
         // kernel_commit set's None bucket renders one `unknown`
         // line as well. Total: 3 occurrences.
+        //
+        // `run_source` is the fourth optional dim but does NOT
+        // contribute an `unknown` here: `list_values(_, Some(dir))`
+        // calls `apply_archive_source_override` on the loaded pool
+        // (the `--dir` flag treats the supplied root as an archive),
+        // which rewrites every `run_source: None` to
+        // `Some("archive")` BEFORE the dimension-set is built. Every
+        // fixture above leaves `run_source` at its `test_fixture`
+        // default (None), but they all surface as `archive` after
+        // the override — the run_source set never holds a None
+        // entry on this code path, so no `unknown` line is emitted
+        // for it.
         let unknown_count = out.matches("unknown").count();
         assert_eq!(
             unknown_count, 3,
@@ -6244,6 +6495,73 @@ mod tests {
         );
     }
 
+    /// Repeatable `--scheduler A --scheduler B` is OR-combined:
+    /// a row matches iff its `scheduler` equals ANY listed entry.
+    /// Pins the multi-value semantic for the
+    /// post-Vec-promotion `schedulers` field; before promotion
+    /// `--scheduler` was a single-value `Option<String>` and the
+    /// OR semantic did not exist.
+    #[test]
+    fn row_filter_schedulers_or_combined_matches_any_listed() {
+        let row_a = make_filter_row("t", "scx_alpha", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row_b = make_filter_row("t", "scx_beta", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row_c = make_filter_row("t", "scx_gamma", "1n2l4c1t", "CpuSpin", None, &[]);
+        let filter = RowFilter {
+            schedulers: vec!["scx_alpha".to_string(), "scx_beta".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(filter.matches(&row_a), "first listed scheduler must match",);
+        assert!(filter.matches(&row_b), "second listed scheduler must match",);
+        assert!(
+            !filter.matches(&row_c),
+            "scheduler outside the listed set must reject",
+        );
+    }
+
+    /// Repeatable `--topology A --topology B` is OR-combined:
+    /// a row matches iff its `topology` equals ANY listed entry.
+    /// Mirror of
+    /// `row_filter_schedulers_or_combined_matches_any_listed`
+    /// for the topologies field.
+    #[test]
+    fn row_filter_topologies_or_combined_matches_any_listed() {
+        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row_b = make_filter_row("t", "scx_a", "1n2l4c2t", "CpuSpin", None, &[]);
+        let row_c = make_filter_row("t", "scx_a", "1n4l8c1t", "CpuSpin", None, &[]);
+        let filter = RowFilter {
+            topologies: vec!["1n2l4c1t".to_string(), "1n2l4c2t".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(filter.matches(&row_a), "first listed topology must match",);
+        assert!(filter.matches(&row_b), "second listed topology must match",);
+        assert!(
+            !filter.matches(&row_c),
+            "topology outside the listed set must reject",
+        );
+    }
+
+    /// Repeatable `--work-type A --work-type B` is OR-combined:
+    /// a row matches iff its `work_type` equals ANY listed
+    /// entry. Mirror of
+    /// `row_filter_schedulers_or_combined_matches_any_listed`
+    /// for the work_types field.
+    #[test]
+    fn row_filter_work_types_or_combined_matches_any_listed() {
+        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let row_b = make_filter_row("t", "scx_a", "1n2l4c1t", "PageFaultChurn", None, &[]);
+        let row_c = make_filter_row("t", "scx_a", "1n2l4c1t", "MutexContention", None, &[]);
+        let filter = RowFilter {
+            work_types: vec!["CpuSpin".to_string(), "PageFaultChurn".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(filter.matches(&row_a), "first listed work_type must match",);
+        assert!(filter.matches(&row_b), "second listed work_type must match",);
+        assert!(
+            !filter.matches(&row_c),
+            "work_type outside the listed set must reject",
+        );
+    }
+
     /// `--project-commit abcdef1` against a row whose `commit` is `None`
     /// must NOT match — same opt-in policy as `--kernel`. Mirror
     /// of `row_filter_kernel_none_row_never_matches_populated_filter`
@@ -6972,6 +7290,146 @@ mod tests {
         );
     }
 
+    /// Cohort with mixed clean/dirty `commit` values (same hex)
+    /// renders with `+mixed` appended to the canonical
+    /// un-suffixed hex. First contributor is dirty; the second
+    /// is clean. Pinning the rendered form catches a regression
+    /// where averaging silently kept first-seen behaviour and
+    /// hid the WIP-vs-committed disagreement.
+    #[test]
+    fn group_and_average_mixed_dirty_project_commit_renders_plus_mixed() {
+        let mut dirty = make_row("t", "tiny-1llc", true, 0.0);
+        dirty.commit = Some("abc1234-dirty".to_string());
+        let mut clean = make_row("t", "tiny-1llc", true, 0.0);
+        clean.commit = Some("abc1234".to_string());
+
+        let out = group_and_average(&[dirty, clean]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].row.commit.as_deref(),
+            Some("abc1234+mixed"),
+            "mixed clean+dirty must render as `{{hex}}+mixed`, not first-seen",
+        );
+    }
+
+    /// Same shape on `kernel_commit`. Pins the second commit
+    /// dimension separately because the production code uses
+    /// two parallel accumulator-state pairs and a regression
+    /// could miss one.
+    #[test]
+    fn group_and_average_mixed_dirty_kernel_commit_renders_plus_mixed() {
+        let mut clean = make_row("t", "tiny-1llc", true, 0.0);
+        clean.kernel_commit = Some("def5678".to_string());
+        let mut dirty = make_row("t", "tiny-1llc", true, 0.0);
+        dirty.kernel_commit = Some("def5678-dirty".to_string());
+
+        let out = group_and_average(&[clean, dirty]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].row.kernel_commit.as_deref(),
+            Some("def5678+mixed"),
+            "mixed clean+dirty kernel_commit must render as `{{hex}}+mixed`",
+        );
+    }
+
+    /// Homogeneous-dirty cohort (every contributor has `-dirty`)
+    /// must NOT receive the `+mixed` marker — the cohort agrees
+    /// on the working-tree state. Pinning this guards against a
+    /// regression where the marker fires on every dirty value
+    /// regardless of clean siblings.
+    #[test]
+    fn group_and_average_all_dirty_keeps_dirty_suffix_no_mixed() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.commit = Some("abc1234-dirty".to_string());
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.commit = Some("abc1234-dirty".to_string());
+
+        let out = group_and_average(&[a, b]);
+        assert_eq!(
+            out[0].row.commit.as_deref(),
+            Some("abc1234-dirty"),
+            "homogeneous-dirty cohort must keep first-seen `-dirty`, no `+mixed`",
+        );
+    }
+
+    /// Homogeneous-clean cohort (every contributor lacks
+    /// `-dirty`) keeps the un-suffixed first-seen value, no
+    /// marker.
+    #[test]
+    fn group_and_average_all_clean_keeps_value_no_mixed() {
+        let mut a = make_row("t", "tiny-1llc", true, 0.0);
+        a.commit = Some("abc1234".to_string());
+        let mut b = make_row("t", "tiny-1llc", true, 0.0);
+        b.commit = Some("abc1234".to_string());
+
+        let out = group_and_average(&[a, b]);
+        assert_eq!(
+            out[0].row.commit.as_deref(),
+            Some("abc1234"),
+            "homogeneous-clean cohort must keep first-seen value, no `+mixed`",
+        );
+    }
+
+    /// Failing and skipped contributors participate in mixed-
+    /// dirty tracking. The cohort's WIP state is metadata
+    /// independent of metric outcome — a skipped sidecar from a
+    /// dirty tree still counts toward the dirty-flag because it
+    /// records the producer's working-tree state at run time.
+    /// Pin: one passing-clean + one skipped-dirty contributor
+    /// renders `+mixed`.
+    #[test]
+    fn group_and_average_mixed_dirty_tracking_includes_skipped_and_failed() {
+        let mut clean_pass = make_row("t", "tiny-1llc", true, 0.0);
+        clean_pass.commit = Some("abc1234".to_string());
+        let mut dirty_skip = make_row("t", "tiny-1llc", true, 0.0);
+        dirty_skip.skipped = true;
+        dirty_skip.commit = Some("abc1234-dirty".to_string());
+
+        let out = group_and_average(&[clean_pass, dirty_skip]);
+        assert_eq!(
+            out[0].row.commit.as_deref(),
+            Some("abc1234+mixed"),
+            "skipped contributors still flip the dirty flag — \
+             cohort metadata is independent of metric outcome",
+        );
+    }
+
+    /// Mixed-dirty marker uses canonical un-suffixed hex even
+    /// when `acc.first` is the dirty form. Pin: first contributor
+    /// is `abc1234-dirty`, second is `abc1234`; rendered form is
+    /// `abc1234+mixed`, NOT `abc1234-dirty+mixed`. Guards against
+    /// a stripping bug in `render_mixed_dirty`.
+    #[test]
+    fn group_and_average_mixed_dirty_strips_dirty_from_first_seen() {
+        let mut dirty_first = make_row("t", "tiny-1llc", true, 0.0);
+        dirty_first.commit = Some("abc1234-dirty".to_string());
+        let mut clean_second = make_row("t", "tiny-1llc", true, 0.0);
+        clean_second.commit = Some("abc1234".to_string());
+
+        let out = group_and_average(&[dirty_first, clean_second]);
+        let rendered = out[0].row.commit.as_deref().expect("commit must render");
+        assert_eq!(rendered, "abc1234+mixed");
+        assert!(
+            !rendered.contains("-dirty"),
+            "rendered form must drop `-dirty` even when first contributor was dirty; got: {rendered}",
+        );
+    }
+
+    /// `None`-only cohort keeps `None`. Sanity check that the
+    /// dirty-tracking does not synthesize a marker when no
+    /// contributor has a commit value.
+    #[test]
+    fn group_and_average_all_none_commits_keeps_none_no_mixed() {
+        let a = make_row("t", "tiny-1llc", true, 0.0);
+        let b = make_row("t", "tiny-1llc", true, 0.0);
+
+        let out = group_and_average(&[a, b]);
+        assert!(
+            out[0].row.commit.is_none(),
+            "None-only cohort must keep None — no synthesized `+mixed`",
+        );
+    }
+
     /// End-to-end: aggregated rows feed `compare_rows` cleanly.
     /// Side A has [10, 12, 14] (mean 12); side B has [28, 30, 32]
     /// (mean 30). The 18-unit delta on `worst_spread`
@@ -7415,6 +7873,93 @@ mod tests {
         );
     }
 
+    /// Topology-only diff: filters that disagree on `topologies`
+    /// and agree on every other dimension produce a slicing-dim
+    /// set containing exactly `Dimension::Topology`. Pins the
+    /// Topology arm of the per-dimension comparison switch in
+    /// [`derive_slicing_dims`] for the post-Vec-promotion
+    /// `topologies` field; before promotion `--topology` was a
+    /// single-value `Option<String>` and the per-arm comparison
+    /// shape was `Option<String> != Option<String>`. Mirror of
+    /// `derive_slicing_dims_source_only_diff` for the Topology
+    /// arm.
+    #[test]
+    fn derive_slicing_dims_topology_only_diff() {
+        let f_a = RowFilter {
+            topologies: vec!["1n2l4c1t".to_string()],
+            ..RowFilter::default()
+        };
+        let f_b = RowFilter {
+            topologies: vec!["1n2l4c2t".to_string()],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            derive_slicing_dims(&f_a, &f_b),
+            vec![Dimension::Topology],
+            "differing `topologies` must surface Topology as a slicing dim",
+        );
+
+        // Sorted-deduped Vec semantics: same set in different
+        // order/multiplicity must NOT slice.
+        let f_c = RowFilter {
+            topologies: vec!["1n2l4c1t".to_string(), "1n2l4c2t".to_string()],
+            ..RowFilter::default()
+        };
+        let f_d = RowFilter {
+            topologies: vec![
+                "1n2l4c2t".to_string(),
+                "1n2l4c1t".to_string(),
+                "1n2l4c1t".to_string(),
+            ],
+            ..RowFilter::default()
+        };
+        assert!(
+            derive_slicing_dims(&f_c, &f_d).is_empty(),
+            "same topology set in different order/multiplicity must NOT slice",
+        );
+    }
+
+    /// WorkType-only diff: filters that disagree on `work_types`
+    /// and agree on every other dimension produce a slicing-dim
+    /// set containing exactly `Dimension::WorkType`. Mirror of
+    /// `derive_slicing_dims_topology_only_diff` for the WorkType
+    /// arm.
+    #[test]
+    fn derive_slicing_dims_work_type_only_diff() {
+        let f_a = RowFilter {
+            work_types: vec!["CpuSpin".to_string()],
+            ..RowFilter::default()
+        };
+        let f_b = RowFilter {
+            work_types: vec!["PageFaultChurn".to_string()],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            derive_slicing_dims(&f_a, &f_b),
+            vec![Dimension::WorkType],
+            "differing `work_types` must surface WorkType as a slicing dim",
+        );
+
+        // Sorted-deduped Vec semantics: same set in different
+        // order/multiplicity must NOT slice.
+        let f_c = RowFilter {
+            work_types: vec!["CpuSpin".to_string(), "PageFaultChurn".to_string()],
+            ..RowFilter::default()
+        };
+        let f_d = RowFilter {
+            work_types: vec![
+                "PageFaultChurn".to_string(),
+                "CpuSpin".to_string(),
+                "CpuSpin".to_string(),
+            ],
+            ..RowFilter::default()
+        };
+        assert!(
+            derive_slicing_dims(&f_c, &f_d).is_empty(),
+            "same work_type set in different order/multiplicity must NOT slice",
+        );
+    }
+
     /// `kernel_filter_matches`: major.minor (`6.12`) prefix
     /// matches every patch in the series via the
     /// `starts_with("6.12.")` arm, and ALSO matches `6.12`
@@ -7626,6 +8171,102 @@ mod tests {
         );
     }
 
+    /// Clean and dirty contributors at the same canonical hex
+    /// must land in the same pairing bucket. Without the
+    /// `-dirty` strip in `commit_pairing_key_part`, `abc1234`
+    /// and `abc1234-dirty` shatter into separate groups,
+    /// defeating `group_and_average_by`'s `+mixed` cohort
+    /// detection (which can only fire when the two contributors
+    /// land in ONE group).
+    #[test]
+    fn pairing_key_from_row_strips_dirty_suffix_on_commit() {
+        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_clean.commit = Some("abc1234".to_string());
+        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_dirty.commit = Some("abc1234-dirty".to_string());
+
+        let pair_dims = &[Dimension::Commit];
+        let key_clean = PairingKey::from_row(&row_clean, pair_dims);
+        let key_dirty = PairingKey::from_row(&row_dirty, pair_dims);
+
+        assert_eq!(
+            key_clean, key_dirty,
+            "clean `abc1234` and dirty `abc1234-dirty` must produce \
+             EQUAL pairing keys so the +mixed cohort machinery in \
+             group_and_average_by can surface their disagreement",
+        );
+        assert_eq!(
+            key_clean.0,
+            vec!["scn".to_string(), "abc1234".to_string()],
+            "key part must be the canonical un-suffixed hex",
+        );
+    }
+
+    /// Same shape on the kernel_commit dimension. Pins the
+    /// second commit dim's strip independently because
+    /// `from_row` uses two parallel arms; a regression could
+    /// strip one but not the other.
+    #[test]
+    fn pairing_key_from_row_strips_dirty_suffix_on_kernel_commit() {
+        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_clean.kernel_commit = Some("def5678".to_string());
+        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_dirty.kernel_commit = Some("def5678-dirty".to_string());
+
+        let pair_dims = &[Dimension::KernelCommit];
+        let key_clean = PairingKey::from_row(&row_clean, pair_dims);
+        let key_dirty = PairingKey::from_row(&row_dirty, pair_dims);
+
+        assert_eq!(
+            key_clean, key_dirty,
+            "clean and dirty kernel_commit at the same canonical \
+             hex must pair together",
+        );
+        assert_eq!(key_clean.0, vec!["scn".to_string(), "def5678".to_string()],);
+    }
+
+    /// Distinct hexes still differentiate even when one carries
+    /// `-dirty`. Pins that the strip operates ONLY on the
+    /// suffix, not on the entire value — `aaa1111-dirty` and
+    /// `bbb2222` remain distinct.
+    #[test]
+    fn pairing_key_from_row_distinct_hexes_remain_distinct_under_strip() {
+        let mut row_a = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_a.commit = Some("aaa1111-dirty".to_string());
+        let mut row_b = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_b.commit = Some("bbb2222".to_string());
+
+        let pair_dims = &[Dimension::Commit];
+        let key_a = PairingKey::from_row(&row_a, pair_dims);
+        let key_b = PairingKey::from_row(&row_b, pair_dims);
+
+        assert_ne!(
+            key_a, key_b,
+            "distinct canonical hexes must remain distinct after the \
+             -dirty strip — only the suffix is stripped",
+        );
+        assert_eq!(key_a.0[1], "aaa1111");
+        assert_eq!(key_b.0[1], "bbb2222");
+    }
+
+    /// `None` commit values still collapse to the empty slot
+    /// (the strip is a no-op on `None`). Pins the absence path
+    /// against a regression that special-cased the strip and
+    /// inadvertently changed the unwrap_or_default behavior.
+    #[test]
+    fn pairing_key_from_row_none_commit_unchanged_under_strip() {
+        let mut row = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row.commit = None;
+        row.kernel_commit = None;
+        let pair_dims = &[Dimension::Commit, Dimension::KernelCommit];
+        let key = PairingKey::from_row(&row, pair_dims);
+        assert_eq!(
+            key.0,
+            vec!["scn".to_string(), String::new(), String::new()],
+            "None commit and None kernel_commit must collapse to empty slots",
+        );
+    }
+
     // -- render_side_label --
 
     /// Empty slicing dims → the bare label is returned.
@@ -7635,9 +8276,13 @@ mod tests {
         assert_eq!(render_side_label(&f, &[], "A"), "A");
     }
 
-    /// Single-dim Option scheduler renders the value verbatim.
+    /// Single-dim single-value scheduler renders the value
+    /// verbatim. After the Vec promotion of `--scheduler` the
+    /// scheduler arm goes through `render_vec_dim` like every
+    /// other Vec dim; a single entry still surfaces the bare
+    /// string.
     #[test]
-    fn render_side_label_single_option_dim() {
+    fn render_side_label_single_value_dim() {
         let f = RowFilter {
             schedulers: vec!["scx_rusty".to_string()],
             ..RowFilter::default()
@@ -7829,6 +8474,235 @@ mod tests {
             render_side_label(&f_empty, &[Dimension::Source], "B"),
             "B",
             "empty run_sources Vec must fall back to the bare letter",
+        );
+    }
+
+    /// `zero_match_diagnostic` flags a `--run-source` value that is
+    /// not present in the pool, naming the unknown value AND the
+    /// distinct values actually seen. Guards against the
+    /// typo-class miss (e.g. `--run-source loca` for `local`,
+    /// `--run-source CI` for `ci`) that produces a silent
+    /// zero-match in `compare_partitions`.
+    #[test]
+    fn zero_match_diagnostic_unknown_run_source_lists_present_values() {
+        let mut row_local = make_row("scn", "1n1l1c1t", true, 1.0);
+        row_local.run_source = Some("local".to_string());
+        let mut row_ci = make_row("scn", "1n1l1c1t", true, 1.0);
+        row_ci.run_source = Some("ci".to_string());
+        let rows = vec![row_local, row_ci];
+        let filter = RowFilter {
+            run_sources: vec!["loca".to_string()],
+            ..Default::default()
+        };
+
+        let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+
+        assert!(
+            msg.contains("--run-source `loca` not found"),
+            "must name the unknown value verbatim; got:\n{msg}",
+        );
+        assert!(
+            msg.contains("`ci`") && msg.contains("`local`"),
+            "must list distinct values present in the pool so the \
+             operator can correct the typo; got:\n{msg}",
+        );
+        assert!(
+            msg.contains("case-sensitive"),
+            "must mention case sensitivity (`ci` ≠ `CI`); got:\n{msg}",
+        );
+    }
+
+    /// When every row has `run_source: None`, the hint surfaces the
+    /// "(none — every row has `run_source: null`)" form rather than
+    /// an empty list. This is the post-`apply_archive_source_override`
+    /// path with a pool that pre-dates the run_source field, so
+    /// distinguishing "unknown value, no values present" from
+    /// "unknown value, here's what's there" is operator-actionable.
+    #[test]
+    fn zero_match_diagnostic_unknown_run_source_with_empty_pool_explains_absence() {
+        let row = make_row("scn", "1n1l1c1t", true, 1.0);
+        let rows = vec![row];
+        let filter = RowFilter {
+            run_sources: vec!["ci".to_string()],
+            ..Default::default()
+        };
+
+        let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+
+        assert!(
+            msg.contains("--run-source `ci` not found"),
+            "must name the unknown value; got:\n{msg}",
+        );
+        assert!(
+            msg.contains("none — every row has `run_source: null`"),
+            "must explain the empty-distinct-values case rather than \
+             listing nothing; got:\n{msg}",
+        );
+    }
+
+    /// A `--run-source` value that DOES match a row in the pool
+    /// must NOT trigger the unknown-value hint, even when the
+    /// filter still matches zero rows due to other dimension
+    /// mismatches (e.g. scenario filter zeroes the set first).
+    /// Pinning this guards against a regression where the hint
+    /// fires for every populated `--run-source` regardless of
+    /// pool membership.
+    #[test]
+    fn zero_match_diagnostic_known_run_source_does_not_fire_unknown_hint() {
+        let mut row = make_row("scn", "1n1l1c1t", true, 1.0);
+        row.run_source = Some("local".to_string());
+        let rows = vec![row];
+        let filter = RowFilter {
+            run_sources: vec!["local".to_string()],
+            ..Default::default()
+        };
+
+        let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+
+        assert!(
+            !msg.contains("--run-source") || !msg.contains("not found"),
+            "must NOT fire the unknown-source hint when the value is \
+             present in the pool; got:\n{msg}",
+        );
+    }
+
+    /// `zero_match_diagnostic` fires the dirty-form hint for a
+    /// `--project-commit X` filter when the pool contains a
+    /// matching `X-dirty` row — pointing the operator at the
+    /// dirty form so they don't have to manually scan
+    /// `stats list-values`. The hint must name the original
+    /// value, the dirty form, and the suggested replacement
+    /// flag form.
+    #[test]
+    fn zero_match_diagnostic_project_commit_dirty_hint_fires() {
+        let mut row = make_row("scn", "1n1l1c1t", true, 1.0);
+        row.commit = Some("abcdef1-dirty".to_string());
+        let rows = vec![row];
+        let filter = RowFilter {
+            project_commits: vec!["abcdef1".to_string()],
+            ..Default::default()
+        };
+
+        let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+
+        assert!(
+            msg.contains("no rows match `--project-commit abcdef1`"),
+            "hint must name the unmatched filter value verbatim; \
+             got:\n{msg}",
+        );
+        assert!(
+            msg.contains("`abcdef1-dirty` exists in the pool"),
+            "hint must surface the dirty form found in the pool; \
+             got:\n{msg}",
+        );
+        assert!(
+            msg.contains("did you mean `--project-commit abcdef1-dirty`"),
+            "hint must propose the dirty form as the corrected flag; \
+             got:\n{msg}",
+        );
+    }
+
+    /// Companion to
+    /// `zero_match_diagnostic_project_commit_dirty_hint_fires`
+    /// for the `kernel_commits` arm. Same shape: hint names the
+    /// unmatched value, the matching `-dirty` form found in the
+    /// pool, and the suggested `--kernel-commit` replacement.
+    /// A regression that wired the kernel_commits arm to scan
+    /// `row.commit` (or never wired it at all) would surface
+    /// here as a missing hint.
+    #[test]
+    fn zero_match_diagnostic_kernel_commit_dirty_hint_fires() {
+        let mut row = make_row("scn", "1n1l1c1t", true, 1.0);
+        row.kernel_commit = Some("kabcde7-dirty".to_string());
+        let rows = vec![row];
+        let filter = RowFilter {
+            kernel_commits: vec!["kabcde7".to_string()],
+            ..Default::default()
+        };
+
+        let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+
+        assert!(
+            msg.contains("no rows match `--kernel-commit kabcde7`"),
+            "hint must name the unmatched kernel_commit value verbatim; \
+             got:\n{msg}",
+        );
+        assert!(
+            msg.contains("`kabcde7-dirty` exists in the pool"),
+            "hint must surface the dirty form found in the pool; \
+             got:\n{msg}",
+        );
+        assert!(
+            msg.contains("did you mean `--kernel-commit kabcde7-dirty`"),
+            "hint must propose the dirty form as the corrected flag; \
+             got:\n{msg}",
+        );
+    }
+
+    /// `zero_match_diagnostic` appends the `stats list-values`
+    /// redirect when the operator narrowed on a commit
+    /// dimension (project_commits OR kernel_commits populated)
+    /// — that redirect points at the per-dimension dump where
+    /// the commit values can be cross-referenced. Without a
+    /// commit-dim filter the redirect is suppressed because
+    /// `list-values` would dump every dimension, which is no
+    /// more actionable than the existing `stats list` redirect
+    /// at the top of the message for a kernel / scheduler /
+    /// topology miss.
+    #[test]
+    fn zero_match_diagnostic_list_values_redirect_when_commit_dim_populated() {
+        let row = make_row("scn", "1n1l1c1t", true, 1.0);
+        let rows = vec![row];
+        let filter = RowFilter {
+            project_commits: vec!["abcdef1".to_string()],
+            ..Default::default()
+        };
+
+        let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+
+        assert!(
+            msg.contains("cargo ktstr stats list-values"),
+            "must include the list-values redirect when commit \
+             dim filter is populated; got:\n{msg}",
+        );
+
+        // Same redirect when only kernel_commits is populated.
+        let filter_kc = RowFilter {
+            kernel_commits: vec!["kabcde7".to_string()],
+            ..Default::default()
+        };
+        let msg_kc = zero_match_diagnostic("A", &filter_kc, &rows, rows.len());
+        assert!(
+            msg_kc.contains("cargo ktstr stats list-values"),
+            "list-values redirect must also fire on the \
+             kernel_commits arm; got:\n{msg_kc}",
+        );
+    }
+
+    /// Without a commit-dim filter populated, the list-values
+    /// redirect must NOT fire — generic kernel / scheduler /
+    /// topology / work-type misses already get the `stats list`
+    /// redirect, and a list-values dump would be noise rather
+    /// than signal. Pins the suppression so a regression that
+    /// always emitted the redirect (or omitted the touched-
+    /// commit-dim guard) surfaces here.
+    #[test]
+    fn zero_match_diagnostic_no_list_values_redirect_when_no_commit_dim() {
+        let row = make_row("scn", "1n1l1c1t", true, 1.0);
+        let rows = vec![row];
+        // Filter narrowed on a non-commit dim only — the
+        // redirect must stay quiet.
+        let filter = RowFilter {
+            schedulers: vec!["scx_alpha".to_string()],
+            ..Default::default()
+        };
+
+        let msg = zero_match_diagnostic("A", &filter, &rows, rows.len());
+
+        assert!(
+            !msg.contains("cargo ktstr stats list-values"),
+            "list-values redirect must NOT fire when no commit-dim \
+             filter is populated; got:\n{msg}",
         );
     }
 }

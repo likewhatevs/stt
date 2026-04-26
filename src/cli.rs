@@ -1690,14 +1690,19 @@ pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
     let config = std::fs::read_to_string(&config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
 
-    // Build a HashSet of `.config` lines once, then probe each
-    // critical option in O(1). The previous formulation walked
-    // `config.lines()` once per critical option (O(N×M) with
-    // M≈6 critical options and N≈5000 .config lines), which
+    // Build a HashSet of trimmed `.config` lines once, then probe
+    // each critical option in O(1). The previous formulation
+    // walked `config.lines()` once per critical option (O(N×M)
+    // with M≈6 critical options and N≈5000 .config lines), which
     // turned every kernel-build pipeline into a 30K-line scan.
-    // Mirrors the HashSet-backed approach `all_fragment_lines_present`
-    // already uses for the configure-time check.
-    let existing: std::collections::HashSet<&str> = config.lines().collect();
+    // Trimming each line matches `all_fragment_lines_present`'s
+    // configure-time behavior so the same `.config` parses
+    // identically across both checks — without trim, a
+    // configure-time write that produced trailing whitespace (or
+    // a `.config` edited by hand on a Windows host with `\r\n`
+    // line endings) would silently flag every critical option as
+    // missing here while passing the configure-time check.
+    let existing: std::collections::HashSet<&str> = config.lines().map(str::trim).collect();
 
     let mut missing = Vec::new();
     for &(option, hint) in VALIDATE_CONFIG_CRITICAL {

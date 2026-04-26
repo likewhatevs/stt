@@ -242,6 +242,13 @@ reference it via `payload = ...` (primary slot) or
 `workloads = [...]` (additional slots):
 
 ```rust
+// SCHBENCH is a `pub const SCHBENCH: Payload` declared in
+// tests/common/fixtures.rs. Bring it into scope alongside the
+// fixtures module's other re-exports (SCHBENCH_HINTED,
+// SCHBENCH_JSON, etc.) before the test references it.
+mod common;
+use common::fixtures::*;
+
 #[ktstr_test(scheduler = MY_SCHED_PAYLOAD, payload = SCHBENCH)]
 fn schbench_under_my_sched(ctx: &Ctx) -> Result<AssertResult> {
     let report = ctx.payload(&SCHBENCH).run()?;

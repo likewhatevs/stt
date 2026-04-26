@@ -7,12 +7,18 @@
 //! KVM stats across gauntlet variants.
 //!
 //! Responsibilities owned by this module:
-//! - [`SidecarResult`]: the on-disk schema. Fields serialize as
-//!   `null` / `[]` when empty — no `skip_serializing_if` or
-//!   `serde(default)` — so serialize and deserialize are symmetric.
-//!   A missing field in a parsed sidecar is a hard error (pre-1.0:
-//!   old sidecar JSON is disposable; regenerate by re-running the
-//!   test).
+//! - [`SidecarResult`]: the on-disk schema. Writer-side: every field
+//!   is always emitted — `null` for `None`, `[]` for empty `Vec` —
+//!   with no `skip_serializing_if` and no `serde(default)`. Reader-
+//!   side: serde's native `Option<T>` deserialize tolerates absence
+//!   (a missing key parses as `None`); non-`Option` fields (e.g.
+//!   `test_name`, `passed`, `stats`) are hard-required and a missing
+//!   key fails deserialize. The contract is intentionally asymmetric
+//!   so a future producer that drops an `Option` field still parses
+//!   on older readers, while the current writer guarantees full
+//!   round-trip symmetry. Pre-1.0: old sidecar JSON is disposable;
+//!   regenerate by re-running the test rather than relying on the
+//!   reader-side tolerance for migration.
 //! - [`collect_sidecars`]: load every `*.ktstr.json` under a directory
 //!   (one level of subdirectories for per-job gauntlet layouts).
 //! - [`write_sidecar`] / [`write_skip_sidecar`]: serialize one run to
@@ -74,9 +80,11 @@ pub struct SidecarResult {
     /// [`crate::test_support::SchedulerSpec::scheduler_commit`]
     /// for the full per-variant rationale.
     ///
-    /// Always emitted (`"scheduler_commit": null` on absence);
-    /// required on deserialize — matches every other nullable on
-    /// this struct.
+    /// Writer always emits (`"scheduler_commit": null` on absence).
+    /// Reader-side: serde's native `Option<T>` deserialize tolerates
+    /// absence (a missing key parses as `None`); see the module-level
+    /// doc for the full asymmetric contract that governs every
+    /// nullable on this struct.
     pub scheduler_commit: Option<String>,
     /// Best-effort git HEAD of the ktstr project tree at sidecar-
     /// write time. Captured by [`detect_project_commit`] via
@@ -96,20 +104,23 @@ pub struct SidecarResult {
     /// stats CLI can answer "which version of the harness produced
     /// this sidecar?" without inspecting the scheduler.
     ///
-    /// Always emitted (`"project_commit": null` on absence);
-    /// required on deserialize — matches every other nullable on
-    /// this struct. Excluded from [`sidecar_variant_hash`] for the
-    /// same cross-host grouping reason `scheduler_commit` is
-    /// excluded: two runs of the same semantic variant on
-    /// different ktstr commits must still bucket together so
-    /// `stats compare` can diff them; the commit-drift detection
-    /// inspects this field directly via `--project-commit` / `--a-project-commit`
-    /// / `--b-project-commit`.
+    /// Writer always emits (`"project_commit": null` on absence).
+    /// Reader-side: serde's native `Option<T>` deserialize tolerates
+    /// absence (a missing key parses as `None`) — see the module-
+    /// level doc for the full asymmetric contract. Excluded from
+    /// [`sidecar_variant_hash`] for the same cross-host grouping
+    /// reason `scheduler_commit` is excluded: two runs of the same
+    /// semantic variant on different ktstr commits must still bucket
+    /// together so `stats compare` can diff them; the commit-drift
+    /// detection inspects this field directly via `--project-commit`
+    /// / `--a-project-commit` / `--b-project-commit`.
     pub project_commit: Option<String>,
     /// Binary payload name (matches `Payload::name` when
     /// `entry.payload` is set). `None` when the test declared no
-    /// binary payload. Serialized as `"payload": null` in that case;
-    /// required on deserialize — matches `host`'s symmetric pattern.
+    /// binary payload. Writer always emits (`"payload": null` on
+    /// absence); reader-side, serde's native `Option<T>` deserialize
+    /// tolerates absence — see the module-level doc for the full
+    /// asymmetric contract.
     pub payload: Option<String>,
     /// Per-payload extracted metrics collected from `ctx.payload(X).run()`
     /// / `.spawn().wait()` call sites during the test body.
@@ -117,8 +128,10 @@ pub struct SidecarResult {
     /// One [`PayloadMetrics`] per invocation, in the order the calls
     /// ran. Empty when no payload calls were made (scheduler-only
     /// tests, or a binary-only test where the body bailed before
-    /// running the payload). Always emitted as `"metrics": []` in
-    /// that case; required on deserialize.
+    /// running the payload). Writer always emits (`"metrics": []` in
+    /// that case); reader-side, this `Vec` field is hard-required —
+    /// non-`Option` fields fail deserialize on absence. See the
+    /// module-level doc for the full contract.
     pub metrics: Vec<PayloadMetrics>,
     /// Overall pass/fail verdict for this run.
     pub passed: bool,
@@ -132,8 +145,9 @@ pub struct SidecarResult {
     pub stats: ScenarioStats,
     /// Monitor summary. `None` means the monitor loop did not run
     /// (host-only tests, early VM failure) or sample collection
-    /// produced no valid data. Always emitted (`"monitor": null` on
-    /// absence); required on deserialize.
+    /// produced no valid data. Writer always emits (`"monitor": null`
+    /// on absence); reader-side, serde's native `Option<T>`
+    /// deserialize tolerates absence — see the module-level doc.
     pub monitor: Option<MonitorSummary>,
     /// Ordered stimulus events published by the guest step executor
     /// while the scenario ran.
@@ -147,21 +161,27 @@ pub struct SidecarResult {
     pub active_flags: Vec<String>,
     /// Per-BPF-program verifier statistics captured from the VM's
     /// scheduler (when one was loaded). Empty when no scheduler
-    /// programs were inspected. Always emitted as `"verifier_stats":
-    /// []` in that case; required on deserialize.
+    /// programs were inspected. Writer always emits as
+    /// `"verifier_stats": []` in that case; reader-side, this `Vec`
+    /// field is hard-required (non-`Option` fields fail deserialize
+    /// on absence). See the module-level doc.
     pub verifier_stats: Vec<crate::monitor::bpf_prog::ProgVerifierStats>,
     /// Aggregate per-vCPU KVM stats read after VM exit. `None` when
     /// the VM did not run (host-only tests) or KVM stats were
-    /// unavailable. Always emitted as `"kvm_stats": null` on absence;
-    /// required on deserialize.
+    /// unavailable. Writer always emits (`"kvm_stats": null` on
+    /// absence); reader-side, serde's native `Option<T>` deserialize
+    /// tolerates absence — see the module-level doc.
     pub kvm_stats: Option<crate::vmm::KvmStatsTotals>,
     /// Effective sysctls active during this test run, recorded as raw
-    /// `sysctl.key=value` cmdline strings. Always emitted as
-    /// `"sysctls": []` when none; required on deserialize.
+    /// `sysctl.key=value` cmdline strings. Writer always emits as
+    /// `"sysctls": []` when none; reader-side, this `Vec` field is
+    /// hard-required (non-`Option` fields fail deserialize on
+    /// absence). See the module-level doc.
     pub sysctls: Vec<String>,
     /// Effective kernel command-line args active during this test run.
-    /// Always emitted as `"kargs": []` when none; required on
-    /// deserialize.
+    /// Writer always emits as `"kargs": []` when none; reader-side,
+    /// this `Vec` field is hard-required (non-`Option` fields fail
+    /// deserialize on absence). See the module-level doc.
     pub kargs: Vec<String>,
     /// Kernel version of the VM under test (from cache metadata,
     /// e.g. `"6.14.2"`). Populated from the cache entry's
@@ -171,8 +191,10 @@ pub struct SidecarResult {
     /// cache key; `None` for host-only tests or when neither
     /// source yields a version string. The host's running kernel
     /// release is carried separately in `host.kernel_release`.
-    /// Always emitted (`"kernel_version": null` on absence);
-    /// required on deserialize.
+    /// Writer always emits (`"kernel_version": null` on absence);
+    /// reader-side, serde's native `Option<T>` deserialize tolerates
+    /// absence — see the module-level doc for the full asymmetric
+    /// contract.
     pub kernel_version: Option<String>,
     /// Kernel SOURCE TREE git HEAD short hex (7 chars via
     /// `oid::to_hex_with_len(7)`), with `-dirty` suffix appended
@@ -206,13 +228,14 @@ pub struct SidecarResult {
     ///   with zero commits);
     /// - any other gix probe failure — metadata, not a gate.
     ///
-    /// Always emitted (`"kernel_commit": null` on absence);
-    /// required on deserialize. Excluded from
-    /// [`sidecar_variant_hash`] for the same cross-host grouping
-    /// reason `scheduler_commit` and `project_commit` are
-    /// excluded: two runs of the same semantic variant on
-    /// different kernel-source HEADs must still bucket together
-    /// so `stats compare` can diff them; the commit-drift
+    /// Writer always emits (`"kernel_commit": null` on absence);
+    /// reader-side, serde's native `Option<T>` deserialize tolerates
+    /// absence — see the module-level doc for the full asymmetric
+    /// contract. Excluded from [`sidecar_variant_hash`] for the same
+    /// cross-host grouping reason `scheduler_commit` and
+    /// `project_commit` are excluded: two runs of the same semantic
+    /// variant on different kernel-source HEADs must still bucket
+    /// together so `stats compare` can diff them; the commit-drift
     /// detection inspects this field directly via the
     /// `--kernel-commit` filter.
     pub kernel_commit: Option<String>,
@@ -230,16 +253,16 @@ pub struct SidecarResult {
     /// gauntlet variants on different hosts collapse into the same
     /// hash bucket.
     ///
-    /// No serde attributes: the field is always emitted
-    /// (`"host": null` when `None`) and always required on
-    /// deserialize. Every other `Option` and `Vec` field on this
-    /// struct follows the same pattern — `serde(default)` and
-    /// `skip_serializing_if` have been removed crate-wide so
-    /// serialize and deserialize are symmetric for all sidecar
-    /// fields. A missing field in a parsed sidecar is a hard error;
-    /// pre-1.0, sidecar data is disposable, so regenerate by
+    /// No serde attributes: writer always emits (`"host": null` when
+    /// `None`); reader-side, serde's native `Option<T>` deserialize
+    /// tolerates absence (a missing key parses as `None`). The
+    /// asymmetric contract is crate-wide — see the module-level doc.
+    /// Pre-1.0, sidecar data is disposable, so regenerate by
     /// re-running the test rather than carrying a compat shim for
-    /// older JSON.
+    /// older JSON; the reader-side tolerance exists so an in-flight
+    /// schema rename of an `Option` field does not break parsing of
+    /// older sidecars during the same producer-version, not as a
+    /// long-term migration story.
     pub host: Option<crate::host_context::HostContext>,
     /// Wall-clock milliseconds spent in
     /// [`KtstrVm::collect_results`](crate::vmm::KtstrVm) — the host-side
@@ -250,10 +273,10 @@ pub struct SidecarResult {
     /// CLI uses integer ms or seconds, and JSON has no native
     /// `Duration`). `None` when the run was killed by the watchdog
     /// before `collect_results` returned, or for the `host_only` /
-    /// host-only-stub paths that never boot a VM. Always emitted
-    /// (`"cleanup_duration_ms": null` on absence); required on
-    /// deserialize per the same symmetry rule that governs every other
-    /// nullable on this struct.
+    /// host-only-stub paths that never boot a VM. Writer always emits
+    /// (`"cleanup_duration_ms": null` on absence); reader-side,
+    /// serde's native `Option<T>` deserialize tolerates absence — see
+    /// the module-level doc for the full asymmetric contract.
     pub cleanup_duration_ms: Option<u64>,
     /// Provenance tag for this sidecar — distinguishes a developer's
     /// local run from a CI run so cross-environment comparisons in
@@ -277,20 +300,42 @@ pub struct SidecarResult {
     /// wants a new tag (e.g. `"benchmark"`); the consumer side
     /// treats unknown values the same as known ones — they are
     /// strings the operator can pass via `--run-source` to filter on.
-    /// Always emitted (`"run_source": null` on absence); required on
-    /// deserialize per the same symmetry rule that governs every
-    /// other nullable on this struct. Excluded from
-    /// [`sidecar_variant_hash`] for the same cross-host grouping
-    /// reason `host` is excluded — two runs of the same semantic
-    /// variant from different environments must still bucket
-    /// together so `stats compare` can diff them; `--run-source` and
-    /// `--a-run-source` / `--b-run-source` are the explicit knobs for
-    /// source-aware narrowing.
+    /// Writer always emits (`"run_source": null` on absence);
+    /// reader-side, serde's native `Option<T>` deserialize tolerates
+    /// absence — see the module-level doc for the full asymmetric
+    /// contract. Excluded from [`sidecar_variant_hash`] for the same
+    /// cross-host grouping reason `host` is excluded — two runs of
+    /// the same semantic variant from different environments must
+    /// still bucket together so `stats compare` can diff them;
+    /// `--run-source` and `--a-run-source` / `--b-run-source` are the
+    /// explicit knobs for source-aware narrowing.
     ///
     /// Field name `run_source` (renamed from `source`) disambiguates
     /// from [`crate::cache::KernelSource`] / `KernelMetadata.source`
     /// — those describe the kernel build's input (tarball / git /
     /// local), this describes the run-environment provenance.
+    ///
+    /// **On-disk JSON key changed from `"source"` to `"run_source"`
+    /// in the field rename.** No `#[serde(alias = "source")]` is
+    /// in place: archived sidecars written before the rename carry
+    /// the `"source"` key, which the current schema treats as an
+    /// unknown field. Because `SidecarResult`'s derive does NOT
+    /// set `deny_unknown_fields`, the deserialize does not fail
+    /// outright — instead serde silently DROPS the stale `"source"`
+    /// payload and lands `run_source = None` (since `Option<T>`'s
+    /// "tolerate absence" rule kicks in for the missing
+    /// `"run_source"` field). The data is lost, not preserved. This
+    /// is deliberate per the project's pre-1.0 disposable-data
+    /// contract: re-running tests regenerates sidecars under the
+    /// new key rather than carrying compat shims forward. Consumers
+    /// who need the run-source classification on archived JSON
+    /// must either rename the key in-place before deserialize, or
+    /// re-run the test to regenerate the sidecar with the new
+    /// schema. Tooling that runs against the renamed schema and
+    /// observes a `None` `run_source` cannot distinguish "sidecar
+    /// pre-dates the field" from "sidecar pre-dates the rename and
+    /// lost its tag" — both lower-bound at `None` for filter
+    /// purposes.
     pub run_source: Option<String>,
 }
 
@@ -1181,15 +1226,26 @@ pub(crate) fn apply_archive_source_override(pool: &mut [SidecarResult]) {
 /// - `KernelId::Path(p)`: returns the raw path verbatim. The
 ///   typical case: `KTSTR_KERNEL=/path/to/linux` points at a
 ///   working source tree that may be a git repo.
-/// - `KernelId::Version(_)` / `KernelId::CacheKey(_)`: looks up
-///   the cache entry. If `metadata.source` is
-///   `KernelSource::Local { source_tree_path: Some(p), .. }`,
-///   returns `p` — that build was driven from a local source
-///   tree whose worktree may still exist. For
-///   `KernelSource::Tarball` / `KernelSource::Git`, the source
-///   was transient (extracted into a tempdir, then deleted by
-///   the cache pipeline) and there is no git tree to probe;
-///   returns `None`.
+/// - `KernelId::Version(ver)`: looks for a Local cache entry
+///   whose `metadata.version == ver` carrying a
+///   `source_tree_path`. The tarball-shaped key (`{ver}-tarball-
+///   {arch}-kc{suffix}`) is checked first because it is the
+///   most-common form a Version-shaped env points at; on miss
+///   (or hit yielding `Tarball` / `Git` source, both of which
+///   are transient with no on-disk tree to probe), the function
+///   falls back to scanning every valid cache entry for a Local
+///   match on version. The fallback is the bug fix for #58:
+///   without it, a cache populated by `kernel build --kernel
+///   /path/to/linux` (a Local entry with source_tree_path) is
+///   never found by a sidecar writer that has
+///   `KTSTR_KERNEL=6.14.2`, even though the local tree is
+///   exactly what the kernel_commit field needs to probe.
+/// - `KernelId::CacheKey(k)`: uses `k` verbatim — the cache key
+///   already carries every detail (source-type prefix, arch,
+///   kconfig hash). On hit, returns
+///   `KernelSource::Local::source_tree_path` if set, else
+///   `None` (Tarball / Git entries are transient and have no
+///   persisted source tree).
 /// - `KernelId::Range { .. }` / `KernelId::Git { .. }`:
 ///   multi-kernel specs in `KTSTR_KERNEL` never reach this
 ///   helper in production (find_kernel's env reader bails
@@ -1200,28 +1256,96 @@ pub(crate) fn apply_archive_source_override(pool: &mut [SidecarResult]) {
 fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
     use crate::kernel_path::KernelId;
     let raw = crate::ktstr_kernel_env()?;
-    match KernelId::parse(&raw) {
+    let id = KernelId::parse(&raw);
+    match id {
         KernelId::Path(_) => Some(std::path::PathBuf::from(&raw)),
         KernelId::Version(_) | KernelId::CacheKey(_) => {
             let cache = crate::cache::CacheDir::new().ok()?;
-            let key = match KernelId::parse(&raw) {
-                KernelId::Version(ver) => {
-                    let arch = std::env::consts::ARCH;
-                    format!("{ver}-tarball-{arch}-kc{}", crate::cache_key_suffix())
-                }
-                KernelId::CacheKey(k) => k,
-                _ => return None,
-            };
-            let entry = cache.lookup(&key)?;
-            match entry.metadata.source {
-                crate::cache::KernelSource::Local {
+            resolve_kernel_source_dir_with_cache(&id, &cache)
+        }
+        KernelId::Range { .. } | KernelId::Git { .. } => None,
+    }
+}
+
+/// Pure helper for [`resolve_kernel_source_dir`] that takes the
+/// parsed `KernelId` and an opened `CacheDir`, returning the source
+/// tree path if recoverable.
+///
+/// Split out from [`resolve_kernel_source_dir`] so tests can pin a
+/// `CacheDir` at a tempdir root without mutating env vars (which
+/// would race other tests reading `KTSTR_KERNEL` /
+/// `KTSTR_CACHE_DIR`).
+///
+/// Lookup order for [`KernelId::Version`]:
+/// 1. Tarball-shaped cache key (`{ver}-tarball-{arch}-kc{suffix}`),
+///    direct lookup. Returns `Some` only if the entry is a
+///    `KernelSource::Local` carrying a `source_tree_path`.
+/// 2. Fallback scan: every valid cache entry whose
+///    `metadata.version == ver`. First match with
+///    `KernelSource::Local::source_tree_path` set wins. Handles
+///    the case where the user built `--kernel /path/to/linux`
+///    (a Local cache entry without the tarball cache-key prefix)
+///    but later set `KTSTR_KERNEL=6.14.2` for the test run —
+///    without this fallback, the local source tree would be
+///    invisible to the sidecar writer.
+///
+/// `KernelSource::Tarball` and `KernelSource::Git` entries are
+/// skipped at every step because their source trees are transient
+/// (deleted by the cache pipeline after build), so probing them
+/// for a `kernel_commit` would always fail.
+///
+/// For [`KernelId::CacheKey`], performs a single direct lookup —
+/// the cache key already encodes every detail (source-type
+/// prefix, arch, kconfig hash) so no fallback scan is needed.
+fn resolve_kernel_source_dir_with_cache(
+    id: &crate::kernel_path::KernelId,
+    cache: &crate::cache::CacheDir,
+) -> Option<std::path::PathBuf> {
+    use crate::kernel_path::KernelId;
+    match id {
+        KernelId::Version(ver) => {
+            let arch = std::env::consts::ARCH;
+            let tarball_key = format!("{ver}-tarball-{arch}-kc{}", crate::cache_key_suffix());
+            if let Some(entry) = cache.lookup(&tarball_key)
+                && let crate::cache::KernelSource::Local {
                     source_tree_path: Some(p),
                     ..
-                } => Some(p),
+                } = &entry.metadata.source
+            {
+                return Some(p.clone());
+            }
+            let entries = cache.list().ok()?;
+            for listed in entries {
+                let crate::cache::ListedEntry::Valid(entry) = listed else {
+                    continue;
+                };
+                if entry.metadata.version.as_deref() != Some(ver.as_str()) {
+                    continue;
+                }
+                if let crate::cache::KernelSource::Local {
+                    source_tree_path: Some(p),
+                    ..
+                } = &entry.metadata.source
+                {
+                    return Some(p.clone());
+                }
+            }
+            None
+        }
+        KernelId::CacheKey(k) => {
+            let entry = cache.lookup(k)?;
+            match entry.metadata.source {
+                crate::cache::KernelSource::Local {
+                    source_tree_path: Some(ref p),
+                    ..
+                } => Some(p.clone()),
                 _ => None,
             }
         }
-        KernelId::Range { .. } | KernelId::Git { .. } => None,
+        // Path / Range / Git callers do not reach this helper —
+        // resolve_kernel_source_dir handles them inline. Defensive
+        // None covers any future caller that adds a new arm.
+        _ => None,
     }
 }
 
@@ -2310,32 +2434,37 @@ mod tests {
         assert!(loaded.monitor.is_none());
         assert!(loaded.stimulus_events.is_empty());
         // `monitor` is emitted as `"monitor":null` when absent — the
-        // sidecar schema is symmetric, with every `Option` field always
-        // present on the wire and required on deserialize. Pinning the
-        // emission pattern prevents a drift back to the old asymmetric
-        // `skip_serializing_if` form that failed deserialize on a None-
-        // produced sidecar.
+        // writer side guarantees full symmetry by always emitting
+        // every field. (The reader side tolerates absence on `Option`
+        // fields per serde's native rule; non-`Option` fields remain
+        // hard-required.) Pinning the emission pattern prevents a
+        // drift back to the old asymmetric `skip_serializing_if` form
+        // that omitted None-produced fields entirely.
         assert!(
             json.contains("\"monitor\":null"),
             "monitor=None must serialize as `\"monitor\":null`, not be omitted: {json}",
         );
     }
 
-    /// Strict-schema rejection: a sidecar JSON that omits a required
-    /// top-level field (here: `test_name`) must fail deserialization,
-    /// not silently default to the empty string. The SidecarResult
-    /// policy — serde(default) removed crate-wide so serialize and
-    /// deserialize are symmetric — is stated in the module doc and
-    /// on the `host` field; this test pins the policy by
-    /// construction. A regression that reintroduces `#[serde(default)]`
-    /// on any top-level SidecarResult field would cause the
-    /// `from_str` below to succeed instead of error.
+    /// Strict-schema rejection for non-`Option` fields: a sidecar
+    /// JSON that omits any required (non-`Option`) top-level field
+    /// must fail deserialization, not silently default to the empty
+    /// string / empty Vec / similar. The SidecarResult policy —
+    /// `serde(default)` removed crate-wide, no `skip_serializing_if`
+    /// — is stated in the module doc; this test pins the parser-side
+    /// half by construction. A regression that reintroduces
+    /// `#[serde(default)]` on any non-`Option` SidecarResult field
+    /// would cause the `from_str` calls below to succeed instead of
+    /// error.
     ///
-    /// `test_name` is the chosen field because it is a plain String
-    /// and its absence produces a clean "missing field" error from
-    /// serde without sibling-field interference. Other top-level
-    /// fields (Vec, Option, nested struct) follow the same contract;
-    /// picking one is sufficient to guard the policy.
+    /// `Option` fields are deliberately excluded: serde's native
+    /// `Option<T>` deserialize rule treats absence as `None`, and
+    /// that tolerance is part of the asymmetric contract documented
+    /// at the module level — writer always emits, reader tolerates
+    /// absence on `Option`s. The sibling
+    /// `serialize_always_emits_option_keys` tests pin the writer
+    /// side; this loop pins the reader side for non-`Option` fields
+    /// only.
     #[test]
     fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         // Table-driven expansion covering every non-`Option` field of
@@ -4813,5 +4942,440 @@ mod tests {
             head.to_hex_with_len(7).to_string(),
             "uninitialized submodule must not trigger -dirty suffix"
         );
+    }
+
+    /// `detect_project_commit` memoizes its probe behind a
+    /// process-wide [`std::sync::OnceLock`] (declared on the
+    /// function body). Two consecutive calls in the same process
+    /// must therefore return identical [`Option<String>`] results
+    /// — the first call seeds the cache with a probe of cwd; the
+    /// second collapses to a `Clone` of the cached entry.
+    ///
+    /// The OnceLock is process-global and writes during the FIRST
+    /// call observed by the test process — that may be this test
+    /// or any sibling that ran earlier, since the cache survives
+    /// across test functions in a single binary. Either way, the
+    /// public-API contract this test pins is "consecutive calls
+    /// agree", which holds whether the cache is hot from a
+    /// previous test or warmed by the first call here.
+    ///
+    /// `Option<String>::None` (cwd outside any git repo) memoizes
+    /// the same way as `Some` per the function's own commentary
+    /// — repeating the failing probe yields the same `None`. The
+    /// test does not constrain whether the result is Some or None
+    /// because the cwd at test-runner launch is environmental;
+    /// equality across the two calls is the testable contract.
+    #[test]
+    fn detect_project_commit_memoizes_across_consecutive_calls() {
+        let first = super::detect_project_commit();
+        let second = super::detect_project_commit();
+        assert_eq!(
+            first, second,
+            "consecutive detect_project_commit calls must return \
+             identical Option<String> via the OnceLock cache; \
+             got first={first:?}, second={second:?}",
+        );
+        // Also pin against a third call to catch a regression that
+        // re-probes on every non-first call (e.g. one that read
+        // the OnceLock but bypassed it on the return path).
+        let third = super::detect_project_commit();
+        assert_eq!(
+            first, third,
+            "third detect_project_commit call must still match the \
+             first; got first={first:?}, third={third:?}",
+        );
+    }
+
+    /// `detect_kernel_commit` memoizes its probe behind a
+    /// process-wide [`std::sync::Mutex<HashMap<PathBuf,
+    /// Option<String>>>`] keyed on the input path. Two
+    /// consecutive calls with the SAME path must return identical
+    /// results — the first call seeds the cache; the second
+    /// returns a clone of the cached entry without re-probing.
+    ///
+    /// Uses a fresh tempdir so the cache key is unique to this
+    /// test (no collision with other test functions in the same
+    /// binary). The hashmap key is `PathBuf::to_path_buf()` of
+    /// `&Path`, so a stable path argument across calls produces
+    /// a cache hit on the second invocation.
+    #[test]
+    fn detect_kernel_commit_memoizes_across_consecutive_calls_same_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let head = init_clean_repo_with_file(tmp.path());
+        let expected = head.to_hex_with_len(7).to_string();
+
+        let first = super::detect_kernel_commit(tmp.path());
+        let second = super::detect_kernel_commit(tmp.path());
+        let third = super::detect_kernel_commit(tmp.path());
+
+        assert_eq!(
+            first.as_deref(),
+            Some(expected.as_str()),
+            "first call must return the clean short hash {expected:?}; \
+             got {first:?}",
+        );
+        assert_eq!(
+            first, second,
+            "consecutive detect_kernel_commit calls with the same \
+             path must agree via the Mutex<HashMap> cache; got \
+             first={first:?}, second={second:?}",
+        );
+        assert_eq!(
+            first, third,
+            "third detect_kernel_commit call with the same path must \
+             still match; got first={first:?}, third={third:?}",
+        );
+    }
+
+    /// `detect_kernel_commit`'s path-keyed cache must not
+    /// cross-contaminate between distinct kernel directories. Two
+    /// fresh tempdirs with different HEADs (different blob
+    /// content → different tree → different commit OID) must each
+    /// return their OWN HEAD short hash. A regression that, e.g.,
+    /// keyed the cache on a prefix or a hash-collision-prone
+    /// derivation would surface here as one of the two paths
+    /// returning the OTHER path's HEAD.
+    ///
+    /// Mixed call interleaving (`a`, `b`, `a`, `b`) catches a
+    /// regression that overwrites the entry on every call rather
+    /// than inserting per-key.
+    #[test]
+    fn detect_kernel_commit_distinct_paths_do_not_cross_contaminate() {
+        let tmp_a = tempfile::TempDir::new().expect("tempdir A");
+        let tmp_b = tempfile::TempDir::new().expect("tempdir B");
+
+        // Distinct HEADs: write a different blob in each repo so
+        // the resulting commit OIDs differ. The blob bytes alone
+        // determine the tree OID via gix; identical blobs would
+        // yield identical commit OIDs and defeat the test.
+        let head_a = init_clean_repo_with_file(tmp_a.path());
+        // Overwrite the helper's "original\n" content with a
+        // distinct payload, then re-commit so HEAD diverges from
+        // tmp_b's. We can't reuse `init_clean_repo_with_file`
+        // verbatim because that would commit the same content.
+        let mut repo_b = gix::init(tmp_b.path()).expect("gix::init B");
+        let _ = repo_b
+            .committer_or_set_generic_fallback()
+            .expect("committer fallback B");
+        let blob_id_b: gix::ObjectId = repo_b
+            .write_blob(b"different\n")
+            .expect("write blob B")
+            .detach();
+        let tree_b = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: "file.txt".into(),
+                oid: blob_id_b,
+            }],
+        };
+        let tree_id_b: gix::ObjectId = repo_b.write_object(&tree_b).expect("write tree B").detach();
+        let head_b: gix::ObjectId = repo_b
+            .commit(
+                "HEAD",
+                "init B",
+                tree_id_b,
+                std::iter::empty::<gix::ObjectId>(),
+            )
+            .expect("commit B")
+            .detach();
+        let mut idx_b = repo_b
+            .index_from_tree(&tree_id_b)
+            .expect("index_from_tree B");
+        idx_b
+            .write(gix::index::write::Options::default())
+            .expect("write index B");
+        std::fs::write(tmp_b.path().join("file.txt"), b"different\n")
+            .expect("write worktree file B");
+
+        let expected_a = head_a.to_hex_with_len(7).to_string();
+        let expected_b = head_b.to_hex_with_len(7).to_string();
+        assert_ne!(
+            expected_a, expected_b,
+            "fixture precondition: the two repos must have distinct \
+             HEADs for this test to mean anything; got a={expected_a} \
+             b={expected_b}",
+        );
+
+        // Interleave the calls: a, b, a, b. A regression that
+        // overwrote the cache on each insert (instead of inserting
+        // per-key) would surface here as the second `a` call
+        // returning B's hash, or the second `b` returning A's.
+        let a1 = super::detect_kernel_commit(tmp_a.path());
+        let b1 = super::detect_kernel_commit(tmp_b.path());
+        let a2 = super::detect_kernel_commit(tmp_a.path());
+        let b2 = super::detect_kernel_commit(tmp_b.path());
+
+        assert_eq!(
+            a1.as_deref(),
+            Some(expected_a.as_str()),
+            "first call against path A must return A's HEAD short \
+             hash {expected_a:?}; got {a1:?}",
+        );
+        assert_eq!(
+            b1.as_deref(),
+            Some(expected_b.as_str()),
+            "first call against path B must return B's HEAD short \
+             hash {expected_b:?}; got {b1:?}",
+        );
+        assert_eq!(
+            a1, a2,
+            "second call against path A must match the first \
+             (cache hit on the A entry); got a1={a1:?}, a2={a2:?}",
+        );
+        assert_eq!(
+            b1, b2,
+            "second call against path B must match the first \
+             (cache hit on the B entry, NOT contaminated by A); \
+             got b1={b1:?}, b2={b2:?}",
+        );
+        assert_ne!(
+            a2, b2,
+            "after interleaved calls, A and B must STILL hold \
+             distinct values — a regression that lost per-key \
+             distinction would equate them; got a2={a2:?}, b2={b2:?}",
+        );
+    }
+
+    /// Helper for `resolve_kernel_source_dir_with_cache` tests:
+    /// build a [`KernelMetadata`] for a Local-source entry. Used
+    /// across the fallback-scan and tarball-priority tests.
+    fn local_metadata_with_source_tree(
+        version: &str,
+        source_tree_path: std::path::PathBuf,
+    ) -> crate::cache::KernelMetadata {
+        crate::cache::KernelMetadata::new(
+            crate::cache::KernelSource::Local {
+                source_tree_path: Some(source_tree_path),
+                git_hash: None,
+            },
+            std::env::consts::ARCH.to_string(),
+            "bzImage".to_string(),
+            "2026-04-26T00:00:00Z".to_string(),
+        )
+        .with_version(Some(version.to_string()))
+        .with_config_hash(Some("abc123".to_string()))
+        .with_ktstr_kconfig_hash(Some("def456".to_string()))
+    }
+
+    /// Helper: build a fake kernel image file under `dir` and
+    /// return its path. Cache `store()` requires an existing image
+    /// file to copy into the entry directory.
+    fn create_fake_image_in(dir: &std::path::Path) -> std::path::PathBuf {
+        let image = dir.join("bzImage");
+        std::fs::write(&image, b"fake kernel image").expect("write fake image");
+        image
+    }
+
+    /// Tarball-shaped lookup hit yields the entry's source_tree_path
+    /// directly when the entry is a Local source. Pins the fast
+    /// path of the Version arm before exercising the fallback scan.
+    #[test]
+    fn resolve_kernel_source_dir_with_cache_version_tarball_key_local_source() {
+        let cache_root = tempfile::TempDir::new().expect("cache tempdir");
+        let cache = crate::cache::CacheDir::with_root(cache_root.path().to_path_buf());
+        let src = tempfile::TempDir::new().expect("src tempdir");
+        let image_dir = tempfile::TempDir::new().expect("image tempdir");
+        let image = create_fake_image_in(image_dir.path());
+
+        let arch = std::env::consts::ARCH;
+        let key = format!("6.14.2-tarball-{arch}-kc{}", crate::cache_key_suffix());
+        let meta = local_metadata_with_source_tree("6.14.2", src.path().to_path_buf());
+        cache
+            .store(&key, &crate::cache::CacheArtifacts::new(&image), &meta)
+            .expect("store cache entry");
+
+        let id = crate::kernel_path::KernelId::Version("6.14.2".to_string());
+        let resolved = super::resolve_kernel_source_dir_with_cache(&id, &cache);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(src.path()),
+            "tarball-shaped Local entry must resolve via direct lookup",
+        );
+    }
+
+    /// Fallback scan: the tarball-shaped key is absent, but a
+    /// non-tarball cache entry (e.g. one stored under a `local-`
+    /// or git-shaped key) carries a matching version + Local
+    /// source_tree_path. The Version arm must find it via the
+    /// list-and-match fallback. This is the bug fix for #58.
+    #[test]
+    fn resolve_kernel_source_dir_with_cache_version_falls_back_to_scan_for_local() {
+        let cache_root = tempfile::TempDir::new().expect("cache tempdir");
+        let cache = crate::cache::CacheDir::with_root(cache_root.path().to_path_buf());
+        let src = tempfile::TempDir::new().expect("src tempdir");
+        let image_dir = tempfile::TempDir::new().expect("image tempdir");
+        let image = create_fake_image_in(image_dir.path());
+
+        // Store under a non-tarball key shape — mimics a build
+        // driven by `--kernel /path/to/linux`.
+        let key = format!(
+            "local-deadbee-{arch}-kc{suffix}",
+            arch = std::env::consts::ARCH,
+            suffix = crate::cache_key_suffix(),
+        );
+        let meta = local_metadata_with_source_tree("6.14.2", src.path().to_path_buf());
+        cache
+            .store(&key, &crate::cache::CacheArtifacts::new(&image), &meta)
+            .expect("store cache entry");
+
+        let id = crate::kernel_path::KernelId::Version("6.14.2".to_string());
+        let resolved = super::resolve_kernel_source_dir_with_cache(&id, &cache);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(src.path()),
+            "fallback scan must find a Local entry by version when \
+             the tarball-shaped lookup misses",
+        );
+    }
+
+    /// Fallback scan must SKIP non-Local entries even when the
+    /// version matches. A Tarball or Git entry has no on-disk
+    /// source tree to probe, so iterating past it to find the
+    /// Local sibling (or returning `None` when no Local exists)
+    /// is the correct behavior.
+    #[test]
+    fn resolve_kernel_source_dir_with_cache_version_skips_non_local_in_fallback() {
+        let cache_root = tempfile::TempDir::new().expect("cache tempdir");
+        let cache = crate::cache::CacheDir::with_root(cache_root.path().to_path_buf());
+        let image_dir = tempfile::TempDir::new().expect("image tempdir");
+        let image = create_fake_image_in(image_dir.path());
+
+        // Store ONE entry: a tarball-source entry under a non-
+        // tarball cache-key shape (so the direct lookup misses and
+        // we hit the fallback scan). Version matches the query but
+        // source is Tarball, so resolve must yield None.
+        let key = format!(
+            "weird-key-{arch}-kc{suffix}",
+            arch = std::env::consts::ARCH,
+            suffix = crate::cache_key_suffix(),
+        );
+        let meta = crate::cache::KernelMetadata::new(
+            crate::cache::KernelSource::Tarball,
+            std::env::consts::ARCH.to_string(),
+            "bzImage".to_string(),
+            "2026-04-26T00:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()))
+        .with_config_hash(Some("abc123".to_string()))
+        .with_ktstr_kconfig_hash(Some("def456".to_string()));
+        cache
+            .store(&key, &crate::cache::CacheArtifacts::new(&image), &meta)
+            .expect("store cache entry");
+
+        let id = crate::kernel_path::KernelId::Version("6.14.2".to_string());
+        let resolved = super::resolve_kernel_source_dir_with_cache(&id, &cache);
+        assert!(
+            resolved.is_none(),
+            "non-Local entries are transient and must not be returned by the fallback scan; got {resolved:?}",
+        );
+    }
+
+    /// Version mismatch: even a Local entry with source_tree_path
+    /// is skipped when its `metadata.version` differs from the
+    /// queried version. Pinning this prevents a regression where
+    /// the fallback scan returns the first Local entry regardless
+    /// of version (collapsing every Version query to the same
+    /// path).
+    #[test]
+    fn resolve_kernel_source_dir_with_cache_version_skips_mismatched_version_in_fallback() {
+        let cache_root = tempfile::TempDir::new().expect("cache tempdir");
+        let cache = crate::cache::CacheDir::with_root(cache_root.path().to_path_buf());
+        let src = tempfile::TempDir::new().expect("src tempdir");
+        let image_dir = tempfile::TempDir::new().expect("image tempdir");
+        let image = create_fake_image_in(image_dir.path());
+
+        let key = format!(
+            "local-deadbee-{arch}-kc{suffix}",
+            arch = std::env::consts::ARCH,
+            suffix = crate::cache_key_suffix(),
+        );
+        let meta = local_metadata_with_source_tree("6.13.0", src.path().to_path_buf());
+        cache
+            .store(&key, &crate::cache::CacheArtifacts::new(&image), &meta)
+            .expect("store cache entry");
+
+        let id = crate::kernel_path::KernelId::Version("6.14.2".to_string());
+        let resolved = super::resolve_kernel_source_dir_with_cache(&id, &cache);
+        assert!(
+            resolved.is_none(),
+            "Local entry with mismatched version must not be returned; got {resolved:?}",
+        );
+    }
+
+    /// `KernelId::CacheKey` resolves via direct cache.lookup — no
+    /// fallback scan needed because the key already encodes every
+    /// detail (source-type prefix, arch, kconfig hash). Pinning
+    /// the CacheKey arm against a Local entry stored under that
+    /// exact key.
+    #[test]
+    fn resolve_kernel_source_dir_with_cache_cache_key_direct_lookup_local() {
+        let cache_root = tempfile::TempDir::new().expect("cache tempdir");
+        let cache = crate::cache::CacheDir::with_root(cache_root.path().to_path_buf());
+        let src = tempfile::TempDir::new().expect("src tempdir");
+        let image_dir = tempfile::TempDir::new().expect("image tempdir");
+        let image = create_fake_image_in(image_dir.path());
+
+        let key = format!(
+            "local-deadbee-{arch}-kc{suffix}",
+            arch = std::env::consts::ARCH,
+            suffix = crate::cache_key_suffix(),
+        );
+        let meta = local_metadata_with_source_tree("6.14.2", src.path().to_path_buf());
+        cache
+            .store(&key, &crate::cache::CacheArtifacts::new(&image), &meta)
+            .expect("store cache entry");
+
+        let id = crate::kernel_path::KernelId::CacheKey(key);
+        let resolved = super::resolve_kernel_source_dir_with_cache(&id, &cache);
+        assert_eq!(resolved.as_deref(), Some(src.path()));
+    }
+
+    /// CacheKey lookup against a non-Local entry yields None — no
+    /// transient source tree to probe.
+    #[test]
+    fn resolve_kernel_source_dir_with_cache_cache_key_non_local_yields_none() {
+        let cache_root = tempfile::TempDir::new().expect("cache tempdir");
+        let cache = crate::cache::CacheDir::with_root(cache_root.path().to_path_buf());
+        let image_dir = tempfile::TempDir::new().expect("image tempdir");
+        let image = create_fake_image_in(image_dir.path());
+
+        let key = format!(
+            "main-git-deadbee-{arch}-kc{suffix}",
+            arch = std::env::consts::ARCH,
+            suffix = crate::cache_key_suffix(),
+        );
+        let meta = crate::cache::KernelMetadata::new(
+            crate::cache::KernelSource::Git {
+                git_hash: Some("deadbee".to_string()),
+                git_ref: Some("main".to_string()),
+            },
+            std::env::consts::ARCH.to_string(),
+            "bzImage".to_string(),
+            "2026-04-26T00:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()))
+        .with_config_hash(Some("abc123".to_string()))
+        .with_ktstr_kconfig_hash(Some("def456".to_string()));
+        cache
+            .store(&key, &crate::cache::CacheArtifacts::new(&image), &meta)
+            .expect("store cache entry");
+
+        let id = crate::kernel_path::KernelId::CacheKey(key);
+        let resolved = super::resolve_kernel_source_dir_with_cache(&id, &cache);
+        assert!(
+            resolved.is_none(),
+            "Git source has no persisted source tree; got {resolved:?}",
+        );
+    }
+
+    /// Empty cache + Version query yields None. Sanity check
+    /// against a regression that crashes on an empty entries list.
+    #[test]
+    fn resolve_kernel_source_dir_with_cache_version_empty_cache_yields_none() {
+        let cache_root = tempfile::TempDir::new().expect("cache tempdir");
+        let cache = crate::cache::CacheDir::with_root(cache_root.path().to_path_buf());
+        let id = crate::kernel_path::KernelId::Version("6.14.2".to_string());
+        let resolved = super::resolve_kernel_source_dir_with_cache(&id, &cache);
+        assert!(resolved.is_none());
     }
 }
