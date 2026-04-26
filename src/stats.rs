@@ -7370,15 +7370,23 @@ mod tests {
         );
     }
 
-    /// Failing and skipped contributors participate in mixed-
-    /// dirty tracking. The cohort's WIP state is metadata
-    /// independent of metric outcome — a skipped sidecar from a
-    /// dirty tree still counts toward the dirty-flag because it
-    /// records the producer's working-tree state at run time.
-    /// Pin: one passing-clean + one skipped-dirty contributor
-    /// renders `+mixed`.
+    /// Skipped contributors participate in mixed-dirty tracking.
+    /// The cohort's WIP state is metadata independent of metric
+    /// outcome — a skipped sidecar from a dirty tree still
+    /// counts toward the dirty-flag because it records the
+    /// producer's working-tree state at run time. Pin: one
+    /// passing-clean + one skipped-dirty contributor renders
+    /// `+mixed`.
+    ///
+    /// Tests the SKIPPED arm only (`passed=true, skipped=true`).
+    /// The failed arm (`passed=false, skipped=false`) is pinned
+    /// separately by
+    /// `group_and_average_mixed_dirty_tracking_includes_failed_contributors`
+    /// — the two arms exit through distinct `continue` statements
+    /// in `group_and_average_by` and a regression in either is
+    /// independent of the other.
     #[test]
-    fn group_and_average_mixed_dirty_tracking_includes_skipped_and_failed() {
+    fn group_and_average_mixed_dirty_tracking_includes_skipped() {
         let mut clean_pass = make_row("t", "tiny-1llc", true, 0.0);
         clean_pass.commit = Some("abc1234".to_string());
         let mut dirty_skip = make_row("t", "tiny-1llc", true, 0.0);
@@ -7411,7 +7419,7 @@ mod tests {
     /// the operator needs to see.
     ///
     /// Distinct from
-    /// `group_and_average_mixed_dirty_tracking_includes_skipped_and_failed`
+    /// `group_and_average_mixed_dirty_tracking_includes_skipped`
     /// which exercises the SKIPPED arm only (`passed=true,
     /// skipped=true`). The two arms have separate `continue`
     /// statements and one could regress without the other; this

@@ -513,7 +513,9 @@ pub const KTSTR_KERNEL_LIST_ENV: &str = "KTSTR_KERNEL_LIST";
 ///
 /// Parsed as `usize`; 0 and unparseable values fall through
 /// to the default cap so a typoed export does not silently
-/// disable parallelism. Read by
+/// disable parallelism. Leading/trailing whitespace is trimmed
+/// before parsing so a shell-quoted `=" 8 "` behaves the same
+/// as the unquoted form. Read by
 /// [`crate::cli::resolve_kernel_parallelism`] (the helper
 /// that combines this env value with the
 /// `available_parallelism()` fallback) so the parsing rules

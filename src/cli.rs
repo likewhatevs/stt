@@ -2566,6 +2566,8 @@ pub fn cleanup(parent_cgroup: Option<String>) -> Result<()> {
 /// the host-CPU default rather than disabling parallelism — a
 /// disabled-pool resolve would serialize multi-spec invocations
 /// with no observable signal that the env var was the cause.
+/// Leading/trailing whitespace is trimmed before parsing so a
+/// shell-quoted `=" 8 "` behaves the same as the unquoted form.
 ///
 /// Extracted from cargo-ktstr's `resolve_kernel_set` so the
 /// parsing rules live in one place; the cargo-ktstr binary
@@ -5520,11 +5522,18 @@ mod tests {
 
     /// `KTSTR_KERNEL_PARALLELISM=0`: zero is a sentinel meaning
     /// "ignore me" rather than "disable parallelism." A
-    /// num_threads(0) ThreadPool would silently fall through to
-    /// the global rayon default (rayon's documented behavior),
-    /// which would defeat the cap entirely; the explicit `n > 0`
-    /// guard in `resolve_kernel_parallelism` rejects the parsed
-    /// zero so the host-CPU default takes over.
+    /// `ThreadPoolBuilder::num_threads(0)` does NOT bound the
+    /// pool to zero — rayon's documented behavior treats `0` as
+    /// "auto-size" and resolves the width via `RAYON_NUM_THREADS`
+    /// (if set) or `available_parallelism()`, which would defeat
+    /// the explicit cap our caller is trying to install. The
+    /// explicit `n > 0` guard in `resolve_kernel_parallelism`
+    /// rejects the parsed-zero case in our own helper so the
+    /// host-CPU default we compute (rather than rayon's auto-
+    /// sizing) drives the pool — keeping cap semantics
+    /// predictable and independent of rayon's internal sizing
+    /// rules and of any ambient `RAYON_NUM_THREADS` in the
+    /// environment.
     #[test]
     fn resolve_kernel_parallelism_zero_falls_through_to_default() {
         use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
