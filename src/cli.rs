@@ -2299,6 +2299,536 @@ pub fn show_run_host(run: &str, dir: Option<&Path>) -> Result<String> {
     Ok(host.format_human())
 }
 
+/// Whether a `None` value on a [`crate::test_support::SidecarResult`]
+/// `Option` field is the expected steady-state shape (e.g. `payload`
+/// for a scheduler-only test) or signals a recoverable gap an
+/// operator can remediate (e.g. `kernel_commit` from a tarball-cache
+/// kernel that has no on-disk source tree to probe).
+///
+/// Used by [`explain_sidecar`] to label every diagnostic block; the
+/// `JSON` shape exposes this as a `"classification"` string per
+/// field so dashboards can color-code "expected" vs "actionable"
+/// blocks without re-deriving the rule from causes prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoneClassification {
+    /// `None` is the expected steady state for this field — no
+    /// operator action recovers it (the source data does not
+    /// exist or has not been wired yet).
+    Expected,
+    /// `None` indicates a recoverable gap — re-running the test in
+    /// a different environment (in-repo cwd, non-tarball kernel,
+    /// non-host-only test) would populate the field.
+    Actionable,
+}
+
+impl NoneClassification {
+    /// Stable string token for the JSON `classification` key on
+    /// [`explain_sidecar`]'s machine-readable output. The text
+    /// renderer uses the same token so a human reading the
+    /// terminal output sees the same label they would scrape from
+    /// JSON.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Expected => "expected",
+            Self::Actionable => "actionable",
+        }
+    }
+}
+
+/// Catalog entry for one [`crate::test_support::SidecarResult`]
+/// `Option` field — wired into [`SIDECAR_NONE_CATALOG`] so the
+/// diagnostic surface stays in lockstep with the on-disk schema.
+///
+/// Each entry was derived from the rustdoc on the corresponding
+/// field in `src/test_support/sidecar.rs` — see the per-field
+/// references at the catalog site for the source of truth. This
+/// catalog is static (no live probing): explain-sidecar's purpose
+/// is post-hoc archive diagnosis, not live debugging, and dynamic
+/// probes against an absent host (e.g. checking `KTSTR_KERNEL` on
+/// a CI runner that produced an archived sidecar) would return
+/// nonsense.
+struct NoneCatalogEntry {
+    /// Field name as serialized on disk (matches the struct field
+    /// identifier verbatim — serde uses the field name without
+    /// rename attributes for [`crate::test_support::SidecarResult`]).
+    field: &'static str,
+    /// Classification when this field is `None`. See
+    /// [`NoneClassification`].
+    classification: NoneClassification,
+    /// Human-readable cause prose, one entry per documented cause
+    /// from the field's rustdoc. The text renderer prints each
+    /// cause on its own bulleted line; the JSON shape emits them
+    /// as a JSON string array verbatim.
+    causes: &'static [&'static str],
+}
+
+/// Static catalog covering every `Option<T>` field on
+/// [`crate::test_support::SidecarResult`]. Order matches the on-
+/// disk schema declaration order so a human diff against
+/// `SidecarResult` reads top-to-bottom.
+///
+/// Causes prose is sourced FROM the per-field rustdoc on
+/// `SidecarResult` — see `src/test_support/sidecar.rs` for the
+/// single source of truth on what each `None` means. A future
+/// schema change that adds, removes, or renames an `Option`
+/// field MUST update this catalog; the
+/// `none_catalog_covers_every_option_field` test enforces
+/// `SIDECAR_NONE_CATALOG.len() == EXPECTED_OPTION_FIELD_COUNT`
+/// (a hand-coded `10`) and asserts the projection helper
+/// enumerates the same field names in the same order. A new
+/// `Option` field on `SidecarResult` requires bumping the
+/// constant, extending [`project_optional_fields`]'s array
+/// (which has compile-checked length `10` and will fail to
+/// compile on a missing entry), and adding a catalog row.
+const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
+    // See SidecarResult::scheduler_commit — currently always
+    // None for every SchedulerSpec variant.
+    NoneCatalogEntry {
+        field: "scheduler_commit",
+        classification: NoneClassification::Expected,
+        causes: &["no SchedulerSpec variant currently exposes a reliable \
+             commit source — reserved on the schema for future \
+             enrichment (e.g. --version probe or ELF-note read on \
+             the resolved scheduler binary)"],
+    },
+    // See SidecarResult::project_commit (cause split mirrors
+    // detect_project_commit's documented None cases).
+    NoneCatalogEntry {
+        field: "project_commit",
+        classification: NoneClassification::Actionable,
+        causes: &[
+            "current_dir() could not be resolved at sidecar-write \
+             time (process cwd was rmdir'd while alive)",
+            "test process cwd was not inside any git repository",
+            "HEAD could not be read (unborn HEAD on a fresh \
+             `git init` with zero commits, or a corrupt repository)",
+        ],
+    },
+    // See SidecarResult::payload — None when no binary payload
+    // declared.
+    NoneCatalogEntry {
+        field: "payload",
+        classification: NoneClassification::Expected,
+        causes: &["test declared no binary payload (scheduler-only test \
+             or pure-scenario test that never invokes \
+             ctx.payload(...))"],
+    },
+    // See SidecarResult::monitor — None for host-only / early VM
+    // failure / no valid samples.
+    NoneCatalogEntry {
+        field: "monitor",
+        classification: NoneClassification::Actionable,
+        causes: &[
+            "host-only test path: monitor loop never started",
+            "early VM failure: monitor loop terminated before \
+             producing samples",
+            "sample collection produced no valid data",
+        ],
+    },
+    // See SidecarResult::kvm_stats — None when VM did not run
+    // or KVM stats were unavailable.
+    NoneCatalogEntry {
+        field: "kvm_stats",
+        classification: NoneClassification::Actionable,
+        causes: &[
+            "host-only test path: VM did not run",
+            "KVM stats were unavailable on this host (e.g. KVM \
+             module not loaded, /dev/kvm permissions, or kernel \
+             missing the stats interface)",
+        ],
+    },
+    // See SidecarResult::kernel_version — None for host-only or
+    // missing metadata.
+    NoneCatalogEntry {
+        field: "kernel_version",
+        classification: NoneClassification::Actionable,
+        causes: &[
+            "host-only test path: no kernel under test",
+            "neither cache metadata nor `include/config/kernel.release` \
+             yielded a version string",
+        ],
+    },
+    // See SidecarResult::kernel_commit — five enumerated None
+    // causes per the field's rustdoc.
+    NoneCatalogEntry {
+        field: "kernel_commit",
+        classification: NoneClassification::Actionable,
+        causes: &[
+            "KTSTR_KERNEL is unset or empty",
+            "kernel source is a Tarball or Git transient cache \
+             entry (no on-disk source tree to probe)",
+            "resolved kernel directory is not a git repository \
+             (gix::open failed)",
+            "HEAD cannot be read (unborn HEAD on a fresh `git init` \
+             with zero commits)",
+            "gix probe failed for another reason — metadata, not \
+             a gate",
+        ],
+    },
+    // See SidecarResult::host — production writers always
+    // populate this field; None on a non-fixture sidecar
+    // signals a pre-enrichment archive predating the
+    // host-context landing.
+    NoneCatalogEntry {
+        field: "host",
+        classification: NoneClassification::Actionable,
+        causes: &[
+            "test-fixture path: not the production sidecar \
+             writer (production writers always populate `host`)",
+            "pre-enrichment archive: sidecar predates the \
+             host-context landing — re-run the test to \
+             regenerate under the current schema",
+        ],
+    },
+    // See SidecarResult::cleanup_duration_ms — None for
+    // watchdog-kill or host-only.
+    NoneCatalogEntry {
+        field: "cleanup_duration_ms",
+        classification: NoneClassification::Actionable,
+        causes: &[
+            "host-only / host-only-stub test path: no VM teardown \
+             window to time",
+            "run was killed by the watchdog before \
+             `KtstrVm::collect_results` returned",
+        ],
+    },
+    // See SidecarResult::run_source — only None case in the
+    // current writer is a pre-rename archive whose `source`
+    // key was dropped as unknown by the renamed schema.
+    NoneCatalogEntry {
+        field: "run_source",
+        classification: NoneClassification::Actionable,
+        causes: &["pre-rename archive: sidecar carries the old `source` \
+             key which the current schema drops as an unknown \
+             field, leaving `run_source` to fall back to None via \
+             serde's tolerate-absence rule. Re-run the test to \
+             regenerate under the new schema, or rename the key \
+             in-place before deserialize"],
+    },
+];
+
+/// Project one [`crate::test_support::SidecarResult`] onto its
+/// `Option` fields, returning `(field_name, is_some)` pairs in the
+/// same order as [`SIDECAR_NONE_CATALOG`].
+///
+/// Hand-written rather than derived because:
+/// - Only the 10 `Option<T>` fields are diagnostic surface; the
+///   non-`Option` fields (`test_name`, `passed`, `stats`, etc.)
+///   are always populated by deserialize and would clutter the
+///   output without adding signal.
+/// - The order MUST match the catalog so the field-by-field
+///   lookup in [`render_explain_sidecar_text`] resolves
+///   correctly.
+///
+/// A future schema addition that introduces a new `Option<T>`
+/// field on `SidecarResult` MUST update this projection; the
+/// `[(_, _); 10]` array literal makes the length compile-checked
+/// — adding an entry without updating the length is a compile
+/// error — and the `none_catalog_covers_every_option_field` test
+/// asserts the catalog and projection enumerate the same names
+/// in the same order.
+fn project_optional_fields(sc: &crate::test_support::SidecarResult) -> [(&'static str, bool); 10] {
+    [
+        ("scheduler_commit", sc.scheduler_commit.is_some()),
+        ("project_commit", sc.project_commit.is_some()),
+        ("payload", sc.payload.is_some()),
+        ("monitor", sc.monitor.is_some()),
+        ("kvm_stats", sc.kvm_stats.is_some()),
+        ("kernel_version", sc.kernel_version.is_some()),
+        ("kernel_commit", sc.kernel_commit.is_some()),
+        ("host", sc.host.is_some()),
+        ("cleanup_duration_ms", sc.cleanup_duration_ms.is_some()),
+        ("run_source", sc.run_source.is_some()),
+    ]
+}
+
+/// File-walk statistics for the run directory under
+/// [`explain_sidecar`]. `walked` counts every `.ktstr.json` file
+/// the walker visited (corrupt + valid); `valid` counts how many
+/// of those parsed into a [`crate::test_support::SidecarResult`].
+/// `walked - valid` is the silent-skip count.
+struct WalkStats {
+    walked: usize,
+    valid: usize,
+}
+
+/// Count `.ktstr.json` files under `run_dir` using
+/// [`crate::test_support::collect_sidecars`]'s walk shape (flat
+/// files plus one level of subdirectories). Pure file-existence
+/// pass — no parsing, no `serde_json` work — used purely to
+/// derive the `walked` count for [`WalkStats`].
+fn count_sidecar_files(run_dir: &Path) -> usize {
+    let mut count = 0usize;
+    let is_sidecar = |path: &Path| -> bool {
+        path.extension().and_then(|e| e.to_str()) == Some("json")
+            && path.to_str().is_some_and(|s| s.contains(".ktstr."))
+    };
+    let entries = match std::fs::read_dir(run_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+            continue;
+        }
+        if is_sidecar(&path) {
+            count += 1;
+        }
+    }
+    for sub in subdirs {
+        if let Ok(entries) = std::fs::read_dir(&sub) {
+            for entry in entries.flatten() {
+                if is_sidecar(&entry.path()) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Load sidecars under `run_dir` and report file-walk statistics.
+///
+/// Delegates parsing to [`crate::test_support::collect_sidecars`]
+/// — that helper emits per-file `eprintln!` hints on parse
+/// failure, surfacing the actionable schema-drift message to
+/// the operator. The `walked` count is derived independently via
+/// [`count_sidecar_files`] so the diagnostic header reports
+/// total `.ktstr.json` files visited (corrupt + valid), while
+/// `collect_sidecars`'s parse hints carry the per-file detail.
+fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResult>, WalkStats) {
+    let walked = count_sidecar_files(run_dir);
+    let sidecars = crate::test_support::collect_sidecars(run_dir);
+    let valid = sidecars.len();
+    (sidecars, WalkStats { walked, valid })
+}
+
+/// Diagnose `Option`-field absences for a run's sidecars. Mirrors
+/// [`show_run_host`]'s shape (`--run` + optional `--dir`,
+/// printable string return) but renders one block per sidecar
+/// listing populated fields plus per-`None` cause-and-classification
+/// from [`SIDECAR_NONE_CATALOG`]. Different gauntlet variants on
+/// the same run legitimately differ on which fields are populated
+/// (host-only vs VM-backed, scheduler-only vs payload-bearing),
+/// so the report is per-sidecar rather than aggregate.
+///
+/// Loads sidecars verbatim — this command does NOT call
+/// [`crate::test_support::apply_archive_source_override`] even
+/// when `dir` is set, because rewriting `run_source` to
+/// `"archive"` at load time would destroy the only signal that
+/// surfaces the pre-rename `source`-key drop case (see the
+/// `run_source` entry in [`SIDECAR_NONE_CATALOG`]). The
+/// diagnostic value of explain-sidecar depends on observing the
+/// on-disk shape unmodified; deviation from the
+/// `stats compare` / `stats list-values` archive-override
+/// pattern is intentional. This DOES match
+/// [`show_run_host`]'s pattern.
+///
+/// `json: true` emits a JSON object with two top-level keys:
+/// `"_walk"` (an envelope carrying `walked` and `valid` counts —
+/// the same numbers the text header reports) and `"fields"`
+/// (a map keyed by [`SIDECAR_NONE_CATALOG`] field name where
+/// each value is `{ "none_count": N, "classification": "...",
+/// "causes": [...] }`). `none_count` is the across-all-sidecars-
+/// in-this-run count of `None` for that field. This shape is
+/// dashboard-friendly: a CI consumer can ingest the JSON
+/// without parsing per-sidecar prose. The text form retains
+/// per-sidecar detail for human triage.
+///
+/// # Errors
+///
+/// - The run directory does not exist.
+/// - The run directory exists but the walk produced zero valid
+///   sidecars (every file failed to parse, or the directory was
+///   empty).
+pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<String> {
+    let root: std::path::PathBuf = match dir {
+        Some(d) => d.to_path_buf(),
+        None => crate::test_support::runs_root(),
+    };
+    let run_dir = root.join(run);
+    if !run_dir.exists() {
+        bail!(
+            "run '{run}' not found under {}. \
+             Run `cargo ktstr stats list` to enumerate available run keys.",
+            root.display(),
+        );
+    }
+    let (sidecars, walk_stats) = walk_run_with_stats(&run_dir);
+    if walk_stats.walked == 0 {
+        bail!("run '{run}' has no sidecar data");
+    }
+    if sidecars.is_empty() {
+        bail!(
+            "run '{run}' walked {} sidecar file(s) but parsed 0 — every \
+             file failed to deserialize against the current schema. \
+             Pre-1.0 disposable-sidecar policy: re-run the test to \
+             regenerate under the current schema.",
+            walk_stats.walked,
+        );
+    }
+    if json {
+        Ok(render_explain_sidecar_json(&sidecars, &walk_stats))
+    } else {
+        Ok(render_explain_sidecar_text(&sidecars, &walk_stats))
+    }
+}
+
+/// Render the per-sidecar text block for [`explain_sidecar`].
+/// Header line names the run-wide walked / valid counts so a
+/// corrupt-skip surfaces in human output too. Each block lists
+/// populated `Option` fields, then `None` fields with their
+/// classification and the causes catalog entry.
+///
+/// Sidecars are sorted by `test_name` (with `run_id` as a tie
+/// breaker for deterministic order across same-test variants)
+/// before rendering so output is stable across filesystem
+/// `read_dir` orderings — operators diffing two `explain-sidecar`
+/// runs see content changes, not iteration-order noise.
+fn render_explain_sidecar_text(
+    sidecars: &[crate::test_support::SidecarResult],
+    walk_stats: &WalkStats,
+) -> String {
+    use std::fmt::Write as _;
+    let mut sorted: Vec<&crate::test_support::SidecarResult> = sidecars.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.test_name
+            .cmp(&b.test_name)
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "walked {} sidecar file(s), parsed {} valid\n",
+        walk_stats.walked, walk_stats.valid,
+    );
+    for sc in &sorted {
+        let _ = writeln!(out, "test: {}", sc.test_name);
+        let _ = writeln!(out, "  topology: {}", sc.topology);
+        let _ = writeln!(out, "  scheduler: {}", sc.scheduler);
+        let _ = writeln!(out, "  run_id: {}", sc.run_id);
+        let projected = project_optional_fields(sc);
+        let populated: Vec<&'static str> = projected
+            .iter()
+            .filter(|(_, b)| *b)
+            .map(|(n, _)| *n)
+            .collect();
+        let none_fields: Vec<&'static str> = projected
+            .iter()
+            .filter(|(_, b)| !*b)
+            .map(|(n, _)| *n)
+            .collect();
+        let populated_text = if populated.is_empty() {
+            "<none>".to_string()
+        } else {
+            populated.join(", ")
+        };
+        let _ = writeln!(
+            out,
+            "  populated optional fields ({}): {populated_text}",
+            populated.len(),
+        );
+        if none_fields.is_empty() {
+            let _ = writeln!(out, "  none fields: <all populated>\n");
+            continue;
+        }
+        let _ = writeln!(out, "  none fields ({}):", none_fields.len());
+        for field in none_fields {
+            // Catalog lookup is O(catalog) per lookup, but
+            // catalog is fixed at 10 entries and a sidecar has
+            // at most 10 None fields — O(100) per sidecar in
+            // the worst case. A HashMap would add hashing
+            // overhead without measurable benefit.
+            let entry = SIDECAR_NONE_CATALOG
+                .iter()
+                .find(|e| e.field == field)
+                .expect(
+                    "catalog must cover every projected field — \
+                     guarded by none_catalog_covers_every_option_field",
+                );
+            let _ = writeln!(
+                out,
+                "    {} [{}]",
+                entry.field,
+                entry.classification.as_str(),
+            );
+            for cause in entry.causes {
+                let _ = writeln!(out, "      - {cause}");
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Render the aggregate JSON shape for [`explain_sidecar`]. The
+/// top-level object has two keys: `"_walk"` (an envelope
+/// carrying the walked / valid counts so JSON consumers see the
+/// corrupt-file signal alongside the per-field breakdown) and
+/// `"fields"` — a map keyed by [`SIDECAR_NONE_CATALOG`] field
+/// name where each value carries `none_count` (sum across all
+/// sidecars in the run) plus the static classification + causes
+/// catalog entry.
+fn render_explain_sidecar_json(
+    sidecars: &[crate::test_support::SidecarResult],
+    walk_stats: &WalkStats,
+) -> String {
+    let mut fields = serde_json::Map::new();
+    for entry in SIDECAR_NONE_CATALOG {
+        let none_count = sidecars
+            .iter()
+            .filter(|sc| {
+                project_optional_fields(sc)
+                    .iter()
+                    .any(|(n, b)| *n == entry.field && !*b)
+            })
+            .count();
+        let mut field_obj = serde_json::Map::new();
+        field_obj.insert(
+            "none_count".to_string(),
+            serde_json::Value::from(none_count),
+        );
+        field_obj.insert(
+            "classification".to_string(),
+            serde_json::Value::from(entry.classification.as_str()),
+        );
+        field_obj.insert(
+            "causes".to_string(),
+            serde_json::Value::Array(
+                entry
+                    .causes
+                    .iter()
+                    .map(|c| serde_json::Value::from(*c))
+                    .collect(),
+            ),
+        );
+        fields.insert(
+            entry.field.to_string(),
+            serde_json::Value::Object(field_obj),
+        );
+    }
+    let mut top = serde_json::Map::new();
+    let mut walk = serde_json::Map::new();
+    walk.insert(
+        "walked".to_string(),
+        serde_json::Value::from(walk_stats.walked),
+    );
+    walk.insert(
+        "valid".to_string(),
+        serde_json::Value::from(walk_stats.valid),
+    );
+    top.insert("_walk".to_string(), serde_json::Value::Object(walk));
+    top.insert("fields".to_string(), serde_json::Value::Object(fields));
+    let value = serde_json::Value::Object(top);
+    serde_json::to_string_pretty(&value).expect(
+        "static-shape JSON serialization is infallible — the value \
+         contains no NaN, no non-string keys, and no unsupported types",
+    )
+}
+
 /// Return the registered test name whose Levenshtein edit distance
 /// from `query` is smallest AND within the closeness threshold, or
 /// `None` if no candidate is close enough.
@@ -4205,6 +4735,490 @@ mod tests {
         assert!(
             out.contains("kernel_name"),
             "output from populated sidecar must include kernel_name: {out}",
+        );
+    }
+
+    // -- explain_sidecar --
+
+    /// Drift guard: every `Option<T>` field on `SidecarResult` must
+    /// have a matching catalog entry in `SIDECAR_NONE_CATALOG`, and
+    /// the projected-fields helper must enumerate the same set. A
+    /// schema change that adds, removes, or renames an `Option`
+    /// field MUST update both — this test fires when they drift.
+    ///
+    /// Counts must match the actual `Option<T>` count on
+    /// `SidecarResult`: the 10 documented at the top of
+    /// `src/test_support/sidecar.rs`. Any future addition flips
+    /// this count and forces a co-update.
+    #[test]
+    fn none_catalog_covers_every_option_field() {
+        const EXPECTED_OPTION_FIELD_COUNT: usize = 10;
+        assert_eq!(
+            super::SIDECAR_NONE_CATALOG.len(),
+            EXPECTED_OPTION_FIELD_COUNT,
+            "SIDECAR_NONE_CATALOG must cover every Option<T> field on \
+             SidecarResult; expected {EXPECTED_OPTION_FIELD_COUNT}, got \
+             {}. A schema change must update the catalog in lockstep.",
+            super::SIDECAR_NONE_CATALOG.len(),
+        );
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        let projected = super::project_optional_fields(&sc);
+        assert_eq!(
+            projected.len(),
+            EXPECTED_OPTION_FIELD_COUNT,
+            "project_optional_fields must enumerate every Option<T> \
+             field; expected {EXPECTED_OPTION_FIELD_COUNT}, got {}. Co-update \
+             with the catalog when adding a new Option field.",
+            projected.len(),
+        );
+        // Cross-check: every projected field name appears in the
+        // catalog and vice versa. Stable order between the two is
+        // a separate invariant the renderer relies on.
+        for (i, (name, _)) in projected.iter().enumerate() {
+            let catalog = &super::SIDECAR_NONE_CATALOG[i];
+            assert_eq!(
+                *name, catalog.field,
+                "projected field {i} ({name:?}) must match catalog \
+                 entry at the same index ({:?}) — order drift breaks \
+                 the renderer's catalog-lookup expectation",
+                catalog.field,
+            );
+        }
+    }
+
+    /// Catalog `causes` arrays must be non-empty for every entry.
+    /// An empty causes list would render as a classification with
+    /// no rationale — defeats the diagnostic surface's purpose.
+    #[test]
+    fn none_catalog_every_entry_has_causes() {
+        for entry in super::SIDECAR_NONE_CATALOG {
+            assert!(
+                !entry.causes.is_empty(),
+                "catalog entry for {} has no causes — every field's \
+                 None case must document at least one cause",
+                entry.field,
+            );
+        }
+    }
+
+    /// Error path: the named run directory does not exist. Mirrors
+    /// `show_run_host_missing_run_returns_error`'s error shape so
+    /// operators see consistent diagnostics across the two
+    /// run-named subcommands.
+    #[test]
+    fn explain_sidecar_missing_run_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = super::explain_sidecar("nonexistent-run", Some(tmp.path()), false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("run 'nonexistent-run' not found"),
+            "missing-run error must name the run: {msg}",
+        );
+        assert!(
+            msg.contains("cargo ktstr stats list"),
+            "missing-run error must name the discovery command: {msg}",
+        );
+    }
+
+    /// Error path: run directory exists but is empty. Walked count
+    /// is zero — distinct from "files present but parse-failed."
+    /// Diagnostic must say "no sidecar data" to match
+    /// `show_run_host`'s error shape.
+    #[test]
+    fn explain_sidecar_empty_run_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("run-empty")).unwrap();
+        let err = super::explain_sidecar("run-empty", Some(tmp.path()), false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no sidecar data"),
+            "empty-run error must use the canonical message: {msg}",
+        );
+    }
+
+    /// Error path: walker visits one or more `.ktstr.json` files
+    /// but every parse fails. The error must NAME the walked
+    /// count so an operator sees the corrupt-file signal even
+    /// before reaching the diagnostic body.
+    #[test]
+    fn explain_sidecar_all_corrupt_returns_error_with_walked_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-corrupt");
+        std::fs::create_dir(&run_dir).unwrap();
+        // Two `.ktstr.json` files with garbage content. Walker
+        // counts both; parser rejects both.
+        std::fs::write(run_dir.join("a-0000000000000000.ktstr.json"), "not json {").unwrap();
+        std::fs::write(
+            run_dir.join("b-0000000000000000.ktstr.json"),
+            "{\"missing\": \"required-fields\"}",
+        )
+        .unwrap();
+        let err = super::explain_sidecar("run-corrupt", Some(tmp.path()), false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("walked 2"),
+            "all-corrupt error must name the walked count so the \
+             corrupt-file signal surfaces: {msg}",
+        );
+        assert!(
+            msg.contains("parsed 0"),
+            "all-corrupt error must distinguish walked-vs-parsed: {msg}",
+        );
+    }
+
+    /// Happy path: one sidecar from `test_fixture` (every
+    /// `Option<T>` field starts as `None`). Text output must
+    /// list ALL ten fields under "none fields" with their
+    /// classification + at least one cause string.
+    #[test]
+    fn explain_sidecar_text_lists_all_none_fields_for_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-all-none");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-all-none", Some(tmp.path()), false).unwrap();
+        assert!(out.contains("walked 1"), "header must report walked: {out}");
+        assert!(out.contains("parsed 1"), "header must report parsed: {out}");
+        assert!(
+            out.contains("none fields (10)"),
+            "fixture has every Option as None — count must be 10: {out}",
+        );
+        // Spot-check that each catalog field name appears.
+        for entry in super::SIDECAR_NONE_CATALOG {
+            assert!(
+                out.contains(entry.field),
+                "output must mention field {}: {out}",
+                entry.field,
+            );
+        }
+        // Classification labels must surface.
+        assert!(
+            out.contains("[expected]"),
+            "expected-class fields must surface their tag: {out}",
+        );
+        assert!(
+            out.contains("[actionable]"),
+            "actionable-class fields must surface their tag: {out}",
+        );
+    }
+
+    /// JSON shape: aggregate per-field with `none_count`,
+    /// `classification`, and `causes`. With one fixture sidecar
+    /// (every Option None), every field must report
+    /// `none_count: 1`. The `_walk` envelope must carry walked /
+    /// valid counts.
+    #[test]
+    fn explain_sidecar_json_shape_aggregates_none_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-json");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-json", Some(tmp.path()), true).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("json output must round-trip parse");
+        let walk = parsed.get("_walk").expect("must have _walk key");
+        assert_eq!(walk.get("walked").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(walk.get("valid").and_then(|v| v.as_u64()), Some(1));
+        let fields = parsed.get("fields").expect("must have fields key");
+        for entry in super::SIDECAR_NONE_CATALOG {
+            let f = fields
+                .get(entry.field)
+                .unwrap_or_else(|| panic!("missing field {}", entry.field));
+            assert_eq!(
+                f.get("none_count").and_then(|v| v.as_u64()),
+                Some(1),
+                "every field in fixture is None — none_count must be 1 for {}",
+                entry.field,
+            );
+            assert_eq!(
+                f.get("classification").and_then(|v| v.as_str()),
+                Some(entry.classification.as_str()),
+                "classification must round-trip for {}",
+                entry.field,
+            );
+            let causes = f
+                .get("causes")
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("missing causes for {}", entry.field));
+            assert_eq!(
+                causes.len(),
+                entry.causes.len(),
+                "causes array length must match catalog for {}",
+                entry.field,
+            );
+        }
+    }
+
+    /// Mixed populated/None: some `Option` fields populated,
+    /// others None. The diagnostic block must list both
+    /// "populated" and "none fields" sections with the right
+    /// counts. Catches a regression that emitted populated
+    /// fields under "none fields" or vice versa.
+    #[test]
+    fn explain_sidecar_text_distinguishes_populated_from_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-mixed");
+        std::fs::create_dir(&run_dir).unwrap();
+        let mut sc = crate::test_support::SidecarResult::test_fixture();
+        sc.payload = Some("ipc_pingpong".to_string());
+        sc.kernel_version = Some("6.14.2".to_string());
+        sc.run_source = Some("local".to_string());
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-mixed", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("populated optional fields (3)"),
+            "must report 3 populated: {out}",
+        );
+        assert!(
+            out.contains("payload"),
+            "populated `payload` must appear: {out}",
+        );
+        assert!(out.contains("none fields (7)"), "must report 7 None: {out}",);
+    }
+
+    /// Per-sidecar text output: two sidecars in the same run
+    /// with different None patterns must each get their own
+    /// block. Aggregate-only output would conflate them.
+    #[test]
+    fn explain_sidecar_text_emits_one_block_per_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-two");
+        std::fs::create_dir(&run_dir).unwrap();
+        let mut a = crate::test_support::SidecarResult::test_fixture();
+        a.test_name = "test_a".to_string();
+        let mut b = crate::test_support::SidecarResult::test_fixture();
+        b.test_name = "test_b".to_string();
+        b.payload = Some("ipc_pingpong".to_string());
+        std::fs::write(
+            run_dir.join("a-0000000000000000.ktstr.json"),
+            serde_json::to_string(&a).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("b-0000000000000000.ktstr.json"),
+            serde_json::to_string(&b).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-two", Some(tmp.path()), false).unwrap();
+        assert!(out.contains("test: test_a"), "test_a block missing: {out}");
+        assert!(out.contains("test: test_b"), "test_b block missing: {out}");
+        assert!(out.contains("walked 2"), "walked count must be 2: {out}");
+        assert!(out.contains("parsed 2"), "parsed count must be 2: {out}");
+    }
+
+    /// JSON aggregation across multiple sidecars: one sidecar
+    /// has `payload = Some(...)`, the other has `payload = None`.
+    /// `none_count` for `payload` must be 1 (not 2, not 0).
+    #[test]
+    fn explain_sidecar_json_aggregates_partial_none_correctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-partial");
+        std::fs::create_dir(&run_dir).unwrap();
+        let a = crate::test_support::SidecarResult::test_fixture();
+        let mut b = crate::test_support::SidecarResult::test_fixture();
+        b.payload = Some("ipc_pingpong".to_string());
+        std::fs::write(
+            run_dir.join("a-0000000000000000.ktstr.json"),
+            serde_json::to_string(&a).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("b-0000000000000000.ktstr.json"),
+            serde_json::to_string(&b).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-partial", Some(tmp.path()), true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let payload = parsed
+            .get("fields")
+            .and_then(|f| f.get("payload"))
+            .expect("payload field must be present");
+        assert_eq!(
+            payload.get("none_count").and_then(|v| v.as_u64()),
+            Some(1),
+            "payload None in 1 of 2 sidecars — none_count must be 1",
+        );
+        // Sanity: `host` is None in both sidecars.
+        let host = parsed
+            .get("fields")
+            .and_then(|f| f.get("host"))
+            .expect("host field must be present");
+        assert_eq!(
+            host.get("none_count").and_then(|v| v.as_u64()),
+            Some(2),
+            "host None in 2 of 2 sidecars — none_count must be 2",
+        );
+    }
+
+    /// Walker counts both valid and corrupt `.ktstr.json` files.
+    /// One valid sidecar + one corrupt produces walked=2,
+    /// parsed=1; the diagnostic still emits the valid sidecar's
+    /// block.
+    #[test]
+    fn explain_sidecar_walks_corrupt_files_into_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-mixed-parse");
+        std::fs::create_dir(&run_dir).unwrap();
+        let valid = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("a-0000000000000000.ktstr.json"),
+            serde_json::to_string(&valid).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(run_dir.join("b-0000000000000000.ktstr.json"), "garbage{").unwrap();
+        let out = super::explain_sidecar("run-mixed-parse", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("walked 2"),
+            "walker must visit both files: {out}",
+        );
+        assert!(
+            out.contains("parsed 1"),
+            "only the valid file parses: {out}",
+        );
+    }
+
+    /// Walker recurses one level into subdirectories — matches
+    /// `collect_sidecars`'s gauntlet-job layout. A sidecar in
+    /// `run/job-1/foo.ktstr.json` must be loaded.
+    #[test]
+    fn explain_sidecar_walks_one_level_subdirectory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-sub");
+        let sub = run_dir.join("job-x");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            sub.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-sub", Some(tmp.path()), false).unwrap();
+        assert!(out.contains("walked 1"), "must walk into job-x: {out}");
+        assert!(
+            out.contains("parsed 1"),
+            "must parse the nested file: {out}"
+        );
+    }
+
+    /// Walker MUST ignore non-`.ktstr.json` files even when they
+    /// have a `.json` extension. A `metadata.json` or other
+    /// adjacent JSON in the run directory must NOT inflate the
+    /// walked count or trigger a parse.
+    #[test]
+    fn explain_sidecar_ignores_non_ktstr_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-with-other-json");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        // Adjacent non-ktstr JSON file — must be skipped.
+        std::fs::write(run_dir.join("metadata.json"), "{}").unwrap();
+        let out = super::explain_sidecar("run-with-other-json", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("walked 1"),
+            "non-ktstr JSON must not inflate the walked count: {out}",
+        );
+    }
+
+    /// JSON output must be a single valid JSON document — round-
+    /// trips through `serde_json::from_str` cleanly. Catches
+    /// regressions that trailing-comma or invalid escape would
+    /// produce.
+    #[test]
+    fn explain_sidecar_json_is_valid_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-roundtrip");
+        std::fs::create_dir(&run_dir).unwrap();
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-roundtrip", Some(tmp.path()), true).unwrap();
+        // Strict round-trip — any malformed delimiter would error.
+        let _: serde_json::Value = serde_json::from_str(&out).expect("output must be valid JSON");
+    }
+
+    /// Partial population: the 7 string/u64-shaped `Option`
+    /// fields are populated while monitor / kvm_stats / host
+    /// stay None (those carry struct shapes whose full fixtures
+    /// are deliberately out of scope here). The diagnostic
+    /// surface must split the report into "populated optional
+    /// fields (7)" and "none fields (3)" — proving the
+    /// projection helper distinguishes the two arms correctly
+    /// at non-degenerate populated counts.
+    #[test]
+    fn explain_sidecar_text_handles_partial_population() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-partial-pop");
+        std::fs::create_dir(&run_dir).unwrap();
+        let mut sc = crate::test_support::SidecarResult::test_fixture();
+        sc.scheduler_commit = Some("aaaa111".to_string());
+        sc.project_commit = Some("bbbb222".to_string());
+        sc.payload = Some("payload".to_string());
+        sc.kernel_version = Some("6.14.2".to_string());
+        sc.kernel_commit = Some("cccc333".to_string());
+        sc.cleanup_duration_ms = Some(123);
+        sc.run_source = Some("local".to_string());
+        // 7 Options populated; 3 still None (monitor, kvm_stats, host).
+        std::fs::write(
+            run_dir.join("t-0000000000000000.ktstr.json"),
+            serde_json::to_string(&sc).unwrap(),
+        )
+        .unwrap();
+        let out = super::explain_sidecar("run-partial-pop", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("populated optional fields (7)"),
+            "7 of 10 Options populated must be reflected in the count: {out}",
+        );
+        assert!(
+            out.contains("none fields (3)"),
+            "3 of 10 Options remain None — must report (3): {out}",
+        );
+    }
+
+    /// Classification labels are stable strings ("expected" vs
+    /// "actionable") usable as JSON enum tokens. A regression that
+    /// renamed one would break dashboard consumers.
+    #[test]
+    fn none_classification_as_str_returns_stable_tokens() {
+        assert_eq!(super::NoneClassification::Expected.as_str(), "expected");
+        assert_eq!(super::NoneClassification::Actionable.as_str(), "actionable",);
+    }
+
+    /// `kernel_commit` is the most-multi-cause field (5 documented
+    /// causes per its rustdoc). Catalog must enumerate all 5 so
+    /// the diagnostic surface mirrors the schema documentation.
+    #[test]
+    fn kernel_commit_catalog_lists_five_causes() {
+        let entry = super::SIDECAR_NONE_CATALOG
+            .iter()
+            .find(|e| e.field == "kernel_commit")
+            .expect("kernel_commit must be in the catalog");
+        assert_eq!(
+            entry.causes.len(),
+            5,
+            "kernel_commit rustdoc enumerates 5 None causes; catalog \
+             must mirror that",
         );
     }
 

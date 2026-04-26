@@ -446,6 +446,57 @@ enum StatsCommand {
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
     },
+    /// Diagnose missing optional fields across a run's sidecars.
+    ///
+    /// Loads every `*.ktstr.json` under `--run <id>` and reports,
+    /// per sidecar, which optional fields landed as null along
+    /// with the documented reasons each one can be missing. Every
+    /// such field carries a classification:
+    ///
+    /// - `expected` — null is the steady-state shape; no operator
+    ///   action recovers it (e.g. payload metadata for a
+    ///   scheduler-only test).
+    /// - `actionable` — null indicates a recoverable gap;
+    ///   re-running in a different environment (in-repo cwd,
+    ///   non-tarball kernel, non-host-only test) would populate
+    ///   the field.
+    ///
+    /// Different gauntlet variants on the same run legitimately
+    /// differ on which fields populate (host-only vs VM-backed,
+    /// scheduler-only vs payload-bearing), so the report is
+    /// per-sidecar rather than aggregate.
+    ///
+    /// Sidecars are loaded verbatim. Diverges intentionally from
+    /// `stats compare` / `stats list-values` (which rewrite the
+    /// `run_source` field to `"archive"` when `--dir` is set):
+    /// the override would erase the only signal that surfaces a
+    /// pre-rename archive whose `run_source` field was lost on
+    /// load. Matches `stats show-host` semantics.
+    ///
+    /// Default output is per-sidecar text blocks with a header
+    /// line reporting walked / parsed counts (so a corrupt
+    /// `.ktstr.json` file surfaces as a parse-failure delta
+    /// against the file count). `--json` emits a single object
+    /// with `_walk` carrying the same counts and `fields`
+    /// carrying one aggregated entry per optional field with a
+    /// run-wide `none_count`.
+    ExplainSidecar {
+        /// Run key (from `cargo ktstr stats list`).
+        #[arg(long)]
+        run: String,
+        /// Alternate run root to resolve `--run` against.
+        /// Defaults to `target/ktstr/`. Same semantics as
+        /// `cargo ktstr stats compare --dir`.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Emit aggregate JSON instead of per-sidecar text. The
+        /// text shape is per-sidecar (different gauntlet variants
+        /// have different None patterns); the JSON shape is
+        /// across-the-run aggregate by field, suitable for
+        /// dashboards and CI ingestion.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare two filter-defined partitions of the sidecar pool
     /// and report regressions across slicing dimensions.
     ///
@@ -1713,6 +1764,15 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
         }
         Some(StatsCommand::ShowHost { run, dir }) => {
             match cli::show_run_host(run, dir.as_deref()) {
+                Ok(s) => {
+                    print!("{s}");
+                    Ok(())
+                }
+                Err(e) => Err(format!("{e:#}")),
+            }
+        }
+        Some(StatsCommand::ExplainSidecar { run, dir, json }) => {
+            match cli::explain_sidecar(run, dir.as_deref(), *json) {
                 Ok(s) => {
                     print!("{s}");
                     Ok(())
@@ -4318,6 +4378,85 @@ mod tests {
     fn parse_stats_show_host_missing_run_rejected() {
         let rejected = Cargo::try_parse_from(["cargo", "ktstr", "stats", "show-host"]);
         assert!(rejected.is_err(), "stats show-host must require --run",);
+    }
+
+    /// `cargo ktstr stats explain-sidecar --run X` parses to
+    /// `StatsCommand::ExplainSidecar { run: X, dir: None,
+    /// json: false }`. Mirrors `parse_stats_show_host_with_run`
+    /// for the explain-sidecar shape.
+    #[test]
+    fn parse_stats_explain_sidecar_with_run() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "explain-sidecar",
+            "--run",
+            "my-run-id",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::ExplainSidecar { run, dir, json }),
+                ..
+            } => {
+                assert_eq!(run, "my-run-id");
+                assert!(dir.is_none(), "bare --run must not populate --dir");
+                assert!(!json, "default output is text, not json");
+            }
+            _ => panic!("expected Stats ExplainSidecar"),
+        }
+    }
+
+    /// `cargo ktstr stats explain-sidecar --run X --dir PATH
+    /// --json` carries all three flags. Same --dir threading
+    /// contract as `show-host`; the `--json` flag toggles the
+    /// aggregate-by-field output shape.
+    #[test]
+    fn parse_stats_explain_sidecar_with_dir_and_json() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "explain-sidecar",
+            "--run",
+            "archive-2024-01-15",
+            "--dir",
+            "/tmp/archived-runs",
+            "--json",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::ExplainSidecar { run, dir, json }),
+                ..
+            } => {
+                assert_eq!(run, "archive-2024-01-15");
+                assert_eq!(
+                    dir.as_deref(),
+                    Some(std::path::Path::new("/tmp/archived-runs")),
+                );
+                assert!(json, "--json must toggle aggregate JSON output");
+            }
+            _ => panic!("expected Stats ExplainSidecar"),
+        }
+    }
+
+    /// `cargo ktstr stats explain-sidecar` WITHOUT `--run` must
+    /// fail at parse time. Same required-flag contract as
+    /// `show-host`; without it, an operator could invoke the
+    /// command with no target.
+    #[test]
+    fn parse_stats_explain_sidecar_missing_run_rejected() {
+        let rejected = Cargo::try_parse_from(["cargo", "ktstr", "stats", "explain-sidecar"]);
+        assert!(
+            rejected.is_err(),
+            "stats explain-sidecar must require --run",
+        );
     }
 
     // -- try_get_matches_from: kernel list --

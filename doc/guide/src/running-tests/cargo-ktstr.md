@@ -443,8 +443,8 @@ cargo ktstr completions fish > ~/.config/fish/completions/cargo-ktstr.fish
 
 ## stats
 
-Sidecar analysis and run-to-run comparison. See
-[Runs](runs.md) for the directory layout.
+Sidecar analysis, per-record diagnostics, and run-to-run comparison.
+See [Runs](runs.md) for the directory layout.
 
 ```sh
 cargo ktstr stats                                             # print analysis of newest run
@@ -457,6 +457,7 @@ cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 -E cgroup_steady      
 cargo ktstr stats compare --a-project-commit abcdef1 --b-project-commit fedcba2 --no-average  # opt out of trial averaging
 cargo ktstr stats compare --a-kernel-commit abcdef1 --b-kernel-commit fedcba2    # slice on kernel source HEAD
 cargo ktstr stats compare --a-run-source ci --b-run-source local                 # slice on run environment
+cargo ktstr stats explain-sidecar --run RUN_ID                                   # diagnose Option-field absences
 ```
 
 When invoked without a subcommand, prints gauntlet analysis from
@@ -581,6 +582,56 @@ returning empty output.
 | `--run ID` | required | Run key (from `cargo ktstr stats list`). |
 | `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`: useful for archived sidecar trees copied off a CI host. |
 
+### explain-sidecar
+
+Diagnose `Option`-field absences across a run's sidecars. Loads
+every `*.ktstr.json` under `--run ID` (or its subdirectories one
+level deep, mirroring `compare`'s gauntlet-job layout) and reports,
+per sidecar, which `Option<T>` fields landed as `None` plus the
+documented causes for each absence and a classification:
+
+- `expected` — `None` is the steady-state shape; no operator
+  action recovers it (e.g. `payload` for a scheduler-only test,
+  `scheduler_commit` which no `SchedulerSpec` variant exposes
+  today).
+- `actionable` — `None` indicates a recoverable gap; re-running
+  in a different environment (in-repo cwd, non-tarball kernel,
+  non-host-only test) would populate the field.
+
+Different gauntlet variants on the same run legitimately differ
+on which fields populate (host-only vs VM-backed,
+scheduler-only vs payload-bearing), so the report is per-sidecar
+rather than aggregate.
+
+Sidecars are loaded verbatim — this command does NOT rewrite
+`run_source` to `"archive"` even when `--dir` is set. Diverges
+intentionally from `compare` / `list-values`; matches `show-host`.
+The override would erase the only signal that surfaces the
+pre-rename `source`-key drop case.
+
+The output header reports `walked N, parsed M`: `N` counts every
+`.ktstr.json` file the walker visited, `M` counts how many
+parsed against the current schema. `walked > parsed` signals a
+corrupt or pre-1.0-schema sidecar — re-run the test to
+regenerate under the current schema.
+
+`--json` emits a single object whose top-level `fields` key
+carries one entry per `Option<T>` field with `none_count`
+aggregated across the run's sidecars; the `_walk` key carries
+the same counts as the text header.
+
+```sh
+cargo ktstr stats explain-sidecar --run RUN_ID                       # text per-sidecar diagnostic
+cargo ktstr stats explain-sidecar --run RUN_ID --json                 # aggregate JSON for dashboards
+cargo ktstr stats explain-sidecar --run RUN_ID --dir /path/archive    # diagnose archived sidecars
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--run ID` | required | Run key (from `cargo ktstr stats list`). |
+| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`. |
+| `--json` | off | Emit aggregate JSON instead of per-sidecar text. |
+
 ### compare
 
 Pool every sidecar under `target/ktstr/` (or `--dir`), partition
@@ -689,6 +740,12 @@ answer to "what have I got?". `list-values` reports all eight
 filterable dimensions; the JSON keys `commit` and `source` map
 to the per-side filter flags `--project-commit` and
 `--run-source`.
+
+When a side comes back as `unknown` for one of the optional
+dimensions (`kernel`, `commit`, `kernel_commit`, `source`),
+[`cargo ktstr stats explain-sidecar`](#explain-sidecar) on the
+underlying run reports per-sidecar which optional fields are
+missing and what each absence means.
 
 | Flag | Default | Description |
 |------|---------|-------------|
