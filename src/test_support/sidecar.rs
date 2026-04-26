@@ -1003,6 +1003,36 @@ pub fn runs_root() -> PathBuf {
     target.join("ktstr")
 }
 
+/// Predicate: is `entry` a candidate run directory under
+/// [`runs_root`]?
+///
+/// True iff `entry`'s path is a directory AND its filename does
+/// NOT begin with a `.` byte. The dotfile filter excludes the
+/// flock sentinel subdirectory ([`RUN_LOCK_DIR_NAME`] =
+/// `.locks/`) plus any other operator-created or filesystem-
+/// reserved dotfile directories from run-listing walkers
+/// ([`newest_run_dir`] here, `sorted_run_entries` in
+/// `crate::stats`) so the lock infrastructure does not pollute
+/// `cargo ktstr stats list` output or claim the "most recent
+/// run" bucket. Checking the first byte directly via
+/// `as_encoded_bytes` is OS-string-safe (no UTF-8 round-trip)
+/// and short-circuits cleanly on non-UTF-8 names that would
+/// confuse a `to_str().starts_with('.')` chain.
+///
+/// Single source of truth for "is this a run-dir entry?" — both
+/// run-listing call sites must pipe through this predicate so a
+/// future relocation of `.locks/` (or any other added reserved
+/// dotfile) updates one place.
+pub(crate) fn is_run_directory(entry: &std::fs::DirEntry) -> bool {
+    let path = entry.path();
+    if !path.is_dir() {
+        return false;
+    }
+    path.file_name()
+        .and_then(|n| n.as_encoded_bytes().first().copied())
+        .is_none_or(|b| b != b'.')
+}
+
 /// Find the most recently modified run directory under [`runs_root`].
 ///
 /// Used by bare `cargo ktstr stats` (no subcommand) when
@@ -1011,12 +1041,19 @@ pub fn runs_root() -> PathBuf {
 /// `{kernel}-{project_commit}` key that the test process used.
 /// Picking the newest subdirectory by mtime mirrors "show me the
 /// report from my last test run."
+///
+/// Dotfile-prefixed entries (notably the flock sentinel
+/// subdirectory `.locks/`) are excluded via [`is_run_directory`]
+/// so the lock infrastructure cannot claim the "most recent
+/// run" bucket — `.locks/`'s mtime tracks per-write flock
+/// activity and would otherwise eclipse the actual newest run
+/// dir on every default-path sidecar write.
 pub fn newest_run_dir() -> Option<PathBuf> {
     let root = runs_root();
     let entries = std::fs::read_dir(&root).ok()?;
     entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
+        .filter(is_run_directory)
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
         .map(|e| e.path())
 }
@@ -1862,6 +1899,25 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
 /// and causing the second call to re-fire pre-clear and wipe the
 /// first call's sidecars.
 ///
+/// CROSS-PROCESS SERIALIZATION: on the default path (override
+/// unset), the call acquires advisory `LOCK_EX` on a per-run-key
+/// sentinel file (`{runs_root}/.locks/{key}.lock`) before
+/// pre-clear runs and holds it for the duration of the
+/// pre-clear + serialize + write cycle. The lock prevents
+/// process B's `pre_clear_run_dir_once` from interleaving with
+/// process A's mid-write `std::fs::write` — the kernel-flock
+/// critical section makes the (read_dir + remove_file) +
+/// (serialize + write) sequence atomic with respect to peer
+/// processes targeting the same `{kernel}-{project_commit}`
+/// directory. Without the lock, two concurrent CI jobs sharing
+/// the same key could (a) tear partially-written sidecars
+/// (write fd open while pre-clear's `remove_file` runs) or
+/// (b) interleave pre-clear + write phases, leaving the dir
+/// in a state neither process intended. The override path
+/// skips the lock for the same reason it skips pre-clear:
+/// operator-chosen directories are owned by the operator and
+/// out of scope for the cross-process gate.
+///
 /// `label` is a caller-supplied noun for the context message ("skip
 /// sidecar" / "sidecar") so the error chain points at the right call
 /// site.
@@ -1889,6 +1945,19 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
     // the relative-vs-absolute split.
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create sidecar dir {}", dir.display()))?;
+    // Acquire the per-run-key cross-process flock for the duration
+    // of the pre-clear + write cycle. The override branch (operator-
+    // chosen directory) skips the lock for the same reason it skips
+    // pre-clear — see the function-level doc. `_run_dir_lock` is
+    // scoped to this function body so the kernel-side flock releases
+    // via `OwnedFd::drop` when the function returns (success or
+    // error path), making the lock RAII-managed without an explicit
+    // unlock call.
+    let _run_dir_lock = if do_pre_clear {
+        Some(acquire_run_dir_flock(&dir)?)
+    } else {
+        None
+    };
     if do_pre_clear {
         pre_clear_run_dir_once(&dir);
     }
@@ -2001,7 +2070,7 @@ fn warn_unknown_project_commit_inner(
         let _ = writeln!(
             sink,
             "ktstr: WARNING: project commit unavailable (cwd not in a git \
-             repo, or HEAD unreadable); runs at this kernel will overwrite \
+             repo, or HEAD unreadable); runs at this kernel overwrite \
              each other in target/ktstr/{{kernel}}-unknown/. Set \
              KTSTR_SIDECAR_DIR=<unique-path> per run, or run from inside a \
              git repo with at least one commit."
@@ -2131,6 +2200,146 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
         }
     }
     drop(guard);
+}
+
+/// Subdirectory under [`runs_root`] that holds per-run-key flock
+/// sentinels. Mirrors the cache module's `.locks/` convention
+/// (see `LOCK_DIR_NAME` in `crate::cache`) so the two coordination
+/// surfaces share a layout: `<root>/.locks/<key>.lock`. The
+/// dotfile prefix keeps the lock subdirectory out of run-listing
+/// walks (`is_dir()` filters in [`collect_pool`] and the stats
+/// `sorted_run_entries` walker exclude it implicitly because the
+/// lockfiles inside are regular files, but the dotfile prefix
+/// is also belt-and-suspenders against any future walker that
+/// reaches this level).
+const RUN_LOCK_DIR_NAME: &str = ".locks";
+
+/// Wall-clock timeout for [`acquire_run_dir_flock`] before it gives
+/// up and returns an error. 30 s is generous for the per-write
+/// critical section: each peer writer holds the lock for at most
+/// one (read_dir + bounded removes) + one (serialize + write)
+/// cycle, all measured in milliseconds. A holder that does not
+/// release within 30 s has stalled (a stuck filesystem, a panic
+/// inside the locked section that somehow survived the RAII
+/// drop, etc.) and surfacing that as an actionable error beats
+/// hanging the test run indefinitely. The timeout is asymmetric
+/// with the cache-store 60 s timeout because cache-store waits
+/// for tens of test runs to drain whereas this lock waits for
+/// at most one peer write.
+const RUN_DIR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Poll interval for [`acquire_run_dir_flock`]. Matches the
+/// cache module's `FLOCK_POLL_INTERVAL` constant for consistency
+/// (100 ms balances responsiveness — contention clears in ≤1
+/// poll under normal load — against CPU burn at 10 wakes/s per
+/// waiter).
+const RUN_DIR_LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Compute the per-run-key flock sentinel path for `dir`.
+///
+/// Layout: `{dir.parent()}/.locks/{dir.file_name()}.lock`. When
+/// `dir = {runs_root}/{key}` (the production default-path shape),
+/// this resolves to `{runs_root}/.locks/{key}.lock`. The lockfile
+/// shares the cache module's `.locks/` layout convention.
+///
+/// Returns `None` when `dir` has no parent (root) or no
+/// `file_name` component (current dir, root) — neither case is
+/// reachable on the production default path
+/// ([`runs_root`] always returns a non-root multi-component
+/// path), but the function is total over the input domain so a
+/// future caller passing an unusual path surfaces a clean `None`
+/// rather than panicking on `unwrap`.
+///
+/// Pure function over the input path — no I/O. The caller is
+/// responsible for materializing the parent `.locks/`
+/// subdirectory before opening the lockfile (see
+/// [`acquire_run_dir_flock`]).
+fn run_dir_lock_path(dir: &std::path::Path) -> Option<PathBuf> {
+    let parent = dir.parent()?;
+    let leaf = dir.file_name()?;
+    let mut filename = std::ffi::OsString::from(leaf);
+    filename.push(".lock");
+    Some(parent.join(RUN_LOCK_DIR_NAME).join(filename))
+}
+
+/// Acquire `LOCK_EX` on the per-run-key flock sentinel for `dir`.
+/// Polls every [`RUN_DIR_LOCK_POLL_INTERVAL`] until either the
+/// lock is held or [`RUN_DIR_LOCK_TIMEOUT`] elapses.
+///
+/// Production wrapper over [`acquire_run_dir_flock_with_timeout`];
+/// see that helper's doc for the full behavior contract. The
+/// timeout split exists so tests can exercise the contention /
+/// timeout path with a sub-second deadline rather than waiting
+/// 30 s of real time per assertion.
+fn acquire_run_dir_flock(dir: &std::path::Path) -> anyhow::Result<std::os::fd::OwnedFd> {
+    acquire_run_dir_flock_with_timeout(dir, RUN_DIR_LOCK_TIMEOUT)
+}
+
+/// Test-parametrizable inner of [`acquire_run_dir_flock`].
+///
+/// Lockfile path is computed via [`run_dir_lock_path`] (see its
+/// doc for the layout). The parent `.locks/` subdirectory is
+/// created lazily here, mirroring the cache module's
+/// `ensure_lock_dir` semantics so a freshly-resolved
+/// `{runs_root}/{key}` does not need an explicit setup step
+/// before the first write.
+///
+/// Returns `Err` on:
+/// - `run_dir_lock_path(dir)` returning `None` (no parent / no
+///   file_name — production default path always satisfies both,
+///   so this is a defensive arm),
+/// - the parent `.locks/` directory failing to materialize
+///   (filesystem error),
+/// - `try_flock` itself surfacing an error (remote-fs rejection,
+///   open failure, unexpected flock errno),
+/// - the wall-clock `timeout` elapsing while a peer continues to
+///   hold an incompatible lock — the error message names the
+///   lockfile path so an operator can grep `/proc/locks` or run
+///   `ktstr locks` to identify the holder.
+///
+/// Returns `Ok(OwnedFd)` on successful acquire. Caller drops the
+/// fd to release the kernel-side flock; the OFD-bound semantics
+/// of `flock(2)` mean no explicit unlock call is required —
+/// `OwnedFd::drop` runs `close(2)` which releases the lock when
+/// no other fd refers to the same OFD (the fresh `try_flock`
+/// open guarantees uniqueness).
+fn acquire_run_dir_flock_with_timeout(
+    dir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::os::fd::OwnedFd> {
+    let lock_path = run_dir_lock_path(dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot derive run-dir lock path from {} (no parent or no file_name component)",
+            dir.display(),
+        )
+    })?;
+    if let Some(lock_dir) = lock_path.parent() {
+        std::fs::create_dir_all(lock_dir)
+            .with_context(|| format!("create run-dir lock subdirectory {}", lock_dir.display()))?;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)? {
+            Some(fd) => return Ok(fd),
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let holders = crate::flock::read_holders(&lock_path).unwrap_or_default();
+                    anyhow::bail!(
+                        "flock LOCK_EX on run-dir {} timed out after {:?} \
+                         (lockfile {}, holders: {}). A peer cargo ktstr \
+                         test process is writing sidecars to the same \
+                         {{kernel}}-{{project_commit}} directory; wait for \
+                         it to finish or kill it, then retry.",
+                        dir.display(),
+                        timeout,
+                        lock_path.display(),
+                        crate::flock::format_holder_list(&holders),
+                    );
+                }
+                std::thread::sleep(RUN_DIR_LOCK_POLL_INTERVAL);
+            }
+        }
+    }
 }
 
 /// Return `active_flags` sorted into canonical
@@ -3797,6 +4006,290 @@ mod tests {
              the OnceLock<()> gating is the load-bearing invariant; got \
              len {} (expected {after_first})",
             sink.len(),
+        );
+    }
+
+    // -- newest_run_dir tests --
+    //
+    // Pin the dotfile filter so the flock sentinel subdirectory
+    // (`.locks/`) cannot eclipse a real run dir as the "most
+    // recent run" — `.locks/`'s mtime tracks per-write flock
+    // activity and would otherwise advance past the run dir's
+    // own mtime on the most recent sidecar write, claiming the
+    // newest-run bucket.
+
+    /// `newest_run_dir` must pick a real run directory in
+    /// preference to a NEWER `.locks/` directory at the same
+    /// runs root. Mtime ordering is stamped via filesystem
+    /// create order with a sleep between calls so the test
+    /// deterministically distinguishes "newer .locks ignored"
+    /// from "older real run picked up because it happened to
+    /// have the largest mtime."
+    #[test]
+    fn newest_run_dir_skips_dotfile_subdirectories() {
+        use std::thread::sleep;
+        use std::time::Duration;
+        let _lock = lock_env();
+        let target_dir = tempfile::TempDir::new().unwrap();
+        let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
+        // `runs_root()` returns `{CARGO_TARGET_DIR}/ktstr/`, so
+        // create that intermediate before populating run subdirs.
+        let runs = target_dir.path().join("ktstr");
+        std::fs::create_dir(&runs).expect("mkdir runs root");
+        // Real run dir created first, so its mtime is OLDER.
+        let real = runs.join("real-run");
+        std::fs::create_dir(&real).expect("mkdir real run dir");
+        sleep(Duration::from_millis(50));
+        // .locks/ created second, so its mtime is NEWER. Without
+        // the dotfile filter, this entry would win the
+        // max_by_key contest and `newest_run_dir` would return
+        // `.locks/` — the regression that this test guards.
+        std::fs::create_dir(runs.join(".locks")).expect("mkdir .locks");
+        let got = newest_run_dir().expect("non-empty runs root must yield Some");
+        assert_eq!(
+            got, real,
+            "newest_run_dir must pick the real run dir even when \
+             .locks/ has a newer mtime — a regression that drops \
+             the dotfile filter would surface here as `.locks/` \
+             winning the mtime contest",
+        );
+    }
+
+    /// `newest_run_dir` returns `None` when only dotfile-prefixed
+    /// subdirectories exist under the runs root. Pins the
+    /// post-filter empty case: even if the runs root itself is
+    /// non-empty, a fresh repo state (only `.locks/` lives there
+    /// because no test has ever produced a sidecar) must not
+    /// surface `.locks/` as a stand-in run.
+    #[test]
+    fn newest_run_dir_yields_none_when_only_dotfiles_exist() {
+        let _lock = lock_env();
+        let target_dir = tempfile::TempDir::new().unwrap();
+        let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
+        let runs = target_dir.path().join("ktstr");
+        std::fs::create_dir(&runs).expect("mkdir runs root");
+        std::fs::create_dir(runs.join(".locks")).expect("mkdir .locks");
+        std::fs::create_dir(runs.join(".cache")).expect("mkdir .cache");
+        let got = newest_run_dir();
+        assert!(
+            got.is_none(),
+            "runs root with only dotfile subdirs must yield None; got {got:?}",
+        );
+    }
+
+    // -- is_run_directory predicate tests --
+    //
+    // Direct unit tests over the predicate that backs both
+    // `newest_run_dir` and `sorted_run_entries`'s filter. Pure
+    // shape contract, no I/O beyond a tempdir to materialize
+    // DirEntries the predicate can consume.
+
+    /// A regular subdirectory whose name does not start with `.`
+    /// passes the predicate.
+    #[test]
+    fn is_run_directory_accepts_non_dotfile_subdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("real-run")).unwrap();
+        let entry = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            super::is_run_directory(&entry),
+            "non-dotfile subdir must be accepted",
+        );
+    }
+
+    /// A subdirectory whose name starts with `.` is rejected.
+    /// Pins the dotfile filter — the load-bearing rule for the
+    /// `.locks/` exclusion.
+    #[test]
+    fn is_run_directory_rejects_dotfile_subdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".locks")).unwrap();
+        let entry = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !super::is_run_directory(&entry),
+            "dotfile subdir must be rejected",
+        );
+    }
+
+    /// A regular file (not a directory) is rejected, regardless
+    /// of name — the `is_dir()` short-circuit must precede the
+    /// dotfile check.
+    #[test]
+    fn is_run_directory_rejects_regular_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("regular-file"), b"x").unwrap();
+        let entry = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !super::is_run_directory(&entry),
+            "regular file must be rejected",
+        );
+    }
+
+    // -- run_dir_lock_path / acquire_run_dir_flock tests --
+    //
+    // Pin the cross-process flock contract added for the
+    // concurrent-write collision fix:
+    //
+    // 1. `run_dir_lock_path` derives the canonical
+    //    `{parent}/.locks/{leaf}.lock` shape so two callers
+    //    keying off the same `dir` agree on the lockfile.
+    // 2. `acquire_run_dir_flock_with_timeout` materializes the
+    //    parent `.locks/` subdirectory on first call and returns
+    //    an `OwnedFd` whose Drop releases the lock — so a second
+    //    call after the first returns can acquire successfully.
+    // 3. While a peer holds `LOCK_EX` on the lockfile, the helper
+    //    times out with an actionable error. (Different `OwnedFd`s
+    //    in the same process are distinct OFDs, so flock(2)
+    //    serializes them the same way it would two processes —
+    //    no fork required to exercise the contention path.)
+    //
+    // No `lock_env` needed: the helpers don't touch any env var.
+    // Each test owns a tempdir so the per-test lockfile namespace
+    // is isolated.
+
+    /// `run_dir_lock_path({parent}/{key})` returns
+    /// `{parent}/.locks/{key}.lock`. Pins the layout so a future
+    /// edit to `RUN_LOCK_DIR_NAME` or the join shape surfaces here
+    /// rather than as a silent cross-call divergence.
+    #[test]
+    fn run_dir_lock_path_returns_expected_shape() {
+        let dir = std::path::Path::new("/runs-root/6.14.2-deadbee");
+        let lock = super::run_dir_lock_path(dir).expect("non-root dir must yield Some");
+        assert_eq!(
+            lock,
+            std::path::PathBuf::from("/runs-root/.locks/6.14.2-deadbee.lock"),
+        );
+    }
+
+    /// A path with no parent (root `/`) has no canonical lockfile
+    /// location — the helper returns `None` rather than constructing
+    /// an unsafe sentinel. Pins the defensive arm so a regression
+    /// that unwraps `parent()` surfaces here.
+    #[test]
+    fn run_dir_lock_path_no_parent_returns_none() {
+        let lock = super::run_dir_lock_path(std::path::Path::new("/"));
+        assert!(
+            lock.is_none(),
+            "root path must yield None (no parent), got {lock:?}",
+        );
+    }
+
+    /// First call against a fresh `dir` materializes the parent
+    /// `.locks/` subdirectory on demand and returns an `OwnedFd`
+    /// holding `LOCK_EX`. The lockfile itself persists after the
+    /// fd is dropped (only the kernel-side lock is released);
+    /// that's what `try_flock`'s own contract guarantees.
+    #[test]
+    fn acquire_run_dir_flock_creates_locks_subdir_lazily() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("6.14.2-deadbee");
+        // `acquire_run_dir_flock_with_timeout` doesn't require the
+        // run-dir itself to exist — the production caller
+        // materializes it via `create_dir_all` BEFORE this point.
+        // Mirror that pattern.
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fd = super::acquire_run_dir_flock_with_timeout(&dir, std::time::Duration::from_secs(1))
+            .expect("first acquire must succeed against an uncontended dir");
+        assert!(
+            tmp.path().join(".locks").exists(),
+            ".locks/ subdirectory must be created lazily on first acquire",
+        );
+        assert!(
+            tmp.path().join(".locks/6.14.2-deadbee.lock").exists(),
+            "lockfile must exist on disk after acquire",
+        );
+        // Drop the fd — releases the kernel-side flock. The
+        // sentinel file persists (released, but not unlinked).
+        drop(fd);
+        assert!(
+            tmp.path().join(".locks/6.14.2-deadbee.lock").exists(),
+            "lockfile sentinel must persist after fd drop — \
+             try_flock's contract is fd-bound release, not file unlink",
+        );
+    }
+
+    /// A second `acquire_run_dir_flock_with_timeout` against the
+    /// same dir AFTER the first fd was dropped must succeed —
+    /// proves the kernel-side release happens via `OwnedFd::drop`
+    /// (no leaked OFD blocking subsequent acquires).
+    #[test]
+    fn acquire_run_dir_flock_releases_on_drop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("key");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fd1 =
+            super::acquire_run_dir_flock_with_timeout(&dir, std::time::Duration::from_secs(1))
+                .expect("first acquire");
+        drop(fd1);
+        let fd2 =
+            super::acquire_run_dir_flock_with_timeout(&dir, std::time::Duration::from_secs(1))
+                .expect(
+                    "second acquire after drop must succeed — a regression that \
+             fails to release the kernel flock on OwnedFd::drop would \
+             leak this assertion",
+                );
+        drop(fd2);
+    }
+
+    /// While a peer holds `LOCK_EX` on the same dir's lockfile,
+    /// `acquire_run_dir_flock_with_timeout` waits and eventually
+    /// fails with an actionable error message. Pins the
+    /// cross-process serialization contract.
+    ///
+    /// In-process collision: two `try_flock` calls open distinct
+    /// OFDs against the same lockfile, and `flock(2)` serializes
+    /// them the same way it would two processes — so this test
+    /// exercises the production contention path without spawning
+    /// a child.
+    #[test]
+    fn acquire_run_dir_flock_times_out_when_peer_holds_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("contended-key");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Peer: acquire the lock through the same machinery and
+        // hold the fd alive for the duration of the test. Any
+        // sibling acquire must time out behind this hold.
+        let lock_path = super::run_dir_lock_path(&dir).unwrap();
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let _peer_fd = crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)
+            .expect("peer flock attempt")
+            .expect("peer must acquire on a fresh lockfile");
+
+        let start = std::time::Instant::now();
+        let err =
+            super::acquire_run_dir_flock_with_timeout(&dir, std::time::Duration::from_millis(300))
+                .expect_err("acquire must fail while peer holds LOCK_EX");
+        let elapsed = start.elapsed();
+        // Sanity: the helper waited at least roughly the requested
+        // timeout before erroring — proves it polled rather than
+        // returning EWOULDBLOCK on the first try.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "acquire must wait ~timeout before erroring; elapsed={elapsed:?}",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out"),
+            "error must surface the timeout cause; got: {msg}",
+        );
+        assert!(
+            msg.contains("LOCK_EX"),
+            "error must name the flock mode for operator triage; got: {msg}",
         );
     }
 

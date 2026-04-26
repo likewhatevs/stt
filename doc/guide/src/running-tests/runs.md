@@ -68,6 +68,13 @@ stats output. Operators driving subdirectory layouts must clean
 those subdirectories themselves; pre-clear's contract covers the
 top-level only.
 
+### Filesystem requirement
+
+The runs root must reside on a local filesystem (ext4, xfs,
+btrfs, tmpfs). NFS and other remote filesystems are rejected by
+the advisory lock used for cross-process sidecar-write
+serialization.
+
 ### Unknown-commit collisions
 
 When the test process is not inside a git repository (so
@@ -128,13 +135,16 @@ tree copied off a CI host). They do NOT consult
    cargo ktstr stats list
    ```
 
-   Each row carries `RUN`, `TESTS`, and `DATE` columns. `DATE` is
-   the earliest sidecar timestamp present in the directory — under
-   the last-writer-wins semantics, this equals the **most recent
-   run's first sidecar timestamp** (the prior run's sidecars were
-   pre-cleared at the new run's first write, so only the new
-   run's timestamps remain). Rows are ordered by directory mtime,
-   most recent first.
+   Each row carries `RUN`, `TESTS`, `DATE`, and `ARCH` columns.
+   `DATE` is the earliest sidecar timestamp present in the
+   directory — under the last-writer-wins semantics, this equals
+   the **most recent run's first sidecar timestamp** (the prior
+   run's sidecars were pre-cleared at the new run's first write,
+   so only the new run's timestamps remain). `ARCH` is the
+   `host.arch` value (`x86_64`, `aarch64`, …) from the run's
+   first sidecar, or `-` when no sidecar carries a populated host
+   context. Rows are ordered by directory mtime, most recent
+   first.
 
 4. **Compare** across dimensions:
 
