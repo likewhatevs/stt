@@ -4893,6 +4893,147 @@ mod tests {
     use super::*;
     use crate::scenario;
 
+    // -- explain-sidecar test helpers (#140) --
+    //
+    // Twelve+ tests in this module follow the same on-disk layout
+    // boilerplate: open a tempdir, create a `<tmp>/<run-name>/`
+    // directory, write one or more `.ktstr.json` files into it,
+    // call `explain_sidecar(<run-name>, Some(tmp.path()), ...)`.
+    // The helpers below collapse that boilerplate so:
+    //
+    // - new tests do not have to re-derive the directory layout
+    //   (parent test code is the only place gauntlet-job nesting
+    //   has to land);
+    // - a regression that drifts the `.ktstr.json` filename
+    //   convention surfaces in one place rather than across
+    //   every test that hand-rolls the path.
+    //
+    // Each helper holds the `tempfile::TempDir` alive via the
+    // returned tuple — dropping the helper drops the directory.
+    // Per CLAUDE.md "follow established patterns": these helpers
+    // mirror the existing `let tmp = tempfile::tempdir().unwrap();
+    // let run_dir = tmp.path().join(name); std::fs::create_dir
+    // (&run_dir).unwrap();` pattern used at every prior test
+    // site, just lifted into one place.
+
+    /// Create a tempdir + a named run directory inside it. Returns
+    /// `(TempDir, run_dir_path)`. The TempDir guard MUST be kept
+    /// alive in the test scope so the directory survives until
+    /// the test asserts; Rust drops it at the end of the function
+    /// scope, which deletes the directory tree.
+    fn make_test_run(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let run_dir = tmp.path().join(name);
+        std::fs::create_dir(&run_dir).expect("create run dir");
+        (tmp, run_dir)
+    }
+
+    /// Write a serialized [`crate::test_support::SidecarResult`] to
+    /// `<dir>/<key>.ktstr.json`. `key` is the variant-hash-shaped
+    /// prefix used by the production writer (see
+    /// `sidecar_variant_hash`); tests typically use `"a-0000…0"`
+    /// or a per-test `t-…` for filename-sort determinism.
+    fn write_sidecar(
+        dir: &std::path::Path,
+        key: &str,
+        sc: &crate::test_support::SidecarResult,
+    ) -> std::path::PathBuf {
+        let path = dir.join(format!("{key}.ktstr.json"));
+        let json = serde_json::to_string(sc).expect("fixture must serialize");
+        std::fs::write(&path, json).expect("write sidecar");
+        path
+    }
+
+    /// Write raw bytes (intended to be unparseable JSON or an
+    /// alternate serialization of `SidecarResult` with mutated
+    /// keys) to `<dir>/<key>.ktstr.json`. Used by parse-failure
+    /// and old-key-archive tests. Returns the resolved path so
+    /// callers can assert against `path.display().to_string()`.
+    fn write_corrupt_sidecar(dir: &std::path::Path, key: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(format!("{key}.ktstr.json"));
+        std::fs::write(&path, body).expect("write corrupt sidecar");
+        path
+    }
+
+    /// `Vec<T>` field names on [`crate::test_support::SidecarResult`].
+    /// These fields are hard-required (serde fails deserialize on
+    /// absence) and serialize as `[]` when empty — distinct from
+    /// the 10 `Option<T>` fields the diagnostic surface enumerates.
+    /// The catalog and projection helper MUST never surface these
+    /// names, since "missing Option" and "empty Vec" are different
+    /// invariants.
+    ///
+    /// Pinned as a constant so the
+    /// [`explain_sidecar_does_not_flag_empty_vec_fields_as_none`]
+    /// test and any future Vec-aware test source the same list.
+    /// A schema change that adds, removes, or renames a Vec
+    /// field MUST update this constant — the
+    /// [`sidecar_vec_fields_drift_guard`] test fires when the
+    /// runtime fixture's Vec field set diverges.
+    pub(super) const SIDECAR_VEC_FIELDS: &[&str] = &[
+        "metrics",
+        "stimulus_events",
+        "active_flags",
+        "verifier_stats",
+        "sysctls",
+        "kargs",
+    ];
+
+    /// Drift guard: serialize `SidecarResult::test_fixture()` and
+    /// confirm every name in [`SIDECAR_VEC_FIELDS`] appears as an
+    /// array-typed key in the JSON, AND that the count of array
+    /// keys equals the constant's length. A schema change that
+    /// promotes a Vec to an Option (or vice versa), renames a
+    /// Vec field, or adds a new one without updating
+    /// [`SIDECAR_VEC_FIELDS`] surfaces here — preventing the
+    /// constant from going stale relative to the live struct.
+    ///
+    /// Distinct from
+    /// [`none_catalog_covers_every_option_field`]: that test
+    /// guards Option-arity, this one guards Vec-arity. A schema
+    /// change must satisfy both.
+    #[test]
+    fn sidecar_vec_fields_drift_guard() {
+        let sc = crate::test_support::SidecarResult::test_fixture();
+        let value = serde_json::to_value(&sc).expect("fixture must serialize");
+        let obj = value.as_object().expect("fixture is an Object");
+        // Every name in SIDECAR_VEC_FIELDS must serialize as a
+        // JSON array.
+        for name in SIDECAR_VEC_FIELDS {
+            let v = obj.get(*name).unwrap_or_else(|| {
+                panic!(
+                    "SIDECAR_VEC_FIELDS lists `{name}` but \
+                                            it is not on the serialized fixture — \
+                                            schema rename or removal not propagated \
+                                            to the constant"
+                )
+            });
+            assert!(
+                v.is_array(),
+                "SIDECAR_VEC_FIELDS lists `{name}` but it is not a \
+                 JSON array on the fixture — schema flipped Vec→Option \
+                 or another shape; update the constant",
+            );
+        }
+        // Count guard: every JSON array key on the fixture must
+        // be in the constant. Catches Vec additions that didn't
+        // update the constant.
+        let array_keys: Vec<&str> = obj
+            .iter()
+            .filter(|(_, v)| v.is_array())
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            array_keys.len(),
+            SIDECAR_VEC_FIELDS.len(),
+            "SidecarResult has {} JSON-array fields, SIDECAR_VEC_FIELDS \
+             lists {}. Drift detected — update the constant. \
+             Live array keys: {array_keys:?}; constant: {SIDECAR_VEC_FIELDS:?}",
+            array_keys.len(),
+            SIDECAR_VEC_FIELDS.len(),
+        );
+    }
+
     // -- parse_topology_string --
 
     /// Happy path: a canonical `"n,l,c,t"` string round-trips to the
@@ -5440,30 +5581,45 @@ mod tests {
             "actionable-class fields must surface their tag: {out}",
         );
         // The fix: line must surface for entries that carry one.
-        // Spot-check the project_commit fix (a stable, single-
-        // sentence remediation that wouldn't accidentally appear
-        // in any other rendered string).
+        // Catalog-derived rather than hardcoded — sourcing the
+        // expected string from `SIDECAR_NONE_CATALOG` makes the
+        // assertion auto-update if the catalog's fix prose changes
+        // (e.g. wording polish). A regression that drops the fix
+        // line entirely still surfaces; only intentional prose
+        // edits avoid the test churn that hardcoding would force.
+        let project_commit_fix = super::SIDECAR_NONE_CATALOG
+            .iter()
+            .find(|e| e.field == "project_commit")
+            .and_then(|e| e.fix)
+            .expect("project_commit must carry a fix per the design ruling");
         assert!(
-            out.contains(
-                "fix: run from inside a git-tracked source tree with at \
-                 least one commit",
-            ),
-            "project_commit's fix: line must render: {out}",
+            out.contains(&format!("fix: {project_commit_fix}")),
+            "project_commit's fix: line must render its catalog \
+             prose verbatim ({project_commit_fix:?}): {out}",
         );
         // Entries without a fix must NOT emit a `fix:` line for
-        // that field. The test fixture has every Option as None
-        // including the fix=None entries (scheduler_commit,
-        // payload, monitor, kvm_stats, kernel_version,
-        // cleanup_duration_ms), so a regression that emitted
-        // an empty-string fix would surface as a stray
-        // `fix: \n` somewhere — count the fix lines and assert
-        // it matches the count of fix=Some entries (4: project_
-        // commit, kernel_commit, host, run_source).
+        // that field. The test fixture has every Option as None,
+        // so the rendered output must contain exactly one
+        // `fix:` line per catalog entry whose `fix` is `Some(_)`,
+        // and zero for entries whose `fix` is `None`. A
+        // regression that emitted an empty-string fix would
+        // surface as a stray `fix: \n` somewhere and inflate the
+        // count beyond the catalog's true fix-bearing population.
+        //
+        // Catalog-derived count: a future entry that adds or
+        // drops a `fix:` updates `SIDECAR_NONE_CATALOG`, and
+        // this assertion auto-tracks. Hardcoding `== 4` would
+        // require a coordinated edit at every catalog change.
         let fix_line_count = out.matches("\n      fix:").count();
+        let expected_fix_count = super::SIDECAR_NONE_CATALOG
+            .iter()
+            .filter(|e| e.fix.is_some())
+            .count();
         assert_eq!(
-            fix_line_count, 4,
-            "exactly 4 entries carry a fix: in the catalog \
-             (project_commit, kernel_commit, host, run_source); \
+            fix_line_count, expected_fix_count,
+            "exactly {expected_fix_count} entries carry a fix: in \
+             the catalog (count derived via \
+             SIDECAR_NONE_CATALOG.iter().filter(|e| e.fix.is_some()).count()); \
              output emitted {fix_line_count}: {out}",
         );
     }
@@ -6091,13 +6247,11 @@ mod tests {
     /// `enriched_parse_error_message_returns_prose_for_host_missing_pattern`.
     #[test]
     fn explain_sidecar_text_omits_enriched_line_for_generic_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let run_dir = tmp.path().join("run-generic-fail-text");
-        std::fs::create_dir(&run_dir).unwrap();
+        let (tmp, run_dir) = make_test_run("run-generic-fail-text");
         // `garbage{` triggers a generic serde parse error — no
         // enrichment applies, so the `enriched:` line must NOT
         // appear in the rendered output.
-        std::fs::write(run_dir.join("a-0000000000000000.ktstr.json"), "garbage{").unwrap();
+        write_corrupt_sidecar(&run_dir, "a-0000000000000000", "garbage{");
         let out = super::explain_sidecar("run-generic-fail-text", Some(tmp.path()), false).unwrap();
         assert!(
             out.contains("corrupt sidecars (1):"),
@@ -6120,12 +6274,21 @@ mod tests {
     /// path on its own line, then the error message indented as
     /// "    error: ...". Operators see parse failures inline
     /// rather than relying on stderr eprintln.
+    ///
+    /// Positional invariant: the corrupt-sidecars block is a
+    /// TRAILING block — it must appear AFTER the
+    /// `walked N sidecar file(s), parsed M valid` header AND
+    /// after every per-sidecar `test:` block. A regression that
+    /// reordered output (e.g. emitted parse failures before the
+    /// header) would mislead operators reading top-down. Pin
+    /// the relative position so that ordering is enforced.
     #[test]
     fn explain_sidecar_text_appends_corrupt_sidecars_block() {
         let tmp = tempfile::tempdir().unwrap();
         let run_dir = tmp.path().join("run-text-corrupt");
         std::fs::create_dir(&run_dir).unwrap();
-        let valid = crate::test_support::SidecarResult::test_fixture();
+        let mut valid = crate::test_support::SidecarResult::test_fixture();
+        valid.test_name = "valid_test".to_string();
         std::fs::write(
             run_dir.join("a-0000000000000000.ktstr.json"),
             serde_json::to_string(&valid).unwrap(),
@@ -6147,22 +6310,48 @@ mod tests {
             out.contains("    error:"),
             "corrupt-sidecars block must indent each error under its path: {out}",
         );
+        // Positional ordering: the header (`walked N sidecar file(s)`),
+        // then the per-sidecar block (`test: valid_test`), then
+        // the trailing `corrupt sidecars (N):` block. Failing
+        // any of these orderings would produce a confusing
+        // top-down read.
+        let header_pos = out
+            .find("walked 2 sidecar file(s)")
+            .expect("walked-header must precede everything");
+        let test_block_pos = out
+            .find("test: valid_test")
+            .expect("per-sidecar block must emit for the valid file");
+        let corrupt_pos = out
+            .find("corrupt sidecars (1):")
+            .expect("corrupt-sidecars block must emit");
+        assert!(
+            header_pos < test_block_pos,
+            "header must precede per-sidecar blocks: {out}",
+        );
+        assert!(
+            test_block_pos < corrupt_pos,
+            "per-sidecar blocks must precede the trailing corrupt \
+             block — operators read top-down: {out}",
+        );
     }
 
     /// The "corrupt sidecars" block is suppressed when the walk
     /// produced zero parse failures. Common case for clean runs;
     /// emitting an empty header would be visual noise.
+    ///
+    /// First test in the module migrated to the
+    /// [`make_test_run`] / [`write_sidecar`] helpers (#140) — the
+    /// boilerplate previously open-coded across 12+ tests now
+    /// flows through the helpers, so a future regression in the
+    /// shared on-disk layout surfaces in one place. Existing
+    /// tests will migrate as they're touched for unrelated
+    /// reasons; a wholesale sweep is out of scope for the
+    /// helper-extraction task itself.
     #[test]
     fn explain_sidecar_text_omits_corrupt_block_when_no_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let run_dir = tmp.path().join("run-text-clean");
-        std::fs::create_dir(&run_dir).unwrap();
+        let (tmp, run_dir) = make_test_run("run-text-clean");
         let sc = crate::test_support::SidecarResult::test_fixture();
-        std::fs::write(
-            run_dir.join("t-0000000000000000.ktstr.json"),
-            serde_json::to_string(&sc).unwrap(),
-        )
-        .unwrap();
+        write_sidecar(&run_dir, "t-0000000000000000", &sc);
         let out = super::explain_sidecar("run-text-clean", Some(tmp.path()), false).unwrap();
         assert!(
             !out.contains("corrupt sidecars"),
@@ -6210,18 +6399,15 @@ mod tests {
             out.contains("none fields: <all populated>"),
             "all Options populated — must report no None fields: {out}",
         );
-        // Six Vec field names — none must appear anywhere as a
-        // diagnosed field. Substring match is safe: these are
-        // distinctive snake_case identifiers, no false positives in
-        // the rendered output.
-        for vec_field in [
-            "metrics",
-            "stimulus_events",
-            "active_flags",
-            "verifier_stats",
-            "sysctls",
-            "kargs",
-        ] {
+        // Source the Vec field names from the SIDECAR_VEC_FIELDS
+        // constant — single source of truth shared with
+        // `sidecar_vec_fields_drift_guard`. A schema change that
+        // renames or adds a Vec field updates the constant in
+        // one place; this assertion picks up the new name
+        // without an independent edit. Substring match is safe:
+        // these are distinctive snake_case identifiers, no false
+        // positives in the rendered output.
+        for vec_field in SIDECAR_VEC_FIELDS {
             assert!(
                 !out.contains(vec_field),
                 "Vec field '{vec_field}' is hard-required (not Option) and \
@@ -6396,6 +6582,15 @@ mod tests {
     /// flipping any field's classification would silently mislead
     /// dashboards and triage. Pin the exact mapping per the
     /// catalog's documented design ruling.
+    ///
+    /// HashMap dedup guard: collecting catalog entries into a
+    /// `HashMap` keyed by field name silently overwrites
+    /// duplicates — two entries with the same `field` would
+    /// land as one, and the test would read whichever survived
+    /// without ever signaling the duplication. Asserting that
+    /// `by_field.len() == SIDECAR_NONE_CATALOG.len()` catches
+    /// a regression where two catalog entries share a field
+    /// name (rename collision, copy-paste).
     #[test]
     fn explain_sidecar_classification_accuracy_per_field() {
         let by_field: std::collections::HashMap<&'static str, super::NoneClassification> =
@@ -6403,6 +6598,21 @@ mod tests {
                 .iter()
                 .map(|e| (e.field, e.classification))
                 .collect();
+        // Dedup guard: HashMap collapses duplicate keys silently.
+        // If two catalog entries shared a field name, this length
+        // would diverge from the catalog length and the
+        // per-field assertions below would silently miss the
+        // overwritten entry.
+        assert_eq!(
+            by_field.len(),
+            super::SIDECAR_NONE_CATALOG.len(),
+            "SIDECAR_NONE_CATALOG must have unique `field` values \
+             — HashMap collected {} entries, catalog has {}. Two \
+             entries sharing a name would silently overwrite during \
+             collect.",
+            by_field.len(),
+            super::SIDECAR_NONE_CATALOG.len(),
+        );
         // Per-field expected classification — pinned from the
         // catalog's documented design ruling. Two Expected
         // (steady-state None with no operator action), eight
@@ -6633,6 +6843,156 @@ mod tests {
         assert!(
             io_errs.is_empty(),
             "no IO failures — _walk.io_errors must be empty: {out}",
+        );
+    }
+
+    // -- explain_sidecar E2E enrichment rendering (#139) --
+
+    /// Direct-renderer test: construct a synthetic [`WalkStats`]
+    /// carrying a [`crate::test_support::SidecarParseError`] with a
+    /// non-`None` `enriched_message`, call
+    /// [`super::render_explain_sidecar_text`] in isolation, and
+    /// assert the trailing `corrupt sidecars` block emits both
+    /// the raw `error:` line AND the `enriched:` line below it.
+    ///
+    /// Why bypass `explain_sidecar`'s public surface: producing
+    /// an enriched parse failure end-to-end requires fabricating
+    /// a sidecar whose serde error contains both `"missing field"`
+    /// and ``"`host`"`` substrings (the
+    /// `enriched_parse_error_message` trigger). Modern
+    /// [`crate::test_support::SidecarResult`] declares `host:
+    /// Option<HostContext>`, so serde tolerates absence and never
+    /// emits that error — meaning the enrichment surface is
+    /// otherwise unreachable from the live schema. Driving the
+    /// renderer directly with a synthetic `SidecarParseError`
+    /// pins the rendering invariant without depending on a
+    /// schema bump that promotes `host` to non-Option.
+    ///
+    /// Sibling [`explain_sidecar_json_e2e_enrichment_renders_in_walk_errors`]
+    /// pins the JSON-channel rendering of the same input.
+    /// Together they guarantee the enrichment payload reaches
+    /// both output channels — the prior coverage matrix
+    /// exercised the catalog (`enriched_parse_error_message_returns_prose_for_host_missing_pattern`)
+    /// and the renderer (`explain_sidecar_text_omits_enriched_line_for_generic_failure`)
+    /// but never the enriched-rendering path itself.
+    #[test]
+    fn explain_sidecar_text_e2e_enrichment_renders_in_corrupt_block() {
+        let parse_err = crate::test_support::SidecarParseError {
+            path: std::path::PathBuf::from("/tmp/example-run/sidecar.ktstr.json"),
+            raw_error: "missing field `host` at line 1 column 100".to_string(),
+            enriched_message: Some(
+                "ktstr_test: skipping /tmp/example-run/sidecar.ktstr.json: \
+                 missing field `host` ... — re-run the test"
+                    .to_string(),
+            ),
+        };
+        let walk = super::WalkStats {
+            walked: 1,
+            valid: 0,
+            errors: vec![parse_err],
+            io_errors: Vec::new(),
+        };
+        let out = super::render_explain_sidecar_text(&[], &walk);
+
+        // The corrupt-sidecars header MUST emit (errors vec non-empty).
+        assert!(
+            out.contains("corrupt sidecars (1):"),
+            "non-empty errors must surface the trailing block: {out}",
+        );
+        // Both the `error:` line (raw serde) and the `enriched:`
+        // line (catalog prose) must emit, in that order, indented
+        // under the path. Asserting on the substring catches a
+        // regression that drops either channel.
+        assert!(
+            out.contains("    error: missing field `host`"),
+            "raw serde error must render verbatim: {out}",
+        );
+        assert!(
+            out.contains("    enriched: "),
+            "enriched line must render below the raw error: {out}",
+        );
+        // Positional ordering: the `error:` line must appear
+        // BEFORE the `enriched:` line in the rendered text. A
+        // regression that swaps the two would surface here.
+        let error_pos = out
+            .find("    error: ")
+            .expect("error: substring must be present");
+        let enriched_pos = out
+            .find("    enriched: ")
+            .expect("enriched: substring must be present");
+        assert!(
+            error_pos < enriched_pos,
+            "raw `error:` line must precede `enriched:` line in \
+             the rendered text — operator reads grep-friendly raw \
+             first, then human remediation: {out}",
+        );
+    }
+
+    /// JSON-channel mirror of
+    /// [`explain_sidecar_text_e2e_enrichment_renders_in_corrupt_block`].
+    /// Constructs a synthetic [`WalkStats`] with one enriched
+    /// [`crate::test_support::SidecarParseError`] and validates
+    /// that [`super::render_explain_sidecar_json`] emits the
+    /// enriched prose under `_walk.errors[].enriched_message` as
+    /// a JSON string (not null).
+    ///
+    /// Counterweight to the existing
+    /// [`explain_sidecar_json_walk_errors_lists_corrupt_files`]
+    /// test which only covers the generic-failure case
+    /// (enriched_message: null). Without this test, a regression
+    /// that dropped `enriched_message.as_deref()` and emitted a
+    /// constant null would pass every prior JSON test.
+    #[test]
+    fn explain_sidecar_json_e2e_enrichment_renders_in_walk_errors() {
+        let prose = "ktstr_test: skipping path: missing field `host` \
+                     — re-run the test to regenerate";
+        let parse_err = crate::test_support::SidecarParseError {
+            path: std::path::PathBuf::from("/tmp/example-run/sidecar.ktstr.json"),
+            raw_error: "missing field `host` at line 1 column 100".to_string(),
+            enriched_message: Some(prose.to_string()),
+        };
+        let walk = super::WalkStats {
+            walked: 1,
+            valid: 0,
+            errors: vec![parse_err],
+            io_errors: Vec::new(),
+        };
+        let out = super::render_explain_sidecar_json(&[], &walk);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("json output must round-trip parse");
+
+        let errors = parsed
+            .get("_walk")
+            .and_then(|w| w.get("errors"))
+            .and_then(|e| e.as_array())
+            .expect("_walk.errors must be a JSON array");
+        assert_eq!(
+            errors.len(),
+            1,
+            "synthetic input has exactly one parse error: {out}",
+        );
+        let entry = &errors[0];
+        // `enriched_message` MUST be a JSON string carrying the
+        // catalog prose verbatim — not null, not a different
+        // string. A regression that emitted `null` for non-None
+        // `enriched_message` would fail here.
+        let enriched = entry
+            .get("enriched_message")
+            .and_then(|v| v.as_str())
+            .expect("enriched_message must be a JSON string for enriched failures");
+        assert_eq!(
+            enriched, prose,
+            "enriched_message must round-trip the catalog prose verbatim: {out}",
+        );
+        // The raw `error` field still emits alongside — both
+        // channels are exposed so dashboards can pick.
+        let raw = entry
+            .get("error")
+            .and_then(|v| v.as_str())
+            .expect("error must be a JSON string");
+        assert!(
+            raw.contains("missing field"),
+            "raw error must round-trip verbatim alongside enriched: {out}",
         );
     }
 
