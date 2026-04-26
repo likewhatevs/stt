@@ -55,17 +55,22 @@ affects where new sidecars are written and what bare
    cargo ktstr stats list
    ```
 
-4. **Compare** two runs:
+4. **Compare** across dimensions:
 
    ```sh
-   cargo ktstr stats compare 6.14-20260424T014200Z 7.0-20260424T015830Z
-   cargo ktstr stats compare 6.14-20260424T014200Z 7.0-20260424T015830Z -E cgroup_steady
+   cargo ktstr stats compare --a-kernel 6.14 --b-kernel 7.0
+   cargo ktstr stats compare --a-kernel 6.14 --b-kernel 7.0 -E cgroup_steady
+   cargo ktstr stats compare --a-scheduler scx_rusty --b-scheduler scx_lavd --kernel 6.14
    ```
 
-   Per-metric deltas are computed using the unified `MetricDef`
-   registry (polarity, absolute and relative thresholds). Output is
-   colored: red for regressions, green for improvements. The command
-   exits non-zero when regressions are detected.
+   Per-side filters (`--a-*` / `--b-*`) partition the sidecar pool
+   into two sides; shared filters (`--kernel`, `--scheduler`, etc.)
+   pin both sides. Per-metric deltas are computed using the unified
+   `MetricDef` registry (polarity, absolute and relative thresholds).
+   Output is colored: red for regressions, green for improvements.
+   The command exits non-zero when regressions are detected. Use
+   `cargo ktstr stats list-values` to discover available dimension
+   values before constructing a comparison.
 
 5. **Print analysis** for the most recent run (no subcommand):
 
