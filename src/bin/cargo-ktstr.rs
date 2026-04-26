@@ -653,6 +653,14 @@ enum StatsCommand {
         /// A-side overrides: replace the corresponding shared
         /// `--X` value for the A side only. See the per-side
         /// semantics on each `--X` flag's doc.
+        ///
+        /// `--a-kernel` carries the same match-shape rule as the
+        /// shared `--kernel`: a two-segment value (e.g.
+        /// `--a-kernel 6.12`) is a major.minor PREFIX matching
+        /// every patch release in that series; a three-or-more-
+        /// segment value (`6.14.2`, `6.15-rc3`) is strict
+        /// equality. NOT strict equality across the board — see
+        /// [`kernel_filter_matches`] for the cutoff implementation.
         #[arg(long = "a-kernel", action = ArgAction::Append)]
         a_kernel: Vec<String>,
         #[arg(long = "a-project-commit", action = ArgAction::Append)]
@@ -673,6 +681,14 @@ enum StatsCommand {
         /// B-side overrides: replace the corresponding shared
         /// `--X` value for the B side only. See the per-side
         /// semantics on each `--X` flag's doc.
+        ///
+        /// `--b-kernel` carries the same match-shape rule as the
+        /// shared `--kernel`: a two-segment value (e.g.
+        /// `--b-kernel 6.12`) is a major.minor PREFIX matching
+        /// every patch release in that series; a three-or-more-
+        /// segment value (`6.14.2`, `6.15-rc3`) is strict
+        /// equality. NOT strict equality across the board — see
+        /// [`kernel_filter_matches`] for the cutoff implementation.
         #[arg(long = "b-kernel", action = ArgAction::Append)]
         b_kernel: Vec<String>,
         #[arg(long = "b-project-commit", action = ArgAction::Append)]
@@ -1007,6 +1023,38 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Dedupe identical (label, path) tuples before collision
+    // detection: two `--kernel 6.14.2` specs (or a Range that
+    // overlaps a separate Version spec) resolve to the same
+    // (label, path) pair by construction — `resolve_one` is
+    // deterministic per spec, so identical inputs produce
+    // identical outputs. Letting the duplicate flow into
+    // `detect_label_collisions` would trip its same-label
+    // diagnostic on a fundamentally benign input. Tuple-level
+    // dedup keeps the intent ("dedupe identical specs") narrow:
+    // two specs that produce the SAME label but DIFFERENT paths
+    // represent a real cache-key collision that
+    // `detect_label_collisions` must still catch — those rows
+    // survive dedup because their tuples differ on the path.
+    //
+    // Order-preserving dedup via a sequential first-seen pass:
+    // the rayon pipeline upstream may have shuffled the input
+    // order, so we honor whatever order arrived (the downstream
+    // wire format is `;`-separated and order-insensitive at the
+    // dispatch layer; preserving order keeps stderr diagnostics
+    // operator-readable). HashSet membership check + Vec push
+    // is O(n) — acceptable on the ~10s-of-kernels scale this
+    // function targets.
+    let mut seen: std::collections::HashSet<(String, PathBuf)> =
+        std::collections::HashSet::with_capacity(resolved.len());
+    let mut deduped: Vec<(String, PathBuf)> = Vec::with_capacity(resolved.len());
+    for entry in resolved {
+        if seen.insert(entry.clone()) {
+            deduped.push(entry);
+        }
+    }
+    let resolved = deduped;
+
     detect_label_collisions(&resolved)?;
     Ok(resolved)
 }
@@ -1023,12 +1071,19 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
 /// inputs (e.g. spell `6.14.2` and `git+...#6.14.2` distinctly
 /// rather than relying on suffix-encoded identity).
 ///
-/// Identical labels appearing twice ARE a collision under this
-/// check — `seen.insert` finds the prior occurrence and surfaces a
-/// `labels "X" and "X"` diagnostic. De-duplication of identical
-/// `--kernel` specs is the operator's responsibility (or a future
-/// task #21); this helper is the last line of defense against the
-/// silent-routing class of bug.
+/// Identical (label, path) tuples are deduped UPSTREAM in
+/// `resolve_kernel_set` before this helper runs, so two identical
+/// `--kernel 6.14.2` specs resolving to the same (label, path)
+/// pair never reach this check. What CAN reach this check is two
+/// distinct producer-side labels that sanitize to the same nextest
+/// suffix — that IS a real collision (different kernel content,
+/// same routing identity), and surfaces here. Same-label-different-
+/// path inputs (e.g. a hypothetical future producer that emits a
+/// label with cache-collision shape) also reach here because the
+/// upstream tuple-level dedup leaves them distinct, and
+/// `seen.insert` then finds the prior label and surfaces the
+/// `labels "X" and "X"` diagnostic. This helper is the last line
+/// of defense against the silent-routing class of bug.
 ///
 /// Extracted from `resolve_kernel_set` so the collision-detection
 /// algorithm is unit-testable on contrived inputs without driving
@@ -1155,10 +1210,56 @@ fn git_kernel_label(url: &str, git_ref: &str) -> String {
 /// KTSTR_KERNEL_LIST` reads as a meaningful kernel→path map rather
 /// than as raw cache-key plumbing.
 fn encode_kernel_list(resolved: &[(String, PathBuf)]) -> Result<String, String> {
+    // KTSTR_KERNEL_LIST wire format is
+    // `label1=path1;label2=path2;...`. Both metacharacters MUST be
+    // rejected on the label side: `;` would split the label into
+    // two pseudo-entries (the parser's `split(';')` upstream of
+    // `split_once('=')`); `=` would split label/path
+    // pathologically (the parser's `split_once('=')` consumes the
+    // FIRST `=`, so a label `a=b` paired with path `/x` would
+    // emit `a=b=/x` — the parser would treat `a` as the label
+    // and `b=/x` as the path). Rejecting at encode time bails
+    // with an actionable error rather than silently producing a
+    // malformed env var that the test-binary parser would split
+    // into garbage.
+    //
+    // Producers feeding this helper today (the encoder family
+    // around `path_kernel_label` / `git_kernel_label` /
+    // `version_kernel_label`) never emit either character in
+    // practice — basenames are `[a-zA-Z0-9._-]+`, version
+    // strings have `[0-9.-]`, and git labels are
+    // `git_{owner}_{repo}_{ref}` with hash-stripped refs. The
+    // checks here guard against a future producer change OR a
+    // direct caller of `encode_kernel_list` (e.g. a unit test
+    // injecting synthetic input) that violates the wire-format
+    // invariant.
+    for (label, _) in resolved {
+        if label.contains(';') {
+            return Err(format!(
+                "kernel label {label:?} contains a `;`; \
+                 KTSTR_KERNEL_LIST uses `;` as the entry separator. \
+                 The label-emission path must produce `;`-free identifiers — \
+                 if a producer is emitting this label, fix the producer to \
+                 sanitize/strip `;` from its output."
+            ));
+        }
+        if label.contains('=') {
+            return Err(format!(
+                "kernel label {label:?} contains a `=`; \
+                 KTSTR_KERNEL_LIST uses `=` to separate label from path within an entry. \
+                 The label-emission path must produce `=`-free identifiers — \
+                 if a producer is emitting this label, fix the producer to \
+                 sanitize/strip `=` from its output."
+            ));
+        }
+    }
     // POSIX permits `;` in paths but the wire format uses it as
     // entry separator. Bail with an actionable error rather than
     // silently producing a malformed env var that the test-binary
-    // parser would split into garbage.
+    // parser would split into garbage. `=` in paths is fine — the
+    // parser's `split_once('=')` only consumes the first `=`,
+    // which sits inside the label↔path boundary; subsequent `=`s
+    // become part of the path payload verbatim.
     for (label, dir) in resolved {
         let path = dir.display().to_string();
         if path.contains(';') {
@@ -5055,6 +5156,68 @@ mod tests {
         assert!(
             err.contains("/cache/has;semicolon"),
             "error must include the offending path: {err}",
+        );
+    }
+
+    /// `;` in a label is a wire-format violation distinct from `;`
+    /// in a path: the parser's outer `split(';')` upstream of
+    /// `split_once('=')` would split a `;`-bearing label into two
+    /// pseudo-entries. The encoder rejects with an actionable error
+    /// before any output is built so the corrupted env never reaches
+    /// the test-binary parser. Pins the label-side label-validation
+    /// loop (sibling check to the path-side `;` rejection above).
+    #[test]
+    fn encode_kernel_list_rejects_semicolon_in_label() {
+        let resolved = vec![("evil;label".to_string(), PathBuf::from("/cache/clean"))];
+        let err = encode_kernel_list(&resolved)
+            .expect_err("label containing `;` must be rejected by encoder");
+        assert!(
+            err.contains("`;`"),
+            "error must reference the offending separator: {err}",
+        );
+        assert!(
+            err.contains("evil;label"),
+            "error must name the offending label so the operator \
+             can locate the producer that emitted it: {err}",
+        );
+        // The error explicitly identifies it as a LABEL error, not
+        // a path error — distinguishes from the path-side check
+        // whose message starts with `kernel directory path`.
+        assert!(
+            err.contains("kernel label"),
+            "error must classify the violation as a label problem (not \
+             a path problem) so an operator reading the diagnostic \
+             knows which side of the wire format is at fault: {err}",
+        );
+    }
+
+    /// `=` in a label is a wire-format violation: the parser's
+    /// inner `split_once('=')` consumes the FIRST `=` to separate
+    /// label from path, so a label `a=b` paired with path `/x` would
+    /// emit `a=b=/x`, and the parser would treat `a` as the label
+    /// and `b=/x` as the path — silently misrouting the kernel
+    /// directory. Pins the second label-validation check in
+    /// `encode_kernel_list`. (Note: `=` in PATHS is fine — the
+    /// parser only consumes the first `=` and subsequent ones land
+    /// inside the path payload — so there is no symmetric path-side
+    /// `=` rejection.)
+    #[test]
+    fn encode_kernel_list_rejects_equals_in_label() {
+        let resolved = vec![("evil=label".to_string(), PathBuf::from("/cache/clean"))];
+        let err = encode_kernel_list(&resolved)
+            .expect_err("label containing `=` must be rejected by encoder");
+        assert!(
+            err.contains("`=`"),
+            "error must reference the offending separator: {err}",
+        );
+        assert!(
+            err.contains("evil=label"),
+            "error must name the offending label so the operator \
+             can locate the producer that emitted it: {err}",
+        );
+        assert!(
+            err.contains("kernel label"),
+            "error must classify the violation as a label problem: {err}",
         );
     }
 
