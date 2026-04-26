@@ -1565,6 +1565,49 @@ pub fn prefer_source_tree_for_dwarf(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Read `dir/metadata.json` and return the persisted source-tree
+/// path when the entry was built from a local source tree
+/// ([`KernelSource::Local`] with `source_tree_path: Some(_)`).
+///
+/// Used by callers that have a path which may be either a
+/// kernel-cache entry directory (`<cache>/local-{hash7}-...`) or
+/// a kernel source tree, and need the source-tree path either
+/// way:
+///
+/// - When `dir` is a cache entry produced by `kernel build` /
+///   `cargo ktstr test --kernel /path/to/linux`, the metadata
+///   carries the original `source_tree_path` and this helper
+///   returns it.
+/// - When `dir` IS the source tree (no `metadata.json`, or
+///   metadata that isn't `KernelSource::Local`, or a Local
+///   entry with no recorded `source_tree_path`), this helper
+///   returns `None` and the caller falls back to using `dir`
+///   itself.
+///
+/// The two callers (cargo-ktstr.rs `gix::open(KTSTR_KERNEL)` site
+/// for `cargo ktstr stats compare`, and
+/// [`crate::test_support::sidecar::resolve_kernel_source_dir`]'s
+/// Path arm for sidecar `kernel_commit` resolution) need the
+/// same logic; centralising here avoids drift.
+///
+/// Distinct from [`prefer_source_tree_for_dwarf`]: that helper
+/// gates on a present `vmlinux` file inside the source tree (DWARF
+/// access requires the on-disk ELF). This helper does NOT — git
+/// repo / source-tree probes (commit detection, tree opens) only
+/// need the directory path, and the tree may be present without a
+/// rebuilt vmlinux.
+pub fn recover_local_source_tree(dir: &Path) -> Option<PathBuf> {
+    let metadata = read_metadata(dir).ok()?;
+    if let KernelSource::Local {
+        source_tree_path: Some(p),
+        ..
+    } = metadata.source
+    {
+        return Some(p);
+    }
+    None
+}
+
 /// Structural ELF sections that must survive any cache-time strip
 /// so that downstream readers can parse the result. Not tied to any
 /// specific consumer — independent of monitor or probe code.
@@ -5192,6 +5235,151 @@ mod tests {
              to None at the `let src_path = source_tree_path?;` line \
              — no filesystem probe must run",
         );
+    }
+
+    // -- recover_local_source_tree --
+    //
+    // Sibling helper to `prefer_source_tree_for_dwarf` but with
+    // distinct semantics: NO `vmlinux` presence check, NO arm for
+    // tarball/git entries (returns None when metadata.source isn't
+    // `KernelSource::Local`). Used by callers that just need the
+    // source tree directory (git open, commit detection); DWARF
+    // callers stay on `prefer_source_tree_for_dwarf` for the
+    // additional vmlinux gate.
+
+    /// Cache entry built from a local tree: helper returns the
+    /// recorded `source_tree_path` regardless of whether the
+    /// source tree still has a `vmlinux` on disk. The vmlinux gate
+    /// is `prefer_source_tree_for_dwarf`'s concern, NOT this
+    /// helper's — git tree opens and commit detection only need
+    /// the directory path.
+    #[test]
+    fn recover_local_source_tree_local_with_path_returns_source_tree() {
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        let src_tree = tmp.path().join("src");
+        fs::create_dir_all(&cache_entry).unwrap();
+        fs::create_dir_all(&src_tree).unwrap();
+        // Deliberately omit vmlinux from the source tree so this
+        // test pins the "no vmlinux gate" contract — a regression
+        // that copied prefer_source_tree_for_dwarf's vmlinux check
+        // would surface here as a None result.
+
+        let meta = KernelMetadata {
+            version: Some("6.14.2".to_string()),
+            source: KernelSource::Local {
+                source_tree_path: Some(src_tree.clone()),
+                git_hash: Some("abc1234".to_string()),
+            },
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            has_vmlinux: false,
+            vmlinux_stripped: false,
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(recover_local_source_tree(&cache_entry), Some(src_tree));
+    }
+
+    /// No `metadata.json` on disk: helper returns `None` and the
+    /// caller falls back to using the input dir verbatim
+    /// (cargo-ktstr stats compare's `gix::open` site treats the
+    /// env value as the source tree itself; sidecar's
+    /// `resolve_kernel_source_dir` Path arm does the same).
+    #[test]
+    fn recover_local_source_tree_no_metadata_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        // No metadata.json planted — `tmp.path()` is a bare empty
+        // tempdir, modeling the dirty-source-tree path that
+        // skipped cache store.
+        assert_eq!(recover_local_source_tree(tmp.path()), None);
+    }
+
+    /// `metadata.json` present but `source` is `Tarball`: helper
+    /// returns `None`. Tarball entries never carry a
+    /// `source_tree_path` (the extraction dir is transient);
+    /// callers should not probe a tarball entry as a git repo.
+    #[test]
+    fn recover_local_source_tree_tarball_source_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        fs::create_dir_all(&cache_entry).unwrap();
+
+        let meta = KernelMetadata {
+            version: Some("6.14.2".to_string()),
+            source: KernelSource::Tarball,
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            has_vmlinux: true,
+            vmlinux_stripped: true,
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(recover_local_source_tree(&cache_entry), None);
+    }
+
+    /// `Local` source with `source_tree_path: None` (the
+    /// dirty-tree case where the source-tree path was not
+    /// recorded): helper returns `None`. Distinct from the
+    /// no-metadata case but produces the same outcome.
+    #[test]
+    fn recover_local_source_tree_local_with_none_path_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        fs::create_dir_all(&cache_entry).unwrap();
+
+        let meta = KernelMetadata {
+            version: Some("6.14.2".to_string()),
+            source: KernelSource::Local {
+                source_tree_path: None,
+                git_hash: Some("abc1234".to_string()),
+            },
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            has_vmlinux: true,
+            vmlinux_stripped: true,
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(recover_local_source_tree(&cache_entry), None);
+    }
+
+    /// Malformed `metadata.json`: helper short-circuits to `None`
+    /// silently. Mirrors `prefer_source_tree_for_dwarf`'s contract
+    /// — a corrupt cache entry must not blow up callers; they fall
+    /// back to using the input dir verbatim.
+    #[test]
+    fn recover_local_source_tree_malformed_metadata_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        fs::create_dir_all(&cache_entry).unwrap();
+        fs::write(
+            cache_entry.join("metadata.json"),
+            br#"{"not_kernel_metadata": true}"#,
+        )
+        .unwrap();
+        assert_eq!(recover_local_source_tree(&cache_entry), None);
     }
 
     // -- strip_vmlinux_debug --

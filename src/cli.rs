@@ -1932,8 +1932,13 @@ pub(crate) fn acquire_build_reservation(
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 ///
-/// `is_local_source` should be true when the user passed `--source`.
-/// It controls the mrproper warning and `source_tree_path` in metadata.
+/// `is_local_source` should be true when the source is a local
+/// kernel source tree, regardless of how the caller arrived there
+/// (`kernel build --source`, `cargo ktstr test --kernel <path>`,
+/// or any other Path-spec entry that funnels through
+/// [`resolve_kernel_dir`] / [`resolve_kernel_dir_to_entry`]). It
+/// controls the mrproper warning and `source_tree_path` in
+/// metadata.
 pub fn kernel_build_pipeline(
     acquired: &crate::fetch::AcquiredSource,
     cache: &crate::cache::CacheDir,
@@ -4257,6 +4262,115 @@ pub fn resolve_git_kernel(url: &str, git_ref: &str, cli_label: &str) -> Result<s
     }
 }
 
+/// Cache-hit signal returned from [`resolve_kernel_dir_to_entry`]
+/// when a clean source tree's cache entry was found and reused
+/// without invoking [`kernel_build_pipeline`].
+///
+/// Carries the cache key and the persisted `built_at` ISO-8601
+/// timestamp so callers can render a user-facing line that names
+/// both the cache identity and the build age. `None` (returned
+/// from the same function) means the build pipeline ran — either
+/// to populate the cache (clean-tree cache miss) or to build
+/// directly without storing (dirty-tree path).
+#[derive(Debug, Clone)]
+pub struct KernelDirCacheHit {
+    /// Cache key that resolved to this entry, e.g.
+    /// `local-abc1234-x86_64-kc{suffix}`.
+    pub cache_key: String,
+    /// ISO-8601 timestamp recorded in the entry's `metadata.json`
+    /// at store time. Suitable for `humantime::parse_rfc3339`.
+    pub built_at: String,
+}
+
+/// Resolve a source-tree path through the local-kernel cache,
+/// returning the DIRECTORY that holds the resulting boot image
+/// plus a cache-hit signal.
+///
+/// For a clean source tree:
+///   - Cache hit on `local-{hash7}-{arch}-kc{suffix}` → returns
+///     `(CACHE_ENTRY_DIR, Some(KernelDirCacheHit))`. The build
+///     pipeline does not run.
+///   - Cache miss → runs [`kernel_build_pipeline`] which builds
+///     in the source tree and stores a stripped vmlinux + boot
+///     image under the cache entry; returns
+///     `(CACHE_ENTRY_DIR, None)`.
+///
+/// For a dirty source tree:
+///   - [`kernel_build_pipeline`] skips the cache store
+///     (`is_dirty` short-circuit at the cache-store boundary) and
+///     returns the source-tree image. This function returns
+///     `(CANONICAL_SOURCE_DIR, None)` (boot image at
+///     `<source>/arch/<arch>/boot/<image_name>`).
+///
+/// The optional [`KernelDirCacheHit`] in the return tuple lets
+/// callers emit a user-facing cache-hit log without duplicating
+/// the (expensive) `local_source` and cache-lookup work. Returning
+/// `None` covers both the cache-miss-after-build and dirty-build
+/// branches; callers that want to distinguish them can probe the
+/// returned directory shape (cache entry vs source tree).
+///
+/// Both directory return shapes are valid inputs to
+/// [`crate::kernel_path::find_image_in_dir`], which probes both
+/// layouts. Callers that need the boot-image FILE path (not the
+/// directory) should use [`resolve_kernel_dir`] instead — that
+/// function applies the same pipeline but returns the image path.
+///
+/// Used by `cargo-ktstr`'s Path-spec resolver to wire `--kernel
+/// PATH` invocations through the same cache pipeline that
+/// Version/CacheKey/Git specs use, so a clean source-tree rebuild
+/// hits the cache instead of re-running `make`.
+///
+/// `cli_label` prefixes status output and is threaded into
+/// [`kernel_build_pipeline`]'s diagnostic surface. `cpu_cap`
+/// forwards the resource-budget cap; `None` keeps the
+/// 30%-of-allowed default. See [`resolve_kernel_dir`] for the
+/// matching image-returning sibling's `cpu_cap` rationale —
+/// identical here because both functions reach the same pipeline.
+pub fn resolve_kernel_dir_to_entry(
+    path: &std::path::Path,
+    cli_label: &str,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+) -> Result<(std::path::PathBuf, Option<KernelDirCacheHit>)> {
+    let acquired = acquire_local_source_tree(path)?;
+    let cache_key = acquired.cache_key.clone();
+    // Open the cache once and reuse for both the clean-tree
+    // lookup and the post-build store. Both legs need the same
+    // root resolution; opening twice is wasted work and risks
+    // a TOCTOU split if `KTSTR_CACHE_DIR` changes between calls.
+    // A failure here is fatal — we cannot proceed without a cache
+    // root for either lookup or store.
+    let cache = crate::cache::CacheDir::new()?;
+
+    // Clean trees: cache lookup before build.
+    if !acquired.is_dirty
+        && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label)
+    {
+        // `entry.path` is the cache entry directory; the boot
+        // image lives at `<entry.path>/<image_name>`. Verify the
+        // image is actually present before returning, so a
+        // partially-corrupt entry doesn't bypass the
+        // build-and-restore path.
+        if entry.image_path().exists() {
+            let hit = KernelDirCacheHit {
+                cache_key: cache_key.clone(),
+                built_at: entry.metadata.built_at.clone(),
+            };
+            return Ok((entry.path, Some(hit)));
+        }
+    }
+
+    let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap)?;
+
+    // Prefer the cached entry directory (stable across rebuilds).
+    // For dirty trees, `entry` is `None` — fall back to the
+    // canonical source directory, which `local_source` already
+    // resolved into `acquired.source_dir`.
+    match result.entry {
+        Some(entry) => Ok((entry.path, None)),
+        None => Ok((acquired.source_dir, None)),
+    }
+}
+
 /// Resolve a kernel directory: auto-build from source tree.
 ///
 /// Requires Makefile + Kconfig. Checks cache for clean trees,
@@ -4275,22 +4389,20 @@ pub fn resolve_kernel_dir(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<std::path::PathBuf> {
-    let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
-    if !is_source_tree {
-        bail!(
-            "no kernel image found in {} (not a kernel source tree — \
-             missing Makefile or Kconfig)",
-            path.display()
-        );
-    }
-
-    let acquired = crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let acquired = acquire_local_source_tree(path)?;
     let cache_key = acquired.cache_key.clone();
+    // Open the cache once and reuse for both the clean-tree
+    // lookup and the post-build store. Both legs need the same
+    // root resolution; opening twice is wasted work and risks
+    // a TOCTOU split if `KTSTR_CACHE_DIR` changes between calls.
+    // A failure here is fatal — we cannot proceed without a cache
+    // root for either lookup or store. Mirrors the same hoist
+    // applied in [`resolve_kernel_dir_to_entry`].
+    let cache = crate::cache::CacheDir::new()?;
 
     // Clean trees: cache lookup before build.
     // Dirty trees: skip cache, always build.
     if !acquired.is_dirty
-        && let Ok(cache) = crate::cache::CacheDir::new()
         && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label)
     {
         let image = entry.image_path();
@@ -4300,7 +4412,6 @@ pub fn resolve_kernel_dir(
         }
     }
 
-    let cache = crate::cache::CacheDir::new()?;
     let result = kernel_build_pipeline(&acquired, &cache, cli_label, false, true, cpu_cap)?;
 
     // Prefer the cached image path (stable across rebuilds).
@@ -4308,6 +4419,25 @@ pub fn resolve_kernel_dir(
         Some(entry) => Ok(entry.image_path()),
         None => Ok(result.image_path),
     }
+}
+
+/// Validate `path` is a kernel source tree (Makefile + Kconfig at
+/// the root) and return the [`AcquiredSource`] computed by
+/// [`crate::fetch::local_source`].
+///
+/// Shared across [`resolve_kernel_dir`] and
+/// [`resolve_kernel_dir_to_entry`] so the validation diagnostic
+/// and `local_source` error stringification live in one place.
+fn acquire_local_source_tree(path: &std::path::Path) -> Result<crate::fetch::AcquiredSource> {
+    let is_source_tree = path.join("Makefile").exists() && path.join("Kconfig").exists();
+    if !is_source_tree {
+        bail!(
+            "no kernel image found in {} (not a kernel source tree — \
+             missing Makefile or Kconfig)",
+            path.display()
+        );
+    }
+    crate::fetch::local_source(path).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Whether stderr supports color (cached per process).

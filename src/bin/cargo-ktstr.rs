@@ -875,69 +875,89 @@ enum StatsCommand {
     },
 }
 
-/// Configure if needed and build the kernel.
+/// Resolve a `KernelId::Path` to a directory suitable for export
+/// via [`ktstr::KTSTR_KERNEL_ENV`].
 ///
-/// Returns `anyhow::Result<()>` so the five `cli::*` calls below
-/// chain directly with `?` — the outer bin surface is still
-/// `Result<(), String>` (a broader anyhow migration across
-/// cargo-ktstr.rs is pending), and callers bridge at the
-/// boundary. Internally, anyhow lets this function propagate the
-/// already-`anyhow::Error` returns from `cli::run_make` /
-/// `configure_kernel` / `make_kernel_with_output` /
-/// `validate_kernel_config` / `run_make_with_output` without a
-/// `.map_err(|e| format!("{e:#}"))` stringification per call.
-fn build_kernel(kernel_dir: &Path, clean: bool) -> anyhow::Result<()> {
-    if !kernel_dir.is_dir() {
-        anyhow::bail!("{}: not a directory", kernel_dir.display());
-    }
-
-    if clean {
-        eprintln!("cargo ktstr: make mrproper");
-        cli::run_make(kernel_dir, &["mrproper"])?;
-    }
-
-    if !cli::has_sched_ext(kernel_dir) {
-        cli::Spinner::with_progress("Configuring kernel...", "Kernel configured", |_| {
-            cli::configure_kernel(kernel_dir, cli::EMBEDDED_KCONFIG)
+/// Routes Path specs through [`cli::resolve_kernel_dir_to_entry`]
+/// so they share the same cache pipeline as Version / CacheKey /
+/// Git specs:
+///   - Clean source tree, cache miss → build, store at
+///     `local-{hash7}-{arch}-kc{suffix}`, return cache entry dir.
+///   - Clean source tree, cache hit → skip build, emit a stderr
+///     line referencing the user's raw input path, the resolved
+///     cache key, and the build age, then return cache entry dir.
+///   - Dirty source tree → build in source, skip cache store,
+///     return canonical source dir.
+///
+/// Both shapes are valid inputs to
+/// [`crate::kernel_path::find_image_in_dir`]'s child consumers;
+/// the cache-entry layout (`<dir>/<image_name>`) and source-tree
+/// layout (`<dir>/arch/<arch>/boot/<image_name>`) are both probed.
+///
+/// `raw_input` is the verbatim user-supplied `--kernel` argument
+/// before canonicalization — used in the cache-hit stderr line so
+/// the operator sees the path they actually typed (e.g.
+/// `../linux`) rather than the resolved canonical form, and in
+/// the resolve-failure error so a typo names whatever the user
+/// supplied.
+///
+/// On canonicalize / source-tree-validation failure, the inner
+/// error is re-wrapped with the user's raw input + the standard
+/// `KTSTR_KERNEL_HINT` so the diagnostic shape matches the
+/// behaviour the previous inline `canonicalize` call provided.
+/// The single canonicalize then lives inside
+/// [`crate::fetch::local_source`] (called via
+/// [`cli::resolve_kernel_dir_to_entry`]); doing it twice in this
+/// function and again in `local_source` produced redundant
+/// syscalls without changing the resulting path.
+fn resolve_path_kernel(p: &Path, raw_input: &str) -> Result<PathBuf, String> {
+    // Boundary bridge: `cli::resolve_kernel_dir_to_entry` returns
+    // `anyhow::Result<(PathBuf, Option<KernelDirCacheHit>)>`
+    // while this function returns `Result<_, String>`, so we
+    // stringify at the call site. A broader anyhow migration
+    // across cargo-ktstr.rs is pending and would drop this last
+    // bridge.
+    let (entry_dir, cache_hit) =
+        cli::resolve_kernel_dir_to_entry(p, "cargo ktstr", None).map_err(|e| {
+            format!(
+                "--kernel {raw_input}: {e:#}. {hint}",
+                hint = ktstr::KTSTR_KERNEL_HINT,
+            )
         })?;
+    if let Some(hit) = cache_hit {
+        eprintln!(
+            "cargo ktstr: cache hit for {raw_input} ({key}{age})",
+            key = hit.cache_key,
+            age = format_built_age(&hit.built_at),
+        );
     }
-
-    cli::Spinner::with_progress("Building kernel...", "Kernel built", |sp| {
-        cli::make_kernel_with_output(kernel_dir, Some(sp), None)
-    })?;
-
-    cli::validate_kernel_config(kernel_dir)?;
-
-    cli::Spinner::with_progress("Generating compile_commands.json...", "Done", |sp| {
-        cli::run_make_with_output(kernel_dir, &["compile_commands.json"], Some(sp))
-    })?;
-    Ok(())
+    Ok(entry_dir)
 }
 
-/// Resolve a `KernelId::Path` to a canonicalized, ready-to-build
-/// directory and trigger the auto-build pipeline. Returns the
-/// canonical path suitable for export via [`ktstr::KTSTR_KERNEL_ENV`].
+/// Format a cache entry's `built_at` ISO-8601 timestamp as a
+/// human-readable age suffix for the cache-hit log line.
 ///
-/// The previous inline `unwrap_or_else(|_| PathBuf::from(&p))`
-/// silently fell back to the raw string on canonicalize failure —
-/// that behaviour is preserved here as a hard error so a typo can't
-/// exec into a successful-looking run that silently picks up a
-/// different kernel via `find_kernel`'s fallback chain.
-fn resolve_path_kernel(p: &Path) -> Result<PathBuf, String> {
-    let dir = std::fs::canonicalize(p).map_err(|e| {
-        format!(
-            "--kernel {}: path does not exist or cannot be \
-             canonicalized ({e:#}). {hint}",
-            p.display(),
-            hint = ktstr::KTSTR_KERNEL_HINT,
-        )
-    })?;
-    // Boundary bridge: `build_kernel` returns `anyhow::Result<()>`
-    // while this function returns `Result<_, String>`, so we
-    // stringify at the call site. A broader anyhow migration across
-    // cargo-ktstr.rs is pending and would drop this last bridge.
-    build_kernel(&dir, false).map_err(|e| format!("{e:#}"))?;
-    Ok(dir)
+/// Returns `, built {age} ago` (with the leading comma+space) on
+/// successful parse + elapsed-since-now computation, so the call
+/// site can splice it directly into the parenthesised message:
+/// `(local-..., built 2h 15m ago)`. Returns the empty string when
+/// either the timestamp can't be parsed (malformed metadata) or
+/// the build moment is in the future relative to local clock
+/// (clock skew on a shared cache); callers see `(local-...)` with
+/// no age suffix in those degenerate cases.
+fn format_built_age(built_at: &str) -> String {
+    let Ok(parsed) = humantime::parse_rfc3339(built_at) else {
+        return String::new();
+    };
+    let Ok(elapsed) = std::time::SystemTime::now().duration_since(parsed) else {
+        return String::new();
+    };
+    // Truncate to whole-second granularity. `format_duration` on
+    // sub-second remainders renders nanos that aren't useful
+    // ("2h 15m 32s 184ms 7us 12ns") and clutter the cache-hit
+    // line.
+    let elapsed = std::time::Duration::from_secs(elapsed.as_secs());
+    format!(", built {} ago", humantime::format_duration(elapsed))
 }
 
 /// Canonicalize a cache-entry directory before exporting it via
@@ -1011,8 +1031,35 @@ fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, PathBuf), St
     use ktstr::kernel_path::KernelId;
     match id {
         KernelId::Path(p) => {
-            let dir = resolve_path_kernel(&p)?;
-            let label = path_kernel_label(&dir);
+            // Capture the user's raw input string before any
+            // canonicalization so cache-hit diagnostics inside
+            // `resolve_path_kernel` can name the path they
+            // actually typed (`../linux`) instead of the
+            // resolved canonical form.
+            let raw_input = p.display().to_string();
+            // Compute the label from the CANONICAL SOURCE TREE
+            // path, NOT the directory `resolve_path_kernel`
+            // returns. The returned dir may be a cache entry
+            // (`<cache>/local-{hash7}-{arch}-kc{suffix}`); a
+            // basename-derived label off that would render as
+            // `path_local-{hash7}-{arch}-kc{suffix}_{hash6}` and
+            // change between cache-miss runs (when
+            // `path_kernel_label` would have observed the source
+            // tree dir) and cache-hit runs (when it would have
+            // observed the cache entry dir). Pinning the label
+            // to the canonical SOURCE path keeps the operator-
+            // facing identifier stable across cache states for
+            // the same `--kernel /path/to/linux` invocation.
+            let canon_input = std::fs::canonicalize(&p).map_err(|e| {
+                format!(
+                    "--kernel {}: path does not exist or cannot be \
+                     canonicalized ({e:#}). {hint}",
+                    p.display(),
+                    hint = ktstr::KTSTR_KERNEL_HINT,
+                )
+            })?;
+            let label = path_kernel_label(&canon_input);
+            let dir = resolve_path_kernel(&p, &raw_input)?;
             Ok((label, dir))
         }
         KernelId::Version(ref ver) => {
@@ -1069,7 +1116,12 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
     preflight_collision_check(specs)?;
 
     // Each spec resolves independently:
-    //   - Path → just canonicalize on disk (no network).
+    //   - Path → cache lookup → maybe build (no network).
+    //     Clean source trees hit the local-source cache key
+    //     `local-{hash7}-{arch}-kc{suffix}`; cache miss reaches
+    //     the same `kernel_build_pipeline` Version/CacheKey/Git
+    //     specs use, with the result stored back at the same key.
+    //     Dirty trees skip the cache store and build in place.
     //   - Version / CacheKey → cache lookup → maybe download +
     //     build.
     //   - Range → fetch releases.json once, then per-version
@@ -2003,9 +2055,24 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             let project_repo = std::env::current_dir()
                 .ok()
                 .and_then(|cwd| gix::discover(cwd).ok());
+            // Probe `KTSTR_KERNEL` for the kernel-side git repo.
+            // Path-spec resolution in cargo-ktstr now exports the
+            // CACHE ENTRY directory for clean source trees (see
+            // [`ktstr::cli::resolve_kernel_dir_to_entry`]); a
+            // direct `gix::open` against that dir would fail
+            // because the cache entry is not a git repo. The
+            // shared `recover_local_source_tree` helper reads
+            // `metadata.json` and returns the recorded
+            // `source_tree_path` when present; when absent (the
+            // env value is itself a source tree — the dirty
+            // build-every-time path), fall back to opening the
+            // env value verbatim.
             let kernel_repo = ktstr::ktstr_kernel_env()
                 .map(std::path::PathBuf::from)
-                .and_then(|p| gix::open(p).ok());
+                .and_then(|p| {
+                    let target = ktstr::cache::recover_local_source_tree(&p).unwrap_or(p);
+                    gix::open(target).ok()
+                });
             let project_commit =
                 resolve_commit_specs(project_repo.as_ref(), project_commit, "project-commit");
             let kernel_commit =
@@ -6114,6 +6181,143 @@ mod tests {
             path_kernel_label(a),
             path_kernel_label(b),
             "distinct path parents must produce distinct labels",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // format_built_age — cache-hit log line age suffix
+    // ---------------------------------------------------------------
+    //
+    // The helper renders the persisted `built_at` ISO-8601 stamp as
+    // `, built {age} ago`. It must produce the empty string on
+    // unparseable inputs (so the cache-hit line still renders
+    // gracefully without a malformed suffix), and must include a
+    // leading comma+space prefix on the success path so the call
+    // site can splice it directly into `(cache_key{age})`.
+
+    #[test]
+    fn format_built_age_unparseable_returns_empty_string() {
+        // Malformed timestamp must not panic and must not yield a
+        // half-formed suffix. The cache-hit log line stays valid
+        // even when metadata is corrupt: `(cache_key)` with no
+        // age portion.
+        assert_eq!(format_built_age("not-a-timestamp"), "");
+        assert_eq!(format_built_age(""), "");
+        // Almost-valid RFC 3339 (missing trailing Z) must also
+        // collapse to empty rather than returning a partial.
+        assert_eq!(format_built_age("2026-01-02T03:04:05"), "");
+    }
+
+    #[test]
+    fn format_built_age_future_timestamp_returns_empty_string() {
+        // A timestamp far in the future fails
+        // `duration_since` because the build moment hasn't
+        // occurred yet relative to local clock — clock skew on a
+        // shared cache between two hosts can produce this. The
+        // helper collapses to empty rather than rendering
+        // `built -2h ago` or panicking.
+        assert_eq!(format_built_age("9999-12-31T23:59:59Z"), "");
+    }
+
+    #[test]
+    fn format_built_age_past_timestamp_includes_leading_comma_and_seconds() {
+        // A reachable past timestamp must produce the
+        // `, built ... ago` shape. We don't pin the exact age
+        // string (it depends on `SystemTime::now()` at test time),
+        // but assert the structural invariants:
+        //   * non-empty
+        //   * starts with `, built ` (the leading comma+space lets
+        //     the caller splice into `(cache_key{age})` without a
+        //     conditional separator)
+        //   * ends with ` ago` (the trailing keyword renders the
+        //     duration as relative-past in human language)
+        let one_hour_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(3600);
+        let timestamp = humantime::format_rfc3339(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(one_hour_ago),
+        )
+        .to_string();
+        let age = format_built_age(&timestamp);
+        assert!(
+            age.starts_with(", built "),
+            "age suffix must start with the splice prefix `, built `, got {age:?}",
+        );
+        assert!(
+            age.ends_with(" ago"),
+            "age suffix must end with the relative-past keyword ` ago`, got {age:?}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_path_kernel — Path-spec error diagnostics
+    // ---------------------------------------------------------------
+    //
+    // The diagnostic shape `--kernel {raw}: {inner}. {KTSTR_KERNEL_HINT}`
+    // is what the user sees when `--kernel /path/...` fails. The
+    // raw input must appear verbatim so a typo names the exact
+    // string they passed; the inner error must come from the
+    // shared resolution pipeline (currently
+    // `cli::resolve_kernel_dir_to_entry`); the hint must guide
+    // the user toward the supported `--kernel` shapes.
+
+    /// Nonexistent path: the source-tree validation
+    /// (`Makefile + Kconfig` exist) fails inside
+    /// [`cli::resolve_kernel_dir_to_entry`] (via
+    /// [`cli::resolve_kernel_dir_to_entry`] →
+    /// `acquire_local_source_tree`), and `resolve_path_kernel`
+    /// re-wraps the error with the user's raw input + the
+    /// standard hint. Pins the `--kernel {raw}: ...` prefix and
+    /// the trailing hint marker so a regression that dropped
+    /// either surfaces here.
+    #[test]
+    fn resolve_path_kernel_nonexistent_returns_actionable_error() {
+        let raw = "/this/path/should/not/exist/under/test";
+        let result = resolve_path_kernel(std::path::Path::new(raw), raw);
+        let err = result.expect_err("nonexistent path must surface as Err");
+        assert!(
+            err.contains(&format!("--kernel {raw}")),
+            "error must lead with `--kernel {{raw_input}}:` so a typo \
+             names the exact string the user passed. got: {err}",
+        );
+        // The hint string carries the documented `--kernel` value
+        // shapes; pin its presence rather than its prose so a
+        // future hint rewrite doesn't break this test.
+        assert!(
+            err.contains(ktstr::KTSTR_KERNEL_HINT),
+            "error must end with KTSTR_KERNEL_HINT so the user sees \
+             the supported `--kernel` shapes. got: {err}",
+        );
+    }
+
+    /// Empty tempdir (real directory, no Makefile or Kconfig):
+    /// `acquire_local_source_tree` rejects it as "not a kernel
+    /// source tree" and `resolve_path_kernel` re-wraps with the
+    /// user's raw input + hint. Distinct from
+    /// `resolve_path_kernel_nonexistent_returns_actionable_error`
+    /// because the inner error path differs (existence-check
+    /// pass, content-shape fail) — both must surface the same
+    /// outer wrapping.
+    #[test]
+    fn resolve_path_kernel_empty_tempdir_returns_not_a_source_tree_error() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let raw = tmp.path().display().to_string();
+        let result = resolve_path_kernel(tmp.path(), &raw);
+        let err = result.expect_err("empty tempdir must surface as Err");
+        assert!(
+            err.contains(&format!("--kernel {raw}")),
+            "error must lead with `--kernel {{raw_input}}:`. got: {err}",
+        );
+        assert!(
+            err.contains("not a kernel source tree"),
+            "error must include the `not a kernel source tree` phrase \
+             from `acquire_local_source_tree`'s diagnostic. got: {err}",
+        );
+        assert!(
+            err.contains(ktstr::KTSTR_KERNEL_HINT),
+            "error must end with KTSTR_KERNEL_HINT. got: {err}",
         );
     }
 

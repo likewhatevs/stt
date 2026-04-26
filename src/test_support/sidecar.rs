@@ -1595,9 +1595,17 @@ pub(crate) fn apply_archive_source_override(pool: &mut [SidecarResult]) {
 /// value and [`crate::kernel_path::KernelId`] for variant
 /// dispatch:
 ///
-/// - `KernelId::Path(p)`: returns the raw path verbatim. The
-///   typical case: `KTSTR_KERNEL=/path/to/linux` points at a
-///   working source tree that may be a git repo.
+/// - `KernelId::Path(p)`: probes the path's `metadata.json` first
+///   — `cargo-ktstr`'s `--kernel /path/to/linux` resolver routes
+///   clean source trees through the cache pipeline (see
+///   [`crate::cli::resolve_kernel_dir_to_entry`]) and exports the
+///   CACHE ENTRY directory through `KTSTR_KERNEL`, not the
+///   literal source tree. When `metadata.json` parses and carries
+///   a `KernelSource::Local::source_tree_path`, that path is the
+///   underlying source tree and is returned. When parsing fails
+///   (the path IS the source tree, the dirty-tree path that
+///   skipped the cache store), falls back to using the raw env
+///   value verbatim — that path is itself the source tree.
 /// - `KernelId::Version(ver)`: looks for a Local cache entry
 ///   whose `metadata.version == ver` carrying a
 ///   `source_tree_path`. The tarball-shaped key (`{ver}-tarball-
@@ -1630,7 +1638,16 @@ fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
     let raw = crate::ktstr_kernel_env()?;
     let id = KernelId::parse(&raw);
     match id {
-        KernelId::Path(_) => Some(std::path::PathBuf::from(&raw)),
+        KernelId::Path(_) => {
+            let p = std::path::Path::new(&raw);
+            // Cache-entry layout: `metadata.json` carries the
+            // `KernelSource::Local::source_tree_path` recorded at
+            // build time. Source-tree layout (dirty path that
+            // skipped cache store): no metadata, so the env value
+            // IS the source tree. The shared helper handles both.
+            crate::cache::recover_local_source_tree(p)
+                .or_else(|| Some(std::path::PathBuf::from(&raw)))
+        }
         KernelId::Version(_) | KernelId::CacheKey(_) => {
             let cache = crate::cache::CacheDir::new().ok()?;
             resolve_kernel_source_dir_with_cache(&id, &cache)
@@ -7327,5 +7344,101 @@ mod tests {
         let id = crate::kernel_path::KernelId::Version("6.14.2".to_string());
         let resolved = super::resolve_kernel_source_dir_with_cache(&id, &cache);
         assert!(resolved.is_none());
+    }
+
+    // -- resolve_kernel_source_dir Path arm --
+    //
+    // The Path arm at sidecar.rs:1641 routes via the shared
+    // `cache::recover_local_source_tree` helper: when
+    // `KTSTR_KERNEL` points at a CACHE ENTRY directory (the shape
+    // `cargo-ktstr` exports for clean Path specs), the helper
+    // reads `metadata.json` and returns the recorded
+    // `source_tree_path`. When the env value is itself a SOURCE
+    // TREE (no metadata.json — the dirty path) or the metadata
+    // doesn't carry a `KernelSource::Local::source_tree_path`,
+    // the arm falls back to the env value verbatim.
+
+    /// (a) Path env points at a cache entry whose metadata.json
+    /// carries `KernelSource::Local::source_tree_path`. Resolver
+    /// returns the source-tree path so commit detection probes
+    /// the actual git repo, not the cache entry dir.
+    #[test]
+    fn resolve_kernel_source_dir_path_metadata_local_returns_source_tree() {
+        use super::super::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        // Cache entry dir + planted metadata.json pointing at the
+        // (separate) source tree.
+        let cache_entry = tempfile::TempDir::new().expect("cache entry tempdir");
+        let src_tree = tempfile::TempDir::new().expect("src tree tempdir");
+        let meta = local_metadata_with_source_tree("6.14.2", src_tree.path().to_path_buf());
+        std::fs::write(
+            cache_entry.path().join("metadata.json"),
+            serde_json::to_string(&meta).expect("serialize metadata"),
+        )
+        .expect("write metadata.json");
+
+        let _guard = EnvVarGuard::set("KTSTR_KERNEL", cache_entry.path());
+        assert_eq!(
+            super::resolve_kernel_source_dir().as_deref(),
+            Some(src_tree.path()),
+            "Path arm must recover source_tree_path from metadata.json \
+             when the env value points at a cache entry with a Local source",
+        );
+    }
+
+    /// (b) Path env with no metadata.json present: resolver falls
+    /// back to the env value verbatim. Mirrors the dirty-source-
+    /// tree case where `cargo ktstr test --kernel /path/to/linux`
+    /// skipped the cache store and `KTSTR_KERNEL` is the source
+    /// tree itself.
+    #[test]
+    fn resolve_kernel_source_dir_path_no_metadata_returns_env_value() {
+        use super::super::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let dir = tempfile::TempDir::new().expect("dir tempdir");
+        // Deliberately no metadata.json — `recover_local_source_tree`
+        // returns None and the Path arm's fallback kicks in.
+
+        let _guard = EnvVarGuard::set("KTSTR_KERNEL", dir.path());
+        assert_eq!(
+            super::resolve_kernel_source_dir().as_deref(),
+            Some(dir.path()),
+            "Path arm with no metadata.json must return the env value verbatim",
+        );
+    }
+
+    /// (c) Path env points at a cache entry whose metadata.json
+    /// carries a non-Local source (`KernelSource::Tarball`). The
+    /// helper short-circuits to None inside
+    /// `recover_local_source_tree`; the arm's fallback returns the
+    /// env value verbatim. Tarball entries lack a persisted
+    /// source tree, so probing the cache-entry directory itself
+    /// (an extracted tarball) is the only available answer.
+    #[test]
+    fn resolve_kernel_source_dir_path_metadata_non_local_falls_through() {
+        use super::super::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let cache_entry = tempfile::TempDir::new().expect("cache entry tempdir");
+        let meta = crate::cache::KernelMetadata::new(
+            crate::cache::KernelSource::Tarball,
+            std::env::consts::ARCH.to_string(),
+            "bzImage".to_string(),
+            "2026-04-26T00:00:00Z".to_string(),
+        )
+        .with_version(Some("6.14.2".to_string()));
+        std::fs::write(
+            cache_entry.path().join("metadata.json"),
+            serde_json::to_string(&meta).expect("serialize metadata"),
+        )
+        .expect("write metadata.json");
+
+        let _guard = EnvVarGuard::set("KTSTR_KERNEL", cache_entry.path());
+        assert_eq!(
+            super::resolve_kernel_source_dir().as_deref(),
+            Some(cache_entry.path()),
+            "Path arm with non-Local source metadata must fall back \
+             to the env value verbatim — Tarball entries have no \
+             persisted source_tree_path to recover",
+        );
     }
 }
