@@ -33,8 +33,8 @@ ktstr workspace's git HEAD at sidecar-write time), so the
 runs from two branches land disjoint values on the `commit`
 dimension regardless of how the directories are named. The
 simplest collection workflow is to merge both branches' run
-subdirectories under one root and rely on `--a-commit` /
-`--b-commit` to partition them:
+subdirectories under one root and rely on
+`--a-project-commit` / `--b-project-commit` to partition them:
 
 ```sh
 mkdir -p ~/opensource/scx-runs/ktstr
@@ -65,12 +65,19 @@ not see runs written to a custom flat directory unless
 The framework records the ktstr project's git commit on every
 sidecar via `SidecarResult::project_commit`, so two runs from
 different commits land disjoint values on the `commit`
-dimension and `--a-commit` / `--b-commit` slice between them
-without any per-run directory bookkeeping. Use
+dimension and `--a-project-commit` / `--b-project-commit`
+slice between them without any per-run directory bookkeeping.
+Use
 `cargo ktstr stats list-values --dir DIR` to enumerate the
 distinct values of every filterable dimension (`kernel`,
-`commit`, `scheduler`, `topology`, `work_type`, `flags`)
-present in the pool, so per-side filters target real values:
+`commit`, `kernel_commit`, `source`, `scheduler`, `topology`,
+`work_type`, `flags`) present in the pool, so per-side filters
+target real values. The `commit` and `source` keys map to the
+internal `SidecarResult::project_commit` / `run_source` fields;
+the per-side filter flags spell as `--a-project-commit` /
+`--b-project-commit` and `--a-run-source` / `--b-run-source`
+on the [`compare`](../running-tests/cargo-ktstr.md#compare)
+subcommand.
 
 ```sh
 cd ~/opensource/scx
@@ -83,8 +90,8 @@ CARGO_TARGET_DIR=~/opensource/scx-runs cargo ktstr stats list-values
 ```sh
 cd ~/opensource/scx
 CARGO_TARGET_DIR=~/opensource/scx-runs cargo ktstr stats compare \
-    --a-commit <baseline-short-hex> \
-    --b-commit <current-short-hex>
+    --a-project-commit <baseline-short-hex> \
+    --b-project-commit <current-short-hex>
 ```
 
 `stats compare` is pool-driven: every sidecar under the runs
@@ -93,9 +100,10 @@ root is loaded into a single pool, and per-side filter flags
 contrasts. The dimensions on which the A and B filters DIFFER
 are the *slicing* dimensions of the contrast; every other
 dimension is part of the dynamic *pairing key* the comparison
-joins on. Slicing on `commit` alone joins each baseline scenario
-with its matching experimental counterpart on every other
-dimension (kernel, scheduler, topology, work_type, flags).
+joins on. Slicing on `project-commit` alone joins each
+baseline scenario with its matching experimental counterpart
+on every other dimension (kernel, kernel-commit, run-source,
+scheduler, topology, work_type, flags).
 
 Other slicing axes work the same way:
 

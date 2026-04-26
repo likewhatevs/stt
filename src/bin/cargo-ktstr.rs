@@ -383,20 +383,26 @@ enum StatsCommand {
     ///
     /// Walks every run directory under `runs_root()` (or `--dir`),
     /// pools the sidecars, and reports the set of distinct values
-    /// found per dimension: `kernel`, `commit`, `scheduler`,
+    /// found across all eight filterable dimensions: `kernel`,
+    /// `commit`, `kernel_commit`, `source`, `scheduler`,
     /// `topology`, `work_type`, and `flags` (individual flag
-    /// names). Use this before crafting a `cargo ktstr stats
-    /// compare` invocation to discover what `--a-X` / `--b-X`
-    /// values the pool actually carries — a `--a-kernel 6.20`
-    /// against an empty pool fails downstream with "no rows match
-    /// filter A", and `list-values` is the upstream answer to "what
-    /// kernels do I have?".
+    /// names). The JSON keys `commit` and `source` map to the
+    /// internal `SidecarResult::project_commit` /
+    /// `SidecarResult::run_source` fields; the per-side filter
+    /// flags spell `--project-commit` / `--run-source` on the
+    /// `compare` subcommand. Use this before crafting a
+    /// `cargo ktstr stats compare` invocation to discover what
+    /// `--a-X` / `--b-X` values the pool actually carries — a
+    /// `--a-kernel 6.20` against an empty pool fails downstream
+    /// with "no rows match filter A", and `list-values` is the
+    /// upstream answer to "what kernels do I have?".
     ///
     /// Default output renders one block per dimension with values
     /// one per line; `--json` emits a single JSON object keyed by
-    /// dimension name. Optional dimensions (`kernel`, `commit`)
-    /// surface absent values as the textual sentinel `unknown` in
-    /// the table shape and as JSON `null` in the JSON shape.
+    /// dimension name. The four optional dimensions (`kernel`,
+    /// `commit`, `kernel_commit`, `source`) surface absent values
+    /// as the textual sentinel `unknown` in the table shape and as
+    /// JSON `null` in the JSON shape.
     ListValues {
         /// Emit JSON instead of a per-dimension text block.
         #[arg(long)]
@@ -417,7 +423,7 @@ enum StatsCommand {
     /// `HostContext::format_human`. Useful for inspecting the
     /// CPU model, memory config, THP policy, and sched_* tunables
     /// captured at archive time — the same fingerprint
-    /// `compare_runs` uses for its host-delta section, now
+    /// `compare_partitions` uses for its host-delta section, now
     /// available on a single run.
     ///
     /// Scans sidecars in iteration order and returns the FIRST
@@ -505,17 +511,28 @@ enum StatsCommand {
         /// CI host.
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
-        /// Strict equality match against the sidecar's
-        /// `kernel_version` field (e.g. `--kernel 6.14.2`).
+        /// Match against the sidecar's `kernel_version` field
+        /// (e.g. `--kernel 6.14.2`). **Match shape depends on
+        /// segment count**: a two-segment value (`--kernel 6.12`)
+        /// is a major.minor PREFIX — it matches `6.12`, `6.12.0`,
+        /// `6.12.5`, etc., letting the operator narrow on a stable
+        /// series without naming every patch release. A
+        /// three-or-more-segment value (`--kernel 6.14.2`,
+        /// `--kernel 6.15-rc3`) is STRICT EQUALITY — `6.14.2` does
+        /// NOT match `6.14.20`. See [`kernel_filter_matches`] in
+        /// stats.rs for the cutoff implementation.
+        ///
         /// Repeatable: `--kernel A --kernel B` keeps rows whose
-        /// `kernel_version` equals A OR B. Rows whose
+        /// `kernel_version` equals A OR B (each value applies its
+        /// own match shape per the segment-count rule). Rows whose
         /// `kernel_version` is `None` (sidecar writer could not
         /// extract a version) NEVER match a populated filter —
         /// passing `--kernel` is an opt-in that demands a
         /// known-version row. Same flag name as on `cargo ktstr
         /// test`/`coverage`/`llvm-cov` for consistency: every
         /// subcommand that accepts a kernel filter spells it
-        /// `--kernel`.
+        /// `--kernel`. The per-side overrides `--a-kernel` /
+        /// `--b-kernel` carry the same match-shape rule.
         #[arg(long, action = ArgAction::Append)]
         kernel: Vec<String>,
         /// Strict equality match against the sidecar's
@@ -599,13 +616,13 @@ enum StatsCommand {
         /// `doc/guide/src/concepts/work-types.md`.
         #[arg(long)]
         work_type: Option<String>,
-        /// Strict equality match against the sidecar's `source`
+        /// Strict equality match against the sidecar's `run_source`
         /// field (e.g. `--run-source local`, `--run-source ci`,
         /// `--run-source archive`). Repeatable: `--run-source A
-        /// --run-source B` keeps rows whose `source` equals A OR
-        /// B. Rows whose `source` is `None` (sidecar pre-dates
-        /// the field) NEVER match a populated filter — same
-        /// opt-in policy as `--kernel` / `--project-commit` /
+        /// --run-source B` keeps rows whose `run_source` equals A
+        /// OR B. Rows whose `run_source` is `None` (sidecar
+        /// pre-dates the field) NEVER match a populated filter —
+        /// same opt-in policy as `--kernel` / `--project-commit` /
         /// `--kernel-commit`.
         ///
         /// Filters on the run-environment provenance recorded by
@@ -3711,10 +3728,11 @@ mod tests {
         );
     }
 
-    /// Per-side `--a-source` / `--b-source` produce disjoint per-
-    /// side filters with the shared `run_sources` left empty.
-    /// Mirrors `build_compare_filters_disjoint_per_side_kernel_yields_two_filters`
-    /// for the source dimension. Pins the wiring of the
+    /// Per-side `--a-run-source` / `--b-run-source` produce
+    /// disjoint per-side filters with the shared `run_sources`
+    /// left empty. Mirrors
+    /// `build_compare_filters_disjoint_per_side_kernel_yields_two_filters`
+    /// for the run-source dimension. Pins the wiring of the
     /// `run_sources` field through `build()` so a regression that
     /// dropped it from the per-side branch — silently leaving
     /// `fa.run_sources` / `fb.run_sources` empty under per-side
@@ -3731,10 +3749,10 @@ mod tests {
         assert_eq!(fb.run_sources, vec!["local".to_string()]);
     }
 
-    /// Shared `--source` pins BOTH sides to the same vec. Sugar
-    /// for `--a-source V --b-source V`. Mirrors
+    /// Shared `--run-source` pins BOTH sides to the same vec.
+    /// Sugar for `--a-run-source V --b-run-source V`. Mirrors
     /// `build_compare_filters_shared_kernel_pins_both_sides` for
-    /// the source dimension.
+    /// the run-source dimension.
     #[test]
     fn build_compare_filters_shared_source_pins_both_sides() {
         let b = BuildCompareFilters {
@@ -3746,11 +3764,12 @@ mod tests {
         assert_eq!(fb.run_sources, vec!["ci".to_string()]);
     }
 
-    /// Per-side `--a-source` overrides shared `--source` for A
-    /// only; B retains the shared value. "More-specific replaces"
-    /// semantics — same shape as the existing
+    /// Per-side `--a-run-source` overrides shared `--run-source`
+    /// for A only; B retains the shared value. "More-specific
+    /// replaces" semantics — same shape as the existing
     /// `per_side_overrides_shared_for_that_side_only` for kernels.
-    /// Pins the override resolution path for the source dimension.
+    /// Pins the override resolution path for the run-source
+    /// dimension.
     #[test]
     fn build_compare_filters_per_side_source_overrides_shared_for_that_side_only() {
         let b = BuildCompareFilters {

@@ -108,7 +108,7 @@ impl MetricDef {
 /// case: `true` takes max, `false` takes min. Unknown names (not in
 /// this registry) default to max; register a `MetricDef` here before
 /// relying on min-polarity merge. The comparison system
-/// ([`compare_runs`]) uses `higher_is_worse` for delta direction.
+/// ([`compare_partitions`]) uses `higher_is_worse` for delta direction.
 ///
 /// # Metric-name triples (registry / field / DataFrame column)
 ///
@@ -559,23 +559,25 @@ pub struct GauntletRow {
     /// at write time (cwd not inside a checkout, or
     /// [`crate::test_support::sidecar::detect_project_commit`]
     /// failed for any reason). Surfaced via the typed
-    /// [`RowFilter::commits`] for narrowing — when the user
-    /// passes `--commit abcdef1` (repeatable), rows with `None`
-    /// are dropped to preserve the operator's intent ("only these
-    /// commits"); a `None`-as-wildcard would silently dilute the
-    /// filtered set, mirroring the [`RowFilter::kernels`] policy.
+    /// [`RowFilter::project_commits`] for narrowing — when the
+    /// user passes `--project-commit abcdef1` (repeatable), rows
+    /// with `None` are dropped to preserve the operator's intent
+    /// ("only these commits"); a `None`-as-wildcard would silently
+    /// dilute the filtered set, mirroring the [`RowFilter::kernels`]
+    /// policy.
     ///
     /// Sourced from `SidecarResult::project_commit`; shortened to
-    /// `commit` for the analysis layer because the project commit
-    /// is the most-frequently-narrowed-on of the three commit
-    /// dimensions on `SidecarResult`. The other two commit fields
-    /// — `SidecarResult::scheduler_commit` and
+    /// `commit` on the row because the project commit is the
+    /// most-frequently-narrowed-on of the three commit dimensions
+    /// on `SidecarResult`. The other two commit fields —
+    /// `SidecarResult::scheduler_commit` and
     /// `SidecarResult::kernel_commit` — get fully-qualified names
     /// here (`scheduler_commit` is reserved and not yet exposed,
     /// `kernel_commit` is the typed filter `RowFilter::kernel_commits`
-    /// applies). The bare `commit` shortening is intentional and
-    /// keeps the filter spelling `--commit X` (vs the more verbose
-    /// `--project-commit X`).
+    /// applies). The bare `commit` shortening is internal to
+    /// `GauntletRow`; the CLI flag is the disambiguated
+    /// `--project-commit` form so an operator never has to guess
+    /// which "commit" dimension a bare `--commit` would have meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     /// Kernel SOURCE TREE git commit carried from the source
@@ -601,7 +603,7 @@ pub struct GauntletRow {
     /// kernel.
     ///
     /// Surfaced via the typed [`RowFilter::kernel_commits`] for
-    /// narrowing — same opt-in policy as [`RowFilter::commits`]:
+    /// narrowing — same opt-in policy as [`RowFilter::project_commits`]:
     /// rows with `None` never match a populated filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_commit: Option<String>,
@@ -625,7 +627,7 @@ pub struct GauntletRow {
     /// produced before the field existed (pre-1.0 disposable
     /// schema; re-running the test regenerates the entry).
     /// Surfaced via the typed [`RowFilter::run_sources`] for
-    /// narrowing — when the user passes `--source local`
+    /// narrowing — when the user passes `--run-source local`
     /// (repeatable), rows with `None` are dropped to preserve the
     /// operator's intent ("only these environments"); a
     /// `None`-as-wildcard would silently dilute the filtered set,
@@ -779,8 +781,8 @@ pub struct GauntletRow {
 /// `cargo ktstr stats compare` pipeline. Every field is `None` /
 /// empty by default; populated fields are AND-combined ACROSS
 /// fields, with field-internal OR/AND semantics described per-field
-/// below. Applied via [`apply_row_filters`] in `compare_runs` before
-/// the rows reach `compare_rows`.
+/// below. Applied via [`apply_row_filters`] in `compare_partitions`
+/// before the rows reach `compare_rows`.
 ///
 /// Match semantics:
 /// - `scheduler` / `topology` / `work_type` — STRICT EQUALITY against
@@ -793,26 +795,28 @@ pub struct GauntletRow {
 ///   `--kernel` flag on `cargo ktstr test`/`coverage`/`llvm-cov`
 ///   so the same flag name carries the same multi-value semantic
 ///   across every subcommand.
-/// - `commits` — repeatable, OR-combined: a row matches iff its
-///   `commit` equals ANY entry in `commits`. Same multi-value
-///   semantic as `kernels`, applied to the ktstr project commit
-///   recorded by `detect_project_commit` at sidecar-write time.
+/// - `project_commits` — repeatable, OR-combined: a row matches
+///   iff its `commit` equals ANY entry in `project_commits`. Same
+///   multi-value semantic as `kernels`, applied to the ktstr
+///   project commit recorded by `detect_project_commit` at
+///   sidecar-write time. Surfaced as the `--project-commit` CLI
+///   flag.
 /// - `kernel_commits` — repeatable, OR-combined: a row matches
 ///   iff its `kernel_commit` equals ANY entry in `kernel_commits`.
-///   Same multi-value semantic as `commits`, applied to the
-///   kernel source-tree commit recorded by
+///   Same multi-value semantic as `project_commits`, applied to
+///   the kernel source-tree commit recorded by
 ///   [`crate::test_support::sidecar::detect_kernel_commit`] at
 ///   sidecar-write time. Filters on the kernel HEAD, NOT on the
 ///   kernel release version (`kernels` is the version filter).
-/// - `sources` — repeatable, OR-combined: a row matches iff its
-///   `source` equals ANY entry in `sources`. Same multi-value
-///   semantic as `kernels` / `commits` / `kernel_commits`,
-///   applied to the run-environment provenance tag (`"local"`,
-///   `"ci"`, `"archive"`) recorded by
+/// - `run_sources` — repeatable, OR-combined: a row matches iff
+///   its `run_source` equals ANY entry in `run_sources`. Same
+///   multi-value semantic as `kernels` / `project_commits` /
+///   `kernel_commits`, applied to the run-environment provenance
+///   tag (`"local"`, `"ci"`, `"archive"`) recorded by
 ///   [`crate::test_support::sidecar::detect_run_source`] at
 ///   sidecar-write time, or rewritten to `"archive"` at load
 ///   time when the consumer pulled the pool from a non-default
-///   `--dir`.
+///   `--dir`. Surfaced as the `--run-source` CLI flag.
 /// - `flags` — AND-combined: every entry in the filter must appear
 ///   somewhere in the row's `flags` vec. The row may carry
 ///   additional flags beyond the filter set; the filter pins
@@ -821,9 +825,9 @@ pub struct GauntletRow {
 ///   `kernel_version` is `None` ALWAYS fails (no wildcard semantic)
 ///   — the operator wrote specific versions and a `None`-row would
 ///   silently dilute the set. The same opt-in policy applies to
-///   `commits` against rows with `commit == None`, to
+///   `project_commits` against rows with `commit == None`, to
 ///   `kernel_commits` against rows with `kernel_commit == None`,
-///   and to `sources` against rows with `source == None`.
+///   and to `run_sources` against rows with `run_source == None`.
 ///
 /// Empty `RowFilter` (every field `None`/empty) is the no-op default
 /// and matches every row. Use [`RowFilter::default()`] to build it.
@@ -928,7 +932,7 @@ impl RowFilter {
             // mirroring the `kernels` policy: a row whose `commit`
             // is `None` (the sidecar writer's gix probe failed or
             // cwd was outside any git repo) never matches a
-            // populated filter, so a `--commit` argument is opt-in
+            // populated filter, so a `--project-commit` argument is opt-in
             // to "only rows with this commit" rather than a wildcard.
             let row_commit = row.commit.as_deref();
             let any = self
@@ -945,7 +949,7 @@ impl RowFilter {
             // `kernel_commit` is `None` (the sidecar writer's
             // `detect_kernel_commit` probe failed, or `KTSTR_KERNEL`
             // pointed at a non-git source) never matches a populated
-            // filter — same opt-in semantic as `--commit` /
+            // filter — same opt-in semantic as `--project-commit` /
             // `--kernel`.
             let row_kc = row.kernel_commit.as_deref();
             let any = self
@@ -961,7 +965,7 @@ impl RowFilter {
             // mirroring the `kernels` / `project_commits` /
             // `kernel_commits` opt-in policy: a row whose
             // `run_source` is `None` (sidecar pre-dates the field)
-            // never matches a populated filter, so a `--source`
+            // never matches a populated filter, so a `--run-source`
             // argument demands a tagged row rather than acting as a
             // wildcard.
             let row_run_source = row.run_source.as_deref();
@@ -1076,7 +1080,7 @@ fn is_major_minor_prefix(s: &str) -> bool {
 /// Iteration order via [`Dimension::ALL`] is deterministic and
 /// matches the order operators read in the CLI flags
 /// (`--kernel` / `--scheduler` / `--topology` / `--work-type` /
-/// `--commit` / `--kernel-commit` / `--source` / `--flag`), so
+/// `--project-commit` / `--kernel-commit` / `--run-source` / `--flag`), so
 /// generated labels and error messages list dims in a stable,
 /// predictable order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -2182,25 +2186,29 @@ pub fn list_runs() -> anyhow::Result<()> {
 /// Pool every sidecar under the runs root (or `dir` when set) and
 /// emit the distinct values present on each filterable dimension.
 ///
-/// Seven dimensions are reported, matching the seven fields on
+/// Eight dimensions are reported, matching the eight fields on
 /// [`RowFilter`]: `kernel` (from `SidecarResult::kernel_version`),
 /// `scheduler`, `topology`, `work_type`, `commit`
 /// (from `SidecarResult::project_commit`), `kernel_commit` (from
-/// `SidecarResult::kernel_commit`), and `flags` (individual flag
+/// `SidecarResult::kernel_commit`), `source` (from
+/// `SidecarResult::run_source`), and `flags` (individual flag
 /// names, exploded from each row's `active_flags`). The dimension
 /// catalogue here matches what `cargo ktstr stats compare`
 /// accepts as `--X` and `--a-X` / `--b-X` filter flags — the
 /// command exists so an operator can answer "what kernel versions
-/// are in the pool?" before crafting a compare invocation.
+/// are in the pool?" before crafting a compare invocation. The
+/// JSON keys `commit` and `source` are the wire contract; the
+/// corresponding per-side filter flags spell `--project-commit`
+/// and `--run-source`.
 ///
-/// `kernel_version`, `project_commit`, and `kernel_commit` are
-/// `Option<String>` on the source sidecar; absence is reported as
-/// a literal JSON `null` in the JSON shape and the textual
-/// sentinel `unknown` in the table shape. The set is sorted by
-/// the type's natural ordering (`BTreeSet`); `None` collates
-/// before any populated value in `Option<String>` ordering, so
-/// `null` / `unknown` always lands at the top of the per-dimension
-/// listing.
+/// `kernel_version`, `project_commit`, `kernel_commit`, and
+/// `run_source` are `Option<String>` on the source sidecar;
+/// absence is reported as a literal JSON `null` in the JSON
+/// shape and the textual sentinel `unknown` in the table shape.
+/// The set is sorted by the type's natural ordering (`BTreeSet`);
+/// `None` collates before any populated value in `Option<String>`
+/// ordering, so `null` / `unknown` always lands at the top of the
+/// per-dimension listing.
 ///
 /// `flags` is exploded: each entry in any row's `active_flags`
 /// vector becomes a single value in the flag set. The
@@ -2211,8 +2219,10 @@ pub fn list_runs() -> anyhow::Result<()> {
 ///
 /// `json=true` emits a JSON object keyed by dimension name with
 /// arrays of values (with `null` interleaved for absent
-/// `kernel`/`commit` entries); `json=false` emits a per-dimension
-/// human-readable block with the values one per line.
+/// `kernel`, `commit`, `kernel_commit`, or `source` entries —
+/// the four optional dimensions); `json=false` emits a
+/// per-dimension human-readable block with the values one per
+/// line.
 ///
 /// `dir` mirrors `compare_partitions` / `show_run_host` semantics:
 /// when `Some(d)`, `d` replaces `runs_root()` as the pool source;
@@ -2287,7 +2297,13 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
         // JSON keys stay as `commit` / `source` — operator-visible
         // wire contract for `cargo ktstr stats list-values --json`
         // does not rename when the internal field/variable does.
-        // The CLI flag spelling `--commit` / `--source` matches.
+        // Note: the per-side filter flags on `compare` spell as
+        // `--project-commit` / `--run-source` (longer-form
+        // disambiguating names), so the JSON keys here intentionally
+        // diverge from the CLI flag names. The wire contract is the
+        // shorter form because that's what every external consumer
+        // (CI scripts, archive readers) has been parsing since the
+        // sidecar format was first introduced.
         let payload = serde_json::json!({
             "kernel": kernels_json,
             "commit": project_commits_json,
@@ -2403,7 +2419,7 @@ pub(crate) struct CompareReport {
 }
 
 /// Per-metric threshold policy driving [`compare_rows`] /
-/// [`compare_runs`].
+/// [`compare_partitions`].
 ///
 /// Resolution priority for a given metric's relative significance
 /// threshold, highest first:
@@ -2946,7 +2962,7 @@ pub fn compare_partitions(
     // distinction is meaningful on the host that wrote the
     // sidecars; once the files have been copied off, the only
     // useful classification is "this came from elsewhere", which
-    // is what `--source archive` queries for. Operators who need
+    // is what `--run-source archive` queries for. Operators who need
     // to retain the producer-side distinction read from the
     // default root (no `--dir`) so values pass through untouched.
     let (root, override_archive) = match dir {
@@ -3112,8 +3128,8 @@ pub fn compare_partitions(
         );
     }
 
-    // Host-context delta. Same first-Some(host) baseline as the
-    // legacy `compare_runs` flow — picking representative hosts
+    // Host-context delta. Same first-Some(host) baseline
+    // `compare_partitions` uses — picking representative hosts
     // off the partitioned sidecars rather than the full pool so
     // the delta reflects what actually fed the comparison.
     let sidecars_a: Vec<&crate::test_support::SidecarResult> = pool
@@ -3179,7 +3195,7 @@ fn check_no_duplicate_pairing_keys(
 /// Pure function of (`pre_agg_a`, `pre_agg_b`, `a`, `b`) so the
 /// exact-string contract — the operator-visible "averaged across
 /// N runs (A) and M runs (B)" surface — can be unit-tested
-/// without capturing stdout from `compare_runs`.
+/// without capturing stdout from `compare_partitions`.
 ///
 /// `pre_agg_a` / `pre_agg_b` are the post-typed-filter contributor
 /// row counts (i.e. the number of sidecar rows that fed
@@ -3515,8 +3531,8 @@ mod tests {
 
     /// `sidecar_to_row` must copy `SidecarResult::project_commit`
     /// into `GauntletRow::commit` verbatim so the typed
-    /// `--commit` filter and the upcoming `--a-commit` /
-    /// `--b-commit` slicers see the value the sidecar writer
+    /// `--project-commit` filter and the upcoming `--a-project-commit` /
+    /// `--b-project-commit` slicers see the value the sidecar writer
     /// recorded. A regression that left the field at the
     /// `Option::default()` (`None`) would silently drop the
     /// commit dimension from every comparison even when the
@@ -3568,7 +3584,7 @@ mod tests {
             row_none.commit.is_none(),
             "absent project_commit must propagate as None — a \
              regression substituting an empty string would dilute \
-             every `--commit` filter into matching all None rows",
+             every `--project-commit` filter into matching all None rows",
         );
     }
 
@@ -3661,8 +3677,8 @@ mod tests {
     }
 
     /// `sidecar_to_row` must copy `SidecarResult::run_source` into
-    /// `GauntletRow::run_source` verbatim so the typed `--source`
-    /// filter and per-side `--a-source` / `--b-source` slicers
+    /// `GauntletRow::run_source` verbatim so the typed `--run-source`
+    /// filter and per-side `--a-run-source` / `--b-run-source` slicers
     /// see the run-environment provenance tag the sidecar writer
     /// recorded. A regression that left the field at the
     /// `Option::default()` (`None`) would silently drop the
@@ -3705,7 +3721,7 @@ mod tests {
             row_none.run_source.is_none(),
             "absent run_source must propagate as None — a regression \
              substituting an empty string would dilute every \
-             `--source` filter into matching all None rows",
+             `--run-source` filter into matching all None rows",
         );
 
         // Field non-aliasing pin: `run_source` must route to its
@@ -6124,7 +6140,7 @@ mod tests {
         );
     }
 
-    /// `--commit abcdef1` against a row whose `commit` is `None`
+    /// `--project-commit abcdef1` against a row whose `commit` is `None`
     /// must NOT match — same opt-in policy as `--kernel`. Mirror
     /// of `row_filter_kernel_none_row_never_matches_populated_filter`
     /// for the project-commit field.
@@ -6142,7 +6158,7 @@ mod tests {
         );
     }
 
-    /// `--commit abcdef1` against a row whose `commit` is
+    /// `--project-commit abcdef1` against a row whose `commit` is
     /// `Some("abcdef1")` matches; `Some("other")` rejects.
     /// Pins the strict-equality contract for commit, including
     /// the OR-combined multi-value semantic and the `-dirty`
@@ -6197,7 +6213,7 @@ mod tests {
 
     /// `--kernel-commit kabcde7` against a row whose
     /// `kernel_commit` is `None` must NOT match — same opt-in
-    /// policy as `--commit` and `--kernel`. Mirror of
+    /// policy as `--project-commit` and `--kernel`. Mirror of
     /// `row_filter_commit_none_row_never_matches_populated_filter`
     /// for the kernel-commit field.
     #[test]
@@ -6268,7 +6284,7 @@ mod tests {
         );
     }
 
-    /// `--kernel-commit` and `--commit` filter on DISTINCT row
+    /// `--kernel-commit` and `--project-commit` filter on DISTINCT row
     /// fields. Pins the field non-aliasing: a row whose
     /// `kernel_commit` matches but whose `commit` does not (or
     /// vice versa) must reject. A regression that cross-wired
@@ -6313,9 +6329,9 @@ mod tests {
         );
     }
 
-    /// `--source local` against a row whose `run_source` is
+    /// `--run-source local` against a row whose `run_source` is
     /// `None` must NOT match — same opt-in policy as `--kernel`,
-    /// `--commit`, and `--kernel-commit`. The operator wrote
+    /// `--project-commit`, and `--kernel-commit`. The operator wrote
     /// specific tags and a None-row would silently dilute the
     /// filtered set. Mirror of
     /// `row_filter_kernel_commit_none_row_never_matches_populated_filter`
@@ -6334,7 +6350,7 @@ mod tests {
         );
     }
 
-    /// Repeatable `--source A --source B` is OR-combined: a row
+    /// Repeatable `--run-source A --run-source B` is OR-combined: a row
     /// matches iff its `run_source` equals ANY listed entry.
     /// Mirror of `row_filter_kernels_or_combined_matches_any_listed`
     /// for the `run_source` dimension.
@@ -6364,7 +6380,7 @@ mod tests {
         );
     }
 
-    /// `--source` and `--kernel-commit` filter on DISTINCT row
+    /// `--run-source` and `--kernel-commit` filter on DISTINCT row
     /// fields. Pins the field non-aliasing: a row whose
     /// `run_source` matches but whose `kernel_commit` does not
     /// (or vice versa) must reject. A regression that cross-wired
@@ -6410,7 +6426,7 @@ mod tests {
         );
     }
 
-    /// `--commit` and `--kernel` compose with AND semantics: a
+    /// `--project-commit` and `--kernel` compose with AND semantics: a
     /// populated commit filter and a populated kernel filter must
     /// BOTH match for the row to survive. Pins the cross-field
     /// composition rule for the new commit field, mirroring the
@@ -6983,7 +6999,7 @@ mod tests {
     // -- format_average_header / format_per_group_pass_counts --
 
     /// `format_average_header` renders the exact header line that
-    /// `compare_runs` prints above the comparison table when
+    /// `compare_partitions` prints above the comparison table when
     /// `--average` is active. Pins the operator-visible surface
     /// (the "averaged across N runs (A) and M runs (B)" string)
     /// so a regression that reworded the header without
@@ -7002,7 +7018,7 @@ mod tests {
     /// edge case so a regression that special-cased `pre_agg = 0`
     /// (e.g. omitted the side, said "no contributors") would
     /// fail here. The companion empty-rows path is already
-    /// guarded upstream by `compare_runs`' `sidecars_*.is_empty()`
+    /// guarded upstream by `compare_partitions`' `sidecars_*.is_empty()`
     /// bail; this test guards the formatter itself in case it's
     /// reused outside the compare path.
     #[test]
@@ -7134,7 +7150,7 @@ mod tests {
 
     // -- Dimension / derive_slicing_dims / pairing dims --
 
-    /// `Dimension::ALL` lists all seven dims in canonical order.
+    /// `Dimension::ALL` lists all eight dims in canonical order.
     /// Order matters for [`PairingKey::from_row`] and for header
     /// rendering — a regression that reordered the slice would
     /// silently shift every dynamic key, splitting previously-

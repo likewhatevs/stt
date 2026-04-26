@@ -102,11 +102,14 @@ normally.
 
 **`host_only` tests under multi-kernel**: tests marked
 `host_only` (those that run on the host without booting a VM)
-currently still expand across the kernel dimension and run N
-times for N kernels — N copies of identical work, since the test
-never observes the kernel directory. A future change will skip
-the kernel suffix for `host_only` entries so they list and run
-once regardless of `KTSTR_KERNEL_LIST` cardinality.
+skip the kernel suffix and list / run **once** regardless of
+`KTSTR_KERNEL_LIST` cardinality. The dispatch sites
+(`list_tests`, `list_tests_budget`, and `--exact`'s
+`run_host_only_test` in `src/test_support/dispatch.rs`) all gate
+on `entry.host_only` before consulting the resolved kernel set,
+so a host-side test never observes the kernel directory and
+multiplying it across kernels would just run N copies of
+identical work for no signal.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -308,21 +311,24 @@ find the latest available tarball. Skips building when a cached entry already ex
 | `--ref REF` | Git ref to checkout (branch, tag, commit). Required with `--git`. |
 | `--force` | Rebuild even if a cached image exists. |
 | `--clean` | Run `make mrproper` before configuring. Only meaningful with `--source`. |
+| `--cpu-cap N` | Reserve exactly N host CPUs for the build (integer ≥ 1; must be ≤ the calling process's `sched_getaffinity` cpuset size). When absent, 30% of the allowed CPUs are reserved (minimum 1). The planner walks whole LLCs in consolidation- and NUMA-aware order, partial-taking the last LLC so `plan.cpus.len() == N` exactly. Under `--cpu-cap`, `make -jN` parallelism matches the reserved CPU count and the build runs inside a cgroup v2 sandbox that pins gcc/ld to the reserved CPUs + NUMA nodes. Mutually exclusive with `KTSTR_BYPASS_LLC_LOCKS=1`. Also settable via `KTSTR_CPU_CAP` env var (CLI flag wins when both are present). |
 
 ### kernel clean
 
 Remove cached kernel images.
 
 ```sh
-cargo ktstr kernel clean                 # remove all (with confirmation prompt)
-cargo ktstr kernel clean --keep 3        # keep 3 most recent
-cargo ktstr kernel clean --force         # skip confirmation prompt
+cargo ktstr kernel clean                          # remove all (with confirmation prompt)
+cargo ktstr kernel clean --keep 3                 # keep 3 most recent
+cargo ktstr kernel clean --force                  # skip confirmation prompt
+cargo ktstr kernel clean --corrupt-only --force   # remove only corrupt entries
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--keep N` | Keep the N most recent cached kernels. |
+| `--keep N` | Keep the N most recent VALID cached kernels. Corrupt entries (metadata missing or unparseable, image file absent) are always candidates for removal regardless of this value — a corrupt entry never consumes a keep slot. Mutually exclusive with `--corrupt-only`. |
 | `--force` | Skip confirmation prompt. Required in non-interactive contexts. |
+| `--corrupt-only` | Remove only corrupt cache entries (metadata missing or unparseable, image file absent). Valid entries are left untouched regardless of `--force`. Useful for clearing broken entries after an interrupted build without risking the curated set of good kernels. Mutually exclusive with `--keep`. |
 
 ## verifier
 
@@ -352,7 +358,7 @@ across profiles.
 |------|-------------|
 | `--scheduler PKG` | Scheduler package name to build and analyze. |
 | `--scheduler-bin PATH` | Path to pre-built scheduler binary. Conflicts with `--scheduler`. |
-| `--kernel ID` | Kernel identifier: path, raw image file (`bzImage`/`Image`), version, or cache key. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. |
+| `--kernel ID` | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Raw image files (`bzImage`/`Image`) are NOT accepted by `verifier` — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
 | `--raw` | Print raw verifier output without cycle collapse. |
 | `--all-profiles` | Run verifier for all flag profiles (power set). |
 | `--profiles LIST` | Run verifier for specific profiles only (comma-separated, e.g. `default,llc,llc+steal`). |
@@ -403,8 +409,9 @@ cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15     # slice on kernel
 cargo ktstr stats compare --a-scheduler scx_rusty --b-scheduler scx_alpha  # slice on scheduler
 cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 --scheduler scx_rusty  # slice on kernel, pin scheduler on both sides
 cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 -E cgroup_steady       # add substring filter
-cargo ktstr stats compare --a-commit abcdef1 --b-commit fedcba2 --no-average     # opt out of trial averaging
+cargo ktstr stats compare --a-project-commit abcdef1 --b-project-commit fedcba2 --no-average  # opt out of trial averaging
 cargo ktstr stats compare --a-kernel-commit abcdef1 --b-kernel-commit fedcba2    # slice on kernel source HEAD
+cargo ktstr stats compare --a-run-source ci --b-run-source local                 # slice on run environment
 ```
 
 When invoked without a subcommand, prints gauntlet analysis from
@@ -434,8 +441,7 @@ and date.
 List the registered regression metrics and their default
 thresholds. Enumerates the `ktstr::stats::METRICS` registry: metric
 name, polarity (higher/lower better), default absolute-delta gate,
-default relative-delta gate, display unit, and a one-line
-description. Use this to see which metric names
+default relative-delta gate, and display unit. Use this to see which metric names
 `ComparisonPolicy.per_metric_percent` keys can reference, and what
 each default absolute and relative gate starts at before an
 override. Default output is a human-readable table; `--json` emits
@@ -455,9 +461,12 @@ cargo ktstr stats list-metrics --json       # JSON array
 List the distinct values present per filterable dimension in the
 sidecar pool. Walks every run directory under `target/ktstr/`
 (or `--dir`), pools the sidecars, and reports per-dimension sets
-for `kernel`, `commit`, `kernel_commit`, `scheduler`,
-`topology`, `work_type`, and `flags` (individual flag names,
-exploded from each row's `active_flags`).
+for all eight dimensions: `kernel`, `commit`, `kernel_commit`,
+`source`, `scheduler`, `topology`, `work_type`, and `flags`
+(individual flag names, exploded from each row's
+`active_flags`). The `commit` and `source` keys map to the
+internal `SidecarResult::project_commit` / `run_source` fields;
+the JSON wire keys keep the shorter spellings.
 
 Use this before crafting a `cargo ktstr stats compare`
 invocation to discover what `--a-X` / `--b-X` values the pool
@@ -480,6 +489,7 @@ dimension name with arrays of values:
   "kernel": [null, "6.14.2", "6.15.0"],
   "commit": [null, "abcdef1", "abcdef1-dirty"],
   "kernel_commit": [null, "kabcde7", "kabcde7-dirty"],
+  "source": [null, "ci", "local"],
   "scheduler": ["eevdf", "scx_rusty"],
   "topology": ["1n2l4c1t", "1n4l2c1t"],
   "work_type": ["CpuSpin", "PageFaultChurn"],
@@ -487,11 +497,18 @@ dimension name with arrays of values:
 }
 ```
 
-`kernel`, `commit`, and `kernel_commit` are optional on the
-source sidecar (`SidecarResult::kernel_version` /
-`project_commit` / `kernel_commit` are `Option<String>`); the
-textual sentinel `unknown` and JSON `null` both denote a sidecar
-that did not record a value for that dimension.
+The JSON keys `commit` and `source` are the wire contract;
+internally the corresponding fields are
+`SidecarResult::project_commit` and `SidecarResult::run_source`,
+and the per-side filter flags spell as `--project-commit` /
+`--run-source` (see [`compare`](#compare)).
+
+`kernel`, `commit`, `kernel_commit`, and `source` are optional
+on the source sidecar (`SidecarResult::kernel_version` /
+`project_commit` / `kernel_commit` / `run_source` are
+`Option<String>`); the textual sentinel `unknown` and JSON
+`null` both denote a sidecar that did not record a value for
+that dimension.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -542,19 +559,26 @@ cargo ktstr stats compare \
     --a-kernel 6.14 --a-scheduler scx_rusty \
     --b-kernel 6.15 --b-scheduler scx_alpha
 
-# Slice on commit, narrow both sides to one scheduler+kernel.
+# Slice on project commit, narrow both sides to one scheduler+kernel.
 cargo ktstr stats compare \
-    --a-commit abcdef1 --b-commit fedcba2 \
+    --a-project-commit abcdef1 --b-project-commit fedcba2 \
     --kernel 6.14 --scheduler scx_rusty
+
+# Slice on run environment: CI runs vs local developer runs.
+cargo ktstr stats compare \
+    --a-run-source ci --b-run-source local
 ```
 
 **Symmetric sugar.** Shared `--X` flags (`--kernel`, `--scheduler`,
-`--topology`, `--work-type`, `--commit`, `--kernel-commit`,
-`--flag`) pin BOTH sides to the same value(s). Per-side
-`--a-X` / `--b-X` flags REPLACE the corresponding shared
-`--X` value for that side only — "more-specific replaces"
+`--topology`, `--work-type`, `--project-commit`, `--kernel-commit`,
+`--run-source`, `--flag`) pin BOTH sides to the same value(s).
+Per-side `--a-X` / `--b-X` flags REPLACE the corresponding
+shared `--X` value for that side only — "more-specific replaces"
 semantics. So `--kernel 6.14 --a-kernel 6.13` puts A on 6.13
-and B on 6.14.
+and B on 6.14. Together the eight slicing dimensions
+(`kernel`, `scheduler`, `topology`, `work-type`,
+`project-commit`, `kernel-commit`, `run-source`, `flags`) cover
+every typed axis the comparison can contrast on.
 
 **Validation.** The dispatch site rejects two cases up front:
 - **Empty slicing**: no `--a-X` / `--b-X` at all, OR the per-side
@@ -594,35 +618,41 @@ applies to `--a-kernel` / `--b-kernel`.
 **Discovering filter values.** Run
 [`cargo ktstr stats list-values`](#list-values) before
 crafting a `compare` invocation to see what `kernel`, `commit`,
-`kernel_commit`, `scheduler`, `topology`, `work_type`, and
-`flags` values the sidecar pool actually carries; passing a
+`kernel_commit`, `source`, `scheduler`, `topology`, `work_type`,
+and `flags` values the sidecar pool actually carries; passing a
 `--a-kernel 6.20` against an empty pool fails downstream with
 "no rows match filter A" and `list-values` is the upstream
-answer to "what have I got?".
+answer to "what have I got?". `list-values` reports all eight
+filterable dimensions; the JSON keys `commit` and `source` map
+to the per-side filter flags `--project-commit` and
+`--run-source`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-E FILTER` | -- | Substring filter applied to the joined `scenario topology scheduler work_type flags` string. Composes with the typed dimension filters: typed narrows happen first, substring runs over the surviving set. |
+| `-E FILTER` | -- | Substring filter applied to the joined `scenario topology scheduler work_type flags` string. **Scope is limited**: `-E` does NOT match against `kernel`, `project_commit`, `kernel_commit`, or `run_source` — those are typed dimensions reachable only via the dedicated `--kernel` / `--project-commit` / `--kernel-commit` / `--run-source` flags. To narrow on those, use the typed flags. Composes with the typed dimension filters: typed narrows happen first, substring runs over the surviving set. |
 | `--kernel VER` (repeatable) | -- | Pin BOTH sides to the listed kernel version(s). Sugar for `--a-kernel V1 --a-kernel V2 --b-kernel V1 --b-kernel V2`. Per-side `--a-kernel` / `--b-kernel` REPLACES this shared value for that side only. Major.minor (`6.12`) prefix-matches; three-segment (`6.14.2`) is strict. |
 | `--scheduler NAME` | -- | Pin BOTH sides to one scheduler. Sugar for `--a-scheduler N --b-scheduler N`. Strict equality. |
 | `--topology LABEL` | -- | Pin BOTH sides to one rendered topology label (e.g. `1n2l4c2t`). Strict equality. |
 | `--work-type TYPE` | -- | Pin BOTH sides to one work_type (PascalCase variant of `WorkType`, e.g. `CpuSpin`). See [Work types](../concepts/work-types.md). |
-| `--commit HASH` (repeatable) | -- | Pin BOTH sides to listed `project_commit` value(s) (7-char hex, optional `-dirty` suffix). Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. |
+| `--project-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `project_commit` value(s) (7-char hex, optional `-dirty` suffix). Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. Renamed from `--commit` for naming symmetry with `--kernel-commit`. |
 | `--kernel-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `kernel_commit` value(s) (7-char hex, optional `-dirty` suffix). Filters the kernel SOURCE TREE commit (`SidecarResult::kernel_commit`), distinct from the kernel release version (`--kernel`): two runs of the same `kernel_version` with different `kernel_commit` values represent the same release rebuilt from different trees. Rows whose `kernel_commit` is `None` (KTSTR_KERNEL pointed at a non-git path, the underlying source was Tarball / Git rather than a `Local` tree, or the gix probe failed) NEVER match a populated filter. |
+| `--run-source NAME` (repeatable) | -- | Pin BOTH sides to listed run-environment source(s). Filters `SidecarResult::run_source` set by `detect_run_source` at sidecar-write time: `"local"` for developer runs, `"ci"` when `KTSTR_CI` was set, or rewritten to `"archive"` at load time when `--dir` points at a non-default pool root. Rows whose `run_source` is `None` (sidecar pre-dates the field) NEVER match a populated filter — same opt-in policy as `--kernel` / `--project-commit` / `--kernel-commit`. Combine per-side `--a-run-source ci --b-run-source local` to contrast CI runs against developer runs of the same scenarios. |
 | `--flag NAME` | -- | Repeatable AND-combined flag filter pinning BOTH sides. Every listed flag must appear in `active_flags`; rows may carry additional flags. |
 | `--a-kernel VER` (repeatable) | -- | A-side kernel filter. Replaces the shared `--kernel` for the A side only. |
 | `--a-scheduler NAME` | -- | A-side scheduler filter. Replaces the shared `--scheduler` for the A side only. |
 | `--a-topology LABEL` | -- | A-side topology filter. Replaces the shared `--topology` for the A side only. |
 | `--a-work-type TYPE` | -- | A-side work_type filter. Replaces the shared `--work-type` for the A side only. |
-| `--a-commit HASH` (repeatable) | -- | A-side commit filter. Replaces the shared `--commit` for the A side only. |
+| `--a-project-commit HASH` (repeatable) | -- | A-side project-commit filter. Replaces the shared `--project-commit` for the A side only. |
 | `--a-kernel-commit HASH` (repeatable) | -- | A-side kernel-commit filter. Replaces the shared `--kernel-commit` for the A side only. |
+| `--a-run-source NAME` (repeatable) | -- | A-side run-source filter. Replaces the shared `--run-source` for the A side only. |
 | `--a-flag NAME` (repeatable) | -- | A-side flag filter. Replaces the shared `--flag` for the A side only. |
 | `--b-kernel VER` (repeatable) | -- | B-side kernel filter. Replaces the shared `--kernel` for the B side only. |
 | `--b-scheduler NAME` | -- | B-side scheduler filter. Replaces the shared `--scheduler` for the B side only. |
 | `--b-topology LABEL` | -- | B-side topology filter. Replaces the shared `--topology` for the B side only. |
 | `--b-work-type TYPE` | -- | B-side work_type filter. Replaces the shared `--work-type` for the B side only. |
-| `--b-commit HASH` (repeatable) | -- | B-side commit filter. Replaces the shared `--commit` for the B side only. |
+| `--b-project-commit HASH` (repeatable) | -- | B-side project-commit filter. Replaces the shared `--project-commit` for the B side only. |
 | `--b-kernel-commit HASH` (repeatable) | -- | B-side kernel-commit filter. Replaces the shared `--kernel-commit` for the B side only. |
+| `--b-run-source NAME` (repeatable) | -- | B-side run-source filter. Replaces the shared `--run-source` for the B side only. |
 | `--b-flag NAME` (repeatable) | -- | B-side flag filter. Replaces the shared `--flag` for the B side only. |
 | `--no-average` | off | Disable averaging. Each sidecar stays distinct; bails with an actionable error when multiple sidecars on the same side share the same pairing key (since pairing across sides becomes ambiguous). |
 | `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy`. |

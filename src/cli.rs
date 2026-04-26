@@ -2008,7 +2008,7 @@ pub fn list_runs() -> Result<()> {
 /// Render the metric registry for `cargo ktstr stats list-metrics`.
 ///
 /// Thin wrapper over [`crate::stats::list_metrics`] — exposed through
-/// `cli::` to match the `list_runs` / `compare_runs` / `show_host`
+/// `cli::` to match the `list_runs` / `compare_partitions` / `show_host`
 /// convention where every stats-subcommand dispatch arm lands on a
 /// `cli::*` helper before reaching the private `stats` module. The
 /// returned `String` is printed verbatim by the dispatch site.
@@ -2047,7 +2047,7 @@ pub fn compare_partitions(
 /// see `lib.rs` — and therefore not a stable public path). The
 /// policy is the only item in `stats` that a CLI or external
 /// consumer constructs directly; every other item is internal
-/// plumbing reached via `cli::compare_runs`.
+/// plumbing reached via `cli::compare_partitions`.
 pub use crate::stats::{AveragedGroup, ComparisonPolicy, RowFilter, group_and_average};
 
 /// Collect the current host context via
@@ -2111,7 +2111,7 @@ pub fn restore_sigpipe_default() {
 /// - The run directory does not exist (actionable message names
 ///   the expected root),
 /// - The run directory exists but has no sidecar data (matches
-///   the `compare_runs` error shape),
+///   the `compare_partitions` error shape),
 /// - Every sidecar carried `host: None` (older pre-enrichment
 ///   runs won't have the field).
 pub fn show_run_host(run: &str, dir: Option<&Path>) -> Result<String> {
@@ -3910,7 +3910,7 @@ mod tests {
 
     /// Error path: the run directory exists but has no sidecars.
     /// Returns `Err` with the `no sidecar data` diagnostic to
-    /// match the `compare_runs` error shape — consistency across
+    /// match the `compare_partitions` error shape — consistency across
     /// the two stats subcommands.
     #[test]
     fn show_run_host_empty_run_returns_error() {

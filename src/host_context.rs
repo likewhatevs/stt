@@ -2215,7 +2215,7 @@ Hugepagesize:       2048 kB
     }
 
     /// Two identical contexts diff to an empty string. This is the
-    /// signal `compare_runs` uses to print `host: identical
+    /// signal `compare_partitions` uses to print `host: identical
     /// between a and b` instead of an empty delta section.
     #[test]
     fn diff_identical_is_empty() {

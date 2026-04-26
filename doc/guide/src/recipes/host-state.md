@@ -8,6 +8,32 @@ tunables, and kernel cmdline; `cargo ktstr stats compare`
 surfaces the changes between two sidecars in a host-delta
 section of its output so you can see what moved.
 
+## Two `show-host` commands: live vs archived
+
+Two distinct subcommands print host context, and they are NOT
+interchangeable — pick the one whose target matches your question:
+
+- **`cargo ktstr show-host`** captures the **live** host context
+  by reading `/proc`, `/sys`, and `uname()` at invocation time.
+  Use this when you want to inspect the current machine, e.g.
+  before running a benchmark, after a sysctl change, or to
+  confirm what `cargo ktstr stats compare` would record on the
+  next run produced here. No prior runs needed.
+- **`cargo ktstr stats show-host --run RUN_ID`** prints the
+  **archived** host context captured at sidecar-write time for
+  the named run. Use this when investigating a regression in a
+  past run — what looked like a code change might trace back to
+  a host change at the time the sidecar was produced. Resolves
+  `--run` against `target/ktstr/` (or `--dir`) and renders the
+  first sidecar in the run that carries a populated `host`
+  field via the same `HostContext::format_human` formatter the
+  live `show-host` uses, so the two outputs are byte-for-byte
+  comparable when the host is unchanged.
+
+The sections below cover the live `show-host`. For the archived
+variant's flag table see
+[`stats show-host`](../running-tests/cargo-ktstr.md#show-host).
+
 ## Capture: `show-host`
 
 ```sh
@@ -52,13 +78,13 @@ writer would attach to a fresh test run).
 ## Compare: `stats compare`
 
 ```sh
-cargo ktstr stats compare --a-commit <baseline> --b-commit <current>
+cargo ktstr stats compare --a-project-commit <baseline> --b-project-commit <current>
 ```
 
 Per-side filter flags (`--a-X` / `--b-X`) partition the
 sidecar pool into the two sides of the contrast — slice on
-`commit`, `kernel`, `scheduler`, etc. depending on what you
-are diffing. `compare` picks the first sidecar with
+`project-commit`, `kernel`, `scheduler`, `run-source`, etc.
+depending on what you are diffing. `compare` picks the first sidecar with
 `Some(host)` from each side, collects every host field that
 differs, and prints a side-by-side delta unconditionally as
 part of the compare output (there is no opt-in flag — the
@@ -87,16 +113,16 @@ from "the whole map was unknown at capture time".
 Gauntlet runs emit the host block automatically in every
 sidecar. To diff the host state across two CI runs, slice the
 pool on whatever dimension separates them (typically
-`--a-commit` / `--b-commit` or `--a-kernel` / `--b-kernel`) —
-the host-delta section appears automatically in the compare
-output when any host field differs between the two sides. A
-CI job can:
+`--a-project-commit` / `--b-project-commit` or `--a-kernel` /
+`--b-kernel`) — the host-delta section appears automatically
+in the compare output when any host field differs between the
+two sides. A CI job can:
 
 1. Run the gauntlet on the candidate commit and the baseline.
 2. Invoke `stats compare` slicing on the dimension that
    separates the two runs (e.g.
-   `--a-commit <baseline> --b-commit <current>`) and inspect
-   the host-delta section of its output.
+   `--a-project-commit <baseline> --b-project-commit <current>`)
+   and inspect the host-delta section of its output.
 3. Fail (or annotate the PR) if any host dimension changed —
    an unchanged host set is the precondition for a clean A/B
    of scheduler behavior.

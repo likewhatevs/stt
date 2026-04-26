@@ -103,8 +103,8 @@ pub struct SidecarResult {
     /// excluded: two runs of the same semantic variant on
     /// different ktstr commits must still bucket together so
     /// `stats compare` can diff them; the commit-drift detection
-    /// inspects this field directly via `--commit` / `--a-commit`
-    /// / `--b-commit`.
+    /// inspects this field directly via `--project-commit` / `--a-project-commit`
+    /// / `--b-project-commit`.
     pub project_commit: Option<String>,
     /// Binary payload name (matches `Payload::name` when
     /// `entry.payload` is set). `None` when the test declared no
@@ -276,15 +276,15 @@ pub struct SidecarResult {
     /// extensible without a serde-version bump if a future producer
     /// wants a new tag (e.g. `"benchmark"`); the consumer side
     /// treats unknown values the same as known ones — they are
-    /// strings the operator can pass via `--source` to filter on.
+    /// strings the operator can pass via `--run-source` to filter on.
     /// Always emitted (`"run_source": null` on absence); required on
     /// deserialize per the same symmetry rule that governs every
     /// other nullable on this struct. Excluded from
     /// [`sidecar_variant_hash`] for the same cross-host grouping
     /// reason `host` is excluded — two runs of the same semantic
     /// variant from different environments must still bucket
-    /// together so `stats compare` can diff them; `--source` and
-    /// `--a-source` / `--b-source` are the explicit knobs for
+    /// together so `stats compare` can diff them; `--run-source` and
+    /// `--a-run-source` / `--b-run-source` are the explicit knobs for
     /// source-aware narrowing.
     ///
     /// Field name `run_source` (renamed from `source`) disambiguates
@@ -785,18 +785,22 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// Dirt-detection runs through the shared [`repo_is_dirty`]
 /// helper (peel HEAD to its tree, diff tree-vs-index, then
 /// `status()` for worktree-vs-index, submodules skipped); see its
-/// doc for cascade details. The cascade matches
-/// [`crate::fetch::local_source`], but the HASH REPRESENTATION
-/// DIFFERS: `fetch::local_source` DROPS the short hash entirely
-/// on dirty (returns `None`) because the commit no longer
-/// describes the build input the cache key embeds — publishing a
-/// stale hash there would misidentify the build. This helper
-/// KEEPS the hash with a `-dirty` suffix instead because the
-/// sidecar's `project_commit` is a debugging breadcrumb
-/// (operator-readable identity, not a cache-key input); the hash
-/// plus dirty flag carries strictly more information than `None`
-/// for the operator's "which ktstr commit did this sidecar come
-/// from?" question.
+/// doc for cascade details. The cascade is similar in spirit to
+/// [`crate::fetch::local_source`]'s dirt probe but deliberately
+/// diverges in missing-index handling: the sidecar path silently
+/// degrades a missing index leg to "treat as clean" so metadata
+/// probes never gate sidecar writes, whereas `local_source`'s
+/// cache-key path treats every leg as load-bearing. The HASH
+/// REPRESENTATION also DIFFERS: `fetch::local_source` DROPS the
+/// short hash entirely on dirty (returns `None`) because the
+/// commit no longer describes the build input the cache key
+/// embeds — publishing a stale hash there would misidentify the
+/// build. This helper KEEPS the hash with a `-dirty` suffix
+/// instead because the sidecar's `project_commit` is a debugging
+/// breadcrumb (operator-readable identity, not a cache-key input);
+/// the hash plus dirty flag carries strictly more information
+/// than `None` for the operator's "which ktstr commit did this
+/// sidecar come from?" question.
 ///
 /// Returns `None` when:
 /// - `current_dir()` cannot be resolved (process has no valid
@@ -816,7 +820,7 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// `None` is the documented fallback — sidecar writing must not
 /// abort because of a metadata probe failure. Stats tooling that
 /// reads `project_commit` already tolerates `None` rows by
-/// treating them as wildcards (no `--commit` filter narrowing
+/// treating them as wildcards (no `--project-commit` filter narrowing
 /// applies).
 ///
 /// `gix::discover` is preferred over `gix::open` because tests can
@@ -958,9 +962,14 @@ fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
 /// changes are observed. Dirt-detection runs through the shared
 /// [`repo_is_dirty`] helper (submodules skipped via
 /// `Submodule::Given { ignore: All }`); see its doc for cascade
-/// details. The cascade matches [`detect_project_commit`] and
-/// [`crate::fetch::local_source`]. Same "treat as clean on probe
-/// failure" degradation rules apply: a missing index, an
+/// details. The cascade matches [`detect_project_commit`] and is
+/// similar in spirit to [`crate::fetch::local_source`] but
+/// deliberately diverges in missing-index handling: the sidecar
+/// path silently degrades a missing index leg to "treat as
+/// clean" so metadata probes never gate sidecar writes, whereas
+/// `local_source`'s cache-key path treats every leg as
+/// load-bearing. Same "treat as clean on probe failure"
+/// degradation rules apply otherwise: a missing index, an
 /// unreadable worktree, or `head_tree()` failure each fall
 /// through as "clean" rather than aborting the probe — metadata
 /// must not gate sidecar writes.
@@ -1131,7 +1140,7 @@ fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
 /// payload, work_type, flags, sysctls, kargs) — NOT over
 /// [`HostContext`], NOT over `scheduler_commit`, NOT over
 /// `project_commit`, NOT over `kernel_commit`, and NOT over
-/// `source`. The [`HostContext`] exclusion is pinned by
+/// `run_source`. The [`HostContext`] exclusion is pinned by
 /// [`sidecar_variant_hash_excludes_host_context`]; the
 /// `scheduler_commit` exclusion by
 /// [`sidecar_variant_hash_excludes_scheduler_commit`]; the
@@ -1139,24 +1148,24 @@ fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
 /// [`sidecar_variant_hash_excludes_project_commit`]; the
 /// `kernel_commit` exclusion by
 /// [`sidecar_variant_hash_excludes_kernel_commit`]; the
-/// `source` exclusion by
-/// [`sidecar_variant_hash_excludes_source`]. All five are
+/// `run_source` exclusion by
+/// [`sidecar_variant_hash_excludes_run_source`]. All five are
 /// deliberate for the same cross-host grouping reason — a
 /// gauntlet rebuilt against a different userspace scheduler
 /// commit, a bumped ktstr checkout, a kernel source tree at a
 /// different HEAD, or a different CI runner / developer
 /// machine must still bucket with the same-named variant so
-/// `compare_runs` can diff two runs of the "same" test without
-/// the commit hash or source tag shattering them into
-/// one-row-per-commit islands. Callers that want to detect a
-/// commit drift or compare across run environments inspect
+/// `compare_partitions` can diff two runs of the "same" test
+/// without the commit hash or run-source tag shattering them
+/// into one-row-per-commit islands. Callers that want to detect
+/// a commit drift or compare across run environments inspect
 /// [`SidecarResult::scheduler_commit`] /
 /// [`SidecarResult::project_commit`] /
-/// [`SidecarResult::kernel_commit`] / [`SidecarResult::source`]
-/// directly (the latter three via `--commit` /
-/// `--kernel-commit` / `--source` on `stats compare`); the
-/// filename stays stable across commits and run environments by
-/// design.
+/// [`SidecarResult::kernel_commit`] /
+/// [`SidecarResult::run_source`] directly (the latter three via
+/// `--project-commit` / `--kernel-commit` / `--run-source` on
+/// `stats compare`); the filename stays stable across commits
+/// and run environments by design.
 ///
 /// The corollary of the HostContext exclusion: if the host's
 /// observable state mutates mid-suite — NUMA hotplug, hugepage
@@ -1339,7 +1348,7 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
 /// path that inserts `llc` then `steal` versus one that inserts
 /// `steal` then `llc` — would otherwise produce distinct hashes,
 /// distinct sidecar filenames, and end up as two separate rows in
-/// `compare_runs` even though they describe the same variant. By
+/// `compare_partitions` even though they describe the same variant. By
 /// canonicalizing at write time against the canonical
 /// [`crate::scenario::flags::ALL`] positional ordering (shared
 /// with `compute_flag_profiles` at scenario/mod.rs, which sorts
@@ -3946,7 +3955,7 @@ mod tests {
     /// influence the variant hash. Two runs of the same semantic
     /// variant — one from a developer machine (`run_source: "local"`)
     /// and one from a CI runner (`run_source: "ci"`) — must produce
-    /// the same sidecar filename so `compare_runs` can diff them
+    /// the same sidecar filename so `compare_partitions` can diff them
     /// across the CI/local boundary without the run-source tag
     /// shattering them into per-environment buckets. Mirrors the
     /// commit-exclusion tests: covers `None` vs `Some("local")`,
