@@ -439,7 +439,7 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
 ///
 /// `json=false` renders a comfy-table with one row per registered
 /// metric and columns NAME / POLARITY / DEFAULT_ABS / DEFAULT_REL
-/// / UNIT / DESCRIPTION. `json=true` emits `serde_json::to_string_pretty`
+/// / UNIT. `json=true` emits `serde_json::to_string_pretty`
 /// on the whole [`METRICS`] slice — the `accessor` fn-pointer is
 /// `#[serde(skip)]` so the array carries only wire-stable fields.
 ///
@@ -462,7 +462,6 @@ pub fn list_metrics(json: bool) -> anyhow::Result<String> {
         "DEFAULT_ABS",
         "DEFAULT_REL",
         "UNIT",
-        "DESCRIPTION",
     ]);
     for m in METRICS {
         table.add_row(vec![
@@ -2766,13 +2765,23 @@ fn render_dirty_warning(rows_a: &[GauntletRow], rows_b: &[GauntletRow]) -> Optio
     let mut dirty_kernel: BTreeSet<&str> = BTreeSet::new();
     let mut dirty_project: BTreeSet<&str> = BTreeSet::new();
     for row in rows_a.iter().chain(rows_b.iter()) {
+        // `ends_with` matches the producer contract: `detect_kernel_commit`
+        // and `detect_project_commit` (sidecar.rs:851, :983) append
+        // `-dirty` as a SUFFIX to the 7-char hex via
+        // `format!("{short_hash}-dirty")`, so the dirty marker is
+        // always tail-positioned. `contains` would also match a
+        // hex hash that legitimately contains the substring `-dirty`
+        // somewhere in the middle (impossible for the current
+        // 7-char hex prefix, but a future commit-ish format change
+        // would let a non-dirty value flag itself dirty under
+        // `contains`).
         if let Some(c) = row.kernel_commit.as_deref()
-            && c.contains("-dirty")
+            && c.ends_with("-dirty")
         {
             dirty_kernel.insert(c);
         }
         if let Some(c) = row.commit.as_deref()
-            && c.contains("-dirty")
+            && c.ends_with("-dirty")
         {
             dirty_project.insert(c);
         }
@@ -3625,6 +3634,86 @@ mod tests {
         );
     }
 
+    /// `sidecar_to_row` must copy `SidecarResult::source` into
+    /// `GauntletRow::source` verbatim so the typed `--source`
+    /// filter and per-side `--a-source` / `--b-source` slicers
+    /// see the run-environment provenance tag the sidecar writer
+    /// recorded. A regression that left the field at the
+    /// `Option::default()` (`None`) would silently drop the
+    /// source dimension from every comparison even when the
+    /// sidecar had a populated value. Mirrors
+    /// `sidecar_to_row_propagates_kernel_commit` for the
+    /// `source` field; pinned for `None` and the canonical
+    /// `Some("local")` / `Some("ci")` / `Some("archive")`
+    /// values so a regression that special-cased one tag and
+    /// not the others surfaces here. A non-aliasing pin
+    /// confirms `source` reads from `sc.source` rather than
+    /// being cross-wired to the visually-similar
+    /// `kernel_commit` / `project_commit` fields.
+    #[test]
+    fn sidecar_to_row_propagates_source() {
+        use crate::test_support;
+        for tag in ["local", "ci", "archive"] {
+            let sc = test_support::SidecarResult {
+                test_name: format!("source_{tag}_test"),
+                topology: "1n1l2c1t".to_string(),
+                source: Some(tag.to_string()),
+                ..test_support::SidecarResult::test_fixture()
+            };
+            let row = sidecar_to_row(&sc);
+            assert_eq!(
+                row.source.as_deref(),
+                Some(tag),
+                "populated source `{tag}` must propagate verbatim",
+            );
+        }
+
+        let sc_none = test_support::SidecarResult {
+            test_name: "no_source_test".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            source: None,
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row_none = sidecar_to_row(&sc_none);
+        assert!(
+            row_none.source.is_none(),
+            "absent source must propagate as None — a regression \
+             substituting an empty string would dilute every \
+             `--source` filter into matching all None rows",
+        );
+
+        // Field non-aliasing pin: `source` must route to its own
+        // row field. A regression that cross-wired `source` to
+        // `kernel_commit` (or vice versa) would hide behind the
+        // populated tests above unless the values are visibly
+        // different. Distinct tokens make the swap obvious.
+        let sc_distinct = test_support::SidecarResult {
+            test_name: "source_distinct_test".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            source: Some("local".to_string()),
+            kernel_commit: Some("kabcde7".to_string()),
+            project_commit: Some("pabcde7".to_string()),
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row_distinct = sidecar_to_row(&sc_distinct);
+        assert_eq!(
+            row_distinct.source.as_deref(),
+            Some("local"),
+            "row.source must come from sc.source, not from \
+             kernel_commit or project_commit",
+        );
+        assert_eq!(
+            row_distinct.kernel_commit.as_deref(),
+            Some("kabcde7"),
+            "row.kernel_commit must remain sourced from sc.kernel_commit",
+        );
+        assert_eq!(
+            row_distinct.commit.as_deref(),
+            Some("pabcde7"),
+            "row.commit must remain sourced from sc.project_commit",
+        );
+    }
+
     #[test]
     fn sidecar_to_row_no_stall() {
         use crate::monitor;
@@ -4018,14 +4107,7 @@ mod tests {
     #[test]
     fn list_metrics_text_header_pins_column_names() {
         let out = list_metrics(false).expect("text render must succeed");
-        for header in [
-            "NAME",
-            "POLARITY",
-            "DEFAULT_ABS",
-            "DEFAULT_REL",
-            "UNIT",
-            "DESCRIPTION",
-        ] {
+        for header in ["NAME", "POLARITY", "DEFAULT_ABS", "DEFAULT_REL", "UNIT"] {
             assert!(
                 out.contains(header),
                 "list_metrics(false) output missing column header {header}: {out}",
@@ -6204,6 +6286,97 @@ mod tests {
         );
     }
 
+    /// `--source local` against a row whose `source` is `None`
+    /// must NOT match — same opt-in policy as `--kernel`,
+    /// `--commit`, and `--kernel-commit`. The operator wrote
+    /// specific tags and a None-row would silently dilute the
+    /// filtered set. Mirror of
+    /// `row_filter_kernel_commit_none_row_never_matches_populated_filter`
+    /// for the `source` field.
+    #[test]
+    fn row_filter_source_none_row_never_matches_populated_filter() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let filter = RowFilter {
+            sources: vec!["local".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter.matches(&row),
+            "None-source row must not match populated filter; \
+             got dilution",
+        );
+    }
+
+    /// Repeatable `--source A --source B` is OR-combined: a row
+    /// matches iff its `source` equals ANY listed entry. Mirror
+    /// of `row_filter_kernels_or_combined_matches_any_listed`
+    /// for the `source` dimension.
+    #[test]
+    fn row_filter_sources_or_combined_matches_any_listed() {
+        let mut row_local = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row_local.source = Some("local".to_string());
+        let mut row_ci = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row_ci.source = Some("ci".to_string());
+        let mut row_archive = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row_archive.source = Some("archive".to_string());
+        let filter = RowFilter {
+            sources: vec!["local".to_string(), "ci".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(filter.matches(&row_local), "first listed source must match");
+        assert!(filter.matches(&row_ci), "second listed source must match");
+        assert!(
+            !filter.matches(&row_archive),
+            "source outside the listed set must reject",
+        );
+    }
+
+    /// `--source` and `--kernel-commit` filter on DISTINCT row
+    /// fields. Pins the field non-aliasing: a row whose `source`
+    /// matches but whose `kernel_commit` does not (or vice
+    /// versa) must reject. A regression that cross-wired the
+    /// `matches()` arms (e.g. `sources` checked against
+    /// `row.kernel_commit`) would silently dilute filtered sets.
+    /// Mirror of
+    /// `row_filter_kernel_commit_and_commit_filter_distinct_fields`
+    /// for the `source` × `kernel_commit` cross-wire surface.
+    #[test]
+    fn row_filter_sources_and_kernel_commits_are_distinct_fields() {
+        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row.source = Some("local".to_string());
+        row.kernel_commit = None;
+        let filter = RowFilter {
+            sources: vec!["local".to_string()],
+            kernel_commits: vec!["abc1234".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter.matches(&row),
+            "AND composition must reject when kernel_commit gate \
+             fails (row's kernel_commit is None) even though the \
+             source gate matches; a regression that cross-wired \
+             sources against `row.kernel_commit` would accept here",
+        );
+
+        // Symmetric arm: source mismatches but kernel_commit
+        // matches. Whole filter must still reject.
+        let mut row2 = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row2.source = Some("ci".to_string());
+        row2.kernel_commit = Some("abc1234".to_string());
+        let filter2 = RowFilter {
+            sources: vec!["local".to_string()],
+            kernel_commits: vec!["abc1234".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter2.matches(&row2),
+            "AND composition must reject when source gate fails \
+             even though kernel_commit gate passes; a regression \
+             that cross-wired kernel_commits against `row.source` \
+             would accept here",
+        );
+    }
+
     /// `--commit` and `--kernel` compose with AND semantics: a
     /// populated commit filter and a populated kernel filter must
     /// BOTH match for the row to survive. Pins the cross-field
@@ -7043,6 +7216,49 @@ mod tests {
         assert_eq!(
             derive_slicing_dims(&f_a, &f_b),
             vec![Dimension::Kernel, Dimension::Scheduler],
+        );
+    }
+
+    /// Source-only diff: filters that disagree on `sources` and
+    /// agree on every other dimension produce a slicing-dim set
+    /// containing exactly `Dimension::Source`. Pins the Source
+    /// arm of the per-dimension comparison switch in
+    /// [`derive_slicing_dims`] — a regression that omitted the
+    /// arm or compared the wrong field would surface here as an
+    /// empty slicing-dim set (and downstream as a `compare`
+    /// command that mistakenly bails with "A and B select
+    /// identical rows" on a legitimate source contrast).
+    #[test]
+    fn derive_slicing_dims_source_only_diff() {
+        let f_a = RowFilter {
+            sources: vec!["local".to_string()],
+            ..RowFilter::default()
+        };
+        let f_b = RowFilter {
+            sources: vec!["ci".to_string()],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            derive_slicing_dims(&f_a, &f_b),
+            vec![Dimension::Source],
+            "differing `sources` must surface Source as a slicing dim",
+        );
+
+        // Sorted-deduped Vec semantics also apply on the Source
+        // dim — same set in different order/multiplicity must NOT
+        // slice. Mirrors the `derive_slicing_dims_vec_compares_as_set`
+        // contract for the Source arm.
+        let f_c = RowFilter {
+            sources: vec!["local".to_string(), "ci".to_string()],
+            ..RowFilter::default()
+        };
+        let f_d = RowFilter {
+            sources: vec!["ci".to_string(), "local".to_string(), "local".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            derive_slicing_dims(&f_c, &f_d).is_empty(),
+            "same source set in different order/multiplicity must NOT slice",
         );
     }
 

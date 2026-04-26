@@ -783,12 +783,42 @@ fn export_kernel_for_variant(entry: &KernelEntry) {
 /// Handles base tests (`ktstr/{name}`), gauntlet variants
 /// (`gauntlet/{name}/{preset}/{profile}`), and bare names
 /// (backward compat). When `KTSTR_KERNEL_LIST` carries 2+ kernels,
-/// every test name additionally ends with `/{sanitized_kernel_label}`
-/// — that suffix is peeled here and the matching kernel directory
-/// is re-exported via [`KTSTR_KERNEL_ENV`] before the dispatch
-/// continues. Returns an exit code.
+/// VM-bound test names additionally end with
+/// `/{sanitized_kernel_label}` — that suffix is peeled here and
+/// the matching kernel directory is re-exported via
+/// [`KTSTR_KERNEL_ENV`] before the dispatch continues. `host_only`
+/// tests are short-circuited BEFORE the suffix peel: they never
+/// boot a VM, so the kernel-suffix listing path emits one
+/// `ktstr/{name}: test` entry without a kernel suffix regardless
+/// of the kernel-list cardinality (see `list_tests_all` /
+/// `list_tests_budget`), and routing them through
+/// `strip_kernel_suffix` would surface as a "no recognised kernel
+/// suffix" exit-1 error. Returns an exit code.
 pub(crate) fn run_named_test(test_name: &str) -> i32 {
     let kernel_list = read_kernel_list();
+
+    // host_only short-circuit: in multi-kernel mode, host_only tests
+    // are listed without a `/{sanitized_kernel_label}` suffix (see
+    // `list_tests_all` / `list_tests_budget`, which emit a single
+    // `ktstr/{name}: test` line for host_only entries regardless of
+    // the kernel-list cardinality — a host_only test never boots a
+    // VM, so the kernel never affects what runs). Calling
+    // `strip_kernel_suffix` on such a name in multi-kernel mode
+    // would fail with the "no recognised kernel suffix" error and
+    // misroute every host_only dispatch to exit 1.
+    //
+    // Resolve the host_only check from `find_test` BEFORE the
+    // suffix peel so the multi-kernel branch only applies to
+    // VM-bound tests. Single-kernel mode is unaffected — the
+    // pass-through arm in `strip_kernel_suffix` returns the input
+    // verbatim either way.
+    let bare_for_lookup = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
+    if let Some(entry) = find_test(bare_for_lookup)
+        && entry.host_only
+    {
+        return run_host_only_test(entry);
+    }
+
     let (test_name, kernel_entry) = match strip_kernel_suffix(test_name, &kernel_list) {
         Ok(pair) => pair,
         Err(e) => {
@@ -813,6 +843,10 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
         }
     };
 
+    // Defense-in-depth: host_only re-check after suffix peel for the
+    // edge case where the bare_for_lookup pre-strip lookup missed
+    // (e.g. a future test name shape that doesn't match the
+    // pre-strip form but does after the suffix peel).
     if entry.host_only {
         return run_host_only_test(entry);
     }

@@ -907,11 +907,18 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
     // own lock and finds the just-written entry, skipping the
     // redundant build.
     //
-    // `flat_map_iter` flattens Range expansion into the same
-    // parallel pool: a 5-version range from a single spec
-    // contributes 5 independent download-and-build futures
-    // alongside any peer specs, rather than serializing the
-    // range against itself the way the prior loop body did.
+    // `flat_map_iter` flattens Range expansion under one rayon
+    // worker: the closure resolves every version of a single
+    // Range spec sequentially via `.map(...).collect::<Vec<_>>()`
+    // before yielding the iterator, so a 5-version range
+    // serializes its five resolves against itself within one
+    // worker. Peer specs (other top-level `--kernel` arguments)
+    // still parallelize across workers — only versions WITHIN
+    // one Range are serial. The serialization is acceptable
+    // because the per-version build phase is already serialized
+    // at the LLC-flock layer (see comment above), so the lost
+    // intra-range download overlap is a small fraction of total
+    // wall time on multi-version Range invocations.
     //
     // Result-collecting fail-fast: rayon's `collect` on
     // `Result<_, _>` short-circuits on the first error, so a
@@ -933,9 +940,13 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
             }
         })
         .flat_map_iter(|trimmed| {
-            // `flat_map_iter` returns an iterator per input, so a
-            // Range spec contributes N items to the parallel
-            // pool. Each yielded item is an opaque
+            // `flat_map_iter` returns an iterator per input. The
+            // Range arm below pre-collects every version's
+            // `resolve_one` result into a Vec before yielding,
+            // so versions WITHIN a single Range spec resolve
+            // sequentially under one rayon worker; only PEER
+            // specs (other top-level `--kernel` args) parallelize
+            // across workers. Each yielded item is an opaque
             // `Result<(String, PathBuf), String>` driven by the
             // shared `resolve_one` helper; rayon's `collect` on
             // `Result` short-circuits on the first error.
