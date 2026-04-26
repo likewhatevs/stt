@@ -2371,10 +2371,11 @@ struct NoneCatalogEntry {
     ///
     /// One fix per entry: this is the most-common-case
     /// remediation, picked when a field has multiple causes that
-    /// all converge on the same operator action. A future
-    /// per-cause refactor (tracked separately) would split this
-    /// into per-cause remediations; the current shape covers the
-    /// typical case without forcing a deeper data-model change.
+    /// all converge on the same operator action. The current
+    /// shape covers the typical case without forcing a deeper
+    /// data-model change; a per-cause split is possible if the
+    /// catalog grows fields whose causes legitimately diverge
+    /// in their remediation.
     fix: Option<&'static str>,
 }
 
@@ -2636,9 +2637,9 @@ fn project_optional_fields(sc: &crate::test_support::SidecarResult) -> [(&'stati
 /// file the walker visited; `valid` counts how many parsed
 /// into a [`crate::test_support::SidecarResult`]; `errors`
 /// carries the per-file parse failures as
-/// `(path, raw-serde-error, optional-enrichment)` triples
-/// sourced from
-/// [`crate::test_support::collect_sidecars_with_errors`].
+/// [`crate::test_support::SidecarParseError`] records (named
+/// fields: `path`, `raw_error`, `enriched_message`) sourced
+/// from [`crate::test_support::collect_sidecars_with_errors`].
 ///
 /// The enrichment field is `Some(prose)` for parse failures
 /// where a known schema-drift remediation applies (currently
@@ -2669,12 +2670,13 @@ struct WalkStats {
 /// files plus one level of subdirectories). Pure file-existence
 /// pass — no parsing, no `serde_json` work — used purely to
 /// derive the `walked` count for [`WalkStats`].
+///
+/// Filename predicate is shared with the parsing walker via
+/// [`crate::test_support::is_sidecar_filename`] so the count and
+/// parse-outcome walkers cannot disagree on what qualifies as a
+/// sidecar.
 fn count_sidecar_files(run_dir: &Path) -> usize {
     let mut count = 0usize;
-    let is_sidecar = |path: &Path| -> bool {
-        path.extension().and_then(|e| e.to_str()) == Some("json")
-            && path.to_str().is_some_and(|s| s.contains(".ktstr."))
-    };
     let entries = match std::fs::read_dir(run_dir) {
         Ok(e) => e,
         Err(_) => return 0,
@@ -2686,14 +2688,14 @@ fn count_sidecar_files(run_dir: &Path) -> usize {
             subdirs.push(path);
             continue;
         }
-        if is_sidecar(&path) {
+        if crate::test_support::is_sidecar_filename(&path) {
             count += 1;
         }
     }
     for sub in subdirs {
         if let Ok(entries) = std::fs::read_dir(&sub) {
             for entry in entries.flatten() {
-                if is_sidecar(&entry.path()) {
+                if crate::test_support::is_sidecar_filename(&entry.path()) {
                     count += 1;
                 }
             }
@@ -2708,13 +2710,15 @@ fn count_sidecar_files(run_dir: &Path) -> usize {
 /// [`crate::test_support::collect_sidecars_with_errors`] — that
 /// helper emits per-file `eprintln!` hints on parse failure
 /// (surfacing the actionable schema-drift message to the
-/// operator) AND returns a structured `(path, error)` list that
-/// flows into [`WalkStats::errors`] for the JSON / text renderers
-/// to surface alongside the per-field breakdown. The `walked`
-/// count is derived independently via [`count_sidecar_files`] so
-/// the diagnostic header reports total `.ktstr.json` files
-/// visited (corrupt + valid), independent of any parse-failure
-/// short-circuit.
+/// operator) AND returns a structured
+/// `Vec<`[`crate::test_support::SidecarParseError`]`>` (each
+/// record carries `path`, `raw_error`, and
+/// `enriched_message`) that flows into [`WalkStats::errors`] for
+/// the JSON / text renderers to surface alongside the per-field
+/// breakdown. The `walked` count is derived independently via
+/// [`count_sidecar_files`] so the diagnostic header reports total
+/// `.ktstr.json` files visited (corrupt + valid), independent of
+/// any parse-failure short-circuit.
 fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResult>, WalkStats) {
     let walked = count_sidecar_files(run_dir);
     let (sidecars, errors) = crate::test_support::collect_sidecars_with_errors(run_dir);
@@ -2782,6 +2786,17 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 /// per-file visibility into total-parse-failure runs rather
 /// than a single-line bail.
 ///
+/// Exit-code contract: this command exits 0 even when every
+/// sidecar in the run failed to parse — the diagnostic
+/// surface is the structured `_walk.errors` array (or the
+/// trailing `corrupt sidecars` text block), not the process
+/// exit code. CI scripts that need to fail on parse failures
+/// MUST gate on `_walk.valid > 0` or `_walk.errors.len() == 0`
+/// rather than relying on exit code. The only exit-code
+/// failures are the two errors documented below: missing run
+/// directory and zero `.ktstr.json` files (an empty run, not
+/// a corrupt one).
+///
 /// # Errors
 ///
 /// - The run directory does not exist.
@@ -2833,8 +2848,10 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
 /// runs see content changes, not iteration-order noise.
 ///
 /// When `walk_stats.errors` is non-empty, a trailing block
-/// "corrupt sidecars (N):" lists each `(path, error)` pair so
-/// operators see parse failures alongside the per-sidecar
+/// "corrupt sidecars (N):" lists each
+/// [`crate::test_support::SidecarParseError`] entry — `path`
+/// followed by `raw_error` and (when present) `enriched_message`
+/// — so operators see parse failures alongside the per-sidecar
 /// breakdown rather than relying on the eprintln-only stderr
 /// path. Block emits only when errors exist — the common
 /// all-valid case stays unchanged.
@@ -2916,16 +2933,16 @@ fn render_explain_sidecar_text(
     }
     if !walk_stats.errors.is_empty() {
         let _ = writeln!(out, "corrupt sidecars ({}):", walk_stats.errors.len());
-        for (path, error, enriched) in &walk_stats.errors {
-            let _ = writeln!(out, "  {}", path.display());
-            let _ = writeln!(out, "    error: {error}");
+        for err in &walk_stats.errors {
+            let _ = writeln!(out, "  {}", err.path.display());
+            let _ = writeln!(out, "    error: {}", err.raw_error);
             // Enriched prose lands on its own indented line below
             // the raw serde error so an operator sees both the
             // grep-friendly raw message and the human remediation
             // without losing either. Suppressed when no
             // enrichment applies (the common case — only the
             // host-missing schema-drift case enriches today).
-            if let Some(prose) = enriched {
+            if let Some(prose) = &err.enriched_message {
                 let _ = writeln!(out, "    enriched: {prose}");
             }
         }
@@ -2940,6 +2957,10 @@ fn render_explain_sidecar_text(
 /// dashboard consumers can gate on a known shape rather than
 /// guessing from the keys present. Additive shape changes (new
 /// optional keys, new entries in `fields`) do NOT bump this.
+///
+/// Consumers should parse this string as an integer before
+/// comparing — gate on `parsed >= 1` (integer comparison, not
+/// lexicographic string comparison).
 const EXPLAIN_SIDECAR_SCHEMA_VERSION: &str = "1";
 
 /// Top-level JSON shape for [`explain_sidecar`] in `--json` mode.
@@ -2948,10 +2969,28 @@ const EXPLAIN_SIDECAR_SCHEMA_VERSION: &str = "1";
 /// first so consumers gating on it see it before scanning the
 /// rest of the document, then `_walk`, then `fields`.
 ///
+/// **Per-field ordering across the two channels diverges**:
 /// `fields` uses [`std::collections::BTreeMap`] so JSON output
 /// orders entries alphabetically (deterministic across
 /// invocations); a [`std::collections::HashMap`] would surface
-/// hash-randomized ordering.
+/// hash-randomized ordering. The text renderer iterates the
+/// projection helper's array directly, so text output orders
+/// `None` fields by their declaration order in
+/// [`SIDECAR_NONE_CATALOG`] (which matches struct declaration
+/// order on [`crate::test_support::SidecarResult`]). Consumers
+/// diffing JSON vs text outputs should expect `kernel_commit`
+/// before `kernel_version` in JSON (alphabetical) but
+/// `kernel_version` before `kernel_commit` in text (catalog
+/// order).
+///
+/// **`_` prefix convention**: keys whose names begin with `_`
+/// (`_schema_version`, `_walk`) are envelope keys carrying
+/// metadata about the response itself rather than per-field
+/// diagnostic data. The struct declares them before `fields`,
+/// so they appear first in the serialized output (serde
+/// preserves struct declaration order, not lexicographic
+/// order). The `_` prefix is a convention signaling
+/// envelope/metadata keys to consumers.
 #[derive(serde::Serialize)]
 struct ExplainOutput<'a> {
     _schema_version: &'a str,
@@ -3065,10 +3104,10 @@ fn render_explain_sidecar_json(
     let errors: Vec<WalkError<'_>> = walk_stats
         .errors
         .iter()
-        .map(|(path, error, enriched)| WalkError {
-            path: path.display().to_string(),
-            error,
-            enriched_message: enriched.as_deref(),
+        .map(|err| WalkError {
+            path: err.path.display().to_string(),
+            error: &err.raw_error,
+            enriched_message: err.enriched_message.as_deref(),
         })
         .collect();
     let output = ExplainOutput {

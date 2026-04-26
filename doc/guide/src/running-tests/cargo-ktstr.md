@@ -665,15 +665,20 @@ across all valid sidecars in the run, summing to
 Output produced before the schema-version stamp landed has
 no `_schema_version` key; consumers should treat the key's
 absence as pre-stamp output (compatible with shape `"1"` in
-practice but unstamped). Parse the stamp as an integer (not
-a substring or float) when gating on it.
+practice but unstamped).
 
 The version bumps on incompatible shape changes (key
 rename, key removal, semantic shift in an existing key) but
 NOT on additive changes (new optional top-level keys, new
 entries in `fields`, new optional sub-keys under existing
-entries). Pin loosely — gate on `>= "1"` rather than `== "1"`
-so dashboard code keeps working when the catalog grows.
+entries). The stamp is emitted as a JSON string (e.g. `"1"`,
+`"2"`); parse it by stripping the quotes and converting the
+inner digits to an integer, then gate on `parsed >= 1`
+(integer comparison) — never use raw string comparison, since
+lexicographic order would put `"10"` ahead of `"2"`. Pin
+loosely (e.g. accept any version `>= 1`) so dashboard code
+keeps working when the catalog grows; tighten only on the
+specific bumps a consumer cannot tolerate.
 
 ```sh
 cargo ktstr stats explain-sidecar --run RUN_ID                       # text per-sidecar diagnostic

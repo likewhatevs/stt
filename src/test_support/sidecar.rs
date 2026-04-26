@@ -248,7 +248,16 @@ pub struct SidecarResult {
     /// Host context — static-ish runtime state (CPU model,
     /// memory size, THP policy, kernel release, host cmdline,
     /// scheduler tunables). Populated by production sidecar
-    /// writers; `None` on the test-fixture path.
+    /// writers.
+    ///
+    /// `None` causes:
+    /// - **test-fixture path**: not the production sidecar
+    ///   writer (production writers always populate `host`).
+    /// - **pre-enrichment archive**: sidecar predates the
+    ///   host-context landing — re-run the test to regenerate
+    ///   under the current schema (no migration shim exists
+    ///   per the pre-1.0 disposable-data contract).
+    ///
     /// Deliberately excluded from the variant hash so
     /// gauntlet variants on different hosts collapse into the same
     /// hash bucket.
@@ -403,6 +412,39 @@ impl SidecarResult {
     }
 }
 
+/// Predicate: is `path` a ktstr sidecar JSON filename?
+///
+/// True iff the path's extension is `json` AND the path's
+/// FILENAME COMPONENT (`Path::file_name`) contains `.ktstr.` —
+/// matching the on-disk shape produced by [`write_sidecar`]
+/// (`<test>-<variant_hash>.ktstr.json`). Both gates are required:
+/// bare `*.json` files (cargo cache, stray fixtures) and non-json
+/// files whose name happens to contain `.ktstr.` (e.g. a log)
+/// are excluded.
+///
+/// The filename-component check (rather than full-path string)
+/// is load-bearing: a parent directory like
+/// `target/foo.ktstr.bar/extra.json` would falsely match a
+/// whole-path `contains(".ktstr.")` while NOT being a sidecar.
+/// `Path::file_name()` returns only the trailing component, so
+/// `.ktstr.` in any ancestor segment cannot trigger the predicate.
+///
+/// Single source of truth for "is this file a sidecar?" — used
+/// by [`collect_sidecars_with_errors`]'s parsing walker and by
+/// [`crate::cli::count_sidecar_files`]'s file-count walker. Both
+/// walkers MUST agree on the predicate so `walked` (count) and
+/// `valid + errors` (parse outcomes) reconcile against each
+/// other; a divergence would let a file count toward `walked`
+/// without contributing to either bucket, manifesting as a
+/// silent-drop count that has no source.
+pub(crate) fn is_sidecar_filename(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("json")
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".ktstr."))
+}
+
 /// Scan a directory for ktstr sidecar JSON files. Recurses one level
 /// into subdirectories to handle per-job gauntlet layouts.
 ///
@@ -416,22 +458,28 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
 
 /// Per-file parse-failure record returned by
 /// [`collect_sidecars_with_errors`] and threaded through
-/// [`crate::cli::WalkStats::errors`] to the renderers. The
-/// triple is `(path, raw-serde-error, optional-enrichment)`:
+/// [`crate::cli::WalkStats::errors`] to the renderers.
 ///
-/// - `path`: the on-disk path of the sidecar that failed.
-/// - raw serde-error string: serde's verbatim message, kept for
-///   grep-friendly parse-error tracking.
-/// - optional enrichment prose: `Some(...)` for known
-///   schema-drift cases (currently the `host` missing-field
-///   pattern), `None` otherwise. Computed by
-///   [`enriched_parse_error_message`].
-///
-/// Aliased so callers don't restate the tuple shape and so a
-/// future move to a named struct stays a single-site rename.
-/// Also silences clippy's `type_complexity` on the walker's
-/// return type without the noise of an inline `#[allow]`.
-pub(crate) type SidecarParseError = (std::path::PathBuf, String, Option<String>);
+/// Named-field struct (rather than a `(PathBuf, String,
+/// Option<String>)` tuple) so call sites read fields by name —
+/// pattern-matching `for err in errors` and accessing
+/// `err.path` / `err.raw_error` / `err.enriched_message`
+/// resists the tuple-position-swap class of bug where positional
+/// fields could destructure in either order without compiler help.
+pub(crate) struct SidecarParseError {
+    /// On-disk path of the sidecar JSON that failed to parse.
+    pub path: std::path::PathBuf,
+    /// Verbatim serde-error string. Kept raw for
+    /// grep-friendly parse-error tracking and surfaced through
+    /// the JSON channel as the `error` key.
+    pub raw_error: String,
+    /// Operator-facing remediation prose computed by
+    /// [`enriched_parse_error_message`]. `Some(...)` for known
+    /// schema-drift cases (currently the `host` missing-field
+    /// pattern), `None` otherwise. Surfaced through the JSON
+    /// channel as `enriched_message`.
+    pub enriched_message: Option<String>,
+}
 
 /// Test-only re-export of [`enriched_parse_error_message`] so
 /// `cli::tests` can verify the enrichment-pattern logic
@@ -477,21 +525,22 @@ fn enriched_parse_error_message(path: &std::path::Path, raw_error: &str) -> Opti
 }
 
 /// Scan a directory for ktstr sidecar JSON files, returning both
-/// the parsed sidecars and a `(path, raw-serde-error,
-/// optional-enrichment)` triple for every file that failed to
-/// deserialize. Recurses one level into subdirectories to handle
-/// per-job gauntlet layouts.
+/// the parsed sidecars and a [`SidecarParseError`] record (named
+/// fields `path`, `raw_error`, `enriched_message`) for every file
+/// that failed to deserialize. Recurses one level into
+/// subdirectories to handle per-job gauntlet layouts.
 ///
 /// Surfaces parse failures in two channels:
 /// - `eprintln!` to stderr (preserved for the operator-facing
 ///   pre-1.0 disposable-sidecar diagnostic — emits the enriched
 ///   prose for the host-missing schema-drift case, the raw serde
 ///   message otherwise).
-/// - The returned errors vec, capturing
-///   `(path, raw-error, Option<enriched>)` for structured callers
-///   (`explain-sidecar`'s walker output). Both raw and enriched
-///   are exposed so dashboard consumers can pick: raw for parse-
-///   error grepping, enriched for human-facing remediation prose.
+/// - The returned errors vec, capturing a [`SidecarParseError`]
+///   record (named fields `path`, `raw_error`, `enriched_message`)
+///   for structured callers (`explain-sidecar`'s walker output).
+///   Both raw and enriched are exposed so dashboard consumers can
+///   pick: raw for parse-error grepping, enriched for human-facing
+///   remediation prose.
 ///
 /// Both channels surface every parse failure — the eprintln path
 /// is informational, the returned vec is structured. Callers that
@@ -509,10 +558,7 @@ pub(crate) fn collect_sidecars_with_errors(
     let try_load = |path: &std::path::Path,
                     out: &mut Vec<SidecarResult>,
                     errs: &mut Vec<SidecarParseError>| {
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            return;
-        }
-        if !path.to_str().is_some_and(|s| s.contains(".ktstr.")) {
+        if !is_sidecar_filename(path) {
             return;
         }
         let data = match std::fs::read_to_string(path) {
@@ -532,7 +578,11 @@ pub(crate) fn collect_sidecars_with_errors(
                     Some(prose) => eprintln!("{prose}"),
                     None => eprintln!("ktstr_test: skipping {}: {raw}", path.display()),
                 }
-                errs.push((path.to_path_buf(), raw, enriched));
+                errs.push(SidecarParseError {
+                    path: path.to_path_buf(),
+                    raw_error: raw,
+                    enriched_message: enriched,
+                });
             }
         }
     };
