@@ -744,19 +744,21 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// observed. Submodules are ignored
 /// (`Submodule::Given { ignore: All }`).
 ///
-/// The dirt-detection cascade matches [`crate::fetch::local_source`]
-/// (`src/fetch.rs` ~line 698): peel HEAD to its tree, diff
-/// tree-vs-index, then `status()` for worktree-vs-index. The HASH
-/// REPRESENTATION DIFFERS, however: `fetch::local_source` DROPS
-/// the short hash entirely on dirty (returns `None`) because the
-/// commit no longer describes the build input the cache key
-/// embeds — publishing a stale hash there would misidentify the
-/// build. This helper KEEPS the hash with a `-dirty` suffix
-/// instead because the sidecar's `project_commit` is a debugging
-/// breadcrumb (operator-readable identity, not a cache-key input);
-/// the hash plus dirty flag carries strictly more information
-/// than `None` for the operator's "which ktstr commit did this
-/// sidecar come from?" question.
+/// Dirt-detection runs through the shared [`repo_is_dirty`]
+/// helper (peel HEAD to its tree, diff tree-vs-index, then
+/// `status()` for worktree-vs-index, submodules skipped); see its
+/// doc for cascade details. The cascade matches
+/// [`crate::fetch::local_source`], but the HASH REPRESENTATION
+/// DIFFERS: `fetch::local_source` DROPS the short hash entirely
+/// on dirty (returns `None`) because the commit no longer
+/// describes the build input the cache key embeds — publishing a
+/// stale hash there would misidentify the build. This helper
+/// KEEPS the hash with a `-dirty` suffix instead because the
+/// sidecar's `project_commit` is a debugging breadcrumb
+/// (operator-readable identity, not a cache-key input); the hash
+/// plus dirty flag carries strictly more information than `None`
+/// for the operator's "which ktstr commit did this sidecar come
+/// from?" question.
 ///
 /// Returns `None` when:
 /// - `current_dir()` cannot be resolved (process has no valid
@@ -815,25 +817,51 @@ fn detect_commit_at(path: &std::path::Path) -> Option<String> {
     // method.
     let short_hash = head.to_hex_with_len(7).to_string();
 
-    // Peel HEAD to its tree for the tree-vs-index diff that
-    // detects staged changes. A failure here means HEAD points
-    // at something that cannot be read as a tree — return the
-    // short hash without `-dirty` per the doc's "treat as clean
-    // on probe failure" contract.
-    let head_tree_id = match repo.head_tree() {
-        Ok(t) => t.id,
-        Err(_) => return Some(short_hash),
-    };
+    if repo_is_dirty(&repo).unwrap_or(false) {
+        Some(format!("{short_hash}-dirty"))
+    } else {
+        Some(short_hash)
+    }
+}
 
-    // `repo.index()` returns `Err` on missing-index repos
-    // (partially-checked-out clones, or fresh `git init` before
-    // the first commit). `index_or_empty()` would silently
-    // substitute an empty index, then the tree-vs-index diff
-    // below would flag every tracked file as "deleted from
-    // index" and trip false-dirty. Using `index()` so that the
-    // missing-index case falls through the `if let Ok(...)` and
-    // leaves `index_dirty = false`, matching the doc's contract
-    // that probe-leg failures degrade to "treat as clean."
+/// Probe whether a gix repository's working tree differs from its
+/// HEAD commit, ignoring submodules.
+///
+/// Returns `Some(true)` when the index differs from the HEAD tree
+/// or the worktree differs from the index for any tracked file;
+/// `Some(false)` when neither leg observed a difference; `None`
+/// when the HEAD-tree peel itself failed (HEAD points at something
+/// that cannot be read as a tree).
+///
+/// Callers in [`detect_commit_at`] / [`detect_kernel_commit`]
+/// degrade `None` to "treat as clean" via `unwrap_or(false)` so
+/// metadata probes never gate sidecar writes.
+///
+/// PROBE LEGS:
+/// - tree-vs-index: peel HEAD to its tree, then `tree_index_status`
+///   diff against the on-disk index. `repo.index()` returning Err
+///   (missing index — partially-checked-out clones, or fresh
+///   `git init` before the first commit) silently leaves the
+///   index-dirty leg false. `index_or_empty()` is deliberately
+///   NOT used because it would substitute an empty index and the
+///   diff would flag every tracked file as "deleted from index",
+///   tripping false-dirty.
+/// - index-vs-worktree: `repo.status()` configured with
+///   `Submodule::Given { ignore: All }` so submodule worktree
+///   state is skipped. Short-circuited when the tree-vs-index leg
+///   already flipped dirty: the result only needs one positive
+///   signal, so a known-dirty index makes the worktree walk
+///   redundant. Matches the equivalent short-circuit in
+///   [`crate::fetch::local_source`].
+///
+/// FAILURE DEGRADATION: any individual leg failure (missing index,
+/// `repo.status()` failure, `into_index_worktree_iter()` failure)
+/// silently degrades that leg to "no signal" rather than aborting.
+/// The function only returns `None` when the HEAD-tree peel
+/// fails, because at that point neither leg can run at all.
+fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
+    let head_tree_id = repo.head_tree().ok()?.id;
+
     let mut index_dirty = false;
     if let Ok(index) = repo.index() {
         let _ = repo.tree_index_status(
@@ -848,11 +876,6 @@ fn detect_commit_at(path: &std::path::Path) -> Option<String> {
         );
     }
 
-    // Check index-vs-worktree for modified tracked files, skipping
-    // submodules entirely (Ignore::All). Short-circuited when
-    // `index_dirty` is already true: the suffix only needs to flip
-    // once, so a known-dirty index makes the worktree walk
-    // redundant. Matches the same short-circuit at fetch.rs:726.
     let worktree_dirty = if index_dirty {
         false
     } else {
@@ -874,11 +897,7 @@ fn detect_commit_at(path: &std::path::Path) -> Option<String> {
             .unwrap_or(false)
     };
 
-    if index_dirty || worktree_dirty {
-        Some(format!("{short_hash}-dirty"))
-    } else {
-        Some(short_hash)
-    }
+    Some(index_dirty || worktree_dirty)
 }
 
 /// Detect the kernel SOURCE TREE's git HEAD at sidecar-write time.
@@ -898,15 +917,15 @@ fn detect_commit_at(path: &std::path::Path) -> Option<String> {
 ///
 /// Reads HEAD short-hex (7 chars via `oid::to_hex_with_len(7)`)
 /// and appends `-dirty` when index-vs-HEAD or worktree-vs-index
-/// changes are observed. Submodules are ignored
-/// (`Submodule::Given { ignore: All }`). The dirt-detection
-/// cascade matches [`detect_project_commit`] / [`crate::fetch::local_source`]:
-/// peel HEAD to its tree, diff tree-vs-index, then `status()`
-/// for worktree-vs-index. Same "treat as clean on probe failure"
-/// degradation rules apply: a missing index, an unreadable
-/// worktree, or `head_tree()` failure each fall through as
-/// "clean" rather than aborting the probe — metadata must not
-/// gate sidecar writes.
+/// changes are observed. Dirt-detection runs through the shared
+/// [`repo_is_dirty`] helper (submodules skipped via
+/// `Submodule::Given { ignore: All }`); see its doc for cascade
+/// details. The cascade matches [`detect_project_commit`] and
+/// [`crate::fetch::local_source`]. Same "treat as clean on probe
+/// failure" degradation rules apply: a missing index, an
+/// unreadable worktree, or `head_tree()` failure each fall
+/// through as "clean" rather than aborting the probe — metadata
+/// must not gate sidecar writes.
 ///
 /// HASH REPRESENTATION matches [`detect_project_commit`]: keeps
 /// the hash with `-dirty` appended (operator-readable identity).
@@ -930,47 +949,7 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
     let head = repo.head_id().ok()?;
     let short_hash = head.to_hex_with_len(7).to_string();
 
-    let head_tree_id = match repo.head_tree() {
-        Ok(t) => t.id,
-        Err(_) => return Some(short_hash),
-    };
-
-    let mut index_dirty = false;
-    if let Ok(index) = repo.index() {
-        let _ = repo.tree_index_status(
-            &head_tree_id,
-            &index,
-            None,
-            gix::status::tree_index::TrackRenames::Disabled,
-            |_, _, _| {
-                index_dirty = true;
-                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
-            },
-        );
-    }
-
-    let worktree_dirty = if index_dirty {
-        false
-    } else {
-        repo.status(gix::progress::Discard)
-            .ok()
-            .and_then(|s| {
-                s.index_worktree_rewrites(None)
-                    .index_worktree_submodules(gix::status::Submodule::Given {
-                        ignore: gix::submodule::config::Ignore::All,
-                        check_dirty: false,
-                    })
-                    .index_worktree_options_mut(|opts| {
-                        opts.dirwalk_options = None;
-                    })
-                    .into_index_worktree_iter(Vec::new())
-                    .ok()
-                    .map(|mut iter| iter.next().is_some())
-            })
-            .unwrap_or(false)
-    };
-
-    if index_dirty || worktree_dirty {
+    if repo_is_dirty(&repo).unwrap_or(false) {
         Some(format!("{short_hash}-dirty"))
     } else {
         Some(short_hash)
@@ -4101,6 +4080,43 @@ mod tests {
             result,
             format!("{expected_prefix}-dirty"),
             "dirty result must be {expected_prefix:?} + -dirty suffix"
+        );
+    }
+
+    /// `repo_is_dirty` returns `Some(false)` for a clean repo. Pins
+    /// the contract that the helper distinguishes "I checked, it's
+    /// clean" from "I couldn't check" (`None`), so future callers
+    /// that need that distinction get reliable signal. The
+    /// callthrough from `detect_commit_at` collapses both via
+    /// `unwrap_or(false)`, so this test covers a branch the
+    /// end-to-end `detect_project_commit_clean_repo_returns_short_hash`
+    /// test cannot pin.
+    #[test]
+    fn repo_is_dirty_clean_repo_returns_some_false() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_clean_repo_with_file(tmp.path());
+        let repo = gix::open(tmp.path()).expect("gix::open clean repo");
+        assert_eq!(
+            super::repo_is_dirty(&repo),
+            Some(false),
+            "clean repo must yield Some(false)"
+        );
+    }
+
+    /// `repo_is_dirty` returns `Some(true)` when the worktree
+    /// diverges from the index. Pins the index-vs-worktree leg of
+    /// the cascade independently of the suffix-formatting logic in
+    /// `detect_commit_at`.
+    #[test]
+    fn repo_is_dirty_dirty_worktree_returns_some_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_clean_repo_with_file(tmp.path());
+        std::fs::write(tmp.path().join("file.txt"), b"modified\n").unwrap();
+        let repo = gix::open(tmp.path()).expect("gix::open dirty repo");
+        assert_eq!(
+            super::repo_is_dirty(&repo),
+            Some(true),
+            "dirty worktree must yield Some(true)"
         );
     }
 

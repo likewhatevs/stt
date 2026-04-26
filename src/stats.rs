@@ -2641,6 +2641,94 @@ pub(crate) fn compare_rows_by(
     report
 }
 
+/// Emit a stderr warning naming any `-dirty` commit values present
+/// in the partitioned rows so the operator knows the comparison
+/// includes builds whose source tree may not match the recorded
+/// HEAD.
+///
+/// Scans `commit` (project HEAD) and `kernel_commit` (kernel source
+/// tree HEAD) on both sides' rows, dedupes the surviving values,
+/// and emits one warning block listing each distinct dirty value
+/// per dimension. Emits at most one block — silent when no row
+/// carries a `-dirty` suffix on either dimension.
+///
+/// Dirty runs reuse the same sidecar filename as their clean HEAD
+/// (the variant hash excludes `commit` / `kernel_commit` per
+/// [`crate::test_support::sidecar`]), so re-running the same test
+/// from a dirty tree overwrites the previous record. The warning
+/// surfaces this so an operator can decide whether to commit the
+/// working tree before re-running for a reproducible comparison.
+///
+/// Splits collection from emission via [`render_dirty_warning`] so
+/// unit tests can pin the rendered text without trapping `stderr`.
+fn warn_on_dirty_builds(rows_a: &[GauntletRow], rows_b: &[GauntletRow]) {
+    if let Some(text) = render_dirty_warning(rows_a, rows_b) {
+        eprint!("{text}");
+    }
+}
+
+/// Build the dirty-builds warning block from row data.
+///
+/// Returns `None` when no row on either side carries a `-dirty`
+/// suffix on either `commit` or `kernel_commit`. Otherwise returns
+/// the full multi-line warning text — the body emitted to stderr by
+/// [`warn_on_dirty_builds`] — terminated with a trailing newline so
+/// the caller can `eprint!` it without further formatting.
+///
+/// Dimensions render in fixed order ("kernel source" before
+/// "project") so the same dirty hashes always produce byte-identical
+/// output across runs; values within each dimension are
+/// `BTreeSet`-deduped so multiple rows sharing one dirty hash list
+/// it once, and multiple distinct dirty hashes on one dimension list
+/// in lex order.
+fn render_dirty_warning(rows_a: &[GauntletRow], rows_b: &[GauntletRow]) -> Option<String> {
+    use std::collections::BTreeSet;
+    use std::fmt::Write;
+
+    let mut dirty_kernel: BTreeSet<&str> = BTreeSet::new();
+    let mut dirty_project: BTreeSet<&str> = BTreeSet::new();
+    for row in rows_a.iter().chain(rows_b.iter()) {
+        if let Some(c) = row.kernel_commit.as_deref()
+            && c.contains("-dirty")
+        {
+            dirty_kernel.insert(c);
+        }
+        if let Some(c) = row.commit.as_deref()
+            && c.contains("-dirty")
+        {
+            dirty_project.insert(c);
+        }
+    }
+
+    if dirty_kernel.is_empty() && dirty_project.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    writeln!(out, "warning: comparison includes dirty builds:").unwrap();
+    for v in &dirty_kernel {
+        writeln!(
+            out,
+            "  - kernel source: {v} (working tree may have changed since this run)"
+        )
+        .unwrap();
+    }
+    for v in &dirty_project {
+        writeln!(
+            out,
+            "  - project: {v} (working tree may have changed since this run)"
+        )
+        .unwrap();
+    }
+    writeln!(
+        out,
+        "  Dirty runs overwrite previous results with the same HEAD."
+    )
+    .unwrap();
+    writeln!(out, "  Commit changes for reproducible-ish comparisons.").unwrap();
+    Some(out)
+}
+
 /// Compare two filter-defined partitions of the sidecar pool and
 /// report regressions across slicing dimensions.
 ///
@@ -2777,6 +2865,8 @@ pub fn compare_partitions(
             pool.len(),
         );
     }
+
+    warn_on_dirty_builds(&rows_a, &rows_b);
 
     let pre_agg_a = rows_a.len();
     let pre_agg_b = rows_b.len();
@@ -5524,6 +5614,162 @@ mod tests {
         );
     }
 
+    // -- render_dirty_warning --
+
+    /// No `-dirty` commit values on either side returns `None` so
+    /// the caller emits no banner. Pins the silent-when-clean
+    /// contract that lets `warn_on_dirty_builds` be a no-op for
+    /// release-quality runs.
+    #[test]
+    fn render_dirty_warning_silent_when_no_dirty_commits() {
+        let mut row = make_row("scn", "topo", true, 1.0);
+        row.commit = Some("abcdef1".into());
+        row.kernel_commit = Some("0123456".into());
+        let other = row.clone();
+        assert!(
+            super::render_dirty_warning(&[row], &[other]).is_none(),
+            "clean rows on both sides must yield no warning"
+        );
+    }
+
+    /// Empty input on both sides is silent — `compare_partitions`
+    /// bails before the call when either side is empty, but the
+    /// helper itself must still degrade cleanly.
+    #[test]
+    fn render_dirty_warning_silent_on_empty_inputs() {
+        assert!(
+            super::render_dirty_warning(&[], &[]).is_none(),
+            "empty inputs must yield no warning"
+        );
+    }
+
+    /// Dirty `kernel_commit` values across both sides are deduped
+    /// into one block under "kernel source", with each distinct
+    /// value listed once and `commit` (project) absent because
+    /// none of the rows are dirty on that dimension.
+    #[test]
+    fn render_dirty_warning_kernel_only_dedupes_values_across_sides() {
+        let mut a = make_row("scn", "topo", true, 1.0);
+        a.kernel_commit = Some("aaaaaaa-dirty".into());
+        a.commit = Some("clean01".into());
+        let mut a2 = make_row("scn2", "topo", true, 1.0);
+        a2.kernel_commit = Some("aaaaaaa-dirty".into()); // same as a
+        let mut b = make_row("scn", "topo", true, 1.0);
+        b.kernel_commit = Some("bbbbbbb-dirty".into());
+        let text = super::render_dirty_warning(&[a, a2], &[b])
+            .expect("dirty kernel_commit must yield warning");
+        assert!(
+            text.contains("warning: comparison includes dirty builds:"),
+            "missing header in {text:?}"
+        );
+        assert_eq!(
+            text.matches("kernel source: aaaaaaa-dirty").count(),
+            1,
+            "duplicate kernel_commit must be deduped, got {text:?}"
+        );
+        assert!(
+            text.contains("kernel source: bbbbbbb-dirty"),
+            "second distinct dirty kernel_commit must be listed, got {text:?}"
+        );
+        assert!(
+            !text.contains("project:"),
+            "no -dirty project commit; the project line must not appear: {text:?}"
+        );
+        assert!(
+            text.contains("Dirty runs overwrite previous results with the same HEAD."),
+            "missing trailer line 1 in {text:?}"
+        );
+        assert!(
+            text.contains("Commit changes for reproducible-ish comparisons."),
+            "missing trailer line 2 in {text:?}"
+        );
+    }
+
+    /// Dirty `commit` (project) values are listed under "project"
+    /// when no `kernel_commit` is dirty, so each dimension renders
+    /// only when populated.
+    #[test]
+    fn render_dirty_warning_project_only_omits_kernel_section() {
+        let mut a = make_row("scn", "topo", true, 1.0);
+        a.commit = Some("ccccccc-dirty".into());
+        let text = super::render_dirty_warning(&[a], &[]).expect("dirty commit must yield warning");
+        assert!(
+            text.contains("project: ccccccc-dirty"),
+            "expected project line in {text:?}"
+        );
+        assert!(
+            !text.contains("kernel source:"),
+            "kernel section must not appear when only project is dirty: {text:?}"
+        );
+    }
+
+    /// Both dimensions dirty: the warning lists "kernel source"
+    /// before "project" in stable order so byte-identical inputs
+    /// always render byte-identically. BTreeSet ordering of distinct
+    /// hashes within each dimension is also pinned (lex order).
+    #[test]
+    fn render_dirty_warning_both_dimensions_in_stable_order() {
+        let mut a = make_row("scn", "topo", true, 1.0);
+        a.kernel_commit = Some("kkkkk22-dirty".into());
+        a.commit = Some("pppp222-dirty".into());
+        let mut b = make_row("scn", "topo", true, 1.0);
+        b.kernel_commit = Some("kkkkk11-dirty".into());
+        b.commit = Some("pppp111-dirty".into());
+        let text = super::render_dirty_warning(&[a], &[b])
+            .expect("both dimensions dirty must yield warning");
+        let kernel11 = text
+            .find("kernel source: kkkkk11-dirty")
+            .expect("kernel11 line absent");
+        let kernel22 = text
+            .find("kernel source: kkkkk22-dirty")
+            .expect("kernel22 line absent");
+        let project11 = text
+            .find("project: pppp111-dirty")
+            .expect("project11 line absent");
+        let project22 = text
+            .find("project: pppp222-dirty")
+            .expect("project22 line absent");
+        assert!(
+            kernel11 < kernel22,
+            "kernel section must list values in lex order: {text:?}"
+        );
+        assert!(
+            project11 < project22,
+            "project section must list values in lex order: {text:?}"
+        );
+        assert!(
+            kernel22 < project11,
+            "kernel section must precede project section: {text:?}"
+        );
+    }
+
+    /// `None` commit fields and clean (suffix-free) values on the
+    /// other rows do not contribute to either set, so the warning
+    /// only mentions the actually-dirty hash.
+    #[test]
+    fn render_dirty_warning_skips_none_and_clean_values() {
+        let mut clean_a = make_row("a", "topo", true, 1.0);
+        clean_a.commit = Some("clean01".into());
+        clean_a.kernel_commit = None;
+        let mut dirty_b = make_row("b", "topo", true, 1.0);
+        dirty_b.commit = None;
+        dirty_b.kernel_commit = Some("dddddd1-dirty".into());
+        let text = super::render_dirty_warning(&[clean_a], &[dirty_b])
+            .expect("at least one dirty value must yield warning");
+        assert!(
+            text.contains("kernel source: dddddd1-dirty"),
+            "dirty kernel_commit must surface in {text:?}"
+        );
+        assert!(
+            !text.contains("project:"),
+            "no dirty project commit; project section must be absent in {text:?}"
+        );
+        assert!(
+            !text.contains("clean01"),
+            "clean commit values must not appear in {text:?}"
+        );
+    }
+
     // -- RowFilter / apply_row_filters --
 
     /// Helper that builds a `GauntletRow` with controllable
@@ -6587,7 +6833,7 @@ mod tests {
 
     // -- Dimension / derive_slicing_dims / pairing dims --
 
-    /// `Dimension::ALL` lists all six dims in canonical order.
+    /// `Dimension::ALL` lists all seven dims in canonical order.
     /// Order matters for [`PairingKey::from_row`] and for header
     /// rendering — a regression that reordered the slice would
     /// silently shift every dynamic key, splitting previously-
@@ -6602,6 +6848,7 @@ mod tests {
                 Dimension::Topology,
                 Dimension::WorkType,
                 Dimension::Commit,
+                Dimension::KernelCommit,
                 Dimension::Flags,
             ],
         );
@@ -6620,6 +6867,7 @@ mod tests {
                 Dimension::Scheduler,
                 Dimension::Topology,
                 Dimension::WorkType,
+                Dimension::KernelCommit,
                 Dimension::Flags,
             ],
         );
