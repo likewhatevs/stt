@@ -30,10 +30,13 @@ distinct directories, so no run ever overwrites another.
 `KTSTR_SIDECAR_DIR` overrides the *sidecar* directory itself
 (used as-is, no key suffix), not the parent. The override only
 affects where new sidecars are written and what bare
-`cargo ktstr stats` reads. `cargo ktstr stats list` and
-`cargo ktstr stats compare` always enumerate
-`{CARGO_TARGET_DIR or "target"}/ktstr/` regardless of
-`KTSTR_SIDECAR_DIR`.
+`cargo ktstr stats` reads. `cargo ktstr stats list`,
+`cargo ktstr stats compare`, `cargo ktstr stats list-values`,
+and `cargo ktstr stats show-host` all walk
+`{CARGO_TARGET_DIR or "target"}/ktstr/` by default — pass
+`--dir DIR` on `compare` / `list-values` / `show-host` to point
+them at an alternate run root (e.g. an archived sidecar tree
+copied off a CI host). They do NOT consult `KTSTR_SIDECAR_DIR`.
 
 ## Workflow
 

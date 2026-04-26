@@ -22,12 +22,24 @@ how that flag is set.
 
 ## Variant naming
 
-Each gauntlet variant is named `gauntlet/{test_name}/{preset}/{profile}`:
+Single-kernel runs name each gauntlet variant
+`gauntlet/{test_name}/{preset}/{profile}`:
 
 - `{test_name}` -- the `#[ktstr_test]` function name
 - `{preset}` -- one of the topology preset names below
 - `{profile}` -- `default` when no flags are active, otherwise the
   active flags joined with `+` (e.g. `llc+borrow`)
+
+When `--kernel` resolves to two or more kernels (multiple
+`--kernel` flags or a `START..END` range that expands to
+several releases), `cargo ktstr test` / `coverage` /
+`llvm-cov` add the kernel as a fifth dimension and append a
+`{kernel_label}` suffix:
+`gauntlet/{test_name}/{preset}/{profile}/{kernel_label}`. See
+[Multi-kernel: kernel as a gauntlet dimension](cargo-ktstr.md#multi-kernel-kernel-as-a-gauntlet-dimension)
+for how the kernel labels are derived (sanitized from the
+resolved version, range expansion, cache key, git source, or
+path basename).
 
 To run a single variant:
 

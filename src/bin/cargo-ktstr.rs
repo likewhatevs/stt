@@ -918,7 +918,21 @@ fn git_kernel_label(url: &str, git_ref: &str) -> String {
 /// or `local`), so the env var inspected directly via `printenv
 /// KTSTR_KERNEL_LIST` reads as a meaningful kernel→path map rather
 /// than as raw cache-key plumbing.
-fn encode_kernel_list(resolved: &[(String, PathBuf)]) -> String {
+fn encode_kernel_list(resolved: &[(String, PathBuf)]) -> Result<String, String> {
+    // POSIX permits `;` in paths but the wire format uses it as
+    // entry separator. Bail with an actionable error rather than
+    // silently producing a malformed env var that the test-binary
+    // parser would split into garbage.
+    for (label, dir) in resolved {
+        let path = dir.display().to_string();
+        if path.contains(';') {
+            return Err(format!(
+                "kernel directory path for {label:?} contains a `;` ({path:?}); \
+                 KTSTR_KERNEL_LIST uses `;` as the entry separator and cannot encode \
+                 such paths. Move or symlink the kernel cache to a path without `;`."
+            ));
+        }
+    }
     let mut out = String::new();
     for (i, (label, dir)) in resolved.iter().enumerate() {
         if i > 0 {
@@ -928,7 +942,7 @@ fn encode_kernel_list(resolved: &[(String, PathBuf)]) -> String {
         out.push('=');
         out.push_str(&dir.display().to_string());
     }
-    out
+    Ok(out)
 }
 
 /// Shared runner for `cargo ktstr test`, `cargo ktstr coverage`, and
@@ -1023,7 +1037,7 @@ fn run_cargo_sub(
         cmd.env(ktstr::KTSTR_KERNEL_ENV, first_dir);
 
         if resolved.len() > 1 {
-            let encoded = encode_kernel_list(&resolved);
+            let encoded = encode_kernel_list(&resolved)?;
             eprintln!(
                 "cargo ktstr: fanning gauntlet across {n} kernels",
                 n = resolved.len(),
@@ -3028,6 +3042,88 @@ mod tests {
                     dir.is_none(),
                     "bare --no-average must not spuriously populate --dir",
                 );
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    /// `--commit V` round-trips to `Compare { commit: vec![V], .. }`.
+    /// Pins the clap binding for the shared `--commit` filter on the
+    /// stats compare subcommand; a regression that removed the
+    /// derive arg, renamed the flag, or dropped its `ArgAction::Append`
+    /// would land here at parse time.
+    #[test]
+    fn parse_stats_compare_with_commit_single() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--commit",
+            "abc1234",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command:
+                    Some(StatsCommand::Compare {
+                        commit,
+                        a_commit,
+                        b_commit,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(commit, vec!["abc1234"]);
+                assert!(
+                    a_commit.is_empty(),
+                    "shared --commit must not populate --a-commit",
+                );
+                assert!(
+                    b_commit.is_empty(),
+                    "shared --commit must not populate --b-commit",
+                );
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    /// `--commit A --commit B` produces a Vec with two entries —
+    /// the flag is `ArgAction::Append`, so multiple occurrences
+    /// accumulate into the OR-combined filter the dispatch
+    /// applies. A regression that lost the Append action would
+    /// drop the first occurrence.
+    #[test]
+    fn parse_stats_compare_with_commit_repeatable() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--commit",
+            "a",
+            "--commit",
+            "b",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::Compare { commit, .. }),
+                ..
+            } => {
+                assert_eq!(commit, vec!["a", "b"]);
             }
             _ => panic!("expected Stats Compare"),
         }

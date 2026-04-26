@@ -536,11 +536,19 @@ fn list_tests_all(ignored_only: bool) {
         }
 
         if !ignored_only || is_ignored(entry) {
-            for suffix in &kernel_suffixes {
-                if suffix.is_empty() {
-                    println!("ktstr/{}: test", entry.name);
-                } else {
-                    println!("ktstr/{}/{suffix}: test", entry.name);
+            // host_only tests never boot a VM, so the kernel never
+            // affects what runs — emit one entry without a kernel
+            // suffix even in multi-kernel mode. Otherwise we'd run N
+            // identical copies of the same host-side function.
+            if entry.host_only {
+                println!("ktstr/{}: test", entry.name);
+            } else {
+                for suffix in &kernel_suffixes {
+                    if suffix.is_empty() {
+                        println!("ktstr/{}: test", entry.name);
+                    } else {
+                        println!("ktstr/{}/{suffix}: test", entry.name);
+                    }
                 }
             }
         }
@@ -620,17 +628,30 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
 
         // Base test
         if !ignored_only || base_ignored {
-            for suffix in &kernel_suffixes {
-                let name = if suffix.is_empty() {
-                    format!("ktstr/{}: test", entry.name)
-                } else {
-                    format!("ktstr/{}/{suffix}: test", entry.name)
-                };
+            // host_only tests never boot a VM, so the kernel never
+            // affects what runs — push one candidate without a
+            // kernel suffix even in multi-kernel mode. Otherwise the
+            // budget selector would consider N identical copies of
+            // the same host-side function.
+            if entry.host_only {
                 candidates.push(TestCandidate {
-                    name,
+                    name: format!("ktstr/{}: test", entry.name),
                     features: extract_features(entry, &base_topo, &[], false, entry.name),
                     estimated_secs: estimate_duration(entry, &base_topo),
                 });
+            } else {
+                for suffix in &kernel_suffixes {
+                    let name = if suffix.is_empty() {
+                        format!("ktstr/{}: test", entry.name)
+                    } else {
+                        format!("ktstr/{}/{suffix}: test", entry.name)
+                    };
+                    candidates.push(TestCandidate {
+                        name,
+                        features: extract_features(entry, &base_topo, &[], false, entry.name),
+                        estimated_secs: estimate_duration(entry, &base_topo),
+                    });
+                }
             }
         }
 

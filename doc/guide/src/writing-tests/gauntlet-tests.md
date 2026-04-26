@@ -67,11 +67,17 @@ never appears.
 The total number of gauntlet variants for a test is:
 
 ```
-valid_presets × valid_profiles
+valid_presets × valid_profiles × resolved_kernels
 ```
 
 A test with 8 valid presets and 4 valid profiles produces 32 gauntlet
-variants.
+variants under a single-kernel run; passing two kernels
+(`--kernel A --kernel B`) doubles that to 64. The kernel
+dimension is contributed by `cargo ktstr test` / `coverage` /
+`llvm-cov` at the CLI surface (zero or one resolved kernels
+keeps the historical 4-segment name shape; two or more
+expands the gauntlet across kernels). See
+[Multi-kernel: kernel as a gauntlet dimension](../running-tests/cargo-ktstr.md#multi-kernel-kernel-as-a-gauntlet-dimension).
 
 ## Tests that skip gauntlet
 

@@ -52,17 +52,21 @@ writer would attach to a fresh test run).
 ## Compare: `stats compare`
 
 ```sh
-cargo ktstr stats compare RUN_A RUN_B
+cargo ktstr stats compare --a-commit <baseline> --b-commit <current>
 ```
 
-Picks the first sidecar with `Some(host)` from each run,
-collects every host field that differs, and prints a side-by-side
-delta unconditionally as part of the compare output (there is no
-opt-in flag — the host-delta section appears whenever the two
-sidecars disagree on a host field):
+Per-side filter flags (`--a-X` / `--b-X`) partition the
+sidecar pool into the two sides of the contrast — slice on
+`commit`, `kernel`, `scheduler`, etc. depending on what you
+are diffing. `compare` picks the first sidecar with
+`Some(host)` from each side, collects every host field that
+differs, and prints a side-by-side delta unconditionally as
+part of the compare output (there is no opt-in flag — the
+host-delta section appears whenever the two sides disagree on
+a host field):
 
 ```
-host delta ('RUN_A' → 'RUN_B'):
+host delta ('A' → 'B'):
   kernel_release: 6.14.2 → 6.15.0
   thp_enabled: always [madvise] never → always madvise [never]
   sched_tunables.sched_migration_cost_ns: 500000 → 100000
@@ -81,14 +85,18 @@ from "the whole map was unknown at capture time".
 ### CI integration
 
 Gauntlet runs emit the host block automatically in every
-sidecar. To diff the host state across two CI runs, point
-`stats compare` at the sidecar directories of the two runs —
-host delta appears automatically in the compare output when
-any host field differs. A CI job can:
+sidecar. To diff the host state across two CI runs, slice the
+pool on whatever dimension separates them (typically
+`--a-commit` / `--b-commit` or `--a-kernel` / `--b-kernel`) —
+the host-delta section appears automatically in the compare
+output when any host field differs between the two sides. A
+CI job can:
 
 1. Run the gauntlet on the candidate commit and the baseline.
-2. Run `stats compare` between the two runs and inspect the
-   host-delta section of its output.
+2. Invoke `stats compare` slicing on the dimension that
+   separates the two runs (e.g.
+   `--a-commit <baseline> --b-commit <current>`) and inspect
+   the host-delta section of its output.
 3. Fail (or annotate the PR) if any host dimension changed —
    an unchanged host set is the precondition for a clean A/B
    of scheduler behavior.

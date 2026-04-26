@@ -3,7 +3,8 @@
 `cargo ktstr` is a cargo plugin for kernel build, cache, and test
 workflow. Subcommands in `--help` order: `test` (alias: `nextest`),
 `coverage`, `llvm-cov`, `stats`, `kernel`, `model`, `verifier`,
-`completions`, `show-host`, `show-thresholds`, `cleanup`, `shell`.
+`completions`, `show-host`, `show-thresholds`, `cleanup`, `locks`,
+`shell`.
 
 ## test
 
@@ -571,6 +572,15 @@ major.minor) PREFIX-matches every patch release in that series:
 filter (`--kernel 6.14.2`, `--kernel 6.15-rc3`) is strict
 equality — `6.14.2` does NOT match `6.14.20`. The same shape
 applies to `--a-kernel` / `--b-kernel`.
+
+**Discovering filter values.** Run
+[`cargo ktstr stats list-values`](#list-values) before
+crafting a `compare` invocation to see what `kernel`, `commit`,
+`scheduler`, `topology`, `work_type`, and `flags` values the
+sidecar pool actually carries; passing a `--a-kernel 6.20`
+against an empty pool fails downstream with "no rows match
+filter A" and `list-values` is the upstream answer to "what
+have I got?".
 
 | Flag | Default | Description |
 |------|---------|-------------|
