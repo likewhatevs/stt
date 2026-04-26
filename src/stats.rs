@@ -2386,11 +2386,23 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
 /// undated group itself stable.
 pub fn list_runs() -> anyhow::Result<()> {
     let root = crate::test_support::runs_root();
+    // Both the missing-root case (target/ktstr/ never created) and
+    // the empty-rows case (directory exists but no run
+    // subdirectories pass `is_run_directory`) reduce to the same
+    // operator state: no test data is on disk yet. Surface the
+    // same actionable hint in both branches so a fresh checkout
+    // sees consistent guidance regardless of whether
+    // `target/ktstr/` was ever created.
+    let hint = "Run `cargo ktstr test` to generate sidecar data.";
     if !root.exists() {
-        eprintln!("no runs found at {}", root.display());
+        eprintln!("no runs found at {}. {hint}", root.display());
         return Ok(());
     }
     let rows = sorted_run_entries(&root)?;
+    if rows.is_empty() {
+        eprintln!("no runs found at {}. {hint}", root.display());
+        return Ok(());
+    }
     let mut table = crate::cli::new_table();
     table.set_header(vec!["RUN", "TESTS", "DATE", "ARCH"]);
     for (path, count, date, arch) in rows {

@@ -4395,6 +4395,22 @@ pub(crate) struct CacheLockRow {
     pub(crate) holders: Vec<crate::flock::HolderInfo>,
 }
 
+/// One run-dir-lock row. Per-run-key sidecar-write locks live at
+/// `{runs_root}/.locks/{run_key}.lock` where `{run_key}` is the
+/// `{kernel}-{project_commit}` directory name; `run_key` is parsed
+/// from the filename stem (same shape as
+/// [`CacheLockRow::cache_key`] — the row exists as a distinct type
+/// so the "this lock serializes sidecar writes" semantic is
+/// visible at the schema level rather than buried under the cache
+/// table's heading).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct RunDirLockRow {
+    pub(crate) run_key: String,
+    pub(crate) lockfile: String,
+    pub(crate) holders: Vec<crate::flock::HolderInfo>,
+}
+
 /// Snapshot of every ktstr flock discoverable on the host at the
 /// moment this is built. Assembled by [`collect_locks_snapshot`] and
 /// rendered by either the human [`render_locks_human`] or JSON
@@ -4405,38 +4421,46 @@ pub(crate) struct LocksSnapshot {
     pub(crate) llcs: Vec<LlcLockRow>,
     pub(crate) cpus: Vec<CpuLockRow>,
     pub(crate) cache: Vec<CacheLockRow>,
+    pub(crate) run_dirs: Vec<RunDirLockRow>,
 }
 
 /// Enumerate every ktstr lockfile reachable on the host, attach the
 /// holder list parsed from `/proc/locks`, and return a structured
 /// snapshot suitable for either human or JSON rendering.
 ///
-/// Missing paths (no `/tmp` glob matches, no cache `.locks/`) produce
-/// empty row vectors — not an error. The lockfile glob pattern uses
-/// the `glob` crate (already a dep); failures to expand are treated
-/// as "no files matched" and surfaced via `tracing::warn!` so the
-/// operator still sees a populated snapshot for the paths that did
-/// work.
+/// Missing paths (no `/tmp` glob matches, no `cache_root/.locks/`,
+/// no `runs_root/.locks/`) produce empty row vectors — not an
+/// error. The lockfile glob pattern uses the `glob` crate (already
+/// a dep); failures to expand are treated as "no files matched"
+/// and surfaced via `tracing::warn!` so the operator still sees a
+/// populated snapshot for the paths that did work.
 fn collect_locks_snapshot() -> Result<LocksSnapshot> {
     let cache_root = CacheDir::default_root().ok();
-    collect_locks_snapshot_from(Path::new("/tmp"), cache_root.as_deref())
+    let runs_root = crate::test_support::runs_root();
+    collect_locks_snapshot_from(Path::new("/tmp"), cache_root.as_deref(), Some(&runs_root))
 }
 
 /// Seam behind [`collect_locks_snapshot`]: enumerate LLC, per-CPU,
-/// and cache-entry lockfiles under the given roots. Tests inject a
-/// tempdir for `tmp_root` + `cache_root` so the `ktstr locks`
-/// snapshot shape can be pinned without touching the real
-/// host `/tmp` or the operator's cache directory.
+/// cache-entry, and per-run-key lockfiles under the given roots.
+/// Tests inject tempdirs for each of `tmp_root`, `cache_root`, and
+/// `runs_root` so the `ktstr locks` snapshot shape can be pinned
+/// without touching the real host `/tmp`, the operator's cache
+/// directory, or the workspace's `target/ktstr/`.
 ///
 /// `tmp_root` is the directory containing `ktstr-llc-*.lock` and
 /// `ktstr-cpu-*.lock` (in production: `/tmp`). `cache_root` is the
 /// cache-directory whose `.locks/` subdirectory holds per-entry
 /// locks (in production: `CacheDir::default_root()`); `None`
 /// suppresses the cache-lock enumeration entirely, matching the
-/// "home unresolvable" production fallback.
+/// "home unresolvable" production fallback. `runs_root` is the
+/// directory whose `.locks/` subdirectory holds per-run-key
+/// sidecar-write locks (in production:
+/// [`crate::test_support::runs_root`]); `None` suppresses run-dir
+/// lock enumeration.
 pub(crate) fn collect_locks_snapshot_from(
     tmp_root: &Path,
     cache_root: Option<&Path>,
+    runs_root: Option<&Path>,
 ) -> Result<LocksSnapshot> {
     use crate::vmm::host_topology::HostTopology;
 
@@ -4513,9 +4537,12 @@ pub(crate) fn collect_locks_snapshot_from(
 
     // Cache-entry locks: {cache_root}/.locks/*.lock — skipped when
     // `cache_root` is None (unresolvable home / test isolation).
+    // Subdirectory name sourced from `crate::flock::LOCK_DIR_NAME`
+    // so the cache scan and the run-dir scan below stay in sync
+    // with the cache module and sidecar module's on-disk layout.
     let mut cache: Vec<CacheLockRow> = Vec::new();
     if let Some(cache_root) = cache_root {
-        let locks_dir = cache_root.join(".locks");
+        let locks_dir = cache_root.join(crate::flock::LOCK_DIR_NAME);
         let pattern = format!("{}/*.lock", locks_dir.display());
         if let Ok(expanded) = glob::glob(&pattern) {
             for entry in expanded.flatten() {
@@ -4533,10 +4560,42 @@ pub(crate) fn collect_locks_snapshot_from(
     }
     cache.sort_by(|a, b| a.cache_key.cmp(&b.cache_key));
 
-    Ok(LocksSnapshot { llcs, cpus, cache })
+    // Per-run-key sidecar-write locks: {runs_root}/.locks/*.lock —
+    // skipped when `runs_root` is None (test isolation). Mirrors
+    // the cache-lock loop's shape (single-segment file_stem →
+    // run_key), but the row carries a distinct `RunDirLockRow`
+    // type so the JSON surface and human heading distinguish
+    // "this lock serializes sidecar writes" from "this lock
+    // serializes a kernel cache install".
+    let mut run_dirs: Vec<RunDirLockRow> = Vec::new();
+    if let Some(runs_root) = runs_root {
+        let locks_dir = runs_root.join(crate::flock::LOCK_DIR_NAME);
+        let pattern = format!("{}/*.lock", locks_dir.display());
+        if let Ok(expanded) = glob::glob(&pattern) {
+            for entry in expanded.flatten() {
+                let Some(stem) = entry.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let holders = crate::flock::read_holders(&entry).unwrap_or_default();
+                run_dirs.push(RunDirLockRow {
+                    run_key: stem.to_string(),
+                    lockfile: entry.display().to_string(),
+                    holders,
+                });
+            }
+        }
+    }
+    run_dirs.sort_by(|a, b| a.run_key.cmp(&b.run_key));
+
+    Ok(LocksSnapshot {
+        llcs,
+        cpus,
+        cache,
+        run_dirs,
+    })
 }
 
-/// Render a [`LocksSnapshot`] as three stacked comfy-tables for
+/// Render a [`LocksSnapshot`] as four stacked comfy-tables for
 /// interactive reading. Empty sections print "(none)" under their
 /// header so the operator can distinguish "no locks of this kind" from
 /// a display bug. NUMA column renders the numeric node when available
@@ -4609,6 +4668,22 @@ fn render_locks_human(snap: &LocksSnapshot) -> String {
         for r in &snap.cache {
             t.add_row([
                 r.cache_key.clone(),
+                r.lockfile.clone(),
+                fmt_holders(&r.holders),
+            ]);
+        }
+        writeln!(out, "{t}").unwrap();
+    }
+
+    writeln!(out, "\nRun-dir locks:").unwrap();
+    if snap.run_dirs.is_empty() {
+        writeln!(out, "  (none)").unwrap();
+    } else {
+        let mut t = new_table();
+        t.set_header(["RUN KEY", "LOCKFILE", "HOLDERS"]);
+        for r in &snap.run_dirs {
+            t.add_row([
+                r.run_key.clone(),
                 r.lockfile.clone(),
                 fmt_holders(&r.holders),
             ]);
@@ -10816,14 +10891,15 @@ mod tests {
     // ─── `ktstr locks` snapshot + JSON serde pins ────────────────
 
     /// `LocksSnapshot` JSON top-level keys are stable: `llcs`,
-    /// `cpus`, `cache`. Downstream consumers of `ktstr locks --json`
-    /// (shell scripts piping through `jq`, the mdbook recipe pages,
-    /// future dashboards) parse against these names — a refactor
-    /// that renames them would silently break every consumer.
+    /// `cpus`, `cache`, `run_dirs`. Downstream consumers of
+    /// `ktstr locks --json` (shell scripts piping through `jq`, the
+    /// mdbook recipe pages, future dashboards) parse against these
+    /// names — a refactor that renames them would silently break
+    /// every consumer.
     ///
     /// Also pins the `rename_all = "snake_case"` contract on the
-    /// nested row structs: LlcLockRow's "llc_idx" and "numa_node"
-    /// must NOT emit as camelCase.
+    /// nested row structs: LlcLockRow's "llc_idx" and "numa_node",
+    /// RunDirLockRow's "run_key", must NOT emit as camelCase.
     #[test]
     fn locks_snapshot_json_field_names_are_stable() {
         let snap = LocksSnapshot {
@@ -10844,6 +10920,11 @@ mod tests {
                 lockfile: "/tmp/.locks/6.14.2-tarball-x86_64.lock".to_string(),
                 holders: Vec::new(),
             }],
+            run_dirs: vec![RunDirLockRow {
+                run_key: "6.14-abc1234".to_string(),
+                lockfile: "/tmp/.locks/6.14-abc1234.lock".to_string(),
+                holders: Vec::new(),
+            }],
         };
         let val = serde_json::to_value(&snap).expect("serde serialize");
         // Top-level keys.
@@ -10858,6 +10939,10 @@ mod tests {
         assert!(
             val.get("cache").is_some(),
             "top-level must have 'cache': {val}"
+        );
+        assert!(
+            val.get("run_dirs").is_some(),
+            "top-level must have 'run_dirs': {val}"
         );
         // Nested LLC row.
         let llc0 = &val["llcs"][0];
@@ -10875,23 +10960,38 @@ mod tests {
         // Nested Cache row — cache_key stays snake_case.
         let cache0 = &val["cache"][0];
         assert!(cache0.get("cache_key").is_some(), "cache_key: {cache0}");
+        // Nested RunDir row — run_key stays snake_case.
+        let run0 = &val["run_dirs"][0];
+        assert!(run0.get("run_key").is_some(), "run_key: {run0}");
+        assert!(run0.get("lockfile").is_some(), "lockfile: {run0}");
+        assert!(run0.get("holders").is_some(), "holders: {run0}");
     }
 
     /// `collect_locks_snapshot_from` on a fresh tempdir with no
-    /// ktstr lockfiles returns an empty LocksSnapshot (all three
+    /// ktstr lockfiles returns an empty LocksSnapshot (all four
     /// row vectors empty). Production wrapper always sees the same
-    /// behavior when `/tmp` has no `ktstr-*.lock` files and the
-    /// cache dir has no `.locks/` subdirectory.
+    /// behavior when `/tmp` has no `ktstr-*.lock` files, the cache
+    /// dir has no `.locks/` subdirectory, and the runs root has
+    /// no `.locks/` subdirectory.
     #[test]
     fn collect_locks_snapshot_empty_roots() {
         use tempfile::TempDir;
         let tmp_dir = TempDir::new().expect("tempdir tmp_root");
         let cache_dir = TempDir::new().expect("tempdir cache_root");
-        let snap = collect_locks_snapshot_from(tmp_dir.path(), Some(cache_dir.path()))
-            .expect("collect must succeed on empty roots");
+        let runs_dir = TempDir::new().expect("tempdir runs_root");
+        let snap = collect_locks_snapshot_from(
+            tmp_dir.path(),
+            Some(cache_dir.path()),
+            Some(runs_dir.path()),
+        )
+        .expect("collect must succeed on empty roots");
         assert!(snap.llcs.is_empty(), "no ktstr-llc-*.lock → empty llcs");
         assert!(snap.cpus.is_empty(), "no ktstr-cpu-*.lock → empty cpus");
         assert!(snap.cache.is_empty(), "no .locks/ → empty cache");
+        assert!(
+            snap.run_dirs.is_empty(),
+            "no .locks/ under runs_root → empty run_dirs",
+        );
     }
 
     /// `collect_locks_snapshot_from` discovers synthetic LLC + CPU
@@ -10913,7 +11013,7 @@ mod tests {
         // Junk: looks close but doesn't match the prefix-N-.lock
         // pattern. The parse::<usize>() on "oops" fails → skip.
         std::fs::write(path.join("ktstr-llc-oops.lock"), b"").expect("plant junk");
-        let snap = collect_locks_snapshot_from(path, None).expect("collect must succeed");
+        let snap = collect_locks_snapshot_from(path, None, None).expect("collect must succeed");
         // LLC rows, ascending.
         assert_eq!(snap.llcs.len(), 2);
         assert_eq!(snap.llcs[0].llc_idx, 2, "sort ascending: llc 2 first");
@@ -10923,6 +11023,37 @@ mod tests {
         assert_eq!(snap.cpus[0].cpu, 7);
         // Cache row empty because cache_root=None.
         assert!(snap.cache.is_empty());
+        // Run-dir row empty because runs_root=None.
+        assert!(snap.run_dirs.is_empty());
+    }
+
+    /// `collect_locks_snapshot_from` discovers synthetic per-run-key
+    /// lockfiles planted under `{runs_root}/.locks/*.lock`. Pins:
+    /// run_key parses as the file stem (the `{kernel}-{project_commit}`
+    /// dirname), rows sort ascending by run_key, and the cache /
+    /// run-dir scans live in independent code paths (passing
+    /// `cache_root=None` does NOT suppress run-dir enumeration).
+    #[test]
+    fn collect_locks_snapshot_discovers_run_dir_lockfiles() {
+        use tempfile::TempDir;
+        let runs_dir = TempDir::new().expect("tempdir runs_root");
+        let locks_dir = runs_dir.path().join(crate::flock::LOCK_DIR_NAME);
+        std::fs::create_dir_all(&locks_dir).expect("mkdir .locks/");
+        // Plant two run-dir lockfiles out of order — snapshot must
+        // sort ascending. Use realistic run-key shapes.
+        std::fs::write(locks_dir.join("7.0-def5678.lock"), b"").expect("plant 7.0");
+        std::fs::write(locks_dir.join("6.14-abc1234.lock"), b"").expect("plant 6.14");
+        // tmp_root tempdir is empty so the LLC/CPU scans yield no
+        // rows — keeps the assertion focused on the run_dirs path.
+        let tmp_dir = TempDir::new().expect("tempdir tmp_root");
+        let snap = collect_locks_snapshot_from(tmp_dir.path(), None, Some(runs_dir.path()))
+            .expect("collect must succeed");
+        assert_eq!(snap.run_dirs.len(), 2);
+        assert_eq!(
+            snap.run_dirs[0].run_key, "6.14-abc1234",
+            "sort ascending: 6.14 lexically before 7.0",
+        );
+        assert_eq!(snap.run_dirs[1].run_key, "7.0-def5678");
     }
 
     // ---------------------------------------------------------------

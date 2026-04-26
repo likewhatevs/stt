@@ -164,20 +164,27 @@ floor guards against `make -j0` (unbounded on GNU make).
 `ktstr locks` (or `cargo ktstr locks`) prints every ktstr flock
 currently held on the host, cross-referenced against
 `/proc/locks` to name each holder by PID + truncated cmdline.
-Read-only — takes no flocks. Three categories:
+Read-only — takes no flocks. Four categories:
 
 1. **LLC locks** under `/tmp/ktstr-llc-*.lock`
 2. **Per-CPU locks** under `/tmp/ktstr-cpu-*.lock`
 3. **Cache-entry locks** under `{cache_root}/.locks/*.lock`
+4. **Run-dir locks** under
+   `{runs_root}/.locks/{kernel}-{project_commit}.lock` — held
+   for the duration of the (pre-clear + write) cycle by
+   `serialize_and_write_sidecar` so two concurrent ktstr
+   processes targeting the same run-dir key serialize on the
+   sidecar write rather than tearing each other's mid-write
+   files.
 
 Flags:
 
 - `--json` — emit a structured snapshot. One-shot uses
   `to_string_pretty` for readability; under `--watch` each frame
   is compact on its own line (ndjson-style) for streaming
-  consumers. Top-level keys: `llcs`, `cpus`, `cache`. Each row
-  names its `lockfile` path and a `holders` array; every holder
-  has `pid` + `cmdline`.
+  consumers. Top-level keys: `llcs`, `cpus`, `cache`, `run_dirs`.
+  Each row names its `lockfile` path and a `holders` array;
+  every holder has `pid` + `cmdline`.
 - `--watch <interval>` — redraw on the given interval until
   SIGINT. Interval uses `humantime` syntax (`100ms`, `1s`,
   `5m`, `1h`).

@@ -205,7 +205,7 @@ companion for `--cpu-cap` contention: when a build or test is
 stalled behind a peer's reservation, `ktstr locks` names the
 peer (PID + cmdline) without disturbing any of its flocks.
 
-Scans three lock-file roots:
+Scans four lock-file roots:
 
 - `/tmp/ktstr-llc-*.lock` — per-LLC reservations held by
   perf-mode test runs and `--cpu-cap`-bounded builds.
@@ -213,18 +213,13 @@ Scans three lock-file roots:
   same flow.
 - `{cache_root}/.locks/*.lock` — cache-entry locks held
   during `kernel build` writes.
+- `{runs_root}/.locks/{kernel}-{project_commit}.lock` —
+  per-run-key sidecar-write locks held for the duration of
+  the (pre-clear + write) cycle to serialize concurrent
+  ktstr processes targeting the same run directory.
 
 Each lock is cross-referenced against `/proc/locks` to name the
 holder PID and cmdline.
-
-A fourth lock category — per-run-key sidecar-write locks at
-`{runs_root}/.locks/{kernel}-{project_commit}.lock`, held for
-the duration of the (pre-clear + write) cycle to serialize
-concurrent ktstr processes targeting the same run directory —
-exists on disk but is **not yet enumerated** by
-`ktstr locks`. To inspect a run-dir flock holder, fall back to
-`cat /proc/locks` and grep for the lockfile path. Run-dir lock
-enumeration is tracked as a follow-up.
 
 ```sh
 ktstr locks                       # one-shot snapshot

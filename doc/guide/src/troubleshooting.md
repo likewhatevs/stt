@@ -631,9 +631,9 @@ for the per-filesystem rationale).
 **Diagnose:**
 
 - `cargo ktstr locks` (or `ktstr locks --watch 1s`) prints every
-  ktstr flock currently held on the host with PID + cmdline. Today
-  the command enumerates LLC, per-CPU, and cache-entry locks; the
-  per-run-key sidecar locks are not yet listed (see
+  ktstr flock currently held on the host with PID + cmdline,
+  including per-run-key sidecar locks under the "Run-dir locks"
+  section (see
   [`cargo ktstr locks`](running-tests/cargo-ktstr.md#locks)).
 - `cat /proc/locks | grep '<lockfile-path-from-error>'` falls
   back to the kernel's own flock enumeration when the holder is
