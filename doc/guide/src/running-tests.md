@@ -16,6 +16,15 @@ cargo nextest run -E 'test(sched_basic_proportional)'
 cargo nextest run --run-ignored ignored-only -E 'test(gauntlet/)'
 ```
 
+## Run analysis
+
+Each test invocation writes a `*.ktstr.json` sidecar per variant
+into `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`.
+`cargo ktstr stats list` enumerates runs; `cargo ktstr stats
+compare`, `list-values`, `list-metrics`, and `show-host` operate on
+those sidecars. See [Runs](running-tests/runs.md) for the directory
+layout, last-writer-wins semantics, and the comparison workflow.
+
 ## Flags
 
 Define flags via `#[derive(Scheduler)]` with `#[flag(...)]` attributes.

@@ -269,6 +269,13 @@ ktstr_test 'my_test' [topo=1n1l2c1t] failed:
   cg1: workers=2 cpus=2 spread=12.3% gap=890ms migrations=4 iter=14870
 ```
 
+Each test invocation writes results into
+`{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}/`
+as one `*.ktstr.json` sidecar per `#[ktstr_test]` variant. Run
+`cargo ktstr stats list` to see runs (RUN, TESTS, DATE, ARCH
+columns). See [Runs](running-tests/runs.md) for the full layout
+and analysis workflow.
+
 ### Using cargo-ktstr
 
 `cargo ktstr test` handles kernel resolution and test execution in

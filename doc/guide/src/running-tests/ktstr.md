@@ -217,6 +217,15 @@ Scans three lock-file roots:
 Each lock is cross-referenced against `/proc/locks` to name the
 holder PID and cmdline.
 
+A fourth lock category — per-run-key sidecar-write locks at
+`{runs_root}/.locks/{kernel}-{project_commit}.lock`, held for
+the duration of the (pre-clear + write) cycle to serialize
+concurrent ktstr processes targeting the same run directory —
+exists on disk but is **not yet enumerated** by
+`ktstr locks`. To inspect a run-dir flock holder, fall back to
+`cat /proc/locks` and grep for the lockfile path. Run-dir lock
+enumeration is tracked as a follow-up.
+
 ```sh
 ktstr locks                       # one-shot snapshot
 ktstr locks --json                # JSON snapshot

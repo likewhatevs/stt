@@ -218,9 +218,10 @@ never calls `CpuCap::resolve`, it goes through
 ## Filesystem requirement
 
 Every ktstr lockfile (`/tmp/ktstr-llc-*.lock`,
-`/tmp/ktstr-cpu-*.lock`, `{cache_root}/.locks/*.lock`) must live
-on a local filesystem — tmpfs, ext4, xfs, btrfs, f2fs, or
-bcachefs are the explicitly-accepted set. `flock(2)` behavior
+`/tmp/ktstr-cpu-*.lock`, `{cache_root}/.locks/*.lock`,
+`{runs_root}/.locks/*.lock`) must live on a local filesystem —
+tmpfs, ext4, xfs, btrfs, f2fs, or bcachefs are the
+explicitly-accepted set. `flock(2)` behavior
 on NFS, CIFS, SMB2, CephFS, AFS, and FUSE is unreliable: NFSv3
 is advisory-only without an NLM peer and NFSv4 byte-range
 locking does not cover `flock(2)`; SMB does not emit

@@ -2353,6 +2353,23 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
 /// last-writer-wins snapshot of (kernel, project commit) rather
 /// than an append-only archive of every invocation.
 ///
+/// The rendered table carries four columns:
+/// - `RUN`: the run-directory leaf name
+///   (`{kernel}-{project_commit}` per the keying above).
+/// - `TESTS`: number of `*.ktstr.json` sidecars in the directory
+///   (and one level of subdirectories for per-job gauntlet
+///   layouts that `collect_sidecars` walks).
+/// - `DATE`: the earliest sidecar timestamp in the directory.
+///   Under last-writer-wins this equals the most recent run's
+///   first sidecar timestamp because the prior run's sidecars
+///   were pre-cleared at the new run's first write.
+/// - `ARCH`: the `host.arch` value (`x86_64`, `aarch64`, …) from
+///   the run's first sidecar that carries a populated host
+///   field. Renders as `-` when no sidecar carries a host
+///   (pre-host-context-landing archives, host-only test stubs
+///   that never populate host) so the column reads consistently
+///   with the `DATE` sentinel.
+///
 /// Rows are sorted by directory mtime, **most recent first**, so
 /// the latest run lands at the top of the table — the operator's
 /// usual interest. Sorting by `file_name()` would produce

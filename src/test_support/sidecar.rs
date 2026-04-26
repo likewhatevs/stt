@@ -30,6 +30,43 @@
 //!   `{project_commit}` is the project tree's HEAD short hex from
 //!   [`detect_project_commit`], suffixed `-dirty` when the
 //!   worktree differs).
+//! - [`format_run_dirname`]: render the
+//!   `{kernel}-{project_commit}` leaf name from the resolved
+//!   kernel + commit slots, substituting the literal `unknown`
+//!   when either probe returned `None` so the dirname stays
+//!   filesystem-safe (see the unknown-commit collision
+//!   semantics in the runs guide).
+//! - [`is_run_directory`]: predicate consumed by run-listing
+//!   walkers ([`newest_run_dir`] here, `sorted_run_entries` in
+//!   `crate::stats`). Filters non-directories and dotfile
+//!   subdirectories (notably the `.locks/` flock-sentinel
+//!   subdirectory) so the lock infrastructure cannot pollute
+//!   `cargo ktstr stats list` output or claim the "most recent
+//!   run" bucket.
+//! - [`pre_clear_run_dir_once`]: shallow-wipe `*.ktstr.json` files
+//!   in the run directory at the FIRST write of each test
+//!   process so a re-run at the same `{kernel}-{project_commit}`
+//!   key produces a last-writer-wins snapshot rather than an
+//!   append-only archive. Subsequent writes in the same process
+//!   are gated by an internal `Mutex<HashSet<PathBuf>>` so only
+//!   the first call per key per process clears.
+//! - [`acquire_run_dir_flock`]: cross-process `LOCK_EX` on the
+//!   per-run-key sentinel
+//!   (`{runs_root}/.locks/{key}.lock`) held for the duration of
+//!   the pre-clear + serialize + write cycle. Two concurrent
+//!   ktstr processes targeting the same key serialize through
+//!   this lock so neither tears the other's mid-write
+//!   sidecars. The override branch (operator-chosen
+//!   `KTSTR_SIDECAR_DIR`) skips the flock for the same reason
+//!   it skips pre-clear: the operator owns the directory's
+//!   contents.
+//! - [`warn_unknown_project_commit_once`]: one-shot stderr warning
+//!   on first sidecar write when `detect_project_commit` returns
+//!   `None` (test process not in a git repo) so concurrent or
+//!   successive non-git runs colliding on `{kernel}-unknown`
+//!   surface the disambiguation hint
+//!   (`KTSTR_SIDECAR_DIR=…` or place the tree under git) at
+//!   first invocation rather than as a silent collision.
 //! - [`format_verifier_stats`], [`format_callback_profile`],
 //!   [`format_kvm_stats`]: human-readable summaries from a
 //!   `Vec<SidecarResult>` for CLI output.

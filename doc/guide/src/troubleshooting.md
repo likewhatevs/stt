@@ -559,6 +559,106 @@ skipped during the walk.
 
 **Fix:** Verify the directory contains the files you expect.
 
+## Model load failed
+
+```text
+GGUF model load failed at /home/.../models/Qwen3-4B-Q4_K_M.gguf. The
+file may be corrupt or incompatible with the linked llama.cpp version
+— delete the file and re-run `cargo ktstr model fetch` to download
+a fresh copy. Check stderr for the upstream llama.cpp rejection reason.
+```
+
+The host-side LLM extraction backend (`OutputFormat::LlmExtract`)
+could not load the cached GGUF weights. The cached file is either
+corrupt (partial download, disk error) or incompatible with the
+linked llama.cpp version.
+
+**Diagnose:**
+
+- Re-run with `RUST_LOG=llama-cpp-2=info` (or `=debug` for more
+  detail) to surface llama.cpp's own rejection reason on stderr.
+  The first call to the inference engine routes
+  `llama_cpp_2::send_logs_to_tracing` events through the tracing
+  subscriber under target `"llama-cpp-2"` (literal hyphens — see
+  [Environment Variables](reference/environment-variables.md) for
+  the EnvFilter shape).
+- `cargo ktstr model status` reports the cache path and verdict
+  (`Matches`, `Mismatches`, `CheckFailed`, `NotCached`).
+
+**Fix:**
+
+- Delete the cached file and re-fetch:
+  `rm <path-from-error> && cargo ktstr model fetch`. The fetch
+  re-downloads from the pinned URL and SHA-checks the result.
+- If `model status` reports `Mismatches`, the local file's hash
+  diverged from the pinned digest — `cargo ktstr model fetch` will
+  refuse to overwrite a corrupt cache and the explicit `rm` is
+  required first.
+- If you set `KTSTR_MODEL_OFFLINE=1`, unset it for the re-fetch.
+  See [`cargo ktstr model`](running-tests/cargo-ktstr.md#model).
+
+## Flock timeout / NFS rejection
+
+```text
+flock LOCK_EX on run-dir target/ktstr/6.14-abc1234 timed out after
+30s (lockfile target/ktstr/.locks/6.14-abc1234.lock, holders:
+  pid=12345 cmd=cargo-ktstr test --kernel 6.14). A peer cargo
+ktstr test process is writing sidecars to the same
+{kernel}-{project_commit} directory; wait for it to finish or kill
+it, then retry.
+```
+
+A peer process is holding the per-run-key advisory `flock(2)`
+that serializes sidecar writes; the helper polled for 30 s and
+gave up. Run-dir locks live at
+`{runs_root}/.locks/{kernel}-{project_commit}.lock` and serialize
+the (pre-clear + write) cycle so two concurrent ktstr runs
+sharing the same key can't tear partially-written sidecars.
+
+```text
+target/ktstr/.locks/6.14-abc1234.lock: filesystem NFS is not
+supported for ktstr lockfiles (NFSv3 is advisory-only without
+an NLM peer; NFSv4 byte-range locking does not cover flock(2)).
+Move the lockfile path to a local filesystem (tmpfs, ext4, xfs,
+btrfs, f2fs, bcachefs).
+```
+
+`try_flock` rejects NFS, CIFS, SMB2, CephFS, AFS, and FUSE mounts
+because `flock(2)` semantics on those filesystems are unreliable
+(see [Resource Budget — Filesystem requirement](concepts/resource-budget.md#filesystem-requirement)
+for the per-filesystem rationale).
+
+**Diagnose:**
+
+- `cargo ktstr locks` (or `ktstr locks --watch 1s`) prints every
+  ktstr flock currently held on the host with PID + cmdline. Today
+  the command enumerates LLC, per-CPU, and cache-entry locks; the
+  per-run-key sidecar locks are not yet listed (see
+  [`cargo ktstr locks`](running-tests/cargo-ktstr.md#locks)).
+- `cat /proc/locks | grep '<lockfile-path-from-error>'` falls
+  back to the kernel's own flock enumeration when the holder is
+  outside ktstr.
+- `stat -f -c '%T' <runs-root>` reports the filesystem type when
+  the rejection error names NFS/CIFS/SMB/CephFS/AFS/FUSE.
+
+**Fix:**
+
+- For a peer-holder timeout: wait for the peer to finish, kill
+  it (`kill <pid>` from the holder list), or retry with the peer
+  done.
+- For an NFS / remote-fs rejection: relocate the runs root to a
+  local filesystem. Set `KTSTR_SIDECAR_DIR` to a local path
+  (`/tmp/ktstr-sidecars`, a tmpfs mount) — note that this
+  override path **also skips the cross-process flock**, so
+  concurrent runs targeting the same `KTSTR_SIDECAR_DIR` have no
+  serialization between them. Use the override only for a
+  single-process run or per-process distinct paths.
+- The kernel cache's lockfiles
+  (`{cache_root}/.locks/*.lock`) face the same constraint —
+  override `KTSTR_CACHE_DIR` to a local filesystem if the default
+  resolves to NFS. See
+  [Cache directory not found](#cache-directory-not-found).
+
 ## Tests pass locally but fail in CI
 
 Common causes:
