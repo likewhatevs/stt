@@ -37,8 +37,12 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 /// direct [`fetch_releases`] call against [`RELEASES_URL`] (the
 /// production URL — the bypass skips the cache, NOT the URL). For
 /// full URL injection (e.g. localhost mock server testing), call
-/// [`fetch_releases`] directly with the mock URL — see
-/// `fetch_releases_against_localhost_mock_returns_parsed`.
+/// either [`fetch_releases`] directly with the mock URL — see
+/// `fetch_releases_against_localhost_mock_returns_parsed` — or use
+/// the cache-aware seam [`cached_releases_with_url`], which routes
+/// the non-singleton bypass branch through the supplied URL while
+/// preserving the singleton/cache routing identical to
+/// [`cached_releases_with`].
 ///
 /// # Panics
 ///
@@ -123,10 +127,7 @@ fn is_shared_client(client: &Client) -> bool {
 /// [`RELEASES_CACHE`]; any other (test-constructed) `Client`
 /// bypasses [`RELEASES_CACHE`] and calls [`fetch_releases`] with
 /// [`RELEASES_URL`] directly — the cache is skipped but the
-/// production URL is used. Tests that need URL injection
-/// (e.g. localhost mock server testing) should call
-/// [`fetch_releases`] directly with their mock URL rather than
-/// route through this helper.
+/// production URL is used.
 ///
 /// Used by every in-file caller that already threads a `&Client`
 /// — [`fetch_latest_stable_version`], [`fetch_version_for_prefix`],
@@ -134,6 +135,43 @@ fn is_shared_client(client: &Client) -> bool {
 /// [`RELEASES_CACHE`] and tests still get cache-bypass via the
 /// pointer-equality gate. [`cached_releases`] is the no-`Client`
 /// wrapper for top-level CLI entries.
+///
+/// Tests that need URL injection on the bypass branch (e.g.
+/// localhost mock server testing) call
+/// [`cached_releases_with_url`] directly with their mock URL —
+/// the URL-injectable form preserves identical routing
+/// semantics. This wrapper is the production entry point and
+/// pins the URL to [`RELEASES_URL`]; production code MUST go
+/// through this wrapper rather than calling
+/// [`cached_releases_with_url`] with a non-production URL on
+/// the singleton path (which would populate [`RELEASES_CACHE`]
+/// with non-production data and corrupt every later production
+/// call). Caching, race semantics, and the bypass-vs-cache
+/// routing are fully documented on [`cached_releases_with_url`].
+fn cached_releases_with(client: &Client) -> Result<Vec<Release>> {
+    cached_releases_with_url(client, RELEASES_URL)
+}
+
+/// URL-injectable form of [`cached_releases_with`]. Production
+/// always reaches this through the [`cached_releases_with`]
+/// wrapper, which pins `url` to [`RELEASES_URL`]; the explicit
+/// `url` parameter exists so the bypass-branch test can route
+/// the non-singleton path through a localhost
+/// [`std::net::TcpListener`]-backed mock instead of hitting real
+/// kernel.org. Without this seam, the bypass test would either
+/// (a) require a real network round-trip on every run, or
+/// (b) accept a 5s timeout penalty on offline hosts to surface
+/// `Err` as a bypass-confirmation signal — both costs the seam
+/// eliminates.
+///
+/// Cache contract is identical to [`cached_releases_with`]:
+/// non-singleton clients bypass [`RELEASES_CACHE`] and call
+/// [`fetch_releases`] with `url`; the singleton routes through
+/// the cache (consulting via `OnceLock::get`, populating via
+/// `OnceLock::set` on miss). The cache only ever stores data
+/// fetched from the singleton path — bypass-branch fetches are
+/// never cached, so a test that injects a mock URL on the bypass
+/// path cannot pollute the production cache.
 ///
 /// Failures are propagated without populating [`RELEASES_CACHE`],
 /// so a transient kernel.org outage on the first call lets the
@@ -151,15 +189,34 @@ fn is_shared_client(client: &Client) -> bool {
 /// populates [`RELEASES_CACHE`]; every later call — from any
 /// thread — observes the populated slot via the `get` fast-path
 /// and skips the network.
-fn cached_releases_with(client: &Client) -> Result<Vec<Release>> {
+fn cached_releases_with_url(client: &Client, url: &str) -> Result<Vec<Release>> {
     // Non-singleton clients bypass the cache (test fault injection).
     if !is_shared_client(client) {
-        return fetch_releases(client, RELEASES_URL);
+        return fetch_releases(client, url);
     }
+    // Cache-poison guard: the singleton path populates
+    // RELEASES_CACHE on miss. A test author that mistakenly
+    // passes a non-production URL with shared_client() would
+    // fill the cache with non-production data and corrupt every
+    // later production call (which reaches the cache via
+    // get-fast-path). Catch the misuse at debug-build time —
+    // production callers always thread RELEASES_URL through the
+    // `cached_releases_with` wrapper, so the assertion is a
+    // no-op for them; only a future test author wiring this
+    // function up with shared_client() and a mock URL would trip
+    // it.
+    debug_assert!(
+        url == RELEASES_URL,
+        "cached_releases_with_url: shared_client() must use RELEASES_URL \
+         to avoid RELEASES_CACHE pollution — got url={url:?}, expected \
+         RELEASES_URL ({RELEASES_URL:?}). Tests that need URL injection \
+         must pass a non-singleton Client (which takes the bypass branch \
+         above and never touches the cache).",
+    );
     if let Some(cached) = RELEASES_CACHE.get() {
         return Ok(cached.clone());
     }
-    let fresh = fetch_releases(client, RELEASES_URL)?;
+    let fresh = fetch_releases(client, url)?;
     // Race-loss: `set` returns `Err(clone)` carrying back the
     // clone we passed in; we discard it and return the original
     // `fresh` below. See the rustdoc above for full semantics.
@@ -1295,16 +1352,19 @@ mod tests {
     /// Bypass-branch routing is covered by two complementary
     /// tests: the `is_shared_client` predicate is unit-tested by
     /// [`is_shared_client_rejects_test_constructed_clients`],
-    /// and the end-to-end branch through [`cached_releases_with`]
-    /// is exercised by
+    /// and the end-to-end branch through
+    /// [`cached_releases_with_url`] is exercised by
     /// [`cached_releases_with_non_singleton_bypasses_cache`] —
-    /// which proves a non-singleton `Client` skips
-    /// [`RELEASES_CACHE`] and reaches [`fetch_releases`] (either
-    /// returning non-synthetic Ok or any Err proves the bypass).
+    /// which drives the bypass against a localhost mock URL via
+    /// the URL-injection seam and proves the non-singleton
+    /// `Client` skips [`RELEASES_CACHE`] and reaches
+    /// [`fetch_releases`] with the supplied URL.
     /// [`fetch_releases`]'s GET-and-parse mechanics — the same
-    /// function the bypass branch invokes (with [`RELEASES_URL`])
-    /// and that production callers reach on cache miss — are
-    /// covered deterministically by
+    /// function the bypass branch invokes with whatever URL is
+    /// threaded in, and that production callers reach on cache
+    /// miss (with [`RELEASES_URL`] pinned by the
+    /// [`cached_releases_with`] wrapper) — are covered
+    /// deterministically by
     /// [`fetch_releases_against_localhost_mock_returns_parsed`]
     /// against a TcpListener mock with an injected URL, plus the
     /// `fetch_releases_*` family of error-path tests
@@ -1431,9 +1491,14 @@ mod tests {
     }
 
     /// End-to-end bypass-branch routing through
-    /// [`cached_releases_with`]: a non-singleton `Client` MUST
-    /// skip [`RELEASES_CACHE`] and exercise [`fetch_releases`]
-    /// against [`RELEASES_URL`], NOT consult the cache.
+    /// [`cached_releases_with_url`]: a non-singleton `Client`
+    /// MUST skip [`RELEASES_CACHE`] and exercise
+    /// [`fetch_releases`] against the supplied URL, NOT consult
+    /// the cache. Routes through the URL-injection seam
+    /// ([`cached_releases_with_url`]) so the bypass-branch fetch
+    /// hits a localhost [`std::net::TcpListener`] mock that
+    /// returns deterministic non-synthetic data — no real
+    /// kernel.org round-trip, no offline-host timeout penalty.
     ///
     /// Coexistence with `cached_releases_routing_singleton_path`:
     /// both tests pre-populate [`RELEASES_CACHE`] with the SAME
@@ -1446,32 +1511,21 @@ mod tests {
     /// test's `is_ok()` invariant was relaxed to the same
     /// tolerance for the same reason.
     ///
-    /// Why two outcomes are both valid:
-    /// - `Ok(data)`: bypass took the network path and reached
-    ///   the production [`RELEASES_URL`]. The returned vector
-    ///   reflects whatever real kernel.org served (or any
-    ///   intermediate proxy / CDN response). The synthetic
-    ///   vector is 3 entries with deliberately-realistic
-    ///   versions, but production releases.json has many more
-    ///   entries; a length match would be coincidence and a
-    ///   value-equal match would be near-impossible. Asserting
-    ///   inequality against synthetic proves the cache was
-    ///   skipped — a regression that mis-routed the
-    ///   non-singleton through the cache would return the
-    ///   3-entry synthetic verbatim.
-    /// - `Err(_)`: the network attempt failed (no DNS, no route,
-    ///   timeout, TLS handshake failure, etc.). The mere fact
-    ///   that an Err surfaces (rather than the synthetic Ok)
-    ///   proves the bypass branch was taken — the cache-hit
-    ///   path returns Ok unconditionally because [`RELEASES_CACHE`]
-    ///   is populated. Any Err here means [`fetch_releases`] was
-    ///   reached, which is the bypass branch's only entry.
-    ///
-    /// 5s timeout: bounds the worst-case test runtime when
-    /// network egress is slow or blackholed (offline CI runners,
-    /// air-gapped dev environments). Default reqwest blocking
-    /// `Client` has no timeout and would block past nextest's
-    /// slow-test cutoff.
+    /// Mock-served data is deliberately distinct from the
+    /// synthetic cache contents — different version strings (in
+    /// the 9.x range, never seen on real kernel.org) so a
+    /// regression that mis-routed the non-singleton through the
+    /// cache would return the synthetic verbatim and the
+    /// `data != mock_payload` proof would surface as a value
+    /// mismatch. The `Ok(...)` arm of the match below requires a
+    /// successful round-trip to the mock; the `Err(_)` arm is
+    /// retained as a defensive fallback for the (improbable)
+    /// case where mock setup or the underlying TCP exchange
+    /// fails on a constrained test host — bypass is still
+    /// proven because the cache-hit path returns Ok
+    /// unconditionally and any Err means
+    /// [`cached_releases_with_url`] reached [`fetch_releases`],
+    /// which is the bypass branch's only entry.
     #[test]
     fn cached_releases_with_non_singleton_bypasses_cache() {
         // SAME synthetic data the singleton-path test uses —
@@ -1510,16 +1564,30 @@ mod tests {
         // Verify byte-equal contents, not just length. A peer test
         // populating the cache with the same row count but
         // different moniker/version would defeat the bypass
-        // assertion below — the `data != synthetic` check would
-        // succeed against the wrong baseline, missing a real
-        // cache-routing regression.
+        // assertion below — the `data != mock_payload` check
+        // would still succeed but against the wrong baseline,
+        // missing a peer-data corruption regression.
         assert_releases_eq(in_cache, &synthetic, "cache populate sanity");
+
+        // Mock body: 2 entries with version strings (9.x range)
+        // distinct from both the synthetic cache contents and
+        // anything that has ever appeared on real kernel.org.
+        // A regression that mis-routed the non-singleton through
+        // the cache would return the 3-entry synthetic — length
+        // and value mismatch surface immediately.
+        let mock_body = r#"{
+            "releases": [
+                { "moniker": "stable",   "version": "9.99.99" },
+                { "moniker": "longterm", "version": "9.98.50" }
+            ]
+        }"#;
+        let (mock_url, handle) = spawn_one_shot_releases_mock(200, "OK", mock_body);
 
         // Build a non-singleton client via the shared 5s-timeout
         // builder helper. The address differs from
         // `shared_client()`'s OnceLock-stored address, so
         // `is_shared_client(&non_singleton)` returns false and
-        // `cached_releases_with` takes the bypass branch.
+        // `cached_releases_with_url` takes the bypass branch.
         let non_singleton = build_localhost_test_client();
         // Sanity check: the predicate that gates cache routing
         // must report this client as non-singleton. Without
@@ -1531,45 +1599,111 @@ mod tests {
             !super::is_shared_client(&non_singleton),
             "test precondition: non-singleton client MUST NOT compare \
              equal to the shared_client() singleton — the bypass-branch \
-             proof relies on `cached_releases_with` taking the \
+             proof relies on `cached_releases_with_url` taking the \
              non-singleton path",
         );
 
-        // Drive the bypass branch. Either Ok with non-synthetic
-        // data or Err proves the cache was skipped — both
-        // outcomes mean `cached_releases_with` reached
-        // `fetch_releases`, which is the bypass branch's only
-        // exit. The cache-hit path returns Ok(synthetic_clone)
-        // unconditionally; an Err here cannot come from the
-        // cache-hit path.
-        match super::cached_releases_with(&non_singleton) {
+        // Drive the bypass branch through the URL-injection
+        // seam. Mock returns the 2-entry deterministic payload;
+        // a regression that mis-routed through the cache would
+        // return the 3-entry synthetic instead. The match
+        // structure handles both the (expected) Ok path and the
+        // defensive Err fallback for a hypothetical TCP-level
+        // exchange failure.
+        let result = super::cached_releases_with_url(&non_singleton, &mock_url);
+
+        // Mock-payload reference for the Ok-arm assertion. Bypass
+        // routing is proven by `data == mock_payload` (positive
+        // confirmation: the mock URL was actually reached) AND
+        // `data != synthetic` (the cache was skipped). Both
+        // checks together pin BOTH directions of the bypass-vs-
+        // cache routing decision.
+        let mock_payload = vec![
+            Release {
+                moniker: "stable".to_string(),
+                version: "9.99.99".to_string(),
+            },
+            Release {
+                moniker: "longterm".to_string(),
+                version: "9.98.50".to_string(),
+            },
+        ];
+        match result {
             Ok(data) => {
-                // Compare data against the synthetic vector.
-                // If the bypass routing is correct, `data` is
-                // whatever the production URL served — almost
-                // certainly NOT the 3-entry synthetic.
-                let same_shape = data.len() == synthetic.len()
+                // Positive proof: data must equal the mock
+                // payload byte-for-byte. The cache-hit path
+                // returns the 3-entry synthetic; the bypass
+                // branch reaches the mock and returns the
+                // 2-entry mock payload. Equality against
+                // mock_payload directly tests both the routing
+                // (cache vs bypass) AND the mock-server
+                // exchange (URL injection actually delivered).
+                assert_releases_eq(
+                    &data,
+                    &mock_payload,
+                    "bypass branch must return the mock-served payload",
+                );
+                // Negative proof: data must NOT match the
+                // synthetic cache contents. Redundant with the
+                // positive check above (mock_payload and
+                // synthetic differ on length and values), but
+                // surfaces a clearer assertion message if a
+                // future regression somehow returned a third
+                // shape that happens to equal the synthetic.
+                let same_as_cache = data.len() == synthetic.len()
                     && data.iter().zip(synthetic.iter()).all(|(got, want)| {
                         got.moniker == want.moniker && got.version == want.version
                     });
                 assert!(
-                    !same_shape,
+                    !same_as_cache,
                     "bypass branch returned synthetic data verbatim — \
                      cache-routing leaked, the non-singleton client \
                      was incorrectly served from RELEASES_CACHE \
-                     instead of reaching the network. Synthetic was \
-                     {synthetic:?}; got identical {data:?}",
+                     instead of reaching the localhost mock URL. \
+                     Synthetic was {synthetic:?}; got identical {data:?}",
                 );
             }
             Err(_) => {
-                // Network attempt failed. This is acceptable —
-                // any Err here proves `fetch_releases` was
-                // reached (the cache-hit path can't produce
-                // Err because RELEASES_CACHE is populated with
-                // a Vec, not a Result). The bypass branch is
-                // confirmed.
+                // TCP-level exchange failed before mock could
+                // respond (improbable on localhost but tolerated
+                // for robustness on constrained test hosts). The
+                // mere fact that an Err surfaces — rather than
+                // Ok(synthetic) — proves the bypass branch was
+                // taken: the cache-hit path returns Ok
+                // unconditionally because RELEASES_CACHE is
+                // populated with a Vec, not a Result. Bypass is
+                // confirmed; mock-payload positive check is
+                // skipped under this branch.
             }
         }
+
+        // Cache-unchanged invariant: the bypass branch must NOT
+        // populate RELEASES_CACHE. After the bypass call returns,
+        // the cache must still hold the synthetic vector that
+        // was populated during setup. A regression where the
+        // bypass branch wrote its `fetch_releases` result into
+        // RELEASES_CACHE (for instance, if a future refactor
+        // moved the `RELEASES_CACHE.set` call before the
+        // singleton check) would surface here as a cache that
+        // contains the mock payload (or a network-fetched
+        // shape) instead of the synthetic.
+        let post = super::RELEASES_CACHE.get().expect(
+            "RELEASES_CACHE must remain populated after the bypass call — \
+             a regression that cleared the cache between setup and now \
+             would surface here",
+        );
+        assert_releases_eq(
+            post,
+            &synthetic,
+            "cache must remain unchanged after bypass call",
+        );
+
+        // Join the mock thread so an `expect`-panic inside it
+        // (e.g. accept failed, write_all failed) propagates as
+        // an outer test failure with the original panic message
+        // intact. Without this, a thread-side panic is silently
+        // swallowed by the default thread panic policy.
+        handle.join().expect("mock thread must not panic");
     }
 
     /// Spawn a one-shot HTTP/1.1 mock that listens on
@@ -1659,15 +1793,18 @@ mod tests {
     /// pinned to "Ok with synthetic data".
     ///
     /// Covers [`fetch_releases`]'s GET-and-parse mechanics — the
-    /// same function [`cached_releases_with`]'s bypass branch
-    /// invokes (with [`RELEASES_URL`]), and the same function
-    /// production callers reach on cache miss. The bypass branch
-    /// itself uses the production URL, not a mock URL; that
-    /// routing decision is verified separately by
+    /// same function [`cached_releases_with_url`]'s bypass branch
+    /// invokes with whatever URL is threaded in, and the same
+    /// function production callers reach on cache miss (with
+    /// [`RELEASES_URL`] pinned by the [`cached_releases_with`]
+    /// wrapper). The bypass-branch routing decision (non-singleton
+    /// reaches `fetch_releases` with the supplied URL, NOT
+    /// [`RELEASES_CACHE`]) is verified separately by
     /// [`is_shared_client_rejects_test_constructed_clients`]
     /// (predicate-level) and by
     /// [`cached_releases_with_non_singleton_bypasses_cache`]
-    /// (end-to-end through the cache helper).
+    /// (end-to-end through the cache helper, driven against a
+    /// localhost mock URL via [`cached_releases_with_url`]).
     #[test]
     fn fetch_releases_against_localhost_mock_returns_parsed() {
         // Synthetic releases.json shape — distinct from the
@@ -1870,6 +2007,119 @@ mod tests {
         handle.join().expect("mock thread must not panic");
     }
 
+    /// A row missing the `version` field is silently dropped — the
+    /// `r.get("version")?` step in [`fetch_releases`]'s filter_map
+    /// returns `None` and the row falls out. Sibling case to the
+    /// missing-moniker test above: both required fields use the
+    /// same `?`-chain pattern, so the same per-row tolerance must
+    /// apply on either side.
+    #[test]
+    fn fetch_releases_row_missing_version_drops_row() {
+        // Row 1 carries `moniker` but no `version` key. The
+        // `r.get("version")?` short-circuits to None; `filter_map`
+        // drops row 1. Surrounding rows must still parse.
+        let body = r#"{
+            "releases": [
+                { "moniker": "stable",   "version": "9.99.99" },
+                { "moniker": "linux-next" },
+                { "moniker": "longterm", "version": "9.97.50" }
+            ]
+        }"#;
+        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", body);
+        let client = build_localhost_test_client();
+        let releases = super::fetch_releases(&client, &url)
+            .expect("row missing version must NOT abort the fetch");
+        assert_eq!(
+            releases.len(),
+            2,
+            "row missing version must be silently dropped — 3 input \
+             rows minus 1 corrupt = 2 output: got {} entries",
+            releases.len(),
+        );
+        assert_eq!(releases[0].moniker, "stable");
+        assert_eq!(releases[0].version, "9.99.99");
+        assert_eq!(releases[1].moniker, "longterm");
+        assert_eq!(releases[1].version, "9.97.50");
+        handle.join().expect("mock thread must not panic");
+    }
+
+    /// A row whose `moniker` is a numeric value (rather than a
+    /// JSON string) is silently dropped — `r.get("moniker")?`
+    /// returns `Some(Value::Number)`, then `.as_str()?`
+    /// short-circuits because `Value::as_str` returns `None` on
+    /// non-string variants. Pins type-tolerance at the row level:
+    /// a kernel.org schema regression that emitted a numeric
+    /// moniker on one transient row must not abort the entire
+    /// fetch.
+    #[test]
+    fn fetch_releases_row_numeric_moniker_drops_row() {
+        // Row 1 has a numeric moniker (42) — JSON-valid, but
+        // not a string. `r.get("moniker")?.as_str()?` short-
+        // circuits at the `as_str()` step. `filter_map` drops
+        // row 1; the surviving rows must still parse.
+        let body = r#"{
+            "releases": [
+                { "moniker": "stable",   "version": "9.99.99" },
+                { "moniker": 42,         "version": "9.98.99" },
+                { "moniker": "longterm", "version": "9.97.50" }
+            ]
+        }"#;
+        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", body);
+        let client = build_localhost_test_client();
+        let releases = super::fetch_releases(&client, &url)
+            .expect("row with numeric moniker must NOT abort the fetch");
+        assert_eq!(
+            releases.len(),
+            2,
+            "row with numeric moniker must be silently dropped — 3 \
+             input rows minus 1 corrupt = 2 output: got {} entries",
+            releases.len(),
+        );
+        assert_eq!(releases[0].moniker, "stable");
+        assert_eq!(releases[0].version, "9.99.99");
+        assert_eq!(releases[1].moniker, "longterm");
+        assert_eq!(releases[1].version, "9.97.50");
+        handle.join().expect("mock thread must not panic");
+    }
+
+    /// A row whose `version` is the JSON `null` value is silently
+    /// dropped — `r.get("version")?` returns `Some(Value::Null)`,
+    /// then `.as_str()?` short-circuits because `Value::as_str`
+    /// returns `None` on `Null`. Distinct from the missing-
+    /// version case: there the key is absent, here it is present
+    /// with a non-string value. Both cases must take the same
+    /// row-drop path.
+    #[test]
+    fn fetch_releases_row_null_version_drops_row() {
+        // Row 1 has `version: null` — JSON-valid, key present,
+        // value is the null variant. The `?`-chain short-circuits
+        // at `as_str()`. `filter_map` drops row 1; the surviving
+        // rows must still parse.
+        let body = r#"{
+            "releases": [
+                { "moniker": "stable",   "version": "9.99.99" },
+                { "moniker": "mainline", "version": null },
+                { "moniker": "longterm", "version": "9.97.50" }
+            ]
+        }"#;
+        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", body);
+        let client = build_localhost_test_client();
+        let releases = super::fetch_releases(&client, &url)
+            .expect("row with null version must NOT abort the fetch");
+        assert_eq!(
+            releases.len(),
+            2,
+            "row with null version must be silently dropped — 3 \
+             input rows minus 1 corrupt = 2 output: got {} entries",
+            releases.len(),
+        );
+        assert_eq!(releases[0].moniker, "stable");
+        assert_eq!(releases[0].version, "9.99.99");
+        assert_eq!(releases[1].moniker, "longterm");
+        assert_eq!(releases[1].version, "9.97.50");
+        handle.join().expect("mock thread must not panic");
+    }
+
     /// An empty `releases` array surfaces as `Ok(empty Vec)` — not
     /// an error. Pins [`fetch_releases`]'s "no rows" path: a
     /// kernel.org outage might briefly return an empty array
@@ -2010,9 +2260,11 @@ mod tests {
     /// returns `false`. This is the bypass branch of
     /// [`cached_releases_with`] — tests that build their own
     /// `Client` and route through the cache helper land here,
-    /// skipping [`RELEASES_CACHE`] (the request still goes to
-    /// [`RELEASES_URL`] — URL injection requires calling
-    /// [`fetch_releases`] directly).
+    /// skipping [`RELEASES_CACHE`] (when called via
+    /// [`cached_releases_with`] the request goes to
+    /// [`RELEASES_URL`]; tests that need URL injection on the
+    /// bypass branch call [`cached_releases_with_url`] with a
+    /// mock URL, or [`fetch_releases`] directly).
     #[test]
     fn is_shared_client_rejects_test_constructed_clients() {
         // Force singleton construction before building local
