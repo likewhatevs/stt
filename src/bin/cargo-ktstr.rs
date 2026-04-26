@@ -597,25 +597,35 @@ enum StatsCommand {
         #[arg(long, action = ArgAction::Append)]
         kernel_commit: Vec<String>,
         /// Strict equality match against the sidecar's `scheduler`
-        /// field (e.g. `--scheduler scx_rusty`). Distinct from `-E`,
-        /// which matches a substring across the joined fields. Use
-        /// this when the operator wants to pin a specific scheduler
-        /// rather than narrow on a fragment.
-        #[arg(long)]
-        scheduler: Option<String>,
+        /// field (e.g. `--scheduler scx_rusty`). Repeatable:
+        /// `--scheduler A --scheduler B` keeps rows whose
+        /// `scheduler` equals A OR B (OR-combined like `--kernel`).
+        /// Distinct from `-E`, which matches a substring across
+        /// the joined fields. Use this when the operator wants to
+        /// pin specific schedulers rather than narrow on a
+        /// fragment. Empty (no `--scheduler` flag) is the no-op
+        /// default and matches every row's scheduler.
+        #[arg(long, action = ArgAction::Append)]
+        scheduler: Vec<String>,
         /// Strict equality match against the rendered topology label
         /// (e.g. `--topology 1n2l4c2t`). The label is what
         /// `Topology::Display` produces; `cargo ktstr stats list`
-        /// shows the form per-row.
-        #[arg(long)]
-        topology: Option<String>,
+        /// shows the form per-row. Repeatable: `--topology A
+        /// --topology B` keeps rows whose `topology` equals A OR B
+        /// (OR-combined like `--kernel`). Empty is the no-op
+        /// default.
+        #[arg(long, action = ArgAction::Append)]
+        topology: Vec<String>,
         /// Strict equality match against the sidecar's `work_type`
         /// field (e.g. `--work-type CpuSpin`). Valid names are the
         /// PascalCase variants of `WorkType`. See
         /// `WorkType::ALL_NAMES` for the canonical variant list, or
-        /// `doc/guide/src/concepts/work-types.md`.
-        #[arg(long)]
-        work_type: Option<String>,
+        /// `doc/guide/src/concepts/work-types.md`. Repeatable:
+        /// `--work-type A --work-type B` keeps rows whose
+        /// `work_type` equals A OR B (OR-combined like `--kernel`).
+        /// Empty is the no-op default.
+        #[arg(long = "work-type", action = ArgAction::Append)]
+        work_type: Vec<String>,
         /// Strict equality match against the sidecar's `run_source`
         /// field (e.g. `--run-source local`, `--run-source ci`,
         /// `--run-source archive`). Repeatable: `--run-source A
@@ -669,12 +679,12 @@ enum StatsCommand {
         a_kernel_commit: Vec<String>,
         #[arg(long = "a-run-source", action = ArgAction::Append)]
         a_run_source: Vec<String>,
-        #[arg(long = "a-scheduler")]
-        a_scheduler: Option<String>,
-        #[arg(long = "a-topology")]
-        a_topology: Option<String>,
-        #[arg(long = "a-work-type")]
-        a_work_type: Option<String>,
+        #[arg(long = "a-scheduler", action = ArgAction::Append)]
+        a_scheduler: Vec<String>,
+        #[arg(long = "a-topology", action = ArgAction::Append)]
+        a_topology: Vec<String>,
+        #[arg(long = "a-work-type", action = ArgAction::Append)]
+        a_work_type: Vec<String>,
         #[arg(long = "a-flag")]
         a_flags: Vec<String>,
 
@@ -697,12 +707,12 @@ enum StatsCommand {
         b_kernel_commit: Vec<String>,
         #[arg(long = "b-run-source", action = ArgAction::Append)]
         b_run_source: Vec<String>,
-        #[arg(long = "b-scheduler")]
-        b_scheduler: Option<String>,
-        #[arg(long = "b-topology")]
-        b_topology: Option<String>,
-        #[arg(long = "b-work-type")]
-        b_work_type: Option<String>,
+        #[arg(long = "b-scheduler", action = ArgAction::Append)]
+        b_scheduler: Vec<String>,
+        #[arg(long = "b-topology", action = ArgAction::Append)]
+        b_topology: Vec<String>,
+        #[arg(long = "b-work-type", action = ArgAction::Append)]
+        b_work_type: Vec<String>,
         #[arg(long = "b-flag")]
         b_flags: Vec<String>,
 
@@ -1608,25 +1618,25 @@ struct BuildCompareFilters {
     shared_project_commit: Vec<String>,
     shared_kernel_commit: Vec<String>,
     shared_run_source: Vec<String>,
-    shared_scheduler: Option<String>,
-    shared_topology: Option<String>,
-    shared_work_type: Option<String>,
+    shared_scheduler: Vec<String>,
+    shared_topology: Vec<String>,
+    shared_work_type: Vec<String>,
     shared_flags: Vec<String>,
     a_kernel: Vec<String>,
     a_project_commit: Vec<String>,
     a_kernel_commit: Vec<String>,
     a_run_source: Vec<String>,
-    a_scheduler: Option<String>,
-    a_topology: Option<String>,
-    a_work_type: Option<String>,
+    a_scheduler: Vec<String>,
+    a_topology: Vec<String>,
+    a_work_type: Vec<String>,
     a_flags: Vec<String>,
     b_kernel: Vec<String>,
     b_project_commit: Vec<String>,
     b_kernel_commit: Vec<String>,
     b_run_source: Vec<String>,
-    b_scheduler: Option<String>,
-    b_topology: Option<String>,
-    b_work_type: Option<String>,
+    b_scheduler: Vec<String>,
+    b_topology: Vec<String>,
+    b_work_type: Vec<String>,
     b_flags: Vec<String>,
 }
 
@@ -1634,8 +1644,11 @@ impl BuildCompareFilters {
     /// Resolve sugar into per-side `RowFilter` instances.
     /// "More-specific replaces": a per-side Vec is applied
     /// verbatim when non-empty, otherwise the shared Vec is
-    /// used; a per-side Option is `Some(_).or(shared)` —
-    /// per-side Some wins, per-side None defers to shared.
+    /// used. Every dimension on `RowFilter` is now a `Vec<String>`
+    /// (after the #13 conversion from `Option<String>` to repeatable
+    /// Vec for scheduler/topology/work_type), so a single `pick_vec`
+    /// helper handles every dim uniformly — the prior `pick_opt`
+    /// branch is no longer reachable.
     fn build(&self) -> (ktstr::cli::RowFilter, ktstr::cli::RowFilter) {
         let pick_vec = |a: &[String], shared: &[String]| -> Vec<String> {
             if a.is_empty() {
@@ -1644,17 +1657,14 @@ impl BuildCompareFilters {
                 a.to_vec()
             }
         };
-        let pick_opt = |a: &Option<String>, shared: &Option<String>| -> Option<String> {
-            a.clone().or_else(|| shared.clone())
-        };
         let filter_a = ktstr::cli::RowFilter {
             kernels: pick_vec(&self.a_kernel, &self.shared_kernel),
             project_commits: pick_vec(&self.a_project_commit, &self.shared_project_commit),
             kernel_commits: pick_vec(&self.a_kernel_commit, &self.shared_kernel_commit),
             run_sources: pick_vec(&self.a_run_source, &self.shared_run_source),
-            scheduler: pick_opt(&self.a_scheduler, &self.shared_scheduler),
-            topology: pick_opt(&self.a_topology, &self.shared_topology),
-            work_type: pick_opt(&self.a_work_type, &self.shared_work_type),
+            schedulers: pick_vec(&self.a_scheduler, &self.shared_scheduler),
+            topologies: pick_vec(&self.a_topology, &self.shared_topology),
+            work_types: pick_vec(&self.a_work_type, &self.shared_work_type),
             flags: pick_vec(&self.a_flags, &self.shared_flags),
         };
         let filter_b = ktstr::cli::RowFilter {
@@ -1662,9 +1672,9 @@ impl BuildCompareFilters {
             project_commits: pick_vec(&self.b_project_commit, &self.shared_project_commit),
             kernel_commits: pick_vec(&self.b_kernel_commit, &self.shared_kernel_commit),
             run_sources: pick_vec(&self.b_run_source, &self.shared_run_source),
-            scheduler: pick_opt(&self.b_scheduler, &self.shared_scheduler),
-            topology: pick_opt(&self.b_topology, &self.shared_topology),
-            work_type: pick_opt(&self.b_work_type, &self.shared_work_type),
+            schedulers: pick_vec(&self.b_scheduler, &self.shared_scheduler),
+            topologies: pick_vec(&self.b_topology, &self.shared_topology),
+            work_types: pick_vec(&self.b_work_type, &self.shared_work_type),
             flags: pick_vec(&self.b_flags, &self.shared_flags),
         };
         (filter_a, filter_b)
@@ -3634,15 +3644,17 @@ mod tests {
         assert!(fa.project_commits.is_empty());
         assert!(fa.kernel_commits.is_empty());
         assert!(fa.run_sources.is_empty());
-        assert!(fa.scheduler.is_none());
-        assert!(fa.topology.is_none());
-        assert!(fa.work_type.is_none());
+        assert!(fa.schedulers.is_empty());
+        assert!(fa.topologies.is_empty());
+        assert!(fa.work_types.is_empty());
         assert!(fa.flags.is_empty());
         assert_eq!(fa.kernels, fb.kernels);
         assert_eq!(fa.project_commits, fb.project_commits);
         assert_eq!(fa.kernel_commits, fb.kernel_commits);
         assert_eq!(fa.run_sources, fb.run_sources);
-        assert_eq!(fa.scheduler, fb.scheduler);
+        assert_eq!(fa.schedulers, fb.schedulers);
+        assert_eq!(fa.topologies, fb.topologies);
+        assert_eq!(fa.work_types, fb.work_types);
     }
 
     /// Per-side `--a-kernel-commit` overrides shared
@@ -3739,22 +3751,30 @@ mod tests {
         assert_eq!(fb.kernels, vec!["6.15"]);
     }
 
-    /// Per-side `--a-scheduler` (Option) overrides shared
-    /// `--scheduler` for A only. Sibling test for the
-    /// Option-typed override path.
+    /// Per-side `--a-scheduler` overrides shared `--scheduler` for
+    /// A only. Sibling test for the scheduler dimension after the
+    /// #13 conversion from `Option<String>` to repeatable
+    /// `Vec<String>` — the override semantics now mirror every
+    /// other Vec dim ("non-empty per-side replaces shared
+    /// verbatim"), so this test pins the same shape every other
+    /// override-test pins for kernel / commit / source / etc.
     #[test]
-    fn build_compare_filters_per_side_option_dim_override() {
+    fn build_compare_filters_per_side_scheduler_overrides_shared() {
         let b = BuildCompareFilters {
-            shared_scheduler: Some("scx_default".to_string()),
-            a_scheduler: Some("scx_alpha".to_string()),
+            shared_scheduler: vec!["scx_default".to_string()],
+            a_scheduler: vec!["scx_alpha".to_string()],
             ..BuildCompareFilters::default()
         };
         let (fa, fb) = b.build();
-        assert_eq!(fa.scheduler.as_deref(), Some("scx_alpha"));
         assert_eq!(
-            fb.scheduler.as_deref(),
-            Some("scx_default"),
-            "B retains the shared scheduler when only --a-scheduler overrides",
+            fa.schedulers,
+            vec!["scx_alpha".to_string()],
+            "A overrides shared scheduler",
+        );
+        assert_eq!(
+            fb.schedulers,
+            vec!["scx_default".to_string()],
+            "B retains shared scheduler when only --a-scheduler overrides",
         );
     }
 
@@ -3767,15 +3787,15 @@ mod tests {
     fn build_compare_filters_shared_pin_plus_per_side_slice() {
         let b = BuildCompareFilters {
             shared_kernel: vec!["6.14".to_string()],
-            a_scheduler: Some("scx_alpha".to_string()),
-            b_scheduler: Some("scx_beta".to_string()),
+            a_scheduler: vec!["scx_alpha".to_string()],
+            b_scheduler: vec!["scx_beta".to_string()],
             ..BuildCompareFilters::default()
         };
         let (fa, fb) = b.build();
         assert_eq!(fa.kernels, vec!["6.14"]);
         assert_eq!(fb.kernels, vec!["6.14"]);
-        assert_eq!(fa.scheduler.as_deref(), Some("scx_alpha"));
-        assert_eq!(fb.scheduler.as_deref(), Some("scx_beta"));
+        assert_eq!(fa.schedulers, vec!["scx_alpha".to_string()]);
+        assert_eq!(fb.schedulers, vec!["scx_beta".to_string()]);
         // The slicing-dim derivation for these two filters
         // returns just [Scheduler] — kernel pins both sides
         // so the comparison joins on kernel and contrasts on

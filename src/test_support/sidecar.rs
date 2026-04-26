@@ -850,16 +850,52 @@ pub(crate) fn detect_project_commit() -> Option<String> {
 /// `gix::init`-built fixtures in tempdirs without mutating the
 /// process-wide `current_dir`. The public entry point reads `cwd`
 /// once and delegates here.
+///
+/// `gix::discover` walks parents until it finds a `.git` marker —
+/// tests can be launched from a subdirectory of the repo (e.g.
+/// `cd src && cargo test`); the parent walk handles that, where
+/// `gix::open` would require the exact root. The
+/// open-vs-discover distinction is the ONLY difference between
+/// this function and [`detect_kernel_commit`]; the post-open
+/// "read HEAD, format short hex, append `-dirty` on dirt" body
+/// lives in the shared [`commit_with_dirty_suffix`] helper.
 fn detect_commit_at(path: &std::path::Path) -> Option<String> {
     let repo = gix::discover(path).ok()?;
-    let head = repo.head_id().ok()?;
-    // `to_hex_with_len(7)` produces a `HexDisplay` that formats
-    // 7 hex chars without the 40-char intermediate `format!("{}")`
-    // allocation. `Id` derefs to `oid` (gix-hash) which owns the
-    // method.
-    let short_hash = head.to_hex_with_len(7).to_string();
+    commit_with_dirty_suffix(&repo)
+}
 
-    if repo_is_dirty(&repo).unwrap_or(false) {
+/// Shared post-open body for [`detect_commit_at`] and
+/// [`detect_kernel_commit`]: read `repo.head_id()`, format the
+/// 7-char short hex, and append `-dirty` when [`repo_is_dirty`]
+/// returns `Some(true)`.
+///
+/// Returns `None` when `head_id()` fails (unborn HEAD on a fresh
+/// `gix::init` with zero commits, or a corrupt repository) — the
+/// short-hex cannot be formed.
+///
+/// Returns `Some(short_hash)` (without `-dirty`) when the HEAD
+/// read succeeds but the [`repo_is_dirty`] probe returns `None`
+/// (HEAD-tree peel failure). This matches the documented "treat
+/// as clean on probe failure" degradation: metadata probes must
+/// not gate sidecar writes, so a probe failure flows through as
+/// "clean" rather than aborting.
+///
+/// `to_hex_with_len(7)` produces a `HexDisplay` that formats 7
+/// hex chars without the 40-char intermediate `format!("{}")`
+/// allocation. `Id` derefs to `oid` (gix-hash) which owns the
+/// method.
+///
+/// CALL SITES diverge ONLY on the open mode (`gix::discover` for
+/// the project commit, `gix::open` for the kernel commit). The
+/// helper takes a `&Repository` so each caller picks the open
+/// strategy that matches its semantics: project commit walks
+/// parents (cwd may be inside a subdir of the repo); kernel
+/// commit demands the explicit root (the kernel directory is
+/// not walked-up to avoid resolving the parent ktstr repo).
+fn commit_with_dirty_suffix(repo: &gix::Repository) -> Option<String> {
+    let head = repo.head_id().ok()?;
+    let short_hash = head.to_hex_with_len(7).to_string();
+    if repo_is_dirty(repo).unwrap_or(false) {
         Some(format!("{short_hash}-dirty"))
     } else {
         Some(short_hash)
@@ -992,15 +1028,16 @@ fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
 /// "treat as clean" rather than aborting the probe, because
 /// metadata must not gate sidecar writes.
 pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<String> {
+    // `gix::open` (NOT `gix::discover`) — `kernel_dir` must BE the
+    // repo root. Without this the parent walk could resolve to the
+    // ktstr project's own `.git` when `kernel_dir` is a non-git
+    // subdirectory inside the ktstr checkout. The
+    // open-vs-discover distinction is the ONLY difference between
+    // this function and [`detect_commit_at`]; the post-open
+    // "read HEAD, format short hex, append `-dirty` on dirt" body
+    // lives in the shared [`commit_with_dirty_suffix`] helper.
     let repo = gix::open(kernel_dir).ok()?;
-    let head = repo.head_id().ok()?;
-    let short_hash = head.to_hex_with_len(7).to_string();
-
-    if repo_is_dirty(&repo).unwrap_or(false) {
-        Some(format!("{short_hash}-dirty"))
-    } else {
-        Some(short_hash)
-    }
+    commit_with_dirty_suffix(&repo)
 }
 
 /// Environment variable CI runners set to mark sidecars they produce

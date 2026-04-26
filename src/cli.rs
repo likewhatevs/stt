@@ -326,7 +326,31 @@ pub const KERNEL_LIST_LONG_ABOUT: &str = concat!(
     "                   only when has_vmlinux is true (false otherwise).\n",
     "  config_hash      CRC32 of the final merged .config; distinct\n",
     "                   from ktstr_kconfig_hash which covers only the\n",
-    "                   ktstr fragment."
+    "                   ktstr fragment.\n",
+    "\n",
+    "When --range is set, the subcommand SWITCHES to range-preview\n",
+    "mode and emits a structurally different JSON shape — the cache\n",
+    "is not walked at all, only kernel.org's releases.json is fetched\n",
+    "to expand the inclusive range. The --json output is one object\n",
+    "with four top-level fields:\n",
+    "\n",
+    "  range     literal range string supplied to --range\n",
+    "            (e.g. \"6.12..6.14\").\n",
+    "  start     parsed start endpoint\n",
+    "            (MAJOR.MINOR[.PATCH][-rcN]).\n",
+    "  end       parsed end endpoint, same shape as start.\n",
+    "  versions  array of resolved version strings inside\n",
+    "            [start, end] inclusive, ascending by\n",
+    "            (major, minor, patch, rc) tuple. Stable and\n",
+    "            longterm releases only — mainline / linux-next\n",
+    "            are excluded by the moniker filter.\n",
+    "\n",
+    "Range-mode output never carries cache metadata\n",
+    "(no current_ktstr_kconfig_hash, no entries) — to inspect cached\n",
+    "kernels for one of the resolved versions, run `kernel list`\n",
+    "without --range. Consumers should dispatch on the presence of\n",
+    "the `range` key (range mode) versus `entries` key (list mode)\n",
+    "to branch the parse."
 );
 
 /// Emitted by `kernel build` when a local source tree has

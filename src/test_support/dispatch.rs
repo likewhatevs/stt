@@ -33,6 +33,100 @@ use super::{
     run_ktstr_test_inner, sidecar_dir, try_flush_profraw, validate_entry_flags,
 };
 
+/// A nextest-safe kernel identifier whose construction is gated
+/// through [`sanitize_kernel_label`] — once a value of this type
+/// exists, the contained string is GUARANTEED to match the
+/// `kernel_[a-z0-9_]+` shape that nextest's test-name parsing
+/// accepts. The wrapped `String` is private so a future caller
+/// cannot bypass [`Self::new`] and stuff a raw label into the
+/// invariant.
+///
+/// Constructed by [`Self::new`] (which always calls
+/// [`sanitize_kernel_label`]). Read access is via
+/// [`Self::as_str`] / `Display` / `AsRef<str>` — both of which
+/// expose the sanitized form unchanged.
+///
+/// `pub(crate)` because every consumer (this module, the
+/// production parser at [`parse_kernel_list`], and the encoder
+/// helpers in `cargo-ktstr` that thread labels through
+/// `parse_kernel_list`) lives inside the workspace; no external
+/// surface is needed today. If a future external consumer needs
+/// to construct a `SanitizedKernelLabel` directly, expose
+/// `Self::new` as `pub` then — but the private inner stays a
+/// private invariant either way.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SanitizedKernelLabel(String);
+
+impl SanitizedKernelLabel {
+    /// Sanitize `raw` via [`sanitize_kernel_label`] and wrap the
+    /// result in the invariant-preserving newtype. The only path
+    /// that produces a `SanitizedKernelLabel`; bypassing it is
+    /// impossible because the inner field is private to this
+    /// module.
+    pub(crate) fn new(raw: &str) -> Self {
+        Self(sanitize_kernel_label(raw))
+    }
+
+    /// Read access to the sanitized identifier. Returns `&str`
+    /// rather than `&String` so callers can compose with
+    /// `format!` / `starts_with` / `strip_suffix` without
+    /// chaining `.as_str().as_str()`.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SanitizedKernelLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for SanitizedKernelLabel {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+// `PartialEq<&str>` and `PartialEq<str>` impls let `assert_eq!`
+// against a string literal stay readable in tests
+// (`assert_eq!(entries[0].sanitized, "kernel_6_14_2")`) without
+// forcing every consumer to chain `.as_str()`. The wrapped
+// `String` is private to this module, so impls comparing
+// against external `&str` values cannot break the
+// "constructor enforces sanitization" invariant — the
+// invariant attaches to value PRODUCTION, not to value
+// COMPARISON.
+impl PartialEq<&str> for SanitizedKernelLabel {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<str> for SanitizedKernelLabel {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+#[cfg(test)]
+impl SanitizedKernelLabel {
+    /// Test-only escape hatch: wrap a string that's ALREADY in
+    /// the sanitized shape (`kernel_[a-z0-9_]+`) without running
+    /// the sanitizer. Used by unit-test fixtures that hand-roll
+    /// `KernelEntry` values whose `sanitized` field is meant to
+    /// be a literal — running [`Self::new`] on `"kernel_6_14_2"`
+    /// would double-prefix to `"kernel_kernel_6_14_2"`.
+    ///
+    /// Production code must NEVER call this — invariant
+    /// violation here means callers can stuff arbitrary strings
+    /// into the field, defeating the point of the newtype.
+    /// `#[cfg(test)]` enforces that at compile time.
+    pub(crate) fn from_pre_sanitized_for_test(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
 /// One resolved kernel entry from `KTSTR_KERNEL_LIST` (the multi-
 /// kernel fan-out wire format that `cargo ktstr test --kernel A
 /// --kernel B` exports before exec'ing into `cargo nextest`).
@@ -50,15 +144,18 @@ use super::{
 ///   the canonical path, disambiguating two `linux` directories
 ///   under different parents.
 ///
-/// [`sanitize_kernel_label`] applies the `kernel_` prefix and
-/// `[a-z0-9_]+` normalization downstream.
+/// [`SanitizedKernelLabel::new`] (which calls [`sanitize_kernel_label`])
+/// applies the `kernel_` prefix and `[a-z0-9_]+` normalization
+/// downstream. The newtype on this field makes the invariant
+/// compile-checked: a future caller cannot construct a
+/// `KernelEntry` whose `sanitized` field skipped sanitization.
 ///
 /// `kernel_dir` is the canonical absolute path to the kernel-build
 /// directory the per-variant subprocess re-exports as
 /// `KTSTR_KERNEL`.
 #[derive(Clone, Debug)]
 pub(crate) struct KernelEntry {
-    pub(crate) sanitized: String,
+    pub(crate) sanitized: SanitizedKernelLabel,
     pub(crate) kernel_dir: PathBuf,
 }
 
@@ -88,7 +185,7 @@ pub(crate) fn parse_kernel_list(raw: &str) -> Vec<KernelEntry> {
                 return None;
             }
             Some(KernelEntry {
-                sanitized: sanitize_kernel_label(label),
+                sanitized: SanitizedKernelLabel::new(label),
                 kernel_dir: PathBuf::from(path),
             })
         })
@@ -1428,7 +1525,7 @@ mod tests {
     #[test]
     fn strip_kernel_suffix_single_kernel_passthrough() {
         let kernel_list = vec![KernelEntry {
-            sanitized: "kernel_6_14_2".to_string(),
+            sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
             kernel_dir: PathBuf::from("/a"),
         }];
         let (stripped, entry) =
@@ -1447,11 +1544,11 @@ mod tests {
     fn strip_kernel_suffix_multi_kernel_peels_suffix() {
         let kernel_list = vec![
             KernelEntry {
-                sanitized: "kernel_6_14_2".to_string(),
+                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
                 kernel_dir: PathBuf::from("/a"),
             },
             KernelEntry {
-                sanitized: "kernel_6_15_0".to_string(),
+                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_15_0"),
                 kernel_dir: PathBuf::from("/b"),
             },
         ];
@@ -1475,11 +1572,11 @@ mod tests {
     fn strip_kernel_suffix_multi_kernel_missing_suffix_errors() {
         let kernel_list = vec![
             KernelEntry {
-                sanitized: "kernel_6_14_2".to_string(),
+                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
                 kernel_dir: PathBuf::from("/a"),
             },
             KernelEntry {
-                sanitized: "kernel_6_15_0".to_string(),
+                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_15_0"),
                 kernel_dir: PathBuf::from("/b"),
             },
         ];
@@ -1499,11 +1596,11 @@ mod tests {
     fn strip_kernel_suffix_does_not_peel_profile_segment() {
         let kernel_list = vec![
             KernelEntry {
-                sanitized: "kernel_6_14_2".to_string(),
+                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
                 kernel_dir: PathBuf::from("/a"),
             },
             KernelEntry {
-                sanitized: "kernel_6_15_0".to_string(),
+                sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_15_0"),
                 kernel_dir: PathBuf::from("/b"),
             },
         ];

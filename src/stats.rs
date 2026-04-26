@@ -879,16 +879,26 @@ pub struct RowFilter {
     /// [`crate::cache::KernelSource`] — those describe the kernel
     /// build's input, this describes the run-environment provenance.
     pub run_sources: Vec<String>,
-    /// Match against `GauntletRow::scheduler` (strict equality).
-    /// `None` here is "do not filter on scheduler".
-    pub scheduler: Option<String>,
-    /// Match against `GauntletRow::topology` (strict equality on the
-    /// rendered form, e.g. `"1n2l4c2t"`). `None` here is "do not
-    /// filter on topology".
-    pub topology: Option<String>,
-    /// Match against `GauntletRow::work_type` (strict equality).
-    /// `None` here is "do not filter on work type".
-    pub work_type: Option<String>,
+    /// Repeatable scheduler-name filter, OR-combined: a row matches
+    /// iff its `GauntletRow::scheduler` equals ANY entry. Empty vec
+    /// disables the filter ("do not filter on scheduler"). Strict
+    /// equality on each entry — the substring `-E` filter is the
+    /// only fuzzy-match knob; typed flags exact-match. Mirrors the
+    /// shape of `kernels` / `project_commits` / `kernel_commits` /
+    /// `run_sources` so every typed dimension supports the same
+    /// repeatable OR-combined idiom.
+    pub schedulers: Vec<String>,
+    /// Repeatable topology filter, OR-combined: a row matches iff
+    /// its `GauntletRow::topology` equals ANY entry. The filter
+    /// values are the rendered form (e.g. `"1n2l4c2t"`) that
+    /// `Topology::Display` emits and `cargo ktstr stats list`
+    /// shows. Empty vec disables the filter.
+    pub topologies: Vec<String>,
+    /// Repeatable work-type filter, OR-combined: a row matches iff
+    /// its `GauntletRow::work_type` equals ANY entry. Valid names
+    /// are the PascalCase variants of `WorkType::ALL_NAMES`. Empty
+    /// vec disables the filter.
+    pub work_types: Vec<String>,
     /// Repeatable flag filter, AND-combined: every entry must appear
     /// in `GauntletRow::flags`. Empty vec disables the filter.
     pub flags: Vec<String>,
@@ -977,20 +987,29 @@ impl RowFilter {
                 return false;
             }
         }
-        if let Some(want) = &self.scheduler
-            && row.scheduler != *want
-        {
-            return false;
+        if !self.schedulers.is_empty() {
+            // OR-combined match against `GauntletRow::scheduler`
+            // (a `String`, never `None`). Strict equality on each
+            // entry — same shape as the other repeatable typed
+            // filters above.
+            let any = self.schedulers.contains(&row.scheduler);
+            if !any {
+                return false;
+            }
         }
-        if let Some(want) = &self.topology
-            && row.topology != *want
-        {
-            return false;
+        if !self.topologies.is_empty() {
+            // OR-combined match against `GauntletRow::topology`.
+            let any = self.topologies.contains(&row.topology);
+            if !any {
+                return false;
+            }
         }
-        if let Some(want) = &self.work_type
-            && row.work_type != *want
-        {
-            return false;
+        if !self.work_types.is_empty() {
+            // OR-combined match against `GauntletRow::work_type`.
+            let any = self.work_types.contains(&row.work_type);
+            if !any {
+                return false;
+            }
         }
         for required in &self.flags {
             if !row.flags.iter().any(|f| f == required) {
@@ -1162,15 +1181,14 @@ pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] =
 /// dimension) is the PAIRING-key dimension set used by
 /// [`compare_rows`] to join A-side rows against B-side rows.
 ///
-/// Comparison shape per dimension:
-/// - `Kernel` / `Commit` / `KernelCommit` / `Source` / `Flags`: a
-///   slicing dim iff the two sides' filter vecs differ as
-///   SORTED-DEDUPED `Vec<&str>`. Order does not matter
-///   (`--a-kernel 6.14 --a-kernel 6.15` and `--b-kernel 6.15
-///   --b-kernel 6.14` are NOT a slice).
-/// - `Scheduler` / `Topology` / `WorkType`: a slicing dim iff the
-///   two `Option<String>` filters differ. `Some("foo") != None`
-///   counts as a differ.
+/// Comparison shape per dimension: every dim uses the same
+/// SORTED-DEDUPED `Vec<&str>` comparison — order and multiplicity
+/// don't matter (`--a-kernel 6.14 --a-kernel 6.15` and
+/// `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice). All eight
+/// dimensions are now repeatable Vec filters; the previously
+/// `Option<String>`-typed `scheduler` / `topology` / `work_type`
+/// dims were promoted to `Vec<String>` so the operator-visible
+/// shape is uniform across every dimension.
 ///
 /// Returns dimensions in [`Dimension::ALL`] order so callers
 /// (header lines, error messages, side labels) get a stable
@@ -1180,9 +1198,15 @@ pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Di
     for &dim in Dimension::ALL {
         let differs = match dim {
             Dimension::Kernel => sorted_dedup(&filter_a.kernels) != sorted_dedup(&filter_b.kernels),
-            Dimension::Scheduler => filter_a.scheduler != filter_b.scheduler,
-            Dimension::Topology => filter_a.topology != filter_b.topology,
-            Dimension::WorkType => filter_a.work_type != filter_b.work_type,
+            Dimension::Scheduler => {
+                sorted_dedup(&filter_a.schedulers) != sorted_dedup(&filter_b.schedulers)
+            }
+            Dimension::Topology => {
+                sorted_dedup(&filter_a.topologies) != sorted_dedup(&filter_b.topologies)
+            }
+            Dimension::WorkType => {
+                sorted_dedup(&filter_a.work_types) != sorted_dedup(&filter_b.work_types)
+            }
             Dimension::Commit => {
                 sorted_dedup(&filter_a.project_commits) != sorted_dedup(&filter_b.project_commits)
             }
@@ -1235,18 +1259,9 @@ pub(crate) fn render_side_label(
     for &dim in dims {
         let part = match dim {
             Dimension::Kernel => render_vec_dim(&filter.kernels, bare_label),
-            Dimension::Scheduler => filter
-                .scheduler
-                .clone()
-                .unwrap_or_else(|| bare_label.to_string()),
-            Dimension::Topology => filter
-                .topology
-                .clone()
-                .unwrap_or_else(|| bare_label.to_string()),
-            Dimension::WorkType => filter
-                .work_type
-                .clone()
-                .unwrap_or_else(|| bare_label.to_string()),
+            Dimension::Scheduler => render_vec_dim(&filter.schedulers, bare_label),
+            Dimension::Topology => render_vec_dim(&filter.topologies, bare_label),
+            Dimension::WorkType => render_vec_dim(&filter.work_types, bare_label),
             Dimension::Commit => render_vec_dim(&filter.project_commits, bare_label),
             Dimension::KernelCommit => render_vec_dim(&filter.kernel_commits, bare_label),
             Dimension::Source => render_vec_dim(&filter.run_sources, bare_label),
@@ -5802,11 +5817,11 @@ mod tests {
         }
 
         let filter_a = RowFilter {
-            scheduler: Some("scx_alpha".to_string()),
+            schedulers: vec!["scx_alpha".to_string()],
             ..RowFilter::default()
         };
         let filter_b = RowFilter {
-            scheduler: Some("scx_beta".to_string()),
+            schedulers: vec!["scx_beta".to_string()],
             ..RowFilter::default()
         };
 
@@ -6058,7 +6073,7 @@ mod tests {
     fn row_filter_scheduler_strict_equality_rejects_prefix() {
         let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "CpuSpin", None, &[]);
         let filter = RowFilter {
-            scheduler: Some("scx".to_string()),
+            schedulers: vec!["scx".to_string()],
             ..RowFilter::default()
         };
         assert!(
@@ -6074,7 +6089,7 @@ mod tests {
     fn row_filter_scheduler_strict_equality_matches_exact() {
         let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "CpuSpin", None, &[]);
         let filter = RowFilter {
-            scheduler: Some("scx_rusty".to_string()),
+            schedulers: vec!["scx_rusty".to_string()],
             ..RowFilter::default()
         };
         assert!(filter.matches(&row));
@@ -6465,12 +6480,12 @@ mod tests {
     fn row_filter_topology_strict_equality() {
         let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
         let filter_match = RowFilter {
-            topology: Some("1n2l4c1t".to_string()),
+            topologies: vec!["1n2l4c1t".to_string()],
             ..RowFilter::default()
         };
         assert!(filter_match.matches(&row));
         let filter_miss = RowFilter {
-            topology: Some("1n2l4c2t".to_string()),
+            topologies: vec!["1n2l4c2t".to_string()],
             ..RowFilter::default()
         };
         assert!(!filter_miss.matches(&row));
@@ -6534,10 +6549,10 @@ mod tests {
         // 3 of 4 typed fields match (scheduler, topology, kernels);
         // work_type mismatches. Whole filter must reject.
         let filter = RowFilter {
-            scheduler: Some("scx_a".to_string()),
-            topology: Some("1n2l4c1t".to_string()),
+            schedulers: vec!["scx_a".to_string()],
+            topologies: vec!["1n2l4c1t".to_string()],
             kernels: vec!["6.14.2".to_string()],
-            work_type: Some("YieldHeavy".to_string()),
+            work_types: vec!["YieldHeavy".to_string()],
             ..RowFilter::default()
         };
         assert!(
@@ -6559,7 +6574,7 @@ mod tests {
             make_filter_row("t3", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]),
         ];
         let filter = RowFilter {
-            scheduler: Some("scx_b".to_string()),
+            schedulers: vec!["scx_b".to_string()],
             ..RowFilter::default()
         };
         let kept = apply_row_filters(&rows, &filter);
@@ -6966,11 +6981,11 @@ mod tests {
         }
 
         let filter_a = RowFilter {
-            scheduler: Some("scx_alpha".to_string()),
+            schedulers: vec!["scx_alpha".to_string()],
             ..RowFilter::default()
         };
         let filter_b = RowFilter {
-            scheduler: Some("scx_beta".to_string()),
+            schedulers: vec!["scx_beta".to_string()],
             ..RowFilter::default()
         };
 
@@ -7209,7 +7224,7 @@ mod tests {
     #[test]
     fn derive_slicing_dims_identical_filters_yields_empty() {
         let f = RowFilter {
-            scheduler: Some("scx_alpha".to_string()),
+            schedulers: vec!["scx_alpha".to_string()],
             ..RowFilter::default()
         };
         assert!(derive_slicing_dims(&f, &f).is_empty());
@@ -7219,11 +7234,11 @@ mod tests {
     #[test]
     fn derive_slicing_dims_single_dim_diff() {
         let f_a = RowFilter {
-            scheduler: Some("scx_alpha".to_string()),
+            schedulers: vec!["scx_alpha".to_string()],
             ..RowFilter::default()
         };
         let f_b = RowFilter {
-            scheduler: Some("scx_beta".to_string()),
+            schedulers: vec!["scx_beta".to_string()],
             ..RowFilter::default()
         };
         assert_eq!(derive_slicing_dims(&f_a, &f_b), vec![Dimension::Scheduler]);
@@ -7254,12 +7269,12 @@ mod tests {
     fn derive_slicing_dims_multi_dim_diff_in_canonical_order() {
         let f_a = RowFilter {
             kernels: vec!["6.14".to_string()],
-            scheduler: Some("scx_alpha".to_string()),
+            schedulers: vec!["scx_alpha".to_string()],
             ..RowFilter::default()
         };
         let f_b = RowFilter {
             kernels: vec!["6.15".to_string()],
-            scheduler: Some("scx_beta".to_string()),
+            schedulers: vec!["scx_beta".to_string()],
             ..RowFilter::default()
         };
         assert_eq!(
@@ -7535,7 +7550,7 @@ mod tests {
     #[test]
     fn render_side_label_single_option_dim() {
         let f = RowFilter {
-            scheduler: Some("scx_rusty".to_string()),
+            schedulers: vec!["scx_rusty".to_string()],
             ..RowFilter::default()
         };
         assert_eq!(
@@ -7584,7 +7599,7 @@ mod tests {
     fn render_side_label_multi_dim_joins_with_colon() {
         let f = RowFilter {
             kernels: vec!["6.14".to_string()],
-            scheduler: Some("scx_rusty".to_string()),
+            schedulers: vec!["scx_rusty".to_string()],
             ..RowFilter::default()
         };
         assert_eq!(
