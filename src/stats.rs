@@ -618,21 +618,27 @@ pub struct GauntletRow {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<String>,
     /// Run-environment provenance tag carried from
-    /// `SidecarResult::source` (`"local"` for developer runs,
+    /// `SidecarResult::run_source` (`"local"` for developer runs,
     /// `"ci"` when [`KTSTR_CI_ENV`](crate::test_support::sidecar::KTSTR_CI_ENV)
     /// was set at write time, `"archive"` when the consumer pulled
     /// the pool from a non-default `--dir`). `None` for sidecars
     /// produced before the field existed (pre-1.0 disposable
     /// schema; re-running the test regenerates the entry).
-    /// Surfaced via the typed [`RowFilter::sources`] for narrowing —
-    /// when the user passes `--source local` (repeatable), rows
-    /// with `None` are dropped to preserve the operator's intent
-    /// ("only these environments"); a `None`-as-wildcard would
-    /// silently dilute the filtered set, mirroring the
-    /// [`RowFilter::kernels`] / [`RowFilter::commits`] /
-    /// [`RowFilter::kernel_commits`] policy.
+    /// Surfaced via the typed [`RowFilter::run_sources`] for
+    /// narrowing — when the user passes `--source local`
+    /// (repeatable), rows with `None` are dropped to preserve the
+    /// operator's intent ("only these environments"); a
+    /// `None`-as-wildcard would silently dilute the filtered set,
+    /// mirroring the [`RowFilter::kernels`] /
+    /// [`RowFilter::project_commits`] / [`RowFilter::kernel_commits`]
+    /// policy.
+    ///
+    /// Field name `run_source` (renamed from `source`) disambiguates
+    /// from [`crate::cache::KernelSource`] / `KernelMetadata.source`
+    /// — those describe the kernel build's input (tarball / git /
+    /// local), this describes the run-environment provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub run_source: Option<String>,
     pub passed: bool,
     /// True when the run was skipped (topology mismatch, missing
     /// resource). `passed` stays `true` for gate-compat; `skipped`
@@ -834,30 +840,41 @@ pub struct RowFilter {
     /// disables the filter ("do not filter on commit"). A row whose
     /// `commit` is itself `None` never matches a non-empty filter
     /// — same opt-in semantic as `kernels`.
-    pub commits: Vec<String>,
+    ///
+    /// Field name `project_commits` (renamed from `commits`)
+    /// disambiguates from the sibling `kernel_commits` field — both
+    /// describe commit dimensions, so the prefix makes "which
+    /// repository's commit?" obvious at every call site.
+    pub project_commits: Vec<String>,
     /// Repeatable kernel-source-commit filter, OR-combined: a row
     /// matches iff its `GauntletRow::kernel_commit` equals ANY
     /// entry. Empty vec disables the filter ("do not filter on
     /// kernel commit"). A row whose `kernel_commit` is itself
     /// `None` never matches a non-empty filter — same opt-in
-    /// semantic as `commits`.
+    /// semantic as `project_commits`.
     ///
-    /// Distinct from `commits` (the ktstr framework commit) and
-    /// from `kernels` (the kernel release version): two runs with
-    /// the same `kernel_version` but different `kernel_commit`
+    /// Distinct from `project_commits` (the ktstr framework commit)
+    /// and from `kernels` (the kernel release version): two runs
+    /// with the same `kernel_version` but different `kernel_commit`
     /// values represent the same release rebuilt from different
     /// trees (e.g. WIP patches on top, a different remote ref).
     pub kernel_commits: Vec<String>,
     /// Repeatable run-environment-source filter, OR-combined: a row
-    /// matches iff its `GauntletRow::source` equals ANY entry.
-    /// Empty vec disables the filter ("do not filter on source").
-    /// A row whose `source` is itself `None` (sidecar pre-dates
-    /// the field) never matches a non-empty filter — same opt-in
-    /// semantic as `kernels` / `commits` / `kernel_commits`.
+    /// matches iff its `GauntletRow::run_source` equals ANY entry.
+    /// Empty vec disables the filter ("do not filter on
+    /// run_source"). A row whose `run_source` is itself `None`
+    /// (sidecar pre-dates the field) never matches a non-empty
+    /// filter — same opt-in semantic as `kernels` /
+    /// `project_commits` / `kernel_commits`.
     /// Typical values: `"local"`, `"ci"`, `"archive"`. The schema
     /// is open: any string is acceptable so a future producer can
     /// introduce a new tag without a version bump.
-    pub sources: Vec<String>,
+    ///
+    /// Field name `run_sources` (renamed from `sources`)
+    /// disambiguates from `KernelMetadata.source` /
+    /// [`crate::cache::KernelSource`] — those describe the kernel
+    /// build's input, this describes the run-environment provenance.
+    pub run_sources: Vec<String>,
     /// Match against `GauntletRow::scheduler` (strict equality).
     /// `None` here is "do not filter on scheduler".
     pub scheduler: Option<String>,
@@ -906,7 +923,7 @@ impl RowFilter {
                 return false;
             }
         }
-        if !self.commits.is_empty() {
+        if !self.project_commits.is_empty() {
             // OR-combined match against `GauntletRow::commit`,
             // mirroring the `kernels` policy: a row whose `commit`
             // is `None` (the sidecar writer's gix probe failed or
@@ -915,7 +932,7 @@ impl RowFilter {
             // to "only rows with this commit" rather than a wildcard.
             let row_commit = row.commit.as_deref();
             let any = self
-                .commits
+                .project_commits
                 .iter()
                 .any(|want| row_commit == Some(want.as_str()));
             if !any {
@@ -924,7 +941,7 @@ impl RowFilter {
         }
         if !self.kernel_commits.is_empty() {
             // OR-combined match against `GauntletRow::kernel_commit`,
-            // mirroring the `commits` policy: a row whose
+            // mirroring the `project_commits` policy: a row whose
             // `kernel_commit` is `None` (the sidecar writer's
             // `detect_kernel_commit` probe failed, or `KTSTR_KERNEL`
             // pointed at a non-git source) never matches a populated
@@ -939,18 +956,19 @@ impl RowFilter {
                 return false;
             }
         }
-        if !self.sources.is_empty() {
-            // OR-combined match against `GauntletRow::source`,
-            // mirroring the `kernels` / `commits` / `kernel_commits`
-            // opt-in policy: a row whose `source` is `None`
-            // (sidecar pre-dates the field) never matches a
-            // populated filter, so a `--source` argument demands a
-            // tagged row rather than acting as a wildcard.
-            let row_source = row.source.as_deref();
+        if !self.run_sources.is_empty() {
+            // OR-combined match against `GauntletRow::run_source`,
+            // mirroring the `kernels` / `project_commits` /
+            // `kernel_commits` opt-in policy: a row whose
+            // `run_source` is `None` (sidecar pre-dates the field)
+            // never matches a populated filter, so a `--source`
+            // argument demands a tagged row rather than acting as a
+            // wildcard.
+            let row_run_source = row.run_source.as_deref();
             let any = self
-                .sources
+                .run_sources
                 .iter()
-                .any(|want| row_source == Some(want.as_str()));
+                .any(|want| row_run_source == Some(want.as_str()));
             if !any {
                 return false;
             }
@@ -1161,11 +1179,15 @@ pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Di
             Dimension::Scheduler => filter_a.scheduler != filter_b.scheduler,
             Dimension::Topology => filter_a.topology != filter_b.topology,
             Dimension::WorkType => filter_a.work_type != filter_b.work_type,
-            Dimension::Commit => sorted_dedup(&filter_a.commits) != sorted_dedup(&filter_b.commits),
+            Dimension::Commit => {
+                sorted_dedup(&filter_a.project_commits) != sorted_dedup(&filter_b.project_commits)
+            }
             Dimension::KernelCommit => {
                 sorted_dedup(&filter_a.kernel_commits) != sorted_dedup(&filter_b.kernel_commits)
             }
-            Dimension::Source => sorted_dedup(&filter_a.sources) != sorted_dedup(&filter_b.sources),
+            Dimension::Source => {
+                sorted_dedup(&filter_a.run_sources) != sorted_dedup(&filter_b.run_sources)
+            }
             Dimension::Flags => sorted_dedup(&filter_a.flags) != sorted_dedup(&filter_b.flags),
         };
         if differs {
@@ -1221,9 +1243,9 @@ pub(crate) fn render_side_label(
                 .work_type
                 .clone()
                 .unwrap_or_else(|| bare_label.to_string()),
-            Dimension::Commit => render_vec_dim(&filter.commits, bare_label),
+            Dimension::Commit => render_vec_dim(&filter.project_commits, bare_label),
             Dimension::KernelCommit => render_vec_dim(&filter.kernel_commits, bare_label),
-            Dimension::Source => render_vec_dim(&filter.sources, bare_label),
+            Dimension::Source => render_vec_dim(&filter.run_sources, bare_label),
             Dimension::Flags => render_vec_dim(&filter.flags, bare_label),
         };
         parts.push(part);
@@ -1280,7 +1302,7 @@ impl PairingKey {
                 Dimension::WorkType => row.work_type.clone(),
                 Dimension::Commit => row.commit.clone().unwrap_or_default(),
                 Dimension::KernelCommit => row.kernel_commit.clone().unwrap_or_default(),
-                Dimension::Source => row.source.clone().unwrap_or_default(),
+                Dimension::Source => row.run_source.clone().unwrap_or_default(),
                 Dimension::Flags => {
                     let mut sorted: Vec<&str> = row.flags.iter().map(String::as_str).collect();
                     sorted.sort_unstable();
@@ -1552,7 +1574,7 @@ pub fn group_and_average_by(
             kernel_version: acc.first.kernel_version.clone(),
             commit: acc.first.commit.clone(),
             kernel_commit: acc.first.kernel_commit.clone(),
-            source: acc.first.source.clone(),
+            run_source: acc.first.run_source.clone(),
             flags: acc.first.flags.clone(),
             // ALL must pass: any failed or skipped contributor
             // flips the aggregate. A group with zero
@@ -1659,7 +1681,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         commit: sc.project_commit.clone(),
         kernel_commit: sc.kernel_commit.clone(),
         flags: sc.active_flags.clone(),
-        source: sc.source.clone(),
+        run_source: sc.run_source.clone(),
         passed: sc.passed,
         skipped: sc.skipped,
         spread: finite_or_zero("spread", sc.stats.worst_spread),
@@ -2212,9 +2234,9 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     }
 
     let mut kernels: BTreeSet<Option<String>> = BTreeSet::new();
-    let mut commits: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut project_commits: BTreeSet<Option<String>> = BTreeSet::new();
     let mut kernel_commits: BTreeSet<Option<String>> = BTreeSet::new();
-    let mut sources: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut run_sources: BTreeSet<Option<String>> = BTreeSet::new();
     let mut schedulers: BTreeSet<String> = BTreeSet::new();
     let mut topologies: BTreeSet<String> = BTreeSet::new();
     let mut work_types: BTreeSet<String> = BTreeSet::new();
@@ -2222,9 +2244,9 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
 
     for sc in &pool {
         kernels.insert(sc.kernel_version.clone());
-        commits.insert(sc.project_commit.clone());
+        project_commits.insert(sc.project_commit.clone());
         kernel_commits.insert(sc.kernel_commit.clone());
-        sources.insert(sc.source.clone());
+        run_sources.insert(sc.run_source.clone());
         schedulers.insert(sc.scheduler.clone());
         topologies.insert(sc.topology.clone());
         work_types.insert(sc.work_type.clone());
@@ -2241,7 +2263,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
                 None => serde_json::Value::Null,
             })
             .collect();
-        let commits_json: Vec<serde_json::Value> = commits
+        let project_commits_json: Vec<serde_json::Value> = project_commits
             .iter()
             .map(|opt| match opt {
                 Some(s) => serde_json::Value::String(s.clone()),
@@ -2255,18 +2277,22 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
                 None => serde_json::Value::Null,
             })
             .collect();
-        let sources_json: Vec<serde_json::Value> = sources
+        let run_sources_json: Vec<serde_json::Value> = run_sources
             .iter()
             .map(|opt| match opt {
                 Some(s) => serde_json::Value::String(s.clone()),
                 None => serde_json::Value::Null,
             })
             .collect();
+        // JSON keys stay as `commit` / `source` — operator-visible
+        // wire contract for `cargo ktstr stats list-values --json`
+        // does not rename when the internal field/variable does.
+        // The CLI flag spelling `--commit` / `--source` matches.
         let payload = serde_json::json!({
             "kernel": kernels_json,
-            "commit": commits_json,
+            "commit": project_commits_json,
             "kernel_commit": kernel_commits_json,
-            "source": sources_json,
+            "source": run_sources_json,
             "scheduler": schedulers.iter().collect::<Vec<_>>(),
             "topology": topologies.iter().collect::<Vec<_>>(),
             "work_type": work_types.iter().collect::<Vec<_>>(),
@@ -2315,9 +2341,9 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
         out.push('\n');
     };
     render_opt_set(&mut out, "kernel:", &kernels);
-    render_opt_set(&mut out, "commit:", &commits);
+    render_opt_set(&mut out, "commit:", &project_commits);
     render_opt_set(&mut out, "kernel_commit:", &kernel_commits);
-    render_opt_set(&mut out, "source:", &sources);
+    render_opt_set(&mut out, "source:", &run_sources);
     render_str_set(&mut out, "scheduler:", &schedulers);
     render_str_set(&mut out, "topology:", &topologies);
     render_str_set(&mut out, "work_type:", &work_types);
@@ -3304,7 +3330,7 @@ mod tests {
             kernel_version: None,
             commit: None,
             kernel_commit: None,
-            source: None,
+            run_source: None,
             flags: Vec::new(),
             skipped: false,
             passed,
@@ -3634,72 +3660,73 @@ mod tests {
         );
     }
 
-    /// `sidecar_to_row` must copy `SidecarResult::source` into
-    /// `GauntletRow::source` verbatim so the typed `--source`
+    /// `sidecar_to_row` must copy `SidecarResult::run_source` into
+    /// `GauntletRow::run_source` verbatim so the typed `--source`
     /// filter and per-side `--a-source` / `--b-source` slicers
     /// see the run-environment provenance tag the sidecar writer
     /// recorded. A regression that left the field at the
     /// `Option::default()` (`None`) would silently drop the
-    /// source dimension from every comparison even when the
+    /// run-source dimension from every comparison even when the
     /// sidecar had a populated value. Mirrors
     /// `sidecar_to_row_propagates_kernel_commit` for the
-    /// `source` field; pinned for `None` and the canonical
+    /// `run_source` field; pinned for `None` and the canonical
     /// `Some("local")` / `Some("ci")` / `Some("archive")`
     /// values so a regression that special-cased one tag and
     /// not the others surfaces here. A non-aliasing pin
-    /// confirms `source` reads from `sc.source` rather than
-    /// being cross-wired to the visually-similar
+    /// confirms `run_source` reads from `sc.run_source` rather
+    /// than being cross-wired to the visually-similar
     /// `kernel_commit` / `project_commit` fields.
     #[test]
-    fn sidecar_to_row_propagates_source() {
+    fn sidecar_to_row_propagates_run_source() {
         use crate::test_support;
         for tag in ["local", "ci", "archive"] {
             let sc = test_support::SidecarResult {
-                test_name: format!("source_{tag}_test"),
+                test_name: format!("run_source_{tag}_test"),
                 topology: "1n1l2c1t".to_string(),
-                source: Some(tag.to_string()),
+                run_source: Some(tag.to_string()),
                 ..test_support::SidecarResult::test_fixture()
             };
             let row = sidecar_to_row(&sc);
             assert_eq!(
-                row.source.as_deref(),
+                row.run_source.as_deref(),
                 Some(tag),
-                "populated source `{tag}` must propagate verbatim",
+                "populated run_source `{tag}` must propagate verbatim",
             );
         }
 
         let sc_none = test_support::SidecarResult {
-            test_name: "no_source_test".to_string(),
+            test_name: "no_run_source_test".to_string(),
             topology: "1n1l2c1t".to_string(),
-            source: None,
+            run_source: None,
             ..test_support::SidecarResult::test_fixture()
         };
         let row_none = sidecar_to_row(&sc_none);
         assert!(
-            row_none.source.is_none(),
-            "absent source must propagate as None — a regression \
+            row_none.run_source.is_none(),
+            "absent run_source must propagate as None — a regression \
              substituting an empty string would dilute every \
              `--source` filter into matching all None rows",
         );
 
-        // Field non-aliasing pin: `source` must route to its own
-        // row field. A regression that cross-wired `source` to
-        // `kernel_commit` (or vice versa) would hide behind the
-        // populated tests above unless the values are visibly
-        // different. Distinct tokens make the swap obvious.
+        // Field non-aliasing pin: `run_source` must route to its
+        // own row field. A regression that cross-wired
+        // `run_source` to `kernel_commit` (or vice versa) would
+        // hide behind the populated tests above unless the values
+        // are visibly different. Distinct tokens make the swap
+        // obvious.
         let sc_distinct = test_support::SidecarResult {
-            test_name: "source_distinct_test".to_string(),
+            test_name: "run_source_distinct_test".to_string(),
             topology: "1n1l2c1t".to_string(),
-            source: Some("local".to_string()),
+            run_source: Some("local".to_string()),
             kernel_commit: Some("kabcde7".to_string()),
             project_commit: Some("pabcde7".to_string()),
             ..test_support::SidecarResult::test_fixture()
         };
         let row_distinct = sidecar_to_row(&sc_distinct);
         assert_eq!(
-            row_distinct.source.as_deref(),
+            row_distinct.run_source.as_deref(),
             Some("local"),
-            "row.source must come from sc.source, not from \
+            "row.run_source must come from sc.run_source, not from \
              kernel_commit or project_commit",
         );
         assert_eq!(
@@ -5969,7 +5996,7 @@ mod tests {
             kernel_version: kernel_version.map(str::to_owned),
             commit: None,
             kernel_commit: None,
-            source: None,
+            run_source: None,
             flags: flags.iter().map(|s| (*s).to_owned()).collect(),
             passed: true,
             skipped: false,
@@ -6105,7 +6132,7 @@ mod tests {
     fn row_filter_commit_none_row_never_matches_populated_filter() {
         let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
         let filter = RowFilter {
-            commits: vec!["abcdef1".to_string()],
+            project_commits: vec!["abcdef1".to_string()],
             ..RowFilter::default()
         };
         assert!(
@@ -6131,7 +6158,7 @@ mod tests {
         row_other.commit = Some("fedcba2".to_string());
 
         let filter_single = RowFilter {
-            commits: vec!["abcdef1".to_string()],
+            project_commits: vec!["abcdef1".to_string()],
             ..RowFilter::default()
         };
         assert!(
@@ -6150,7 +6177,7 @@ mod tests {
         );
 
         let filter_or = RowFilter {
-            commits: vec!["abcdef1".to_string(), "fedcba2".to_string()],
+            project_commits: vec!["abcdef1".to_string(), "fedcba2".to_string()],
             ..RowFilter::default()
         };
         assert!(
@@ -6276,77 +6303,83 @@ mod tests {
 
         // Filter on commit only — kernel_commit dimension is unconstrained.
         let commit_mismatch = RowFilter {
-            commits: vec!["kernel1".to_string()],
+            project_commits: vec!["kernel1".to_string()],
             ..RowFilter::default()
         };
         assert!(
             !commit_mismatch.matches(&row),
-            "commits filter must check `commit` not `kernel_commit` — \
+            "project_commits filter must check `commit` not `kernel_commit` — \
              a regression that cross-wired the fields would accept here",
         );
     }
 
-    /// `--source local` against a row whose `source` is `None`
-    /// must NOT match — same opt-in policy as `--kernel`,
+    /// `--source local` against a row whose `run_source` is
+    /// `None` must NOT match — same opt-in policy as `--kernel`,
     /// `--commit`, and `--kernel-commit`. The operator wrote
     /// specific tags and a None-row would silently dilute the
     /// filtered set. Mirror of
     /// `row_filter_kernel_commit_none_row_never_matches_populated_filter`
-    /// for the `source` field.
+    /// for the `run_source` field.
     #[test]
-    fn row_filter_source_none_row_never_matches_populated_filter() {
+    fn row_filter_run_source_none_row_never_matches_populated_filter() {
         let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
         let filter = RowFilter {
-            sources: vec!["local".to_string()],
+            run_sources: vec!["local".to_string()],
             ..RowFilter::default()
         };
         assert!(
             !filter.matches(&row),
-            "None-source row must not match populated filter; \
+            "None-run_source row must not match populated filter; \
              got dilution",
         );
     }
 
     /// Repeatable `--source A --source B` is OR-combined: a row
-    /// matches iff its `source` equals ANY listed entry. Mirror
-    /// of `row_filter_kernels_or_combined_matches_any_listed`
-    /// for the `source` dimension.
+    /// matches iff its `run_source` equals ANY listed entry.
+    /// Mirror of `row_filter_kernels_or_combined_matches_any_listed`
+    /// for the `run_source` dimension.
     #[test]
-    fn row_filter_sources_or_combined_matches_any_listed() {
+    fn row_filter_run_sources_or_combined_matches_any_listed() {
         let mut row_local = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
-        row_local.source = Some("local".to_string());
+        row_local.run_source = Some("local".to_string());
         let mut row_ci = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
-        row_ci.source = Some("ci".to_string());
+        row_ci.run_source = Some("ci".to_string());
         let mut row_archive = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
-        row_archive.source = Some("archive".to_string());
+        row_archive.run_source = Some("archive".to_string());
         let filter = RowFilter {
-            sources: vec!["local".to_string(), "ci".to_string()],
+            run_sources: vec!["local".to_string(), "ci".to_string()],
             ..RowFilter::default()
         };
-        assert!(filter.matches(&row_local), "first listed source must match");
-        assert!(filter.matches(&row_ci), "second listed source must match");
+        assert!(
+            filter.matches(&row_local),
+            "first listed run_source must match",
+        );
+        assert!(
+            filter.matches(&row_ci),
+            "second listed run_source must match",
+        );
         assert!(
             !filter.matches(&row_archive),
-            "source outside the listed set must reject",
+            "run_source outside the listed set must reject",
         );
     }
 
     /// `--source` and `--kernel-commit` filter on DISTINCT row
-    /// fields. Pins the field non-aliasing: a row whose `source`
-    /// matches but whose `kernel_commit` does not (or vice
-    /// versa) must reject. A regression that cross-wired the
-    /// `matches()` arms (e.g. `sources` checked against
+    /// fields. Pins the field non-aliasing: a row whose
+    /// `run_source` matches but whose `kernel_commit` does not
+    /// (or vice versa) must reject. A regression that cross-wired
+    /// the `matches()` arms (e.g. `run_sources` checked against
     /// `row.kernel_commit`) would silently dilute filtered sets.
     /// Mirror of
     /// `row_filter_kernel_commit_and_commit_filter_distinct_fields`
-    /// for the `source` × `kernel_commit` cross-wire surface.
+    /// for the `run_source` × `kernel_commit` cross-wire surface.
     #[test]
-    fn row_filter_sources_and_kernel_commits_are_distinct_fields() {
+    fn row_filter_run_sources_and_kernel_commits_are_distinct_fields() {
         let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
-        row.source = Some("local".to_string());
+        row.run_source = Some("local".to_string());
         row.kernel_commit = None;
         let filter = RowFilter {
-            sources: vec!["local".to_string()],
+            run_sources: vec!["local".to_string()],
             kernel_commits: vec!["abc1234".to_string()],
             ..RowFilter::default()
         };
@@ -6354,26 +6387,26 @@ mod tests {
             !filter.matches(&row),
             "AND composition must reject when kernel_commit gate \
              fails (row's kernel_commit is None) even though the \
-             source gate matches; a regression that cross-wired \
-             sources against `row.kernel_commit` would accept here",
+             run_source gate matches; a regression that cross-wired \
+             run_sources against `row.kernel_commit` would accept here",
         );
 
-        // Symmetric arm: source mismatches but kernel_commit
+        // Symmetric arm: run_source mismatches but kernel_commit
         // matches. Whole filter must still reject.
         let mut row2 = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
-        row2.source = Some("ci".to_string());
+        row2.run_source = Some("ci".to_string());
         row2.kernel_commit = Some("abc1234".to_string());
         let filter2 = RowFilter {
-            sources: vec!["local".to_string()],
+            run_sources: vec!["local".to_string()],
             kernel_commits: vec!["abc1234".to_string()],
             ..RowFilter::default()
         };
         assert!(
             !filter2.matches(&row2),
-            "AND composition must reject when source gate fails \
-             even though kernel_commit gate passes; a regression \
-             that cross-wired kernel_commits against `row.source` \
-             would accept here",
+            "AND composition must reject when run_source gate \
+             fails even though kernel_commit gate passes; a \
+             regression that cross-wired kernel_commits against \
+             `row.run_source` would accept here",
         );
     }
 
@@ -6388,7 +6421,7 @@ mod tests {
         row.commit = Some("abcdef1".to_string());
         let filter_both_match = RowFilter {
             kernels: vec!["6.14.2".to_string()],
-            commits: vec!["abcdef1".to_string()],
+            project_commits: vec!["abcdef1".to_string()],
             ..RowFilter::default()
         };
         assert!(
@@ -6397,7 +6430,7 @@ mod tests {
         );
         let filter_kernel_only_match = RowFilter {
             kernels: vec!["6.14.2".to_string()],
-            commits: vec!["fedcba2".to_string()],
+            project_commits: vec!["fedcba2".to_string()],
             ..RowFilter::default()
         };
         assert!(
@@ -7219,10 +7252,10 @@ mod tests {
         );
     }
 
-    /// Source-only diff: filters that disagree on `sources` and
-    /// agree on every other dimension produce a slicing-dim set
-    /// containing exactly `Dimension::Source`. Pins the Source
-    /// arm of the per-dimension comparison switch in
+    /// Source-only diff: filters that disagree on `run_sources`
+    /// and agree on every other dimension produce a slicing-dim
+    /// set containing exactly `Dimension::Source`. Pins the
+    /// Source arm of the per-dimension comparison switch in
     /// [`derive_slicing_dims`] — a regression that omitted the
     /// arm or compared the wrong field would surface here as an
     /// empty slicing-dim set (and downstream as a `compare`
@@ -7231,17 +7264,17 @@ mod tests {
     #[test]
     fn derive_slicing_dims_source_only_diff() {
         let f_a = RowFilter {
-            sources: vec!["local".to_string()],
+            run_sources: vec!["local".to_string()],
             ..RowFilter::default()
         };
         let f_b = RowFilter {
-            sources: vec!["ci".to_string()],
+            run_sources: vec!["ci".to_string()],
             ..RowFilter::default()
         };
         assert_eq!(
             derive_slicing_dims(&f_a, &f_b),
             vec![Dimension::Source],
-            "differing `sources` must surface Source as a slicing dim",
+            "differing `run_sources` must surface Source as a slicing dim",
         );
 
         // Sorted-deduped Vec semantics also apply on the Source
@@ -7249,16 +7282,16 @@ mod tests {
         // slice. Mirrors the `derive_slicing_dims_vec_compares_as_set`
         // contract for the Source arm.
         let f_c = RowFilter {
-            sources: vec!["local".to_string(), "ci".to_string()],
+            run_sources: vec!["local".to_string(), "ci".to_string()],
             ..RowFilter::default()
         };
         let f_d = RowFilter {
-            sources: vec!["ci".to_string(), "local".to_string(), "local".to_string()],
+            run_sources: vec!["ci".to_string(), "local".to_string(), "local".to_string()],
             ..RowFilter::default()
         };
         assert!(
             derive_slicing_dims(&f_c, &f_d).is_empty(),
-            "same source set in different order/multiplicity must NOT slice",
+            "same run_source set in different order/multiplicity must NOT slice",
         );
     }
 
@@ -7368,6 +7401,111 @@ mod tests {
         );
     }
 
+    /// `PairingKey::from_row` includes the row's `kernel_commit`
+    /// when `KernelCommit` is in the pairing-dim list, and
+    /// excludes it when `KernelCommit` is the slicing dim. Pins
+    /// the [`Dimension::KernelCommit`] arm of the from_row match
+    /// — a regression that omitted the arm or substituted the
+    /// wrong row field would surface here as either a missing
+    /// key slot or a slot carrying the wrong value.
+    ///
+    /// `None` kernel_commit renders as the empty string slot per
+    /// the `unwrap_or_default()` policy on Option dims; that
+    /// shape is shared across every Option-typed dim arm.
+    #[test]
+    fn pairing_key_from_row_includes_kernel_commit_when_pairing() {
+        let mut row_some = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_some.kernel_commit = Some("kabcde7".to_string());
+        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_none.kernel_commit = None;
+
+        // KernelCommit in pairing dims → key carries the commit
+        // value (or the empty slot for None). The two rows
+        // therefore produce DIFFERENT keys because their
+        // kernel_commit values disagree.
+        let pair_dims = &[Dimension::KernelCommit];
+        let key_some = PairingKey::from_row(&row_some, pair_dims);
+        let key_none = PairingKey::from_row(&row_none, pair_dims);
+        assert_eq!(
+            key_some.0,
+            vec!["scn".to_string(), "kabcde7".to_string()],
+            "Some(kernel_commit) must occupy the second slot verbatim",
+        );
+        assert_eq!(
+            key_none.0,
+            vec!["scn".to_string(), String::new()],
+            "None kernel_commit must collapse to an empty slot per \
+             unwrap_or_default policy",
+        );
+        assert_ne!(
+            key_some, key_none,
+            "two rows differing on kernel_commit must produce \
+             distinct pairing keys when KernelCommit is a pairing dim",
+        );
+
+        // KernelCommit excluded (slicing) → the two rows pair to
+        // the same key because the dim is dropped. Pins the
+        // dimensional-slicing semantic for the new arm.
+        let slice_dims = Dimension::pairing_dims(&[Dimension::KernelCommit]);
+        assert_eq!(
+            PairingKey::from_row(&row_some, &slice_dims),
+            PairingKey::from_row(&row_none, &slice_dims),
+            "rows differing only on the slicing dim (KernelCommit) \
+             must produce equal pairing keys",
+        );
+    }
+
+    /// `PairingKey::from_row` includes the row's `run_source`
+    /// when `Source` is in the pairing-dim list, and excludes it
+    /// when `Source` is the slicing dim. Pins the
+    /// [`Dimension::Source`] arm of the from_row match — same
+    /// shape and motivation as
+    /// `pairing_key_from_row_includes_kernel_commit_when_pairing`
+    /// but for the run_source arm. A regression that omitted the
+    /// arm or substituted `row.kernel_commit` for
+    /// `row.run_source` would surface here.
+    #[test]
+    fn pairing_key_from_row_includes_run_source_when_pairing() {
+        let mut row_local = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_local.run_source = Some("local".to_string());
+        let mut row_ci = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_ci.run_source = Some("ci".to_string());
+        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
+        row_none.run_source = None;
+
+        let pair_dims = &[Dimension::Source];
+        let key_local = PairingKey::from_row(&row_local, pair_dims);
+        let key_ci = PairingKey::from_row(&row_ci, pair_dims);
+        let key_none = PairingKey::from_row(&row_none, pair_dims);
+        assert_eq!(
+            key_local.0,
+            vec!["scn".to_string(), "local".to_string()],
+            "Some(run_source) must occupy the second slot verbatim",
+        );
+        assert_eq!(key_ci.0, vec!["scn".to_string(), "ci".to_string()]);
+        assert_eq!(
+            key_none.0,
+            vec!["scn".to_string(), String::new()],
+            "None run_source must collapse to an empty slot per \
+             unwrap_or_default policy",
+        );
+        assert_ne!(
+            key_local, key_ci,
+            "two rows differing on run_source must produce \
+             distinct pairing keys when Source is a pairing dim",
+        );
+
+        // Source excluded (slicing) → the differing-run_source
+        // rows pair to the same key.
+        let slice_dims = Dimension::pairing_dims(&[Dimension::Source]);
+        assert_eq!(
+            PairingKey::from_row(&row_local, &slice_dims),
+            PairingKey::from_row(&row_ci, &slice_dims),
+            "rows differing only on the slicing dim (Source) must \
+             produce equal pairing keys",
+        );
+    }
+
     // -- render_side_label --
 
     /// Empty slicing dims → the bare label is returned.
@@ -7454,6 +7592,123 @@ mod tests {
             render_side_label(&f, &[Dimension::Scheduler], "B"),
             "B",
             "None Option dim must fall back to the bare letter",
+        );
+    }
+
+    /// `Dimension::KernelCommit` arm of [`render_side_label`] reads
+    /// `filter.kernel_commits` (a Vec) and routes through the same
+    /// `render_vec_dim` path as `Kernel` / `Commit` / `Flags`. Pins
+    /// the arm so a regression that omitted it (or substituted the
+    /// wrong field, e.g. `filter.project_commits`) surfaces here
+    /// instead of silently rendering the bare label even when the
+    /// filter is populated.
+    ///
+    /// Single-value: emits the value verbatim. Two-value: joins
+    /// sorted with `|` per `render_vec_dim`'s ≤3 rule. >3 values:
+    /// collapse to bare. Empty Vec: bare. Same shape as the
+    /// `Kernel` arm pinned above; a regression in the
+    /// `KernelCommit` arm specifically would NOT be caught by the
+    /// existing `render_side_label_vec_dim_*` tests because those
+    /// only exercise the `Kernel` field.
+    #[test]
+    fn render_side_label_kernel_commit_arm_renders_filter_value() {
+        let f_one = RowFilter {
+            kernel_commits: vec!["kabcde7".to_string()],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f_one, &[Dimension::KernelCommit], "A"),
+            "kabcde7",
+            "single kernel_commit value must render verbatim — \
+             a regression that read `filter.project_commits` instead of \
+             `filter.kernel_commits` would render `A` here because \
+             the project-commit field is empty",
+        );
+
+        let f_two = RowFilter {
+            kernel_commits: vec!["kbbb222".to_string(), "kaaa111".to_string()],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f_two, &[Dimension::KernelCommit], "A"),
+            "kaaa111|kbbb222",
+            "≤3 kernel_commit values must join sorted with `|`",
+        );
+
+        let f_long = RowFilter {
+            kernel_commits: vec![
+                "k111".to_string(),
+                "k222".to_string(),
+                "k333".to_string(),
+                "k444".to_string(),
+            ],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f_long, &[Dimension::KernelCommit], "A"),
+            "A",
+            ">3 kernel_commit values must collapse to the bare letter",
+        );
+
+        let f_empty = RowFilter::default();
+        assert_eq!(
+            render_side_label(&f_empty, &[Dimension::KernelCommit], "B"),
+            "B",
+            "empty kernel_commits Vec must fall back to the bare letter",
+        );
+    }
+
+    /// `Dimension::Source` arm of [`render_side_label`] reads
+    /// `filter.run_sources` (a Vec) and routes through the same
+    /// `render_vec_dim` path as the other Vec dims. Mirror of
+    /// `render_side_label_kernel_commit_arm_renders_filter_value`
+    /// for the Source arm. A regression that omitted the Source
+    /// arm or substituted the wrong field would surface here
+    /// instead of silently rendering the bare label even when
+    /// the filter is populated.
+    #[test]
+    fn render_side_label_source_arm_renders_filter_value() {
+        let f_one = RowFilter {
+            run_sources: vec!["local".to_string()],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f_one, &[Dimension::Source], "A"),
+            "local",
+            "single run_source value must render verbatim — a \
+             regression that read another field would render `A` here",
+        );
+
+        let f_two = RowFilter {
+            run_sources: vec!["local".to_string(), "ci".to_string()],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f_two, &[Dimension::Source], "A"),
+            "ci|local",
+            "≤3 run_source values must join sorted with `|`",
+        );
+
+        let f_long = RowFilter {
+            run_sources: vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            ..RowFilter::default()
+        };
+        assert_eq!(
+            render_side_label(&f_long, &[Dimension::Source], "A"),
+            "A",
+            ">3 run_source values must collapse to the bare letter",
+        );
+
+        let f_empty = RowFilter::default();
+        assert_eq!(
+            render_side_label(&f_empty, &[Dimension::Source], "B"),
+            "B",
+            "empty run_sources Vec must fall back to the bare letter",
         );
     }
 }

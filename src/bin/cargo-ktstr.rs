@@ -519,13 +519,14 @@ enum StatsCommand {
         #[arg(long, action = ArgAction::Append)]
         kernel: Vec<String>,
         /// Strict equality match against the sidecar's
-        /// `project_commit` field (e.g. `--commit abcdef1` or
-        /// `--commit abcdef1-dirty`). Repeatable: `--commit A
-        /// --commit B` keeps rows whose `project_commit` equals
-        /// A OR B. Rows whose `project_commit` is `None` (sidecar
-        /// writer's gix probe failed, or cwd was outside any git
-        /// repo at write time) NEVER match a populated filter —
-        /// same opt-in policy as `--kernel`.
+        /// `project_commit` field (e.g. `--project-commit abcdef1`
+        /// or `--project-commit abcdef1-dirty`). Repeatable:
+        /// `--project-commit A --project-commit B` keeps rows
+        /// whose `project_commit` equals A OR B. Rows whose
+        /// `project_commit` is `None` (sidecar writer's gix probe
+        /// failed, or cwd was outside any git repo at write time)
+        /// NEVER match a populated filter — same opt-in policy as
+        /// `--kernel`.
         ///
         /// Filters on the ktstr framework commit
         /// (`SidecarResult::project_commit`); the scheduler
@@ -540,8 +541,12 @@ enum StatsCommand {
         /// index-vs-worktree changes are detected, so a clean run
         /// and a dirty run of the same HEAD bucket separately
         /// under this filter.
-        #[arg(long, action = ArgAction::Append)]
-        commit: Vec<String>,
+        ///
+        /// Symmetric with `--kernel-commit` (which filters on the
+        /// kernel SOURCE TREE commit). Together the pair lets the
+        /// operator narrow on either or both commit dimensions.
+        #[arg(long = "project-commit", action = ArgAction::Append)]
+        project_commit: Vec<String>,
         /// Strict equality match against the sidecar's
         /// `kernel_commit` field (e.g. `--kernel-commit abcdef1`
         /// or `--kernel-commit abcdef1-dirty`). Repeatable:
@@ -551,8 +556,8 @@ enum StatsCommand {
         /// non-git path, the underlying source was Tarball / Git
         /// rather than a `Local` tree, or
         /// `detect_kernel_commit`'s gix probe failed) NEVER match
-        /// a populated filter — same opt-in policy as `--commit`
-        /// / `--kernel`.
+        /// a populated filter — same opt-in policy as
+        /// `--project-commit` / `--kernel`.
         ///
         /// Filters on the kernel SOURCE TREE commit
         /// (`SidecarResult::kernel_commit`), NOT on the kernel
@@ -595,24 +600,32 @@ enum StatsCommand {
         #[arg(long)]
         work_type: Option<String>,
         /// Strict equality match against the sidecar's `source`
-        /// field (e.g. `--source local`, `--source ci`,
-        /// `--source archive`). Repeatable: `--source A --source
-        /// B` keeps rows whose `source` equals A OR B. Rows whose
-        /// `source` is `None` (sidecar pre-dates the field) NEVER
-        /// match a populated filter — same opt-in policy as
-        /// `--kernel` / `--commit` / `--kernel-commit`.
+        /// field (e.g. `--run-source local`, `--run-source ci`,
+        /// `--run-source archive`). Repeatable: `--run-source A
+        /// --run-source B` keeps rows whose `source` equals A OR
+        /// B. Rows whose `source` is `None` (sidecar pre-dates
+        /// the field) NEVER match a populated filter — same
+        /// opt-in policy as `--kernel` / `--project-commit` /
+        /// `--kernel-commit`.
         ///
         /// Filters on the run-environment provenance recorded by
         /// `detect_run_source` at sidecar-write time (`"local"`
         /// for developer runs, `"ci"` when `KTSTR_CI` was set),
         /// or rewritten to `"archive"` at load time when this
         /// command's `--dir` flag points at a non-default pool
-        /// root. Combine with `--a-source` / `--b-source` to
-        /// contrast across run environments (e.g. `--a-source ci
-        /// --b-source local` to diff CI runs against developer
-        /// runs of the same scenarios).
-        #[arg(long, action = ArgAction::Append)]
-        source: Vec<String>,
+        /// root. Combine with `--a-run-source` / `--b-run-source`
+        /// to contrast across run environments (e.g.
+        /// `--a-run-source ci --b-run-source local` to diff CI
+        /// runs against developer runs of the same scenarios).
+        ///
+        /// Named `--run-source` (rather than `--source`) to
+        /// disambiguate from `KernelSource` — every other
+        /// `source`-shaped CLI surface in the workspace
+        /// (`kernel build --source`, `KernelMetadata.source`)
+        /// refers to a kernel-source kind, not a run-environment
+        /// tag.
+        #[arg(long = "run-source", action = ArgAction::Append)]
+        run_source: Vec<String>,
         /// Repeatable AND-combined flag filter (e.g.
         /// `--flag llc --flag rusty_balance`). Every flag listed
         /// must be present in the sidecar's `active_flags`; the row
@@ -625,12 +638,12 @@ enum StatsCommand {
         /// semantics on each `--X` flag's doc.
         #[arg(long = "a-kernel", action = ArgAction::Append)]
         a_kernel: Vec<String>,
-        #[arg(long = "a-commit", action = ArgAction::Append)]
-        a_commit: Vec<String>,
+        #[arg(long = "a-project-commit", action = ArgAction::Append)]
+        a_project_commit: Vec<String>,
         #[arg(long = "a-kernel-commit", action = ArgAction::Append)]
         a_kernel_commit: Vec<String>,
-        #[arg(long = "a-source", action = ArgAction::Append)]
-        a_source: Vec<String>,
+        #[arg(long = "a-run-source", action = ArgAction::Append)]
+        a_run_source: Vec<String>,
         #[arg(long = "a-scheduler")]
         a_scheduler: Option<String>,
         #[arg(long = "a-topology")]
@@ -645,12 +658,12 @@ enum StatsCommand {
         /// semantics on each `--X` flag's doc.
         #[arg(long = "b-kernel", action = ArgAction::Append)]
         b_kernel: Vec<String>,
-        #[arg(long = "b-commit", action = ArgAction::Append)]
-        b_commit: Vec<String>,
+        #[arg(long = "b-project-commit", action = ArgAction::Append)]
+        b_project_commit: Vec<String>,
         #[arg(long = "b-kernel-commit", action = ArgAction::Append)]
         b_kernel_commit: Vec<String>,
-        #[arg(long = "b-source", action = ArgAction::Append)]
-        b_source: Vec<String>,
+        #[arg(long = "b-run-source", action = ArgAction::Append)]
+        b_run_source: Vec<String>,
         #[arg(long = "b-scheduler")]
         b_scheduler: Option<String>,
         #[arg(long = "b-topology")]
@@ -977,18 +990,38 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Detect sanitization collisions: two distinct producer-side
-    // labels that normalize to the same nextest identifier via
-    // `sanitize_kernel_label` would shatter into two cache directories
-    // sharing one test-name suffix, so the dispatch-side label-to-dir
-    // map in `parse_kernel_list` would silently retain only the last
-    // entry and every prior collision would route to the wrong kernel.
-    // Bail at resolve time naming both labels so the operator can
-    // disambiguate the inputs (e.g. spell `6.14.2` and `git+...#6.14.2`
-    // distinctly rather than relying on suffix-encoded identity).
+    detect_label_collisions(&resolved)?;
+    Ok(resolved)
+}
+
+/// Detect two distinct producer-side labels that normalize to the
+/// same nextest identifier via [`ktstr::test_support::sanitize_kernel_label`].
+/// A collision would shatter two cache directories under one test-
+/// name suffix, so the dispatch-side label-to-dir map in
+/// `parse_kernel_list` would silently retain only the last entry
+/// and every prior collision would route to the wrong kernel.
+///
+/// On collision: returns `Err(message)` naming both labels and the
+/// shared sanitized form so the operator can disambiguate the
+/// inputs (e.g. spell `6.14.2` and `git+...#6.14.2` distinctly
+/// rather than relying on suffix-encoded identity).
+///
+/// Identical labels appearing twice ARE a collision under this
+/// check — `seen.insert` finds the prior occurrence and surfaces a
+/// `labels "X" and "X"` diagnostic. De-duplication of identical
+/// `--kernel` specs is the operator's responsibility (or a future
+/// task #21); this helper is the last line of defense against the
+/// silent-routing class of bug.
+///
+/// Extracted from `resolve_kernel_set` so the collision-detection
+/// algorithm is unit-testable on contrived inputs without driving
+/// the rayon resolve pipeline (every `resolve_one` arm performs
+/// real I/O — canonicalize+build for Path, cache lookup+download
+/// for Version/CacheKey, shallow git clone for Git).
+fn detect_label_collisions(resolved: &[(String, PathBuf)]) -> Result<(), String> {
     let mut seen: std::collections::HashMap<String, &str> =
         std::collections::HashMap::with_capacity(resolved.len());
-    for (label, _) in &resolved {
+    for (label, _) in resolved {
         let sanitized = ktstr::test_support::sanitize_kernel_label(label);
         if let Some(prior) = seen.insert(sanitized.clone(), label.as_str()) {
             return Err(format!(
@@ -998,8 +1031,7 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
             ));
         }
     }
-
-    Ok(resolved)
+    Ok(())
 }
 
 /// Build the `path_{basename}_{hash6}` label for a `Path`-resolved
@@ -1330,25 +1362,25 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             policy,
             dir,
             kernel,
-            commit,
+            project_commit,
             kernel_commit,
-            source,
+            run_source,
             scheduler,
             topology,
             work_type,
             flags,
             a_kernel,
-            a_commit,
+            a_project_commit,
             a_kernel_commit,
-            a_source,
+            a_run_source,
             a_scheduler,
             a_topology,
             a_work_type,
             a_flags,
             b_kernel,
-            b_commit,
+            b_project_commit,
             b_kernel_commit,
-            b_source,
+            b_run_source,
             b_scheduler,
             b_topology,
             b_work_type,
@@ -1393,25 +1425,25 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             // a dumb data carrier.
             let build = BuildCompareFilters {
                 shared_kernel: kernel.clone(),
-                shared_commit: commit.clone(),
+                shared_project_commit: project_commit.clone(),
                 shared_kernel_commit: kernel_commit.clone(),
-                shared_source: source.clone(),
+                shared_run_source: run_source.clone(),
                 shared_scheduler: scheduler.clone(),
                 shared_topology: topology.clone(),
                 shared_work_type: work_type.clone(),
                 shared_flags: flags.clone(),
                 a_kernel: a_kernel.clone(),
-                a_commit: a_commit.clone(),
+                a_project_commit: a_project_commit.clone(),
                 a_kernel_commit: a_kernel_commit.clone(),
-                a_source: a_source.clone(),
+                a_run_source: a_run_source.clone(),
                 a_scheduler: a_scheduler.clone(),
                 a_topology: a_topology.clone(),
                 a_work_type: a_work_type.clone(),
                 a_flags: a_flags.clone(),
                 b_kernel: b_kernel.clone(),
-                b_commit: b_commit.clone(),
+                b_project_commit: b_project_commit.clone(),
                 b_kernel_commit: b_kernel_commit.clone(),
-                b_source: b_source.clone(),
+                b_run_source: b_run_source.clone(),
                 b_scheduler: b_scheduler.clone(),
                 b_topology: b_topology.clone(),
                 b_work_type: b_work_type.clone(),
@@ -1455,25 +1487,25 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
 #[derive(Debug, Clone, Default)]
 struct BuildCompareFilters {
     shared_kernel: Vec<String>,
-    shared_commit: Vec<String>,
+    shared_project_commit: Vec<String>,
     shared_kernel_commit: Vec<String>,
-    shared_source: Vec<String>,
+    shared_run_source: Vec<String>,
     shared_scheduler: Option<String>,
     shared_topology: Option<String>,
     shared_work_type: Option<String>,
     shared_flags: Vec<String>,
     a_kernel: Vec<String>,
-    a_commit: Vec<String>,
+    a_project_commit: Vec<String>,
     a_kernel_commit: Vec<String>,
-    a_source: Vec<String>,
+    a_run_source: Vec<String>,
     a_scheduler: Option<String>,
     a_topology: Option<String>,
     a_work_type: Option<String>,
     a_flags: Vec<String>,
     b_kernel: Vec<String>,
-    b_commit: Vec<String>,
+    b_project_commit: Vec<String>,
     b_kernel_commit: Vec<String>,
-    b_source: Vec<String>,
+    b_run_source: Vec<String>,
     b_scheduler: Option<String>,
     b_topology: Option<String>,
     b_work_type: Option<String>,
@@ -1499,9 +1531,9 @@ impl BuildCompareFilters {
         };
         let filter_a = ktstr::cli::RowFilter {
             kernels: pick_vec(&self.a_kernel, &self.shared_kernel),
-            commits: pick_vec(&self.a_commit, &self.shared_commit),
+            project_commits: pick_vec(&self.a_project_commit, &self.shared_project_commit),
             kernel_commits: pick_vec(&self.a_kernel_commit, &self.shared_kernel_commit),
-            sources: pick_vec(&self.a_source, &self.shared_source),
+            run_sources: pick_vec(&self.a_run_source, &self.shared_run_source),
             scheduler: pick_opt(&self.a_scheduler, &self.shared_scheduler),
             topology: pick_opt(&self.a_topology, &self.shared_topology),
             work_type: pick_opt(&self.a_work_type, &self.shared_work_type),
@@ -1509,9 +1541,9 @@ impl BuildCompareFilters {
         };
         let filter_b = ktstr::cli::RowFilter {
             kernels: pick_vec(&self.b_kernel, &self.shared_kernel),
-            commits: pick_vec(&self.b_commit, &self.shared_commit),
+            project_commits: pick_vec(&self.b_project_commit, &self.shared_project_commit),
             kernel_commits: pick_vec(&self.b_kernel_commit, &self.shared_kernel_commit),
-            sources: pick_vec(&self.b_source, &self.shared_source),
+            run_sources: pick_vec(&self.b_run_source, &self.shared_run_source),
             scheduler: pick_opt(&self.b_scheduler, &self.shared_scheduler),
             topology: pick_opt(&self.b_topology, &self.shared_topology),
             work_type: pick_opt(&self.b_work_type, &self.shared_work_type),
@@ -3259,13 +3291,13 @@ mod tests {
         }
     }
 
-    /// `--commit V` round-trips to `Compare { commit: vec![V], .. }`.
-    /// Pins the clap binding for the shared `--commit` filter on the
-    /// stats compare subcommand; a regression that removed the
-    /// derive arg, renamed the flag, or dropped its `ArgAction::Append`
-    /// would land here at parse time.
+    /// `--project-commit V` round-trips to `Compare { project_commit:
+    /// vec![V], .. }`. Pins the clap binding for the shared
+    /// `--project-commit` filter on the stats compare subcommand; a
+    /// regression that removed the derive arg, renamed the flag, or
+    /// dropped its `ArgAction::Append` would land here at parse time.
     #[test]
-    fn parse_stats_compare_with_commit_single() {
+    fn parse_stats_compare_with_project_commit_single() {
         let Cargo {
             command: CargoSub::Ktstr(k),
         } = Cargo::try_parse_from([
@@ -3273,7 +3305,7 @@ mod tests {
             "ktstr",
             "stats",
             "compare",
-            "--commit",
+            "--project-commit",
             "abc1234",
             "--a-kernel",
             "6.14",
@@ -3285,34 +3317,34 @@ mod tests {
             KtstrCommand::Stats {
                 command:
                     Some(StatsCommand::Compare {
-                        commit,
-                        a_commit,
-                        b_commit,
+                        project_commit,
+                        a_project_commit,
+                        b_project_commit,
                         ..
                     }),
                 ..
             } => {
-                assert_eq!(commit, vec!["abc1234"]);
+                assert_eq!(project_commit, vec!["abc1234"]);
                 assert!(
-                    a_commit.is_empty(),
-                    "shared --commit must not populate --a-commit",
+                    a_project_commit.is_empty(),
+                    "shared --project-commit must not populate --a-project-commit",
                 );
                 assert!(
-                    b_commit.is_empty(),
-                    "shared --commit must not populate --b-commit",
+                    b_project_commit.is_empty(),
+                    "shared --project-commit must not populate --b-project-commit",
                 );
             }
             _ => panic!("expected Stats Compare"),
         }
     }
 
-    /// `--commit A --commit B` produces a Vec with two entries —
-    /// the flag is `ArgAction::Append`, so multiple occurrences
-    /// accumulate into the OR-combined filter the dispatch
+    /// `--project-commit A --project-commit B` produces a Vec with two
+    /// entries — the flag is `ArgAction::Append`, so multiple
+    /// occurrences accumulate into the OR-combined filter the dispatch
     /// applies. A regression that lost the Append action would
     /// drop the first occurrence.
     #[test]
-    fn parse_stats_compare_with_commit_repeatable() {
+    fn parse_stats_compare_with_project_commit_repeatable() {
         let Cargo {
             command: CargoSub::Ktstr(k),
         } = Cargo::try_parse_from([
@@ -3320,9 +3352,9 @@ mod tests {
             "ktstr",
             "stats",
             "compare",
-            "--commit",
+            "--project-commit",
             "a",
-            "--commit",
+            "--project-commit",
             "b",
             "--a-kernel",
             "6.14",
@@ -3332,10 +3364,10 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         match k.command {
             KtstrCommand::Stats {
-                command: Some(StatsCommand::Compare { commit, .. }),
+                command: Some(StatsCommand::Compare { project_commit, .. }),
                 ..
             } => {
-                assert_eq!(commit, vec!["a", "b"]);
+                assert_eq!(project_commit, vec!["a", "b"]);
             }
             _ => panic!("expected Stats Compare"),
         }
@@ -3347,7 +3379,7 @@ mod tests {
     /// subcommand; a regression that removed the derive arg,
     /// renamed the flag, or dropped its `ArgAction::Append`
     /// would land here at parse time. Mirrors
-    /// `parse_stats_compare_with_commit_single` for the
+    /// `parse_stats_compare_with_project_commit_single` for the
     /// `kernel_commit` dimension.
     #[test]
     fn parse_stats_compare_with_kernel_commit_single() {
@@ -3481,15 +3513,17 @@ mod tests {
         let b = BuildCompareFilters::default();
         let (fa, fb) = b.build();
         assert!(fa.kernels.is_empty());
-        assert!(fa.commits.is_empty());
+        assert!(fa.project_commits.is_empty());
         assert!(fa.kernel_commits.is_empty());
+        assert!(fa.run_sources.is_empty());
         assert!(fa.scheduler.is_none());
         assert!(fa.topology.is_none());
         assert!(fa.work_type.is_none());
         assert!(fa.flags.is_empty());
         assert_eq!(fa.kernels, fb.kernels);
-        assert_eq!(fa.commits, fb.commits);
+        assert_eq!(fa.project_commits, fb.project_commits);
         assert_eq!(fa.kernel_commits, fb.kernel_commits);
+        assert_eq!(fa.run_sources, fb.run_sources);
         assert_eq!(fa.scheduler, fb.scheduler);
     }
 
@@ -3649,6 +3683,90 @@ mod tests {
         assert_eq!(fb.flags, vec!["llc"]);
     }
 
+    /// Sibling of `build_compare_filters_empty_yields_default_default`
+    /// for the `run_sources` field. The existing empty-default test
+    /// asserts on `run_sources` already (see line ~3499) — this
+    /// companion adds the cross-side equality check that ensures
+    /// `fa.run_sources == fb.run_sources` under the empty default,
+    /// matching the same pattern other dimensions have. A regression
+    /// that diverged the per-side `run_sources` defaults (e.g. by
+    /// forgetting to thread `shared_run_source` into BOTH
+    /// constructors in `BuildCompareFilters::build`) would surface
+    /// here.
+    #[test]
+    fn build_compare_filters_empty_run_sources_field_equal_on_both_sides() {
+        let b = BuildCompareFilters::default();
+        let (fa, fb) = b.build();
+        assert!(
+            fa.run_sources.is_empty(),
+            "empty BuildCompareFilters must produce A-side filter with empty run_sources",
+        );
+        assert!(
+            fb.run_sources.is_empty(),
+            "empty BuildCompareFilters must produce B-side filter with empty run_sources",
+        );
+        assert_eq!(
+            fa.run_sources, fb.run_sources,
+            "both sides must agree on empty run_sources",
+        );
+    }
+
+    /// Per-side `--a-source` / `--b-source` produce disjoint per-
+    /// side filters with the shared `run_sources` left empty.
+    /// Mirrors `build_compare_filters_disjoint_per_side_kernel_yields_two_filters`
+    /// for the source dimension. Pins the wiring of the
+    /// `run_sources` field through `build()` so a regression that
+    /// dropped it from the per-side branch — silently leaving
+    /// `fa.run_sources` / `fb.run_sources` empty under per-side
+    /// input — surfaces here.
+    #[test]
+    fn build_compare_filters_disjoint_per_side_source_yields_two_filters() {
+        let b = BuildCompareFilters {
+            a_run_source: vec!["ci".to_string()],
+            b_run_source: vec!["local".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.run_sources, vec!["ci".to_string()]);
+        assert_eq!(fb.run_sources, vec!["local".to_string()]);
+    }
+
+    /// Shared `--source` pins BOTH sides to the same vec. Sugar
+    /// for `--a-source V --b-source V`. Mirrors
+    /// `build_compare_filters_shared_kernel_pins_both_sides` for
+    /// the source dimension.
+    #[test]
+    fn build_compare_filters_shared_source_pins_both_sides() {
+        let b = BuildCompareFilters {
+            shared_run_source: vec!["ci".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.run_sources, vec!["ci".to_string()]);
+        assert_eq!(fb.run_sources, vec!["ci".to_string()]);
+    }
+
+    /// Per-side `--a-source` overrides shared `--source` for A
+    /// only; B retains the shared value. "More-specific replaces"
+    /// semantics — same shape as the existing
+    /// `per_side_overrides_shared_for_that_side_only` for kernels.
+    /// Pins the override resolution path for the source dimension.
+    #[test]
+    fn build_compare_filters_per_side_source_overrides_shared_for_that_side_only() {
+        let b = BuildCompareFilters {
+            shared_run_source: vec!["local".to_string(), "archive".to_string()],
+            a_run_source: vec!["ci".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.run_sources, vec!["ci".to_string()], "A overrides shared");
+        assert_eq!(
+            fb.run_sources,
+            vec!["local".to_string(), "archive".to_string()],
+            "B retains shared default",
+        );
+    }
+
     /// `cargo ktstr stats show-host --run X` parses to
     /// `StatsCommand::ShowHost { run: X, dir: None }`.
     #[test]
@@ -3788,13 +3906,13 @@ mod tests {
         }
     }
 
-    /// `--source V` round-trips to `Compare { source: vec![V], .. }`.
-    /// Pins the clap binding for the shared `--source` filter.
-    /// Mirrors `parse_stats_compare_with_commit_single` for the
-    /// new dimension; per-side `--a-source` / `--b-source` are
-    /// covered by the `_per_side` sibling below.
+    /// `--run-source V` round-trips to `Compare { run_source: vec![V],
+    /// .. }`. Pins the clap binding for the shared `--run-source`
+    /// filter. Mirrors `parse_stats_compare_with_project_commit_single`
+    /// for the new dimension; per-side `--a-run-source` /
+    /// `--b-run-source` are covered by the `_per_side` sibling below.
     #[test]
-    fn parse_stats_compare_with_source_single() {
+    fn parse_stats_compare_with_run_source_single() {
         let Cargo {
             command: CargoSub::Ktstr(k),
         } = Cargo::try_parse_from([
@@ -3806,7 +3924,7 @@ mod tests {
             "6.14",
             "--b-kernel",
             "6.15",
-            "--source",
+            "--run-source",
             "ci",
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -3814,39 +3932,39 @@ mod tests {
             KtstrCommand::Stats {
                 command:
                     Some(StatsCommand::Compare {
-                        source,
-                        a_source,
-                        b_source,
+                        run_source,
+                        a_run_source,
+                        b_run_source,
                         ..
                     }),
                 ..
             } => {
                 assert_eq!(
-                    source,
+                    run_source,
                     vec!["ci".to_string()],
-                    "shared --source must populate the shared vec",
+                    "shared --run-source must populate the shared vec",
                 );
                 assert!(
-                    a_source.is_empty(),
-                    "shared --source must not populate --a-source",
+                    a_run_source.is_empty(),
+                    "shared --run-source must not populate --a-run-source",
                 );
                 assert!(
-                    b_source.is_empty(),
-                    "shared --source must not populate --b-source",
+                    b_run_source.is_empty(),
+                    "shared --run-source must not populate --b-run-source",
                 );
             }
             _ => panic!("expected Stats Compare"),
         }
     }
 
-    /// `--a-source A --b-source B` round-trips to populated
-    /// per-side vecs with the shared `source` left empty. Pins
+    /// `--a-run-source A --b-run-source B` round-trips to populated
+    /// per-side vecs with the shared `run_source` left empty. Pins
     /// the per-side override path that
     /// `BuildCompareFilters::build` consumes — a regression that
     /// merged shared and per-side into one bucket would surface
     /// here.
     #[test]
-    fn parse_stats_compare_with_source_per_side() {
+    fn parse_stats_compare_with_run_source_per_side() {
         let Cargo {
             command: CargoSub::Ktstr(k),
         } = Cargo::try_parse_from([
@@ -3854,9 +3972,9 @@ mod tests {
             "ktstr",
             "stats",
             "compare",
-            "--a-source",
+            "--a-run-source",
             "ci",
-            "--b-source",
+            "--b-run-source",
             "local",
         ])
         .unwrap_or_else(|e| panic!("{e}"));
@@ -3864,19 +3982,19 @@ mod tests {
             KtstrCommand::Stats {
                 command:
                     Some(StatsCommand::Compare {
-                        source,
-                        a_source,
-                        b_source,
+                        run_source,
+                        a_run_source,
+                        b_run_source,
                         ..
                     }),
                 ..
             } => {
                 assert!(
-                    source.is_empty(),
-                    "per-side flags must not populate the shared --source vec",
+                    run_source.is_empty(),
+                    "per-side flags must not populate the shared --run-source vec",
                 );
-                assert_eq!(a_source, vec!["ci".to_string()]);
-                assert_eq!(b_source, vec!["local".to_string()]);
+                assert_eq!(a_run_source, vec!["ci".to_string()]);
+                assert_eq!(b_run_source, vec!["local".to_string()]);
             }
             _ => panic!("expected Stats Compare"),
         }
@@ -4824,5 +4942,273 @@ mod tests {
             path_kernel_label(b),
             "distinct path parents must produce distinct labels",
         );
+    }
+
+    // ---------------------------------------------------------------
+    // encode_kernel_list — KTSTR_KERNEL_LIST wire-format encoding
+    // ---------------------------------------------------------------
+    //
+    // The wire format is `label1=path1;label2=path2;...` per the
+    // doc comment on `encode_kernel_list`. Empty input encodes to
+    // an empty string (idempotent — env var consumers treat the
+    // empty value as "no list, single-kernel mode"). Paths
+    // containing `;` are rejected with an actionable error since
+    // the separator collision would produce a malformed env var
+    // the test-binary parser would split into garbage.
+
+    #[test]
+    fn encode_kernel_list_empty_input_returns_empty_string() {
+        // Pin the idempotent empty case — `cargo ktstr` skips the
+        // env-var export entirely on empty kernel sets, but the
+        // encoder must not panic or produce garbage if it ever does
+        // see an empty slice.
+        let encoded = encode_kernel_list(&[]).expect("empty input must succeed");
+        assert!(
+            encoded.is_empty(),
+            "empty resolved list must encode to empty string, got {encoded:?}",
+        );
+    }
+
+    #[test]
+    fn encode_kernel_list_single_entry_has_no_separator() {
+        // Single-entry payload omits the `;` separator entirely:
+        // the format is `label=path`, NOT `label=path;`.
+        let resolved = vec![("6.14.2".to_string(), PathBuf::from("/cache/foo"))];
+        let encoded = encode_kernel_list(&resolved).expect("single entry must succeed");
+        assert_eq!(
+            encoded, "6.14.2=/cache/foo",
+            "single-entry encoding must be `label=path` with no trailing separator",
+        );
+    }
+
+    #[test]
+    fn encode_kernel_list_two_entries_uses_semicolon_separator() {
+        // Two-entry payload uses `;` as the entry separator; `=`
+        // separates the label from the path within each entry.
+        let resolved = vec![
+            ("6.14.2".to_string(), PathBuf::from("/cache/a")),
+            ("6.15.0".to_string(), PathBuf::from("/cache/b")),
+        ];
+        let encoded = encode_kernel_list(&resolved).expect("two entries must succeed");
+        assert_eq!(
+            encoded, "6.14.2=/cache/a;6.15.0=/cache/b",
+            "two-entry encoding must be `label=path;label=path`",
+        );
+    }
+
+    #[test]
+    fn encode_kernel_list_three_entries_preserves_order() {
+        // The encoder iterates `resolved` in input order and writes
+        // entries in that order. A regression that sorted entries
+        // (e.g. by label alphabetically) would silently reorder the
+        // multi-kernel test-name suffix dimension and break
+        // operator-stable test naming.
+        let resolved = vec![
+            ("z-late".to_string(), PathBuf::from("/cache/z")),
+            ("a-early".to_string(), PathBuf::from("/cache/a")),
+            ("m-mid".to_string(), PathBuf::from("/cache/m")),
+        ];
+        let encoded = encode_kernel_list(&resolved).expect("three entries must succeed");
+        assert_eq!(
+            encoded, "z-late=/cache/z;a-early=/cache/a;m-mid=/cache/m",
+            "encoder must preserve input order; sorting would change test-name suffix order",
+        );
+    }
+
+    #[test]
+    fn encode_kernel_list_rejects_semicolon_in_path() {
+        // POSIX permits `;` in paths, but the wire format claims
+        // `;` as the entry separator. The encoder must bail with an
+        // actionable error rather than silently producing
+        // `label=foo;bar` which the parser would split into a
+        // malformed `(label, "foo")` + spurious `bar` segment.
+        let resolved = vec![("6.14.2".to_string(), PathBuf::from("/cache/has;semicolon"))];
+        let err = encode_kernel_list(&resolved)
+            .expect_err("path containing `;` must be rejected by encoder");
+        assert!(
+            err.contains("`;`"),
+            "error must reference the offending separator: {err}",
+        );
+        assert!(
+            err.contains("6.14.2"),
+            "error must name the offending label so the operator can locate the entry: {err}",
+        );
+        assert!(
+            err.contains("/cache/has;semicolon"),
+            "error must include the offending path: {err}",
+        );
+    }
+
+    #[test]
+    fn encode_kernel_list_first_entry_with_semicolon_rejected_before_emit() {
+        // Even on a multi-entry payload where ONLY the first entry's
+        // path has a `;`, the encoder must bail without emitting
+        // anything — partial encoding would mean the caller exec's
+        // a child with a corrupted env value where the early entries
+        // succeeded.
+        let resolved = vec![
+            ("first".to_string(), PathBuf::from("/cache/has;semicolon")),
+            ("second".to_string(), PathBuf::from("/cache/clean")),
+        ];
+        let err = encode_kernel_list(&resolved)
+            .expect_err("path containing `;` must be rejected even when other entries are clean");
+        assert!(err.contains("first"));
+    }
+
+    #[test]
+    fn encode_kernel_list_later_entry_with_semicolon_still_rejected() {
+        // The validation loop scans every entry before emit, so a
+        // `;` in the second/later entry's path also bails.
+        let resolved = vec![
+            ("first".to_string(), PathBuf::from("/cache/clean")),
+            ("second".to_string(), PathBuf::from("/cache/has;semicolon")),
+        ];
+        let err = encode_kernel_list(&resolved)
+            .expect_err("`;` anywhere in any path must abort the encode");
+        assert!(err.contains("second"));
+    }
+
+    // ---------------------------------------------------------------
+    // detect_label_collisions — sanitization-collision guard
+    // ---------------------------------------------------------------
+    //
+    // Two distinct producer-side labels that normalize to the same
+    // nextest identifier via `sanitize_kernel_label` would shatter
+    // their cache directories under one test-name suffix. The
+    // helper bails before the encoded `KTSTR_KERNEL_LIST` reaches
+    // the test binary so the operator gets an actionable
+    // "spell each --kernel value distinctly" diagnostic rather
+    // than silent misroute to the wrong kernel.
+
+    #[test]
+    fn detect_label_collisions_empty_input_succeeds() {
+        // Trivial: an empty resolved set has no pairs to compare;
+        // the helper must return Ok without error.
+        let resolved: Vec<(String, PathBuf)> = Vec::new();
+        detect_label_collisions(&resolved).expect("empty input must succeed");
+    }
+
+    #[test]
+    fn detect_label_collisions_unique_labels_succeed() {
+        // Two distinct labels that sanitize to distinct nextest
+        // identifiers — no collision, no error.
+        let resolved = vec![
+            ("6.14.2".to_string(), PathBuf::from("/cache/a")),
+            ("6.15.0".to_string(), PathBuf::from("/cache/b")),
+        ];
+        detect_label_collisions(&resolved).expect("distinct sanitized identifiers must succeed");
+    }
+
+    #[test]
+    fn detect_label_collisions_period_vs_dash_collides() {
+        // `sanitize_kernel_label` replaces both `.` and `-` with
+        // `_` — so `6.14.2` and `6-14-2` both sanitize to
+        // `kernel_6_14_2`. This is the canonical collision shape
+        // referenced in the doc comment ("e.g. spell `6.14.2` and
+        // `git+...#6.14.2` distinctly").
+        let resolved = vec![
+            ("6.14.2".to_string(), PathBuf::from("/cache/a")),
+            ("6-14-2".to_string(), PathBuf::from("/cache/b")),
+        ];
+        let err = detect_label_collisions(&resolved)
+            .expect_err("colliding sanitized identifiers must surface an error");
+        // Both labels named in the diagnostic so the operator can
+        // disambiguate without grepping the resolver source.
+        assert!(
+            err.contains("6.14.2"),
+            "error must name first colliding label: {err}",
+        );
+        assert!(
+            err.contains("6-14-2"),
+            "error must name second colliding label: {err}",
+        );
+        // Sanitized form named so the operator sees the shared
+        // identifier the dispatch side would have used.
+        assert!(
+            err.contains("kernel_6_14_2"),
+            "error must include the shared sanitized identifier: {err}",
+        );
+        // Diagnostic carries the actionable hint.
+        assert!(
+            err.contains("Spell each --kernel value distinctly"),
+            "error must include the actionable remediation hint: {err}",
+        );
+    }
+
+    #[test]
+    fn detect_label_collisions_uppercase_vs_lowercase_collides() {
+        // `sanitize_kernel_label` lowercases its input, so `ABC`
+        // and `abc` both sanitize to `kernel_abc`. Distinct
+        // collision shape from the period-vs-dash case — pins the
+        // case-folding contract.
+        let resolved = vec![
+            ("ABC".to_string(), PathBuf::from("/cache/a")),
+            ("abc".to_string(), PathBuf::from("/cache/b")),
+        ];
+        let err = detect_label_collisions(&resolved)
+            .expect_err("uppercase vs lowercase labels must collide post-sanitize");
+        assert!(err.contains("kernel_abc"));
+    }
+
+    #[test]
+    fn detect_label_collisions_identical_labels_collide() {
+        // De-duplication of identical `--kernel` specs is the
+        // operator's responsibility (or future task #21); this
+        // helper is the LAST line of defense and must surface the
+        // duplicate as a collision rather than silently letting
+        // both entries through.
+        let resolved = vec![
+            ("6.14.2".to_string(), PathBuf::from("/cache/a")),
+            ("6.14.2".to_string(), PathBuf::from("/cache/b")),
+        ];
+        let err = detect_label_collisions(&resolved)
+            .expect_err("two identical labels must surface as a collision");
+        assert!(err.contains("6.14.2"));
+        assert!(err.contains("kernel_6_14_2"));
+    }
+
+    #[test]
+    fn detect_label_collisions_three_entries_two_collide_one_unique() {
+        // First two collide after sanitization; third is distinct.
+        // The helper must bail on the first detected collision —
+        // the unique third entry never reaches the diagnostic but
+        // its absence from the error message is intentional (the
+        // operator only needs to know which two labels conflict).
+        let resolved = vec![
+            ("6.14.2".to_string(), PathBuf::from("/cache/a")),
+            ("6-14-2".to_string(), PathBuf::from("/cache/b")),
+            ("7.0.0".to_string(), PathBuf::from("/cache/c")),
+        ];
+        let err = detect_label_collisions(&resolved)
+            .expect_err("collision in the first two entries must surface");
+        assert!(err.contains("6.14.2"));
+        assert!(err.contains("6-14-2"));
+        // Third entry's label not mentioned — only the conflicting
+        // pair is named (the API contract is "name the first
+        // colliding pair", not "enumerate every collision").
+        assert!(
+            !err.contains("7.0.0"),
+            "non-conflicting label should not appear in the collision diagnostic: {err}",
+        );
+    }
+
+    #[test]
+    fn detect_label_collisions_first_two_unique_third_collides_with_first() {
+        // First and third collide; second is unique. Ensures the
+        // detection scans past the unique second entry rather than
+        // bailing as soon as a non-collision is seen.
+        let resolved = vec![
+            ("6.14.2".to_string(), PathBuf::from("/cache/a")),
+            ("7.0.0".to_string(), PathBuf::from("/cache/b")),
+            ("6-14-2".to_string(), PathBuf::from("/cache/c")),
+        ];
+        let err = detect_label_collisions(&resolved)
+            .expect_err("late-arriving collision against an earlier entry must surface");
+        // The diagnostic names the EARLIER entry (the one already
+        // in `seen`) as the `prior` label and the LATER entry as
+        // the `label`. The shared sanitized form is also named.
+        assert!(err.contains("6.14.2"), "earlier (prior) label must appear");
+        assert!(err.contains("6-14-2"), "later label must appear");
+        assert!(err.contains("kernel_6_14_2"));
     }
 }

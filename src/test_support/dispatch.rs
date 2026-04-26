@@ -1517,4 +1517,238 @@ mod tests {
         assert_eq!(stripped, "gauntlet/eevdf/2llc/default");
         assert!(entry.is_some());
     }
+
+    // ---------------------------------------------------------------
+    // host_only kernel-suffix skip — multi-kernel listing
+    // ---------------------------------------------------------------
+    //
+    // `list_tests_all` and `list_tests_budget` short-circuit
+    // `host_only` entries: a host_only test never boots a VM, so the
+    // kernel never affects what runs. Both listers emit ONE entry per
+    // host_only test regardless of `KTSTR_KERNEL_LIST` cardinality —
+    // otherwise N identical copies of the same host-side function
+    // would land in nextest's plan.
+    //
+    // The tests below register a dedicated `host_only=true` entry in
+    // `KTSTR_TESTS` via `linkme::distributed_slice`, set
+    // `KTSTR_KERNEL_LIST` to a 2-entry payload, and capture stdout
+    // while invoking each lister. The capture asserts the host_only
+    // entry name appears EXACTLY once and never with a `/kernel_…`
+    // suffix.
+
+    /// Process-wide mutex serializing every stdout-capture call in
+    /// this module. `fd 1 → tempfile` redirection is a non-reentrant
+    /// process-global mutation — two concurrent callers would see
+    /// each other's output land in their sink. Mirrors the
+    /// `STDERR_CAPTURE_LOCK` pattern in `test_support::test_helpers`
+    /// (see `capture_stderr_serializes_concurrent_callers` for the
+    /// rationale and the failure mode without serialization).
+    static STDOUT_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that restores the saved stdout fd on Drop, even if
+    /// the captured closure panics under the `panic = "unwind"` test
+    /// profile. Without this guard a panicking closure would leak the
+    /// fd-1 swap and every subsequent stdout write in the test
+    /// process would land in the orphaned tempfile. `saved` is
+    /// `Option` so Drop can `take()` and consume it without an `&mut`
+    /// borrow fight. Mirrors `StderrRestoreGuard` in
+    /// `test_support::test_helpers`.
+    struct StdoutRestoreGuard {
+        saved: Option<std::os::fd::OwnedFd>,
+    }
+    impl Drop for StdoutRestoreGuard {
+        fn drop(&mut self) {
+            if let Some(saved) = self.saved.take() {
+                let _ = nix::unistd::dup2_stdout(&saved);
+            }
+        }
+    }
+
+    /// Run `f` with stdout redirected to an in-memory tempfile;
+    /// return both `f`'s value and the captured bytes. Uses
+    /// [`STDOUT_CAPTURE_LOCK`] to serialize against every other
+    /// stdout-capture call in this module. The RAII
+    /// [`StdoutRestoreGuard`] restores fd 1 even if `f` panics
+    /// under `panic = "unwind"`. Mirrors `capture_stderr` in
+    /// `test_support::test_helpers`.
+    fn capture_stdout<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let _lock = STDOUT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut sink = tempfile::tempfile().expect("create stdout-capture tempfile");
+        // Flush before redirect: println! is line-buffered behind
+        // the Stdout lock; pre-call bytes need to reach the
+        // ORIGINAL fd 1 or they leak into the captured tempfile.
+        std::io::stdout().flush().ok();
+        let saved = nix::unistd::dup(std::io::stdout()).expect("dup(stdout)");
+        nix::unistd::dup2_stdout(&sink).expect("dup2_stdout(sink)");
+        let guard = StdoutRestoreGuard { saved: Some(saved) };
+        let result = f();
+        std::io::stdout().flush().ok();
+        drop(guard);
+        sink.seek(SeekFrom::Start(0)).expect("rewind sink");
+        let mut bytes = Vec::new();
+        sink.read_to_end(&mut bytes).expect("read sink");
+        (result, bytes)
+    }
+
+    /// Stub func for the host_only listing-test entry. The listers
+    /// never invoke `func` — they only iterate `KTSTR_TESTS` to
+    /// emit names — so an Err-returning stub is sufficient and
+    /// matches the pattern `default_test_func` uses in
+    /// `entry::DEFAULT`. If a future regression accidentally drove
+    /// dispatch through this entry, the bail message would surface
+    /// the misroute rather than silently passing.
+    fn host_only_listing_stub(
+        _ctx: &crate::scenario::Ctx,
+    ) -> anyhow::Result<crate::assert::AssertResult> {
+        anyhow::bail!(
+            "host_only_listing_test_entry::func called — entry exists \
+             only to drive the host_only kernel-suffix skip tests in \
+             list_tests_all / list_tests_budget; func should never run"
+        )
+    }
+
+    /// Distinct sentinel name so the listing-output filters in the
+    /// tests below match this entry and not the `__unit_test_dummy__`
+    /// (also registered in `KTSTR_TESTS` from the
+    /// `test_support::tests` module) or any other entry that may be
+    /// added later. The `__unit_test_…__` shape collides with
+    /// `is_test_sentinel` (see the predicate at the top of this
+    /// module) so the `cargo test` harness still classifies it as a
+    /// sentinel and the early-dispatch warning logic does not
+    /// double-fire.
+    const HOST_ONLY_LISTING_NAME: &str = "__unit_test_host_only_listing__";
+
+    #[linkme::distributed_slice(KTSTR_TESTS)]
+    static __HOST_ONLY_LISTING_ENTRY: KtstrTestEntry = KtstrTestEntry {
+        name: HOST_ONLY_LISTING_NAME,
+        func: host_only_listing_stub,
+        host_only: true,
+        ..KtstrTestEntry::DEFAULT
+    };
+
+    /// Two-kernel KTSTR_KERNEL_LIST payload reused by the listing
+    /// tests below. Both labels sanitize to distinct nextest
+    /// suffixes (`kernel_6_14_2`, `kernel_6_15_0`), so a regression
+    /// that started emitting `/kernel_…` suffixes for the host_only
+    /// entry would surface as either `2` matches (one per kernel)
+    /// rather than the expected `1`, or as suffix substrings on the
+    /// emitted line.
+    const TWO_KERNEL_LIST: &str = "6.14.2=/cache/a;6.15.0=/cache/b";
+
+    /// Filter the captured listing output to only the lines that
+    /// reference `HOST_ONLY_LISTING_NAME`. Other lines from the
+    /// `__unit_test_dummy__` entry (and from any future entries
+    /// registered in this binary's `KTSTR_TESTS`) are intentionally
+    /// dropped so the assertions key on this fixture's behaviour
+    /// alone.
+    fn host_only_listing_lines(captured: &[u8]) -> Vec<String> {
+        std::str::from_utf8(captured)
+            .expect("capture must be UTF-8")
+            .lines()
+            .filter(|l| l.contains(HOST_ONLY_LISTING_NAME))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `list_tests_all` in multi-kernel mode emits exactly ONE line
+    /// for a `host_only` entry, with NO `/kernel_…` suffix. Pins the
+    /// `if entry.host_only { println!("ktstr/{}: test", entry.name); }`
+    /// branch at the top of `list_tests_all` against a regression
+    /// that fell through into the kernel-suffix loop. A regression
+    /// would yield 2 matches (one per kernel) and at least one line
+    /// would carry a `/kernel_6_14_2` or `/kernel_6_15_0` suffix.
+    ///
+    /// Holds [`crate::test_support::test_helpers::lock_env`] for the
+    /// full save/mutate/restore window — `KTSTR_KERNEL_LIST` is
+    /// process-wide, and the budget-test sibling below also rewrites
+    /// env vars. Without the lock, a concurrent test mutating a
+    /// different env key could observe a transiently-corrupt
+    /// `KTSTR_KERNEL_LIST` value.
+    #[test]
+    fn list_tests_all_host_only_skips_kernel_suffix_under_multi_kernel() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
+        // Suppress the budget-mode branch — `KTSTR_BUDGET_SECS` would
+        // route the dispatcher through `list_tests_budget` instead of
+        // `list_tests_all`, but we are calling the lister directly so
+        // the dispatcher path is irrelevant. Removing the env var here
+        // is defensive against a parallel test that set it without
+        // restoring (would not affect this call's output, but keeps
+        // the test's runtime hypothesis explicit).
+        let _budget_guard = EnvVarGuard::remove("KTSTR_BUDGET_SECS");
+
+        let (_, captured) = capture_stdout(|| list_tests_all(false));
+        let lines = host_only_listing_lines(&captured);
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "list_tests_all must emit exactly 1 line for a host_only entry \
+             under multi-kernel mode (saw {n}): {lines:?}",
+            n = lines.len(),
+        );
+        let line = &lines[0];
+        // Expected exact form (mirrors the `println!("ktstr/{}: test", entry.name)`
+        // in the host_only branch of `list_tests_all`).
+        assert_eq!(
+            line,
+            &format!("ktstr/{HOST_ONLY_LISTING_NAME}: test"),
+            "host_only line must be `ktstr/<name>: test` with no kernel suffix",
+        );
+        // Belt-and-suspenders: neither sanitized kernel label appears
+        // anywhere on the line, even as a substring.
+        assert!(
+            !line.contains("kernel_6_14_2") && !line.contains("kernel_6_15_0"),
+            "host_only line must carry NO sanitized kernel suffix — \
+             a regression that emitted `/kernel_…` would surface here. line: {line:?}",
+        );
+    }
+
+    /// `list_tests_budget` mirror: in multi-kernel mode, the
+    /// budget-selecting lister emits exactly ONE candidate for a
+    /// `host_only` entry without a kernel suffix. Pins the second
+    /// `if entry.host_only { … } else { … }` branch in
+    /// `list_tests_budget` against the same regression class as the
+    /// `list_tests_all` sibling.
+    ///
+    /// Budget is set generously (10000 secs) so the greedy selector
+    /// in `crate::budget::select` picks every distinct-feature
+    /// candidate including this fixture (the `HOST_ONLY_SHIFT` bit
+    /// in `extract_features` makes the host_only entry's feature set
+    /// uniquely contributory — see `budget::extract_features`).
+    /// The selector prints to stdout AND `eprintln!`s a summary
+    /// line to stderr; only stdout is captured here, so the stderr
+    /// summary lands on the test runner's normal stderr.
+    #[test]
+    fn list_tests_budget_host_only_skips_kernel_suffix_under_multi_kernel() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
+
+        let (_, captured) = capture_stdout(|| list_tests_budget(false, 10_000.0));
+        let lines = host_only_listing_lines(&captured);
+
+        assert_eq!(
+            lines.len(),
+            1,
+            "list_tests_budget must emit exactly 1 candidate line for a \
+             host_only entry under multi-kernel mode (saw {n}): {lines:?}",
+            n = lines.len(),
+        );
+        let line = &lines[0];
+        assert_eq!(
+            line,
+            &format!("ktstr/{HOST_ONLY_LISTING_NAME}: test"),
+            "host_only candidate name must be `ktstr/<name>: test` with no kernel suffix",
+        );
+        assert!(
+            !line.contains("kernel_6_14_2") && !line.contains("kernel_6_15_0"),
+            "host_only candidate must carry NO sanitized kernel suffix — \
+             a regression that emitted `/kernel_…` would surface here. line: {line:?}",
+        );
+    }
 }
