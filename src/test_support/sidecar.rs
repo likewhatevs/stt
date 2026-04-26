@@ -746,7 +746,17 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// the build host.
 pub(crate) fn detect_project_commit() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    let repo = gix::discover(&cwd).ok()?;
+    detect_commit_at(&cwd)
+}
+
+/// Path-taking core of [`detect_project_commit`]. Factored out so
+/// unit tests can drive the full branch matrix (clean repo, dirty
+/// repo, non-git directory, unborn HEAD, concurrent calls) against
+/// `gix::init`-built fixtures in tempdirs without mutating the
+/// process-wide `current_dir`. The public entry point reads `cwd`
+/// once and delegates here.
+fn detect_commit_at(path: &std::path::Path) -> Option<String> {
+    let repo = gix::discover(path).ok()?;
     let head = repo.head_id().ok()?;
     // `to_hex_with_len(7)` produces a `HexDisplay` that formats
     // 7 hex chars without the 40-char intermediate `format!("{}")`
@@ -3667,5 +3677,267 @@ mod tests {
                 "sidecar {i}: sched_tunables presence flipped across sidecars",
             );
         }
+    }
+
+    // -- detect_project_commit branch coverage --
+    //
+    // The five branches probed below cover every shape `detect_commit_at`
+    // can produce: a clean repo (Some(hex)), a dirty tracked-file
+    // worktree (Some(hex-dirty)), a non-git directory (None), an unborn
+    // HEAD (None), and a submodule-entry tree with the submodule
+    // unchecked-out (Some(hex), no -dirty). Fixtures use gix directly
+    // — no `git` shell-out — so the tests reflect the same library the
+    // production probe uses.
+
+    /// Construct a single-blob tree at `dir`, populate the index from it,
+    /// write the file content into the worktree, and return the new
+    /// HEAD commit's id. After this helper the repo is fully clean:
+    /// HEAD-tree == index == worktree.
+    ///
+    /// `committer_or_set_generic_fallback` is invoked because the test
+    /// process inherits no `user.name|email` git config and the
+    /// commit/ref-edit path requires a non-empty signature; the
+    /// fallback writes "no name configured" / "noEmailAvailable@…"
+    /// into the in-memory config snapshot, which is sufficient to
+    /// produce a syntactically valid commit object.
+    fn init_clean_repo_with_file(dir: &std::path::Path) -> gix::ObjectId {
+        let mut repo = gix::init(dir).expect("gix::init");
+        let _ = repo
+            .committer_or_set_generic_fallback()
+            .expect("committer fallback");
+        let blob_id: gix::ObjectId = repo.write_blob(b"original\n").expect("write blob").detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: "file.txt".into(),
+                oid: blob_id,
+            }],
+        };
+        let tree_id: gix::ObjectId = repo.write_object(&tree).expect("write tree").detach();
+        let commit_id: gix::ObjectId = repo
+            .commit("HEAD", "init", tree_id, std::iter::empty::<gix::ObjectId>())
+            .expect("commit")
+            .detach();
+        // Populate the index from the tree and persist it so the
+        // tree-vs-index check sees no staged drift, then write the
+        // worktree file so the index-vs-worktree check sees no
+        // unstaged drift.
+        let mut idx = repo.index_from_tree(&tree_id).expect("index_from_tree");
+        idx.write(gix::index::write::Options::default())
+            .expect("write index");
+        std::fs::write(dir.join("file.txt"), b"original\n").expect("write worktree file");
+        commit_id
+    }
+
+    /// Clean repo: HEAD reachable, no staged or worktree diffs. The
+    /// short-hash matches `head.to_hex_with_len(7)`, exactly the same
+    /// shape `detect_commit_at` formats with — pinning the literal
+    /// also confirms the 7-char truncation is honored end-to-end (a
+    /// future refactor that swapped to `format!("{}").chars().take(8)`
+    /// would silently break the cross-run grouping that stats tooling
+    /// relies on).
+    #[test]
+    fn detect_project_commit_clean_repo_returns_short_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let head = init_clean_repo_with_file(tmp.path());
+        let result = super::detect_commit_at(tmp.path()).expect("clean repo must yield Some");
+        assert_eq!(
+            result.len(),
+            7,
+            "clean result must be a 7-char hex hash, got {result:?}"
+        );
+        assert!(
+            !result.contains('-'),
+            "clean result must not carry a -dirty suffix, got {result:?}"
+        );
+        assert!(
+            result.chars().all(|c| c.is_ascii_hexdigit()),
+            "clean result must be pure hex, got {result:?}"
+        );
+        assert_eq!(
+            result,
+            head.to_hex_with_len(7).to_string(),
+            "clean result must match the HEAD short hash exactly"
+        );
+    }
+
+    /// Dirty tracked-file worktree: HEAD reachable, index matches
+    /// HEAD, but worktree diverges from the index. The result must
+    /// carry the `-dirty` suffix per the `index_worktree` leg of the
+    /// dirt probe.
+    #[test]
+    fn detect_project_commit_dirty_repo_appends_dirty_suffix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let head = init_clean_repo_with_file(tmp.path());
+        // Mutate the tracked file so index-vs-worktree diverges.
+        std::fs::write(tmp.path().join("file.txt"), b"modified\n").unwrap();
+        let result = super::detect_commit_at(tmp.path()).expect("dirty repo must yield Some");
+        let expected_prefix = head.to_hex_with_len(7).to_string();
+        assert_eq!(
+            result,
+            format!("{expected_prefix}-dirty"),
+            "dirty result must be {expected_prefix:?} + -dirty suffix"
+        );
+    }
+
+    /// Non-git directory: `gix::discover` walks the parent chain of
+    /// the tempdir all the way up; if a parent happens to be a git
+    /// repo (e.g. tests run from inside a checkout), `discover`
+    /// resolves to that ancestor. To pin the "no repo" branch we have
+    /// to break the parent walk, which is impossible from inside a
+    /// tempdir nested under a git checkout — the test instead asserts
+    /// that no repo is discoverable from the system temp root, which
+    /// is reliably outside any project repo.
+    #[test]
+    fn detect_project_commit_non_git_returns_none() {
+        // Use a fresh tempdir directly under /tmp so no parent in the
+        // walk is itself a git repo. The TempDir's path is unique per
+        // run, so concurrent tests do not collide.
+        let tmp = tempfile::TempDir::new_in(std::env::temp_dir()).unwrap();
+        // Sanity: discover from this path must fail before we trust
+        // the test's None expectation. If a future change makes
+        // /tmp/* sit inside a discoverable repo (extremely unlikely
+        // on POSIX hosts) the assert here surfaces the violation
+        // before the function-under-test assertion below.
+        assert!(
+            gix::discover(tmp.path()).is_err(),
+            "tempdir {} must not resolve to any ancestor git repo",
+            tmp.path().display()
+        );
+        let result = super::detect_commit_at(tmp.path());
+        assert!(
+            result.is_none(),
+            "non-git directory must yield None, got {result:?}"
+        );
+    }
+
+    /// Unborn HEAD: `gix::init` produces a repo whose HEAD points at a
+    /// branch that has not been written to yet. `head_id()` returns
+    /// Err on this state; `detect_commit_at` returns None.
+    #[test]
+    fn detect_project_commit_unborn_head_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _repo = gix::init(tmp.path()).expect("gix::init");
+        let result = super::detect_commit_at(tmp.path());
+        assert!(
+            result.is_none(),
+            "unborn HEAD must yield None, got {result:?}"
+        );
+    }
+
+    /// Concurrent invocation stability: the probe is read-only across
+    /// the gix layer, so N parallel calls against the same repo must
+    /// all return the same result. Failure here would indicate a
+    /// thread-safety regression in either gix or our usage of it.
+    #[test]
+    fn detect_project_commit_concurrent_calls_agree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_clean_repo_with_file(tmp.path());
+        let path = tmp.path();
+        let baseline =
+            super::detect_commit_at(path).expect("baseline single-thread call must yield Some");
+
+        const THREADS: usize = 8;
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(THREADS);
+            for _ in 0..THREADS {
+                handles.push(scope.spawn(|| super::detect_commit_at(path)));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread join"))
+                .collect::<Vec<_>>()
+        });
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(
+                r.as_deref(),
+                Some(baseline.as_str()),
+                "thread {i} disagreed with baseline {baseline:?}: got {r:?}"
+            );
+        }
+    }
+
+    /// Submodule false-positive guard: an uninitialized submodule (a
+    /// gitlinks tree+index entry whose checked-out subdirectory has no
+    /// `.git` artifact yet) must NOT trip the dirty probe.
+    /// `detect_commit_at` configures `Submodule::Given { ignore: All,
+    /// .. }` precisely so a parent repo cloned without
+    /// `--recurse-submodules` does not get erroneously tagged `-dirty`
+    /// for every sidecar.
+    ///
+    /// The fixture writes a tree containing a `.gitmodules` blob (the
+    /// submodule registration gix needs to recognise the gitlinks
+    /// entry as a submodule rather than a phantom directory) plus a
+    /// `Commit`-mode tree entry pointing at an arbitrary OID. The
+    /// worktree contains the `.gitmodules` file and an EMPTY `submod/`
+    /// directory — modelling a parent that was cloned without
+    /// `--recurse-submodules`. The probe must still report clean.
+    #[test]
+    fn detect_project_commit_submodule_uninit_is_clean() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut repo = gix::init(tmp.path()).expect("gix::init");
+        let _ = repo
+            .committer_or_set_generic_fallback()
+            .expect("committer fallback");
+
+        // A submodule reference needs both a `.gitmodules` registration
+        // (so gix recognises the gitlinks entry as a submodule, not a
+        // phantom file) and the gitlinks tree entry itself. The
+        // submodule directory is INTENTIONALLY left absent from the
+        // worktree, which is the "uninitialized" state the production
+        // probe must tolerate.
+        let gitmodules_content = b"\
+[submodule \"submod\"]\n\
+\tpath = submod\n\
+\turl = https://example.invalid/submod.git\n";
+        let gitmodules_blob: gix::ObjectId = repo
+            .write_blob(gitmodules_content)
+            .expect("write .gitmodules blob")
+            .detach();
+        // Any 20-byte OID is a syntactically valid commit reference
+        // from the tree's perspective. The null id keeps the fixture
+        // self-contained — no dependency on an actual submodule commit
+        // having been written.
+        let null_commit_id = gix::ObjectId::null(gix::hash::Kind::Sha1);
+        let tree = gix::objs::Tree {
+            entries: vec![
+                gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: ".gitmodules".into(),
+                    oid: gitmodules_blob,
+                },
+                gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Commit.into(),
+                    filename: "submod".into(),
+                    oid: null_commit_id,
+                },
+            ],
+        };
+        let tree_id: gix::ObjectId = repo.write_object(&tree).expect("write tree").detach();
+        let head: gix::ObjectId = repo
+            .commit("HEAD", "init", tree_id, std::iter::empty::<gix::ObjectId>())
+            .expect("commit")
+            .detach();
+        let mut idx = repo.index_from_tree(&tree_id).expect("index_from_tree");
+        idx.write(gix::index::write::Options::default())
+            .expect("write index");
+        // Materialize the .gitmodules blob in the worktree so the
+        // index-vs-worktree leg sees no diff for that file. Create an
+        // empty `submod/` directory to model a parent that was cloned
+        // with `--no-recurse-submodules`: the gitlinks entry is in the
+        // tree and index, the directory exists in the worktree, but no
+        // `.git` artifact lives inside it (the submodule is
+        // unintialized).
+        std::fs::write(tmp.path().join(".gitmodules"), gitmodules_content)
+            .expect("write .gitmodules worktree");
+        std::fs::create_dir(tmp.path().join("submod")).expect("create submod dir");
+
+        let result =
+            super::detect_commit_at(tmp.path()).expect("submodule repo must still yield Some");
+        assert_eq!(
+            result,
+            head.to_hex_with_len(7).to_string(),
+            "uninitialized submodule must not trigger -dirty suffix"
+        );
     }
 }

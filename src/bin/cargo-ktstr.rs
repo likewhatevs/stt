@@ -812,6 +812,29 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
             }
         }
     }
+
+    // Detect sanitization collisions: two distinct producer-side
+    // labels that normalize to the same nextest identifier via
+    // `sanitize_kernel_label` would shatter into two cache directories
+    // sharing one test-name suffix, so the dispatch-side label-to-dir
+    // map in `parse_kernel_list` would silently retain only the last
+    // entry and every prior collision would route to the wrong kernel.
+    // Bail at resolve time naming both labels so the operator can
+    // disambiguate the inputs (e.g. spell `6.14.2` and `git+...#6.14.2`
+    // distinctly rather than relying on suffix-encoded identity).
+    let mut seen: std::collections::HashMap<String, &str> =
+        std::collections::HashMap::with_capacity(resolved.len());
+    for (label, _) in &resolved {
+        let sanitized = ktstr::test_support::sanitize_kernel_label(label);
+        if let Some(prior) = seen.insert(sanitized.clone(), label.as_str()) {
+            return Err(format!(
+                "--kernel: labels {prior:?} and {label:?} both sanitize to {sanitized:?} — \
+                 the nextest test-name suffix cannot disambiguate them. \
+                 Spell each --kernel value distinctly so its sanitized form is unique."
+            ));
+        }
+    }
+
     Ok(resolved)
 }
 

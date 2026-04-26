@@ -122,7 +122,7 @@ pub(crate) fn read_kernel_list() -> Vec<KernelEntry> {
 /// - `6.15-rc3` → `kernel_6_15_rc3`
 /// - `git_tj_sched_ext_for-next` → `kernel_git_tj_sched_ext_for_next`
 /// - `path_linux_a3f2b1` → `kernel_path_linux_a3f2b1`
-fn sanitize_kernel_label(raw: &str) -> String {
+pub fn sanitize_kernel_label(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 7);
     out.push_str("kernel_");
     let mut last_underscore = true; // suppress leading `_` after `kernel_`

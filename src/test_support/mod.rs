@@ -75,7 +75,9 @@ pub(crate) use sidecar::{
     collect_sidecars, format_callback_profile, format_kvm_stats, format_verifier_stats, sidecar_dir,
 };
 
-pub use dispatch::{analyze_sidecars, ktstr_main, ktstr_test_early_dispatch, run_ktstr_test};
+pub use dispatch::{
+    analyze_sidecars, ktstr_main, ktstr_test_early_dispatch, run_ktstr_test, sanitize_kernel_label,
+};
 pub(crate) use entry::validate_entry_flags;
 pub use entry::{
     BpfMapWrite, CgroupPath, KTSTR_TESTS, KtstrTestEntry, MemSideCache, NumaDistance, NumaNode,
