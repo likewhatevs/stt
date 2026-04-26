@@ -94,8 +94,8 @@ pub use metrics::{
     walk_json_leaves,
 };
 pub use model::{
-    DEFAULT_MODEL, LLM_DEBUG_RESPONSES_ENV, ModelSpec, ModelStatus, OFFLINE_ENV, ShaVerdict,
-    ensure, status,
+    CleanReport, DEFAULT_MODEL, LLM_DEBUG_RESPONSES_ENV, ModelSpec, ModelStatus, OFFLINE_ENV,
+    ShaVerdict, clean, ensure, status,
 };
 pub(crate) use output::{
     SENTINEL_EXEC_EXIT_PREFIX, SENTINEL_EXIT_PREFIX, SENTINEL_INIT_STARTED,

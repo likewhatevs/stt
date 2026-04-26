@@ -1012,6 +1012,127 @@ pub fn status(spec: &ModelSpec) -> Result<ModelStatus> {
     })
 }
 
+/// Report emitted by [`clean`]: which files were deleted (or absent)
+/// and how many bytes each freed. The two paths are returned even
+/// when their `*_freed_bytes` field is `None` so a caller rendering
+/// the operator-facing message can name the path that was checked
+/// (and confirm the cache root resolved as expected) regardless of
+/// whether the file was actually present.
+///
+/// Pre-1.0: callers (`cargo ktstr model clean`) read these fields
+/// directly; no `Display` impl is provided because the renderer
+/// belongs to the consumer (CLI) layer rather than the library.
+#[derive(Debug, Clone)]
+pub struct CleanReport {
+    /// Cache path of the GGUF artifact (`{cache_root}/models/{file}`).
+    /// Always populated: even on the absent-file branch the caller
+    /// wants to report which path was checked.
+    pub artifact_path: PathBuf,
+    /// `Some(N)` when the artifact existed at `artifact_path` and
+    /// was deleted (N is the file size in bytes captured before
+    /// `remove_file`). `None` when the artifact was absent — no
+    /// deletion happened.
+    pub artifact_freed_bytes: Option<u64>,
+    /// Path of the `.mtime-size` warm-cache sidecar that lives
+    /// alongside `artifact_path`. Always populated for the same
+    /// reason as `artifact_path`.
+    pub sidecar_path: PathBuf,
+    /// `Some(N)` when the sidecar existed and was deleted; `None`
+    /// when absent. Independent of `artifact_freed_bytes` because
+    /// the sidecar can be present without the artifact (sidecar
+    /// is a warm-cache helper, not a guard) and vice versa.
+    pub sidecar_freed_bytes: Option<u64>,
+}
+
+impl CleanReport {
+    /// `true` when neither the artifact nor the sidecar existed —
+    /// the "no cached model found" case. Callers branch on this to
+    /// emit a single "nothing to clean" line instead of two
+    /// "(absent)" lines.
+    pub fn is_empty(&self) -> bool {
+        self.artifact_freed_bytes.is_none() && self.sidecar_freed_bytes.is_none()
+    }
+
+    /// Total bytes freed by the clean operation (artifact + sidecar).
+    /// Sidecar size is typically ~50 bytes (a magic header line and
+    /// a `mtime size` line); artifact is the multi-GiB GGUF. The
+    /// sum is what operators want to see as "freed" — splitting
+    /// the two would over-emphasize the sidecar.
+    pub fn total_freed_bytes(&self) -> u64 {
+        self.artifact_freed_bytes.unwrap_or(0) + self.sidecar_freed_bytes.unwrap_or(0)
+    }
+}
+
+/// Remove the cached GGUF artifact for `spec` plus its `.mtime-size`
+/// warm-cache sidecar, returning a [`CleanReport`] describing what
+/// was deleted and how many bytes were freed.
+///
+/// Both files are removed independently — a caller cleaning up
+/// after a corrupt fetch may have one file but not the other on
+/// disk (e.g. the partial download landed at the artifact path
+/// without the sidecar ever being written, or a manual edit
+/// removed the artifact but left the sidecar pointing at stale
+/// metadata). Each file's size is captured BEFORE `remove_file`
+/// so the report is accurate even if the unlink race-loses to
+/// another process.
+///
+/// Errors:
+///  - [`resolve_cache_root`] failure (HOME unset, KTSTR_CACHE_DIR
+///    non-UTF-8, etc.) propagates up — the operator needs the
+///    cache root before any deletion can happen.
+///  - `metadata` errors other than `NotFound` propagate up so a
+///    permission-denied or I/O failure surfaces actionably
+///    instead of being swallowed.
+///  - `remove_file` errors propagate up for the same reason. A
+///    successful metadata read followed by a failed remove is the
+///    main case here (concurrent unlink, read-only filesystem).
+///
+/// Subsequent `cargo ktstr model fetch` re-downloads the pin from
+/// scratch; subsequent `cargo ktstr model status` reports
+/// `NotCached`.
+pub fn clean(spec: &ModelSpec) -> Result<CleanReport> {
+    let root = resolve_cache_root()?;
+    let artifact_path = root.join(spec.file_name);
+    let sidecar_path = mtime_size_sidecar_path(&artifact_path);
+
+    let artifact_freed_bytes = remove_if_present(&artifact_path)?;
+    let sidecar_freed_bytes = remove_if_present(&sidecar_path)?;
+
+    Ok(CleanReport {
+        artifact_path,
+        artifact_freed_bytes,
+        sidecar_path,
+        sidecar_freed_bytes,
+    })
+}
+
+/// Capture the size and remove the file at `path`. Returns
+/// `Ok(Some(size))` when the file existed and was deleted,
+/// `Ok(None)` when absent (no error), and propagates other I/O
+/// failures (permission denied, read-only filesystem, dangling
+/// symlink whose target is unreachable, etc.) so [`clean`] surfaces
+/// them rather than silently dropping the cleanup.
+///
+/// Size is captured BEFORE `remove_file` so the returned count
+/// describes what was actually freed even if a peer process
+/// races to truncate the file between metadata and remove.
+fn remove_if_present(path: &std::path::Path) -> Result<Option<u64>> {
+    use anyhow::Context;
+
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let size = meta.len();
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove cached model file {}", path.display()))?;
+            Ok(Some(size))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            Err(e).with_context(|| format!("stat cached model file {} for cleanup", path.display()))
+        }
+    }
+}
+
 /// Magic header line prefixing every
 /// `{artifact}.mtime-size` warm-cache sidecar. A sidecar whose
 /// first line does not match this literal is rejected as
@@ -2958,6 +3079,198 @@ mod tests {
             "absent file must produce ShaVerdict::NotCached (no \
              check performed); got: {:?}",
             st.sha_verdict,
+        );
+    }
+
+    // ─── clean() — `cargo ktstr model clean` library helper ──────
+
+    /// `clean()` on a populated cache deletes both the GGUF
+    /// artifact and its `.mtime-size` warm-cache sidecar, returning
+    /// per-file freed-byte counts that match what was on disk.
+    /// Pins the happy-path contract that `cargo ktstr model clean`
+    /// builds its rendered output on.
+    #[test]
+    fn clean_removes_artifact_and_sidecar_and_reports_freed_bytes() {
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
+        let spec = ModelSpec {
+            file_name: "to-clean.gguf",
+            url: "https://placeholder.example/to-clean.gguf",
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let artifact_path = cache.path().join(spec.file_name);
+        let sidecar_path = mtime_size_sidecar_path(&artifact_path);
+        let artifact_bytes = b"fake gguf body, exact length pinned by the assertion below";
+        let sidecar_bytes = b"KTSTR_SHA_MTIME_SIZE_V1\n123 456\n";
+        std::fs::write(&artifact_path, artifact_bytes).expect("plant artifact");
+        std::fs::write(&sidecar_path, sidecar_bytes).expect("plant sidecar");
+
+        let report = clean(&spec).expect("clean must succeed when files exist");
+
+        assert_eq!(report.artifact_path, artifact_path);
+        assert_eq!(report.sidecar_path, sidecar_path);
+        assert_eq!(
+            report.artifact_freed_bytes,
+            Some(artifact_bytes.len() as u64),
+            "artifact_freed_bytes must equal the planted artifact size",
+        );
+        assert_eq!(
+            report.sidecar_freed_bytes,
+            Some(sidecar_bytes.len() as u64),
+            "sidecar_freed_bytes must equal the planted sidecar size",
+        );
+        assert!(
+            !artifact_path.exists(),
+            "artifact must be removed from disk after clean",
+        );
+        assert!(
+            !sidecar_path.exists(),
+            "sidecar must be removed from disk after clean",
+        );
+        assert!(
+            !report.is_empty(),
+            "is_empty() must be false when at least one file was removed",
+        );
+        assert_eq!(
+            report.total_freed_bytes(),
+            (artifact_bytes.len() + sidecar_bytes.len()) as u64,
+            "total_freed_bytes() must sum artifact + sidecar bytes",
+        );
+    }
+
+    /// `clean()` on an empty cache returns a [`CleanReport`] whose
+    /// freed-byte fields are both `None` and whose `is_empty()`
+    /// helper returns `true`. The CLI surface (`cargo ktstr model
+    /// clean`) branches on `is_empty()` to print the "no cached
+    /// model found" line, so the contract is load-bearing.
+    #[test]
+    fn clean_empty_cache_reports_is_empty() {
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
+        let spec = ModelSpec {
+            file_name: "absent.gguf",
+            url: "https://placeholder.example/absent.gguf",
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let report = clean(&spec).expect("clean must succeed when nothing is cached");
+        assert_eq!(report.artifact_path, cache.path().join(spec.file_name));
+        assert_eq!(
+            report.sidecar_path,
+            mtime_size_sidecar_path(&cache.path().join(spec.file_name)),
+        );
+        assert!(
+            report.artifact_freed_bytes.is_none(),
+            "artifact_freed_bytes must be None when artifact was absent; got {:?}",
+            report.artifact_freed_bytes,
+        );
+        assert!(
+            report.sidecar_freed_bytes.is_none(),
+            "sidecar_freed_bytes must be None when sidecar was absent; got {:?}",
+            report.sidecar_freed_bytes,
+        );
+        assert!(
+            report.is_empty(),
+            "is_empty() must be true when no files were removed",
+        );
+        assert_eq!(
+            report.total_freed_bytes(),
+            0,
+            "total_freed_bytes() must be 0 on an empty cache",
+        );
+    }
+
+    /// `clean()` removes whichever of (artifact, sidecar) exists and
+    /// reports `None` for the absent one — the two unlinks are
+    /// independent. Catches a regression that gated sidecar removal
+    /// on artifact presence (or vice versa), which would leave stale
+    /// sidecars behind after a manual artifact-only delete.
+    #[test]
+    fn clean_removes_orphaned_sidecar_when_artifact_absent() {
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
+        let spec = ModelSpec {
+            file_name: "orphan.gguf",
+            url: "https://placeholder.example/orphan.gguf",
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let artifact_path = cache.path().join(spec.file_name);
+        let sidecar_path = mtime_size_sidecar_path(&artifact_path);
+        // Plant ONLY the sidecar — the artifact stays absent.
+        let sidecar_bytes = b"KTSTR_SHA_MTIME_SIZE_V1\n111 222\n";
+        std::fs::write(&sidecar_path, sidecar_bytes).expect("plant orphan sidecar");
+
+        let report = clean(&spec).expect("clean must succeed on a sidecar-only cache");
+
+        assert!(
+            report.artifact_freed_bytes.is_none(),
+            "no artifact on disk → artifact_freed_bytes must be None",
+        );
+        assert_eq!(
+            report.sidecar_freed_bytes,
+            Some(sidecar_bytes.len() as u64),
+            "orphaned sidecar must be removed and its size reported",
+        );
+        assert!(
+            !sidecar_path.exists(),
+            "orphaned sidecar must be removed from disk",
+        );
+        assert!(
+            !report.is_empty(),
+            "is_empty() must be false when the sidecar was removed",
+        );
+    }
+
+    /// Symmetric to `clean_removes_orphaned_sidecar_when_artifact_absent`:
+    /// when only the artifact is on disk (no sidecar), `clean()` must
+    /// still remove the artifact and report `None` for the sidecar.
+    /// Catches the inverse coupling regression — a code change that
+    /// only invokes `remove_if_present` for the sidecar when the
+    /// artifact removal succeeded would pass the orphan-sidecar
+    /// test (sidecar removed regardless) but fail this test (the
+    /// artifact must still be removed when the sidecar is absent).
+    /// Together the two tests pin both directions of the
+    /// independence contract.
+    #[test]
+    fn clean_removes_artifact_when_sidecar_absent() {
+        let _lock = lock_env();
+        let cache = isolated_cache_dir();
+        let spec = ModelSpec {
+            file_name: "artifact-only.gguf",
+            url: "https://placeholder.example/artifact-only.gguf",
+            sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 1,
+        };
+        let artifact_path = cache.path().join(spec.file_name);
+        let sidecar_path = mtime_size_sidecar_path(&artifact_path);
+        // Plant ONLY the artifact — the sidecar stays absent.
+        let artifact_bytes = b"artifact-only body, sidecar will not be planted";
+        std::fs::write(&artifact_path, artifact_bytes).expect("plant artifact-only");
+
+        let report = clean(&spec).expect("clean must succeed on an artifact-only cache");
+
+        assert_eq!(
+            report.artifact_freed_bytes,
+            Some(artifact_bytes.len() as u64),
+            "artifact must be removed and its size reported",
+        );
+        assert!(
+            report.sidecar_freed_bytes.is_none(),
+            "no sidecar on disk → sidecar_freed_bytes must be None",
+        );
+        assert!(
+            !artifact_path.exists(),
+            "artifact must be removed from disk",
+        );
+        assert!(
+            !sidecar_path.exists(),
+            "sidecar that was never planted must remain absent",
+        );
+        assert!(
+            !report.is_empty(),
+            "is_empty() must be false when the artifact was removed",
         );
     }
 

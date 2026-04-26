@@ -345,11 +345,13 @@ cargo ktstr kernel clean --corrupt-only --force   # remove only corrupt entries
 Manage the LLM model cache used by `OutputFormat::LlmExtract`
 payloads. `fetch` downloads the default pinned model into the
 ktstr model cache; `status` reports whether a SHA-checked copy
-is already cached.
+is already cached; `clean` deletes the cached artifact plus
+its warm-cache sidecar.
 
 ```sh
 cargo ktstr model fetch                          # download + SHA-check (no-op if cached)
 cargo ktstr model status                         # report cache path + verdict
+cargo ktstr model clean                          # delete cached artifact + sidecar
 ```
 
 `fetch` is a no-op when the cache already holds a SHA-checked
@@ -377,6 +379,19 @@ not be SHA-checked due to an I/O error — re-fetch),
 digest — re-fetch), `Matches` (silent — the all-clear path).
 Re-fetch is the shared remediation tail for every cached-but-
 not-Matches branch.
+
+`clean` removes both the GGUF artifact at
+`{cache_root}/models/{file_name}` and its `.mtime-size`
+warm-cache sidecar (a small companion file the SHA fast-path
+uses to skip re-hashing on subsequent `status` calls). Per-
+file output names what was deleted with an IEC-prefixed size
+in parentheses (`removed /path/to/Qwen3-4B-Q4_K_M.gguf (2.34
+GiB)`); a final `freed N total` line sums the artifact and
+sidecar bytes. A no-op clean (nothing cached) prints a single
+`no cached model found at {path}` line so an idempotent re-run
+produces a clear "nothing to do" outcome instead of two
+"(absent)" lines. Subsequent `cargo ktstr model fetch`
+re-downloads the pin from scratch.
 
 ## verifier
 

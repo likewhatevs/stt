@@ -160,7 +160,8 @@ enum KtstrCommand {
     /// payloads. `fetch` downloads the default pinned model to
     /// `~/.cache/ktstr/models/` (respecting `KTSTR_CACHE_DIR` /
     /// `XDG_CACHE_HOME`); `status` reports whether a SHA-checked copy
-    /// is already cached.
+    /// is already cached; `clean` deletes the cached artifact and
+    /// its `.mtime-size` warm-cache sidecar.
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -346,6 +347,10 @@ enum ModelCommand {
     /// Print the cache path for the default model and whether a
     /// SHA-checked copy is already present.
     Status,
+    /// Delete the cached GGUF artifact and its `.mtime-size`
+    /// warm-cache sidecar. Subsequent `model fetch` re-downloads
+    /// the pin from scratch. No-op when nothing is cached.
+    Clean,
 }
 
 // `clippy::large_enum_variant` triggers because clap's argument
@@ -3030,6 +3035,50 @@ fn run_model_status() -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo ktstr model clean` — remove the cached GGUF artifact and
+/// its `.mtime-size` sidecar. Wraps
+/// `ktstr::test_support::clean` and renders the resulting
+/// [`ktstr::test_support::CleanReport`] as a per-file deletion
+/// log plus a total-freed summary line. Sizes pass through
+/// `indicatif::HumanBytes` for IEC-prefixed rendering ("2.34 GiB",
+/// "52 B") consistent with the rest of the model surface.
+///
+/// Empty-cache case (neither file present) prints a single
+/// "no cached model found" line so an idempotent re-run after a
+/// successful clean produces a clear "nothing to do" outcome
+/// rather than two "(absent)" lines.
+fn run_model_clean() -> Result<(), String> {
+    let spec = ktstr::test_support::DEFAULT_MODEL;
+    let report =
+        ktstr::test_support::clean(&spec).map_err(|e| format!("clean model cache: {e:#}"))?;
+    if report.is_empty() {
+        println!(
+            "no cached model found at {}",
+            report.artifact_path.display()
+        );
+        return Ok(());
+    }
+    if let Some(bytes) = report.artifact_freed_bytes {
+        println!(
+            "removed {} ({})",
+            report.artifact_path.display(),
+            indicatif::HumanBytes(bytes),
+        );
+    }
+    if let Some(bytes) = report.sidecar_freed_bytes {
+        println!(
+            "removed {} ({})",
+            report.sidecar_path.display(),
+            indicatif::HumanBytes(bytes),
+        );
+    }
+    println!(
+        "freed {} total",
+        indicatif::HumanBytes(report.total_freed_bytes()),
+    );
+    Ok(())
+}
+
 fn main() {
     // Restore SIGPIPE so piping `cargo ktstr ... | head` doesn't
     // panic inside `print!`. See `ktstr::cli::restore_sigpipe_default`
@@ -3101,6 +3150,7 @@ fn main() {
         KtstrCommand::Model { command } => match command {
             ModelCommand::Fetch => run_model_fetch(),
             ModelCommand::Status => run_model_status(),
+            ModelCommand::Clean => run_model_clean(),
         },
         KtstrCommand::Verifier {
             scheduler,

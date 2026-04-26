@@ -588,11 +588,13 @@ linked llama.cpp version.
 **Fix:**
 
 - Delete the cached file and re-fetch:
-  `rm <path-from-error> && cargo ktstr model fetch`. The fetch
-  re-downloads from the pinned URL and SHA-checks the result.
+  `cargo ktstr model clean && cargo ktstr model fetch`. `clean`
+  removes both the GGUF artifact and its `.mtime-size` warm-cache
+  sidecar; `fetch` re-downloads from the pinned URL and SHA-checks
+  the result.
 - If `model status` reports `Mismatches`, the local file's hash
   diverged from the pinned digest — `cargo ktstr model fetch` will
-  refuse to overwrite a corrupt cache and the explicit `rm` is
+  refuse to overwrite a corrupt cache and the explicit `clean` is
   required first.
 - If you set `KTSTR_MODEL_OFFLINE=1`, unset it for the re-fetch.
   See [`cargo ktstr model`](running-tests/cargo-ktstr.md#model).
