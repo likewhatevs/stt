@@ -2018,6 +2018,143 @@ pub fn list_runs() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pool every sidecar under the runs root (or `dir` when set) and
+/// emit the distinct values present on each filterable dimension.
+///
+/// Six dimensions are reported, matching the six fields on
+/// [`RowFilter`]: `kernel` (from `SidecarResult::kernel_version`),
+/// `scheduler`, `topology`, `work_type`, `commit`
+/// (from `SidecarResult::project_commit`), and `flags` (individual
+/// flag names, exploded from each row's `active_flags`). The
+/// dimension catalogue here matches what `cargo ktstr stats compare`
+/// accepts as `--X` and `--a-X` / `--b-X` filter flags — the
+/// command exists so an operator can answer "what kernel versions
+/// are in the pool?" before crafting a compare invocation.
+///
+/// `kernel_version` and `project_commit` are `Option<String>` on
+/// the source sidecar; absence is reported as a literal JSON `null`
+/// in the JSON shape and the textual sentinel `unknown` in the
+/// table shape. The set is sorted by the type's natural ordering
+/// (`BTreeSet`); `None` collates before any populated value in
+/// `Option<String>` ordering, so `null` / `unknown` always lands
+/// at the top of the per-dimension listing.
+///
+/// `flags` is exploded: each entry in any row's `active_flags`
+/// vector becomes a single value in the flag set. The
+/// `--flag NAME` filter on `compare` matches individual flag
+/// names so the discovery output mirrors the filter's input shape.
+/// A scheduler that activates `["llc", "rusty_balance"]` therefore
+/// contributes two distinct entries to this dimension's set.
+///
+/// `json=true` emits a JSON object keyed by dimension name with
+/// arrays of values (with `null` interleaved for absent
+/// `kernel`/`commit` entries); `json=false` emits a per-dimension
+/// human-readable block with the values one per line.
+///
+/// `dir` mirrors `compare_partitions` / `show_run_host` semantics:
+/// when `Some(d)`, `d` replaces `runs_root()` as the pool source;
+/// when `None`, `runs_root()` is used.
+pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<String> {
+    use std::collections::BTreeSet;
+
+    let root: std::path::PathBuf = match dir {
+        Some(d) => d.to_path_buf(),
+        None => crate::test_support::runs_root(),
+    };
+    let pool = crate::test_support::collect_pool(&root);
+
+    let mut kernels: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut commits: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut schedulers: BTreeSet<String> = BTreeSet::new();
+    let mut topologies: BTreeSet<String> = BTreeSet::new();
+    let mut work_types: BTreeSet<String> = BTreeSet::new();
+    let mut flags: BTreeSet<String> = BTreeSet::new();
+
+    for sc in &pool {
+        kernels.insert(sc.kernel_version.clone());
+        commits.insert(sc.project_commit.clone());
+        schedulers.insert(sc.scheduler.clone());
+        topologies.insert(sc.topology.clone());
+        work_types.insert(sc.work_type.clone());
+        for f in &sc.active_flags {
+            flags.insert(f.clone());
+        }
+    }
+
+    if json {
+        let kernels_json: Vec<serde_json::Value> = kernels
+            .iter()
+            .map(|opt| match opt {
+                Some(s) => serde_json::Value::String(s.clone()),
+                None => serde_json::Value::Null,
+            })
+            .collect();
+        let commits_json: Vec<serde_json::Value> = commits
+            .iter()
+            .map(|opt| match opt {
+                Some(s) => serde_json::Value::String(s.clone()),
+                None => serde_json::Value::Null,
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "kernel": kernels_json,
+            "commit": commits_json,
+            "scheduler": schedulers.iter().collect::<Vec<_>>(),
+            "topology": topologies.iter().collect::<Vec<_>>(),
+            "work_type": work_types.iter().collect::<Vec<_>>(),
+            "flags": flags.iter().collect::<Vec<_>>(),
+        });
+        return serde_json::to_string_pretty(&payload)
+            .map(|mut s| {
+                s.push('\n');
+                s
+            })
+            .map_err(|e| anyhow::anyhow!("serialize list-values JSON: {e}"));
+    }
+
+    let mut out = String::new();
+    let render_opt_set = |out: &mut String, label: &str, set: &BTreeSet<Option<String>>| {
+        out.push_str(label);
+        out.push('\n');
+        if set.is_empty() {
+            out.push_str("  (no sidecars in pool)\n");
+        } else {
+            for opt in set {
+                match opt {
+                    Some(s) => {
+                        out.push_str("  ");
+                        out.push_str(s);
+                        out.push('\n');
+                    }
+                    None => out.push_str("  unknown\n"),
+                }
+            }
+        }
+        out.push('\n');
+    };
+    let render_str_set = |out: &mut String, label: &str, set: &BTreeSet<String>| {
+        out.push_str(label);
+        out.push('\n');
+        if set.is_empty() {
+            out.push_str("  (no sidecars in pool)\n");
+        } else {
+            for s in set {
+                out.push_str("  ");
+                out.push_str(s);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    };
+    render_opt_set(&mut out, "kernel:", &kernels);
+    render_opt_set(&mut out, "commit:", &commits);
+    render_str_set(&mut out, "scheduler:", &schedulers);
+    render_str_set(&mut out, "topology:", &topologies);
+    render_str_set(&mut out, "work_type:", &work_types);
+    render_str_set(&mut out, "flags:", &flags);
+    Ok(out)
+}
+
 /// One significant per-metric finding produced by [`compare_rows`].
 ///
 /// `pairing_key` carries the dynamic identity the row pair joined
@@ -3611,6 +3748,283 @@ mod tests {
             );
             last_pos = pos;
         }
+    }
+
+    // -- list_values --
+
+    /// Helper that writes N sidecars to `{root}/{run_key}/{run_key}.ktstr.json`.
+    /// Each sidecar overrides only the fields the test wants to vary;
+    /// the rest come from `SidecarResult::test_fixture()`. Used by the
+    /// `list_values_*` tests to build pool fixtures isolated from
+    /// `runs_root()`.
+    fn write_listvalues_fixture(
+        root: &std::path::Path,
+        sidecars: &[crate::test_support::SidecarResult],
+    ) {
+        for (i, sc) in sidecars.iter().enumerate() {
+            let run_key = format!("__lv_fixture_{i}__");
+            let run_dir = root.join(&run_key);
+            std::fs::create_dir_all(&run_dir).expect("create run dir");
+            let json = serde_json::to_string(sc).expect("serialize fixture sidecar");
+            let path = run_dir.join(format!("{run_key}.ktstr.json"));
+            std::fs::write(&path, json).expect("write fixture sidecar");
+        }
+    }
+
+    /// Empty pool (no run subdirs) must produce a well-formed text
+    /// shape with the "(no sidecars in pool)" sentinel under each
+    /// dimension heading. The function does NOT bail — discovery on
+    /// an empty pool is a valid query that should answer "nothing"
+    /// rather than fail.
+    #[test]
+    fn list_values_empty_pool_text_has_sentinel_per_dim() {
+        let alt = tempfile::TempDir::new().expect("tempdir");
+        let out = list_values(false, Some(alt.path())).expect("text render must succeed");
+        for dim in [
+            "kernel:",
+            "commit:",
+            "scheduler:",
+            "topology:",
+            "work_type:",
+            "flags:",
+        ] {
+            assert!(
+                out.contains(dim),
+                "text output must include heading for {dim}: {out}",
+            );
+        }
+        // Each dim should report the empty-pool sentinel exactly six
+        // times — one per dim — so a regression that dropped the
+        // sentinel for one dim falls out as a count mismatch.
+        let sentinel_count = out.matches("(no sidecars in pool)").count();
+        assert_eq!(
+            sentinel_count, 6,
+            "empty pool must surface the no-sidecars sentinel under every \
+             one of the 6 dims (kernel/commit/scheduler/topology/work_type/flags); \
+             got {sentinel_count} occurrences in:\n{out}",
+        );
+    }
+
+    /// Empty pool → JSON object with empty arrays for every dim.
+    /// Pins the JSON shape so a regression that dropped a key (e.g.
+    /// "scheduler") on the empty-pool branch surfaces here.
+    #[test]
+    fn list_values_empty_pool_json_emits_empty_arrays() {
+        let alt = tempfile::TempDir::new().expect("tempdir");
+        let out = list_values(true, Some(alt.path())).expect("json render must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json output must parse");
+        for dim in [
+            "kernel",
+            "commit",
+            "scheduler",
+            "topology",
+            "work_type",
+            "flags",
+        ] {
+            let arr = parsed
+                .get(dim)
+                .unwrap_or_else(|| panic!("missing key {dim}"));
+            assert!(arr.is_array(), "key {dim} must serialize as an array");
+            assert_eq!(
+                arr.as_array().unwrap().len(),
+                0,
+                "key {dim} must be an empty array on empty pool",
+            );
+        }
+    }
+
+    /// Populated pool: distinct values per dim are deduplicated and
+    /// sorted; flags are exploded (each entry of `active_flags`
+    /// becomes one set member); `kernel_version: None` and
+    /// `project_commit: None` produce a `null` entry (JSON) and
+    /// `unknown` line (text).
+    #[test]
+    fn list_values_text_dedupes_and_sorts_per_dim() {
+        use crate::test_support::SidecarResult;
+
+        let alt = tempfile::TempDir::new().expect("tempdir");
+        let sidecars = vec![
+            SidecarResult {
+                test_name: "t_a".to_string(),
+                topology: "1n2l4c1t".to_string(),
+                scheduler: "scx_rusty".to_string(),
+                work_type: "CpuSpin".to_string(),
+                active_flags: vec!["llc".to_string(), "rusty_balance".to_string()],
+                kernel_version: Some("6.14.2".to_string()),
+                project_commit: Some("abcdef1".to_string()),
+                ..SidecarResult::test_fixture()
+            },
+            SidecarResult {
+                test_name: "t_b".to_string(),
+                topology: "1n4l2c1t".to_string(),
+                scheduler: "eevdf".to_string(),
+                work_type: "PageFaultChurn".to_string(),
+                active_flags: vec!["llc".to_string()],
+                kernel_version: None,
+                project_commit: None,
+                ..SidecarResult::test_fixture()
+            },
+            // Duplicate of the first sidecar's identity-fields; the
+            // BTreeSet must dedupe so each value lands once in the
+            // rendered output.
+            SidecarResult {
+                test_name: "t_c".to_string(),
+                topology: "1n2l4c1t".to_string(),
+                scheduler: "scx_rusty".to_string(),
+                work_type: "CpuSpin".to_string(),
+                active_flags: vec!["rusty_balance".to_string()],
+                kernel_version: Some("6.14.2".to_string()),
+                project_commit: Some("abcdef1".to_string()),
+                ..SidecarResult::test_fixture()
+            },
+        ];
+        write_listvalues_fixture(alt.path(), &sidecars);
+
+        let out = list_values(false, Some(alt.path())).expect("text render must succeed");
+
+        // Dedupe: each distinct VALUE appears EXACTLY once per
+        // dim (set semantics) even though "scx_rusty" / "1n2l4c1t"
+        // / "CpuSpin" / "abcdef1" / "6.14.2" come from two of the
+        // three fixtures. Each value below is unique to its dim
+        // so it should appear once across the rendered text. The
+        // `unknown` sentinel is checked separately because both
+        // `kernel` and `commit` are optional dims and each emits
+        // its own `unknown` line.
+        for value in [
+            "6.14.2",
+            "abcdef1",
+            "scx_rusty",
+            "eevdf",
+            "1n2l4c1t",
+            "1n4l2c1t",
+            "CpuSpin",
+            "PageFaultChurn",
+            "llc",
+            "rusty_balance",
+        ] {
+            let count = out.matches(value).count();
+            assert_eq!(
+                count, 1,
+                "value {value} must appear exactly once in text output (BTreeSet dedup); \
+                 got {count} in:\n{out}",
+            );
+        }
+        // `unknown` appears once per Optional dim that has a None
+        // entry: kernel and commit. Both fixtures' second sidecar
+        // has `kernel_version: None` and `project_commit: None`
+        // so we expect 2 occurrences total.
+        let unknown_count = out.matches("unknown").count();
+        assert_eq!(
+            unknown_count, 2,
+            "`unknown` must render once per optional dim with a None \
+             entry (kernel + commit = 2); got {unknown_count} in:\n{out}",
+        );
+
+        // Sort: both schedulers in ascending lex order means
+        // "eevdf" appears BEFORE "scx_rusty" in the rendered text.
+        let pos_eevdf = out.find("eevdf").expect("eevdf in output");
+        let pos_rusty = out.find("scx_rusty").expect("scx_rusty in output");
+        assert!(
+            pos_eevdf < pos_rusty,
+            "values within a dim must render sorted (BTreeSet iter order); \
+             expected 'eevdf' before 'scx_rusty' in:\n{out}",
+        );
+    }
+
+    /// JSON shape: `kernel` and `commit` arrays carry `null` for
+    /// absent values, `Value::String` for present values; the other
+    /// four dims are bare `String` arrays. `flags` is exploded —
+    /// individual flag names, not the joined-set string.
+    #[test]
+    fn list_values_json_carries_null_for_optional_dims() {
+        use crate::test_support::SidecarResult;
+
+        let alt = tempfile::TempDir::new().expect("tempdir");
+        let sidecars = vec![
+            SidecarResult {
+                test_name: "t_known".to_string(),
+                kernel_version: Some("6.14.2".to_string()),
+                project_commit: Some("abcdef1".to_string()),
+                active_flags: vec!["llc".to_string(), "rusty_balance".to_string()],
+                ..SidecarResult::test_fixture()
+            },
+            SidecarResult {
+                test_name: "t_unknown".to_string(),
+                kernel_version: None,
+                project_commit: None,
+                active_flags: vec![],
+                ..SidecarResult::test_fixture()
+            },
+        ];
+        write_listvalues_fixture(alt.path(), &sidecars);
+
+        let out = list_values(true, Some(alt.path())).expect("json render must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json output must parse");
+
+        let kernel = parsed
+            .get("kernel")
+            .expect("kernel key")
+            .as_array()
+            .unwrap();
+        assert!(
+            kernel.iter().any(|v| v.is_null()),
+            "kernel array must include a literal null for the None entry; got {kernel:?}",
+        );
+        assert!(
+            kernel.iter().any(|v| v.as_str() == Some("6.14.2")),
+            "kernel array must include the populated value 6.14.2; got {kernel:?}",
+        );
+
+        let commit = parsed
+            .get("commit")
+            .expect("commit key")
+            .as_array()
+            .unwrap();
+        assert!(
+            commit.iter().any(|v| v.is_null()),
+            "commit array must include a literal null for the None entry; got {commit:?}",
+        );
+        assert!(
+            commit.iter().any(|v| v.as_str() == Some("abcdef1")),
+            "commit array must include the populated value abcdef1; got {commit:?}",
+        );
+
+        // Flags: exploded — both "llc" and "rusty_balance" appear
+        // as DISTINCT entries, NOT a single "llc|rusty_balance"
+        // string.
+        let flags = parsed.get("flags").expect("flags key").as_array().unwrap();
+        assert_eq!(
+            flags.len(),
+            2,
+            "flags must explode to individual names — expected 2 \
+             entries (llc, rusty_balance), got {flags:?}",
+        );
+        let flag_names: Vec<&str> = flags
+            .iter()
+            .map(|v| v.as_str().expect("flag is string"))
+            .collect();
+        assert!(flag_names.contains(&"llc"));
+        assert!(flag_names.contains(&"rusty_balance"));
+    }
+
+    /// `dir = None` resolves against `runs_root()`; if `runs_root()`
+    /// does not exist, the function returns Ok with empty arrays /
+    /// per-dim sentinel rather than bailing. Pins the no-bail
+    /// contract on missing-root.
+    #[test]
+    fn list_values_none_dir_does_not_bail_on_missing_root() {
+        // We cannot reliably wipe `runs_root()` from a unit test, but
+        // we can pin the "Some(nonexistent_path)" branch which
+        // exercises the same `collect_pool -> empty Vec` codepath
+        // (`fs::read_dir` returns Err on a missing root, and
+        // `collect_pool` swallows that into an empty pool).
+        let alt = tempfile::TempDir::new().expect("tempdir");
+        let nonexistent = alt.path().join("definitely_does_not_exist");
+        let out = list_values(false, Some(&nonexistent)).expect("must not bail on missing root");
+        assert!(
+            out.contains("(no sidecars in pool)"),
+            "missing root must render the no-sidecars sentinel: {out}",
+        );
     }
 
     // -- MetricDef::read tests --

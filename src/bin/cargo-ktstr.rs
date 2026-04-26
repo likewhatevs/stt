@@ -378,6 +378,37 @@ enum StatsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List the distinct values present per filterable dimension in
+    /// the sidecar pool.
+    ///
+    /// Walks every run directory under `runs_root()` (or `--dir`),
+    /// pools the sidecars, and reports the set of distinct values
+    /// found per dimension: `kernel`, `commit`, `scheduler`,
+    /// `topology`, `work_type`, and `flags` (individual flag
+    /// names). Use this before crafting a `cargo ktstr stats
+    /// compare` invocation to discover what `--a-X` / `--b-X`
+    /// values the pool actually carries — a `--a-kernel 6.20`
+    /// against an empty pool fails downstream with "no rows match
+    /// filter A", and `list-values` is the upstream answer to "what
+    /// kernels do I have?".
+    ///
+    /// Default output renders one block per dimension with values
+    /// one per line; `--json` emits a single JSON object keyed by
+    /// dimension name. Optional dimensions (`kernel`, `commit`)
+    /// surface absent values as the textual sentinel `unknown` in
+    /// the table shape and as JSON `null` in the JSON shape.
+    ListValues {
+        /// Emit JSON instead of a per-dimension text block.
+        #[arg(long)]
+        json: bool,
+        /// Alternate run root to walk. Defaults to
+        /// `test_support::runs_root()` (typically `target/ktstr/`).
+        /// Same semantics as `cargo ktstr stats compare --dir` and
+        /// `cargo ktstr stats show-host --dir`: useful when
+        /// inspecting archived sidecar trees copied off a CI host.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
     /// Print the archived host context for a specific run.
     ///
     /// Resolves `--run <id>` against `test_support::runs_root()`
@@ -1074,6 +1105,15 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             }
             Err(e) => Err(format!("{e:#}")),
         },
+        Some(StatsCommand::ListValues { json, dir }) => {
+            match cli::list_values(*json, dir.as_deref()) {
+                Ok(s) => {
+                    print!("{s}");
+                    Ok(())
+                }
+                Err(e) => Err(format!("{e:#}")),
+            }
+        }
         Some(StatsCommand::ShowHost { run, dir }) => {
             match cli::show_run_host(run, dir.as_deref()) {
                 Ok(s) => {
@@ -2561,6 +2601,95 @@ mod tests {
         assert!(
             rejected.is_err(),
             "list-metrics must reject positional arguments",
+        );
+    }
+
+    /// `cargo ktstr stats list-values` parses with no flags and
+    /// dispatches to the `ListValues` variant with `json=false` and
+    /// `dir=None`. Pins the bare-call defaults.
+    #[test]
+    fn parse_stats_list_values_bare() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-values"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::ListValues { json, dir }),
+                ..
+            } => {
+                assert!(!json, "bare `list-values` must default to text mode");
+                assert!(
+                    dir.is_none(),
+                    "bare `list-values` must default to no --dir override"
+                );
+            }
+            _ => panic!("expected Stats ListValues"),
+        }
+    }
+
+    /// `cargo ktstr stats list-values --json` sets `json=true`.
+    /// Pins the flag name so the same `--json` convention used by
+    /// `list-metrics` and `kernel list` carries here too.
+    #[test]
+    fn parse_stats_list_values_json() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-values", "--json"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::ListValues { json, .. }),
+                ..
+            } => {
+                assert!(json, "--json must set the flag true");
+            }
+            _ => panic!("expected Stats ListValues"),
+        }
+    }
+
+    /// `cargo ktstr stats list-values --dir PATH` round-trips the
+    /// path through clap to the dispatch site. Same `--dir`
+    /// convention as `compare --dir` and `show-host --dir`.
+    #[test]
+    fn parse_stats_list_values_with_dir() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "list-values",
+            "--dir",
+            "/tmp/archived-runs",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::ListValues { dir, json }),
+                ..
+            } => {
+                assert_eq!(
+                    dir.as_deref(),
+                    Some(std::path::Path::new("/tmp/archived-runs")),
+                    "--dir must round-trip to Some(PathBuf)",
+                );
+                assert!(!json, "bare --dir must not spuriously set --json");
+            }
+            _ => panic!("expected Stats ListValues"),
+        }
+    }
+
+    /// `list-values` takes no positional args — clap must reject
+    /// strays so a typo like `list-values kernel` (intending a
+    /// per-dim filter) fails loudly rather than getting silently
+    /// dropped.
+    #[test]
+    fn parse_stats_list_values_rejects_positional() {
+        let rejected = Cargo::try_parse_from(["cargo", "ktstr", "stats", "list-values", "kernel"]);
+        assert!(
+            rejected.is_err(),
+            "list-values must reject positional arguments",
         );
     }
 

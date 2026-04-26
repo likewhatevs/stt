@@ -433,6 +433,53 @@ cargo ktstr stats list-metrics --json       # JSON array
 |------|---------|-------------|
 | `--json` | off | Emit JSON instead of a table. |
 
+### list-values
+
+List the distinct values present per filterable dimension in the
+sidecar pool. Walks every run directory under `target/ktstr/`
+(or `--dir`), pools the sidecars, and reports per-dimension sets
+for `kernel`, `commit`, `scheduler`, `topology`, `work_type`,
+and `flags` (individual flag names, exploded from each row's
+`active_flags`).
+
+Use this before crafting a `cargo ktstr stats compare`
+invocation to discover what `--a-X` / `--b-X` values the pool
+actually carries: `--a-kernel 6.20` against an empty pool fails
+downstream with "no rows match filter A", and `list-values` is
+the upstream answer to "what kernels do I have?".
+
+```sh
+cargo ktstr stats list-values                       # text per-dim blocks
+cargo ktstr stats list-values --json                # JSON object
+cargo ktstr stats list-values --dir /tmp/archived   # archived sidecar tree
+```
+
+The text shape renders one block per dimension with values one
+per line. The JSON shape emits a single object keyed by
+dimension name with arrays of values:
+
+```json
+{
+  "kernel": [null, "6.14.2", "6.15.0"],
+  "commit": [null, "abcdef1", "abcdef1-dirty"],
+  "scheduler": ["eevdf", "scx_rusty"],
+  "topology": ["1n2l4c1t", "1n4l2c1t"],
+  "work_type": ["CpuSpin", "PageFaultChurn"],
+  "flags": ["llc", "rusty_balance"]
+}
+```
+
+`kernel` and `commit` are optional on the source sidecar
+(`SidecarResult::kernel_version` / `project_commit` are
+`Option<String>`); the textual sentinel `unknown` and JSON `null`
+both denote a sidecar that did not record a value for that
+dimension.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--json` | off | Emit JSON instead of per-dimension text blocks. |
+| `--dir DIR` | `target/ktstr/` | Alternate run root. Same semantics as `compare --dir`. |
+
 ### show-host
 
 Print the archived `HostContext` for a specific run: CPU identity,

@@ -1893,6 +1893,17 @@ pub fn list_metrics(json: bool) -> Result<String> {
     crate::stats::list_metrics(json)
 }
 
+/// Render the distinct-value catalogue for the sidecar pool, for
+/// `cargo ktstr stats list-values`.
+///
+/// Thin wrapper over [`crate::stats::list_values`] — exposed
+/// through `cli::` for the same surface-stability reason as
+/// [`list_metrics`]. The returned `String` is printed verbatim by
+/// the dispatch site.
+pub fn list_values(json: bool, dir: Option<&Path>) -> Result<String> {
+    crate::stats::list_values(json, dir)
+}
+
 /// Compare two filter-defined partitions of the sidecar pool and
 /// report regressions across slicing dimensions. See
 /// [`crate::stats::compare_partitions`] for the full contract.
