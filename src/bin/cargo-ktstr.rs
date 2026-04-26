@@ -985,53 +985,99 @@ fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBuf)>, String
     // out of scope, see `download_and_cache_version` /
     // `resolve_git_kernel` for the `tempfile::TempDir`-driven
     // teardown).
-    let resolved: Vec<(String, PathBuf)> = specs
-        .into_par_iter()
-        .filter_map(|raw| {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-        .flat_map_iter(|trimmed| {
-            // `flat_map_iter` returns an iterator per input. The
-            // Range arm below pre-collects every version's
-            // `resolve_one` result into a Vec before yielding,
-            // so versions WITHIN a single Range spec resolve
-            // sequentially under one rayon worker; only PEER
-            // specs (other top-level `--kernel` args) parallelize
-            // across workers. Each yielded item is an opaque
-            // `Result<(String, PathBuf), String>` driven by the
-            // shared `resolve_one` helper; rayon's `collect` on
-            // `Result` short-circuits on the first error.
-            //
-            // Validation runs first so an inverted Range bails
-            // before any I/O — same diagnostic timing the
-            // sequential loop preserved.
-            let id = KernelId::parse(&trimmed);
-            if let Err(e) = id.validate() {
-                return vec![Err(format!("--kernel {id}: {e}"))].into_iter();
-            }
-            match id {
-                KernelId::Range { start, end } => {
-                    match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr") {
-                        Ok(versions) => versions
-                            .into_iter()
-                            .map(|ver| {
-                                resolve_one(KernelId::Version(ver.clone()))
-                                    .map_err(|e| format!("resolve kernel {ver}: {e}"))
-                            })
-                            .collect::<Vec<_>>()
-                            .into_iter(),
-                        Err(e) => vec![Err(format!("{e:#}"))].into_iter(),
-                    }
+    // Cap rayon parallelism via a bounded ThreadPool installed
+    // ONLY for this resolve pipeline. Without the cap, an
+    // operator passing `--kernel A --kernel B ... --kernel Z`
+    // (10+ specs) would saturate the global rayon pool with
+    // simultaneous git_clone + tarball downloads. Each download
+    // / clone is network-bound and largely cooperative on local
+    // CPU, but the spawn cost (rayon worker steal-and-park,
+    // tempdir creation, gix or reqwest init) compounds in
+    // proportion to spec count, and a contended local network
+    // (the kernel.org CDN's per-IP throttle, a developer's home
+    // ISP, a CI runner's shared NIC) degrades when too many
+    // streams overlap.
+    //
+    // The cap is `available_parallelism()` — the host's logical
+    // CPU count, std-lib provided so no extra dependency is
+    // pulled in. Saturating local parallelism is the right
+    // ceiling: download streams shouldn't outnumber the threads
+    // the host can drive without thrashing, and the build phase
+    // is already serialized at the LLC-flock layer (see comment
+    // above) so additional download fan-out wouldn't accelerate
+    // builds anyway.
+    //
+    // Bounded ThreadPool via `pool.install(|| ...)` scopes the
+    // cap to this pipeline only — the global rayon pool is
+    // unaffected, so any other rayon-using code in the same
+    // process (test parallelism in nextest's harness, polars'
+    // groupby, etc.) keeps its own width. Falls back to the
+    // global pool if `ThreadPoolBuilder::build` fails (e.g. on
+    // a host that's already maxed its thread limits) — better
+    // to run the resolve under the default global pool than
+    // bail with a cap-construction error that has nothing to
+    // do with the user's `--kernel` input.
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let bounded_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_threads)
+        .build()
+        .ok();
+
+    let resolve_in_pool = || -> Result<Vec<(String, PathBuf)>, String> {
+        specs
+            .into_par_iter()
+            .filter_map(|raw| {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
                 }
-                other => vec![resolve_one(other)].into_iter(),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            })
+            .flat_map_iter(|trimmed| {
+                // `flat_map_iter` returns an iterator per input. The
+                // Range arm below pre-collects every version's
+                // `resolve_one` result into a Vec before yielding,
+                // so versions WITHIN a single Range spec resolve
+                // sequentially under one rayon worker; only PEER
+                // specs (other top-level `--kernel` args) parallelize
+                // across workers. Each yielded item is an opaque
+                // `Result<(String, PathBuf), String>` driven by the
+                // shared `resolve_one` helper; rayon's `collect` on
+                // `Result` short-circuits on the first error.
+                //
+                // Validation runs first so an inverted Range bails
+                // before any I/O — same diagnostic timing the
+                // sequential loop preserved.
+                let id = KernelId::parse(&trimmed);
+                if let Err(e) = id.validate() {
+                    return vec![Err(format!("--kernel {id}: {e}"))].into_iter();
+                }
+                match id {
+                    KernelId::Range { start, end } => {
+                        match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr") {
+                            Ok(versions) => versions
+                                .into_iter()
+                                .map(|ver| {
+                                    resolve_one(KernelId::Version(ver.clone()))
+                                        .map_err(|e| format!("resolve kernel {ver}: {e}"))
+                                })
+                                .collect::<Vec<_>>()
+                                .into_iter(),
+                            Err(e) => vec![Err(format!("{e:#}"))].into_iter(),
+                        }
+                    }
+                    other => vec![resolve_one(other)].into_iter(),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let resolved: Vec<(String, PathBuf)> = match bounded_pool {
+        Some(pool) => pool.install(resolve_in_pool)?,
+        None => resolve_in_pool()?,
+    };
 
     // Dedupe identical (label, path) tuples before collision
     // detection: two `--kernel 6.14.2` specs (or a Range that

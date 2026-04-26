@@ -1204,14 +1204,69 @@ pub fn kernel_clean(keep: Option<usize>, force: bool, corrupt_only: bool) -> Res
     Ok(())
 }
 
-/// Run make in a kernel directory.
+/// Run make in a kernel directory under a wall-clock timeout.
+///
+/// Used for non-build make invocations (`defconfig`, `olddefconfig`,
+/// `mrproper`, etc.) where the parent inherits stdout/stderr — the
+/// pipe-drained sibling [`run_make_with_output`] handles the full-
+/// build path with a separate EOF-driven termination.
+///
+/// The timeout protects against a wedged make holding the calling
+/// pipeline forever. Without it, a stuck `olddefconfig` (e.g. an
+/// interactive `conf` prompt that the configure_kernel pre-step
+/// failed to bypass, or a kernel-tree inconsistency that wedges
+/// `make`) would block the parent process indefinitely. The
+/// ceiling is intentionally generous — a single `make defconfig`
+/// completes in seconds on any hardware, but large WIP kernel
+/// trees with many out-of-tree patches can stretch
+/// `mrproper` / `olddefconfig` past the typical seconds-scale; 30
+/// minutes covers every legitimate caller while still bounding a
+/// genuine wedge.
+///
+/// Polls `try_wait` at 100ms granularity — small enough that a
+/// completed make is reaped within one tick, large enough that
+/// the polling itself is not measurable load. On timeout, the
+/// child is killed (SIGKILL via `kill_on_drop`-style semantics)
+/// and reaped before bailing so no zombie outlives the function.
 pub fn run_make(kernel_dir: &Path, args: &[&str]) -> Result<()> {
-    let status = std::process::Command::new("make")
+    const RUN_MAKE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    let mut child = std::process::Command::new("make")
         .args(args)
         .current_dir(kernel_dir)
-        .status()?;
-    anyhow::ensure!(status.success(), "make {} failed", args.join(" "));
-    Ok(())
+        .spawn()
+        .with_context(|| format!("spawn make {}", args.join(" ")))?;
+
+    let deadline = std::time::Instant::now() + RUN_MAKE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                anyhow::ensure!(status.success(), "make {} failed", args.join(" "));
+                return Ok(());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Wedged — kill + reap before bailing so no
+                    // zombie persists after we return Err.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "make {} timed out after {RUN_MAKE_TIMEOUT:?}; child killed",
+                        args.join(" "),
+                    );
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => {
+                // Reap before propagating so a transient try_wait
+                // failure doesn't leak the child.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e).with_context(|| format!("wait on make {}", args.join(" ")));
+            }
+        }
+    }
 }
 
 /// Ensure the kconfig fragment is applied to the kernel's .config.
@@ -1635,10 +1690,19 @@ pub fn validate_kernel_config(kernel_dir: &std::path::Path) -> Result<()> {
     let config = std::fs::read_to_string(&config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
 
+    // Build a HashSet of `.config` lines once, then probe each
+    // critical option in O(1). The previous formulation walked
+    // `config.lines()` once per critical option (O(N×M) with
+    // M≈6 critical options and N≈5000 .config lines), which
+    // turned every kernel-build pipeline into a 30K-line scan.
+    // Mirrors the HashSet-backed approach `all_fragment_lines_present`
+    // already uses for the configure-time check.
+    let existing: std::collections::HashSet<&str> = config.lines().collect();
+
     let mut missing = Vec::new();
     for &(option, hint) in VALIDATE_CONFIG_CRITICAL {
         let enabled = format!("{option}=y");
-        if !config.lines().any(|l| l == enabled) {
+        if !existing.contains(enabled.as_str()) {
             missing.push((option, hint));
         }
     }

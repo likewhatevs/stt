@@ -840,8 +840,35 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// produced this sidecar" depends on the cwd at test launch, not
 /// the build host.
 pub(crate) fn detect_project_commit() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    detect_commit_at(&cwd)
+    // Per-process memoization: the cwd is stable for the lifetime
+    // of a test process (no caller mutates it), and the project
+    // tree's HEAD plus dirty state cannot change underneath us
+    // without an explicit user action that's outside the scope
+    // of any individual sidecar write. Gauntlet runs invoke this
+    // function once per sidecar — thousands of times per process
+    // — so caching the result behind a `OnceLock` collapses every
+    // post-first call to a `Clone`. The probe itself does
+    // ~3 syscalls (gix discover + head_id + status) which dominate
+    // the sidecar-write critical path; eliminating that cost is
+    // the only meaningful perf win available here.
+    //
+    // The cache is `Option<String>` so `None` (probe failure: no
+    // git repo, unborn HEAD, etc.) also memoizes — repeating the
+    // failing probe yields the same `None`, no point re-running.
+    //
+    // CACHE DOES NOT INVALIDATE: a user who commits / amends /
+    // resets the project tree mid-run and expects the new HEAD
+    // to surface in subsequent sidecars will see stale values.
+    // This is acceptable per CLAUDE.md guidance — the project
+    // tree is treated as stable-enough for a single suite run;
+    // callers mutating the tree during a run own the consequences.
+    static PROJECT_COMMIT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PROJECT_COMMIT
+        .get_or_init(|| {
+            let cwd = std::env::current_dir().ok()?;
+            detect_commit_at(&cwd)
+        })
+        .clone()
 }
 
 /// Path-taking core of [`detect_project_commit`]. Factored out so
@@ -1028,6 +1055,40 @@ fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
 /// "treat as clean" rather than aborting the probe, because
 /// metadata must not gate sidecar writes.
 pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<String> {
+    // Per-process, path-keyed memoization. Same rationale as
+    // `detect_project_commit`: gauntlet runs invoke this function
+    // once per sidecar — thousands of times — and the kernel
+    // tree's HEAD plus dirty state cannot change underneath us
+    // mid-suite without an explicit user action outside any
+    // sidecar's control. The path key handles the fixture-test
+    // case where unit tests rotate through synthetic
+    // `tempfile::TempDir` kernel paths in the same process; each
+    // distinct path memoizes independently.
+    //
+    // `Mutex<HashMap>` rather than `OnceLock` because the input
+    // is parameterized on `kernel_dir` — a `OnceLock` collapses
+    // every input to one cached result, which would conflate
+    // different kernel directories into a single value.
+    // Contention is bounded: post-warm reads are O(1) hash
+    // lookups against a near-empty map (in production typically
+    // ONE kernel per process), and the mutex is held only for
+    // the duration of the lookup + insert.
+    //
+    // Mutex poisoning recovery: a panic mid-probe could poison
+    // the lock; the `unwrap_or_else(|e| e.into_inner())` pattern
+    // recovers the guard so a future caller doesn't fail
+    // catastrophically. The cached map is just a HashMap of
+    // owned types; no invariant beyond "key→value mapping" can
+    // be broken by an interrupted probe.
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    static KERNEL_COMMIT_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+    let cache = KERNEL_COMMIT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = guard.get(kernel_dir) {
+        return cached.clone();
+    }
     // `gix::open` (NOT `gix::discover`) — `kernel_dir` must BE the
     // repo root. Without this the parent walk could resolve to the
     // ktstr project's own `.git` when `kernel_dir` is a non-git
@@ -1036,8 +1097,11 @@ pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<Strin
     // this function and [`detect_commit_at`]; the post-open
     // "read HEAD, format short hex, append `-dirty` on dirt" body
     // lives in the shared [`commit_with_dirty_suffix`] helper.
-    let repo = gix::open(kernel_dir).ok()?;
-    commit_with_dirty_suffix(&repo)
+    let result = gix::open(kernel_dir)
+        .ok()
+        .and_then(|repo| commit_with_dirty_suffix(&repo));
+    guard.insert(kernel_dir.to_path_buf(), result.clone());
+    result
 }
 
 /// Environment variable CI runners set to mark sidecars they produce
