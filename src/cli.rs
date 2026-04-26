@@ -2635,8 +2635,17 @@ fn project_optional_fields(sc: &crate::test_support::SidecarResult) -> [(&'stati
 /// [`explain_sidecar`]. `walked` counts every `.ktstr.json`
 /// file the walker visited; `valid` counts how many parsed
 /// into a [`crate::test_support::SidecarResult`]; `errors`
-/// carries the per-file parse failures (path + serde error
-/// message).
+/// carries the per-file parse failures as
+/// `(path, raw-serde-error, optional-enrichment)` triples
+/// sourced from
+/// [`crate::test_support::collect_sidecars_with_errors`].
+///
+/// The enrichment field is `Some(prose)` for parse failures
+/// where a known schema-drift remediation applies (currently
+/// the `host` missing-field case) and `None` otherwise. Both
+/// channels are exposed so JSON consumers can render the raw
+/// serde message for grep-friendly parse-error tracking AND
+/// the enriched prose for human-facing remediation.
 ///
 /// Files whose `read_to_string` fails (permission denied,
 /// mid-rotate truncation, etc.) silently drop from both
@@ -2645,13 +2654,14 @@ fn project_optional_fields(sc: &crate::test_support::SidecarResult) -> [(&'stati
 /// is the implicit silent-drop count, zero in a clean run.
 ///
 /// `errors` surfaces in both render paths: text appends a
-/// trailing block listing corrupt paths, JSON exposes them
-/// under `_walk.errors` so dashboard consumers can surface
-/// them without parsing prose.
+/// trailing block listing corrupt paths and (when present)
+/// the enriched prose, JSON exposes them under `_walk.errors`
+/// as `{path, error, enriched_message}` entries so dashboard
+/// consumers can surface them without parsing prose.
 struct WalkStats {
     walked: usize,
     valid: usize,
-    errors: Vec<(std::path::PathBuf, String)>,
+    errors: Vec<crate::test_support::SidecarParseError>,
 }
 
 /// Count `.ktstr.json` files under `run_dir` using
@@ -2745,8 +2755,10 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 /// `"1"` — that consumers can gate on for incompatible shape
 /// changes), `"_walk"` (an envelope carrying `walked` / `valid`
 /// counts — the same numbers the text header reports — plus an
-/// `errors` array of `{path, error}` pairs covering every parse
-/// failure), and `"fields"` (a map keyed by
+/// `errors` array of `{path, error, enriched_message}` entries
+/// covering every parse failure; `enriched_message` is a
+/// human-facing remediation string when one applies, JSON null
+/// otherwise), and `"fields"` (a map keyed by
 /// [`SIDECAR_NONE_CATALOG`] field name where each value is
 /// `{ "none_count": N, "some_count": M, "classification": "...",
 /// "causes": [...], "fix": "..." }`). `none_count` and
@@ -2761,12 +2773,21 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 /// per-sidecar detail for human triage and appends a trailing
 /// "corrupt sidecars" block when parse errors occurred.
 ///
+/// All-corrupt runs (every file failed to parse) are NOT a
+/// hard error — both renderers fall through with `valid = 0`,
+/// no per-sidecar blocks (none parsed), the per-field `fields`
+/// entries reporting zero counts, and the full
+/// `_walk.errors` / corrupt-sidecars block listing every
+/// parse failure. This gives dashboard consumers structured
+/// per-file visibility into total-parse-failure runs rather
+/// than a single-line bail.
+///
 /// # Errors
 ///
 /// - The run directory does not exist.
-/// - The run directory exists but the walk produced zero valid
-///   sidecars (every file failed to parse, or the directory was
-///   empty).
+/// - The run directory exists but the walker found zero
+///   `.ktstr.json` files at all (empty or read-permission
+///   failure on the directory itself).
 pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<String> {
     let root: std::path::PathBuf = match dir {
         Some(d) => d.to_path_buf(),
@@ -2787,16 +2808,11 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
             run_dir.display(),
         );
     }
-    if sidecars.is_empty() {
-        bail!(
-            "run '{run}' walked {} sidecar file(s) under {} but parsed 0 — \
-             every file failed to deserialize against the current schema. \
-             Pre-1.0 disposable-sidecar policy: re-run the test to \
-             regenerate under the current schema.",
-            walk_stats.walked,
-            run_dir.display(),
-        );
-    }
+    // All-corrupt runs (sidecars.is_empty() && walk_stats.walked > 0)
+    // fall through to the renderers — _walk.errors / the trailing
+    // corrupt-sidecars block carry the structured per-file
+    // visibility. Bailing here would lose the same diagnostic data
+    // the JSON channel was designed to surface.
     if json {
         Ok(render_explain_sidecar_json(&sidecars, &walk_stats))
     } else {
@@ -2900,9 +2916,18 @@ fn render_explain_sidecar_text(
     }
     if !walk_stats.errors.is_empty() {
         let _ = writeln!(out, "corrupt sidecars ({}):", walk_stats.errors.len());
-        for (path, error) in &walk_stats.errors {
+        for (path, error, enriched) in &walk_stats.errors {
             let _ = writeln!(out, "  {}", path.display());
             let _ = writeln!(out, "    error: {error}");
+            // Enriched prose lands on its own indented line below
+            // the raw serde error so an operator sees both the
+            // grep-friendly raw message and the human remediation
+            // without losing either. Suppressed when no
+            // enrichment applies (the common case — only the
+            // host-missing schema-drift case enriches today).
+            if let Some(prose) = enriched {
+                let _ = writeln!(out, "    enriched: {prose}");
+            }
         }
         out.push('\n');
     }
@@ -2954,11 +2979,19 @@ struct WalkStatsJson<'a> {
 /// `String` via `Path::display().to_string()` — matches the text
 /// output's path encoding and side-steps the lossy / platform-
 /// specific `PathBuf` → JSON conversion. `error` borrows the
-/// serde error message verbatim from [`WalkStats::errors`].
+/// raw serde error message verbatim from [`WalkStats::errors`];
+/// `enriched_message` borrows the optional human-facing
+/// remediation prose, JSON null when no enrichment applies (the
+/// common case — only the `host` missing-field schema-drift
+/// case produces an enrichment today).
+///
+/// Both keys emit on every entry so dashboard consumers see a
+/// uniform shape across enriched and non-enriched failures.
 #[derive(serde::Serialize)]
 struct WalkError<'a> {
     path: String,
     error: &'a str,
+    enriched_message: Option<&'a str>,
 }
 
 /// Per-field diagnostic entry under [`ExplainOutput::fields`].
@@ -3032,9 +3065,10 @@ fn render_explain_sidecar_json(
     let errors: Vec<WalkError<'_>> = walk_stats
         .errors
         .iter()
-        .map(|(path, error)| WalkError {
+        .map(|(path, error, enriched)| WalkError {
             path: path.display().to_string(),
             error,
+            enriched_message: enriched.as_deref(),
         })
         .collect();
     let output = ExplainOutput {
@@ -5159,12 +5193,14 @@ mod tests {
         );
     }
 
-    /// Error path: walker visits one or more `.ktstr.json` files
-    /// but every parse fails. The error must NAME the walked
-    /// count so an operator sees the corrupt-file signal even
-    /// before reaching the diagnostic body.
+    /// All-corrupt run is NOT a hard error — the renderer falls
+    /// through with valid=0, no per-sidecar blocks, and the
+    /// trailing corrupt-sidecars block carries every parse
+    /// failure. Operators get the same structured per-file
+    /// diagnostic that the JSON channel exposes, rather than a
+    /// single bail line that loses per-file detail.
     #[test]
-    fn explain_sidecar_all_corrupt_returns_error_with_walked_count() {
+    fn explain_sidecar_all_corrupt_renders_structured_diagnostic() {
         let tmp = tempfile::tempdir().unwrap();
         let run_dir = tmp.path().join("run-corrupt");
         std::fs::create_dir(&run_dir).unwrap();
@@ -5176,16 +5212,27 @@ mod tests {
             "{\"missing\": \"required-fields\"}",
         )
         .unwrap();
-        let err = super::explain_sidecar("run-corrupt", Some(tmp.path()), false).unwrap_err();
-        let msg = format!("{err:#}");
+        let out = super::explain_sidecar("run-corrupt", Some(tmp.path()), false)
+            .expect("all-corrupt is no longer a hard error — must render");
         assert!(
-            msg.contains("walked 2"),
-            "all-corrupt error must name the walked count so the \
-             corrupt-file signal surfaces: {msg}",
+            out.contains("walked 2"),
+            "header must name the walked count: {out}",
         );
         assert!(
-            msg.contains("parsed 0"),
-            "all-corrupt error must distinguish walked-vs-parsed: {msg}",
+            out.contains("parsed 0 valid"),
+            "header must distinguish walked-vs-parsed (zero valid): {out}",
+        );
+        assert!(
+            out.contains("corrupt sidecars (2):"),
+            "all-corrupt run must surface the corrupt-sidecars \
+             block listing every parse failure: {out}",
+        );
+        // Per-sidecar `test:` blocks must NOT appear — there are
+        // no parsed sidecars to render.
+        assert!(
+            !out.contains("test:"),
+            "no sidecar parsed — must not emit any per-sidecar \
+             block: {out}",
         );
     }
 
@@ -5692,12 +5739,14 @@ mod tests {
         );
     }
 
-    /// JSON `_walk.errors` lists `{path, error}` pairs for every
-    /// file that failed to parse. The valid file stays counted
-    /// in `_walk.valid`; the corrupt one surfaces under errors.
-    /// Pins the structured-error channel — previously parse
-    /// failures were eprintln-only and dashboard consumers had
-    /// no programmatic way to surface them.
+    /// JSON `_walk.errors` lists `{path, error, enriched_message}`
+    /// triples for every file that failed to parse. The valid file
+    /// stays counted in `_walk.valid`; the corrupt one surfaces
+    /// under errors. `enriched_message` is JSON null for generic
+    /// parse failures (no schema-drift remediation applies). Pins
+    /// the structured-error channel — previously parse failures
+    /// were eprintln-only and dashboard consumers had no
+    /// programmatic way to surface them.
     #[test]
     fn explain_sidecar_json_walk_errors_lists_corrupt_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5740,6 +5789,165 @@ mod tests {
             !error.is_empty(),
             "error message must not be empty (serde_json should produce \
              a parse-error message for `garbage{{`): {out}",
+        );
+        // `enriched_message` MUST be present on every entry as a
+        // uniform shape (no contains_key branching for dashboard
+        // consumers). For generic parse failures like `garbage{`,
+        // no schema-drift remediation applies — the value is JSON
+        // null.
+        let enriched = entry
+            .get("enriched_message")
+            .expect("each error entry must carry an enriched_message key");
+        assert!(
+            enriched.is_null(),
+            "generic parse failure has no schema-drift remediation; \
+             enriched_message must be JSON null: {enriched:?}",
+        );
+    }
+
+    /// `enriched_parse_error_message` returns operator-facing
+    /// remediation prose for the host-missing schema-drift
+    /// pattern (a serde error mentioning both "missing field"
+    /// and "`host`"). Verifies the helper directly against a
+    /// synthetic error string — modern `SidecarResult` declares
+    /// `host: Option<HostContext>`, so serde tolerates absence
+    /// and never emits the missing-field error against the live
+    /// schema. The enrichment exists as a forward-compat
+    /// remediation surface for a future schema bump that
+    /// promotes `host` to a non-Option field, or for sidecars
+    /// produced under such a bump's transitional window.
+    #[test]
+    fn enriched_parse_error_message_returns_prose_for_host_missing_pattern() {
+        // Construct a synthetic serde-style error string that
+        // matches the enrichment trigger.
+        let raw = "missing field `host` at line 1 column 100";
+        let path = std::path::Path::new("/tmp/example-run/sidecar.ktstr.json");
+        let enriched = crate::test_support::enriched_parse_error_message_for_test(path, raw)
+            .expect("host-missing pattern must produce enrichment prose");
+        assert!(
+            enriched.contains("host"),
+            "enrichment must mention the host field: {enriched}",
+        );
+        assert!(
+            enriched.contains("re-run"),
+            "enrichment must point at the re-run remediation: {enriched}",
+        );
+        assert!(
+            enriched.contains("disposable-sidecar"),
+            "enrichment must reference the pre-1.0 disposable-sidecar \
+             policy: {enriched}",
+        );
+        // Generic parse errors return None — no enrichment prose.
+        let raw_generic = "expected ident at line 1 column 2";
+        let no_enrichment =
+            crate::test_support::enriched_parse_error_message_for_test(path, raw_generic);
+        assert!(
+            no_enrichment.is_none(),
+            "generic parse error must produce no enrichment: {no_enrichment:?}",
+        );
+    }
+
+    /// All-corrupt run renders structured JSON with `valid: 0`,
+    /// every parse failure populated under `_walk.errors`, and
+    /// each field's counts at zero (no valid sidecars to count
+    /// over). Pins the no-bail behavior — dashboard consumers
+    /// that ingest the JSON channel see the same shape regardless
+    /// of partial vs full corruption, just with `valid` collapsed
+    /// to 0 and `none_count`/`some_count` mirroring that.
+    #[test]
+    fn explain_sidecar_all_corrupt_json_renders_structured_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-all-corrupt-json");
+        std::fs::create_dir(&run_dir).unwrap();
+        std::fs::write(run_dir.join("a-0000000000000000.ktstr.json"), "{").unwrap();
+        std::fs::write(run_dir.join("b-0000000000000000.ktstr.json"), "garbage{").unwrap();
+        let out = super::explain_sidecar("run-all-corrupt-json", Some(tmp.path()), true)
+            .expect("all-corrupt JSON must render, not bail");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("json output must round-trip parse");
+        let walk = parsed.get("_walk").expect("must have _walk key");
+        assert_eq!(walk.get("walked").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            walk.get("valid").and_then(|v| v.as_u64()),
+            Some(0),
+            "all-corrupt run must report valid=0: {out}",
+        );
+        let errors = walk
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .expect("_walk.errors must be present");
+        assert_eq!(
+            errors.len(),
+            2,
+            "every parse failure must surface in _walk.errors: {out}",
+        );
+        // Every field entry exists with zero counts — no valid
+        // sidecars to count over, but the catalog shape is
+        // preserved so dashboard consumers see a uniform schema.
+        let fields = parsed
+            .get("fields")
+            .and_then(|f| f.as_object())
+            .expect("fields must be present");
+        for entry in super::SIDECAR_NONE_CATALOG {
+            let f = fields
+                .get(entry.field)
+                .unwrap_or_else(|| panic!("field {} must be present", entry.field));
+            assert_eq!(
+                f.get("none_count").and_then(|v| v.as_u64()),
+                Some(0),
+                "{}: zero valid sidecars — none_count must be 0",
+                entry.field,
+            );
+            assert_eq!(
+                f.get("some_count").and_then(|v| v.as_u64()),
+                Some(0),
+                "{}: zero valid sidecars — some_count must be 0",
+                entry.field,
+            );
+        }
+        // Schema-version stamp still emits — the all-corrupt
+        // path is a regular render, not a degenerate one.
+        assert_eq!(
+            parsed.get("_schema_version").and_then(|v| v.as_str()),
+            Some(super::EXPLAIN_SIDECAR_SCHEMA_VERSION),
+            "schema_version must stamp on every render: {out}",
+        );
+    }
+
+    /// Text output renders the corrupt-sidecars block with
+    /// `enriched:` lines below `error:` lines for failures
+    /// carrying enrichment prose. Generic failures emit only
+    /// `error:`. The renderer is private; this test drives the
+    /// public surface with a generic-failure fixture (the only
+    /// reliably-triggerable parse-failure shape against the live
+    /// schema, since `host` is `Option<HostContext>` and serde
+    /// tolerates absence) and verifies the absence of an
+    /// `enriched:` line. The host-missing enrichment payload
+    /// itself is exercised by
+    /// `enriched_parse_error_message_returns_prose_for_host_missing_pattern`.
+    #[test]
+    fn explain_sidecar_text_omits_enriched_line_for_generic_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run-generic-fail-text");
+        std::fs::create_dir(&run_dir).unwrap();
+        // `garbage{` triggers a generic serde parse error — no
+        // enrichment applies, so the `enriched:` line must NOT
+        // appear in the rendered output.
+        std::fs::write(run_dir.join("a-0000000000000000.ktstr.json"), "garbage{").unwrap();
+        let out = super::explain_sidecar("run-generic-fail-text", Some(tmp.path()), false).unwrap();
+        assert!(
+            out.contains("corrupt sidecars (1):"),
+            "generic parse failure must surface in the corrupt \
+             block: {out}",
+        );
+        assert!(
+            out.contains("    error:"),
+            "generic parse failure must emit raw `error:` line: {out}",
+        );
+        assert!(
+            !out.contains("    enriched:"),
+            "generic parse failure has no enrichment — `enriched:` \
+             line must NOT appear: {out}",
         );
     }
 

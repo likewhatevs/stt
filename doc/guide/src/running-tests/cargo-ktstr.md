@@ -625,8 +625,27 @@ remediation) emit no `fix:` line.
 When the walk encounters parse failures, the text output
 appends a trailing `corrupt sidecars (N):` block listing
 each corrupt path on its own line followed by the serde
-error message indented as `error: ...`. The block is
-suppressed when every sidecar parsed cleanly.
+error message indented as `error: ...`, optionally
+followed by an `enriched: ...` line with operator-facing
+remediation prose when the parse failure matches a known
+schema-drift case (currently the `host` missing-field
+case). The block is suppressed when every sidecar parsed
+cleanly.
+
+All-corrupt runs (every file failed to parse) are NOT a
+hard error — text output renders the header (`walked N
+sidecar file(s), parsed 0 valid`) followed directly by the
+`corrupt sidecars (N):` block, skipping the per-sidecar
+breakdown that has nothing to render. JSON output mirrors
+this with `valid: 0`, `_walk.errors` populated, and per-
+field counts at zero. This preserves structured per-file
+visibility for dashboard consumers facing total parse-
+failure runs.
+
+All-corrupt runs exit 0 (not a hard error); CI scripts
+should gate on `_walk.valid > 0` or check `_walk.errors`
+length for failure detection rather than relying on exit
+code.
 
 `--json` emits a single object with three top-level keys:
 `_schema_version` (a string version stamp — currently
@@ -634,12 +653,14 @@ suppressed when every sidecar parsed cleanly.
 changes), `_walk` (an envelope carrying `walked` / `valid`
 counts — same numbers the text header reports under "walked
 N sidecar file(s), parsed M valid" — plus an `errors` array
-of `{path, error}` entries covering every parse failure),
-and `fields`. Each entry under `fields` carries
-`none_count` and `some_count` (counts across all valid
-sidecars in the run, summing to `_walk.valid`),
-`classification`, `causes`, and `fix` (string when a
-remediation applies, JSON null otherwise).
+of `{path, error, enriched_message}` entries covering every
+parse failure; `enriched_message` is a human-facing
+remediation string when a known schema-drift case matches,
+JSON null otherwise), and `fields`. Each entry under
+`fields` carries `none_count` and `some_count` (counts
+across all valid sidecars in the run, summing to
+`_walk.valid`), `classification`, `causes`, and `fix`
+(string when a remediation applies, JSON null otherwise).
 
 Output produced before the schema-version stamp landed has
 no `_schema_version` key; consumers should treat the key's

@@ -483,19 +483,28 @@ enum StatsCommand {
     /// None` for env-unset cases). When the walk encounters
     /// parse failures, the text output appends a trailing
     /// `corrupt sidecars (N):` block listing each corrupt path
-    /// with the serde error message.
+    /// with the raw serde error message and (when applicable)
+    /// an `enriched:` line with operator-facing remediation
+    /// prose for known schema-drift cases. All-corrupt runs
+    /// render the header + corrupt-block alone (no per-sidecar
+    /// breakdown to render), preserving per-file diagnostic
+    /// detail rather than collapsing to a single error line.
     ///
     /// `--json` emits a single object with three top-level
     /// keys: `_schema_version` (string version stamp —
     /// currently `"1"` — that consumers can gate on for
     /// incompatible shape changes), `_walk` (carrying the same
     /// walked / valid counts plus an `errors` array of
-    /// `{path, error}` pairs covering every parse failure),
-    /// and `fields` (one entry per optional field with run-wide
-    /// `none_count` + `some_count` summing to `_walk.valid`,
-    /// plus the static `classification` / `causes` /
-    /// `fix` catalog entry; `fix` is a JSON string when a
-    /// remediation applies, JSON null otherwise).
+    /// `{path, error, enriched_message}` entries covering every
+    /// parse failure; `enriched_message` is a JSON string
+    /// when a known schema-drift remediation applies, JSON null
+    /// otherwise), and `fields` (one entry per optional field
+    /// with run-wide `none_count` + `some_count` summing to
+    /// `_walk.valid`, plus the static `classification` /
+    /// `causes` / `fix` catalog entry; `fix` is a JSON string
+    /// when a remediation applies, JSON null otherwise). All-
+    /// corrupt runs render the same shape with `valid = 0` and
+    /// per-field counts at zero — never bail.
     ExplainSidecar {
         /// Run key (from `cargo ktstr stats list`).
         #[arg(long)]

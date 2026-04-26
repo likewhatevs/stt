@@ -414,29 +414,93 @@ pub(crate) fn collect_sidecars(dir: &std::path::Path) -> Vec<SidecarResult> {
     collect_sidecars_with_errors(dir).0
 }
 
+/// Per-file parse-failure record returned by
+/// [`collect_sidecars_with_errors`] and threaded through
+/// [`crate::cli::WalkStats::errors`] to the renderers. The
+/// triple is `(path, raw-serde-error, optional-enrichment)`:
+///
+/// - `path`: the on-disk path of the sidecar that failed.
+/// - raw serde-error string: serde's verbatim message, kept for
+///   grep-friendly parse-error tracking.
+/// - optional enrichment prose: `Some(...)` for known
+///   schema-drift cases (currently the `host` missing-field
+///   pattern), `None` otherwise. Computed by
+///   [`enriched_parse_error_message`].
+///
+/// Aliased so callers don't restate the tuple shape and so a
+/// future move to a named struct stays a single-site rename.
+/// Also silences clippy's `type_complexity` on the walker's
+/// return type without the noise of an inline `#[allow]`.
+pub(crate) type SidecarParseError = (std::path::PathBuf, String, Option<String>);
+
+/// Test-only re-export of [`enriched_parse_error_message`] so
+/// `cli::tests` can verify the enrichment-pattern logic
+/// directly against synthetic error strings. The helper itself
+/// stays private so production code routes through
+/// [`collect_sidecars_with_errors`].
+#[cfg(test)]
+pub(crate) fn enriched_parse_error_message_for_test(
+    path: &std::path::Path,
+    raw_error: &str,
+) -> Option<String> {
+    enriched_parse_error_message(path, raw_error)
+}
+
+/// Compute the operator-prose enrichment for a serde parse-error
+/// message, when one applies. Today the only enriched case is the
+/// `host` missing-field schema-drift diagnostic; the function
+/// returns `None` for any other shape so consumers can branch on
+/// "enrichment exists" without re-implementing the match.
+///
+/// Pulled out of [`collect_sidecars_with_errors`]'s hot path so
+/// the eprintln-side prose and the structured-channel
+/// `enriched` carry identical text.
+///
+/// Matching on the Display text is deliberate: serde's typed-error
+/// surface for `missing field "X"` is not stable across
+/// serde_json versions, but the rendered message is — a
+/// forward-compat regression-resilient check costs one string
+/// search.
+fn enriched_parse_error_message(path: &std::path::Path, raw_error: &str) -> Option<String> {
+    let is_missing_host = raw_error.contains("missing field") && raw_error.contains("`host`");
+    if is_missing_host {
+        Some(format!(
+            "ktstr_test: skipping {}: {raw_error} — the `host` field \
+             was added to SidecarResult; pre-1.0 policy is \
+             disposable-sidecar: re-run the test to regenerate this \
+             file under the current schema (no migration shim exists)",
+            path.display(),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Scan a directory for ktstr sidecar JSON files, returning both
-/// the parsed sidecars and a list of `(path, serde-error message)`
-/// pairs for every file that failed to deserialize. Recurses one
-/// level into subdirectories to handle per-job gauntlet layouts.
+/// the parsed sidecars and a `(path, raw-serde-error,
+/// optional-enrichment)` triple for every file that failed to
+/// deserialize. Recurses one level into subdirectories to handle
+/// per-job gauntlet layouts.
 ///
 /// Surfaces parse failures in two channels:
 /// - `eprintln!` to stderr (preserved for the operator-facing
-///   pre-1.0 disposable-sidecar diagnostic — host-missing
-///   schema-drift case carries an enriched message).
-/// - The returned errors vec, capturing the same `(path, msg)`
-///   pair for structured callers (`explain-sidecar`'s walker
-///   output) that need to render parse failures alongside the
-///   per-field breakdown rather than relying on the operator
-///   eyeballing stderr.
+///   pre-1.0 disposable-sidecar diagnostic — emits the enriched
+///   prose for the host-missing schema-drift case, the raw serde
+///   message otherwise).
+/// - The returned errors vec, capturing
+///   `(path, raw-error, Option<enriched>)` for structured callers
+///   (`explain-sidecar`'s walker output). Both raw and enriched
+///   are exposed so dashboard consumers can pick: raw for parse-
+///   error grepping, enriched for human-facing remediation prose.
 ///
 /// Both channels surface every parse failure — the eprintln path
 /// is informational, the returned vec is structured. Callers that
 /// don't need structured errors should use [`collect_sidecars`].
 pub(crate) fn collect_sidecars_with_errors(
     dir: &std::path::Path,
-) -> (Vec<SidecarResult>, Vec<(std::path::PathBuf, String)>) {
+) -> (Vec<SidecarResult>, Vec<SidecarParseError>) {
     let mut sidecars = Vec::new();
-    let mut errors: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut errors: Vec<SidecarParseError> = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return (sidecars, errors),
@@ -444,7 +508,7 @@ pub(crate) fn collect_sidecars_with_errors(
     let mut subdirs = Vec::new();
     let try_load = |path: &std::path::Path,
                     out: &mut Vec<SidecarResult>,
-                    errs: &mut Vec<(std::path::PathBuf, String)>| {
+                    errs: &mut Vec<SidecarParseError>| {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             return;
         }
@@ -458,40 +522,17 @@ pub(crate) fn collect_sidecars_with_errors(
         match serde_json::from_str::<SidecarResult>(&data) {
             Ok(sc) => out.push(sc),
             Err(e) => {
-                // Enrich the diagnostic when a serde "missing field"
-                // error mentions `host` (the most common miss after
-                // the host-context landing) — point the operator at
-                // the fix that pre-1.0 disposable-sidecar policy
-                // calls for: re-run the test to regenerate the
-                // sidecar under the current schema. Generic errors
-                // fall through to the unadorned message so the
-                // original serde line number / column remain visible.
-                //
-                // Matching on the Display text is deliberate: serde's
-                // typed-error surface for `missing field "X"` is not
-                // stable across serde_json versions, but the rendered
-                // message is — a forward-compat regression-resilient
-                // check costs one string search.
-                let msg = e.to_string();
-                let is_missing_host = msg.contains("missing field") && msg.contains("`host`");
-                if is_missing_host {
-                    eprintln!(
-                        "ktstr_test: skipping {}: {e} — the `host` field was \
-                         added to SidecarResult; pre-1.0 policy is \
-                         disposable-sidecar: re-run the test to \
-                         regenerate this file under the current schema \
-                         (no migration shim exists)",
-                        path.display(),
-                    );
-                } else {
-                    eprintln!("ktstr_test: skipping {}: {e}", path.display());
+                let raw = e.to_string();
+                let enriched = enriched_parse_error_message(path, &raw);
+                // eprintln channel: emit the enriched prose when
+                // it applies, the raw serde message otherwise.
+                // Identical text flows through both channels —
+                // both go through `enriched_parse_error_message`.
+                match &enriched {
+                    Some(prose) => eprintln!("{prose}"),
+                    None => eprintln!("ktstr_test: skipping {}: {raw}", path.display()),
                 }
-                // Capture the unadorned serde error in the
-                // structured channel — the eprintln-only enrichment
-                // is operator prose, not part of the structured
-                // error surface. Consumers that want the enrichment
-                // can layer it on top of the raw serde message.
-                errs.push((path.to_path_buf(), msg));
+                errs.push((path.to_path_buf(), raw, enriched));
             }
         }
     };
