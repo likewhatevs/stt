@@ -934,9 +934,29 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// snapshot keyed on (kernel, project commit), not an append-only
 /// archive of every invocation.
 pub(crate) fn sidecar_dir() -> PathBuf {
-    if let Some(d) = sidecar_dir_override() {
-        return d;
-    }
+    sidecar_dir_override().unwrap_or_else(resolve_default_sidecar_dir)
+}
+
+/// Compute the default-path sidecar directory:
+/// `{runs_root}/{kernel}-{project_commit}` where `{kernel}` and
+/// `{project_commit}` come from [`detect_kernel_version`] and
+/// [`detect_project_commit`] respectively, with `"unknown"`
+/// substituted via [`format_run_dirname`] when either probe
+/// returns `None`. Emits the one-shot
+/// [`warn_unknown_project_commit_once`] stderr warning when the
+/// project commit probe falls back to `"unknown"` (operators in
+/// this state lose the per-commit run-directory discriminator).
+///
+/// Shared by [`sidecar_dir`] and the default-path branch of
+/// [`serialize_and_write_sidecar`] so both call sites resolve the
+/// same kernel/commit/warn/format chain through one place.
+/// `serialize_and_write_sidecar` cannot call [`sidecar_dir`]
+/// directly because it needs a single-read of
+/// [`sidecar_dir_override`] (gated against the env-var flipping
+/// mid-call between the dir-resolve and the pre-clear gate); the
+/// helper supplies the default-branch body so the override read
+/// stays at one site.
+fn resolve_default_sidecar_dir() -> PathBuf {
     let kernel = detect_kernel_version();
     let commit = detect_project_commit();
     if commit.is_none() {
@@ -1846,7 +1866,17 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
 /// sidecar" / "sidecar") so the error chain points at the right call
 /// site.
 fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::Result<()> {
-    let dir = sidecar_dir();
+    // Read the override ONCE. The two branches below carry the
+    // result through structurally so neither leg re-reads
+    // `KTSTR_SIDECAR_DIR` — preventing the override from flipping
+    // mid-call (which would otherwise let an external mutation
+    // between the dir resolve and the pre-clear gate either skip
+    // the wipe on a default-path dir or fire a wipe on an
+    // operator-chosen one).
+    let (dir, do_pre_clear) = match sidecar_dir_override() {
+        Some(path) => (path, false),
+        None => (resolve_default_sidecar_dir(), true),
+    };
     // Materialize the directory FIRST so `pre_clear_run_dir_once`
     // can canonicalize a path that exists on disk. Without this,
     // the very first invocation in a process resolves the cache
@@ -1859,7 +1889,7 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
     // the relative-vs-absolute split.
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create sidecar dir {}", dir.display()))?;
-    if sidecar_dir_override().is_none() {
+    if do_pre_clear {
         pre_clear_run_dir_once(&dir);
     }
     let variant_hash = sidecar_variant_hash(sidecar);
@@ -1914,19 +1944,62 @@ fn sidecar_dir_override() -> Option<PathBuf> {
 /// so each run carries its own commit hash.
 ///
 /// `OnceLock<()>` gates the warning to fire EXACTLY ONCE per
-/// process: every gauntlet variant resolves [`sidecar_dir`]
-/// independently, so without the gate the operator would see
-/// thousands of duplicate warnings interleaved with test output.
-/// Called from [`sidecar_dir`] only on the default-path branch
-/// (the override branch returns before the warning site is
-/// reached) so an operator who set `KTSTR_SIDECAR_DIR` to
-/// disambiguate non-git runs does not see a misleading
-/// "commit unknown" warning that does not apply to their
-/// effective directory layout.
+/// process: every gauntlet variant resolves a sidecar directory
+/// independently (via [`sidecar_dir`] and
+/// [`serialize_and_write_sidecar`]), so without the gate the
+/// operator would see thousands of duplicate warnings interleaved
+/// with test output. Called via [`resolve_default_sidecar_dir`] —
+/// which is the shared default-path body that both [`sidecar_dir`]
+/// and [`serialize_and_write_sidecar`] funnel through — so the
+/// warning fires only on the default-path branch. The override
+/// branch in either caller returns before
+/// [`resolve_default_sidecar_dir`] is reached, so an operator who
+/// set `KTSTR_SIDECAR_DIR` to disambiguate non-git runs does not
+/// see a misleading "commit unknown" warning that does not apply
+/// to their effective directory layout.
+///
+/// Implementation is split into a public-facing wrapper
+/// (this function) that owns the process-global `OnceLock` and
+/// targets stderr, and a pure inner helper
+/// [`warn_unknown_project_commit_inner`] that takes the
+/// `&OnceLock<()>` gate and the `&mut dyn Write` sink as
+/// parameters. The split lets tests drive the warning logic
+/// against a local `OnceLock` and a `Vec<u8>` sink without
+/// fighting the process-global gate or the global stderr fd —
+/// the wrapper's behavior is what the inner does, just with
+/// the static gate and stderr supplied.
 fn warn_unknown_project_commit_once() {
     static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    WARNED.get_or_init(|| {
-        eprintln!(
+    let mut sink = std::io::stderr();
+    warn_unknown_project_commit_inner(&WARNED, &mut sink);
+}
+
+/// Pure helper for [`warn_unknown_project_commit_once`]: gate the
+/// warning on `gate` and write the warning text to `sink` exactly
+/// once across the gate's lifetime. Both parameters are taken by
+/// reference so call sites supply ownership semantics that match
+/// their gating story:
+/// - The production wrapper passes a `'static` `OnceLock<()>` so
+///   the gate spans the whole process and a stderr handle so the
+///   warning lands in the operator's terminal.
+/// - Tests pass a local `OnceLock<()>` so each test gets a fresh
+///   gate (no cross-test contamination via a process-global)
+///   and a `Vec<u8>` sink so the test can read back the emitted
+///   bytes and assert on the warning text.
+///
+/// Errors from `writeln!` are ignored via `let _ =`: a metadata
+/// probe warning must not gate sidecar writes. This DEPARTS from
+/// the previous `eprintln!` semantics (which panic on stderr
+/// write failure per the std docs) — here we drop the write
+/// error silently because a metadata probe warning must not gate
+/// sidecar writes.
+fn warn_unknown_project_commit_inner(
+    gate: &std::sync::OnceLock<()>,
+    sink: &mut dyn std::io::Write,
+) {
+    gate.get_or_init(|| {
+        let _ = writeln!(
+            sink,
             "ktstr: WARNING: project commit unavailable (cwd not in a git \
              repo, or HEAD unreadable); runs at this kernel will overwrite \
              each other in target/ktstr/{{kernel}}-unknown/. Set \
@@ -1990,12 +2063,19 @@ fn warn_unknown_project_commit_once() {
 ///
 /// CONCURRENT WRITERS: the per-process `Mutex<HashSet>` guards
 /// against multiple writes within a single process re-clearing
-/// the same directory. Two concurrent test processes that both
-/// resolve to the same `{kernel}-{project_commit}` run dir will
-/// both pre-clear; that race is out of scope here (tracked separately
-/// under the concurrent-write collision protection backlog item)
-/// and would corrupt each other's outputs even without
-/// pre-clearing.
+/// the same directory. The cache mutex is held ACROSS the
+/// `read_dir` walk and per-file removals — releasing it after
+/// the cache insert but before the walk would open a TOCTOU
+/// window where a sibling thread observes the cached entry,
+/// skips its own pre-clear, writes a sidecar, and then the
+/// original thread's still-pending walk deletes that sibling's
+/// fresh file. Holding the lock across the bounded walk closes
+/// the window. Two concurrent test PROCESSES that both resolve
+/// to the same `{kernel}-{project_commit}` run dir will both
+/// pre-clear; that cross-process race is out of scope here
+/// (tracked separately under the concurrent-write collision
+/// protection backlog item) and would corrupt each other's
+/// outputs even without pre-clearing.
 ///
 /// FAILURE: `read_dir` errors are silently ignored — defensive
 /// behavior for direct callers (e.g. unit tests probing the
@@ -2029,8 +2109,19 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
     if !guard.insert(cache_key) {
         return;
     }
-    // First time this directory has been seen — wipe sidecars.
-    drop(guard);
+    // First time this directory has been seen — wipe sidecars while
+    // the cache mutex is still held. Releasing the guard before the
+    // read_dir walk would open a TOCTOU window: a sibling thread that
+    // observes the now-cached entry would skip its own pre-clear,
+    // proceed to write a sidecar, and the original thread's walk
+    // (running after the drop) would then delete that sibling's
+    // freshly-written file. The walk is one read_dir + a bounded
+    // number of `*.ktstr.json` removals, so holding the lock across
+    // it is brief; concurrent calls against DIFFERENT directories
+    // serialize through this critical section but each does a small,
+    // bounded amount of I/O, which is acceptable for a metadata
+    // probe call pattern. `guard` is dropped at end-of-scope so the
+    // lock release happens after the loop completes.
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -2039,6 +2130,7 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
             }
         }
     }
+    drop(guard);
 }
 
 /// Return `active_flags` sorted into canonical
@@ -3248,23 +3340,24 @@ mod tests {
     #[test]
     fn write_sidecar_defaults_to_target_dir_without_env() {
         let _lock = lock_env();
+        let target_dir = tempfile::TempDir::new().unwrap();
+        let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
         let _env_sidecar = EnvVarGuard::remove("KTSTR_SIDECAR_DIR");
         let _env_kernel = EnvVarGuard::remove("KTSTR_KERNEL");
-        let _env_target = EnvVarGuard::remove("CARGO_TARGET_DIR");
 
         let dir = sidecar_dir();
-        // Expected layout: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{project_commit}`.
+        // Expected layout: `{CARGO_TARGET_DIR}/ktstr/{kernel}-{project_commit}`.
         // `KTSTR_KERNEL` is unset so kernel resolves to `"unknown"`.
-        // `{project_commit}` is the project tree's HEAD short hex
-        // (with `-dirty` suffix when the worktree differs); the test
-        // process runs from inside the ktstr repo, so
-        // `detect_project_commit()` returns `Some(...)`. Falling
-        // back to `"unknown"` covers a non-git cwd or probe failure
-        // — the same fallback `sidecar_dir()` itself uses, so the
-        // expected matches the production code path symmetrically.
-        let commit = detect_project_commit().unwrap_or_else(|| "unknown".to_string());
-        let expected = format!("target/ktstr/unknown-{commit}");
-        assert_eq!(dir, PathBuf::from(&expected));
+        // `{project_commit}` is whatever `detect_project_commit()`
+        // resolves on this machine (`Some(hex7)` when cwd is inside
+        // a git repo, `None` -> `"unknown"` otherwise). Compute the
+        // expected via `runs_root` + `format_run_dirname` so the
+        // assertion matches the production path symmetrically and
+        // does not depend on the cwd's git state.
+        let kernel = detect_kernel_version();
+        let commit = detect_project_commit();
+        let expected = runs_root().join(format_run_dirname(kernel.as_deref(), commit.as_deref()));
+        assert_eq!(dir, expected);
 
         fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
             Ok(AssertResult::pass())
@@ -3279,14 +3372,12 @@ mod tests {
         let check_result = AssertResult::pass();
         write_sidecar(&entry, &vm_result, &[], &check_result, "CpuSpin", &[], &[]).unwrap();
 
-        // Clean up written files. The actual on-disk filename
-        // embeds a variant-hash suffix (see
-        // `serialize_and_write_sidecar`), so a fixed `test_name +
-        // ".ktstr.json"` path never matches — use the
-        // prefix-scan helper the sibling tests use. The parent
-        // `dir` itself is shared with any other test that runs
-        // without `KTSTR_SIDECAR_DIR` set, so leave it in place;
-        // only this test's own files are removed.
+        // The actual on-disk filename embeds a variant-hash suffix
+        // (see `serialize_and_write_sidecar`), so a fixed
+        // `test_name + ".ktstr.json"` path never matches — use the
+        // prefix-scan helper the sibling tests use. The tempdir's
+        // Drop wipes everything when this scope ends, so no manual
+        // cleanup is required.
         let paths = find_sidecars_by_prefix(&dir, "__sidecar_default_dir__-");
         // One call to `write_sidecar` above must produce exactly
         // one sidecar under this test's unique prefix. A count
@@ -3309,9 +3400,6 @@ mod tests {
              to wipe a stale sidecar from a prior crashed run.",
             paths.len(),
         );
-        for p in paths {
-            let _ = std::fs::remove_file(&p);
-        }
     }
 
     // -- KTSTR_SIDECAR_DIR override: empty-string falls back to default --
@@ -3619,6 +3707,96 @@ mod tests {
             "first call against B must wipe B's sidecar — proves the \
              per-dir keying distinguishes A from B (a OnceLock<()> \
              that fired once for A would leak this assertion).",
+        );
+    }
+
+    // -- warn_unknown_project_commit_inner tests --
+    //
+    // Pin the three behavioral invariants the inner helper exposes:
+    // 1. Calling once writes the warning text to the sink.
+    // 2. The emitted text contains the operator-actionable substring
+    //    pointing at `KTSTR_SIDECAR_DIR` so a future doc-drift on the
+    //    warning prose surfaces here rather than silently changing
+    //    operator-facing remediation.
+    // 3. A second call against the SAME `OnceLock<()>` is a no-op —
+    //    the second call must NOT append additional bytes to the sink.
+    //
+    // Each test owns a local `OnceLock<()>` so the tests are
+    // independent of any other test (or the production wrapper) that
+    // might already have initialized the process-global gate. No
+    // `lock_env` needed: the inner helper does not touch any env var
+    // or any shared global state beyond the gate the caller supplies.
+
+    /// First call against a fresh `OnceLock<()>` writes the warning
+    /// text to the sink. Pins the emit-once invariant on initial
+    /// invocation and proves the inner helper emits via the
+    /// caller-provided sink rather than fd 2.
+    #[test]
+    fn warn_unknown_project_commit_inner_emits_on_first_call() {
+        let gate = std::sync::OnceLock::new();
+        let mut sink: Vec<u8> = Vec::new();
+        warn_unknown_project_commit_inner(&gate, &mut sink);
+        assert!(
+            !sink.is_empty(),
+            "first call must emit bytes to the sink; got empty",
+        );
+    }
+
+    /// Pin the operator-actionable substring of the warning. The
+    /// test does NOT pin the entire prose verbatim — that would
+    /// make every wording tweak break here — but it DOES pin the
+    /// single load-bearing remediation hint (`KTSTR_SIDECAR_DIR`)
+    /// so a future edit that drops the recommended env var loses
+    /// this assertion. The `WARNING:` marker is also pinned so a
+    /// downgrade from warning to info changes the severity tag
+    /// observably.
+    #[test]
+    fn warn_unknown_project_commit_inner_emits_expected_substring() {
+        let gate = std::sync::OnceLock::new();
+        let mut sink: Vec<u8> = Vec::new();
+        warn_unknown_project_commit_inner(&gate, &mut sink);
+        let captured = String::from_utf8(sink).expect("warning text must be UTF-8");
+        assert!(
+            captured.contains("WARNING:"),
+            "warning must carry the WARNING severity tag; got: {captured:?}",
+        );
+        assert!(
+            captured.contains("KTSTR_SIDECAR_DIR"),
+            "warning must reference KTSTR_SIDECAR_DIR as the remediation \
+             knob — operators rely on this hint to disambiguate \
+             non-git runs; got: {captured:?}",
+        );
+    }
+
+    /// A second call against the SAME `OnceLock<()>` is a no-op —
+    /// the gate has already been initialized by the first call, so
+    /// `get_or_init`'s closure does not fire and no additional bytes
+    /// land in the sink. Pins the once-per-gate contract that
+    /// gauntlet variants rely on (otherwise the operator would see
+    /// thousands of duplicate warnings interleaved with test output).
+    ///
+    /// The assertion compares the sink's length AFTER the second
+    /// call against its length AFTER the first call. A regression
+    /// that re-fires the warning would extend the sink and break
+    /// this equality.
+    #[test]
+    fn warn_unknown_project_commit_inner_second_call_is_no_op() {
+        let gate = std::sync::OnceLock::new();
+        let mut sink: Vec<u8> = Vec::new();
+        warn_unknown_project_commit_inner(&gate, &mut sink);
+        let after_first = sink.len();
+        assert!(
+            after_first > 0,
+            "fixture precondition: first call must emit bytes",
+        );
+        warn_unknown_project_commit_inner(&gate, &mut sink);
+        assert_eq!(
+            sink.len(),
+            after_first,
+            "second call against the same gate must NOT append bytes — \
+             the OnceLock<()> gating is the load-bearing invariant; got \
+             len {} (expected {after_first})",
+            sink.len(),
         );
     }
 
