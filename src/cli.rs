@@ -2360,6 +2360,22 @@ struct NoneCatalogEntry {
     /// cause on its own bulleted line; the JSON shape emits them
     /// as a JSON string array verbatim.
     causes: &'static [&'static str],
+    /// Operator-actionable remediation, when one applies.
+    /// `Some(...)` for fields where re-running in a different
+    /// configuration would populate the value (e.g.
+    /// `kernel_commit` recovers when `KTSTR_KERNEL` points at a
+    /// local source tree); `None` for fields whose `None` is the
+    /// steady-state shape with no recourse (e.g.
+    /// `scheduler_commit` is reserved on the schema for future
+    /// enrichment).
+    ///
+    /// One fix per entry: this is the most-common-case
+    /// remediation, picked when a field has multiple causes that
+    /// all converge on the same operator action. A future
+    /// per-cause refactor (tracked separately) would split this
+    /// into per-cause remediations; the current shape covers the
+    /// typical case without forcing a deeper data-model change.
+    fix: Option<&'static str>,
 }
 
 /// Static catalog covering every `Option<T>` field on
@@ -2390,6 +2406,9 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
              commit source — reserved on the schema for future \
              enrichment (e.g. --version probe or ELF-note read on \
              the resolved scheduler binary)"],
+        // Steady-state None — no operator action recovers this
+        // until a future SchedulerSpec wires up a commit source.
+        fix: None,
     },
     // See SidecarResult::project_commit (cause split mirrors
     // detect_project_commit's documented None cases).
@@ -2403,6 +2422,18 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
             "HEAD could not be read (unborn HEAD on a fresh \
              `git init` with zero commits, or a corrupt repository)",
         ],
+        // Most-common cause is "cwd not inside a git repo";
+        // running from inside any git-tracked source tree with
+        // at least one commit reaches the `gix::discover`
+        // walk-up that `detect_project_commit` performs. Stays
+        // project-agnostic so external scheduler crates
+        // depending on ktstr see prose that applies to their
+        // own clones; also covers the unborn-HEAD cause by
+        // requiring "at least one commit".
+        fix: Some(
+            "run from inside a git-tracked source tree with at \
+             least one commit",
+        ),
     },
     // See SidecarResult::payload — None when no binary payload
     // declared.
@@ -2412,6 +2443,10 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
         causes: &["test declared no binary payload (scheduler-only test \
              or pure-scenario test that never invokes \
              ctx.payload(...))"],
+        // Steady-state None for scheduler-only tests — declaring
+        // a payload would be a test-design change, not an
+        // operator-side remediation.
+        fix: None,
     },
     // See SidecarResult::monitor — None for host-only / early VM
     // failure / no valid samples.
@@ -2424,6 +2459,13 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
              producing samples",
             "sample collection produced no valid data",
         ],
+        // No single operator-actionable fix: causes span
+        // host-only test choice (test-design), VM failure
+        // (debug the failure), and sample-collection issues
+        // (likely a kernel/sched_ext bug). Per-cause
+        // remediations are tracked separately for a future
+        // refactor.
+        fix: None,
     },
     // See SidecarResult::kvm_stats — None when VM did not run
     // or KVM stats were unavailable.
@@ -2436,6 +2478,12 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
              module not loaded, /dev/kvm permissions, or kernel \
              missing the stats interface)",
         ],
+        // No single operator-actionable fix: causes span
+        // host-only test choice (test-design) and host KVM
+        // setup (load module / fix permissions). Both are
+        // distinct remediations — left as None to avoid
+        // suggesting a fix that doesn't apply.
+        fix: None,
     },
     // See SidecarResult::kernel_version — None for host-only or
     // missing metadata.
@@ -2447,6 +2495,11 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
             "neither cache metadata nor `include/config/kernel.release` \
              yielded a version string",
         ],
+        // No single operator-actionable fix: causes span
+        // host-only test choice (test-design) and missing
+        // metadata (cache regeneration). Per-cause remediations
+        // would require splitting the entry; left as None.
+        fix: None,
     },
     // See SidecarResult::kernel_commit — five enumerated None
     // causes per the field's rustdoc.
@@ -2464,6 +2517,17 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
             "gix probe failed for another reason — metadata, not \
              a gate",
         ],
+        // Most-common causes (env-unset and tarball/git
+        // transient cache) both recover by pointing
+        // `KTSTR_KERNEL` at a real on-disk kernel source
+        // tree. The "git repository" qualifier is load-bearing:
+        // tarball extractions have no `.git`, so a path at a
+        // bare-tree extraction will still produce
+        // `kernel_commit = None` even with `KTSTR_KERNEL` set.
+        fix: Some(
+            "set KTSTR_KERNEL to a local kernel source tree that \
+             is a git repository (e.g. a git clone of the kernel)",
+        ),
     },
     // See SidecarResult::host — production writers always
     // populate this field; None on a non-fixture sidecar
@@ -2479,6 +2543,18 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
              host-context landing — re-run the test to \
              regenerate under the current schema",
         ],
+        // The pre-enrichment archive case is the only one an
+        // operator can recover; the test-fixture path is by
+        // construction not a production sidecar — calling that
+        // out in the prose so an operator inspecting fixture
+        // output doesn't try to re-run a non-production
+        // sidecar.
+        fix: Some(
+            "for pre-enrichment archives, re-run the test to \
+             regenerate under the current schema; test-fixture \
+             sidecars are not production runs and cannot be \
+             recovered by re-running",
+        ),
     },
     // See SidecarResult::cleanup_duration_ms — None for
     // watchdog-kill or host-only.
@@ -2491,6 +2567,12 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
             "run was killed by the watchdog before \
              `KtstrVm::collect_results` returned",
         ],
+        // No single operator-actionable fix: causes span
+        // host-only test choice (test-design) and watchdog
+        // kill (debug the underlying timeout). Per-cause
+        // remediations would require splitting the entry;
+        // left as None.
+        fix: None,
     },
     // See SidecarResult::run_source — only None case in the
     // current writer is a pre-rename archive whose `source`
@@ -2504,6 +2586,13 @@ const SIDECAR_NONE_CATALOG: &[NoneCatalogEntry] = &[
              serde's tolerate-absence rule. Re-run the test to \
              regenerate under the new schema, or rename the key \
              in-place before deserialize"],
+        // The only None case has two distinct recoveries:
+        // re-run (regenerates the sidecar under the new schema)
+        // or rename the on-disk JSON key in place before load.
+        fix: Some(
+            "re-run the test to regenerate, or rename the on-disk \
+             `source` key to `run_source`",
+        ),
     },
 ];
 
@@ -2631,10 +2720,15 @@ fn walk_run_with_stats(run_dir: &Path) -> (Vec<crate::test_support::SidecarResul
 /// `"_walk"` (an envelope carrying `walked` and `valid` counts —
 /// the same numbers the text header reports) and `"fields"`
 /// (a map keyed by [`SIDECAR_NONE_CATALOG`] field name where
-/// each value is `{ "none_count": N, "classification": "...",
-/// "causes": [...] }`). `none_count` is the across-all-sidecars-
-/// in-this-run count of `None` for that field. This shape is
-/// dashboard-friendly: a CI consumer can ingest the JSON
+/// each value is `{ "none_count": N, "some_count": M,
+/// "classification": "...", "causes": [...], "fix": "..." }`).
+/// `none_count` and `some_count` are the across-all-sidecars-
+/// in-this-run counts of `None` and `Some(_)` for that field,
+/// summing to `_walk.valid` — both are emitted so dashboard
+/// consumers do not need to derive the second from the first.
+/// `fix` carries an operator-actionable remediation string for
+/// fields where one applies, or JSON null otherwise. This shape
+/// is dashboard-friendly: a CI consumer can ingest the JSON
 /// without parsing per-sidecar prose. The text form retains
 /// per-sidecar detail for human triage.
 ///
@@ -2659,15 +2753,19 @@ pub fn explain_sidecar(run: &str, dir: Option<&Path>, json: bool) -> Result<Stri
     }
     let (sidecars, walk_stats) = walk_run_with_stats(&run_dir);
     if walk_stats.walked == 0 {
-        bail!("run '{run}' has no sidecar data");
+        bail!(
+            "run '{run}' has no sidecar data (searched {})",
+            run_dir.display(),
+        );
     }
     if sidecars.is_empty() {
         bail!(
-            "run '{run}' walked {} sidecar file(s) but parsed 0 — every \
-             file failed to deserialize against the current schema. \
+            "run '{run}' walked {} sidecar file(s) under {} but parsed 0 — \
+             every file failed to deserialize against the current schema. \
              Pre-1.0 disposable-sidecar policy: re-run the test to \
              regenerate under the current schema.",
             walk_stats.walked,
+            run_dir.display(),
         );
     }
     if json {
@@ -2758,6 +2856,9 @@ fn render_explain_sidecar_text(
             for cause in entry.causes {
                 let _ = writeln!(out, "      - {cause}");
             }
+            if let Some(fix) = entry.fix {
+                let _ = writeln!(out, "      fix: {fix}");
+            }
         }
         out.push('\n');
     }
@@ -2769,9 +2870,11 @@ fn render_explain_sidecar_text(
 /// carrying the walked / valid counts so JSON consumers see the
 /// corrupt-file signal alongside the per-field breakdown) and
 /// `"fields"` — a map keyed by [`SIDECAR_NONE_CATALOG`] field
-/// name where each value carries `none_count` (sum across all
-/// sidecars in the run) plus the static classification + causes
-/// catalog entry.
+/// name where each value carries `none_count` and `some_count`
+/// (counts across all valid sidecars in the run, summing to
+/// `_walk.valid`) plus the static classification, causes, and
+/// `fix` catalog entry. The `fix` key is JSON null for fields
+/// whose `None` is the steady-state shape.
 fn render_explain_sidecar_json(
     sidecars: &[crate::test_support::SidecarResult],
     walk_stats: &WalkStats,
@@ -2786,10 +2889,23 @@ fn render_explain_sidecar_json(
                     .any(|(n, b)| *n == entry.field && !*b)
             })
             .count();
+        // `some_count = total - none_count`. Total is the
+        // count of sidecars in this run (`sidecars.len()` ==
+        // `walk_stats.valid`); we subtract rather than count
+        // separately so the two never disagree on rounding /
+        // off-by-one. Saturating subtraction is defensive
+        // against an underflow that the projection helper's
+        // boolean partition makes impossible — every sidecar
+        // contributes exactly 0 or 1 to `none_count` per field.
+        let some_count = sidecars.len().saturating_sub(none_count);
         let mut field_obj = serde_json::Map::new();
         field_obj.insert(
             "none_count".to_string(),
             serde_json::Value::from(none_count),
+        );
+        field_obj.insert(
+            "some_count".to_string(),
+            serde_json::Value::from(some_count),
         );
         field_obj.insert(
             "classification".to_string(),
@@ -2805,6 +2921,13 @@ fn render_explain_sidecar_json(
                     .collect(),
             ),
         );
+        // `fix` emits as JSON null when None so dashboard
+        // consumers see the key uniformly across entries
+        // (no `serde_json::Map::contains_key` branching).
+        // `serde_json::json!(Option<&str>)` produces a JSON
+        // string for `Some` and a JSON null for `None`,
+        // collapsing the prior match arm.
+        field_obj.insert("fix".to_string(), serde_json::json!(entry.fix));
         fields.insert(
             entry.field.to_string(),
             serde_json::Value::Object(field_obj),
@@ -4801,6 +4924,89 @@ mod tests {
         }
     }
 
+    /// Expected-classified entries (steady-state None) must NOT
+    /// carry a `fix:` — there is no operator action that
+    /// recovers an Expected None, so emitting one would mislead.
+    /// Pin the invariant so a future entry that flips
+    /// classification without removing its fix gets caught.
+    #[test]
+    fn none_catalog_expected_entries_have_no_fix() {
+        for entry in super::SIDECAR_NONE_CATALOG {
+            if matches!(entry.classification, super::NoneClassification::Expected) {
+                assert!(
+                    entry.fix.is_none(),
+                    "Expected-classified field {} must not carry a `fix:` \
+                     — there is no operator action that recovers a \
+                     steady-state None",
+                    entry.field,
+                );
+            }
+        }
+    }
+
+    /// Per the design ruling: the most-common-case `fix:`
+    /// assignments are Some for project_commit (run from a
+    /// git-tracked source tree), kernel_commit (set
+    /// KTSTR_KERNEL), host (re-run), and run_source (re-run or
+    /// rename). Other Actionable fields (monitor / kvm_stats /
+    /// kernel_version / cleanup_duration_ms) span causes that
+    /// don't converge on a single operator action and
+    /// intentionally carry None. Encoding the assignment matrix
+    /// in a test makes a future reviewer's "why doesn't monitor
+    /// have a fix?" question answerable from the test name
+    /// alone.
+    #[test]
+    fn none_catalog_fix_assignments_match_design_ruling() {
+        let by_field: std::collections::HashMap<&'static str, Option<&'static str>> =
+            super::SIDECAR_NONE_CATALOG
+                .iter()
+                .map(|e| (e.field, e.fix))
+                .collect();
+        // Fields that MUST carry a fix.
+        let must_fix = ["project_commit", "kernel_commit", "host", "run_source"];
+        // Fields that intentionally carry no fix because no
+        // single operator action covers their multi-cause set.
+        let must_not_fix = [
+            "scheduler_commit",
+            "payload",
+            "monitor",
+            "kvm_stats",
+            "kernel_version",
+            "cleanup_duration_ms",
+        ];
+        // Total-count guard: every catalog entry must be placed
+        // in exactly one of the two lists. Without this, a new
+        // `Option` field added to `SidecarResult` could land in
+        // the catalog with neither `must_fix` nor `must_not_fix`
+        // covering it, and the test below would silently
+        // ignore the placement decision.
+        assert_eq!(
+            must_fix.len() + must_not_fix.len(),
+            super::SIDECAR_NONE_CATALOG.len(),
+            "every catalog entry must be classified as either \
+             must-fix or must-not-fix; expected sum = catalog len \
+             ({}), got must_fix={} + must_not_fix={}",
+            super::SIDECAR_NONE_CATALOG.len(),
+            must_fix.len(),
+            must_not_fix.len(),
+        );
+        for field in &must_fix {
+            let fix = by_field.get(field).copied().flatten();
+            assert!(
+                fix.is_some(),
+                "field {field} must carry a `fix:` per the design ruling",
+            );
+        }
+        for field in &must_not_fix {
+            let fix = by_field.get(field).copied().flatten();
+            assert!(
+                fix.is_none(),
+                "field {field} must NOT carry a `fix:` (multi-cause or \
+                 steady-state None) — got: {fix:?}",
+            );
+        }
+    }
+
     /// Error path: the named run directory does not exist. Mirrors
     /// `show_run_host_missing_run_returns_error`'s error shape so
     /// operators see consistent diagnostics across the two
@@ -4823,16 +5029,30 @@ mod tests {
     /// Error path: run directory exists but is empty. Walked count
     /// is zero — distinct from "files present but parse-failed."
     /// Diagnostic must say "no sidecar data" to match
-    /// `show_run_host`'s error shape.
+    /// `show_run_host`'s error shape AND name the resolved
+    /// run-directory path so an operator can confirm which
+    /// directory was searched (catches `--dir` typos and pool-
+    /// root mismatches without a separate `find` invocation).
     #[test]
     fn explain_sidecar_empty_run_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("run-empty")).unwrap();
+        let run_dir = tmp.path().join("run-empty");
+        std::fs::create_dir(&run_dir).unwrap();
         let err = super::explain_sidecar("run-empty", Some(tmp.path()), false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no sidecar data"),
             "empty-run error must use the canonical message: {msg}",
+        );
+        assert!(
+            msg.contains("searched"),
+            "empty-run error must name the searched directory: {msg}",
+        );
+        assert!(
+            msg.contains(&run_dir.display().to_string()),
+            "empty-run error must include the resolved run_dir path \
+             ({}): {msg}",
+            run_dir.display(),
         );
     }
 
@@ -4905,13 +5125,41 @@ mod tests {
             out.contains("[actionable]"),
             "actionable-class fields must surface their tag: {out}",
         );
+        // The fix: line must surface for entries that carry one.
+        // Spot-check the project_commit fix (a stable, single-
+        // sentence remediation that wouldn't accidentally appear
+        // in any other rendered string).
+        assert!(
+            out.contains(
+                "fix: run from inside a git-tracked source tree with at \
+                 least one commit",
+            ),
+            "project_commit's fix: line must render: {out}",
+        );
+        // Entries without a fix must NOT emit a `fix:` line for
+        // that field. The test fixture has every Option as None
+        // including the fix=None entries (scheduler_commit,
+        // payload, monitor, kvm_stats, kernel_version,
+        // cleanup_duration_ms), so a regression that emitted
+        // an empty-string fix would surface as a stray
+        // `fix: \n` somewhere — count the fix lines and assert
+        // it matches the count of fix=Some entries (4: project_
+        // commit, kernel_commit, host, run_source).
+        let fix_line_count = out.matches("\n      fix:").count();
+        assert_eq!(
+            fix_line_count, 4,
+            "exactly 4 entries carry a fix: in the catalog \
+             (project_commit, kernel_commit, host, run_source); \
+             output emitted {fix_line_count}: {out}",
+        );
     }
 
     /// JSON shape: aggregate per-field with `none_count`,
-    /// `classification`, and `causes`. With one fixture sidecar
-    /// (every Option None), every field must report
-    /// `none_count: 1`. The `_walk` envelope must carry walked /
-    /// valid counts.
+    /// `some_count`, `classification`, and `causes`. With one
+    /// fixture sidecar (every Option None), every field must
+    /// report `none_count: 1` and `some_count: 0`, and the two
+    /// counts must sum to `_walk.valid`. The `_walk` envelope
+    /// must carry walked / valid counts.
     #[test]
     fn explain_sidecar_json_shape_aggregates_none_counts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4934,10 +5182,28 @@ mod tests {
             let f = fields
                 .get(entry.field)
                 .unwrap_or_else(|| panic!("missing field {}", entry.field));
+            let none_count = f
+                .get("none_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| panic!("missing none_count for {}", entry.field));
+            let some_count = f
+                .get("some_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| panic!("missing some_count for {}", entry.field));
             assert_eq!(
-                f.get("none_count").and_then(|v| v.as_u64()),
-                Some(1),
+                none_count, 1,
                 "every field in fixture is None — none_count must be 1 for {}",
+                entry.field,
+            );
+            assert_eq!(
+                some_count, 0,
+                "every field in fixture is None — some_count must be 0 for {}",
+                entry.field,
+            );
+            assert_eq!(
+                none_count + some_count,
+                1,
+                "none_count + some_count must sum to _walk.valid (1) for {}",
                 entry.field,
             );
             assert_eq!(
@@ -4956,6 +5222,32 @@ mod tests {
                 "causes array length must match catalog for {}",
                 entry.field,
             );
+            // `fix` must round-trip as the catalog's value:
+            // string when Some, JSON null when None. Emitting
+            // the key uniformly across entries (even on null)
+            // saves dashboard consumers a `contains_key`
+            // branch.
+            let fix_value = f
+                .get("fix")
+                .unwrap_or_else(|| panic!("missing fix for {}", entry.field));
+            match entry.fix {
+                Some(expected) => {
+                    assert_eq!(
+                        fix_value.as_str(),
+                        Some(expected),
+                        "fix string must round-trip for {}",
+                        entry.field,
+                    );
+                }
+                None => {
+                    assert!(
+                        fix_value.is_null(),
+                        "fix must be JSON null for fix=None entry {}: \
+                         got {fix_value:?}",
+                        entry.field,
+                    );
+                }
+            }
         }
     }
 
@@ -5022,7 +5314,10 @@ mod tests {
 
     /// JSON aggregation across multiple sidecars: one sidecar
     /// has `payload = Some(...)`, the other has `payload = None`.
-    /// `none_count` for `payload` must be 1 (not 2, not 0).
+    /// `none_count` for `payload` must be 1 (not 2, not 0), and
+    /// `some_count` must be 1 — both surfaced so dashboards do
+    /// not need to derive the second from `_walk.valid` minus the
+    /// first.
     #[test]
     fn explain_sidecar_json_aggregates_partial_none_correctly() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5052,6 +5347,11 @@ mod tests {
             Some(1),
             "payload None in 1 of 2 sidecars — none_count must be 1",
         );
+        assert_eq!(
+            payload.get("some_count").and_then(|v| v.as_u64()),
+            Some(1),
+            "payload Some in 1 of 2 sidecars — some_count must be 1",
+        );
         // Sanity: `host` is None in both sidecars.
         let host = parsed
             .get("fields")
@@ -5061,6 +5361,11 @@ mod tests {
             host.get("none_count").and_then(|v| v.as_u64()),
             Some(2),
             "host None in 2 of 2 sidecars — none_count must be 2",
+        );
+        assert_eq!(
+            host.get("some_count").and_then(|v| v.as_u64()),
+            Some(0),
+            "host Some in 0 of 2 sidecars — some_count must be 0",
         );
     }
 

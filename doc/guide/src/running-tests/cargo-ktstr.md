@@ -609,16 +609,27 @@ intentionally from `compare` / `list-values`; matches `show-host`.
 The override would erase the only signal that surfaces the
 pre-rename `source`-key drop case.
 
-The output header reports `walked N, parsed M`: `N` counts every
+The output header reports `walked N sidecar file(s), parsed M valid`: `N` counts every
 `.ktstr.json` file the walker visited, `M` counts how many
 parsed against the current schema. `walked > parsed` signals a
 corrupt or pre-1.0-schema sidecar — re-run the test to
 regenerate under the current schema.
 
-`--json` emits a single object whose top-level `fields` key
-carries one entry per `Option<T>` field with `none_count`
-aggregated across the run's sidecars; the `_walk` key carries
-the same counts as the text header.
+Per-`None` blocks in the text output also include a `fix:`
+line for fields whose `None` is recoverable by an operator
+action (e.g. `kernel_commit` recovers when `KTSTR_KERNEL`
+points at a local kernel git tree). Fields whose `None` is
+the steady-state shape (or a multi-cause set with no single
+remediation) emit no `fix:` line.
+
+`--json` emits a single object with `_walk` (carrying the
+`walked` / `valid` counts — same numbers the text header
+reports under "walked N sidecar file(s), parsed M valid")
+and `fields`. Each entry under `fields` carries `none_count`
+and `some_count` (counts across all valid sidecars in the
+run, summing to `_walk.valid`), `classification`, `causes`,
+and `fix` (string when a remediation applies, JSON null
+otherwise).
 
 ```sh
 cargo ktstr stats explain-sidecar --run RUN_ID                       # text per-sidecar diagnostic
