@@ -567,16 +567,45 @@ pub struct GauntletRow {
     /// filtered set, mirroring the [`RowFilter::kernels`] policy.
     ///
     /// Sourced from `SidecarResult::project_commit`; shortened to
-    /// `commit` for the analysis layer because only one commit
-    /// dimension is exposed here. `SidecarResult::scheduler_commit`
-    /// is a separate concept (the userspace scheduler binary's
-    /// commit, currently always `None`) and is not currently
-    /// exposed as a filter on `GauntletRow`; if a future change
-    /// surfaces it, the field will need a disambiguating name
-    /// (e.g. `project_commit` vs `scheduler_commit`) rather than
-    /// the bare `commit` used here.
+    /// `commit` for the analysis layer because the project commit
+    /// is the most-frequently-narrowed-on of the three commit
+    /// dimensions on `SidecarResult`. The other two commit fields
+    /// — `SidecarResult::scheduler_commit` and
+    /// `SidecarResult::kernel_commit` — get fully-qualified names
+    /// here (`scheduler_commit` is reserved and not yet exposed,
+    /// `kernel_commit` is the typed filter `RowFilter::kernel_commits`
+    /// applies). The bare `commit` shortening is intentional and
+    /// keeps the filter spelling `--commit X` (vs the more verbose
+    /// `--project-commit X`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Kernel SOURCE TREE git commit carried from the source
+    /// sidecar (`SidecarResult::kernel_commit`). Short hex with
+    /// optional `-dirty` suffix (e.g. `"abcdef1"` or
+    /// `"abcdef1-dirty"`). `None` when the sidecar writer could
+    /// not probe a git repo for the kernel directory at write
+    /// time (KTSTR_KERNEL points at a non-git path, the
+    /// underlying source is `Tarball` / `Git` rather than
+    /// `Local`, or
+    /// [`crate::test_support::sidecar::detect_kernel_commit`]
+    /// failed for any reason).
+    ///
+    /// Distinct from [`GauntletRow::commit`]: that field tracks
+    /// the ktstr framework HEAD ("which version of the harness
+    /// produced this sidecar?"); this field tracks the kernel
+    /// tree HEAD ("which kernel commit did this run boot?"). Two
+    /// runs with the same `commit` but different `kernel_commit`
+    /// values are typical when the kernel under test is updated
+    /// without re-checking out the harness; two runs with the
+    /// same `kernel_commit` but different `commit` values are
+    /// typical when the harness is bumped without rebuilding the
+    /// kernel.
+    ///
+    /// Surfaced via the typed [`RowFilter::kernel_commits`] for
+    /// narrowing — same opt-in policy as [`RowFilter::commits`]:
+    /// rows with `None` never match a populated filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_commit: Option<String>,
     /// Active scheduler flags carried from
     /// `SidecarResult::active_flags`. Previously this field did not
     /// exist on the row; every A/B comparison therefore ignored
@@ -747,6 +776,13 @@ pub struct GauntletRow {
 ///   `commit` equals ANY entry in `commits`. Same multi-value
 ///   semantic as `kernels`, applied to the ktstr project commit
 ///   recorded by `detect_project_commit` at sidecar-write time.
+/// - `kernel_commits` — repeatable, OR-combined: a row matches
+///   iff its `kernel_commit` equals ANY entry in `kernel_commits`.
+///   Same multi-value semantic as `commits`, applied to the
+///   kernel source-tree commit recorded by
+///   [`crate::test_support::sidecar::detect_kernel_commit`] at
+///   sidecar-write time. Filters on the kernel HEAD, NOT on the
+///   kernel release version (`kernels` is the version filter).
 /// - `flags` — AND-combined: every entry in the filter must appear
 ///   somewhere in the row's `flags` vec. The row may carry
 ///   additional flags beyond the filter set; the filter pins
@@ -755,7 +791,8 @@ pub struct GauntletRow {
 ///   `kernel_version` is `None` ALWAYS fails (no wildcard semantic)
 ///   — the operator wrote specific versions and a `None`-row would
 ///   silently dilute the set. The same opt-in policy applies to
-///   `commits` against rows with `commit == None`.
+///   `commits` against rows with `commit == None`, and to
+///   `kernel_commits` against rows with `kernel_commit == None`.
 ///
 /// Empty `RowFilter` (every field `None`/empty) is the no-op default
 /// and matches every row. Use [`RowFilter::default()`] to build it.
@@ -773,6 +810,19 @@ pub struct RowFilter {
     /// `commit` is itself `None` never matches a non-empty filter
     /// — same opt-in semantic as `kernels`.
     pub commits: Vec<String>,
+    /// Repeatable kernel-source-commit filter, OR-combined: a row
+    /// matches iff its `GauntletRow::kernel_commit` equals ANY
+    /// entry. Empty vec disables the filter ("do not filter on
+    /// kernel commit"). A row whose `kernel_commit` is itself
+    /// `None` never matches a non-empty filter — same opt-in
+    /// semantic as `commits`.
+    ///
+    /// Distinct from `commits` (the ktstr framework commit) and
+    /// from `kernels` (the kernel release version): two runs with
+    /// the same `kernel_version` but different `kernel_commit`
+    /// values represent the same release rebuilt from different
+    /// trees (e.g. WIP patches on top, a different remote ref).
+    pub kernel_commits: Vec<String>,
     /// Match against `GauntletRow::scheduler` (strict equality).
     /// `None` here is "do not filter on scheduler".
     pub scheduler: Option<String>,
@@ -833,6 +883,23 @@ impl RowFilter {
                 .commits
                 .iter()
                 .any(|want| row_commit == Some(want.as_str()));
+            if !any {
+                return false;
+            }
+        }
+        if !self.kernel_commits.is_empty() {
+            // OR-combined match against `GauntletRow::kernel_commit`,
+            // mirroring the `commits` policy: a row whose
+            // `kernel_commit` is `None` (the sidecar writer's
+            // `detect_kernel_commit` probe failed, or `KTSTR_KERNEL`
+            // pointed at a non-git source) never matches a populated
+            // filter — same opt-in semantic as `--commit` /
+            // `--kernel`.
+            let row_kc = row.kernel_commit.as_deref();
+            let any = self
+                .kernel_commits
+                .iter()
+                .any(|want| row_kc == Some(want.as_str()));
             if !any {
                 return false;
             }
@@ -924,13 +991,14 @@ fn is_major_minor_prefix(s: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// One of the six dimensions that compose a [`GauntletRow`]'s
+/// One of the seven dimensions that compose a [`GauntletRow`]'s
 /// identity in the comparison pipeline: `kernel`, `scheduler`,
-/// `topology`, `work_type`, `commit`, `flags`. Each maps to the
-/// corresponding `RowFilter` field and `GauntletRow` field; the
-/// dimension model lets [`compare_partitions`] derive its slicing
-/// dims and dynamic pairing key without hardcoding the dimension
-/// list at every call site.
+/// `topology`, `work_type`, `commit`, `kernel_commit`, `flags`.
+/// Each maps to the corresponding `RowFilter` field and
+/// `GauntletRow` field; the dimension model lets
+/// [`compare_partitions`] derive its slicing dims and dynamic
+/// pairing key without hardcoding the dimension list at every
+/// call site.
 ///
 /// `scenario` is NOT a dimension — it is the test name and is
 /// always part of the pairing key (you can't compare scenario A
@@ -939,8 +1007,9 @@ fn is_major_minor_prefix(s: &str) -> bool {
 /// Iteration order via [`Dimension::ALL`] is deterministic and
 /// matches the order operators read in the CLI flags
 /// (`--kernel` / `--scheduler` / `--topology` / `--work-type` /
-/// `--commit` / `--flag`), so generated labels and error
-/// messages list dims in a stable, predictable order.
+/// `--commit` / `--kernel-commit` / `--flag`), so generated
+/// labels and error messages list dims in a stable, predictable
+/// order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dimension {
     Kernel,
@@ -948,6 +1017,7 @@ pub enum Dimension {
     Topology,
     WorkType,
     Commit,
+    KernelCommit,
     Flags,
 }
 
@@ -962,6 +1032,7 @@ impl Dimension {
         Dimension::Topology,
         Dimension::WorkType,
         Dimension::Commit,
+        Dimension::KernelCommit,
         Dimension::Flags,
     ];
 
@@ -991,6 +1062,7 @@ impl Dimension {
             Dimension::Topology => "topology",
             Dimension::WorkType => "work-type",
             Dimension::Commit => "commit",
+            Dimension::KernelCommit => "kernel-commit",
             Dimension::Flags => "flags",
         }
     }
@@ -1015,10 +1087,11 @@ pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] =
 /// [`compare_rows`] to join A-side rows against B-side rows.
 ///
 /// Comparison shape per dimension:
-/// - `Kernel` / `Commit` / `Flags`: a slicing dim iff the two
-///   sides' filter vecs differ as SORTED-DEDUPED `Vec<&str>`.
-///   Order does not matter (`--a-kernel 6.14 --a-kernel 6.15` and
-///   `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice).
+/// - `Kernel` / `Commit` / `KernelCommit` / `Flags`: a slicing
+///   dim iff the two sides' filter vecs differ as SORTED-DEDUPED
+///   `Vec<&str>`. Order does not matter (`--a-kernel 6.14
+///   --a-kernel 6.15` and `--b-kernel 6.15 --b-kernel 6.14` are
+///   NOT a slice).
 /// - `Scheduler` / `Topology` / `WorkType`: a slicing dim iff the
 ///   two `Option<String>` filters differ. `Some("foo") != None`
 ///   counts as a differ.
@@ -1035,6 +1108,9 @@ pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Di
             Dimension::Topology => filter_a.topology != filter_b.topology,
             Dimension::WorkType => filter_a.work_type != filter_b.work_type,
             Dimension::Commit => sorted_dedup(&filter_a.commits) != sorted_dedup(&filter_b.commits),
+            Dimension::KernelCommit => {
+                sorted_dedup(&filter_a.kernel_commits) != sorted_dedup(&filter_b.kernel_commits)
+            }
             Dimension::Flags => sorted_dedup(&filter_a.flags) != sorted_dedup(&filter_b.flags),
         };
         if differs {
@@ -1091,6 +1167,7 @@ pub(crate) fn render_side_label(
                 .clone()
                 .unwrap_or_else(|| bare_label.to_string()),
             Dimension::Commit => render_vec_dim(&filter.commits, bare_label),
+            Dimension::KernelCommit => render_vec_dim(&filter.kernel_commits, bare_label),
             Dimension::Flags => render_vec_dim(&filter.flags, bare_label),
         };
         parts.push(part);
@@ -1146,6 +1223,7 @@ impl PairingKey {
                 Dimension::Topology => row.topology.clone(),
                 Dimension::WorkType => row.work_type.clone(),
                 Dimension::Commit => row.commit.clone().unwrap_or_default(),
+                Dimension::KernelCommit => row.kernel_commit.clone().unwrap_or_default(),
                 Dimension::Flags => {
                     let mut sorted: Vec<&str> = row.flags.iter().map(String::as_str).collect();
                     sorted.sort_unstable();
@@ -1416,6 +1494,7 @@ pub fn group_and_average_by(
             scheduler: acc.first.scheduler.clone(),
             kernel_version: acc.first.kernel_version.clone(),
             commit: acc.first.commit.clone(),
+            kernel_commit: acc.first.kernel_commit.clone(),
             flags: acc.first.flags.clone(),
             // ALL must pass: any failed or skipped contributor
             // flips the aggregate. A group with zero
@@ -1520,6 +1599,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         scheduler: sc.scheduler.clone(),
         kernel_version: sc.kernel_version.clone(),
         commit: sc.project_commit.clone(),
+        kernel_commit: sc.kernel_commit.clone(),
         flags: sc.active_flags.clone(),
         passed: sc.passed,
         skipped: sc.skipped,
@@ -2021,23 +2101,25 @@ pub fn list_runs() -> anyhow::Result<()> {
 /// Pool every sidecar under the runs root (or `dir` when set) and
 /// emit the distinct values present on each filterable dimension.
 ///
-/// Six dimensions are reported, matching the six fields on
+/// Seven dimensions are reported, matching the seven fields on
 /// [`RowFilter`]: `kernel` (from `SidecarResult::kernel_version`),
 /// `scheduler`, `topology`, `work_type`, `commit`
-/// (from `SidecarResult::project_commit`), and `flags` (individual
-/// flag names, exploded from each row's `active_flags`). The
-/// dimension catalogue here matches what `cargo ktstr stats compare`
+/// (from `SidecarResult::project_commit`), `kernel_commit` (from
+/// `SidecarResult::kernel_commit`), and `flags` (individual flag
+/// names, exploded from each row's `active_flags`). The dimension
+/// catalogue here matches what `cargo ktstr stats compare`
 /// accepts as `--X` and `--a-X` / `--b-X` filter flags — the
 /// command exists so an operator can answer "what kernel versions
 /// are in the pool?" before crafting a compare invocation.
 ///
-/// `kernel_version` and `project_commit` are `Option<String>` on
-/// the source sidecar; absence is reported as a literal JSON `null`
-/// in the JSON shape and the textual sentinel `unknown` in the
-/// table shape. The set is sorted by the type's natural ordering
-/// (`BTreeSet`); `None` collates before any populated value in
-/// `Option<String>` ordering, so `null` / `unknown` always lands
-/// at the top of the per-dimension listing.
+/// `kernel_version`, `project_commit`, and `kernel_commit` are
+/// `Option<String>` on the source sidecar; absence is reported as
+/// a literal JSON `null` in the JSON shape and the textual
+/// sentinel `unknown` in the table shape. The set is sorted by
+/// the type's natural ordering (`BTreeSet`); `None` collates
+/// before any populated value in `Option<String>` ordering, so
+/// `null` / `unknown` always lands at the top of the per-dimension
+/// listing.
 ///
 /// `flags` is exploded: each entry in any row's `active_flags`
 /// vector becomes a single value in the flag set. The
@@ -2065,6 +2147,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
 
     let mut kernels: BTreeSet<Option<String>> = BTreeSet::new();
     let mut commits: BTreeSet<Option<String>> = BTreeSet::new();
+    let mut kernel_commits: BTreeSet<Option<String>> = BTreeSet::new();
     let mut schedulers: BTreeSet<String> = BTreeSet::new();
     let mut topologies: BTreeSet<String> = BTreeSet::new();
     let mut work_types: BTreeSet<String> = BTreeSet::new();
@@ -2073,6 +2156,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     for sc in &pool {
         kernels.insert(sc.kernel_version.clone());
         commits.insert(sc.project_commit.clone());
+        kernel_commits.insert(sc.kernel_commit.clone());
         schedulers.insert(sc.scheduler.clone());
         topologies.insert(sc.topology.clone());
         work_types.insert(sc.work_type.clone());
@@ -2096,9 +2180,17 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
                 None => serde_json::Value::Null,
             })
             .collect();
+        let kernel_commits_json: Vec<serde_json::Value> = kernel_commits
+            .iter()
+            .map(|opt| match opt {
+                Some(s) => serde_json::Value::String(s.clone()),
+                None => serde_json::Value::Null,
+            })
+            .collect();
         let payload = serde_json::json!({
             "kernel": kernels_json,
             "commit": commits_json,
+            "kernel_commit": kernel_commits_json,
             "scheduler": schedulers.iter().collect::<Vec<_>>(),
             "topology": topologies.iter().collect::<Vec<_>>(),
             "work_type": work_types.iter().collect::<Vec<_>>(),
@@ -2148,6 +2240,7 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     };
     render_opt_set(&mut out, "kernel:", &kernels);
     render_opt_set(&mut out, "commit:", &commits);
+    render_opt_set(&mut out, "kernel_commit:", &kernel_commits);
     render_str_set(&mut out, "scheduler:", &schedulers);
     render_str_set(&mut out, "topology:", &topologies);
     render_str_set(&mut out, "work_type:", &work_types);
@@ -3021,6 +3114,7 @@ mod tests {
             scheduler: String::new(),
             kernel_version: None,
             commit: None,
+            kernel_commit: None,
             flags: Vec::new(),
             skipped: false,
             passed,
@@ -3259,6 +3353,94 @@ mod tests {
             "absent project_commit must propagate as None — a \
              regression substituting an empty string would dilute \
              every `--commit` filter into matching all None rows",
+        );
+    }
+
+    /// `sidecar_to_row` must copy `SidecarResult::kernel_commit`
+    /// into `GauntletRow::kernel_commit` verbatim so the typed
+    /// `--kernel-commit` filter and per-side
+    /// `--a-kernel-commit` / `--b-kernel-commit` slicers see the
+    /// value the sidecar writer recorded. A regression that left
+    /// the field at the `Option::default()` (`None`) would
+    /// silently drop the kernel-commit dimension from every
+    /// comparison even when the sidecar had a populated value.
+    /// Mirrors `sidecar_to_row_propagates_project_commit` for
+    /// the kernel_commit field; pinned for `None`, clean `Some`
+    /// (no suffix), and dirty `Some` (`-dirty` suffix) to catch
+    /// a regression that special-cases one shape and not the
+    /// others.
+    #[test]
+    fn sidecar_to_row_propagates_kernel_commit() {
+        use crate::test_support;
+        let sc_dirty = test_support::SidecarResult {
+            test_name: "kc_dirty_test".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            kernel_commit: Some("kabcde7-dirty".to_string()),
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row_dirty = sidecar_to_row(&sc_dirty);
+        assert_eq!(
+            row_dirty.kernel_commit.as_deref(),
+            Some("kabcde7-dirty"),
+            "populated dirty kernel_commit must propagate \
+             verbatim, including the `-dirty` suffix",
+        );
+
+        let sc_clean = test_support::SidecarResult {
+            test_name: "kc_clean_test".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            kernel_commit: Some("kabcde7".to_string()),
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row_clean = sidecar_to_row(&sc_clean);
+        assert_eq!(
+            row_clean.kernel_commit.as_deref(),
+            Some("kabcde7"),
+            "populated clean kernel_commit (no `-dirty` suffix) \
+             must propagate verbatim — a regression that always \
+             appended `-dirty` or always stripped a tail would \
+             surface here independently of the dirty case above",
+        );
+
+        let sc_none = test_support::SidecarResult {
+            test_name: "no_kc_test".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            kernel_commit: None,
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row_none = sidecar_to_row(&sc_none);
+        assert!(
+            row_none.kernel_commit.is_none(),
+            "absent kernel_commit must propagate as None — a \
+             regression substituting an empty string would dilute \
+             every `--kernel-commit` filter into matching all \
+             None rows",
+        );
+
+        // Field non-aliasing pin: kernel_commit and commit must
+        // route to distinct row fields. A regression that
+        // accidentally cross-wired the two (e.g. `commit:
+        // sc.kernel_commit.clone()` instead of
+        // `sc.project_commit.clone()`) would hide behind the
+        // populated tests above unless the values differ — which
+        // they do here. Distinct tokens make the swap obvious.
+        let sc_both = test_support::SidecarResult {
+            test_name: "both_test".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            project_commit: Some("project1".to_string()),
+            kernel_commit: Some("kernel1".to_string()),
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row_both = sidecar_to_row(&sc_both);
+        assert_eq!(
+            row_both.commit.as_deref(),
+            Some("project1"),
+            "row.commit must come from project_commit, not kernel_commit",
+        );
+        assert_eq!(
+            row_both.kernel_commit.as_deref(),
+            Some("kernel1"),
+            "row.kernel_commit must come from kernel_commit, not project_commit",
         );
     }
 
@@ -3783,6 +3965,7 @@ mod tests {
         for dim in [
             "kernel:",
             "commit:",
+            "kernel_commit:",
             "scheduler:",
             "topology:",
             "work_type:",
@@ -3793,15 +3976,15 @@ mod tests {
                 "text output must include heading for {dim}: {out}",
             );
         }
-        // Each dim should report the empty-pool sentinel exactly six
+        // Each dim should report the empty-pool sentinel exactly seven
         // times — one per dim — so a regression that dropped the
         // sentinel for one dim falls out as a count mismatch.
         let sentinel_count = out.matches("(no sidecars in pool)").count();
         assert_eq!(
-            sentinel_count, 6,
+            sentinel_count, 7,
             "empty pool must surface the no-sidecars sentinel under every \
-             one of the 6 dims (kernel/commit/scheduler/topology/work_type/flags); \
-             got {sentinel_count} occurrences in:\n{out}",
+             one of the 7 dims (kernel/commit/kernel_commit/scheduler/topology/\
+             work_type/flags); got {sentinel_count} occurrences in:\n{out}",
         );
     }
 
@@ -3816,6 +3999,7 @@ mod tests {
         for dim in [
             "kernel",
             "commit",
+            "kernel_commit",
             "scheduler",
             "topology",
             "work_type",
@@ -3910,14 +4094,18 @@ mod tests {
             );
         }
         // `unknown` appears once per Optional dim that has a None
-        // entry: kernel and commit. Both fixtures' second sidecar
-        // has `kernel_version: None` and `project_commit: None`
-        // so we expect 2 occurrences total.
+        // entry: kernel, commit, and kernel_commit. The second
+        // fixture has `kernel_version: None` and `project_commit:
+        // None`; every fixture in this test leaves `kernel_commit`
+        // at its `test_fixture` default (None), so the
+        // kernel_commit set's None bucket renders one `unknown`
+        // line as well. Total: 3 occurrences.
         let unknown_count = out.matches("unknown").count();
         assert_eq!(
-            unknown_count, 2,
+            unknown_count, 3,
             "`unknown` must render once per optional dim with a None \
-             entry (kernel + commit = 2); got {unknown_count} in:\n{out}",
+             entry (kernel + commit + kernel_commit = 3); got \
+             {unknown_count} in:\n{out}",
         );
 
         // Sort: both schedulers in ascending lex order means
@@ -5358,6 +5546,7 @@ mod tests {
             scheduler: scheduler.into(),
             kernel_version: kernel_version.map(str::to_owned),
             commit: None,
+            kernel_commit: None,
             flags: flags.iter().map(|s| (*s).to_owned()).collect(),
             passed: true,
             skipped: false,
@@ -5553,6 +5742,124 @@ mod tests {
             !filter_or.matches(&row_dirty),
             "`abcdef1-dirty` must still reject — the suffix-bearing \
              form is its own identity even in OR-combined mode",
+        );
+    }
+
+    /// `--kernel-commit kabcde7` against a row whose
+    /// `kernel_commit` is `None` must NOT match — same opt-in
+    /// policy as `--commit` and `--kernel`. Mirror of
+    /// `row_filter_commit_none_row_never_matches_populated_filter`
+    /// for the kernel-commit field.
+    #[test]
+    fn row_filter_kernel_commit_none_row_never_matches_populated_filter() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let filter = RowFilter {
+            kernel_commits: vec!["kabcde7".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter.matches(&row),
+            "None-kernel-commit row must not match populated filter; \
+             got dilution",
+        );
+    }
+
+    /// `--kernel-commit kabcde7` against a row whose
+    /// `kernel_commit` is `Some("kabcde7")` matches;
+    /// `Some("other")` rejects. Pins the strict-equality
+    /// contract for kernel_commit, including the OR-combined
+    /// multi-value semantic and the `-dirty` suffix's
+    /// contribution to identity (a clean and dirty run of the
+    /// same kernel HEAD bucket separately).
+    #[test]
+    fn row_filter_kernel_commit_exact_match_and_or_combined() {
+        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row_clean.kernel_commit = Some("kabcde7".to_string());
+        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row_dirty.kernel_commit = Some("kabcde7-dirty".to_string());
+        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row_other.kernel_commit = Some("fedcba2".to_string());
+
+        let filter_single = RowFilter {
+            kernel_commits: vec!["kabcde7".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            filter_single.matches(&row_clean),
+            "exact kernel_commit match must succeed",
+        );
+        assert!(
+            !filter_single.matches(&row_dirty),
+            "`kabcde7-dirty` must NOT match a filter for `kabcde7` — \
+             the suffix is part of identity, so the dirty run buckets \
+             separately from the clean run of the same kernel HEAD",
+        );
+        assert!(
+            !filter_single.matches(&row_other),
+            "different kernel_commit must reject",
+        );
+
+        let filter_or = RowFilter {
+            kernel_commits: vec!["kabcde7".to_string(), "fedcba2".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            filter_or.matches(&row_clean),
+            "first listed kernel_commit must match in OR-combined filter",
+        );
+        assert!(
+            filter_or.matches(&row_other),
+            "second listed kernel_commit must match in OR-combined filter",
+        );
+        assert!(
+            !filter_or.matches(&row_dirty),
+            "`kabcde7-dirty` must still reject — the suffix-bearing \
+             form is its own identity even in OR-combined mode",
+        );
+    }
+
+    /// `--kernel-commit` and `--commit` filter on DISTINCT row
+    /// fields. Pins the field non-aliasing: a row whose
+    /// `kernel_commit` matches but whose `commit` does not (or
+    /// vice versa) must reject. A regression that cross-wired
+    /// the `matches()` arms (e.g. `kernel_commits` checked
+    /// against `row.commit`) would silently dilute filtered
+    /// sets.
+    #[test]
+    fn row_filter_kernel_commit_and_commit_filter_distinct_fields() {
+        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row.commit = Some("project1".to_string());
+        row.kernel_commit = Some("kernel1".to_string());
+
+        // Filter on kernel_commit only — commit dimension is unconstrained.
+        let kc_only = RowFilter {
+            kernel_commits: vec!["kernel1".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            kc_only.matches(&row),
+            "kernel_commit match with no commit filter must accept",
+        );
+
+        let kc_mismatch = RowFilter {
+            kernel_commits: vec!["project1".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            !kc_mismatch.matches(&row),
+            "kernel_commits filter must check `kernel_commit` not `commit` — \
+             a regression that cross-wired the fields would accept here",
+        );
+
+        // Filter on commit only — kernel_commit dimension is unconstrained.
+        let commit_mismatch = RowFilter {
+            commits: vec!["kernel1".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            !commit_mismatch.matches(&row),
+            "commits filter must check `commit` not `kernel_commit` — \
+             a regression that cross-wired the fields would accept here",
         );
     }
 

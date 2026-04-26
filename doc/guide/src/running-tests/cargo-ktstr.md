@@ -389,6 +389,7 @@ cargo ktstr stats compare --a-scheduler scx_rusty --b-scheduler scx_alpha  # sli
 cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 --scheduler scx_rusty  # slice on kernel, pin scheduler on both sides
 cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15 -E cgroup_steady       # add substring filter
 cargo ktstr stats compare --a-commit abcdef1 --b-commit fedcba2 --no-average     # opt out of trial averaging
+cargo ktstr stats compare --a-kernel-commit abcdef1 --b-kernel-commit fedcba2    # slice on kernel source HEAD
 ```
 
 When invoked without a subcommand, prints gauntlet analysis from
@@ -439,9 +440,9 @@ cargo ktstr stats list-metrics --json       # JSON array
 List the distinct values present per filterable dimension in the
 sidecar pool. Walks every run directory under `target/ktstr/`
 (or `--dir`), pools the sidecars, and reports per-dimension sets
-for `kernel`, `commit`, `scheduler`, `topology`, `work_type`,
-and `flags` (individual flag names, exploded from each row's
-`active_flags`).
+for `kernel`, `commit`, `kernel_commit`, `scheduler`,
+`topology`, `work_type`, and `flags` (individual flag names,
+exploded from each row's `active_flags`).
 
 Use this before crafting a `cargo ktstr stats compare`
 invocation to discover what `--a-X` / `--b-X` values the pool
@@ -463,6 +464,7 @@ dimension name with arrays of values:
 {
   "kernel": [null, "6.14.2", "6.15.0"],
   "commit": [null, "abcdef1", "abcdef1-dirty"],
+  "kernel_commit": [null, "kabcde7", "kabcde7-dirty"],
   "scheduler": ["eevdf", "scx_rusty"],
   "topology": ["1n2l4c1t", "1n4l2c1t"],
   "work_type": ["CpuSpin", "PageFaultChurn"],
@@ -470,11 +472,11 @@ dimension name with arrays of values:
 }
 ```
 
-`kernel` and `commit` are optional on the source sidecar
-(`SidecarResult::kernel_version` / `project_commit` are
-`Option<String>`); the textual sentinel `unknown` and JSON `null`
-both denote a sidecar that did not record a value for that
-dimension.
+`kernel`, `commit`, and `kernel_commit` are optional on the
+source sidecar (`SidecarResult::kernel_version` /
+`project_commit` / `kernel_commit` are `Option<String>`); the
+textual sentinel `unknown` and JSON `null` both denote a sidecar
+that did not record a value for that dimension.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -532,11 +534,12 @@ cargo ktstr stats compare \
 ```
 
 **Symmetric sugar.** Shared `--X` flags (`--kernel`, `--scheduler`,
-`--topology`, `--work-type`, `--commit`, `--flag`) pin BOTH
-sides to the same value(s). Per-side `--a-X` / `--b-X` flags
-REPLACE the corresponding shared `--X` value for that side
-only — "more-specific replaces" semantics. So
-`--kernel 6.14 --a-kernel 6.13` puts A on 6.13 and B on 6.14.
+`--topology`, `--work-type`, `--commit`, `--kernel-commit`,
+`--flag`) pin BOTH sides to the same value(s). Per-side
+`--a-X` / `--b-X` flags REPLACE the corresponding shared
+`--X` value for that side only — "more-specific replaces"
+semantics. So `--kernel 6.14 --a-kernel 6.13` puts A on 6.13
+and B on 6.14.
 
 **Validation.** The dispatch site rejects two cases up front:
 - **Empty slicing**: no `--a-X` / `--b-X` at all, OR the per-side
@@ -576,11 +579,11 @@ applies to `--a-kernel` / `--b-kernel`.
 **Discovering filter values.** Run
 [`cargo ktstr stats list-values`](#list-values) before
 crafting a `compare` invocation to see what `kernel`, `commit`,
-`scheduler`, `topology`, `work_type`, and `flags` values the
-sidecar pool actually carries; passing a `--a-kernel 6.20`
-against an empty pool fails downstream with "no rows match
-filter A" and `list-values` is the upstream answer to "what
-have I got?".
+`kernel_commit`, `scheduler`, `topology`, `work_type`, and
+`flags` values the sidecar pool actually carries; passing a
+`--a-kernel 6.20` against an empty pool fails downstream with
+"no rows match filter A" and `list-values` is the upstream
+answer to "what have I got?".
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -590,18 +593,21 @@ have I got?".
 | `--topology LABEL` | -- | Pin BOTH sides to one rendered topology label (e.g. `1n2l4c2t`). Strict equality. |
 | `--work-type TYPE` | -- | Pin BOTH sides to one work_type (PascalCase variant of `WorkType`, e.g. `CpuSpin`). See [Work types](../concepts/work-types.md). |
 | `--commit HASH` (repeatable) | -- | Pin BOTH sides to listed `project_commit` value(s) (7-char hex, optional `-dirty` suffix). Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. |
+| `--kernel-commit HASH` (repeatable) | -- | Pin BOTH sides to listed `kernel_commit` value(s) (7-char hex, optional `-dirty` suffix). Filters the kernel SOURCE TREE commit (`SidecarResult::kernel_commit`), distinct from the kernel release version (`--kernel`): two runs of the same `kernel_version` with different `kernel_commit` values represent the same release rebuilt from different trees. Rows whose `kernel_commit` is `None` (KTSTR_KERNEL pointed at a non-git path, the underlying source was Tarball / Git rather than a `Local` tree, or the gix probe failed) NEVER match a populated filter. |
 | `--flag NAME` | -- | Repeatable AND-combined flag filter pinning BOTH sides. Every listed flag must appear in `active_flags`; rows may carry additional flags. |
 | `--a-kernel VER` (repeatable) | -- | A-side kernel filter. Replaces the shared `--kernel` for the A side only. |
 | `--a-scheduler NAME` | -- | A-side scheduler filter. Replaces the shared `--scheduler` for the A side only. |
 | `--a-topology LABEL` | -- | A-side topology filter. Replaces the shared `--topology` for the A side only. |
 | `--a-work-type TYPE` | -- | A-side work_type filter. Replaces the shared `--work-type` for the A side only. |
 | `--a-commit HASH` (repeatable) | -- | A-side commit filter. Replaces the shared `--commit` for the A side only. |
+| `--a-kernel-commit HASH` (repeatable) | -- | A-side kernel-commit filter. Replaces the shared `--kernel-commit` for the A side only. |
 | `--a-flag NAME` (repeatable) | -- | A-side flag filter. Replaces the shared `--flag` for the A side only. |
 | `--b-kernel VER` (repeatable) | -- | B-side kernel filter. Replaces the shared `--kernel` for the B side only. |
 | `--b-scheduler NAME` | -- | B-side scheduler filter. Replaces the shared `--scheduler` for the B side only. |
 | `--b-topology LABEL` | -- | B-side topology filter. Replaces the shared `--topology` for the B side only. |
 | `--b-work-type TYPE` | -- | B-side work_type filter. Replaces the shared `--work-type` for the B side only. |
 | `--b-commit HASH` (repeatable) | -- | B-side commit filter. Replaces the shared `--commit` for the B side only. |
+| `--b-kernel-commit HASH` (repeatable) | -- | B-side kernel-commit filter. Replaces the shared `--kernel-commit` for the B side only. |
 | `--b-flag NAME` (repeatable) | -- | B-side flag filter. Replaces the shared `--flag` for the B side only. |
 | `--no-average` | off | Disable averaging. Each sidecar stays distinct; bails with an actionable error when multiple sidecars on the same side share the same pairing key (since pairing across sides becomes ambiguous). |
 | `--threshold PCT` | per-metric `default_rel` | Uniform relative significance threshold in percent. Overrides the per-metric `default_rel` for every metric; the absolute gate is always per-metric and cannot be tuned from the CLI. Mutually exclusive with `--policy`. |

@@ -30,6 +30,14 @@
 //!   when the cache metadata is absent or does not carry a
 //!   version (e.g. a raw source-tree path set in `KTSTR_KERNEL`
 //!   rather than a cache key).
+//! - [`detect_kernel_commit`]: read the kernel SOURCE TREE's git
+//!   HEAD short hex (with `-dirty` suffix when worktree differs
+//!   from the index or HEAD differs from the index) for the
+//!   `kernel_commit` field. Distinct from `kernel_version`
+//!   (release string from `kernel.release`) and `project_commit`
+//!   (ktstr framework HEAD): this records "what kernel commit
+//!   produced this run" so two runs of the same `kernel_version`
+//!   but different WIP source trees compare distinctly.
 
 use std::path::PathBuf;
 
@@ -166,6 +174,48 @@ pub struct SidecarResult {
     /// Always emitted (`"kernel_version": null` on absence);
     /// required on deserialize.
     pub kernel_version: Option<String>,
+    /// Kernel SOURCE TREE git HEAD short hex (7 chars via
+    /// `oid::to_hex_with_len(7)`), with `-dirty` suffix appended
+    /// when HEAD-vs-index or index-vs-worktree changes are
+    /// observed. Probes via `gix::open` against the kernel
+    /// directory resolved from `KTSTR_KERNEL` (not `gix::discover`
+    /// — the kernel dir is explicit, not walked-up). Captured by
+    /// [`detect_kernel_commit`] at sidecar-write time.
+    ///
+    /// Distinct from sibling fields:
+    /// - [`SidecarResult::kernel_version`] — release string read
+    ///   from cache metadata or `include/config/kernel.release`,
+    ///   e.g. `"6.14.2"`. Two runs of `6.14.2` from a clean
+    ///   tree and a `-dirty` worktree at the same HEAD share
+    ///   `kernel_version` but differ on `kernel_commit`.
+    /// - [`SidecarResult::project_commit`] — ktstr framework
+    ///   HEAD captured from the test process's cwd. Tracks
+    ///   "what version of the harness produced this sidecar?"
+    ///   independently of the kernel under test.
+    /// - [`SidecarResult::scheduler_commit`] — userspace
+    ///   scheduler binary's commit (currently always `None`).
+    ///
+    /// `None` when:
+    /// - `KTSTR_KERNEL` is unset or empty;
+    /// - the resolved `KernelId` is `Version` / `CacheKey` whose
+    ///   underlying source is `Tarball` / `Git` (no source tree
+    ///   on disk to probe);
+    /// - the resolved kernel directory is not a git repository
+    ///   (`gix::open` fails);
+    /// - HEAD cannot be read (unborn HEAD on a fresh `git init`
+    ///   with zero commits);
+    /// - any other gix probe failure — metadata, not a gate.
+    ///
+    /// Always emitted (`"kernel_commit": null` on absence);
+    /// required on deserialize. Excluded from
+    /// [`sidecar_variant_hash`] for the same cross-host grouping
+    /// reason `scheduler_commit` and `project_commit` are
+    /// excluded: two runs of the same semantic variant on
+    /// different kernel-source HEADs must still bucket together
+    /// so `stats compare` can diff them; the commit-drift
+    /// detection inspects this field directly via the
+    /// `--kernel-commit` filter.
+    pub kernel_commit: Option<String>,
     /// ISO 8601 timestamp of when this test run started.
     pub timestamp: String,
     /// Unique identifier for the test run. Derived from the repo commit
@@ -261,6 +311,7 @@ impl SidecarResult {
             sysctls: Vec::new(),
             kargs: Vec::new(),
             kernel_version: None,
+            kernel_commit: None,
             timestamp: String::new(),
             run_id: String::new(),
             host: None,
@@ -830,6 +881,156 @@ fn detect_commit_at(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// Detect the kernel SOURCE TREE's git HEAD at sidecar-write time.
+///
+/// `kernel_dir` is the explicit kernel source directory — typically
+/// resolved from `KTSTR_KERNEL` for `KernelId::Path`, or from the
+/// cache entry's `KernelSource::Local::source_tree_path` when
+/// `KTSTR_KERNEL` is a Version / CacheKey whose underlying build
+/// recorded a local tree. Uses `gix::open(kernel_dir)` (NOT
+/// `gix::discover`) because the kernel directory is explicit, not
+/// walked-up: the parent walk that `discover` performs would
+/// resolve to whichever ancestor `.git` it found first, which
+/// might be the ktstr project's repo when `kernel_dir` is a
+/// non-git subdirectory inside it. `open` requires `kernel_dir`
+/// itself to be the repo root, which is the documented invariant
+/// for kernel checkouts.
+///
+/// Reads HEAD short-hex (7 chars via `oid::to_hex_with_len(7)`)
+/// and appends `-dirty` when index-vs-HEAD or worktree-vs-index
+/// changes are observed. Submodules are ignored
+/// (`Submodule::Given { ignore: All }`). The dirt-detection
+/// cascade matches [`detect_project_commit`] / [`crate::fetch::local_source`]:
+/// peel HEAD to its tree, diff tree-vs-index, then `status()`
+/// for worktree-vs-index. Same "treat as clean on probe failure"
+/// degradation rules apply: a missing index, an unreadable
+/// worktree, or `head_tree()` failure each fall through as
+/// "clean" rather than aborting the probe — metadata must not
+/// gate sidecar writes.
+///
+/// HASH REPRESENTATION matches [`detect_project_commit`]: keeps
+/// the hash with `-dirty` appended (operator-readable identity).
+/// Distinct from [`crate::fetch::local_source`], which DROPS the
+/// hash on dirty because the commit no longer describes the
+/// build INPUT for cache-key purposes.
+///
+/// Returns `None` when:
+/// - `kernel_dir` is not a git repository (`gix::open` fails);
+/// - HEAD cannot be read (unborn HEAD on a fresh `git init` with
+///   zero commits, or a corrupt repository).
+///
+/// Returns `Some(short_hash)` (without the `-dirty` suffix) when
+/// the HEAD read succeeds but a downstream dirt-detection call
+/// fails — including a missing index, an unreadable working
+/// tree, or `head_tree()` failure. Each failed leg degrades to
+/// "treat as clean" rather than aborting the probe, because
+/// metadata must not gate sidecar writes.
+pub(crate) fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<String> {
+    let repo = gix::open(kernel_dir).ok()?;
+    let head = repo.head_id().ok()?;
+    let short_hash = head.to_hex_with_len(7).to_string();
+
+    let head_tree_id = match repo.head_tree() {
+        Ok(t) => t.id,
+        Err(_) => return Some(short_hash),
+    };
+
+    let mut index_dirty = false;
+    if let Ok(index) = repo.index() {
+        let _ = repo.tree_index_status(
+            &head_tree_id,
+            &index,
+            None,
+            gix::status::tree_index::TrackRenames::Disabled,
+            |_, _, _| {
+                index_dirty = true;
+                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+            },
+        );
+    }
+
+    let worktree_dirty = if index_dirty {
+        false
+    } else {
+        repo.status(gix::progress::Discard)
+            .ok()
+            .and_then(|s| {
+                s.index_worktree_rewrites(None)
+                    .index_worktree_submodules(gix::status::Submodule::Given {
+                        ignore: gix::submodule::config::Ignore::All,
+                        check_dirty: false,
+                    })
+                    .index_worktree_options_mut(|opts| {
+                        opts.dirwalk_options = None;
+                    })
+                    .into_index_worktree_iter(Vec::new())
+                    .ok()
+                    .map(|mut iter| iter.next().is_some())
+            })
+            .unwrap_or(false)
+    };
+
+    if index_dirty || worktree_dirty {
+        Some(format!("{short_hash}-dirty"))
+    } else {
+        Some(short_hash)
+    }
+}
+
+/// Resolve the kernel source-tree path for [`detect_kernel_commit`]
+/// from the [`crate::KTSTR_KERNEL_ENV`] env var.
+///
+/// Routes through [`crate::ktstr_kernel_env`] for the raw env
+/// value and [`crate::kernel_path::KernelId`] for variant
+/// dispatch:
+///
+/// - `KernelId::Path(p)`: returns the raw path verbatim. The
+///   typical case: `KTSTR_KERNEL=/path/to/linux` points at a
+///   working source tree that may be a git repo.
+/// - `KernelId::Version(_)` / `KernelId::CacheKey(_)`: looks up
+///   the cache entry. If `metadata.source` is
+///   `KernelSource::Local { source_tree_path: Some(p), .. }`,
+///   returns `p` — that build was driven from a local source
+///   tree whose worktree may still exist. For
+///   `KernelSource::Tarball` / `KernelSource::Git`, the source
+///   was transient (extracted into a tempdir, then deleted by
+///   the cache pipeline) and there is no git tree to probe;
+///   returns `None`.
+/// - `KernelId::Range { .. }` / `KernelId::Git { .. }`:
+///   multi-kernel specs in `KTSTR_KERNEL` never reach this
+///   helper in production (find_kernel's env reader bails
+///   before sidecar writing). Defensive: returns `None`.
+///
+/// Returns `None` when the env var is unset, when no source
+/// tree path is recoverable, or when the cache lookup fails.
+fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
+    use crate::kernel_path::KernelId;
+    let raw = crate::ktstr_kernel_env()?;
+    match KernelId::parse(&raw) {
+        KernelId::Path(_) => Some(std::path::PathBuf::from(&raw)),
+        KernelId::Version(_) | KernelId::CacheKey(_) => {
+            let cache = crate::cache::CacheDir::new().ok()?;
+            let key = match KernelId::parse(&raw) {
+                KernelId::Version(ver) => {
+                    let arch = std::env::consts::ARCH;
+                    format!("{ver}-tarball-{arch}-kc{}", crate::cache_key_suffix())
+                }
+                KernelId::CacheKey(k) => k,
+                _ => return None,
+            };
+            let entry = cache.lookup(&key)?;
+            match entry.metadata.source {
+                crate::cache::KernelSource::Local {
+                    source_tree_path: Some(p),
+                    ..
+                } => Some(p),
+                _ => None,
+            }
+        }
+        KernelId::Range { .. } | KernelId::Git { .. } => None,
+    }
+}
+
 /// Compute a stable 64-bit discriminator over the fields that
 /// distinguish gauntlet variants of the same test. Used to suffix
 /// the sidecar filename so concurrent variants do not clobber each
@@ -844,25 +1045,29 @@ fn detect_commit_at(path: &std::path::Path) -> Option<String> {
 ///
 /// The hash is over test-identity fields (topology, scheduler,
 /// payload, work_type, flags, sysctls, kargs) — NOT over
-/// [`HostContext`], NOT over `scheduler_commit`, and NOT over
-/// `project_commit`. The [`HostContext`] exclusion is pinned by
+/// [`HostContext`], NOT over `scheduler_commit`, NOT over
+/// `project_commit`, and NOT over `kernel_commit`. The
+/// [`HostContext`] exclusion is pinned by
 /// [`sidecar_variant_hash_excludes_host_context`]; the
 /// `scheduler_commit` exclusion by
 /// [`sidecar_variant_hash_excludes_scheduler_commit`]; the
 /// `project_commit` exclusion by
-/// [`sidecar_variant_hash_excludes_project_commit`]. All three
+/// [`sidecar_variant_hash_excludes_project_commit`]; the
+/// `kernel_commit` exclusion by
+/// [`sidecar_variant_hash_excludes_kernel_commit`]. All four
 /// are deliberate for the same cross-host grouping reason — a
 /// gauntlet rebuilt against a different userspace scheduler
-/// commit, a bumped ktstr checkout, or a different CI runner /
-/// developer machine must still bucket with the same-named
-/// variant so `compare_runs` can diff two runs of the "same"
-/// test without the commit hash shattering them into
-/// one-row-per-commit islands. Callers that want to detect a
-/// commit drift between two runs inspect
-/// [`SidecarResult::scheduler_commit`] /
-/// [`SidecarResult::project_commit`] directly (the latter via
-/// `--commit` on `stats compare`); the filename stays stable
-/// across commits by design.
+/// commit, a bumped ktstr checkout, a kernel source tree at a
+/// different HEAD, or a different CI runner / developer
+/// machine must still bucket with the same-named variant so
+/// `compare_runs` can diff two runs of the "same" test without
+/// the commit hash shattering them into one-row-per-commit
+/// islands. Callers that want to detect a commit drift between
+/// two runs inspect [`SidecarResult::scheduler_commit`] /
+/// [`SidecarResult::project_commit`] /
+/// [`SidecarResult::kernel_commit`] directly (the latter two
+/// via `--commit` / `--kernel-commit` on `stats compare`); the
+/// filename stays stable across commits by design.
 ///
 /// The corollary of the HostContext exclusion: if the host's
 /// observable state mutates mid-suite — NUMA hotplug, hugepage
@@ -1171,6 +1376,7 @@ pub(crate) fn write_skip_sidecar(
         sysctls,
         kargs,
         kernel_version: detect_kernel_version(),
+        kernel_commit: resolve_kernel_source_dir().and_then(|d| detect_kernel_commit(&d)),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
         host: Some(crate::host_context::collect_host_context()),
@@ -1232,6 +1438,7 @@ pub(crate) fn write_sidecar(
         sysctls,
         kargs,
         kernel_version: detect_kernel_version(),
+        kernel_commit: resolve_kernel_source_dir().and_then(|d| detect_kernel_commit(&d)),
         timestamp: now_iso8601(),
         run_id: generate_run_id(),
         host: Some(crate::host_context::collect_host_context()),
@@ -1467,6 +1674,10 @@ mod tests {
             sc.kernel_version.is_none(),
             "kernel_version must default None"
         );
+        assert!(
+            sc.kernel_commit.is_none(),
+            "kernel_commit must default None"
+        );
         assert!(sc.host.is_none(), "host must default None");
         assert!(
             sc.timestamp.is_empty(),
@@ -1575,6 +1786,7 @@ mod tests {
             sysctls: vec![],
             kargs: vec![],
             kernel_version: None,
+            kernel_commit: Some("kabcde7".to_string()),
             timestamp: String::new(),
             run_id: String::new(),
             host: None,
@@ -1611,6 +1823,7 @@ mod tests {
             sysctls,
             kargs,
             kernel_version,
+            kernel_commit,
             timestamp,
             run_id,
             host,
@@ -1624,6 +1837,17 @@ mod tests {
         // Nullable string metadata fields.
         assert_eq!(scheduler_commit.as_deref(), Some("abc123"));
         assert_eq!(project_commit.as_deref(), Some("def4567"));
+        assert_eq!(
+            kernel_commit.as_deref(),
+            Some("kabcde7"),
+            "kernel_commit must round-trip the literal string \
+             populated on the write side, including the 7-char \
+             hex shape `detect_kernel_commit` produces. The \
+             fixture uses `kabcde7` (hex-only) to make accidental \
+             field-swap regressions with project_commit / \
+             scheduler_commit obvious — each commit field carries \
+             a distinct token.",
+        );
         assert_eq!(payload, None, "fixture declared no payload");
         assert_eq!(kvm_stats, None, "fixture declared no kvm_stats");
         assert_eq!(kernel_version, None, "fixture declared no kernel_version");
@@ -1767,6 +1991,7 @@ mod tests {
             sysctls: vec!["sysctl.kernel.audit_sysctl=1".to_string()],
             kargs: vec!["audit_karg".to_string()],
             kernel_version: Some("6.99.0".to_string()),
+            kernel_commit: Some("kabcde7-dirty".to_string()),
             timestamp: "audit-timestamp".to_string(),
             run_id: "audit-run-id".to_string(),
             host: Some(HostContext {
@@ -1830,6 +2055,19 @@ mod tests {
         assert_eq!(loaded.sysctls, vec!["sysctl.kernel.audit_sysctl=1"]);
         assert_eq!(loaded.kargs, vec!["audit_karg"]);
         assert_eq!(loaded.kernel_version.as_deref(), Some("6.99.0"));
+        assert_eq!(
+            loaded.kernel_commit.as_deref(),
+            Some("kabcde7-dirty"),
+            "kernel_commit must round-trip the literal string \
+             populated on the write side, including the `-dirty` \
+             suffix that `detect_kernel_commit` appends. Fixture \
+             uses 7-char hex (`kabcde7`) to match the \
+             `oid::to_hex_with_len(7)` shape `detect_kernel_commit` \
+             produces in production. The leading `k` in the fixture \
+             token makes a project_commit / kernel_commit field-swap \
+             regression visible — each commit field carries a \
+             distinct token in the audit fixture.",
+        );
         assert_eq!(loaded.timestamp, "audit-timestamp");
         assert_eq!(loaded.run_id, "audit-run-id");
         let host = loaded.host.expect("host round-trips");
@@ -3084,6 +3322,11 @@ mod tests {
             "absent project_commit must emit as `\"project_commit\":null`, \
              not be omitted via `skip_serializing_if`: {json}",
         );
+        assert!(
+            json.contains("\"kernel_commit\":null"),
+            "absent kernel_commit must emit as `\"kernel_commit\":null`, \
+             not be omitted via `skip_serializing_if`: {json}",
+        );
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
         // Exhaustive destructure so a new `Option<_>` / `Vec<_>`
         // field on `SidecarResult` that defaults to `None` / empty
@@ -3112,6 +3355,7 @@ mod tests {
             sysctls,
             kargs,
             kernel_version,
+            kernel_commit,
             timestamp: _,
             run_id: _,
             host,
@@ -3132,6 +3376,7 @@ mod tests {
         assert!(sysctls.is_empty());
         assert!(kargs.is_empty());
         assert!(kernel_version.is_none());
+        assert!(kernel_commit.is_none());
         assert!(host.is_none());
         assert!(cleanup_duration_ms.is_none());
     }
@@ -3496,6 +3741,85 @@ mod tests {
             sidecar_variant_hash(&with_commit_clean),
             sidecar_variant_hash(&with_commit_dirty),
             "project_commit must not influence variant hash — \
+             clean vs `-dirty` of the same hex case (catches a \
+             regression that distinguished only the dirty bit)",
+        );
+    }
+
+    /// `kernel_commit` is metadata, not a variant discriminator:
+    /// two gauntlet runs differing only in the recorded kernel
+    /// source-tree commit (e.g. same variant re-run after a
+    /// `git pull` of the kernel tree, or the same release rebuilt
+    /// on top of a WIP patch) must share one hash bucket so
+    /// `stats compare` treats them as the same semantic variant.
+    /// If a future change folds `kernel_commit` into
+    /// `sidecar_variant_hash`, this test catches it before the
+    /// run-key split reaches on-disk sidecars and splits
+    /// previously-comparable runs. Mirrors
+    /// `sidecar_variant_hash_excludes_project_commit` /
+    /// `sidecar_variant_hash_excludes_scheduler_commit` — the
+    /// same exclusion rationale applies to all three metadata
+    /// commit fields.
+    ///
+    /// Three cases pinned: (1) None vs Some, (2) two distinct
+    /// populated values, (3) clean Some vs `-dirty` Some. Without
+    /// the populated×populated case, a regression that XOR'd
+    /// kernel_commit's bytes into the hash would still pass the
+    /// None vs Some case if the empty-input contribution happened
+    /// to be zero; the third case guards specifically against a
+    /// change that distinguished only the dirty bit.
+    #[test]
+    fn sidecar_variant_hash_excludes_kernel_commit() {
+        let without_commit = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            kernel_commit: None,
+            ..SidecarResult::test_fixture()
+        };
+        let with_commit = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            kernel_commit: Some("abcdef1-dirty".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&without_commit),
+            sidecar_variant_hash(&with_commit),
+            "kernel_commit must not influence variant hash — \
+             None vs Some(...) case",
+        );
+
+        let with_commit_a = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            kernel_commit: Some("abc1234".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        let with_commit_b = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            kernel_commit: Some("def5678".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&with_commit_a),
+            sidecar_variant_hash(&with_commit_b),
+            "kernel_commit must not influence variant hash — \
+             two distinct populated commits case (catches XOR-style \
+             regressions where None and one specific Some happen to \
+             collide)",
+        );
+
+        let with_commit_clean = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            kernel_commit: Some("abc1234".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        let with_commit_dirty = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            kernel_commit: Some("abc1234-dirty".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&with_commit_clean),
+            sidecar_variant_hash(&with_commit_dirty),
+            "kernel_commit must not influence variant hash — \
              clean vs `-dirty` of the same hex case (catches a \
              regression that distinguished only the dirty bit)",
         );
@@ -3934,6 +4258,173 @@ mod tests {
 
         let result =
             super::detect_commit_at(tmp.path()).expect("submodule repo must still yield Some");
+        assert_eq!(
+            result,
+            head.to_hex_with_len(7).to_string(),
+            "uninitialized submodule must not trigger -dirty suffix"
+        );
+    }
+
+    // -- detect_kernel_commit branch coverage --
+    //
+    // Mirror the `detect_project_commit` branch matrix for the
+    // kernel-tree probe. The implementations are nearly identical
+    // except for `gix::open` (NOT `gix::discover`) so the parent
+    // walk does not surface; the tests pin the open-vs-discover
+    // shape explicitly.
+
+    /// Clean kernel repo: HEAD reachable, no staged or worktree
+    /// diffs. `detect_kernel_commit` returns the 7-char short
+    /// hash.
+    #[test]
+    fn detect_kernel_commit_clean_repo_returns_short_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let head = init_clean_repo_with_file(tmp.path());
+        let result = super::detect_kernel_commit(tmp.path()).expect("clean repo must yield Some");
+        assert_eq!(
+            result.len(),
+            7,
+            "clean result must be a 7-char hex hash, got {result:?}"
+        );
+        assert!(
+            !result.contains('-'),
+            "clean result must not carry a -dirty suffix, got {result:?}"
+        );
+        assert!(
+            result.chars().all(|c| c.is_ascii_hexdigit()),
+            "clean result must be pure hex, got {result:?}"
+        );
+        assert_eq!(
+            result,
+            head.to_hex_with_len(7).to_string(),
+            "clean result must match the HEAD short hash exactly"
+        );
+    }
+
+    /// Dirty tracked-file worktree: HEAD reachable, index matches
+    /// HEAD, but worktree diverges. The result must carry the
+    /// `-dirty` suffix.
+    #[test]
+    fn detect_kernel_commit_dirty_repo_appends_dirty_suffix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let head = init_clean_repo_with_file(tmp.path());
+        std::fs::write(tmp.path().join("file.txt"), b"modified\n").unwrap();
+        let result = super::detect_kernel_commit(tmp.path()).expect("dirty repo must yield Some");
+        let expected_prefix = head.to_hex_with_len(7).to_string();
+        assert_eq!(
+            result,
+            format!("{expected_prefix}-dirty"),
+            "dirty result must be {expected_prefix:?} + -dirty suffix"
+        );
+    }
+
+    /// Non-git directory: `detect_kernel_commit` uses `gix::open`,
+    /// NOT `gix::discover`. Open requires `kernel_dir` to BE the
+    /// repo root, so a non-git directory yields None even when an
+    /// ancestor IS a git repo. This is the critical behavioural
+    /// difference from `detect_project_commit`: the kernel
+    /// directory is explicit, not walked-up.
+    ///
+    /// Reproduces the failure mode `gix::discover` would trip
+    /// (parent walk resolves to ktstr's repo when the user passes
+    /// a non-git subdir as KTSTR_KERNEL): a literal subdirectory
+    /// of a real git tempdir, NOT initialized as its own repo,
+    /// must still yield None for the kernel probe.
+    #[test]
+    fn detect_kernel_commit_non_git_directory_returns_none() {
+        let parent = tempfile::TempDir::new().unwrap();
+        // Parent IS a git repo — discover() would walk up and find
+        // it from any subdir.
+        init_clean_repo_with_file(parent.path());
+        let nested = parent.path().join("not_a_repo");
+        std::fs::create_dir(&nested).expect("create nested non-git subdir");
+        // Pin the precondition: discover() WOULD succeed from this
+        // path because the parent is a git repo. If `detect_kernel_commit`
+        // accidentally used discover instead of open, it would
+        // surface the parent's HEAD here — which is exactly the
+        // wrong-kernel-commit-recorded bug we want to prevent.
+        assert!(
+            gix::discover(&nested).is_ok(),
+            "gix::discover must succeed from the nested path (parent IS a repo) — \
+             this precondition validates that detect_kernel_commit's open-vs-discover \
+             choice is the correct one for the test scenario",
+        );
+        let result = super::detect_kernel_commit(&nested);
+        assert!(
+            result.is_none(),
+            "non-git directory must yield None — `detect_kernel_commit` uses \
+             `gix::open` (NOT `gix::discover`), so the parent's HEAD must \
+             NOT leak through. Got {result:?}",
+        );
+    }
+
+    /// Unborn HEAD: `gix::init` produces a repo whose HEAD points at a
+    /// branch that has not been written to yet. `head_id()` returns
+    /// Err on this state; `detect_kernel_commit` returns None.
+    #[test]
+    fn detect_kernel_commit_unborn_head_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _repo = gix::init(tmp.path()).expect("gix::init");
+        let result = super::detect_kernel_commit(tmp.path());
+        assert!(
+            result.is_none(),
+            "unborn HEAD must yield None, got {result:?}"
+        );
+    }
+
+    /// Submodule false-positive guard, mirroring
+    /// `detect_project_commit_submodule_uninit_is_clean` — an
+    /// uninitialized submodule must NOT trip the dirty probe in
+    /// the kernel-tree shape either. Kernel trees commonly carry
+    /// submodules (e.g. `.git` worktrees pointing to lib stubs)
+    /// without those subdirectories being checked out, and a
+    /// false-positive `-dirty` would shatter every sidecar's
+    /// kernel_commit into a unique bucket.
+    #[test]
+    fn detect_kernel_commit_submodule_uninit_is_clean() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut repo = gix::init(tmp.path()).expect("gix::init");
+        let _ = repo
+            .committer_or_set_generic_fallback()
+            .expect("committer fallback");
+
+        let gitmodules_content = b"\
+[submodule \"submod\"]\n\
+\tpath = submod\n\
+\turl = https://example.invalid/submod.git\n";
+        let gitmodules_blob: gix::ObjectId = repo
+            .write_blob(gitmodules_content)
+            .expect("write .gitmodules blob")
+            .detach();
+        let null_commit_id = gix::ObjectId::null(gix::hash::Kind::Sha1);
+        let tree = gix::objs::Tree {
+            entries: vec![
+                gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Blob.into(),
+                    filename: ".gitmodules".into(),
+                    oid: gitmodules_blob,
+                },
+                gix::objs::tree::Entry {
+                    mode: gix::objs::tree::EntryKind::Commit.into(),
+                    filename: "submod".into(),
+                    oid: null_commit_id,
+                },
+            ],
+        };
+        let tree_id: gix::ObjectId = repo.write_object(&tree).expect("write tree").detach();
+        let head: gix::ObjectId = repo
+            .commit("HEAD", "init", tree_id, std::iter::empty::<gix::ObjectId>())
+            .expect("commit")
+            .detach();
+        let mut idx = repo.index_from_tree(&tree_id).expect("index_from_tree");
+        idx.write(gix::index::write::Options::default())
+            .expect("write index");
+        std::fs::write(tmp.path().join(".gitmodules"), gitmodules_content)
+            .expect("write .gitmodules worktree");
+        std::fs::create_dir(tmp.path().join("submod")).expect("create submod dir");
+
+        let result =
+            super::detect_kernel_commit(tmp.path()).expect("submodule repo must still yield Some");
         assert_eq!(
             result,
             head.to_hex_with_len(7).to_string(),

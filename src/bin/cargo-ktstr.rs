@@ -542,6 +542,38 @@ enum StatsCommand {
         /// under this filter.
         #[arg(long, action = ArgAction::Append)]
         commit: Vec<String>,
+        /// Strict equality match against the sidecar's
+        /// `kernel_commit` field (e.g. `--kernel-commit abcdef1`
+        /// or `--kernel-commit abcdef1-dirty`). Repeatable:
+        /// `--kernel-commit A --kernel-commit B` keeps rows whose
+        /// `kernel_commit` equals A OR B. Rows whose
+        /// `kernel_commit` is `None` (KTSTR_KERNEL pointed at a
+        /// non-git path, the underlying source was Tarball / Git
+        /// rather than a `Local` tree, or
+        /// `detect_kernel_commit`'s gix probe failed) NEVER match
+        /// a populated filter — same opt-in policy as `--commit`
+        /// / `--kernel`.
+        ///
+        /// Filters on the kernel SOURCE TREE commit
+        /// (`SidecarResult::kernel_commit`), NOT on the kernel
+        /// release version (`SidecarResult::kernel_version` —
+        /// filter that with `--kernel`). Two runs of the same
+        /// `kernel_version` with different `kernel_commit` values
+        /// represent the same release rebuilt from different
+        /// trees (e.g. WIP patches on top of a tagged release);
+        /// `--kernel-commit` distinguishes them, `--kernel` does
+        /// not.
+        ///
+        /// The recorded value is whatever
+        /// `detect_kernel_commit` reads via
+        /// `gix::open(<kernel-dir>)` (NOT `discover` — the
+        /// kernel directory is explicit, not walked-up); the
+        /// `-dirty` suffix lands when HEAD-vs-index or
+        /// index-vs-worktree changes are detected, so a clean
+        /// kernel tree and a dirty one at the same HEAD bucket
+        /// separately under this filter.
+        #[arg(long, action = ArgAction::Append)]
+        kernel_commit: Vec<String>,
         /// Strict equality match against the sidecar's `scheduler`
         /// field (e.g. `--scheduler scx_rusty`). Distinct from `-E`,
         /// which matches a substring across the joined fields. Use
@@ -576,6 +608,8 @@ enum StatsCommand {
         a_kernel: Vec<String>,
         #[arg(long = "a-commit", action = ArgAction::Append)]
         a_commit: Vec<String>,
+        #[arg(long = "a-kernel-commit", action = ArgAction::Append)]
+        a_kernel_commit: Vec<String>,
         #[arg(long = "a-scheduler")]
         a_scheduler: Option<String>,
         #[arg(long = "a-topology")]
@@ -592,6 +626,8 @@ enum StatsCommand {
         b_kernel: Vec<String>,
         #[arg(long = "b-commit", action = ArgAction::Append)]
         b_commit: Vec<String>,
+        #[arg(long = "b-kernel-commit", action = ArgAction::Append)]
+        b_kernel_commit: Vec<String>,
         #[arg(long = "b-scheduler")]
         b_scheduler: Option<String>,
         #[arg(long = "b-topology")]
@@ -1167,18 +1203,21 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             dir,
             kernel,
             commit,
+            kernel_commit,
             scheduler,
             topology,
             work_type,
             flags,
             a_kernel,
             a_commit,
+            a_kernel_commit,
             a_scheduler,
             a_topology,
             a_work_type,
             a_flags,
             b_kernel,
             b_commit,
+            b_kernel_commit,
             b_scheduler,
             b_topology,
             b_work_type,
@@ -1224,18 +1263,21 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             let build = BuildCompareFilters {
                 shared_kernel: kernel.clone(),
                 shared_commit: commit.clone(),
+                shared_kernel_commit: kernel_commit.clone(),
                 shared_scheduler: scheduler.clone(),
                 shared_topology: topology.clone(),
                 shared_work_type: work_type.clone(),
                 shared_flags: flags.clone(),
                 a_kernel: a_kernel.clone(),
                 a_commit: a_commit.clone(),
+                a_kernel_commit: a_kernel_commit.clone(),
                 a_scheduler: a_scheduler.clone(),
                 a_topology: a_topology.clone(),
                 a_work_type: a_work_type.clone(),
                 a_flags: a_flags.clone(),
                 b_kernel: b_kernel.clone(),
                 b_commit: b_commit.clone(),
+                b_kernel_commit: b_kernel_commit.clone(),
                 b_scheduler: b_scheduler.clone(),
                 b_topology: b_topology.clone(),
                 b_work_type: b_work_type.clone(),
@@ -1280,18 +1322,21 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
 struct BuildCompareFilters {
     shared_kernel: Vec<String>,
     shared_commit: Vec<String>,
+    shared_kernel_commit: Vec<String>,
     shared_scheduler: Option<String>,
     shared_topology: Option<String>,
     shared_work_type: Option<String>,
     shared_flags: Vec<String>,
     a_kernel: Vec<String>,
     a_commit: Vec<String>,
+    a_kernel_commit: Vec<String>,
     a_scheduler: Option<String>,
     a_topology: Option<String>,
     a_work_type: Option<String>,
     a_flags: Vec<String>,
     b_kernel: Vec<String>,
     b_commit: Vec<String>,
+    b_kernel_commit: Vec<String>,
     b_scheduler: Option<String>,
     b_topology: Option<String>,
     b_work_type: Option<String>,
@@ -1318,6 +1363,7 @@ impl BuildCompareFilters {
         let filter_a = ktstr::cli::RowFilter {
             kernels: pick_vec(&self.a_kernel, &self.shared_kernel),
             commits: pick_vec(&self.a_commit, &self.shared_commit),
+            kernel_commits: pick_vec(&self.a_kernel_commit, &self.shared_kernel_commit),
             scheduler: pick_opt(&self.a_scheduler, &self.shared_scheduler),
             topology: pick_opt(&self.a_topology, &self.shared_topology),
             work_type: pick_opt(&self.a_work_type, &self.shared_work_type),
@@ -1326,6 +1372,7 @@ impl BuildCompareFilters {
         let filter_b = ktstr::cli::RowFilter {
             kernels: pick_vec(&self.b_kernel, &self.shared_kernel),
             commits: pick_vec(&self.b_commit, &self.shared_commit),
+            kernel_commits: pick_vec(&self.b_kernel_commit, &self.shared_kernel_commit),
             scheduler: pick_opt(&self.b_scheduler, &self.shared_scheduler),
             topology: pick_opt(&self.b_topology, &self.shared_topology),
             work_type: pick_opt(&self.b_work_type, &self.shared_work_type),
@@ -3152,6 +3199,135 @@ mod tests {
         }
     }
 
+    /// `--kernel-commit V` round-trips to `Compare {
+    /// kernel_commit: vec![V], .. }`. Pins the clap binding for
+    /// the shared `--kernel-commit` filter on the stats compare
+    /// subcommand; a regression that removed the derive arg,
+    /// renamed the flag, or dropped its `ArgAction::Append`
+    /// would land here at parse time. Mirrors
+    /// `parse_stats_compare_with_commit_single` for the
+    /// `kernel_commit` dimension.
+    #[test]
+    fn parse_stats_compare_with_kernel_commit_single() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--kernel-commit",
+            "abc1234",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command:
+                    Some(StatsCommand::Compare {
+                        kernel_commit,
+                        a_kernel_commit,
+                        b_kernel_commit,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(kernel_commit, vec!["abc1234"]);
+                assert!(
+                    a_kernel_commit.is_empty(),
+                    "shared --kernel-commit must not populate --a-kernel-commit",
+                );
+                assert!(
+                    b_kernel_commit.is_empty(),
+                    "shared --kernel-commit must not populate --b-kernel-commit",
+                );
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    /// `--kernel-commit A --kernel-commit B` produces a Vec with
+    /// two entries via `ArgAction::Append`. Mirrors
+    /// `parse_stats_compare_with_commit_repeatable` for the
+    /// kernel-commit dimension.
+    #[test]
+    fn parse_stats_compare_with_kernel_commit_repeatable() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--kernel-commit",
+            "a",
+            "--kernel-commit",
+            "b",
+            "--a-kernel",
+            "6.14",
+            "--b-kernel",
+            "6.15",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command: Some(StatsCommand::Compare { kernel_commit, .. }),
+                ..
+            } => {
+                assert_eq!(kernel_commit, vec!["a", "b"]);
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
+    /// `--a-kernel-commit X --b-kernel-commit Y` populates the
+    /// per-side fields without touching the shared
+    /// `kernel_commit`. Pins the clap binding for the per-side
+    /// kernel-commit slicers — required for the
+    /// `derive_slicing_dims` path to put `KernelCommit` in the
+    /// slicing-dim set when the operator wants to slice by
+    /// kernel HEAD.
+    #[test]
+    fn parse_stats_compare_with_per_side_kernel_commit() {
+        let Cargo {
+            command: CargoSub::Ktstr(k),
+        } = Cargo::try_parse_from([
+            "cargo",
+            "ktstr",
+            "stats",
+            "compare",
+            "--a-kernel-commit",
+            "abc1234",
+            "--b-kernel-commit",
+            "def5678",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match k.command {
+            KtstrCommand::Stats {
+                command:
+                    Some(StatsCommand::Compare {
+                        kernel_commit,
+                        a_kernel_commit,
+                        b_kernel_commit,
+                        ..
+                    }),
+                ..
+            } => {
+                assert!(
+                    kernel_commit.is_empty(),
+                    "per-side --a-kernel-commit / --b-kernel-commit must not \
+                     populate the shared --kernel-commit vec",
+                );
+                assert_eq!(a_kernel_commit, vec!["abc1234"]);
+                assert_eq!(b_kernel_commit, vec!["def5678"]);
+            }
+            _ => panic!("expected Stats Compare"),
+        }
+    }
+
     // -- BuildCompareFilters: symmetric sugar resolution --
 
     /// Empty input → both sides default. No filters populated
@@ -3164,12 +3340,65 @@ mod tests {
         let (fa, fb) = b.build();
         assert!(fa.kernels.is_empty());
         assert!(fa.commits.is_empty());
+        assert!(fa.kernel_commits.is_empty());
         assert!(fa.scheduler.is_none());
         assert!(fa.topology.is_none());
         assert!(fa.work_type.is_none());
         assert!(fa.flags.is_empty());
         assert_eq!(fa.kernels, fb.kernels);
+        assert_eq!(fa.commits, fb.commits);
+        assert_eq!(fa.kernel_commits, fb.kernel_commits);
         assert_eq!(fa.scheduler, fb.scheduler);
+    }
+
+    /// Per-side `--a-kernel-commit` overrides shared
+    /// `--kernel-commit` for A only; B retains the shared value.
+    /// Same "more-specific replaces" semantics as `--a-kernel`.
+    /// The per-side override path is what populates the slicing
+    /// dim on `KernelCommit` — without it, two sides with
+    /// different live kernel HEADs cannot be contrasted in one
+    /// `compare` invocation.
+    #[test]
+    fn build_compare_filters_per_side_kernel_commit_overrides_shared() {
+        let b = BuildCompareFilters {
+            shared_kernel_commit: vec!["abcdef1".to_string(), "fedcba2".to_string()],
+            a_kernel_commit: vec!["111aaaa".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(
+            fa.kernel_commits,
+            vec!["111aaaa"],
+            "A overrides shared kernel-commit",
+        );
+        assert_eq!(
+            fb.kernel_commits,
+            vec!["abcdef1", "fedcba2"],
+            "B retains shared kernel-commit default",
+        );
+    }
+
+    /// `--a-kernel-commit X --b-kernel-commit Y` slices on the
+    /// `KernelCommit` dimension. Pins the slicing-dim derivation
+    /// for the kernel-commit axis so a regression that dropped
+    /// the dim from `derive_slicing_dims` lands here.
+    #[test]
+    fn build_compare_filters_disjoint_per_side_kernel_commit_slices() {
+        let b = BuildCompareFilters {
+            a_kernel_commit: vec!["abcdef1".to_string()],
+            b_kernel_commit: vec!["fedcba2".to_string()],
+            ..BuildCompareFilters::default()
+        };
+        let (fa, fb) = b.build();
+        assert_eq!(fa.kernel_commits, vec!["abcdef1"]);
+        assert_eq!(fb.kernel_commits, vec!["fedcba2"]);
+        let slicing = ktstr::cli::derive_slicing_dims(&fa, &fb);
+        assert_eq!(
+            slicing,
+            vec![ktstr::cli::Dimension::KernelCommit],
+            "differing per-side kernel-commit must derive as a single \
+             KernelCommit slicing dim",
+        );
     }
 
     /// Shared `--kernel V` pins BOTH sides to the same vec.

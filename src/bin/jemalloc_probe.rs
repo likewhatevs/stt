@@ -4922,6 +4922,7 @@ mod tests {
             sysctls: Vec::new(),
             kargs: Vec::new(),
             kernel_version: None,
+            kernel_commit: None,
             timestamp: String::new(),
             run_id: String::new(),
             host: None,
