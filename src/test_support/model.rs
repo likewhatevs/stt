@@ -57,7 +57,7 @@
 //!    via [`memoized_inference`] (concurrent first-call races
 //!    serialize on the outer `Mutex` so at most one load runs
 //!    end-to-end, and a failed load is cached as `Err` so
-//!    subsequent calls fail-closed without repeating the 2.44 GiB
+//!    subsequent calls fail-closed without repeating the 2.33 GiB
 //!    load; the inner `Mutex` then serializes repeated generation
 //!    passes against the shared `LlamaModel`); tests that mutate
 //!    `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` call [`reset`]
@@ -108,31 +108,60 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 /// panic with the rendered reason rather than threading a fallible
 /// return through every caller.
 ///
-/// Log suppression: `send_logs_to_tracing(LogOptions::default()
-/// .with_logs_enabled(false))` is called inside the OnceLock
-/// initializer, BEFORE any `LlamaModel::load_from_file` call hits
-/// the C side. This routes llama.cpp's internal log stream
-/// (model-load progress, GGML init chatter, KV-cache reservation
-/// notes) to a no-op sink so CI test output stays clean of engine-
-/// internal noise. The upstream wrapper tracks log-state via a
-/// `OnceLock`-backed singleton itself ("TODO: Reinitialize the
-/// state to support calling send_logs_to_tracing multiple times" in
-/// upstream `lib.rs`), so we get exactly one call per process.
-/// Operators debugging engine-level issues can re-route logs by
-/// wrapping the body in a tracing-subscriber filter and calling
-/// the upstream API directly from a test fixture.
+/// Log routing: `send_logs_to_tracing(LogOptions::default())` is
+/// called inside the OnceLock initializer, BEFORE any
+/// `LlamaModel::load_from_file` call hits the C side. The default
+/// `LogOptions` has logs ENABLED, routing llama.cpp's internal log
+/// stream (model-load progress, GGML init chatter, KV-cache
+/// reservation notes, error reasons) into the tracing subscriber.
+/// This is the ONLY surface that exposes the upstream reason behind
+/// an [`InferenceError::ModelLoad`] /
+/// `LlamaModelLoadError::NullResult` failure — the C side writes
+/// its actual rejection reason (mmap failure, vocab parse error,
+/// version mismatch, etc.) into that log stream, and without it the
+/// wrapper just surfaces "null result from llama cpp" with no
+/// detail.
+///
+/// The upstream wrapper tracks log-state via a `OnceLock`-backed
+/// singleton itself ("TODO: Reinitialize the state to support
+/// calling send_logs_to_tracing multiple times" in upstream
+/// `lib.rs`), so we get exactly one call per process. Operators
+/// who want to suppress llama.cpp's log noise on a one-off basis
+/// can install a tracing-subscriber filter that drops
+/// `target = "llama-cpp-2"` events (the upstream metadata name
+/// at `llama-cpp-2/src/log.rs:18`, with hyphens — not the Rust
+/// path `llama_cpp_2`); suppression is no longer the default
+/// because the diagnostic value of the upstream stream
+/// outweighs the test-output noise.
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 
 fn global_backend() -> &'static LlamaBackend {
     BACKEND.get_or_init(|| {
-        // Suppress llama.cpp's internal logs first — `send_logs_to_tracing`
-        // runs once per process, so calling it before the first
-        // `LlamaModel::load_from_file` is the only window where the
-        // suppression takes effect. After this point all
-        // llama.cpp/GGML logs flow into a no-op sink.
-        llama_cpp_2::send_logs_to_tracing(
-            llama_cpp_2::LogOptions::default().with_logs_enabled(false),
-        );
+        // Install a minimal `tracing-subscriber` BEFORE
+        // `send_logs_to_tracing` — without a subscriber, llama.cpp's
+        // log events route into tracing but get silently dropped, so
+        // load failures surface as bare "null result from llama cpp"
+        // with no upstream detail. `try_init` is a no-op when a
+        // subscriber is already installed (e.g. a sibling test using
+        // `tracing-test` to capture events into a per-test buffer);
+        // the `.ok()` discard mirrors the upstream pattern of
+        // best-effort install since the existing subscriber's events
+        // already cover whatever sink that test wanted.
+        //
+        // Routes to stderr by default; CI captures and redirected
+        // stderr both pick up the events automatically. Operators who
+        // want to suppress llama.cpp's log noise on a one-off basis
+        // can install their own subscriber FIRST (this function's
+        // try_init becomes a no-op) with whatever EnvFilter / target
+        // filter they want.
+        let _ = tracing_subscriber::fmt::try_init();
+        // Enable llama.cpp's internal logs via tracing.
+        // `send_logs_to_tracing` runs once per process, so calling it
+        // before the first `LlamaModel::load_from_file` is the only
+        // window where the configuration takes effect. The default
+        // `LogOptions` has logs enabled — surfacing the C-side
+        // diagnostic stream is now the default behavior.
+        llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
         LlamaBackend::init().expect("llama_cpp_2::LlamaBackend::init must succeed exactly once")
     })
 }
@@ -177,7 +206,12 @@ fn global_backend() -> &'static LlamaBackend {
 ///   distinct llama-cpp-2 error.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InferenceError {
-    #[error("load GGUF model at {path}")]
+    #[error(
+        "GGUF model load failed at {path}. The file may be corrupt or \
+         incompatible with the linked llama.cpp version — delete the \
+         file and re-run `cargo ktstr model fetch` to download a fresh \
+         copy. Check stderr for the upstream llama.cpp rejection reason."
+    )]
     ModelLoad {
         path: PathBuf,
         #[source]
@@ -249,7 +283,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 /// arriving with the slot still `None` runs `load_inference`
 /// end-to-end and stores the result; competing callers block on the
 /// `lock()` until the initializer returns, then read the now-`Some`
-/// slot and proceed. So the 2.44 GiB GGUF load in `load_inference`
+/// slot and proceed. So the 2.33 GiB GGUF load in `load_inference`
 /// happens at most once per process rather than once per racing
 /// thread.
 ///
@@ -302,7 +336,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 /// **First-call blocking.** The first caller to reach
 /// [`memoized_inference`] with an empty slot runs `load_inference`
 /// inside the outer lock. That load opens the pinned Qwen3-4B
-/// Q4_K_M GGUF (~2.44 GiB) via
+/// Q4_K_M GGUF (~2.33 GiB) via
 /// `llama_cpp_2::LlamaModel::load_from_file`, which mmap's the file
 /// and routes the per-layer quantized tensors into a `LlamaModel`
 /// owned by llama.cpp. Every concurrent caller queued behind the
@@ -406,7 +440,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 ///    error as transient and burn 30s+ of wasted retries on each
 ///    of dozens of tests.
 /// 2. **A retry under load pressure compounds the original
-///    failure.** Re-attempting a 2.44 GiB mmap that just OOM-killed
+///    failure.** Re-attempting a 2.33 GiB mmap that just OOM-killed
 ///    a peer most likely re-OOMs. Keeping the Err sticky lets the
 ///    operator restart the process in a less-pressured environment
 ///    rather than blocking forward progress on a doomed retry.
@@ -502,7 +536,7 @@ pub struct ModelSpec {
 /// Default model served when a payload declares
 /// [`OutputFormat::LlmExtract`] without pointing at a custom pin.
 ///
-/// Qwen3-4B Q4_K_M GGUF (~2.44 GiB — 2500 MiB per [`ModelSpec::size_bytes`]).
+/// Qwen3-4B Q4_K_M GGUF (~2.33 GiB — 2400 MiB per [`ModelSpec::size_bytes`]).
 /// The 4B-parameter tier gives usable structured-JSON extraction
 /// quality (better than 1-2B tiers for the "emit ONLY a JSON object"
 /// constraint the `LLM_EXTRACT_PROMPT_TEMPLATE` enforces) at an
@@ -548,14 +582,20 @@ pub struct ModelSpec {
 ///
 /// Rotating the pin is a two-step commit: the SHA change alone
 /// invalidates every cached artifact in the repo — users re-fetch
-/// 2.44 GiB on next run — so batch it with a narrative commit message
+/// 2.33 GiB on next run — so batch it with a narrative commit message
 /// explaining why (tokenizer drift, quantization upgrade, model
 /// family change) so downstream users can anticipate the re-fetch.
 pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
     file_name: "Qwen3-4B-Q4_K_M.gguf",
     url: "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
     sha256_hex: "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
-    size_bytes: 2500 * 1024 * 1024,
+    // Actual on-disk size for the SHA-pinned bytes is 2_497_280_256
+    // bytes (2381 MiB ≈ 2.33 GiB). The 2400-MiB ballpark
+    // overestimates by ~19 MB so the free-space gate and
+    // download-timeout budget have a small safety margin without
+    // wasting ~118 MB of slack the prior `2500 * 1024 * 1024` value
+    // carried.
+    size_bytes: 2400 * 1024 * 1024,
 };
 
 /// Canonical list of every [`ModelSpec`] declared in this module.
@@ -603,7 +643,7 @@ const _: () = {
 };
 
 // Ballpark size bounds on the pinned artifact. The pinned Qwen3-4B
-// Q4_K_M GGUF is ~2.44 GiB; bound tight at 3 GiB so a silent swap to a
+// Q4_K_M GGUF is ~2.33 GiB; bound tight at 3 GiB so a silent swap to a
 // higher-bit quantization (Q5/Q6/Q8) of the same 4B-parameter base —
 // which would balloon the artifact past 3 GiB and multiply inference
 // latency — fails this check instead of slipping through. The lower
@@ -1136,7 +1176,7 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // that trade-off for responsiveness, but `ensure()` is the
     // integrity gate. The cost is one full SHA-256 walk per
     // `ensure()` call against an existing cache entry (~10 s for
-    // the 2.44 GiB Qwen3-4B pin); the prefetch at nextest
+    // the 2.33 GiB Qwen3-4B pin); the prefetch at nextest
     // bootstrap amortises this over every test in the binary, and
     // the in-test cache reuses the post-ensure `ModelStatus` so
     // the walk fires at most once per process run.
@@ -1164,7 +1204,7 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // no-cache case: status() returned `ShaVerdict::NotCached` without
     // calling `check_sha256`, so without this gate a placeholder
     // (all-`?`) pin would drop through to `fetch` and waste a
-    // 2.44 GiB download before the post-download `check_sha256`
+    // 2.33 GiB download before the post-download `check_sha256`
     // bails.
     if !is_valid_sha256_hex(spec.sha256_hex) {
         anyhow::bail!(
@@ -1248,7 +1288,7 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
 /// a typo'd or unexpectedly large pin (e.g. a 20 GiB `size_bytes`)
 /// would demand roughly 2 h of linear budget with no CI wall-clock
 /// cap to stop it. The ceiling kicks in at `1800 s × 3 MB/s =
-/// 5.4 GB` of body; the current pin (`DEFAULT_MODEL` ≈ 2.44 GiB) is
+/// 5.4 GB` of body; the current pin (`DEFAULT_MODEL` ≈ 2.33 GiB) is
 /// well under that crossover and continues to receive its linear
 /// budget unchanged, and a future 5
 /// GiB model pin (`5 × 1024³ / 3_000_000 ≈ 1789 s`) also sits just
@@ -1451,7 +1491,7 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     // than `reqwest::blocking::get`, which has no timeout and will
     // hang forever on a slow or unreachable mirror. 30s connect
     // catches DNS/TLS wedges early. The overall timeout scales with
-    // `spec.size_bytes` via [`fetch_timeout_for_size`] so a 2.44 GiB
+    // `spec.size_bytes` via [`fetch_timeout_for_size`] so a 2.33 GiB
     // model does not share a single one-size-fits-all cap — the
     // previous fixed 15-minute ceiling either let a wedged download
     // hang for 15 minutes past any
@@ -2376,7 +2416,7 @@ pub(crate) fn reset() {
 /// from this shape:
 ///
 /// 1. **`Ok(cache)` — cached forever**. The loaded model stays in
-///    memory for the process lifetime; the ~2.44 GiB slot is never
+///    memory for the process lifetime; the ~2.33 GiB slot is never
 ///    evicted. Subsequent `extract_via_llm` calls reuse the same
 ///    inference state.
 /// 2. **`Err(reason)` — cached forever**. A load failure is cached
@@ -2411,7 +2451,7 @@ pub(crate) fn extract_via_llm(
     // the outer mutex: every caller observes the same stored value,
     // and exactly one caller's closure runs end-to-end. A failed load
     // is memoized as `Err` so subsequent calls return the same
-    // reason string without repeating the 2.44 GiB load.
+    // reason string without repeating the 2.33 GiB load.
     let cached = memoized_inference();
     let cache = match cached.as_ref() {
         Ok(c) => c,
@@ -4864,7 +4904,7 @@ mod tests {
         let _lock = lock_env();
         // Seed a populated slot so we can prove reset clears it. Use
         // the offline-gate path so seeding doesn't try to load the
-        // 2.44 GiB GGUF.
+        // 2.33 GiB GGUF.
         reset();
         let _cache = isolated_cache_dir();
         let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
@@ -4910,7 +4950,7 @@ mod tests {
     /// observed as `None`. Once populated (with `Ok` or `Err`), every
     /// subsequent call must short-circuit through the `Arc::clone`
     /// fast path without re-invoking the load pipeline. Breaking this
-    /// invariant would re-run the 2.44 GiB GGUF load (or, in offline
+    /// invariant would re-run the 2.33 GiB GGUF load (or, in offline
     /// mode, re-trip `ensure()`'s gate) on every metric extraction.
     ///
     /// The test pins the invariant empirically via a test-only
@@ -5031,7 +5071,7 @@ mod tests {
 
     // -- Integration tests (model required) --
     //
-    // These tests load the ~2.44 GiB GGUF and run real inference.
+    // These tests load the ~2.33 GiB GGUF and run real inference.
     // Marked `#[ignore]` so default `cargo nextest run` skips them
     // (CI runs without the model cache populated would either bail
     // on offline-gate or burn ~2 minutes downloading). Run on a
@@ -5072,7 +5112,7 @@ mod tests {
     /// gate is explicitly off for this test even if the test
     /// process inherited an `OFFLINE_ENV=1` from an earlier crash.
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_stdout_produces_well_formed_metrics() {
         let _lock = lock_env();
         reset();
@@ -5131,7 +5171,7 @@ mod tests {
     /// unit tests this can only be inferred via the chain proof; with
     /// a real model it can be observed end-to-end.
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_stderr_tags_metrics_with_stderr() {
         let _lock = lock_env();
         reset();
@@ -5174,7 +5214,7 @@ mod tests {
     /// `Sampling::TopK`, a temperature > 0, a seed-driven sampler —
     /// would surface here as a metric Vec drift between calls.
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_is_deterministic_across_calls() {
         let _lock = lock_env();
         reset();
@@ -5218,7 +5258,7 @@ mod tests {
     /// (those run under offline-gate) but would silently inflate
     /// every test run's wall clock by the model-download time.
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_ensure_default_model_succeeds() {
         let _lock = lock_env();
         reset();
@@ -5288,7 +5328,7 @@ mod tests {
     /// 2-call test on luck; the 3-call test reduces the false-pass
     /// probability to 1/4).
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_three_call_determinism() {
         let _lock = lock_env();
         reset();
@@ -5335,7 +5375,7 @@ mod tests {
     /// would be longer and the per-test wall clock would balloon.
     /// We pin on response presence and bounded wall clock.
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_eos_terminates_short_prompt() {
         let _lock = lock_env();
         reset();
@@ -5377,7 +5417,7 @@ mod tests {
     /// `parse_llm_response`. Pins the "empty input is a clean
     /// no-op, not an error" contract end-to-end.
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_empty_stdout_returns_empty_metrics() {
         let _lock = lock_env();
         reset();
@@ -5410,7 +5450,7 @@ mod tests {
     /// length-stable across two calls — pinning the strip's
     /// determinism end-to-end).
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_chatml_in_input_handled_by_strip_defense() {
         let _lock = lock_env();
         reset();
@@ -5456,7 +5496,7 @@ mod tests {
     /// U+FFFD embedded mid-stream. The contract pin is that this
     /// path doesn't crash the tokenizer or the inference loop.
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_handles_replacement_chars_lossy() {
         let _lock = lock_env();
         reset();
@@ -5532,7 +5572,7 @@ mod tests {
     /// emergent and not pinned; the load-bearing pin is
     /// "different inputs → different outputs".
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_cross_call_isolation_distinct_prompts() {
         let _lock = lock_env();
         reset();
@@ -5586,7 +5626,7 @@ mod tests {
     /// calls) would cause prompt_A's two runs to diverge once
     /// prompt_B's KV reads/writes touched any shared slots.
     #[test]
-    #[ignore = "model required: loads ~2.44 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_prompt_a_b_a_determinism() {
         let _lock = lock_env();
         reset();
@@ -5636,7 +5676,7 @@ mod tests {
     /// `parse_llm_response`; the full `extract_via_llm` wrapper
     /// needs a loaded model to reach this branch, so the helper
     /// is the seam where the non-JSON path is exercisable without
-    /// the ~2.44 GiB weights load.
+    /// the ~2.33 GiB weights load.
     #[test]
     fn parse_llm_response_non_json_returns_empty_metrics() {
         let got = parse_llm_response(
@@ -6822,16 +6862,18 @@ mod tests {
         assert_eq!(got, std::time::Duration::from_secs(60));
     }
 
-    /// `fetch_timeout_for_size` for the model (2500 MiB) is well
-    /// above the 180 MB crossover so the proportional term wins:
-    /// `(2500 × 1024 × 1024) / 3_000_000 = 873` seconds. Pins the
-    /// proportional branch — a regression that clamped the timeout
-    /// (e.g. re-introduced a fixed 900 s ceiling) would surface
-    /// here, and so would a divisor-unit swap (byte vs KiB vs MiB).
+    /// `fetch_timeout_for_size` for the model (2400 MiB —
+    /// `DEFAULT_MODEL.size_bytes`) is well above the 180 MB
+    /// crossover so the proportional term wins: `(2400 × 1024 ×
+    /// 1024) / 3_000_000 = 838` seconds (integer division floors
+    /// 838.86). Pins the proportional branch — a regression that
+    /// clamped the timeout (e.g. re-introduced a fixed 900 s
+    /// ceiling) would surface here, and so would a divisor-unit
+    /// swap (byte vs KiB vs MiB).
     #[test]
     fn fetch_timeout_for_size_model_scales_up() {
         let got = fetch_timeout_for_size(DEFAULT_MODEL.size_bytes);
-        assert_eq!(got, std::time::Duration::from_secs(873));
+        assert_eq!(got, std::time::Duration::from_secs(838));
     }
 
     /// For two artifacts BOTH above the floor-crossover, the
@@ -7162,24 +7204,28 @@ mod tests {
         );
     }
 
-    /// Pin the IEC human-readable rendering for `DEFAULT_MODEL`'s
-    /// 2500 MiB: `HumanBytes(2500 * 1024 * 1024)` lands as
-    /// `"2.44 GiB"`, and `HumanBytes(2750 * 1024 * 1024)` — the
-    /// size plus the 10% margin — lands as `"2.69 GiB"`. This does
-    /// NOT go through `ensure_free_space` because a real tempdir
-    /// filesystem trivially clears a 2.69 GiB gate and the error
-    /// path never fires. The test instead pins the formatter's
-    /// exact string so a regression that swapped to `DecimalBytes`
-    /// (SI prefixes, `"2.88 GB"` for 2750 MiB) or to raw bytes
-    /// would surface here.
+    /// Pin the IEC human-readable rendering for
+    /// `DEFAULT_MODEL.size_bytes` (2400 MiB):
+    /// `HumanBytes(2400 * 1024 * 1024)` lands as `"2.34 GiB"`, and
+    /// `HumanBytes(2640 * 1024 * 1024)` — the size plus the 10%
+    /// margin — lands as `"2.58 GiB"`. This does NOT go through
+    /// `ensure_free_space` because a real tempdir filesystem
+    /// trivially clears a 2.58 GiB gate and the error path never
+    /// fires. The test instead pins the formatter's exact string so
+    /// a regression that swapped to `DecimalBytes` (SI prefixes,
+    /// `"2.77 GB"` for 2640 MiB) or to raw bytes would surface here.
+    /// Sourced from `DEFAULT_MODEL.size_bytes` so a pin rotation
+    /// that updates the const but forgets the test is caught by
+    /// drift between the assertion and the rendered string instead
+    /// of silently passing on stale literals.
     #[test]
     fn human_bytes_rendering_is_pinned_for_default_model_size() {
-        let size_only = 2500u64 * 1024 * 1024;
+        let size_only = DEFAULT_MODEL.size_bytes;
         let size_plus_margin = size_only + size_only / 10;
-        assert_eq!(format!("{}", indicatif::HumanBytes(size_only)), "2.44 GiB");
+        assert_eq!(format!("{}", indicatif::HumanBytes(size_only)), "2.34 GiB");
         assert_eq!(
             format!("{}", indicatif::HumanBytes(size_plus_margin)),
-            "2.69 GiB"
+            "2.58 GiB"
         );
     }
 
