@@ -2352,37 +2352,111 @@ pub fn analyze_rows(rows: &[GauntletRow]) -> String {
 /// `*.ktstr.json` files at first write so the directory is a
 /// last-writer-wins snapshot of (kernel, project commit) rather
 /// than an append-only archive of every invocation.
+///
+/// Rows are sorted by directory mtime, **most recent first**, so
+/// the latest run lands at the top of the table — the operator's
+/// usual interest. Sorting by `file_name()` would produce
+/// alphabetical-by-hex output (the `{commit}` half is a hex
+/// short-hash with no temporal ordering), which scatters
+/// chronologically-adjacent runs across the listing. `file_name`
+/// is the tiebreaker on the secondary axis: pairs with equal
+/// mtimes (or both unreadable) collapse onto a deterministic
+/// alphabetical order so the listing stays stable across
+/// re-invocations. Entries whose mtime cannot be read at all
+/// (filesystem error, permission issue) sort to the END of the
+/// listing — `Reverse(None) > Reverse(Some(_))` lands them after
+/// every dated entry, with the file_name tiebreaker keeping the
+/// undated group itself stable.
 pub fn list_runs() -> anyhow::Result<()> {
-    use std::fs;
     let root = crate::test_support::runs_root();
     if !root.exists() {
         eprintln!("no runs found at {}", root.display());
         return Ok(());
     }
-    let mut entries: Vec<_> = fs::read_dir(&root)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
+    let rows = sorted_run_entries(&root)?;
     let mut table = crate::cli::new_table();
     table.set_header(vec!["RUN", "TESTS", "DATE"]);
-    for entry in &entries {
-        let key = entry.file_name();
-        let key_str = key.to_string_lossy();
-        let sidecars = crate::test_support::collect_sidecars(&entry.path());
-        let count = sidecars.len();
-        let date = sidecars
-            .iter()
-            .map(|s| s.timestamp.as_str())
-            .filter(|t| !t.is_empty())
-            .min()
-            .unwrap_or("-")
-            .to_string();
-        table.add_row(vec![key_str.to_string(), count.to_string(), date]);
+    for (path, count, date) in rows {
+        let key = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let date_cell = date.unwrap_or_else(|| "-".to_string());
+        table.add_row(vec![key, count.to_string(), date_cell]);
     }
     println!("{table}");
     Ok(())
+}
+
+/// Pure-IO sort + collection step of [`list_runs`]. Reads `root`,
+/// filters to subdirectories, computes each entry's mtime + sidecar
+/// pool, and returns the rows sorted by mtime DESCENDING (most
+/// recent first), with `file_name` as a tiebreaker for equal mtimes
+/// or both-unreadable mtime pairs. Entries whose mtime cannot be
+/// read sort to the END of the returned vec.
+///
+/// Each row carries `(PathBuf, usize, Option<String>)`:
+/// - `PathBuf`: the run-directory path (caller derives `file_name`
+///   for display).
+/// - `usize`: number of sidecars under the run dir (one level deep
+///   per [`crate::test_support::collect_sidecars`]).
+/// - `Option<String>`: earliest non-empty sidecar timestamp present
+///   in the directory, or `None` when no sidecar carries a
+///   non-empty timestamp (caller substitutes a display sentinel
+///   like `"-"`).
+///
+/// Factored out of [`list_runs`] so unit tests can exercise the
+/// sort + row-shape contract without tee'ing stdout. Called once
+/// per `cargo ktstr stats list` invocation; takes `&Path` so the
+/// test harness can drive it against a tempdir-backed fixture
+/// without mutating env vars.
+fn sorted_run_entries(
+    root: &std::path::Path,
+) -> std::io::Result<Vec<(std::path::PathBuf, usize, Option<String>)>> {
+    use std::fs;
+    use std::time::SystemTime;
+    // Collect (entry, mtime) pairs so the sort key is computed once
+    // per entry rather than per pairwise comparison. Entries whose
+    // metadata or mtime cannot be read fall through with `None` and
+    // sort to the end of the listing — the secondary `file_name`
+    // tiebreaker keeps that group stable.
+    let mut entries: Vec<(fs::DirEntry, Option<SystemTime>)> = fs::read_dir(root)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| {
+            let mtime = e.metadata().ok().and_then(|m| m.modified().ok());
+            (e, mtime)
+        })
+        .collect();
+    // Sort by mtime DESCENDING (newest first), with file_name as a
+    // deterministic tiebreaker. `None` mtimes (metadata read
+    // failure) sort to the END so good rows lead the listing —
+    // `Reverse(Some(t))` orders larger times first, and `None`
+    // wraps as `Reverse(None)` which compares as greater than
+    // any `Reverse(Some(_))`, landing it at the end.
+    entries.sort_by(|(a, a_mtime), (b, b_mtime)| {
+        use std::cmp::Reverse;
+        Reverse(*a_mtime)
+            .cmp(&Reverse(*b_mtime))
+            .then_with(|| a.file_name().cmp(&b.file_name()))
+    });
+
+    let rows = entries
+        .into_iter()
+        .map(|(entry, _)| {
+            let path = entry.path();
+            let sidecars = crate::test_support::collect_sidecars(&path);
+            let count = sidecars.len();
+            let date = sidecars
+                .iter()
+                .map(|s| s.timestamp.as_str())
+                .filter(|t| !t.is_empty())
+                .min()
+                .map(|s| s.to_string());
+            (path, count, date)
+        })
+        .collect();
+    Ok(rows)
 }
 
 /// Pool every sidecar under the runs root (or `dir` when set) and
@@ -8785,6 +8859,115 @@ mod tests {
             !msg.contains("cargo ktstr stats list-values"),
             "list-values redirect must NOT fire when no commit-dim \
              filter is populated; got:\n{msg}",
+        );
+    }
+
+    // -- sorted_run_entries (testable extraction of list_runs sort logic) --
+
+    /// `sorted_run_entries` orders subdirectories under `root` by
+    /// directory mtime DESCENDING — newest first. Pins the contract
+    /// so a regression that flips the sort direction (e.g. drops
+    /// `Reverse`) or removes the mtime probe (reverting to
+    /// `file_name`-only sort) surfaces here as the order shift.
+    ///
+    /// Three subdirs are created with `std::thread::sleep` between
+    /// `create_dir` calls so each directory's mtime is captured at
+    /// a strictly later instant than the previous one. 100 ms is
+    /// generous: ext4/btrfs/xfs nsec resolution + monotonic
+    /// CLOCK_REALTIME advancement guarantee distinct mtimes per
+    /// dir at this granularity.
+    ///
+    /// The OLDEST directory is named `aaa_oldest` and the NEWEST
+    /// is named `zzz_newest` — paired so the lexical-ascending
+    /// order (aaa, mmm, zzz) is the OPPOSITE of the mtime-descending
+    /// order (zzz_newest, mmm_middle, aaa_oldest). Without this
+    /// pairing, lexical-ascending and mtime-descending would
+    /// produce the same output and a regression to filename-only
+    /// sort would not be detectable. With this pairing, any
+    /// regression that drops `Reverse` (mtime-ASCENDING) OR
+    /// reverts to filename-only sort (lexical-ASCENDING) yields
+    /// `aaa, mmm, zzz` — the WRONG order — and the test fails
+    /// loud.
+    #[test]
+    fn sorted_run_entries_orders_by_mtime_descending() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let oldest = root.path().join("aaa_oldest");
+        let middle = root.path().join("mmm_middle");
+        let newest = root.path().join("zzz_newest");
+        std::fs::create_dir(&oldest).expect("mkdir oldest");
+        sleep(Duration::from_millis(100));
+        std::fs::create_dir(&middle).expect("mkdir middle");
+        sleep(Duration::from_millis(100));
+        std::fs::create_dir(&newest).expect("mkdir newest");
+
+        let rows = super::sorted_run_entries(root.path()).expect("sorted_run_entries must succeed");
+        let names: Vec<String> = rows
+            .iter()
+            .map(|(p, _, _)| {
+                p.file_name()
+                    .expect("path must have a file_name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "zzz_newest".to_string(),
+                "mmm_middle".to_string(),
+                "aaa_oldest".to_string(),
+            ],
+            "rows must be sorted by mtime descending: newest dir \
+             (`zzz_newest`) first, oldest dir (`aaa_oldest`) last. \
+             A regression that drops Reverse (mtime-ascending) or \
+             reverts to filename-only sort (lexical-ascending) \
+             would yield aaa, mmm, zzz — the OPPOSITE of the \
+             expected mtime-descending order — and would fail this \
+             assertion.",
+        );
+    }
+
+    /// Empty root: `sorted_run_entries` returns an empty vec
+    /// rather than erroring. Pins the no-runs path that the
+    /// `list_runs` caller short-circuits with the
+    /// "no runs found" eprintln.
+    #[test]
+    fn sorted_run_entries_empty_root_yields_empty_vec() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let rows = super::sorted_run_entries(root.path()).expect("sorted_run_entries must succeed");
+        assert!(
+            rows.is_empty(),
+            "empty root must yield empty vec; got {rows:?}",
+        );
+    }
+
+    /// `sorted_run_entries` skips files (only subdirectories
+    /// become rows). Pins the `is_dir()` filter — a regression
+    /// that included file entries would surface here as a row
+    /// for the file.
+    #[test]
+    fn sorted_run_entries_skips_non_directory_entries() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir(root.path().join("a_dir")).expect("mkdir");
+        std::fs::write(root.path().join("a_file"), b"not a run dir").expect("write file");
+
+        let rows = super::sorted_run_entries(root.path()).expect("sorted_run_entries must succeed");
+        let names: Vec<String> = rows
+            .iter()
+            .map(|(p, _, _)| {
+                p.file_name()
+                    .expect("path must have a file_name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a_dir".to_string()],
+            "only the subdirectory must be returned; file entries are skipped",
         );
     }
 }

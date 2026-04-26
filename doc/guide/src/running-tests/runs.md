@@ -78,6 +78,12 @@ the previous one's sidecars. To disambiguate non-git runs, set
 `KTSTR_SIDECAR_DIR` to a per-run path or place the project tree
 under git so each run carries its own commit hash.
 
+ktstr emits a one-shot stderr warning on first sidecar write
+under this configuration; setting `KTSTR_SIDECAR_DIR` both
+disambiguates the run and suppresses the warning (the override
+branch returns from `sidecar_dir` before the warning site is
+reached).
+
 The `unknown` sentinel applies to the **dirname only**. The
 in-memory `SidecarResult.project_commit` field stays `None`
 (serialized as JSON `null`) for these runs — the dirname uses a
@@ -126,7 +132,8 @@ tree copied off a CI host). They do NOT consult
    the last-writer-wins semantics, this equals the **most recent
    run's first sidecar timestamp** (the prior run's sidecars were
    pre-cleared at the new run's first write, so only the new
-   run's timestamps remain).
+   run's timestamps remain). Rows are ordered by directory mtime,
+   most recent first.
 
 4. **Compare** across dimensions:
 

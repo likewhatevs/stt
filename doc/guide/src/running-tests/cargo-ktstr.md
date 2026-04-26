@@ -499,8 +499,10 @@ Print a table of run directories under
   run's timestamps remain). See [Runs](runs.md) for the full
   semantics.
 
-Rows are sorted alphabetically by `RUN` (filename order, not
-mtime).
+Rows are sorted by directory mtime, **most recent first**, so the
+latest run lands at the top — the operator's usual interest.
+Entries whose mtime cannot be read fall back to filename order as
+a deterministic tiebreaker and sort to the end of the listing.
 
 ### list-metrics
 

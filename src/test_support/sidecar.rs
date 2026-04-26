@@ -914,7 +914,7 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// the override is set, `serialize_and_write_sidecar` ALSO skips
 /// the per-directory pre-clear so any pre-existing sidecars in
 /// the operator-chosen directory are preserved verbatim — see
-/// [`sidecar_dir_is_overridden`].
+/// [`sidecar_dir_override`].
 ///
 /// Default: `{CARGO_TARGET_DIR or "target"}/ktstr/{kernel}-{commit}/`,
 /// where `{kernel}` is the version detected from `KTSTR_KERNEL`'s
@@ -932,13 +932,14 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// snapshot keyed on (kernel, project commit), not an append-only
 /// archive of every invocation.
 pub(crate) fn sidecar_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("KTSTR_SIDECAR_DIR")
-        && !d.is_empty()
-    {
-        return PathBuf::from(d);
+    if let Some(d) = sidecar_dir_override() {
+        return d;
     }
     let kernel = detect_kernel_version();
     let commit = detect_project_commit();
+    if commit.is_none() {
+        warn_unknown_project_commit_once();
+    }
     runs_root().join(format_run_dirname(kernel.as_deref(), commit.as_deref()))
 }
 
@@ -1854,7 +1855,7 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
     // the relative-vs-absolute split.
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create sidecar dir {}", dir.display()))?;
-    if !sidecar_dir_is_overridden() {
+    if sidecar_dir_override().is_none() {
         pre_clear_run_dir_once(&dir);
     }
     let variant_hash = sidecar_variant_hash(sidecar);
@@ -1868,16 +1869,67 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
     Ok(())
 }
 
-/// True when `KTSTR_SIDECAR_DIR` is set non-empty, meaning
-/// [`sidecar_dir`] is returning the operator's override path
-/// rather than the computed `runs_root().join({kernel}-{commit})`
-/// default. Pre-clear gates on this so an operator-chosen
-/// directory is never silently wiped — the override is for users
-/// who want exact control over where sidecars land (test
-/// isolation, archival capture, custom CI layouts), and clobbering
-/// pre-existing files there violates that contract.
-fn sidecar_dir_is_overridden() -> bool {
-    std::env::var("KTSTR_SIDECAR_DIR").is_ok_and(|d| !d.is_empty())
+/// `Some(path)` when `KTSTR_SIDECAR_DIR` is set non-empty,
+/// returning the override path verbatim; `None` when the env
+/// var is unset or empty (default-path branch). Single source
+/// of truth for the override read so [`sidecar_dir`] and
+/// [`serialize_and_write_sidecar`] (which gates pre-clear on
+/// the override's presence) share one env-read site rather
+/// than each calling `std::env::var` independently.
+///
+/// The `is_empty()` filter is deliberate: a defensively-cleared
+/// `KTSTR_SIDECAR_DIR=""` must NOT be treated as an override
+/// (joining an empty path onto the run-root would silently
+/// alias the runs-root itself, contaminating the listing).
+/// Empty-string aliases unset, matching the
+/// `if let Ok(d) ... && !d.is_empty()` predicate the function
+/// replaced.
+///
+/// `serialize_and_write_sidecar` interprets `Some(_)` as the
+/// "operator chose this dir, do not pre-clear" gate — silent
+/// data loss is unacceptable on an explicit override (the
+/// override is for users who want exact control over where
+/// sidecars land: test isolation, archival capture, custom CI
+/// layouts).
+fn sidecar_dir_override() -> Option<PathBuf> {
+    std::env::var("KTSTR_SIDECAR_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Emit a one-shot stderr warning when [`detect_project_commit`]
+/// resolves to `None` and the run directory therefore lands at
+/// `{kernel}-unknown`. Operators in this state lose the
+/// `{commit}` discriminator on the run-directory name — every
+/// non-git invocation at the same kernel collides on a single
+/// directory, with the latest run pre-clearing the previous
+/// one's sidecars. The warning surfaces this loss-of-isolation
+/// risk so the operator can either set `KTSTR_SIDECAR_DIR` to
+/// disambiguate per-run, or place the project tree under git
+/// so each run carries its own commit hash.
+///
+/// `OnceLock<()>` gates the warning to fire EXACTLY ONCE per
+/// process: every gauntlet variant resolves [`sidecar_dir`]
+/// independently, so without the gate the operator would see
+/// thousands of duplicate warnings interleaved with test output.
+/// Called from [`sidecar_dir`] only on the default-path branch
+/// (the override branch returns before the warning site is
+/// reached) so an operator who set `KTSTR_SIDECAR_DIR` to
+/// disambiguate non-git runs does not see a misleading
+/// "commit unknown" warning that does not apply to their
+/// effective directory layout.
+fn warn_unknown_project_commit_once() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        eprintln!(
+            "ktstr: WARNING: project commit unavailable (cwd not in a git \
+             repo, or HEAD unreadable); runs at this kernel will overwrite \
+             each other in target/ktstr/{{kernel}}-unknown/. Set \
+             KTSTR_SIDECAR_DIR=<unique-path> per run, or run from inside a \
+             git repo with at least one commit."
+        );
+    });
 }
 
 /// Remove any pre-existing `*.ktstr.json` files in the resolved
@@ -1911,7 +1963,7 @@ fn sidecar_dir_is_overridden() -> bool {
 /// In production today only the default-path
 /// `runs_root().join({kernel}-{commit})` is fed into this
 /// function (the override path skips pre-clear entirely via
-/// [`sidecar_dir_is_overridden`]), so per-process cache size
+/// [`sidecar_dir_override`]), so per-process cache size
 /// stays at exactly 1 entry. The HashSet shape is the
 /// future-proof keying for direct unit-test fixtures (which
 /// rotate tempdir paths through this helper) and any future
@@ -3255,6 +3307,63 @@ mod tests {
         for p in paths {
             let _ = std::fs::remove_file(&p);
         }
+    }
+
+    // -- KTSTR_SIDECAR_DIR override: empty-string falls back to default --
+
+    /// `KTSTR_SIDECAR_DIR=""` (defensively-cleared empty string)
+    /// must NOT activate the override branch — `sidecar_dir`
+    /// must compute the default `runs_root().join({kernel}-{commit})`
+    /// path instead of returning an empty path. Pins the
+    /// `is_empty()` filter on the override read in
+    /// [`sidecar_dir_override`]: a regression that dropped the
+    /// filter (e.g. simplified to `std::env::var("...").ok().map(PathBuf::from)`)
+    /// would surface here as `sidecar_dir()` returning `PathBuf::from("")`
+    /// — a path that joins onto runs-root as a no-op alias and
+    /// silently contaminates the runs listing.
+    ///
+    /// The override branch SHORT-CIRCUITS on a non-empty value
+    /// (returns the override verbatim, skipping the format-run-dirname
+    /// computation), so the assertion below — comparing
+    /// `sidecar_dir()` against the manually-computed default — is
+    /// proof that the empty-string DID NOT take the short-circuit
+    /// path. A regression that activated the override on empty
+    /// would surface as `dir == PathBuf::from("")`, not equal to
+    /// the computed default.
+    #[test]
+    fn sidecar_dir_empty_override_falls_back_to_default() {
+        let _lock = lock_env();
+        let target_dir = tempfile::TempDir::new().unwrap();
+        let _env_target = EnvVarGuard::set("CARGO_TARGET_DIR", target_dir.path());
+        // EnvVarGuard::set with an empty path covers the
+        // defensively-cleared `KTSTR_SIDECAR_DIR=""` operator
+        // pattern. EnvVarGuard accepts AsRef<OsStr>, and a
+        // zero-length `&str` ("") satisfies that bound.
+        let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", "");
+        let _env_kernel = EnvVarGuard::remove("KTSTR_KERNEL");
+
+        let dir = sidecar_dir();
+        // Compute the expected default the same way `sidecar_dir`
+        // does on its default branch. With KTSTR_KERNEL unset the
+        // kernel resolves to "unknown"; commit comes from the
+        // OnceLock-cached project probe (Some(hash) when running
+        // inside the ktstr repo).
+        let kernel = detect_kernel_version();
+        let commit = detect_project_commit();
+        let expected = runs_root().join(format_run_dirname(kernel.as_deref(), commit.as_deref()));
+        assert_eq!(
+            dir, expected,
+            "empty KTSTR_SIDECAR_DIR must fall back to the default \
+             `runs_root().join(format_run_dirname(...))` path, NOT \
+             return PathBuf::from(\"\"). A regression that dropped \
+             the `is_empty()` filter on the override read would \
+             surface here as `dir == PathBuf::from(\"\")`.",
+        );
+        assert_ne!(
+            dir,
+            std::path::PathBuf::new(),
+            "sidecar_dir must never return an empty path",
+        );
     }
 
     // -- format_run_dirname (pure function, no OnceLock dependency) --
