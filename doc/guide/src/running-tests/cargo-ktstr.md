@@ -387,6 +387,7 @@ cargo ktstr stats compare <a> <b>                             # compare two runs
 cargo ktstr stats compare <a> <b> -E filt                     # substring filter
 cargo ktstr stats compare <a> <b> --scheduler scx_rusty       # pin scheduler
 cargo ktstr stats compare <a> <b> --work-type CpuSpin         # pin work type
+cargo ktstr stats compare <a> <b> --commit abcdef1            # pin ktstr commit
 cargo ktstr stats compare <a> <b> --average                   # average across trials
 ```
 
@@ -465,6 +466,7 @@ thresholds from the unified metric registry, and print colored output
 |------|---------|-------------|
 | `-E FILTER` | -- | Substring filter applied to `scenario topology scheduler work_type`. The scheduler is searchable via the filter but is not part of the pairing key, so the same `(scenario, topology, work_type)` pair still compares across different scheduler binaries when the filter does not constrain it. |
 | `--kernel VER` (repeatable) | -- | Strict equality match against the sidecar's `kernel_version` field (e.g. `--kernel 6.14.2 --kernel 6.15.0` keeps rows whose kernel is 6.14.2 OR 6.15.0). Rows with no recorded kernel version never match a populated filter. Same flag name as on `cargo ktstr test`/`coverage`/`llvm-cov` for consistency across subcommands. |
+| `--commit HASH` (repeatable) | -- | Strict equality match against the sidecar's `project_commit` field (7-char hex, optional `-dirty` suffix). Repeatable: `--commit A --commit B` keeps rows whose `project_commit` equals A OR B. Rows with no recorded commit never match a populated filter. Filters the ktstr framework commit; the scheduler binary's commit (`SidecarResult::scheduler_commit`) is not currently exposed as a filter. |
 | `--scheduler NAME` | -- | Strict equality match against the sidecar's `scheduler` field (e.g. `--scheduler scx_rusty`). Unlike `-E`, which matches a substring across joined fields, this pins a specific scheduler. |
 | `--topology LABEL` | -- | Strict equality match against the rendered topology label (e.g. `--topology 1n2l4c2t`). The label is what `Topology::Display` produces; `cargo ktstr stats list` shows the form per-row. |
 | `--work-type TYPE` | -- | Strict equality match against the sidecar's `work_type` field (e.g. `--work-type CpuSpin`). Valid names are the PascalCase variants of `WorkType`; see `WorkType::ALL_NAMES` for the canonical variant list, or [Work types](../concepts/work-types.md). |

@@ -70,6 +70,34 @@ pub struct SidecarResult {
     /// required on deserialize — matches every other nullable on
     /// this struct.
     pub scheduler_commit: Option<String>,
+    /// Best-effort git HEAD of the ktstr project tree at sidecar-
+    /// write time. Captured by [`detect_project_commit`] via
+    /// `gix::discover` from the test process's current working
+    /// directory; walks up to find the enclosing repo and reads
+    /// HEAD short-hex, suffixing `-dirty` when index-vs-HEAD or
+    /// worktree-vs-index changes are observed (submodules ignored,
+    /// matching the [`crate::fetch::local_source`] dirty-detection
+    /// pattern). `None` when cwd is not inside any git repo, or
+    /// when the gix probe fails for any reason — this is metadata,
+    /// not a gate, so probe failure must not abort the run.
+    ///
+    /// Distinct from [`SidecarResult::scheduler_commit`]: that
+    /// field tracks the userspace scheduler binary's commit
+    /// (currently always `None` per its own doc); this field
+    /// tracks the ktstr framework / test-runner commit, so the
+    /// stats CLI can answer "which version of the harness produced
+    /// this sidecar?" without inspecting the scheduler.
+    ///
+    /// Always emitted (`"project_commit": null` on absence);
+    /// required on deserialize — matches every other nullable on
+    /// this struct. Excluded from [`sidecar_variant_hash`] for the
+    /// same cross-host grouping reason `scheduler_commit` is
+    /// excluded: two runs of the same semantic variant on
+    /// different ktstr commits must still bucket together so
+    /// `stats compare` can diff them; the commit-drift detection
+    /// inspects this field directly via `--commit` / `--a-commit`
+    /// / `--b-commit`.
+    pub project_commit: Option<String>,
     /// Binary payload name (matches `Payload::name` when
     /// `entry.payload` is set). `None` when the test declared no
     /// binary payload. Serialized as `"payload": null` in that case;
@@ -218,6 +246,7 @@ impl SidecarResult {
             topology: "1n1l1c1t".to_string(),
             scheduler: "eevdf".to_string(),
             scheduler_commit: None,
+            project_commit: None,
             payload: None,
             metrics: Vec::new(),
             passed: true,
@@ -607,6 +636,142 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
     }
 }
 
+/// Detect the ktstr project's git HEAD at sidecar-write time.
+///
+/// Walks up from the test process's current working directory via
+/// `gix::discover` to find an enclosing repository, then reads HEAD
+/// short-hex (7 chars via `oid::to_hex_with_len(7)`) and appends
+/// `-dirty` when index-vs-HEAD or worktree-vs-index changes are
+/// observed. Submodules are ignored
+/// (`Submodule::Given { ignore: All }`).
+///
+/// The dirt-detection cascade matches [`crate::fetch::local_source`]
+/// (`src/fetch.rs` ~line 698): peel HEAD to its tree, diff
+/// tree-vs-index, then `status()` for worktree-vs-index. The HASH
+/// REPRESENTATION DIFFERS, however: `fetch::local_source` DROPS
+/// the short hash entirely on dirty (returns `None`) because the
+/// commit no longer describes the build input the cache key
+/// embeds — publishing a stale hash there would misidentify the
+/// build. This helper KEEPS the hash with a `-dirty` suffix
+/// instead because the sidecar's `project_commit` is a debugging
+/// breadcrumb (operator-readable identity, not a cache-key input);
+/// the hash plus dirty flag carries strictly more information
+/// than `None` for the operator's "which ktstr commit did this
+/// sidecar come from?" question.
+///
+/// Returns `None` when:
+/// - `current_dir()` cannot be resolved (process has no valid
+///   cwd — extremely rare; happens only for processes whose cwd
+///   was rmdir'd while alive);
+/// - cwd is not inside any git repository (`gix::discover` fails);
+/// - HEAD cannot be read (an unborn HEAD on a fresh `git init`
+///   with zero commits, or a corrupt repository).
+///
+/// Returns `Some(short_hash)` (without the `-dirty` suffix) when
+/// the HEAD read succeeds but a downstream dirt-detection call
+/// fails — including a missing index, an unreadable working tree,
+/// or `head_tree()` failure. Each failed leg degrades to "treat
+/// as clean" rather than aborting the probe, because metadata
+/// must not gate sidecar writes.
+///
+/// `None` is the documented fallback — sidecar writing must not
+/// abort because of a metadata probe failure. Stats tooling that
+/// reads `project_commit` already tolerates `None` rows by
+/// treating them as wildcards (no `--commit` filter narrowing
+/// applies).
+///
+/// `gix::discover` is preferred over `gix::open` because tests can
+/// be launched from a subdirectory of the repo (e.g.
+/// `cd src && cargo test`); `discover` walks parents until it
+/// finds the `.git` marker, while `open` requires the exact root
+/// path. The walk is cheap — a few stat() calls bounded by the
+/// depth of the cwd inside the repo.
+///
+/// `env!("CARGO_MANIFEST_DIR")` is deliberately NOT used here:
+/// `env!` resolves at compile time and bakes the build-host's
+/// absolute manifest path into the binary's read-only data
+/// segment, leaking the build environment into every published
+/// artifact. Resolving cwd at runtime instead means the recorded
+/// commit reflects the ktstr clone the test was launched FROM —
+/// which is the more accurate semantic anyway, since "what code
+/// produced this sidecar" depends on the cwd at test launch, not
+/// the build host.
+pub(crate) fn detect_project_commit() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let repo = gix::discover(&cwd).ok()?;
+    let head = repo.head_id().ok()?;
+    // `to_hex_with_len(7)` produces a `HexDisplay` that formats
+    // 7 hex chars without the 40-char intermediate `format!("{}")`
+    // allocation. `Id` derefs to `oid` (gix-hash) which owns the
+    // method.
+    let short_hash = head.to_hex_with_len(7).to_string();
+
+    // Peel HEAD to its tree for the tree-vs-index diff that
+    // detects staged changes. A failure here means HEAD points
+    // at something that cannot be read as a tree — return the
+    // short hash without `-dirty` per the doc's "treat as clean
+    // on probe failure" contract.
+    let head_tree_id = match repo.head_tree() {
+        Ok(t) => t.id,
+        Err(_) => return Some(short_hash),
+    };
+
+    // `repo.index()` returns `Err` on missing-index repos
+    // (partially-checked-out clones, or fresh `git init` before
+    // the first commit). `index_or_empty()` would silently
+    // substitute an empty index, then the tree-vs-index diff
+    // below would flag every tracked file as "deleted from
+    // index" and trip false-dirty. Using `index()` so that the
+    // missing-index case falls through the `if let Ok(...)` and
+    // leaves `index_dirty = false`, matching the doc's contract
+    // that probe-leg failures degrade to "treat as clean."
+    let mut index_dirty = false;
+    if let Ok(index) = repo.index() {
+        let _ = repo.tree_index_status(
+            &head_tree_id,
+            &index,
+            None,
+            gix::status::tree_index::TrackRenames::Disabled,
+            |_, _, _| {
+                index_dirty = true;
+                Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()))
+            },
+        );
+    }
+
+    // Check index-vs-worktree for modified tracked files, skipping
+    // submodules entirely (Ignore::All). Short-circuited when
+    // `index_dirty` is already true: the suffix only needs to flip
+    // once, so a known-dirty index makes the worktree walk
+    // redundant. Matches the same short-circuit at fetch.rs:726.
+    let worktree_dirty = if index_dirty {
+        false
+    } else {
+        repo.status(gix::progress::Discard)
+            .ok()
+            .and_then(|s| {
+                s.index_worktree_rewrites(None)
+                    .index_worktree_submodules(gix::status::Submodule::Given {
+                        ignore: gix::submodule::config::Ignore::All,
+                        check_dirty: false,
+                    })
+                    .index_worktree_options_mut(|opts| {
+                        opts.dirwalk_options = None;
+                    })
+                    .into_index_worktree_iter(Vec::new())
+                    .ok()
+                    .map(|mut iter| iter.next().is_some())
+            })
+            .unwrap_or(false)
+    };
+
+    if index_dirty || worktree_dirty {
+        Some(format!("{short_hash}-dirty"))
+    } else {
+        Some(short_hash)
+    }
+}
+
 /// Compute a stable 64-bit discriminator over the fields that
 /// distinguish gauntlet variants of the same test. Used to suffix
 /// the sidecar filename so concurrent variants do not clobber each
@@ -621,19 +786,25 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 ///
 /// The hash is over test-identity fields (topology, scheduler,
 /// payload, work_type, flags, sysctls, kargs) — NOT over
-/// [`HostContext`], and NOT over `scheduler_commit`. The
-/// [`HostContext`] exclusion is pinned by
+/// [`HostContext`], NOT over `scheduler_commit`, and NOT over
+/// `project_commit`. The [`HostContext`] exclusion is pinned by
 /// [`sidecar_variant_hash_excludes_host_context`]; the
-/// `scheduler_commit` exclusion is deliberate for the same
-/// cross-host grouping reason — a gauntlet rebuilt against a
-/// different userspace scheduler commit (bumped ktstr checkout,
-/// different CI runner, different developer machine) must still
-/// bucket with the same-named variant so `compare_runs` can diff
-/// two runs of the "same" test without the commit hash shattering
-/// them into one-row-per-commit islands. Callers that want to
-/// detect a commit drift between two runs inspect
-/// `SidecarResult::scheduler_commit` directly; the filename stays
-/// stable across commits by design.
+/// `scheduler_commit` exclusion by
+/// [`sidecar_variant_hash_excludes_scheduler_commit`]; the
+/// `project_commit` exclusion by
+/// [`sidecar_variant_hash_excludes_project_commit`]. All three
+/// are deliberate for the same cross-host grouping reason — a
+/// gauntlet rebuilt against a different userspace scheduler
+/// commit, a bumped ktstr checkout, or a different CI runner /
+/// developer machine must still bucket with the same-named
+/// variant so `compare_runs` can diff two runs of the "same"
+/// test without the commit hash shattering them into
+/// one-row-per-commit islands. Callers that want to detect a
+/// commit drift between two runs inspect
+/// [`SidecarResult::scheduler_commit`] /
+/// [`SidecarResult::project_commit`] directly (the latter via
+/// `--commit` on `stats compare`); the filename stays stable
+/// across commits by design.
 ///
 /// The corollary of the HostContext exclusion: if the host's
 /// observable state mutates mid-suite — NUMA hotplug, hugepage
@@ -920,6 +1091,7 @@ pub(crate) fn write_skip_sidecar(
         topology: entry.topology.to_string(),
         scheduler,
         scheduler_commit,
+        project_commit: detect_project_commit(),
         // A skip never runs the payload. Still record the declared
         // payload name so stats tooling can attribute the skip to
         // the payload-gauntlet variant rather than losing the
@@ -987,6 +1159,7 @@ pub(crate) fn write_sidecar(
         topology: entry.topology.to_string(),
         scheduler,
         scheduler_commit,
+        project_commit: detect_project_commit(),
         payload: entry.payload.map(|p| p.name.to_string()),
         metrics: payload_metrics.to_vec(),
         passed: check_result.passed,
@@ -1284,6 +1457,7 @@ mod tests {
             topology: "1n2l4c2t".to_string(),
             scheduler: "scx_mitosis".to_string(),
             scheduler_commit: Some("abc123".to_string()),
+            project_commit: Some("def4567".to_string()),
             payload: None,
             metrics: vec![],
             passed: true,
@@ -1364,6 +1538,7 @@ mod tests {
             topology,
             scheduler,
             scheduler_commit,
+            project_commit,
             payload,
             metrics,
             passed,
@@ -1390,6 +1565,7 @@ mod tests {
         assert_eq!(work_type, "CpuSpin");
         // Nullable string metadata fields.
         assert_eq!(scheduler_commit.as_deref(), Some("abc123"));
+        assert_eq!(project_commit.as_deref(), Some("def4567"));
         assert_eq!(payload, None, "fixture declared no payload");
         assert_eq!(kvm_stats, None, "fixture declared no kvm_stats");
         assert_eq!(kernel_version, None, "fixture declared no kernel_version");
@@ -1488,6 +1664,7 @@ mod tests {
             topology: "8n8l16c2t".to_string(),
             scheduler: "scx_audit".to_string(),
             scheduler_commit: Some("deadbeef1234567890abcdef".to_string()),
+            project_commit: Some("cafebab-dirty".to_string()),
             payload: Some("audit_payload".to_string()),
             metrics: vec![PayloadMetrics {
                 payload_index: 0,
@@ -1554,6 +1731,18 @@ mod tests {
             "scheduler_commit must round-trip the literal string \
              populated on the write side — not collapse to None via \
              a missing serde attribute or default fallback",
+        );
+        assert_eq!(
+            loaded.project_commit.as_deref(),
+            Some("cafebab-dirty"),
+            "project_commit must round-trip the literal string \
+             populated on the write side, including the `-dirty` \
+             suffix that `detect_project_commit` appends — a \
+             regression that stripped the suffix or substituted \
+             None for a populated value would surface here. \
+             Fixture uses 7-char hex (`cafebab`) to match the \
+             `oid::to_hex_with_len(7)` shape `detect_project_commit` \
+             produces in production.",
         );
         assert_eq!(loaded.payload.as_deref(), Some("audit_payload"));
         assert_eq!(loaded.metrics.len(), 1);
@@ -2832,6 +3021,11 @@ mod tests {
             json.contains("\"metrics\":[]"),
             "empty metrics must emit as `\"metrics\":[]`: {json}",
         );
+        assert!(
+            json.contains("\"project_commit\":null"),
+            "absent project_commit must emit as `\"project_commit\":null`, \
+             not be omitted via `skip_serializing_if`: {json}",
+        );
         let loaded: SidecarResult = serde_json::from_str(&json).unwrap();
         // Exhaustive destructure so a new `Option<_>` / `Vec<_>`
         // field on `SidecarResult` that defaults to `None` / empty
@@ -2845,6 +3039,7 @@ mod tests {
             topology: _,
             scheduler: _,
             scheduler_commit,
+            project_commit,
             payload,
             metrics,
             passed: _,
@@ -2870,6 +3065,7 @@ mod tests {
         // nullable must be None and every Vec empty, matching the
         // always-emit invariants that the JSON shape above pins.
         assert!(scheduler_commit.is_none());
+        assert!(project_commit.is_none());
         assert!(monitor.is_none());
         assert!(stimulus_events.is_empty());
         assert!(active_flags.is_empty());
@@ -3167,6 +3363,83 @@ mod tests {
              runs of the same semantic variant on different \
              scheduler-binary builds must remain comparable by \
              `stats compare`",
+        );
+    }
+
+    /// `project_commit` is metadata, not a variant discriminator:
+    /// two gauntlet runs differing only in the recorded ktstr
+    /// project commit (e.g. same variant re-run after a `git pull`
+    /// of the harness, or run from two ktstr clones at different
+    /// HEADs) must share one hash bucket so `stats compare`
+    /// treats them as the same semantic variant. If a future
+    /// change folds `project_commit` into `sidecar_variant_hash`,
+    /// this test catches it before the run-key split reaches
+    /// on-disk sidecars and splits previously-comparable runs.
+    /// Mirrors `sidecar_variant_hash_excludes_scheduler_commit` —
+    /// the same exclusion rationale applies to both metadata
+    /// fields.
+    ///
+    /// Three cases pinned: (1) None vs Some, (2) two distinct
+    /// populated values, (3) clean Some vs `-dirty` Some. Without
+    /// the populated×populated case, a regression that XOR'd
+    /// project_commit's bytes into the hash would still pass the
+    /// None vs Some case if the empty-input contribution happened
+    /// to be zero; the third case guards specifically against a
+    /// change that distinguished only the dirty bit.
+    #[test]
+    fn sidecar_variant_hash_excludes_project_commit() {
+        let without_commit = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            project_commit: None,
+            ..SidecarResult::test_fixture()
+        };
+        let with_commit = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            project_commit: Some("abcdef1-dirty".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&without_commit),
+            sidecar_variant_hash(&with_commit),
+            "project_commit must not influence variant hash — \
+             None vs Some(...) case",
+        );
+
+        let with_commit_a = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            project_commit: Some("abc1234".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        let with_commit_b = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            project_commit: Some("def5678".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&with_commit_a),
+            sidecar_variant_hash(&with_commit_b),
+            "project_commit must not influence variant hash — \
+             two distinct populated commits case (catches XOR-style \
+             regressions where None and one specific Some happen to \
+             collide)",
+        );
+
+        let with_commit_clean = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            project_commit: Some("abc1234".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        let with_commit_dirty = SidecarResult {
+            topology: "1n1l2c1t".to_string(),
+            project_commit: Some("abc1234-dirty".to_string()),
+            ..SidecarResult::test_fixture()
+        };
+        assert_eq!(
+            sidecar_variant_hash(&with_commit_clean),
+            sidecar_variant_hash(&with_commit_dirty),
+            "project_commit must not influence variant hash — \
+             clean vs `-dirty` of the same hex case (catches a \
+             regression that distinguished only the dirty bit)",
         );
     }
 

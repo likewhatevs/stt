@@ -462,6 +462,30 @@ enum StatsCommand {
         /// `--kernel`.
         #[arg(long, action = ArgAction::Append)]
         kernel: Vec<String>,
+        /// Strict equality match against the sidecar's
+        /// `project_commit` field (e.g. `--commit abcdef1` or
+        /// `--commit abcdef1-dirty`). Repeatable: `--commit A
+        /// --commit B` keeps rows whose `project_commit` equals
+        /// A OR B. Rows whose `project_commit` is `None` (sidecar
+        /// writer's gix probe failed, or cwd was outside any git
+        /// repo at write time) NEVER match a populated filter —
+        /// same opt-in policy as `--kernel`.
+        ///
+        /// Filters on the ktstr framework commit
+        /// (`SidecarResult::project_commit`); the scheduler
+        /// binary's commit (`SidecarResult::scheduler_commit`,
+        /// currently always `None`) is a separate concept and is
+        /// not currently exposed as a filter.
+        ///
+        /// The recorded commit is whatever
+        /// `detect_project_commit` reads from `gix::discover`
+        /// walking up from the test process's cwd at sidecar-write
+        /// time; the `-dirty` suffix lands when HEAD-vs-index or
+        /// index-vs-worktree changes are detected, so a clean run
+        /// and a dirty run of the same HEAD bucket separately
+        /// under this filter.
+        #[arg(long, action = ArgAction::Append)]
+        commit: Vec<String>,
         /// Strict equality match against the sidecar's `scheduler`
         /// field (e.g. `--scheduler scx_rusty`). Distinct from `-E`,
         /// which matches a substring across the joined fields. Use
@@ -1011,6 +1035,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             policy,
             dir,
             kernel,
+            commit,
             scheduler,
             topology,
             work_type,
@@ -1054,6 +1079,7 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             // `RowFilter` doc for the full match-semantics contract.
             let row_filter = ktstr::cli::RowFilter {
                 kernels: kernel.clone(),
+                commits: commit.clone(),
                 scheduler: scheduler.clone(),
                 topology: topology.clone(),
                 work_type: work_type.clone(),

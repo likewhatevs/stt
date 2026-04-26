@@ -553,6 +553,30 @@ pub struct GauntletRow {
     /// filtered set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_version: Option<String>,
+    /// ktstr project git commit carried from the source sidecar
+    /// (`SidecarResult::project_commit`). Short hex with optional
+    /// `-dirty` suffix (e.g. `"abcdef1"` or `"abcdef1-dirty"`).
+    /// `None` when the sidecar writer could not probe a git repo
+    /// at write time (cwd not inside a checkout, or
+    /// [`crate::test_support::sidecar::detect_project_commit`]
+    /// failed for any reason). Surfaced via the typed
+    /// [`RowFilter::commits`] for narrowing — when the user
+    /// passes `--commit abcdef1` (repeatable), rows with `None`
+    /// are dropped to preserve the operator's intent ("only these
+    /// commits"); a `None`-as-wildcard would silently dilute the
+    /// filtered set, mirroring the [`RowFilter::kernels`] policy.
+    ///
+    /// Sourced from `SidecarResult::project_commit`; shortened to
+    /// `commit` for the analysis layer because only one commit
+    /// dimension is exposed here. `SidecarResult::scheduler_commit`
+    /// is a separate concept (the userspace scheduler binary's
+    /// commit, currently always `None`) and is not currently
+    /// exposed as a filter on `GauntletRow`; if a future change
+    /// surfaces it, the field will need a disambiguating name
+    /// (e.g. `project_commit` vs `scheduler_commit`) rather than
+    /// the bare `commit` used here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     /// Active scheduler flags carried from
     /// `SidecarResult::active_flags`. Previously this field did not
     /// exist on the row; every A/B comparison therefore ignored
@@ -719,6 +743,10 @@ pub struct GauntletRow {
 ///   `--kernel` flag on `cargo ktstr test`/`coverage`/`llvm-cov`
 ///   so the same flag name carries the same multi-value semantic
 ///   across every subcommand.
+/// - `commits` — repeatable, OR-combined: a row matches iff its
+///   `commit` equals ANY entry in `commits`. Same multi-value
+///   semantic as `kernels`, applied to the ktstr project commit
+///   recorded by `detect_project_commit` at sidecar-write time.
 /// - `flags` — AND-combined: every entry in the filter must appear
 ///   somewhere in the row's `flags` vec. The row may carry
 ///   additional flags beyond the filter set; the filter pins
@@ -726,7 +754,8 @@ pub struct GauntletRow {
 /// - A `kernels`-populated filter against a row whose
 ///   `kernel_version` is `None` ALWAYS fails (no wildcard semantic)
 ///   — the operator wrote specific versions and a `None`-row would
-///   silently dilute the set.
+///   silently dilute the set. The same opt-in policy applies to
+///   `commits` against rows with `commit == None`.
 ///
 /// Empty `RowFilter` (every field `None`/empty) is the no-op default
 /// and matches every row. Use [`RowFilter::default()`] to build it.
@@ -738,6 +767,12 @@ pub struct RowFilter {
     /// whose `kernel_version` is itself `None` never matches a
     /// non-empty filter.
     pub kernels: Vec<String>,
+    /// Repeatable project-commit filter, OR-combined: a row matches
+    /// iff its `GauntletRow::commit` equals ANY entry. Empty vec
+    /// disables the filter ("do not filter on commit"). A row whose
+    /// `commit` is itself `None` never matches a non-empty filter
+    /// — same opt-in semantic as `kernels`.
+    pub commits: Vec<String>,
     /// Match against `GauntletRow::scheduler` (strict equality).
     /// `None` here is "do not filter on scheduler".
     pub scheduler: Option<String>,
@@ -768,6 +803,22 @@ impl RowFilter {
                 .kernels
                 .iter()
                 .any(|want| row_kernel == Some(want.as_str()));
+            if !any {
+                return false;
+            }
+        }
+        if !self.commits.is_empty() {
+            // OR-combined match against `GauntletRow::commit`,
+            // mirroring the `kernels` policy: a row whose `commit`
+            // is `None` (the sidecar writer's gix probe failed or
+            // cwd was outside any git repo) never matches a
+            // populated filter, so a `--commit` argument is opt-in
+            // to "only rows with this commit" rather than a wildcard.
+            let row_commit = row.commit.as_deref();
+            let any = self
+                .commits
+                .iter()
+                .any(|want| row_commit == Some(want.as_str()));
             if !any {
                 return false;
             }
@@ -1046,6 +1097,7 @@ pub fn group_and_average(rows: &[GauntletRow]) -> Vec<AveragedGroup> {
             work_type: acc.first.work_type.clone(),
             scheduler: acc.first.scheduler.clone(),
             kernel_version: acc.first.kernel_version.clone(),
+            commit: acc.first.commit.clone(),
             flags: acc.first.flags.clone(),
             // ALL must pass: any failed or skipped contributor
             // flips the aggregate. A group with zero
@@ -1149,6 +1201,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         work_type: sc.work_type.clone(),
         scheduler: sc.scheduler.clone(),
         kernel_version: sc.kernel_version.clone(),
+        commit: sc.project_commit.clone(),
         flags: sc.active_flags.clone(),
         passed: sc.passed,
         skipped: sc.skipped,
@@ -2353,6 +2406,7 @@ mod tests {
             work_type: "CpuSpin".into(),
             scheduler: String::new(),
             kernel_version: None,
+            commit: None,
             flags: Vec::new(),
             skipped: false,
             passed,
@@ -2533,6 +2587,65 @@ mod tests {
         assert_eq!(row.stall_count, 0);
         assert_eq!(row.fallback_count, 0);
         assert_eq!(row.keep_last_count, 0);
+    }
+
+    /// `sidecar_to_row` must copy `SidecarResult::project_commit`
+    /// into `GauntletRow::commit` verbatim so the typed
+    /// `--commit` filter and the upcoming `--a-commit` /
+    /// `--b-commit` slicers see the value the sidecar writer
+    /// recorded. A regression that left the field at the
+    /// `Option::default()` (`None`) would silently drop the
+    /// commit dimension from every comparison even when the
+    /// sidecar had a populated value. Pinned for `None`, clean
+    /// `Some` (no suffix), and dirty `Some` (`-dirty` suffix) to
+    /// catch a regression that special-cases one shape and not
+    /// the others — e.g. one that stripped the suffix when copying.
+    #[test]
+    fn sidecar_to_row_propagates_project_commit() {
+        use crate::test_support;
+        let sc_dirty = test_support::SidecarResult {
+            test_name: "commit_dirty_test".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            project_commit: Some("abcdef1-dirty".to_string()),
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row_dirty = sidecar_to_row(&sc_dirty);
+        assert_eq!(
+            row_dirty.commit.as_deref(),
+            Some("abcdef1-dirty"),
+            "populated dirty project_commit must propagate \
+             verbatim, including the `-dirty` suffix",
+        );
+
+        let sc_clean = test_support::SidecarResult {
+            test_name: "commit_clean_test".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            project_commit: Some("abcdef1".to_string()),
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row_clean = sidecar_to_row(&sc_clean);
+        assert_eq!(
+            row_clean.commit.as_deref(),
+            Some("abcdef1"),
+            "populated clean project_commit (no `-dirty` suffix) \
+             must propagate verbatim — a regression that always \
+             appended `-dirty` or always stripped a tail would \
+             surface here independently of the dirty case above",
+        );
+
+        let sc_none = test_support::SidecarResult {
+            test_name: "no_commit_test".to_string(),
+            topology: "1n1l2c1t".to_string(),
+            project_commit: None,
+            ..test_support::SidecarResult::test_fixture()
+        };
+        let row_none = sidecar_to_row(&sc_none);
+        assert!(
+            row_none.commit.is_none(),
+            "absent project_commit must propagate as None — a \
+             regression substituting an empty string would dilute \
+             every `--commit` filter into matching all None rows",
+        );
     }
 
     #[test]
@@ -4425,6 +4538,7 @@ mod tests {
             work_type: work_type.into(),
             scheduler: scheduler.into(),
             kernel_version: kernel_version.map(str::to_owned),
+            commit: None,
             flags: flags.iter().map(|s| (*s).to_owned()).collect(),
             passed: true,
             skipped: false,
@@ -4549,6 +4663,107 @@ mod tests {
         assert!(
             !filter.matches(&row_c),
             "kernel outside the listed set must reject",
+        );
+    }
+
+    /// `--commit abcdef1` against a row whose `commit` is `None`
+    /// must NOT match — same opt-in policy as `--kernel`. Mirror
+    /// of `row_filter_kernel_none_row_never_matches_populated_filter`
+    /// for the project-commit field.
+    #[test]
+    fn row_filter_commit_none_row_never_matches_populated_filter() {
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        let filter = RowFilter {
+            commits: vec!["abcdef1".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter.matches(&row),
+            "None-commit row must not match populated filter; \
+             got dilution",
+        );
+    }
+
+    /// `--commit abcdef1` against a row whose `commit` is
+    /// `Some("abcdef1")` matches; `Some("other")` rejects.
+    /// Pins the strict-equality contract for commit, including
+    /// the OR-combined multi-value semantic and the `-dirty`
+    /// suffix's contribution to identity (a clean and dirty run
+    /// of the same HEAD bucket separately).
+    #[test]
+    fn row_filter_commit_exact_match_and_or_combined() {
+        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row_clean.commit = Some("abcdef1".to_string());
+        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row_dirty.commit = Some("abcdef1-dirty".to_string());
+        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", None, &[]);
+        row_other.commit = Some("fedcba2".to_string());
+
+        let filter_single = RowFilter {
+            commits: vec!["abcdef1".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            filter_single.matches(&row_clean),
+            "exact commit match must succeed",
+        );
+        assert!(
+            !filter_single.matches(&row_dirty),
+            "`abcdef1-dirty` must NOT match a filter for `abcdef1` — \
+             the suffix is part of identity, so the dirty run buckets \
+             separately from the clean run of the same HEAD",
+        );
+        assert!(
+            !filter_single.matches(&row_other),
+            "different commit must reject",
+        );
+
+        let filter_or = RowFilter {
+            commits: vec!["abcdef1".to_string(), "fedcba2".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            filter_or.matches(&row_clean),
+            "first listed commit must match in OR-combined filter",
+        );
+        assert!(
+            filter_or.matches(&row_other),
+            "second listed commit must match in OR-combined filter",
+        );
+        assert!(
+            !filter_or.matches(&row_dirty),
+            "`abcdef1-dirty` must still reject — the suffix-bearing \
+             form is its own identity even in OR-combined mode",
+        );
+    }
+
+    /// `--commit` and `--kernel` compose with AND semantics: a
+    /// populated commit filter and a populated kernel filter must
+    /// BOTH match for the row to survive. Pins the cross-field
+    /// composition rule for the new commit field, mirroring the
+    /// existing multi-field test for scheduler+topology+kernel.
+    #[test]
+    fn row_filter_commit_and_kernel_compose_and() {
+        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "CpuSpin", Some("6.14.2"), &[]);
+        row.commit = Some("abcdef1".to_string());
+        let filter_both_match = RowFilter {
+            kernels: vec!["6.14.2".to_string()],
+            commits: vec!["abcdef1".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            filter_both_match.matches(&row),
+            "both filters matching must accept the row",
+        );
+        let filter_kernel_only_match = RowFilter {
+            kernels: vec!["6.14.2".to_string()],
+            commits: vec!["fedcba2".to_string()],
+            ..RowFilter::default()
+        };
+        assert!(
+            !filter_kernel_only_match.matches(&row),
+            "AND composition must reject when commit mismatches even \
+             though kernel matches",
         );
     }
 
