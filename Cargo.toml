@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.4.8"
+version = "0.4.9"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

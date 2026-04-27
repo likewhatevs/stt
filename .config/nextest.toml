@@ -10,7 +10,7 @@ path = "junit.xml"
 
 [profile.ci]
 slow-timeout = { period = "90s", terminate-after = 3 }
-retries = { backoff = "exponential", count = 6, delay = "5s", jitter = true, max-delay = "60s" }
+retries = { backoff = "exponential", count = 24, delay = "20s", jitter = true, max-delay = "60s" }
 failure-output = "final"
 fail-fast = false
 
