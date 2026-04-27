@@ -2290,7 +2290,7 @@ pub fn kernel_build_pipeline(
     .with_version(acquired.version.clone())
     .with_config_hash(config_hash)
     .with_ktstr_kconfig_hash(Some(kconfig_hash));
-    if let Some((size, mtime_secs)) = source_vmlinux_stat {
+    if is_local_source && let Some((size, mtime_secs)) = source_vmlinux_stat {
         metadata = metadata.with_source_vmlinux_stat(size, mtime_secs);
     }
 
@@ -2406,7 +2406,7 @@ pub fn compare_partitions(
 /// policy is the only item in `stats` that a CLI or external
 /// consumer constructs directly; every other item is internal
 /// plumbing reached via `cli::compare_partitions`.
-pub use crate::stats::{AveragedGroup, ComparisonPolicy, RowFilter, group_and_average};
+pub use crate::stats::{AveragedGroup, ComparisonPolicy, RowFilter};
 
 /// Collect the current host context via
 /// [`crate::host_context::collect_host_context`] and render it as
@@ -3884,12 +3884,16 @@ pub fn cleanup(parent_cgroup: Option<String>) -> Result<()> {
 /// Sentinel handling: `0` and unparseable values fall through
 /// (`from_str` errs on non-digits, and the explicit `n > 0`
 /// guard rejects the parsed-zero case). A typoed export
-/// (`KTSTR_KERNEL_PARALLELISM=abc` or `=0`) silently degrades to
-/// the host-CPU default rather than disabling parallelism — a
+/// (`KTSTR_KERNEL_PARALLELISM=abc` or `=0`) degrades to the
+/// host-CPU default rather than disabling parallelism — a
 /// disabled-pool resolve would serialize multi-spec invocations
 /// with no observable signal that the env var was the cause.
-/// Leading/trailing whitespace is trimmed before parsing so a
-/// shell-quoted `=" 8 "` behaves the same as the unquoted form.
+/// The fall-through path emits a `tracing::warn!` carrying the
+/// raw value so the operator sees their typo'd export was
+/// ignored; the default still applies so forward progress is
+/// preserved. Leading/trailing whitespace is trimmed before
+/// parsing so a shell-quoted `=" 8 "` behaves the same as the
+/// unquoted form.
 ///
 /// Extracted from cargo-ktstr's `resolve_kernel_set` so the
 /// parsing rules live in one place; the cargo-ktstr binary
@@ -3900,10 +3904,15 @@ pub fn cleanup(parent_cgroup: Option<String>) -> Result<()> {
 pub fn resolve_kernel_parallelism() -> usize {
     if let Ok(raw) = std::env::var(crate::KTSTR_KERNEL_PARALLELISM_ENV) {
         let trimmed = raw.trim();
-        if let Ok(n) = trimmed.parse::<usize>()
-            && n > 0
-        {
-            return n;
+        match trimmed.parse::<usize>() {
+            Ok(n) if n > 0 => return n,
+            _ => {
+                tracing::warn!(
+                    env_var = crate::KTSTR_KERNEL_PARALLELISM_ENV,
+                    value = %raw,
+                    "KTSTR_KERNEL_PARALLELISM={raw:?} failed to parse, using default",
+                );
+            }
         }
     }
     std::thread::available_parallelism()

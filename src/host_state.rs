@@ -1520,7 +1520,7 @@ mod tests {
         let snap = capture();
         assert!(!snap.threads.is_empty());
         // Every captured thread carries non-ephemeral identity.
-        let pid = std::process::id() as u32;
+        let pid = std::process::id();
         let self_threads: Vec<_> = snap.threads.iter().filter(|t| t.tgid == pid).collect();
         assert!(!self_threads.is_empty(), "own tgid missing from capture");
     }

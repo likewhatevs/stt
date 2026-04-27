@@ -1368,10 +1368,18 @@ impl KtstrVm {
                                             return;
                                         }
                                         // Not 'x'/'X' after Ctrl+A: the 0x01
-                                        // was a real keystroke. Forward it now.
+                                        // was a real keystroke. Flush any
+                                        // unflushed bytes preceding this point
+                                        // first so the deferred 0x01 lands in
+                                        // chronological order, then queue the
+                                        // 0x01, then continue processing from
+                                        // `i` onward (current byte may itself
+                                        // be 0x01).
+                                        if forward_start < i {
+                                            vc_for_stdin.lock().queue_input(&buf[forward_start..i]);
+                                            forward_start = i;
+                                        }
                                         vc_for_stdin.lock().queue_input(&[0x01]);
-                                        // Current byte is processed normally
-                                        // below (may itself be 0x01).
                                     }
                                     if buf[i] == 0x01 {
                                         // Flush bytes before the Ctrl+A.
@@ -2485,7 +2493,7 @@ impl KtstrVm {
                     let host_base = vm
                         .guest_mem
                         .get_host_address(GuestAddress(DRAM_BASE))
-                        .unwrap();
+                        .context("resolve guest DRAM base host address (watchdog)")?;
                     // Size of the first contiguous region only.
                     // host_base addresses that single mapping; using the
                     // sum of all region lengths would extend past the
@@ -2743,7 +2751,7 @@ impl KtstrVm {
                 let host_base = vm
                     .guest_mem
                     .get_host_address(GuestAddress(DRAM_BASE))
-                    .unwrap();
+                    .context("resolve guest DRAM base host address (monitor)")?;
                 // Size of the first contiguous region only.
                 // host_base addresses that single mapping; using the
                 // sum of all region lengths would extend past the
@@ -2950,7 +2958,7 @@ impl KtstrVm {
                 let host_base = vm
                     .guest_mem
                     .get_host_address(GuestAddress(DRAM_BASE))
-                    .unwrap();
+                    .context("resolve guest DRAM base host address (bpf-map-write)")?;
                 // Size of the first contiguous region only.
                 // host_base addresses that single mapping; using the
                 // sum of all region lengths would extend past the
@@ -3228,7 +3236,7 @@ impl KtstrVm {
         // Merge mid-flight drain (from monitor thread) with post-mortem
         // drain (snapshot after VM exit). Mid-flight entries come first
         // since they were drained during execution.
-        let (shm_data, stimulus_events) = if self.shm_size > 0 {
+        let (shm_data, stimulus_events) = if (self.shm_size as usize) >= shm_ring::HEADER_SIZE {
             let mem_size = (self.effective_memory_mb(&run.vm.guest_mem) as u64) << 20;
             let shm_base = DRAM_BASE + mem_size - self.shm_size;
             let shm_size = self.shm_size as usize;

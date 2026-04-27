@@ -17,6 +17,19 @@ use vmm_sys_util::ioctl_io_nr;
 ioctl_io_nr!(KVM_GET_STATS_FD, kvm_bindings::KVMIO, 0xce);
 
 /// Size of `kvm_stats_desc` fixed fields before the variable-length name.
+///
+/// Mirrors `struct kvm_stats_desc` from `include/uapi/linux/kvm.h`:
+///   __u32 flags;        //  0..4
+///   __s16 exponent;     //  4..6
+///   __u16 size;         //  6..8
+///   __u32 offset;       //  8..12
+///   __u32 bucket_size;  // 12..16
+///   char  name[];       // 16..
+/// The reads below at offsets 6 (size) and 8 (offset) and the
+/// `DESC_FIXED_SIZE..DESC_FIXED_SIZE + name_size` slice for the
+/// trailing name string match this layout exactly. `flags`, `exponent`,
+/// and `bucket_size` are unused (only scalar value reads are emitted,
+/// and bucket_size only applies to histogram stats).
 const DESC_FIXED_SIZE: usize = 16;
 
 /// Issue KVM_GET_STATS_FD on an fd (VmFd or VcpuFd).

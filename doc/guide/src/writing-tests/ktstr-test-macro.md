@@ -57,7 +57,7 @@ All attributes are optional with defaults.
 
 | Attribute | Default | Description |
 |---|---|---|
-| `llcs` | inherited | Number of LLCs (`sockets` is accepted as an alias) |
+| `llcs` | inherited | Number of LLCs |
 | `numa_nodes` | inherited | Number of NUMA nodes |
 | `cores` | inherited | Cores per LLC |
 | `threads` | inherited | Threads per core |
@@ -159,7 +159,7 @@ for profile generation examples.
 | `max_llcs` | 12 | Maximum LLCs for gauntlet topology filtering |
 | `min_cpus` | 1 | Minimum total CPU count for gauntlet topology filtering |
 | `max_cpus` | 192 | Maximum total CPU count for gauntlet topology filtering |
-| `min_numa_nodes` | 1 | Minimum NUMA nodes for gauntlet topology filtering (`min_sockets` accepted as alias) |
+| `min_numa_nodes` | 1 | Minimum NUMA nodes for gauntlet topology filtering |
 | `max_numa_nodes` | 1 | Maximum NUMA nodes for gauntlet topology filtering |
 | `requires_smt` | `false` | Require SMT (threads > 1) topologies. On aarch64 the gauntlet ships only non-SMT presets, so any test with `requires_smt = true` is skipped entirely on that arch. |
 

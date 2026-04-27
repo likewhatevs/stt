@@ -12,6 +12,8 @@
 /// (no E820 entry covers it), on aarch64 via FDT /reserved-memory and
 /// /memreserve/. The guest init binary discovers the region via KTSTR_SHM_BASE
 /// and KTSTR_SHM_SIZE parameters on the kernel command line.
+use std::ptr;
+
 use zerocopy::{FromBytes, IntoBytes};
 
 /// Result of a successful `/dev/mem` mmap of the SHM region.
@@ -280,14 +282,20 @@ pub fn init_shm_ptr(base: *mut u8, size: usize) {
 /// mmap pointer. No-op if SHM is not initialized.
 ///
 /// Acquires `SHM_WRITE_LOCK` to serialize against concurrent writers
-/// (sched-exit-mon thread and step executor).
+/// (sched-exit-mon thread and step executor). Operates on the raw
+/// mmap pointer via volatile reads/writes — never materializes a
+/// `&mut [u8]` over the SHM region. The host monitor thread reads
+/// the same memory concurrently (`shm_drain_live`), so a `&mut [u8]`
+/// would alias the host's `&` view and violate Rust's reference
+/// rules, even though the lock serializes guest-side writers.
 pub fn write_msg(msg_type: u32, payload: &[u8]) {
     let Ok((ptr, size)) = shm_ptr() else { return };
     // Safe to re-enter: write_ptr advances only after header + payload
     // land, so a mid-write panic cannot corrupt committed messages.
     let _guard = SHM_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
-    shm_write(buf, 0, msg_type, payload);
+    // SAFETY: `ptr` points to a `size`-byte mmap region that outlives
+    // every guest thread (set once via `OnceLock` during init).
+    unsafe { shm_write_raw(ptr, size, msg_type, payload) };
 }
 
 /// Guest-side: try to write a TLV message without blocking.
@@ -307,8 +315,9 @@ pub fn write_msg_nonblocking(msg_type: u32, payload: &[u8]) -> bool {
     let Ok(_guard) = SHM_WRITE_LOCK.try_lock() else {
         return false;
     };
-    let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
-    shm_write(buf, 0, msg_type, payload);
+    // SAFETY: same invariant as `write_msg` — `ptr` is a valid
+    // `size`-byte mmap region.
+    unsafe { shm_write_raw(ptr, size, msg_type, payload) };
     true
 }
 
@@ -622,6 +631,14 @@ fn read_ring_into(buf: &[u8], data_start: usize, capacity: usize, ptr: u64, out:
 /// `buf` is the full guest memory (read-only). `shm_offset` is the byte
 /// offset where the SHM region starts.
 pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
+    // A misconfigured caller (e.g., an `shm_size` smaller than
+    // `HEADER_SIZE` propagating into `collect_results`) must not panic
+    // the host: `read_header` indexes `buf[shm_offset..shm_offset +
+    // HEADER_SIZE]` unconditionally and would slice-panic on a
+    // too-small buffer. Bail with an empty drain instead.
+    if shm_offset.saturating_add(HEADER_SIZE) > buf.len() {
+        return ShmDrainResult::default();
+    }
     let header = read_header(buf, shm_offset);
     if header.magic != SHM_RING_MAGIC {
         return ShmDrainResult::default();
@@ -642,15 +659,49 @@ pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
     let mut read_pos = header.read_ptr;
     let write_pos = header.write_ptr;
     let mut entries = Vec::new();
+    // Ring invariant: at most `capacity` bytes are unread at any
+    // moment. A torn/corrupt header where `read_ptr > write_ptr`
+    // (or where the gap exceeds capacity for any reason) makes
+    // `wrapping_sub` return a near-`u64::MAX` distance — without
+    // this guard the loop would iterate ~2^60 times before
+    // termination, OOMing the host long before that.
+    //
+    // Mirrors the writer-side invariant check in `shm_write` /
+    // `shm_write_raw` (`if used > capacity { return; }`).
+    if write_pos.wrapping_sub(read_pos) > capacity as u64 {
+        return ShmDrainResult {
+            entries,
+            drops: header.drops,
+        };
+    }
+    // Largest payload that can fit in a valid message: any
+    // `msg.length` larger than this is necessarily torn/corrupt and
+    // must not be trusted as an allocation size. Without this cap a
+    // guest-controlled `u32` (up to 4 GiB) could trigger an OOM via
+    // `vec![0u8; msg.length as usize]` in `read_ring_bytes`.
+    let max_payload = (capacity - MSG_HEADER_SIZE.min(capacity)) as u64;
 
-    while read_pos + MSG_HEADER_SIZE as u64 <= write_pos {
+    // Modular distance: `write_pos.wrapping_sub(read_pos)` handles
+    // both the normal case and the (extremely rare) u64 overflow of
+    // `write_pos` ahead of `read_pos`. Raw addition would overflow
+    // when `read_pos` is near `u64::MAX`.
+    while write_pos.wrapping_sub(read_pos) >= MSG_HEADER_SIZE as u64 {
         let mut hdr_buf = [0u8; MSG_HEADER_SIZE];
         read_ring_into(buf, data_start, capacity, read_pos, &mut hdr_buf);
         let msg = ShmMessage::read_from_bytes(&hdr_buf)
             .expect("MSG_HEADER_SIZE matches ShmMessage layout");
 
+        // Reject implausible message lengths before allocating: a
+        // length larger than the entire ring's payload area cannot
+        // come from a complete, non-torn write. Stop draining rather
+        // than allocating multi-GiB or chasing further corrupt
+        // entries.
+        if msg.length as u64 > max_payload {
+            break;
+        }
+
         let total_msg_size = MSG_HEADER_SIZE as u64 + msg.length as u64;
-        if read_pos + total_msg_size > write_pos {
+        if write_pos.wrapping_sub(read_pos) < total_msg_size {
             // Incomplete message — stop.
             break;
         }
@@ -659,7 +710,7 @@ pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
             buf,
             data_start,
             capacity,
-            read_pos + MSG_HEADER_SIZE as u64,
+            read_pos.wrapping_add(MSG_HEADER_SIZE as u64),
             msg.length as usize,
         );
 
@@ -670,7 +721,7 @@ pub fn shm_drain(buf: &[u8], shm_offset: usize) -> ShmDrainResult {
             crc_ok: computed_crc == msg.crc32,
         });
 
-        read_pos += total_msg_size;
+        read_pos = read_pos.wrapping_add(total_msg_size);
     }
 
     ShmDrainResult {
@@ -717,16 +768,44 @@ pub fn shm_drain_live(mem: &crate::monitor::reader::GuestMem, shm_base_pa: u64) 
     let data_start_pa = shm_base_pa + HEADER_SIZE as u64;
     let mut read_pos = read_ptr;
     let mut entries = Vec::new();
+    // Ring invariant: at most `capacity` bytes are unread. A
+    // torn/corrupt header where `read_ptr > write_ptr` (or where
+    // the gap exceeds capacity) makes `wrapping_sub` return a
+    // near-`u64::MAX` distance — without this guard the loop
+    // would iterate ~2^60 times before terminating and OOM the
+    // host monitor thread.
+    //
+    // Bail without advancing `read_ptr` so the next tick re-reads
+    // the (hopefully recovered) header. Mirrors the writer-side
+    // invariant check in `shm_write` / `shm_write_raw`.
+    if write_ptr.wrapping_sub(read_pos) > capacity as u64 {
+        return ShmDrainResult { entries, drops };
+    }
+    // Same OOM cap as `shm_drain`: a guest-supplied `msg.length`
+    // larger than the ring's payload area can never come from a
+    // complete write, and trusting it would let an untrusted guest
+    // request a multi-GiB host allocation.
+    let max_payload = (capacity - MSG_HEADER_SIZE.min(capacity)) as u64;
 
-    while read_pos + MSG_HEADER_SIZE as u64 <= write_ptr {
+    // Modular distance via `wrapping_sub` — `read_pos + ...` would
+    // overflow when `read_pos` is near `u64::MAX` (post-wraparound
+    // case validated by `shm_write_wrapping_sub_handles_u64_overflow_of_write_ptr`).
+    while write_ptr.wrapping_sub(read_pos) >= MSG_HEADER_SIZE as u64 {
         // Read message header via volatile.
         let mut hdr_buf = [0u8; MSG_HEADER_SIZE];
         read_ring_volatile(mem, data_start_pa, capacity, read_pos, &mut hdr_buf);
         let msg = ShmMessage::read_from_bytes(&hdr_buf)
             .expect("MSG_HEADER_SIZE matches ShmMessage layout");
 
+        // Reject implausible `msg.length` before allocating: prevents
+        // a torn-write or guest-controlled u32 (up to ~4GiB) from
+        // triggering an OOM via `vec![0u8; msg.length as usize]`.
+        if msg.length as u64 > max_payload {
+            break;
+        }
+
         let total_msg_size = MSG_HEADER_SIZE as u64 + msg.length as u64;
-        if read_pos + total_msg_size > write_ptr {
+        if write_ptr.wrapping_sub(read_pos) < total_msg_size {
             break;
         }
 
@@ -736,7 +815,7 @@ pub fn shm_drain_live(mem: &crate::monitor::reader::GuestMem, shm_base_pa: u64) 
                 mem,
                 data_start_pa,
                 capacity,
-                read_pos + MSG_HEADER_SIZE as u64,
+                read_pos.wrapping_add(MSG_HEADER_SIZE as u64),
                 &mut payload,
             );
         }
@@ -748,7 +827,7 @@ pub fn shm_drain_live(mem: &crate::monitor::reader::GuestMem, shm_base_pa: u64) 
             crc_ok: computed_crc == msg.crc32,
         });
 
-        read_pos += total_msg_size;
+        read_pos = read_pos.wrapping_add(total_msg_size);
     }
 
     // Advance read_ptr so the guest can reuse the drained space.
@@ -905,6 +984,125 @@ fn write_ring_bytes(buf: &mut [u8], data_start: usize, capacity: usize, ptr: u64
         src_pos += chunk;
         dst_pos = 0; // wrap
         remaining -= chunk;
+    }
+}
+
+/// Raw-pointer mirror of [`shm_write`] used by the guest production
+/// writers (`write_msg`, `write_msg_nonblocking`). Operates entirely
+/// through `ptr::read_volatile` / `ptr::write_volatile` so the SHM
+/// region is never materialized as `&mut [u8]` — the host monitor
+/// thread reads the same memory concurrently via `shm_drain_live`,
+/// so a `&mut` slice would alias the host's view and violate Rust's
+/// reference rules even though `SHM_WRITE_LOCK` serializes guest-side
+/// writers.
+///
+/// SAFETY: caller must ensure `base` points to a valid `size`-byte
+/// mapping that outlives the call, and that no other code holds a
+/// `&` or `&mut` reference to bytes in that mapping.
+#[allow(dead_code)]
+unsafe fn shm_write_raw(base: *mut u8, size: usize, msg_type: u32, payload: &[u8]) {
+    if size < HEADER_SIZE {
+        return;
+    }
+    // Read the current header field-by-field via volatile loads.
+    // Order mirrors `ShmRingHeader`: magic (0), version (4),
+    // capacity (8), control_bytes (12), write_ptr (16), read_ptr (24),
+    // drops (32). Only `capacity`, `write_ptr`, `read_ptr`, and
+    // `drops` are needed by the write path.
+    let capacity = unsafe { ptr::read_volatile(base.add(8) as *const u32) } as usize;
+    if capacity == 0 || capacity > size - HEADER_SIZE {
+        return;
+    }
+    let write_ptr = unsafe { ptr::read_volatile(base.add(16) as *const u64) };
+    let read_ptr = unsafe { ptr::read_volatile(base.add(24) as *const u64) };
+
+    let bump_drops = || {
+        // SAFETY: caller invariant; `drops` field at offset 32 lies
+        // wholly within the `size`-byte mapping because
+        // `size >= HEADER_SIZE` was checked above.
+        let drops = unsafe { ptr::read_volatile(base.add(32) as *const u64) };
+        unsafe { ptr::write_volatile(base.add(32) as *mut u64, drops.saturating_add(1)) };
+    };
+
+    let Some(total) = MSG_HEADER_SIZE.checked_add(payload.len()) else {
+        bump_drops();
+        return;
+    };
+
+    let used = write_ptr.wrapping_sub(read_ptr) as usize;
+    if used > capacity {
+        return;
+    }
+    let needed = used.checked_add(total);
+    if needed.is_none_or(|n| n > capacity) {
+        bump_drops();
+        return;
+    }
+
+    let Ok(length_u32) = u32::try_from(payload.len()) else {
+        bump_drops();
+        return;
+    };
+
+    let msg = ShmMessage {
+        msg_type,
+        length: length_u32,
+        crc32: crc32fast::hash(payload),
+        _pad: 0,
+    };
+    let msg_bytes = msg.as_bytes();
+
+    // Data area starts immediately after the header.
+    let data_base = unsafe { base.add(HEADER_SIZE) };
+
+    // Write the TLV header bytes into the ring data area.
+    // SAFETY: caller invariant + all bounds derived from `capacity`
+    // which we just verified is `<= size - HEADER_SIZE`.
+    unsafe {
+        write_ring_volatile(data_base, capacity, write_ptr, msg_bytes);
+        if !payload.is_empty() {
+            write_ring_volatile(
+                data_base,
+                capacity,
+                write_ptr.wrapping_add(MSG_HEADER_SIZE as u64),
+                payload,
+            );
+        }
+    }
+
+    // Publish: bump write_ptr last so a concurrent host reader never
+    // observes a partially written message past the previous
+    // `write_ptr`. `wrapping_add` matches the modular distance used
+    // throughout the drain path (`shm_drain` / `shm_drain_live`),
+    // which already tolerates `write_ptr` wrapping past `u64::MAX`.
+    let new_write = write_ptr.wrapping_add(total as u64);
+    unsafe { ptr::write_volatile(base.add(16) as *mut u64, new_write) };
+}
+
+/// Volatile byte-by-byte write of `data` into the ring's data area
+/// starting at monotonic offset `ptr`, handling wraparound. Mirror
+/// of [`read_ring_volatile`] for guest-side writers.
+///
+/// SAFETY: `data_base` must point to a `capacity`-byte ring data area
+/// that lives for the duration of the call.
+#[allow(dead_code)]
+unsafe fn write_ring_volatile(data_base: *mut u8, capacity: usize, ptr: u64, data: &[u8]) {
+    let mut remaining = data.len();
+    let mut src_pos = 0usize;
+    let mut dst_pos = (ptr % capacity as u64) as usize;
+    while remaining > 0 {
+        let chunk = remaining.min(capacity - dst_pos);
+        for i in 0..chunk {
+            // SAFETY: `dst_pos + i < capacity` because chunk is bounded
+            // by `capacity - dst_pos`; caller guarantees `data_base`
+            // points to a `capacity`-byte mapping.
+            unsafe {
+                ptr::write_volatile(data_base.add(dst_pos + i), data[src_pos + i]);
+            }
+        }
+        src_pos += chunk;
+        remaining -= chunk;
+        dst_pos = 0; // wrap
     }
 }
 
@@ -1849,5 +2047,250 @@ mod tests {
         for (i, &b) in out[4..].iter().enumerate() {
             assert_eq!(b, i as u8);
         }
+    }
+
+    // ---- shm_write_raw round-trip --------------------------------
+    //
+    // `shm_write_raw` is the production guest-side writer that
+    // operates on `*mut u8` instead of `&mut [u8]` so the host's
+    // concurrent volatile reader cannot violate Rust aliasing. The
+    // round-trip tests pin its byte-level layout against the slice
+    // reader (`shm_drain`) — they must agree on every field.
+
+    #[test]
+    fn shm_write_raw_round_trips_through_drain() {
+        // Allocate a buffer, init the ring header via the slice
+        // helper, then write through the raw-pointer path. Drain via
+        // the slice reader and verify the message arrived intact.
+        let shm_size = 1024usize;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        let payload = b"raw-ptr round trip";
+        // SAFETY: `buf` outlives the call; no concurrent reference
+        // to its bytes exists during the write.
+        unsafe {
+            shm_write_raw(buf.as_mut_ptr(), shm_size, MSG_TYPE_STIMULUS, payload);
+        }
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, MSG_TYPE_STIMULUS);
+        assert_eq!(result.entries[0].payload, payload);
+        assert!(result.entries[0].crc_ok);
+        assert_eq!(result.drops, 0);
+    }
+
+    #[test]
+    fn shm_write_raw_handles_wraparound() {
+        // Force the ring to wrap mid-payload by pre-advancing
+        // read_ptr/write_ptr near the boundary.
+        let shm_size = HEADER_SIZE + 48;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        let capacity_u64 = (shm_size - HEADER_SIZE) as u64;
+        // Place write_ptr at capacity - 8 so a 16-byte header + 4-byte
+        // payload (= 20 bytes) wraps.
+        let pre = capacity_u64 - 8;
+        buf[16..24].copy_from_slice(&pre.to_ne_bytes());
+        buf[24..32].copy_from_slice(&pre.to_ne_bytes());
+
+        let payload = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        // SAFETY: see `shm_write_raw_round_trips_through_drain`.
+        unsafe {
+            shm_write_raw(buf.as_mut_ptr(), shm_size, 0xDEAD_BEEF, &payload);
+        }
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].msg_type, 0xDEAD_BEEF);
+        assert_eq!(result.entries[0].payload, payload);
+        assert!(result.entries[0].crc_ok);
+    }
+
+    #[test]
+    fn shm_write_raw_rejects_undersized_mapping() {
+        // A `size` smaller than HEADER_SIZE must noop without
+        // touching memory — the volatile reads at offsets 8/16/24/32
+        // would read past the end of the mapping otherwise.
+        let mut buf = vec![0xAAu8; HEADER_SIZE - 1];
+        // SAFETY: buf is `HEADER_SIZE - 1` bytes; the call must
+        // bail before touching offset 8.
+        unsafe {
+            shm_write_raw(buf.as_mut_ptr(), buf.len(), 1, b"x");
+        }
+        // No bytes mutated — sentinel intact.
+        assert!(buf.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn shm_write_raw_rejects_torn_capacity() {
+        // capacity = 0 (torn init): drop without writing.
+        let shm_size = 1024usize;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        // Overwrite capacity field with 0.
+        buf[8..12].copy_from_slice(&0u32.to_ne_bytes());
+
+        // SAFETY: see `shm_write_raw_round_trips_through_drain`.
+        unsafe {
+            shm_write_raw(buf.as_mut_ptr(), shm_size, 1, b"probe");
+        }
+        // write_ptr unchanged.
+        assert_eq!(u64::from_ne_bytes(buf[16..24].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn shm_write_raw_increments_drops_when_full() {
+        // Fill the ring, then write once more — drops must bump.
+        let shm_size = HEADER_SIZE + 32;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        let big = vec![0xCCu8; 16]; // 16 + 16 = 32, fills capacity.
+        // SAFETY: see `shm_write_raw_round_trips_through_drain`.
+        unsafe {
+            shm_write_raw(buf.as_mut_ptr(), shm_size, 1, &big);
+            shm_write_raw(buf.as_mut_ptr(), shm_size, 2, b"x");
+        }
+        // drops field at offset 32.
+        let drops = u64::from_ne_bytes(buf[32..40].try_into().unwrap());
+        assert_eq!(drops, 1);
+    }
+
+    // ---- shm_drain panic-guard / OOM-cap / overflow guards ------
+
+    #[test]
+    fn shm_drain_returns_empty_when_buf_smaller_than_header() {
+        // A misconfigured caller (e.g. shm_size < HEADER_SIZE)
+        // must produce an empty drain instead of slice-panicking
+        // inside `read_header`.
+        let buf = vec![0u8; HEADER_SIZE - 1];
+        let result = shm_drain(&buf, 0);
+        assert!(result.entries.is_empty());
+        assert_eq!(result.drops, 0);
+    }
+
+    #[test]
+    fn shm_drain_returns_empty_when_offset_pushes_past_end() {
+        // shm_offset positioned so that `shm_offset + HEADER_SIZE`
+        // exceeds buf.len(). Must not panic.
+        let buf = vec![0u8; 1024];
+        let result = shm_drain(&buf, 1024 - HEADER_SIZE + 1);
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn shm_drain_caps_torn_msg_length_against_capacity() {
+        // Torn header advertises `msg.length = u32::MAX`. The OOM
+        // guard must reject before allocation.
+        let shm_size = 1024usize;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        // Plant a TLV header at the start of the data area:
+        // msg_type=1, length=u32::MAX, crc=0, _pad=0.
+        let data_start = HEADER_SIZE;
+        buf[data_start..data_start + 4].copy_from_slice(&1u32.to_ne_bytes());
+        buf[data_start + 4..data_start + 8].copy_from_slice(&u32::MAX.to_ne_bytes());
+        buf[data_start + 8..data_start + 12].copy_from_slice(&0u32.to_ne_bytes());
+        buf[data_start + 12..data_start + 16].copy_from_slice(&0u32.to_ne_bytes());
+        // Set write_ptr large enough that the loop enters and the
+        // torn `length` is read.
+        buf[16..24].copy_from_slice(&64u64.to_ne_bytes());
+
+        let result = shm_drain(&buf, 0);
+        // Must not have allocated 4GiB; result is empty (cap break).
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn shm_drain_handles_read_pos_near_u64_max() {
+        // Set read_ptr near u64::MAX and write_ptr just past wrap;
+        // the modular distance check (`wrapping_sub`) must drive the
+        // loop without overflowing the additive form.
+        let shm_size = HEADER_SIZE + 64;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        // First write a normal message via shm_write so the layout
+        // is valid, then force read_ptr/write_ptr to the post-wrap
+        // window while keeping the pattern length consistent.
+        let _ = shm_write(&mut buf, 0, 1, b"abcd"); // total 20.
+        // Move write_ptr := 5, read_ptr := u64::MAX - 14
+        // (so wrapping_sub(write_ptr, read_ptr) == 20).
+        let new_write: u64 = 5;
+        let new_read: u64 = u64::MAX - 14;
+        buf[16..24].copy_from_slice(&new_write.to_ne_bytes());
+        buf[24..32].copy_from_slice(&new_read.to_ne_bytes());
+        // Sanity.
+        assert_eq!(new_write.wrapping_sub(new_read), 20);
+
+        // The drain enters the loop, computes total_msg_size=20,
+        // attempts to read the header from `data_start + (read_pos %
+        // capacity)`. Since the original write left valid bytes only
+        // at position 0, the header read at position
+        // `(u64::MAX - 14) % 64` resolves to a defined byte position
+        // in the data area — the test's purpose is to confirm no
+        // panic, not to verify the parsed payload. Drain returns
+        // either empty (CRC mismatch / max_payload reject) or a
+        // single entry, but never panics.
+        let result = shm_drain(&buf, 0);
+        // The pre-write established `drops = 0` and modular
+        // arithmetic must not have aborted.
+        assert!(result.entries.len() <= 1);
+    }
+
+    #[test]
+    fn shm_drain_rejects_used_greater_than_capacity() {
+        // Writer-side invariant: `used = write_ptr - read_ptr` is at
+        // most `capacity`. A torn header can violate this (e.g.
+        // `read_ptr > write_ptr` so `wrapping_sub` returns a
+        // near-`u64::MAX` distance). The drain MUST bail before
+        // entering the loop — without the guard it would iterate
+        // ~2^60 times and OOM the host.
+        let shm_size = 1024usize;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        // Force read_ptr > write_ptr to make wrapping_sub huge.
+        let bogus_write: u64 = 0;
+        let bogus_read: u64 = 100;
+        buf[16..24].copy_from_slice(&bogus_write.to_ne_bytes());
+        buf[24..32].copy_from_slice(&bogus_read.to_ne_bytes());
+        // Sanity: distance vastly exceeds capacity (984 bytes).
+        assert!(bogus_write.wrapping_sub(bogus_read) > (shm_size - HEADER_SIZE) as u64);
+
+        // Must return immediately — no allocation, no iteration.
+        let result = shm_drain(&buf, 0);
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn shm_drain_rejects_used_one_past_capacity() {
+        // Boundary case: distance is exactly `capacity + 1`. The
+        // strict `>` comparison must reject; `==` would accept.
+        let shm_size = HEADER_SIZE + 64;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        // capacity = 64. Set distance to 65 via wrapping_sub.
+        let new_write: u64 = 65;
+        let new_read: u64 = 0;
+        buf[16..24].copy_from_slice(&new_write.to_ne_bytes());
+        buf[24..32].copy_from_slice(&new_read.to_ne_bytes());
+
+        let result = shm_drain(&buf, 0);
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn shm_drain_accepts_used_exactly_capacity() {
+        // The invariant permits `used == capacity` (full ring); the
+        // guard must NOT trip on this case. Build a full ring via
+        // the writer and verify drain succeeds.
+        let shm_size = HEADER_SIZE + 32;
+        let mut buf = vec![0u8; shm_size];
+        shm_init(&mut buf, 0, shm_size);
+        let payload = vec![0xCCu8; 16]; // 16 + 16 = 32 = capacity.
+        let written = shm_write(&mut buf, 0, 1, &payload);
+        assert_eq!(written, 32);
+
+        let result = shm_drain(&buf, 0);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].payload, payload);
     }
 }

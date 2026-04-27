@@ -1,19 +1,21 @@
 # Running Tests
 
-Tests run via `cargo nextest run`, which boots KVM virtual machines
-for each `#[ktstr_test]` entry.
+Tests run via `cargo ktstr test --kernel ../linux`, which resolves the
+kernel and wraps `cargo nextest run` to boot KVM virtual machines for
+each `#[ktstr_test]` entry. Raw `cargo nextest run` remains available
+as a fallback once a kernel is in place via the discovery chain.
 
 ## Quick reference
 
 ```sh
 # Run all tests
-cargo nextest run --workspace
+cargo ktstr test --kernel ../linux
 
 # Run a specific test
-cargo nextest run -E 'test(sched_basic_proportional)'
+cargo ktstr test --kernel ../linux -- -E 'test(sched_basic_proportional)'
 
 # Run ignored gauntlet tests
-cargo nextest run --run-ignored ignored-only -E 'test(gauntlet/)'
+cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(gauntlet/)'
 ```
 
 ## Run analysis
@@ -43,10 +45,10 @@ quick smoke tests.
 
 ```sh
 # Run the best 5 minutes of tests
-KTSTR_BUDGET_SECS=300 cargo nextest run --workspace
+KTSTR_BUDGET_SECS=300 cargo ktstr test --kernel ../linux
 
 # Budget applies to gauntlet variants too
-KTSTR_BUDGET_SECS=600 cargo nextest run --run-ignored all
+KTSTR_BUDGET_SECS=600 cargo ktstr test --kernel ../linux -- --run-ignored all
 ```
 
 The selector encodes each test as a bitset of properties (scheduler,

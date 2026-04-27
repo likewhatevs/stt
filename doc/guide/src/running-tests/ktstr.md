@@ -212,7 +212,9 @@ Scans four lock-file roots:
 - `/tmp/ktstr-cpu-*.lock` — per-CPU reservations from the
   same flow.
 - `{cache_root}/.locks/*.lock` — cache-entry locks held
-  during `kernel build` writes.
+  during `kernel build` writes, and `source-{path_hash}.lock`
+  files held for the duration of `kernel build --source` and
+  `cargo ktstr test --kernel <path>` against the same source tree.
 - `{runs_root}/.locks/{kernel}-{project_commit}.lock` —
   per-run-key sidecar-write locks held for the duration of
   the (pre-clear + write) cycle to serialize concurrent

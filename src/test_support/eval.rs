@@ -114,7 +114,7 @@ pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String
 // `MSG_TYPE_RAW_PAYLOAD_OUTPUT` and emits an empty-metrics
 // `PayloadMetrics` placeholder under `MSG_TYPE_PAYLOAD_METRICS` for
 // every `OutputFormat::LlmExtract` invocation. The guest does NOT
-// load the local model into VM RAM (the model is ~2.4 GiB; the test
+// load the local model into VM RAM (the model is ~2.55 GiB; the test
 // VM's RAM budget cannot accommodate it). The host runs
 // `extract_via_llm` here, after VM exit, on the captured text — same
 // stdout-primary / stderr-fallback contract that previously lived in
@@ -1027,10 +1027,10 @@ pub(crate) fn run_ktstr_test_inner(
     // CPUs the host process is permitted on (cgroup cpuset / sudo
     // -u limits / CI runner allocation), which is exactly what
     // `host_allowed_cpus()` returns via `sched_getaffinity(0)`.
-    // The team-lead's #30 direction: "use no-perf-mode cpuset for
-    // inference" — `set_thread_cpumask` against the broader
-    // host-allowed pool is the no-perf-mode primitive applied to
-    // a wider set than any single LLC-plan would carve out.
+    // Use no-perf-mode cpuset for inference: `set_thread_cpumask`
+    // against the broader host-allowed pool is the no-perf-mode
+    // primitive applied to a wider set than any single LLC-plan
+    // would carve out.
     //
     // Empty `host_allowed_cpus()` (sched_getaffinity unavailable,
     // procfs fallback failed) skips the call rather than masking
@@ -4121,7 +4121,7 @@ mod tests {
     ///
     /// The setup also has an empty-metrics PM at payload_index=0
     /// (no matching raw_output), which triggers the post-pairing
-    /// orphan-PM scan added by #46. So this test sees BOTH the
+    /// orphan-PM scan. So this test sees BOTH the
     /// orphan-raw detail (from the pairing loop) AND the
     /// orphan-PM detail (from the post-loop scan). Pin both so a
     /// regression that drops either path surfaces here.
@@ -4162,7 +4162,7 @@ mod tests {
     /// caught.
     ///
     /// The empty-metrics PM at payload_index=0 also triggers the
-    /// post-pairing orphan-PM scan (#46). So we expect 3 orphan-raw
+    /// post-pairing orphan-PM scan. So we expect 3 orphan-raw
     /// details + 1 orphan-PM combined detail = 4 total failures.
     #[test]
     fn host_side_llm_extract_multiple_orphans_each_surface() {
@@ -4194,9 +4194,9 @@ mod tests {
     /// Json payload that produced zero metrics (empty `metrics` vec)
     /// must NOT be conflated with an LlmExtract placeholder when an
     /// LlmExtract raw output is also present at a different index.
-    /// This pins the motivating scenario for #20: positional pairing
-    /// would have written the LlmExtract result into the Json
-    /// payload's empty slot.
+    /// This pins the motivating scenario for index-based pairing:
+    /// positional pairing would have written the LlmExtract result
+    /// into the Json payload's empty slot.
     ///
     /// Setup: a Json payload at `payload_index=5` with empty metrics
     /// (indistinguishable from an LlmExtract placeholder by content
@@ -4205,7 +4205,7 @@ mod tests {
     ///
     /// Expected: the raw output is reported as orphan; the Json
     /// payload's empty slot is NEVER touched. Additionally, the
-    /// post-pairing orphan-PM scan (#46) flags the Json slot at
+    /// post-pairing orphan-PM scan flags the Json slot at
     /// index 5 as a candidate for "raw output may have been dropped"
     /// — this is a known false-positive case the scan's own diagnostic
     /// prose calls out, since a Json-with-no-leaves payload looks
@@ -4244,10 +4244,10 @@ mod tests {
 
     /// SHM ring overflow with LlmExtract in use: a non-zero
     /// `shm_drops` while raw outputs are present surfaces a
-    /// `SHM ring overflow` detail. Pins the design contract from
-    /// task #8 — silent metric truncation must propagate as a
-    /// host-actionable failure rather than letting downstream
-    /// stats see a quietly-incomplete metric set.
+    /// `SHM ring overflow` detail. Pins the design contract that
+    /// silent metric truncation must propagate as a host-actionable
+    /// failure rather than letting downstream stats see a
+    /// quietly-incomplete metric set.
     ///
     /// Constructed with an ORPHAN raw output (payload_index=99
     /// has no matching `PayloadMetrics` slot) so the pairing
@@ -4310,9 +4310,9 @@ mod tests {
         );
     }
 
-    // -- orphan-PayloadMetrics scan (#46) --
+    // -- orphan-PayloadMetrics scan --
 
-    /// Task #46: an empty-metrics `PayloadMetrics` whose
+    /// An empty-metrics `PayloadMetrics` whose
     /// `payload_index` has no matching `RawPayloadOutput` is
     /// surfaced by the post-pairing scan. Most likely cause is a
     /// CRC-bad RawPayloadOutput silently dropped during SHM
@@ -4354,7 +4354,7 @@ mod tests {
         );
     }
 
-    /// Task #46: when ALL PMs have matching raws, the orphan-PM
+    /// When ALL PMs have matching raws, the orphan-PM
     /// scan does NOT fire. Pins that the scan is gated on the
     /// missing-pair condition rather than blanketly emitting a
     /// detail for every empty-metrics PM in an LlmExtract test
@@ -4402,7 +4402,7 @@ mod tests {
     // model-touching paths via the offline gate (`KTSTR_MODEL_OFFLINE=1`).
     // The gate makes `extract_via_llm` return Err deterministically,
     // so the tests pin the host-side dispatch behavior without
-    // standing up the ~2.4 GiB model.
+    // standing up the ~2.55 GiB model.
     //
     // Every test holds `lock_env()` and calls `super::super::model::reset()`
     // before the gate is set, ensuring no previously-memoized
@@ -4412,11 +4412,10 @@ mod tests {
     //
     // The companion happy-path tests for stdout-primary / stderr-fallback
     // with a real model live in the integration test
-    // `tests/llm_extract_e2e_test.rs` — pinned by task #13. The unit
-    // tests here pin the deterministic boundaries that don't require
-    // a model.
+    // `tests/llm_extract_e2e_test.rs`. The unit tests here pin the
+    // deterministic boundaries that don't require a model.
 
-    /// Task #7: a `RawPayloadOutput` carrying empty stdout AND empty
+    /// A `RawPayloadOutput` carrying empty stdout AND empty
     /// stderr — paired with a matching `PayloadMetrics` slot — must
     /// not panic the host extraction. Under the offline gate, the
     /// stdout call surfaces a load-failed detail (deterministic),
@@ -4474,7 +4473,7 @@ mod tests {
         );
     }
 
-    /// Task #9: with `KTSTR_MODEL_OFFLINE=1` set, `host_side_llm_extract`
+    /// With `KTSTR_MODEL_OFFLINE=1` set, `host_side_llm_extract`
     /// must surface an actionable `LlmExtract model load failed`
     /// detail naming the offline env var. Pins the host-side
     /// equivalent of the `extract_via_llm_returns_empty_when_backend_unavailable`
@@ -4554,7 +4553,7 @@ mod tests {
         );
     }
 
-    /// Task #10 (offline-gate side): when stdout's `extract_via_llm`
+    /// Offline-gate side: when stdout's `extract_via_llm`
     /// call surfaces a load-failure reason, the stderr fallback is
     /// SKIPPED — the failure reason is identical across both calls
     /// and re-invoking inference would burn cycles to no purpose.
@@ -4603,7 +4602,7 @@ mod tests {
         );
     }
 
-    /// Task #10 (multi-pair side): the offline-gate behavior is
+    /// Multi-pair side: the offline-gate behavior is
     /// per-pair, not global — a load-failure on one
     /// (RawPayloadOutput, PayloadMetrics) pair must NOT short-
     /// circuit processing of subsequent pairs. Each pair gets its
@@ -4661,7 +4660,7 @@ mod tests {
         );
     }
 
-    /// Task #10 (orphan + load-failure interaction): a mix of an
+    /// Orphan + load-failure interaction: a mix of an
     /// orphan raw output (no matching PM slot) AND a matched-but-
     /// load-failing pair under the offline gate produces TWO
     /// distinct details — one orphan-pairing and one load-failure.
@@ -4714,7 +4713,7 @@ mod tests {
         );
     }
 
-    /// Task #10 (drops + offline gate): a non-zero drops counter
+    /// Drops + offline gate: a non-zero drops counter
     /// AND a load failure both surface — the overflow detail and
     /// the load-failure detail are independent. Pins that the
     /// drops detail emits BEFORE the pair loop (eval.rs:209) and
@@ -4752,7 +4751,7 @@ mod tests {
         );
     }
 
-    /// Task #12 (SHM wire-frame round-trip): the full
+    /// SHM wire-frame round-trip: the full
     /// guest→SHM→host transport for `MSG_TYPE_RAW_PAYLOAD_OUTPUT`
     /// must preserve BOTH stdout and stderr streams independently.
     /// A regression that concatenated the streams (e.g. a guest-

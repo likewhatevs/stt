@@ -1614,8 +1614,8 @@ pub(crate) fn apply_archive_source_override(pool: &mut [SidecarResult]) {
 ///   (or hit yielding `Tarball` / `Git` source, both of which
 ///   are transient with no on-disk tree to probe), the function
 ///   falls back to scanning every valid cache entry for a Local
-///   match on version. The fallback is the bug fix for #58:
-///   without it, a cache populated by `kernel build --kernel
+///   match on version. Without this fallback,
+///   a cache populated by `kernel build --kernel
 ///   /path/to/linux` (a Local entry with source_tree_path) is
 ///   never found by a sidecar writer that has
 ///   `KTSTR_KERNEL=6.14.2`, even though the local tree is
@@ -4310,7 +4310,7 @@ mod tests {
         );
     }
 
-    // -- write_sidecar reuse-dir behavior (fix #5) --
+    // -- write_sidecar reuse-dir behavior --
 
     /// Two `write_sidecar` invocations against the same effective
     /// run directory (same `KTSTR_SIDECAR_DIR` here, simulating two
@@ -4322,7 +4322,7 @@ mod tests {
     ///
     /// CAVEAT: this test exercises the OVERRIDE path
     /// (`KTSTR_SIDECAR_DIR` is set), where pre-clear is currently
-    /// SKIPPED per the fix-#2 contract. To exercise pre-clear in
+    /// SKIPPED per the override contract. To exercise pre-clear in
     /// the env-overridden context, the test directly calls
     /// `pre_clear_run_dir_once` BETWEEN the two writes — modeling
     /// what `serialize_and_write_sidecar` does on the default path
@@ -4394,7 +4394,7 @@ mod tests {
         );
     }
 
-    // -- KTSTR_SIDECAR_DIR override skips pre-clear (fix #2) --
+    // -- KTSTR_SIDECAR_DIR override skips pre-clear --
 
     /// When `KTSTR_SIDECAR_DIR` is set, `serialize_and_write_sidecar`
     /// must NOT call `pre_clear_run_dir_once` against the override
@@ -4450,18 +4450,18 @@ mod tests {
         );
     }
 
-    // -- B3 regression: relative-path canonicalize cache split (fix #1 in pass 2 ruling) --
+    // -- relative-path canonicalize cache split regression --
 
     /// Two sequential `write_sidecar` calls in the same process
     /// against the DEFAULT path (no `KTSTR_SIDECAR_DIR` override)
     /// must both survive: the second call must NOT wipe the first.
     ///
-    /// Pins the regression caught in pass-2 review: when
+    /// Pins the regression:
     /// `serialize_and_write_sidecar` invoked `pre_clear_run_dir_once`
-    /// BEFORE `create_dir_all`, the first call resolved the
+    /// BEFORE `create_dir_all`. The first call resolved the
     /// pre-clear cache key against the raw path because
-    /// `canonicalize` failed on a missing dir. The first call then
-    /// created the dir via `create_dir_all` and wrote sidecar 1.
+    /// `canonicalize` failed on a missing dir, then created the
+    /// dir via `create_dir_all` and wrote sidecar 1.
     /// On the second call, `canonicalize` SUCCEEDED against the
     /// now-existing dir, producing an absolute path that DIFFERED
     /// from the cache key inserted by the first call — so the
@@ -7164,7 +7164,7 @@ mod tests {
     /// non-tarball cache entry (e.g. one stored under a `local-`
     /// or git-shaped key) carries a matching version + Local
     /// source_tree_path. The Version arm must find it via the
-    /// list-and-match fallback. This is the bug fix for #58.
+    /// list-and-match fallback.
     #[test]
     fn resolve_kernel_source_dir_with_cache_version_falls_back_to_scan_for_local() {
         let cache_root = tempfile::TempDir::new().expect("cache tempdir");

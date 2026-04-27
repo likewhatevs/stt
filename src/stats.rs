@@ -137,29 +137,21 @@ impl MetricDef {
 /// | `worst_page_locality` | `page_locality` | `page_locality` |
 /// | `worst_cross_node_migration_ratio` | `cross_node_migration_ratio` | `cross_node_migration_ratio` |
 ///
-/// Six of the remaining metrics in [`METRICS`] have matching
-/// registry / field / DataFrame column names (`worst_p99_wake_latency_us`,
-/// `worst_median_wake_latency_us`, `worst_wake_latency_cv`,
-/// `total_iterations`, `worst_mean_run_delay_us`,
-/// `worst_run_delay_us`) and are not listed — no translation
-/// to document.
-///
-/// Two further entries in [`METRICS`] —
-/// `worst_wake_latency_tail_ratio` and
-/// `worst_iterations_per_worker` — are registered and
-/// populated on [`GauntletRow`] but have NO DataFrame column
-/// in [`build_dataframe`]. Consumers that reach for them via
-/// polars receive "column not found" — go through the
-/// registry accessor closure instead. A follow-up task (see
-/// comments on the two [`GauntletRow`] fields) wires them into
-/// the DataFrame once the comparison pipeline accounts for the
-/// two new dimensions.
+/// Eight of the remaining metrics in [`METRICS`] have matching
+/// registry / field / DataFrame column names
+/// (`worst_p99_wake_latency_us`, `worst_median_wake_latency_us`,
+/// `worst_wake_latency_cv`, `total_iterations`,
+/// `worst_mean_run_delay_us`, `worst_run_delay_us`,
+/// `worst_wake_latency_tail_ratio`,
+/// `worst_iterations_per_worker`) and are not listed — no
+/// translation to document.
 ///
 /// Quoting the matching list instead of a bare count avoids
-/// the prior silent-drift failure mode: the old "remaining
-/// eight metrics" sentence was wrong (two of the eight have
-/// no DataFrame column) and it would have stayed wrong on any
-/// future matching-name rename.
+/// silent drift on rename: a metric whose registry / field /
+/// column names diverge belongs in the table above, while a
+/// matching triple belongs in this paragraph; a future rename
+/// that forgets to migrate the metric across the boundary
+/// surfaces here as a stale list rather than a wrong count.
 ///
 /// Consumers that cross the registry / DataFrame boundary should
 /// go through [`MetricDef::read`] / the accessor closure rather
@@ -1085,12 +1077,16 @@ fn is_major_minor_prefix(s: &str) -> bool {
 
 /// One of the eight dimensions that compose a [`GauntletRow`]'s
 /// identity in the comparison pipeline: `kernel`, `scheduler`,
-/// `topology`, `work_type`, `commit`, `kernel_commit`, `source`,
-/// `flags`. Each maps to the corresponding `RowFilter` field and
-/// `GauntletRow` field; the dimension model lets
-/// [`compare_partitions`] derive its slicing dims and dynamic
-/// pairing key without hardcoding the dimension list at every
-/// call site.
+/// `topology`, `work-type`, `project-commit`, `kernel-commit`,
+/// `run-source`, `flags`. Each maps to the corresponding
+/// `RowFilter` field and `GauntletRow` field; the dimension
+/// model lets [`compare_partitions`] derive its slicing dims and
+/// dynamic pairing key without hardcoding the dimension list at
+/// every call site. Variant names match the CLI flag suffix
+/// (e.g. `Dimension::ProjectCommit` ↔ `--project-commit`,
+/// `Dimension::RunSource` ↔ `--run-source`) so a reader can map
+/// from operator surface to internal enum without a translation
+/// table.
 ///
 /// `scenario` is NOT a dimension — it is the test name and is
 /// always part of the pairing key (you can't compare scenario A
@@ -1108,9 +1104,9 @@ pub enum Dimension {
     Scheduler,
     Topology,
     WorkType,
-    Commit,
+    ProjectCommit,
     KernelCommit,
-    Source,
+    RunSource,
     Flags,
 }
 
@@ -1124,9 +1120,9 @@ impl Dimension {
         Dimension::Scheduler,
         Dimension::Topology,
         Dimension::WorkType,
-        Dimension::Commit,
+        Dimension::ProjectCommit,
         Dimension::KernelCommit,
-        Dimension::Source,
+        Dimension::RunSource,
         Dimension::Flags,
     ];
 
@@ -1155,9 +1151,9 @@ impl Dimension {
             Dimension::Scheduler => "scheduler",
             Dimension::Topology => "topology",
             Dimension::WorkType => "work-type",
-            Dimension::Commit => "commit",
+            Dimension::ProjectCommit => "project-commit",
             Dimension::KernelCommit => "kernel-commit",
-            Dimension::Source => "source",
+            Dimension::RunSource => "run-source",
             Dimension::Flags => "flags",
         }
     }
@@ -1170,7 +1166,9 @@ impl Dimension {
 /// the remaining three dimensions are listed here. Production
 /// callers (`compare_partitions`) compute pairing dims via
 /// [`Dimension::pairing_dims`] from the slicing-dim derivation;
-/// only test fixtures use this constant directly.
+/// only test fixtures use this constant directly, so it is gated
+/// behind `#[cfg(test)]`.
+#[cfg(test)]
 pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] =
     &[Dimension::Topology, Dimension::WorkType, Dimension::Flags];
 
@@ -1207,13 +1205,13 @@ pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Di
             Dimension::WorkType => {
                 sorted_dedup(&filter_a.work_types) != sorted_dedup(&filter_b.work_types)
             }
-            Dimension::Commit => {
+            Dimension::ProjectCommit => {
                 sorted_dedup(&filter_a.project_commits) != sorted_dedup(&filter_b.project_commits)
             }
             Dimension::KernelCommit => {
                 sorted_dedup(&filter_a.kernel_commits) != sorted_dedup(&filter_b.kernel_commits)
             }
-            Dimension::Source => {
+            Dimension::RunSource => {
                 sorted_dedup(&filter_a.run_sources) != sorted_dedup(&filter_b.run_sources)
             }
             Dimension::Flags => sorted_dedup(&filter_a.flags) != sorted_dedup(&filter_b.flags),
@@ -1262,9 +1260,9 @@ pub(crate) fn render_side_label(
             Dimension::Scheduler => render_vec_dim(&filter.schedulers, bare_label),
             Dimension::Topology => render_vec_dim(&filter.topologies, bare_label),
             Dimension::WorkType => render_vec_dim(&filter.work_types, bare_label),
-            Dimension::Commit => render_vec_dim(&filter.project_commits, bare_label),
+            Dimension::ProjectCommit => render_vec_dim(&filter.project_commits, bare_label),
             Dimension::KernelCommit => render_vec_dim(&filter.kernel_commits, bare_label),
-            Dimension::Source => render_vec_dim(&filter.run_sources, bare_label),
+            Dimension::RunSource => render_vec_dim(&filter.run_sources, bare_label),
             Dimension::Flags => render_vec_dim(&filter.flags, bare_label),
         };
         parts.push(part);
@@ -1311,7 +1309,7 @@ impl PairingKey {
     /// `|`-joined string so the same set produces the same key
     /// regardless of input order.
     ///
-    /// Commit dimensions (`Commit`, `KernelCommit`) strip the
+    /// Commit dimensions (`ProjectCommit`, `KernelCommit`) strip the
     /// trailing `-dirty` suffix before contributing to the key.
     /// Without the strip, a clean run at HEAD `abc1234` and a
     /// dirty run at the same HEAD (`abc1234-dirty`) would shatter
@@ -1333,9 +1331,9 @@ impl PairingKey {
                 Dimension::Scheduler => row.scheduler.clone(),
                 Dimension::Topology => row.topology.clone(),
                 Dimension::WorkType => row.work_type.clone(),
-                Dimension::Commit => commit_pairing_key_part(&row.commit),
+                Dimension::ProjectCommit => commit_pairing_key_part(&row.commit),
                 Dimension::KernelCommit => commit_pairing_key_part(&row.kernel_commit),
-                Dimension::Source => row.run_source.clone().unwrap_or_default(),
+                Dimension::RunSource => row.run_source.clone().unwrap_or_default(),
                 Dimension::Flags => {
                     let mut sorted: Vec<&str> = row.flags.iter().map(String::as_str).collect();
                     sorted.sort_unstable();
@@ -1354,8 +1352,8 @@ impl PairingKey {
 /// (`Some("abc1234-dirty")`) is canonicalized to `"abc1234"` so
 /// it pairs with its clean sibling.
 ///
-/// Used by [`PairingKey::from_row`] for both the `Commit` and
-/// `KernelCommit` arms; the per-row `-dirty` distinction is
+/// Used by [`PairingKey::from_row`] for both the `ProjectCommit`
+/// and `KernelCommit` arms; the per-row `-dirty` distinction is
 /// preserved separately by [`group_and_average_by`] via its
 /// dirty-tracking accumulator and `+mixed` marker.
 fn commit_pairing_key_part(value: &Option<String>) -> String {
@@ -1365,7 +1363,7 @@ fn commit_pairing_key_part(value: &Option<String>) -> String {
     s.strip_suffix("-dirty").unwrap_or(s).to_string()
 }
 
-/// One aggregated [`GauntletRow`] produced by [`group_and_average`],
+/// One aggregated [`GauntletRow`] produced by [`group_and_average_by`],
 /// plus the pass-bookkeeping needed to render `N/M` in the per-group
 /// summary block.
 ///
@@ -1478,21 +1476,23 @@ fn render_mixed_dirty(
     first_commit.clone()
 }
 
-/// Group `rows` by `(scenario, topology, work_type, flags)` and
-/// arithmetic-mean their metric fields, returning one
-/// [`AveragedGroup`] per distinct key.
+/// Group `rows` by the dynamic pairing key (`scenario` plus every
+/// dimension in `pairing_dims`) and arithmetic-mean their metric
+/// fields, returning one [`AveragedGroup`] per distinct key.
+/// Slicing dims are EXCLUDED from `pairing_dims` (rows on the A/B
+/// sides differ on them by design); pairing dims are INCLUDED.
 ///
-/// Group key matches [`compare_rows`]' pairing key so the post-
+/// Group key matches [`compare_rows_by`]' pairing key so the post-
 /// aggregation row vec joins cleanly across A/B sides under the
 /// same identity contract — different flag profiles do not
-/// collide.
+/// collide as long as `Dimension::Flags` is in `pairing_dims`.
 ///
 /// Aggregation rules:
 /// - `passed` aggregates as a logical AND across every contributor.
 ///   A single fail flips the aggregate to `passed = false`.
 /// - `skipped` aggregates as a logical OR across every contributor:
 ///   any single skipped contributor flips the aggregate to
-///   `skipped = true`. The OR aligns with [`compare_rows`]' skip
+///   `skipped = true`. The OR aligns with [`compare_rows_by`]' skip
 ///   gate (one skipped side drops the pair) — averaging across a
 ///   mixed pass-and-skip set would silently dilute the metric mean
 ///   with rows that didn't run.
@@ -1504,7 +1504,7 @@ fn render_mixed_dirty(
 ///   are therefore excluded from the mean. When no contributor
 ///   passed cleanly, every metric defaults to zero and the
 ///   aggregate's `passed = false` routes the pair to
-///   [`compare_rows`]' `skipped_failed` gate.
+///   [`compare_rows_by`]' `skipped_failed` gate.
 /// - `u64` / `i64` fields take the rounded mean
 ///   (`(sum / count).round() as u64`). The 0.5-unit rounding error
 ///   is well below every integer metric's `default_abs` gate (the
@@ -1540,22 +1540,6 @@ fn render_mixed_dirty(
 /// order) so we maintain a parallel `Vec<key>` to preserve
 /// first-seen ordering. Stable order keeps test fixtures
 /// deterministic across runs.
-/// Backward-compatible wrapper that uses [`LEGACY_PAIRING_DIMS`]
-/// (topology, work-type, flags). New code that participates in
-/// the dimensional-slicing pipeline should call
-/// [`group_and_average_by`] directly with the dynamic pairing
-/// dims derived from `derive_slicing_dims`.
-pub fn group_and_average(rows: &[GauntletRow]) -> Vec<AveragedGroup> {
-    group_and_average_by(rows, LEGACY_PAIRING_DIMS)
-}
-
-/// Group rows by the dynamic pairing key (`scenario` plus every
-/// dimension in `pairing_dims`) and return one [`AveragedGroup`]
-/// per distinct key. The pairing-dim model lets the comparison
-/// pipeline parametrise grouping without hardcoding a fixed
-/// tuple — slicing dims are EXCLUDED from the key (rows on the
-/// A/B sides differ on them by design), pairing dims are
-/// INCLUDED.
 pub fn group_and_average_by(
     rows: &[GauntletRow],
     pairing_dims: &[Dimension],
@@ -2010,6 +1994,11 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let total_iters: Vec<f64> = rows.iter().map(|r| r.total_iterations as f64).collect();
     let mean_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_mean_run_delay_us).collect();
     let worst_run_delay: Vec<f64> = rows.iter().map(|r| r.worst_run_delay_us).collect();
+    let tail_ratio: Vec<f64> = rows
+        .iter()
+        .map(|r| r.worst_wake_latency_tail_ratio)
+        .collect();
+    let iters_per_worker: Vec<f64> = rows.iter().map(|r| r.worst_iterations_per_worker).collect();
     let page_locality: Vec<f64> = rows.iter().map(|r| r.page_locality).collect();
     let cross_node_mig: Vec<f64> = rows.iter().map(|r| r.cross_node_migration_ratio).collect();
 
@@ -2034,6 +2023,8 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
         "total_iterations" => &total_iters,
         "worst_mean_run_delay_us" => &mean_run_delay,
         "worst_run_delay_us" => &worst_run_delay,
+        "worst_wake_latency_tail_ratio" => &tail_ratio,
+        "worst_iterations_per_worker" => &iters_per_worker,
         "page_locality" => &page_locality,
         "cross_node_migration_ratio" => &cross_node_mig,
     )
@@ -2896,7 +2887,7 @@ impl ComparisonPolicy {
     /// Resolve the relative threshold (as a fraction, e.g. `0.10`
     /// for 10%) for `metric_name` with `default_rel` as the
     /// registry-level fallback. Handles the percent→fraction
-    /// conversion so [`compare_rows`] does not need to re-derive
+    /// conversion so [`compare_rows_by`] does not need to re-derive
     /// `p / 100.0` at every call site.
     pub fn rel_threshold(&self, metric_name: &str, default_rel: f64) -> f64 {
         if let Some(p) = self.per_metric_percent.get(metric_name) {
@@ -2909,16 +2900,23 @@ impl ComparisonPolicy {
     }
 }
 
-/// Compare two row sets metric-by-metric.
+/// Compare two row sets metric-by-metric, parametrised on
+/// `pairing_dims`.
 ///
-/// Pure function: no I/O, no globals. Pairs `rows_a` and `rows_b` by
-/// `(scenario, topology, work_type)`. When `filter` is `Some(s)`, a
-/// row is included only if `s` appears as a substring of the joined
-/// `"scenario topology scheduler work_type"` string. The scheduler
-/// is searchable via the filter but is not part of the pairing key,
-/// so the same scenario+topology+work_type pair compares correctly
-/// across different scheduler binaries when the filter does not
-/// constrain it.
+/// Pure function: no I/O, no globals. Two rows pair iff their
+/// [`PairingKey`] (scenario + every value for each dimension in
+/// `pairing_dims`) is equal — this is the dimensional-slicing
+/// pipeline's join primitive, with slicing dims EXCLUDED from
+/// `pairing_dims` so rows on the A/B sides that differ on those
+/// dims still pair as long as they agree on every non-slicing
+/// dim. When `filter` is `Some(s)`, a row is included only if
+/// `s` appears as a substring of the joined `"scenario topology
+/// scheduler work_type flags"` string. The scheduler is
+/// searchable via the substring filter but is not part of the
+/// pairing key by default (only when `Dimension::Scheduler` is
+/// in `pairing_dims`), so the same scenario+topology+work_type
+/// pair compares correctly across different scheduler binaries
+/// when the filter does not constrain it.
 ///
 /// Row-pair accounting:
 /// - B-side rows with no A-side match are counted in `new_in_b`.
@@ -2938,32 +2936,6 @@ impl ComparisonPolicy {
 /// override → `default_percent` → registry `default_rel`. The
 /// absolute gate always uses the metric's `default_abs`. A delta
 /// must clear both gates to count as significant.
-/// Backward-compatible wrapper that uses [`LEGACY_PAIRING_DIMS`]
-/// (topology, work-type, flags) for pairing. New code that
-/// participates in the dimensional-slicing pipeline should call
-/// [`compare_rows_by`] with the dynamic pairing dims derived
-/// from `derive_slicing_dims`. Production callers all route
-/// through [`compare_partitions`] which calls `_by` directly;
-/// only test fixtures still call this wrapper, and they keep it
-/// alive without a `cfg(test)` gate so the API surface stays
-/// uniform between debug and release builds.
-#[allow(dead_code)]
-pub(crate) fn compare_rows(
-    rows_a: &[GauntletRow],
-    rows_b: &[GauntletRow],
-    filter: Option<&str>,
-    policy: &ComparisonPolicy,
-) -> CompareReport {
-    compare_rows_by(rows_a, rows_b, LEGACY_PAIRING_DIMS, filter, policy)
-}
-
-/// Pair-by-key comparison parametrised on `pairing_dims`. Two
-/// rows pair iff their [`PairingKey`] (scenario + every value
-/// for each dimension in `pairing_dims`) is equal. This is the
-/// dimensional-slicing pipeline's join primitive — the slicing
-/// dims are EXCLUDED from `pairing_dims` so rows on the A/B
-/// sides that differ on those dims still pair as long as they
-/// agree on every non-slicing dim.
 pub(crate) fn compare_rows_by(
     rows_a: &[GauntletRow],
     rows_b: &[GauntletRow],
@@ -3676,7 +3648,7 @@ fn check_no_duplicate_pairing_keys(
 ///
 /// `pre_agg_a` / `pre_agg_b` are the post-typed-filter contributor
 /// row counts (i.e. the number of sidecar rows that fed
-/// [`group_and_average`]), NOT the post-aggregation unique-key
+/// [`group_and_average_by`]), NOT the post-aggregation unique-key
 /// counts. The two answer different operator questions; the
 /// header surfaces the contributor count because that's the
 /// "how many trials got folded?" intuition the `--average` flag
@@ -5119,7 +5091,13 @@ mod tests {
         // unchanged for worst_spread.
         let rows_a = vec![cmp_row("test_a", "tiny-1llc", true, 10.0, 0)];
         let rows_b = vec![cmp_row("test_a", "tiny-1llc", true, 12.0, 0)];
-        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
+        let res = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res.regressions, 0, "abs gate must block 2.0 < 5.0");
         assert_eq!(res.improvements, 0);
         assert_eq!(
@@ -5131,7 +5109,13 @@ mod tests {
         // Confirm the rel gate alone is not enough: spread 10 -> 14 has
         // rel 0.40 (>= 0.25) but abs delta 4.0 (< 5.0), still unchanged.
         let rows_b2 = vec![cmp_row("test_a", "tiny-1llc", true, 14.0, 0)];
-        let res2 = compare_rows(&rows_a, &rows_b2, None, &ComparisonPolicy::default());
+        let res2 = compare_rows_by(
+            &rows_a,
+            &rows_b2,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(
             res2.regressions, 0,
             "rel-only is insufficient: abs gate must also fire"
@@ -5149,7 +5133,13 @@ mod tests {
         // significant metric.
         let rows_a = vec![cmp_row("test1", "tiny-1llc", true, 10.0, 1000)];
         let rows_b = vec![cmp_row("test1", "tiny-1llc", true, 30.0, 500)];
-        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::uniform(10.0));
+        let res = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::uniform(10.0),
+        );
         assert_eq!(
             res.regressions, 2,
             "spread up + iterations down both regress"
@@ -5166,7 +5156,13 @@ mod tests {
         }
 
         // Reverse direction: improvements should also surface.
-        let res_imp = compare_rows(&rows_b, &rows_a, None, &ComparisonPolicy::uniform(10.0));
+        let res_imp = compare_rows_by(
+            &rows_b,
+            &rows_a,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::uniform(10.0),
+        );
         assert_eq!(res_imp.regressions, 0);
         assert_eq!(res_imp.improvements, 2);
         for d in &res_imp.findings {
@@ -5180,7 +5176,13 @@ mod tests {
         // 500 must be reported as a regression, not an improvement.
         let rows_a = vec![cmp_row("t", "tiny-1llc", true, 0.0, 1000)];
         let rows_b = vec![cmp_row("t", "tiny-1llc", true, 0.0, 500)];
-        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
+        let res = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         let iters_delta = res
             .findings
             .iter()
@@ -5198,7 +5200,13 @@ mod tests {
         // regression; a decrease must be an improvement.
         let rows_a2 = vec![cmp_row("t", "tiny-1llc", true, 10.0, 0)];
         let rows_b2 = vec![cmp_row("t", "tiny-1llc", true, 30.0, 0)];
-        let res_up = compare_rows(&rows_a2, &rows_b2, None, &ComparisonPolicy::default());
+        let res_up = compare_rows_by(
+            &rows_a2,
+            &rows_b2,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         let spread_up = res_up
             .findings
             .iter()
@@ -5207,7 +5215,13 @@ mod tests {
         assert!(spread_up.is_regression, "spread increase is a regression");
         assert_eq!(spread_up.delta, 20.0);
 
-        let res_down = compare_rows(&rows_b2, &rows_a2, None, &ComparisonPolicy::default());
+        let res_down = compare_rows_by(
+            &rows_b2,
+            &rows_a2,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         let spread_down = res_down
             .findings
             .iter()
@@ -5231,9 +5245,10 @@ mod tests {
         let mut row_a = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         let mut row_b = cmp_row("t", "tiny-1llc", true, 10.0, 100);
         row_a.skipped = true; // A side was skipped
-        let res = compare_rows(
+        let res = compare_rows_by(
             &[row_a.clone()],
             &[row_b.clone()],
+            LEGACY_PAIRING_DIMS,
             None,
             &ComparisonPolicy::default(),
         );
@@ -5247,7 +5262,13 @@ mod tests {
         // Symmetrically on the B side.
         row_a.skipped = false;
         row_b.skipped = true;
-        let res = compare_rows(&[row_a], &[row_b], None, &ComparisonPolicy::default());
+        let res = compare_rows_by(
+            &[row_a],
+            &[row_b],
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res.regressions, 0);
         assert_eq!(res.improvements, 0);
         assert_eq!(res.skipped_failed, 1);
@@ -5272,7 +5293,13 @@ mod tests {
             cmp_row("test_failed_b", "tiny-1llc", false, 30.0, 500),
             cmp_row("test_failed_a", "tiny-1llc", true, 30.0, 500),
         ];
-        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::uniform(10.0));
+        let res = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::uniform(10.0),
+        );
         assert_eq!(
             res.skipped_failed, 2,
             "test_failed_a and test_failed_b skip"
@@ -5298,9 +5325,10 @@ mod tests {
             cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
             cmp_row("beta", "tiny-1llc", true, 30.0, 0),
         ];
-        let res = compare_rows(
+        let res = compare_rows_by(
             &rows_a,
             &rows_b,
+            LEGACY_PAIRING_DIMS,
             Some("alpha"),
             &ComparisonPolicy::default(),
         );
@@ -5316,14 +5344,21 @@ mod tests {
         // share the "tiny-1llc" topology and only worst_spread crosses
         // both gates (10 -> 30 with default_abs=5.0, default_rel=0.25),
         // so each row contributes exactly one finding.
-        let res_topo = compare_rows(&rows_a, &rows_b, Some("tiny"), &ComparisonPolicy::default());
+        let res_topo = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            Some("tiny"),
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res_topo.regressions, 2, "both rows match 'tiny' topology");
         assert_eq!(res_topo.findings.len(), 2);
 
         // Non-matching filter yields no comparisons at all.
-        let res_none = compare_rows(
+        let res_none = compare_rows_by(
             &rows_a,
             &rows_b,
+            LEGACY_PAIRING_DIMS,
             Some("nomatch"),
             &ComparisonPolicy::default(),
         );
@@ -5340,7 +5375,13 @@ mod tests {
         // (default rel fails) → unchanged with default thresholds.
         let rows_a = vec![cmp_row("t", "tiny-1llc", true, 100.0, 0)];
         let rows_b = vec![cmp_row("t", "tiny-1llc", true, 106.0, 0)];
-        let res_default = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
+        let res_default = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         let spread_default = res_default
             .findings
             .iter()
@@ -5352,7 +5393,13 @@ mod tests {
 
         // Override threshold to 5% (Some(5.0) → rel_thresh 0.05). Now
         // rel 0.06 >= 0.05, both gates fire → regression.
-        let res_override = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::uniform(5.0));
+        let res_override = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::uniform(5.0),
+        );
         let spread_override = res_override
             .findings
             .iter()
@@ -5366,9 +5413,10 @@ mod tests {
         // can't promote it to significant.
         let rows_a_small = vec![cmp_row("t", "tiny-1llc", true, 1.0, 0)];
         let rows_b_small = vec![cmp_row("t", "tiny-1llc", true, 1.5, 0)];
-        let res_small = compare_rows(
+        let res_small = compare_rows_by(
             &rows_a_small,
             &rows_b_small,
+            LEGACY_PAIRING_DIMS,
             None,
             &ComparisonPolicy::uniform(1.0),
         );
@@ -5468,9 +5516,10 @@ mod tests {
             "below-floor B accessor must return None even when the \
              raw field would have carried a suspicious value",
         );
-        let below = compare_rows(
+        let below = compare_rows_by(
             std::slice::from_ref(&low_a),
             std::slice::from_ref(&low_b),
+            LEGACY_PAIRING_DIMS,
             None,
             &ComparisonPolicy::default(),
         );
@@ -5497,9 +5546,10 @@ mod tests {
             Some(2.0),
             "at-floor accessor must return Some",
         );
-        let above = compare_rows(
+        let above = compare_rows_by(
             std::slice::from_ref(&hi_a),
             std::slice::from_ref(&hi_b),
+            LEGACY_PAIRING_DIMS,
             None,
             &ComparisonPolicy::default(),
         );
@@ -5568,9 +5618,10 @@ mod tests {
         // classify the pair as unchanged — both sides collapse to
         // 0.0 via unwrap_or, then the `abs() < EPSILON` guard
         // short-circuits without producing a finding.
-        let report = compare_rows(
+        let report = compare_rows_by(
             std::slice::from_ref(&row_a),
             std::slice::from_ref(&row_b),
+            LEGACY_PAIRING_DIMS,
             None,
             &ComparisonPolicy::default(),
         );
@@ -5856,7 +5907,7 @@ mod tests {
             .per_metric_percent
             .insert("worst_spread".to_string(), 5.0);
 
-        let res = compare_rows(&[row_a], &[row_b], None, &policy);
+        let res = compare_rows_by(&[row_a], &[row_b], LEGACY_PAIRING_DIMS, None, &policy);
 
         let spread_finding = res
             .findings
@@ -5916,7 +5967,13 @@ mod tests {
             cmp_row("t", "tiny-1llc", true, 29.0, 0),
         ];
         let rows_b = vec![cmp_row("t", "tiny-1llc", true, 30.0, 0)];
-        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
+        let res = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res.regressions, 1, "first match (spread=10) must win");
         let spread = res
             .findings
@@ -5959,7 +6016,13 @@ mod tests {
 
         let rows_a = vec![a_llc, a_borrow];
         let rows_b = vec![b_borrow, b_llc];
-        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
+        let res = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
 
         // Each flag profile's spread moved by 90 → one regression
         // (llc 10→100) and one improvement (borrow 100→10).
@@ -5990,16 +6053,23 @@ mod tests {
         ];
         // Without a filter, beta's failed row contributes
         // skipped_failed=1.
-        let unfiltered = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
+        let unfiltered = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(unfiltered.skipped_failed, 1);
         assert_eq!(unfiltered.regressions, 1, "alpha still regresses");
 
         // Filtering to "alpha" excludes beta entirely; the failed row
         // is filtered out before the passed gate runs, so
         // skipped_failed=0.
-        let filtered = compare_rows(
+        let filtered = compare_rows_by(
             &rows_a,
             &rows_b,
+            LEGACY_PAIRING_DIMS,
             Some("alpha"),
             &ComparisonPolicy::default(),
         );
@@ -6025,9 +6095,10 @@ mod tests {
         let mut b2 = cmp_row("test2", "tiny-1llc", true, 30.0, 0);
         b2.scheduler = "scx_beta".into();
 
-        let res = compare_rows(
+        let res = compare_rows_by(
             &[a1, a2],
             &[b1, b2],
+            LEGACY_PAIRING_DIMS,
             Some("scx_alpha"),
             &ComparisonPolicy::default(),
         );
@@ -6057,7 +6128,13 @@ mod tests {
             cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
             cmp_row("beta", "tiny-1llc", true, 30.0, 0),
         ];
-        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
+        let res = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         assert_eq!(res.regressions, 1, "alpha regresses on worst_spread");
         assert_eq!(res.new_in_b, 1, "beta is new on B side");
         assert_eq!(res.removed_from_a, 1, "gamma is removed on B side");
@@ -6080,9 +6157,10 @@ mod tests {
 
         // Filter to "alpha" -- beta and gamma are excluded by the
         // substring filter on both passes.
-        let res = compare_rows(
+        let res = compare_rows_by(
             &rows_a,
             &rows_b,
+            LEGACY_PAIRING_DIMS,
             Some("alpha"),
             &ComparisonPolicy::default(),
         );
@@ -7243,7 +7321,7 @@ mod tests {
         }
     }
 
-    // -- group_and_average / AveragedGroup --
+    // -- group_and_average_by / AveragedGroup --
 
     /// Mutate a row's metric fields away from defaults so
     /// aggregation has a non-zero signal to average. Returns the
@@ -7276,7 +7354,7 @@ mod tests {
     /// run directories.
     #[test]
     fn group_and_average_empty_input_yields_empty_output() {
-        let out = group_and_average(&[]);
+        let out = group_and_average_by(&[], LEGACY_PAIRING_DIMS);
         assert!(out.is_empty());
     }
 
@@ -7289,7 +7367,7 @@ mod tests {
     fn group_and_average_single_pass_passes_through_metrics() {
         let mut row = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut row, 12.0, 200, 50, 1000);
-        let out = group_and_average(std::slice::from_ref(&row));
+        let out = group_and_average_by(std::slice::from_ref(&row), LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 1);
@@ -7317,7 +7395,7 @@ mod tests {
         paint_metrics(&mut b, 20.0, 200, 60, 1100);
         let mut c = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut c, 30.0, 300, 90, 1000);
-        let out = group_and_average(&[a, b, c]);
+        let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 3);
@@ -7351,7 +7429,7 @@ mod tests {
         paint_metrics(&mut a, 10.0, 100, 30, 1000);
         let mut b = make_row("beta", "tiny-1llc", true, 0.0);
         paint_metrics(&mut b, 50.0, 500, 100, 2000);
-        let out = group_and_average(&[a, b]);
+        let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 2);
         // First-seen iteration order preserved (alpha before beta).
         assert_eq!(out[0].row.scenario, "alpha");
@@ -7374,7 +7452,7 @@ mod tests {
         let mut borrow1 = make_row("t", "tiny-1llc", true, 0.0);
         borrow1.flags = vec!["borrow".to_string()];
         paint_metrics(&mut borrow1, 80.0, 800, 200, 5000);
-        let out = group_and_average(&[llc1, llc2, borrow1]);
+        let out = group_and_average_by(&[llc1, llc2, borrow1], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 2);
         let llc_ar = out
             .iter()
@@ -7405,7 +7483,7 @@ mod tests {
         paint_metrics(&mut fail, 10000.0, 99999, 99999, 99999);
         let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut pass2, 30.0, 300, 90, 1000);
-        let out = group_and_average(&[pass1, fail, pass2]);
+        let out = group_and_average_by(&[pass1, fail, pass2], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 2);
@@ -7436,7 +7514,7 @@ mod tests {
         paint_metrics(&mut skip, 9999.0, 99999, 99999, 99999);
         let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut pass2, 50.0, 500, 70, 2000);
-        let out = group_and_average(&[pass1, skip, pass2]);
+        let out = group_and_average_by(&[pass1, skip, pass2], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 2);
@@ -7465,7 +7543,7 @@ mod tests {
         paint_metrics(&mut fail1, 99.0, 999, 99, 999);
         let mut fail2 = make_row("t", "tiny-1llc", false, 0.0);
         paint_metrics(&mut fail2, 88.0, 888, 88, 888);
-        let out = group_and_average(&[fail1, fail2]);
+        let out = group_and_average_by(&[fail1, fail2], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         assert_eq!(ar.passes_observed, 0);
@@ -7492,7 +7570,7 @@ mod tests {
         let mut b = make_row("t", "tiny-1llc", true, 0.0);
         b.ext_metrics.insert("shared".into(), 30.0);
         b.ext_metrics.insert("b_only".into(), 200.0);
-        let out = group_and_average(&[a, b]);
+        let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 1);
         let ar = &out[0];
         // shared: (10 + 30) / 2 = 20.
@@ -7503,7 +7581,7 @@ mod tests {
         assert_eq!(ar.row.ext_metrics.get("b_only"), Some(&200.0));
     }
 
-    /// `group_and_average` preserves first-seen iteration order so
+    /// `group_and_average_by` preserves first-seen iteration order so
     /// downstream tests against the result remain deterministic
     /// even though the internal map uses BTreeMap (key-sorted)
     /// for storage. Pinned by feeding keys in z→a order and
@@ -7513,7 +7591,7 @@ mod tests {
         let zebra = make_row("zebra", "tiny-1llc", true, 0.0);
         let alpha = make_row("alpha", "tiny-1llc", true, 0.0);
         let mango = make_row("mango", "tiny-1llc", true, 0.0);
-        let out = group_and_average(&[zebra, alpha, mango]);
+        let out = group_and_average_by(&[zebra, alpha, mango], LEGACY_PAIRING_DIMS);
         let names: Vec<&str> = out.iter().map(|r| r.row.scenario.as_str()).collect();
         assert_eq!(
             names,
@@ -7535,7 +7613,7 @@ mod tests {
         let mut clean = make_row("t", "tiny-1llc", true, 0.0);
         clean.commit = Some("abc1234".to_string());
 
-        let out = group_and_average(&[dirty, clean]);
+        let out = group_and_average_by(&[dirty, clean], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].row.commit.as_deref(),
@@ -7555,7 +7633,7 @@ mod tests {
         let mut dirty = make_row("t", "tiny-1llc", true, 0.0);
         dirty.kernel_commit = Some("def5678-dirty".to_string());
 
-        let out = group_and_average(&[clean, dirty]);
+        let out = group_and_average_by(&[clean, dirty], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].row.kernel_commit.as_deref(),
@@ -7576,7 +7654,7 @@ mod tests {
         let mut b = make_row("t", "tiny-1llc", true, 0.0);
         b.commit = Some("abc1234-dirty".to_string());
 
-        let out = group_and_average(&[a, b]);
+        let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
         assert_eq!(
             out[0].row.commit.as_deref(),
             Some("abc1234-dirty"),
@@ -7594,7 +7672,7 @@ mod tests {
         let mut b = make_row("t", "tiny-1llc", true, 0.0);
         b.commit = Some("abc1234".to_string());
 
-        let out = group_and_average(&[a, b]);
+        let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
         assert_eq!(
             out[0].row.commit.as_deref(),
             Some("abc1234"),
@@ -7625,7 +7703,7 @@ mod tests {
         dirty_skip.skipped = true;
         dirty_skip.commit = Some("abc1234-dirty".to_string());
 
-        let out = group_and_average(&[clean_pass, dirty_skip]);
+        let out = group_and_average_by(&[clean_pass, dirty_skip], LEGACY_PAIRING_DIMS);
         assert_eq!(
             out[0].row.commit.as_deref(),
             Some("abc1234+mixed"),
@@ -7663,7 +7741,7 @@ mod tests {
         let mut dirty_fail = make_row("t", "tiny-1llc", false, 0.0);
         dirty_fail.commit = Some("abc1234-dirty".to_string());
 
-        let out = group_and_average(&[clean_pass, dirty_fail]);
+        let out = group_and_average_by(&[clean_pass, dirty_fail], LEGACY_PAIRING_DIMS);
         assert_eq!(out.len(), 1, "single cohort key must produce one aggregate");
         assert_eq!(
             out[0].row.commit.as_deref(),
@@ -7684,7 +7762,7 @@ mod tests {
         let mut clean_fail = make_row("t", "tiny-1llc", false, 0.0);
         clean_fail.commit = Some("def5678".to_string());
 
-        let out = group_and_average(&[dirty_pass, clean_fail]);
+        let out = group_and_average_by(&[dirty_pass, clean_fail], LEGACY_PAIRING_DIMS);
         assert_eq!(
             out[0].row.commit.as_deref(),
             Some("def5678+mixed"),
@@ -7716,7 +7794,7 @@ mod tests {
         let mut clean_second = make_row("t", "tiny-1llc", true, 0.0);
         clean_second.commit = Some("abc1234".to_string());
 
-        let out = group_and_average(&[dirty_first, clean_second]);
+        let out = group_and_average_by(&[dirty_first, clean_second], LEGACY_PAIRING_DIMS);
         let rendered = out[0].row.commit.as_deref().expect("commit must render");
         assert_eq!(rendered, "abc1234+mixed");
         assert!(
@@ -7733,7 +7811,7 @@ mod tests {
         let a = make_row("t", "tiny-1llc", true, 0.0);
         let b = make_row("t", "tiny-1llc", true, 0.0);
 
-        let out = group_and_average(&[a, b]);
+        let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
         assert!(
             out[0].row.commit.is_none(),
             "None-only cohort must keep None — no synthesized `+mixed`",
@@ -7760,11 +7838,17 @@ mod tests {
         let mut b3 = make_row("t", "tiny-1llc", true, 0.0);
         paint_metrics(&mut b3, 32.0, 320, 80, 1000);
 
-        let agg_a = group_and_average(&[a1, a2, a3]);
-        let agg_b = group_and_average(&[b1, b2, b3]);
+        let agg_a = group_and_average_by(&[a1, a2, a3], LEGACY_PAIRING_DIMS);
+        let agg_b = group_and_average_by(&[b1, b2, b3], LEGACY_PAIRING_DIMS);
         let rows_a: Vec<GauntletRow> = agg_a.iter().map(|r| r.row.clone()).collect();
         let rows_b: Vec<GauntletRow> = agg_b.iter().map(|r| r.row.clone()).collect();
-        let res = compare_rows(&rows_a, &rows_b, None, &ComparisonPolicy::default());
+        let res = compare_rows_by(
+            &rows_a,
+            &rows_b,
+            LEGACY_PAIRING_DIMS,
+            None,
+            &ComparisonPolicy::default(),
+        );
         let spread = res
             .findings
             .iter()
@@ -8036,9 +8120,9 @@ mod tests {
                 Dimension::Scheduler,
                 Dimension::Topology,
                 Dimension::WorkType,
-                Dimension::Commit,
+                Dimension::ProjectCommit,
                 Dimension::KernelCommit,
-                Dimension::Source,
+                Dimension::RunSource,
                 Dimension::Flags,
             ],
         );
@@ -8050,7 +8134,7 @@ mod tests {
     /// iterates `ALL`, not `slicing`).
     #[test]
     fn dimension_pairing_dims_complements_slicing() {
-        let pair = Dimension::pairing_dims(&[Dimension::Kernel, Dimension::Commit]);
+        let pair = Dimension::pairing_dims(&[Dimension::Kernel, Dimension::ProjectCommit]);
         assert_eq!(
             pair,
             vec![
@@ -8058,13 +8142,13 @@ mod tests {
                 Dimension::Topology,
                 Dimension::WorkType,
                 Dimension::KernelCommit,
-                Dimension::Source,
+                Dimension::RunSource,
                 Dimension::Flags,
             ],
         );
         // Order of slicing input doesn't change the output —
         // the function iterates ALL and filters.
-        let pair_reversed = Dimension::pairing_dims(&[Dimension::Commit, Dimension::Kernel]);
+        let pair_reversed = Dimension::pairing_dims(&[Dimension::ProjectCommit, Dimension::Kernel]);
         assert_eq!(pair, pair_reversed);
     }
 
@@ -8142,7 +8226,7 @@ mod tests {
 
     /// Source-only diff: filters that disagree on `run_sources`
     /// and agree on every other dimension produce a slicing-dim
-    /// set containing exactly `Dimension::Source`. Pins the
+    /// set containing exactly `Dimension::RunSource`. Pins the
     /// Source arm of the per-dimension comparison switch in
     /// [`derive_slicing_dims`] — a regression that omitted the
     /// arm or compared the wrong field would surface here as an
@@ -8161,7 +8245,7 @@ mod tests {
         };
         assert_eq!(
             derive_slicing_dims(&f_a, &f_b),
-            vec![Dimension::Source],
+            vec![Dimension::RunSource],
             "differing `run_sources` must surface Source as a slicing dim",
         );
 
@@ -8431,9 +8515,9 @@ mod tests {
     }
 
     /// `PairingKey::from_row` includes the row's `run_source`
-    /// when `Source` is in the pairing-dim list, and excludes it
-    /// when `Source` is the slicing dim. Pins the
-    /// [`Dimension::Source`] arm of the from_row match — same
+    /// when `RunSource` is in the pairing-dim list, and excludes it
+    /// when `RunSource` is the slicing dim. Pins the
+    /// [`Dimension::RunSource`] arm of the from_row match — same
     /// shape and motivation as
     /// `pairing_key_from_row_includes_kernel_commit_when_pairing`
     /// but for the run_source arm. A regression that omitted the
@@ -8448,7 +8532,7 @@ mod tests {
         let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
         row_none.run_source = None;
 
-        let pair_dims = &[Dimension::Source];
+        let pair_dims = &[Dimension::RunSource];
         let key_local = PairingKey::from_row(&row_local, pair_dims);
         let key_ci = PairingKey::from_row(&row_ci, pair_dims);
         let key_none = PairingKey::from_row(&row_none, pair_dims);
@@ -8472,7 +8556,7 @@ mod tests {
 
         // Source excluded (slicing) → the differing-run_source
         // rows pair to the same key.
-        let slice_dims = Dimension::pairing_dims(&[Dimension::Source]);
+        let slice_dims = Dimension::pairing_dims(&[Dimension::RunSource]);
         assert_eq!(
             PairingKey::from_row(&row_local, &slice_dims),
             PairingKey::from_row(&row_ci, &slice_dims),
@@ -8495,7 +8579,7 @@ mod tests {
         let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
         row_dirty.commit = Some("abc1234-dirty".to_string());
 
-        let pair_dims = &[Dimension::Commit];
+        let pair_dims = &[Dimension::ProjectCommit];
         let key_clean = PairingKey::from_row(&row_clean, pair_dims);
         let key_dirty = PairingKey::from_row(&row_dirty, pair_dims);
 
@@ -8546,7 +8630,7 @@ mod tests {
         let mut row_b = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
         row_b.commit = Some("bbb2222".to_string());
 
-        let pair_dims = &[Dimension::Commit];
+        let pair_dims = &[Dimension::ProjectCommit];
         let key_a = PairingKey::from_row(&row_a, pair_dims);
         let key_b = PairingKey::from_row(&row_b, pair_dims);
 
@@ -8568,7 +8652,7 @@ mod tests {
         let mut row = make_filter_row("scn", "scx_a", "1n1l", "CpuSpin", Some("6.14"), &[]);
         row.commit = None;
         row.kernel_commit = None;
-        let pair_dims = &[Dimension::Commit, Dimension::KernelCommit];
+        let pair_dims = &[Dimension::ProjectCommit, Dimension::KernelCommit];
         let key = PairingKey::from_row(&row, pair_dims);
         assert_eq!(
             key.0,
@@ -8672,7 +8756,7 @@ mod tests {
 
     /// `Dimension::KernelCommit` arm of [`render_side_label`] reads
     /// `filter.kernel_commits` (a Vec) and routes through the same
-    /// `render_vec_dim` path as `Kernel` / `Commit` / `Flags`. Pins
+    /// `render_vec_dim` path as `Kernel` / `ProjectCommit` / `Flags`. Pins
     /// the arm so a regression that omitted it (or substituted the
     /// wrong field, e.g. `filter.project_commits`) surfaces here
     /// instead of silently rendering the bare label even when the
@@ -8733,7 +8817,7 @@ mod tests {
         );
     }
 
-    /// `Dimension::Source` arm of [`render_side_label`] reads
+    /// `Dimension::RunSource` arm of [`render_side_label`] reads
     /// `filter.run_sources` (a Vec) and routes through the same
     /// `render_vec_dim` path as the other Vec dims. Mirror of
     /// `render_side_label_kernel_commit_arm_renders_filter_value`
@@ -8748,7 +8832,7 @@ mod tests {
             ..RowFilter::default()
         };
         assert_eq!(
-            render_side_label(&f_one, &[Dimension::Source], "A"),
+            render_side_label(&f_one, &[Dimension::RunSource], "A"),
             "local",
             "single run_source value must render verbatim — a \
              regression that read another field would render `A` here",
@@ -8759,7 +8843,7 @@ mod tests {
             ..RowFilter::default()
         };
         assert_eq!(
-            render_side_label(&f_two, &[Dimension::Source], "A"),
+            render_side_label(&f_two, &[Dimension::RunSource], "A"),
             "ci|local",
             "≤3 run_source values must join sorted with `|`",
         );
@@ -8774,14 +8858,14 @@ mod tests {
             ..RowFilter::default()
         };
         assert_eq!(
-            render_side_label(&f_long, &[Dimension::Source], "A"),
+            render_side_label(&f_long, &[Dimension::RunSource], "A"),
             "A",
             ">3 run_source values must collapse to the bare letter",
         );
 
         let f_empty = RowFilter::default();
         assert_eq!(
-            render_side_label(&f_empty, &[Dimension::Source], "B"),
+            render_side_label(&f_empty, &[Dimension::RunSource], "B"),
             "B",
             "empty run_sources Vec must fall back to the bare letter",
         );

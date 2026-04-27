@@ -6,7 +6,7 @@
 it does not build or run on other platforms.
 
 - Linux host with KVM access (`/dev/kvm`)
-- Rust toolchain (stable, >= 1.95; pinned via `rust-toolchain.toml`)
+- Rust toolchain (stable, >= 1.94.1; pinned via `rust-toolchain.toml`)
 - clang (BPF skeleton compilation)
 - pkg-config, make, gcc
 - autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
@@ -35,14 +35,14 @@ sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 ## Install tools
 
 ```sh
-cargo install cargo-nextest           # recommended test runner (optional)
+cargo install cargo-nextest           # required for the recommended workflow (gauntlet expansion)
 cargo install --locked ktstr          # both binaries: ktstr + cargo-ktstr (optional)
 ```
 
-`cargo-nextest` enables gauntlet expansion; `cargo test` works
-without it for base topology. `cargo install --locked ktstr` installs
-both the host-side CLI (`ktstr`) and the dev workflow plugin
-(`cargo-ktstr`).
+`cargo-nextest` is required for the recommended `cargo ktstr test`
+workflow and for gauntlet expansion; `cargo test` works for base
+topology only. `cargo install --locked ktstr` installs both the
+host-side CLI (`ktstr`) and the dev workflow plugin (`cargo-ktstr`).
 
 ## Add the dependency
 
@@ -247,18 +247,24 @@ list of checks and thresholds.
 
 ## Run
 
-No special setup is needed. `#[ktstr_test]` functions work with both
-`cargo test` and `cargo nextest run` out of the box. The ktstr ctor
-automatically intercepts nextest protocol args (`--list`, `--exact`)
-for gauntlet expansion and budget-driven test selection.
-
-- `cargo nextest run`: ctor intercepts, runs gauntlet-expanded tests.
-- `cargo test`: standard harness runs the `#[test]` wrappers (base
-  topology only, no gauntlet expansion).
+The recommended way to run `#[ktstr_test]` tests is `cargo ktstr test`,
+which handles kernel resolution and wraps `cargo nextest`:
 
 ```sh
-cargo nextest run
+cargo ktstr test --kernel ../linux
 ```
+
+The ktstr ctor automatically intercepts nextest protocol args
+(`--list`, `--exact`) for gauntlet expansion and budget-driven test
+selection.
+
+Fallbacks:
+
+- `cargo nextest run`: ctor intercepts, runs gauntlet-expanded tests
+  (you must supply your own kernel via `KTSTR_KERNEL` /
+  `KTSTR_TEST_KERNEL` or the discovery chain).
+- `cargo test`: standard harness runs the `#[test]` wrappers (base
+  topology only, no gauntlet expansion).
 
 Requires `/dev/kvm`. See
 [Troubleshooting](troubleshooting.md#devkvm-not-accessible) if KVM

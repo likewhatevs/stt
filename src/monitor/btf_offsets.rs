@@ -176,8 +176,9 @@ pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
     };
     let offset = shdr.sh_offset as usize;
     let size = shdr.sh_size as usize;
-    let btf_data = data
-        .get(offset..offset + size)
+    let btf_data = offset
+        .checked_add(size)
+        .and_then(|end| data.get(offset..end))
         .context(".BTF section data out of bounds")?;
     let btf = Btf::from_bytes(btf_data).map_err(|e| anyhow::anyhow!("{e}"))?;
 

@@ -1405,6 +1405,18 @@ fn clean_orphaned_tmp_dirs(cache_root: &Path) -> anyhow::Result<()> {
             Ok(p) => p,
             Err(_) => continue, // non-numeric suffix — not our format
         };
+        // Reject non-positive pids defensively: `kill(0, None)` probes
+        // the caller's own process group and `kill(-N, None)` probes
+        // process group N — both have broadcast semantics that would
+        // misclassify a live unrelated group as our own dead orphan.
+        // The current parser builds the suffix via `rsplit_once('-')`,
+        // which strips the dash — `parse::<i32>()` cannot produce a
+        // negative — but a future refactor that emitted `-N` (regex,
+        // explicit splitn(3, '-'), …) would land in the broadcast
+        // probe and silently delete unrelated tempdirs.
+        if pid <= 0 {
+            continue;
+        }
         // Portable liveness probe via `kill(pid, signal=None)`:
         // `Ok(())` — signal could have been delivered, pid is alive
         // (same uid or we hold CAP_KILL). `Err(ESRCH)` — pid is
@@ -1502,10 +1514,11 @@ impl Drop for TmpDirGuard<'_> {
 /// Atomically swap two filesystem paths.
 ///
 /// Wraps Linux `renameat2(AT_FDCWD, src, AT_FDCWD, dst,
-/// RENAME_EXCHANGE)`. Both paths must already exist. On success the
-/// inodes they name are exchanged in a single syscall — observers
-/// traversing either path see the old target or the new one, never
-/// a missing or partial entry.
+/// RENAME_EXCHANGE)` via [`rustix::fs::renameat_with`]. Both paths
+/// must already exist. On success the inodes they name are
+/// exchanged in a single syscall — observers traversing either path
+/// see the old target or the new one, never a missing or partial
+/// entry.
 ///
 /// Fails if the kernel does not support `RENAME_EXCHANGE`
 /// (pre-3.15, `ENOSYS`), if either path is missing (`ENOENT`), or
@@ -1513,35 +1526,20 @@ impl Drop for TmpDirGuard<'_> {
 /// cache keeps both tmp_dir and final_dir under the same root, so
 /// `EXDEV` would only fire on exotic bind mounts.
 fn atomic_swap_dirs(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let src_c = std::ffi::CString::new(src.as_os_str().as_bytes())
-        .map_err(|e| anyhow::anyhow!("src path contains NUL: {e}"))?;
-    let dst_c = std::ffi::CString::new(dst.as_os_str().as_bytes())
-        .map_err(|e| anyhow::anyhow!("dst path contains NUL: {e}"))?;
-    // SAFETY: both pointers come from CString::as_ptr and outlive
-    // the syscall. AT_FDCWD interprets the paths relative to the
-    // current working directory of the calling thread, matching
-    // what fs::rename does.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            src_c.as_ptr(),
-            libc::AT_FDCWD,
-            dst_c.as_ptr(),
-            libc::RENAME_EXCHANGE,
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        src,
+        rustix::fs::CWD,
+        dst,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "renameat2(RENAME_EXCHANGE) {} <-> {}: {e}",
+            src.display(),
+            dst.display(),
         )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    Err(anyhow::anyhow!(
-        "renameat2(RENAME_EXCHANGE) {} <-> {}: {}",
-        src.display(),
-        dst.display(),
-        err,
-    ))
+    })
 }
 
 /// Read and deserialize metadata.json from a cache entry directory.
@@ -4105,16 +4103,13 @@ mod tests {
         assert!(unrelated.exists(), "unrelated entry must survive");
     }
 
-    /// `pid == 0` suffix: `nix::sys::signal::kill(Pid::from_raw(0),
-    /// None)` broadcasts a signal probe to the process group of the
-    /// CURRENT process (POSIX semantics: signal pid 0 = self's
-    /// pgrp). Under a running test process, that check almost
-    /// always returns `Ok(())`, which the scan classifies as
-    /// "alive" and LEAVES the entry in place. Pins the
-    /// safe-default behavior: a `.tmp-key-0` orphan is not touched,
-    /// even though "pid 0" is not a real process — because the
-    /// liveness probe's answer is not specific enough to justify
-    /// removal.
+    /// `pid == 0` suffix: the scan rejects non-positive pids before
+    /// the liveness probe runs. `kill(0, None)` has process-group
+    /// broadcast semantics (POSIX: signal pid 0 = self's pgrp) and
+    /// could not authoritatively classify a `.tmp-key-0` directory
+    /// as belonging to a dead orphan even on `Err(ESRCH)`, so the
+    /// `pid <= 0` filter forces the safe default (preserve) without
+    /// invoking the probe at all.
     #[test]
     fn clean_orphaned_tmp_dirs_preserves_pid_zero_suffix() {
         let tmp = TempDir::new().unwrap();
@@ -4123,9 +4118,9 @@ mod tests {
         clean_orphaned_tmp_dirs(tmp.path()).unwrap();
         assert!(
             entry.exists(),
-            "pid=0 suffix must be preserved — kill(0, None) reports \
-             the current process group as alive, safe-default is \
-             skip rather than remove",
+            "pid=0 suffix must be preserved — `pid <= 0` filter \
+             skips the entry before kill(0, None)'s pgrp-broadcast \
+             ambiguity can reach the liveness probe",
         );
     }
 

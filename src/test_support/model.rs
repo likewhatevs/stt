@@ -57,7 +57,7 @@
 //!    via [`memoized_inference`] (concurrent first-call races
 //!    serialize on the outer `Mutex` so at most one load runs
 //!    end-to-end, and a failed load is cached as `Err` so
-//!    subsequent calls fail-closed without repeating the 2.33 GiB
+//!    subsequent calls fail-closed without repeating the 2.55 GiB
 //!    load; the inner `Mutex` then serializes repeated generation
 //!    passes against the shared `LlamaModel`); tests that mutate
 //!    `KTSTR_MODEL_OFFLINE` or `KTSTR_CACHE_DIR` call [`reset`]
@@ -283,7 +283,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 /// arriving with the slot still `None` runs `load_inference`
 /// end-to-end and stores the result; competing callers block on the
 /// `lock()` until the initializer returns, then read the now-`Some`
-/// slot and proceed. So the 2.33 GiB GGUF load in `load_inference`
+/// slot and proceed. So the 2.55 GiB GGUF load in `load_inference`
 /// happens at most once per process rather than once per racing
 /// thread.
 ///
@@ -336,7 +336,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 /// **First-call blocking.** The first caller to reach
 /// [`memoized_inference`] with an empty slot runs `load_inference`
 /// inside the outer lock. That load opens the pinned Qwen3-4B
-/// Q4_K_M GGUF (~2.33 GiB) via
+/// Q4_K_M GGUF (~2.55 GiB) via
 /// `llama_cpp_2::LlamaModel::load_from_file`, which mmap's the file
 /// and routes the per-layer quantized tensors into a `LlamaModel`
 /// owned by llama.cpp. Every concurrent caller queued behind the
@@ -440,7 +440,7 @@ fn prompt_excerpt(prompt: &str) -> String {
 ///    error as transient and burn 30s+ of wasted retries on each
 ///    of dozens of tests.
 /// 2. **A retry under load pressure compounds the original
-///    failure.** Re-attempting a 2.33 GiB mmap that just OOM-killed
+///    failure.** Re-attempting a 2.55 GiB mmap that just OOM-killed
 ///    a peer most likely re-OOMs. Keeping the Err sticky lets the
 ///    operator restart the process in a less-pressured environment
 ///    rather than blocking forward progress on a doomed retry.
@@ -1265,7 +1265,7 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // that trade-off for responsiveness, but `ensure()` is the
     // integrity gate. The cost is one full SHA-256 walk per
     // `ensure()` call against an existing cache entry (~10 s for
-    // the 2.33 GiB Qwen3-4B pin); the prefetch at nextest
+    // the 2.55 GiB Qwen3-4B pin); the prefetch at nextest
     // bootstrap amortises this over every test in the binary, and
     // the in-test cache reuses the post-ensure `ModelStatus` so
     // the walk fires at most once per process run.
@@ -1293,7 +1293,7 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
     // no-cache case: status() returned `ShaVerdict::NotCached` without
     // calling `check_sha256`, so without this gate a placeholder
     // (all-`?`) pin would drop through to `fetch` and waste a
-    // 2.33 GiB download before the post-download `check_sha256`
+    // 2.55 GiB download before the post-download `check_sha256`
     // bails.
     if !is_valid_sha256_hex(spec.sha256_hex) {
         anyhow::bail!(
@@ -1377,7 +1377,7 @@ pub fn ensure(spec: &ModelSpec) -> Result<PathBuf> {
 /// a typo'd or unexpectedly large pin (e.g. a 20 GiB `size_bytes`)
 /// would demand roughly 2 h of linear budget with no CI wall-clock
 /// cap to stop it. The ceiling kicks in at `1800 s × 3 MB/s =
-/// 5.4 GB` of body; the current pin (`DEFAULT_MODEL` ≈ 2.33 GiB) is
+/// 5.4 GB` of body; the current pin (`DEFAULT_MODEL` ≈ 2.55 GiB) is
 /// well under that crossover and continues to receive its linear
 /// budget unchanged, and a future 5
 /// GiB model pin (`5 × 1024³ / 3_000_000 ≈ 1789 s`) also sits just
@@ -1580,7 +1580,7 @@ fn fetch(spec: &ModelSpec, final_path: &std::path::Path) -> Result<PathBuf> {
     // than `reqwest::blocking::get`, which has no timeout and will
     // hang forever on a slow or unreachable mirror. 30s connect
     // catches DNS/TLS wedges early. The overall timeout scales with
-    // `spec.size_bytes` via [`fetch_timeout_for_size`] so a 2.33 GiB
+    // `spec.size_bytes` via [`fetch_timeout_for_size`] so a 2.55 GiB
     // model does not share a single one-size-fits-all cap — the
     // previous fixed 15-minute ceiling either let a wedged download
     // hang for 15 minutes past any
@@ -2511,7 +2511,7 @@ pub(crate) fn reset() {
 /// from this shape:
 ///
 /// 1. **`Ok(cache)` — cached forever**. The loaded model stays in
-///    memory for the process lifetime; the ~2.33 GiB slot is never
+///    memory for the process lifetime; the ~2.55 GiB slot is never
 ///    evicted. Subsequent `extract_via_llm` calls reuse the same
 ///    inference state.
 /// 2. **`Err(reason)` — cached forever**. A load failure is cached
@@ -2546,7 +2546,7 @@ pub(crate) fn extract_via_llm(
     // the outer mutex: every caller observes the same stored value,
     // and exactly one caller's closure runs end-to-end. A failed load
     // is memoized as `Err` so subsequent calls return the same
-    // reason string without repeating the 2.33 GiB load.
+    // reason string without repeating the 2.55 GiB load.
     let cached = memoized_inference();
     let cache = match cached.as_ref() {
         Ok(c) => c,
@@ -4409,7 +4409,7 @@ mod tests {
     // -- llama-cpp-2 migration shape tests --
     //
     // Pin the post-migration invariants that hold without loading
-    // the 2.4 GiB GGUF: the registered ModelSpec list, the
+    // the 2.55 GiB GGUF: the registered ModelSpec list, the
     // `LoadedInference` field shape, and the `LlamaBackend`
     // singleton contract. These regress instantly on an accidental
     // re-introduction of a separate tokenizer artifact, an extra
@@ -5293,7 +5293,7 @@ mod tests {
         let _lock = lock_env();
         // Seed a populated slot so we can prove reset clears it. Use
         // the offline-gate path so seeding doesn't try to load the
-        // 2.33 GiB GGUF.
+        // 2.55 GiB GGUF.
         reset();
         let _cache = isolated_cache_dir();
         let _env_offline = EnvVarGuard::set(OFFLINE_ENV, "1");
@@ -5339,7 +5339,7 @@ mod tests {
     /// observed as `None`. Once populated (with `Ok` or `Err`), every
     /// subsequent call must short-circuit through the `Arc::clone`
     /// fast path without re-invoking the load pipeline. Breaking this
-    /// invariant would re-run the 2.33 GiB GGUF load (or, in offline
+    /// invariant would re-run the 2.55 GiB GGUF load (or, in offline
     /// mode, re-trip `ensure()`'s gate) on every metric extraction.
     ///
     /// The test pins the invariant empirically via a test-only
@@ -5460,7 +5460,7 @@ mod tests {
 
     // -- Integration tests (model required) --
     //
-    // These tests load the ~2.33 GiB GGUF and run real inference.
+    // These tests load the ~2.55 GiB GGUF and run real inference.
     // Marked `#[ignore]` so default `cargo nextest run` skips them
     // (CI runs without the model cache populated would either bail
     // on offline-gate or burn ~2 minutes downloading). Run on a
@@ -5501,7 +5501,7 @@ mod tests {
     /// gate is explicitly off for this test even if the test
     /// process inherited an `OFFLINE_ENV=1` from an earlier crash.
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_stdout_produces_well_formed_metrics() {
         let _lock = lock_env();
         reset();
@@ -5560,7 +5560,7 @@ mod tests {
     /// unit tests this can only be inferred via the chain proof; with
     /// a real model it can be observed end-to-end.
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_stderr_tags_metrics_with_stderr() {
         let _lock = lock_env();
         reset();
@@ -5603,7 +5603,7 @@ mod tests {
     /// `Sampling::TopK`, a temperature > 0, a seed-driven sampler —
     /// would surface here as a metric Vec drift between calls.
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_is_deterministic_across_calls() {
         let _lock = lock_env();
         reset();
@@ -5647,7 +5647,7 @@ mod tests {
     /// (those run under offline-gate) but would silently inflate
     /// every test run's wall clock by the model-download time.
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_ensure_default_model_succeeds() {
         let _lock = lock_env();
         reset();
@@ -5676,19 +5676,18 @@ mod tests {
         }
     }
 
-    // -- Group B test plan gap fills (B1, B2, B3, B4-b, B6) --
+    // -- integration-plan gap fills --
     //
-    // Targeted gap-fills against the tester's group-B integration
-    // plan. Each fills a TC-Bx case that wasn't covered by the
-    // initial `model_loaded_*` set. All are `#[ignore]`'d and
-    // gated by a runtime `status(&DEFAULT_MODEL).is_match()`
-    // pre-flight that skips with a clear stderr message when the
-    // cache is cold.
+    // Targeted gap-fills against the integration test plan that
+    // weren't covered by the initial `model_loaded_*` set. All are
+    // `#[ignore]`'d and gated by a runtime
+    // `status(&DEFAULT_MODEL).is_match()` pre-flight that skips
+    // with a clear stderr message when the cache is cold.
     //
-    // B4-a (offline-Err) is covered by the existing
+    // The offline-Err case is covered by the existing
     // `extract_via_llm_returns_empty_when_backend_unavailable`
     // (which asserts the OFFLINE_ENV name surfaces in the error
-    // chain). B5 (schbench smoke) is the existing
+    // chain). The schbench smoke case is the existing
     // `tests/llm_extract_e2e_test.rs::model_loaded_llm_extract_schbench`.
     // No duplicate coverage.
 
@@ -5707,7 +5706,7 @@ mod tests {
         }
     }
 
-    /// **TC-B1-a (extended)**: 3 consecutive calls to
+    /// 3 consecutive calls to
     /// `extract_via_llm` on identical (text, hint, stream) input
     /// produce three byte-identical metric Vecs. Stronger than the
     /// 2-call sibling `model_loaded_extract_via_llm_is_deterministic_across_calls`
@@ -5717,7 +5716,7 @@ mod tests {
     /// 2-call test on luck; the 3-call test reduces the false-pass
     /// probability to 1/4).
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_three_call_determinism() {
         let _lock = lock_env();
         reset();
@@ -5748,7 +5747,7 @@ mod tests {
         }
     }
 
-    /// **TC-B2-a**: a short, easily-bounded prompt produces a
+    /// A short, easily-bounded prompt produces a
     /// response that terminates via EOS (end-of-generation) before
     /// the SAMPLE_LEN token cap. `invoke_with_model`'s loop returns
     /// when `state.model.is_eog_token(token)` fires; pinning this
@@ -5764,7 +5763,7 @@ mod tests {
     /// would be longer and the per-test wall clock would balloon.
     /// We pin on response presence and bounded wall clock.
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_eos_terminates_short_prompt() {
         let _lock = lock_env();
         reset();
@@ -5797,7 +5796,7 @@ mod tests {
         let _ = result; // length-agnostic; the time bound IS the EOS pin.
     }
 
-    /// **TC-B3-a**: empty stdout fed to `extract_via_llm` returns
+    /// Empty stdout fed to `extract_via_llm` returns
     /// `Ok(Vec::new())` when the model is loaded — the call
     /// succeeds (no model-load failure), runs inference on the
     /// empty body wrapped in the ChatML template, and the model's
@@ -5806,7 +5805,7 @@ mod tests {
     /// `parse_llm_response`. Pins the "empty input is a clean
     /// no-op, not an error" contract end-to-end.
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_empty_stdout_returns_empty_metrics() {
         let _lock = lock_env();
         reset();
@@ -5823,7 +5822,7 @@ mod tests {
         );
     }
 
-    /// **TC-B3-b**: stdout containing literal ChatML control
+    /// Stdout containing literal ChatML control
     /// tokens (`<|im_start|>`, `<|im_end|>`) is sanitized by
     /// `compose_prompt`'s `strip_chatml_control_tokens` defense
     /// before reaching the tokenizer. Pins that the production
@@ -5839,7 +5838,7 @@ mod tests {
     /// length-stable across two calls — pinning the strip's
     /// determinism end-to-end).
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_chatml_in_input_handled_by_strip_defense() {
         let _lock = lock_env();
         reset();
@@ -5874,7 +5873,7 @@ mod tests {
         );
     }
 
-    /// **TC-B3-c**: non-UTF-8 bytes in stdout are handled by the
+    /// Non-UTF-8 bytes in stdout are handled by the
     /// upstream framework's stream-capture contract (replaced with
     /// U+FFFD before they reach `extract_via_llm`), so by the time
     /// the call site runs the input is always valid UTF-8. Pins
@@ -5885,7 +5884,7 @@ mod tests {
     /// U+FFFD embedded mid-stream. The contract pin is that this
     /// path doesn't crash the tokenizer or the inference loop.
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_handles_replacement_chars_lossy() {
         let _lock = lock_env();
         reset();
@@ -5903,7 +5902,7 @@ mod tests {
         let _ = result;
     }
 
-    /// **TC-B4-b (time-bounded offline-mode)**: under the offline
+    /// Time-bounded offline-mode: under the offline
     /// gate, `extract_via_llm` returns Err in well under 1 second
     /// — proves the gate trips BEFORE any model-load attempt
     /// (which would take seconds even on warm cache for the SHA
@@ -5919,7 +5918,7 @@ mod tests {
     /// Holds 200ms as the bound — generous for slow CI but tight
     /// enough that a regression to "load model THEN check offline
     /// gate" would blow the bound on the first SHA walk (~10s on
-    /// 2.4 GiB).
+    /// 2.55 GiB).
     #[test]
     #[ignore = "model optional but useful: bounds the offline-gate path's wall clock"]
     fn model_loaded_extract_via_llm_offline_gate_bails_under_200ms() {
@@ -5946,7 +5945,7 @@ mod tests {
         );
     }
 
-    /// **TC-B6-a**: cross-call state isolation between distinct
+    /// Cross-call state isolation between distinct
     /// prompts. Two different prompts in succession must produce
     /// independent results — neither call's state should leak into
     /// the other. The migration's `LoadedInference { model }` shape
@@ -5961,7 +5960,7 @@ mod tests {
     /// emergent and not pinned; the load-bearing pin is
     /// "different inputs → different outputs".
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_cross_call_isolation_distinct_prompts() {
         let _lock = lock_env();
         reset();
@@ -6000,7 +5999,7 @@ mod tests {
         );
     }
 
-    /// **TC-B6-b** (the strongest pin for fresh-LlamaContext-per-call):
+    /// The strongest pin for fresh-LlamaContext-per-call:
     /// run prompt_A → prompt_B → prompt_A and assert the two
     /// invocations of prompt_A produce byte-identical results. If
     /// prompt_B had leaked its KV state into the shared model, the
@@ -6015,7 +6014,7 @@ mod tests {
     /// calls) would cause prompt_A's two runs to diverge once
     /// prompt_B's KV reads/writes touched any shared slots.
     #[test]
-    #[ignore = "model required: loads ~2.33 GiB GGUF and runs real inference"]
+    #[ignore = "model required: loads ~2.55 GiB GGUF and runs real inference"]
     fn model_loaded_extract_via_llm_prompt_a_b_a_determinism() {
         let _lock = lock_env();
         reset();
@@ -6065,7 +6064,7 @@ mod tests {
     /// `parse_llm_response`; the full `extract_via_llm` wrapper
     /// needs a loaded model to reach this branch, so the helper
     /// is the seam where the non-JSON path is exercisable without
-    /// the ~2.33 GiB weights load.
+    /// the ~2.55 GiB weights load.
     #[test]
     fn parse_llm_response_non_json_returns_empty_metrics() {
         let got = parse_llm_response(
@@ -6237,7 +6236,7 @@ mod tests {
         );
     }
 
-    /// Task #10 (stream-tagging side, Stdout case): every metric
+    /// Stream-tagging side, Stdout case: every metric
     /// emitted by `parse_llm_response` with `MetricStream::Stdout`
     /// must carry `MetricStream::Stdout` on its `stream` field.
     /// `parse_llm_response` is the seam where the host-side
@@ -6271,7 +6270,7 @@ mod tests {
         }
     }
 
-    /// Task #10 (stream-tagging side, Stderr case): the inverse of
+    /// Stream-tagging side, Stderr case: the inverse of
     /// `parse_llm_response_stream_tagging_stdout`. When called with
     /// `MetricStream::Stderr`, every emitted metric must carry the
     /// Stderr tag — proves the stream parameter actually flows to
@@ -6311,7 +6310,7 @@ mod tests {
         }
     }
 
-    /// Task #10 (orthogonality side): the stream tag is stamped
+    /// Orthogonality side: the stream tag is stamped
     /// orthogonally to the source tag — every metric MUST carry
     /// `MetricSource::LlmExtract` regardless of which stream tag
     /// was passed. Pins the two tags don't accidentally couple
@@ -6902,16 +6901,16 @@ mod tests {
         assert_eq!(strip_think_block(s), s);
     }
 
-    // -- Group A test plan gap fills (A4-f, A5-b, A6-b, A7-a, A8) --
+    // -- unit-test plan gap fills --
     //
-    // Targeted gap-fills against the tester's group-A unit-test plan
-    // for the post-migration model.rs. Existing coverage already pins
-    // most A1-A6 cases (compose_prompt, wrap_chatml_no_think,
+    // Targeted gap-fills against the unit-test plan for the
+    // post-migration model.rs. Existing coverage already pins
+    // most cases (compose_prompt, wrap_chatml_no_think,
     // strip_think_block, parse_llm_response, global_backend, model
     // cache invariants); these tests close the items that weren't
     // previously covered.
 
-    /// **TC-A4-f**: `parse_llm_response` on a truncated JSON region
+    /// `parse_llm_response` on a truncated JSON region
     /// (the model emits a partial object that ends mid-value before
     /// the closing brace). The recovery walker
     /// [`super::super::metrics::find_and_parse_json`] requires a
@@ -6935,7 +6934,7 @@ mod tests {
         );
     }
 
-    /// **TC-A4-f variant**: truncated JSON with a balanced inner
+    /// Truncated JSON with a balanced inner
     /// region — the recovery walker is documented to find the FIRST
     /// balanced region, so a truncation that severs an outer object
     /// still recovers a complete inner one.
@@ -6958,7 +6957,7 @@ mod tests {
         );
     }
 
-    /// **TC-A5-b**: `global_backend()` is thread-safe across
+    /// `global_backend()` is thread-safe across
     /// concurrent first-call races. Multiple threads invoking it
     /// simultaneously must all observe the same `&'static LlamaBackend`
     /// — the [`OnceLock`] singleton serializes the init, but a
@@ -7006,7 +7005,7 @@ mod tests {
         }
     }
 
-    /// **TC-A6-b**: `memoized_inference()` runs `load_inference`
+    /// `memoized_inference()` runs `load_inference`
     /// AT MOST ONCE across concurrent first-call races. Multiple
     /// threads invoking the public path
     /// (`extract_via_llm` → `memoized_inference`) simultaneously
@@ -7066,7 +7065,7 @@ mod tests {
         );
     }
 
-    /// **TC-A7-a** (composition): `strip_think_block` followed by
+    /// Composition: `strip_think_block` followed by
     /// [`super::super::metrics::find_and_parse_json`] round-trips
     /// the structured payload from a model response that wraps its
     /// JSON output in a thinking block. This is the production
@@ -7127,7 +7126,7 @@ mod tests {
         assert_eq!(rps.value, 1000.0);
     }
 
-    // --- Group A8: stateful UTF-8 decoder via encoding_rs ---
+    // --- stateful UTF-8 decoder via encoding_rs ---
     //
     // `invoke_with_model` uses a stateful `encoding_rs::UTF_8.new_decoder()`
     // to stitch token-piece byte sequences across `token_to_piece`
@@ -7144,7 +7143,7 @@ mod tests {
     // decoder for `String::from_utf8_lossy` (which is NOT stateful)
     // would surface here as a corrupted multi-byte stitch.
 
-    /// **TC-A8-a**: a 4-byte UTF-8 codepoint split across two
+    /// A 4-byte UTF-8 codepoint split across two
     /// decoder calls stitches into a single character. Drives a
     /// 4-byte sequence (U+1F600 GRINNING FACE = `0xF0 0x9F 0x98 0x80`)
     /// fed as bytes 0..2 then bytes 2..4 — a partial-codepoint
@@ -7176,7 +7175,7 @@ mod tests {
         );
     }
 
-    /// **TC-A8-b**: a complete multi-byte codepoint delivered in a
+    /// A complete multi-byte codepoint delivered in a
     /// single call decodes correctly without splitting. Pins the
     /// non-degenerate happy path so a regression that special-
     /// cased the split-byte path (and broke the unsplit case)
@@ -7199,7 +7198,7 @@ mod tests {
         );
     }
 
-    /// **TC-A8-c**: a lone invalid byte (0xFF — never valid in
+    /// A lone invalid byte (0xFF — never valid in
     /// UTF-8) must emit U+FFFD REPLACEMENT CHARACTER under the
     /// `decode_to_string` (with-replacement) API. Pins that the
     /// production code path uses replacement semantics — a

@@ -2190,20 +2190,23 @@ fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
 /// `..`-ranges, mixed-case, longer than 40 chars — is
 /// considered an attempted revspec and warrants the warning.
 ///
-/// Case-sensitive lower-hex only: `detect_*_commit`'s
-/// `to_hex_with_len` produces lowercase, and the sidecar pool
-/// stores lowercase, so an uppercase input like `ABC1234`
-/// would not match a row anyway — but it might also be a
-/// branch name a user expects to resolve. Warning is the safe
-/// default for that ambiguous shape.
+/// Case-insensitive hex: `detect_*_commit`'s `to_hex_with_len`
+/// produces lowercase and the sidecar pool stores lowercase, so
+/// an uppercase input like `ABC1234` will not match a stored row
+/// — but it is still recognizably a hash, not a revspec, and
+/// silently emitting "did not resolve as a revspec" on it is
+/// noise. Pasted-from-elsewhere uppercase / mixed-case hex
+/// strings pass the predicate; the suppressed warning means the
+/// downstream filter sees the literal verbatim and the
+/// (lowercase) pool simply produces an empty match — the same
+/// outcome as a legitimate-but-unknown short hash.
 fn looks_like_literal_hash(input: &str) -> bool {
     let core = input.strip_suffix("-dirty").unwrap_or(input);
     let len = core.len();
     if !(7..=40).contains(&len) {
         return false;
     }
-    core.bytes()
-        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    core.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Resolve git revspecs (HEAD~1, tags, branch names, ranges
@@ -2366,17 +2369,19 @@ fn resolve_commit_specs(
             },
             Err(_) => {
                 // Suppress the warning when `input` already looks
-                // like a literal hash (`^[0-9a-f]{7,40}(-dirty)?$`).
-                // Those are the SHAPE the sidecar writer produces,
-                // and the operator typing them at the CLI is the
-                // common case — emitting "did not resolve as a
-                // revspec" on every legitimate `--project-commit
-                // abc1234` invocation is pure noise. Only warn for
-                // inputs that look like an attempted revspec
-                // (alpha beyond hex, ~, .., ^, longer than 40
-                // chars, or other non-hash shapes) so a typo'd
-                // revspec ("HEAD~XYZ", "main") still surfaces a
-                // diagnostic.
+                // like a literal hash (`^[0-9a-fA-F]{7,40}(-dirty)?$`).
+                // Lowercase is the SHAPE the sidecar writer produces;
+                // uppercase / mixed-case is what an operator pastes
+                // from `git log` output or another tool's UI. Both
+                // are recognizably hashes and the operator typing
+                // them at the CLI is the common case — emitting
+                // "did not resolve as a revspec" on every legitimate
+                // `--project-commit abc1234` invocation is pure
+                // noise. Only warn for inputs that look like an
+                // attempted revspec (alpha beyond hex, ~, .., ^,
+                // longer than 40 chars, or other non-hash shapes)
+                // so a typo'd revspec ("HEAD~XYZ", "main") still
+                // surfaces a diagnostic.
                 if !looks_like_literal_hash(input) {
                     eprintln!(
                         "cargo ktstr: --{flag_name} '{input}' did not resolve as \
@@ -7545,7 +7550,9 @@ mod tests {
     /// so the gated rev_parse-Err warning still fires for them.
     /// Pins the negative side of the predicate against every
     /// shape the team-lead's gating spec calls out: alpha beyond
-    /// hex, ~, .., ^, mixed-case, and out-of-bound lengths.
+    /// hex, ~, .., ^, and out-of-bound lengths. Mixed-case hex
+    /// is now ACCEPTED — see
+    /// [`looks_like_literal_hash_accepts_uppercase_and_mixed_case`].
     #[test]
     fn looks_like_literal_hash_rejects_revspec_shapes() {
         // Alpha beyond hex.
@@ -7557,8 +7564,6 @@ mod tests {
         assert!(!looks_like_literal_hash("HEAD~3..HEAD"));
         // Caret form.
         assert!(!looks_like_literal_hash("HEAD^"));
-        // Mixed-case rejection (sidecar writer is lowercase-only).
-        assert!(!looks_like_literal_hash("ABC1234"));
         // Below 7-char minimum.
         assert!(!looks_like_literal_hash("abc123"));
         // Above 40-char maximum (e.g. SHA-256 prefix or paste of
@@ -7570,5 +7575,26 @@ mod tests {
         assert!(!looks_like_literal_hash(""));
         // -dirty without enough hex prefix.
         assert!(!looks_like_literal_hash("abc-dirty"));
+    }
+
+    /// `looks_like_literal_hash` accepts uppercase and mixed-case
+    /// hex. The sidecar writer produces lowercase, but operators
+    /// commonly paste hashes from `git log` UIs or other tools that
+    /// uppercase. Suppressing the rev_parse-Err warning on these
+    /// keeps CLI noise down; the literal still passes through, and
+    /// the (lowercase) sidecar pool simply produces no match — the
+    /// same outcome as a legitimate-but-unknown short hash.
+    #[test]
+    fn looks_like_literal_hash_accepts_uppercase_and_mixed_case() {
+        // Pure uppercase hex.
+        assert!(looks_like_literal_hash("ABC1234"));
+        // Mixed-case hex.
+        assert!(looks_like_literal_hash("AbC1234"));
+        // Uppercase + -dirty.
+        assert!(looks_like_literal_hash("ABC1234-dirty"));
+        // 40-char uppercase full hash.
+        assert!(looks_like_literal_hash(
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+        ));
     }
 }

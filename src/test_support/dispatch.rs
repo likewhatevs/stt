@@ -1069,7 +1069,7 @@ fn strip_kernel_suffix<'a>(
     // `kernel_6_14` vs `kernel_x_kernel_6_14`), the iterate-and-
     // first-match below would pick whichever appears first in
     // the kernel_list — deterministic but potentially wrong.
-    // Producer-side regression detection (#123) would catch that
+    // Producer-side regression detection would catch that
     // class of collision before it reaches this peeler.
     for entry in kernel_list {
         let needle = format!("/{}", entry.sanitized);

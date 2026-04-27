@@ -8,6 +8,7 @@
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
@@ -20,10 +21,29 @@ use reqwest::blocking::Client;
 /// re-handshake because reqwest's connection pool keys on host.
 static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 
+/// Connect-phase timeout for [`shared_client`]: bounds the time spent
+/// in the TCP + TLS handshake before reqwest gives up on a peer.
+/// Bounds the dead-route case — a CDN edge that accepts the SYN but
+/// stalls the handshake, or a route that blackholes outright —
+/// without putting any ceiling on the response body's streaming
+/// duration once the connection is up.
+///
+/// No total request `.timeout()` is set: the same client serves both
+/// short HEAD probes ([`probe_patch_exists`]) and large tarball
+/// streams ([`download_stable_tarball`], [`download_rc_tarball`]),
+/// where a 130–180 MB compressed payload over a slow uplink can take
+/// minutes of wall-clock to deliver. Capping that with a per-request
+/// timeout would abort legitimate downloads; bounding only the
+/// connect phase preserves the dead-route guarantee while letting
+/// the body stream as long as the upstream is making forward
+/// progress.
+const SHARED_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Return the process-wide shared [`reqwest::blocking::Client`]. First
-/// call constructs it with `reqwest::blocking::Client::new()`; every
-/// subsequent call returns a reference to the same instance. This
-/// helper is for top-level CLI entries that want the default client.
+/// call constructs it via `Client::builder()` with
+/// [`SHARED_CLIENT_CONNECT_TIMEOUT`] applied; every subsequent call
+/// returns a reference to the same instance. This helper is for
+/// top-level CLI entries that want the default client.
 ///
 /// Tests that need to verify a network round-trip (rather than a
 /// cache hit) must NOT pass `shared_client()` to a cache-routed
@@ -46,15 +66,20 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 ///
 /// # Panics
 ///
-/// Panics on the first call if `reqwest::blocking::Client::new()` fails
-/// to build a default client — inherited behavior from reqwest, which
-/// uses it as the infallible constructor. The documented failure modes
-/// are TLS backend initialization (e.g. rustls/native-tls subsystem
-/// unreachable) and are treated as setup bugs rather than runtime
-/// errors; a failing first call would have failed just as hard under
-/// the pre-singleton `Client::new()` per-callsite pattern.
+/// Panics on the first call if `Client::builder().build()` fails to
+/// construct a client. The documented failure modes are TLS backend
+/// initialization (e.g. rustls/native-tls subsystem unreachable) and
+/// are treated as setup bugs rather than runtime errors. The
+/// `expect` here, rather than propagating the error, mirrors the
+/// inherited behavior of `reqwest::blocking::Client::new()` (which
+/// is itself an infallible wrapper around `builder().build().expect`).
 pub fn shared_client() -> &'static Client {
-    SHARED_CLIENT.get_or_init(Client::new)
+    SHARED_CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(SHARED_CLIENT_CONNECT_TIMEOUT)
+            .build()
+            .expect("build shared reqwest client")
+    })
 }
 
 /// Process-wide cache of the parsed `releases.json` payload.
@@ -575,7 +600,8 @@ fn parse_releases_body(body: &str) -> Result<Vec<Release>> {
         .get("releases")
         .and_then(|r| r.as_array())
         .ok_or_else(|| anyhow!("releases.json: missing releases array"))?;
-    Ok(releases
+    let input_rows = releases.len();
+    let parsed: Vec<Release> = releases
         .iter()
         .filter_map(|r| {
             let moniker = r.get("moniker")?.as_str()?;
@@ -585,7 +611,30 @@ fn parse_releases_body(body: &str) -> Result<Vec<Release>> {
                 version: version.to_string(),
             })
         })
-        .collect())
+        .collect();
+    // Per-row tolerance: a corrupt row is silently dropped via the
+    // filter_map `?` chain so a single bad entry does not abort the
+    // whole fetch (see `fetch_releases_row_missing_moniker_drops_row`
+    // and siblings). The drop is also a hazard: the truncated vector
+    // gets cached in [`RELEASES_CACHE`] for the rest of the process
+    // lifetime via the singleton path, so a transient malformed row
+    // at fetch time persists as a partial snapshot for every later
+    // cache-hit caller. Surface the drop count so an operator
+    // tailing logs sees that releases.json arrived partial — without
+    // this, the symptom (a missing version on resolve) is invisible
+    // until it propagates as "version not found" elsewhere.
+    let dropped = input_rows - parsed.len();
+    if dropped > 0 {
+        tracing::warn!(
+            input_rows,
+            parsed_rows = parsed.len(),
+            dropped,
+            "releases.json: dropped {dropped} of {input_rows} row(s) \
+             missing moniker/version (or non-string values); cached \
+             snapshot will reflect this for the process lifetime"
+        );
+    }
+    Ok(parsed)
 }
 
 /// Fetch the latest stable kernel version from kernel.org.

@@ -162,11 +162,13 @@ impl GuestMem {
         }
     }
 
-    /// Resolve a DRAM-relative byte offset to a host pointer.
+    /// Resolve a DRAM-relative byte offset to a host pointer plus the
+    /// number of bytes remaining in the resolved region (i.e. how far
+    /// the returned pointer can be advanced before leaving the mmap).
     ///
     /// Binary-searches the sorted region list. Returns `None` if the
     /// offset falls outside all regions.
-    fn resolve_ptr(&self, offset: u64) -> Option<*mut u8> {
+    fn resolve_ptr(&self, offset: u64) -> Option<(*mut u8, u64)> {
         let idx = self
             .regions
             .partition_point(|r| r.offset <= offset)
@@ -176,7 +178,8 @@ impl GuestMem {
         if local < r.size {
             // SAFETY: `local < r.size` ensures the offset is within
             // the mmap'd region that `host_ptr` points to.
-            Some(unsafe { r.host_ptr.add(local as usize) })
+            let ptr = unsafe { r.host_ptr.add(local as usize) };
+            Some((ptr, r.size - local))
         } else {
             None
         }
@@ -223,32 +226,66 @@ impl GuestMem {
 
     /// Bounds-checked volatile read of `N` little/native-endian bytes at
     /// DRAM offset `pa + offset`. Returns `[0; N]` if the range falls
-    /// outside the mapped region.
+    /// outside the mapped region, straddles a region boundary in a
+    /// multi-region (NUMA) layout, or if the address arithmetic overflows
+    /// (`pa` may be derived from an attacker-controlled guest page-table
+    /// entry).
     ///
     /// `N` must match the width of the scalar caller. `read_volatile_bytes`
     /// reads byte-by-byte, so the access does not require `N`-alignment.
     fn read_scalar<const N: usize>(&self, pa: u64, offset: usize) -> [u8; N] {
-        let addr = pa + offset as u64;
-        if addr + N as u64 > self.size {
+        let Some(addr) = pa.checked_add(offset as u64) else {
+            return [0; N];
+        };
+        let Some(end) = addr.checked_add(N as u64) else {
+            return [0; N];
+        };
+        if end > self.size {
             return [0; N];
         }
         match self.resolve_ptr(addr) {
-            // SAFETY: bounds checked above; resolve_ptr returned a
-            // valid pointer into the mapped region.
-            Some(ptr) => unsafe { Self::read_volatile_bytes::<N>(ptr as *const u8) },
+            Some((ptr, region_avail)) => {
+                // Reject reads that would walk past the end of the
+                // resolved region's mmap. Multi-region GuestMems can
+                // have non-contiguous host mappings; reading off the
+                // end of one region's mmap is undefined behavior even
+                // if `addr + N <= self.size` overall.
+                if (N as u64) > region_avail {
+                    return [0; N];
+                }
+                // SAFETY: bounds checked above; resolve_ptr returned a
+                // valid pointer into the mapped region and the read of
+                // N bytes stays within `region_avail`.
+                unsafe { Self::read_volatile_bytes::<N>(ptr as *const u8) }
+            }
             None => [0; N],
         }
     }
 
     /// Bounds-checked volatile write of `bytes` at DRAM offset `pa + offset`.
-    /// Silently no-ops if the range falls outside the mapped region.
+    /// Silently no-ops if the range falls outside the mapped region,
+    /// straddles a region boundary in a multi-region (NUMA) layout, or if
+    /// the address arithmetic overflows (`pa` may be derived from an
+    /// attacker-controlled guest page-table entry).
     fn write_scalar<const N: usize>(&self, pa: u64, offset: usize, bytes: [u8; N]) {
-        let addr = pa + offset as u64;
-        if addr + N as u64 > self.size {
+        let Some(addr) = pa.checked_add(offset as u64) else {
+            return;
+        };
+        let Some(end) = addr.checked_add(N as u64) else {
+            return;
+        };
+        if end > self.size {
             return;
         }
-        if let Some(ptr) = self.resolve_ptr(addr) {
-            // SAFETY: bounds checked above.
+        if let Some((ptr, region_avail)) = self.resolve_ptr(addr) {
+            // Reject writes that would walk past the end of the
+            // resolved region's mmap (see `read_scalar` for the
+            // rationale on multi-region GuestMems).
+            if (N as u64) > region_avail {
+                return;
+            }
+            // SAFETY: bounds checked above; the write of N bytes stays
+            // within `region_avail`.
             unsafe { Self::write_volatile_bytes::<N>(ptr, bytes) };
         }
     }
@@ -285,7 +322,10 @@ impl GuestMem {
 
     /// Read `len` bytes from DRAM offset `pa` into `buf`.
     /// Returns the number of bytes actually read (may be less than `len`
-    /// if the read would go past the end of guest memory).
+    /// if the read would go past the end of guest memory or the end of
+    /// the resolved region — multi-region NUMA layouts can have
+    /// non-contiguous host mappings, so the copy must not extend past
+    /// the region containing `pa`).
     pub fn read_bytes(&self, pa: u64, buf: &mut [u8]) -> usize {
         let len = buf.len() as u64;
         if pa >= self.size {
@@ -293,11 +333,14 @@ impl GuestMem {
         }
         let avail = (self.size - pa).min(len) as usize;
         match self.resolve_ptr(pa) {
-            Some(ptr) => {
+            Some((ptr, region_avail)) => {
+                let copy_len = avail.min(region_avail as usize);
+                // SAFETY: `copy_len <= region_avail`, so the read stays
+                // within the mmap that `ptr` points into.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), avail);
+                    std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len);
                 }
-                avail
+                copy_len
             }
             None => 0,
         }
@@ -427,7 +470,12 @@ impl GuestMem {
         // OA mask for 64KB granule: bits [47:16]
         const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_0000;
 
-        let to_offset = |gpa: u64| -> u64 { gpa.wrapping_sub(DRAM_START) };
+        // Convert a guest physical address to a DRAM-relative offset.
+        // `checked_sub` rejects descriptors whose payload addresses fall
+        // below DRAM_START — a malicious or corrupted descriptor that
+        // wraps would otherwise produce a near-u64::MAX offset and cause
+        // out-of-bounds reads. Treat underflow as "not present" (None).
+        let to_offset = |gpa: u64| -> Option<u64> { gpa.checked_sub(DRAM_START) };
 
         // 3-level walk for 64KB granule, 48-bit VA.
         let kva_bits = kva.0;
@@ -445,11 +493,11 @@ impl GuestMem {
         // PGD block: 4TB region (unlikely but spec-allowed)
         if pgde & DESC_MASK == BLOCK {
             let base = pgde & 0x0000_FC00_0000_0000;
-            return Some(to_offset(base) | (kva_bits & 0x3FF_FFFF_FFFF));
+            return Some(to_offset(base)? | (kva_bits & 0x3FF_FFFF_FFFF));
         }
 
         // PMD
-        let pmd_off = to_offset(pgde & ADDR_MASK) + pmd_idx * 8;
+        let pmd_off = to_offset(pgde & ADDR_MASK)? + pmd_idx * 8;
         let pmde = self.read_u64(pmd_off, 0);
         if pmde & VALID == 0 {
             return None;
@@ -457,11 +505,11 @@ impl GuestMem {
         // PMD block: 512MB region
         if pmde & DESC_MASK == BLOCK {
             let base = pmde & 0x0000_FFFF_E000_0000;
-            return Some(to_offset(base) | (kva_bits & 0x1FFF_FFFF));
+            return Some(to_offset(base)? | (kva_bits & 0x1FFF_FFFF));
         }
 
         // PTE — page descriptor (bits [1:0] = 0b11)
-        let pte_off = to_offset(pmde & ADDR_MASK) + pte_idx * 8;
+        let pte_off = to_offset(pmde & ADDR_MASK)? + pte_idx * 8;
         let ptee = self.read_u64(pte_off, 0);
         if ptee & VALID == 0 {
             return None;
@@ -470,7 +518,7 @@ impl GuestMem {
             return None;
         }
 
-        Some(to_offset(ptee & ADDR_MASK) | page_off)
+        Some(to_offset(ptee & ADDR_MASK)? | page_off)
     }
 
     /// 5-level page table walk: CR3 -> PML5 -> P4D -> PUD -> PMD -> PTE.

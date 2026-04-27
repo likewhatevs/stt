@@ -94,8 +94,8 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
 //      memslot path (`BpfMapAccessor::write_value_u32` dispatched
 //      from `vmm::bpf_map_write_thread`).
 //   2. GUEST scheduler's BPF dispatcher reads the new `stall` value
-//      from its `.bss` section on the next dispatch entry (line 93
-//      of main.bpf.c: `if (stall) return;`).
+//      from its `.bss` section on the next dispatch entry
+//      (`if (stall) return;` in main.bpf.c).
 //   3. GUEST ACTS: the scheduler stops inserting tasks into DSQs,
 //      every CPU sits idle, the scx watchdog observes no progress
 //      within its budget and tears the scheduler down (emitted
@@ -120,7 +120,7 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
 // natural scenario end.
 static BPF_STALL_HOST_WRITE: BpfMapWrite = BpfMapWrite {
     map_name_suffix: ".bss",
-    offset: 0, // stall @ main.bpf.c line 14
+    offset: 0, // stall flag in main.bpf.c .bss
     value: 1,
 };
 
@@ -205,10 +205,6 @@ fn scenario_scattershot(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Ass
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-const SCATTER_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const SCATTER_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&SCATTER_SCHED);
-
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_SCATTER: ktstr::test_support::KtstrTestEntry =
@@ -223,7 +219,7 @@ static __KTSTR_ENTRY_SCATTER: ktstr::test_support::KtstrTestEntry =
             nodes: None,
             distances: None,
         },
-        scheduler: &SCATTER_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
         extra_sched_args: &["--scattershot"],
         performance_mode: true,
         duration: std::time::Duration::from_secs(5),
@@ -246,17 +242,13 @@ fn scenario_throughput_regression(
     execute_steps_with(ctx, steps, Some(&checks))
 }
 
-const SLOW_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const SLOW_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&SLOW_SCHED);
-
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_SLOW: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_throughput_regression",
         func: scenario_throughput_regression,
-        scheduler: &SLOW_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
         extra_sched_args: &["--slow"],
         performance_mode: true,
         duration: std::time::Duration::from_secs(5),
@@ -274,17 +266,13 @@ fn scenario_auto_repro(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::Asse
     execute_steps(ctx, steps)
 }
 
-const STALL_SCHED: Scheduler =
-    Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const STALL_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&STALL_SCHED);
-
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_AUTO_REPRO: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_auto_repro",
         func: scenario_auto_repro,
-        scheduler: &STALL_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
@@ -439,7 +427,7 @@ static __KTSTR_ENTRY_WATCHDOG_TIMING: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "watchdog_override_timing_precision",
         func: scenario_watchdog_timing_precision,
-        scheduler: &STALL_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(2),
         duration: std::time::Duration::from_secs(15),

@@ -20,7 +20,7 @@
 //!
 //! # Module layout
 //!
-//! Implementation is split across 14 private submodules re-exported
+//! Implementation is split across 15 private submodules re-exported
 //! at `test_support::*` for a flat public API: `args` (CLI argument
 //! extraction), `dispatch` (ktstr / cargo-ktstr CLI entry points),
 //! `entry` (scheduler + test-entry types), `eval` (host-side VM
@@ -28,6 +28,7 @@
 //! `model` (LLM backend + model cache), `output` (guest-output and
 //! console parsing), `payload` (`Payload` / `Check` / `Metric` /
 //! `Polarity`), `probe` (auto-repro and BPF probe pipeline),
+//! `probe_metrics` (host-side BPF map introspection),
 //! `profraw` (coverage flush), `runtime` (neutral home for
 //! verbose/shm-size/config-file-parts shared by eval and probe so
 //! they don't circularly depend on each other), `sidecar` (per-run

@@ -239,12 +239,18 @@ complete failure output format and auto-repro walkthrough.
 ## Insufficient hugepages
 
 ```text
-performance_mode: WARNING: not enough hugepages (needed N MB = M pages, available K pages). Using regular pages.
+performance_mode: WARNING: no 2MB hugepages available, guest memory will use regular pages
+```
+
+```text
+performance_mode: WARNING: need N 2MB hugepages, only K free — falling back to regular pages
 ```
 
 [Performance mode](concepts/performance-mode.md) requests 2MB
-hugepages for guest memory. Without enough free hugepages, the VM
-falls back to regular pages (with a warning).
+hugepages for guest memory. The first form fires when no 2MB hugepages
+are reserved on the host (`free == 0`); the second fires when some are
+reserved but fewer than the run needs. In both cases the VM falls back
+to regular pages and continues to boot.
 
 **Fix:**
 
@@ -409,21 +415,28 @@ files.
 ## Cache directory not found
 
 ```text
-HOME not set; cannot resolve cache directory. Set KTSTR_CACHE_DIR to specify a cache location.
+HOME is unset; cannot resolve cache directory. The container init or login shell did not assign HOME — set it to an absolute path, or set KTSTR_CACHE_DIR to an absolute path (e.g. /tmp/ktstr-cache) or XDG_CACHE_HOME to specify a cache location explicitly.
+```
+
+```text
+HOME is set to the empty string; cannot resolve cache directory. An empty HOME usually means a Dockerfile or shell rc has `export HOME=` or `ENV HOME=` with no value. Either set HOME to a real absolute path, or set KTSTR_CACHE_DIR to an absolute path (e.g. /tmp/ktstr-cache) or XDG_CACHE_HOME to specify a cache location explicitly.
 ```
 
 The kernel image cache requires a writable directory. ktstr resolves
 it as: `KTSTR_CACHE_DIR` > `$XDG_CACHE_HOME/ktstr/kernels/` >
-`$HOME/.cache/ktstr/kernels/`.
+`$HOME/.cache/ktstr/kernels/`. The first form fires when `HOME` is
+absent from the environment (typical of bare container inits or
+systemd units with no `Environment=HOME=...`); the second fires when
+`HOME` is present but assigned to the empty string.
 
 **Fix:** Set `KTSTR_CACHE_DIR` to an explicit path, or ensure `HOME`
-is set.
+is set to a real absolute path.
 
 ## Stale kconfig
 
 ```text
 warning: entries marked (stale kconfig) were built against a different ktstr.kconfig.
-Rebuild with: kernel build --force VERSION
+Rebuild with: kernel build --force <entry version>
 ```
 
 `cargo ktstr kernel list` marks entries whose stored `ktstr_kconfig_hash`

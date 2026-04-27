@@ -1,6 +1,6 @@
 //! Advisory flock(2) primitives shared across every ktstr lock file.
 //!
-//! ktstr uses advisory `flock(2)` in three places:
+//! ktstr uses advisory `flock(2)` in four places:
 //!
 //!  - LLC reservation locks at `/tmp/ktstr-llc-{N}.lock` and per-CPU
 //!    locks at `/tmp/ktstr-cpu-{C}.lock` (see
@@ -9,12 +9,16 @@
 //!  - Per-cache-entry coordination locks at
 //!    `{cache_root}/.locks/{cache_key}.lock` (see
 //!    `crate::cache::CacheDir::acquire_shared_lock` and friends).
+//!  - Per-source-tree build locks at
+//!    `{cache_root}/.locks/source-{path_hash}.lock` (see
+//!    `crate::cli::acquire_source_tree_lock`) — serialize concurrent
+//!    `make` invocations against the same kernel source checkout.
 //!  - Observational enumeration from `ktstr locks --json` — a
 //!    read-only scan that does NOT acquire flocks; reads
 //!    /proc/locks through [`read_holders`] to attribute holders
 //!    without contending with active acquirers.
 //!
-//! All three share:
+//! All four share:
 //!  - Non-blocking `LOCK_NB` attempt (the cache-entry path wraps this
 //!    in a poll loop for timed-wait semantics).
 //!  - `O_CLOEXEC` on every open so the kernel's "release flock when
@@ -28,7 +32,7 @@
 //!  - `HolderInfo` with `pid` + truncated `/proc/{pid}/cmdline` for
 //!    actionable error messages.
 //!
-//! # Why mountinfo (and fdinfo), not `stat().st_dev`
+//! # Why mountinfo, not `stat().st_dev`
 //!
 //! `/proc/locks` emits `i_sb->s_dev` for each held flock — the
 //! filesystem's superblock device id. For most filesystems that
@@ -42,27 +46,17 @@
 //! correctness failure for `--cpu-cap` contention diagnostics and
 //! the `ktstr locks` observational command.
 //!
-//! Two needle producers, one format:
+//! Needle production:
 //!
-//!  - [`needle_from_path`] — path-only callers. Resolves `path` to
-//!    the mount-point covering it via `/proc/self/mountinfo`
-//!    (longest-prefix match on the mount_point field), then reads
-//!    the `{major:minor}` field of that mount entry. Combines with
-//!    `stat().st_ino` for the full triple. The mountinfo
-//!    `{major:minor}` is the kernel's `i_sb->s_dev` verbatim, so
-//!    the resulting needle matches /proc/locks by construction.
-//!  - [`needle_from_fd`] — callers that hold a freshly-flocked
-//!    [`OwnedFd`]. Reads the fd's `/proc/self/fdinfo/{fd}` and
-//!    extracts the `lock:` line's `{major:02x}:{minor:02x}:{inode}`
-//!    triple verbatim from the kernel's own formatting. No
-//!    mountinfo parse, no per-host stat() round-trip; works even
-//!    when the path has been unlinked while the fd is still open.
-//!
-//! Both producers feed [`read_holders_for_needle`], which scans
-//! `/proc/locks` exactly once and byte-compares. All in-tree
-//! callers today are path-only (they call [`read_holders`], which
-//! is the path-only adapter); `needle_from_fd` is exposed for
-//! future telemetry and cross-check tests.
+//! [`needle_from_path`] resolves `path` to the mount-point covering
+//! it via `/proc/self/mountinfo` (longest-prefix match on the
+//! `mount_point` field), then reads the `{major:minor}` field of
+//! that mount entry. Combines with `stat().st_ino` for the full
+//! triple. The mountinfo `{major:minor}` is the kernel's
+//! `i_sb->s_dev` verbatim, so the resulting needle matches
+//! /proc/locks by construction. The needle feeds
+//! [`read_holders_for_needle`], which scans `/proc/locks` exactly
+//! once and byte-compares.
 //!
 //! # Remote-filesystem rejection
 //!
@@ -322,22 +316,13 @@ pub fn try_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<Option<Owne
 /// process holding an advisory `FLOCK` matching `needle`.
 ///
 /// `needle` must be the `{major:02x}:{minor:02x}:{inode}` triple in
-/// /proc/locks' own formatting — the two producers are:
-///
-///  - [`needle_from_path`]: resolves `(major, minor)` via
-///    `/proc/self/mountinfo` and `inode` via `stat().st_ino`. Used
-///    by path-only callers ([`read_holders`], the `ktstr locks`
-///    observational scan, and the EWOULDBLOCK-branch peer-holder
-///    lookup in `cache.rs`). `acquire_llc_plan`'s DISCOVER phase
-///    uses [`needle_from_path_with_mountinfo`] instead so the
-///    mountinfo read amortizes across every LLC in one invocation.
-///  - [`needle_from_fd`]: reads `/proc/self/fdinfo/{fd}` and
-///    extracts the `lock:` line's triple verbatim. Used by callers
-///    that hold a freshly-flocked fd and want to key the needle
-///    against the kernel's own formatting without a mountinfo parse.
-///    No in-tree caller today — exposed for future telemetry and
-///    for completeness: the two producers must agree on all hosts,
-///    and a future test can cross-check them.
+/// /proc/locks' own formatting, produced by [`needle_from_path`]:
+/// `(major, minor)` via `/proc/self/mountinfo` and `inode` via
+/// `stat().st_ino`. Used by path-only callers ([`read_holders`],
+/// the `ktstr locks` observational scan, and the EWOULDBLOCK-branch
+/// peer-holder lookup in `cache.rs`). `acquire_llc_plan`'s DISCOVER
+/// phase uses [`needle_from_path_with_mountinfo`] instead so the
+/// mountinfo read amortizes across every LLC in one invocation.
 ///
 /// Best-effort: returns `Ok(vec![])` when no /proc/locks entry
 /// matches the needle, and propagates only the hard `/proc/locks`
@@ -517,59 +502,6 @@ pub(crate) fn needle_from_path_with_mountinfo(path: &Path, mountinfo: &str) -> R
     Ok(format!("{major:02x}:{minor:02x}:{inode}"))
 }
 
-/// Build a /proc/locks match needle from `/proc/self/fdinfo/{fd}`.
-/// Reads the fd's fdinfo, parses the `lock:` line (one per lock
-/// held on this OFD), and extracts the first `FLOCK` line's
-/// `{major:02x}:{minor:02x}:{inode}` triple verbatim.
-///
-/// Intended for callers that hold a freshly-flocked [`OwnedFd`] and
-/// want the needle without a mountinfo parse. The resulting needle
-/// must byte-equal the one [`needle_from_path`] produces for the
-/// same lockfile — both derive from the same kernel state, by
-/// different paths.
-///
-/// Returns `None` when fdinfo has no `lock:` line (fd opened but
-/// not flocked; observational callers that just want the inode
-/// triple cannot use this path — they must go through
-/// [`needle_from_path`]).
-///
-/// No in-tree caller today; exposed for future use and cross-check
-/// testing. See module-level rationale.
-#[allow(dead_code)]
-pub(crate) fn needle_from_fd<F: std::os::fd::AsRawFd>(fd: &F) -> Result<Option<String>> {
-    use anyhow::Context;
-    use std::fs;
-
-    let raw = fd.as_raw_fd();
-    let path = format!("/proc/self/fdinfo/{raw}");
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("read {path} for fd-needle derivation"))?;
-
-    // fdinfo format for flock-holding fds:
-    //   lock:\t1: FLOCK ADVISORY WRITE 12345 08:02:1234 0 EOF
-    // The "1:" id is arbitrary (there can be multiple lock: lines).
-    // We take the first FLOCK line's dev:inode triple.
-    for line in contents.lines() {
-        let rest = match line.strip_prefix("lock:") {
-            Some(s) => s.trim_start(),
-            None => continue,
-        };
-        let mut fields = rest.split_whitespace();
-        let _id = fields.next(); // "N:"
-        let lock_type = fields.next();
-        if lock_type != Some("FLOCK") {
-            continue;
-        }
-        let _adv = fields.next(); // ADVISORY/MANDATORY
-        let _mode = fields.next(); // READ/WRITE
-        let _pid = fields.next(); // our own pid
-        if let Some(triple) = fields.next() {
-            return Ok(Some(triple.to_string()));
-        }
-    }
-    Ok(None)
-}
-
 /// Resolve `path` to its containing mount point's kernel major:minor
 /// from pre-read `/proc/self/mountinfo` text.
 ///
@@ -729,10 +661,22 @@ fn unescape_mountinfo_field(raw: &str) -> std::borrow::Cow<'_, str> {
             && is_octal_digit(bytes[i + 2])
             && is_octal_digit(bytes[i + 3])
         {
-            let b =
-                ((bytes[i + 1] - b'0') << 6) | ((bytes[i + 2] - b'0') << 3) | (bytes[i + 3] - b'0');
-            out.push(b);
-            i += 4;
+            // Compose three octal digits in u16 to avoid u8 shift
+            // overflow on `\400` and above. The kernel's mangle_path
+            // only emits values ≤ `\377` (the escape set is " \t\n\\"
+            // and the ASCII byte for each is < 0x80), but malformed
+            // input must not panic — reject out-of-range values and
+            // copy the original `\NNN` bytes verbatim instead.
+            let val = ((bytes[i + 1] - b'0') as u16) << 6
+                | ((bytes[i + 2] - b'0') as u16) << 3
+                | (bytes[i + 3] - b'0') as u16;
+            if val <= 0xff {
+                out.push(val as u8);
+                i += 4;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
         } else {
             out.push(bytes[i]);
             i += 1;
@@ -1341,6 +1285,42 @@ mod tests {
         assert_eq!(decoded.as_ref(), "/trunc\\04");
     }
 
+    /// `\NNN` octal-overflow guard. The kernel's `mangle_path` only
+    /// emits values ≤ `\377` (escape set is `" \t\n\\"`, all ASCII),
+    /// but malformed `/proc/self/mountinfo` input — corrupt file,
+    /// kernel bug, in-process tampering — must not panic the parser
+    /// nor silently truncate via u8 wraparound. Pins three points:
+    ///
+    ///  - `\377` (val = 0xFF) is the in-range upper bound and decodes
+    ///    to the single byte `0xFF`. The lossy UTF-8 layer turns that
+    ///    isolated continuation byte into `U+FFFD` — the established
+    ///    contract for non-UTF-8 mountinfo bytes.
+    ///  - `\400` (val = 0x100) is the first out-of-range value and
+    ///    must round-trip as the literal 4-byte sequence `\400`.
+    ///    Without this guard, `(b'4' - b'0') << 6` overflows u8 to
+    ///    `0` and the parser silently emits `NUL`, masking the
+    ///    malformed input.
+    ///  - `\777` (val = 0x1FF) is the upper bound of the 3-octal-digit
+    ///    grammar — a future change that compared the decoded byte
+    ///    against a `>= 0x100` threshold using a wider type but
+    ///    forgot to widen the shift would still trip on `\777`.
+    #[test]
+    fn unescape_mountinfo_field_preserves_out_of_range_octal() {
+        // \377 → 0xFF (in range), then lossy UTF-8 → U+FFFD.
+        let decoded = unescape_mountinfo_field("\\377");
+        assert_eq!(decoded.as_ref(), "\u{FFFD}");
+
+        // \400 (val == 256, > 0xff) — must preserve the literal
+        // 4-byte sequence rather than wrap to a NUL byte.
+        let decoded = unescape_mountinfo_field("\\400");
+        assert_eq!(decoded.as_ref(), "\\400");
+
+        // \777 (val == 511) — upper bound of the 3-octal-digit
+        // grammar; same preserve-as-literal contract.
+        let decoded = unescape_mountinfo_field("\\777");
+        assert_eq!(decoded.as_ref(), "\\777");
+    }
+
     /// `is_octal_digit` accepts exactly the 8 valid digits of a
     /// `\NNN` escape and rejects everything else. Pins the
     /// boundary so a future refactor that uses
@@ -1470,7 +1450,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // read_holders_for_needle + needle_from_fd — light /proc-touching
+    // read_holders_for_needle — light /proc-touching
     // ---------------------------------------------------------------
 
     /// `parse_flock_pids_for_needle` skips `POSIX` and `OFDLCK`
@@ -1621,78 +1601,6 @@ mod tests {
             holders.is_empty(),
             "impossible needle must not match any holder: {holders:?}"
         );
-    }
-
-    /// `needle_from_fd` on an fd opened without flock returns
-    /// Ok(None). Verifies the "no `lock:` line" branch via a
-    /// bare open — no flock ever taken.
-    ///
-    /// Uses `tempfile::TempDir` so cleanup runs via RAII on panic
-    /// — replaces the earlier manual `/tmp/ktstr-flock-test-...`
-    /// that leaked a file if the test panicked.
-    #[test]
-    fn needle_from_fd_without_flock_returns_none() {
-        use std::fs::OpenOptions;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join("unflocked.lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)
-            .expect("create temp file");
-        let needle = needle_from_fd(&file).expect("fdinfo readable");
-        assert!(
-            needle.is_none(),
-            "unflocked fd must produce no needle: {needle:?}"
-        );
-    }
-
-    /// Positive cross-check: EX-flock a tempfile, derive the
-    /// needle from the held fd, then scan /proc/locks with that
-    /// needle and verify OUR pid appears as a holder.
-    ///
-    /// This pins the "both producers must agree on all hosts"
-    /// invariant promised in the module doc at the top of this
-    /// file: `needle_from_fd` (fdinfo-based) and the implicit
-    /// round-trip through `/proc/locks` must meet on the same
-    /// triple. A divergence between the fdinfo `lock:` line and
-    /// the /proc/locks FLOCK line would break holder enumeration
-    /// for any held fd; this test catches it.
-    #[test]
-    fn needle_from_fd_and_read_holders_round_trip() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join("flocked.lock");
-        let fd = try_flock(&path, FlockMode::Exclusive)
-            .expect("try_flock must succeed on fresh tempfile")
-            .expect("EX must acquire on clean pool");
-
-        // 1. Derive needle via fdinfo. Must be Some (we hold a flock).
-        let needle = needle_from_fd(&fd)
-            .expect("fdinfo readable")
-            .expect("fdinfo must have a `lock:` line for flocked fd");
-        // Format: `{major:02x}:{minor:02x}:{inode}` — exactly 2 colons.
-        assert_eq!(
-            needle.chars().filter(|&c| c == ':').count(),
-            2,
-            "needle must be 2-colon format (major:minor:inode), got {needle}",
-        );
-
-        // 2. Scan /proc/locks with that needle — our pid must be
-        // a holder of the just-taken flock.
-        let holders = read_holders_for_needle(&needle).expect("/proc/locks readable");
-        let our_pid = std::process::id();
-        assert!(
-            holders.iter().any(|h| h.pid == our_pid),
-            "our pid {our_pid} must appear in holders {holders:?} for \
-             needle {needle}",
-        );
-
-        drop(fd);
     }
 
     /// Equivalence between the cached-mountinfo and one-shot
