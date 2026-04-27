@@ -304,33 +304,44 @@ pub struct ThreadState {
     pub nr_wakeups_migrate: u64,
     pub nr_wakeups_idle: u64,
     pub nr_migrations: u64,
+    /// Total nanoseconds the task spent on the runqueue waiting
+    /// to be picked. Populated from `/proc/<tid>/sched`'s
+    /// `wait_sum` key — kernel emits via `PN_SCHEDSTAT` as
+    /// `ms.ns_remainder`, reconstructed by the parser to full ns.
     pub wait_sum: u64,
     pub wait_count: u64,
     /// Total nanoseconds the task slept (voluntary block in
     /// `schedule()` — sleep syscalls, futex wait, etc.). Populated
-    /// from `/proc/<tid>/sched`'s `sum_sleep_runtime` key. There
-    /// is no `sleep_count` counterpart: the kernel does not emit
-    /// one — the scheduler records the aggregate runtime but not
-    /// the sleep-event count separately from `nr_wakeups`, which
-    /// already covers the wake-side tally.
+    /// from `/proc/<tid>/sched`'s `sum_sleep_runtime` key (kernel
+    /// emits `ms.ns_remainder` via `PN_SCHEDSTAT`; the parser
+    /// reconstructs full ns). There is no `sleep_count`
+    /// counterpart: the kernel does not emit one — the scheduler
+    /// records the aggregate runtime but not the sleep-event
+    /// count separately from `nr_wakeups`, which already covers
+    /// the wake-side tally.
     pub sleep_sum: u64,
-    /// Total time blocked in the scheduler — every path that
-    /// puts the task into `TASK_UNINTERRUPTIBLE` contributes:
+    /// Total nanoseconds blocked in the scheduler — every path
+    /// that puts the task into `TASK_UNINTERRUPTIBLE` contributes:
     /// swap-in, page-fault resolution, disk I/O, plus
     /// mutex/rwsem/completion waits inside kernel code that
-    /// hold the task off the runqueue. `block_sum - iowait_sum`
-    /// is therefore an UPPER BOUND on non-iowait
-    /// involuntary-block time — swap/zswap decompression
-    /// contributes, but so do the lock-family waits, so the
-    /// delta cannot be read as swap latency without further
-    /// attribution.
+    /// hold the task off the runqueue. Populated from
+    /// `/proc/<tid>/sched`'s `sum_block_runtime` key (kernel
+    /// emits `ms.ns_remainder` via `PN_SCHEDSTAT`; the parser
+    /// reconstructs full ns). `block_sum - iowait_sum` is
+    /// therefore an UPPER BOUND on non-iowait involuntary-block
+    /// time — swap/zswap decompression contributes, but so do
+    /// the lock-family waits, so the delta cannot be read as
+    /// swap latency without further attribution. There is no
+    /// `block_count` counterpart: the kernel does not emit one.
     pub block_sum: u64,
-    pub block_count: u64,
-    /// Total time in I/O wait specifically (subset of
+    /// Total nanoseconds in I/O wait specifically (subset of
     /// `block_sum`). Distinguishes disk-backed I/O delay from
     /// the full involuntary-block total — callers that want
     /// disk latency alone read this field, callers that want
-    /// every blocked window read `block_sum`.
+    /// every blocked window read `block_sum`. Populated from
+    /// `/proc/<tid>/sched`'s `iowait_sum` key (kernel emits
+    /// `ms.ns_remainder` via `PN_SCHEDSTAT`; the parser
+    /// reconstructs full ns).
     pub iowait_sum: u64,
     pub iowait_count: u64,
 
@@ -1025,9 +1036,44 @@ struct SchedFields {
     wait_count: Option<u64>,
     sleep_sum: Option<u64>,
     block_sum: Option<u64>,
-    block_count: Option<u64>,
     iowait_sum: Option<u64>,
     iowait_count: Option<u64>,
+}
+
+/// Parse a `PN_SCHEDSTAT`-emitted dotted nanosecond value into
+/// full ns. The kernel formats schedstat fractional fields via
+/// `__PSN(S, F) SEQ_printf(m, "%-45s:%14Ld.%06ld\n", S, SPLIT_NS(F))`
+/// where `SPLIT_NS(x) = (x / 1_000_000, x % 1_000_000)` — the
+/// integer part is MILLISECONDS, the 6-digit fractional part is
+/// the NANOSECOND remainder within a millisecond. Reconstructing
+/// the original ns value is `ms * 1_000_000 + ns_remainder`.
+///
+/// Tolerates fractional widths other than 6 (some test fixtures
+/// emit `5000.25` or `7.999`) by zero-padding the right side
+/// before parsing — `.25` becomes `.250000` (=250_000 ns), `.999`
+/// becomes `.999000` (=999_000 ns). Truncates fractional widths
+/// >6 to the first 6 digits.
+///
+/// Returns `None` for unparseable input (negative integer part,
+/// non-numeric, overflow). Negative integer parts (kernel emits
+/// `-5.000000` for a negative SPLIT_NS via `%Ld`) collapse to
+/// None at the SchedFields layer; the capture site
+/// `unwrap_or(0)`s these into the absent-counter zero per the
+/// best-effort capture contract.
+///
+/// The bare-integer (no dot) branch parses the value as raw ns
+/// — used for test fixtures and graceful degradation; the
+/// kernel's PN_SCHEDSTAT format always emits the dotted form.
+fn parsed_ns_from_dotted(value: &str) -> Option<u64> {
+    if let Some((ms_str, ns_str)) = value.split_once('.') {
+        let ms = ms_str.trim().parse::<u64>().ok()?;
+        let ns_part: String = ns_str.chars().take(6).collect();
+        let padded = format!("{:0<6}", ns_part);
+        let ns = padded.parse::<u64>().ok()?;
+        ms.checked_mul(1_000_000)?.checked_add(ns)
+    } else {
+        value.trim().parse::<u64>().ok()
+    }
 }
 
 /// Parse `/proc/<tgid>/task/<tid>/sched`. Requires
@@ -1037,10 +1083,12 @@ struct SchedFields {
 /// or bare names. The reader matches on the LAST dot-delimited
 /// segment to absorb that variation.
 ///
-/// Some fields (`wait_sum`, `sleep_sum`) are fractional on
-/// newer kernels — parsed as `u64` first, falling back to
-/// `f64` truncation so a `wait_sum : 123.456` line still
-/// contributes the integer part.
+/// PN_SCHEDSTAT fields (`wait_sum`, `sum_sleep_runtime`,
+/// `sum_block_runtime`, `iowait_sum`) emit a `ms.ns_remainder`
+/// dotted format — reconstructed to full ns via
+/// [`parsed_ns_from_dotted`]. P_SCHEDSTAT fields
+/// (`wait_count`, `iowait_count`, `nr_wakeups*`,
+/// `nr_migrations`) emit plain integers — parsed as `u64`.
 fn parse_sched(raw: &str) -> SchedFields {
     let mut out = SchedFields::default();
     for line in raw.lines() {
@@ -1051,12 +1099,6 @@ fn parse_sched(raw: &str) -> SchedFields {
         let value = value.trim();
         let short = key.rsplit('.').next().unwrap_or(key);
         let parsed_u64 = || value.parse::<u64>().ok();
-        let parsed_u64_lossy = || {
-            value
-                .parse::<u64>()
-                .ok()
-                .or_else(|| value.parse::<f64>().ok().map(|f| f.max(0.0) as u64))
-        };
         match short {
             "nr_wakeups" => out.nr_wakeups = parsed_u64(),
             "nr_wakeups_local" => out.nr_wakeups_local = parsed_u64(),
@@ -1065,7 +1107,7 @@ fn parse_sched(raw: &str) -> SchedFields {
             "nr_wakeups_migrate" => out.nr_wakeups_migrate = parsed_u64(),
             "nr_wakeups_idle" => out.nr_wakeups_idle = parsed_u64(),
             "nr_migrations" => out.nr_migrations = parsed_u64(),
-            "wait_sum" => out.wait_sum = parsed_u64_lossy(),
+            "wait_sum" => out.wait_sum = parsed_ns_from_dotted(value),
             "wait_count" => out.wait_count = parsed_u64(),
             // Kernel emits `sum_sleep_runtime` (see
             // `kernel/sched/debug.c` -> `proc_sched_show_task`); the
@@ -1074,10 +1116,15 @@ fn parse_sched(raw: &str) -> SchedFields {
             // The kernel does not emit a `sleep_count` counterpart;
             // `nr_wakeups` (matched above) covers the wake-side
             // event tally.
-            "sum_sleep_runtime" => out.sleep_sum = parsed_u64_lossy(),
-            "block_sum" => out.block_sum = parsed_u64_lossy(),
-            "block_count" => out.block_count = parsed_u64(),
-            "iowait_sum" => out.iowait_sum = parsed_u64_lossy(),
+            "sum_sleep_runtime" => out.sleep_sum = parsed_ns_from_dotted(value),
+            // Kernel emits `sum_block_runtime`; the matching
+            // ThreadState field is `block_sum` for symmetry with
+            // the other `*_sum` fields. There is no `block_count`
+            // counterpart from the kernel — the schedstat printout
+            // pairs `wait_sum/wait_count` and `iowait_sum/iowait_count`
+            // but `sum_block_runtime` has no per-event counter.
+            "sum_block_runtime" => out.block_sum = parsed_ns_from_dotted(value),
+            "iowait_sum" => out.iowait_sum = parsed_ns_from_dotted(value),
             "iowait_count" => out.iowait_count = parsed_u64(),
             _ => {}
         }
@@ -1220,7 +1267,6 @@ pub fn capture_thread_at(
         wait_count: sched.wait_count.unwrap_or(0),
         sleep_sum: sched.sleep_sum.unwrap_or(0),
         block_sum: sched.block_sum.unwrap_or(0),
-        block_count: sched.block_count.unwrap_or(0),
         iowait_sum: sched.iowait_sum.unwrap_or(0),
         iowait_count: sched.iowait_count.unwrap_or(0),
         allocated_bytes: 0,
@@ -2088,7 +2134,10 @@ mod tests {
         assert_eq!(f.nr_wakeups, Some(1000));
         assert_eq!(f.nr_migrations, Some(42));
         assert_eq!(f.nr_wakeups_local, Some(600));
-        assert_eq!(f.wait_sum, Some(12345));
+        // PN_SCHEDSTAT format: ms.ns_remainder. `12345.678`
+        // pads `.678` → `.678000` (= 678_000 ns), then
+        // 12345 * 1_000_000 + 678_000 = 12_345_678_000 ns.
+        assert_eq!(f.wait_sum, Some(12_345_678_000));
     }
 
     #[test]
@@ -2654,8 +2703,7 @@ mod tests {
              wait_sum                                       :    5000.25\n\
              wait_count                                     :         15\n\
              sum_sleep_runtime                              :    3200.50\n\
-             block_sum                                      :    1100.75\n\
-             block_count                                    :          2\n\
+             sum_block_runtime                              :    1100.75\n\
              iowait_sum                                     :       77.0\n\
              iowait_count                                   :         18\n";
         fs::write(task_dir.join("sched"), sched).unwrap();
@@ -2784,16 +2832,30 @@ mod tests {
         assert_eq!(t.nr_wakeups_migrate, 1);
         assert_eq!(t.nr_wakeups_idle, 4);
         assert_eq!(t.nr_migrations, 9);
-        assert_eq!(t.wait_sum, 5000, "fractional 5000.25 truncates to 5000");
+        // PN_SCHEDSTAT format is ms.ns_remainder. Reconstructed
+        // ns = ms_part * 1_000_000 + zero-right-padded ns_part.
+        // `5000.25` → `.25` pads to `.250000` (=250_000 ns) +
+        // 5000ms × 1_000_000 = 5_000_250_000 ns total.
+        assert_eq!(
+            t.wait_sum, 5_000_250_000,
+            "PN_SCHEDSTAT 5000.25 reconstructs to 5_000_250_000 ns \
+             (5000ms + 250_000ns)",
+        );
         assert_eq!(t.wait_count, 15);
         assert_eq!(
-            t.sleep_sum, 3200,
-            "fractional 3200.50 truncates to 3200 — sleep_sum is \
-             populated from the kernel's `sum_sleep_runtime` key",
+            t.sleep_sum, 3_200_500_000,
+            "PN_SCHEDSTAT 3200.50 reconstructs to 3_200_500_000 ns; \
+             sleep_sum is populated from the kernel's `sum_sleep_runtime` key",
         );
-        assert_eq!(t.block_sum, 1100, "fractional 1100.75 truncates to 1100");
-        assert_eq!(t.block_count, 2);
-        assert_eq!(t.iowait_sum, 77, "fractional 77.0 truncates to 77");
+        assert_eq!(
+            t.block_sum, 1_100_750_000,
+            "PN_SCHEDSTAT 1100.75 reconstructs to 1_100_750_000 ns; \
+             block_sum is populated from the kernel's `sum_block_runtime` key",
+        );
+        assert_eq!(
+            t.iowait_sum, 77_000_000,
+            "PN_SCHEDSTAT 77.0 reconstructs to 77_000_000 ns",
+        );
         assert_eq!(t.iowait_count, 18);
 
         // jemalloc TSD counters: synthetic procfs has no real ELF
@@ -3011,13 +3073,16 @@ mod tests {
     // H4 — parse_sched every-field coverage + parse fallbacks
     // ------------------------------------------------------------
 
-    /// Populated `/proc/<tid>/sched` with every one of the 14
+    /// Populated `/proc/<tid>/sched` with every one of the 13
     /// fields parse_sched recognises. Ordering mixed (sync before
     /// local, migrate before idle) so the test doesn't pin a
     /// single-pass scan order that the helper doesn't actually
-    /// promise.
+    /// promise. Integer-only PN_SCHEDSTAT values (no fractional
+    /// part) parse via the no-dot branch of `parsed_ns_from_dotted`
+    /// — interpreted as plain ns counts — so the values pass
+    /// through unchanged.
     #[test]
-    fn parse_sched_populates_all_fourteen_fields() {
+    fn parse_sched_populates_all_thirteen_fields() {
         let raw = "\
              se.statistics.nr_wakeups                       :         11\n\
              se.statistics.nr_wakeups_sync                  :          2\n\
@@ -3029,8 +3094,7 @@ mod tests {
              wait_sum                                       :       500\n\
              wait_count                                     :         15\n\
              sum_sleep_runtime                              :       320\n\
-             block_sum                                      :       110\n\
-             block_count                                    :          2\n\
+             sum_block_runtime                              :       110\n\
              iowait_sum                                     :         77\n\
              iowait_count                                   :         18\n";
         let s = parse_sched(raw);
@@ -3048,38 +3112,52 @@ mod tests {
             Some(320),
             "sleep_sum reads the kernel's `sum_sleep_runtime` key",
         );
-        assert_eq!(s.block_sum, Some(110));
-        assert_eq!(s.block_count, Some(2));
+        assert_eq!(
+            s.block_sum,
+            Some(110),
+            "block_sum reads the kernel's `sum_block_runtime` key",
+        );
         assert_eq!(s.iowait_sum, Some(77));
         assert_eq!(s.iowait_count, Some(18));
     }
 
-    /// Fractional-parse fallback — newer kernels emit
-    /// `wait_sum/sleep_sum/block_sum/iowait_sum` as floats;
-    /// parse_sched first tries u64, then falls back to
-    /// f64-truncate. The integer part survives.
+    /// Dotted PN_SCHEDSTAT fractional values reconstruct full ns
+    /// via `ms * 1_000_000 + zero-right-padded ns_remainder`.
+    /// Pins the helper for varying fractional widths (1, 2, and
+    /// 3 digits past the dot — all zero-pad to 6).
     #[test]
-    fn parse_sched_fractional_fields_truncate_to_integer() {
+    fn parse_sched_fractional_fields_reconstruct_ns() {
         let raw = "\
              wait_sum                                       :    1234.5\n\
              sum_sleep_runtime                              :     678.9\n\
-             block_sum                                      :      42.1\n\
+             sum_block_runtime                              :      42.1\n\
              iowait_sum                                     :       7.999\n";
         let s = parse_sched(raw);
-        assert_eq!(s.wait_sum, Some(1234));
-        assert_eq!(s.sleep_sum, Some(678));
-        assert_eq!(s.block_sum, Some(42));
-        assert_eq!(s.iowait_sum, Some(7));
+        // 1234.5 → .5 pads to .500000 (=500_000) + 1234ms = 1_234_500_000 ns
+        assert_eq!(s.wait_sum, Some(1_234_500_000));
+        // 678.9 → .9 pads to .900000 (=900_000) + 678ms = 678_900_000 ns
+        assert_eq!(s.sleep_sum, Some(678_900_000));
+        // 42.1 → .1 pads to .100000 (=100_000) + 42ms = 42_100_000 ns
+        assert_eq!(s.block_sum, Some(42_100_000));
+        // 7.999 → .999 pads to .999000 (=999_000) + 7ms = 7_999_000 ns
+        assert_eq!(s.iowait_sum, Some(7_999_000));
     }
 
-    /// Fractional fallback must clamp negatives to 0 — f64::as u64
-    /// on a negative value is UB-adjacent, so the helper uses
-    /// `.max(0.0) as u64`. Pins that clamp.
+    /// `parsed_ns_from_dotted` rejects negative integer parts —
+    /// `u64` parse fails on `-5`. The capture site
+    /// `unwrap_or(0)`s these into the absent-counter zero per the
+    /// best-effort capture contract, so a kernel that emits a
+    /// negative SPLIT_NS (rare; can happen for clock skew on
+    /// suspend/resume) does not pollute downstream metrics.
     #[test]
-    fn parse_sched_negative_fractional_clamps_to_zero() {
+    fn parse_sched_negative_value_returns_none() {
         let raw = "wait_sum                                       :   -5.0\n";
         let s = parse_sched(raw);
-        assert_eq!(s.wait_sum, Some(0));
+        assert_eq!(
+            s.wait_sum, None,
+            "negative ms part fails u64 parse → None; downstream \
+             unwrap_or(0) collapses this to absent-counter zero",
+        );
     }
 
     /// Bare-key names (no `se.statistics.` prefix) must still

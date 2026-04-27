@@ -214,21 +214,17 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         unit: "ns",
         rule: AggRule::Sum(|t| t.sleep_sum),
     },
-    // No `sleep_count` metric: the kernel does not emit
-    // that counter. The prior entry matched a ghost field
-    // that never populated; removed alongside the parser
-    // key fix (`sum_sleep_runtime` is the real key for
-    // sleep_sum, and there is no per-event counter pair).
+    // No `sleep_count` metric: the kernel does not emit that
+    // counter — the wake-side tally is captured by `nr_wakeups`
+    // already.
     HostStateMetricDef {
         name: "block_sum",
         unit: "ns",
         rule: AggRule::Sum(|t| t.block_sum),
     },
-    HostStateMetricDef {
-        name: "block_count",
-        unit: "",
-        rule: AggRule::Sum(|t| t.block_count),
-    },
+    // No `block_count` metric: the kernel emits no per-event
+    // counter for `sum_block_runtime` (unlike `wait_sum/wait_count`
+    // and `iowait_sum/iowait_count` pairs).
     HostStateMetricDef {
         name: "iowait_sum",
         unit: "ns",
