@@ -203,7 +203,29 @@ enum Command {
     /// does not bias the reading — a diff between two captures
     /// measures exactly the activity over the window.
     ///
-    /// `compare` joins two snapshots on `(pcomm, comm)` and
+    /// Memory fields (`allocated_bytes` / `deallocated_bytes`)
+    /// are JEMALLOC-ONLY: they read the per-thread
+    /// `tsd_s.thread_allocated` / `thread_deallocated` TSD
+    /// counters via ptrace + `process_vm_readv`. Targets not
+    /// linked against jemalloc, or for which the probe attach
+    /// fails, land their threads at zero per the best-effort
+    /// capture contract. Other allocators (glibc malloc, mimalloc)
+    /// expose no equivalent per-thread counter the capture
+    /// pipeline can reach.
+    ///
+    /// PRIVILEGE: capture pulls the jemalloc counters by briefly
+    /// stopping every probed thread via `ptrace(PTRACE_SEIZE)`
+    /// (an unavoidable observer effect; the stop is bounded to a
+    /// handful of milliseconds per thread). `PTRACE_SEIZE` requires
+    /// root, the `CAP_SYS_PTRACE` capability, OR a host configured
+    /// with `kernel.yama.ptrace_scope=0`. When the attach is
+    /// denied, the probe falls through to the absent-counter
+    /// default of zero — the rest of the snapshot still populates.
+    /// See the capture summary line for a per-snapshot tally and
+    /// remediation hint.
+    ///
+    /// `compare` joins two snapshots on the selected grouping
+    /// axis (pcomm, cgroup, or comm — see `--group-by`) and
     /// renders a per-metric baseline/candidate/delta table.
     HostState {
         #[command(subcommand)]
@@ -250,6 +272,109 @@ enum HostStateCommand {
     /// CSW / page faults / io bytes / affinity / cgroup / identity.
     /// Per-cgroup aggregates (cpu.stat, memory.current) are
     /// captured once per distinct path.
+    ///
+    /// Memory fields are JEMALLOC-ONLY (per-thread TSD
+    /// `thread_allocated` / `thread_deallocated` counters); other
+    /// allocators land at zero. Capture briefly stops every probed
+    /// thread via ptrace (observer effect, bounded ms per thread)
+    /// and therefore needs root, `CAP_SYS_PTRACE`, or
+    /// `kernel.yama.ptrace_scope=0` to pull the jemalloc counters.
+    /// Without the privilege, the rest of the snapshot still
+    /// populates and the jemalloc fields fall through to zero.
+    ///
+    /// PROBE SUMMARY LINE: capture emits a single info-level
+    /// `tracing` event per snapshot summarising probe outcomes. The
+    /// default tracing config writes to stderr, so the line lands
+    /// alongside any other capture-time diagnostics; `RUST_LOG=warn`
+    /// suppresses it (alongside other info), `RUST_LOG=debug`
+    /// reveals the per-tgid attach events that feed it.
+    ///
+    /// Format depends on whether any per-tgid failures landed:
+    ///
+    /// 1. No failures —
+    ///    `host-state probe: <N> tgids walked, <N> jemalloc detected,
+    ///    <N> probed OK, 0 failed`
+    /// 2. Failures, ptrace not dominant —
+    ///    `... <N> failed (dominant: <tag>)`
+    /// 3. Failures, ptrace dominates (≥50% of failures attributable
+    ///    to `ptrace-seize` or `ptrace-interrupt`) —
+    ///    `... <N> failed (dominant: <tag>; hint: re-run as root, or
+    ///    sudo setcap cap_sys_ptrace+eip $(which ktstr), or set
+    ///    kernel.yama.ptrace_scope=0)`
+    ///
+    /// "tgids walked" counts every live tgid the procfs walk reached
+    /// (the snapshot's full denominator); "jemalloc detected" counts
+    /// the subset that successfully attached the TSD probe; "probed
+    /// OK" counts per-thread reads that returned a counter pair;
+    /// "failed" counts attach-or-probe failures whose tag is
+    /// classified ACTIONABLE — see filter rule below — so a busy
+    /// host typically reports `failed` ≪ (`tgids walked` − `jemalloc
+    /// detected`) because the bulk of the system is not jemalloc-
+    /// linked and that case does not count as a failure.
+    ///
+    /// ACTIONABLE TAGS (operator-facing causes for the
+    /// `(dominant: <tag>)` clause):
+    ///
+    /// Pre-thread (attach-time) failures:
+    /// - `pid-missing` — `/proc/<pid>` does not exist or is
+    ///   unreachable; possible race-with-exit between enumeration
+    ///   and attach.
+    /// - `maps-read-failure` — `/proc/<pid>/maps` could not be read;
+    ///   possible race-with-exit, uid mismatch, or sandbox/namespace
+    ///   restriction.
+    /// - `jemalloc-in-dso` — target's jemalloc symbol resides in a
+    ///   shared object (e.g. `libjemalloc.so`). Static-TLS resolution
+    ///   only reaches the main executable; DSO-linked jemalloc needs
+    ///   DTV walking the engine does not implement yet.
+    /// - `arch-mismatch` — target ELF arch differs from the probe
+    ///   binary's. ptrace is same-arch only; rebuild the probe for
+    ///   the target's arch (or filter the offending tgids).
+    /// - `dwarf-parse-failure` — target binary is stripped without
+    ///   reachable external debuginfo, debuglink CRC mismatched, or
+    ///   the `tsd_s` struct / its member fields are absent from the
+    ///   DWARF. Install matching `-debuginfo` / `-dbg` packages.
+    ///
+    /// Per-thread (probe-time) failures:
+    /// - `ptrace-seize` — `PTRACE_SEIZE` rejected by the kernel.
+    ///   ESRCH is benign (thread exited mid-snapshot); EPERM is the
+    ///   privilege case the EPERM hint targets; EBUSY means another
+    ///   tracer is attached.
+    /// - `ptrace-interrupt` — `PTRACE_INTERRUPT` failed after a
+    ///   successful seize. Race causes — privilege is already
+    ///   established by the preceding successful seize. ESRCH (target
+    ///   died between seize and interrupt) is the dominant case.
+    /// - `waitpid` — `waitpid` after `PTRACE_INTERRUPT` returned an
+    ///   unexpected status, a syscall error, or the post-interrupt
+    ///   stop did not arrive within 250ms.
+    /// - `get-regset` — `PTRACE_GETREGSET` failed when reading the
+    ///   thread pointer. Race causes — privilege established. ESRCH
+    ///   (target died mid-probe) is the dominant case.
+    /// - `process-vm-readv` — `process_vm_readv` failed or returned
+    ///   a short read at the resolved TSD address. Investigate
+    ///   target memory protection or a corrupted TSD.
+    /// - `tls-arithmetic` — TLS-address arithmetic over- or
+    ///   underflowed. Indicates a malformed TLS image — file a bug
+    ///   with the target binary's identity.
+    ///
+    /// FILTER RULE — two AttachError tags are NOT actionable and are
+    /// suppressed from both the per-tgid `tracing::warn!` log and
+    /// the `(dominant: <tag>)` clause:
+    ///
+    /// - `jemalloc-not-found` — target is not jemalloc-linked, OR
+    ///   links a jemalloc build whose symbol-name prefix is not in
+    ///   the recognized set. The dominant outcome on most system
+    ///   processes.
+    /// - `readlink-failure` — `readlink(/proc/<pid>/exe)` failed.
+    ///   Typically a race-with-exit between enumeration and the
+    ///   per-tgid attach, OR permission denied under the active
+    ///   ptrace policy.
+    ///
+    /// Filtered tags do NOT contribute to the `failed` counter, so a
+    /// snapshot whose only "failures" are these two will emit the
+    /// no-failure variant of the line (no `(dominant: ...)` clause).
+    /// If the operator sees no `(dominant: ...)` clause despite many
+    /// non-jemalloc tgids on the host, that is correct: the noise
+    /// floor was filtered.
     Capture {
         /// Destination path (convention: `.hst.zst`).
         #[arg(short, long)]

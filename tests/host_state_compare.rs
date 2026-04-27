@@ -8,7 +8,7 @@
 //! non-zero deltas.
 //!
 //! The fixtures are synthetic (no VM) because the capture-side
-//! implementation lands in parallel. Once `ktstr host-state -o`
+//! implementation lands in parallel. Once `ktstr host-state capture -o`
 //! is wired end-to-end, a VM-backed integration test will run
 //! the same toy workload twice through real capture and
 //! compare the real snapshots; that test is tracked separately.
@@ -73,7 +73,8 @@ fn compare_options(group_by: GroupBy, flatten: Vec<String>) -> CompareOptions {
 ///
 /// Baseline and candidate differ in `run_time_ns` and
 /// `voluntary_csw` so the renderer's delta path is exercised;
-/// they share `(pcomm, comm)` so the join matches them.
+/// they share both pcomm and comm so they group together
+/// under any GroupBy axis.
 #[test]
 fn full_pipeline_with_disk_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
@@ -205,7 +206,7 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
     let diff = compare(&loaded_a, &loaded_b, &opts);
     assert!(
         diff.only_baseline.is_empty() && diff.only_candidate.is_empty(),
-        "flatten failed to join: only_a={:?} only_b={:?}",
+        "flatten failed to group: only_a={:?} only_b={:?}",
         diff.only_baseline,
         diff.only_candidate,
     );

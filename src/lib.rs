@@ -124,22 +124,45 @@
 //! - [`cache`] -- kernel image cache (XDG directories, metadata, atomic writes)
 //! - [`cgroup`] -- cgroup v2 filesystem operations
 //! - [`cli`] -- shared helpers backing the `ktstr` and `cargo-ktstr` binaries
+//! - [`fetch`] -- kernel tarball and git source acquisition
+//! - [`flock`] -- advisory file-locking primitives used by cache + LLC reservations
+//! - [`kernel_path`] -- kernel ID parsing and filesystem image discovery
+//! - [`remote_cache`] -- GitHub Actions cache integration
 //! - [`runner`] -- host-side scenario runner used by `ktstr run`
 //! - [`scenario`] -- declarative ops API (`CgroupDef`, `Step`, `Op`, `Backdrop`, `execute_defs`, `execute_steps`, `execute_scenario`)
 //! - [`scenario::scenarios`] -- curated canned scenarios for common patterns
 //! - [`mod@assert`] -- pass/fail assertions (starvation, isolation, fairness)
-//! - [`workload`] -- worker process types and telemetry collection
-//! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
-//! - [`kernel_path`] -- kernel ID parsing and filesystem image discovery
-//! - [`verifier`] -- BPF verifier log parsing, cycle detection, and output formatting
 //! - [`test_support`] -- `#[ktstr_test]` runtime and registration
-//! - [`fetch`] -- kernel tarball and git source acquisition
-//! - [`remote_cache`] -- GitHub Actions cache integration
+//! - [`topology`] -- CPU topology abstraction (LLCs, NUMA nodes)
+//! - [`verifier`] -- BPF verifier log parsing, cycle detection, and output formatting
+//! - [`worker_ready`] / [`worker_ready_wait`] -- pid-scoped marker file the alloc/test workers write before the parent samples them
+//! - [`workload`] -- worker process types and telemetry collection
 //!
-//! Internal modules (not re-exported): `monitor` reads live guest
-//! state, `probe` attaches BPF probes to traced functions, `vmm`
-//! owns the KVM VM lifecycle, and `timeline` correlates stimulus
-//! events with monitor samples for phase-aligned reporting.
+//! ## Host-state subsystem
+//!
+//! Per-thread + per-process runtime profile, captured via
+//! `ktstr host-state capture` and compared via
+//! `ktstr host-state compare`:
+//!
+//! - [`host_context`] -- one-shot host snapshot (kernel, CPU, memory, tunables)
+//! - [`host_heap`] -- jemalloc global heap counters (mallctl)
+//! - [`host_state`] -- per-thread procfs walk + cumulative scheduling, I/O, page-fault, jemalloc TSD counters
+//! - [`host_state_compare`] -- two-snapshot diff engine (group-by + delta tables)
+//!
+//! `host_thread_probe` (the ELF/DWARF + ptrace + `process_vm_readv`
+//! engine that pulls per-thread jemalloc TSD counters) is
+//! `pub(crate)`-only and consumed exclusively by `host_state` plus
+//! the source-shared standalone `ktstr-jemalloc-probe` binary.
+//! Direct probe access from downstream is intentionally not part
+//! of the surface — scheduler authors get the captured counters
+//! through `host_state::ThreadState`.
+//!
+//! Internal modules (not re-exported): `host_thread_probe` reads
+//! per-thread jemalloc TSD counters via ptrace, `monitor` reads
+//! live guest state, `probe` attaches BPF probes to traced
+//! functions, `vmm` owns the KVM VM lifecycle, and `timeline`
+//! correlates stimulus events with monitor samples for
+//! phase-aligned reporting.
 
 // `#[derive(Payload)]` and `#[derive(Scheduler)]` expand into
 // `::ktstr::test_support::...` paths so downstream crates can use
@@ -321,6 +344,7 @@ pub mod host_context;
 pub mod host_heap;
 pub mod host_state;
 pub mod host_state_compare;
+pub(crate) mod host_thread_probe;
 pub mod kernel_path;
 pub(crate) mod monitor;
 pub(crate) mod probe;

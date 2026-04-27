@@ -90,7 +90,7 @@ it does not build or run on other platforms.
 **Required:**
 
 - Linux host with `/dev/kvm`
-- Rust >= 1.95 (stable, pinned via `rust-toolchain.toml`)
+- Rust >= 1.94.1 (stable, pinned via `rust-toolchain.toml`)
 - clang (BPF skeleton compilation)
 - pkg-config, make, gcc
 - autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
@@ -355,7 +355,9 @@ ktstr kernel build --source ../linux
 ktstr kernel build --git URL --ref v6.14
 ktstr kernel clean --keep 3
 ktstr host-state capture --output baseline.hst.zst         # snapshot every live thread's counters
-ktstr host-state compare baseline.hst.zst candidate.hst.zst # diff two snapshots on (pcomm, comm)
+# host-state capture pulls per-thread jemalloc counters via ptrace; needs root,
+# `sudo setcap cap_sys_ptrace+eip $(which ktstr)`, or `kernel.yama.ptrace_scope=0`
+ktstr host-state compare baseline.hst.zst candidate.hst.zst # diff two snapshots on the selected grouping axis
 ktstr completions bash
 ```
 

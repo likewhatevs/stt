@@ -3,7 +3,7 @@
 //!
 //! Design summary: the per-thread profiler emits
 //! one snapshot per run. Comparison groups threads within each
-//! snapshot by `(pcomm, comm)` (or by cgroup / comm, see
+//! snapshot by a single axis (pcomm, cgroup, or comm — see
 //! [`GroupBy`]), aggregates every metric per the rule on its
 //! [`HostStateMetricDef`], then matches groups across the two
 //! snapshots and emits one row per `(group, metric)` pair. Groups
@@ -759,9 +759,9 @@ fn format_cpu_range(cpus: &[u32]) -> String {
 /// Arguments for the `ktstr host-state compare` subcommand.
 #[derive(Debug, clap::Args)]
 pub struct HostStateCompareArgs {
-    /// Baseline snapshot (`.hst.zst`) from `ktstr host-state -o`.
+    /// Baseline snapshot (`.hst.zst`) from `ktstr host-state capture -o`.
     pub baseline: std::path::PathBuf,
-    /// Candidate snapshot (`.hst.zst`) from `ktstr host-state -o`.
+    /// Candidate snapshot (`.hst.zst`) from `ktstr host-state capture -o`.
     pub candidate: std::path::PathBuf,
     /// Grouping key. `pcomm` (default) aggregates per process
     /// name; `cgroup` per cgroup path; `comm` per thread name
@@ -769,8 +769,8 @@ pub struct HostStateCompareArgs {
     #[arg(long, value_enum, default_value_t = GroupBy::Pcomm)]
     pub group_by: GroupBy,
     /// Glob patterns that collapse dynamic cgroup path segments
-    /// so structurally-equivalent cgroups across runs join
-    /// correctly. Example:
+    /// so structurally-equivalent cgroups across runs group
+    /// together. Example:
     /// `--cgroup-flatten '/kubepods/*/workload'` treats different
     /// pod IDs as the same group. Repeatable.
     #[arg(long)]
@@ -966,6 +966,7 @@ mod tests {
             host: None,
             threads,
             cgroup_stats: BTreeMap::new(),
+            probe_summary: None,
         }
     }
 

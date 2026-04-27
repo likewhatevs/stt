@@ -2,34 +2,98 @@
 //!
 //! [`HostStateSnapshot`] is the serialized container for a single
 //! host-wide per-thread profile. Capture produces one via the
-//! `ktstr host-state -o snapshot.hst.zst` subcommand; comparison
-//! reads two and joins them on `(pcomm, comm)`.
+//! `ktstr host-state capture -o snapshot.hst.zst` subcommand;
+//! comparison reads two and joins them on the selected grouping
+//! axis (pcomm, cgroup, or comm).
 //!
 //! Every field is cumulative-from-birth so probe timing does not
 //! alter the output: the design principle is that a thread sampled
 //! twice at different wall-clock instants produces the same numbers
-//! so long as its cumulative counters have not rolled over. Metrics
-//! that reset on attachment (perf_event_open counters, etc.) are
-//! intentionally absent from this capture layer.
+//! so long as its cumulative counters have not rolled over. The
+//! jemalloc per-thread TSD counters
+//! (`tsd_s.thread_allocated` / `thread_deallocated`) jemalloc
+//! maintains unconditionally on its alloc/dalloc fast and slow
+//! paths, so the ptrace-based attach this layer performs does not
+//! perturb them; counters previously accumulated remain valid
+//! across the brief stop the attach induces. Metrics not derivable
+//! from cumulative state (e.g. perf_event_open counters that reset
+//! on attachment) are intentionally absent from this capture layer.
 //!
 //! # Capture model
 //!
 //! [`capture`] walks `/proc` for every live tgid, enumerates its
 //! threads, and populates each [`ThreadState`] from a handful of
 //! procfs sources: `stat`, `schedstat`, `status`, `io`, `sched`,
-//! `comm`, `cgroup`. Each internal reader returns `Option`
-//! (graceful on missing/unreadable — a kernel without
-//! `CONFIG_SCHEDSTATS` or `CONFIG_SCHED_DEBUG` yields `None` from
-//! the affected reader without failing the rest of the thread).
-//! The assembled [`ThreadState`] treats `None` as "absent at
-//! capture" via the field type — counters collapse to `0`,
-//! identity strings collapse to empty, affinity collapses to an
-//! empty vec. A missing reading is therefore indistinguishable
-//! from a genuine zero in the serialized output; the capture
-//! contract is best-effort, never-fail-the-snapshot. Tests that
-//! need stronger guarantees inspect the underlying readers
-//! directly (they remain `Option`-shaped, unit-tested in this
-//! module).
+//! `comm`, `cgroup`. The procfs walk runs sequentially per tid in
+//! [`capture_with`] phase 2; phase 1 attaches the jemalloc TSD
+//! probe in parallel across tgids (see "Probe wiring" below).
+//!
+//! ## Probe wiring (most-expensive step)
+//!
+//! For every tgid the walk reaches, the capture pipeline calls
+//! the `pub(crate)` `host_thread_probe::attach_jemalloc_at` (or
+//! its default-root `attach_jemalloc` wrapper) to resolve the
+//! target's jemalloc TLS symbol + per-`tsd_s` field offsets via
+//! an ELF parse and DWARF walk; per-thread counter reads then
+//! dispatch through `host_thread_probe::probe_thread` for one
+//! ptrace cycle: seize → interrupt → waitpid → getregset →
+//! `process_vm_readv` → detach (the detach happens automatically
+//! via the `ScopeDetach` Drop guard, so any fallible step still
+//! leaves the target unstuck). The remote read pulls a
+//! contiguous 24-byte counter span — the canonical jemalloc
+//! `TSD_DATA_FAST` layout (allocated, fast-event slot,
+//! deallocated) — but the byte count is computed dynamically by
+//! `combined_read_span` from the DWARF-resolved field offsets, so
+//! a future jemalloc layout change is absorbed. This is the
+//! dominant wall-clock cost of a snapshot:
+//! O(unique-exe-inode tgids) ELF parses + O(jemalloc-linked
+//! tgids) DWARF walks + O(threads of jemalloc-linked tgids)
+//! ptrace cycles. The first term covers non-jemalloc tgids: each
+//! distinct `/proc/<pid>/exe` inode still costs one ELF parse to
+//! discover absence (the inode-keyed cache below collapses
+//! repeats). `attach_jemalloc_at` is the sole detection gate —
+//! tgids that attach successfully populate `allocated_bytes` /
+//! `deallocated_bytes`; tgids that fail attach (not jemalloc-
+//! linked, stripped binary, ptrace denied, arch mismatch — see
+//! `host_thread_probe::AttachError`) land their threads at the
+//! absent-counter default of zero.
+//!
+//! Phase 1 parallelism is gated by host CPU headroom (read from
+//! `<proc_root>/loadavg`, clamped to `[1, num_cpus/2 + 1]`) so the
+//! capture cannot drown a hot host with concurrent ELF reads.
+//! Per-tgid attach results are inode-keyed cached so a fork-bombed
+//! tgid family resolves DWARF once. The per-tgid wrapper
+//! `try_attach_probe_for_tgid_at` records every outcome in a single
+//! `ProbeSummary` tally; `emit_probe_summary` surfaces a single
+//! info-level line per snapshot summarising tgids walked, jemalloc
+//! detected, probed OK, failed, plus the dominant actionable
+//! failure tag and an EPERM remediation hint when ptrace-attach
+//! failures dominate.
+//!
+//! Each internal procfs reader returns `Option` (graceful on
+//! missing/unreadable — a kernel without `CONFIG_SCHEDSTATS` or
+//! `CONFIG_SCHED_DEBUG` yields `None` from the affected reader
+//! without failing the rest of the thread). The assembled
+//! [`ThreadState`] treats `None` as "absent at capture" via the
+//! field type — counters collapse to `0`, identity strings
+//! collapse to empty, affinity collapses to an empty vec. A
+//! missing reading is therefore indistinguishable from a genuine
+//! zero in the serialized output; the capture contract is
+//! best-effort, never-fail-the-snapshot. Tests that need stronger
+//! guarantees inspect the underlying readers directly (they remain
+//! `Option`-shaped, unit-tested in this module).
+//!
+//! # Privilege
+//!
+//! Pulling the jemalloc per-thread TSD counters requires
+//! `ptrace(PTRACE_SEIZE)` against the target. Under
+//! `kernel.yama.ptrace_scope=0` any same-uid process attaches.
+//! Under `=1` (Debian/Ubuntu host default) the tracer must be an
+//! ancestor of the target or carry `CAP_SYS_PTRACE`; `=2` and `=3`
+//! raise the bar further. When attach fails, the per-thread
+//! `allocated_bytes` / `deallocated_bytes` collapse to 0 per the
+//! best-effort contract — the rest of the snapshot still
+//! populates from procfs.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -50,7 +114,7 @@ pub struct HostStateSnapshot {
     /// epoch. Useful as a tie-breaker when comparing two snapshots
     /// that originate from the same host — the newer one is
     /// candidate by default — but carries no load-bearing role in
-    /// the join key.
+    /// any grouping axis.
     pub captured_at_unix_ns: u64,
 
     /// Host context snapshot (kernel, CPU, memory, tunables).
@@ -62,8 +126,7 @@ pub struct HostStateSnapshot {
 
     /// One entry per observed thread on the host at capture time.
     /// Order is not load-bearing; the comparison pipeline groups
-    /// by `(pcomm, comm)` / `cgroup` / `comm` depending on
-    /// `--group-by`.
+    /// by `pcomm` / `cgroup` / `comm` depending on `--group-by`.
     pub threads: Vec<ThreadState>,
 
     /// Enrichment metadata for every cgroup that at least one
@@ -74,29 +137,96 @@ pub struct HostStateSnapshot {
     /// cpu.stat / memory.current describe the cgroup's aggregate
     /// state, not per-thread contribution.
     pub cgroup_stats: BTreeMap<String, CgroupStats>,
+
+    /// Probe outcome statistics for the snapshot, when the probe
+    /// pass ran. `None` indicates the snapshot was assembled
+    /// without the per-tgid jemalloc probe walk (synthetic-tree
+    /// tests pass `use_syscall_affinity=false` to skip it).
+    /// `Some(_)` carries the per-snapshot tally — see
+    /// [`HostStateProbeSummary`] for the curated field set.
+    pub probe_summary: Option<HostStateProbeSummary>,
+}
+
+/// Per-snapshot probe outcome statistics. Curated projection of
+/// the capture pipeline's internal probe tally — exposes the
+/// counters and the dominant failure tag a downstream consumer
+/// needs to decide whether the snapshot's `allocated_bytes` /
+/// `deallocated_bytes` fields are trustworthy on a given host
+/// without parsing the operator-facing tracing line.
+///
+/// The internal probe taxonomy (the per-variant
+/// `host_thread_probe::AttachError` and `ProbeError` enums) is
+/// deliberately NOT mirrored here — it is implementation
+/// detail that may change shape without breaking this contract.
+/// `dominant_failure` carries the operator-facing tag string
+/// (e.g. `"ptrace-seize"`, `"dwarf-parse-failure"`) that the
+/// capture pipeline already surfaces in its tracing summary; the
+/// stable token format is documented in the `ktstr host-state
+/// capture` CLI help.
+///
+/// The four counters are zero when the probe pass reached zero
+/// tgids (e.g. an empty `proc_root`); `dominant_failure` is
+/// `None` when no actionable failures landed.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct HostStateProbeSummary {
+    /// Total tgids the probe pass walked. Equals the number of
+    /// `/proc/<pid>` directories the capture saw, minus the
+    /// calling process's own tgid (which is skipped because
+    /// `PTRACE_SEIZE` rejects self-attach).
+    pub tgids_walked: u64,
+    /// Tgids whose `attach_jemalloc_at` call succeeded — i.e.
+    /// the target was identified as jemalloc-linked, the TSD
+    /// symbol resolved, and the per-`tsd_s` field offsets came
+    /// out of the DWARF walk. A subset of `tgids_walked`.
+    pub jemalloc_detected: u64,
+    /// Per-thread probe reads that returned a counter pair.
+    /// Bounded above by the sum of thread counts across all
+    /// `jemalloc_detected` tgids; per-thread failures (target
+    /// thread exited mid-attach, EPERM, etc.) reduce this count
+    /// below the upper bound.
+    pub probed_ok: u64,
+    /// Attach-or-probe failures whose tag is classified
+    /// ACTIONABLE — see the `ktstr host-state capture` CLI help
+    /// for the full filter rule and tag taxonomy. Routine
+    /// non-actionable outcomes (target not jemalloc-linked,
+    /// `readlink` race-with-exit) do NOT contribute to this
+    /// count.
+    pub failed: u64,
+    /// Tag string for the most-frequent actionable failure across
+    /// all attach-and-probe failures. `None` when `failed == 0`.
+    /// Stable single-word identifiers — the wire contract that
+    /// downstream consumers match against. The full taxonomy is
+    /// documented in the `ktstr host-state capture` CLI help.
+    /// Examples: `"ptrace-seize"`, `"dwarf-parse-failure"`,
+    /// `"jemalloc-in-dso"`.
+    pub dominant_failure: Option<String>,
 }
 
 /// Per-thread cumulative resource profile.
 ///
 /// Populated by the capture layer from `/proc/tid/{sched,status,
 /// io,stat,comm,cgroup}`, `sched_getaffinity`, and (for jemalloc-
-/// linked processes only) the per-thread-destructor TSD cache.
-/// All numeric fields are cumulative since thread birth so the
-/// value is insensitive to probe-attach latency.
+/// linked processes only, via ptrace + `process_vm_readv`) the
+/// per-thread `tsd_s.thread_allocated` / `thread_deallocated` TLS
+/// counters. All numeric fields are cumulative since thread birth
+/// so the value is insensitive to probe-attach latency.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct ThreadState {
     // -- identity --
-    /// Kernel task id. Ephemeral across runs; not used for join.
+    /// Kernel task id. Ephemeral across runs; not used as a
+    /// grouping axis.
     pub tid: u32,
     /// Thread group id (process id). Ephemeral across runs.
     pub tgid: u32,
     /// Process name, read from `/proc/<tgid>/comm`. Stable across
-    /// runs on the same build; part of the comparison join key.
+    /// runs on the same build; the grouping key under
+    /// `--group-by pcomm`.
     pub pcomm: String,
     /// Thread name, read from `/proc/<tid>/comm`. Stable when the
     /// runtime assigns deterministic names (worker pools, async
-    /// runtimes); part of the comparison join key.
+    /// runtimes); the grouping key under `--group-by comm`.
     pub comm: String,
     /// Cgroup v2 path.
     ///
@@ -125,9 +255,6 @@ pub struct ThreadState {
     /// string in the compare pipeline without improving the
     /// semantic guarantee. This doc is the canonical
     /// documentation of the namespace-relative contract.
-    ///
-    /// Enrichment for grouping and filtering views; not a join
-    /// key.
     pub cgroup: String,
     /// `/proc/<tid>/stat` field 22 (`start_time`) in USER_HZ
     /// clock ticks since system boot. The kernel exports this
@@ -135,10 +262,9 @@ pub struct ThreadState {
     /// `include/asm-generic/param.h` as `USER_HZ == 100` on
     /// every architecture the capture layer targets — x86_64
     /// and aarch64) — NOT raw internal jiffies, which scale
-    /// with CONFIG_HZ. The name corrects a prior misnaming:
-    /// cross-host comparison between x86_64 and aarch64 IS
-    /// meaningful because USER_HZ is the same 100 on both, so
-    /// a diff between two hosts on different CONFIG_HZ
+    /// with CONFIG_HZ. Cross-host comparison between x86_64 and
+    /// aarch64 is meaningful because USER_HZ is the same 100 on
+    /// both, so a diff between two hosts on different CONFIG_HZ
     /// settings still compares correctly. Seconds-since-boot
     /// is simply `start_time_clock_ticks / 100` on those
     /// architectures. Other in-tree architectures carry
@@ -182,13 +308,11 @@ pub struct ThreadState {
     pub wait_count: u64,
     /// Total nanoseconds the task slept (voluntary block in
     /// `schedule()` — sleep syscalls, futex wait, etc.). Populated
-    /// from `/proc/<tid>/sched`'s `sum_sleep_runtime` key; earlier
-    /// drafts of this field misnamed the kernel key as `sleep_sum`
-    /// and therefore never populated. There is no `sleep_count`
-    /// counterpart: the kernel does not emit one (the scheduler
-    /// records the aggregate runtime but not the sleep-event count
-    /// separately from `nr_wakeups`, which already covers the
-    /// wake-side tally).
+    /// from `/proc/<tid>/sched`'s `sum_sleep_runtime` key. There
+    /// is no `sleep_count` counterpart: the kernel does not emit
+    /// one — the scheduler records the aggregate runtime but not
+    /// the sleep-event count separately from `nr_wakeups`, which
+    /// already covers the wake-side tally.
     pub sleep_sum: u64,
     /// Total time blocked in the scheduler — every path that
     /// puts the task into `TASK_UNINTERRUPTIBLE` contributes:
@@ -210,15 +334,51 @@ pub struct ThreadState {
     pub iowait_sum: u64,
     pub iowait_count: u64,
 
-    // -- memory (jemalloc TSD; /proc/tid/stat fields 10, 12) --
-    /// Bytes allocated by this thread's lifetime, summed from
-    /// jemalloc's per-thread-destructor cache. Zero for
-    /// processes not linked against jemalloc — the capture
-    /// layer cannot observe glibc's opaque arena counters, and
-    /// a missing value is indistinguishable from a real zero
-    /// rather than a capture failure.
+    // -- jemalloc per-thread TSD counters (tsd_s.thread_allocated / thread_deallocated, via ptrace) --
+    /// Bytes allocated by this thread over its lifetime — read
+    /// directly from jemalloc's per-thread TSD u64 counter
+    /// (`tsd_s.thread_allocated`) via ptrace + `process_vm_readv`.
+    /// Cumulative-from-thread-creation; jemalloc updates the
+    /// per-thread TSD counters unconditionally on its alloc fast
+    /// and slow paths, so attaching the probe late does not lose
+    /// data.
+    ///
+    /// Distinct from [`crate::host_heap::HostHeapState::allocated_bytes`],
+    /// which is the runner process's own
+    /// `tikv_jemalloc_ctl::stats::allocated` reading — a global
+    /// arena counter for the calling process. This field is the
+    /// per-thread TSD counter for an arbitrary target thread the
+    /// probe attached to.
+    ///
+    /// Zero when the capture layer could not pull the counter:
+    /// (a) the target process is not linked against jemalloc,
+    /// (b) the probe attach failed for any other reason (DWARF
+    /// missing, jemalloc in a DSO rather than the main
+    /// executable, arch mismatch),
+    /// (c) the per-thread ptrace step failed (tid exited
+    /// mid-capture, EPERM under YAMA scope=1 without
+    /// `CAP_SYS_PTRACE`),
+    /// or (d) the thread is in the calling process's own tgid
+    /// (PTRACE_SEIZE rejects self-attach). All four collapse to
+    /// zero per the best-effort "absent = 0" capture contract.
+    /// Snapshot-level diagnosis lives on
+    /// [`HostStateProbeSummary::dominant_failure`]
+    /// (via [`HostStateSnapshot::probe_summary`]); the per-tag
+    /// taxonomy is documented in the `ktstr host-state capture`
+    /// CLI help.
     pub allocated_bytes: u64,
+    /// Bytes freed by this thread over its lifetime — read from
+    /// jemalloc's per-thread TSD u64 counter
+    /// (`tsd_s.thread_deallocated`) via the same probe path that
+    /// populates [`Self::allocated_bytes`].
+    /// `allocated_bytes - deallocated_bytes` is a thread-local
+    /// estimate of currently-held bytes; the difference races
+    /// any in-flight allocator activity since the two counters
+    /// are sampled in one `process_vm_readv` over a 24-byte span
+    /// the target may continue to mutate during the read.
     pub deallocated_bytes: u64,
+
+    // -- procfs page fault fields (/proc/<tid>/stat fields 10, 12) --
     /// Minor faults (no disk I/O). `/proc/tid/stat` field 10.
     pub minflt: u64,
     /// Major faults (backed by disk). `/proc/tid/stat` field 12.
@@ -907,19 +1067,14 @@ fn parse_sched(raw: &str) -> SchedFields {
             "nr_migrations" => out.nr_migrations = parsed_u64(),
             "wait_sum" => out.wait_sum = parsed_u64_lossy(),
             "wait_count" => out.wait_count = parsed_u64(),
-            // Kernel emits `sum_sleep_runtime` (see `kernel/sched/debug.c`
-            // -> `proc_sched_show_task`), NOT `sleep_sum`. The old
-            // `"sleep_sum"` match arm was a misnaming carried over
-            // from an early misread of the procfs dump and never
-            // populated for any in-tree kernel. Match on the real
-            // kernel key so the field actually carries data.
+            // Kernel emits `sum_sleep_runtime` (see
+            // `kernel/sched/debug.c` -> `proc_sched_show_task`); the
+            // matching ThreadState field is named `sleep_sum` for
+            // symmetry with `wait_sum` / `block_sum` / `iowait_sum`.
+            // The kernel does not emit a `sleep_count` counterpart;
+            // `nr_wakeups` (matched above) covers the wake-side
+            // event tally.
             "sum_sleep_runtime" => out.sleep_sum = parsed_u64_lossy(),
-            // `sleep_count` is NOT emitted anywhere — the
-            // counterpart to sum_sleep_runtime is `nr_wakeups` (total
-            // wake events), already covered above. The old
-            // `sleep_count` field was a ghost parallel to `wait_count`
-            // that never had a kernel-side source; removed along
-            // with its match arm.
             "block_sum" => out.block_sum = parsed_u64_lossy(),
             "block_count" => out.block_count = parsed_u64(),
             "iowait_sum" => out.iowait_sum = parsed_u64_lossy(),
@@ -985,73 +1140,33 @@ pub fn read_cgroup_stats_at(cgroup_root: &Path, path: &str) -> CgroupStats {
     }
 }
 
-/// Heuristic check: does `/proc/<tgid>/maps` mention a jemalloc
-/// DSO?
-///
-/// # Dead-code status and lift-point intent
-///
-/// Currently UNUSED by the capture layer: [`capture_thread_at`]
-/// hardcodes `allocated_bytes: 0` / `deallocated_bytes: 0`
-/// because populating those two fields requires DWARF-based TSD
-/// offset resolution + ptrace, which lives in the out-of-band
-/// `ktstr-jemalloc-probe` binary — NOT in the capture layer.
-/// Shipping this detector as a public "scans maps for jemalloc"
-/// API that callers cannot actually act on would be a trap; the
-/// `#[allow(dead_code)]` attribute below keeps the code in-tree
-/// as the lift-point for the future integration without letting
-/// it signal "we enumerate jemalloc processes" to external
-/// consumers.
-///
-/// Retained for the follow-up that wires the probe into the
-/// capture pass — when that lands, `capture_thread_at` will
-/// call this detector to decide whether to spawn the probe for
-/// the current tgid, and the `#[allow]` attribute can be
-/// removed alongside the `allocated_bytes: 0` hard-coding.
-/// Until then, the detector is dead code with a deliberate
-/// purpose: existing with the right signature so the wiring
-/// change is a drop-in rather than a new file.
-#[allow(dead_code)]
-pub fn process_linked_against_jemalloc(tgid: i32) -> bool {
-    process_linked_against_jemalloc_at(Path::new(DEFAULT_PROC_ROOT), tgid)
-}
-
-/// `proc_root`-parameterised variant of
-/// [`process_linked_against_jemalloc`]. Lets tests drive the
-/// detector against a synthetic `/proc/<tgid>/maps` file under
-/// a tempdir without touching the real procfs. Production code
-/// should stick with the default-root wrapper above; this
-/// variant is kept `pub` so downstream harnesses that stand up
-/// alternate `/proc` shapes (containers with mount namespaces,
-/// pid-namespaced probes) can reuse the detection without
-/// copy-pasting the maps-substring heuristic.
-///
-/// Shares the dead-code status documented on
-/// [`process_linked_against_jemalloc`] — see that function for
-/// why the detector exists without a production caller.
-#[allow(dead_code)]
-pub fn process_linked_against_jemalloc_at(proc_root: &Path, tgid: i32) -> bool {
-    let Ok(raw) = fs::read_to_string(proc_root.join(tgid.to_string()).join("maps")) else {
-        return false;
-    };
-    for line in raw.lines() {
-        // Maps lines end with an optional path; jemalloc DSOs
-        // embed "jemalloc" in the filename, and static-linked
-        // jemalloc binaries reference its symbols from the
-        // executable's own path. A crude substring match on the
-        // path region is sufficient for gating — false positives
-        // are absorbed by the downstream TSD probe, which does a
-        // full ELF walk.
-        if line.contains("jemalloc") {
-            return true;
-        }
-    }
-    false
-}
-
-/// Capture one thread's profile under an arbitrary procfs root.
-/// Each procfs reader returns `Option`; the assembled
+/// Capture one thread's procfs-derived profile under an arbitrary
+/// procfs root. Each procfs reader returns `Option`; the assembled
 /// [`ThreadState`] coerces `None` to the field's default per the
-/// module-level capture contract.
+/// module-level capture contract. The jemalloc per-thread TSD
+/// counters (`allocated_bytes` / `deallocated_bytes`) are NOT
+/// populated by this function — they require a tgid-scoped probe
+/// attach that the caller owns ([`capture_with`] /
+/// [`capture_pid_with`] do this and write the counters directly
+/// onto the returned `ThreadState`). On the returned struct, both
+/// fields therefore land at the absent-counter default of zero
+/// unless the caller overwrites them.
+///
+/// `comm` is the thread name the caller has already read from
+/// `<proc_root>/<tgid>/task/<tid>/comm` (typically via
+/// [`read_thread_comm_at`]). Passing it in — symmetric with the
+/// pre-existing `pcomm` parameter — lets the caller share one
+/// procfs read with the per-tid probe-recording path
+/// (`probe_thread_recording`), which needs the thread name for
+/// tracing on probe failures: a hot loop that re-reads the file
+/// inside this fn would double the comm syscalls per tid on hosts
+/// with thousands of threads.
+///
+/// Pass empty string for the absent-comm default; the ghost
+/// filter in [`capture_with`] / [`capture_pid_with`] keys on
+/// `ThreadState::comm.is_empty()` to drop a tid that exited
+/// between `iter_task_ids_at` and this call, so an empty `comm`
+/// is the correct shape for that path.
 ///
 /// `use_syscall_affinity` gates the `sched_getaffinity(2)` path —
 /// tests staging a synthetic `/proc` pass `false` so the syscall
@@ -1063,9 +1178,9 @@ pub fn capture_thread_at(
     tgid: i32,
     tid: i32,
     pcomm: &str,
+    comm: &str,
     use_syscall_affinity: bool,
 ) -> ThreadState {
-    let comm = read_thread_comm_at(proc_root, tgid, tid).unwrap_or_default();
     let cgroup = read_cgroup_at(proc_root, tgid, tid).unwrap_or_default();
     let stat = read_stat_at(proc_root, tgid, tid);
     let (run_time_ns, wait_time_ns, timeslices) = read_schedstat_at(proc_root, tgid, tid);
@@ -1083,7 +1198,7 @@ pub fn capture_thread_at(
         tid: tid as u32,
         tgid: tgid as u32,
         pcomm: pcomm.to_string(),
-        comm,
+        comm: comm.to_string(),
         cgroup,
         start_time_clock_ticks: stat.start_time_clock_ticks.unwrap_or(0),
         policy: stat.policy.map(policy_name).unwrap_or_default(),
@@ -1123,7 +1238,253 @@ pub fn capture_thread_at(
 
 #[cfg(test)]
 fn capture_thread(tgid: i32, tid: i32, pcomm: &str) -> ThreadState {
-    capture_thread_at(Path::new(DEFAULT_PROC_ROOT), tgid, tid, pcomm, true)
+    let proc_root = Path::new(DEFAULT_PROC_ROOT);
+    let comm = read_thread_comm_at(proc_root, tgid, tid).unwrap_or_default();
+    capture_thread_at(proc_root, tgid, tid, pcomm, &comm, true)
+}
+
+/// Running tally for the per-snapshot jemalloc-probe summary line
+/// emitted by [`capture_with`] and [`capture_pid_with`]. The
+/// dominant `AttachError` tag and `ProbeError` tag are tracked so
+/// the summary can surface a remediation hint when one error class
+/// dominates (e.g. EPERM under YAMA).
+#[derive(Debug, Default)]
+struct ProbeSummary {
+    tgids_walked: u64,
+    jemalloc_detected: u64,
+    probed_ok: u64,
+    failed: u64,
+    attach_tag_counts: BTreeMap<&'static str, u64>,
+    probe_tag_counts: BTreeMap<&'static str, u64>,
+}
+
+impl ProbeSummary {
+    /// Pick the most frequent ACTIONABLE error tag (across attach
+    /// and probe failures) for the summary line. Ties resolve to
+    /// REVERSE-alphabetical order so the output is deterministic:
+    /// the comparator's secondary key is `b.0.cmp(a.0)` (note the
+    /// argument flip), so when two tags share a count, the
+    /// alphabetically-EARLIER tag wins (e.g. `dwarf-parse-failure`
+    /// beats `ptrace-seize`).
+    ///
+    /// `jemalloc-not-found` and `readlink-failure` are filtered out
+    /// of the attach side: both are the expected outcome on the bulk
+    /// of system processes (most tgids are not jemalloc-linked, and
+    /// short-lived ones routinely fail readlink mid-walk), so
+    /// surfacing them as the operator-facing "dominant failure tag"
+    /// would drown the actionable signal (privilege drops, stripped
+    /// debuginfo, arch mismatch) under known-benign noise on every
+    /// snapshot. The filter is the same matches! arm
+    /// `try_attach_probe_for_tgid_at` uses to route those two tags
+    /// to debug-level tracing rather than warn-level — the
+    /// dominant-tag summary mirrors the same actionable/non-actionable
+    /// cut. Probe tags are not filtered: every `ProbeError` variant
+    /// is actionable.
+    fn dominant_tag(&self) -> Option<&'static str> {
+        self.attach_tag_counts
+            .iter()
+            .filter(|(t, _)| !matches!(**t, "jemalloc-not-found" | "readlink-failure"))
+            .chain(self.probe_tag_counts.iter())
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(tag, _)| *tag)
+    }
+
+    /// True when `ptrace-seize` (or `ptrace-interrupt`) failures
+    /// dominate, signalling a privilege issue. Used to gate the
+    /// EPERM remediation hint.
+    fn ptrace_dominates(&self) -> bool {
+        let total_ptrace: u64 = self
+            .probe_tag_counts
+            .iter()
+            .filter(|(t, _)| matches!(**t, "ptrace-seize" | "ptrace-interrupt"))
+            .map(|(_, n)| *n)
+            .sum();
+        // Half of failures or more attributable to ptrace-attach
+        // privilege — high enough that the hint is useful, low
+        // enough that a few EPERMs in an otherwise-clean run
+        // don't drown the summary.
+        self.failed > 0 && total_ptrace * 2 >= self.failed
+    }
+
+    /// Project the internal tally to the curated public surface.
+    /// Drops the per-tag `attach_tag_counts` / `probe_tag_counts`
+    /// maps (implementation detail) and surfaces only the
+    /// counters + dominant tag string. Mirrors the
+    /// actionable/non-actionable cut [`Self::dominant_tag`] uses,
+    /// so `dominant_failure` is `None` exactly when the snapshot
+    /// has zero actionable failures.
+    fn to_public(&self) -> HostStateProbeSummary {
+        HostStateProbeSummary {
+            tgids_walked: self.tgids_walked,
+            jemalloc_detected: self.jemalloc_detected,
+            probed_ok: self.probed_ok,
+            failed: self.failed,
+            dominant_failure: self.dominant_tag().map(|t| t.to_string()),
+        }
+    }
+}
+
+/// Stable EPERM remediation hint for the capture summary. References
+/// `$(which ktstr)` rather than a hardcoded path so the suggestion
+/// works regardless of where the binary is installed.
+const PTRACE_EPERM_HINT: &str = "hint: re-run as root, or sudo setcap cap_sys_ptrace+eip $(which ktstr), or set kernel.yama.ptrace_scope=0";
+
+/// Result of the stateless attach pass for a single tgid:
+/// the procfs-derived `pcomm` (for tracing) plus the underlying
+/// `attach_jemalloc_at` outcome. Carries no shared state, so it
+/// can be assembled by rayon workers in parallel without locking.
+struct AttachOutcome {
+    pcomm: String,
+    result: std::result::Result<
+        crate::host_thread_probe::JemallocProbe,
+        crate::host_thread_probe::AttachError,
+    >,
+}
+
+/// Stateless half of the per-tgid attach: read `pcomm` and run
+/// `attach_jemalloc_at` (the expensive ELF parse + DWARF walk).
+/// No summary mutation — the result is paired with `pcomm` and
+/// returned to the caller for application via
+/// [`record_attach_outcome`]. Splitting attach from the summary
+/// update lets the parallel probe phase in [`capture_with`] hold
+/// the `summary_mutex` only for the cheap counter+tracing step,
+/// rather than serialising every rayon worker on the slowest
+/// call in the pipeline.
+fn attach_probe_for_tgid_at(proc_root: &Path, tgid: i32) -> AttachOutcome {
+    let pcomm = read_process_comm_at(proc_root, tgid).unwrap_or_default();
+    let result = crate::host_thread_probe::attach_jemalloc_at(proc_root, tgid);
+    AttachOutcome { pcomm, result }
+}
+
+/// Stateful half of the per-tgid attach: apply `outcome` to
+/// `summary` and emit one tracing event. Two attach-error tags
+/// log at `debug` rather than `warn`: `jemalloc-not-found` (the
+/// bulk of system processes are not jemalloc-linked, so this is
+/// the dominant non-actionable outcome on a busy host) and
+/// `readlink-failure` (a tgid that exited between the procfs
+/// walk and `readlink(/proc/<pid>/exe)` is also routine — race-
+/// with-exit on short-lived helpers). Every other variant logs
+/// at `warn` because a jemalloc-linked target failing to attach
+/// is actionable (privilege drop, stripped binary, …). The
+/// matches! arm here is the same one [`ProbeSummary::dominant_tag`]
+/// uses to filter the operator-facing summary, so the level
+/// routing and the dominance ranking surface the same
+/// actionable/non-actionable cut. No I/O — safe to call under a
+/// short-held mutex from the parallel probe phase.
+fn record_attach_outcome(
+    tgid: i32,
+    outcome: AttachOutcome,
+    summary: &mut ProbeSummary,
+) -> Option<crate::host_thread_probe::JemallocProbe> {
+    summary.tgids_walked += 1;
+    let AttachOutcome { pcomm, result } = outcome;
+    match result {
+        Ok(probe) => {
+            summary.jemalloc_detected += 1;
+            tracing::debug!(tgid, %pcomm, "host-state probe: jemalloc detected");
+            Some(probe)
+        }
+        Err(err) => {
+            let tag = err.tag();
+            *summary.attach_tag_counts.entry(tag).or_insert(0) += 1;
+            if matches!(tag, "jemalloc-not-found" | "readlink-failure") {
+                tracing::debug!(tgid, %pcomm, tag, err = %err, "host-state probe: attach skipped");
+            } else {
+                summary.failed += 1;
+                tracing::warn!(tgid, %pcomm, tag, err = %err, "host-state probe: attach failed");
+            }
+            None
+        }
+    }
+}
+
+/// Single-call wrapper around [`attach_probe_for_tgid_at`] +
+/// [`record_attach_outcome`] for sequential callers (tests + the
+/// per-pid `capture_pid_with` path) that don't need the
+/// stateless/stateful split. The parallel probe phase in
+/// [`capture_with`] calls the two halves separately so the
+/// expensive attach runs outside the summary mutex.
+fn try_attach_probe_for_tgid_at(
+    proc_root: &Path,
+    tgid: i32,
+    summary: &mut ProbeSummary,
+) -> Option<crate::host_thread_probe::JemallocProbe> {
+    let outcome = attach_probe_for_tgid_at(proc_root, tgid);
+    record_attach_outcome(tgid, outcome, summary)
+}
+
+/// Pull `(allocated_bytes, deallocated_bytes)` for one tid via the
+/// pre-attached probe, recording the outcome in `summary` and
+/// emitting a `tracing::warn!` once per failed tgid (the engine
+/// shares the same `AttachError`/`ProbeError` taxonomy across every
+/// tid of a tgid, so logging each tid would spam the operator).
+fn probe_thread_recording(
+    probe: &crate::host_thread_probe::JemallocProbe,
+    tid: i32,
+    tgid: i32,
+    pcomm: &str,
+    comm: &str,
+    summary: &mut ProbeSummary,
+    failed_tgids_logged: &mut std::collections::BTreeSet<i32>,
+) -> (u64, u64) {
+    match crate::host_thread_probe::probe_thread(probe, tid) {
+        Ok(c) => {
+            summary.probed_ok += 1;
+            (c.allocated_bytes, c.deallocated_bytes)
+        }
+        Err(err) => {
+            let tag = err.tag();
+            *summary.probe_tag_counts.entry(tag).or_insert(0) += 1;
+            summary.failed += 1;
+            if failed_tgids_logged.insert(tgid) {
+                tracing::warn!(
+                    tgid,
+                    tid,
+                    %pcomm,
+                    %comm,
+                    tag,
+                    err = %err,
+                    "host-state probe: probe_thread failed",
+                );
+            }
+            (0, 0)
+        }
+    }
+}
+
+/// Emit the once-per-snapshot summary line. Includes the dominant
+/// failure tag when any failures landed and an EPERM remediation
+/// hint when ptrace-attach privilege failures dominate.
+fn emit_probe_summary(summary: &ProbeSummary) {
+    let tgids_walked = summary.tgids_walked;
+    let jemalloc_detected = summary.jemalloc_detected;
+    let probed_ok = summary.probed_ok;
+    let failed = summary.failed;
+    if failed > 0 {
+        let dominant = summary.dominant_tag().unwrap_or("?");
+        if summary.ptrace_dominates() {
+            tracing::info!(
+                "host-state probe: {tgids_walked} tgids walked, \
+                 {jemalloc_detected} jemalloc detected, \
+                 {probed_ok} probed OK, {failed} failed \
+                 (dominant: {dominant}; {})",
+                PTRACE_EPERM_HINT,
+            );
+        } else {
+            tracing::info!(
+                "host-state probe: {tgids_walked} tgids walked, \
+                 {jemalloc_detected} jemalloc detected, \
+                 {probed_ok} probed OK, {failed} failed \
+                 (dominant: {dominant})",
+            );
+        }
+    } else {
+        tracing::info!(
+            "host-state probe: {tgids_walked} tgids walked, \
+             {jemalloc_detected} jemalloc detected, \
+             {probed_ok} probed OK, {failed} failed",
+        );
+    }
 }
 
 /// Capture a complete host-wide snapshot under arbitrary procfs
@@ -1134,6 +1495,20 @@ fn capture_thread(tgid: i32, tid: i32, pcomm: &str) -> ThreadState {
 /// O(cgroups) rather than O(threads)). The default-roots
 /// production entry point is [`capture`]; tests pass a tempdir
 /// to exercise the walk against a synthetic tree.
+///
+/// `use_syscall_affinity` gates BOTH `sched_getaffinity(2)` AND
+/// the jemalloc per-thread probe attach — synthetic-tree tests
+/// pass `false` because the staged procfs has no real ELF behind
+/// it (so neither the syscall nor the probe can run); production
+/// passes `true` so affinity falls back to `Cpus_allowed_list:` on
+/// EPERM and the probe attaches against every jemalloc-linked
+/// tgid the walk encounters.
+///
+/// Self-skip: the caller's own tgid is excluded from the per-tgid
+/// probe-attach loop because `PTRACE_SEIZE` rejects self-attach.
+/// The capture still produces ThreadState entries for self-tids —
+/// they just keep the absent-counter default (0) for the jemalloc
+/// fields. Other procfs-derived fields populate normally.
 pub fn capture_with(
     proc_root: &Path,
     cgroup_root: &Path,
@@ -1148,11 +1523,142 @@ pub fn capture_with(
     } else {
         None
     };
+    // Linux pid_max is bounded above by 2^22 (kernel/pid.c —
+    // PID_MAX_LIMIT) on every supported architecture, well
+    // inside i32::MAX, so the u32 → i32 cast cannot wrap.
+    let self_pid = std::process::id() as i32;
     let mut threads: Vec<ThreadState> = Vec::new();
-    for tgid in iter_tgids_at(proc_root) {
+    let mut failed_tgids_logged: std::collections::BTreeSet<i32> =
+        std::collections::BTreeSet::new();
+
+    // Phase 1: resolve probes in parallel via rayon. The expensive
+    // ELF parse + DWARF walk runs concurrently across tgids, with
+    // an inode cache (Mutex-wrapped) so duplicate binaries are
+    // resolved only once. The result is a map of tgid → probe.
+    let tgids = iter_tgids_at(proc_root);
+    let probe_cache: std::sync::Mutex<
+        std::collections::HashMap<(u64, u64), Option<crate::host_thread_probe::JemallocProbe>>,
+    > = std::sync::Mutex::new(std::collections::HashMap::new());
+    let summary_mutex = std::sync::Mutex::new(ProbeSummary::default());
+
+    let probe_map: std::collections::HashMap<i32, Option<crate::host_thread_probe::JemallocProbe>> =
+        if use_syscall_affinity {
+            use rayon::prelude::*;
+            // Scale parallelism by available CPU headroom: read
+            // `<proc_root>/loadavg`, subtract from online CPU count,
+            // clamp to [1, num_cpus/2 + 1]. Avoids drowning a hot
+            // host. Routing the read through `proc_root` (rather
+            // than `/proc` directly) keeps the parameterised-root
+            // contract intact so synthetic-tree tests can stage
+            // their own loadavg shape.
+            let max_threads = {
+                let num_cpus = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let load = std::fs::read_to_string(proc_root.join("loadavg"))
+                    .ok()
+                    .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let headroom = (num_cpus as f64 - load).max(1.0) as usize;
+                headroom.clamp(1, num_cpus / 2 + 1)
+            };
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(max_threads)
+                .build()
+                .unwrap();
+            pool.install(|| tgids
+                .par_iter()
+                .copied()
+                .filter(|&tgid| tgid != self_pid)
+                .map(|tgid| {
+                    let cache_key = std::fs::metadata(
+                        proc_root.join(tgid.to_string()).join("exe"),
+                    )
+                    .ok()
+                    .map(|m| {
+                        use std::os::unix::fs::MetadataExt;
+                        (m.dev(), m.ino())
+                    });
+
+                    let probe = if let Some(key) = cache_key {
+                        let cached = probe_cache.lock().unwrap().get(&key).cloned();
+                        if let Some(cached_result) = cached {
+                            let mut s = summary_mutex.lock().unwrap();
+                            s.tgids_walked += 1;
+                            if cached_result.is_some() {
+                                s.jemalloc_detected += 1;
+                                tracing::debug!(tgid, "host-state probe: cache hit (jemalloc)");
+                            } else {
+                                tracing::debug!(tgid, "host-state probe: cache hit (not jemalloc or prior failure)");
+                            }
+                            cached_result
+                        } else {
+                            // Stateless attach (the expensive ELF parse +
+                            // DWARF walk) runs OUTSIDE the summary mutex
+                            // so rayon workers parallelise it. The lock
+                            // is only held for the cheap counter +
+                            // tracing application via `record_attach_outcome`.
+                            //
+                            // Shared-inode cache misses can produce
+                            // duplicate parses when N workers enter
+                            // simultaneously — all run the attach before
+                            // any inserts. The cache fully amortises
+                            // subsequent lookups; the duplicate work is
+                            // bounded by the rayon pool size.
+                            let outcome = attach_probe_for_tgid_at(proc_root, tgid);
+                            let mut s = summary_mutex.lock().unwrap();
+                            let result = record_attach_outcome(tgid, outcome, &mut s);
+                            drop(s);
+                            probe_cache.lock().unwrap().insert(key, result.clone());
+                            result
+                        }
+                    } else {
+                        // No cache key — exe symlink unreadable. Same
+                        // attach-outside-lock pattern as the cache-miss
+                        // branch above; result is not cached because
+                        // there's no key to file it under.
+                        let outcome = attach_probe_for_tgid_at(proc_root, tgid);
+                        let mut s = summary_mutex.lock().unwrap();
+                        record_attach_outcome(tgid, outcome, &mut s)
+                    };
+                    (tgid, probe)
+                })
+                .collect()
+            )
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    // `mut` is required because phase 2 below threads `&mut
+    // summary` into `probe_thread_recording`.
+    let mut summary = summary_mutex.into_inner().unwrap();
+
+    // Phase 2: sequential per-tid walk + ptrace reads.
+    for tgid in &tgids {
+        let tgid = *tgid;
         let pcomm = read_process_comm_at(proc_root, tgid).unwrap_or_default();
+        let probe: Option<&crate::host_thread_probe::JemallocProbe> = probe_map
+            .get(&tgid)
+            .and_then(|p: &Option<crate::host_thread_probe::JemallocProbe>| p.as_ref());
         for tid in iter_task_ids_at(proc_root, tgid) {
-            let t = capture_thread_at(proc_root, tgid, tid, &pcomm, use_syscall_affinity);
+            let comm = read_thread_comm_at(proc_root, tgid, tid).unwrap_or_default();
+            let (allocated_bytes, deallocated_bytes) = probe
+                .map(|p| {
+                    probe_thread_recording(
+                        p,
+                        tid,
+                        tgid,
+                        &pcomm,
+                        &comm,
+                        &mut summary,
+                        &mut failed_tgids_logged,
+                    )
+                })
+                .unwrap_or((0, 0));
+            let mut t =
+                capture_thread_at(proc_root, tgid, tid, &pcomm, &comm, use_syscall_affinity);
+            t.allocated_bytes = allocated_bytes;
+            t.deallocated_bytes = deallocated_bytes;
             // Ghost-thread filter: a tid that exited between the
             // `iter_task_ids_at` readdir and our per-file reads
             // produces an all-Default `ThreadState` — empty comm
@@ -1176,6 +1682,12 @@ pub fn capture_with(
             threads.push(t);
         }
     }
+    let probe_summary = if use_syscall_affinity {
+        emit_probe_summary(&summary);
+        Some(summary.to_public())
+    } else {
+        None
+    };
     let mut cgroup_stats: BTreeMap<String, CgroupStats> = BTreeMap::new();
     for t in &threads {
         if !t.cgroup.is_empty() && !cgroup_stats.contains_key(&t.cgroup) {
@@ -1190,18 +1702,144 @@ pub fn capture_with(
         host,
         threads,
         cgroup_stats,
+        probe_summary,
     }
 }
 
 /// Capture a complete host-wide snapshot against the default
-/// procfs and cgroup roots (`/proc` and `/sys/fs/cgroup`). Thin
-/// shim over [`capture_with`].
+/// procfs and cgroup roots (`/proc` and `/sys/fs/cgroup`).
+/// Probes every jemalloc-linked tgid the walk reaches and
+/// populates per-thread `allocated_bytes` / `deallocated_bytes`
+/// from the jemalloc TSD counters; tgids the probe cannot attach
+/// against (ptrace denied, not jemalloc-linked, stripped binary)
+/// land their threads at the absent-counter default of 0 per the
+/// best-effort capture contract.
+///
+/// # Cost
+///
+/// O(threads-on-host) for the procfs walk; additionally one ELF
+/// open + DWARF parse for every tgid `attach_jemalloc` resolves
+/// successfully, plus a ptrace seize/interrupt/waitpid/detach
+/// round-trip per thread of those tgids. On a host with many
+/// jemalloc-linked daemons (database / browser / runtime
+/// processes) the probe path dominates the wall-clock cost.
+/// Callers that need only one tgid's data should use
+/// [`capture_pid`] to scope the walk.
 pub fn capture() -> HostStateSnapshot {
     capture_with(
         Path::new(DEFAULT_PROC_ROOT),
         Path::new(DEFAULT_CGROUP_ROOT),
         true,
     )
+}
+
+/// Capture a host-state snapshot scoped to a single tgid.
+///
+/// Walks `/proc/<pid>/task` for thread enumeration but skips every
+/// other tgid on the host, sidestepping the wall-clock cost (and
+/// blast-radius) of the global probe pass that [`capture`] runs.
+/// Probes the target tgid's jemalloc TSD counters when it is
+/// jemalloc-linked and not the calling process; otherwise the
+/// per-thread allocated / deallocated fields land at zero per the
+/// best-effort capture contract.
+///
+/// Useful for tests and tools that already know which process they
+/// care about — the resulting snapshot's `threads` vec only carries
+/// entries for `pid`'s tgid (one entry per thread of that process).
+/// `host` and `cgroup_stats` populate normally so the snapshot
+/// stays self-describing.
+pub fn capture_pid(pid: i32) -> HostStateSnapshot {
+    capture_pid_with(
+        Path::new(DEFAULT_PROC_ROOT),
+        Path::new(DEFAULT_CGROUP_ROOT),
+        pid,
+        true,
+    )
+}
+
+/// `proc_root` + `cgroup_root` parameterised variant of
+/// [`capture_pid`]. Lets tests stage a synthetic procfs / cgroupfs
+/// for the capture walk without touching the real host.
+///
+/// `use_syscall_affinity` gates BOTH `sched_getaffinity(2)` AND
+/// the jemalloc probe attach — synthetic-tree tests pass `false`
+/// because the staged procfs has no real ELF behind
+/// `/proc/<pid>/exe`; production passes `true`.
+pub fn capture_pid_with(
+    proc_root: &Path,
+    cgroup_root: &Path,
+    pid: i32,
+    use_syscall_affinity: bool,
+) -> HostStateSnapshot {
+    let captured_at_unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let host = if use_syscall_affinity {
+        Some(crate::host_context::collect_host_context())
+    } else {
+        None
+    };
+    // Linux pid_max is bounded above by 2^22 (kernel/pid.c —
+    // PID_MAX_LIMIT) on every supported architecture, well
+    // inside i32::MAX, so the u32 → i32 cast cannot wrap.
+    let self_pid = std::process::id() as i32;
+    let pcomm = read_process_comm_at(proc_root, pid).unwrap_or_default();
+    let mut summary = ProbeSummary::default();
+    let mut failed_tgids_logged: std::collections::BTreeSet<i32> =
+        std::collections::BTreeSet::new();
+    let probe = if use_syscall_affinity && pid != self_pid {
+        try_attach_probe_for_tgid_at(proc_root, pid, &mut summary)
+    } else {
+        None
+    };
+    let mut threads: Vec<ThreadState> = Vec::new();
+    for tid in iter_task_ids_at(proc_root, pid) {
+        let comm = read_thread_comm_at(proc_root, pid, tid).unwrap_or_default();
+        let (allocated_bytes, deallocated_bytes) = probe
+            .as_ref()
+            .map(|p| {
+                probe_thread_recording(
+                    p,
+                    tid,
+                    pid,
+                    &pcomm,
+                    &comm,
+                    &mut summary,
+                    &mut failed_tgids_logged,
+                )
+            })
+            .unwrap_or((0, 0));
+        let mut t = capture_thread_at(proc_root, pid, tid, &pcomm, &comm, use_syscall_affinity);
+        t.allocated_bytes = allocated_bytes;
+        t.deallocated_bytes = deallocated_bytes;
+        if t.comm.is_empty() && t.start_time_clock_ticks == 0 {
+            continue;
+        }
+        threads.push(t);
+    }
+    let probe_summary = if use_syscall_affinity {
+        emit_probe_summary(&summary);
+        Some(summary.to_public())
+    } else {
+        None
+    };
+    let mut cgroup_stats: BTreeMap<String, CgroupStats> = BTreeMap::new();
+    for t in &threads {
+        if !t.cgroup.is_empty() && !cgroup_stats.contains_key(&t.cgroup) {
+            cgroup_stats.insert(
+                t.cgroup.clone(),
+                read_cgroup_stats_at(cgroup_root, &t.cgroup),
+            );
+        }
+    }
+    HostStateSnapshot {
+        captured_at_unix_ns,
+        host,
+        threads,
+        cgroup_stats,
+        probe_summary,
+    }
 }
 
 /// Capture a snapshot and write it to `path` in the canonical
@@ -1217,6 +1855,7 @@ pub fn capture_to(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
 
     fn thread(pcomm: &str, comm: &str, run_time_ns: u64) -> ThreadState {
         ThreadState {
@@ -1252,6 +1891,7 @@ mod tests {
                     memory_current: 1 << 20,
                 },
             )]),
+            probe_summary: None,
         };
         let tmp = tempfile::NamedTempFile::new().unwrap();
         snap.write(tmp.path()).unwrap();
@@ -1517,11 +2157,23 @@ mod tests {
 
     #[test]
     fn capture_produces_non_empty_snapshot() {
-        let snap = capture();
+        // Scope to self_pid so the probe-attach pass is skipped (the
+        // capture pipeline excludes the calling process from the
+        // ptrace path because PTRACE_SEIZE rejects self-attach). The
+        // global `capture()` would attempt to probe every jemalloc-
+        // linked tgid on the host — orders of magnitude slower in a
+        // unit-test context, and not what this test is asserting on.
+        // The wiring-end-to-end test path lives in
+        // `tests/host_state_capture_jemalloc_wiring.rs`, which spawns
+        // a real jemalloc target.
+        let pid = std::process::id() as i32;
+        let snap = capture_pid(pid);
         assert!(!snap.threads.is_empty());
-        // Every captured thread carries non-ephemeral identity.
-        let pid = std::process::id();
-        let self_threads: Vec<_> = snap.threads.iter().filter(|t| t.tgid == pid).collect();
+        let self_threads: Vec<_> = snap
+            .threads
+            .iter()
+            .filter(|t| t.tgid == pid as u32)
+            .collect();
         assert!(!self_threads.is_empty(), "own tgid missing from capture");
     }
 
@@ -1732,7 +2384,7 @@ mod tests {
     /// because the `!trimmed.is_empty()` guard rejects the blank
     /// path. A kernel bug or a synthetic fixture that emitted
     /// `0::` without a path must not land an empty-string cgroup
-    /// in the ThreadState (which would then join against other
+    /// in the ThreadState (which would then group with other
     /// cgroup-less threads and produce noise).
     ///
     /// Also pins the first-wins behavior when multiple unified
@@ -1754,7 +2406,7 @@ mod tests {
     /// the comm file exists but contains only whitespace. The
     /// trim-then-is-empty guard is load-bearing: a `Some("")` in
     /// ThreadState.comm would both (a) disable the empty-comm ghost
-    /// filter and (b) pollute comparison joins that key on comm.
+    /// filter and (b) pollute comparisons grouped by comm.
     /// Pins the explicit empty→None routing so a future refactor
     /// that simplified the fn to `.ok().map(|s| s.trim().to_string())`
     /// (losing the empty guard) would break this test.
@@ -2021,12 +2673,11 @@ mod tests {
     /// ghost tid under the same tgid, calls `capture_with`, and
     /// asserts the output contains only the live thread.
     ///
-    /// Without the filter (the pre-FIX-PhD3 behaviour), the
-    /// ghost would land as `{ tid: 202, comm: "", cgroup: "",
-    /// start_time_clock_ticks: 0, ...all counters zero }` and
-    /// pollute downstream comparisons — a baseline run captures
-    /// some number of ghosts, the candidate captures a
-    /// different number, and the diff surfaces spurious
+    /// Without the filter, the ghost would land as `{ tid: 202,
+    /// comm: "", cgroup: "", start_time_clock_ticks: 0, ...all
+    /// counters zero }` and pollute downstream comparisons — a
+    /// baseline run captures some number of ghosts, the candidate
+    /// captures a different number, and the diff surfaces spurious
     /// "thread vanished" signal on every report.
     #[test]
     fn capture_with_filters_ghost_threads_with_empty_comm_and_zero_start() {
@@ -2137,14 +2788,121 @@ mod tests {
         assert_eq!(t.wait_count, 15);
         assert_eq!(
             t.sleep_sum, 3200,
-            "fractional 3200.50 truncates to 3200 — sourced from the \
-             kernel `sum_sleep_runtime` key, NOT the misnamed `sleep_sum` \
-             of earlier drafts",
+            "fractional 3200.50 truncates to 3200 — sleep_sum is \
+             populated from the kernel's `sum_sleep_runtime` key",
         );
         assert_eq!(t.block_sum, 1100, "fractional 1100.75 truncates to 1100");
         assert_eq!(t.block_count, 2);
         assert_eq!(t.iowait_sum, 77, "fractional 77.0 truncates to 77");
         assert_eq!(t.iowait_count, 18);
+
+        // jemalloc TSD counters: synthetic procfs has no real ELF
+        // behind /proc/<tgid>/exe, so the probe attach is gated off
+        // (use_syscall_affinity=false). Both fields land at the
+        // absent-counter default of 0. Pins this so a future
+        // regression that always-probes (ignoring use_syscall_affinity)
+        // would either crash on the synthetic /proc or surface garbage
+        // here.
+        assert_eq!(
+            t.allocated_bytes, 0,
+            "synthetic-tree capture must not probe — allocated_bytes \
+             collapses to absent-counter zero",
+        );
+        assert_eq!(
+            t.deallocated_bytes, 0,
+            "synthetic-tree capture must not probe — deallocated_bytes \
+             collapses to absent-counter zero",
+        );
+    }
+
+    /// Capture against an empty `proc_root` (no tgid subdirs at
+    /// all) must complete without panic and produce an empty
+    /// snapshot. Pins the rayon parallel-probe phase's empty-input
+    /// handling: `iter_tgids_at` returns an empty Vec, `par_iter`
+    /// over zero elements collects to an empty HashMap, and the
+    /// sequential phase 2 loop runs zero iterations. `use_syscall_affinity=true`
+    /// is required to enter the rayon block at all (the `false`
+    /// branch skips probe-attach entirely and assigns an empty
+    /// HashMap directly). Without this gate test, the rayon
+    /// par_iter over empty input has zero coverage.
+    #[test]
+    fn capture_with_empty_proc_root_produces_empty_snapshot() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+
+        // Stage `/proc/loadavg` so the parallelism-clamp read at
+        // <proc_root>/loadavg succeeds rather than falling back to
+        // the 0.0 default. Empty `proc_root` otherwise — no tgid
+        // subdirs, so `iter_tgids_at` returns Vec::new().
+        std::fs::write(proc_tmp.path().join("loadavg"), "0.0 0.0 0.0 1/1 1\n").unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        assert!(
+            snap.threads.is_empty(),
+            "empty proc_root must produce empty snapshot; got {} threads",
+            snap.threads.len(),
+        );
+    }
+
+    /// Exercises the cache-lookup and insert code path in the
+    /// rayon probe loop. Two tgids whose `/proc/<tgid>/exe`
+    /// symlinks resolve to the same underlying inode trigger
+    /// cache interaction: both attach calls fail with
+    /// AttachError::MapsReadFailure (the synthetic tree has no
+    /// `/proc/<tgid>/maps`), and the absent-counter contract
+    /// holds — both threads land in the snapshot with
+    /// allocated_bytes==0.
+    #[test]
+    fn capture_with_inode_cache_collapses_duplicate_binaries() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+
+        // Required by the parallelism-clamp logic in capture_with.
+        std::fs::write(proc_tmp.path().join("loadavg"), "0.0 0.0 0.0 1/1 1\n").unwrap();
+
+        // One real file, two symlinks pointing at it. Both tgids'
+        // exe metadata calls return the same (dev, ino) tuple, so
+        // the cache_key matches across them.
+        let shared_exe = proc_tmp.path().join("shared-exe");
+        std::fs::write(&shared_exe, b"\x7fELFsynthetic\n").unwrap();
+
+        for tgid in [4242, 4243] {
+            stage_synthetic_proc(
+                proc_tmp.path(),
+                tgid,
+                tgid + 1,
+                "shared-pcomm",
+                "shared-comm",
+            );
+            // `/proc/<tgid>/exe` symlink points at the shared file.
+            // `attach_jemalloc_at` will read_link this successfully
+            // and then fail on the absent `/proc/<tgid>/maps` →
+            // AttachError::MapsReadFailure. The cache stores None
+            // keyed by (dev, ino) of the shared file.
+            let exe_link = proc_tmp.path().join(tgid.to_string()).join("exe");
+            std::os::unix::fs::symlink(&shared_exe, &exe_link).unwrap();
+        }
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+
+        // Both threads still land in the snapshot — the failed
+        // attach just leaves allocated_bytes at the absent-counter
+        // default of zero. If the cache-hit branch panicked
+        // (poisoned mutex, key collision logic, etc.), the rayon
+        // worker would crash and `capture_with` would not return.
+        assert_eq!(
+            snap.threads.len(),
+            2,
+            "both staged threads must land in the snapshot",
+        );
+        for thread in &snap.threads {
+            assert_eq!(
+                thread.allocated_bytes, 0,
+                "synthetic /proc has no maps; attach fails, allocated_bytes \
+                 collapses to absent-counter zero — cache-hit branch must not \
+                 fabricate a non-zero counter",
+            );
+        }
     }
 
     // ------------------------------------------------------------
@@ -2288,8 +3046,7 @@ mod tests {
         assert_eq!(
             s.sleep_sum,
             Some(320),
-            "kernel key is `sum_sleep_runtime`, not `sleep_sum` — the \
-             old match arm was a ghost and never populated",
+            "sleep_sum reads the kernel's `sum_sleep_runtime` key",
         );
         assert_eq!(s.block_sum, Some(110));
         assert_eq!(s.block_count, Some(2));
@@ -2375,65 +3132,392 @@ mod tests {
     }
 
     // ------------------------------------------------------------
-    // H5 — process_linked_against_jemalloc_at with synthetic maps
+    // H5 — ProbeSummary discipline
+    //
+    // The capture pipeline tallies every per-tgid attach result and
+    // every per-tid probe_thread result into a [`ProbeSummary`]
+    // before emitting one info-level line per snapshot. The tests
+    // below pin the summary's accounting + EPERM-hint policy
+    // independently of any real ptrace dispatch — a regression that
+    // mis-categorised a tag, dropped the dominant-tag tiebreak,
+    // or flipped the ptrace-dominates threshold lands here loudly.
     // ------------------------------------------------------------
 
-    /// Maps file containing a `libjemalloc.so.2` DSO path →
-    /// detector returns `true`.
-    #[test]
-    fn process_linked_against_jemalloc_at_detects_dso_in_maps() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let tgid = 777;
-        let proc_dir = tmp.path().join(tgid.to_string());
-        std::fs::create_dir_all(&proc_dir).unwrap();
-        let maps = "\
-             5583e6f7a000-5583e6f7b000 r-xp 00000000 00:00 0\n\
-             7f4567890000-7f4567abc000 r-xp 00000000 fe:00 12345 /usr/lib/x86_64-linux-gnu/libjemalloc.so.2\n\
-             7f4567abc000-7f4567def000 r--p 00000000 fe:00 67890 /usr/lib/x86_64-linux-gnu/libc.so.6\n";
-        std::fs::write(proc_dir.join("maps"), maps).unwrap();
-        assert!(process_linked_against_jemalloc_at(tmp.path(), tgid));
+    /// Construct a populated `ProbeSummary` for unit-test cases.
+    /// Lifts the otherwise-repetitive default-then-mutate pattern
+    /// out of every test (clippy's `field_reassign_with_default`
+    /// flags it; using a constructor keeps the tests terse).
+    fn make_summary(
+        failed: u64,
+        attach: &[(&'static str, u64)],
+        probe: &[(&'static str, u64)],
+    ) -> ProbeSummary {
+        ProbeSummary {
+            failed,
+            attach_tag_counts: attach.iter().copied().collect(),
+            probe_tag_counts: probe.iter().copied().collect(),
+            ..ProbeSummary::default()
+        }
     }
 
-    /// Maps file without a jemalloc reference → detector returns
-    /// `false`.
     #[test]
-    fn process_linked_against_jemalloc_at_absent_returns_false() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let tgid = 888;
-        let proc_dir = tmp.path().join(tgid.to_string());
-        std::fs::create_dir_all(&proc_dir).unwrap();
-        let maps = "\
-             5583e6f7a000-5583e6f7b000 r-xp 00000000 00:00 0\n\
-             7f4567abc000-7f4567def000 r--p 00000000 fe:00 67890 /usr/lib/x86_64-linux-gnu/libc.so.6\n";
-        std::fs::write(proc_dir.join("maps"), maps).unwrap();
-        assert!(!process_linked_against_jemalloc_at(tmp.path(), tgid));
+    fn probe_summary_dominant_tag_picks_highest_count() {
+        // dwarf-parse-failure is an ACTIONABLE attach tag (it
+        // signals a stripped binary worth surfacing), so it
+        // survives the `jemalloc-not-found / readlink-failure`
+        // filter in `dominant_tag` and competes against the probe
+        // side on raw count.
+        let s = make_summary(6, &[("dwarf-parse-failure", 5)], &[("ptrace-seize", 1)]);
+        assert_eq!(s.dominant_tag(), Some("dwarf-parse-failure"));
     }
 
-    /// Missing `/proc/<tgid>/maps` file (process exited
-    /// mid-read) → detector returns `false` gracefully.
+    /// `dominant_tag` filters `jemalloc-not-found` and
+    /// `readlink-failure` out of the attach side BEFORE the
+    /// max-by-count step. Both are the expected outcome on the
+    /// bulk of system processes (most tgids are not jemalloc-
+    /// linked; short-lived tgids race readlink mid-walk), so
+    /// surfacing them as the dominant tag would drown actionable
+    /// signal under benign noise. This pin proves the filter
+    /// engages even when the filtered tag has the highest raw
+    /// count: 100 jemalloc-not-found events lose to a single
+    /// ptrace-seize because the former does not enter the
+    /// comparison at all.
+    ///
+    /// Also covers `readlink-failure` symmetrically — both
+    /// non-actionable attach tags are filtered, only one is in
+    /// the production code's matches! arm but the test doubles
+    /// up to keep the contract from quietly degrading to "only
+    /// jemalloc-not-found is filtered."
     #[test]
-    fn process_linked_against_jemalloc_at_missing_file_returns_false() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // No /proc/<tgid>/maps staged.
-        assert!(!process_linked_against_jemalloc_at(tmp.path(), 999));
+    fn probe_summary_dominant_tag_filters_non_actionable_attach_tags() {
+        // jemalloc-not-found dominates by count but is filtered.
+        let s = make_summary(101, &[("jemalloc-not-found", 100)], &[("ptrace-seize", 1)]);
+        assert_eq!(
+            s.dominant_tag(),
+            Some("ptrace-seize"),
+            "jemalloc-not-found must be filtered out even at \
+             100x the count of an actionable tag",
+        );
+        // readlink-failure dominates by count but is filtered.
+        let s = make_summary(101, &[("readlink-failure", 100)], &[("get-regset", 1)]);
+        assert_eq!(
+            s.dominant_tag(),
+            Some("get-regset"),
+            "readlink-failure must be filtered out even at \
+             100x the count of an actionable tag",
+        );
+        // Both filtered tags present together: still filtered;
+        // the actionable probe tag wins.
+        let s = make_summary(
+            201,
+            &[("jemalloc-not-found", 100), ("readlink-failure", 100)],
+            &[("waitpid", 1)],
+        );
+        assert_eq!(
+            s.dominant_tag(),
+            Some("waitpid"),
+            "both filtered attach tags together must NOT push their \
+             aggregate above an actionable probe tag",
+        );
+        // Only filtered tags, no actionable counterparts: None
+        // (the filter removes them, the chain is empty).
+        let s = make_summary(5, &[("jemalloc-not-found", 5)], &[]);
+        assert_eq!(
+            s.dominant_tag(),
+            None,
+            "only-filtered-tags case must produce None, not the \
+             filtered tag itself",
+        );
     }
 
-    /// Static-linked jemalloc — the "jemalloc" substring appears
-    /// in the executable path, not in a libjemalloc.so DSO. The
-    /// detector's crude substring match catches both forms; this
-    /// pins the static case so a future tightening to
-    /// "libjemalloc" prefix doesn't silently drop static
-    /// detection without the test surfacing the behaviour change.
     #[test]
-    fn process_linked_against_jemalloc_at_detects_static_linked() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let tgid = 1234;
-        let proc_dir = tmp.path().join(tgid.to_string());
-        std::fs::create_dir_all(&proc_dir).unwrap();
-        let maps = "\
-             5583e6f7a000-5583e6f7b000 r-xp 00000000 fe:00 555 /usr/local/bin/my-jemalloc-linked-app\n\
-             7f4567abc000-7f4567def000 r--p 00000000 fe:00 67890 /usr/lib/x86_64-linux-gnu/libc.so.6\n";
-        std::fs::write(proc_dir.join("maps"), maps).unwrap();
-        assert!(process_linked_against_jemalloc_at(tmp.path(), tgid));
+    fn probe_summary_dominant_tag_breaks_ties_reverse_alphabetically() {
+        // Two tags tied at count=2 — the tiebreak's secondary key
+        // is `b.0.cmp(a.0)` (note the flip), so the alphabetically-
+        // EARLIER tag wins. With "ptrace-seize" vs
+        // "dwarf-parse-failure", "dwarf-parse-failure" precedes
+        // "ptrace-seize" lexicographically, so it wins. This
+        // "reverse-alphabetical" framing matches how the
+        // `dominant_tag` doc describes the comparator.
+        let s = make_summary(4, &[("ptrace-seize", 2)], &[("dwarf-parse-failure", 2)]);
+        assert_eq!(s.dominant_tag(), Some("dwarf-parse-failure"));
+    }
+
+    #[test]
+    fn probe_summary_ptrace_dominates_when_half_of_failures() {
+        // 3/6 failures are ptrace-attach — meets the half
+        // threshold so the EPERM hint engages.
+        let s = make_summary(6, &[], &[("ptrace-seize", 3), ("waitpid", 3)]);
+        assert!(s.ptrace_dominates());
+    }
+
+    #[test]
+    fn probe_summary_ptrace_does_not_dominate_when_below_half() {
+        let s = make_summary(6, &[], &[("ptrace-seize", 2), ("waitpid", 4)]);
+        assert!(!s.ptrace_dominates());
+    }
+
+    #[test]
+    fn probe_summary_no_failures_no_dominant_tag() {
+        let s = ProbeSummary::default();
+        assert!(!s.ptrace_dominates());
+        assert_eq!(s.dominant_tag(), None);
+    }
+
+    /// EPERM remediation hint references `$(which ktstr)` rather
+    /// than a hardcoded path — pins the wording so a future drift
+    /// to a fixed install path lands here loudly.
+    #[test]
+    fn ptrace_eperm_hint_uses_which_ktstr() {
+        assert!(
+            PTRACE_EPERM_HINT.contains("$(which ktstr)"),
+            "EPERM hint must use $(which ktstr) for portability, got: {PTRACE_EPERM_HINT}",
+        );
+        assert!(PTRACE_EPERM_HINT.contains("cap_sys_ptrace"));
+        assert!(PTRACE_EPERM_HINT.contains("yama.ptrace_scope"));
+    }
+
+    /// `to_public()` carries every counter through verbatim and
+    /// projects `dominant_tag` to `dominant_failure` as the owned
+    /// tag string. Pins the public surface contract so a refactor
+    /// that drops a counter or rewires the projection lands here.
+    #[test]
+    fn to_public_carries_counters_and_dominant_tag() {
+        let mut s = make_summary(3, &[("dwarf-parse-failure", 2)], &[("ptrace-seize", 1)]);
+        s.tgids_walked = 10;
+        s.jemalloc_detected = 5;
+        s.probed_ok = 4;
+
+        let public = s.to_public();
+        assert_eq!(public.tgids_walked, 10);
+        assert_eq!(public.jemalloc_detected, 5);
+        assert_eq!(public.probed_ok, 4);
+        assert_eq!(public.failed, 3);
+        assert_eq!(
+            public.dominant_failure.as_deref(),
+            Some("dwarf-parse-failure"),
+            "dominant_tag picks the highest-count actionable tag, \
+             projected as an owned String",
+        );
+    }
+
+    /// Zero-failure summary projects to `dominant_failure: None` —
+    /// the absence-of-failure case must surface as None, not an
+    /// empty string. Mirrors the internal `dominant_tag` returning
+    /// None when both tag maps are empty.
+    #[test]
+    fn to_public_dominant_failure_is_none_when_no_failures() {
+        let s = make_summary(0, &[("jemalloc-not-found", 12)], &[]);
+        let public = s.to_public();
+        assert_eq!(public.failed, 0);
+        assert!(
+            public.dominant_failure.is_none(),
+            "no actionable failures means dominant_failure is None; \
+             got {:?}",
+            public.dominant_failure,
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Summary-line emission discipline (tracing assertions)
+    //
+    // emit_probe_summary is the single source of truth for the
+    // operator-facing per-snapshot summary. The tests below run
+    // under `#[traced_test]` so the emitted `tracing::info!` /
+    // `tracing::warn!` events are captured into an in-memory
+    // buffer queryable via `logs_contain`. Without these, a
+    // refactor that silently dropped the dominant-tag clause or
+    // the EPERM hint would be invisible — the structural unit
+    // tests above pin the helpers that feed the summary, but
+    // only an emission test pins what the operator actually
+    // reads.
+    // ------------------------------------------------------------
+
+    /// Zero-failure snapshot emits a clean summary line — no
+    /// failure-class clause, no privilege hint. Pins the "happy
+    /// path" shape so a future refactor that always-appended a
+    /// hint would surface here.
+    ///
+    /// Test fn names deliberately avoid the substrings asserted
+    /// against (e.g. "dominant", "hint") because
+    /// `tracing-test`'s `logs_contain` matches across the entire
+    /// captured frame INCLUDING the span (which is the test fn
+    /// name). The terse `summary_emits_*` naming keeps the span
+    /// text disjoint from the assertions.
+    #[traced_test]
+    #[test]
+    fn summary_emits_clean_line_when_no_failures() {
+        let summary = make_summary(0, &[("jemalloc-not-found", 12)], &[]);
+        emit_probe_summary(&summary);
+        assert!(logs_contain("host-state probe:"));
+        assert!(logs_contain("0 tgids walked"));
+        assert!(logs_contain("0 failed"));
+        assert!(
+            !logs_contain("(dominant:"),
+            "no failures means the dominant-tag clause is omitted",
+        );
+        assert!(
+            !logs_contain("hint:"),
+            "no failures means the EPERM hint is omitted",
+        );
+    }
+
+    /// Privilege-dominated snapshot emits the hint with the
+    /// `$(which ktstr)` substring intact. Catches a regression
+    /// that drops the hint when the ptrace-dominates threshold
+    /// fires.
+    #[traced_test]
+    #[test]
+    fn summary_emits_privilege_hint_when_ptrace_dominates() {
+        let summary = ProbeSummary {
+            tgids_walked: 4,
+            jemalloc_detected: 2,
+            probed_ok: 0,
+            failed: 4,
+            attach_tag_counts: BTreeMap::new(),
+            probe_tag_counts: [("ptrace-seize", 4u64)].into_iter().collect(),
+        };
+        emit_probe_summary(&summary);
+        assert!(logs_contain("(dominant: ptrace-seize"));
+        assert!(logs_contain("hint:"));
+        assert!(logs_contain("$(which ktstr)"));
+        assert!(logs_contain("cap_sys_ptrace"));
+        assert!(logs_contain("yama.ptrace_scope"));
+    }
+
+    /// Mixed-failure snapshot (DWARF + ptrace) where ptrace
+    /// stays below the half threshold emits the dominant tag
+    /// but NOT the privilege hint — a stripped-binary host
+    /// doesn't need the privilege fix, it needs debuginfo.
+    #[traced_test]
+    #[test]
+    fn summary_omits_privilege_hint_when_debuginfo_failures_lead() {
+        let summary = ProbeSummary {
+            tgids_walked: 5,
+            jemalloc_detected: 3,
+            probed_ok: 0,
+            failed: 5,
+            attach_tag_counts: [("dwarf-parse-failure", 4u64)].into_iter().collect(),
+            probe_tag_counts: [("ptrace-seize", 1u64)].into_iter().collect(),
+        };
+        emit_probe_summary(&summary);
+        assert!(logs_contain("(dominant: dwarf-parse-failure"));
+        assert!(
+            !logs_contain("hint:"),
+            "DWARF-dominated failures must NOT trigger the privilege \
+             hint — only privilege failures earn the privilege remediation",
+        );
+    }
+
+    /// `try_attach_probe_for_tgid_at` against a known-bad pid (0,
+    /// reserved by the kernel) emits a `tracing::warn!` event
+    /// (not debug) because PidMissing is NOT the
+    /// jemalloc-not-found case — it's a hard error worth
+    /// surfacing. Pins the level-routing rule from the helper's
+    /// doc.
+    #[traced_test]
+    #[test]
+    fn try_attach_probe_for_tgid_at_warns_on_pid_missing() {
+        let mut summary = ProbeSummary::default();
+        let probe = try_attach_probe_for_tgid_at(Path::new(DEFAULT_PROC_ROOT), 0, &mut summary);
+        assert!(probe.is_none(), "pid 0 must not produce a probe");
+        // PidMissing → tag "pid-missing", logged at warn, counted as failed.
+        assert!(logs_contain("attach failed"));
+        assert!(logs_contain("pid-missing"));
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.jemalloc_detected, 0);
+        assert_eq!(summary.tgids_walked, 1);
+        assert_eq!(
+            summary.attach_tag_counts.get("pid-missing").copied(),
+            Some(1),
+            "PidMissing tag must increment its bucket",
+        );
+    }
+
+    /// `try_attach_probe_for_tgid_at` against a real process that
+    /// is NOT jemalloc-linked (`/bin/sleep` spawned for the
+    /// duration of the test) returns `None` AND logs at debug,
+    /// not warn — the JemallocNotFound case is the expected
+    /// outcome for the bulk of system processes and must not
+    /// flood the operator's log. Pins the
+    /// `jemalloc-not-found → debug` routing rule.
+    #[traced_test]
+    #[test]
+    fn try_attach_probe_for_tgid_at_debugs_on_non_jemalloc_target() {
+        // /bin/sleep is a coreutils binary not linked against
+        // jemalloc; attach_jemalloc walks its /proc/<pid>/maps,
+        // finds no TSD symbol, and returns JemallocNotFound.
+        let mut child = match std::process::Command::new("sleep")
+            .arg("3")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("skipping — /bin/sleep unavailable");
+                return;
+            }
+        };
+        // Poll for `/proc/<pid>/exe` to become readable rather than
+        // burning a hardcoded settle window. On a fast host the
+        // exe symlink resolves within microseconds of fork+exec; on
+        // a contended CI runner it can lag a few ms. A 1 s deadline
+        // with 1 ms backoff bounds the worst case while keeping the
+        // common case nearly instantaneous, and deterministically
+        // gates the test on the actual readiness signal rather than
+        // a guess. `read_link` is the same syscall the probe attach
+        // exercises, so once it succeeds the downstream
+        // `try_attach_probe_for_tgid_at` call is guaranteed to find
+        // an exe symlink it can resolve.
+        let pid = child.id() as i32;
+        let exe_link = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::fs::read_link(&exe_link).is_err() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "/proc/{pid}/exe did not become readable within 1s — \
+                     kernel did not surface the freshly-forked child's exe \
+                     symlink in time, the test cannot proceed"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let mut summary = ProbeSummary::default();
+        let probe = try_attach_probe_for_tgid_at(Path::new(DEFAULT_PROC_ROOT), pid, &mut summary);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(probe.is_none(), "sleep is not jemalloc-linked");
+        assert_eq!(summary.tgids_walked, 1);
+        assert_eq!(summary.jemalloc_detected, 0);
+        assert_eq!(
+            summary.failed, 0,
+            "jemalloc-not-found must NOT count as failure — it's the \
+             expected outcome for the bulk of system processes",
+        );
+        assert_eq!(
+            summary.attach_tag_counts.get("jemalloc-not-found").copied(),
+            Some(1),
+        );
+        // The debug event carries the "attach skipped" message;
+        // tracing-test's logs_contain looks across all captured
+        // events including debug.
+        assert!(
+            logs_contain("attach skipped"),
+            "JemallocNotFound must emit the debug 'attach skipped' \
+             event so log filters can route it separately from \
+             actionable warnings",
+        );
+        assert!(
+            !logs_contain("attach failed"),
+            "jemalloc-not-found must NOT emit the warn 'attach failed' \
+             event — that level is reserved for actionable failures",
+        );
     }
 }

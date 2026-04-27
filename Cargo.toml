@@ -77,7 +77,7 @@ memmap2 = "0.9"
 # at probe time (jemalloc-probe binary). Already present transitively
 # via blazesym; pinned as a direct dep so the probe's offset-recovery
 # path doesn't depend on blazesym's re-export surface.
-gimli = "0.32"
+gimli = "0.33"
 rayon = "1"
 # ELF reader/writer. `features = ["build"]` pulls in the full
 # `object::build::elf::Builder` surface used by `elf_strip.rs` and
