@@ -370,6 +370,42 @@ free-form `error` string.
   for all cleanup options, including `--keep N --force` to preserve
   the N newest entries.
 
+## Stale `vmlinux.btf` or `default.profraw` in kernel source tree
+
+After upgrading from an older ktstr version, you may notice extra
+files in your kernel source directory:
+
+- `<source>/vmlinux.btf` — a sidecar of the kernel's `.BTF`
+  section bytes. Older ktstr versions wrote it next to whichever
+  `vmlinux` they parsed, including source-tree builds. Current
+  ktstr only writes the sidecar when the vmlinux path is inside
+  the cache root (`~/.cache/ktstr/kernels/` or whatever
+  `KTSTR_CACHE_DIR` points at) so source trees stay pristine.
+- `<source>/default.profraw` — an LLVM coverage runtime artifact.
+  Older ktstr versions could leave it in cwd when a
+  coverage-instrumented `cargo ktstr test` was launched from
+  inside the kernel tree. Current ktstr injects
+  `LLVM_PROFILE_FILE=<cargo-ktstr-binary-parent>/llvm-cov-target/default-{pid}-{binary_hash}.profraw`
+  for the bare `nextest` path so the profraw lands next to the
+  cargo-ktstr binary regardless of cwd. See
+  [profraw layout](running-tests/cargo-ktstr.md#profraw-layout)
+  for the per-population directory map.
+
+Both files are leftover state from prior runs and are safe to
+remove:
+
+```sh
+rm -f /path/to/linux/vmlinux.btf
+rm -f /path/to/linux/default.profraw
+```
+
+If you also see them turn up under a different ktstr-driven
+source tree, check that you are running a current ktstr build
+(re-run `cargo build` or `cargo install ktstr` to pick up the
+fix) before deleting again — the guards live in the resolver,
+not on disk, so an old binary will keep regenerating these
+files.
+
 ## Cache directory not found
 
 ```text

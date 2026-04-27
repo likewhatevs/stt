@@ -128,35 +128,93 @@ identical work for no signal.
 ### What it does (path mode only)
 
 These steps run only when `--kernel` is a source directory path.
-Cached version and cache-key identifiers skip to step 5; uncached
-version identifiers run through download + configure + build first.
-Ranges fan out to per-version resolution (every release downloads
-+ builds + caches independently if not already present) before
-reaching step 5; git sources clone shallow at the ref, build, and
-cache the result. Multi-kernel resolution finishes for every
-requested kernel BEFORE step 5 — the cargo-nextest invocation in
-step 5 sees the complete kernel set as a single `KTSTR_KERNEL_LIST`
-export, so nextest fans the gauntlet across kernels in a single
-run.
+Cached version and cache-key identifiers skip straight to test
+execution (step 6); uncached version identifiers run through
+download + configure + build + cache-store first. Ranges fan out
+to per-version resolution (every release downloads + builds +
+caches independently if not already present); git sources clone
+shallow at the ref, build, and cache. Multi-kernel resolution
+finishes for every requested kernel BEFORE step 6 — the
+cargo-nextest invocation in step 6 sees the complete kernel set
+as a single `KTSTR_KERNEL_LIST` export, so nextest fans the
+gauntlet across kernels in a single run.
 
-1. **Config check** -- reads `<kernel>/.config` for
-   `CONFIG_SCHED_CLASS_EXT=y`.
-2. **Auto-configure** -- if the config sentinel is missing, runs
-   `make defconfig` (when no `.config` exists), appends `ktstr.kconfig`
-   to `.config`, then runs `make olddefconfig`.
-3. **Kernel build** -- runs `make -j$(nproc) KCFLAGS=-Wno-error`.
-   This always runs; `make` handles the no-op case when the kernel
-   is already built.
-4. **compile_commands.json** -- runs `make compile_commands.json` to
-   generate the compilation database for clangd / LSP.
-5. **Test execution** -- execs `cargo nextest run` once with
+For path mode, the source tree is gix-discovered and classified
+as either *clean* (HEAD reachable, index matches HEAD, worktree
+matches index) or *dirty or non-git* (any tracked-file diff, or
+the directory is not a git repo at all). The cache is keyed at
+`local-{hash7}-{arch}-kc{suffix}` where `{hash7}` is the source
+tree's HEAD short hash; dirty trees and non-git trees both
+collapse to the literal `local-unknown-...` key and never cache.
+
+1. **Source-tree validation** — verifies `<kernel>/Makefile` and
+   `<kernel>/Kconfig` both exist. If either is missing, bails
+   with `not a kernel source tree`.
+2. **Cache lookup** (clean trees only) — looks up
+   `local-{hash7}-{arch}-kc{suffix}`. **Cache hit short-circuits
+   to step 6**: cargo-ktstr exports the cache entry directory via
+   `KTSTR_KERNEL` and emits a `cargo ktstr: cache hit for
+   {input_path} ({cache_key}, built {age} ago)` line on stderr
+   (the `, built {age} ago` suffix is omitted when the timestamp
+   is unparseable or future-dated). Cache miss continues to
+   step 3.
+3. **Auto-configure** — if `<kernel>/.config` lacks the
+   `CONFIG_SCHED_CLASS_EXT=y` sentinel, runs `make defconfig`
+   (when no `.config` exists), appends `ktstr.kconfig` to
+   `.config`, then runs `make olddefconfig`.
+4. **Kernel build** — runs `make -j$(nproc) KCFLAGS=-Wno-error`,
+   then runs `validate_kernel_config` to verify critical config
+   options (`CONFIG_SCHED_CLASS_EXT`, `CONFIG_DEBUG_INFO_BTF`,
+   `CONFIG_BPF_SYSCALL`, `CONFIG_FTRACE`, `CONFIG_KPROBE_EVENTS`,
+   `CONFIG_BPF_EVENTS`) survived the build — the kernel build
+   system silently disables options whose dependencies are not
+   met, and the validator surfaces those failures with a per-
+   option remediation hint. `make` handles the no-op case when
+   the kernel is already built. For dirty / non-git trees this
+   is the unconditional path; for clean trees, only reached on
+   cache miss.
+5. **compile_commands.json + cache store** — runs `make
+   compile_commands.json` (skipped only for transient temp
+   directories like extracted tarballs) so LSP / clangd work
+   against the local tree. Then for clean trees, the kernel
+   image + stripped vmlinux are persisted under
+   `local-{hash7}-{arch}-kc{suffix}` with `metadata.json`
+   recording the source tree path. Dirty / non-git trees skip
+   the cache store (no stable HEAD identity for the cache key)
+   but still get `compile_commands.json`.
+6. **Test execution** — execs `cargo nextest run` once with
    `KTSTR_KERNEL` set in the environment (single-kernel) or with
    both `KTSTR_KERNEL` and `KTSTR_KERNEL_LIST` (multi-kernel; the
    latter encodes the resolved kernel set as
-   `label1=path1;label2=path2;…`). The test binary's gauntlet
-   expansion adds the kernel as a fifth dimension when the list
-   carries 2+ entries; nextest's parallelism, retries, and `-E`
-   filtering apply natively to every (test × kernel) variant.
+   `label1=path1;label2=path2;…`). For clean Path-spec resolution
+   `KTSTR_KERNEL` points at the cache entry directory; for dirty
+   or non-git trees it points at the source tree directly. The
+   test binary's gauntlet expansion adds the kernel as a fifth
+   dimension when the list carries 2+ entries; nextest's
+   parallelism, retries, and `-E` filtering apply natively to
+   every (test × kernel) variant.
+
+> **Implicit vs explicit kernel discovery diverge**: `cargo ktstr
+> test --kernel ../linux` (explicit Path spec) routes through the
+> cache pipeline above — the source tree is gix-classified, the
+> `local-{hash7}-...` cache key is computed, the kernel is built
+> (or short-circuited on cache hit), and the cache entry directory
+> is exported via `KTSTR_KERNEL`. `cargo ktstr test` (no `--kernel`
+> flag) does NOT run the build pipeline or produce a new cache
+> entry. The test binary's `find_kernel` chain reads existing
+> cache entries (most-recent-valid first; entries built with a
+> different kconfig fragment are skipped) and falls back to local
+> build trees (`./linux`, `../linux`) and host paths. Whatever
+> pre-built image it finds is returned as-is — no cache key is
+> computed for source trees discovered on the filesystem, no
+> `make` is invoked, and the result does not land in the kernel
+> cache for a future `cache_key`-keyed lookup. The `KTSTR_KERNEL`
+> env var with a path value follows this same direct-image flow
+> — the cache write path is reached only via the `cargo ktstr`
+> `--kernel` argument (or via `cargo ktstr kernel build --source
+> ../linux` as an explicit cache-populate step). Pass
+> `--kernel ../linux` to opt into the cache pipeline so a clean
+> tree's build is stored once and reused on subsequent runs.
 
 ### Passing nextest arguments
 
@@ -214,6 +272,67 @@ Arguments after `coverage` are passed through to
 cargo ktstr coverage -- --workspace --profile ci --lcov --output-path lcov.info
 cargo ktstr coverage -- --features integration
 ```
+
+### profraw layout
+
+Three populations of `*.profraw` files arise from `cargo ktstr`
+runs. They land in different directories and are not all
+collected by the same workflow:
+
+| Filename shape | Directory | Producer | Collected by |
+|---|---|---|---|
+| `default-{pid}-{binary_hash}.profraw` | parent of `cargo-ktstr` binary, joined with `llvm-cov-target/` (e.g. `target/{profile}/llvm-cov-target/` for `cargo run --bin cargo-ktstr`, or `~/.cargo/bin/llvm-cov-target/` for an installed binary) | host-side `cargo ktstr test` (via `LLVM_PROFILE_FILE` injection) | not auto-collected; needs an explicit `cargo llvm-cov` report invocation |
+| cargo-llvm-cov-managed (shape set by the outer harness) | `target/llvm-cov-target/` (workspace target dir, NOT under `{profile}`) | host-side `cargo ktstr coverage` (cargo-llvm-cov sets its own `LLVM_PROFILE_FILE`) | merged into the `cargo ktstr coverage` report automatically |
+| `ktstr-test-{pid}-{counter}.profraw` | parent of the test binary's `LLVM_PROFILE_FILE` env var, falling back to `<test-binary parent>/llvm-cov-target/` (typically `target/{profile}/deps/llvm-cov-target/` when no env override is in play); under `cargo ktstr test`, inherits the host-side injected dir, so co-locates with `default-{pid}-{binary_hash}.profraw` | guest-side `__llvm_profile_write_buffer` flushed via the SHM ring at VM exit | merged into the `cargo ktstr coverage` report automatically |
+
+`cargo ktstr test` injects `LLVM_PROFILE_FILE` (added to prevent
+`default.profraw` leaking into a kernel source tree when the
+shell cwd was the kernel dir; see
+[Stale `vmlinux.btf` or `default.profraw`](../troubleshooting.md#stale-vmlinuxbtf-or-defaultprofraw-in-kernel-source-tree)).
+The resulting host-side `default-{pid}-{binary_hash}.profraw`
+files do NOT land in the `target/llvm-cov-target/` directory
+that `cargo ktstr coverage` (cargo-llvm-cov) reads; they are NOT
+picked up by a later `cargo ktstr coverage` run unless you
+explicitly include them in a `cargo llvm-cov report`
+invocation pointed at the cargo-ktstr binary's `llvm-cov-target/`
+directory.
+
+To clean accumulated profraw between runs:
+
+```sh
+# Remove ONLY *.profraw under target/llvm-cov-target/ (top-level glob, non-recursive):
+cargo ktstr llvm-cov clean --profraw-only
+
+# Drop host-side test-path profraw next to the cargo-ktstr binary.
+# Run only the line(s) matching how cargo-ktstr was launched —
+# the brace-list form is bash-only, so each path is its own command
+# for portable POSIX shells (sh / dash):
+rm -f target/debug/llvm-cov-target/default-*.profraw
+rm -f target/release/llvm-cov-target/default-*.profraw
+
+# If ktstr was installed via `cargo install`:
+rm -f ~/.cargo/bin/llvm-cov-target/default-*.profraw
+```
+
+`--profraw-only` is the safe default: it removes only `*.profraw`
+files at the top level of `target/llvm-cov-target/` (the cargo-
+llvm-cov-managed dir) and leaves coverage reports, profdata, and
+build artifacts intact. It does NOT touch the `default-*.profraw`
+files next to the cargo-ktstr binary (under
+`target/{profile}/llvm-cov-target/` for `cargo run` / `cargo build`,
+or `~/.cargo/bin/llvm-cov-target/` for `cargo install`-deployed
+binaries) produced by the host-side injection — remove those with
+the explicit `rm -f` lines above for whichever launch mode you use.
+Avoid `cargo ktstr llvm-cov clean` without arguments (recursively
+wipes all of `target/llvm-cov-target/`, including reports) and
+`--workspace` (additionally runs `cargo clean` on workspace
+packages, removing build artifacts); both are destructive beyond
+profraw.
+
+To opt out of the host-side `LLVM_PROFILE_FILE` injection
+entirely, export `LLVM_PROFILE_FILE` yourself before running
+`cargo ktstr test` — the injector only fires when the env is
+absent, so an explicit operator setting takes precedence.
 
 ## llvm-cov
 

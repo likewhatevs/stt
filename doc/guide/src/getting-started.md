@@ -82,6 +82,22 @@ The host's installed kernel works for basic testing. For sched_ext
 tests, build a kernel with the ktstr config fragment (below). See
 [Troubleshooting](troubleshooting.md#no-kernel-found) for details.
 
+> **Implicit discovery reads existing cache entries but does not
+> run the build pipeline or produce a new cache entry.** The
+> chain reads existing cache entries on the read path
+> (most-recent-valid first; entries built with a different
+> kconfig fragment are skipped) and falls back to local build
+> trees and host paths when nothing matches. It does NOT compute
+> a `local-{hash7}-{arch}-kc{suffix}` cache key, run the build
+> pipeline, or store a new cache entry from whatever source-tree
+> image it ends up using. To opt into the build + cache-store
+> pipeline so a source tree's build is recorded and reused under
+> a stable cache key, pass the path explicitly via
+> `cargo ktstr test --kernel ../linux`; see
+> [cargo-ktstr — What it does](running-tests/cargo-ktstr.md#what-it-does-path-mode-only)
+> for the full path-mode flow including the cache-hit
+> short-circuit.
+
 ## Build a kernel
 
 `cargo ktstr kernel build` downloads a kernel tarball from kernel.org,
@@ -283,7 +299,7 @@ one command:
 
 ```sh
 cargo ktstr test                                              # auto-discover kernel
-cargo ktstr test --kernel ../linux                            # local source tree
+cargo ktstr test --kernel ../linux                            # local source tree (builds + caches; subsequent runs hit cache)
 cargo ktstr test --kernel 6.14.2                              # version (auto-downloads on miss)
 cargo ktstr test -- -E 'test(my_test)'                        # pass nextest args
 ```
