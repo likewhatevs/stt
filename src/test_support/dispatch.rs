@@ -58,6 +58,14 @@ use super::{
     run_ktstr_test_inner, sidecar_dir, try_flush_profraw, validate_entry_flags,
 };
 
+/// Check if an `anyhow::Error` is a `ResourceContention`.
+/// Used by the `#[ktstr_test]` macro expansion to skip gracefully
+/// on CPU lock exhaustion instead of panicking.
+pub fn is_resource_contention(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
+        .is_some()
+}
+
 /// Overwrite the argv string at index `arg_idx` with `replacement`.
 ///
 /// Uses `RAW_ARGV` captured by the `.init_array` constructor above.

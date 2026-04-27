@@ -3089,24 +3089,34 @@ mod tests {
 
     #[test]
     fn cpu_lock_acquire_success() {
-        // acquire_cpu_locks starts at offset 0. Use total_host_cpus
-        // large enough that a free 3-CPU window always exists even
-        // when other parallel tests hold some low-index CPU locks.
-        let locks = acquire_cpu_locks(3, 100, None).unwrap();
+        let locks = match acquire_cpu_locks(3, 100, None) {
+            Ok(l) => l,
+            Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            Err(e) => panic!("{e:#}"),
+        };
         assert_eq!(locks.len(), 3);
     }
 
     #[test]
     fn cpu_lock_acquire_slides_past_held() {
-        // Hold CPU 0. acquire_cpu_locks(count=2, total=100) slides
-        // past window [0,1] and finds a free window. Headroom of
-        // 100 CPUs absorbs parallel test interference.
         cleanup_lock("/tmp/ktstr-cpu-0.lock");
         let holder = try_flock("/tmp/ktstr-cpu-0.lock", FlockMode::Exclusive)
             .unwrap()
             .unwrap();
 
-        let locks = acquire_cpu_locks(2, 100, None).unwrap();
+        let locks = match acquire_cpu_locks(2, 100, None) {
+            Ok(l) => l,
+            Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
+                drop(holder);
+                cleanup_lock("/tmp/ktstr-cpu-0.lock");
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            Err(e) => panic!("{e:#}"),
+        };
         assert_eq!(locks.len(), 2);
 
         drop(locks);
@@ -3146,8 +3156,14 @@ mod tests {
 
         let topo = HostTopology::new_for_tests(&[((0..100).collect(), 0)]);
 
-        let locks = acquire_cpu_locks(2, 100, Some(&topo)).unwrap();
-        // 2 CPU locks + 1 shared LLC lock = 3.
+        let locks = match acquire_cpu_locks(2, 100, Some(&topo)) {
+            Ok(l) => l,
+            Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            Err(e) => panic!("{e:#}"),
+        };
         assert_eq!(locks.len(), 3);
 
         // The LLC lock is shared — another shared should coexist.

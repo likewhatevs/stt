@@ -80,7 +80,8 @@ pub(crate) use sidecar::{
 pub use sidecar::{SidecarResult, collect_pool, newest_run_dir, repo_is_dirty, runs_root};
 
 pub use dispatch::{
-    analyze_sidecars, ktstr_main, ktstr_test_early_dispatch, run_ktstr_test, sanitize_kernel_label,
+    analyze_sidecars, is_resource_contention, ktstr_main, ktstr_test_early_dispatch,
+    run_ktstr_test, sanitize_kernel_label,
 };
 pub(crate) use entry::validate_entry_flags;
 pub use entry::{

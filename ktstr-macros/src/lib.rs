@@ -943,7 +943,14 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         quote! {
-            let _result = ::ktstr::test_support::run_ktstr_test(&#entry_name).unwrap();
+            match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
+                Ok(_) => {}
+                Err(e) if ::ktstr::test_support::is_resource_contention(&e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Err(e) => panic!("{e:#}"),
+            }
         }
     };
 
