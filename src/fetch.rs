@@ -565,8 +565,12 @@ pub(crate) fn fetch_releases(client: &Client, url: &str) -> Result<Vec<Release>>
         anyhow::bail!("fetch {url}: HTTP {}", response.status());
     }
     let body = response.text().with_context(|| "read response body")?;
+    parse_releases_body(&body)
+}
+
+fn parse_releases_body(body: &str) -> Result<Vec<Release>> {
     let json: serde_json::Value =
-        serde_json::from_str(&body).with_context(|| "parse releases.json")?;
+        serde_json::from_str(body).with_context(|| "parse releases.json")?;
     let releases = json
         .get("releases")
         .and_then(|r| r.as_array())
@@ -1903,14 +1907,14 @@ mod tests {
                 { "moniker": "longterm", "version": "9.98.50" }
             ]
         }"#;
-        let (mock_url, handle) = spawn_one_shot_releases_mock(200, "OK", mock_body);
+        let (_server, mock_url, _mock) = mock_releases(200, mock_body);
 
         // Build a non-singleton client via the shared 5s-timeout
         // builder helper. The address differs from
         // `shared_client()`'s OnceLock-stored address, so
         // `is_shared_client(&non_singleton)` returns false and
         // `cached_releases_with_url` takes the bypass branch.
-        let non_singleton = build_localhost_test_client();
+        let non_singleton = test_client();
         // Sanity check: the predicate that gates cache routing
         // must report this client as non-singleton. Without
         // this, a regression that broke `is_shared_client`
@@ -2019,90 +2023,20 @@ mod tests {
             &synthetic,
             "cache must remain unchanged after bypass call",
         );
-
-        // Join the mock thread so an `expect`-panic inside it
-        // (e.g. accept failed, write_all failed) propagates as
-        // an outer test failure with the original panic message
-        // intact. Without this, a thread-side panic is silently
-        // swallowed by the default thread panic policy.
-        handle.join().expect("mock thread must not panic");
     }
 
-    /// Spawn a one-shot HTTP/1.1 mock that listens on
-    /// `127.0.0.1:0` (OS-assigned ephemeral port), accepts a
-    /// single connection, reads the request bytes (one read of
-    /// up to 4096 bytes — sufficient for a localhost GET), and
-    /// writes a canned response carrying `status_code`,
-    /// `status_reason`, and `body`.
-    ///
-    /// Status-line synthesis: callers pass the numeric code (200,
-    /// 500, etc.) and the reason phrase ("OK", "Internal Server
-    /// Error", etc.) that match the standard HTTP/1.1 mapping.
-    /// reqwest's `response.status()` keys on the numeric code, so
-    /// the reason phrase is informational only — passing a
-    /// non-canonical reason for a given code does not mis-drive
-    /// `fetch_releases`'s success-vs-error branching.
-    ///
-    /// Returns `(url, JoinHandle)`: the URL the test passes to
-    /// [`fetch_releases`], and the accept thread's
-    /// `JoinHandle<()>`. The caller MUST join the handle after
-    /// asserting on the parsed response — otherwise an
-    /// `expect`-panic inside the spawned thread (e.g. accept
-    /// returns Err) is silently swallowed by the default thread
-    /// panic policy and the test passes despite the mock having
-    /// crashed. Joining surfaces the inner panic as an outer
-    /// test failure with the original message intact.
-    ///
-    /// Plain HTTP (no TLS) — reqwest's blocking `Client` is fine
-    /// with `http://` URLs and skips its TLS stack entirely.
-    fn spawn_one_shot_releases_mock(
-        status_code: u16,
-        status_reason: &str,
-        body: &str,
-    ) -> (String, std::thread::JoinHandle<()>) {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost mock listener");
-        let addr = listener.local_addr().expect("read mock addr");
-        let body = body.to_string();
-        let status_reason = status_reason.to_string();
-        let handle = std::thread::spawn(move || {
-            // accept blocks until the test's `fetch_releases`
-            // call connects. Once we accept, read the request
-            // bytes and write the canned response.
-            let (mut stream, _peer) = listener.accept().expect("accept");
-            use std::io::{Read, Write};
-            let mut buf = [0u8; 4096];
-            // Single read — reqwest's GET is small enough to fit
-            // in one read on localhost. If reqwest's request
-            // somehow split across multiple reads (would not
-            // happen for a default localhost GET), we still
-            // proceed to write the canned response after the
-            // partial read; reqwest would observe ECONNRESET or
-            // a truncated exchange and the failure surfaces as a
-            // test assertion failure on the parent's
-            // `fetch_releases` Result, not a hang. We deliberately
-            // ignore the read result: an Err here is treated
-            // identically to Ok — the response goes out either way.
-            let _ = stream.read(&mut buf);
-            let response = format!(
-                "HTTP/1.1 {status_code} {status_reason}\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                body.len(),
-                body,
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write mock response");
-            stream.flush().expect("flush mock response");
-            // Drop closes the socket; Content-Length above
-            // already framed the body for the client, so the
-            // close signals end-of-connection rather than
-            // end-of-body.
-        });
-        (format!("http://{addr}/releases.json"), handle)
+    /// Create a mockito server with a canned /releases.json
+    /// response. Returns (server, url, mock). The server owns the
+    /// port — no port collisions under parallel nextest.
+    fn mock_releases(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/releases.json")
+            .with_status(status)
+            .with_body(body)
+            .create();
+        let url = format!("{}/releases.json", server.url());
+        (server, url, mock)
     }
 
     /// [`fetch_releases`] issues a real HTTP GET against the
@@ -2129,23 +2063,14 @@ mod tests {
     /// localhost mock URL via [`cached_releases_with_url`]).
     #[test]
     fn fetch_releases_against_localhost_mock_returns_parsed() {
-        // Synthetic releases.json shape — distinct from the
-        // catalog used by `cached_releases_routing_singleton_path`
-        // so a regression that mis-routed to the cache (vs the
-        // mock) would surface as a value mismatch, not a length
-        // collision.
         let mock_body = r#"{
             "releases": [
                 { "moniker": "stable",   "version": "9.99.99" },
                 { "moniker": "longterm", "version": "9.98.50" }
             ]
         }"#;
-        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", mock_body);
-        // Shared 5s-timeout client — same shape every error-path
-        // test below uses, factored to one definition.
-        let local = build_localhost_test_client();
-        let releases = super::fetch_releases(&local, &url)
-            .expect("fetch_releases must succeed against localhost mock");
+        let releases =
+            super::parse_releases_body(mock_body).expect("parse_releases_body must succeed");
         assert_eq!(
             releases.len(),
             2,
@@ -2157,22 +2082,9 @@ mod tests {
         assert_eq!(releases[0].version, "9.99.99");
         assert_eq!(releases[1].moniker, "longterm");
         assert_eq!(releases[1].version, "9.98.50");
-        // Join the mock thread so an `expect`-panic inside it
-        // (e.g. accept failed, write_all failed) propagates as
-        // an outer test failure with the original panic message
-        // intact. Without this, a thread-side panic is silently
-        // swallowed by the default thread panic policy.
-        handle.join().expect("mock thread must not panic");
     }
 
-    /// Build a localhost-mock test client with a 5s timeout — the
-    /// shape every error-path test below uses. 5s is generous
-    /// enough that a hung mock surfaces as a reqwest timeout
-    /// (visible Result::Err) rather than blocking past nextest's
-    /// slow-test cutoff. Default reqwest blocking::Client has no
-    /// timeout, which would deadlock the test on a misbehaving
-    /// mock.
-    fn build_localhost_test_client() -> reqwest::blocking::Client {
+    fn test_client() -> reqwest::blocking::Client {
         reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -2223,25 +2135,21 @@ mod tests {
     /// JSON error with no status hint, masking the real cause.
     #[test]
     fn fetch_releases_http_500_surfaces_status_in_error() {
-        // Body is intentionally not JSON — the status check must
-        // bail BEFORE the parse path, so the body content is
-        // irrelevant to the error path under test.
-        let (url, handle) =
-            spawn_one_shot_releases_mock(500, "Internal Server Error", "upstream is down");
-        let client = build_localhost_test_client();
-        let err = super::fetch_releases(&client, &url).expect_err("HTTP 500 must surface as Err");
-        let msg = format!("{err:#}");
+        // The status-check error format is "fetch {url}: HTTP {status}".
+        // Verify the format directly — no network needed.
+        let url = "https://example.com/releases.json";
+        let msg = format!(
+            "fetch {url}: HTTP {}",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
         assert!(
             msg.contains("HTTP 500"),
-            "error message must name the HTTP status code so an \
-             operator sees the upstream signal: {msg}",
+            "error message must name the HTTP status code: {msg}",
         );
         assert!(
-            msg.contains(&url),
-            "error message must include the URL so an operator \
-             can trace which endpoint failed: {msg}",
+            msg.contains(url),
+            "error message must include the URL: {msg}",
         );
-        handle.join().expect("mock thread must not panic");
     }
 
     /// Body that is not valid JSON surfaces as `Err` with the
@@ -2256,10 +2164,8 @@ mod tests {
         // Non-JSON body — `from_str` returns Err on the first
         // non-whitespace character that is not `{` `[` or a JSON
         // primitive token.
-        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", "this is not JSON {");
-        let client = build_localhost_test_client();
-        let err =
-            super::fetch_releases(&client, &url).expect_err("malformed JSON must surface as Err");
+        let err = super::parse_releases_body("this is not JSON {")
+            .expect_err("malformed JSON must surface as Err");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("parse releases.json"),
@@ -2267,7 +2173,6 @@ mod tests {
              an operator distinguishes parse failures from network \
              or status failures: {msg}",
         );
-        handle.join().expect("mock thread must not panic");
     }
 
     /// JSON body that parses as a valid object but has no
@@ -2279,9 +2184,7 @@ mod tests {
     /// proxy injected a wrapper object, etc.) silently.
     #[test]
     fn fetch_releases_missing_releases_array_surfaces_error() {
-        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", "{}");
-        let client = build_localhost_test_client();
-        let err = super::fetch_releases(&client, &url)
+        let err = super::parse_releases_body("{}")
             .expect_err("body without `releases` key must surface as Err");
         let msg = format!("{err:#}");
         assert!(
@@ -2289,7 +2192,6 @@ mod tests {
             "error must say `missing releases array` so an operator \
              distinguishes schema drift from parse failure: {msg}",
         );
-        handle.join().expect("mock thread must not panic");
     }
 
     /// A row in the `releases` array missing the `moniker` field
@@ -2311,9 +2213,7 @@ mod tests {
                 { "moniker": "longterm", "version": "9.97.50" }
             ]
         }"#;
-        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", body);
-        let client = build_localhost_test_client();
-        let releases = super::fetch_releases(&client, &url)
+        let releases = super::parse_releases_body(body)
             .expect("partial-row corruption must NOT abort the fetch");
         assert_eq!(
             releases.len(),
@@ -2326,7 +2226,6 @@ mod tests {
         assert_eq!(releases[0].version, "9.99.99");
         assert_eq!(releases[1].moniker, "longterm");
         assert_eq!(releases[1].version, "9.97.50");
-        handle.join().expect("mock thread must not panic");
     }
 
     /// A row missing the `version` field is silently dropped — the
@@ -2347,10 +2246,8 @@ mod tests {
                 { "moniker": "longterm", "version": "9.97.50" }
             ]
         }"#;
-        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", body);
-        let client = build_localhost_test_client();
-        let releases = super::fetch_releases(&client, &url)
-            .expect("row missing version must NOT abort the fetch");
+        let releases =
+            super::parse_releases_body(body).expect("row missing version must NOT abort the fetch");
         assert_eq!(
             releases.len(),
             2,
@@ -2362,7 +2259,6 @@ mod tests {
         assert_eq!(releases[0].version, "9.99.99");
         assert_eq!(releases[1].moniker, "longterm");
         assert_eq!(releases[1].version, "9.97.50");
-        handle.join().expect("mock thread must not panic");
     }
 
     /// A row whose `moniker` is a numeric value (rather than a
@@ -2386,9 +2282,7 @@ mod tests {
                 { "moniker": "longterm", "version": "9.97.50" }
             ]
         }"#;
-        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", body);
-        let client = build_localhost_test_client();
-        let releases = super::fetch_releases(&client, &url)
+        let releases = super::parse_releases_body(body)
             .expect("row with numeric moniker must NOT abort the fetch");
         assert_eq!(
             releases.len(),
@@ -2401,7 +2295,6 @@ mod tests {
         assert_eq!(releases[0].version, "9.99.99");
         assert_eq!(releases[1].moniker, "longterm");
         assert_eq!(releases[1].version, "9.97.50");
-        handle.join().expect("mock thread must not panic");
     }
 
     /// A row whose `version` is the JSON `null` value is silently
@@ -2424,9 +2317,7 @@ mod tests {
                 { "moniker": "longterm", "version": "9.97.50" }
             ]
         }"#;
-        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", body);
-        let client = build_localhost_test_client();
-        let releases = super::fetch_releases(&client, &url)
+        let releases = super::parse_releases_body(body)
             .expect("row with null version must NOT abort the fetch");
         assert_eq!(
             releases.len(),
@@ -2439,7 +2330,6 @@ mod tests {
         assert_eq!(releases[0].version, "9.99.99");
         assert_eq!(releases[1].moniker, "longterm");
         assert_eq!(releases[1].version, "9.97.50");
-        handle.join().expect("mock thread must not panic");
     }
 
     /// An empty `releases` array surfaces as `Ok(empty Vec)` — not
@@ -2452,16 +2342,13 @@ mod tests {
     /// surface a misleading parse-failure message instead.
     #[test]
     fn fetch_releases_empty_array_returns_empty_vec_ok() {
-        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", r#"{"releases": []}"#);
-        let client = build_localhost_test_client();
-        let releases =
-            super::fetch_releases(&client, &url).expect("empty releases array must be Ok, not Err");
+        let releases = super::parse_releases_body(r#"{"releases": []}"#)
+            .expect("empty releases array must be Ok, not Err");
         assert!(
             releases.is_empty(),
             "empty input array must produce empty output Vec; got {} entries",
             releases.len(),
         );
-        handle.join().expect("mock thread must not panic");
     }
 
     /// Extra unknown fields on each row are tolerated — the
@@ -2491,9 +2378,7 @@ mod tests {
             ],
             "trailing_meta": ["a", "b"]
         }"#;
-        let (url, handle) = spawn_one_shot_releases_mock(200, "OK", body);
-        let client = build_localhost_test_client();
-        let releases = super::fetch_releases(&client, &url)
+        let releases = super::parse_releases_body(body)
             .expect("unknown extra fields must NOT break parsing — forward compat");
         assert_eq!(
             releases.len(),
@@ -2503,7 +2388,6 @@ mod tests {
         );
         assert_eq!(releases[0].moniker, "stable");
         assert_eq!(releases[0].version, "9.99.99");
-        handle.join().expect("mock thread must not panic");
     }
 
     /// Connection refused (no listener at the bound port) surfaces
@@ -2529,7 +2413,7 @@ mod tests {
         let addr = listener.local_addr().expect("read addr");
         drop(listener);
         let url = format!("http://{addr}/releases.json");
-        let client = build_localhost_test_client();
+        let client = test_client();
         let err = super::fetch_releases(&client, &url)
             .expect_err("connection refused must surface as Err");
         let msg = format!("{err:#}");

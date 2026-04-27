@@ -2158,34 +2158,12 @@ fn wrap_chatml_no_think(prompt: &str) -> String {
     format!("<|im_start|>user\n{prompt} /no_think<|im_end|>\n<|im_start|>assistant\n")
 }
 
-/// Run one greedy generation pass against the already-loaded model
-/// and return the decoded assistant text with any `<think>…</think>`
-/// block stripped.
-///
-/// Idempotent: repeated calls with the same `LoadedInference` are
-/// safe. A fresh `LlamaContext` is built per call from the cached
-/// `&LlamaModel`, so each invocation starts with an empty KV cache
-/// without needing an explicit clear step. KV state lives on the
-/// `LlamaContext` (per-call), not on the `LlamaModel` (cached) —
-/// so cross-invocation aliasing is structurally impossible.
-///
-/// Greedy: `LlamaSampler::greedy()` selects the ArgMax token from
-/// the logits at every step. Output is a deterministic function of
 /// Resolve the per-context thread count for llama-cpp inference.
 ///
-/// Argument models the result of `std::thread::available_parallelism`
-/// at the call site: `Some(n)` for a successful syscall and `None` for
-/// the unusual-containerization failure path. Falls back to the static
-/// default of 4 when conversion to `i32` fails (and on `None` from the
-/// caller), and clamps to a hard ceiling of 16. The cap exists because
-/// llama-cpp's OpenMP matmul path scales sub-linearly past ~16 threads
-/// on the quantized model used here — adding more threads spends host
-/// CPU time on coordination overhead while per-token decode latency
-/// barely moves.
-///
-/// Both `with_n_threads` and `with_n_threads_batch` are wired with
-/// the same value at the call site, so this resolver covers both the
-/// prompt-prefill batch path and the per-token decode path.
+/// Falls back to 4 when conversion to `i32` fails or
+/// `available_parallelism` returned `None`, and clamps to 16.
+/// OpenMP matmul scales sub-linearly past ~16 threads on the
+/// quantized model used here.
 fn inference_thread_count(available: Option<std::num::NonZero<usize>>) -> i32 {
     available
         .and_then(|p| i32::try_from(p.get()).ok())
@@ -2193,8 +2171,14 @@ fn inference_thread_count(available: Option<std::num::NonZero<usize>>) -> i32 {
         .min(16)
 }
 
-/// the prompt + weights — `greedy()` carries no RNG state, so
-/// there is no seed to pin.
+/// Run one greedy generation pass against the already-loaded model
+/// and return the decoded assistant text with any `<think>…</think>`
+/// block stripped.
+///
+/// Idempotent: a fresh `LlamaContext` is built per call from the
+/// cached `&LlamaModel`, so each invocation starts with an empty
+/// KV cache. Greedy: `LlamaSampler::greedy()` selects the ArgMax
+/// token — output is a deterministic function of prompt + weights.
 fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Result<String> {
     use std::num::NonZeroU32;
 
@@ -7270,15 +7254,15 @@ mod tests {
     /// `fetch_timeout_for_size` for the model (2400 MiB —
     /// `DEFAULT_MODEL.size_bytes`) is well above the 180 MB
     /// crossover so the proportional term wins: `(2400 × 1024 ×
-    /// 1024) / 3_000_000 = 838` seconds (integer division floors
-    /// 838.86). Pins the proportional branch — a regression that
+    /// 2740937888 / 3_000_000 = 913` seconds (integer division).
+    /// Pins the proportional branch — a regression that
     /// clamped the timeout (e.g. re-introduced a fixed 900 s
     /// ceiling) would surface here, and so would a divisor-unit
     /// swap (byte vs KiB vs MiB).
     #[test]
     fn fetch_timeout_for_size_model_scales_up() {
         let got = fetch_timeout_for_size(DEFAULT_MODEL.size_bytes);
-        assert_eq!(got, std::time::Duration::from_secs(838));
+        assert_eq!(got, std::time::Duration::from_secs(913));
     }
 
     /// For two artifacts BOTH above the floor-crossover, the
@@ -7611,7 +7595,7 @@ mod tests {
 
     /// Pin the IEC human-readable rendering for
     /// `DEFAULT_MODEL.size_bytes` (2400 MiB):
-    /// `HumanBytes(2400 * 1024 * 1024)` lands as `"2.34 GiB"`, and
+    /// `HumanBytes(2740937888)` lands as `"2.55 GiB"`, and
     /// `HumanBytes(2640 * 1024 * 1024)` — the size plus the 10%
     /// margin — lands as `"2.58 GiB"`. This does NOT go through
     /// `ensure_free_space` because a real tempdir filesystem
@@ -7627,10 +7611,10 @@ mod tests {
     fn human_bytes_rendering_is_pinned_for_default_model_size() {
         let size_only = DEFAULT_MODEL.size_bytes;
         let size_plus_margin = size_only + size_only / 10;
-        assert_eq!(format!("{}", indicatif::HumanBytes(size_only)), "2.34 GiB");
+        assert_eq!(format!("{}", indicatif::HumanBytes(size_only)), "2.55 GiB");
         assert_eq!(
             format!("{}", indicatif::HumanBytes(size_plus_margin)),
-            "2.58 GiB"
+            "2.81 GiB"
         );
     }
 

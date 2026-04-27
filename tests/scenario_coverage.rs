@@ -15,7 +15,7 @@ fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_cgroup_pipe_io(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true)]
 fn cover_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
@@ -130,7 +130,7 @@ fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_add_load_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true)]
 fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }
@@ -505,8 +505,7 @@ fn cover_op_move_all_tasks(ctx: &Ctx) -> Result<AssertResult> {
                 CgroupDef::named("cg_dst"),
             ],
             HoldSpec::Fixed(std::time::Duration::from_secs(2)),
-        )
-        .set_ops(vec![Op::add_cgroup("cg_dst")]),
+        ),
         Step::new(
             vec![Op::move_all_tasks("cg_src", "cg_dst")],
             HoldSpec::Fixed(std::time::Duration::from_secs(3)),

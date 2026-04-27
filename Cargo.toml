@@ -155,7 +155,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 sha1 = { version = "0.10", features = ["asm"] }
 # SHA-256 for verifying downloaded model-cache artifacts. `asm`
 # enables `sha2-asm` — hand-tuned SHA-NI assembly on x86_64,
-# NEON on aarch64.
+# ARMv8 SHA-2 crypto extensions on aarch64.
 sha2 = { version = "0.10", features = ["asm"] }
 # Lowercase hex encoding for SHA-256 digest comparisons in the
 # model-cache verify path.
@@ -221,6 +221,7 @@ grok = { version = "2", default-features = false, features = ["fancy-regex"] }
 # where the event originates from ktstr itself.
 tracing-test = "0.2"
 trybuild = "1"
+mockito = "1"
 
 [build-dependencies]
 cc = "1"

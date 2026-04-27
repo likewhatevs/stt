@@ -13,11 +13,11 @@
 //!
 //! Lives in its own integration-test binary (not `ktstr_test_macro.rs`)
 //! because exercising the LLM backend pulls in the full model cache
-//! — running the ~2.44 GiB `DEFAULT_MODEL` load and a multi-second
+//! — running the ~2.55 GiB `DEFAULT_MODEL` load and a multi-second
 //! inference call — and isolating it keeps the cheap scheduler
 //! tests free of that cost when filtering via nextest.
 //!
-//! **Host-only LLM extraction.** The model (~2.4 GiB GGUF) does
+//! **Host-only LLM extraction.** The model (~2.55 GiB GGUF) does
 //! NOT load inside the guest VM: the test VM's RAM
 //! budget cannot fit it, and the cache lives on the host. The
 //! guest-side `evaluate()` skips every model code path for
@@ -108,29 +108,4 @@ fn model_loaded_llm_extract_schbench(ctx: &Ctx) -> Result<AssertResult> {
     // the guest's `Check::ExitCodeEq(0)` pre-pass on SCHBENCH already
     // detected a non-zero exit; that detail surfaces unchanged.
     Ok(assert_result)
-}
-
-/// Diagnostic: does the model load in THIS binary without KVM?
-/// If this fails, the bug is binary-specific, not KVM-specific.
-#[test]
-#[ignore = "diagnostic: model load without VM"]
-fn model_loads_without_vm() {
-    // Can't call model::extract_via_llm directly (private module).
-    // Use llama-cpp-2 directly to test model loading in this binary.
-    use llama_cpp_2::llama_backend::LlamaBackend;
-    use llama_cpp_2::model::LlamaModel;
-    use llama_cpp_2::model::params::LlamaModelParams;
-
-    let backend = LlamaBackend::init().expect("backend init");
-    let model_path = std::path::PathBuf::from(format!(
-        "{}/.cache/ktstr/models/Qwen3.5-4B-Q4_K_M.gguf",
-        env!("HOME")
-    ));
-    assert!(
-        model_path.exists(),
-        "model not cached: {}",
-        model_path.display()
-    );
-    let result = LlamaModel::load_from_file(&backend, &model_path, &LlamaModelParams::default());
-    assert!(result.is_ok(), "model load failed without VM: {result:?}");
 }

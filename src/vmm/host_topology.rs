@@ -3092,8 +3092,7 @@ mod tests {
         let locks = match acquire_cpu_locks(3, 100, None) {
             Ok(l) => l,
             Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
-                eprintln!("{e}");
-                std::process::exit(1);
+                panic!("{e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -3112,8 +3111,7 @@ mod tests {
             Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
                 drop(holder);
                 cleanup_lock("/tmp/ktstr-cpu-0.lock");
-                eprintln!("{e}");
-                std::process::exit(1);
+                panic!("{e}");
             }
             Err(e) => panic!("{e:#}"),
         };
@@ -3159,8 +3157,7 @@ mod tests {
         let locks = match acquire_cpu_locks(2, 100, Some(&topo)) {
             Ok(l) => l,
             Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
-                eprintln!("{e}");
-                std::process::exit(1);
+                panic!("{e}");
             }
             Err(e) => panic!("{e:#}"),
         };

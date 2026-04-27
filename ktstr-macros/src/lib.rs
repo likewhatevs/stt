@@ -946,8 +946,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             match ::ktstr::test_support::run_ktstr_test(&#entry_name) {
                 Ok(_) => {}
                 Err(e) if ::ktstr::test_support::is_resource_contention(&e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
+                    panic!("{e}");
                 }
                 Err(e) => panic!("{e:#}"),
             }
