@@ -1937,12 +1937,26 @@ pub(crate) fn acquire_build_reservation(
 /// olddefconfig vs compile_commands.json) and stomp each other's
 /// `.config` and build artifacts.
 ///
-/// The lockfile path is `/tmp/ktstr-source-{path_hash6}.lock` where
-/// `path_hash6` is a 6-char CRC32 hex prefix of the canonical
-/// source-path bytes. Same hash function the local-unknown cache
-/// key uses ([`crate::fetch::compose_local_cache_key`]) so a single
-/// per-tree identifier ties the source-tree flock to the cache key
-/// it's gating on.
+/// The lockfile lives at
+/// `{KTSTR_CACHE_DIR}/.locks/source-{path_hash}.lock` where
+/// `{path_hash}` is the full 8-char CRC32 hex of the canonical
+/// source-path bytes (same shape and helper the
+/// `local-unknown-{path_hash}` cache key uses, see
+/// [`crate::fetch::canonical_path_hash`] /
+/// [`crate::fetch::compose_local_cache_key`]) — one per-tree
+/// identifier ties the source-tree flock to the cache key it gates.
+///
+/// Lockfile placement piggybacks on the cache root's `.locks/`
+/// subdirectory ([`crate::flock::LOCK_DIR_NAME`]) so source-tree
+/// flocks share the same filesystem-residency story as cache-entry
+/// flocks: never under `/tmp`, where `tmpwatch` (or the equivalent
+/// `systemd-tmpfiles` cleanup) can sweep stale-mtime files out from
+/// under an active flock holder. flock(2) does NOT update the
+/// inode's mtime, so a /tmp-resident lockfile would be a candidate
+/// for sweep on every run, with the resulting `unlink(2)` racing
+/// any peer trying to `open(2)` the same path. The `.locks/`
+/// directory under the user-controlled cache root is exempt from
+/// those sweeps.
 ///
 /// Non-blocking — fails fast with an actionable error pointing the
 /// operator at `cargo ktstr locks` when a concurrent peer holds the
@@ -1961,14 +1975,19 @@ pub(crate) fn acquire_source_tree_lock(
 ) -> Result<std::os::fd::OwnedFd> {
     use anyhow::Context;
 
-    // Share the per-path 6-char CRC32 with `local-unknown-{hash6}`
-    // cache keys so a single per-tree identifier ties the
-    // source-tree flock to the cache slot it gates.
-    let path_hash6 = crate::fetch::canonical_path_hash6(canonical);
-    let lock_path = format!("/tmp/ktstr-source-{path_hash6}.lock");
+    // Share the per-path CRC32 with `local-unknown-{hash}` cache
+    // keys so a single per-tree identifier ties the source-tree
+    // flock to the cache slot it gates.
+    let path_hash = crate::fetch::canonical_path_hash(canonical);
+    let cache = crate::cache::CacheDir::new()
+        .with_context(|| "open cache root for source-tree lockfile placement")?;
+    cache
+        .ensure_lock_dir()
+        .with_context(|| "create cache `.locks/` subdir for source-tree lock")?;
+    let lock_path = cache.lock_path(&format!("source-{path_hash}"));
 
     let fd = crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)
-        .with_context(|| format!("acquire source-tree flock {lock_path}"))?
+        .with_context(|| format!("acquire source-tree flock {}", lock_path.display()))?
         .ok_or_else(|| {
             // Best-effort holder lookup: if /proc/locks reports a
             // peer, surface the pid + cmdline so the operator can
@@ -1976,8 +1995,7 @@ pub(crate) fn acquire_source_tree_lock(
             // locks` separately. A holder-lookup failure is
             // non-fatal — the EWOULDBLOCK message is already
             // actionable on its own.
-            let holders =
-                crate::flock::read_holders(std::path::Path::new(&lock_path)).unwrap_or_default();
+            let holders = crate::flock::read_holders(&lock_path).unwrap_or_default();
             let holder_text = if holders.is_empty() {
                 String::new()
             } else {
@@ -1985,9 +2003,10 @@ pub(crate) fn acquire_source_tree_lock(
             };
             anyhow::anyhow!(
                 "{cli_label}: source tree {} is locked by a concurrent ktstr build \
-                 (lockfile {lock_path}). Wait for the peer to finish, or run \
+                 (lockfile {}). Wait for the peer to finish, or run \
                  `cargo ktstr locks` to identify it.{holder_text}",
                 canonical.display(),
+                lock_path.display(),
             )
         })?;
     Ok(fd)
@@ -4498,7 +4517,7 @@ pub struct KernelDirOutcome {
     ///
     /// - Clean tree: cache entry directory under one of the
     ///   `local-{hash7}-{arch}[-cfg{user_config}]-kc{suffix}` or
-    ///   `local-unknown-{path_hash6}-{arch}-kc{suffix}` shapes (see
+    ///   `local-unknown-{path_hash}-{arch}-kc{suffix}` shapes (see
     ///   [`crate::fetch::compose_local_cache_key`]); boot image at
     ///   `<dir>/<image_name>`.
     /// - Dirty tree: canonical source-tree directory, boot image at

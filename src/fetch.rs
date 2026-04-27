@@ -1042,14 +1042,14 @@ pub fn inspect_local_source_state(canonical: &Path) -> Result<LocalSourceState> 
 ///   `.config` (plain `make defconfig` path or no config file yet)
 /// - `local-{hash7}-{arch}-cfg{user_config}-kc{suffix}` — clean git
 ///   tree with a user `.config` whose hash differs from `defconfig`
-/// - `local-unknown-{path_hash6}-{arch}-kc{suffix}` — dirty / non-git
+/// - `local-unknown-{path_hash}-{arch}-kc{suffix}` — dirty / non-git
 ///   tree (HEAD does not describe the source; the path-derived
 ///   crc32 salt keeps two distinct dirty trees from colliding on the
 ///   same `local-unknown-...` slot)
 ///
-/// `path_hash6` is the first 6 chars of the lowercase-hex CRC32 of
+/// `path_hash` is the full 8-char (32-bit) lowercase-hex CRC32 of
 /// the canonical source-path bytes. CRC32 keeps the per-path
-/// disambiguator short and stable across runs without pulling in a
+/// disambiguator stable across runs without pulling in a
 /// crypto-grade hash for what is fundamentally a slot disambiguator.
 ///
 /// `user_config_hash` is `None` whenever the source tree has no
@@ -1070,30 +1070,31 @@ pub fn compose_local_cache_key(
             None => format!("local-{hash}-{arch}-kc{suffix}"),
         },
         None => {
-            let path_hash = canonical_path_hash6(canonical);
+            let path_hash = canonical_path_hash(canonical);
             format!("local-unknown-{path_hash}-{arch}-kc{suffix}")
         }
     }
 }
 
-/// CRC32 of the canonical source-path bytes, lowercase hex,
-/// truncated to 6 chars. Disambiguates `local-unknown-...` cache
-/// keys across distinct dirty / non-git source trees so two parallel
-/// `cargo ktstr test --kernel ./linux-a` and `--kernel ./linux-b`
-/// runs can't write each other's vmlinux into the same cache slot
-/// on (statistically rare but possible) the same dirty timing
-/// window.
+/// CRC32 of the canonical source-path bytes, lowercase hex
+/// (full 8-char width — the entire 32-bit value). Disambiguates
+/// `local-unknown-...` cache keys and per-source-tree lockfile
+/// names across distinct dirty / non-git source trees so two
+/// parallel `cargo ktstr test --kernel ./linux-a` and
+/// `--kernel ./linux-b` runs can't write each other's vmlinux into
+/// the same cache slot or share a single source-tree flock.
 ///
-/// 6 hex chars (24 bits) of CRC32 keep collision risk vanishing
-/// against the practical population (handful of source trees per
-/// host) while keeping the cache key human-readable. Path bytes are
-/// taken via `OsStr::as_encoded_bytes` so a non-UTF-8 component
-/// (rare on Linux but possible) doesn't lose entropy through a UTF-8
-/// lossy conversion.
-pub(crate) fn canonical_path_hash6(canonical: &Path) -> String {
+/// Full 32 bits (8 hex chars) of CRC32 keep collision risk
+/// negligible against the practical population (handful of source
+/// trees per host) while staying human-readable. The earlier
+/// 6-char (24-bit) form left ~6× the collision surface for the
+/// same key shape; truncation served no purpose other than visual
+/// brevity. Path bytes are taken via `OsStr::as_encoded_bytes` so
+/// a non-UTF-8 component (rare on Linux but possible) doesn't lose
+/// entropy through a UTF-8 lossy conversion.
+pub(crate) fn canonical_path_hash(canonical: &Path) -> String {
     let bytes = canonical.as_os_str().as_encoded_bytes();
-    let full = format!("{:08x}", crc32fast::hash(bytes));
-    full.chars().take(6).collect()
+    format!("{:08x}", crc32fast::hash(bytes))
 }
 
 /// Read `<canonical>/.config` and return its CRC32 as a lowercase
@@ -1551,9 +1552,9 @@ mod tests {
     }
 
     /// `compose_local_cache_key` with no HEAD hash (dirty / non-git
-    /// tree) routes to the `local-unknown-{path_hash6}` shape and
-    /// the `cfg` segment is dropped — the tree's identity collapses
-    /// to the salt anyway, so an additional config segment would be
+    /// tree) routes to the `local-unknown-{path_hash}` shape and the
+    /// `cfg` segment is dropped — the tree's identity collapses to
+    /// the salt anyway, so an additional config segment would be
     /// redundant noise on the unknown path.
     #[test]
     fn compose_local_cache_key_unknown_uses_path_hash_only() {
@@ -1569,16 +1570,16 @@ mod tests {
             key.starts_with("local-unknown-") && key.ends_with(&format!("-x86_64-kc{suffix}")),
             "unknown shape must skip cfg segment; got {key}"
         );
-        // The 6-char path-hash segment sits between `local-unknown-`
-        // and `-x86_64-`. Verify it's exactly 6 hex chars.
+        // The path-hash segment sits between `local-unknown-` and
+        // `-x86_64-`. Verify it's exactly 8 hex chars (full CRC32).
         let path_hash = key
             .strip_prefix("local-unknown-")
             .and_then(|s| s.strip_suffix(&format!("-x86_64-kc{suffix}")))
             .expect("key shape mismatch");
         assert_eq!(
             path_hash.len(),
-            6,
-            "path-hash salt must be 6 chars; got {path_hash}"
+            8,
+            "path-hash salt must be 8 chars (full CRC32); got {path_hash}"
         );
         assert!(
             path_hash.chars().all(|c| c.is_ascii_hexdigit()),

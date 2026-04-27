@@ -158,11 +158,12 @@ one of three shapes:
   distinct configurations against the same commit, so iterative
   `.config` edits at a fixed commit populate distinct cache
   entries instead of colliding.
-- `local-unknown-{path_hash6}-{arch}-kc{suffix}` — dirty / non-git
-  tree (HEAD does not describe the source). `{path_hash6}` is the
-  6-char CRC32 of the canonical source path so two parallel
-  `cargo ktstr test --kernel ./linux-a` and `--kernel ./linux-b`
-  runs do not collide on the same `local-unknown-...` slot.
+- `local-unknown-{path_hash}-{arch}-kc{suffix}` — dirty / non-git
+  tree (HEAD does not describe the source). `{path_hash}` is the
+  full 8-char (32-bit) CRC32 of the canonical source path so two
+  parallel `cargo ktstr test --kernel ./linux-a` and
+  `--kernel ./linux-b` runs do not collide on the same
+  `local-unknown-...` slot.
 
 Dirty / non-git trees never cache — the build pipeline runs in
 the source directory, the kernel label gets a `_dirty` suffix,

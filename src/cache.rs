@@ -1136,7 +1136,7 @@ impl CacheDir {
     /// exists; `fs::create_dir_all` is idempotent (Ok on existing
     /// directory), mirroring the lazy-create semantics
     /// [`CacheDir::store`] uses for the cache root itself.
-    fn ensure_lock_dir(&self) -> anyhow::Result<()> {
+    pub(crate) fn ensure_lock_dir(&self) -> anyhow::Result<()> {
         let dir = self.root.join(LOCK_DIR_NAME);
         fs::create_dir_all(&dir)
             .with_context(|| format!("create lock subdirectory {}", dir.display()))
