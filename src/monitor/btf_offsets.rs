@@ -2120,8 +2120,13 @@ mod tests {
     /// confirm no sidecar lands at either the lexical relative
     /// path's location or the absolute target.
     ///
-    /// Production callers reach `load_btf_from_path` exclusively
-    /// through `find_vmlinux`, which returns absolute paths. A
+    /// Production callers reach `load_btf_from_path` through several
+    /// paths: `crate::vmm::find_vmlinux` (absolute paths derived from
+    /// the kernel-cache entry or distro debug locations), `crate::probe::btf::resolve_btf_path`
+    /// (an absolute path joined onto a `kernel_dir`), and the `None`
+    /// fallback in `crate::probe::btf::parse_btf_functions` /
+    /// `crate::probe::btf::resolve_field_specs` (the absolute literal
+    /// `/sys/kernel/btf/vmlinux`). All emit absolute paths. A
     /// relative-path invocation is unusual, and its semantics
     /// depend on the test process's CWD: if CWD is unrelated to
     /// the relative path's parent (the typical case during a test

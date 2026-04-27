@@ -1786,6 +1786,15 @@ pub struct KernelBuildResult {
     pub entry: Option<crate::cache::CacheEntry>,
     /// Path to the built kernel image.
     pub image_path: std::path::PathBuf,
+    /// Whether the source tree was dirty as observed by the build
+    /// pipeline. `true` if either the acquire-time inspection
+    /// reported dirty OR the post-build re-check observed a
+    /// mid-build mutation (worktree edit, branch flip, mid-build
+    /// commit). The downstream label decoration in cargo-ktstr's
+    /// `resolve_one` uses this to append `_dirty` so a
+    /// non-reproducible run is distinguishable from a clean rebuild
+    /// of the same path.
+    pub post_build_is_dirty: bool,
 }
 
 /// Two-phase build reservation handles (LLC flock plan + cgroup v2
@@ -1922,6 +1931,68 @@ pub(crate) fn acquire_build_reservation(
     })
 }
 
+/// Acquire an exclusive flock on a per-source-canonical-path lockfile
+/// so two concurrent `cargo ktstr test --kernel <path>` runs against
+/// the SAME source tree don't race in `make` (defconfig vs
+/// olddefconfig vs compile_commands.json) and stomp each other's
+/// `.config` and build artifacts.
+///
+/// The lockfile path is `/tmp/ktstr-source-{path_hash6}.lock` where
+/// `path_hash6` is a 6-char CRC32 hex prefix of the canonical
+/// source-path bytes. Same hash function the local-unknown cache
+/// key uses ([`crate::fetch::compose_local_cache_key`]) so a single
+/// per-tree identifier ties the source-tree flock to the cache key
+/// it's gating on.
+///
+/// Non-blocking — fails fast with an actionable error pointing the
+/// operator at `cargo ktstr locks` when a concurrent peer holds the
+/// lock. A blocking acquire would silently stall the operator's
+/// terminal with no signal why; surfacing the contention immediately
+/// lets them inspect peers (or wait deliberately and retry).
+///
+/// Distinct from the cache-entry flock acquired inside
+/// [`crate::cache::CacheDir::store`]: that lock serializes the
+/// atomic install of an artifact bundle into a cache slot; this
+/// lock serializes the BUILD itself against the source-tree
+/// `make` invocations.
+pub(crate) fn acquire_source_tree_lock(
+    canonical: &Path,
+    cli_label: &str,
+) -> Result<std::os::fd::OwnedFd> {
+    use anyhow::Context;
+
+    // Share the per-path 6-char CRC32 with `local-unknown-{hash6}`
+    // cache keys so a single per-tree identifier ties the
+    // source-tree flock to the cache slot it gates.
+    let path_hash6 = crate::fetch::canonical_path_hash6(canonical);
+    let lock_path = format!("/tmp/ktstr-source-{path_hash6}.lock");
+
+    let fd = crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)
+        .with_context(|| format!("acquire source-tree flock {lock_path}"))?
+        .ok_or_else(|| {
+            // Best-effort holder lookup: if /proc/locks reports a
+            // peer, surface the pid + cmdline so the operator can
+            // identify the conflict without running `cargo ktstr
+            // locks` separately. A holder-lookup failure is
+            // non-fatal — the EWOULDBLOCK message is already
+            // actionable on its own.
+            let holders =
+                crate::flock::read_holders(std::path::Path::new(&lock_path)).unwrap_or_default();
+            let holder_text = if holders.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", crate::flock::format_holder_list(&holders))
+            };
+            anyhow::anyhow!(
+                "{cli_label}: source tree {} is locked by a concurrent ktstr build \
+                 (lockfile {lock_path}). Wait for the peer to finish, or run \
+                 `cargo ktstr locks` to identify it.{holder_text}",
+                canonical.display(),
+            )
+        })?;
+    Ok(fd)
+}
+
 /// Post-acquisition kernel build pipeline.
 ///
 /// Handles: clean, configure, build, validate config, generate
@@ -1999,6 +2070,36 @@ pub fn kernel_build_pipeline(
         make_jobs,
     } = acquire_build_reservation(cli_label, cpu_cap)?;
 
+    // Source-tree flock for local sources. Two parallel
+    // `cargo ktstr test --kernel ./linux` runs would otherwise race
+    // in `make` against the same source tree (e.g. one's
+    // `make defconfig` racing with another's `make compile_commands.json`)
+    // and produce inconsistent .config / build artifacts. The flock is
+    // taken on the SOURCE TREE itself (per canonical path), distinct from
+    // the cache-entry flock acquired inside `cache.store` (per cache key).
+    // The two are complementary: the source-tree flock serializes the
+    // build phase; the cache-entry flock serializes the atomic install.
+    //
+    // Held via `OwnedFd` for the lifetime of `_source_lock` — drops at
+    // end of pipeline. Skipped under `KTSTR_BYPASS_LLC_LOCKS` to share
+    // the operator's escape hatch with the LLC-flock bypass; that
+    // env var already declares "I accept noise from concurrent runs."
+    //
+    // `try_flock` is non-blocking — if a concurrent peer holds the
+    // lock, it returns `Ok(None)` and we bail with an actionable error
+    // pointing at `cargo ktstr locks` for diagnosis. A blocking acquire
+    // here would silently stall the operator's terminal with no
+    // indication why; a fail-fast surfaces the contention immediately.
+    let _source_lock = if is_local_source
+        && std::env::var("KTSTR_BYPASS_LLC_LOCKS")
+            .ok()
+            .is_none_or(|v| v.is_empty())
+    {
+        Some(acquire_source_tree_lock(source_dir, cli_label)?)
+    } else {
+        None
+    };
+
     if clean {
         if !is_local_source {
             eprintln!(
@@ -2064,7 +2165,67 @@ pub fn kernel_build_pipeline(
         return Ok(KernelBuildResult {
             entry: None,
             image_path,
+            post_build_is_dirty: true,
         });
+    }
+
+    // Post-build dirty re-check. `local_source` captures
+    // `is_dirty` ONCE at acquire time. The operator may then edit a
+    // tracked file (`.config` mutation, source patch) DURING the
+    // build window. The acquire-time `is_dirty=false` would say
+    // "safe to cache" but the on-disk content actually built
+    // differs from the HEAD commit recorded in the cache key —
+    // a future cache hit on that key would serve a build that no
+    // longer matches its identity. Re-running the same gix probes
+    // catches the race. On any change (dirty flip OR HEAD-hash
+    // shift from a concurrent commit), skip the cache store and
+    // emit a one-liner explaining why the cache slot was passed
+    // over.
+    //
+    // Errors from the re-check are surfaced as a warning rather
+    // than a hard fail — the build itself succeeded; refusing to
+    // store on a re-check probe failure would penalize an
+    // otherwise-clean run for a transient gix glitch. The cache
+    // store proceeds with the original key, on the same
+    // pessimistic basis as a tree the re-check could not classify.
+    if is_local_source {
+        match crate::fetch::inspect_local_source_state(source_dir) {
+            Ok(post) => {
+                let hash_changed = post.short_hash
+                    != acquired
+                        .kernel_source
+                        .as_local_git_hash()
+                        .map(str::to_string);
+                if post.is_dirty || hash_changed {
+                    eprintln!(
+                        "{cli_label}: source tree changed during build \
+                         (acquire-time dirty={}, post-build dirty={}; \
+                         hash_changed={hash_changed}); skipping cache store \
+                         to avoid recording a stale identity. Re-run after \
+                         the working tree settles to populate the cache.",
+                        acquired.is_dirty, post.is_dirty,
+                    );
+                    return Ok(KernelBuildResult {
+                        entry: None,
+                        image_path,
+                        // Mid-build mutation flips the run's
+                        // reproducibility — the cache key recorded at
+                        // acquire time no longer identifies the actual
+                        // build input. Mirror that into the outcome so
+                        // the kernel-label downstream gets the
+                        // `_dirty` suffix.
+                        post_build_is_dirty: true,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cli_label = cli_label,
+                    err = %format!("{e:#}"),
+                    "post-build dirty re-check failed; proceeding to cache store",
+                );
+            }
+        }
     }
 
     let config_path = source_dir.join(".config");
@@ -2077,7 +2238,31 @@ pub fn kernel_build_pipeline(
 
     let kconfig_hash = embedded_kconfig_hash();
 
-    let metadata = crate::cache::KernelMetadata::new(
+    // Source-tree vmlinux stat (size + mtime seconds) so a later
+    // `prefer_source_tree_for_dwarf` lookup can detect a user
+    // rebuild between cache store and DWARF read. Only meaningful
+    // for local sources whose vmlinux survived the build —
+    // `vmlinux_ref` is `None` if vmlinux wasn't found, in which
+    // case there's nothing to stat. mtime read is best-effort:
+    // failure leaves the validation pair `None` and prefers the
+    // pre-validation behavior for this entry.
+    let source_vmlinux_stat = vmlinux_ref.and_then(|v| {
+        let stat = std::fs::metadata(v).ok()?;
+        let mtime_secs = stat.modified().ok().and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .ok()
+                .or_else(|| {
+                    std::time::UNIX_EPOCH
+                        .duration_since(t)
+                        .ok()
+                        .map(|d| -(d.as_secs() as i64))
+                })
+        })?;
+        Some((stat.len(), mtime_secs))
+    });
+
+    let mut metadata = crate::cache::KernelMetadata::new(
         acquired.kernel_source.clone(),
         arch.to_string(),
         image_name.to_string(),
@@ -2086,6 +2271,9 @@ pub fn kernel_build_pipeline(
     .with_version(acquired.version.clone())
     .with_config_hash(config_hash)
     .with_ktstr_kconfig_hash(Some(kconfig_hash));
+    if let Some((size, mtime_secs)) = source_vmlinux_stat {
+        metadata = metadata.with_source_vmlinux_stat(size, mtime_secs);
+    }
 
     let mut artifacts = crate::cache::CacheArtifacts::new(&image_path);
     if let Some(v) = vmlinux_ref {
@@ -2106,7 +2294,11 @@ pub fn kernel_build_pipeline(
         }
     };
 
-    Ok(KernelBuildResult { entry, image_path })
+    Ok(KernelBuildResult {
+        entry,
+        image_path,
+        post_build_is_dirty: false,
+    })
 }
 
 /// Build the make arguments for a kernel build.
@@ -4268,46 +4460,109 @@ pub fn resolve_git_kernel(url: &str, git_ref: &str, cli_label: &str) -> Result<s
 ///
 /// Carries the cache key and the persisted `built_at` ISO-8601
 /// timestamp so callers can render a user-facing line that names
-/// both the cache identity and the build age. `None` (returned
-/// from the same function) means the build pipeline ran — either
-/// to populate the cache (clean-tree cache miss) or to build
-/// directly without storing (dirty-tree path).
+/// both the cache identity and the build age. `None`
+/// ([`KernelDirOutcome::cache_hit`] returns `None`) means the build
+/// pipeline ran — either to populate the cache (clean-tree cache
+/// miss) or to build directly without storing (dirty-tree path).
 #[derive(Debug, Clone)]
 pub struct KernelDirCacheHit {
     /// Cache key that resolved to this entry, e.g.
-    /// `local-abc1234-x86_64-kc{suffix}`.
+    /// `local-abc1234-x86_64-kc{suffix}` or
+    /// `local-abc1234-x86_64-cfgdeadbeef-kc{suffix}` when the source
+    /// tree carried a user `.config`.
     pub cache_key: String,
     /// ISO-8601 timestamp recorded in the entry's `metadata.json`
     /// at store time. Suitable for `humantime::parse_rfc3339`.
     pub built_at: String,
 }
 
+/// Result bundle from [`resolve_kernel_dir_to_entry`].
+///
+/// Bundles the resolved boot-image directory, the cache-hit
+/// signal, and the dirty-tree flag so callers do not have to
+/// re-run `gix::open` to learn whether the build was reproducible.
+/// The dirty flag is the single source of truth for downstream
+/// label decoration ([`crate::test_support::sanitize_kernel_label`]'s
+/// upstream caller appends `_dirty` so test reports show the run
+/// used a non-reproducible build).
+///
+/// `non_exhaustive` so a future field (e.g. cache miss vs cache
+/// store-failed distinction) can land without breaking external
+/// destructuring. Construction goes through field literals at the
+/// definition site only — every external consumer reads via the
+/// public field accessors.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct KernelDirOutcome {
+    /// Directory that holds the resolved boot image.
+    ///
+    /// - Clean tree: cache entry directory under one of the
+    ///   `local-{hash7}-{arch}[-cfg{user_config}]-kc{suffix}` or
+    ///   `local-unknown-{path_hash6}-{arch}-kc{suffix}` shapes (see
+    ///   [`crate::fetch::compose_local_cache_key`]); boot image at
+    ///   `<dir>/<image_name>`.
+    /// - Dirty tree: canonical source-tree directory, boot image at
+    ///   `<dir>/arch/<arch>/boot/<image_name>`.
+    ///
+    /// Both shapes are valid inputs to
+    /// [`crate::kernel_path::find_image_in_dir`].
+    pub dir: std::path::PathBuf,
+    /// `Some` when the resolution short-circuited on a cache hit —
+    /// the build pipeline did not run. `None` when the build
+    /// pipeline ran (clean-tree miss-then-build OR dirty-tree
+    /// build-without-store). [`is_dirty`](Self::is_dirty)
+    /// distinguishes the two `None` cases.
+    pub cache_hit: Option<KernelDirCacheHit>,
+    /// Whether the source tree was non-reproducible. Union of two
+    /// signals:
+    ///
+    /// - Acquire-time inspection by
+    ///   [`crate::fetch::local_source`] (uncommitted modifications
+    ///   before the build started, OR a non-git tree that has no
+    ///   commit hash to record).
+    /// - Post-build re-check from
+    ///   [`crate::fetch::inspect_local_source_state`] (worktree
+    ///   edited, branch flipped, or commit landed during `make`).
+    ///
+    /// Either signal flips this to `true`. Always `false` on a cache
+    /// hit — the cache lookup gate requires a clean tree at acquire
+    /// time and the build pipeline does not run.
+    pub is_dirty: bool,
+}
+
 /// Resolve a source-tree path through the local-kernel cache,
-/// returning the DIRECTORY that holds the resulting boot image
-/// plus a cache-hit signal.
+/// returning a [`KernelDirOutcome`] that carries the boot-image
+/// directory, the cache-hit signal, and the dirty-tree flag.
 ///
 /// For a clean source tree:
-///   - Cache hit on `local-{hash7}-{arch}-kc{suffix}` → returns
-///     `(CACHE_ENTRY_DIR, Some(KernelDirCacheHit))`. The build
-///     pipeline does not run.
-///   - Cache miss → runs [`kernel_build_pipeline`] which builds
-///     in the source tree and stores a stripped vmlinux + boot
-///     image under the cache entry; returns
-///     `(CACHE_ENTRY_DIR, None)`.
+///   - Cache hit → `outcome.dir` is the cache entry directory,
+///     `outcome.cache_hit` is `Some(KernelDirCacheHit)`,
+///     `outcome.is_dirty` is `false`. The build pipeline does not
+///     run.
+///   - Cache miss, no mid-build mutation → runs
+///     [`kernel_build_pipeline`] which builds in the source tree and
+///     stores a stripped vmlinux + boot image under the cache entry;
+///     `outcome.dir` is the cache entry directory,
+///     `outcome.cache_hit` is `None`, `outcome.is_dirty` is `false`.
+///   - Cache miss, mid-build mutation observed by the pipeline's
+///     post-build re-check → the cache store is skipped to avoid
+///     recording a stale identity, `outcome.dir` is the canonical
+///     source-tree directory, `outcome.cache_hit` is `None`,
+///     `outcome.is_dirty` is `true`.
 ///
 /// For a dirty source tree:
 ///   - [`kernel_build_pipeline`] skips the cache store
 ///     (`is_dirty` short-circuit at the cache-store boundary) and
-///     returns the source-tree image. This function returns
-///     `(CANONICAL_SOURCE_DIR, None)` (boot image at
-///     `<source>/arch/<arch>/boot/<image_name>`).
-///
-/// The optional [`KernelDirCacheHit`] in the return tuple lets
-/// callers emit a user-facing cache-hit log without duplicating
-/// the (expensive) `local_source` and cache-lookup work. Returning
-/// `None` covers both the cache-miss-after-build and dirty-build
-/// branches; callers that want to distinguish them can probe the
-/// returned directory shape (cache entry vs source tree).
+///     returns the source-tree image. `outcome.dir` is the
+///     canonical source-tree directory (boot image at
+///     `<source>/arch/<arch>/boot/<image_name>`),
+///     `outcome.cache_hit` is `None`, `outcome.is_dirty` is
+///     `true`. Callers use the dirty flag to mark the run as
+///     non-reproducible in test reports — e.g. `cargo-ktstr`'s
+///     Path-spec resolver appends `_dirty` to the kernel label
+///     so a `path_linux_a3b1c2_dirty` row in the gauntlet output
+///     surfaces the divergence from the cache-stored
+///     `path_linux_a3b1c2` clean variant.
 ///
 /// Both directory return shapes are valid inputs to
 /// [`crate::kernel_path::find_image_in_dir`], which probes both
@@ -4330,9 +4585,10 @@ pub fn resolve_kernel_dir_to_entry(
     path: &std::path::Path,
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
-) -> Result<(std::path::PathBuf, Option<KernelDirCacheHit>)> {
+) -> Result<KernelDirOutcome> {
     let acquired = acquire_local_source_tree(path)?;
     let cache_key = acquired.cache_key.clone();
+    let is_dirty = acquired.is_dirty;
     // Open the cache once and reuse for both the clean-tree
     // lookup and the post-build store. Both legs need the same
     // root resolution; opening twice is wasted work and risks
@@ -4342,9 +4598,7 @@ pub fn resolve_kernel_dir_to_entry(
     let cache = crate::cache::CacheDir::new()?;
 
     // Clean trees: cache lookup before build.
-    if !acquired.is_dirty
-        && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label)
-    {
+    if !is_dirty && let Some(entry) = cache_lookup(&cache, &cache_key, cli_label) {
         // `entry.path` is the cache entry directory; the boot
         // image lives at `<entry.path>/<image_name>`. Verify the
         // image is actually present before returning, so a
@@ -4355,7 +4609,15 @@ pub fn resolve_kernel_dir_to_entry(
                 cache_key: cache_key.clone(),
                 built_at: entry.metadata.built_at.clone(),
             };
-            return Ok((entry.path, Some(hit)));
+            return Ok(KernelDirOutcome {
+                dir: entry.path,
+                cache_hit: Some(hit),
+                // Cache-hit gate already required clean tree —
+                // restate the invariant in the outcome instead of
+                // reading `is_dirty` again, so the bit cannot drift
+                // if the gate condition above evolves.
+                is_dirty: false,
+            });
         }
     }
 
@@ -4365,10 +4627,22 @@ pub fn resolve_kernel_dir_to_entry(
     // For dirty trees, `entry` is `None` — fall back to the
     // canonical source directory, which `local_source` already
     // resolved into `acquired.source_dir`.
-    match result.entry {
-        Some(entry) => Ok((entry.path, None)),
-        None => Ok((acquired.source_dir, None)),
-    }
+    let dir = match result.entry {
+        Some(entry) => entry.path,
+        None => acquired.source_dir,
+    };
+    // The pipeline observes the dirty signal twice: once at acquire
+    // time (captured in `is_dirty` above) and once via the post-build
+    // re-check that detects mid-build mutations. Either source
+    // flipping the bit means the run is non-reproducible — surface
+    // the union here so the kernel-label downstream gets the `_dirty`
+    // suffix even when the tree was clean at acquire and only
+    // dirtied during `make`.
+    Ok(KernelDirOutcome {
+        dir,
+        cache_hit: None,
+        is_dirty: is_dirty || result.post_build_is_dirty,
+    })
 }
 
 /// Resolve a kernel directory: auto-build from source tree.
@@ -9441,8 +9715,11 @@ mod tests {
             reason: "metadata.json missing".to_string(),
         };
 
-        let entries_with_corrupt = [crate::cache::ListedEntry::Valid(valid_1), corrupt_entry];
-        let entries_clean_only = [crate::cache::ListedEntry::Valid(valid_2)];
+        let entries_with_corrupt = [
+            crate::cache::ListedEntry::Valid(Box::new(valid_1)),
+            corrupt_entry,
+        ];
+        let entries_clean_only = [crate::cache::ListedEntry::Valid(Box::new(valid_2))];
 
         fn any_corrupt(entries: &[crate::cache::ListedEntry]) -> bool {
             entries
@@ -10775,11 +11052,11 @@ mod tests {
             "bzImage".to_string(),
             "2026-04-22T00:00:00Z".to_string(),
         );
-        crate::cache::ListedEntry::Valid(CacheEntry {
+        crate::cache::ListedEntry::Valid(Box::new(CacheEntry {
             key: key.to_string(),
             path,
             metadata,
-        })
+        }))
     }
 
     fn mk_corrupt(key: &str) -> crate::cache::ListedEntry {
@@ -11623,6 +11900,310 @@ mod tests {
         assert!(
             msg.contains("kernel list --range 6.16..6.12"),
             "error must cite the operator-supplied range, got: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_kernel_dir_to_entry — success-path tests
+    // ---------------------------------------------------------------
+    //
+    // Error paths (nonexistent path, not-a-source-tree) live next to
+    // [`resolve_path_kernel`] in `bin/cargo-ktstr.rs`. The success
+    // paths exercise the full resolve → cache-lookup → outcome
+    // pipeline with a real Makefile / Kconfig fixture, an
+    // isolated `KTSTR_CACHE_DIR`, and a pre-populated cache entry
+    // for the cache-hit case. The cache-miss + dirty-tree branches
+    // are exercised through their predicate (`is_dirty=true` ⇒
+    // skip cache lookup) without actually invoking
+    // `kernel_build_pipeline`'s `make` subprocess — that would
+    // require a real kernel toolchain and exceed unit-test scope.
+    // The `is_dirty` branch is exercised by mutating the worktree
+    // after commit and asserting the cache lookup is skipped (the
+    // pre-populated entry is still present, so a successful lookup
+    // would land it as the outcome — failing to do so proves the
+    // dirty short-circuit fires).
+
+    /// Initialise a git repo with one committed file, mirroring
+    /// the helper in `fetch.rs`. Inlined here so the
+    /// `resolve_kernel_dir_to_entry` tests are self-contained
+    /// rather than reaching across the test-module boundary.
+    /// `dir` MUST exist; the helper does not create it.
+    fn init_repo_with_commit_for_resolve_test(dir: &std::path::Path) {
+        use std::process::Command;
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "ktstr-test")
+                .env("GIT_AUTHOR_EMAIL", "ktstr-test@localhost")
+                .env("GIT_COMMITTER_NAME", "ktstr-test")
+                .env("GIT_COMMITTER_EMAIL", "ktstr-test@localhost")
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("Makefile"), "# kernel makefile fixture\n").unwrap();
+        std::fs::write(dir.join("Kconfig"), "# kernel kconfig fixture\n").unwrap();
+        std::fs::write(dir.join("README"), "fixture\n").unwrap();
+        run(&["add", "Makefile", "Kconfig", "README"]);
+        run(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ]);
+    }
+
+    /// Pre-populate a cache entry under `cache_root/{cache_key}/`
+    /// containing a synthetic boot image and a `metadata.json`
+    /// marking the entry as a [`crate::cache::KernelSource::Local`]
+    /// build. Returns the entry path. The metadata's
+    /// `source_tree_path` is NOT pinned to the test's source tree
+    /// — `resolve_kernel_dir_to_entry`'s lookup gates only on
+    /// cache key match, so any persisted metadata that round-trips
+    /// is sufficient for the cache-hit assertion.
+    fn populate_cache_entry_for_resolve_test(
+        cache_root: &std::path::Path,
+        cache_key: &str,
+    ) -> std::path::PathBuf {
+        let cache = crate::cache::CacheDir::with_root(cache_root.to_path_buf());
+        let (arch, image_name) = crate::fetch::arch_info();
+        // Stage a fake image as the source path for the store
+        // (which COPIES the bytes into the cache atomically).
+        let staging = tempfile::TempDir::new().expect("staging tempdir");
+        let fake_image = staging.path().join(image_name);
+        std::fs::write(&fake_image, b"fake kernel image bytes").expect("write fake image");
+        let metadata = crate::cache::KernelMetadata::new(
+            crate::cache::KernelSource::Local {
+                source_tree_path: None,
+                git_hash: None,
+            },
+            arch.to_string(),
+            image_name.to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        let artifacts = crate::cache::CacheArtifacts::new(&fake_image);
+        let entry = cache
+            .store(cache_key, &artifacts, &metadata)
+            .expect("pre-populate cache entry");
+        entry.path
+    }
+
+    /// Cache hit — clean tree whose `local_source` cache key
+    /// resolves to a pre-populated entry must short-circuit the
+    /// build pipeline and surface `KernelDirOutcome` with
+    /// `cache_hit = Some(...)`, `is_dirty = false`, and `dir`
+    /// pointing at the cache entry directory (NOT the source
+    /// tree).
+    #[test]
+    fn resolve_kernel_dir_to_entry_clean_tree_cache_hit() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            skip!("git CLI unavailable");
+        }
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let cache_tmp = tempfile::TempDir::new().expect("cache tempdir");
+        let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            cache_tmp.path(),
+        );
+        let src_tmp = tempfile::TempDir::new().expect("src tempdir");
+        init_repo_with_commit_for_resolve_test(src_tmp.path());
+
+        // Compute the cache key the same way `local_source` would.
+        let acquired =
+            crate::fetch::local_source(src_tmp.path()).expect("local_source must succeed");
+        assert!(!acquired.is_dirty, "fixture must be clean before lookup");
+        let cache_key = acquired.cache_key.clone();
+
+        let entry_path = populate_cache_entry_for_resolve_test(cache_tmp.path(), &cache_key);
+
+        let outcome = resolve_kernel_dir_to_entry(src_tmp.path(), "test", None)
+            .expect("resolve must succeed on cache hit");
+        assert_eq!(
+            outcome.dir, entry_path,
+            "cache-hit path must return the cache entry directory, NOT the source tree"
+        );
+        let hit = outcome
+            .cache_hit
+            .expect("cache hit must produce KernelDirCacheHit");
+        assert_eq!(
+            hit.cache_key, cache_key,
+            "cache hit must report the resolved key"
+        );
+        assert_eq!(
+            hit.built_at, "2026-04-12T10:00:00Z",
+            "cache hit must surface the persisted built_at timestamp",
+        );
+        assert!(
+            !outcome.is_dirty,
+            "cache-hit gate requires a clean tree; outcome.is_dirty must be false",
+        );
+    }
+
+    /// Dirty-tree resolve must short-circuit the cache lookup
+    /// even when an entry under the dirty tree's would-be key
+    /// already exists. `is_dirty=true` flips `outcome.is_dirty`
+    /// so the caller (cargo-ktstr) appends `_dirty` to the
+    /// kernel label and the test report distinguishes the
+    /// non-reproducible run from a subsequent clean rebuild.
+    ///
+    /// The test asserts the bypass directly: pre-populate the
+    /// cache entry under the DIRTY tree's `local-unknown-...`
+    /// key (so a cache lookup from the dirty resolve WOULD
+    /// match if the gate were absent) and confirm the resolve
+    /// does NOT short-circuit on it. The actual build pipeline
+    /// then fails on the non-kernel fixture, which is
+    /// independent evidence that the dirty path entered the
+    /// build branch rather than the cache-hit branch.
+    ///
+    /// `KTSTR_BYPASS_LLC_LOCKS=1` skips the resource-budget
+    /// reservation since this test does not represent a real
+    /// build to coordinate against peer measurements.
+    #[test]
+    fn resolve_kernel_dir_to_entry_dirty_tree_skips_cache_lookup() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            skip!("git CLI unavailable");
+        }
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            skip!("make not in PATH");
+        }
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let cache_tmp = tempfile::TempDir::new().expect("cache tempdir");
+        let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            cache_tmp.path(),
+        );
+        let _bypass_env =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_BYPASS_LLC_LOCKS", "1");
+        let src_tmp = tempfile::TempDir::new().expect("src tempdir");
+        init_repo_with_commit_for_resolve_test(src_tmp.path());
+
+        // Dirty the tree FIRST so the `local-unknown-...` key
+        // shape is the one the resolver would look up.
+        std::fs::write(src_tmp.path().join("README"), "modified\n").expect("dirty README");
+        let dirty_acquired = crate::fetch::local_source(src_tmp.path())
+            .expect("local_source on dirty tree must succeed");
+        assert!(
+            dirty_acquired.is_dirty,
+            "post-mutation tree must be dirty for the test to be meaningful"
+        );
+        // Pre-populate under the EXACT key the dirty tree would
+        // hit if the gate were absent. A regression that drops
+        // the `if !is_dirty` short-circuit would land this entry
+        // as the outcome and the assertion below would fail.
+        populate_cache_entry_for_resolve_test(cache_tmp.path(), &dirty_acquired.cache_key);
+
+        let result = resolve_kernel_dir_to_entry(src_tmp.path(), "test", None);
+        // The dirty path must not return the pre-populated entry
+        // as a cache hit. The build pipeline then fails on the
+        // fixture (no real kernel toolchain), surfacing as Err —
+        // that is the expected outcome. Any `Ok(KernelDirOutcome
+        // { cache_hit: Some(_), .. })` would prove the dirty gate
+        // regressed.
+        match result {
+            Ok(outcome) => panic!(
+                "dirty tree must skip the cache lookup, but resolve returned \
+                 Ok with dir={:?}, cache_hit={:?}, is_dirty={}",
+                outcome.dir, outcome.cache_hit, outcome.is_dirty,
+            ),
+            Err(_) => {
+                // The pre-populated entry is still on disk; the
+                // resolve did not consume it.
+                let entry_dir = cache_tmp.path().join(&dirty_acquired.cache_key);
+                assert!(
+                    entry_dir.is_dir(),
+                    "pre-populated entry must still be present after the \
+                     dirty resolve; the gate proved short-circuit by NOT \
+                     returning this directory as the outcome.dir",
+                );
+            }
+        }
+    }
+
+    /// Cache miss on a clean tree must surface as a build attempt
+    /// rather than as a successful shortcut. Pinned through the
+    /// build's eventual failure on a fixture without a real kernel
+    /// toolchain — same shape as the dirty-tree test, but proves
+    /// the cache MISS path also fans out to the pipeline (rather
+    /// than a silent no-op that would erase the per-tree
+    /// invariant).
+    ///
+    /// `KTSTR_BYPASS_LLC_LOCKS=1` skips the resource-budget
+    /// reservation (LLC flocks + cgroup v2 sandbox) since the
+    /// fixture has no real build to coordinate. The build's `make`
+    /// subprocess still runs and still fails on the
+    /// non-kernel-target Makefile — that is the assertion's
+    /// substrate.
+    #[test]
+    fn resolve_kernel_dir_to_entry_clean_tree_cache_miss_attempts_build() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            skip!("git CLI unavailable");
+        }
+        if std::process::Command::new("make")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            skip!("make not in PATH");
+        }
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let cache_tmp = tempfile::TempDir::new().expect("cache tempdir");
+        let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            cache_tmp.path(),
+        );
+        let _bypass_env =
+            crate::test_support::test_helpers::EnvVarGuard::set("KTSTR_BYPASS_LLC_LOCKS", "1");
+        let src_tmp = tempfile::TempDir::new().expect("src tempdir");
+        init_repo_with_commit_for_resolve_test(src_tmp.path());
+
+        // No pre-populated cache entry → cache miss must reach
+        // the build pipeline. The Makefile fixture has no real
+        // kernel targets, so the resulting build attempt fails;
+        // we observe that as evidence the miss path was taken
+        // rather than a silent no-op surfacing as `Ok`.
+        let acquired =
+            crate::fetch::local_source(src_tmp.path()).expect("local_source must succeed");
+        assert!(!acquired.is_dirty, "fixture must be clean before resolve");
+
+        let result = resolve_kernel_dir_to_entry(src_tmp.path(), "test", None);
+        // Either the build attempt fails (kernel_build_pipeline's
+        // make subprocess doesn't find real kernel targets) or
+        // there's an environmental skip (no make / kvm / cgroup);
+        // both are acceptable evidence that the cache MISS path
+        // entered the build pipeline rather than masking as
+        // cache-hit.
+        assert!(
+            result.is_err(),
+            "cache miss without a real kernel toolchain must surface the build failure, \
+             got Ok({:?})",
+            result.as_ref().ok().map(|o| &o.dir),
         );
     }
 }

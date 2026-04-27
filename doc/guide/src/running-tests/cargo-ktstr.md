@@ -80,7 +80,11 @@ sanitized to `kernel_[a-z0-9_]+`:
 - Path → `kernel_path_{basename}_{hash6}` (e.g.
   `kernel_path_linux_a3f2b1`); the 6-char crc32 of the canonical
   path disambiguates two `linux` directories under different
-  parents.
+  parents. Dirty-tree builds (uncommitted source changes, mid-build
+  worktree mutations, or non-git trees) append `_dirty` to the
+  label — e.g. `kernel_path_linux_a3f2b1_dirty` — so the test
+  report distinguishes the non-reproducible run from a subsequent
+  clean rebuild of the same path.
 - Local cache entry → `kernel_local_{hash6}` (first 6 chars of
   the source tree's git short_hash, captured at cache-store
   time) or `kernel_local_unknown` for non-git trees. The
@@ -142,17 +146,37 @@ gauntlet across kernels in a single run.
 For path mode, the source tree is gix-discovered and classified
 as either *clean* (HEAD reachable, index matches HEAD, worktree
 matches index) or *dirty or non-git* (any tracked-file diff, or
-the directory is not a git repo at all). The cache is keyed at
-`local-{hash7}-{arch}-kc{suffix}` where `{hash7}` is the source
-tree's HEAD short hash; dirty trees and non-git trees both
-collapse to the literal `local-unknown-...` key and never cache.
+the directory is not a git repo at all). The cache is keyed in
+one of three shapes:
+
+- `local-{hash7}-{arch}-kc{suffix}` — clean git tree, no user
+  `.config` file in the source tree yet (build will run `make
+  defconfig`). `{hash7}` is the source tree's HEAD short hash;
+  `{suffix}` distinguishes ktstr framework kconfig fragments.
+- `local-{hash7}-{arch}-cfg{user_config}-kc{suffix}` — clean git
+  tree with a user `.config` whose CRC32 hash discriminates
+  distinct configurations against the same commit, so iterative
+  `.config` edits at a fixed commit populate distinct cache
+  entries instead of colliding.
+- `local-unknown-{path_hash6}-{arch}-kc{suffix}` — dirty / non-git
+  tree (HEAD does not describe the source). `{path_hash6}` is the
+  6-char CRC32 of the canonical source path so two parallel
+  `cargo ktstr test --kernel ./linux-a` and `--kernel ./linux-b`
+  runs do not collide on the same `local-unknown-...` slot.
+
+Dirty / non-git trees never cache — the build pipeline runs in
+the source directory, the kernel label gets a `_dirty` suffix,
+and a subsequent run of the same path that goes clean produces a
+distinct cache entry under the clean shape.
 
 1. **Source-tree validation** — verifies `<kernel>/Makefile` and
    `<kernel>/Kconfig` both exist. If either is missing, bails
    with `not a kernel source tree`.
-2. **Cache lookup** (clean trees only) — looks up
-   `local-{hash7}-{arch}-kc{suffix}`. **Cache hit short-circuits
-   to step 6**: cargo-ktstr exports the cache entry directory via
+2. **Cache lookup** (clean trees only) — looks up the
+   `local-{hash7}-{arch}[-cfg{user_config}]-kc{suffix}` key
+   (the `cfg` segment present iff a user `.config` exists in the
+   source tree). **Cache hit short-circuits to step 6**:
+   cargo-ktstr exports the cache entry directory via
    `KTSTR_KERNEL` and emits a `cargo ktstr: cache hit for
    {input_path} ({cache_key}, built {age} ago)` line on stderr
    (the `, built {age} ago` suffix is omitted when the timestamp
@@ -177,11 +201,15 @@ collapse to the literal `local-unknown-...` key and never cache.
    compile_commands.json` (skipped only for transient temp
    directories like extracted tarballs) so LSP / clangd work
    against the local tree. Then for clean trees, the kernel
-   image + stripped vmlinux are persisted under
-   `local-{hash7}-{arch}-kc{suffix}` with `metadata.json`
-   recording the source tree path. Dirty / non-git trees skip
-   the cache store (no stable HEAD identity for the cache key)
-   but still get `compile_commands.json`.
+   image + stripped vmlinux are persisted under the resolved
+   `local-{hash7}-{arch}[-cfg{user_config}]-kc{suffix}` key with
+   `metadata.json` recording the source tree path. A post-build
+   re-check of the dirty state catches mid-build mutations
+   (worktree edits or commits that happened during `make`) and
+   skips the cache store on either signal so a racing-write build
+   can not land under a stale identity. Dirty / non-git trees
+   skip the cache store unconditionally (no stable HEAD identity
+   for the cache key) but still get `compile_commands.json`.
 6. **Test execution** — execs `cargo nextest run` once with
    `KTSTR_KERNEL` set in the environment (single-kernel) or with
    both `KTSTR_KERNEL` and `KTSTR_KERNEL_LIST` (multi-kernel; the
@@ -197,7 +225,7 @@ collapse to the literal `local-unknown-...` key and never cache.
 > **Implicit vs explicit kernel discovery diverge**: `cargo ktstr
 > test --kernel ../linux` (explicit Path spec) routes through the
 > cache pipeline above — the source tree is gix-classified, the
-> `local-{hash7}-...` cache key is computed, the kernel is built
+> `local-{hash7}-{arch}[-cfg{user_config}]-kc{suffix}` cache key is computed, the kernel is built
 > (or short-circuited on cache hit), and the cache entry directory
 > is exported via `KTSTR_KERNEL`. `cargo ktstr test` (no `--kernel`
 > flag) does NOT run the build pipeline or produce a new cache

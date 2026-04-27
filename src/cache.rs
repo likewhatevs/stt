@@ -161,6 +161,25 @@ impl fmt::Display for KernelSource {
     }
 }
 
+impl KernelSource {
+    /// Borrow the `git_hash` field on a [`KernelSource::Local`]
+    /// variant. Returns `None` for any other variant or when the
+    /// Local variant carries `git_hash: None` (dirty / non-git
+    /// tree at acquire time).
+    ///
+    /// Mainly used by [`crate::cli::kernel_build_pipeline`]'s
+    /// post-build dirty re-check, which compares the post-build
+    /// HEAD hash against the acquire-time hash to detect mid-build
+    /// commits or branch flips. Borrows rather than clones so the
+    /// caller does not pay an allocation when only comparing.
+    pub fn as_local_git_hash(&self) -> Option<&str> {
+        match self {
+            KernelSource::Local { git_hash, .. } => git_hash.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 /// Metadata stored alongside a cached kernel image.
 ///
 /// Required fields (`source`, `arch`, `image_name`, `built_at`,
@@ -230,6 +249,33 @@ pub struct KernelMetadata {
     /// [`has_vmlinux`](Self::has_vmlinux) — the authoritative writer
     /// is [`CacheDir::store`].
     vmlinux_stripped: bool,
+    /// Size in bytes of the SOURCE-TREE vmlinux at cache-store time.
+    /// Used by [`prefer_source_tree_for_dwarf`] to validate that a
+    /// later DWARF read against the source-tree vmlinux is reading
+    /// the same ELF the cache entry was built from. A user rebuild
+    /// between the cache store and the read changes the source-tree
+    /// vmlinux size; mismatching sizes signal that the source-tree
+    /// vmlinux no longer matches the cache, and the helper falls
+    /// back to the cached (stripped) vmlinux.
+    ///
+    /// `None` for non-Local entries (Tarball / Git — no source tree
+    /// to validate against), and for Local entries whose vmlinux was
+    /// not found at store time (the cache entry has no vmlinux to
+    /// route to source for either, so validation is moot).
+    pub source_vmlinux_size: Option<u64>,
+    /// Modification time (seconds since UNIX epoch) of the
+    /// SOURCE-TREE vmlinux at cache-store time. Same purpose and
+    /// ownership as [`source_vmlinux_size`]; both fields are checked
+    /// together by [`prefer_source_tree_for_dwarf`]. `None` semantics
+    /// match `source_vmlinux_size`.
+    ///
+    /// `i64` so a pre-1970 mtime (impossible in practice but
+    /// representable on disk) round-trips without panicking on
+    /// duration-since-epoch. Truncates to seconds — sub-second
+    /// precision provides no incremental signal for "did the file
+    /// change between two builds" and varies across filesystems
+    /// (ext4 supports nanoseconds, vfat does not).
+    pub source_vmlinux_mtime_secs: Option<i64>,
 }
 
 impl KernelMetadata {
@@ -262,7 +308,23 @@ impl KernelMetadata {
             ktstr_kconfig_hash: None,
             has_vmlinux: false,
             vmlinux_stripped: false,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
         }
+    }
+
+    /// Set the source-tree vmlinux size and mtime captured at cache
+    /// store time. Used by [`crate::cli::kernel_build_pipeline`]
+    /// before [`CacheDir::store`] so
+    /// [`prefer_source_tree_for_dwarf`] can later validate that the
+    /// on-disk source-tree vmlinux still matches the build the cache
+    /// entry was produced from. Both fields move as a pair — partial
+    /// values would weaken the validation invariant — so the setter
+    /// takes both.
+    pub fn with_source_vmlinux_stat(mut self, size: u64, mtime_secs: i64) -> Self {
+        self.source_vmlinux_size = Some(size);
+        self.source_vmlinux_mtime_secs = Some(mtime_secs);
+        self
     }
 
     /// Set the kernel version.
@@ -482,7 +544,14 @@ impl CacheEntry {
 pub enum ListedEntry {
     /// Valid cache entry with parsed metadata and an image file
     /// present on disk at the metadata-declared path.
-    Valid(CacheEntry),
+    ///
+    /// Boxed so the enum's `Valid` variant doesn't dwarf `Corrupt`
+    /// — `CacheEntry` carries a 280-byte `KernelMetadata` plus
+    /// `PathBuf`s, while `Corrupt` is a flat 72-byte triple.
+    /// Without the indirection clippy's `large_enum_variant` flags
+    /// every `ListedEntry` value as paying for the `Valid` shape
+    /// even when it lands in `Corrupt`.
+    Valid(Box<CacheEntry>),
     /// Entry directory exists but is unusable. Common reasons:
     /// metadata.json missing, metadata.json unparseable, or metadata
     /// parsed cleanly but the declared image file is absent (partial
@@ -519,7 +588,7 @@ impl ListedEntry {
     /// [`ListedEntry::Corrupt`].
     pub fn as_valid(&self) -> Option<&CacheEntry> {
         match self {
-            ListedEntry::Valid(e) => Some(e),
+            ListedEntry::Valid(e) => Some(e.as_ref()),
             ListedEntry::Corrupt { .. } => None,
         }
     }
@@ -772,11 +841,11 @@ impl CacheDir {
                 Ok(metadata) => {
                     let image_path = path.join(&metadata.image_name);
                     if image_path.exists() {
-                        entries.push(ListedEntry::Valid(CacheEntry {
+                        entries.push(ListedEntry::Valid(Box::new(CacheEntry {
                             key: name,
                             path,
                             metadata,
-                        }));
+                        })));
                     } else {
                         // Metadata parsed but the image file declared
                         // inside it is gone — treat as corrupt so
@@ -1545,12 +1614,28 @@ fn read_metadata(dir: &Path) -> Result<KernelMetadata, String> {
 /// - `source_tree_path` is `None` on a Local entry (tree location not recorded).
 /// - `source_tree_path` is set but has no `vmlinux` file (tree deleted
 ///   or rebuilt without saving vmlinux).
+/// - The source-tree vmlinux's current size or mtime does NOT match
+///   the values captured at cache-store time (see
+///   [`KernelMetadata::source_vmlinux_size`] /
+///   [`source_vmlinux_mtime_secs`](KernelMetadata::source_vmlinux_mtime_secs)).
+///   A user rebuild between cache store and this lookup changes the
+///   on-disk vmlinux; routing DWARF reads to a mismatched ELF would
+///   silently surface line numbers from the wrong build. The cache
+///   entry's stripped vmlinux always matches the cached BTF and is
+///   the safe fallback.
+/// - The cache entry's metadata did not record the source-tree
+///   vmlinux size and mtime at store time (vmlinux not present in
+///   the source tree when the cache entry was written). Without the
+///   pair, the validation gate cannot prove the on-disk vmlinux
+///   matches the cache; fall back to the cached stripped vmlinux.
 ///
 /// In any of those cases callers should fall back to the cache
 /// directory for symbol/BTF lookup — file:line is genuinely
 /// unrecoverable without re-downloading sources.
 pub fn prefer_source_tree_for_dwarf(dir: &Path) -> Option<PathBuf> {
     let metadata = read_metadata(dir).ok()?;
+    let want_size = metadata.source_vmlinux_size?;
+    let want_mtime = metadata.source_vmlinux_mtime_secs?;
     let KernelSource::Local {
         source_tree_path, ..
     } = metadata.source
@@ -1558,11 +1643,31 @@ pub fn prefer_source_tree_for_dwarf(dir: &Path) -> Option<PathBuf> {
         return None;
     };
     let src_path = source_tree_path?;
-    if src_path.join("vmlinux").is_file() {
-        Some(src_path)
-    } else {
-        None
+    let vmlinux = src_path.join("vmlinux");
+    let stat = std::fs::metadata(&vmlinux).ok()?;
+    if !stat.is_file() {
+        return None;
     }
+    if stat.len() != want_size {
+        return None;
+    }
+    let cur_mtime = stat.modified().ok().and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .ok()
+            .or_else(|| {
+                // Pre-1970 mtime — represent the negative offset
+                // from epoch via the symmetric earlier-than branch.
+                std::time::UNIX_EPOCH
+                    .duration_since(t)
+                    .ok()
+                    .map(|d| -(d.as_secs() as i64))
+            })
+    })?;
+    if cur_mtime != want_mtime {
+        return None;
+    }
+    Some(src_path)
 }
 
 /// Read `dir/metadata.json` and return the persisted source-tree
@@ -2207,7 +2312,7 @@ fn resolve_cache_root() -> anyhow::Result<PathBuf> {
 /// Is `p` (a file path) located inside the kernel cache root?
 ///
 /// Used by callers that derive sibling artifacts next to a vmlinux on
-/// disk (currently [`crate::monitor::btf_offsets::load_btf_from_path`]'s
+/// disk (e.g. [`crate::monitor::btf_offsets::load_btf_from_path`]'s
 /// `<vmlinux>.btf` sidecar) to avoid writing into directories the
 /// cache does not own — most importantly, kernel source trees and
 /// distro-installed debug paths supplied via [`crate::vmm::find_vmlinux`]
@@ -2222,9 +2327,8 @@ fn resolve_cache_root() -> anyhow::Result<PathBuf> {
 /// through the symlink layer. Callers that need symlink-following
 /// semantics on `p` itself — e.g. `p` is a symlink whose target
 /// lives in a different membership bucket than its lexical parent —
-/// MUST canonicalize `p` before calling this helper.
-/// [`crate::monitor::btf_offsets::load_btf_from_path`] does exactly
-/// that and is the canonical example.
+/// MUST canonicalize `p` before calling this helper, as
+/// [`crate::monitor::btf_offsets::load_btf_from_path`] does.
 ///
 /// Both canonicalizations must succeed — any error (cache root
 /// unset, HOME unresolvable, parent missing, EACCES, etc.) returns
@@ -2339,6 +2443,8 @@ mod tests {
             ktstr_kconfig_hash: Some("def456".to_string()),
             has_vmlinux: false,
             vmlinux_stripped: false,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
         }
     }
 
@@ -2504,6 +2610,8 @@ mod tests {
             ktstr_kconfig_hash: None,
             has_vmlinux: false,
             vmlinux_stripped: false,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -2532,6 +2640,8 @@ mod tests {
             ktstr_kconfig_hash: Some("aaa111".to_string()),
             has_vmlinux: true,
             vmlinux_stripped: true,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: KernelMetadata = serde_json::from_str(&json).unwrap();
@@ -5038,13 +5148,22 @@ mod tests {
     #[test]
     fn prefer_source_tree_local_with_vmlinux() {
         // Local-source cache entry whose source tree is still on disk
-        // and has a vmlinux: helper returns the source tree path.
+        // and has a vmlinux whose size + mtime match the recorded
+        // stat pair: helper returns the source tree path.
         let tmp = TempDir::new().unwrap();
         let cache_entry = tmp.path().join("cache");
         let src_tree = tmp.path().join("src");
         fs::create_dir_all(&cache_entry).unwrap();
         fs::create_dir_all(&src_tree).unwrap();
-        fs::write(src_tree.join("vmlinux"), b"fake-elf").unwrap();
+        let vmlinux = src_tree.join("vmlinux");
+        fs::write(&vmlinux, b"fake-elf").unwrap();
+        let stat = fs::metadata(&vmlinux).unwrap();
+        let mtime_secs = stat
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
         let meta = KernelMetadata {
             version: Some("6.14.2".to_string()),
@@ -5059,6 +5178,8 @@ mod tests {
             ktstr_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
+            source_vmlinux_size: Some(stat.len()),
+            source_vmlinux_mtime_secs: Some(mtime_secs),
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -5073,6 +5194,10 @@ mod tests {
     fn prefer_source_tree_local_without_vmlinux_in_tree() {
         // Local-source cache entry but source tree lacks vmlinux:
         // fall back to None so caller keeps the cache-entry path.
+        // The entry still records the stat pair (cache-store time
+        // may have written the pair, then the user later removed the
+        // source-tree vmlinux); the helper bails on the absent
+        // `vmlinux` file before reaching the size/mtime check.
         let tmp = TempDir::new().unwrap();
         let cache_entry = tmp.path().join("cache");
         let src_tree = tmp.path().join("src");
@@ -5093,6 +5218,8 @@ mod tests {
             ktstr_kconfig_hash: None,
             has_vmlinux: false,
             vmlinux_stripped: false,
+            source_vmlinux_size: Some(42),
+            source_vmlinux_mtime_secs: Some(1_700_000_000),
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -5122,6 +5249,8 @@ mod tests {
             ktstr_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -5198,10 +5327,10 @@ mod tests {
     /// that test has `source_tree_path = Some(...)` but the
     /// filesystem lacks `vmlinux`, so the function reaches the
     /// `src_path.join("vmlinux").is_file()` check before returning
-    /// None. This test short-circuits one step earlier, before any
-    /// filesystem inspection — a regression that replaced the `?`
-    /// with a `.unwrap_or_else(|| default_path)` or a fallback
-    /// would break it.
+    /// None. This test short-circuits earlier, before any filesystem
+    /// inspection — a regression that replaced the `?` with a
+    /// `.unwrap_or_else(|| default_path)` or a fallback would break
+    /// it.
     #[test]
     fn prefer_source_tree_local_with_none_source_tree_path_returns_none() {
         let tmp = TempDir::new().unwrap();
@@ -5221,6 +5350,8 @@ mod tests {
             ktstr_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
+            source_vmlinux_size: Some(42),
+            source_vmlinux_mtime_secs: Some(1_700_000_000),
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -5234,6 +5365,158 @@ mod tests {
             "Local entry with source_tree_path=None must short-circuit \
              to None at the `let src_path = source_tree_path?;` line \
              — no filesystem probe must run",
+        );
+    }
+
+    /// When `source_vmlinux_size` and `source_vmlinux_mtime_secs`
+    /// match the on-disk vmlinux's current stat, the helper returns
+    /// the source-tree path. Pins the validate-and-pass branch
+    /// added for the user-rebuild-detection gate.
+    #[test]
+    fn prefer_source_tree_validates_matching_vmlinux_stat_and_returns_path() {
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        let src_tree = tmp.path().join("src");
+        fs::create_dir_all(&cache_entry).unwrap();
+        fs::create_dir_all(&src_tree).unwrap();
+        let vmlinux = src_tree.join("vmlinux");
+        fs::write(&vmlinux, b"fake-elf-bytes").unwrap();
+        let stat = fs::metadata(&vmlinux).unwrap();
+        let mtime_secs = stat
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let meta = KernelMetadata {
+            version: None,
+            source: KernelSource::Local {
+                source_tree_path: Some(src_tree.clone()),
+                git_hash: None,
+            },
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            has_vmlinux: true,
+            vmlinux_stripped: true,
+            source_vmlinux_size: Some(stat.len()),
+            source_vmlinux_mtime_secs: Some(mtime_secs),
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prefer_source_tree_for_dwarf(&cache_entry),
+            Some(src_tree),
+            "matching size + mtime must pass the validation gate"
+        );
+    }
+
+    /// A size mismatch (user rebuild changed the vmlinux) drops the
+    /// helper to None so callers fall back to the cached stripped
+    /// vmlinux. Without the gate, DWARF reads would silently route
+    /// to a vmlinux whose line numbers no longer correspond to the
+    /// cache's BTF.
+    #[test]
+    fn prefer_source_tree_size_mismatch_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        let src_tree = tmp.path().join("src");
+        fs::create_dir_all(&cache_entry).unwrap();
+        fs::create_dir_all(&src_tree).unwrap();
+        let vmlinux = src_tree.join("vmlinux");
+        fs::write(&vmlinux, b"fake-elf-bytes").unwrap();
+        let stat = fs::metadata(&vmlinux).unwrap();
+        let mtime_secs = stat
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Stored size deliberately wrong by one byte.
+        let meta = KernelMetadata {
+            version: None,
+            source: KernelSource::Local {
+                source_tree_path: Some(src_tree),
+                git_hash: None,
+            },
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            has_vmlinux: true,
+            vmlinux_stripped: true,
+            source_vmlinux_size: Some(stat.len() + 1),
+            source_vmlinux_mtime_secs: Some(mtime_secs),
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prefer_source_tree_for_dwarf(&cache_entry),
+            None,
+            "size mismatch must drop validation and return None"
+        );
+    }
+
+    /// An mtime mismatch (typical user-rebuild signal — `make`
+    /// touches `vmlinux` even when the resulting bytes happen to be
+    /// the same length) drops to None on the same fallback path.
+    #[test]
+    fn prefer_source_tree_mtime_mismatch_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache_entry = tmp.path().join("cache");
+        let src_tree = tmp.path().join("src");
+        fs::create_dir_all(&cache_entry).unwrap();
+        fs::create_dir_all(&src_tree).unwrap();
+        let vmlinux = src_tree.join("vmlinux");
+        fs::write(&vmlinux, b"fake-elf-bytes").unwrap();
+        let stat = fs::metadata(&vmlinux).unwrap();
+        let mtime_secs = stat
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Stored mtime deliberately offset by an hour.
+        let meta = KernelMetadata {
+            version: None,
+            source: KernelSource::Local {
+                source_tree_path: Some(src_tree),
+                git_hash: None,
+            },
+            arch: "x86_64".to_string(),
+            image_name: "bzImage".to_string(),
+            config_hash: None,
+            built_at: "2026-04-18T10:00:00Z".to_string(),
+            ktstr_kconfig_hash: None,
+            has_vmlinux: true,
+            vmlinux_stripped: true,
+            source_vmlinux_size: Some(stat.len()),
+            source_vmlinux_mtime_secs: Some(mtime_secs - 3600),
+        };
+        fs::write(
+            cache_entry.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prefer_source_tree_for_dwarf(&cache_entry),
+            None,
+            "mtime mismatch must drop validation and return None"
         );
     }
 
@@ -5278,6 +5561,8 @@ mod tests {
             ktstr_kconfig_hash: None,
             has_vmlinux: false,
             vmlinux_stripped: false,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -5322,6 +5607,8 @@ mod tests {
             ktstr_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
         };
         fs::write(
             cache_entry.join("metadata.json"),
@@ -5355,6 +5642,8 @@ mod tests {
             ktstr_kconfig_hash: None,
             has_vmlinux: true,
             vmlinux_stripped: true,
+            source_vmlinux_size: None,
+            source_vmlinux_mtime_secs: None,
         };
         fs::write(
             cache_entry.join("metadata.json"),

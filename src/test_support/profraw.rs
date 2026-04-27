@@ -29,6 +29,43 @@
 //! directory next to the test binary) as
 //! `ktstr-test-{pid}-{counter}.profraw`.
 //!
+//! # Host atexit profraw redirect
+//!
+//! The host-side atexit path (the OS-managed dump that fires on
+//! `std::process::exit` for non-VM-dispatch test runs — including
+//! every test run via `cargo nextest run` directly, without a
+//! `cargo ktstr` wrapper) reads `LLVM_PROFILE_FILE` once during the
+//! LLVM runtime's `.init_array` initializer; if unset, the compiler-rt
+//! default is `default.profraw` in the process cwd. When the operator
+//! launched the test from a kernel source tree, that cwd points at the
+//! source tree and the dump leaks into someone else's directory.
+//!
+//! [`redirect_default_profraw_path`] is a `priority = 0` ctor that
+//! runs BEFORE the LLVM runtime's `.init_array` entry (which has no
+//! priority and lands at the default `.init_array` slot per glibc
+//! ordering rules) and points `LLVM_PROFILE_FILE` at the same
+//! workspace-local target directory the cargo-ktstr wrapper already
+//! injects, so a directly-invoked `cargo nextest run` no longer drops
+//! `default.profraw` in cwd. The redirect is a no-op when:
+//!   - getpid() == 1 (in-VM init; the SHM-ring flush above owns
+//!     guest-side coverage and the env is irrelevant inside the VM
+//!     because `std::process::exit` bypasses atexit anyway).
+//!   - `LLVM_PROFILE_FILE` is already set (operator override or
+//!     wrapper injection takes precedence — same `existing_env.is_some()`
+//!     short-circuit `cargo-ktstr.rs::profraw_inject_for` applies).
+//!   - The target binary is NOT coverage-instrumented. Detection is
+//!     a symtab probe for `__llvm_profile_runtime` — the same
+//!     compiler-rt symbol [`try_flush_profraw`] resolves for the
+//!     guest-side flush. Non-instrumented binaries that link the
+//!     ktstr lib (e.g. `cargo-ktstr` itself in a non-coverage build)
+//!     must NOT set the env, otherwise the env propagates to spawned
+//!     child test binaries, which then short-circuit their own
+//!     redirect on the inherited value and write profraw into the
+//!     PARENT's target dir rather than their own per-binary one
+//!     (cargo-ktstr's exe lives in `target/{profile}/` while test
+//!     binaries live in `target/{profile}/deps/`, so the two
+//!     `current_exe`-relative target dirs differ).
+//!
 //! Supporting helpers:
 //! - [`find_symbol_vaddrs`] walks `.symtab` in one pass for multiple
 //!   symbols at once.
@@ -263,6 +300,132 @@ pub fn target_dir() -> PathBuf {
     p
 }
 
+/// Pure decision logic for [`redirect_default_profraw_path`]: given the
+/// current `LLVM_PROFILE_FILE` value, the current pid, the coverage
+/// instrumentation marker, and the workspace-local target dir
+/// resolved from a callable, return the pattern to set on
+/// `LLVM_PROFILE_FILE` or `None` to leave the env untouched.
+/// Mirrors the `cargo-ktstr.rs::profraw_inject_for` predicate so
+/// the directly-invoked `cargo nextest run` and `cargo ktstr test`
+/// paths agree on when to inject.
+///
+/// Returns `Some(pattern)` only when:
+///   - `pid != 1` (a test binary running as `/init` inside the guest VM
+///     is owned by the SHM-ring flush; setting host-side env in that
+///     context would still be a no-op because `std::process::exit`
+///     bypasses atexit, but the early return keeps the in-VM startup
+///     trace clean of an irrelevant env mutation).
+///   - `existing` is `None` (operator-supplied
+///     `LLVM_PROFILE_FILE` or wrapper-injected value takes precedence —
+///     identical short-circuit to the cargo-ktstr wrapper).
+///   - `is_coverage_instrumented` is `true` (the calling binary has
+///     the LLVM compiler-rt profile runtime linked in). Without this
+///     guard, the redirect would fire in `cargo-ktstr` and other
+///     non-instrumented binaries that link the ktstr lib, polluting
+///     the env passed to child test binaries — those child binaries
+///     would then see a pre-set `LLVM_PROFILE_FILE` and short-circuit
+///     their own redirect, writing profraw into the parent's target
+///     dir rather than their own per-binary one. Detecting
+///     instrumentation via the runtime marker symbol scopes the
+///     redirect to the binaries that actually emit profraw.
+///
+/// `target_dir` is taken as a callable so the test suite can drive
+/// the predicate against a synthetic target without building the
+/// real `<current_exe parent>/llvm-cov-target/` path. `%p` (process
+/// id) and `%m` (binary hash) are LLVM runtime expansions that keep
+/// parallel-test output files distinct — the same pattern shape
+/// `cargo-ktstr.rs::profraw_inject_for` emits.
+fn redirect_pattern_for(
+    pid: libc::pid_t,
+    existing: Option<std::ffi::OsString>,
+    is_coverage_instrumented: bool,
+    target_dir: impl FnOnce() -> PathBuf,
+) -> Option<PathBuf> {
+    if pid == 1 || existing.is_some() || !is_coverage_instrumented {
+        return None;
+    }
+    Some(target_dir().join("default-%p-%m.profraw"))
+}
+
+/// Detect whether the running binary has LLVM compiler-rt's profile
+/// runtime linked in by probing for `__llvm_profile_runtime` —
+/// the symbol that
+/// `compiler-rt/lib/profile/InstrProfilingRuntime.cpp` defines as
+/// `INSTR_PROF_PROFILE_RUNTIME_VAR`. Coverage-instrumented binaries
+/// link this symbol; non-instrumented binaries (e.g. `cargo-ktstr`
+/// in a normal release build) do not.
+///
+/// Probes via the symtab walk that profraw flushing already uses
+/// (the symbol has hidden visibility, so dlsym would not find it).
+/// Returns `false` on any failure path (binary mmap, ELF parse,
+/// symbol absent) — false negatives leave the redirect off, which
+/// is the conservative outcome: the binary writes
+/// `default.profraw` in cwd just as before, no regression.
+fn is_coverage_instrumented_binary() -> bool {
+    let exe_file = match File::open("/proc/self/exe") {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // SAFETY: same invariants as `try_flush_profraw`'s mmap — see
+    // the SAFETY block there. The `/proc/self/exe` mapping pins
+    // the binary inode for the mmap's lifetime, and no part of
+    // ktstr writes to its own binary during process startup.
+    let mmap = match unsafe { memmap2::Mmap::map(&exe_file) } {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let elf = match goblin::elf::Elf::parse(&mmap) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let vaddrs = find_symbol_vaddrs(&elf, &["__llvm_profile_runtime"]);
+    matches!(vaddrs[0], Some(v) if v != 0)
+}
+
+/// Set `LLVM_PROFILE_FILE` to the workspace-local target directory
+/// before the LLVM compiler-rt runtime reads it.
+///
+/// `priority = 0` lands this ctor in `.init_array.0`, which the
+/// glibc startup loop walks BEFORE the unprioritized `.init_array`
+/// slot that compiler-rt's `INSTR_PROF_PROFILE_RUNTIME_VAR` static
+/// initializer (`InstrProfilingRuntime.cpp`) lives in. By the time
+/// `__llvm_profile_initialize_file` runs and calls
+/// `getenv("LLVM_PROFILE_FILE")`, our `set_var` has already landed.
+///
+/// See the module-level "Host atexit profraw redirect" section for
+/// the full motivation. This ctor is intentionally separate from
+/// [`crate::test_support::dispatch::ktstr_test_early_dispatch`] (the
+/// unprioritized ctor that handles VM dispatch and SHM-ring flushes)
+/// because that ctor must NOT acquire the priority slot — its
+/// gauntlet-expansion and dispatch logic is order-insensitive
+/// relative to compiler-rt, but pinning a low priority on it would
+/// risk surprising interactions with future `.init_array.NN` entries.
+/// Keeping the redirect in its own minimal ctor scopes the priority
+/// promise to one well-understood operation.
+///
+/// The set_var call is sound in this ctor context: glibc invokes
+/// `.init_array` entries on the main thread before any user code
+/// has spawned an additional thread, so the env-block mutation is
+/// race-free.
+#[ctor::ctor(priority = 0)]
+fn redirect_default_profraw_path() {
+    let pid = unsafe { libc::getpid() };
+    let existing = std::env::var_os("LLVM_PROFILE_FILE");
+    let instrumented = is_coverage_instrumented_binary();
+    if let Some(pattern) = redirect_pattern_for(pid, existing, instrumented, target_dir) {
+        // SAFETY: this ctor runs from `.init_array.0`, before any
+        // user thread has spawned. The env block is single-writer,
+        // single-reader at this moment, so `set_var` is sound. The
+        // `set_var` API was deprecated in Rust 2024 for thread
+        // unsafety in non-startup contexts, but ctor-time mutation
+        // is exactly the protected case the deprecation guidance
+        // carves out via `unsafe`.
+        unsafe {
+            std::env::set_var("LLVM_PROFILE_FILE", &pattern);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{EnvVarGuard, lock_env};
@@ -401,6 +564,106 @@ mod tests {
             "fallback must land at the current_exe-relative llvm-cov-target \
              dir, got: {}",
             dir.display(),
+        );
+    }
+
+    // -- redirect_pattern_for (host-side LLVM_PROFILE_FILE redirect predicate) --
+
+    /// Pid 1 (in-VM init) must short-circuit. Even when no
+    /// `LLVM_PROFILE_FILE` is set and the binary is instrumented,
+    /// the SHM-ring flush owns guest-side coverage and the
+    /// host-side env redirect is irrelevant.
+    #[test]
+    fn redirect_pattern_for_pid_1_returns_none() {
+        let pattern =
+            redirect_pattern_for(1, None, true, || PathBuf::from("/should/not/be/called"));
+        assert!(
+            pattern.is_none(),
+            "pid=1 (guest init) must skip env redirect"
+        );
+    }
+
+    /// An already-set `LLVM_PROFILE_FILE` (operator override or
+    /// cargo-ktstr/cargo-llvm-cov wrapper injection) takes
+    /// precedence — the redirect must be a no-op so it does not
+    /// stomp on the outer harness's profile location.
+    #[test]
+    fn redirect_pattern_for_existing_env_returns_none() {
+        let pattern = redirect_pattern_for(
+            42,
+            Some(std::ffi::OsString::from("/operator/picked/path.profraw")),
+            true,
+            || PathBuf::from("/should/not/be/called"),
+        );
+        assert!(
+            pattern.is_none(),
+            "existing LLVM_PROFILE_FILE must take precedence"
+        );
+    }
+
+    /// Empty `LLVM_PROFILE_FILE` (`Some("")` from a shell that did
+    /// `export LLVM_PROFILE_FILE=`) is a degenerate but possible
+    /// shape. `var_os` returns `Some` for an empty value, so the
+    /// existing-env short-circuit fires and we leave it alone — the
+    /// LLVM runtime treats empty as "fall through to default" so
+    /// `default.profraw` lands in cwd, but that is the operator's
+    /// choice once they explicitly assigned the variable. Pinned
+    /// here so a future "treat empty as unset" change is a deliberate
+    /// decision rather than a silent drift.
+    #[test]
+    fn redirect_pattern_for_empty_env_short_circuits() {
+        let pattern = redirect_pattern_for(42, Some(std::ffi::OsString::new()), true, || {
+            PathBuf::from("/should/not/be/called")
+        });
+        assert!(
+            pattern.is_none(),
+            "Some(\"\") in LLVM_PROFILE_FILE counts as set; redirect must defer"
+        );
+    }
+
+    /// Non-instrumented binaries (cargo-ktstr in normal builds, the
+    /// `ktstr` standalone CLI) must not set the env. Otherwise the
+    /// inherited env in spawned child test binaries pre-empts their
+    /// own redirect and they write profraw into the parent's target
+    /// dir instead of their own per-binary one.
+    #[test]
+    fn redirect_pattern_for_non_instrumented_binary_returns_none() {
+        let pattern =
+            redirect_pattern_for(42, None, false, || PathBuf::from("/should/not/be/called"));
+        assert!(
+            pattern.is_none(),
+            "non-coverage-instrumented binary must not pollute the env passed \
+             to children"
+        );
+    }
+
+    /// Host-pid + unset env + instrumented binary produces a
+    /// redirect to the workspace-local target dir with the LLVM
+    /// `%p`/`%m` expansions baked into the filename.
+    #[test]
+    fn redirect_pattern_for_host_unset_returns_target_pattern() {
+        let target = PathBuf::from("/synthetic/llvm-cov-target");
+        let pattern = redirect_pattern_for(42, None, true, || target.clone())
+            .expect("host pid + unset env + instrumented must produce a redirect pattern");
+        assert_eq!(
+            pattern,
+            PathBuf::from("/synthetic/llvm-cov-target/default-%p-%m.profraw"),
+        );
+    }
+
+    /// The pattern shape matches what
+    /// `cargo-ktstr.rs::profraw_inject_for` emits — both paths
+    /// inject `default-%p-%m.profraw` so coverage merge tools
+    /// (cargo-llvm-cov) see a uniform filename suffix regardless of
+    /// which entry point launched the test binary.
+    #[test]
+    fn redirect_pattern_for_filename_matches_cargo_ktstr_wrapper() {
+        let target = PathBuf::from("/x");
+        let pattern = redirect_pattern_for(42, None, true, || target.clone()).unwrap();
+        assert_eq!(
+            pattern.file_name().and_then(|n| n.to_str()),
+            Some("default-%p-%m.profraw"),
+            "filename suffix must match cargo-ktstr's profraw_inject_for",
         );
     }
 

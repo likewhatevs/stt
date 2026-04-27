@@ -876,20 +876,26 @@ enum StatsCommand {
 }
 
 /// Resolve a `KernelId::Path` to a directory suitable for export
-/// via [`ktstr::KTSTR_KERNEL_ENV`].
+/// via [`ktstr::KTSTR_KERNEL_ENV`] plus the dirty-tree flag the
+/// caller uses to decorate the kernel label.
 ///
 /// Routes Path specs through [`cli::resolve_kernel_dir_to_entry`]
 /// so they share the same cache pipeline as Version / CacheKey /
 /// Git specs:
 ///   - Clean source tree, cache miss → build, store at
-///     `local-{hash7}-{arch}-kc{suffix}`, return cache entry dir.
+///     `local-{hash7}-{arch}-kc{suffix}`, return cache entry dir
+///     with `is_dirty=false`.
 ///   - Clean source tree, cache hit → skip build, emit a stderr
 ///     line referencing the user's raw input path, the resolved
-///     cache key, and the build age, then return cache entry dir.
+///     cache key, and the build age, then return cache entry dir
+///     with `is_dirty=false`.
 ///   - Dirty source tree → build in source, skip cache store,
-///     return canonical source dir.
+///     return canonical source dir with `is_dirty=true`. The
+///     caller appends `_dirty` to the kernel label so the test
+///     report distinguishes the non-reproducible run from a
+///     subsequent clean rebuild of the same tree.
 ///
-/// Both shapes are valid inputs to
+/// Both directory shapes are valid inputs to
 /// [`crate::kernel_path::find_image_in_dir`]'s child consumers;
 /// the cache-entry layout (`<dir>/<image_name>`) and source-tree
 /// layout (`<dir>/arch/<arch>/boot/<image_name>`) are both probed.
@@ -910,28 +916,26 @@ enum StatsCommand {
 /// [`cli::resolve_kernel_dir_to_entry`]); doing it twice in this
 /// function and again in `local_source` produced redundant
 /// syscalls without changing the resulting path.
-fn resolve_path_kernel(p: &Path, raw_input: &str) -> Result<PathBuf, String> {
+fn resolve_path_kernel(p: &Path, raw_input: &str) -> Result<(PathBuf, bool), String> {
     // Boundary bridge: `cli::resolve_kernel_dir_to_entry` returns
-    // `anyhow::Result<(PathBuf, Option<KernelDirCacheHit>)>`
-    // while this function returns `Result<_, String>`, so we
-    // stringify at the call site. A broader anyhow migration
-    // across cargo-ktstr.rs is pending and would drop this last
-    // bridge.
-    let (entry_dir, cache_hit) =
-        cli::resolve_kernel_dir_to_entry(p, "cargo ktstr", None).map_err(|e| {
-            format!(
-                "--kernel {raw_input}: {e:#}. {hint}",
-                hint = ktstr::KTSTR_KERNEL_HINT,
-            )
-        })?;
-    if let Some(hit) = cache_hit {
+    // `anyhow::Result<KernelDirOutcome>` while this function
+    // returns `Result<_, String>`, so we stringify at the call
+    // site. A broader anyhow migration across cargo-ktstr.rs is
+    // pending and would drop this last bridge.
+    let outcome = cli::resolve_kernel_dir_to_entry(p, "cargo ktstr", None).map_err(|e| {
+        format!(
+            "--kernel {raw_input}: {e:#}. {hint}",
+            hint = ktstr::KTSTR_KERNEL_HINT,
+        )
+    })?;
+    if let Some(hit) = outcome.cache_hit {
         eprintln!(
             "cargo ktstr: cache hit for {raw_input} ({key}{age})",
             key = hit.cache_key,
             age = format_built_age(&hit.built_at),
         );
     }
-    Ok(entry_dir)
+    Ok((outcome.dir, outcome.is_dirty))
 }
 
 /// Format a cache entry's `built_at` ISO-8601 timestamp as a
@@ -1037,7 +1041,7 @@ fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, PathBuf), St
             // actually typed (`../linux`) instead of the
             // resolved canonical form.
             let raw_input = p.display().to_string();
-            // Compute the label from the CANONICAL SOURCE TREE
+            // Compute the BASE label from the CANONICAL SOURCE TREE
             // path, NOT the directory `resolve_path_kernel`
             // returns. The returned dir may be a cache entry
             // (`<cache>/local-{hash7}-{arch}-kc{suffix}`); a
@@ -1050,6 +1054,17 @@ fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, PathBuf), St
             // to the canonical SOURCE path keeps the operator-
             // facing identifier stable across cache states for
             // the same `--kernel /path/to/linux` invocation.
+            //
+            // The dirty-tree flag from `resolve_path_kernel`
+            // appends a `_dirty` suffix when `local_source`
+            // observed uncommitted modifications. The dirty-tree
+            // build skips the cache store, so a `path_linux_a3b1c2`
+            // row in the test report is not interchangeable with
+            // a `path_linux_a3b1c2_dirty` row — the former is
+            // reproducible from the recorded git hash, the latter
+            // is not. Surfacing the divergence in the label keeps
+            // the gauntlet output honest about which runs the
+            // operator can re-run from cache.
             let canon_input = std::fs::canonicalize(&p).map_err(|e| {
                 format!(
                     "--kernel {}: path does not exist or cannot be \
@@ -1058,8 +1073,9 @@ fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, PathBuf), St
                     hint = ktstr::KTSTR_KERNEL_HINT,
                 )
             })?;
-            let label = path_kernel_label(&canon_input);
-            let dir = resolve_path_kernel(&p, &raw_input)?;
+            let base_label = path_kernel_label(&canon_input);
+            let (dir, is_dirty) = resolve_path_kernel(&p, &raw_input)?;
+            let label = decorate_path_label_for_dirty(&base_label, is_dirty);
             Ok((label, dir))
         }
         KernelId::Version(ref ver) => {
@@ -1504,6 +1520,31 @@ fn path_kernel_label(dir: &Path) -> String {
     // only a UI nuisance, not a correctness issue — the kernel_dir
     // path itself is the actual identity).
     format!("path_{basename}_{:06x}", hash & 0x00ff_ffff)
+}
+
+/// Append a `_dirty` suffix to a Path-spec kernel label when the
+/// build skipped the cache store because the source tree carried
+/// uncommitted modifications. Returns the label unchanged when the
+/// tree was clean.
+///
+/// Test reports key on the (sanitized) kernel label as the
+/// per-kernel column header; without the suffix, a dirty-tree run
+/// and a clean-tree run on the same path render identically and
+/// the operator cannot tell which row came from a non-reproducible
+/// build. With the suffix:
+///   - clean tree: `path_linux_a3b1c2`
+///   - dirty tree: `path_linux_a3b1c2_dirty`
+///
+/// Downstream [`ktstr::test_support::sanitize_kernel_label`]
+/// preserves alphanumerics and converts `-` / `.` to `_`, so the
+/// `_dirty` suffix passes through verbatim and surfaces in the
+/// nextest test-name suffix as `kernel_path_linux_a3b1c2_dirty`.
+fn decorate_path_label_for_dirty(base_label: &str, is_dirty: bool) -> String {
+    if is_dirty {
+        format!("{base_label}_dirty")
+    } else {
+        base_label.to_string()
+    }
 }
 
 /// Extract a discriminating label from a cache-entry key.
@@ -6181,6 +6222,75 @@ mod tests {
             path_kernel_label(a),
             path_kernel_label(b),
             "distinct path parents must produce distinct labels",
+        );
+    }
+
+    /// `decorate_path_label_for_dirty` is the seam where a
+    /// dirty-tree Path resolve attaches its `_dirty` suffix to
+    /// the operator-readable kernel label. Clean trees pass
+    /// through unchanged so the cache-stored vs in-tree label
+    /// shapes remain stable for the same canonical path.
+    #[test]
+    fn decorate_path_label_for_dirty_clean_tree_passthrough() {
+        let base = "path_linux_a3b1c2";
+        assert_eq!(
+            decorate_path_label_for_dirty(base, false),
+            base,
+            "clean trees must not append a `_dirty` suffix",
+        );
+    }
+
+    /// Dirty trees must append `_dirty` so the test report shows
+    /// a non-reproducible run as distinct from the same path's
+    /// clean rebuild. The suffix is deliberately placed after
+    /// the hash6 segment (rather than between basename and
+    /// hash6) so the `path_{basename}_{hash6}` invariant
+    /// `path_kernel_label` relies on still parses cleanly.
+    #[test]
+    fn decorate_path_label_for_dirty_dirty_tree_appends_suffix() {
+        let base = "path_linux_a3b1c2";
+        assert_eq!(
+            decorate_path_label_for_dirty(base, true),
+            "path_linux_a3b1c2_dirty",
+            "dirty trees must append `_dirty` to the base label",
+        );
+    }
+
+    /// The `_dirty` suffix survives `sanitize_kernel_label`
+    /// transformation verbatim — `_` is alphanumeric-equivalent
+    /// in the sanitizer's preservation table, so the nextest
+    /// test-name suffix renders as `kernel_path_..._dirty`.
+    /// Pins the producer↔consumer round-trip so a future
+    /// sanitizer change that mangles `_` is caught here rather
+    /// than only in operator-visible test reports.
+    #[test]
+    fn decorate_path_label_for_dirty_survives_sanitize() {
+        let dirty_label = decorate_path_label_for_dirty("path_linux_a3b1c2", true);
+        let sanitized = ktstr::test_support::sanitize_kernel_label(&dirty_label);
+        assert_eq!(
+            sanitized, "kernel_path_linux_a3b1c2_dirty",
+            "`_dirty` must survive sanitize verbatim so the test report \
+             distinguishes dirty runs from clean runs in the nextest suffix",
+        );
+    }
+
+    /// Sanity pin on the clean-tree counterpart: the same base
+    /// label without the dirty decoration sanitizes to a label
+    /// that differs from the dirty form. The two test-report
+    /// rows MUST be distinct identifiers downstream so the
+    /// per-kernel column keys do not collide.
+    #[test]
+    fn decorate_path_label_for_dirty_clean_dirty_sanitize_to_distinct_ids() {
+        let base = "path_linux_a3b1c2";
+        let clean =
+            ktstr::test_support::sanitize_kernel_label(&decorate_path_label_for_dirty(base, false));
+        let dirty =
+            ktstr::test_support::sanitize_kernel_label(&decorate_path_label_for_dirty(base, true));
+        assert_ne!(
+            clean, dirty,
+            "clean ({clean:?}) and dirty ({dirty:?}) sanitized labels must \
+             produce distinct nextest identifiers so test reports do not \
+             collapse non-reproducible runs into the cache-stored row",
         );
     }
 

@@ -891,12 +891,74 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource> {
         .canonicalize()
         .with_context(|| format!("canonicalize {}", source_path.display()))?;
 
-    // Git hash extraction and dirty detection via gix.
-    // Submodule checks are skipped (false positives on kernel
-    // trees with uninitialized submodules). The tuple return carries
-    // `(hash, is_dirty, is_git)` so the non-git arm can signal
-    // "this isn't a git repo" to the cache-skip hint at the caller.
-    let (short_hash, is_dirty, is_git) = match gix::discover(&canonical) {
+    let LocalSourceState {
+        short_hash,
+        is_dirty,
+        is_git,
+    } = inspect_local_source_state(&canonical)?;
+
+    // User .config is folded into the cache key so two builds of the
+    // same HEAD with different `.config` files do NOT collide on the
+    // same key — see [`config_hash_for_key`] for the encoding.
+    // Read at `local_source` time (rather than at the post-build
+    // store site) so cache LOOKUP and cache STORE see the same key.
+    let user_config_hash = config_hash_for_key(&canonical);
+
+    let cache_key =
+        compose_local_cache_key(arch, &short_hash, &canonical, user_config_hash.as_deref());
+
+    Ok(AcquiredSource {
+        source_dir: canonical.clone(),
+        cache_key,
+        version: None,
+        kernel_source: crate::cache::KernelSource::Local {
+            source_tree_path: Some(canonical),
+            git_hash: short_hash,
+        },
+        is_temp: false,
+        is_dirty,
+        is_git,
+    })
+}
+
+/// Result of [`inspect_local_source_state`] — git hash and dirty/git
+/// classification of a canonical source-tree path. Pulled out of
+/// [`local_source`] so the post-build dirty re-check (a second call
+/// from [`crate::cli::kernel_build_pipeline`]) reuses the exact same
+/// gix path.
+#[derive(Debug, Clone)]
+pub struct LocalSourceState {
+    /// HEAD short hash (7 chars). `None` when the tree is dirty
+    /// (HEAD doesn't describe the actual source) or non-git (no
+    /// HEAD at all). Mirrors the `git_hash` field on
+    /// [`AcquiredSource::kernel_source`] for [`crate::cache::KernelSource::Local`].
+    pub short_hash: Option<String>,
+    /// Tracked-file dirt: HEAD-vs-index disagreement OR
+    /// index-vs-worktree disagreement. Always `true` for non-git
+    /// trees (dirty detection is impossible without git, so the
+    /// pessimistic stance is dirty).
+    pub is_dirty: bool,
+    /// `true` when `gix::discover` succeeded (the tree is a git
+    /// repo); `false` otherwise. Lets the cache-skip hint branch
+    /// on whether `commit` / `stash` is actionable.
+    pub is_git: bool,
+}
+
+/// Inspect a canonical source-tree path for git hash + dirty state.
+///
+/// Submodule checks are skipped (false positives on kernel trees
+/// with uninitialized submodules). The non-git arm returns
+/// `(None, true, false)` so the caller's cache-skip hint can
+/// distinguish "dirty git repo" from "not a git repo at all".
+///
+/// Called twice per build by [`crate::cli::kernel_build_pipeline`]:
+/// once at acquire time (via [`local_source`]) and again after
+/// `make` returns to detect mid-build worktree edits, branch flips,
+/// or commits that would otherwise let a racing-write build land in
+/// the cache under a stale identity. Both calls share the same gix
+/// path so the post-build comparison is apples-to-apples.
+pub fn inspect_local_source_state(canonical: &Path) -> Result<LocalSourceState> {
+    let (short_hash, is_dirty, is_git) = match gix::discover(canonical) {
         Ok(repo) => {
             let head = repo.head_id().with_context(|| "read HEAD")?;
             let short_hash = format!("{}", head).chars().take(7).collect::<String>();
@@ -964,25 +1026,93 @@ pub fn local_source(source_path: &Path) -> Result<AcquiredSource> {
             (None, true, false)
         }
     };
-
-    let suffix = crate::cache_key_suffix();
-    let cache_key = match &short_hash {
-        Some(hash) => format!("local-{hash}-{arch}-kc{suffix}"),
-        None => format!("local-unknown-{arch}-kc{suffix}"),
-    };
-
-    Ok(AcquiredSource {
-        source_dir: canonical.clone(),
-        cache_key,
-        version: None,
-        kernel_source: crate::cache::KernelSource::Local {
-            source_tree_path: Some(canonical),
-            git_hash: short_hash,
-        },
-        is_temp: false,
+    Ok(LocalSourceState {
+        short_hash,
         is_dirty,
         is_git,
     })
+}
+
+/// Compose the cache key for a local source given its arch, optional
+/// HEAD short hash, canonical source path, and optional user
+/// `.config` hash.
+///
+/// Three shapes:
+/// - `local-{hash7}-{arch}-kc{suffix}` — clean git tree, no user
+///   `.config` (plain `make defconfig` path or no config file yet)
+/// - `local-{hash7}-{arch}-cfg{user_config}-kc{suffix}` — clean git
+///   tree with a user `.config` whose hash differs from `defconfig`
+/// - `local-unknown-{path_hash6}-{arch}-kc{suffix}` — dirty / non-git
+///   tree (HEAD does not describe the source; the path-derived
+///   crc32 salt keeps two distinct dirty trees from colliding on the
+///   same `local-unknown-...` slot)
+///
+/// `path_hash6` is the first 6 chars of the lowercase-hex CRC32 of
+/// the canonical source-path bytes. CRC32 keeps the per-path
+/// disambiguator short and stable across runs without pulling in a
+/// crypto-grade hash for what is fundamentally a slot disambiguator.
+///
+/// `user_config_hash` is `None` whenever the source tree has no
+/// `.config` file yet (the build will run `make defconfig` and
+/// produce one). This collapses the user-config branch back into the
+/// hash-only key so a fresh checkout's first build still hits a
+/// later cache lookup keyed without the cfg segment.
+pub fn compose_local_cache_key(
+    arch: &str,
+    short_hash: &Option<String>,
+    canonical: &Path,
+    user_config_hash: Option<&str>,
+) -> String {
+    let suffix = crate::cache_key_suffix();
+    match short_hash {
+        Some(hash) => match user_config_hash {
+            Some(cfg) => format!("local-{hash}-{arch}-cfg{cfg}-kc{suffix}"),
+            None => format!("local-{hash}-{arch}-kc{suffix}"),
+        },
+        None => {
+            let path_hash = canonical_path_hash6(canonical);
+            format!("local-unknown-{path_hash}-{arch}-kc{suffix}")
+        }
+    }
+}
+
+/// CRC32 of the canonical source-path bytes, lowercase hex,
+/// truncated to 6 chars. Disambiguates `local-unknown-...` cache
+/// keys across distinct dirty / non-git source trees so two parallel
+/// `cargo ktstr test --kernel ./linux-a` and `--kernel ./linux-b`
+/// runs can't write each other's vmlinux into the same cache slot
+/// on (statistically rare but possible) the same dirty timing
+/// window.
+///
+/// 6 hex chars (24 bits) of CRC32 keep collision risk vanishing
+/// against the practical population (handful of source trees per
+/// host) while keeping the cache key human-readable. Path bytes are
+/// taken via `OsStr::as_encoded_bytes` so a non-UTF-8 component
+/// (rare on Linux but possible) doesn't lose entropy through a UTF-8
+/// lossy conversion.
+pub(crate) fn canonical_path_hash6(canonical: &Path) -> String {
+    let bytes = canonical.as_os_str().as_encoded_bytes();
+    let full = format!("{:08x}", crc32fast::hash(bytes));
+    full.chars().take(6).collect()
+}
+
+/// Read `<canonical>/.config` and return its CRC32 as a lowercase
+/// hex string suitable for embedding in the cache key. Returns
+/// `None` when no `.config` exists (a fresh tree before the build
+/// runs `make defconfig`).
+///
+/// Distinct from the `config_hash` written into [`crate::cache::KernelMetadata`]
+/// at store time — that records the FINAL `.config` after
+/// configuration runs, for diagnostic display in `kernel list`.
+/// This helper records the PRE-BUILD `.config` so the cache key
+/// reflects what the operator's tree currently has on disk; the
+/// same `.config` content always maps to the same key, even if the
+/// downstream `make olddefconfig` step elaborates additional
+/// defaults.
+fn config_hash_for_key(canonical: &Path) -> Option<String> {
+    let config_path = canonical.join(".config");
+    let data = std::fs::read(&config_path).ok()?;
+    Some(format!("{:08x}", crc32fast::hash(&data)))
 }
 
 #[cfg(test)]
@@ -1323,6 +1453,197 @@ mod tests {
             acquired.cache_key.starts_with("local-unknown-"),
             "non-git cache_key must use local-unknown prefix, got {}",
             acquired.cache_key
+        );
+    }
+
+    // -- compose_local_cache_key + canonical-path salt --
+
+    /// Two distinct non-git source trees produce DIFFERENT
+    /// `local-unknown-...` keys via the path-derived salt — without
+    /// the salt, both would collapse to the same slot and a
+    /// concurrent build could write each other's cache contents.
+    #[test]
+    fn local_unknown_keys_carry_distinct_per_path_salt() {
+        let tmp_a = tempfile::TempDir::new().unwrap();
+        let tmp_b = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp_a.path().join("file"), b"a").unwrap();
+        std::fs::write(tmp_b.path().join("file"), b"b").unwrap();
+
+        let key_a = local_source(tmp_a.path()).unwrap().cache_key;
+        let key_b = local_source(tmp_b.path()).unwrap().cache_key;
+        assert!(
+            key_a.starts_with("local-unknown-"),
+            "tree-a key shape: {key_a}"
+        );
+        assert!(
+            key_b.starts_with("local-unknown-"),
+            "tree-b key shape: {key_b}"
+        );
+        assert_ne!(
+            key_a, key_b,
+            "distinct paths must produce distinct local-unknown keys; \
+             without per-path salt they would collide and parallel \
+             builds could stomp each other's cache content"
+        );
+    }
+
+    /// Same canonical path always produces the same `local-unknown`
+    /// key — the salt must be a deterministic function of the path
+    /// bytes, NOT a random nonce. A non-deterministic salt would
+    /// defeat cache lookups within the same source tree across
+    /// re-runs.
+    #[test]
+    fn local_unknown_key_stable_across_repeated_calls_on_same_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("file"), b"x").unwrap();
+        let k1 = local_source(tmp.path()).unwrap().cache_key;
+        let k2 = local_source(tmp.path()).unwrap().cache_key;
+        assert_eq!(
+            k1, k2,
+            "salt must be deterministic across repeated calls on the same path"
+        );
+    }
+
+    // -- compose_local_cache_key + user-config hash segment --
+
+    /// `compose_local_cache_key` with a user `.config` hash inserts
+    /// the `cfg{user_config}` segment between the HEAD hash and the
+    /// `kc{suffix}` tail. Verifies the encoding directly, not via
+    /// `local_source` (no `.config` is needed because the helper is
+    /// pure on its inputs).
+    #[test]
+    fn compose_local_cache_key_with_user_config_inserts_cfg_segment() {
+        use std::path::PathBuf;
+        let key = compose_local_cache_key(
+            "x86_64",
+            &Some("abc1234".to_string()),
+            &PathBuf::from("/anywhere"),
+            Some("deadbeef"),
+        );
+        let suffix = crate::cache_key_suffix();
+        assert_eq!(
+            key,
+            format!("local-abc1234-x86_64-cfgdeadbeef-kc{suffix}"),
+            "user-config segment must sit between hash and kc tail"
+        );
+    }
+
+    /// `compose_local_cache_key` without a user `.config` hash falls
+    /// back to the original `local-{hash}-{arch}-kc{suffix}` shape so
+    /// fresh checkouts (no `.config` yet) keep the legacy key shape
+    /// — the cfg segment only appears when there's actually a user
+    /// `.config` to discriminate against.
+    #[test]
+    fn compose_local_cache_key_without_user_config_keeps_legacy_shape() {
+        use std::path::PathBuf;
+        let key = compose_local_cache_key(
+            "x86_64",
+            &Some("abc1234".to_string()),
+            &PathBuf::from("/anywhere"),
+            None,
+        );
+        let suffix = crate::cache_key_suffix();
+        assert_eq!(
+            key,
+            format!("local-abc1234-x86_64-kc{suffix}"),
+            "absent user config must keep the legacy hash-only shape"
+        );
+    }
+
+    /// `compose_local_cache_key` with no HEAD hash (dirty / non-git
+    /// tree) routes to the `local-unknown-{path_hash6}` shape and
+    /// the `cfg` segment is dropped — the tree's identity collapses
+    /// to the salt anyway, so an additional config segment would be
+    /// redundant noise on the unknown path.
+    #[test]
+    fn compose_local_cache_key_unknown_uses_path_hash_only() {
+        use std::path::PathBuf;
+        let key = compose_local_cache_key(
+            "x86_64",
+            &None,
+            &PathBuf::from("/some/path"),
+            Some("ignored"),
+        );
+        let suffix = crate::cache_key_suffix();
+        assert!(
+            key.starts_with("local-unknown-") && key.ends_with(&format!("-x86_64-kc{suffix}")),
+            "unknown shape must skip cfg segment; got {key}"
+        );
+        // The 6-char path-hash segment sits between `local-unknown-`
+        // and `-x86_64-`. Verify it's exactly 6 hex chars.
+        let path_hash = key
+            .strip_prefix("local-unknown-")
+            .and_then(|s| s.strip_suffix(&format!("-x86_64-kc{suffix}")))
+            .expect("key shape mismatch");
+        assert_eq!(
+            path_hash.len(),
+            6,
+            "path-hash salt must be 6 chars; got {path_hash}"
+        );
+        assert!(
+            path_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "path-hash salt must be hex; got {path_hash}"
+        );
+    }
+
+    // -- inspect_local_source_state (post-build re-check semantics) --
+
+    /// Two consecutive `inspect_local_source_state` calls on a clean
+    /// repo return the same shape — pins the "rerun the same probe
+    /// with no false-positive flip" contract that lets
+    /// `kernel_build_pipeline` compare acquire-time vs post-build
+    /// state for change detection.
+    #[test]
+    fn inspect_local_source_state_clean_repo_stable_across_calls() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            skip!("git CLI unavailable");
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+        let canonical = tmp.path().canonicalize().unwrap();
+
+        let pre = inspect_local_source_state(&canonical).unwrap();
+        let post = inspect_local_source_state(&canonical).unwrap();
+        assert_eq!(pre.is_dirty, post.is_dirty);
+        assert_eq!(pre.is_git, post.is_git);
+        assert_eq!(pre.short_hash, post.short_hash);
+    }
+
+    /// A mid-build modification (worktree edit between two
+    /// `inspect_local_source_state` calls) flips `is_dirty` — the
+    /// signal `kernel_build_pipeline` uses to skip the cache store
+    /// on the racing-write path.
+    #[test]
+    fn inspect_local_source_state_detects_mid_build_modification() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            skip!("git CLI unavailable");
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+        let canonical = tmp.path().canonicalize().unwrap();
+
+        let pre = inspect_local_source_state(&canonical).unwrap();
+        assert!(!pre.is_dirty, "acquire-time state must be clean");
+
+        // Simulate a mid-build edit to the tracked file.
+        std::fs::write(canonical.join("file.txt"), b"edited mid-build").unwrap();
+
+        let post = inspect_local_source_state(&canonical).unwrap();
+        assert!(
+            post.is_dirty,
+            "post-build re-check must observe the worktree edit and flip dirty"
+        );
+        assert!(
+            post.short_hash.is_none(),
+            "dirty post-build state must drop short_hash, mirroring acquire-time semantics"
         );
     }
 
