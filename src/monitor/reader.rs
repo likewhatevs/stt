@@ -47,13 +47,12 @@ pub(crate) struct MemRegion {
 /// per-node `MmapRegion`s have `owned=false` and do not munmap.
 /// The guard outlives all threads that hold a `GuestMem`.
 pub struct GuestMem {
-    base: *mut u8,
     size: u64,
     regions: Vec<MemRegion>,
 }
 
-// SAFETY: `base` and `MemRegion::host_ptr` point into a KVM mmap'd
-// region whose lifetime is guaranteed by `ReservationGuard`. Reads
+// SAFETY: `MemRegion::host_ptr` values point into KVM mmap'd
+// regions whose lifetime is guaranteed by `ReservationGuard`. Reads
 // and writes use volatile ops; concurrent access is acceptable
 // because the monitor is a best-effort sampler of guest-owned data.
 unsafe impl Send for GuestMem {}
@@ -93,7 +92,6 @@ impl GuestMem {
     /// logic themselves.
     pub unsafe fn new(base: *mut u8, size: u64) -> Self {
         Self {
-            base,
             size,
             regions: vec![MemRegion {
                 host_ptr: base,
@@ -101,6 +99,29 @@ impl GuestMem {
                 size,
             }],
         }
+    }
+
+    /// Test-only constructor: build a `GuestMem` from explicit
+    /// `MemRegion` entries.
+    ///
+    /// `regions` must be sorted by ascending `offset` and each region's
+    /// host pointer must address a live, readable mapping of at least
+    /// `region.size` bytes. The reported `size()` is the largest
+    /// `offset + size` across all regions (the DRAM-relative end).
+    /// The lifetime of every backing mapping must outlive the
+    /// returned `GuestMem`.
+    ///
+    /// # Safety
+    /// Same constraints as [`GuestMem::new`], applied per region.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_regions_for_test(regions: Vec<MemRegion>) -> Self {
+        assert!(!regions.is_empty(), "at least one region required");
+        let size = regions
+            .iter()
+            .map(|r| r.offset + r.size)
+            .max()
+            .expect("non-empty");
+        Self { size, regions }
     }
 
     /// Build a multi-region GuestMem from a NUMA memory layout.
@@ -124,15 +145,10 @@ impl GuestMem {
         let dram_base = layout.dram_base();
         let total_size = layout.total_bytes();
         let mut regions = Vec::with_capacity(layout.regions().len());
-        let mut base_ptr: Option<*mut u8> = None;
-
         for nr in layout.regions() {
             let host_ptr = guest_mem
                 .get_host_address(vm_memory::GuestAddress(nr.gpa_start))
                 .unwrap();
-            if base_ptr.is_none() {
-                base_ptr = Some(host_ptr);
-            }
             regions.push(MemRegion {
                 host_ptr,
                 offset: nr.gpa_start - dram_base,
@@ -140,17 +156,10 @@ impl GuestMem {
             });
         }
 
-        let base = base_ptr.unwrap();
         Self {
-            base,
             size: total_size,
             regions,
         }
-    }
-
-    /// Raw pointer to the start of guest DRAM.
-    pub fn base_ptr(&self) -> *const u8 {
-        self.base
     }
 
     /// Resolve a DRAM-relative byte offset to a host pointer.
@@ -3241,5 +3250,278 @@ mod tests {
         assert_eq!(snap.local_dsq_depth, dsq_depth);
         assert_eq!(snap.rq_clock, clock);
         assert_eq!(snap.scx_flags, flags);
+    }
+
+    // ---- GuestMem write/resolve coverage --------------------------
+    //
+    // Pin the bounds-check semantics of `write_scalar` (the sole
+    // gateway for `write_u8` / `write_u32` / `write_u64`), the
+    // size-vs-offset interaction documented on `GuestMem::new`, and
+    // the multi-region `resolve_ptr` routing that backs every read
+    // and write on a NUMA layout.
+
+    #[test]
+    fn write_u32_at_boundary_writes_full_word() {
+        let mut buf = [0u8; 16];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        // PA 12 + 4 = 16 == size: write_scalar's `>` bound is not
+        // crossed, so the full word lands at the very end of the
+        // mapping.
+        mem.write_u32(12, 0, 0xDEAD_BEEF);
+        assert_eq!(mem.read_u32(12, 0), 0xDEAD_BEEF);
+        assert_eq!(
+            u32::from_ne_bytes(buf[12..16].try_into().unwrap()),
+            0xDEAD_BEEF
+        );
+    }
+
+    #[test]
+    fn write_u32_one_past_boundary_is_noop() {
+        let mut buf = [0u8; 16];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        // PA 13 + 4 = 17 > 16: write must drop silently.
+        mem.write_u32(13, 0, 0xFFFF_FFFF);
+        assert_eq!(buf, [0u8; 16]);
+    }
+
+    #[test]
+    fn write_u8_at_boundary_writes_last_byte() {
+        let mut buf = [0u8; 4];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        // PA 3 + 1 = 4 == size.
+        mem.write_u8(3, 0, 0xAB);
+        assert_eq!(buf[3], 0xAB);
+    }
+
+    #[test]
+    fn write_scalar_offset_arg_is_added_to_pa() {
+        // `write_scalar` computes `addr = pa + offset`, so a write
+        // through (pa, offset) must land at the same byte as a write
+        // through (pa+offset, 0). Pin this so the offset path can
+        // never silently drift from the pa path.
+        let mut buf = [0u8; 32];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        mem.write_u64(8, 16, 0x0123_4567_89AB_CDEF);
+        assert_eq!(mem.read_u64(24, 0), 0x0123_4567_89AB_CDEF);
+        assert_eq!(
+            u64::from_ne_bytes(buf[24..32].try_into().unwrap()),
+            0x0123_4567_89AB_CDEF
+        );
+    }
+
+    #[test]
+    fn write_scalar_offset_only_out_of_bounds_is_noop() {
+        // pa fits but pa+offset crosses the boundary. The bounds
+        // check must combine pa and offset, not check them
+        // independently.
+        let mut buf = [0xCCu8; 8];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        // pa=4 (in-bounds), offset=4, addr=8, addr+8=16 > 8.
+        mem.write_u64(4, 4, 0xFFFF_FFFF_FFFF_FFFF);
+        assert_eq!(buf, [0xCCu8; 8]);
+    }
+
+    #[test]
+    fn guest_mem_new_size_smaller_than_write_offset_is_noop() {
+        // Construct a GuestMem reporting size N over a backing
+        // buffer of >= N bytes, then attempt a write at offset > N.
+        // The bounds check uses the *declared* size, so the write
+        // must drop and the backing bytes past `size` must remain
+        // untouched.
+        let mut backing = [0u8; 32];
+        let declared_size: u64 = 8;
+        // SAFETY: backing outlives the GuestMem use; declared_size
+        // is <= backing.len() so reads/writes stay within the
+        // allocated buffer when they are accepted.
+        let mem = unsafe { GuestMem::new(backing.as_mut_ptr(), declared_size) };
+        // Write at byte 16 (well past declared size 8) — must noop.
+        mem.write_u64(16, 0, 0xDEAD_BEEF_CAFE_1234);
+        assert_eq!(backing, [0u8; 32]);
+        // The same write inside declared bounds must succeed.
+        mem.write_u64(0, 0, 0xDEAD_BEEF_CAFE_1234);
+        assert_eq!(
+            u64::from_ne_bytes(backing[0..8].try_into().unwrap()),
+            0xDEAD_BEEF_CAFE_1234
+        );
+        // Bytes past the declared size remain untouched.
+        assert_eq!(backing[8..32], [0u8; 24]);
+    }
+
+    #[test]
+    fn resolve_ptr_multi_region_routes_to_correct_region() {
+        // Two distinct host buffers (separate allocations) wired
+        // into a single GuestMem with a gap between their DRAM
+        // offsets. Reads and writes must route to the right host
+        // buffer based on offset; otherwise multi-region NUMA
+        // layouts would silently corrupt or read stale data.
+        let mut buf0 = [0xAAu8; 64];
+        let mut buf1 = [0xBBu8; 64];
+        let regions = vec![
+            MemRegion {
+                host_ptr: buf0.as_mut_ptr(),
+                offset: 0,
+                size: 64,
+            },
+            MemRegion {
+                host_ptr: buf1.as_mut_ptr(),
+                offset: 1024, // gap from 64..1024
+                size: 64,
+            },
+        ];
+        // SAFETY: buf0 and buf1 outlive the GuestMem use; each
+        // region's host_ptr addresses a 64-byte mapping.
+        let mem = unsafe { GuestMem::from_regions_for_test(regions) };
+
+        // Reads within region 0 see buf0's contents.
+        assert_eq!(mem.read_u8(0, 0), 0xAA);
+        assert_eq!(mem.read_u8(63, 0), 0xAA);
+        // Reads within region 1 see buf1's contents.
+        assert_eq!(mem.read_u8(1024, 0), 0xBB);
+        assert_eq!(mem.read_u8(1087, 0), 0xBB);
+        // Reads in the gap return 0 (resolve_ptr -> None ->
+        // read_scalar returns zeroed bytes).
+        assert_eq!(mem.read_u8(64, 0), 0);
+        assert_eq!(mem.read_u8(512, 0), 0);
+        assert_eq!(mem.read_u8(1023, 0), 0);
+
+        // A write in region 1 hits buf1 and leaves buf0 alone.
+        mem.write_u32(1024, 0, 0x1234_5678);
+        assert_eq!(buf0, [0xAAu8; 64]);
+        assert_eq!(
+            u32::from_ne_bytes(buf1[0..4].try_into().unwrap()),
+            0x1234_5678
+        );
+
+        // A write in the gap is a no-op (resolve_ptr -> None).
+        // Re-zero buf1[60..64] then attempt a write into the gap and
+        // verify both buffers remain untouched at their unaffected
+        // byte ranges.
+        let buf0_snapshot = buf0;
+        let buf1_snapshot = buf1;
+        mem.write_u32(900, 0, 0xFFFF_FFFF);
+        assert_eq!(buf0, buf0_snapshot);
+        assert_eq!(buf1, buf1_snapshot);
+    }
+
+    #[test]
+    fn resolve_ptr_multi_region_read_ring_volatile_routes_correctly() {
+        // `read_ring_volatile` (in shm_ring.rs) reads byte-by-byte
+        // via `mem.read_u8`. With a multi-region GuestMem where the
+        // ring's data area sits inside region 1 (past the end of
+        // region 0), each `read_u8` must resolve to region 1's host
+        // pointer — not stale bytes past region 0's end.
+        let mut buf0 = [0u8; 64];
+        let mut buf1 = [0u8; 64];
+        // Plant a known pattern at the start of region 1.
+        buf1[0..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let regions = vec![
+            MemRegion {
+                host_ptr: buf0.as_mut_ptr(),
+                offset: 0,
+                size: 64,
+            },
+            MemRegion {
+                host_ptr: buf1.as_mut_ptr(),
+                offset: 1024,
+                size: 64,
+            },
+        ];
+        // SAFETY: backing buffers outlive the GuestMem use.
+        let mem = unsafe { GuestMem::from_regions_for_test(regions) };
+
+        // Byte-by-byte reads from region 1's first 8 bytes must
+        // return the planted pattern, not bytes from region 0.
+        for (i, expected) in [1, 2, 3, 4, 5, 6, 7, 8].iter().enumerate() {
+            assert_eq!(mem.read_u8(1024 + i as u64, 0), *expected);
+        }
+    }
+
+    #[test]
+    fn resolve_ptr_offset_at_exact_region_end_is_out_of_region() {
+        // resolve_ptr's `local < r.size` check is strict: an offset
+        // equal to a region's end must fall outside that region.
+        // For a single-region GuestMem this means offset == size
+        // resolves to None.
+        let mut buf = [0xCCu8; 16];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        // read_scalar's bounds check (`addr + N > size`) catches
+        // this for >= 1-byte reads, returning zero. The exact-end
+        // u8 read at offset 16 has addr=16, addr+1=17 > 16, so the
+        // outer check returns 0 before resolve_ptr is reached.
+        assert_eq!(mem.read_u8(16, 0), 0);
+    }
+
+    /// Unified bounds-check pin for `write_u8` and `read_u8`: a
+    /// single GuestMem of declared size N is exercised at three
+    /// load-bearing positions:
+    /// 1. last valid offset (N-1) — write must land and a read
+    ///    back must observe the written byte;
+    /// 2. one past the end (N) — write must be a silent no-op
+    ///    (no panic, no out-of-bounds write to the backing buffer);
+    /// 3. one past the end (N) — read must return 0 (the
+    ///    `read_scalar` `addr + N as u64 > self.size` arm fires
+    ///    before `resolve_ptr` is consulted).
+    ///
+    /// `write_scalar`'s bound is `addr + N as u64 > self.size`. For
+    /// the 1-byte path (N=1) the boundary is `addr == size - 1`
+    /// inclusive, `addr == size` exclusive. Pinning all three
+    /// positions on one fixture catches a regression that flips
+    /// the `>` to `>=` (which would reject the last valid byte) or
+    /// drops the bound entirely (which would scribble past the
+    /// declared mapping).
+    #[test]
+    fn write_u8_and_read_u8_bounds_at_declared_size() {
+        const SIZE: u64 = 8;
+        let mut buf = [0u8; SIZE as usize];
+        // SAFETY: buf outlives the GuestMem use; declared_size
+        // matches the backing allocation so even an accepted write
+        // at the last valid offset stays inside `buf`.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), SIZE) };
+
+        // (1) Last valid offset (SIZE - 1). pa=SIZE-1, offset=0,
+        //     addr=SIZE-1, addr+1 = SIZE which is NOT > SIZE, so
+        //     the write is accepted.
+        mem.write_u8(SIZE - 1, 0, 0xAB);
+        assert_eq!(
+            mem.read_u8(SIZE - 1, 0),
+            0xAB,
+            "write at last valid offset must round-trip via read_u8"
+        );
+        assert_eq!(
+            buf[(SIZE - 1) as usize],
+            0xAB,
+            "write at last valid offset must land in the backing byte"
+        );
+
+        // (2) Past the end (SIZE). pa=SIZE, offset=0, addr=SIZE,
+        //     addr+1 = SIZE+1 > SIZE → bound trips, write is a
+        //     silent no-op. Snapshot the buffer to confirm no other
+        //     bytes moved either.
+        let snapshot = buf;
+        mem.write_u8(SIZE, 0, 0xFF);
+        assert_eq!(
+            buf, snapshot,
+            "write past the end must be a silent no-op — no byte of \
+             the backing buffer may change"
+        );
+
+        // (3) Read past the end. addr=SIZE, addr+1 > SIZE → returns 0.
+        assert_eq!(
+            mem.read_u8(SIZE, 0),
+            0,
+            "read past the end must return 0, not stale memory"
+        );
+        // One byte further is also out of bounds.
+        assert_eq!(
+            mem.read_u8(SIZE + 1, 0),
+            0,
+            "read several bytes past the end must also return 0"
+        );
     }
 }

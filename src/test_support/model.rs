@@ -536,16 +536,13 @@ pub struct ModelSpec {
 /// Default model served when a payload declares
 /// [`OutputFormat::LlmExtract`] without pointing at a custom pin.
 ///
-/// Qwen3-4B Q4_K_M GGUF (~2.33 GiB — 2400 MiB per [`ModelSpec::size_bytes`]).
+/// Qwen3.5-4B Q4_K_M GGUF (~2.55 GiB).
 /// The 4B-parameter tier gives usable structured-JSON extraction
-/// quality (better than 1-2B tiers for the "emit ONLY a JSON object"
-/// constraint the `LLM_EXTRACT_PROMPT_TEMPLATE` enforces) at an
-/// artifact size small enough that host-side post-test extraction
-/// loads and runs in reasonable wall time on CPU. Larger 7B-14B tiers
-/// would multiply both disk footprint and inference latency without
-/// a commensurate gain on a narrow "parse benchmark stdout" task.
+/// quality at an artifact size small enough that host-side post-test
+/// extraction loads and runs in reasonable wall time on CPU.
 ///
-/// URL points at the official `Qwen/Qwen3-4B-GGUF` repo on Hugging Face.
+/// URL points at the official `Qwen/Qwen3.5-4B-GGUF` repo on
+/// Hugging Face.
 ///
 /// # Model pin rotation
 ///
@@ -560,42 +557,13 @@ pub struct ModelSpec {
 ///    ```text
 ///    curl -fL <new_url> | sha256sum
 ///    ```
-///    and paste the 64-hex token. `-f` makes curl exit non-zero on
-///    HTTP 4xx/5xx so a 404/500 error-page body does not get hashed
-///    in place of the real artifact. The module-level
-///    `const { assert!(...) }` compile-fails any pin that is not
-///    exactly 64 ASCII hex chars.
+///    and paste the 64-hex token.
 /// 3. **`size_bytes`** — set to the new artifact's on-disk byte count.
-///    The value is surfaced in status output (so users can eyeball
-///    cache entries) and is ballpark-gated by two compile-time
-///    assertions (`>100 MiB` and `<3 GiB`, see the module-scope
-///    `const _: () = assert!(...)` ballpark checks on
-///    `DEFAULT_MODEL.size_bytes`); tighten those bounds if the new
-///    pin falls outside that envelope.
-///
-/// The **ballpark size** serves two orthogonal purposes: (a) catches
-/// pins that accidentally reference a non-weight file
-/// (`README.md`-sized entries fail the lower bound), and (b) keeps
-/// the quantization tier in the 4B-Q4_K_M neighborhood (a 14B full-
-/// precision pin would trip the upper bound and force an explicit
-/// rethink of inference latency).
-///
-/// Rotating the pin is a two-step commit: the SHA change alone
-/// invalidates every cached artifact in the repo — users re-fetch
-/// 2.33 GiB on next run — so batch it with a narrative commit message
-/// explaining why (tokenizer drift, quantization upgrade, model
-/// family change) so downstream users can anticipate the re-fetch.
 pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
-    file_name: "Qwen3-4B-Q4_K_M.gguf",
-    url: "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
-    sha256_hex: "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
-    // Actual on-disk size for the SHA-pinned bytes is 2_497_280_256
-    // bytes (2381 MiB ≈ 2.33 GiB). The 2400-MiB ballpark
-    // overestimates by ~19 MB so the free-space gate and
-    // download-timeout budget have a small safety margin without
-    // wasting ~118 MB of slack the prior `2500 * 1024 * 1024` value
-    // carried.
-    size_bytes: 2400 * 1024 * 1024,
+    file_name: "Qwen3.5-4B-Q4_K_M.gguf",
+    url: "https://huggingface.co/Qwen/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+    sha256_hex: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+    size_bytes: 2740937888,
 };
 
 /// Canonical list of every [`ModelSpec`] declared in this module.
@@ -642,8 +610,8 @@ const _: () = {
     }
 };
 
-// Ballpark size bounds on the pinned artifact. The pinned Qwen3-4B
-// Q4_K_M GGUF is ~2.33 GiB; bound tight at 3 GiB so a silent swap to a
+// Ballpark size bounds on the pinned artifact. The pinned Qwen3.5-4B
+// Q4_K_M GGUF is ~2.55 GiB; bound tight at 3 GiB so a silent swap to a
 // higher-bit quantization (Q5/Q6/Q8) of the same 4B-parameter base —
 // which would balloon the artifact past 3 GiB and multiply inference
 // latency — fails this check instead of slipping through. The lower
@@ -2203,6 +2171,28 @@ fn wrap_chatml_no_think(prompt: &str) -> String {
 ///
 /// Greedy: `LlamaSampler::greedy()` selects the ArgMax token from
 /// the logits at every step. Output is a deterministic function of
+/// Resolve the per-context thread count for llama-cpp inference.
+///
+/// Argument models the result of `std::thread::available_parallelism`
+/// at the call site: `Some(n)` for a successful syscall and `None` for
+/// the unusual-containerization failure path. Falls back to the static
+/// default of 4 when conversion to `i32` fails (and on `None` from the
+/// caller), and clamps to a hard ceiling of 16. The cap exists because
+/// llama-cpp's OpenMP matmul path scales sub-linearly past ~16 threads
+/// on the quantized model used here — adding more threads spends host
+/// CPU time on coordination overhead while per-token decode latency
+/// barely moves.
+///
+/// Both `with_n_threads` and `with_n_threads_batch` are wired with
+/// the same value at the call site, so this resolver covers both the
+/// prompt-prefill batch path and the per-token decode path.
+fn inference_thread_count(available: Option<std::num::NonZero<usize>>) -> i32 {
+    available
+        .and_then(|p| i32::try_from(p.get()).ok())
+        .unwrap_or(4)
+        .min(16)
+}
+
 /// the prompt + weights — `greedy()` carries no RNG state, so
 /// there is no seed to pin.
 fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Result<String> {
@@ -2245,10 +2235,10 @@ fn invoke_with_model(state: &mut LoadedInference, prompt: &str) -> anyhow::Resul
     // `i32::try_from` cannot fail in practice (modern hosts top out
     // around 256 cores; `i32::MAX = 2^31 - 1`), but the fallible
     // form keeps the conversion explicit.
-    let n_threads: i32 = std::thread::available_parallelism()
-        .ok()
-        .and_then(|p| i32::try_from(p.get()).ok())
-        .unwrap_or(4);
+    let n_threads: i32 = inference_thread_count(std::thread::available_parallelism().ok());
+    // Cap at 16: matmul throughput plateaus past ~16 threads on
+    // cross-NUMA hosts due to memory bandwidth saturation and
+    // OpenMP synchronization overhead.
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(N_CTX_TOKENS as u32))
         .with_n_threads(n_threads)
@@ -2646,6 +2636,108 @@ fn parse_llm_response(response: &str, stream: super::MetricStream) -> Vec<super:
 mod tests {
     use super::super::test_helpers::{EnvVarGuard, isolated_cache_dir, lock_env};
     use super::*;
+
+    // ---- inference_thread_count ----------------------------------
+    //
+    // Pin the cap on the OpenMP-thread budget that `invoke_with_model`
+    // hands llama-cpp. The 16-thread ceiling is empirical (sub-linear
+    // scaling past it) — these tests catch a regression that would
+    // either remove the cap (e.g. by reverting the `.min(16)` step) or
+    // raise it without re-checking the underlying scaling assumption.
+
+    #[test]
+    fn inference_thread_count_below_cap_returns_input() {
+        // A 4-core host hands 4 threads to the matmul path: below the
+        // cap, so the `.min(16)` is a no-op and the input flows through.
+        let p = std::num::NonZero::<usize>::new(4).unwrap();
+        assert_eq!(inference_thread_count(Some(p)), 4);
+    }
+
+    #[test]
+    fn inference_thread_count_at_cap_returns_cap() {
+        let p = std::num::NonZero::<usize>::new(16).unwrap();
+        assert_eq!(inference_thread_count(Some(p)), 16);
+    }
+
+    #[test]
+    fn inference_thread_count_above_cap_clamps_to_cap() {
+        // 64-core Threadripper: cap clamps to 16. A regression that
+        // dropped the `.min(16)` would leak the full core count
+        // through here.
+        let p = std::num::NonZero::<usize>::new(64).unwrap();
+        assert_eq!(inference_thread_count(Some(p)), 16);
+    }
+
+    #[test]
+    fn inference_thread_count_huge_input_clamps_to_cap() {
+        // A pathologically large core count (some many-socket
+        // virtualization shapes) still clamps. Exercises the
+        // arithmetic stability of the conversion and clamp path.
+        let p = std::num::NonZero::<usize>::new(4096).unwrap();
+        assert_eq!(inference_thread_count(Some(p)), 16);
+    }
+
+    #[test]
+    fn inference_thread_count_none_falls_back_to_static_default() {
+        // None models `std::thread::available_parallelism` failing on
+        // an exotic containerization (no /proc, mountns drop, etc.).
+        // The static fallback (4) is intentionally below the cap, so
+        // the fallback path returns 4 directly without further
+        // clamping.
+        assert_eq!(inference_thread_count(None), 4);
+    }
+
+    #[test]
+    fn inference_thread_count_overflow_falls_back_to_default() {
+        // `usize::MAX` cannot convert to `i32`, so `i32::try_from`
+        // returns `Err`. The `unwrap_or(4)` then yields 4, and the
+        // `.min(16)` keeps it at 4. Defensive but exercised: a 64-bit
+        // host hands a usize that overflows i32 only on synthetic
+        // fixtures, but the code path must not panic.
+        let p = std::num::NonZero::<usize>::new(usize::MAX).unwrap();
+        assert_eq!(inference_thread_count(Some(p)), 4);
+    }
+
+    /// `available_parallelism` is documented to return at least 1
+    /// on every supported platform — the documented floor. This
+    /// test pins the floor case explicitly: a single-CPU host
+    /// passes through unchanged. Distinct from
+    /// `inference_thread_count_below_cap_returns_input`, which
+    /// covers 4 → 4 (the static fallback value); pinning 1 → 1
+    /// catches a regression that introduces a `max(2)` or other
+    /// lower bound that would silently raise the floor on
+    /// constrained hosts (single-vCPU container, qemu-system-tcg
+    /// fallback, single-core embedded board).
+    #[test]
+    fn inference_thread_count_minimum_one_passes_through() {
+        let p = std::num::NonZero::<usize>::new(1).unwrap();
+        assert_eq!(
+            inference_thread_count(Some(p)),
+            1,
+            "1-CPU host (the documented floor of available_parallelism) \
+             must pass through unchanged — a regression that adds a \
+             lower bound would silently oversubscribe single-CPU hosts"
+        );
+    }
+
+    /// 316-CPU host (a large bare-metal x86 box typical of
+    /// scheduler-test CI) clamps to 16. Distinct from the 64-core
+    /// and 4096-core probes already covered: 316 is the concrete
+    /// production-CI shape we observe, so pinning it directly
+    /// catches a regression at the exact value the test fleet
+    /// exercises rather than relying on coverage by adjacent
+    /// values.
+    #[test]
+    fn inference_thread_count_316_cpu_host_clamps_to_16() {
+        let p = std::num::NonZero::<usize>::new(316).unwrap();
+        assert_eq!(
+            inference_thread_count(Some(p)),
+            16,
+            "316-CPU host (production-CI shape) must clamp to 16 — \
+             pin the exact production value so a regression on this \
+             specific input is caught directly"
+        );
+    }
 
     #[test]
     fn resolve_cache_root_honors_ktstr_cache_dir() {

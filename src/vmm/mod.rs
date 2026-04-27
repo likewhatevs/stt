@@ -1193,7 +1193,7 @@ impl KtstrVm {
 
         // Virtio-console for shell I/O via /dev/hvc0.
         let mut vc = virtio_console::VirtioConsole::new();
-        vc.set_mem(vm.guest_mem.clone());
+        vc.set_mem((*vm.guest_mem).clone());
         let virtio_con = Arc::new(PiMutex::new(vc));
 
         #[cfg(target_arch = "x86_64")]
@@ -2481,11 +2481,21 @@ impl KtstrVm {
             let mem = match vm.numa_layout.as_ref() {
                 Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
                 None => {
+                    use vm_memory::GuestMemoryRegion;
                     let host_base = vm
                         .guest_mem
                         .get_host_address(GuestAddress(DRAM_BASE))
                         .unwrap();
-                    let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
+                    // Size of the first contiguous region only.
+                    // host_base addresses that single mapping; using the
+                    // sum of all region lengths would extend past the
+                    // mapping into host heap when multiple regions exist.
+                    let mem_size = vm
+                        .guest_mem
+                        .iter()
+                        .next()
+                        .expect("guest_mem has at least one region")
+                        .len();
                     // SAFETY: host_base came from GuestMemoryMmap's
                     // get_host_address, mapping is owned by vm.guest_mem
                     // which outlives this GuestMem (both captured by
@@ -2729,11 +2739,21 @@ impl KtstrVm {
         let mem = match vm.numa_layout.as_ref() {
             Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
             None => {
+                use vm_memory::GuestMemoryRegion;
                 let host_base = vm
                     .guest_mem
                     .get_host_address(GuestAddress(DRAM_BASE))
                     .unwrap();
-                let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
+                // Size of the first contiguous region only.
+                // host_base addresses that single mapping; using the
+                // sum of all region lengths would extend past the
+                // mapping into host heap when multiple regions exist.
+                let mem_size = vm
+                    .guest_mem
+                    .iter()
+                    .next()
+                    .expect("guest_mem has at least one region")
+                    .len();
                 // SAFETY: host_base is from GuestMemoryMmap's mapping,
                 // which outlives this GuestMem (owned by `vm` until
                 // return).
@@ -2926,11 +2946,21 @@ impl KtstrVm {
         let mem = match vm.numa_layout.as_ref() {
             Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
             None => {
+                use vm_memory::GuestMemoryRegion;
                 let host_base = vm
                     .guest_mem
                     .get_host_address(GuestAddress(DRAM_BASE))
                     .unwrap();
-                let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
+                // Size of the first contiguous region only.
+                // host_base addresses that single mapping; using the
+                // sum of all region lengths would extend past the
+                // mapping into host heap when multiple regions exist.
+                let mem_size = vm
+                    .guest_mem
+                    .iter()
+                    .next()
+                    .expect("guest_mem has at least one region")
+                    .len();
                 // SAFETY: host_base is from GuestMemoryMmap's mapping,
                 // which outlives this GuestMem (owned by `vm` until
                 // return).
@@ -3308,11 +3338,19 @@ impl KtstrVm {
         let mem = match vm.numa_layout.as_ref() {
             Some(layout) => monitor::reader::GuestMem::from_layout(layout, &vm.guest_mem),
             None => {
+                use vm_memory::GuestMemoryRegion;
                 let host_base = match vm.guest_mem.get_host_address(GuestAddress(DRAM_BASE)) {
                     Ok(ptr) => ptr,
                     Err(_) => return Vec::new(),
                 };
-                let mem_size = (self.effective_memory_mb(&vm.guest_mem) as u64) << 20;
+                // Size of the first contiguous region only.
+                // host_base addresses that single mapping; using the
+                // sum of all region lengths would extend past the
+                // mapping into host heap when multiple regions exist.
+                let mem_size = match vm.guest_mem.iter().next() {
+                    Some(r) => r.len(),
+                    None => return Vec::new(),
+                };
                 // SAFETY: host_base is from GuestMemoryMmap's mapping,
                 // which outlives this GuestMem (borrowed via `vm` for
                 // the body of this function).

@@ -147,10 +147,16 @@ tikv-jemallocator = { version = "0.6", features = ["stats"] }
 # resident/mapped); without it the submodule is absent at compile
 # time. `arenas::narenas` is exposed unconditionally.
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
-# SHA-256 for verifying downloaded model-cache artifacts. `gix` pulls
-# in sha1 only; sha2 is a fresh dep and only the model-cache code
-# path needs it, so keep the feature surface minimal.
-sha2 = "0.10"
+# SHA-1 listed as a direct dep solely to enable `asm` (SHA-NI on
+# x86_64) via Cargo feature unification on the transitive instance
+# pulled in by gix → gix-hash → sha1-checked → sha1. No call sites
+# in ktstr itself — remove this entry if gix ever exposes a
+# passthrough feature.
+sha1 = { version = "0.10", features = ["asm"] }
+# SHA-256 for verifying downloaded model-cache artifacts. `asm`
+# enables `sha2-asm` — hand-tuned SHA-NI assembly on x86_64,
+# NEON on aarch64.
+sha2 = { version = "0.10", features = ["asm"] }
 # Lowercase hex encoding for SHA-256 digest comparisons in the
 # model-cache verify path.
 hex = "0.4"

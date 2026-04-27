@@ -7,6 +7,7 @@ use kvm_bindings::{
     kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
 };
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuFd, VmFd};
+use std::mem::ManuallyDrop;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use crate::vmm::numa_mem::{NumaMemoryLayout, ReservationGuard};
@@ -72,17 +73,17 @@ const GIC_NR_IRQS: u32 = 128;
 /// A KVM virtual machine with configured topology (aarch64).
 #[allow(dead_code)]
 pub struct KtstrKvm {
-    pub kvm: Kvm,
-    pub vm_fd: VmFd,
+    pub kvm: ManuallyDrop<Kvm>,
+    pub vm_fd: ManuallyDrop<VmFd>,
     pub vcpus: Vec<VcpuFd>,
-    pub guest_mem: GuestMemoryMmap,
+    pub guest_mem: ManuallyDrop<GuestMemoryMmap>,
     pub topology: Topology,
     /// Per-node GPA layout used by FDT memory nodes and NUMA distance map.
     /// `None` in deferred mode before `allocate_and_register_memory()`.
     pub(crate) numa_layout: Option<NumaMemoryLayout>,
     pub has_immediate_exit: bool,
     /// GICv3 device fd — held to keep the device alive.
-    gic_fd: DeviceFd,
+    gic_fd: ManuallyDrop<DeviceFd>,
     /// Whether hugepages were requested at construction time.
     /// Stored so deferred memory allocation uses the same backing.
     use_hugepages: bool,
@@ -93,6 +94,29 @@ pub struct KtstrKvm {
     /// Owns the VA reservation for per-node MAP_FIXED mmaps.
     /// Drop munmaps the entire reservation.
     _reservation: Option<ReservationGuard>,
+}
+
+impl Drop for KtstrKvm {
+    fn drop(&mut self) {
+        unsafe {
+            // Ordered teardown: vCPU fds → GICv3 device fd → VM fd →
+            // guest memory → VA reservation → /dev/kvm.
+            //
+            // Closing VmFd triggers kvm_destroy_vm which calls
+            // mmu_notifier_unregister (synchronous SRCU wait). All
+            // KVM references to this process's page tables are removed
+            // before the guest memory munmap fires, preventing stale
+            // mmu_notifier callbacks from racing with the unmap.
+            let vcpus = std::mem::take(&mut self.vcpus);
+            drop(vcpus);
+            ManuallyDrop::drop(&mut self.gic_fd);
+            ManuallyDrop::drop(&mut self.vm_fd);
+            ManuallyDrop::drop(&mut self.guest_mem);
+            let reservation = self._reservation.take();
+            drop(reservation);
+            ManuallyDrop::drop(&mut self.kvm);
+        }
+    }
 }
 
 impl KtstrKvm {
@@ -137,7 +161,10 @@ impl KtstrKvm {
         let layout = NumaMemoryLayout::compute(&self.topology, memory_mb, DRAM_START)?;
         let alloc =
             layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
-        self.guest_mem = alloc.guest_mem;
+        // SAFETY: guest_mem is ManuallyDrop — explicit drop before
+        // replacement prevents leaking the placeholder mapping.
+        unsafe { ManuallyDrop::drop(&mut self.guest_mem) };
+        self.guest_mem = ManuallyDrop::new(alloc.guest_mem);
         self._reservation = Some(alloc.reservation);
         self.numa_layout = Some(layout);
         Ok(())
@@ -220,14 +247,14 @@ impl KtstrKvm {
         Self::setup_gsi_routing(&vm_fd)?;
 
         Ok(KtstrKvm {
-            kvm,
-            vm_fd,
+            kvm: ManuallyDrop::new(kvm),
+            vm_fd: ManuallyDrop::new(vm_fd),
             vcpus,
-            guest_mem,
+            guest_mem: ManuallyDrop::new(guest_mem),
             topology: topo,
             numa_layout,
             has_immediate_exit,
-            gic_fd,
+            gic_fd: ManuallyDrop::new(gic_fd),
             use_hugepages,
             performance_mode,
             _reservation: reservation,

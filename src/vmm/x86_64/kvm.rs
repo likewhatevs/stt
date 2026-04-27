@@ -6,6 +6,7 @@ use kvm_bindings::{
     kvm_enable_cap, kvm_pit_config,
 };
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
+use std::mem::ManuallyDrop;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::topology::{generate_cpuid, max_apic_id};
@@ -92,10 +93,10 @@ const REQUIRED_CAPS: &[Cap] = &[
 /// A KVM virtual machine with configured topology.
 #[allow(dead_code)] // configuration fields read conditionally; reservation held for RAII drop
 pub struct KtstrKvm {
-    pub kvm: Kvm,
-    pub vm_fd: VmFd,
+    pub kvm: ManuallyDrop<Kvm>,
+    pub vm_fd: ManuallyDrop<VmFd>,
     pub vcpus: Vec<VcpuFd>,
-    pub guest_mem: GuestMemoryMmap,
+    pub guest_mem: ManuallyDrop<GuestMemoryMmap>,
     pub topology: Topology,
     /// Per-node GPA layout used by ACPI SRAT/HMAT generation. `None`
     /// in deferred mode before `allocate_and_register_memory()`.
@@ -123,6 +124,30 @@ pub struct KtstrKvm {
     /// take `LOCK_EX` and truncate the segment while the guest still
     /// holds pages that fault through the backing file.
     pub(crate) cow_overlay_guards: Vec<crate::vmm::initramfs::CowOverlayGuard>,
+}
+
+impl Drop for KtstrKvm {
+    fn drop(&mut self) {
+        unsafe {
+            // Ordered teardown: vCPU fds → VM fd → guest memory →
+            // VA reservation → COW flock guards → /dev/kvm.
+            //
+            // Closing VmFd triggers kvm_destroy_vm which calls
+            // mmu_notifier_unregister (synchronous SRCU wait). All
+            // KVM references to this process's page tables are removed
+            // before the guest memory munmap fires, preventing stale
+            // mmu_notifier callbacks from racing with the unmap.
+            let vcpus = std::mem::take(&mut self.vcpus);
+            drop(vcpus);
+            ManuallyDrop::drop(&mut self.vm_fd);
+            ManuallyDrop::drop(&mut self.guest_mem);
+            let reservation = self._reservation.take();
+            drop(reservation);
+            let cow_guards = std::mem::take(&mut self.cow_overlay_guards);
+            drop(cow_guards);
+            ManuallyDrop::drop(&mut self.kvm);
+        }
+    }
 }
 
 impl KtstrKvm {
@@ -167,7 +192,11 @@ impl KtstrKvm {
         let layout = NumaMemoryLayout::compute(&self.topology, memory_mb, 0)?;
         let alloc =
             layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
-        self.guest_mem = alloc.guest_mem;
+        // SAFETY: this is the only call to ManuallyDrop::drop on
+        // self.guest_mem; the next line replaces it with
+        // ManuallyDrop::new(...).
+        unsafe { ManuallyDrop::drop(&mut self.guest_mem) };
+        self.guest_mem = ManuallyDrop::new(alloc.guest_mem);
         self._reservation = Some(alloc.reservation);
         self.numa_layout = Some(layout);
         Ok(())
@@ -408,10 +437,10 @@ impl KtstrKvm {
         }
 
         Ok(KtstrKvm {
-            kvm,
-            vm_fd,
+            kvm: ManuallyDrop::new(kvm),
+            vm_fd: ManuallyDrop::new(vm_fd),
             vcpus,
-            guest_mem,
+            guest_mem: ManuallyDrop::new(guest_mem),
             topology: topo,
             numa_layout,
             has_immediate_exit,

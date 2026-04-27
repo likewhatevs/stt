@@ -20,10 +20,35 @@
 //! `args` (CLI extraction), and the [`crate::vmm`] VM launcher.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use anyhow::Result;
 
 use crate::assert::AssertResult;
+
+/// Deferred nextest dispatch name set by the ctor's argv rewrite.
+/// When the ctor sees `--exact ktstr/...` or `--exact gauntlet/...`,
+/// it stores the full prefixed name here and overwrites the argv
+/// bytes to the bare test name so libtest can match the `#[test]`
+/// wrapper at main-time (after C++ static constructors complete).
+/// `run_ktstr_test` checks this global to resolve the gauntlet
+/// topology or multi-kernel variant from the original name.
+static DEFERRED_DISPATCH: Mutex<Option<String>> = Mutex::new(None);
+
+/// Raw argv pointer captured at process startup via `.init_array`.
+/// Used by `rewrite_argv_exact` to overwrite argv strings in-place.
+static mut RAW_ARGV: *const *mut libc::c_char = std::ptr::null();
+
+#[unsafe(link_section = ".init_array")]
+#[used]
+static CAPTURE_ARGV: unsafe extern "C" fn(libc::c_int, *const *mut libc::c_char) = {
+    unsafe extern "C" fn capture(_argc: libc::c_int, argv: *const *mut libc::c_char) {
+        unsafe {
+            RAW_ARGV = argv;
+        }
+    }
+    capture
+};
 
 use super::{
     KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_flags_arg,
@@ -32,6 +57,30 @@ use super::{
     propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
     run_ktstr_test_inner, sidecar_dir, try_flush_profraw, validate_entry_flags,
 };
+
+/// Overwrite the argv string at index `arg_idx` with `replacement`.
+///
+/// Uses `RAW_ARGV` captured by the `.init_array` constructor above.
+/// The replacement MUST be shorter than or equal to the original
+/// string — the function null-terminates within the existing buffer.
+fn rewrite_argv_exact(arg_idx: usize, replacement: &str) {
+    unsafe {
+        if RAW_ARGV.is_null() {
+            return;
+        }
+        let arg = *RAW_ARGV.add(arg_idx);
+        if arg.is_null() {
+            return;
+        }
+        let original_len = libc::strlen(arg as *const libc::c_char);
+        if replacement.len() > original_len {
+            return;
+        }
+        let dst = arg as *mut u8;
+        std::ptr::copy_nonoverlapping(replacement.as_ptr(), dst, replacement.len());
+        *dst.add(replacement.len()) = 0;
+    }
+}
 
 /// A nextest-safe kernel identifier whose construction is gated
 /// through [`sanitize_kernel_label`] — once a value of this type
@@ -295,12 +344,43 @@ pub fn ktstr_test_early_dispatch() {
     // test binary has only the dummy entry and no gauntlet variants —
     // skip interception so the standard harness discovers #[cfg(test)]
     // module #[test] functions (unit tests).
+    //
+    // For `--list`, ktstr_main prints the gauntlet/ktstr names and
+    // RETURNS so the standard libtest harness can print its own list
+    // of `#[test]` items afterward. This makes plain `#[test]`
+    // functions inside a ktstr_test integration-test binary visible
+    // to nextest — without the fall-through, libtest never runs and
+    // those test names are silently dropped from the listing.
+    //
+    // For `--exact`, ktstr_main runs only when the test name starts
+    // with `ktstr/` or `gauntlet/` — names ktstr owns. Other names
+    // (libtest #[test] items, including the per-entry wrappers
+    // emitted by `#[ktstr_test]` itself) fall through to libtest's
+    // dispatch. Without this guard, run_named_test would fail
+    // `find_test` for a plain `#[test]` name and exit 1, blocking
+    // nextest from running it.
     if std::env::var_os("NEXTEST").is_some() {
         let has_real_tests = KTSTR_TESTS.iter().any(|e| !is_test_sentinel(e.name));
         if has_real_tests {
             let args: Vec<String> = std::env::args().collect();
-            if args.iter().any(|a| a == "--list" || a == "--exact") {
-                ktstr_main();
+            if args.iter().any(|a| a == "--list") {
+                ktstr_list_only();
+                list_plain_tests();
+                std::process::exit(0);
+            } else if let Some(pos) = args.iter().position(|a| a == "--exact")
+                && let Some(name) = args.get(pos + 1)
+                && (name.starts_with("ktstr/") || name.starts_with("gauntlet/"))
+            {
+                let bare = name
+                    .strip_prefix("ktstr/")
+                    .or_else(|| name.strip_prefix("gauntlet/"))
+                    .unwrap_or(name)
+                    .split('/')
+                    .next()
+                    .unwrap_or(name);
+
+                *DEFERRED_DISPATCH.lock().unwrap() = Some(name.to_string());
+                rewrite_argv_exact(pos + 1, bare);
             }
         }
     } else {
@@ -427,6 +507,14 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     // dynamically) hit the same bail messages the macro produces at
     // compile time.
     entry.validate()?;
+
+    // Check if the ctor deferred a prefixed dispatch name via argv
+    // rewrite. If so, resolve the topology and flags from the full
+    // gauntlet/multi-kernel name instead of using the entry defaults.
+    if let Some(deferred) = DEFERRED_DISPATCH.lock().unwrap().take() {
+        return run_deferred_dispatch(entry, &deferred);
+    }
+
     if entry.host_only {
         return run_host_only_test_inner(entry);
     }
@@ -436,13 +524,26 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     {
         anyhow::bail!("vmlinux not found, bpf_map_write requires vmlinux");
     }
-    // Matches run_named_test: tests declaring `required_flags` must
-    // keep them active even on the zero-override library entry point,
-    // otherwise scheduler-feature-gated scenarios silently run with
-    // the wrong flag profile. Passing &[] here is the bug this
-    // replaces.
     let active_flags: Vec<String> = entry.required_flags.iter().map(|s| s.to_string()).collect();
     run_ktstr_test_inner(entry, None, &active_flags)
+}
+
+/// Dispatch a test using the full prefixed name that the ctor stored
+/// in [`DEFERRED_DISPATCH`] before rewriting argv. Resolves gauntlet
+/// topology, multi-kernel suffix, and flag profile from the name,
+/// then delegates to `run_named_test` which handles all dispatch
+/// paths. Called at main-time from the `#[test]` wrapper, so C++
+/// static constructors have completed.
+fn run_deferred_dispatch(_entry: &KtstrTestEntry, deferred_name: &str) -> Result<AssertResult> {
+    let code = run_named_test(deferred_name);
+    if code == 0 {
+        Ok(AssertResult::pass())
+    } else {
+        anyhow::bail!(
+            "deferred dispatch for '{}' exited with code {code}",
+            deferred_name,
+        )
+    }
 }
 
 /// Like `run_ktstr_test` but with an explicit topology override and
@@ -633,10 +734,6 @@ fn list_tests_all(ignored_only: bool) {
         }
 
         if !ignored_only || is_ignored(entry) {
-            // host_only tests never boot a VM, so the kernel never
-            // affects what runs — emit one entry without a kernel
-            // suffix even in multi-kernel mode. Otherwise we'd run N
-            // identical copies of the same host-side function.
             if entry.host_only {
                 println!("ktstr/{}: test", entry.name);
             } else {
@@ -1121,14 +1218,64 @@ pub fn analyze_sidecars(dir: Option<&std::path::Path>) -> String {
     out
 }
 
+/// Discover plain `#[test]` items by re-invoking the binary without
+/// NEXTEST, reading libtest's `--list` output, and printing only
+/// names that don't match any KTSTR_TESTS entry. This lets plain
+/// tests coexist with `#[ktstr_test]` in the same binary without
+/// duplicating the ktstr entries.
+fn list_plain_tests() {
+    use std::collections::HashSet;
+    let ktstr_names: HashSet<&str> = KTSTR_TESTS.iter().map(|e| e.name).collect();
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env_remove("NEXTEST");
+    cmd.args(["--list", "--format", "terse"]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let name = line.trim_end_matches(": test");
+        if !ktstr_names.contains(name) && !name.is_empty() {
+            println!("{line}");
+        }
+    }
+}
+
+/// `--list` subprotocol: emit ktstr/gauntlet test names without
+/// exiting so the standard libtest harness can also print its own
+/// test list afterward. This is what makes plain `#[test]` items
+/// inside a ktstr_test integration-test binary visible to nextest.
+///
+/// Honours `--ignored` the same way [`ktstr_main`] does — when set,
+/// only the ignored subset (gauntlet variants and `demo_` base
+/// tests) is printed. Unlike `ktstr_main`, this function returns to
+/// the caller after listing so the ctor's caller can fall through
+/// to libtest's `main`.
+fn ktstr_list_only() {
+    let args: Vec<String> = std::env::args().collect();
+    let ignored_only = args.iter().any(|a| a == "--ignored");
+    list_tests(ignored_only);
+}
+
 /// Nextest protocol handler.
 ///
 /// Called automatically by [`ktstr_test_early_dispatch`] when running
-/// under nextest. Not intended for direct use.
+/// under nextest with `--exact <ktstr_or_gauntlet_name>`.
+/// Not intended for direct use.
 ///
 /// - `--list --format terse`: output `ktstr/{name}: test\n` for base
 ///   tests and `gauntlet/{name}/{preset}/{profile}: test\n` for
-///   gauntlet variants.
+///   gauntlet variants. (Discovery uses [`ktstr_list_only`] instead
+///   to allow libtest to print its own list afterward; this branch
+///   is preserved for direct callers of `ktstr_main`.)
 /// - `--exact NAME --nocapture`: run the named test, exit 0/1.
 pub fn ktstr_main() -> ! {
     let args: Vec<String> = std::env::args().collect();

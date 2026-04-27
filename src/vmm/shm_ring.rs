@@ -776,8 +776,7 @@ fn read_ring_volatile(
         let chunk = remaining.min(capacity - src_pos);
         for i in 0..chunk {
             let pa = data_start_pa + (src_pos + i) as u64;
-            let byte = unsafe { std::ptr::read_volatile(mem.base_ptr().add(pa as usize)) };
-            out[dst_pos + i] = byte;
+            out[dst_pos + i] = mem.read_u8(pa, 0);
         }
         dst_pos += chunk;
         src_pos = 0; // wrap
@@ -1650,5 +1649,205 @@ mod tests {
         let result = shm_drain(&buf, 0);
         assert_eq!(result.entries.len(), 3);
         assert_eq!(result.drops, 1);
+    }
+
+    // ---- signal_guest_value edge-case offsets ---------------------
+    //
+    // `signal_guest_value` writes one byte at
+    // `shm_base + SIGNAL_SLOT_BASE + slot` via `GuestMem::write_u8`,
+    // which is the bounds-checked entry point. These tests pin the
+    // host-side signal API against the boundary cases of the
+    // GuestMem mapping it sits inside.
+
+    #[test]
+    fn signal_guest_value_writes_to_correct_slot() {
+        // Lay out: [pre-shm bytes] [SHM region]. shm_base is the
+        // offset of the SHM region within the GuestMem mapping.
+        // Slot 0 lands at shm_base + SIGNAL_SLOT_BASE; slot 1 lands
+        // at the next byte.
+        let shm_base: u64 = 64;
+        let total: u64 = shm_base + 32;
+        let mut buf = vec![0u8; total as usize];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), total) };
+        signal_guest_value(&mem, shm_base, 0, SIGNAL_SHUTDOWN_REQ);
+        signal_guest_value(&mem, shm_base, 1, SIGNAL_PROBES_READY);
+        assert_eq!(
+            buf[shm_base as usize + SIGNAL_SLOT_BASE],
+            SIGNAL_SHUTDOWN_REQ
+        );
+        assert_eq!(
+            buf[shm_base as usize + SIGNAL_SLOT_BASE + 1],
+            SIGNAL_PROBES_READY
+        );
+    }
+
+    #[test]
+    fn signal_guest_value_at_zero_shm_base() {
+        // shm_base = 0: slot bytes land at SIGNAL_SLOT_BASE and
+        // SIGNAL_SLOT_BASE + 1 from the start of the mapping.
+        let mut buf = vec![0u8; 32];
+        let len = buf.len() as u64;
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), len) };
+        signal_guest_value(&mem, 0, 0, 0xAB);
+        signal_guest_value(&mem, 0, 1, 0xCD);
+        assert_eq!(buf[SIGNAL_SLOT_BASE], 0xAB);
+        assert_eq!(buf[SIGNAL_SLOT_BASE + 1], 0xCD);
+    }
+
+    #[test]
+    fn signal_guest_value_at_exact_boundary_succeeds() {
+        // GuestMem sized so the last slot byte is the very last
+        // byte of the mapping. write_u8's bounds check
+        // (`addr + 1 > size`) admits exactly this position.
+        let shm_base: u64 = 0;
+        // Last slot is at SIGNAL_SLOT_BASE + 1 (slot index 1).
+        // Size the mapping so that byte sits at size - 1.
+        let total: u64 = (SIGNAL_SLOT_BASE + 2) as u64;
+        let mut buf = vec![0u8; total as usize];
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), total) };
+        signal_guest_value(&mem, shm_base, 1, 0xEE);
+        assert_eq!(buf[SIGNAL_SLOT_BASE + 1], 0xEE);
+    }
+
+    #[test]
+    fn signal_guest_value_past_boundary_is_noop() {
+        // shm_base places the slot byte past the GuestMem size.
+        // GuestMem.write_u8 silently noops; the backing buffer is
+        // unmodified. This covers the defensive path: a misconfigured
+        // shm_base must not corrupt host memory past the declared
+        // GuestMem size.
+        let total: u64 = 32;
+        let mut buf = vec![0xAAu8; (total + 64) as usize]; // sentinel
+        // Declare a mapping smaller than the underlying buffer so we
+        // can detect any write that would have escaped the bounds.
+        // SAFETY: buf is larger than `total`; the in-bounds writes
+        // stay within `buf` and the out-of-bounds case must noop.
+        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), total) };
+        // shm_base 32 + SIGNAL_SLOT_BASE 14 + slot 0 = 46, which
+        // is past the declared size of 32.
+        signal_guest_value(&mem, 32, 0, 0xFF);
+        // Buffer bytes past the declared size remain at their
+        // sentinel value 0xAA — write_u8 dropped silently.
+        assert!(buf.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn signal_guest_value_offset_only_partially_in_bounds_is_noop() {
+        // shm_base is in-bounds, but shm_base + SIGNAL_SLOT_BASE +
+        // slot crosses the boundary. write_u8 must combine pa and
+        // offset before the bounds check, not check pa alone.
+        let total: u64 = (SIGNAL_SLOT_BASE + 1) as u64; // 15
+        let mut buf = vec![0u8; (total + 64) as usize];
+        // SAFETY: buf is larger than `total`; in-bounds writes are
+        // within buf and out-of-bounds writes are dropped.
+        let mem = unsafe { crate::monitor::reader::GuestMem::new(buf.as_mut_ptr(), total) };
+        // shm_base = 1, SIGNAL_SLOT_BASE = 14, slot = 0
+        // -> addr 15, addr + 1 = 16 > 15 -> noop.
+        signal_guest_value(&mem, 1, 0, 0x77);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    // ---- read_ring_volatile multi-region routing -------------------
+    //
+    // `read_ring_volatile` reads each byte through `mem.read_u8(pa, 0)`,
+    // so on a multi-region GuestMem each byte must resolve to the
+    // region that contains its DRAM offset. This test wires up a
+    // 2-region GuestMem with the ring's data area placed inside
+    // region 1 (well past region 0's end) and verifies that the
+    // bytes returned reflect region 1's host buffer, not stale
+    // memory past region 0.
+
+    #[test]
+    fn read_ring_volatile_routes_through_correct_region() {
+        use crate::monitor::reader::{GuestMem, MemRegion};
+
+        // Region 0: 4 KiB at DRAM offset 0, filled with 0xAA.
+        // Region 1: 4 KiB at DRAM offset 1 MiB, filled with 0xBB
+        //           except for a planted 32-byte "ring data area"
+        //           starting at byte 0 of region 1.
+        let mut buf0 = vec![0xAAu8; 4096];
+        let mut buf1 = vec![0xBBu8; 4096];
+        let pattern: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, //
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, //
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, //
+            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, //
+        ];
+        buf1[0..32].copy_from_slice(&pattern);
+
+        let regions = vec![
+            MemRegion {
+                host_ptr: buf0.as_mut_ptr(),
+                offset: 0,
+                size: 4096,
+            },
+            MemRegion {
+                host_ptr: buf1.as_mut_ptr(),
+                offset: 1 << 20, // 1 MiB
+                size: 4096,
+            },
+        ];
+        // SAFETY: buf0 and buf1 outlive the GuestMem use.
+        let mem = unsafe { GuestMem::from_regions_for_test(regions) };
+
+        // Read 32 bytes starting at the data area in region 1.
+        // capacity is set generously so no wraparound occurs in this
+        // straight-line read.
+        let data_start_pa: u64 = 1 << 20;
+        let capacity: usize = 4096;
+        let mut out = vec![0u8; 32];
+        read_ring_volatile(&mem, data_start_pa, capacity, 0, &mut out);
+
+        assert_eq!(out, pattern);
+        // No byte from region 0 (0xAA) leaked into the result.
+        assert!(!out.contains(&0xAA));
+    }
+
+    #[test]
+    fn read_ring_volatile_wraparound_routes_through_correct_region() {
+        // Wraparound case: capacity is small enough that a read of
+        // length capacity starting near the end wraps back to byte 0
+        // of the data area. With multi-region routing, BOTH halves
+        // of the wrapped read must hit the right region.
+        use crate::monitor::reader::{GuestMem, MemRegion};
+
+        let mut buf0 = vec![0xAAu8; 4096];
+        let mut buf1 = vec![0u8; 4096];
+        // Plant a 64-byte pattern; data area starts at offset 0 of
+        // region 1, capacity 64. A read of 64 bytes starting at
+        // pos 60 wraps: bytes at positions 60..64 then 0..60.
+        for (i, slot) in buf1[..64].iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        let regions = vec![
+            MemRegion {
+                host_ptr: buf0.as_mut_ptr(),
+                offset: 0,
+                size: 4096,
+            },
+            MemRegion {
+                host_ptr: buf1.as_mut_ptr(),
+                offset: 1 << 20,
+                size: 4096,
+            },
+        ];
+        // SAFETY: backing buffers outlive the GuestMem use.
+        let mem = unsafe { GuestMem::from_regions_for_test(regions) };
+
+        let data_start_pa: u64 = 1 << 20;
+        let capacity: usize = 64;
+        let mut out = vec![0u8; 64];
+        // ptr 60 -> src_pos = 60 % 64 = 60. First chunk covers 4
+        // bytes (positions 60..63), then wraps to position 0 for
+        // the remaining 60.
+        read_ring_volatile(&mem, data_start_pa, capacity, 60, &mut out);
+
+        assert_eq!(out[0..4], [60u8, 61, 62, 63]);
+        for (i, &b) in out[4..].iter().enumerate() {
+            assert_eq!(b, i as u8);
+        }
     }
 }

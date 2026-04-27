@@ -213,7 +213,7 @@ mod tests {
             distances: None,
         };
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
-        if let Some(fd) = get_stats_fd(&vm.vm_fd) {
+        if let Some(fd) = get_stats_fd(&*vm.vm_fd) {
             assert!(fd.as_raw_fd() >= 0);
         }
     }

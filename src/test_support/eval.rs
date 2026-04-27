@@ -815,39 +815,94 @@ pub(crate) fn run_ktstr_test_inner(
     // the propagation point: a ResourceContention-skipped run is
     // otherwise invisible to stats tooling that enumerates
     // sidecars.
-    let vm = match builder.build() {
-        Ok(vm) => vm,
-        Err(e)
-            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                .is_some() =>
-        {
-            record_skip_sidecar(entry, active_flags);
-            return Err(e);
+    // Save all per-thread CPU state that KVM could corrupt.
+    // Defense in depth: the kernel's fpu_swap_kvm_fpstate should
+    // restore host state on VM exit, but we've confirmed MXCSR PE
+    // flag leaks. Full XSAVE + segment bases + PKRU + signal mask
+    // guards against any state corruption.
+    //
+    // Wrapped in a Drop guard so the restore runs on ALL return
+    // paths — including early Err returns from builder.build() and
+    // vm.run(), and panics. Without the guard, error paths bypass
+    // the restore, leaving the host with KVM-corrupted state.
+    #[cfg(target_arch = "x86_64")]
+    struct CpuStateGuard {
+        #[allow(dead_code)]
+        xsave_buf: Vec<u8>,
+        align_ptr: *mut u8,
+        fsbase: u64,
+        gsbase: u64,
+        pkru: u32,
+        sigmask: libc::sigset_t,
+        sigrtmin_action: libc::sigaction,
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe impl Send for CpuStateGuard {}
+    #[cfg(target_arch = "x86_64")]
+    impl Drop for CpuStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                core::arch::asm!(
+                    "xrstor [{}]",
+                    in(reg) self.align_ptr,
+                    in("eax") 0xFFFF_FFFFu32,
+                    in("edx") 0xFFFF_FFFFu32,
+                    options(nostack),
+                );
+                core::arch::asm!("wrfsbase {}", in(reg) self.fsbase, options(nostack));
+                core::arch::asm!("wrgsbase {}", in(reg) self.gsbase, options(nostack));
+                core::arch::asm!(
+                    "xor ecx, ecx", "wrpkru",
+                    in("eax") self.pkru, in("edx") 0u32, out("ecx") _,
+                    options(nostack),
+                );
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.sigmask, std::ptr::null_mut());
+                libc::sigaction(
+                    libc::SIGRTMIN(),
+                    &self.sigrtmin_action,
+                    std::ptr::null_mut(),
+                );
+            }
         }
-        Err(e) => return Err(e.context("build ktstr_test VM")),
+    }
+    #[cfg(target_arch = "x86_64")]
+    let _cpu_guard = unsafe {
+        let fsbase: u64;
+        core::arch::asm!("rdfsbase {}", out(reg) fsbase, options(nostack));
+        let gsbase: u64;
+        core::arch::asm!("rdgsbase {}", out(reg) gsbase, options(nostack));
+        let pkru: u32;
+        core::arch::asm!(
+            "xor ecx, ecx", "rdpkru",
+            out("eax") pkru, out("ecx") _, out("edx") _,
+            options(nostack),
+        );
+        let mut xsave_buf = vec![0u8; 8192];
+        let align_ptr = ((xsave_buf.as_mut_ptr() as usize + 63) & !63) as *mut u8;
+        core::arch::asm!(
+            "xsave [{}]",
+            in(reg) align_ptr,
+            in("eax") 0xFFFF_FFFFu32,
+            in("edx") 0xFFFF_FFFFu32,
+            options(nostack),
+        );
+        let mut sigmask: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut sigmask);
+        let mut sigrtmin_action: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGRTMIN(), std::ptr::null(), &mut sigrtmin_action);
+        CpuStateGuard {
+            xsave_buf,
+            align_ptr,
+            fsbase,
+            gsbase,
+            pkru,
+            sigmask,
+            sigrtmin_action,
+        }
     };
 
-    let result = match vm.run() {
-        Ok(r) => r,
-        Err(e)
-            if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-                .is_some() =>
-        {
-            record_skip_sidecar(entry, active_flags);
-            return Err(e);
-        }
-        Err(e) => return Err(e.context("run ktstr_test VM")),
-    };
-
-    // Drop the VM to release CPU/LLC flock fds before auto-repro
-    // and host-side LlmExtract inference. Both downstream phases
-    // run under the test-runner's main thread, NOT inside a vCPU
-    // worker, so neither needs the VM-side CPU/LLC reservation.
-    // Releasing here lets concurrent ktstr peers (other tests
-    // running in parallel under nextest, or `cargo ktstr kernel
-    // build` rebuilding cache entries) acquire the same LLC slots
-    // while inference / repro proceed.
-    drop(vm);
+    let vm = builder.build()?;
+    let result = vm.run()?;
 
     // Release the kernel-cache shared lock before
     // `host_side_llm_extract` runs. The shared lock at
@@ -1985,6 +2040,144 @@ mod tests {
     fn kvm_accessible_on_test_host() {
         // Checks that /dev/kvm is accessible with read+write permissions.
         ensure_kvm().expect("/dev/kvm not accessible");
+    }
+
+    // -- SIGRTMIN save/restore pin --
+    //
+    // `run_ktstr_test_inner` (above, x86_64 path) saves the
+    // calling thread's SIGRTMIN sigaction before the VM runs and
+    // restores it on the way out. The kvm-ioctls vCPU machinery
+    // installs a SIGRTMIN handler to stop vCPU threads on
+    // demand; without an explicit save/restore the handler leaks
+    // back into the test runner's main loop and a subsequent
+    // SIGRTMIN delivery (e.g. from a tokio timer wheel that uses
+    // realtime signals on some libc builds) would jump into the
+    // KVM stop-vcpu trampoline rather than the runner's own
+    // disposition.
+    //
+    // The pattern is:
+    //   1. zero a `libc::sigaction` and call `sigaction(SIGRTMIN(),
+    //      null, &mut saved)` to read the current disposition;
+    //   2. … run code that mutates SIGRTMIN …;
+    //   3. call `sigaction(SIGRTMIN(), &saved, null_mut())` to
+    //      restore the saved disposition.
+    //
+    // This test simulates one save/install/restore cycle on a
+    // dummy custom handler, asserting that the saved sigaction
+    // round-trips byte-for-byte after the install + restore.
+
+    /// Dummy signal handler used only as a probe value — never
+    /// invoked, only its function-pointer identity matters. Marked
+    /// `extern "C"` to match the libc handler ABI.
+    extern "C" fn sigrtmin_handler_probe(_sig: libc::c_int) {}
+
+    /// Serializes SIGRTMIN-touching tests against each other.
+    /// Signal dispositions are process-wide, so two tests installing
+    /// custom handlers concurrently could see each other's writes
+    /// between the install and assert steps. Using a dedicated
+    /// mutex (rather than `lock_env`) lets env-mutation tests run
+    /// concurrently with this one — the only conflict is between
+    /// signal-touching tests.
+    static SIGRTMIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `run_ktstr_test_inner` saves and restores the SIGRTMIN
+    /// sigaction across the VM run. The save/restore relies on
+    /// the libc semantic that `sigaction(sig, NULL, &mut out)`
+    /// reads the current disposition, and `sigaction(sig, &saved,
+    /// NULL)` rewrites it. Pin that round-trip on a dedicated
+    /// fixture: read pre-existing sigaction, install a probe
+    /// handler, verify the install landed (sa_sigaction matches
+    /// the probe address), restore from the saved sigaction,
+    /// verify the restored disposition matches what was originally
+    /// saved.
+    ///
+    /// Without this pin, a regression in `run_ktstr_test_inner`
+    /// that flips the save and restore arguments (passing `&saved`
+    /// as the OUT parameter would zero the saved struct) or swaps
+    /// `null` and `null_mut` (the second arg type-checks either
+    /// way under cast-pointer semantics) would silently leave the
+    /// kvm stop-vcpu handler in place after VM teardown.
+    #[test]
+    fn sigrtmin_save_install_restore_roundtrip() {
+        let _serial = SIGRTMIN_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Step 1: save current SIGRTMIN sigaction.
+        let mut saved: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: passing NULL as the new disposition only reads
+        // the current state into `saved`. Per `man sigaction(2)`,
+        // a NULL `act` pointer leaves the disposition unchanged.
+        let rc =
+            unsafe { libc::sigaction(libc::SIGRTMIN(), std::ptr::null(), &mut saved as *mut _) };
+        assert_eq!(
+            rc,
+            0,
+            "sigaction(SIGRTMIN, NULL, &mut saved) must succeed; \
+             got rc={rc}, errno={}",
+            std::io::Error::last_os_error()
+        );
+
+        // Step 2: install a probe handler. Use a dedicated
+        // `extern "C"` function so the address is stable and
+        // distinguishable from SIG_DFL (0) and SIG_IGN (1).
+        let mut probe: libc::sigaction = unsafe { std::mem::zeroed() };
+        probe.sa_sigaction = sigrtmin_handler_probe as *const () as usize;
+        unsafe {
+            libc::sigemptyset(&mut probe.sa_mask);
+        }
+        // SAFETY: probe is fully initialized; we are writing the
+        // disposition for SIGRTMIN with no out-pointer.
+        let rc = unsafe { libc::sigaction(libc::SIGRTMIN(), &probe, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "install probe handler for SIGRTMIN must succeed");
+
+        // Verify the install landed by reading the disposition
+        // back. `sigaction(SIGRTMIN, NULL, &mut current)` matches
+        // the read form used in `run_ktstr_test_inner`.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigaction(libc::SIGRTMIN(), std::ptr::null(), &mut current as *mut _);
+        }
+        let probe_addr = sigrtmin_handler_probe as *const () as usize;
+        assert_eq!(
+            current.sa_sigaction, probe_addr,
+            "after install, sa_sigaction must point at \
+             sigrtmin_handler_probe (0x{:x}); got 0x{:x} — the \
+             install path is broken",
+            probe_addr, current.sa_sigaction
+        );
+
+        // Step 3: restore from the saved sigaction. Mirrors
+        // `run_ktstr_test_inner`'s
+        // `sigaction(SIGRTMIN, &saved_action, null_mut())`.
+        // SAFETY: `saved` was populated in step 1 and is byte-
+        // valid as a `libc::sigaction`.
+        let rc = unsafe { libc::sigaction(libc::SIGRTMIN(), &saved, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "restore from saved sigaction must succeed");
+
+        // Verify the restored disposition matches what was
+        // originally saved — sa_sigaction (the disposition
+        // pointer) is the load-bearing field. A regression that
+        // wrote `&mut saved` as the IN parameter would have
+        // zeroed `saved` in step 1 (turning it into SIG_DFL after
+        // the libc copy), so the post-restore disposition would
+        // be SIG_DFL rather than the pre-test state.
+        let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigaction(libc::SIGRTMIN(), std::ptr::null(), &mut after as *mut _);
+        }
+        assert_eq!(
+            after.sa_sigaction, saved.sa_sigaction,
+            "after restore, sa_sigaction must match the saved \
+             value — restore is broken or `saved` got clobbered \
+             during install. saved=0x{:x}, after=0x{:x}",
+            saved.sa_sigaction, after.sa_sigaction
+        );
+        // sa_flags also rides through the save/restore — pin it
+        // so a regression that copied only sa_sigaction (not the
+        // full struct) trips here.
+        assert_eq!(
+            after.sa_flags, saved.sa_flags,
+            "after restore, sa_flags must match the saved value"
+        );
     }
 
     // -- resolve_scheduler tests --
