@@ -25,8 +25,14 @@
 //! threads, and populates each [`ThreadState`] from a handful of
 //! procfs sources: `stat`, `schedstat`, `status`, `io`, `sched`,
 //! `comm`, `cgroup`. The procfs walk runs sequentially per tid in
-//! [`capture_with`] phase 2; phase 1 attaches the jemalloc TSD
-//! probe in parallel across tgids (see "Probe wiring" below).
+//! [`capture_with`] phase 2. Phase 1 attaches the jemalloc TSD
+//! probe in parallel across tgids when `use_syscall_affinity` is
+//! `true` (the production path); under `use_syscall_affinity =
+//! false` (the synthetic-tree test path), phase 1 is skipped
+//! entirely — the per-tgid probe map starts and stays empty, and
+//! phase 2's per-tid lookup falls through to the absent-counter
+//! default of zero. See "Probe wiring" below for the per-tgid
+//! mechanics.
 //!
 //! ## Probe wiring (most-expensive step)
 //!
@@ -270,7 +276,7 @@ impl HostStateProbeSummary {
 
 /// Per-thread cumulative resource profile.
 ///
-/// Populated by the capture layer from `/proc/tid/{sched,status,
+/// Populated by the capture layer from `/proc/<tid>/{sched,status,
 /// io,stat,comm,cgroup}`, `sched_getaffinity`, and (for jemalloc-
 /// linked processes only, via ptrace + `process_vm_readv`) the
 /// per-thread `tsd_s.thread_allocated` / `thread_deallocated` TLS
@@ -385,7 +391,7 @@ pub struct ThreadState {
     /// see `'\0'`, not `'?'`.
     pub state: char,
 
-    // -- scheduling (cumulative; /proc/tid/sched, needs CONFIG_SCHED_DEBUG) --
+    // -- scheduling (cumulative; /proc/<tid>/sched, needs CONFIG_SCHED_DEBUG) --
     // -- (sched_ext gate: ext.enabled requires CONFIG_SCHED_CLASS_EXT) --
     /// `true` when the task is currently scheduled by sched_ext —
     /// `/proc/<tid>/sched` `ext.enabled` line. The kernel emits
@@ -606,9 +612,9 @@ pub struct ThreadState {
     pub deallocated_bytes: u64,
 
     // -- procfs /proc/<tid>/stat: page faults + CPU time (fields 10, 12, 14, 15) --
-    /// Minor faults (no disk I/O). `/proc/tid/stat` field 10.
+    /// Minor faults (no disk I/O). `/proc/<tid>/stat` field 10.
     pub minflt: u64,
-    /// Major faults (backed by disk). `/proc/tid/stat` field 12.
+    /// Major faults (backed by disk). `/proc/<tid>/stat` field 12.
     pub majflt: u64,
     /// User-mode CPU time in USER_HZ clock ticks since thread
     /// start. `/proc/<tid>/stat` field 14
@@ -626,7 +632,7 @@ pub struct ThreadState {
     /// [`Self::utime_clock_ticks`].
     pub stime_clock_ticks: u64,
 
-    // -- I/O (/proc/tid/io, CONFIG_TASK_IO_ACCOUNTING) --
+    // -- I/O (/proc/<tid>/io, CONFIG_TASK_IO_ACCOUNTING) --
     pub rchar: u64,
     pub wchar: u64,
     pub syscr: u64,
@@ -1854,19 +1860,33 @@ fn emit_probe_summary(summary: &ProbeSummary) {
 /// production entry point is [`capture`]; tests pass a tempdir
 /// to exercise the walk against a synthetic tree.
 ///
-/// `use_syscall_affinity` gates BOTH `sched_getaffinity(2)` AND
-/// the jemalloc per-thread probe attach — synthetic-tree tests
-/// pass `false` because the staged procfs has no real ELF behind
-/// it (so neither the syscall nor the probe can run); production
-/// passes `true` so affinity falls back to `Cpus_allowed_list:` on
-/// EPERM and the probe attaches against every jemalloc-linked
-/// tgid the walk encounters.
+/// `use_syscall_affinity` gates four real-host touchpoints —
+/// (a) the [`crate::host_context::collect_host_context`] sweep
+/// (kernel/CPU/memory/tunables read from the live host); (b)
+/// phase 1, the parallel jemalloc-probe attach pass that walks
+/// every tgid's `/proc/<pid>/exe` for ELF + DWARF metadata; (c)
+/// `sched_getaffinity(2)` inside per-thread capture, with
+/// fall-back to `Cpus_allowed_list:` on syscall failure;
+/// (d) `emit_probe_summary` plus the [`HostStateProbeSummary`]
+/// surfaced on the snapshot, both of which are skipped when
+/// `use_syscall_affinity` is `false`: `emit_probe_summary` is
+/// not called and `probe_summary` is `None`. Synthetic-tree
+/// tests pass `false` so the staged procfs is read in isolation
+/// (no `sched_getaffinity`, no ELF parses, no `host` block, no
+/// `probe_summary`); production passes `true`.
 ///
 /// Self-skip: the caller's own tgid is excluded from the per-tgid
-/// probe-attach loop because `PTRACE_SEIZE` rejects self-attach.
-/// The capture still produces ThreadState entries for self-tids —
-/// they just keep the absent-counter default (0) for the jemalloc
-/// fields. Other procfs-derived fields populate normally.
+/// probe-attach loop because `PTRACE_SEIZE` rejects self-attach
+/// (the rayon `.filter(|&tgid| tgid != self_pid)` drops self
+/// before the attach call). Phase 2 still iterates the full tgid
+/// list including self_pid, and the per-tid lookup
+/// `probe_map.get(&tgid).and_then(|p| p.as_ref())` returns `None`
+/// for self_pid because phase 1 never inserted an entry; the
+/// closure short-circuits via `.map(...).unwrap_or((0, 0))`,
+/// leaving the jemalloc fields at the absent-counter default.
+/// Every other procfs-derived
+/// field populates normally — `capture_thread_at` runs
+/// unconditionally per tid regardless of probe outcome.
 pub fn capture_with(
     proc_root: &Path,
     cgroup_root: &Path,
@@ -2119,10 +2139,20 @@ pub fn capture_pid(pid: i32) -> HostStateSnapshot {
 /// [`capture_pid`]. Lets tests stage a synthetic procfs / cgroupfs
 /// for the capture walk without touching the real host.
 ///
-/// `use_syscall_affinity` gates BOTH `sched_getaffinity(2)` AND
-/// the jemalloc probe attach — synthetic-tree tests pass `false`
-/// because the staged procfs has no real ELF behind
-/// `/proc/<pid>/exe`; production passes `true`.
+/// `use_syscall_affinity` gates the same four real-host
+/// touchpoints as [`capture_with`] — host-context collection,
+/// the jemalloc probe attach (here scoped to the single target
+/// `pid` rather than a phase-1 sweep across every tgid),
+/// `sched_getaffinity(2)` inside per-thread capture, and
+/// `emit_probe_summary` plus the [`HostStateProbeSummary`] on the
+/// snapshot. Synthetic-tree tests pass `false` because the
+/// staged procfs has no real ELF behind `/proc/<pid>/exe`;
+/// production passes `true`. Self-skip parallels the global path:
+/// when `pid == self_pid`, the `probe` binding is `None` (the
+/// `&& pid != self_pid` guard skips the attach), and each tid's
+/// `probe.as_ref().map(...).unwrap_or((0, 0))` short-circuits to
+/// the absent-counter default for the jemalloc fields, with every
+/// other procfs-derived field populated normally.
 pub fn capture_pid_with(
     proc_root: &Path,
     cgroup_root: &Path,
