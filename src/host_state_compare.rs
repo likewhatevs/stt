@@ -26,7 +26,7 @@ use std::sync::LazyLock;
 use anyhow::Context;
 use regex::Regex;
 
-use crate::host_state::{CgroupStats, HostStateSnapshot, ThreadState};
+use crate::host_state::{CgroupStats, HostStateSnapshot, Psi, PsiHalf, PsiResource, ThreadState};
 
 /// Grouping key for the host-state compare.
 ///
@@ -245,6 +245,15 @@ pub struct HostStateMetricDef {
 /// (ties fall back to registry order). Names are the ASCII
 /// short-form used in capture code; long-form display is the
 /// same — no translation layer.
+///
+/// **PSI is intentionally not in this registry.** The accessor
+/// signature `fn(&ThreadState) -> u64` only matches per-thread
+/// data, while Pressure Stall Information is per-snapshot
+/// (host-level) and per-cgroup. PSI surfaces in dedicated
+/// secondary tables under "## Host pressure / ..." and "## Pressure / ..."
+/// headers, rendered by [`write_diff`] / `write_show` directly
+/// rather than via [`AggRule`]. See [`Psi`] / [`PsiResource`] /
+/// [`PsiHalf`] for the data model.
 pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // identity / structural (non-numeric aggregation)
     HostStateMetricDef {
@@ -911,6 +920,13 @@ pub struct HostStateDiff {
     pub cgroup_stats_a: BTreeMap<String, CgroupStats>,
     /// Candidate-only cgroup-level enrichment rows, same shape.
     pub cgroup_stats_b: BTreeMap<String, CgroupStats>,
+    /// Baseline host-level Pressure Stall Information snapshot.
+    /// Always populated (independent of `GroupBy`) — host-level
+    /// PSI surfaces above the per-thread table for any compare,
+    /// not just cgroup-grouped ones.
+    pub host_psi_a: Psi,
+    /// Candidate host-level PSI snapshot.
+    pub host_psi_b: Psi,
 }
 
 /// Compare two snapshots and produce a [`HostStateDiff`].
@@ -1042,6 +1058,9 @@ pub fn compare(
         diff.cgroup_stats_b =
             flatten_cgroup_stats(&candidate.cgroup_stats, &flatten, cgroup_key_map.as_ref());
     }
+
+    diff.host_psi_a = baseline.psi;
+    diff.host_psi_b = candidate.psi;
 
     diff
 }
@@ -1851,8 +1870,43 @@ pub fn flatten_cgroup_stats(
         agg.nr_throttled = agg.nr_throttled.saturating_add(cs.nr_throttled);
         agg.throttled_usec = agg.throttled_usec.saturating_add(cs.throttled_usec);
         agg.memory_current = agg.memory_current.max(cs.memory_current);
+        agg.psi = merge_psi(agg.psi, cs.psi);
     }
     out
+}
+
+/// Merge two [`Psi`] bundles for the cgroup-flatten path. PSI
+/// avg fields (`avg10/60/300`) are percentages, so summing
+/// across cgroups overstates the merged-bucket pressure
+/// (200% has no meaning); max gives "worst-pressured cgroup
+/// in the merged bucket" which is the actionable signal for
+/// regression detection. `total_usec` is cumulative microseconds
+/// of stall time, additive across the merged cgroups —
+/// `saturating_add` matches the existing `throttled_usec`
+/// flatten policy directly above.
+fn merge_psi(a: Psi, b: Psi) -> Psi {
+    Psi {
+        cpu: merge_psi_resource(a.cpu, b.cpu),
+        memory: merge_psi_resource(a.memory, b.memory),
+        io: merge_psi_resource(a.io, b.io),
+        irq: merge_psi_resource(a.irq, b.irq),
+    }
+}
+
+fn merge_psi_resource(a: PsiResource, b: PsiResource) -> PsiResource {
+    PsiResource {
+        some: merge_psi_half(a.some, b.some),
+        full: merge_psi_half(a.full, b.full),
+    }
+}
+
+fn merge_psi_half(a: PsiHalf, b: PsiHalf) -> PsiHalf {
+    PsiHalf {
+        avg10: a.avg10.max(b.avg10),
+        avg60: a.avg60.max(b.avg60),
+        avg300: a.avg300.max(b.avg300),
+        total_usec: a.total_usec.saturating_add(b.total_usec),
+    }
 }
 
 fn format_cpu_range(cpus: &[u32]) -> String {
@@ -2227,11 +2281,11 @@ pub fn write_diff<W: fmt::Write>(
         let mut all_keys: std::collections::BTreeSet<&String> =
             diff.cgroup_stats_a.keys().collect();
         all_keys.extend(diff.cgroup_stats_b.keys());
-        for key in all_keys {
-            let a = diff.cgroup_stats_a.get(key);
-            let b = diff.cgroup_stats_b.get(key);
+        for key in &all_keys {
+            let a = diff.cgroup_stats_a.get(*key);
+            let b = diff.cgroup_stats_b.get(*key);
             ct.add_row(vec![
-                key.clone(),
+                key.to_string(),
                 cgroup_cell(
                     a.map(|s| s.cpu_usage_usec),
                     b.map(|s| s.cpu_usage_usec),
@@ -2251,6 +2305,92 @@ pub fn write_diff<W: fmt::Write>(
             ]);
         }
         writeln!(w, "{ct}")?;
+
+        // Per-cgroup PSI sub-tables — one per resource, each
+        // with `some`+`full` rows × `avg10/60/300/total` columns.
+        // Mirrors the show-side layout but with
+        // baseline→candidate→delta cells rather than single
+        // values. Suppressed when every cell on both sides is
+        // zero — synthetic fixtures and PSI-disabled hosts both
+        // hit this case and there's nothing useful to render.
+        for (resource_name, accessor) in psi_resource_accessors() {
+            let any_data = all_keys.iter().any(|key| {
+                let a = diff.cgroup_stats_a.get(*key).map(|s| accessor(&s.psi));
+                let b = diff.cgroup_stats_b.get(*key).map(|s| accessor(&s.psi));
+                a.as_ref().is_some_and(psi_resource_has_data)
+                    || b.as_ref().is_some_and(psi_resource_has_data)
+            });
+            if !any_data {
+                continue;
+            }
+            writeln!(w)?;
+            writeln!(w, "## Pressure / {resource_name}")?;
+            let mut pt = crate::cli::new_table();
+            pt.set_header(vec!["cgroup", "row", "avg10", "avg60", "avg300", "total"]);
+            for key in &all_keys {
+                let a = diff.cgroup_stats_a.get(*key).map(|s| accessor(&s.psi));
+                let b = diff.cgroup_stats_b.get(*key).map(|s| accessor(&s.psi));
+                pt.add_row(vec![
+                    key.to_string(),
+                    "some".into(),
+                    format_psi_avg_cell(a.map(|r| r.some.avg10), b.map(|r| r.some.avg10)),
+                    format_psi_avg_cell(a.map(|r| r.some.avg60), b.map(|r| r.some.avg60)),
+                    format_psi_avg_cell(a.map(|r| r.some.avg300), b.map(|r| r.some.avg300)),
+                    cgroup_cell(
+                        a.map(|r| r.some.total_usec),
+                        b.map(|r| r.some.total_usec),
+                        "µs",
+                    ),
+                ]);
+                pt.add_row(vec![
+                    key.to_string(),
+                    "full".into(),
+                    format_psi_avg_cell(a.map(|r| r.full.avg10), b.map(|r| r.full.avg10)),
+                    format_psi_avg_cell(a.map(|r| r.full.avg60), b.map(|r| r.full.avg60)),
+                    format_psi_avg_cell(a.map(|r| r.full.avg300), b.map(|r| r.full.avg300)),
+                    cgroup_cell(
+                        a.map(|r| r.full.total_usec),
+                        b.map(|r| r.full.total_usec),
+                        "µs",
+                    ),
+                ]);
+            }
+            writeln!(w, "{pt}")?;
+        }
+    }
+
+    // Host-level PSI compare — one sub-table per resource. Runs
+    // independent of `GroupBy` because host pressure is the
+    // primary scheduler-health signal regardless of which axis
+    // the user grouped per-thread metrics by. Suppressed when
+    // both snapshots' host PSI is all-zero.
+    if psi_pair_has_data(&diff.host_psi_a, &diff.host_psi_b) {
+        for (resource_name, accessor) in psi_resource_accessors() {
+            let a = accessor(&diff.host_psi_a);
+            let b = accessor(&diff.host_psi_b);
+            if !psi_resource_has_data(&a) && !psi_resource_has_data(&b) {
+                continue;
+            }
+            writeln!(w)?;
+            writeln!(w, "## Host pressure / {resource_name}")?;
+            let mut pt = crate::cli::new_table();
+            pt.set_header(vec!["row", "avg10", "avg60", "avg300", "total"]);
+            pt.add_row(vec![
+                "some".into(),
+                format_psi_avg_cell(Some(a.some.avg10), Some(b.some.avg10)),
+                format_psi_avg_cell(Some(a.some.avg60), Some(b.some.avg60)),
+                format_psi_avg_cell(Some(a.some.avg300), Some(b.some.avg300)),
+                cgroup_cell(Some(a.some.total_usec), Some(b.some.total_usec), "µs"),
+            ]);
+            pt.add_row(vec![
+                "full".into(),
+                format_psi_avg_cell(Some(a.full.avg10), Some(b.full.avg10)),
+                format_psi_avg_cell(Some(a.full.avg60), Some(b.full.avg60)),
+                format_psi_avg_cell(Some(a.full.avg300), Some(b.full.avg300)),
+                cgroup_cell(Some(a.full.total_usec), Some(b.full.total_usec), "µs"),
+            ]);
+            writeln!(w, "{pt}")?;
+        }
     }
 
     if !diff.only_baseline.is_empty() {
@@ -2324,6 +2464,77 @@ pub fn cgroup_cell(baseline: Option<u64>, candidate: Option<u64>, unit: &'static
     }
 }
 
+/// Render a baseline→candidate→delta cell for a PSI average
+/// field. `baseline` and `candidate` are centi-percent (0..=10000
+/// covering 0.00..=100.00 %); the cell renders each as `N.NN%`
+/// and computes a signed delta `(+|-D.DD%)`. Mirrors
+/// [`cgroup_cell`]'s structure but does NOT route through the
+/// auto-scale ladder — a pressure percentage is dimensionless
+/// and topping out at 100 means there's nothing to scale.
+pub fn format_psi_avg_cell(baseline: Option<u16>, candidate: Option<u16>) -> String {
+    match (baseline, candidate) {
+        (Some(b), Some(c)) => {
+            let baseline_cell = format_psi_avg_centi_percent(b);
+            let candidate_cell = format_psi_avg_centi_percent(c);
+            let d = c as i32 - b as i32;
+            let sign = if d >= 0 { "+" } else { "-" };
+            let abs = d.unsigned_abs();
+            let delta_int = abs / 100;
+            let delta_frac = abs % 100;
+            format!("{baseline_cell} → {candidate_cell} ({sign}{delta_int}.{delta_frac:02}%)")
+        }
+        (Some(b), None) => format!("{} → -", format_psi_avg_centi_percent(b)),
+        (None, Some(c)) => format!("- → {}", format_psi_avg_centi_percent(c)),
+        (None, None) => "-".to_string(),
+    }
+}
+
+/// Convert a centi-percent value (0..=10000) to its display
+/// form `N.NN%`. The centi-percent representation is 1:1 with
+/// the kernel's `LOAD_INT.LOAD_FRAC` 2-decimal-digit emission at
+/// `kernel/sched/psi.c:1284` — preserve that precision on
+/// display.
+pub fn format_psi_avg_centi_percent(v: u16) -> String {
+    let int = v / 100;
+    let frac = v % 100;
+    format!("{int}.{frac:02}%")
+}
+
+/// One entry in the [`psi_resource_accessors`] table — a
+/// display name paired with the accessor that pulls one
+/// [`PsiResource`] out of a [`Psi`] bundle.
+type PsiAccessor = (&'static str, fn(&Psi) -> PsiResource);
+
+/// Returns the four PSI resource accessors paired with their
+/// display names. Single source of truth for compare-side
+/// rendering — adding a fifth resource means one edit here.
+fn psi_resource_accessors() -> [PsiAccessor; 4] {
+    [
+        ("cpu", |p| p.cpu),
+        ("memory", |p| p.memory),
+        ("io", |p| p.io),
+        ("irq", |p| p.irq),
+    ]
+}
+
+/// Returns true when either side of a [`Psi`] pair has any
+/// non-zero data. Used to suppress a host-pressure or
+/// per-cgroup-pressure section when both sides are flat zero.
+fn psi_pair_has_data(a: &Psi, b: &Psi) -> bool {
+    psi_has_data(a) || psi_has_data(b)
+}
+
+fn psi_has_data(p: &Psi) -> bool {
+    [p.cpu, p.memory, p.io, p.irq]
+        .iter()
+        .any(psi_resource_has_data)
+}
+
+fn psi_resource_has_data(r: &PsiResource) -> bool {
+    let h = |h: &PsiHalf| h.avg10 != 0 || h.avg60 != 0 || h.avg300 != 0 || h.total_usec != 0;
+    h(&r.some) || h(&r.full)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2351,6 +2562,7 @@ mod tests {
             cgroup_stats: BTreeMap::new(),
             probe_summary: None,
             parse_summary: None,
+            psi: crate::host_state::Psi::default(),
         }
     }
 
@@ -2568,6 +2780,7 @@ mod tests {
                 nr_throttled: 1,
                 throttled_usec: 50,
                 memory_current: 1 << 20,
+                ..CgroupStats::default()
             },
         );
         let mut tb = make_thread("app", "w1");
@@ -2580,6 +2793,7 @@ mod tests {
                 nr_throttled: 3,
                 throttled_usec: 250,
                 memory_current: 2 << 20,
+                ..CgroupStats::default()
             },
         );
         let opts = CompareOptions {
@@ -2861,6 +3075,7 @@ mod tests {
                 nr_throttled: 1,
                 throttled_usec: 10,
                 memory_current: 500,
+                ..CgroupStats::default()
             },
         );
         stats.insert(
@@ -2870,6 +3085,7 @@ mod tests {
                 nr_throttled: 2,
                 throttled_usec: 20,
                 memory_current: 800,
+                ..CgroupStats::default()
             },
         );
         let pats = compile_flatten_patterns(&["/kubepods/*/workload".into()]);
@@ -3164,6 +3380,7 @@ mod tests {
                 nr_throttled: 0,
                 throttled_usec: 0,
                 memory_current: 100,
+                ..CgroupStats::default()
             },
         );
         diff.cgroup_stats_b.insert(
@@ -3173,6 +3390,7 @@ mod tests {
                 nr_throttled: 0,
                 throttled_usec: 0,
                 memory_current: 200,
+                ..CgroupStats::default()
             },
         );
         let mut out = String::new();
@@ -3362,6 +3580,84 @@ mod tests {
         assert_eq!(cgroup_cell(None, Some(99), ""), "- → 99");
         // (None, None) → single en-dash (both sides absent).
         assert_eq!(cgroup_cell(None, None, ""), "-");
+    }
+
+    /// Pin all four branches of `format_psi_avg_cell`. Mirrors
+    /// the [`cgroup_cell_renders_all_four_branches`] discipline
+    /// for the centi-percent display path.
+    #[test]
+    fn format_psi_avg_cell_renders_all_four_branches() {
+        // (Some, Some) — both halves render N.NN% with a signed
+        // (+|-D.DD%) delta. 1859 centi-percent = 18.59%, 2431 =
+        // 24.31%, delta = 5.72%.
+        assert_eq!(
+            format_psi_avg_cell(Some(1859), Some(2431)),
+            "18.59% → 24.31% (+5.72%)",
+        );
+        // Negative delta uses an explicit minus sign.
+        assert_eq!(
+            format_psi_avg_cell(Some(2431), Some(1859)),
+            "24.31% → 18.59% (-5.72%)",
+        );
+        // (Some, None) → baseline value then en-dash placeholder.
+        assert_eq!(format_psi_avg_cell(Some(750), None), "7.50% → -");
+        // (None, Some) → leading en-dash placeholder.
+        assert_eq!(format_psi_avg_cell(None, Some(50)), "- → 0.50%");
+        // (None, None) → single en-dash (both sides absent).
+        assert_eq!(format_psi_avg_cell(None, None), "-");
+    }
+
+    /// `format_psi_avg_centi_percent` renders the kernel's
+    /// 2-decimal-digit fixed-point representation. Pins the
+    /// zero-padding boundary explicitly (`5` centi-percent must
+    /// render as `0.05%`, not `0.5%`) — a regression dropping
+    /// the zero-pad would round-trip through display only on
+    /// the integer-percent path.
+    #[test]
+    fn format_psi_avg_centi_percent_zero_pads_fraction() {
+        assert_eq!(format_psi_avg_centi_percent(0), "0.00%");
+        assert_eq!(format_psi_avg_centi_percent(5), "0.05%");
+        assert_eq!(format_psi_avg_centi_percent(50), "0.50%");
+        assert_eq!(format_psi_avg_centi_percent(100), "1.00%");
+        assert_eq!(format_psi_avg_centi_percent(101), "1.01%");
+        assert_eq!(format_psi_avg_centi_percent(10000), "100.00%");
+        // Kernel EWMA rounding ceiling
+        // (include/linux/sched/loadavg.h:35).
+        assert_eq!(format_psi_avg_centi_percent(10099), "100.99%");
+    }
+
+    /// `psi_pair_has_data` returns false only when BOTH sides of
+    /// the pair are entirely zero. Pins the gating used in
+    /// `write_diff` to suppress the host-pressure block.
+    #[test]
+    fn psi_pair_has_data_returns_false_when_both_sides_zero() {
+        let zero = Psi::default();
+        assert!(!psi_pair_has_data(&zero, &zero));
+    }
+
+    #[test]
+    fn psi_pair_has_data_returns_true_when_one_side_nonzero() {
+        let zero = Psi::default();
+        let mut nonzero = Psi::default();
+        nonzero.cpu.some.avg10 = 1;
+        // Either order: the helper checks both sides.
+        assert!(psi_pair_has_data(&zero, &nonzero));
+        assert!(psi_pair_has_data(&nonzero, &zero));
+    }
+
+    /// Boundary: `total_usec` set to a non-zero value with every
+    /// avg-field still at zero counts as "has data". The avg
+    /// fields can lag on a low-pressure system that still
+    /// accumulated cumulative stall time, so a regression that
+    /// only checked avg10/60/300 (omitting total) would render
+    /// a misleading empty section here.
+    #[test]
+    fn psi_pair_has_data_detects_total_usec_only_data() {
+        let zero = Psi::default();
+        let mut total_only = Psi::default();
+        total_only.io.full.total_usec = 1;
+        assert!(psi_pair_has_data(&zero, &total_only));
+        assert!(psi_pair_has_data(&total_only, &zero));
     }
 
     /// Auto-scale on the cgroup_cell µs family: a cpu_usage_usec
@@ -3836,6 +4132,7 @@ mod tests {
                 nr_throttled: 1,
                 throttled_usec: 5,
                 memory_current: 100,
+                ..CgroupStats::default()
             },
         );
         stats.insert(
@@ -3845,6 +4142,7 @@ mod tests {
                 nr_throttled: 2,
                 throttled_usec: 15,
                 memory_current: 200,
+                ..CgroupStats::default()
             },
         );
         let out = flatten_cgroup_stats(&stats, &[], None);

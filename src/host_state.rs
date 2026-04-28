@@ -159,6 +159,15 @@ pub struct HostStateSnapshot {
     /// carries the per-snapshot read-level failure tally — see
     /// [`HostStateParseSummary`].
     pub parse_summary: Option<HostStateParseSummary>,
+
+    /// Host-level Pressure Stall Information, populated from
+    /// `<proc_root>/pressure/{cpu,memory,io,irq}`. Captures
+    /// system-wide stall pressure across the four kernel-exposed
+    /// resources. Defaults to all-zero when the kernel has
+    /// CONFIG_PSI off or when individual resource files are
+    /// absent. See [`Psi`] for the per-resource shape and the
+    /// system-level cpu.full / irq.some caveats.
+    pub psi: Psi,
 }
 
 /// Per-snapshot probe outcome statistics. Curated projection of
@@ -972,9 +981,11 @@ pub struct ThreadState {
 /// Populated from the cgroup v2 filesystem at capture time:
 /// `cpu.stat` exposes `usage_usec`, `nr_throttled`,
 /// `throttled_usec`; `memory.current` is the instantaneous RSS
-/// of the cgroup. These are aggregate-over-the-cgroup values —
-/// NOT summable from per-thread data — so the capture layer
-/// reads them directly from the cgroupfs rather than deriving.
+/// of the cgroup; `<resource>.pressure` exposes Pressure Stall
+/// Information (PSI) per resource. These are
+/// aggregate-over-the-cgroup values — NOT summable from
+/// per-thread data — so the capture layer reads them directly
+/// from the cgroupfs rather than deriving.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct CgroupStats {
@@ -982,6 +993,235 @@ pub struct CgroupStats {
     pub nr_throttled: u64,
     pub throttled_usec: u64,
     pub memory_current: u64,
+    /// Pressure Stall Information for this cgroup, per resource.
+    /// Populated from `<cgroup>/cpu.pressure`,
+    /// `<cgroup>/memory.pressure`, `<cgroup>/io.pressure`, and
+    /// `<cgroup>/irq.pressure` (cgroup v2 files declared at
+    /// `kernel/cgroup/cgroup.c:5453-5482`). Defaults to all-zero
+    /// when the kernel has CONFIG_PSI off, when PSI is disabled
+    /// at runtime via the `psi=0` boot param, or when individual
+    /// resource files are absent (older kernels missing
+    /// irq.pressure).
+    pub psi: Psi,
+}
+
+/// One Pressure Stall Information half-line: either the `some`
+/// or `full` row for one resource. Mirrors the kernel emission
+/// format `%s avg10=%lu.%02lu avg60=%lu.%02lu avg300=%lu.%02lu total=%llu`
+/// at `kernel/sched/psi.c:1284`.
+///
+/// `avg10/60/300` are stored as **centi-percent** (lossless
+/// fixed-point) — the kernel writes `LOAD_INT(avg).LOAD_FRAC(avg)`
+/// as a 2-decimal-digit percentage at psi.c:1284. The integer
+/// expansion is `int * 100 + frac`, giving a numerical range of
+/// `0..=10099`. The upper bound is `100.99` (not `100.00`)
+/// because the kernel's EWMA helper at
+/// `include/linux/sched/loadavg.h:35` rounds via `newload +=
+/// FIXED_1 - 1` before the final `>> FSHIFT`, so a fully-loaded
+/// group can land just over `100.0` for one sample. This avoids
+/// serde JSON float-roundtrip drift that would manifest as
+/// spurious non-zero deltas in compare output.
+///
+/// `total_usec` is microseconds (kernel
+/// `div_u64(total_ns, NSEC_PER_USEC)` at psi.c:1281). Same unit
+/// as [`CgroupStats::cpu_usage_usec`], so the existing
+/// auto_scale "µs" ladder applies.
+///
+/// "some" semantics: at least one task is stalled on this
+/// resource. "full" semantics: every runnable task is stalled.
+/// At the SYSTEM level (`/proc/pressure/cpu`), `cpu.full` is
+/// always zero by kernel design — the explicit gate
+/// `if (!(group == &psi_system && res == PSI_CPU && full))` at
+/// `kernel/sched/psi.c:1276-1277` skips the avg/total
+/// computation, but the `seq_printf` at psi.c:1284 still emits
+/// the structurally-present line. Per-cgroup `cpu.full` (under
+/// `<cgroup>/cpu.pressure`) IS meaningful and computed
+/// normally. `irq` is full-only (kernel `only_full = res == PSI_IRQ`
+/// at psi.c:1268), so [`PsiResource::some`] for irq always reads
+/// zero.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct PsiHalf {
+    /// 10-second running average of pressure %, scaled by 100
+    /// (so 0..=10099 covers 0.00..=100.99 — see the EWMA-rounding
+    /// note on the struct doc).
+    pub avg10: u16,
+    /// 60-second running average of pressure %, same scaling.
+    pub avg60: u16,
+    /// 300-second running average of pressure %, same scaling.
+    pub avg300: u16,
+    /// Cumulative total stalled time in microseconds.
+    pub total_usec: u64,
+}
+
+impl PsiHalf {
+    /// Convert the centi-percent `avg10` value to a percentage
+    /// `f64`. Returns `0.0..=100.99` per the kernel's EWMA
+    /// rounding (see struct-level doc).
+    pub fn avg10_percent(&self) -> f64 {
+        self.avg10 as f64 / 100.0
+    }
+
+    /// Convert the centi-percent `avg60` value to a percentage
+    /// `f64`. Same range as [`Self::avg10_percent`].
+    pub fn avg60_percent(&self) -> f64 {
+        self.avg60 as f64 / 100.0
+    }
+
+    /// Convert the centi-percent `avg300` value to a percentage
+    /// `f64`. Same range as [`Self::avg10_percent`].
+    pub fn avg300_percent(&self) -> f64 {
+        self.avg300 as f64 / 100.0
+    }
+}
+
+/// Pressure Stall Information for one resource (cpu / memory /
+/// io / irq), bundling the `some` and `full` halves.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct PsiResource {
+    pub some: PsiHalf,
+    pub full: PsiHalf,
+}
+
+/// Bundle of [`PsiResource`] for the four kernel-exposed
+/// resources. Same shape used at both system level
+/// ([`HostStateSnapshot::psi`]) and per-cgroup
+/// ([`CgroupStats::psi`]) — the data source differs but the
+/// kernel emits the same format and field set in both places.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct Psi {
+    pub cpu: PsiResource,
+    pub memory: PsiResource,
+    pub io: PsiResource,
+    /// IRQ pressure. Only the `full` half is populated by the
+    /// kernel (psi.c:1268 sets `only_full = res == PSI_IRQ`);
+    /// `irq.some` is structurally present but always zero.
+    /// Requires both `CONFIG_IRQ_TIME_ACCOUNTING` at build AND
+    /// `irqtime_enabled()` at runtime (`/proc/pressure/irq` returns
+    /// `-EOPNOTSUPP` per `kernel/sched/psi.c:1255` otherwise);
+    /// runtime irqtime is gated by the `tsc=...` boot param /
+    /// `irqtime_enabled` static branch — when off, the file open
+    /// fails and the parser leaves this resource at the default
+    /// all-zero value.
+    pub irq: PsiResource,
+}
+
+/// Parse one PSI file's contents. The kernel emits one or two
+/// lines (`some` then `full`), each formatted by `seq_printf` at
+/// `kernel/sched/psi.c:1284`. Lines are tokenized by whitespace;
+/// each token is `key=value`. Unknown keys are ignored so a
+/// future kernel that adds a 4th avg or new field doesn't break
+/// the parser. Missing fields default to 0 (matching the
+/// absent-counter contract used elsewhere in this module).
+fn parse_psi(raw: &str) -> PsiResource {
+    let mut out = PsiResource::default();
+    for line in raw.lines() {
+        let mut tokens = line.split_whitespace();
+        let Some(prefix) = tokens.next() else {
+            continue;
+        };
+        let half = match prefix {
+            "some" => &mut out.some,
+            "full" => &mut out.full,
+            _ => continue,
+        };
+        for tok in tokens {
+            let Some((key, value)) = tok.split_once('=') else {
+                continue;
+            };
+            match key {
+                "avg10" => half.avg10 = parse_centi_percent(value),
+                "avg60" => half.avg60 = parse_centi_percent(value),
+                "avg300" => half.avg300 = parse_centi_percent(value),
+                "total" => half.total_usec = value.parse::<u64>().unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Convert `"N.NN"` (kernel `%lu.%02lu` format from psi.c:1284)
+/// to `N * 100 + NN` (centi-percent integer). On malformed input
+/// returns 0, matching the absent-counter default contract.
+/// Saturates at u16::MAX to guard against pathological input.
+///
+/// The kernel always emits a 2-digit zero-padded fraction
+/// (`%02lu`), but a robust parser zero-pads its own input to
+/// exactly 2 digits before combining: a stray `"1.5"` (one
+/// fractional digit) must read as `150` (1.50%), not `105`
+/// (1.05%); a stray `"1.501"` (three fractional digits) is
+/// truncated to `1.50` rather than producing
+/// `1*100 + 501 = 601`. Mirrors the
+/// [`parsed_ns_from_dotted`] helper's zero-pad-to-six discipline.
+fn parse_centi_percent(s: &str) -> u16 {
+    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
+    let Ok(int) = int_part.parse::<u32>() else {
+        return 0;
+    };
+    let frac = if frac_part.is_empty() {
+        0
+    } else {
+        // Zero-pad-to-2 then truncate-to-2: "5" → "50", "501" →
+        // "50". Matches the kernel's `%02lu` format width
+        // exactly so a parser-side roundtrip can never under- or
+        // over-count the fractional weight.
+        let padded: String = frac_part
+            .chars()
+            .chain(std::iter::repeat('0'))
+            .take(2)
+            .collect();
+        padded.parse::<u32>().unwrap_or(0)
+    };
+    let combined = int.saturating_mul(100).saturating_add(frac);
+    combined.try_into().unwrap_or(u16::MAX)
+}
+
+/// Read host-level PSI files (`<proc_root>/pressure/{cpu,memory,io,irq}`)
+/// and populate a [`Psi`] bundle. Each file is read independently;
+/// absent files (older kernels missing irq.pressure, or hosts
+/// with CONFIG_PSI off) collapse to the all-zero default per the
+/// absent-counter contract.
+fn read_host_psi_at(proc_root: &Path) -> Psi {
+    let pressure_dir = proc_root.join("pressure");
+    Psi {
+        cpu: read_psi_file_at(&pressure_dir.join("cpu")),
+        memory: read_psi_file_at(&pressure_dir.join("memory")),
+        io: read_psi_file_at(&pressure_dir.join("io")),
+        irq: read_psi_file_at(&pressure_dir.join("irq")),
+    }
+}
+
+/// Read per-cgroup PSI files (`<cgroup>/{cpu,memory,io,irq}.pressure`)
+/// and populate a [`Psi`] bundle. The four files are exposed by
+/// `kernel/cgroup/cgroup.c:5453-5482`; the per-cgroup interface
+/// uses the `<resource>.pressure` filename pattern rather than
+/// the host-level `pressure/<resource>` directory layout.
+fn read_cgroup_psi_at(cgroup_root: &Path, path: &str) -> Psi {
+    let relative = path.strip_prefix('/').unwrap_or(path);
+    let dir = if relative.is_empty() {
+        cgroup_root.to_path_buf()
+    } else {
+        cgroup_root.join(relative)
+    };
+    Psi {
+        cpu: read_psi_file_at(&dir.join("cpu.pressure")),
+        memory: read_psi_file_at(&dir.join("memory.pressure")),
+        io: read_psi_file_at(&dir.join("io.pressure")),
+        irq: read_psi_file_at(&dir.join("irq.pressure")),
+    }
+}
+
+/// Read one PSI file by path. Absent files or read errors
+/// collapse to a default-zero [`PsiResource`].
+fn read_psi_file_at(path: &Path) -> PsiResource {
+    fs::read_to_string(path)
+        .ok()
+        .as_deref()
+        .map(parse_psi)
+        .unwrap_or_default()
 }
 
 impl HostStateSnapshot {
@@ -1993,11 +2233,13 @@ fn read_cgroup_stats_at(cgroup_root: &Path, path: &str) -> CgroupStats {
     let memory_current = fs::read_to_string(dir.join("memory.current"))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());
+    let psi = read_cgroup_psi_at(cgroup_root, path);
     CgroupStats {
         cpu_usage_usec: usage.unwrap_or(0),
         nr_throttled: throttled.unwrap_or(0),
         throttled_usec: throttled_usec.unwrap_or(0),
         memory_current: memory_current.unwrap_or(0),
+        psi,
     }
 }
 
@@ -2899,6 +3141,7 @@ fn capture_with(
             );
         }
     }
+    let psi = read_host_psi_at(proc_root);
     HostStateSnapshot {
         captured_at_unix_ns,
         host,
@@ -2906,6 +3149,7 @@ fn capture_with(
         cgroup_stats,
         probe_summary,
         parse_summary,
+        psi,
     }
 }
 
@@ -3074,6 +3318,7 @@ fn capture_pid_with(
             );
         }
     }
+    let psi = read_host_psi_at(proc_root);
     HostStateSnapshot {
         captured_at_unix_ns,
         host,
@@ -3081,6 +3326,7 @@ fn capture_pid_with(
         cgroup_stats,
         probe_summary,
         parse_summary,
+        psi,
     }
 }
 
@@ -3131,10 +3377,12 @@ mod tests {
                     nr_throttled: 0,
                     throttled_usec: 0,
                     memory_current: 1 << 20,
+                    psi: Psi::default(),
                 },
             )]),
             probe_summary: None,
             parse_summary: None,
+            psi: Psi::default(),
         };
         let tmp = tempfile::NamedTempFile::new().unwrap();
         snap.write(tmp.path()).unwrap();
@@ -3365,6 +3613,263 @@ mod tests {
         let raw = "voluntary_ctxt_switches:\t1\n";
         let f = parse_status(raw);
         assert_eq!(f.state, None);
+    }
+
+    /// PSI parser pins the kernel emission format
+    /// `kernel/sched/psi.c:1284`. Two-line shape (some + full)
+    /// is the cpu/memory/io case; cpu's avg/total decomposition
+    /// hits both halves so a one-side regression surfaces here.
+    #[test]
+    fn parse_psi_extracts_some_and_full_halves() {
+        let raw = "some avg10=18.59 avg60=24.31 avg300=20.49 total=78097519837\n\
+                   full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        let r = parse_psi(raw);
+        // some: integer + 2-digit fraction → centi-percent.
+        assert_eq!(r.some.avg10, 1859);
+        assert_eq!(r.some.avg60, 2431);
+        assert_eq!(r.some.avg300, 2049);
+        assert_eq!(r.some.total_usec, 78_097_519_837);
+        assert_eq!(r.full.avg10, 0);
+        assert_eq!(r.full.avg60, 0);
+        assert_eq!(r.full.avg300, 0);
+        assert_eq!(r.full.total_usec, 0);
+    }
+
+    /// IRQ pressure is full-only per
+    /// `kernel/sched/psi.c:1268` (`only_full = res == PSI_IRQ`),
+    /// so the some-half stays at the absent-line default of zero.
+    #[test]
+    fn parse_psi_irq_full_only_leaves_some_at_zero() {
+        let raw = "full avg10=1.09 avg60=1.08 avg300=1.46 total=80506377366\n";
+        let r = parse_psi(raw);
+        assert_eq!(r.full.avg10, 109);
+        assert_eq!(r.full.avg60, 108);
+        assert_eq!(r.full.avg300, 146);
+        assert_eq!(r.full.total_usec, 80_506_377_366);
+        // `some` half left at default zero — the kernel never
+        // emitted a `some` line for irq.
+        assert_eq!(r.some.avg10, 0);
+        assert_eq!(r.some.avg60, 0);
+        assert_eq!(r.some.avg300, 0);
+        assert_eq!(r.some.total_usec, 0);
+    }
+
+    /// Empty / absent file collapses to all-zero bundle. Pins
+    /// the absent-counter contract used elsewhere in this module.
+    #[test]
+    fn parse_psi_empty_input_yields_default() {
+        let r = parse_psi("");
+        assert_eq!(r.some.avg10, 0);
+        assert_eq!(r.full.total_usec, 0);
+    }
+
+    /// Malformed numeric values default to zero rather than
+    /// panicking. Mirrors the broader parser's
+    /// `value.parse::<u64>().ok()` discipline — best-effort
+    /// capture, never a hard error.
+    #[test]
+    fn parse_psi_malformed_value_defaults_to_zero() {
+        let raw = "some avg10=NaN avg60=0.50 avg300=- total=abc\n";
+        let r = parse_psi(raw);
+        assert_eq!(r.some.avg10, 0, "NaN parses to zero");
+        assert_eq!(r.some.avg60, 50, "well-formed neighbor still parses");
+        assert_eq!(r.some.avg300, 0, "lone dash parses to zero");
+        assert_eq!(r.some.total_usec, 0, "non-numeric total parses to zero");
+    }
+
+    /// Centi-percent conversion exhausts the fixed-point range:
+    /// `100.00%` maps to 10_000. Pins the upper boundary
+    /// against the u16 storage choice.
+    #[test]
+    fn parse_psi_full_saturation_maps_to_10000() {
+        let raw = "some avg10=100.00 avg60=100.00 avg300=100.00 total=42\n";
+        let r = parse_psi(raw);
+        assert_eq!(r.some.avg10, 10_000);
+        assert_eq!(r.some.avg60, 10_000);
+        assert_eq!(r.some.avg300, 10_000);
+        assert_eq!(r.some.total_usec, 42);
+    }
+
+    /// Unknown tokens are silently dropped (forward-compat with
+    /// a future kernel that adds a 4th avg or new field).
+    #[test]
+    fn parse_psi_unknown_keys_ignored() {
+        let raw = "some avg10=1.00 avg600=99.99 future_field=42 total=10\n";
+        let r = parse_psi(raw);
+        assert_eq!(r.some.avg10, 100);
+        assert_eq!(r.some.total_usec, 10);
+    }
+
+    /// `parse_centi_percent` pads/truncates the fractional part
+    /// to exactly 2 digits before combining. The kernel always
+    /// emits `%02lu` per `kernel/sched/psi.c:1284`, but a robust
+    /// parser must not silently rescale `"1.5"` (one digit) as
+    /// `1*100+5 = 105` (1.05%) — that would corrupt the value.
+    /// Mirrors `parsed_ns_from_dotted`'s zero-pad-to-six rule.
+    #[test]
+    fn parse_centi_percent_zero_pads_short_fraction() {
+        // No fraction → 0.
+        assert_eq!(parse_centi_percent("0"), 0);
+        assert_eq!(parse_centi_percent("42"), 4200);
+        // One-digit fraction → pad with trailing zero.
+        assert_eq!(parse_centi_percent("1.5"), 150, "1.5 must read as 1.50%");
+        assert_eq!(parse_centi_percent("0.7"), 70, "0.7 must read as 0.70%");
+        // Two-digit fraction → kernel-canonical case.
+        assert_eq!(parse_centi_percent("18.59"), 1859);
+        // Three+ digit fraction → truncate to 2.
+        assert_eq!(
+            parse_centi_percent("1.501"),
+            150,
+            "1.501 truncates to 1.50%"
+        );
+        // Empty fraction (trailing dot) → 0.
+        assert_eq!(parse_centi_percent("3."), 300);
+        // EWMA-rounding ceiling per loadavg.h:35.
+        assert_eq!(parse_centi_percent("100.99"), 10099);
+    }
+
+    /// Stage a synthetic `<proc_root>/pressure/{cpu,memory,io,irq}`
+    /// tree and verify [`read_host_psi_at`] returns a fully
+    /// populated [`Psi`] bundle. Pins the file naming and the
+    /// per-resource bundling — a regression that swapped two
+    /// resource sources (e.g. read `pressure/io` into `psi.cpu`)
+    /// surfaces here as wrong-resource-wrong-value.
+    #[test]
+    fn read_host_psi_at_populates_all_four_resources() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pressure = tmp.path().join("pressure");
+        std::fs::create_dir_all(&pressure).unwrap();
+        std::fs::write(
+            pressure.join("cpu"),
+            "some avg10=1.00 avg60=2.00 avg300=3.00 total=100\n\
+             full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pressure.join("memory"),
+            "some avg10=4.50 avg60=5.50 avg300=6.50 total=200\n\
+             full avg10=7.50 avg60=8.50 avg300=9.50 total=150\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pressure.join("io"),
+            "some avg10=10.10 avg60=20.20 avg300=30.30 total=300\n\
+             full avg10=40.40 avg60=50.50 avg300=60.60 total=250\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pressure.join("irq"),
+            "full avg10=0.50 avg60=0.60 avg300=0.70 total=80\n",
+        )
+        .unwrap();
+
+        let psi = read_host_psi_at(tmp.path());
+
+        // cpu: both halves populated, full all-zero.
+        assert_eq!(psi.cpu.some.avg10, 100);
+        assert_eq!(psi.cpu.some.avg60, 200);
+        assert_eq!(psi.cpu.some.avg300, 300);
+        assert_eq!(psi.cpu.some.total_usec, 100);
+        assert_eq!(psi.cpu.full.avg10, 0);
+        assert_eq!(psi.cpu.full.total_usec, 0);
+
+        // memory: both halves carry distinct nonzero values —
+        // catches a regression that returned the same half
+        // twice.
+        assert_eq!(psi.memory.some.avg10, 450);
+        assert_eq!(psi.memory.full.avg10, 750);
+        assert_eq!(psi.memory.some.total_usec, 200);
+        assert_eq!(psi.memory.full.total_usec, 150);
+
+        // io: largest distinct values; ensures resource-source
+        // routing isn't swapped against memory or cpu.
+        assert_eq!(psi.io.some.avg10, 1010);
+        assert_eq!(psi.io.full.avg300, 6060);
+        assert_eq!(psi.io.some.total_usec, 300);
+
+        // irq: full-only; some-half stays at the absent-line
+        // default of zero.
+        assert_eq!(psi.irq.full.avg10, 50);
+        assert_eq!(psi.irq.full.avg60, 60);
+        assert_eq!(psi.irq.full.avg300, 70);
+        assert_eq!(psi.irq.full.total_usec, 80);
+        assert_eq!(psi.irq.some.avg10, 0);
+        assert_eq!(psi.irq.some.total_usec, 0);
+    }
+
+    /// Absent `pressure/` directory or absent per-resource files
+    /// collapse to the all-zero default. Pins the absent-counter
+    /// contract so a host with `CONFIG_PSI=n` (or older kernels
+    /// missing `irq.pressure`) doesn't error out — capture is
+    /// best-effort.
+    #[test]
+    fn read_host_psi_at_missing_files_yield_default() {
+        // tempdir with no `pressure/` subdir at all.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let psi = read_host_psi_at(tmp.path());
+        assert_eq!(psi.cpu.some.avg10, 0);
+        assert_eq!(psi.memory.full.total_usec, 0);
+        assert_eq!(psi.io.some.avg300, 0);
+        assert_eq!(psi.irq.full.avg60, 0);
+
+        // Partial — only `cpu` exists; the other three should
+        // still default cleanly.
+        let pressure = tmp.path().join("pressure");
+        std::fs::create_dir_all(&pressure).unwrap();
+        std::fs::write(
+            pressure.join("cpu"),
+            "some avg10=12.34 avg60=0 avg300=0 total=0\n\
+             full avg10=0 avg60=0 avg300=0 total=0\n",
+        )
+        .unwrap();
+        let psi = read_host_psi_at(tmp.path());
+        assert_eq!(psi.cpu.some.avg10, 1234);
+        assert_eq!(psi.memory.some.avg10, 0);
+        assert_eq!(psi.io.full.total_usec, 0);
+        assert_eq!(psi.irq.full.avg10, 0);
+    }
+
+    /// Stage a synthetic cgroup tree and verify
+    /// [`read_cgroup_psi_at`] reads `<cgroup>/<resource>.pressure`
+    /// (cgroup v2 file naming, distinct from the host-level
+    /// `pressure/<resource>` directory layout). Pins the
+    /// path-strip-leading-slash behavior shared with
+    /// [`read_cgroup_stats_at`].
+    #[test]
+    fn read_cgroup_psi_at_uses_resource_dot_pressure_naming() {
+        let cgroup_root = tempfile::TempDir::new().unwrap();
+        let cg_dir = cgroup_root.path().join("app");
+        std::fs::create_dir_all(&cg_dir).unwrap();
+        std::fs::write(
+            cg_dir.join("cpu.pressure"),
+            "some avg10=11.11 avg60=0 avg300=0 total=42\n\
+             full avg10=0 avg60=0 avg300=0 total=0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cg_dir.join("memory.pressure"),
+            "some avg10=0 avg60=0 avg300=0 total=0\n\
+             full avg10=22.22 avg60=0 avg300=0 total=999\n",
+        )
+        .unwrap();
+        // io.pressure absent → default zero. irq.pressure
+        // present but full-only.
+        std::fs::write(
+            cg_dir.join("irq.pressure"),
+            "full avg10=33.33 avg60=0 avg300=0 total=7\n",
+        )
+        .unwrap();
+
+        let psi = read_cgroup_psi_at(cgroup_root.path(), "/app");
+
+        assert_eq!(psi.cpu.some.avg10, 1111);
+        assert_eq!(psi.cpu.some.total_usec, 42);
+        assert_eq!(psi.memory.full.avg10, 2222);
+        assert_eq!(psi.memory.full.total_usec, 999);
+        assert_eq!(psi.io.some.avg10, 0, "absent io.pressure → default zero");
+        assert_eq!(psi.io.full.total_usec, 0);
+        assert_eq!(psi.irq.full.avg10, 3333);
+        assert_eq!(psi.irq.some.avg10, 0, "irq is full-only");
     }
 
     #[test]

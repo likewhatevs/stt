@@ -866,10 +866,246 @@ fn write_show<W: std::fmt::Write>(
                 ]);
             }
             writeln!(w, "{ct}")?;
+
+            // Per-cgroup PSI sub-tables — one per resource.
+            // Q8 ruling: per-resource sub-tables, all fields
+            // rendered (no --verbose gate). Each resource shows
+            // a `some` row + a `full` row with `avg10/avg60/avg300/total`
+            // columns. avg fields are stored as centi-percent
+            // (0..=10099, see [`PsiHalf`] doc for the kernel's
+            // EWMA rounding ceiling); render as `N.NN%` for
+            // human-friendliness. total is microseconds; the
+            // auto_scale "µs" ladder applies via
+            // `format_scaled_u64`. Per-resource zero-suppression
+            // mirrors the compare-side write_diff path: skip a
+            // resource sub-table when no cgroup in the bucket
+            // has any non-zero data for it.
+            for (resource_name, accessor) in psi_resources() {
+                let any_data = stats.values().any(|s| {
+                    let r = accessor(&s.psi);
+                    psi_resource_has_data(&r)
+                });
+                if !any_data {
+                    continue;
+                }
+                writeln!(w)?;
+                writeln!(w, "## Pressure / {resource_name}")?;
+                let mut pt = cli::new_table();
+                pt.set_header(vec!["cgroup", "row", "avg10", "avg60", "avg300", "total"]);
+                for (key, s) in &stats {
+                    let r = accessor(&s.psi);
+                    pt.add_row(vec![
+                        key.clone(),
+                        "some".into(),
+                        format_psi_avg(r.some.avg10),
+                        format_psi_avg(r.some.avg60),
+                        format_psi_avg(r.some.avg300),
+                        host_state_compare::format_scaled_u64(r.some.total_usec, "µs"),
+                    ]);
+                    pt.add_row(vec![
+                        key.clone(),
+                        "full".into(),
+                        format_psi_avg(r.full.avg10),
+                        format_psi_avg(r.full.avg60),
+                        format_psi_avg(r.full.avg300),
+                        host_state_compare::format_scaled_u64(r.full.total_usec, "µs"),
+                    ]);
+                }
+                writeln!(w, "{pt}")?;
+            }
+        }
+    }
+
+    // Host-level PSI — surface above the per-thread table when
+    // any resource has nonzero data. Renders as four per-resource
+    // sub-tables (cpu / memory / io / irq) with a `some`+`full`
+    // row each, matching the per-cgroup layout above.
+    if host_psi_has_data(&snap.psi) {
+        for (resource_name, accessor) in psi_resources() {
+            let r = accessor(&snap.psi);
+            if !psi_resource_has_data(&r) {
+                continue;
+            }
+            writeln!(w)?;
+            writeln!(w, "## Host pressure / {resource_name}")?;
+            let mut pt = cli::new_table();
+            pt.set_header(vec!["row", "avg10", "avg60", "avg300", "total"]);
+            pt.add_row(vec![
+                "some".into(),
+                format_psi_avg(r.some.avg10),
+                format_psi_avg(r.some.avg60),
+                format_psi_avg(r.some.avg300),
+                host_state_compare::format_scaled_u64(r.some.total_usec, "µs"),
+            ]);
+            pt.add_row(vec![
+                "full".into(),
+                format_psi_avg(r.full.avg10),
+                format_psi_avg(r.full.avg60),
+                format_psi_avg(r.full.avg300),
+                host_state_compare::format_scaled_u64(r.full.total_usec, "µs"),
+            ]);
+            writeln!(w, "{pt}")?;
         }
     }
 
     Ok(())
+}
+
+/// One entry in the [`psi_resources`] table — a display name
+/// paired with the accessor that pulls one
+/// [`host_state::PsiResource`] out of a [`host_state::Psi`]
+/// bundle.
+type PsiAccessor = (
+    &'static str,
+    fn(&host_state::Psi) -> host_state::PsiResource,
+);
+
+/// Returns the four PSI resource accessors paired with their
+/// display names. Centralizing the resource list keeps the
+/// host-level and per-cgroup rendering paths in lockstep — adding
+/// a fifth resource (e.g. a future `net.pressure`) means one
+/// edit here, not four scattered through the renderers.
+fn psi_resources() -> [PsiAccessor; 4] {
+    [
+        ("cpu", |p| p.cpu),
+        ("memory", |p| p.memory),
+        ("io", |p| p.io),
+        ("irq", |p| p.irq),
+    ]
+}
+
+/// Render a centi-percent PSI average as `N.NN%`. The kernel
+/// emits `LOAD_INT.LOAD_FRAC` at `kernel/sched/psi.c:1284` with
+/// 2-decimal-digit precision — preserve that on display.
+fn format_psi_avg(centi_percent: u16) -> String {
+    let int = centi_percent / 100;
+    let frac = centi_percent % 100;
+    format!("{int}.{frac:02}%")
+}
+
+/// Returns true when any host-level PSI resource has a non-zero
+/// avg or total reading. Used to suppress the host pressure
+/// section when the kernel returned all zeros (CONFIG_PSI off,
+/// PSI not yet warmed up, or synthetic test fixture).
+fn host_psi_has_data(psi: &host_state::Psi) -> bool {
+    [psi.cpu, psi.memory, psi.io, psi.irq]
+        .iter()
+        .any(psi_resource_has_data)
+}
+
+fn psi_resource_has_data(r: &host_state::PsiResource) -> bool {
+    let h = |h: &host_state::PsiHalf| {
+        h.avg10 != 0 || h.avg60 != 0 || h.avg300 != 0 || h.total_usec != 0
+    };
+    h(&r.some) || h(&r.full)
+}
+
+#[cfg(test)]
+mod psi_show_tests {
+    //! Tests for the show-side PSI helpers
+    //! (`psi_resources`, `format_psi_avg`,
+    //! `host_psi_has_data`, `psi_resource_has_data`). The
+    //! integration tests for the full show pipeline already
+    //! exercise the rendering happy path; these unit tests pin
+    //! the helper boundaries (zero-suppression edges,
+    //! centi-percent → display rounding) directly so a
+    //! regression in either function surfaces with a
+    //! pinpointed assertion rather than a rendered-output
+    //! diff.
+    use super::*;
+    use ktstr::host_state::{Psi, PsiHalf, PsiResource};
+
+    #[test]
+    fn format_psi_avg_renders_centi_percent_with_two_decimal_digits() {
+        // Lossless N.NN% display: integer + 2-digit fraction.
+        assert_eq!(format_psi_avg(0), "0.00%");
+        assert_eq!(format_psi_avg(1), "0.01%");
+        assert_eq!(format_psi_avg(50), "0.50%");
+        assert_eq!(format_psi_avg(1859), "18.59%");
+        assert_eq!(format_psi_avg(10000), "100.00%");
+        // Kernel EWMA rounding ceiling per
+        // include/linux/sched/loadavg.h:35; render the boundary
+        // verbatim rather than clamping.
+        assert_eq!(format_psi_avg(10099), "100.99%");
+    }
+
+    #[test]
+    fn psi_resources_lists_four_in_canonical_order() {
+        let names: Vec<&str> = psi_resources().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["cpu", "memory", "io", "irq"]);
+    }
+
+    /// Build a `PsiResource` with one centi-percent sentinel set
+    /// on either the `some` or `full` half. The bin crate is a
+    /// distinct compilation unit from the lib, so the
+    /// `#[non_exhaustive]` markers on `Psi` / `PsiResource` /
+    /// `PsiHalf` block struct-literal construction here — same
+    /// constraint that drives `tests/common/host_state.rs`'s
+    /// Default + per-field assignment pattern.
+    fn psi_resource_with_some_avg10(v: u16) -> PsiResource {
+        let mut half = PsiHalf::default();
+        half.avg10 = v;
+        let mut r = PsiResource::default();
+        r.some = half;
+        r
+    }
+
+    fn psi_resource_with_full_avg10(v: u16) -> PsiResource {
+        let mut half = PsiHalf::default();
+        half.avg10 = v;
+        let mut r = PsiResource::default();
+        r.full = half;
+        r
+    }
+
+    #[test]
+    fn psi_resources_accessors_route_to_correct_field() {
+        // Distinct sentinel per resource so a swapped accessor
+        // surfaces as a wrong-resource value here.
+        let mut psi = Psi::default();
+        psi.cpu = psi_resource_with_some_avg10(1);
+        psi.memory = psi_resource_with_some_avg10(2);
+        psi.io = psi_resource_with_some_avg10(3);
+        psi.irq = psi_resource_with_full_avg10(4);
+        let accessors = psi_resources();
+        assert_eq!(accessors[0].1(&psi).some.avg10, 1, "cpu accessor");
+        assert_eq!(accessors[1].1(&psi).some.avg10, 2, "memory accessor");
+        assert_eq!(accessors[2].1(&psi).some.avg10, 3, "io accessor");
+        assert_eq!(accessors[3].1(&psi).full.avg10, 4, "irq accessor");
+    }
+
+    #[test]
+    fn host_psi_has_data_returns_false_for_all_zero_bundle() {
+        assert!(!host_psi_has_data(&Psi::default()));
+    }
+
+    #[test]
+    fn host_psi_has_data_returns_true_for_any_nonzero_field() {
+        // Each per-half field flagged independently so a
+        // regression that only checked one half (or one resource)
+        // surfaces here.
+        for resource_idx in 0..4 {
+            for is_full in [false, true] {
+                let mut psi = Psi::default();
+                let target_resource = match resource_idx {
+                    0 => &mut psi.cpu,
+                    1 => &mut psi.memory,
+                    2 => &mut psi.io,
+                    _ => &mut psi.irq,
+                };
+                let half = if is_full {
+                    &mut target_resource.full
+                } else {
+                    &mut target_resource.some
+                };
+                half.total_usec = 1;
+                assert!(
+                    host_psi_has_data(&psi),
+                    "resource_idx={resource_idx}, is_full={is_full} should be detected"
+                );
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
