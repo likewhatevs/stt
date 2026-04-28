@@ -197,6 +197,15 @@ encoding_rs = "0.8"
 # pattern phd-2's analysis recommended.
 thiserror = "2"
 
+# Compiled regex patterns for the token-based pattern_key
+# normalizer in `host_state_compare.rs`. Used to express the
+# spec rules in `classify_token` (`^\d+$`, `^[0-9a-f]+$`,
+# `^[A-Za-z]+\d+$`, `^\d+[A-Za-z]+$`) literally rather than as
+# hand-rolled char loops, so the rules read identically to the
+# spec. Already a transitive dep via `fancy-regex` and others;
+# promoted to a direct dep so the import sites are explicit.
+regex = "1"
+
 [profile.release]
 lto = "thin"
 panic = "abort"

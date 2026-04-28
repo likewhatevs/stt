@@ -315,6 +315,8 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
         candidate: candidate_path,
         group_by: GroupBy::Pcomm,
         cgroup_flatten: vec![],
+        no_thread_normalize: false,
+        no_cg_normalize: false,
     };
     // `run_compare` returns `anyhow::Result<i32>`. The contract
     // says the `i32` is always 0 for a successful load+compare,

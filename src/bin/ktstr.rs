@@ -333,6 +333,14 @@ enum HostStateCommand {
     ///   reachable external debuginfo, debuglink CRC mismatched, or
     ///   the `tsd_s` struct / its member fields are absent from the
     ///   DWARF. Install matching `-debuginfo` / `-dbg` packages.
+    /// - `worker-panic` — the per-tgid attach worker panicked
+    ///   (caught via `catch_unwind` so the snapshot still completes).
+    ///   Indicates an unexpected fault inside the parallel attach
+    ///   pipeline — fd exhaustion / OOM during the ELF parse or
+    ///   DWARF walk are the canonical triggers, but any panic-on-bug
+    ///   under `attach_jemalloc_at` lands here. Investigate the
+    ///   `tracing::error!` log for the offending tgid; the recorded
+    ///   payload string identifies the panic site.
     ///
     /// Per-thread (probe-time) failures:
     /// - `ptrace-seize` — `PTRACE_SEIZE` rejected by the kernel.

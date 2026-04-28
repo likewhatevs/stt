@@ -3010,6 +3010,7 @@ dependencies = [
  "proptest",
  "rand 0.10.1",
  "rayon",
+ "regex",
  "reqwest 0.13.2",
  "rmesg",
  "rustix",
