@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use assert_cmd::Command;
 
 use common::host_state::{cgroup_stats_entry, make_thread, snapshot};
+use ktstr::metric_types::{MonotonicCount, MonotonicNs};
 
 fn ktstr() -> Command {
     Command::cargo_bin("ktstr").unwrap()
@@ -41,8 +42,8 @@ fn show_default_renders_pcomm_grouping_columns() {
     let snap_path = tmp.path().join("snap.hst.zst");
 
     let mut t = make_thread("integration_proc", "worker");
-    t.run_time_ns = 5_000_000;
-    t.nr_wakeups = 200;
+    t.run_time_ns = MonotonicNs(5_000_000);
+    t.nr_wakeups = MonotonicCount(200);
     snapshot(vec![t], BTreeMap::new())
         .write(&snap_path)
         .unwrap();
@@ -160,11 +161,11 @@ fn show_sort_by_orders_groups_by_metric_descending() {
     let snap_path = tmp.path().join("snap.hst.zst");
 
     let mut t_alpha = make_thread("alpha", "alpha-w");
-    t_alpha.run_time_ns = 100;
+    t_alpha.run_time_ns = MonotonicNs(100);
     let mut t_bravo = make_thread("bravo", "bravo-w");
-    t_bravo.run_time_ns = 500;
+    t_bravo.run_time_ns = MonotonicNs(500);
     let mut t_charlie = make_thread("charlie", "charlie-w");
-    t_charlie.run_time_ns = 250;
+    t_charlie.run_time_ns = MonotonicNs(250);
     snapshot(vec![t_alpha, t_bravo, t_charlie], BTreeMap::new())
         .write(&snap_path)
         .unwrap();

@@ -1203,13 +1203,17 @@ fn write_show<W: std::fmt::Write>(
     // ShmemPmdMapped=0 etc. are noise rows. kB→B conversion
     // for the auto_scale "B" ladder lives in
     // [`ThreadState::smaps_rollup_bytes`].
-    let smaps_rows: Vec<(&host_state::ThreadState, &String, u64)> = snap
+    let smaps_rows: Vec<(
+        &host_state::ThreadState,
+        &String,
+        ktstr::metric_types::Bytes,
+    )> = snap
         .threads
         .iter()
         .filter(|t| !t.smaps_rollup_kb.is_empty())
         .flat_map(|t| {
             t.smaps_rollup_bytes()
-                .filter(|(_, b)| *b != 0)
+                .filter(|(_, b)| b.0 != 0)
                 .map(move |(k, b)| (t, k, b))
         })
         .collect();
@@ -1222,7 +1226,7 @@ fn write_show<W: std::fmt::Write>(
             st.add_row(vec![
                 format!("{}[{}]", t.pcomm, t.tgid),
                 (*key).clone(),
-                host_state_compare::format_scaled_u64(*bytes, "B"),
+                host_state_compare::format_scaled_u64(bytes.0, "B"),
             ]);
         }
         writeln!(w, "{st}")?;
@@ -1711,6 +1715,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ktstr::metric_types::{MonotonicCount, MonotonicNs};
 
     // -- clap argument-parse pins: Shell --cpu-cap requires --no-perf-mode
     //
@@ -2026,11 +2031,11 @@ mod tests {
         let mut t1 = ktstr::host_state::ThreadState::default();
         t1.pcomm = "worker-proc".to_string();
         t1.comm = "worker-0".to_string();
-        t1.nr_wakeups = 1;
+        t1.nr_wakeups = MonotonicCount(1);
         let mut t2 = ktstr::host_state::ThreadState::default();
         t2.pcomm = "worker-proc".to_string();
         t2.comm = "worker-1".to_string();
-        t2.nr_wakeups = 2;
+        t2.nr_wakeups = MonotonicCount(2);
         snap.threads.push(t1);
         snap.threads.push(t2);
 
@@ -2152,15 +2157,15 @@ mod tests {
         let mut t_alpha = ktstr::host_state::ThreadState::default();
         t_alpha.pcomm = "alpha".to_string();
         t_alpha.comm = "alpha-w".to_string();
-        t_alpha.run_time_ns = 100;
+        t_alpha.run_time_ns = MonotonicNs(100);
         let mut t_bravo = ktstr::host_state::ThreadState::default();
         t_bravo.pcomm = "bravo".to_string();
         t_bravo.comm = "bravo-w".to_string();
-        t_bravo.run_time_ns = 500;
+        t_bravo.run_time_ns = MonotonicNs(500);
         let mut t_charlie = ktstr::host_state::ThreadState::default();
         t_charlie.pcomm = "charlie".to_string();
         t_charlie.comm = "charlie-w".to_string();
-        t_charlie.run_time_ns = 250;
+        t_charlie.run_time_ns = MonotonicNs(250);
         snap.threads.push(t_alpha);
         snap.threads.push(t_bravo);
         snap.threads.push(t_charlie);
@@ -2298,7 +2303,7 @@ mod tests {
         let mut t = ktstr::host_state::ThreadState::default();
         t.pcomm = "worker".to_string();
         t.comm = "w".to_string();
-        t.nr_wakeups_affine = 7;
+        t.nr_wakeups_affine = MonotonicCount(7);
         snap.threads.push(t);
         let mut out = String::new();
         write_show(
@@ -2331,8 +2336,8 @@ mod tests {
         let mut t = ktstr::host_state::ThreadState::default();
         t.pcomm = "worker".to_string();
         t.comm = "w".to_string();
-        t.run_time_ns = 4_000;
-        t.timeslices = 8;
+        t.run_time_ns = MonotonicNs(4_000);
+        t.timeslices = MonotonicCount(8);
         snap.threads.push(t);
         let mut out = String::new();
         write_show(
@@ -2368,7 +2373,7 @@ mod tests {
         let mut t = ktstr::host_state::ThreadState::default();
         t.pcomm = "worker".to_string();
         t.comm = "w".to_string();
-        t.nr_wakeups = 1;
+        t.nr_wakeups = MonotonicCount(1);
         snap.threads.push(t);
 
         let columns = vec![
@@ -2415,11 +2420,11 @@ mod tests {
         let mut t_zulu = ktstr::host_state::ThreadState::default();
         t_zulu.pcomm = "zulu".to_string();
         t_zulu.comm = "zulu-w".to_string();
-        t_zulu.run_time_ns = 999;
+        t_zulu.run_time_ns = MonotonicNs(999);
         let mut t_alpha = ktstr::host_state::ThreadState::default();
         t_alpha.pcomm = "alpha".to_string();
         t_alpha.comm = "alpha-w".to_string();
-        t_alpha.run_time_ns = 1;
+        t_alpha.run_time_ns = MonotonicNs(1);
         snap.threads.push(t_zulu);
         snap.threads.push(t_alpha);
 

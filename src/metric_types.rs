@@ -9,6 +9,50 @@
 //! categoricals carry the mode (most-frequent value), and cpusets
 //! carry an affinity summary.
 //!
+//! # Temporal window
+//!
+//! Every counter / cumulative-time / peak / byte-count newtype
+//! defined here represents a value that the kernel accumulates
+//! across the THREAD LIFETIME — from thread birth to the
+//! moment of the procfs read. All of these fields share the
+//! same window because they live in the same `task_struct` and
+//! tick along with the same task. That shared window is what
+//! makes ratios across fields well-defined (e.g.
+//! `cpu_efficiency = run_time_ns / (run_time_ns + wait_time_ns)`
+//! is a meaningful fraction because both numerator and
+//! denominator measure the same task's same lifetime).
+//!
+//! Cross-file read skew during one capture pass (the
+//! capture pipeline reads `/proc/<tid>/stat`, then `/sched`,
+//! then `/io`, etc. with a few hundred microseconds of drift
+//! between them) is negligible against cumulative-from-birth
+//! totals that grow over hours or days of thread runtime —
+//! the small in-flight delta during the read is rounding noise
+//! relative to the lifetime accumulator. The qualifier holds
+//! relative to a lifetime accumulator that has had time to
+//! integrate; threads captured very early in their lifetime
+//! carry larger relative read-skew error, but their absolute
+//! contribution to any group aggregate is correspondingly
+//! small (a thread alive for 500 µs cannot meaningfully drag
+//! a group total even if its individual reads are skewed by
+//! 100 µs).
+//!
+//! [`crate::host_state_compare`] runs in two modes that both
+//! preserve the shared-window property: SHOW renders one
+//! snapshot's lifetime totals; COMPARE subtracts two snapshots
+//! captured at different wall-clock instants to scope the values
+//! to the (capture-A, capture-B) interval. In both modes every
+//! field carries the same temporal window, so cross-field ratios
+//! and per-thread totals stay well-defined.
+//!
+//! Two newtypes break this convention deliberately: [`GaugeNs`]
+//! (a current-instantaneous reading like the scheduler's current
+//! slice) and [`GaugeCount`] (a current count like
+//! `signal_struct->nr_threads`) — the per-newtype docs call out
+//! the gauge family separately.
+//!
+//! # Type-system enforcement
+//!
 //! Encoding the category into the type system surfaces
 //! category-mismatched aggregation as a compile error. Once the
 //! [`crate::host_state_compare::AggRule`] dispatch migrates to
@@ -41,15 +85,18 @@
 //! - [`GaugeNs`] — instantaneous gauge sampled at capture time, ns.
 //!   `fair_slice_ns` is the canonical example. Summing gauges is a
 //!   category error — N nearly-identical instantaneous samples
-//!   sum to N×gauge with no physical meaning. Structural counts
-//!   that go up AND down at runtime (e.g. `nr_threads`, the
-//!   process-wide thread count from `signal_struct->nr_threads`)
-//!   share the gauge family conceptually — they are not
-//!   monotonic — and reduce by max across a group rather than
-//!   sum, even though the underlying quantity is integer rather
-//!   than time. Phase 2 may either route them through
-//!   [`GaugeNs`] (with a unit-tag override on the rendered cell)
-//!   or grow a dedicated `GaugeCount` newtype.
+//!   sum to N×gauge with no physical meaning.
+//! - [`GaugeCount`] — gauge-family unitless count (u64) that can
+//!   go up AND down at runtime. Carries the same Maxable-only
+//!   contract as [`GaugeNs`] but renders as a plain count rather
+//!   than a nanosecond ladder. `nr_threads` (the process-wide
+//!   thread count from `signal_struct->nr_threads`) is the
+//!   canonical example — threads spawn and exit so the value is
+//!   not monotonic, and the registry reduces it by Max across a
+//!   group rather than Sum. Distinct from [`GaugeNs`] because
+//!   "thread count" and "current slice in nanoseconds" do not
+//!   share a unit; routing nr_threads through GaugeNs would
+//!   render it on the ns auto-scale ladder, which is a unit lie.
 //! - [`ClockTicks`] — USER_HZ-scaled time. Examples:
 //!   `utime_clock_ticks`, `stime_clock_ticks`,
 //!   `delayacct_blkio_ticks`. Auto-scale ladder is
@@ -66,18 +113,23 @@
 //!   kernel's `task_cpu()` returns `unsigned int`
 //!   (`include/linux/sched.h`), but ktstr stores i32 to share
 //!   the [`OrdinalI32`] wrapper with the genuinely-signed nice
-//!   and priority fields). [`OrdinalU64`] is for u64-backed
+//!   and priority fields). [`OrdinalU32`] is for u32-backed
 //!   ordinal fields like `rt_priority` (real-time priority,
-//!   0..99). [`OrdinalU32`] currently has no example in the
-//!   registry — it is reserved for phase-2 migration targets
-//!   that need an unsigned 32-bit ordinal (e.g. a future capture
-//!   field whose value is bounded by `u32::MAX` rather than
-//!   `i32::MAX`).
+//!   0..99 in practice for SCHED_FIFO / SCHED_RR; the kernel
+//!   declares `unsigned int task_struct::rt_priority` in
+//!   `include/linux/sched.h`, so a `u32` matches the kernel
+//!   field width exactly). [`OrdinalU64`] is reserved for
+//!   future ordinal metrics whose kernel-side type genuinely
+//!   exceeds `u32::MAX`; no field uses it today.
 //! - [`CategoricalString`] — string-valued, mode-aggregated.
-//!   Examples: `policy`, `state`. Note: `ext_enabled` is currently
-//!   coerced through `String` via `Display`; if a second bool
-//!   field appears, promote both to a dedicated `CategoricalBool`
-//!   wrapper.
+//!   `policy` is the only example after phase 2. The `state` char
+//!   and `ext_enabled` bool fields stay unwrapped on
+//!   [`crate::host_state::ThreadState`]; the
+//!   [`crate::host_state_compare::AggRule::Mode`] accessor coerces
+//!   them through `String` via `to_string()`/`Display` at the call
+//!   site. If a second bool field appears, promote both to a
+//!   dedicated `CategoricalBool` wrapper rather than continuing the
+//!   ad-hoc coercion.
 //! - [`CpuSet`] — `Vec<u32>` of CPU IDs, affinity-aggregated.
 //!   `cpu_affinity` is the only example.
 //!
@@ -86,26 +138,29 @@
 //! - [`Summable`] — sum across a group. Implemented by the four
 //!   counter newtypes ([`MonotonicCount`], [`MonotonicNs`],
 //!   [`ClockTicks`], [`Bytes`]). NOT implemented by [`PeakNs`] /
-//!   [`GaugeNs`] / [`OrdinalI32`] / [`OrdinalU32`] /
-//!   [`OrdinalU64`] / [`CategoricalString`] / [`CpuSet`]. The
-//!   trait is sealed via [`sealed::SummableSealed`] so a
-//!   downstream crate cannot add `impl Summable for PeakNs` to
-//!   bypass the category invariant.
+//!   [`GaugeNs`] / [`GaugeCount`] / [`OrdinalI32`] /
+//!   [`OrdinalU32`] / [`OrdinalU64`] / [`CategoricalString`] /
+//!   [`CpuSet`]. The trait is sealed via
+//!   [`sealed::SummableSealed`] so a downstream crate cannot add
+//!   `impl Summable for PeakNs` to bypass the category invariant.
 //! - [`Maxable`] — reduce by max. Implemented by every newtype
 //!   that has a meaningful "worst observed" reading: every
 //!   `Summable` (max-of-counter is "biggest single contributor")
 //!   plus [`PeakNs`] (max-of-peak is "worst peak any contributor
-//!   saw") plus [`GaugeNs`] (max-of-gauge is "longest current
-//!   slice in the bucket"). NOT implemented by ordinals (those
-//!   carry a `[min, max]` range, not a single max), nor by
-//!   [`CategoricalString`] (string max has no useful semantic),
-//!   nor by [`CpuSet`] (the affinity reduction is a custom
-//!   summary, not a bare max). Sealed via
+//!   saw"), [`GaugeNs`] (max-of-gauge is "longest current
+//!   slice in the bucket"), and [`GaugeCount`] (max-of-count is
+//!   "biggest current count any contributor carried"). NOT
+//!   implemented by ordinals (those carry a `[min, max]` range,
+//!   not a single max), nor by [`CategoricalString`] (string max
+//!   has no useful semantic), nor by [`CpuSet`] (the affinity
+//!   reduction is a custom summary, not a bare max). Sealed via
 //!   [`sealed::MaxableSealed`].
 //! - [`Modeable`] — reduce by mode (most-frequent value).
-//!   Implemented by [`CategoricalString`] only.
+//!   Implemented by [`CategoricalString`] only. Sealed via
+//!   [`sealed::ModeableSealed`].
 //! - [`Rangeable`] — reduce by `[min, max]`. Implemented by
-//!   [`OrdinalI32`], [`OrdinalU32`], and [`OrdinalU64`].
+//!   [`OrdinalI32`], [`OrdinalU32`], and [`OrdinalU64`]. Sealed
+//!   via [`sealed::RangeableSealed`].
 //!
 //! Reductions are exposed as **trait methods** on
 //! [`Summable`] / [`Maxable`] / [`Rangeable`] / [`Modeable`].
@@ -119,11 +174,10 @@
 //! # Wire-format compatibility
 //!
 //! Every wrapper carries `#[serde(transparent)]` so the JSON
-//! representation matches the unwrapped primitive. Existing
-//! snapshot files (`.hst.zst`) keep deserializing once
-//! [`crate::host_state::ThreadState`] migrates from raw `u64` to
-//! these newtypes (phase 2 of the migration; see the task
-//! sequence on issue #52).
+//! representation matches the unwrapped primitive. The
+//! [`crate::host_state::ThreadState`] migration to these
+//! newtypes (phase 2) preserves wire format — existing
+//! snapshot files (`.hst.zst`) deserialize unchanged.
 //!
 //! # What this module is NOT
 //!
@@ -141,7 +195,9 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Pure monotonic counter — only ever goes up over a thread's
-/// lifetime. Sum across a group, delta across snapshots.
+/// lifetime, accumulated by the kernel from thread birth to the
+/// moment of the procfs read. Sum across a group; delta across
+/// snapshots scopes the value to the inter-capture interval.
 ///
 /// Examples in [`crate::host_state_compare::HOST_STATE_METRICS`]:
 /// `nr_wakeups`, `nr_migrations`, `voluntary_csw`,
@@ -151,7 +207,7 @@ use serde::{Deserialize, Serialize};
 /// `nr_threads` is NOT in this category — it is a structural
 /// gauge that goes up AND down at runtime (threads spawn and
 /// exit), so it reduces by max across a group, not sum. See
-/// the gauge family note on [`GaugeNs`].
+/// [`GaugeCount`].
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -159,12 +215,35 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct MonotonicCount(pub u64);
 
-/// Cumulative-time counter, nanoseconds. Same shape as
+/// Cumulative-time counter, nanoseconds, accumulated by the
+/// kernel from thread birth. Same temporal-window shape as
 /// [`MonotonicCount`] but tagged for the ns auto-scale ladder
 /// (ns → µs → ms → s).
 ///
 /// Examples: `run_time_ns`, `wait_time_ns`, `wait_sum`,
 /// `sleep_sum`, `block_sum`, `iowait_sum`, `core_forceidle_sum`.
+/// Cross-field ratios (e.g.
+/// `run_time_ns / (run_time_ns + wait_time_ns)`) are valid
+/// because every [`MonotonicNs`] field on
+/// [`crate::host_state::ThreadState`] is integrated over the
+/// same thread-lifetime window.
+///
+/// # u64 backing vs kernel s64
+///
+/// Some kernel sources for these values are typed `s64` —
+/// `sum_sleep_runtime` and `sum_block_runtime` live in
+/// `struct sched_statistics` (`include/linux/sched.h`) as
+/// `s64`. The capture pipeline parses these via
+/// `parsed_ns_from_dotted` in [`crate::host_state`], which
+/// returns `None` on negative dotted values; the capture-site
+/// `unwrap_or(0)` then collapses `None` to zero before the
+/// wrapper is constructed. The `u64` backing here is therefore
+/// safe because the parser path guarantees non-negative input
+/// — NOT because the kernel field type promises non-negative.
+/// Any new writer that bypasses `parsed_ns_from_dotted` must
+/// replicate its non-negative guard. A future capture-side
+/// change that exposes raw kernel s64 directly would need a
+/// sentinel-aware wrapper or a dedicated `SignedNs` newtype.
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -172,15 +251,17 @@ pub struct MonotonicCount(pub u64);
 #[serde(transparent)]
 pub struct MonotonicNs(pub u64);
 
-/// USER_HZ-scaled tick counter. The kernel exposes user-mode and
-/// kernel-mode CPU time, plus delayacct blkio delay, in ticks of
-/// the userspace-visible `USER_HZ` frequency. Auto-scale ladder
-/// is `ticks → Kticks → Mticks` (decimal SI), kept distinct from
+/// USER_HZ-scaled tick counter, accumulated by the kernel from
+/// thread birth. The kernel exposes user-mode and kernel-mode
+/// CPU time, plus delayacct blkio delay, in ticks of the
+/// userspace-visible `USER_HZ` frequency. Auto-scale ladder is
+/// `ticks → Kticks → Mticks` (decimal SI), kept distinct from
 /// ns and bytes so the rendered cell carries the correct unit
 /// suffix.
 ///
 /// Examples: `utime_clock_ticks`, `stime_clock_ticks`,
-/// `delayacct_blkio_ticks`.
+/// `delayacct_blkio_ticks`. Same lifetime-window contract as
+/// [`MonotonicNs`]; sum across a group, delta across snapshots.
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -189,10 +270,14 @@ pub struct MonotonicNs(pub u64);
 pub struct ClockTicks(pub u64);
 
 /// Byte count, IEC-binary auto-scaled
-/// (`B → KiB → MiB → GiB → TiB`).
+/// (`B → KiB → MiB → GiB → TiB`). Accumulated by the kernel
+/// (or jemalloc, for the per-thread TSD allocator counters)
+/// from thread birth.
 ///
 /// Examples: `allocated_bytes`, `deallocated_bytes`, `rchar`,
-/// `wchar`, `read_bytes`, `write_bytes`.
+/// `wchar`, `read_bytes`, `write_bytes`. Same lifetime-window
+/// contract as [`MonotonicNs`]; sum across a group, delta
+/// across snapshots.
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -203,15 +288,33 @@ pub struct Bytes(pub u64);
 /// Lifetime high-water mark, nanoseconds. The kernel updates
 /// these as a max-against-prior in `update_stats_*` /
 /// `update_se` / `set_next_entity` paths
-/// (`kernel/sched/stats.c`, `kernel/sched/fair.c`). Group
-/// reduction takes max across contributors so the rendered cell
-/// surfaces the worst single window any thread experienced.
+/// (`kernel/sched/stats.c`, `kernel/sched/fair.c`); the value
+/// at any procfs read is the largest single window the thread
+/// has accumulated since its birth. Group reduction takes max
+/// across contributors so the rendered cell surfaces the worst
+/// single window any thread experienced over its lifetime.
 ///
 /// Summing peaks across threads is a category error — does not
 /// implement [`Summable`]. Implements [`Maxable`].
 ///
 /// Examples: `wait_max`, `sleep_max`, `block_max`, `exec_max`,
 /// `slice_max`.
+///
+/// # u64 backing vs kernel s64
+///
+/// Of the `*_max` schedstat fields, only `exec_max` is typed
+/// `s64` in `struct sched_statistics`
+/// (`include/linux/sched.h`); `wait_max`, `sleep_max`,
+/// `block_max`, and `slice_max` are `u64`. The capture pipeline
+/// parses every dotted-ms.ns value via `parsed_ns_from_dotted`
+/// in [`crate::host_state`], which returns `None` on negative
+/// dotted values; the capture-site `unwrap_or(0)` then collapses
+/// `None` to zero before the wrapper is constructed. The `u64`
+/// backing here is therefore safe even for `exec_max` because
+/// the parser path guarantees non-negative input — NOT because
+/// every kernel-side field promises non-negative. Any new
+/// writer that bypasses `parsed_ns_from_dotted` must replicate
+/// its non-negative guard.
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -225,7 +328,12 @@ pub struct PeakNs(pub u64);
 /// `fair_slice_ns` reads the per-thread `slice` line from
 /// `/proc/<tid>/sched`, which carries the scheduler's current
 /// timeslice for the task — a point-in-time reading, not a
-/// high-water mark.
+/// thread-lifetime accumulator. Cross-field ratios with
+/// [`MonotonicNs`] / [`MonotonicCount`] / etc. produce a
+/// quantity with mixed temporal interpretation (numerator
+/// integrates from thread birth, denominator samples the
+/// present), so callers should treat such ratios as a
+/// rough hint rather than a well-defined fraction.
 ///
 /// Group reduction takes max across contributors. Sum across
 /// threads is a category error — does not implement [`Summable`].
@@ -236,6 +344,36 @@ pub struct PeakNs(pub u64);
 )]
 #[serde(transparent)]
 pub struct GaugeNs(pub u64);
+
+/// Gauge-family unitless count (u64). Distinct from
+/// [`MonotonicCount`]: a [`MonotonicCount`] only ever goes UP
+/// over a thread's lifetime (integrated from birth), while a
+/// [`GaugeCount`] is sampled at capture time and can go up AND
+/// down at runtime as the underlying state changes. Distinct
+/// from [`GaugeNs`]: same Maxable-only contract, but renders as
+/// a unitless count rather than a nanosecond ladder.
+///
+/// `nr_threads` (the process-wide thread count from
+/// `signal_struct->nr_threads`) is the canonical example —
+/// threads spawn and exit, so the value is not monotonic.
+/// Summing thread counts across a group is meaningless (a bucket
+/// of N threads sharing a tgid would over-count their parent
+/// process N-fold); the registry reduces by Max so the rendered
+/// cell shows "the largest process represented in this bucket."
+///
+/// Routing this kind of field through [`GaugeNs`] would render
+/// it on the ns auto-scale ladder — a unit lie. The dedicated
+/// type makes the intent explicit at the field declaration and
+/// lets the format dispatch in phase 4 pick the unitless ladder
+/// instead.
+///
+/// Implements [`Maxable`]. Does NOT implement [`Summable`].
+#[repr(transparent)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct GaugeCount(pub u64);
 
 /// Bounded ordinal scalar (i32). Range-aggregated across a
 /// group: the cell carries the observed `[min, max]` interval,
@@ -257,9 +395,17 @@ pub struct GaugeNs(pub u64);
 pub struct OrdinalI32(pub i32);
 
 /// Bounded ordinal scalar (u32). Same range-aggregation contract
-/// as [`OrdinalI32`] but for unsigned 32-bit fields. No registry
-/// metric uses this width today; reserved for phase-2 migration
-/// targets that need an unsigned 32-bit ordinal.
+/// as [`OrdinalI32`] but for unsigned 32-bit fields.
+///
+/// Example: `rt_priority` (real-time priority, bounded 0..99 in
+/// practice for SCHED_FIFO / SCHED_RR). The kernel declares
+/// `unsigned int task_struct::rt_priority` at
+/// `include/linux/sched.h`; emitted by procfs via
+/// `seq_put_decimal_ull(m, " ", task->rt_priority)` at
+/// `fs/proc/array.c:637`. A `u32` matches the kernel field width
+/// exactly — narrower than the historical `u64` parse path
+/// because no plausible kernel-side rt_priority value exceeds
+/// `u32::MAX`.
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -268,14 +414,9 @@ pub struct OrdinalI32(pub i32);
 pub struct OrdinalU32(pub u32);
 
 /// Bounded ordinal scalar (u64). Same range-aggregation contract
-/// as [`OrdinalI32`] but for unsigned 64-bit fields.
-///
-/// Example: `rt_priority` (real-time priority, bounded 0..99 in
-/// practice for SCHED_FIFO / SCHED_RR; stored as `u64` in
-/// [`crate::host_state::ThreadState`] because
-/// `/proc/<tid>/stat` field 40 is parsed via the same
-/// `parse::<u64>()` path as the other unsigned schedstat
-/// fields).
+/// as [`OrdinalI32`] but for unsigned 64-bit fields. No registry
+/// metric uses this width today; reserved for future ordinal
+/// metrics whose kernel-side type genuinely exceeds `u32::MAX`.
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -287,13 +428,16 @@ pub struct OrdinalU64(pub u64);
 /// mode (most-frequent value); ties break alphabetically per the
 /// existing `aggregate(AggRule::Mode, ...)` rule.
 ///
-/// Examples: `policy` (SCHED_OTHER, SCHED_FIFO, SCHED_RR,
-/// SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT), `state`
-/// (R, S, D, Z, T, etc.). The `ext_enabled` bool field is
-/// coerced through `String` via `Display` at the
-/// `AggRule::Mode` accessor — this wrapper does not currently
-/// hold a dedicated `bool` form because the codebase has only
-/// one bool-valued metric.
+/// `policy` (SCHED_OTHER, SCHED_FIFO, SCHED_RR, SCHED_BATCH,
+/// SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT) is the only
+/// [`CategoricalString`] field on
+/// [`crate::host_state::ThreadState`] after phase 2. The
+/// `state: char` and `ext_enabled: bool` fields stay unwrapped
+/// — the `AggRule::Mode` accessor coerces them through `String`
+/// via `to_string()`/`Display` at the call site. If a second
+/// bool-valued metric appears, promote both to a dedicated
+/// `CategoricalBool` wrapper rather than continuing the ad-hoc
+/// coercion.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CategoricalString(pub String);
@@ -337,6 +481,7 @@ impl_u64_newtype_from!(ClockTicks);
 impl_u64_newtype_from!(Bytes);
 impl_u64_newtype_from!(PeakNs);
 impl_u64_newtype_from!(GaugeNs);
+impl_u64_newtype_from!(GaugeCount);
 
 impl From<i32> for OrdinalI32 {
     fn from(v: i32) -> Self {
@@ -399,26 +544,74 @@ impl From<CpuSet> for Vec<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// `Display` — delegate to the underlying primitive so the
+// auto-scale ladder (phase 4) and ad-hoc `format!("{}", ...)`
+// callers can render a wrapped value as a bare integer / string
+// without unwrapping `.0`. Wrappers carry semantic category, not
+// formatting policy: a unit-aware render path is the format
+// dispatch in phase 4, which consults the registry's `unit` tag
+// rather than the wrapper type. `Display` here is the
+// minimal pass-through.
+// ---------------------------------------------------------------------------
+
+macro_rules! impl_display_passthrough {
+    ($t:ident) => {
+        impl std::fmt::Display for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Display::fmt(&self.0, f)
+            }
+        }
+    };
+}
+
+impl_display_passthrough!(MonotonicCount);
+impl_display_passthrough!(MonotonicNs);
+impl_display_passthrough!(ClockTicks);
+impl_display_passthrough!(Bytes);
+impl_display_passthrough!(PeakNs);
+impl_display_passthrough!(GaugeNs);
+impl_display_passthrough!(GaugeCount);
+impl_display_passthrough!(OrdinalI32);
+impl_display_passthrough!(OrdinalU32);
+impl_display_passthrough!(OrdinalU64);
+impl_display_passthrough!(CategoricalString);
+
+// CpuSet has no canonical Display — the rendered form depends
+// on whether the call site wants `format_cpu_range` ("0-3,5"
+// collapsed runs) or a verbatim debug list. Callers reach for
+// `cpuset.0` and feed it through the appropriate renderer.
+
+// ---------------------------------------------------------------------------
 // Marker traits + reductions
 // ---------------------------------------------------------------------------
 
 /// Private sealing module: the supertraits live here so a
 /// downstream crate cannot bypass the category invariant by
 /// writing `impl Summable for PeakNs`. Adding a new Summable
-/// (or Maxable) requires editing this module — the choke point
-/// the type system creates.
+/// (or Maxable, Modeable, Rangeable) requires editing this
+/// module — the choke point the type system creates.
 mod sealed {
     /// Sealed supertrait of [`super::Summable`].
     pub trait SummableSealed {}
     /// Sealed supertrait of [`super::Maxable`].
     pub trait MaxableSealed {}
+    /// Sealed supertrait of [`super::Modeable`].
+    pub trait ModeableSealed {}
+    /// Sealed supertrait of [`super::Rangeable`].
+    pub trait RangeableSealed {}
 }
 
 /// Marker for newtypes that can be summed across a group.
 ///
 /// Implemented by [`MonotonicCount`], [`MonotonicNs`],
-/// [`ClockTicks`], and [`Bytes`]. Deliberately NOT implemented by
-/// [`PeakNs`] / [`GaugeNs`] / [`OrdinalI32`] / [`OrdinalU32`] /
+/// [`ClockTicks`], and [`Bytes`] — every newtype whose value is
+/// a thread-lifetime accumulator. Summing two such accumulators
+/// across a group is well-defined because both contributors
+/// carry the same temporal window (each thread's lifetime),
+/// and the group total represents the same window union.
+///
+/// Deliberately NOT implemented by [`PeakNs`] / [`GaugeNs`] /
+/// [`GaugeCount`] / [`OrdinalI32`] / [`OrdinalU32`] /
 /// [`OrdinalU64`] / [`CategoricalString`] / [`CpuSet`] — those
 /// reductions are category errors and a generic site bound on
 /// `T: Summable` will reject them at compile time.
@@ -432,6 +625,17 @@ mod sealed {
 /// counters are non-negative u64s, the group total cannot exceed
 /// `u64::MAX`, and a hostile or corrupt reading that would push
 /// the sum past `u64::MAX` saturates rather than wrapping.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not Summable — summing it would conflate semantic categories \
+               or temporal windows",
+    label = "this metric type cannot be summed across a group",
+    note = "PeakNs (lifetime high-water): use Maxable::max_across; \
+            GaugeNs/GaugeCount (instantaneous samples — different temporal window than the \
+            lifetime accumulators): use Maxable::max_across; \
+            OrdinalI32/OrdinalU32/OrdinalU64 (bounded scalars): use Rangeable::range_across; \
+            CategoricalString: use Modeable::mode_across; CpuSet: use the \
+            AffinitySummary reduction in host_state_compare"
+)]
 pub trait Summable: sealed::SummableSealed + Sized + Copy {
     fn sum_across(items: impl IntoIterator<Item = Self>) -> Self;
 }
@@ -440,11 +644,15 @@ pub trait Summable: sealed::SummableSealed + Sized + Copy {
 /// group.
 ///
 /// Implemented by every [`Summable`] (max-of-counter answers
-/// "what's the biggest single contributor's value" — well-defined
-/// even for cumulative counters), plus [`PeakNs`] (max-of-peak is
-/// the worst high-water mark any contributor saw) and
+/// "what's the biggest single thread-lifetime accumulator any
+/// contributor reported" — well-defined even for cumulative
+/// counters), plus [`PeakNs`] (max-of-peak is the worst
+/// high-water mark any contributor saw across its lifetime),
 /// [`GaugeNs`] (max-of-gauge is the longest current value in
-/// the bucket).
+/// the bucket — distinct temporal window: each gauge is a
+/// fresh sample at capture time, not a lifetime accumulator),
+/// and [`GaugeCount`] (max-of-count is the biggest current
+/// value in the bucket — same gauge-window caveat).
 ///
 /// Deliberately NOT implemented by ordinals (those carry a
 /// `[min, max]` range, not a single max), nor by
@@ -455,6 +663,13 @@ pub trait Summable: sealed::SummableSealed + Sized + Copy {
 /// Sealed via [`sealed::MaxableSealed`]: a downstream crate
 /// cannot write `impl Maxable for CategoricalString` because the
 /// sealed supertrait is private to this module.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not Maxable — `max` is undefined for this category",
+    label = "this metric type does not support max-across",
+    note = "OrdinalI32/OrdinalU32/OrdinalU64: use Rangeable::range_across; \
+            CategoricalString: use Modeable::mode_across; CpuSet: use the \
+            AffinitySummary reduction in host_state_compare"
+)]
 pub trait Maxable: sealed::MaxableSealed + Sized + Copy + Ord {
     fn max_across(items: impl IntoIterator<Item = Self>) -> Self;
 }
@@ -468,7 +683,18 @@ pub trait Maxable: sealed::MaxableSealed + Sized + Copy + Ord {
 /// [`crate::host_state_compare::aggregate`]
 /// [`crate::host_state_compare::AggRule::Mode`] contract:
 /// "lexicographically smaller wins" for equal-frequency strings.
-pub trait Modeable: Sized + Clone + Eq + Ord {
+///
+/// Sealed via [`sealed::ModeableSealed`]: a downstream crate
+/// cannot write `impl Modeable for u64` because the sealed
+/// supertrait is private to this module.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not Modeable — Modeable is reserved for CategoricalString in this codebase",
+    label = "this metric type does not support mode-across",
+    note = "CategoricalString is the only Modeable type today. Numeric types use Summable / \
+            Maxable / Rangeable depending on category. If a new categorical newtype \
+            needs mode-aggregation, add the impl in metric_types.rs."
+)]
+pub trait Modeable: sealed::ModeableSealed + Sized + Clone + Eq + Ord {
     /// Returns `(mode_value, count, total)` over the input
     /// iterator, or `None` when the iterator is empty.
     fn mode_across(items: impl IntoIterator<Item = Self>) -> Option<(Self, usize, usize)> {
@@ -508,7 +734,18 @@ pub trait Modeable: Sized + Clone + Eq + Ord {
 /// [`OrdinalU64`].
 ///
 /// `range_across` returns `None` on an empty iterator.
-pub trait Rangeable: Sized + Copy + Ord {
+///
+/// Sealed via [`sealed::RangeableSealed`]: a downstream crate
+/// cannot write `impl Rangeable for u64` because the sealed
+/// supertrait is private to this module.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not Rangeable — Rangeable is reserved for bounded ordinals in this codebase",
+    label = "this metric type does not support range-across",
+    note = "Counters/peaks/gauges: use Summable::sum_across or Maxable::max_across; \
+            CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary \
+            reduction in host_state_compare"
+)]
+pub trait Rangeable: sealed::RangeableSealed + Sized + Copy + Ord {
     fn range_across(items: impl IntoIterator<Item = Self>) -> Option<(Self, Self)> {
         let mut it = items.into_iter();
         let first = it.next()?;
@@ -583,11 +820,16 @@ macro_rules! impl_maxable_only_u64 {
 
 impl_maxable_only_u64!(PeakNs);
 impl_maxable_only_u64!(GaugeNs);
+impl_maxable_only_u64!(GaugeCount);
 
+impl sealed::RangeableSealed for OrdinalI32 {}
+impl sealed::RangeableSealed for OrdinalU32 {}
+impl sealed::RangeableSealed for OrdinalU64 {}
 impl Rangeable for OrdinalI32 {}
 impl Rangeable for OrdinalU32 {}
 impl Rangeable for OrdinalU64 {}
 
+impl sealed::ModeableSealed for CategoricalString {}
 impl Modeable for CategoricalString {}
 
 #[cfg(test)]
@@ -653,11 +895,19 @@ mod tests {
     }
 
     #[test]
+    fn gauge_count_from_u64_roundtrips() {
+        let v: GaugeCount = 16u64.into();
+        assert_eq!(v.0, 16);
+        let back: u64 = v.into();
+        assert_eq!(back, 16);
+    }
+
+    #[test]
     fn ordinal_u32_from_u32_roundtrips() {
-        let v: OrdinalU32 = 256u32.into();
-        assert_eq!(v.0, 256);
+        let v: OrdinalU32 = 99u32.into();
+        assert_eq!(v.0, 99);
         let back: u32 = v.into();
-        assert_eq!(back, 256);
+        assert_eq!(back, 99);
     }
 
     #[test]
@@ -728,14 +978,16 @@ mod tests {
     }
 
     /// Compile-time gate: counters implement Summable; PeakNs /
-    /// GaugeNs / ordinals / categoricals do NOT. The static
-    /// `assert_summable<T>()` helper compiles only when the type
-    /// satisfies `T: Summable`, so this test pins the four
-    /// counter newtypes by exercising the bound. The negative
-    /// assertion — that `assert_summable::<PeakNs>()` fails to
-    /// compile — is enforced by the [`sealed::SummableSealed`]
-    /// supertrait and the omission of `impl SummableSealed for
-    /// PeakNs`. Adding it would require an explicit edit to this
+    /// GaugeNs / GaugeCount / ordinals / categoricals do NOT.
+    /// The static `assert_summable<T>()` helper compiles only
+    /// when the type satisfies `T: Summable`, so this test pins
+    /// the four counter newtypes by exercising the bound. The
+    /// negative assertion — that `assert_summable::<PeakNs>()`,
+    /// `assert_summable::<GaugeNs>()`,
+    /// `assert_summable::<GaugeCount>()` etc. fail to compile —
+    /// is enforced by the [`sealed::SummableSealed`] supertrait
+    /// and the omission of those `impl SummableSealed` lines.
+    /// Adding any one would require an explicit edit to this
     /// module's `impl_summable_maxable_u64!` invocations.
     #[test]
     fn summable_only_implemented_for_counters() {
@@ -760,6 +1012,13 @@ mod tests {
         let xs = [GaugeNs(7), GaugeNs(99), GaugeNs(50)];
         let m = GaugeNs::max_across(xs);
         assert_eq!(m, GaugeNs(99));
+    }
+
+    #[test]
+    fn maxable_gauge_count_picks_largest() {
+        let xs = [GaugeCount(3), GaugeCount(11), GaugeCount(7)];
+        let m = GaugeCount::max_across(xs);
+        assert_eq!(m, GaugeCount(11));
     }
 
     #[test]
@@ -793,6 +1052,7 @@ mod tests {
         assert_maxable::<Bytes>();
         assert_maxable::<PeakNs>();
         assert_maxable::<GaugeNs>();
+        assert_maxable::<GaugeCount>();
     }
 
     // -- Rangeable ------------------------------------------------------------
@@ -896,8 +1156,8 @@ mod tests {
     // -- repr(transparent) wire compatibility --------------------------------
 
     /// Serde transparent: every newtype must serialize identically
-    /// to its primitive. Pin the JSON shape so the future
-    /// ThreadState migration (phase 2) doesn't break existing
+    /// to its primitive. Pin the JSON shape so the
+    /// `ThreadState` migration (phase 2) preserves existing
     /// snapshot files.
     #[test]
     fn serde_transparent_matches_primitive() {
@@ -925,13 +1185,17 @@ mod tests {
         let raw_gauge_json = serde_json::to_string(&raw_gauge).expect("serialize");
         assert_eq!(raw_gauge_json, "7500000");
 
+        let raw_gauge_count = GaugeCount(16);
+        let raw_gauge_count_json = serde_json::to_string(&raw_gauge_count).expect("serialize");
+        assert_eq!(raw_gauge_count_json, "16");
+
         let raw_ordi = OrdinalI32(-5);
         let raw_ordi_json = serde_json::to_string(&raw_ordi).expect("serialize");
         assert_eq!(raw_ordi_json, "-5");
 
-        let raw_ordu32 = OrdinalU32(256);
+        let raw_ordu32 = OrdinalU32(99);
         let raw_ordu32_json = serde_json::to_string(&raw_ordu32).expect("serialize");
-        assert_eq!(raw_ordu32_json, "256");
+        assert_eq!(raw_ordu32_json, "99");
 
         let raw_ordu64 = OrdinalU64(99);
         let raw_ordu64_json = serde_json::to_string(&raw_ordu64).expect("serialize");
@@ -976,6 +1240,7 @@ mod tests {
         assert_eq!(size_of::<Bytes>(), size_of::<u64>());
         assert_eq!(size_of::<PeakNs>(), size_of::<u64>());
         assert_eq!(size_of::<GaugeNs>(), size_of::<u64>());
+        assert_eq!(size_of::<GaugeCount>(), size_of::<u64>());
         assert_eq!(size_of::<OrdinalI32>(), size_of::<i32>());
         assert_eq!(size_of::<OrdinalU32>(), size_of::<u32>());
         assert_eq!(size_of::<OrdinalU64>(), size_of::<u64>());
@@ -992,6 +1257,7 @@ mod tests {
         assert_eq!(Bytes::default(), Bytes(0));
         assert_eq!(PeakNs::default(), PeakNs(0));
         assert_eq!(GaugeNs::default(), GaugeNs(0));
+        assert_eq!(GaugeCount::default(), GaugeCount(0));
         assert_eq!(OrdinalI32::default(), OrdinalI32(0));
         assert_eq!(OrdinalU32::default(), OrdinalU32(0));
         assert_eq!(OrdinalU64::default(), OrdinalU64(0));

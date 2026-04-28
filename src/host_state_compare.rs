@@ -301,7 +301,11 @@ pub struct HostStateMetricDef {
     /// - `"CONFIG_TASK_IO_ACCOUNTING"` — gates the per-task
     ///   I/O accounting fields exposed by `/proc/<tid>/io`
     ///   (`rchar`, `wchar`, `syscr`, `syscw`, `read_bytes`,
-    ///   `write_bytes`).
+    ///   `write_bytes`). The kernel emits all 6 fields under
+    ///   one `do_io_accounting` call, and CONFIG_TASK_IO_ACCOUNTING
+    ///   `depends on` CONFIG_TASK_XACCT in `init/Kconfig` — so
+    ///   from the procfs-reader perspective the file is
+    ///   all-or-nothing.
     pub config_gates: &'static [&'static str],
     /// True for kernel counters that are exposed in `/proc`
     /// but never incremented anywhere in the kernel tree —
@@ -341,7 +345,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "policy",
         unit: "",
-        rule: AggRule::Mode(|t| t.policy.clone()),
+        rule: AggRule::Mode(|t| t.policy.0.clone()),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -350,7 +354,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nice",
         unit: "",
-        rule: AggRule::OrdinalRange(|t| t.nice as i64),
+        rule: AggRule::OrdinalRange(|t| t.nice.0 as i64),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -365,7 +369,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "priority",
         unit: "",
-        rule: AggRule::OrdinalRange(|t| t.priority as i64),
+        rule: AggRule::OrdinalRange(|t| t.priority.0 as i64),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -379,7 +383,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "rt_priority",
         unit: "",
-        rule: AggRule::OrdinalRange(|t| t.rt_priority as i64),
+        rule: AggRule::OrdinalRange(|t| t.rt_priority.0 as i64),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -388,7 +392,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "cpu_affinity",
         unit: "",
-        rule: AggRule::Affinity(|t| t.cpu_affinity.clone()),
+        rule: AggRule::Affinity(|t| t.cpu_affinity.0.clone()),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -397,7 +401,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "processor",
         unit: "",
-        rule: AggRule::OrdinalRange(|t| t.processor as i64),
+        rule: AggRule::OrdinalRange(|t| t.processor.0 as i64),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -439,7 +443,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_threads",
         unit: "",
-        rule: AggRule::Max(|t| t.nr_threads),
+        rule: AggRule::Max(|t| t.nr_threads.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -452,7 +456,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "run_time_ns",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.run_time_ns),
+        rule: AggRule::Sum(|t| t.run_time_ns.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_INFO"],
         is_dead: false,
@@ -464,7 +468,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wait_time_ns",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.wait_time_ns),
+        rule: AggRule::Sum(|t| t.wait_time_ns.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_INFO"],
         is_dead: false,
@@ -475,7 +479,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "timeslices",
         unit: "",
-        rule: AggRule::Sum(|t| t.timeslices),
+        rule: AggRule::Sum(|t| t.timeslices.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_INFO"],
         is_dead: false,
@@ -484,7 +488,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "voluntary_csw",
         unit: "",
-        rule: AggRule::Sum(|t| t.voluntary_csw),
+        rule: AggRule::Sum(|t| t.voluntary_csw.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -493,7 +497,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nonvoluntary_csw",
         unit: "",
-        rule: AggRule::Sum(|t| t.nonvoluntary_csw),
+        rule: AggRule::Sum(|t| t.nonvoluntary_csw.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -508,7 +512,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups),
+        rule: AggRule::Sum(|t| t.nr_wakeups.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -517,7 +521,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_local",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_local),
+        rule: AggRule::Sum(|t| t.nr_wakeups_local.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -526,7 +530,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_remote",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_remote),
+        rule: AggRule::Sum(|t| t.nr_wakeups_remote.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -535,7 +539,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_sync",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_sync),
+        rule: AggRule::Sum(|t| t.nr_wakeups_sync.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -544,7 +548,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_migrate",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_migrate),
+        rule: AggRule::Sum(|t| t.nr_wakeups_migrate.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -558,7 +562,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_idle",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_idle),
+        rule: AggRule::Sum(|t| t.nr_wakeups_idle.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: true,
@@ -573,7 +577,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_passive",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_passive),
+        rule: AggRule::Sum(|t| t.nr_wakeups_passive.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: true,
@@ -589,7 +593,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_affine",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_affine),
+        rule: AggRule::Sum(|t| t.nr_wakeups_affine.0),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -598,7 +602,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_affine_attempts",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_affine_attempts),
+        rule: AggRule::Sum(|t| t.nr_wakeups_affine_attempts.0),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -610,7 +614,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_migrations",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_migrations),
+        rule: AggRule::Sum(|t| t.nr_migrations.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -623,7 +627,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_migrations_cold",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_migrations_cold),
+        rule: AggRule::Sum(|t| t.nr_migrations_cold.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: true,
@@ -635,7 +639,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_forced_migrations",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_forced_migrations),
+        rule: AggRule::Sum(|t| t.nr_forced_migrations.0),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -647,7 +651,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_failed_migrations_affine",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_failed_migrations_affine),
+        rule: AggRule::Sum(|t| t.nr_failed_migrations_affine.0),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -656,7 +660,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_failed_migrations_running",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_failed_migrations_running),
+        rule: AggRule::Sum(|t| t.nr_failed_migrations_running.0),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -665,7 +669,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_failed_migrations_hot",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_failed_migrations_hot),
+        rule: AggRule::Sum(|t| t.nr_failed_migrations_hot.0),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -685,7 +689,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wait_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.wait_sum),
+        rule: AggRule::Sum(|t| t.wait_sum.0),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -694,7 +698,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wait_count",
         unit: "",
-        rule: AggRule::Sum(|t| t.wait_count),
+        rule: AggRule::Sum(|t| t.wait_count.0),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -703,7 +707,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wait_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.wait_max),
+        rule: AggRule::Max(|t| t.wait_max.0),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -725,7 +729,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "sleep_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.sleep_sum),
+        rule: AggRule::Sum(|t| t.sleep_sum.0),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -734,7 +738,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "sleep_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.sleep_max),
+        rule: AggRule::Max(|t| t.sleep_max.0),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -746,7 +750,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "block_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.block_sum),
+        rule: AggRule::Sum(|t| t.block_sum.0),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -755,7 +759,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "block_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.block_max),
+        rule: AggRule::Max(|t| t.block_max.0),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -767,7 +771,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "iowait_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.iowait_sum),
+        rule: AggRule::Sum(|t| t.iowait_sum.0),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -776,7 +780,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "iowait_count",
         unit: "",
-        rule: AggRule::Sum(|t| t.iowait_count),
+        rule: AggRule::Sum(|t| t.iowait_count.0),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -797,7 +801,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "delayacct_blkio_ticks",
         unit: "ticks",
-        rule: AggRule::Sum(|t| t.delayacct_blkio_ticks),
+        rule: AggRule::Sum(|t| t.delayacct_blkio_ticks.0),
         sched_class: None,
         config_gates: &["CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
@@ -811,7 +815,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "exec_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.exec_max),
+        rule: AggRule::Max(|t| t.exec_max.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -824,7 +828,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "slice_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.slice_max),
+        rule: AggRule::Max(|t| t.slice_max.0),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -846,7 +850,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "core_forceidle_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.core_forceidle_sum),
+        rule: AggRule::Sum(|t| t.core_forceidle_sum.0),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_CORE", "CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -867,7 +871,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "fair_slice_ns",
         unit: "ns",
-        rule: AggRule::Max(|t| t.fair_slice_ns),
+        rule: AggRule::Max(|t| t.fair_slice_ns.0),
         sched_class: Some("fair-policy"),
         config_gates: &[],
         is_dead: false,
@@ -877,7 +881,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "allocated_bytes",
         unit: "B",
-        rule: AggRule::Sum(|t| t.allocated_bytes),
+        rule: AggRule::Sum(|t| t.allocated_bytes.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -886,7 +890,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "deallocated_bytes",
         unit: "B",
-        rule: AggRule::Sum(|t| t.deallocated_bytes),
+        rule: AggRule::Sum(|t| t.deallocated_bytes.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -895,7 +899,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "minflt",
         unit: "",
-        rule: AggRule::Sum(|t| t.minflt),
+        rule: AggRule::Sum(|t| t.minflt.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -904,7 +908,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "majflt",
         unit: "",
-        rule: AggRule::Sum(|t| t.majflt),
+        rule: AggRule::Sum(|t| t.majflt.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -913,7 +917,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "utime_clock_ticks",
         unit: "ticks",
-        rule: AggRule::Sum(|t| t.utime_clock_ticks),
+        rule: AggRule::Sum(|t| t.utime_clock_ticks.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -922,18 +926,23 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "stime_clock_ticks",
         unit: "ticks",
-        rule: AggRule::Sum(|t| t.stime_clock_ticks),
+        rule: AggRule::Sum(|t| t.stime_clock_ticks.0),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
         description: "Kernel-mode CPU time, USER_HZ ticks; /proc/<tid>/stat field 15.",
     },
-    // I/O — every per-task IO field exposed via
-    // `/proc/<tid>/io` is gated by CONFIG_TASK_IO_ACCOUNTING.
+    // I/O — `/proc/<tid>/io` is emitted by
+    // `do_io_accounting` (`fs/proc/base.c`) under a single
+    // `CONFIG_TASK_IO_ACCOUNTING` gate, and CONFIG_TASK_IO_ACCOUNTING
+    // `depends on` CONFIG_TASK_XACCT in init/Kconfig — so from
+    // the capture-pipeline perspective the file is
+    // all-or-nothing. All 6 fields share the same
+    // `CONFIG_TASK_IO_ACCOUNTING` gate.
     HostStateMetricDef {
         name: "rchar",
         unit: "B",
-        rule: AggRule::Sum(|t| t.rchar),
+        rule: AggRule::Sum(|t| t.rchar.0),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -942,7 +951,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wchar",
         unit: "B",
-        rule: AggRule::Sum(|t| t.wchar),
+        rule: AggRule::Sum(|t| t.wchar.0),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -951,7 +960,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "syscr",
         unit: "",
-        rule: AggRule::Sum(|t| t.syscr),
+        rule: AggRule::Sum(|t| t.syscr.0),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -960,7 +969,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "syscw",
         unit: "",
-        rule: AggRule::Sum(|t| t.syscw),
+        rule: AggRule::Sum(|t| t.syscw.0),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -969,7 +978,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "read_bytes",
         unit: "B",
-        rule: AggRule::Sum(|t| t.read_bytes),
+        rule: AggRule::Sum(|t| t.read_bytes.0),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -978,7 +987,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "write_bytes",
         unit: "B",
-        rule: AggRule::Sum(|t| t.write_bytes),
+        rule: AggRule::Sum(|t| t.write_bytes.0),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -1925,7 +1934,7 @@ fn collect_smaps_rollup(snap: &HostStateSnapshot) -> BTreeMap<String, BTreeMap<S
         let key = format!("{}[{}]", t.pcomm, t.tgid);
         let bytes_map: BTreeMap<String, u64> = t
             .smaps_rollup_bytes()
-            .map(|(k, b)| (k.clone(), b))
+            .map(|(k, b)| (k.clone(), b.0))
             .collect();
         out.insert(key, bytes_map);
     }
@@ -4700,6 +4709,11 @@ fn psi_resource_has_data(r: &PsiResource) -> bool {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::metric_types::{
+        Bytes, CategoricalString, ClockTicks, CpuSet, GaugeCount, GaugeNs, MonotonicCount,
+        MonotonicNs, OrdinalI32, OrdinalU64, PeakNs,
+    };
 
     fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
         ThreadState {
@@ -4709,9 +4723,9 @@ mod tests {
             comm: comm.into(),
             cgroup: "/".into(),
             start_time_clock_ticks: 0,
-            policy: "SCHED_OTHER".into(),
-            nice: 0,
-            cpu_affinity: vec![0, 1, 2, 3],
+            policy: CategoricalString("SCHED_OTHER".into()),
+            nice: OrdinalI32(0),
+            cpu_affinity: CpuSet(vec![0, 1, 2, 3]),
             ..ThreadState::default()
         }
     }
@@ -4752,10 +4766,10 @@ mod tests {
     #[test]
     fn sum_aggregation_totals_across_group() {
         let mut a = make_thread("app", "w1");
-        a.run_time_ns = 1_000;
+        a.run_time_ns = MonotonicNs(1_000);
         let mut b = make_thread("app", "w2");
-        b.run_time_ns = 3_000;
-        let v = aggregate(AggRule::Sum(|t| t.run_time_ns), &[&a, &b]);
+        b.run_time_ns = MonotonicNs(3_000);
+        let v = aggregate(AggRule::Sum(|t| t.run_time_ns.0), &[&a, &b]);
         match v {
             Aggregated::Sum(s) => assert_eq!(s, 4_000),
             other => panic!("expected Sum, got {other:?}"),
@@ -4765,10 +4779,10 @@ mod tests {
     #[test]
     fn sum_saturates_on_overflow() {
         let mut a = make_thread("app", "w1");
-        a.run_time_ns = u64::MAX;
+        a.run_time_ns = MonotonicNs(u64::MAX);
         let mut b = make_thread("app", "w2");
-        b.run_time_ns = 5;
-        let v = aggregate(AggRule::Sum(|t| t.run_time_ns), &[&a, &b]);
+        b.run_time_ns = MonotonicNs(5);
+        let v = aggregate(AggRule::Sum(|t| t.run_time_ns.0), &[&a, &b]);
         match v {
             Aggregated::Sum(s) => assert_eq!(s, u64::MAX),
             other => panic!("expected Sum, got {other:?}"),
@@ -4778,10 +4792,10 @@ mod tests {
     #[test]
     fn ordinal_range_picks_extremes() {
         let mut a = make_thread("app", "w1");
-        a.nice = -5;
+        a.nice = OrdinalI32(-5);
         let mut b = make_thread("app", "w2");
-        b.nice = 10;
-        let v = aggregate(AggRule::OrdinalRange(|t| t.nice as i64), &[&a, &b]);
+        b.nice = OrdinalI32(10);
+        let v = aggregate(AggRule::OrdinalRange(|t| t.nice.0 as i64), &[&a, &b]);
         match v {
             Aggregated::OrdinalRange { min, max } => {
                 assert_eq!(min, -5);
@@ -4799,7 +4813,7 @@ mod tests {
         b.policy = "SCHED_OTHER".into();
         let mut c = make_thread("app", "w3");
         c.policy = "SCHED_FIFO".into();
-        let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &[&a, &b, &c]);
+        let v = aggregate(AggRule::Mode(|t| t.policy.0.clone()), &[&a, &b, &c]);
         match v {
             Aggregated::Mode {
                 value,
@@ -4818,7 +4832,7 @@ mod tests {
     fn affinity_uniform_preserves_cpuset() {
         let a = make_thread("app", "w1");
         let b = make_thread("app", "w2");
-        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.clone()), &[&a, &b]);
+        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.0.clone()), &[&a, &b]);
         match v {
             Aggregated::Affinity(s) => {
                 assert_eq!(s.min_cpus, 4);
@@ -4833,8 +4847,8 @@ mod tests {
     fn affinity_heterogeneous_drops_uniform() {
         let a = make_thread("app", "w1");
         let mut b = make_thread("app", "w2");
-        b.cpu_affinity = vec![4, 5];
-        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.clone()), &[&a, &b]);
+        b.cpu_affinity = CpuSet(vec![4, 5]);
+        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.0.clone()), &[&a, &b]);
         match v {
             Aggregated::Affinity(s) => {
                 assert_eq!(s.min_cpus, 2);
@@ -4872,9 +4886,9 @@ mod tests {
     #[test]
     fn compare_emits_rows_for_matched_groups() {
         let mut ta = make_thread("app", "w1");
-        ta.run_time_ns = 1_000;
+        ta.run_time_ns = MonotonicNs(1_000);
         let mut tb = make_thread("app", "w1");
-        tb.run_time_ns = 2_000;
+        tb.run_time_ns = MonotonicNs(2_000);
         let a = snap_with(vec![ta]);
         let b = snap_with(vec![tb]);
         let diff = compare(&a, &b, &CompareOptions::default());
@@ -4903,13 +4917,13 @@ mod tests {
         // "big" swings 10x, "small" swings 1.1x. After compare,
         // the "big" row must sort before "small".
         let mut a1 = make_thread("big", "w");
-        a1.run_time_ns = 100;
+        a1.run_time_ns = MonotonicNs(100);
         let mut a2 = make_thread("small", "w");
-        a2.run_time_ns = 1_000;
+        a2.run_time_ns = MonotonicNs(1_000);
         let mut b1 = make_thread("big", "w");
-        b1.run_time_ns = 1_000;
+        b1.run_time_ns = MonotonicNs(1_000);
         let mut b2 = make_thread("small", "w");
-        b2.run_time_ns = 1_100;
+        b2.run_time_ns = MonotonicNs(1_100);
         let diff = compare(
             &snap_with(vec![a1, a2]),
             &snap_with(vec![b1, b2]),
@@ -4928,10 +4942,10 @@ mod tests {
     fn group_by_cgroup_applies_flatten_patterns() {
         let mut ta = make_thread("app", "w1");
         ta.cgroup = "/kubepods/pod-xxx/workload".into();
-        ta.run_time_ns = 1_000;
+        ta.run_time_ns = MonotonicNs(1_000);
         let mut tb = make_thread("app", "w1");
         tb.cgroup = "/kubepods/pod-yyy/workload".into();
-        tb.run_time_ns = 2_000;
+        tb.run_time_ns = MonotonicNs(2_000);
         let opts = CompareOptions {
             group_by: GroupBy::Cgroup.into(),
             cgroup_flatten: vec!["/kubepods/*/workload".into()],
@@ -5010,9 +5024,9 @@ mod tests {
         // still appear (the absolute-delta inflation in sort_key
         // keeps it visible).
         let mut ta = make_thread("app", "w1");
-        ta.run_time_ns = 0;
+        ta.run_time_ns = MonotonicNs(0);
         let mut tb = make_thread("app", "w1");
-        tb.run_time_ns = 100;
+        tb.run_time_ns = MonotonicNs(100);
         let diff = compare(
             &snap_with(vec![ta]),
             &snap_with(vec![tb]),
@@ -5073,8 +5087,8 @@ mod tests {
     #[test]
     fn identical_snapshots_produce_zero_deltas() {
         let mut t = make_thread("app", "w1");
-        t.run_time_ns = 1_000;
-        t.voluntary_csw = 50;
+        t.run_time_ns = MonotonicNs(1_000);
+        t.voluntary_csw = MonotonicCount(50);
         let snap = snap_with(vec![t]);
         let diff = compare(&snap, &snap, &CompareOptions::default());
         // `Aggregated::Mode { .. } => None` (line ~465) gates the
@@ -5114,7 +5128,7 @@ mod tests {
     fn single_thread_group_yields_one_row_per_metric() {
         let a = make_thread("solo", "t");
         let mut b = make_thread("solo", "t");
-        b.run_time_ns = 1;
+        b.run_time_ns = MonotonicNs(1);
         let diff = compare(
             &snap_with(vec![a]),
             &snap_with(vec![b]),
@@ -5152,13 +5166,13 @@ mod tests {
     #[test]
     fn group_by_comm_aggregates_across_processes() {
         let mut ta = make_thread("procA", "worker");
-        ta.run_time_ns = 100;
+        ta.run_time_ns = MonotonicNs(100);
         let mut tb = make_thread("procB", "worker");
-        tb.run_time_ns = 200;
+        tb.run_time_ns = MonotonicNs(200);
         let mut candidate = make_thread("procA", "worker");
-        candidate.run_time_ns = 500;
+        candidate.run_time_ns = MonotonicNs(500);
         let mut candidate2 = make_thread("procB", "worker");
-        candidate2.run_time_ns = 500;
+        candidate2.run_time_ns = MonotonicNs(500);
         let diff = compare(
             &snap_with(vec![ta, tb]),
             &snap_with(vec![candidate, candidate2]),
@@ -5662,53 +5676,68 @@ mod tests {
     /// would catch itself.
     #[test]
     fn sum_metric_accessors_read_expected_field() {
+        use crate::metric_types::{Bytes, ClockTicks, MonotonicCount, MonotonicNs};
         type MetricSetter = fn(&mut ThreadState);
         let cases: &[(&str, MetricSetter)] = &[
-            ("run_time_ns", |t| t.run_time_ns = 1),
-            ("wait_time_ns", |t| t.wait_time_ns = 1),
-            ("timeslices", |t| t.timeslices = 1),
-            ("voluntary_csw", |t| t.voluntary_csw = 1),
-            ("nonvoluntary_csw", |t| t.nonvoluntary_csw = 1),
-            ("nr_wakeups", |t| t.nr_wakeups = 1),
-            ("nr_wakeups_local", |t| t.nr_wakeups_local = 1),
-            ("nr_wakeups_remote", |t| t.nr_wakeups_remote = 1),
-            ("nr_wakeups_sync", |t| t.nr_wakeups_sync = 1),
-            ("nr_wakeups_migrate", |t| t.nr_wakeups_migrate = 1),
-            ("nr_wakeups_idle", |t| t.nr_wakeups_idle = 1),
-            ("nr_wakeups_affine", |t| t.nr_wakeups_affine = 1),
-            ("nr_wakeups_affine_attempts", |t| {
-                t.nr_wakeups_affine_attempts = 1
+            ("run_time_ns", |t| t.run_time_ns = MonotonicNs(1)),
+            ("wait_time_ns", |t| t.wait_time_ns = MonotonicNs(1)),
+            ("timeslices", |t| t.timeslices = MonotonicCount(1)),
+            ("voluntary_csw", |t| t.voluntary_csw = MonotonicCount(1)),
+            ("nonvoluntary_csw", |t| {
+                t.nonvoluntary_csw = MonotonicCount(1)
             }),
-            ("nr_migrations", |t| t.nr_migrations = 1),
-            ("nr_migrations_cold", |t| t.nr_migrations_cold = 1),
-            ("nr_forced_migrations", |t| t.nr_forced_migrations = 1),
+            ("nr_wakeups", |t| t.nr_wakeups = MonotonicCount(1)),
+            ("nr_wakeups_local", |t| {
+                t.nr_wakeups_local = MonotonicCount(1)
+            }),
+            ("nr_wakeups_remote", |t| {
+                t.nr_wakeups_remote = MonotonicCount(1)
+            }),
+            ("nr_wakeups_sync", |t| t.nr_wakeups_sync = MonotonicCount(1)),
+            ("nr_wakeups_migrate", |t| {
+                t.nr_wakeups_migrate = MonotonicCount(1)
+            }),
+            ("nr_wakeups_idle", |t| t.nr_wakeups_idle = MonotonicCount(1)),
+            ("nr_wakeups_affine", |t| {
+                t.nr_wakeups_affine = MonotonicCount(1)
+            }),
+            ("nr_wakeups_affine_attempts", |t| {
+                t.nr_wakeups_affine_attempts = MonotonicCount(1)
+            }),
+            ("nr_migrations", |t| t.nr_migrations = MonotonicCount(1)),
+            ("nr_migrations_cold", |t| {
+                t.nr_migrations_cold = MonotonicCount(1)
+            }),
+            ("nr_forced_migrations", |t| {
+                t.nr_forced_migrations = MonotonicCount(1)
+            }),
             ("nr_failed_migrations_affine", |t| {
-                t.nr_failed_migrations_affine = 1
+                t.nr_failed_migrations_affine = MonotonicCount(1)
             }),
             ("nr_failed_migrations_running", |t| {
-                t.nr_failed_migrations_running = 1
+                t.nr_failed_migrations_running = MonotonicCount(1)
             }),
             ("nr_failed_migrations_hot", |t| {
-                t.nr_failed_migrations_hot = 1
+                t.nr_failed_migrations_hot = MonotonicCount(1)
             }),
-            ("wait_sum", |t| t.wait_sum = 1),
-            ("wait_count", |t| t.wait_count = 1),
-            ("sleep_sum", |t| t.sleep_sum = 1),
-            ("block_sum", |t| t.block_sum = 1),
-            ("iowait_sum", |t| t.iowait_sum = 1),
-            ("iowait_count", |t| t.iowait_count = 1),
-            ("allocated_bytes", |t| t.allocated_bytes = 1),
-            ("deallocated_bytes", |t| t.deallocated_bytes = 1),
-            ("minflt", |t| t.minflt = 1),
-            ("majflt", |t| t.majflt = 1),
-            ("utime_clock_ticks", |t| t.utime_clock_ticks = 1),
-            ("stime_clock_ticks", |t| t.stime_clock_ticks = 1),
-            ("rchar", |t| t.rchar = 1),
-            ("wchar", |t| t.wchar = 1),
-            ("syscr", |t| t.syscr = 1),
-            ("syscw", |t| t.syscw = 1),
-            ("read_bytes", |t| t.read_bytes = 1),
-            ("write_bytes", |t| t.write_bytes = 1),
+            ("wait_sum", |t| t.wait_sum = MonotonicNs(1)),
+            ("wait_count", |t| t.wait_count = MonotonicCount(1)),
+            ("sleep_sum", |t| t.sleep_sum = MonotonicNs(1)),
+            ("block_sum", |t| t.block_sum = MonotonicNs(1)),
+            ("iowait_sum", |t| t.iowait_sum = MonotonicNs(1)),
+            ("iowait_count", |t| t.iowait_count = MonotonicCount(1)),
+            ("allocated_bytes", |t| t.allocated_bytes = Bytes(1)),
+            ("deallocated_bytes", |t| t.deallocated_bytes = Bytes(1)),
+            ("minflt", |t| t.minflt = MonotonicCount(1)),
+            ("majflt", |t| t.majflt = MonotonicCount(1)),
+            ("utime_clock_ticks", |t| t.utime_clock_ticks = ClockTicks(1)),
+            ("stime_clock_ticks", |t| t.stime_clock_ticks = ClockTicks(1)),
+            ("rchar", |t| t.rchar = Bytes(1)),
+            ("wchar", |t| t.wchar = Bytes(1)),
+            ("syscr", |t| t.syscr = MonotonicCount(1)),
+            ("syscw", |t| t.syscw = MonotonicCount(1)),
+            ("read_bytes", |t| t.read_bytes = Bytes(1)),
+            ("write_bytes", |t| t.write_bytes = Bytes(1)),
         ];
         for (name, set) in cases {
             let mut t = make_thread("p", "w");
@@ -6012,7 +6041,10 @@ mod tests {
             ("majflt", None, &[], false),
             ("utime_clock_ticks", None, &[], false),
             ("stime_clock_ticks", None, &[], false),
-            // I/O
+            // I/O — all 6 fields share CONFIG_TASK_IO_ACCOUNTING
+            // (the kernel emits /proc/<tid>/io as a single block
+            // under that gate; CONFIG_TASK_IO_ACCOUNTING `depends
+            // on` CONFIG_TASK_XACCT in init/Kconfig).
             ("rchar", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
             ("wchar", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
             ("syscr", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
@@ -6099,9 +6131,9 @@ mod tests {
     #[test]
     fn write_diff_renders_tagged_metric_cell() {
         let mut a = make_thread("p", "w");
-        a.nr_wakeups_affine = 5;
+        a.nr_wakeups_affine = MonotonicCount(5);
         let mut b = make_thread("p", "w");
-        b.nr_wakeups_affine = 9;
+        b.nr_wakeups_affine = MonotonicCount(9);
         let diff = compare(
             &snap_with(vec![a]),
             &snap_with(vec![b]),
@@ -6131,9 +6163,9 @@ mod tests {
     #[test]
     fn write_diff_renders_non_ext_metric_cell() {
         let mut a = make_thread("p", "w");
-        a.wait_sum = 100;
+        a.wait_sum = MonotonicNs(100);
         let mut b = make_thread("p", "w");
-        b.wait_sum = 200;
+        b.wait_sum = MonotonicNs(200);
         let diff = compare(
             &snap_with(vec![a]),
             &snap_with(vec![b]),
@@ -6161,9 +6193,9 @@ mod tests {
     #[test]
     fn write_diff_renders_is_dead_metric_cell() {
         let mut a = make_thread("p", "w");
-        a.nr_wakeups_idle = 0;
+        a.nr_wakeups_idle = MonotonicCount(0);
         let mut b = make_thread("p", "w");
-        b.nr_wakeups_idle = 0;
+        b.nr_wakeups_idle = MonotonicCount(0);
         let diff = compare(
             &snap_with(vec![a]),
             &snap_with(vec![b]),
@@ -6194,13 +6226,13 @@ mod tests {
     /// column-set tests below.
     fn snap_pair_for_display() -> (HostStateSnapshot, HostStateSnapshot) {
         let mut a = make_thread("p", "w");
-        a.run_time_ns = 100;
-        a.wait_count = 4;
-        a.wait_sum = 1000;
+        a.run_time_ns = MonotonicNs(100);
+        a.wait_count = MonotonicCount(4);
+        a.wait_sum = MonotonicNs(1000);
         let mut b = make_thread("p", "w");
-        b.run_time_ns = 200;
-        b.wait_count = 4;
-        b.wait_sum = 2000;
+        b.run_time_ns = MonotonicNs(200);
+        b.wait_count = MonotonicCount(4);
+        b.wait_sum = MonotonicNs(2000);
         (snap_with(vec![a]), snap_with(vec![b]))
     }
 
@@ -6633,8 +6665,8 @@ mod tests {
     #[test]
     fn derived_affine_success_ratio_formula() {
         let mut t = make_thread("p", "w");
-        t.nr_wakeups_affine = 7;
-        t.nr_wakeups_affine_attempts = 10;
+        t.nr_wakeups_affine = MonotonicCount(7);
+        t.nr_wakeups_affine_attempts = MonotonicCount(10);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6655,8 +6687,8 @@ mod tests {
     #[test]
     fn derived_avg_wait_ns_formula() {
         let mut t = make_thread("p", "w");
-        t.wait_sum = 1000;
-        t.wait_count = 4;
+        t.wait_sum = MonotonicNs(1000);
+        t.wait_count = MonotonicCount(4);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6675,8 +6707,8 @@ mod tests {
     #[test]
     fn derived_voluntary_sleep_sum_subtracts_block() {
         let mut t = make_thread("p", "w");
-        t.sleep_sum = 1000;
-        t.block_sum = 300;
+        t.sleep_sum = MonotonicNs(1000);
+        t.block_sum = MonotonicNs(300);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6695,8 +6727,8 @@ mod tests {
     #[test]
     fn derived_voluntary_sleep_clamps_negative_to_zero() {
         let mut t = make_thread("p", "w");
-        t.sleep_sum = 100;
-        t.block_sum = 200;
+        t.sleep_sum = MonotonicNs(100);
+        t.block_sum = MonotonicNs(200);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6715,8 +6747,8 @@ mod tests {
     #[test]
     fn derived_cpu_efficiency_formula() {
         let mut t = make_thread("p", "w");
-        t.run_time_ns = 100;
-        t.wait_time_ns = 100;
+        t.run_time_ns = MonotonicNs(100);
+        t.wait_time_ns = MonotonicNs(100);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6735,8 +6767,8 @@ mod tests {
     #[test]
     fn derived_avg_slice_ns_formula() {
         let mut t = make_thread("p", "w");
-        t.run_time_ns = 4000;
-        t.timeslices = 8;
+        t.run_time_ns = MonotonicNs(4000);
+        t.timeslices = MonotonicCount(8);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6754,8 +6786,8 @@ mod tests {
     #[test]
     fn derived_involuntary_csw_ratio_formula() {
         let mut t = make_thread("p", "w");
-        t.voluntary_csw = 75;
-        t.nonvoluntary_csw = 25;
+        t.voluntary_csw = MonotonicCount(75);
+        t.nonvoluntary_csw = MonotonicCount(25);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6774,8 +6806,8 @@ mod tests {
     #[test]
     fn derived_disk_io_fraction_formula() {
         let mut t = make_thread("p", "w");
-        t.rchar = 10_000;
-        t.read_bytes = 2_500;
+        t.rchar = Bytes(10_000);
+        t.read_bytes = Bytes(2_500);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6795,8 +6827,8 @@ mod tests {
     #[test]
     fn derived_live_heap_estimate_signed() {
         let mut t = make_thread("p", "w");
-        t.allocated_bytes = 1000;
-        t.deallocated_bytes = 1500;
+        t.allocated_bytes = Bytes(1000);
+        t.deallocated_bytes = Bytes(1500);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6815,8 +6847,8 @@ mod tests {
     #[test]
     fn derived_avg_iowait_ns_formula() {
         let mut t = make_thread("p", "w");
-        t.iowait_sum = 9000;
-        t.iowait_count = 3;
+        t.iowait_sum = MonotonicNs(9000);
+        t.iowait_count = MonotonicCount(3);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6837,25 +6869,25 @@ mod tests {
     fn derived_division_by_zero_returns_none() {
         let mut t = make_thread("p", "w");
         // affine_attempts == 0 → ratio is None
-        t.nr_wakeups_affine = 0;
-        t.nr_wakeups_affine_attempts = 0;
+        t.nr_wakeups_affine = MonotonicCount(0);
+        t.nr_wakeups_affine_attempts = MonotonicCount(0);
         // wait_count == 0 → avg_wait_ns is None
-        t.wait_sum = 0;
-        t.wait_count = 0;
+        t.wait_sum = MonotonicNs(0);
+        t.wait_count = MonotonicCount(0);
         // run + wait == 0 → cpu_efficiency is None
-        t.run_time_ns = 0;
-        t.wait_time_ns = 0;
+        t.run_time_ns = MonotonicNs(0);
+        t.wait_time_ns = MonotonicNs(0);
         // timeslices == 0 → avg_slice_ns is None
-        t.timeslices = 0;
+        t.timeslices = MonotonicCount(0);
         // vcsw + nvcsw == 0 → involuntary_csw_ratio is None
-        t.voluntary_csw = 0;
-        t.nonvoluntary_csw = 0;
+        t.voluntary_csw = MonotonicCount(0);
+        t.nonvoluntary_csw = MonotonicCount(0);
         // rchar == 0 → disk_io_fraction is None
-        t.rchar = 0;
-        t.read_bytes = 0;
+        t.rchar = Bytes(0);
+        t.read_bytes = Bytes(0);
         // iowait_count == 0 → avg_iowait_ns is None
-        t.iowait_sum = 0;
-        t.iowait_count = 0;
+        t.iowait_sum = MonotonicNs(0);
+        t.iowait_count = MonotonicCount(0);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -6894,11 +6926,11 @@ mod tests {
     #[test]
     fn write_diff_derived_ratio_suppresses_pct() {
         let mut a = make_thread("p", "w");
-        a.nr_wakeups_affine = 50;
-        a.nr_wakeups_affine_attempts = 100; // ratio = 0.5
+        a.nr_wakeups_affine = MonotonicCount(50);
+        a.nr_wakeups_affine_attempts = MonotonicCount(100); // ratio = 0.5
         let mut b = make_thread("p", "w");
-        b.nr_wakeups_affine = 60;
-        b.nr_wakeups_affine_attempts = 100; // ratio = 0.6
+        b.nr_wakeups_affine = MonotonicCount(60);
+        b.nr_wakeups_affine_attempts = MonotonicCount(100); // ratio = 0.6
         let diff = compare(
             &snap_with(vec![a]),
             &snap_with(vec![b]),
@@ -6925,11 +6957,11 @@ mod tests {
     #[test]
     fn write_diff_derived_ns_keeps_pct() {
         let mut a = make_thread("p", "w");
-        a.wait_sum = 1000;
-        a.wait_count = 10; // avg = 100ns
+        a.wait_sum = MonotonicNs(1000);
+        a.wait_count = MonotonicCount(10); // avg = 100ns
         let mut b = make_thread("p", "w");
-        b.wait_sum = 1500;
-        b.wait_count = 10; // avg = 150ns
+        b.wait_sum = MonotonicNs(1500);
+        b.wait_count = MonotonicCount(10); // avg = 150ns
         let diff = compare(
             &snap_with(vec![a]),
             &snap_with(vec![b]),
@@ -6958,8 +6990,8 @@ mod tests {
     #[test]
     fn write_diff_emits_derived_section() {
         let mut t = make_thread("p", "w");
-        t.run_time_ns = 1000;
-        t.timeslices = 4;
+        t.run_time_ns = MonotonicNs(1000);
+        t.timeslices = MonotonicCount(4);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
@@ -7140,20 +7172,20 @@ mod tests {
         // Descending sort puts "high" first.
         let mut high_a = make_thread("p", "w");
         high_a.pcomm = "high".to_string();
-        high_a.wait_sum = 100;
-        high_a.wait_count = 1;
+        high_a.wait_sum = MonotonicNs(100);
+        high_a.wait_count = MonotonicCount(1);
         let mut high_b = make_thread("p", "w");
         high_b.pcomm = "high".to_string();
-        high_b.wait_sum = 300;
-        high_b.wait_count = 1;
+        high_b.wait_sum = MonotonicNs(300);
+        high_b.wait_count = MonotonicCount(1);
         let mut low_a = make_thread("p", "w");
         low_a.pcomm = "low".to_string();
-        low_a.wait_sum = 100;
-        low_a.wait_count = 1;
+        low_a.wait_sum = MonotonicNs(100);
+        low_a.wait_count = MonotonicCount(1);
         let mut low_b = make_thread("p", "w");
         low_b.pcomm = "low".to_string();
-        low_b.wait_sum = 150;
-        low_b.wait_count = 1;
+        low_b.wait_sum = MonotonicNs(150);
+        low_b.wait_count = MonotonicCount(1);
         let opts = CompareOptions {
             sort_by: vec![SortKey {
                 metric: "avg_wait_ns",
@@ -7316,7 +7348,7 @@ mod tests {
         a.policy = "SCHED_FIFO".into();
         let mut b = make_thread("app", "w2");
         b.policy = "SCHED_OTHER".into();
-        let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &[&a, &b]);
+        let v = aggregate(AggRule::Mode(|t| t.policy.0.clone()), &[&a, &b]);
         match v {
             Aggregated::Mode { value, count, .. } => {
                 assert_eq!(value, "SCHED_FIFO");
@@ -7334,7 +7366,7 @@ mod tests {
     #[test]
     fn affinity_aggregate_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.clone()), &empty);
+        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.0.clone()), &empty);
         match v {
             Aggregated::Affinity(s) => {
                 assert_eq!(s.min_cpus, 0);
@@ -7547,9 +7579,9 @@ mod tests {
     #[test]
     fn write_diff_delta_cell_has_plus_minus_sign() {
         let mut ta = make_thread("app", "w");
-        ta.run_time_ns = 100;
+        ta.run_time_ns = MonotonicNs(100);
         let mut tb = make_thread("app", "w");
-        tb.run_time_ns = 50;
+        tb.run_time_ns = MonotonicNs(50);
         let diff = compare(
             &snap_with(vec![ta]),
             &snap_with(vec![tb]),
@@ -7609,13 +7641,13 @@ mod tests {
     #[test]
     fn load_compare_render_pipeline_end_to_end() {
         let mut a = make_thread("e2e_proc", "thread_a");
-        a.run_time_ns = 1_000_000;
-        a.voluntary_csw = 10;
+        a.run_time_ns = MonotonicNs(1_000_000);
+        a.voluntary_csw = MonotonicCount(10);
         a.policy = "SCHED_OTHER".into();
         let snap_a = snap_with(vec![a]);
         let mut b = make_thread("e2e_proc", "thread_a");
-        b.run_time_ns = 3_000_000;
-        b.voluntary_csw = 30;
+        b.run_time_ns = MonotonicNs(3_000_000);
+        b.voluntary_csw = MonotonicCount(30);
         b.policy = "SCHED_FIFO".into();
         let snap_b = snap_with(vec![b]);
 
@@ -7875,13 +7907,13 @@ mod tests {
         // Same percentage swing, distinct group keys "alpha" and
         // "bravo". Both rise 1_000 → 2_000 (+100%).
         let mut a1 = make_thread("alpha", "w");
-        a1.run_time_ns = 1_000;
+        a1.run_time_ns = MonotonicNs(1_000);
         let mut a2 = make_thread("bravo", "w");
-        a2.run_time_ns = 1_000;
+        a2.run_time_ns = MonotonicNs(1_000);
         let mut b1 = make_thread("alpha", "w");
-        b1.run_time_ns = 2_000;
+        b1.run_time_ns = MonotonicNs(2_000);
         let mut b2 = make_thread("bravo", "w");
-        b2.run_time_ns = 2_000;
+        b2.run_time_ns = MonotonicNs(2_000);
         let diff = compare(
             &snap_with(vec![a1, a2]),
             &snap_with(vec![b1, b2]),
@@ -7917,14 +7949,14 @@ mod tests {
     fn sort_key_zero_delta_rows_sink_below_nonzero() {
         // Group "calm": identical values → delta 0, pct 0.0.
         let mut a1 = make_thread("calm", "w");
-        a1.run_time_ns = 500;
+        a1.run_time_ns = MonotonicNs(500);
         let mut b1 = make_thread("calm", "w");
-        b1.run_time_ns = 500;
+        b1.run_time_ns = MonotonicNs(500);
         // Group "birth": baseline 0 → candidate 100 → delta 100,
         // pct undefined (None). sort_key inflates to 100 * 1e9.
         let a2 = make_thread("birth", "w");
         let mut b2 = make_thread("birth", "w");
-        b2.run_time_ns = 100;
+        b2.run_time_ns = MonotonicNs(100);
         let diff = compare(
             &snap_with(vec![a1, a2]),
             &snap_with(vec![b1, b2]),
@@ -7957,10 +7989,10 @@ mod tests {
     #[test]
     fn sort_key_none_delta_rows_sink_to_bottom() {
         let mut a = make_thread("app", "w");
-        a.run_time_ns = 100;
+        a.run_time_ns = MonotonicNs(100);
         a.policy = "SCHED_OTHER".into();
         let mut b = make_thread("app", "w");
-        b.run_time_ns = 200;
+        b.run_time_ns = MonotonicNs(200);
         b.policy = "SCHED_FIFO".into();
         let diff = compare(
             &snap_with(vec![a]),
@@ -7994,7 +8026,7 @@ mod tests {
     #[test]
     fn aggregate_ordinal_range_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::OrdinalRange(|t| t.nice as i64), &empty);
+        let v = aggregate(AggRule::OrdinalRange(|t| t.nice.0 as i64), &empty);
         match v {
             Aggregated::OrdinalRange { min, max } => {
                 assert_eq!(min, 0);
@@ -8010,7 +8042,7 @@ mod tests {
     #[test]
     fn aggregate_mode_on_empty_threads_is_empty() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &empty);
+        let v = aggregate(AggRule::Mode(|t| t.policy.0.clone()), &empty);
         match v {
             Aggregated::Mode {
                 value,
@@ -8031,7 +8063,7 @@ mod tests {
     #[test]
     fn aggregate_sum_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::Sum(|t| t.run_time_ns), &empty);
+        let v = aggregate(AggRule::Sum(|t| t.run_time_ns.0), &empty);
         match v {
             Aggregated::Sum(s) => assert_eq!(s, 0),
             other => panic!("expected Sum, got {other:?}"),
@@ -8050,10 +8082,10 @@ mod tests {
         let mut a = make_thread("p", "w");
         let mut b = make_thread("p", "w");
         let mut c = make_thread("p", "w");
-        a.wait_max = 100;
-        b.wait_max = 999_999_999; // The clear group-wide tail.
-        c.wait_max = 50;
-        let v = aggregate(AggRule::Max(|t| t.wait_max), &[&a, &b, &c]);
+        a.wait_max = PeakNs(100);
+        b.wait_max = PeakNs(999_999_999); // The clear group-wide tail.
+        c.wait_max = PeakNs(50);
+        let v = aggregate(AggRule::Max(|t| t.wait_max.0), &[&a, &b, &c]);
         match v {
             Aggregated::Max(m) => {
                 assert_eq!(
@@ -8073,7 +8105,7 @@ mod tests {
     #[test]
     fn aggregate_max_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::Max(|t| t.wait_max), &empty);
+        let v = aggregate(AggRule::Max(|t| t.wait_max.0), &empty);
         match v {
             Aggregated::Max(m) => assert_eq!(m, 0),
             other => panic!("expected Max, got {other:?}"),
@@ -8087,8 +8119,8 @@ mod tests {
     #[test]
     fn aggregate_max_single_thread_returns_thread_value() {
         let mut t = make_thread("p", "w");
-        t.sleep_max = 12_345_678_901;
-        let v = aggregate(AggRule::Max(|t| t.sleep_max), &[&t]);
+        t.sleep_max = PeakNs(12_345_678_901);
+        let v = aggregate(AggRule::Max(|t| t.sleep_max.0), &[&t]);
         match v {
             Aggregated::Max(m) => assert_eq!(m, 12_345_678_901),
             other => panic!("expected Max, got {other:?}"),
@@ -8097,18 +8129,18 @@ mod tests {
 
     /// Each `*_max` metric in the registry reads the matching
     /// per-thread field — guards against a copy-paste mistake
-    /// like `Max(|t| t.wait_max)` for the `block_max` slot.
+    /// like `Max(|t| t.wait_max.0)` for the `block_max` slot.
     /// Mirrors `sum_metric_accessors_read_expected_field` for
     /// the Max family.
     #[test]
     fn max_metric_accessors_read_expected_field() {
         type MetricSetter = fn(&mut ThreadState);
         let cases: &[(&str, MetricSetter)] = &[
-            ("wait_max", |t| t.wait_max = 1),
-            ("sleep_max", |t| t.sleep_max = 1),
-            ("block_max", |t| t.block_max = 1),
-            ("exec_max", |t| t.exec_max = 1),
-            ("slice_max", |t| t.slice_max = 1),
+            ("wait_max", |t| t.wait_max = PeakNs(1)),
+            ("sleep_max", |t| t.sleep_max = PeakNs(1)),
+            ("block_max", |t| t.block_max = PeakNs(1)),
+            ("exec_max", |t| t.exec_max = PeakNs(1)),
+            ("slice_max", |t| t.slice_max = PeakNs(1)),
         ];
         for (name, set) in cases {
             let mut t = make_thread("p", "w");
@@ -8577,19 +8609,19 @@ mod tests {
         let mut threads = Vec::new();
         for i in 0..5 {
             let mut t = make_thread("app", &format!("worker-{i}"));
-            t.run_time_ns = 100 * (i as u64 + 1);
+            t.run_time_ns = MonotonicNs(100 * (i as u64 + 1));
             threads.push(t);
         }
         for i in 0..3 {
             let mut t = make_thread("app", &format!("redis-bg-{i}"));
-            t.run_time_ns = 50 * (i as u64 + 1);
+            t.run_time_ns = MonotonicNs(50 * (i as u64 + 1));
             threads.push(t);
         }
         let mut single = make_thread("app", "main");
-        single.run_time_ns = 999;
+        single.run_time_ns = MonotonicNs(999);
         threads.push(single);
 
-        let input_total: u64 = threads.iter().map(|t| t.run_time_ns).sum();
+        let input_total: u64 = threads.iter().map(|t| t.run_time_ns.0).sum();
         let snap = snap_with(threads);
         let groups = build_groups(&snap, GroupBy::Comm, &[], None, None, false);
 
@@ -9618,13 +9650,13 @@ mod tests {
     #[test]
     fn auto_scale_does_not_affect_sort_order() {
         let mut a_small = make_thread("small", "w");
-        a_small.run_time_ns = 100;
+        a_small.run_time_ns = MonotonicNs(100);
         let mut a_big = make_thread("big", "w");
-        a_big.run_time_ns = 1_000_000;
+        a_big.run_time_ns = MonotonicNs(1_000_000);
         let mut b_small = make_thread("small", "w");
-        b_small.run_time_ns = 110;
+        b_small.run_time_ns = MonotonicNs(110);
         let mut b_big = make_thread("big", "w");
-        b_big.run_time_ns = 2_000_000;
+        b_big.run_time_ns = MonotonicNs(2_000_000);
         let diff = compare(
             &snap_with(vec![a_small, a_big]),
             &snap_with(vec![b_small, b_big]),
@@ -9650,9 +9682,9 @@ mod tests {
     #[test]
     fn write_diff_renders_auto_scaled_cells_for_ns_metric() {
         let mut ta = make_thread("p", "w");
-        ta.run_time_ns = 5_000_000; // 5 ms
+        ta.run_time_ns = MonotonicNs(5_000_000); // 5 ms
         let mut tb = make_thread("p", "w");
-        tb.run_time_ns = 8_000_000; // 8 ms
+        tb.run_time_ns = MonotonicNs(8_000_000); // 8 ms
         let diff = compare(
             &snap_with(vec![ta]),
             &snap_with(vec![tb]),
@@ -10202,13 +10234,13 @@ mod tests {
     #[test]
     fn compare_uses_sort_by_when_set() {
         let mut a_pre = make_thread("alpha", "w");
-        a_pre.run_time_ns = 1_000_000_000; // 1B baseline → big abs but tiny pct change
+        a_pre.run_time_ns = MonotonicNs(1_000_000_000); // 1B baseline → big abs but tiny pct change
         let mut a_post = make_thread("alpha", "w");
-        a_post.run_time_ns = 1_000_000_500; // +500 abs; +5e-5 % change
+        a_post.run_time_ns = MonotonicNs(1_000_000_500); // +500 abs; +5e-5 % change
         let mut b_pre = make_thread("bravo", "w");
-        b_pre.run_time_ns = 100;
+        b_pre.run_time_ns = MonotonicNs(100);
         let mut b_post = make_thread("bravo", "w");
-        b_post.run_time_ns = 200; // +100 abs; +100% change
+        b_post.run_time_ns = MonotonicNs(200); // +100 abs; +100% change
         // Default sort: bravo wins by |delta_pct|. With
         // sort_by=run_time_ns:desc, alpha wins by absolute delta
         // (500 > 100).
@@ -10551,13 +10583,13 @@ mod tests {
         // `bravo` has 100 baseline, +100 delta → +100% delta_pct.
         // Default sort ranks by |delta_pct| desc → bravo first.
         let mut a_pre = make_thread("alpha", "w");
-        a_pre.run_time_ns = 1_000_000_000;
+        a_pre.run_time_ns = MonotonicNs(1_000_000_000);
         let mut a_post = make_thread("alpha", "w");
-        a_post.run_time_ns = 1_000_000_500;
+        a_post.run_time_ns = MonotonicNs(1_000_000_500);
         let mut b_pre = make_thread("bravo", "w");
-        b_pre.run_time_ns = 100;
+        b_pre.run_time_ns = MonotonicNs(100);
         let mut b_post = make_thread("bravo", "w");
-        b_post.run_time_ns = 200;
+        b_post.run_time_ns = MonotonicNs(200);
 
         // Empty sort_by → default delta_pct desc.
         let diff_default = compare(

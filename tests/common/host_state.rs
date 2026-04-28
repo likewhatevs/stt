@@ -17,12 +17,14 @@
 use std::collections::BTreeMap;
 
 use ktstr::host_state::{CgroupStats, HostStateSnapshot, ThreadState};
+use ktstr::metric_types::{CategoricalString, CpuSet};
 
 /// Build a `ThreadState` populated with sane defaults for
 /// integration tests: tid/tgid 1, the supplied pcomm/comm,
 /// root cgroup, `SCHED_OTHER` policy, and a 4-CPU affinity set.
 /// Callers mutate the returned struct further (e.g.
-/// `t.run_time_ns = 5_000_000`) before pushing into a snapshot.
+/// `t.run_time_ns = MonotonicNs(5_000_000)`) before pushing into
+/// a snapshot.
 #[allow(dead_code)]
 pub fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
     let mut t = ThreadState::default();
@@ -31,8 +33,8 @@ pub fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
     t.pcomm = pcomm.into();
     t.comm = comm.into();
     t.cgroup = "/".into();
-    t.policy = "SCHED_OTHER".into();
-    t.cpu_affinity = vec![0, 1, 2, 3];
+    t.policy = CategoricalString("SCHED_OTHER".into());
+    t.cpu_affinity = CpuSet(vec![0, 1, 2, 3]);
     t
 }
 

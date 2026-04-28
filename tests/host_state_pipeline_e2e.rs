@@ -363,14 +363,14 @@ fn host_state_pipeline_e2e_allocated_bytes_delta_survives_round_trip(
         .threads
         .iter()
         .filter(|t| t.tgid == worker1_pid)
-        .map(|t| t.allocated_bytes)
+        .map(|t| t.allocated_bytes.0)
         .max()
         .unwrap_or(0);
     let candidate_alloc: u64 = loaded_candidate
         .threads
         .iter()
         .filter(|t| t.tgid == worker2_pid)
-        .map(|t| t.allocated_bytes)
+        .map(|t| t.allocated_bytes.0)
         .max()
         .unwrap_or(0);
     if baseline_alloc < T3_KNOWN_BYTES {

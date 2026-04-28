@@ -415,6 +415,35 @@ const PARSE_KCONFIG_HINT: &str = "hint: schedstat / io read failures dominate �
                                   kernel may be built without CONFIG_SCHEDSTATS \
                                   and/or CONFIG_TASK_IO_ACCOUNTING";
 
+/// Absent-value sentinel for [`ThreadState::state`]. Used by both
+/// the manual [`Default`] impl on [`ThreadState`] and the
+/// `serde(default = ...)` attribute on the field so the absent
+/// state is `'~'` regardless of how a [`ThreadState`] gets
+/// constructed (default-built test fixture, partial JSON
+/// deserialize, capture-time `unwrap_or` fallback).
+///
+/// `'~'` (U+007E = 126) is chosen specifically because it sorts
+/// strictly AFTER every entry in `fs/proc/array.c::task_state_array`
+/// — `R` (82), `S` (83), `D` (68), `T` (84), `t` (116), `X`
+/// (88), `Z` (90), `P` (80), `I` (73) all have lower codepoints.
+/// [`crate::host_state_compare::aggregate`] breaks
+/// [`crate::host_state_compare::AggRule::Mode`] count-ties
+/// toward the LEX-SMALLEST candidate (the closure
+/// `a.1.cmp(&b.1).then(b.0.cmp(&a.0))` at the
+/// `aggregate(AggRule::Mode, ...)` call site), so a sentinel
+/// smaller than the real letters would HIJACK the tiebreak
+/// whenever a default-built thread sat alongside a real one in
+/// the same group. `'~'` is larger than all of them, so the
+/// real kernel letter always wins the tie.
+///
+/// `'?'` (U+003F = 63) was the obvious-looking pick but is
+/// numerically SMALLER than every state letter the kernel
+/// emits, which would make it a tiebreak hijacker rather than
+/// a safe sentinel. Avoid.
+fn default_state_char() -> char {
+    '~'
+}
+
 /// Per-thread cumulative resource profile.
 ///
 /// Populated by the capture layer from `/proc/<tid>/{sched,status,
@@ -423,7 +452,16 @@ const PARSE_KCONFIG_HINT: &str = "hint: schedstat / io read failures dominate �
 /// per-thread `tsd_s.thread_allocated` / `thread_deallocated` TLS
 /// counters. All numeric fields are cumulative since thread birth
 /// so the value is insensitive to probe-attach latency.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+///
+/// `Default` is implemented manually rather than derived because
+/// the [`Self::state`] field needs `'~'` (the absent-value
+/// sentinel) instead of `'\0'` (the `char` Default). See the
+/// field doc on [`Self::state`] for why: `'\0'` lex-compares
+/// SMALLER than every real kernel state letter, which would
+/// poison [`crate::host_state_compare::AggRule::Mode`]
+/// tie-breaks toward "absent" whenever a default-constructed
+/// thread sat alongside a real one in a group.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct ThreadState {
     // -- identity --
@@ -484,24 +522,43 @@ pub struct ThreadState {
     /// a future port must either restate the divisor or
     /// normalise at capture time. `fs/proc/array.c::do_task_stat`
     /// is where the kernel writes the field to procfs.
+    ///
+    /// Stored as raw `u64`, NOT wrapped in
+    /// [`crate::metric_types::ClockTicks`], because this field
+    /// is an identity / ghost-thread sentinel rather than a
+    /// metric that flows through the aggregation pipeline. The
+    /// ghost-filter in `capture_with` / `capture_pid_with`
+    /// keys on `start_time_clock_ticks == 0` (alongside an
+    /// empty `comm`) to drop `ThreadState`s assembled from a
+    /// tid that exited mid-capture, which is cleaner against a
+    /// raw `u64` than against a wrapped sentinel.
     pub start_time_clock_ticks: u64,
     /// Scheduling policy (SCHED_OTHER, SCHED_FIFO, SCHED_RR,
     /// SCHED_BATCH, SCHED_IDLE, SCHED_DEADLINE, SCHED_EXT). Stored
     /// as the canonical name string rather than the kernel
     /// integer so comparison output is human-readable without a
-    /// reverse-lookup table.
-    pub policy: String,
+    /// reverse-lookup table. Wrapped in
+    /// [`crate::metric_types::CategoricalString`] so the
+    /// aggregation pipeline reduces by mode (most-frequent value)
+    /// rather than a category-mismatched sum or max.
+    pub policy: crate::metric_types::CategoricalString,
     /// Nice value in the standard [-20, 19] range. Signed i32
     /// because the range includes negative values and
     /// [`parse_stat`] extracts the field via `get_i32` on
-    /// procfs's decimal text — the type matches the extraction
-    /// path and the kernel-visible range without coercion.
-    pub nice: i32,
+    /// procfs's decimal text — the inner type matches the
+    /// extraction path and the kernel-visible range without
+    /// coercion. Wrapped in [`crate::metric_types::OrdinalI32`]
+    /// so the aggregation pipeline reduces by `[min, max]` range
+    /// rather than sum.
+    pub nice: crate::metric_types::OrdinalI32,
     /// Allowed CPU set from `sched_getaffinity`. Sorted ascending.
     /// Comparison aggregates via union across the group and
     /// renders as "N cpus (range)" or "mixed" for heterogeneous
     /// sets — see [`crate::host_state_compare::AffinitySummary`].
-    pub cpu_affinity: Vec<u32>,
+    /// Wrapped in [`crate::metric_types::CpuSet`] so the
+    /// aggregation pipeline routes through the dedicated
+    /// affinity-summary reduction rather than a numeric path.
+    pub cpu_affinity: crate::metric_types::CpuSet,
 
     // -- task state (last-CPU, run-state) --
     /// Last CPU the thread executed on. `/proc/<tid>/stat` field
@@ -513,23 +570,43 @@ pub struct ThreadState {
     /// `seq_put_decimal_ll` widening to `s64`. `0` is the
     /// absent-value default (collisions with a legitimate CPU 0
     /// are distinguished by inspecting `cpu_affinity`).
-    pub processor: i32,
+    /// Wrapped in [`crate::metric_types::OrdinalI32`] so the
+    /// aggregation pipeline reduces by `[min, max]` range across
+    /// the group.
+    pub processor: crate::metric_types::OrdinalI32,
     /// Single-letter task state from `/proc/<tid>/status` `State:`
     /// line. Real kernel chars are `R`, `S`, `D`, `T`, `t`, `X`,
     /// `Z`, `P`, `I` (see `fs/proc/array.c::task_state_array`,
-    /// emitted via `get_task_state`). `'?'` is the absent-value
-    /// default — visually distinct from every real kernel char so
-    /// a downstream consumer can distinguish "no state read" from
-    /// a real value. When `'?'` appears in compare output, the
-    /// `/proc/<tid>/status` read failed (thread likely exited
-    /// mid-capture).
+    /// emitted via `get_task_state`). `'~'` is the absent-value
+    /// sentinel — visually distinct from every real kernel char
+    /// so a downstream consumer can distinguish "no state read"
+    /// from a real value. When `'~'` appears in compare output,
+    /// the `/proc/<tid>/status` read failed (thread likely
+    /// exited mid-capture).
     ///
-    /// `ThreadState::default()` produces `'\0'` (the `char`
-    /// default), NOT `'?'` — the `'?'` collapse only applies at
-    /// capture time inside `capture_thread_at_with_tally` via
-    /// `unwrap_or('?')`. A test that constructs `ThreadState`
-    /// directly via `Default::default()` and inspects `state` will
-    /// see `'\0'`, not `'?'`.
+    /// `ThreadState::default()`, the capture-time
+    /// `unwrap_or_else(default_state_char)` fallback, and
+    /// `serde(default)` deserialize of a partial JSON record all
+    /// produce `'~'` (NOT `'\0'`, the bare `char` Default). The
+    /// manual `Default` impl on `ThreadState`, the
+    /// `unwrap_or_else` site in `capture_thread_at_with_tally`,
+    /// and the `serde(default = ...)` attribute on this field
+    /// are paired specifically so the absent-value sentinel is
+    /// the same byte everywhere.
+    ///
+    /// `'~'` (U+007E = 126) is chosen so it sorts AFTER every
+    /// real kernel state letter — `R` (82), `S` (83), `D` (68),
+    /// `T` (84), `t` (116), `X` (88), `Z` (90), `P` (80), `I`
+    /// (73). [`crate::host_state_compare::AggRule::Mode`] breaks
+    /// count-ties toward the LEX-SMALLEST candidate, so a
+    /// sentinel smaller than the real letters would silently
+    /// elect "absent" whenever a default-built thread sat
+    /// alongside a real one in the same group. `'~'` being
+    /// larger than all of them lets the real letter win the
+    /// tie. The earlier `'?'` (U+003F = 63) sentinel was
+    /// numerically smaller than every real state letter — a
+    /// tiebreak hijacker; do not return to it.
+    #[serde(default = "default_state_char")]
     pub state: char,
 
     // -- scheduling (cumulative; /proc/<tid>/sched, needs CONFIG_SCHED_DEBUG) --
@@ -542,24 +619,64 @@ pub struct ThreadState {
     /// `false` on a task expected under sched_ext, the task may
     /// have been ejected (sched_ext fall-back to CFS on BPF error)
     /// or never enrolled.
+    ///
+    /// Stays a bare `bool` — not wrapped in a categorical newtype
+    /// — because it is the only bool-valued metric in the
+    /// registry. The
+    /// [`crate::host_state_compare::AggRule::Mode`] accessor
+    /// coerces it to a `String` via `to_string()`/`Display` at
+    /// the call site (see the
+    /// [`crate::metric_types::CategoricalString`] doc note: if a
+    /// second bool-valued metric appears, promote both to a
+    /// dedicated `CategoricalBool` wrapper rather than keeping
+    /// the ad-hoc coercion).
     pub ext_enabled: bool,
-    pub run_time_ns: u64,
-    pub wait_time_ns: u64,
-    pub timeslices: u64,
-    pub voluntary_csw: u64,
-    pub nonvoluntary_csw: u64,
-    pub nr_wakeups: u64,
-    pub nr_wakeups_local: u64,
-    pub nr_wakeups_remote: u64,
-    pub nr_wakeups_sync: u64,
-    pub nr_wakeups_migrate: u64,
-    pub nr_wakeups_idle: u64,
+    /// Cumulative on-CPU time, ns; `/proc/<tid>/schedstat`
+    /// field 1. `MonotonicNs` per the lifetime-accumulator
+    /// contract.
+    pub run_time_ns: crate::metric_types::MonotonicNs,
+    /// Cumulative time waiting on the runqueue, ns;
+    /// `/proc/<tid>/schedstat` field 2. `MonotonicNs`.
+    pub wait_time_ns: crate::metric_types::MonotonicNs,
+    /// Number of times the task was scheduled onto a CPU;
+    /// `/proc/<tid>/schedstat` field 3. `MonotonicCount`.
+    pub timeslices: crate::metric_types::MonotonicCount,
+    /// Voluntary context switches — task gave up the CPU itself;
+    /// `/proc/<tid>/status` `voluntary_ctxt_switches`.
+    /// `MonotonicCount`.
+    pub voluntary_csw: crate::metric_types::MonotonicCount,
+    /// Involuntary context switches — task was preempted;
+    /// `/proc/<tid>/status` `nonvoluntary_ctxt_switches`.
+    /// `MonotonicCount`.
+    pub nonvoluntary_csw: crate::metric_types::MonotonicCount,
+    /// Total wakeups via `try_to_wake_up()`; `/proc/<tid>/sched`
+    /// `nr_wakeups`. `MonotonicCount`.
+    pub nr_wakeups: crate::metric_types::MonotonicCount,
+    /// Wakeups landed on the same CPU as the waker;
+    /// `/proc/<tid>/sched` `nr_wakeups_local`. `MonotonicCount`.
+    pub nr_wakeups_local: crate::metric_types::MonotonicCount,
+    /// Wakeups landed on a different CPU than the waker;
+    /// `/proc/<tid>/sched` `nr_wakeups_remote`. `MonotonicCount`.
+    pub nr_wakeups_remote: crate::metric_types::MonotonicCount,
+    /// `WF_SYNC` synchronous-wakeup hint count;
+    /// `/proc/<tid>/sched` `nr_wakeups_sync`. `MonotonicCount`.
+    pub nr_wakeups_sync: crate::metric_types::MonotonicCount,
+    /// Wakeups where the task migrated to a different CPU than
+    /// its prior one (`WF_MIGRATED`); `/proc/<tid>/sched`
+    /// `nr_wakeups_migrate`. Distinct from `nr_wakeups_remote`
+    /// (waker CPU != target CPU). `MonotonicCount`.
+    pub nr_wakeups_migrate: crate::metric_types::MonotonicCount,
+    /// Wakeups attributed to the idle path; `/proc/<tid>/sched`
+    /// `nr_wakeups_idle`. KNOWN DEAD COUNTER — never incremented
+    /// in mainline (registered for parser-completeness).
+    /// `MonotonicCount`.
+    pub nr_wakeups_idle: crate::metric_types::MonotonicCount,
     /// Wakeups onto this CPU (cache-affine wakeup
     /// fast-path). `/proc/<tid>/sched` `nr_wakeups_affine`,
     /// emitted via `P_SCHEDSTAT`. Plain u64. Zero on kernels
     /// without `CONFIG_SCHEDSTATS`. Zero under sched_ext:
     /// `wake_affine` is a CFS-only path.
-    pub nr_wakeups_affine: u64,
+    pub nr_wakeups_affine: crate::metric_types::MonotonicCount,
     /// Total invocations of the cache-affine wakeup heuristic
     /// `wake_affine()` — denominator for the affine-wake success
     /// ratio (`nr_wakeups_affine / nr_wakeups_affine_attempts`).
@@ -573,34 +690,39 @@ pub struct ThreadState {
     /// `CONFIG_SCHEDSTATS`. Zero under sched_ext: `wake_affine`
     /// is a CFS-only path and `kernel/sched/ext.c` does not
     /// increment this counter.
-    pub nr_wakeups_affine_attempts: u64,
-    pub nr_migrations: u64,
+    pub nr_wakeups_affine_attempts: crate::metric_types::MonotonicCount,
+    /// Total cross-CPU migrations of the task. Incremented
+    /// unconditionally at `kernel/sched/core.c` (`p->se.nr_migrations++`)
+    /// — no schedstat macro, no class gating. Always populated
+    /// regardless of `CONFIG_SCHEDSTATS` or scheduling class.
+    /// `MonotonicCount`.
+    pub nr_migrations: crate::metric_types::MonotonicCount,
     /// Migrations skipped under cache-cold heuristic (the source
     /// CPU's cache was deemed too cold to warrant moving).
     /// `/proc/<tid>/sched` `nr_migrations_cold`, plain u64 via
     /// `P_SCHEDSTAT`. Zero on kernels without `CONFIG_SCHEDSTATS`.
-    pub nr_migrations_cold: u64,
+    pub nr_migrations_cold: crate::metric_types::MonotonicCount,
     /// Migrations forced by load balance (the load balancer
     /// migrated the task even though the local heuristic would
     /// have skipped it). `/proc/<tid>/sched` `nr_forced_migrations`,
     /// plain u64 via `P_SCHEDSTAT`. Zero on kernels without
     /// `CONFIG_SCHEDSTATS`.
-    pub nr_forced_migrations: u64,
+    pub nr_forced_migrations: crate::metric_types::MonotonicCount,
     /// Failed migrations attributed to affinity mismatch — the
     /// destination CPU was not in `cpus_allowed`. `/proc/<tid>/sched`
     /// `nr_failed_migrations_affine`, plain u64 via `P_SCHEDSTAT`.
     /// Zero on kernels without `CONFIG_SCHEDSTATS`.
-    pub nr_failed_migrations_affine: u64,
+    pub nr_failed_migrations_affine: crate::metric_types::MonotonicCount,
     /// Failed migrations attributed to the task being currently
     /// running on the source CPU. `/proc/<tid>/sched`
     /// `nr_failed_migrations_running`, plain u64 via `P_SCHEDSTAT`.
     /// Zero on kernels without `CONFIG_SCHEDSTATS`.
-    pub nr_failed_migrations_running: u64,
+    pub nr_failed_migrations_running: crate::metric_types::MonotonicCount,
     /// Failed migrations attributed to cache-hot heuristic — the
     /// source CPU's cache was too hot to leave. `/proc/<tid>/sched`
     /// `nr_failed_migrations_hot`, plain u64 via `P_SCHEDSTAT`.
     /// Zero on kernels without `CONFIG_SCHEDSTATS`.
-    pub nr_failed_migrations_hot: u64,
+    pub nr_failed_migrations_hot: crate::metric_types::MonotonicCount,
     /// Total nanoseconds the task spent on the runqueue waiting
     /// to be picked. Populated from `/proc/<tid>/sched`'s
     /// `wait_sum` key — kernel emits via `PN_SCHEDSTAT` as
@@ -610,7 +732,7 @@ pub struct ThreadState {
     /// `__update_stats_wait_end` (`kernel/sched/stats.c`), called
     /// from CFS/RT/DL paths only — `kernel/sched/ext.c` does not
     /// call that helper.
-    pub wait_sum: u64,
+    pub wait_sum: crate::metric_types::MonotonicNs,
     /// Number of runqueue-wait windows the task accumulated —
     /// the per-event tally that pairs with [`Self::wait_sum`].
     /// Populated from `/proc/<tid>/sched`'s `wait_count` key
@@ -619,7 +741,7 @@ pub struct ThreadState {
     /// `wait_sum` (`__update_stats_wait_end` in
     /// `kernel/sched/stats.c`), so the same sched_ext caveat
     /// applies: zero under sched_ext.
-    pub wait_count: u64,
+    pub wait_count: crate::metric_types::MonotonicCount,
     /// Longest single runqueue-wait window the task ever
     /// experienced, in nanoseconds. `/proc/<tid>/sched` `wait_max`
     /// emitted via `PN_SCHEDSTAT` (`ms.ns_remainder`,
@@ -630,20 +752,29 @@ pub struct ThreadState {
     /// `__update_stats_wait_end` from CFS/RT/DL paths only —
     /// `kernel/sched/ext.c` does not call that helper, so
     /// sched_ext-managed tasks never accumulate wait_max.
-    pub wait_max: u64,
-    /// Total nanoseconds the task slept (voluntary block in
-    /// `schedule()` — sleep syscalls, futex wait, etc.). Populated
-    /// from `/proc/<tid>/sched`'s `sum_sleep_runtime` key (kernel
+    pub wait_max: crate::metric_types::PeakNs,
+    /// Total nanoseconds the task spent off-CPU — voluntary
+    /// sleep (`TASK_INTERRUPTIBLE`) PLUS involuntary block
+    /// (`TASK_UNINTERRUPTIBLE`). Populated from
+    /// `/proc/<tid>/sched`'s `sum_sleep_runtime` key (kernel
     /// emits `ms.ns_remainder` via `PN_SCHEDSTAT`; the parser
-    /// reconstructs full ns). There is no `sleep_count`
-    /// counterpart: the kernel does not emit one — the scheduler
-    /// records the aggregate runtime but not the sleep-event
-    /// count separately from `nr_wakeups`, which already covers
-    /// the wake-side tally. Zero on kernels without
-    /// `CONFIG_SCHEDSTATS`. Zero under sched_ext: the kernel
-    /// updates this counter via `__update_stats_enqueue_sleeper`
-    /// (`kernel/sched/stats.c`), called from CFS/RT/DL paths only.
-    pub sleep_sum: u64,
+    /// reconstructs full ns).
+    ///
+    /// `__update_stats_enqueue_sleeper` (`kernel/sched/stats.c`)
+    /// adds the sleeper's elapsed wall-clock window to this
+    /// counter regardless of which sleep state the task was in,
+    /// so `sleep_sum` is the full off-CPU total. To recover pure
+    /// voluntary sleep, subtract [`Self::block_sum`]:
+    /// `voluntary_sleep = sleep_sum - block_sum`.
+    ///
+    /// There is no `sleep_count` counterpart: the kernel does
+    /// not emit one — the scheduler records the aggregate
+    /// runtime but not the sleep-event count separately from
+    /// `nr_wakeups`, which already covers the wake-side tally.
+    /// Zero on kernels without `CONFIG_SCHEDSTATS`. Zero under
+    /// sched_ext: `__update_stats_enqueue_sleeper` is called
+    /// from CFS/RT/DL paths only.
+    pub sleep_sum: crate::metric_types::MonotonicNs,
     /// Longest single sleep window in nanoseconds.
     /// `/proc/<tid>/sched` `sleep_max` emitted via `PN_SCHEDSTAT`
     /// (`ms.ns_remainder`, reconstructed by the parser). Zero on
@@ -651,7 +782,7 @@ pub struct ThreadState {
     /// the kernel sets this counter via
     /// `__update_stats_enqueue_sleeper` from CFS/RT/DL paths
     /// only.
-    pub sleep_max: u64,
+    pub sleep_max: crate::metric_types::PeakNs,
     /// Total nanoseconds blocked in the scheduler — every path
     /// that puts the task into `TASK_UNINTERRUPTIBLE` contributes:
     /// swap-in, page-fault resolution, disk I/O, plus
@@ -669,7 +800,7 @@ pub struct ThreadState {
     /// sched_ext: the kernel updates this counter via
     /// `__update_stats_enqueue_sleeper` (`kernel/sched/stats.c`),
     /// called from CFS/RT/DL paths only.
-    pub block_sum: u64,
+    pub block_sum: crate::metric_types::MonotonicNs,
     /// Longest single block window in nanoseconds.
     /// `/proc/<tid>/sched` `block_max` emitted via `PN_SCHEDSTAT`
     /// (`ms.ns_remainder`, reconstructed by the parser). Tail-
@@ -678,7 +809,7 @@ pub struct ThreadState {
     /// sched_ext: the kernel sets this counter via
     /// `__update_stats_enqueue_sleeper` from CFS/RT/DL paths
     /// only.
-    pub block_max: u64,
+    pub block_max: crate::metric_types::PeakNs,
     /// Total nanoseconds in I/O wait specifically (subset of
     /// `block_sum`). Distinguishes disk-backed I/O delay from
     /// the full involuntary-block total — callers that want
@@ -691,7 +822,7 @@ pub struct ThreadState {
     /// updates this counter via `__update_stats_enqueue_sleeper`
     /// (`kernel/sched/stats.c`), called from CFS/RT/DL paths
     /// only.
-    pub iowait_sum: u64,
+    pub iowait_sum: crate::metric_types::MonotonicNs,
     /// Number of I/O-wait windows the task accumulated — the
     /// per-event tally that pairs with [`Self::iowait_sum`].
     /// Populated from `/proc/<tid>/sched`'s `iowait_count` key
@@ -700,7 +831,7 @@ pub struct ThreadState {
     /// `iowait_sum` (`__update_stats_enqueue_sleeper` in
     /// `kernel/sched/stats.c`), so the same sched_ext caveat
     /// applies: zero under sched_ext.
-    pub iowait_count: u64,
+    pub iowait_count: crate::metric_types::MonotonicCount,
     /// Longest single CPU-burst (run-without-preempt window) in
     /// nanoseconds. `/proc/<tid>/sched` `exec_max` emitted via
     /// `PN_SCHEDSTAT` (`ms.ns_remainder`, reconstructed by the
@@ -708,7 +839,7 @@ pub struct ThreadState {
     /// Updated for sched_ext tasks too: the kernel sets it in
     /// `update_se` (`kernel/sched/fair.c`), which sched_ext
     /// reaches via `update_curr_scx` → `update_curr_common`.
-    pub exec_max: u64,
+    pub exec_max: crate::metric_types::PeakNs,
     /// Longest scheduling slice the task got before being
     /// preempted, in nanoseconds. `/proc/<tid>/sched` `slice_max`
     /// emitted via `PN_SCHEDSTAT` (`ms.ns_remainder`,
@@ -718,7 +849,7 @@ pub struct ThreadState {
     /// (`kernel/sched/fair.c`), a CFS-only path —
     /// sched_ext-managed tasks never accumulate slice_max even
     /// when CONFIG_SCHEDSTATS is enabled.
-    pub slice_max: u64,
+    pub slice_max: crate::metric_types::PeakNs,
 
     // -- jemalloc per-thread TSD counters (tsd_s.thread_allocated / thread_deallocated, via ptrace) --
     /// Bytes allocated by this thread over its lifetime — read
@@ -755,7 +886,7 @@ pub struct ThreadState {
     /// of `failed`), reachable via
     /// [`HostStateSnapshot::probe_summary`]; the per-tag taxonomy
     /// is documented in the `ktstr host-state capture` CLI help.
-    pub allocated_bytes: u64,
+    pub allocated_bytes: crate::metric_types::Bytes,
     /// Bytes freed by this thread over its lifetime — read from
     /// jemalloc's per-thread TSD u64 counter
     /// (`tsd_s.thread_deallocated`) via the same probe path that
@@ -765,13 +896,13 @@ pub struct ThreadState {
     /// any in-flight allocator activity since the two counters
     /// are sampled in one `process_vm_readv` over a 24-byte span
     /// the target may continue to mutate during the read.
-    pub deallocated_bytes: u64,
+    pub deallocated_bytes: crate::metric_types::Bytes,
 
     // -- procfs /proc/<tid>/stat: page faults + CPU time (fields 10, 12, 14, 15) --
     /// Minor faults (no disk I/O). `/proc/<tid>/stat` field 10.
-    pub minflt: u64,
+    pub minflt: crate::metric_types::MonotonicCount,
     /// Major faults (backed by disk). `/proc/<tid>/stat` field 12.
-    pub majflt: u64,
+    pub majflt: crate::metric_types::MonotonicCount,
     /// User-mode CPU time in USER_HZ clock ticks since thread
     /// start. `/proc/<tid>/stat` field 14
     /// (`nsec_to_clock_t(utime)` in `fs/proc/array.c::do_task_stat`).
@@ -780,13 +911,13 @@ pub struct ThreadState {
     /// meaningful because USER_HZ is 100 on both, independent of
     /// CONFIG_HZ. Suffix `_clock_ticks` mirrors the existing
     /// `start_time_clock_ticks` precedent.
-    pub utime_clock_ticks: u64,
+    pub utime_clock_ticks: crate::metric_types::ClockTicks,
     /// Kernel-mode CPU time in USER_HZ clock ticks since thread
     /// start. `/proc/<tid>/stat` field 15
     /// (`nsec_to_clock_t(stime)` in `fs/proc/array.c::do_task_stat`).
     /// Same USER_HZ scaling and `_clock_ticks` suffix convention as
     /// [`Self::utime_clock_ticks`].
-    pub stime_clock_ticks: u64,
+    pub stime_clock_ticks: crate::metric_types::ClockTicks,
     /// Kernel-internal scheduler priority (signed). Distinct
     /// from [`Self::nice`] — `priority` is the post-bias
     /// scheduling priority (`task_prio(task)`) the scheduler
@@ -802,15 +933,23 @@ pub struct ThreadState {
     /// see `[-2..-100]`; SCHED_DEADLINE tasks land at `-101`.
     /// Default 0 when the stat read fails — collides with the
     /// CFS nice-0 case, so a CFS task at default nice and an
-    /// absent stat line both render 0.
-    pub priority: i32,
+    /// absent stat line both render 0. Wrapped in
+    /// [`crate::metric_types::OrdinalI32`] for the
+    /// `[min, max]` range reduction across a group.
+    pub priority: crate::metric_types::OrdinalI32,
     /// Real-time scheduler priority. `/proc/<tid>/stat` field
     /// 40, emitted via `seq_put_decimal_ull(m, " ", task->rt_priority)`
     /// at `fs/proc/array.c:637`. Non-zero only when the task
     /// runs SCHED_FIFO or SCHED_RR; CFS / SCHED_OTHER tasks
     /// land at zero. Useful as a post-hoc filter to identify
-    /// real-time threads in a snapshot.
-    pub rt_priority: u64,
+    /// real-time threads in a snapshot. Wrapped in
+    /// [`crate::metric_types::OrdinalU32`] for the
+    /// `[min, max]` range reduction across a group; the inner
+    /// `u32` matches the kernel's
+    /// `unsigned int task_struct::rt_priority` declaration
+    /// (`include/linux/sched.h`) exactly. Practical range is
+    /// bounded `0..99` regardless of the type width.
+    pub rt_priority: crate::metric_types::OrdinalU32,
     /// Cumulative blkio delay accrued by this thread, in
     /// USER_HZ clock ticks. `/proc/<tid>/stat` field 42, emitted
     /// via `seq_put_decimal_ull(m, " ", delayacct_blkio_ticks(task))`
@@ -835,7 +974,7 @@ pub struct ThreadState {
     /// no-ops, so the counter stays at zero even on a kernel
     /// built with `CONFIG_TASK_DELAY_ACCT=y`. Same USER_HZ
     /// scaling as [`Self::utime_clock_ticks`].
-    pub delayacct_blkio_ticks: u64,
+    pub delayacct_blkio_ticks: crate::metric_types::ClockTicks,
 
     // -- /proc/<tid>/sched additions (counters + ordinal + slice gauge) --
     /// Wakeups onto an idle CPU via the passive-wakeup fast path.
@@ -851,7 +990,7 @@ pub struct ThreadState {
     /// increment. Always zero on mainline 6.x. Mirrors the
     /// existing `nr_wakeups_idle` and `nr_migrations_cold`
     /// dead-counter precedent.
-    pub nr_wakeups_passive: u64,
+    pub nr_wakeups_passive: crate::metric_types::MonotonicCount,
     /// Cumulative time this task forced its SMT sibling idle for
     /// core-scheduling, in nanoseconds. `/proc/<tid>/sched`
     /// `core_forceidle_sum`, dotted ms.ns format via
@@ -910,7 +1049,7 @@ pub struct ThreadState {
     /// runtime gate, see this counter at zero for every task.
     /// Hosts where no SMT cohort has ever accumulated forceidle
     /// also see zero across the board.
-    pub core_forceidle_sum: u64,
+    pub core_forceidle_sum: crate::metric_types::MonotonicNs,
     /// Per-thread `se.slice` in nanoseconds. For fair-class
     /// tasks (SCHED_NORMAL / SCHED_BATCH) this is the
     /// instantaneous slice CFS is currently running the task
@@ -951,7 +1090,7 @@ pub struct ThreadState {
     /// value across the group and obscure the signal (and would
     /// also be semantically meaningless: instantaneous gauges
     /// do not add).
-    pub fair_slice_ns: u64,
+    pub fair_slice_ns: crate::metric_types::GaugeNs,
 
     // -- /proc/<tid>/status (process-wide tgid count) --
     /// Total threads in this task's tgid (process-wide thread
@@ -973,7 +1112,12 @@ pub struct ThreadState {
     /// leader buckets get a 0 contribution from every member —
     /// a bucket whose leader thread did NOT match the grouping
     /// would render 0 even though processes are represented.
-    pub nr_threads: u64,
+    /// Wrapped in [`crate::metric_types::GaugeCount`] so the
+    /// type system rejects sum-style aggregation: a bucket with
+    /// N threads sharing a tgid would over-count the parent
+    /// process N-fold under Sum, while Max is well-defined
+    /// (largest current count any contributor reported).
+    pub nr_threads: crate::metric_types::GaugeCount,
 
     // -- /proc/<tid>/smaps_rollup (per-MM memory breakdown) --
     /// Per-process memory breakdown from
@@ -1012,13 +1156,105 @@ pub struct ThreadState {
     /// CAP_SYS_PTRACE).
     pub smaps_rollup_kb: BTreeMap<String, u64>,
 
-    // -- I/O (/proc/<tid>/io, CONFIG_TASK_IO_ACCOUNTING) --
-    pub rchar: u64,
-    pub wchar: u64,
-    pub syscr: u64,
-    pub syscw: u64,
-    pub read_bytes: u64,
-    pub write_bytes: u64,
+    // -- I/O (/proc/<tid>/io) --
+    //
+    // The whole file is emitted by `do_io_accounting`
+    // (`fs/proc/base.c`) under a single `CONFIG_TASK_IO_ACCOUNTING`
+    // gate, and `CONFIG_TASK_IO_ACCOUNTING` `depends on`
+    // `CONFIG_TASK_XACCT` in `init/Kconfig` — so from the
+    // procfs-reader perspective the file either appears with all
+    // 6 fields or doesn't appear at all. The XACCT split that
+    // sometimes shows up in kernel commentary describes the
+    // increment-side path, not the procfs surface; for the
+    // capture pipeline the relevant gate is `CONFIG_TASK_IO_ACCOUNTING`
+    // for every field below.
+    /// Bytes read at the read syscall layer (incl. cached /
+    /// pagecache hits). Gated by `CONFIG_TASK_IO_ACCOUNTING`.
+    pub rchar: crate::metric_types::Bytes,
+    /// Bytes written at the write syscall layer (incl.
+    /// pagecache / writeback). Gated by `CONFIG_TASK_IO_ACCOUNTING`.
+    pub wchar: crate::metric_types::Bytes,
+    /// Number of read syscalls. Gated by `CONFIG_TASK_IO_ACCOUNTING`.
+    pub syscr: crate::metric_types::MonotonicCount,
+    /// Number of write syscalls. Gated by `CONFIG_TASK_IO_ACCOUNTING`.
+    pub syscw: crate::metric_types::MonotonicCount,
+    /// Bytes that hit the storage device on read (excludes
+    /// pagecache hits). Gated by `CONFIG_TASK_IO_ACCOUNTING`.
+    pub read_bytes: crate::metric_types::Bytes,
+    /// Bytes that hit the storage device on write
+    /// (post-writeback). Gated by `CONFIG_TASK_IO_ACCOUNTING`.
+    pub write_bytes: crate::metric_types::Bytes,
+}
+
+impl Default for ThreadState {
+    fn default() -> Self {
+        Self {
+            tid: 0,
+            tgid: 0,
+            pcomm: String::new(),
+            comm: String::new(),
+            cgroup: String::new(),
+            start_time_clock_ticks: 0,
+            policy: Default::default(),
+            nice: Default::default(),
+            cpu_affinity: Default::default(),
+            processor: Default::default(),
+            // `'~'` (the absent-value sentinel) instead of the
+            // bare `char` Default `'\0'`; see [`Self::state`].
+            state: default_state_char(),
+            ext_enabled: false,
+            run_time_ns: Default::default(),
+            wait_time_ns: Default::default(),
+            timeslices: Default::default(),
+            voluntary_csw: Default::default(),
+            nonvoluntary_csw: Default::default(),
+            nr_wakeups: Default::default(),
+            nr_wakeups_local: Default::default(),
+            nr_wakeups_remote: Default::default(),
+            nr_wakeups_sync: Default::default(),
+            nr_wakeups_migrate: Default::default(),
+            nr_wakeups_idle: Default::default(),
+            nr_wakeups_affine: Default::default(),
+            nr_wakeups_affine_attempts: Default::default(),
+            nr_migrations: Default::default(),
+            nr_migrations_cold: Default::default(),
+            nr_forced_migrations: Default::default(),
+            nr_failed_migrations_affine: Default::default(),
+            nr_failed_migrations_running: Default::default(),
+            nr_failed_migrations_hot: Default::default(),
+            wait_sum: Default::default(),
+            wait_count: Default::default(),
+            wait_max: Default::default(),
+            sleep_sum: Default::default(),
+            sleep_max: Default::default(),
+            block_sum: Default::default(),
+            block_max: Default::default(),
+            iowait_sum: Default::default(),
+            iowait_count: Default::default(),
+            exec_max: Default::default(),
+            slice_max: Default::default(),
+            allocated_bytes: Default::default(),
+            deallocated_bytes: Default::default(),
+            minflt: Default::default(),
+            majflt: Default::default(),
+            utime_clock_ticks: Default::default(),
+            stime_clock_ticks: Default::default(),
+            priority: Default::default(),
+            rt_priority: Default::default(),
+            delayacct_blkio_ticks: Default::default(),
+            nr_wakeups_passive: Default::default(),
+            core_forceidle_sum: Default::default(),
+            fair_slice_ns: Default::default(),
+            nr_threads: Default::default(),
+            smaps_rollup_kb: BTreeMap::new(),
+            rchar: Default::default(),
+            wchar: Default::default(),
+            syscr: Default::default(),
+            syscw: Default::default(),
+            read_bytes: Default::default(),
+            write_bytes: Default::default(),
+        }
+    }
 }
 
 impl ThreadState {
@@ -1030,11 +1266,16 @@ impl ThreadState {
     /// helper centralizes the unit conversion at every render
     /// site (write_show + write_diff). Saturating multiply
     /// guards against pathological input from a malformed
-    /// snapshot file.
-    pub fn smaps_rollup_bytes(&self) -> impl Iterator<Item = (&String, u64)> {
+    /// snapshot file. Wrapped in
+    /// [`crate::metric_types::Bytes`] so the byte-typed value
+    /// flows through the same auto-scale path as the rest of
+    /// the byte-tagged registry metrics.
+    pub fn smaps_rollup_bytes(
+        &self,
+    ) -> impl Iterator<Item = (&String, crate::metric_types::Bytes)> {
         self.smaps_rollup_kb
             .iter()
-            .map(|(k, v)| (k, v.saturating_mul(1024)))
+            .map(|(k, v)| (k, crate::metric_types::Bytes(v.saturating_mul(1024))))
     }
 }
 
@@ -1748,9 +1989,10 @@ struct StatFields {
     processor: Option<i32>,
     /// Field 40: real-time priority. `seq_put_decimal_ull(m,
     /// " ", task->rt_priority)` at `fs/proc/array.c:637`.
-    /// Unsigned per `task_struct::rt_priority` (unsigned int);
+    /// Stored as `u32` to match `unsigned int
+    /// task_struct::rt_priority` from `include/linux/sched.h`;
     /// non-zero only when the task runs SCHED_FIFO / SCHED_RR.
-    rt_priority: Option<u64>,
+    rt_priority: Option<u32>,
     policy: Option<i32>,
     /// Field 42: cumulative blkio delay in USER_HZ clock ticks.
     /// `seq_put_decimal_ull(m, " ", delayacct_blkio_ticks(task))`
@@ -1794,6 +2036,7 @@ fn parse_stat(raw: &str) -> StatFields {
     };
     let parts: Vec<&str> = tail.split_ascii_whitespace().collect();
     let get_u64 = |idx: usize| parts.get(idx).and_then(|s| s.parse::<u64>().ok());
+    let get_u32 = |idx: usize| parts.get(idx).and_then(|s| s.parse::<u32>().ok());
     let get_i32 = |idx: usize| parts.get(idx).and_then(|s| s.parse::<i32>().ok());
     StatFields {
         minflt: get_u64(7),
@@ -1804,7 +2047,7 @@ fn parse_stat(raw: &str) -> StatFields {
         nice: get_i32(16),
         start_time_clock_ticks: get_u64(19),
         processor: get_i32(36),
-        rt_priority: get_u64(37),
+        rt_priority: get_u32(37),
         policy: get_i32(38),
         delayacct_blkio_ticks: get_u64(39),
     }
@@ -1927,8 +2170,11 @@ struct StatusFields {
     /// Real kernel chars are `R` / `S` / `D` / `T` / `t` / `X` /
     /// `Z` / `P` / `I` (see `fs/proc/array.c::task_state_array`).
     /// `None` when the line is absent or blank — the capture site
-    /// collapses to `'?'` which is visually distinct from every
-    /// real kernel char.
+    /// collapses to `'~'` (via `default_state_char`) which sorts
+    /// strictly after every real kernel char in lex order, so
+    /// the [`crate::host_state_compare::AggRule::Mode`]
+    /// lex-smallest-wins tiebreak picks a real letter when one
+    /// is present.
     state: Option<char>,
     /// `Cpus_allowed_list:` as a parsed sorted vec. Kept separate
     /// from the `sched_getaffinity` reader because status-file
@@ -2650,6 +2896,10 @@ fn capture_thread_at_with_tally(
     } else {
         status.cpus_allowed.unwrap_or_default()
     };
+    use crate::metric_types::{
+        Bytes, CategoricalString, ClockTicks, CpuSet, GaugeCount, GaugeNs, MonotonicCount,
+        MonotonicNs, OrdinalI32, OrdinalU32, PeakNs,
+    };
     ThreadState {
         tid: tid as u32,
         tgid: tgid as u32,
@@ -2657,54 +2907,56 @@ fn capture_thread_at_with_tally(
         comm: comm.to_string(),
         cgroup,
         start_time_clock_ticks: stat.start_time_clock_ticks.unwrap_or(0),
-        policy: stat.policy.map(policy_name).unwrap_or_default(),
-        nice: stat.nice.unwrap_or(0),
-        cpu_affinity,
-        processor: stat.processor.unwrap_or(0),
-        state: status.state.unwrap_or('?'),
+        policy: CategoricalString(stat.policy.map(policy_name).unwrap_or_default()),
+        nice: OrdinalI32(stat.nice.unwrap_or(0)),
+        cpu_affinity: CpuSet(cpu_affinity),
+        processor: OrdinalI32(stat.processor.unwrap_or(0)),
+        state: status.state.unwrap_or_else(default_state_char),
         ext_enabled: sched.ext_enabled.unwrap_or(false),
-        run_time_ns: run_time_ns.unwrap_or(0),
-        wait_time_ns: wait_time_ns.unwrap_or(0),
-        timeslices: timeslices.unwrap_or(0),
-        voluntary_csw: status.voluntary_csw.unwrap_or(0),
-        nonvoluntary_csw: status.nonvoluntary_csw.unwrap_or(0),
-        nr_wakeups: sched.nr_wakeups.unwrap_or(0),
-        nr_wakeups_local: sched.nr_wakeups_local.unwrap_or(0),
-        nr_wakeups_remote: sched.nr_wakeups_remote.unwrap_or(0),
-        nr_wakeups_sync: sched.nr_wakeups_sync.unwrap_or(0),
-        nr_wakeups_migrate: sched.nr_wakeups_migrate.unwrap_or(0),
-        nr_wakeups_idle: sched.nr_wakeups_idle.unwrap_or(0),
-        nr_wakeups_affine: sched.nr_wakeups_affine.unwrap_or(0),
-        nr_wakeups_affine_attempts: sched.nr_wakeups_affine_attempts.unwrap_or(0),
-        nr_migrations: sched.nr_migrations.unwrap_or(0),
-        nr_migrations_cold: sched.nr_migrations_cold.unwrap_or(0),
-        nr_forced_migrations: sched.nr_forced_migrations.unwrap_or(0),
-        nr_failed_migrations_affine: sched.nr_failed_migrations_affine.unwrap_or(0),
-        nr_failed_migrations_running: sched.nr_failed_migrations_running.unwrap_or(0),
-        nr_failed_migrations_hot: sched.nr_failed_migrations_hot.unwrap_or(0),
-        wait_sum: sched.wait_sum.unwrap_or(0),
-        wait_count: sched.wait_count.unwrap_or(0),
-        wait_max: sched.wait_max.unwrap_or(0),
-        sleep_sum: sched.sleep_sum.unwrap_or(0),
-        sleep_max: sched.sleep_max.unwrap_or(0),
-        block_sum: sched.block_sum.unwrap_or(0),
-        block_max: sched.block_max.unwrap_or(0),
-        iowait_sum: sched.iowait_sum.unwrap_or(0),
-        iowait_count: sched.iowait_count.unwrap_or(0),
-        exec_max: sched.exec_max.unwrap_or(0),
-        slice_max: sched.slice_max.unwrap_or(0),
-        allocated_bytes: 0,
-        deallocated_bytes: 0,
-        minflt: stat.minflt.unwrap_or(0),
-        majflt: stat.majflt.unwrap_or(0),
-        utime_clock_ticks: stat.utime_clock_ticks.unwrap_or(0),
-        stime_clock_ticks: stat.stime_clock_ticks.unwrap_or(0),
-        priority: stat.priority.unwrap_or(0),
-        rt_priority: stat.rt_priority.unwrap_or(0),
-        delayacct_blkio_ticks: stat.delayacct_blkio_ticks.unwrap_or(0),
-        nr_wakeups_passive: sched.nr_wakeups_passive.unwrap_or(0),
-        core_forceidle_sum: sched.core_forceidle_sum.unwrap_or(0),
-        fair_slice_ns: sched.fair_slice_ns.unwrap_or(0),
+        run_time_ns: MonotonicNs(run_time_ns.unwrap_or(0)),
+        wait_time_ns: MonotonicNs(wait_time_ns.unwrap_or(0)),
+        timeslices: MonotonicCount(timeslices.unwrap_or(0)),
+        voluntary_csw: MonotonicCount(status.voluntary_csw.unwrap_or(0)),
+        nonvoluntary_csw: MonotonicCount(status.nonvoluntary_csw.unwrap_or(0)),
+        nr_wakeups: MonotonicCount(sched.nr_wakeups.unwrap_or(0)),
+        nr_wakeups_local: MonotonicCount(sched.nr_wakeups_local.unwrap_or(0)),
+        nr_wakeups_remote: MonotonicCount(sched.nr_wakeups_remote.unwrap_or(0)),
+        nr_wakeups_sync: MonotonicCount(sched.nr_wakeups_sync.unwrap_or(0)),
+        nr_wakeups_migrate: MonotonicCount(sched.nr_wakeups_migrate.unwrap_or(0)),
+        nr_wakeups_idle: MonotonicCount(sched.nr_wakeups_idle.unwrap_or(0)),
+        nr_wakeups_affine: MonotonicCount(sched.nr_wakeups_affine.unwrap_or(0)),
+        nr_wakeups_affine_attempts: MonotonicCount(sched.nr_wakeups_affine_attempts.unwrap_or(0)),
+        nr_migrations: MonotonicCount(sched.nr_migrations.unwrap_or(0)),
+        nr_migrations_cold: MonotonicCount(sched.nr_migrations_cold.unwrap_or(0)),
+        nr_forced_migrations: MonotonicCount(sched.nr_forced_migrations.unwrap_or(0)),
+        nr_failed_migrations_affine: MonotonicCount(sched.nr_failed_migrations_affine.unwrap_or(0)),
+        nr_failed_migrations_running: MonotonicCount(
+            sched.nr_failed_migrations_running.unwrap_or(0),
+        ),
+        nr_failed_migrations_hot: MonotonicCount(sched.nr_failed_migrations_hot.unwrap_or(0)),
+        wait_sum: MonotonicNs(sched.wait_sum.unwrap_or(0)),
+        wait_count: MonotonicCount(sched.wait_count.unwrap_or(0)),
+        wait_max: PeakNs(sched.wait_max.unwrap_or(0)),
+        sleep_sum: MonotonicNs(sched.sleep_sum.unwrap_or(0)),
+        sleep_max: PeakNs(sched.sleep_max.unwrap_or(0)),
+        block_sum: MonotonicNs(sched.block_sum.unwrap_or(0)),
+        block_max: PeakNs(sched.block_max.unwrap_or(0)),
+        iowait_sum: MonotonicNs(sched.iowait_sum.unwrap_or(0)),
+        iowait_count: MonotonicCount(sched.iowait_count.unwrap_or(0)),
+        exec_max: PeakNs(sched.exec_max.unwrap_or(0)),
+        slice_max: PeakNs(sched.slice_max.unwrap_or(0)),
+        allocated_bytes: Bytes(0),
+        deallocated_bytes: Bytes(0),
+        minflt: MonotonicCount(stat.minflt.unwrap_or(0)),
+        majflt: MonotonicCount(stat.majflt.unwrap_or(0)),
+        utime_clock_ticks: ClockTicks(stat.utime_clock_ticks.unwrap_or(0)),
+        stime_clock_ticks: ClockTicks(stat.stime_clock_ticks.unwrap_or(0)),
+        priority: OrdinalI32(stat.priority.unwrap_or(0)),
+        rt_priority: OrdinalU32(stat.rt_priority.unwrap_or(0)),
+        delayacct_blkio_ticks: ClockTicks(stat.delayacct_blkio_ticks.unwrap_or(0)),
+        nr_wakeups_passive: MonotonicCount(sched.nr_wakeups_passive.unwrap_or(0)),
+        core_forceidle_sum: MonotonicNs(sched.core_forceidle_sum.unwrap_or(0)),
+        fair_slice_ns: GaugeNs(sched.fair_slice_ns.unwrap_or(0)),
         // Dedup `nr_threads` to only the thread leader. Every
         // thread of the same tgid sees the same kernel-emitted
         // value; populating it on every thread would let any
@@ -2715,18 +2967,18 @@ fn capture_thread_at_with_tally(
         // process in this group" rather than "how many threads
         // the kernel believes this group contains" (which is
         // already covered by the row count).
-        nr_threads: if tid == tgid {
+        nr_threads: GaugeCount(if tid == tgid {
             status.nr_threads.unwrap_or(0)
         } else {
             0
-        },
+        }),
         smaps_rollup_kb,
-        rchar: io.rchar.unwrap_or(0),
-        wchar: io.wchar.unwrap_or(0),
-        syscr: io.syscr.unwrap_or(0),
-        syscw: io.syscw.unwrap_or(0),
-        read_bytes: io.read_bytes.unwrap_or(0),
-        write_bytes: io.write_bytes.unwrap_or(0),
+        rchar: Bytes(io.rchar.unwrap_or(0)),
+        wchar: Bytes(io.wchar.unwrap_or(0)),
+        syscr: MonotonicCount(io.syscr.unwrap_or(0)),
+        syscw: MonotonicCount(io.syscw.unwrap_or(0)),
+        read_bytes: Bytes(io.read_bytes.unwrap_or(0)),
+        write_bytes: Bytes(io.write_bytes.unwrap_or(0)),
     }
 }
 
@@ -3417,8 +3669,8 @@ fn capture_with(
                 use_syscall_affinity,
                 &mut tally_opt,
             );
-            t.allocated_bytes = allocated_bytes;
-            t.deallocated_bytes = deallocated_bytes;
+            t.allocated_bytes = crate::metric_types::Bytes(allocated_bytes);
+            t.deallocated_bytes = crate::metric_types::Bytes(deallocated_bytes);
             // Ghost-thread filter: a tid that exited between the
             // `iter_task_ids_at` readdir and our per-file reads
             // produces an all-Default `ThreadState` — empty comm
@@ -3617,8 +3869,8 @@ fn capture_pid_with(
             use_syscall_affinity,
             &mut tally_opt,
         );
-        t.allocated_bytes = allocated_bytes;
-        t.deallocated_bytes = deallocated_bytes;
+        t.allocated_bytes = crate::metric_types::Bytes(allocated_bytes);
+        t.deallocated_bytes = crate::metric_types::Bytes(deallocated_bytes);
         if t.comm.is_empty() && t.start_time_clock_ticks == 0 {
             if let Some(t) = tally_opt.as_mut() {
                 t.discard_pending();
@@ -3677,6 +3929,11 @@ pub fn capture_to(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::metric_types::{
+        Bytes, CategoricalString, ClockTicks, CpuSet, GaugeCount, GaugeNs, MonotonicCount,
+        MonotonicNs, OrdinalI32, OrdinalU32, PeakNs,
+    };
     use tracing_test::traced_test;
 
     fn thread(pcomm: &str, comm: &str, run_time_ns: u64) -> ThreadState {
@@ -3687,12 +3944,189 @@ mod tests {
             comm: comm.into(),
             cgroup: "/".into(),
             start_time_clock_ticks: 0,
-            policy: "SCHED_OTHER".into(),
-            nice: 0,
-            cpu_affinity: vec![0, 1],
-            run_time_ns,
+            policy: CategoricalString("SCHED_OTHER".into()),
+            nice: OrdinalI32(0),
+            cpu_affinity: CpuSet(vec![0, 1]),
+            run_time_ns: MonotonicNs(run_time_ns),
             ..ThreadState::default()
         }
+    }
+
+    /// `ThreadState::default()` produces `'~'` (not `'\0'`) for
+    /// the `state` char so the absent-value sentinel matches the
+    /// capture-time `unwrap_or_else(default_state_char)`
+    /// discipline. The bare `char` Default of `'\0'` (U+0000)
+    /// lex-compares SMALLER than every real kernel state letter
+    /// (`R`/`S`/`D`/`T`/`t`/`X`/`Z`/`P`/`I`); a Mode-tie-break
+    /// that picks the lex-smallest would silently elect `'\0'`
+    /// whenever a default-built thread sat alongside a real one
+    /// in a group, dragging the cell from a meaningful state
+    /// letter down to the absent sentinel. The manual
+    /// [`Default`] impl on [`ThreadState`] pairs with the
+    /// `serde(default = "default_state_char")` attribute on the
+    /// field so both construction paths land on `'~'`.
+    #[test]
+    fn default_threadstate_state_is_sentinel_tilde() {
+        let t = ThreadState::default();
+        assert_eq!(
+            t.state, '~',
+            "ThreadState::default().state must be '~' (the \
+             absent-value sentinel chosen to lex-sort AFTER \
+             every real kernel state letter), not '\\0' (the \
+             bare char Default); see field doc on \
+             ThreadState::state"
+        );
+    }
+
+    /// Mode tie-break regression: a default-constructed
+    /// `ThreadState` must NOT lex-beat a real kernel state
+    /// letter when both contribute to the same Mode aggregation
+    /// at equal frequency. The kernel's
+    /// [`crate::host_state_compare::aggregate`] closure
+    /// `a.1.cmp(&b.1).then(b.0.cmp(&a.0))` selects
+    /// LEX-SMALLEST on count-ties, so the sentinel must be
+    /// LARGER than every real letter to keep the real letter
+    /// winning. `'~'` (U+007E = 126) is larger than every
+    /// kernel state letter (`R`=82, `S`=83, `D`=68, `T`=84,
+    /// `t`=116, `X`=88, `Z`=90, `P`=80, `I`=73), so the
+    /// tiebreak picks `R`. The original `'?'` (U+003F = 63)
+    /// sentinel was SMALLER than every real letter, which
+    /// would have made this test fail.
+    #[test]
+    fn mode_tiebreak_against_default_state_picks_real_letter() {
+        use crate::host_state_compare::{AggRule, Aggregated, aggregate};
+        let default_thread = ThreadState::default();
+        let real_thread = ThreadState {
+            state: 'R',
+            ..ThreadState::default()
+        };
+        let agg = aggregate(
+            AggRule::Mode(|t| t.state.to_string()),
+            &[&default_thread, &real_thread],
+        );
+        match agg {
+            Aggregated::Mode { value, .. } => assert_eq!(
+                value, "R",
+                "Mode tiebreak between '~' (default sentinel) \
+                 and 'R' (real kernel state) must elect 'R'; \
+                 got {value:?}"
+            ),
+            other => panic!("expected Mode, got {other:?}"),
+        }
+    }
+
+    /// Wire-format identity: hand-written JSON with raw
+    /// primitive values at every newtype-wrapped field position
+    /// must deserialize cleanly into a post-phase-2
+    /// `ThreadState` with the wrapper fields holding the
+    /// expected values. Covers one representative field per
+    /// newtype family — MonotonicCount, MonotonicNs, ClockTicks,
+    /// Bytes, PeakNs, GaugeNs, GaugeCount, OrdinalI32,
+    /// OrdinalU32, CategoricalString, CpuSet — so a regression
+    /// that breaks `serde(transparent)` on any wrapper would
+    /// surface here without needing a real .hst.zst file from
+    /// pre-phase-2 capture. Pre-phase-2 snapshot files (raw
+    /// `u64`/`i32`/`String`/`Vec<u32>` at every position)
+    /// continue to deserialize identically.
+    #[test]
+    fn wire_format_identity_raw_primitives_deserialize_into_wrapped_thread_state() {
+        let json = r#"{
+            "tid": 1234,
+            "tgid": 1234,
+            "pcomm": "demo",
+            "comm": "demo-w",
+            "cgroup": "/app",
+            "start_time_clock_ticks": 555000,
+            "policy": "SCHED_OTHER",
+            "nice": -5,
+            "cpu_affinity": [0, 1, 2, 3],
+            "processor": 7,
+            "state": "R",
+            "ext_enabled": false,
+            "run_time_ns": 1000000,
+            "wait_time_ns": 0,
+            "timeslices": 50,
+            "voluntary_csw": 100,
+            "nonvoluntary_csw": 25,
+            "nr_wakeups": 200,
+            "nr_wakeups_local": 80,
+            "nr_wakeups_remote": 30,
+            "nr_wakeups_sync": 10,
+            "nr_wakeups_migrate": 5,
+            "nr_wakeups_idle": 0,
+            "nr_wakeups_affine": 60,
+            "nr_wakeups_affine_attempts": 100,
+            "nr_migrations": 8,
+            "nr_migrations_cold": 0,
+            "nr_forced_migrations": 1,
+            "nr_failed_migrations_affine": 0,
+            "nr_failed_migrations_running": 0,
+            "nr_failed_migrations_hot": 0,
+            "wait_sum": 5000000,
+            "wait_count": 15,
+            "wait_max": 250000,
+            "sleep_sum": 3200000,
+            "sleep_max": 180000,
+            "block_sum": 1100000,
+            "block_max": 60000,
+            "iowait_sum": 77000,
+            "iowait_count": 18,
+            "exec_max": 90000,
+            "slice_max": 400000,
+            "allocated_bytes": 16777216,
+            "deallocated_bytes": 8388608,
+            "minflt": 7777,
+            "majflt": 8888,
+            "utime_clock_ticks": 10,
+            "stime_clock_ticks": 11,
+            "priority": 25,
+            "rt_priority": 99,
+            "delayacct_blkio_ticks": 137,
+            "nr_wakeups_passive": 0,
+            "core_forceidle_sum": 0,
+            "fair_slice_ns": 250000,
+            "nr_threads": 4,
+            "smaps_rollup_kb": {},
+            "rchar": 100,
+            "wchar": 200,
+            "syscr": 10,
+            "syscw": 20,
+            "read_bytes": 4096,
+            "write_bytes": 8192
+        }"#;
+        let t: ThreadState = serde_json::from_str(json).expect("deserialize");
+        // One representative field per newtype family proves
+        // serde(transparent) works post-migration.
+        assert_eq!(t.run_time_ns, crate::metric_types::MonotonicNs(1_000_000));
+        assert_eq!(t.timeslices, crate::metric_types::MonotonicCount(50));
+        assert_eq!(t.utime_clock_ticks, crate::metric_types::ClockTicks(10));
+        assert_eq!(t.allocated_bytes, crate::metric_types::Bytes(16_777_216));
+        assert_eq!(t.wait_max, crate::metric_types::PeakNs(250_000));
+        assert_eq!(t.fair_slice_ns, crate::metric_types::GaugeNs(250_000));
+        assert_eq!(t.nr_threads, crate::metric_types::GaugeCount(4));
+        assert_eq!(t.nice, crate::metric_types::OrdinalI32(-5));
+        assert_eq!(t.rt_priority, crate::metric_types::OrdinalU32(99));
+        assert_eq!(
+            t.policy,
+            crate::metric_types::CategoricalString::from("SCHED_OTHER")
+        );
+        assert_eq!(
+            t.cpu_affinity,
+            crate::metric_types::CpuSet(vec![0, 1, 2, 3])
+        );
+    }
+
+    /// Type-pin: nr_threads MUST be `GaugeCount`. A future
+    /// refactor that flips it to a different newtype (e.g.
+    /// `MonotonicCount`, which would silently re-enable Summable
+    /// and let `--group-by comm`/`--group-by cgroup` over-count
+    /// the parent process N-fold) would break this single
+    /// `let _: GaugeCount = ...;` assignment. The test compiles
+    /// only when the type is exactly `GaugeCount`.
+    #[test]
+    fn nr_threads_field_pinned_to_gauge_count() {
+        let t = ThreadState::default();
+        let _: crate::metric_types::GaugeCount = t.nr_threads;
     }
 
     #[test]
@@ -3720,7 +4154,10 @@ mod tests {
         let back = HostStateSnapshot::load(tmp.path()).unwrap();
         assert_eq!(back.captured_at_unix_ns, 42);
         assert_eq!(back.threads.len(), 2);
-        assert_eq!(back.threads[1].run_time_ns, 2_000_000);
+        assert_eq!(
+            back.threads[1].run_time_ns,
+            crate::metric_types::MonotonicNs(2_000_000),
+        );
         assert_eq!(back.cgroup_stats["/"].cpu.usage_usec, 500);
     }
 
@@ -3938,7 +4375,7 @@ mod tests {
     }
 
     /// Absent `State:` line lands as `None`; capture site collapses
-    /// to `'?'`. Pins the absent-default boundary.
+    /// to `'~'`. Pins the absent-default boundary.
     #[test]
     fn parse_status_absent_state_line_yields_none() {
         let raw = "voluntary_ctxt_switches:\t1\n";
@@ -4731,7 +5168,7 @@ mod tests {
         // On a real /proc, start_time_clock_ticks populates for live tasks.
         assert!(t.start_time_clock_ticks > 0);
         // Policy at minimum resolves to SCHED_OTHER for a normal process.
-        assert!(!t.policy.is_empty());
+        assert!(!t.policy.0.is_empty());
     }
 
     #[test]
@@ -5178,32 +5615,40 @@ mod tests {
         assert_eq!(t.comm, "worker-thread");
         assert_eq!(t.cgroup, "/ktstr.slice/worker0");
 
+        use crate::metric_types::{
+            Bytes, CategoricalString, ClockTicks, CpuSet, MonotonicCount, MonotonicNs, OrdinalI32,
+            PeakNs,
+        };
+
         // /proc/<tid>/stat fields parsed out of the paren-comm
         // tail: nice, utime, stime, starttime, processor, policy,
         // minflt, majflt.
-        assert_eq!(t.nice, -10);
+        assert_eq!(t.nice, OrdinalI32(-10));
         assert_eq!(t.start_time_clock_ticks, 555_555);
-        assert_eq!(t.policy, "SCHED_OTHER");
-        assert_eq!(t.minflt, 7777);
-        assert_eq!(t.majflt, 8888);
+        assert_eq!(t.policy, CategoricalString::from("SCHED_OTHER"));
+        assert_eq!(t.minflt, MonotonicCount(7777));
+        assert_eq!(t.majflt, MonotonicCount(8888));
         assert_eq!(
-            t.utime_clock_ticks, 10,
+            t.utime_clock_ticks,
+            ClockTicks(10),
             "tail[11] of stat fixture lands at utime_clock_ticks",
         );
         assert_eq!(
-            t.stime_clock_ticks, 11,
+            t.stime_clock_ticks,
+            ClockTicks(11),
             "tail[12] of stat fixture lands at stime_clock_ticks",
         );
         assert_eq!(
-            t.processor, 1700,
+            t.processor,
+            OrdinalI32(1700),
             "tail[36] of stat fixture (the 17th post-starttime \
              token, value 100*17=1700) lands at processor",
         );
 
         // schedstat — three-tuple of run/wait/slices.
-        assert_eq!(t.run_time_ns, 1_000_000);
-        assert_eq!(t.wait_time_ns, 200_000);
-        assert_eq!(t.timeslices, 50);
+        assert_eq!(t.run_time_ns, MonotonicNs(1_000_000));
+        assert_eq!(t.wait_time_ns, MonotonicNs(200_000));
+        assert_eq!(t.timeslices, MonotonicCount(50));
 
         // status — state + csw + Cpus_allowed_list. With
         // `use_syscall_affinity=false`, the capture path reads
@@ -5213,83 +5658,93 @@ mod tests {
             "first non-whitespace char of `State:\tR (running)` is \
              the single-letter code R",
         );
-        assert_eq!(t.voluntary_csw, 42);
-        assert_eq!(t.nonvoluntary_csw, 7);
-        assert_eq!(t.cpu_affinity, vec![0, 1, 2, 3]);
+        assert_eq!(t.voluntary_csw, MonotonicCount(42));
+        assert_eq!(t.nonvoluntary_csw, MonotonicCount(7));
+        assert_eq!(t.cpu_affinity, CpuSet(vec![0, 1, 2, 3]));
 
         // io — six cumulative counters.
-        assert_eq!(t.rchar, 100);
-        assert_eq!(t.wchar, 200);
-        assert_eq!(t.syscr, 10);
-        assert_eq!(t.syscw, 20);
-        assert_eq!(t.read_bytes, 4096);
-        assert_eq!(t.write_bytes, 8192);
+        assert_eq!(t.rchar, Bytes(100));
+        assert_eq!(t.wchar, Bytes(200));
+        assert_eq!(t.syscr, MonotonicCount(10));
+        assert_eq!(t.syscw, MonotonicCount(20));
+        assert_eq!(t.read_bytes, Bytes(4096));
+        assert_eq!(t.write_bytes, Bytes(8192));
 
         // sched — every wakeup field, migrations (including the
         // five new failed/forced/cold/affine variants), the four
         // *_sum fractional-parse fields, the five *_max
         // fractional-parse fields, and the ext.enabled bool.
-        assert_eq!(t.nr_wakeups, 11);
-        assert_eq!(t.nr_wakeups_local, 8);
-        assert_eq!(t.nr_wakeups_remote, 3);
-        assert_eq!(t.nr_wakeups_sync, 2);
-        assert_eq!(t.nr_wakeups_migrate, 1);
-        assert_eq!(t.nr_wakeups_idle, 4);
-        assert_eq!(t.nr_wakeups_affine, 12);
+        assert_eq!(t.nr_wakeups, MonotonicCount(11));
+        assert_eq!(t.nr_wakeups_local, MonotonicCount(8));
+        assert_eq!(t.nr_wakeups_remote, MonotonicCount(3));
+        assert_eq!(t.nr_wakeups_sync, MonotonicCount(2));
+        assert_eq!(t.nr_wakeups_migrate, MonotonicCount(1));
+        assert_eq!(t.nr_wakeups_idle, MonotonicCount(4));
+        assert_eq!(t.nr_wakeups_affine, MonotonicCount(12));
         assert_eq!(
-            t.nr_wakeups_affine_attempts, 20,
+            t.nr_wakeups_affine_attempts,
+            MonotonicCount(20),
             "denominator for the affine-wake success ratio \
              (nr_wakeups_affine / nr_wakeups_affine_attempts = 12/20)",
         );
-        assert_eq!(t.nr_migrations, 9);
-        assert_eq!(t.nr_migrations_cold, 5);
-        assert_eq!(t.nr_forced_migrations, 7);
-        assert_eq!(t.nr_failed_migrations_affine, 1);
-        assert_eq!(t.nr_failed_migrations_running, 2);
-        assert_eq!(t.nr_failed_migrations_hot, 3);
+        assert_eq!(t.nr_migrations, MonotonicCount(9));
+        assert_eq!(t.nr_migrations_cold, MonotonicCount(5));
+        assert_eq!(t.nr_forced_migrations, MonotonicCount(7));
+        assert_eq!(t.nr_failed_migrations_affine, MonotonicCount(1));
+        assert_eq!(t.nr_failed_migrations_running, MonotonicCount(2));
+        assert_eq!(t.nr_failed_migrations_hot, MonotonicCount(3));
         // PN_SCHEDSTAT format is ms.ns_remainder. Reconstructed
         // ns = ms_part * 1_000_000 + zero-right-padded ns_part.
         // `5000.25` → `.25` pads to `.250000` (=250_000 ns) +
         // 5000ms × 1_000_000 = 5_000_250_000 ns total.
         assert_eq!(
-            t.wait_sum, 5_000_250_000,
+            t.wait_sum,
+            MonotonicNs(5_000_250_000),
             "PN_SCHEDSTAT 5000.25 reconstructs to 5_000_250_000 ns \
              (5000ms + 250_000ns)",
         );
-        assert_eq!(t.wait_count, 15);
+        assert_eq!(t.wait_count, MonotonicCount(15));
         assert_eq!(
-            t.wait_max, 250_500_000,
+            t.wait_max,
+            PeakNs(250_500_000),
             "PN_SCHEDSTAT 250.5 reconstructs to 250_500_000 ns",
         );
         assert_eq!(
-            t.sleep_sum, 3_200_500_000,
+            t.sleep_sum,
+            MonotonicNs(3_200_500_000),
             "PN_SCHEDSTAT 3200.50 reconstructs to 3_200_500_000 ns; \
              sleep_sum is populated from the kernel's `sum_sleep_runtime` key",
         );
         assert_eq!(
-            t.sleep_max, 180_250_000,
+            t.sleep_max,
+            PeakNs(180_250_000),
             "PN_SCHEDSTAT 180.25 reconstructs to 180_250_000 ns",
         );
         assert_eq!(
-            t.block_sum, 1_100_750_000,
+            t.block_sum,
+            MonotonicNs(1_100_750_000),
             "PN_SCHEDSTAT 1100.75 reconstructs to 1_100_750_000 ns; \
              block_sum is populated from the kernel's `sum_block_runtime` key",
         );
         assert_eq!(
-            t.block_max, 60_750_000,
+            t.block_max,
+            PeakNs(60_750_000),
             "PN_SCHEDSTAT 60.75 reconstructs to 60_750_000 ns",
         );
         assert_eq!(
-            t.iowait_sum, 77_000_000,
+            t.iowait_sum,
+            MonotonicNs(77_000_000),
             "PN_SCHEDSTAT 77.0 reconstructs to 77_000_000 ns",
         );
-        assert_eq!(t.iowait_count, 18);
+        assert_eq!(t.iowait_count, MonotonicCount(18));
         assert_eq!(
-            t.exec_max, 90_000_000,
+            t.exec_max,
+            PeakNs(90_000_000),
             "PN_SCHEDSTAT 90.0 reconstructs to 90_000_000 ns",
         );
         assert_eq!(
-            t.slice_max, 400_500_000,
+            t.slice_max,
+            PeakNs(400_500_000),
             "PN_SCHEDSTAT 400.5 reconstructs to 400_500_000 ns",
         );
         assert!(
@@ -5306,12 +5761,14 @@ mod tests {
         // would either crash on the synthetic /proc or surface garbage
         // here.
         assert_eq!(
-            t.allocated_bytes, 0,
+            t.allocated_bytes,
+            Bytes(0),
             "synthetic-tree capture must not probe — allocated_bytes \
              collapses to absent-counter zero",
         );
         assert_eq!(
-            t.deallocated_bytes, 0,
+            t.deallocated_bytes,
+            Bytes(0),
             "synthetic-tree capture must not probe — deallocated_bytes \
              collapses to absent-counter zero",
         );
@@ -5401,7 +5858,8 @@ mod tests {
         );
         for thread in &snap.threads {
             assert_eq!(
-                thread.allocated_bytes, 0,
+                thread.allocated_bytes,
+                Bytes(0),
                 "synthetic /proc has no maps; attach fails, allocated_bytes \
                  collapses to absent-counter zero — cache-hit branch must not \
                  fabricate a non-zero counter",
@@ -5620,22 +6078,36 @@ mod tests {
             "corrupt stat → start_time_clock_ticks default 0; got {}",
             t.start_time_clock_ticks
         );
-        assert_eq!(t.nice, 0, "corrupt stat → nice default 0; got {}", t.nice);
+        use crate::metric_types::{
+            Bytes, CategoricalString, ClockTicks, MonotonicCount, OrdinalI32,
+        };
         assert_eq!(
-            t.policy, "",
+            t.nice,
+            OrdinalI32(0),
+            "corrupt stat → nice default 0; got {}",
+            t.nice.0,
+        );
+        assert_eq!(
+            t.policy,
+            CategoricalString::from(""),
             "corrupt stat → policy default empty; got {:?}",
             t.policy
         );
-        assert_eq!(t.utime_clock_ticks, 0);
-        assert_eq!(t.stime_clock_ticks, 0);
-        assert_eq!(t.processor, 0);
+        assert_eq!(t.utime_clock_ticks, ClockTicks(0));
+        assert_eq!(t.stime_clock_ticks, ClockTicks(0));
+        assert_eq!(t.processor, OrdinalI32(0));
         // status-derived fields still populate.
         assert_eq!(
-            t.voluntary_csw, 42,
+            t.voluntary_csw,
+            MonotonicCount(42),
             "status file is intact → voluntary_csw still populates"
         );
         // io-derived fields still populate.
-        assert_eq!(t.rchar, 100, "io file is intact → rchar still populates");
+        assert_eq!(
+            t.rchar,
+            Bytes(100),
+            "io file is intact → rchar still populates"
+        );
     }
 
     /// G4b — missing `schedstat` file (kernel without
@@ -5666,13 +6138,15 @@ mod tests {
             "thread still lands with schedstat absent"
         );
         let t = &snap.threads[0];
+        use crate::metric_types::{MonotonicCount, MonotonicNs};
         assert_eq!(
-            t.run_time_ns, 0,
+            t.run_time_ns,
+            MonotonicNs(0),
             "missing schedstat → run_time_ns default 0; got {}",
-            t.run_time_ns
+            t.run_time_ns.0
         );
-        assert_eq!(t.wait_time_ns, 0);
-        assert_eq!(t.timeslices, 0);
+        assert_eq!(t.wait_time_ns, MonotonicNs(0));
+        assert_eq!(t.timeslices, MonotonicCount(0));
         // start_time still populates from intact stat.
         assert_eq!(t.start_time_clock_ticks, 555_555);
     }
@@ -5705,20 +6179,22 @@ mod tests {
         let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
+        use crate::metric_types::MonotonicCount;
         assert_eq!(
-            t.voluntary_csw, 0,
+            t.voluntary_csw,
+            MonotonicCount(0),
             "corrupt status → voluntary_csw default 0; got {}",
-            t.voluntary_csw
+            t.voluntary_csw.0
         );
-        assert_eq!(t.nonvoluntary_csw, 0);
+        assert_eq!(t.nonvoluntary_csw, MonotonicCount(0));
         assert_eq!(
-            t.state, '?',
-            "corrupt status → state collapses to '?' (capture-time \
-             unwrap_or('?')); got {:?}",
+            t.state, '~',
+            "corrupt status → state collapses to '~' (capture-time \
+             unwrap_or_else(default_state_char)); got {:?}",
             t.state
         );
         assert!(
-            t.cpu_affinity.is_empty(),
+            t.cpu_affinity.0.is_empty(),
             "use_syscall_affinity=false + corrupt status → cpu_affinity \
              must be empty Vec, NOT inherit caller's real affinity; got {:?}",
             t.cpu_affinity,
@@ -5748,12 +6224,18 @@ mod tests {
         let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
-        assert_eq!(t.rchar, 0, "missing io → rchar default 0; got {}", t.rchar);
-        assert_eq!(t.wchar, 0);
-        assert_eq!(t.syscr, 0);
-        assert_eq!(t.syscw, 0);
-        assert_eq!(t.read_bytes, 0);
-        assert_eq!(t.write_bytes, 0);
+        use crate::metric_types::{Bytes, MonotonicCount};
+        assert_eq!(
+            t.rchar,
+            Bytes(0),
+            "missing io → rchar default 0; got {}",
+            t.rchar.0,
+        );
+        assert_eq!(t.wchar, Bytes(0));
+        assert_eq!(t.syscr, MonotonicCount(0));
+        assert_eq!(t.syscw, MonotonicCount(0));
+        assert_eq!(t.read_bytes, Bytes(0));
+        assert_eq!(t.write_bytes, Bytes(0));
         // stat-derived fields still populate.
         assert_eq!(t.start_time_clock_ticks, 555_555);
     }
@@ -5781,19 +6263,21 @@ mod tests {
         let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
+        use crate::metric_types::{MonotonicCount, MonotonicNs, PeakNs};
         assert_eq!(
-            t.nr_wakeups, 0,
+            t.nr_wakeups,
+            MonotonicCount(0),
             "missing sched → nr_wakeups default 0; got {}",
-            t.nr_wakeups
+            t.nr_wakeups.0,
         );
-        assert_eq!(t.nr_migrations, 0);
-        assert_eq!(t.wait_sum, 0);
-        assert_eq!(t.wait_max, 0);
-        assert_eq!(t.sleep_sum, 0);
-        assert_eq!(t.block_sum, 0);
-        assert_eq!(t.iowait_sum, 0);
-        assert_eq!(t.exec_max, 0);
-        assert_eq!(t.slice_max, 0);
+        assert_eq!(t.nr_migrations, MonotonicCount(0));
+        assert_eq!(t.wait_sum, MonotonicNs(0));
+        assert_eq!(t.wait_max, PeakNs(0));
+        assert_eq!(t.sleep_sum, MonotonicNs(0));
+        assert_eq!(t.block_sum, MonotonicNs(0));
+        assert_eq!(t.iowait_sum, MonotonicNs(0));
+        assert_eq!(t.exec_max, PeakNs(0));
+        assert_eq!(t.slice_max, PeakNs(0));
         assert!(
             !t.ext_enabled,
             "missing sched → ext.enabled key absent → ext_enabled false; \
@@ -5832,14 +6316,15 @@ mod tests {
         let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1, "comm intact → thread still lands");
         let t = &snap.threads[0];
+        use crate::metric_types::{Bytes, MonotonicCount, MonotonicNs};
         assert_eq!(t.comm, "racy-comm", "comm survives the racy partial reads");
         // Every counter zeros.
         assert_eq!(t.start_time_clock_ticks, 0);
-        assert_eq!(t.nr_wakeups, 0);
-        assert_eq!(t.run_time_ns, 0);
-        assert_eq!(t.voluntary_csw, 0);
-        assert_eq!(t.rchar, 0);
-        assert_eq!(t.minflt, 0);
+        assert_eq!(t.nr_wakeups, MonotonicCount(0));
+        assert_eq!(t.run_time_ns, MonotonicNs(0));
+        assert_eq!(t.voluntary_csw, MonotonicCount(0));
+        assert_eq!(t.rchar, Bytes(0));
+        assert_eq!(t.minflt, MonotonicCount(0));
         assert_eq!(t.cgroup, "");
         assert!(
             snap.cgroup_stats.is_empty(),
@@ -5925,8 +6410,9 @@ mod tests {
         let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
+        use crate::metric_types::MonotonicCount;
         assert!(
-            t.cpu_affinity.is_empty(),
+            t.cpu_affinity.0.is_empty(),
             "malformed Cpus_allowed_list `5-3` → parse_cpu_list returns \
              None → cpu_affinity defaults to empty Vec (NOT a partial \
              range, NOT the caller's affinity); got {:?}",
@@ -5935,7 +6421,8 @@ mod tests {
         // Other status fields still populate (the malformed
         // line failed only the cpulist arm of parse_status).
         assert_eq!(
-            t.voluntary_csw, 1,
+            t.voluntary_csw,
+            MonotonicCount(1),
             "malformed cpulist must NOT corrupt csw fields on the same \
              status file — per-arm Option isolation"
         );
@@ -5972,19 +6459,21 @@ mod tests {
         let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
+        use crate::metric_types::MonotonicCount;
         assert!(
-            t.cpu_affinity.is_empty(),
+            t.cpu_affinity.0.is_empty(),
             "huge cpulist range `0-4294967295` exceeds the 64 Ki \
              expansion cap → parse_cpu_list returns None → cpu_affinity \
              empty (NOT a 4-billion-element Vec, NOT a partial range); \
              got {} elements",
-            t.cpu_affinity.len(),
+            t.cpu_affinity.0.len(),
         );
         // Per-arm isolation: the cap-rejected cpulist must NOT
         // crash the rest of parse_status. csw fields on the same
         // file still populate. Mirrors G8's isolation check.
         assert_eq!(
-            t.voluntary_csw, 1,
+            t.voluntary_csw,
+            MonotonicCount(1),
             "huge cpulist rejection must not break csw parsing on the \
              same status file — per-arm Option isolation"
         );
@@ -7639,14 +8128,15 @@ mod tests {
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
         assert!(
-            t.cpu_affinity.is_empty(),
+            t.cpu_affinity.0.is_empty(),
             "empty Cpus_allowed_list value → parse_cpu_list returns \
              None at the empty-input guard → cpu_affinity empty; \
              got {} elements",
-            t.cpu_affinity.len(),
+            t.cpu_affinity.0.len(),
         );
         assert_eq!(
-            t.voluntary_csw, 1,
+            t.voluntary_csw,
+            MonotonicCount(1),
             "empty cpulist must not break csw parsing on the same \
              status file",
         );

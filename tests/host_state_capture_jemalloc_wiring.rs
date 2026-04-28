@@ -39,6 +39,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use ktstr::metric_types::Bytes;
+
 /// Compile-time path to the alloc-worker binary; cargo populates
 /// `CARGO_BIN_EXE_<name>` for every `[[bin]]` declared in the
 /// workspace, so the test does not need to spell the build
@@ -234,12 +236,12 @@ fn capture_populates_jemalloc_counters_for_alloc_worker() {
     // (only the main thread allocated, helpers stay near zero).
     let allocated: u64 = worker_threads
         .iter()
-        .map(|t| t.allocated_bytes)
+        .map(|t| t.allocated_bytes.0)
         .max()
         .expect("worker_threads non-empty per assert above");
     let deallocated: u64 = worker_threads
         .iter()
-        .map(|t| t.deallocated_bytes)
+        .map(|t| t.deallocated_bytes.0)
         .max()
         .expect("worker_threads non-empty per assert above");
 
@@ -305,17 +307,21 @@ fn capture_pid_skips_self_attach_and_keeps_counters_zero() {
     );
     for t in &self_threads {
         assert_eq!(
-            t.allocated_bytes, 0,
+            t.allocated_bytes,
+            Bytes(0),
             "self-pid threads must carry allocated_bytes=0 — the \
              pid==self_pid gate must keep attach_jemalloc from \
              running against the calling process; got {} on tid {}",
-            t.allocated_bytes, t.tid,
+            t.allocated_bytes,
+            t.tid,
         );
         assert_eq!(
-            t.deallocated_bytes, 0,
+            t.deallocated_bytes,
+            Bytes(0),
             "self-pid threads must carry deallocated_bytes=0; \
              got {} on tid {}",
-            t.deallocated_bytes, t.tid,
+            t.deallocated_bytes,
+            t.tid,
         );
     }
 }
@@ -370,17 +376,21 @@ fn capture_pid_against_non_jemalloc_target_keeps_counters_zero_but_populates_pro
     );
     for t in &target_threads {
         assert_eq!(
-            t.allocated_bytes, 0,
+            t.allocated_bytes,
+            Bytes(0),
             "non-jemalloc target must carry allocated_bytes=0 (attach \
              returned JemallocNotFound, capture absorbed into absent-\
              counter contract); got {} on tid {}",
-            t.allocated_bytes, t.tid,
+            t.allocated_bytes,
+            t.tid,
         );
         assert_eq!(
-            t.deallocated_bytes, 0,
+            t.deallocated_bytes,
+            Bytes(0),
             "non-jemalloc target must carry deallocated_bytes=0; \
              got {} on tid {}",
-            t.deallocated_bytes, t.tid,
+            t.deallocated_bytes,
+            t.tid,
         );
         // Procfs identity + counters populate normally — the attach
         // failure absorbs into the jemalloc fields only, not the
@@ -391,7 +401,7 @@ fn capture_pid_against_non_jemalloc_target_keeps_counters_zero_but_populates_pro
             "/proc/<pid>/stat field 22 must populate for a live target",
         );
         assert!(
-            !t.policy.is_empty(),
+            !t.policy.0.is_empty(),
             "scheduling policy must populate from procfs even when the \
              jemalloc probe fails — proves the per-thread procfs path \
              does not depend on probe success",

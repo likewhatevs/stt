@@ -28,6 +28,7 @@
 use anyhow::{Result, anyhow};
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::ktstr_test;
+use ktstr::metric_types::Bytes;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::payload_run::PayloadHandle;
 use ktstr::test_support::{OutputFormat, Payload, PayloadKind};
@@ -189,14 +190,14 @@ fn host_state_capture_records_allocated_bytes_for_jemalloc_alloc_worker(
     // against any future jemalloc helper thread. Default-mode
     // worker enforces single-threaded via /proc/self/task self-
     // check, so this is normally just one entry.
-    let allocated = worker_threads
+    let allocated: u64 = worker_threads
         .iter()
-        .map(|t| t.allocated_bytes)
+        .map(|t| t.allocated_bytes.0)
         .max()
         .expect("worker_threads non-empty per the gate above");
-    let deallocated = worker_threads
+    let deallocated: u64 = worker_threads
         .iter()
-        .map(|t| t.deallocated_bytes)
+        .map(|t| t.deallocated_bytes.0)
         .max()
         .expect("worker_threads non-empty per the gate above");
 
@@ -309,7 +310,7 @@ fn host_state_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertR
     // populated kernel-thread counters from some other source,
     // or the absent-counter contract regressed.
     for t in &kthreadd_threads {
-        if t.allocated_bytes != 0 {
+        if t.allocated_bytes != Bytes(0) {
             return Ok(AssertResult::fail_msg(format!(
                 "kthreadd tid={} carries allocated_bytes={}; kernel \
                  threads have no userspace heap, the absent-counter \
@@ -317,7 +318,7 @@ fn host_state_capture_completes_against_bare_guest(_ctx: &Ctx) -> Result<AssertR
                 t.tid, t.allocated_bytes,
             )));
         }
-        if t.deallocated_bytes != 0 {
+        if t.deallocated_bytes != Bytes(0) {
             return Ok(AssertResult::fail_msg(format!(
                 "kthreadd tid={} carries deallocated_bytes={}; expected 0",
                 t.tid, t.deallocated_bytes,
@@ -436,11 +437,11 @@ fn host_state_capture_against_churn_worker_does_not_panic(ctx: &Ctx) -> Result<A
     }
 
     let mut result = AssertResult::pass();
-    let main_alloc = snap
+    let main_alloc: u64 = snap
         .threads
         .iter()
         .find(|t| t.tgid == worker_pid && t.tid == worker_pid)
-        .map(|t| t.allocated_bytes)
+        .map(|t| t.allocated_bytes.0)
         .unwrap_or(0);
     result.details.push(AssertDetail::new(
         DetailKind::Other,

@@ -31,6 +31,10 @@ use ktstr::host_state_compare::{
     AggRule, Aggregated, CompareOptions, DisplayOptions, GroupBy, HOST_STATE_METRICS,
     HostStateCompareArgs, aggregate, compare, run_compare, write_diff,
 };
+use ktstr::metric_types::{
+    Bytes, ClockTicks, CpuSet, GaugeCount, GaugeNs, MonotonicCount, MonotonicNs, OrdinalI32,
+    OrdinalU32, PeakNs,
+};
 
 use common::host_state::{cgroup_stats_entry, make_thread, snapshot};
 
@@ -56,13 +60,13 @@ fn full_pipeline_with_disk_roundtrip() {
     let candidate_path = tmp.path().join("candidate.hst.zst");
 
     let mut ta = make_thread("integration_proc", "worker");
-    ta.run_time_ns = 1_000_000;
-    ta.voluntary_csw = 10;
-    ta.nr_wakeups = 100;
+    ta.run_time_ns = MonotonicNs(1_000_000);
+    ta.voluntary_csw = MonotonicCount(10);
+    ta.nr_wakeups = MonotonicCount(100);
     let mut tb = make_thread("integration_proc", "worker");
-    tb.run_time_ns = 3_500_000;
-    tb.voluntary_csw = 40;
-    tb.nr_wakeups = 350;
+    tb.run_time_ns = MonotonicNs(3_500_000);
+    tb.voluntary_csw = MonotonicCount(40);
+    tb.nr_wakeups = MonotonicCount(350);
 
     snapshot(vec![ta], BTreeMap::new())
         .write(&baseline_path)
@@ -154,7 +158,7 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
 
     let mut ta = make_thread("app", "worker");
     ta.cgroup = "/kubepods/burstable/pod-AAA/container".into();
-    ta.run_time_ns = 1_000;
+    ta.run_time_ns = MonotonicNs(1_000);
     let mut cgroup_stats_a = BTreeMap::new();
     cgroup_stats_a.insert(
         "/kubepods/burstable/pod-AAA/container".into(),
@@ -163,7 +167,7 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
 
     let mut tb = make_thread("app", "worker");
     tb.cgroup = "/kubepods/burstable/pod-BBB/container".into();
-    tb.run_time_ns = 4_000;
+    tb.run_time_ns = MonotonicNs(4_000);
     let mut cgroup_stats_b = BTreeMap::new();
     cgroup_stats_b.insert(
         "/kubepods/burstable/pod-BBB/container".into(),
@@ -300,9 +304,9 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
     let candidate_path = tmp.path().join("candidate.hst.zst");
 
     let mut ta = make_thread("run_compare_proc", "w");
-    ta.run_time_ns = 10_000;
+    ta.run_time_ns = MonotonicNs(10_000);
     let mut tb = make_thread("run_compare_proc", "w");
-    tb.run_time_ns = 50_000;
+    tb.run_time_ns = MonotonicNs(50_000);
 
     snapshot(vec![ta], BTreeMap::new())
         .write(&baseline_path)
@@ -351,13 +355,13 @@ fn run_compare_with_valid_sort_by_succeeds() {
     // groups to rank — single-bucket would short-circuit
     // through degenerate ordering.
     let mut a1 = make_thread("alpha", "w");
-    a1.run_time_ns = 1_000;
+    a1.run_time_ns = MonotonicNs(1_000);
     let mut a2 = make_thread("alpha", "w");
-    a2.run_time_ns = 2_000;
+    a2.run_time_ns = MonotonicNs(2_000);
     let mut b1 = make_thread("bravo", "w");
-    b1.run_time_ns = 100;
+    b1.run_time_ns = MonotonicNs(100);
     let mut b2 = make_thread("bravo", "w");
-    b2.run_time_ns = 500;
+    b2.run_time_ns = MonotonicNs(500);
 
     snapshot(vec![a1, b1], BTreeMap::new())
         .write(&baseline_path)
@@ -490,94 +494,122 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("state", |t| t.state = 'R'),
         ("ext_enabled", |t| t.ext_enabled = true),
         // OrdinalRange rules — distinct integers.
-        ("nice", |t| t.nice = 7),
-        ("processor", |t| t.processor = 5),
+        ("nice", |t| t.nice = OrdinalI32(7)),
+        ("processor", |t| t.processor = OrdinalI32(5)),
         // Affinity rule — 5-element uniform cpuset distinct
         // from `make_thread`'s default `vec![0, 1, 2, 3]`.
         ("cpu_affinity", |t| {
-            t.cpu_affinity = vec![10, 11, 12, 13, 14]
+            t.cpu_affinity = CpuSet(vec![10, 11, 12, 13, 14])
         }),
         // Sum rules — each gets a unique u64. The expected
         // value table below mirrors these so a swap between
         // two accessors (run_time_ns ↔ wait_time_ns) would
         // surface as a numeric mismatch citing the metric.
-        ("run_time_ns", |t| t.run_time_ns = 100),
-        ("wait_time_ns", |t| t.wait_time_ns = 101),
-        ("timeslices", |t| t.timeslices = 102),
-        ("voluntary_csw", |t| t.voluntary_csw = 103),
-        ("nonvoluntary_csw", |t| t.nonvoluntary_csw = 104),
-        ("nr_wakeups", |t| t.nr_wakeups = 105),
-        ("nr_wakeups_local", |t| t.nr_wakeups_local = 106),
-        ("nr_wakeups_remote", |t| t.nr_wakeups_remote = 107),
-        ("nr_wakeups_sync", |t| t.nr_wakeups_sync = 108),
-        ("nr_wakeups_migrate", |t| t.nr_wakeups_migrate = 109),
-        ("nr_wakeups_idle", |t| t.nr_wakeups_idle = 110),
-        ("nr_wakeups_affine", |t| t.nr_wakeups_affine = 111),
-        ("nr_wakeups_affine_attempts", |t| {
-            t.nr_wakeups_affine_attempts = 112
+        ("run_time_ns", |t| t.run_time_ns = MonotonicNs(100)),
+        ("wait_time_ns", |t| t.wait_time_ns = MonotonicNs(101)),
+        ("timeslices", |t| t.timeslices = MonotonicCount(102)),
+        ("voluntary_csw", |t| t.voluntary_csw = MonotonicCount(103)),
+        ("nonvoluntary_csw", |t| {
+            t.nonvoluntary_csw = MonotonicCount(104)
         }),
-        ("nr_migrations", |t| t.nr_migrations = 113),
-        ("nr_migrations_cold", |t| t.nr_migrations_cold = 114),
-        ("nr_forced_migrations", |t| t.nr_forced_migrations = 115),
+        ("nr_wakeups", |t| t.nr_wakeups = MonotonicCount(105)),
+        ("nr_wakeups_local", |t| {
+            t.nr_wakeups_local = MonotonicCount(106)
+        }),
+        ("nr_wakeups_remote", |t| {
+            t.nr_wakeups_remote = MonotonicCount(107)
+        }),
+        ("nr_wakeups_sync", |t| {
+            t.nr_wakeups_sync = MonotonicCount(108)
+        }),
+        ("nr_wakeups_migrate", |t| {
+            t.nr_wakeups_migrate = MonotonicCount(109)
+        }),
+        ("nr_wakeups_idle", |t| {
+            t.nr_wakeups_idle = MonotonicCount(110)
+        }),
+        ("nr_wakeups_affine", |t| {
+            t.nr_wakeups_affine = MonotonicCount(111)
+        }),
+        ("nr_wakeups_affine_attempts", |t| {
+            t.nr_wakeups_affine_attempts = MonotonicCount(112)
+        }),
+        ("nr_migrations", |t| t.nr_migrations = MonotonicCount(113)),
+        ("nr_migrations_cold", |t| {
+            t.nr_migrations_cold = MonotonicCount(114)
+        }),
+        ("nr_forced_migrations", |t| {
+            t.nr_forced_migrations = MonotonicCount(115)
+        }),
         ("nr_failed_migrations_affine", |t| {
-            t.nr_failed_migrations_affine = 116
+            t.nr_failed_migrations_affine = MonotonicCount(116)
         }),
         ("nr_failed_migrations_running", |t| {
-            t.nr_failed_migrations_running = 117
+            t.nr_failed_migrations_running = MonotonicCount(117)
         }),
         ("nr_failed_migrations_hot", |t| {
-            t.nr_failed_migrations_hot = 118
+            t.nr_failed_migrations_hot = MonotonicCount(118)
         }),
-        ("wait_sum", |t| t.wait_sum = 119),
-        ("wait_count", |t| t.wait_count = 120),
-        ("sleep_sum", |t| t.sleep_sum = 121),
-        ("block_sum", |t| t.block_sum = 122),
-        ("iowait_sum", |t| t.iowait_sum = 123),
-        ("iowait_count", |t| t.iowait_count = 124),
-        ("allocated_bytes", |t| t.allocated_bytes = 125),
-        ("deallocated_bytes", |t| t.deallocated_bytes = 126),
-        ("minflt", |t| t.minflt = 127),
-        ("majflt", |t| t.majflt = 128),
-        ("utime_clock_ticks", |t| t.utime_clock_ticks = 129),
-        ("stime_clock_ticks", |t| t.stime_clock_ticks = 130),
-        ("rchar", |t| t.rchar = 131),
-        ("wchar", |t| t.wchar = 132),
-        ("syscr", |t| t.syscr = 133),
-        ("syscw", |t| t.syscw = 134),
-        ("read_bytes", |t| t.read_bytes = 135),
-        ("write_bytes", |t| t.write_bytes = 136),
+        ("wait_sum", |t| t.wait_sum = MonotonicNs(119)),
+        ("wait_count", |t| t.wait_count = MonotonicCount(120)),
+        ("sleep_sum", |t| t.sleep_sum = MonotonicNs(121)),
+        ("block_sum", |t| t.block_sum = MonotonicNs(122)),
+        ("iowait_sum", |t| t.iowait_sum = MonotonicNs(123)),
+        ("iowait_count", |t| t.iowait_count = MonotonicCount(124)),
+        ("allocated_bytes", |t| t.allocated_bytes = Bytes(125)),
+        ("deallocated_bytes", |t| t.deallocated_bytes = Bytes(126)),
+        ("minflt", |t| t.minflt = MonotonicCount(127)),
+        ("majflt", |t| t.majflt = MonotonicCount(128)),
+        ("utime_clock_ticks", |t| {
+            t.utime_clock_ticks = ClockTicks(129)
+        }),
+        ("stime_clock_ticks", |t| {
+            t.stime_clock_ticks = ClockTicks(130)
+        }),
+        ("rchar", |t| t.rchar = Bytes(131)),
+        ("wchar", |t| t.wchar = Bytes(132)),
+        ("syscr", |t| t.syscr = MonotonicCount(133)),
+        ("syscw", |t| t.syscw = MonotonicCount(134)),
+        ("read_bytes", |t| t.read_bytes = Bytes(135)),
+        ("write_bytes", |t| t.write_bytes = Bytes(136)),
         // Max rules — each gets a unique u64.
-        ("wait_max", |t| t.wait_max = 200),
-        ("sleep_max", |t| t.sleep_max = 201),
-        ("block_max", |t| t.block_max = 202),
-        ("exec_max", |t| t.exec_max = 203),
-        ("slice_max", |t| t.slice_max = 204),
+        ("wait_max", |t| t.wait_max = PeakNs(200)),
+        ("sleep_max", |t| t.sleep_max = PeakNs(201)),
+        ("block_max", |t| t.block_max = PeakNs(202)),
+        ("exec_max", |t| t.exec_max = PeakNs(203)),
+        ("slice_max", |t| t.slice_max = PeakNs(204)),
         // /proc/<tid>/stat additions (parse_stat).
         // priority: kernel-internal scheduler priority (signed,
         // OrdinalRange).
-        ("priority", |t| t.priority = 25),
+        ("priority", |t| t.priority = OrdinalI32(25)),
         // rt_priority: bounded real-time priority (OrdinalRange
         // — non-Sum because it's a bounded ordinal, not a
         // counter).
-        ("rt_priority", |t| t.rt_priority = 50),
+        ("rt_priority", |t| t.rt_priority = OrdinalU32(50)),
         // delayacct_blkio_ticks: cumulative counter (Sum).
-        ("delayacct_blkio_ticks", |t| t.delayacct_blkio_ticks = 137),
+        ("delayacct_blkio_ticks", |t| {
+            t.delayacct_blkio_ticks = ClockTicks(137)
+        }),
         // /proc/<tid>/sched additions (parse_sched).
         // nr_wakeups_passive: counter (Sum) — known dead on
         // mainline but registered for forward compat.
-        ("nr_wakeups_passive", |t| t.nr_wakeups_passive = 138),
+        ("nr_wakeups_passive", |t| {
+            t.nr_wakeups_passive = MonotonicCount(138)
+        }),
         // core_forceidle_sum: counter (Sum, ns).
-        ("core_forceidle_sum", |t| t.core_forceidle_sum = 139),
+        ("core_forceidle_sum", |t| {
+            t.core_forceidle_sum = MonotonicNs(139)
+        }),
         // fair_slice_ns: current scheduler slice (Max, ns) —
         // distinct from slice_max which is the schedstat
         // high-water. Name mirrors the kernel `fair_policy()`
         // gate, which accepts SCHED_NORMAL/BATCH/EXT.
-        ("fair_slice_ns", |t| t.fair_slice_ns = 250),
+        ("fair_slice_ns", |t| t.fair_slice_ns = GaugeNs(250)),
         // /proc/<tid>/status addition (parse_status).
         // nr_threads: tgid thread count, leader-only dedup. Max
         // surfaces "the largest process represented in this
         // bucket"; the row count already covers thread totals.
-        ("nr_threads", |t| t.nr_threads = 140),
+        ("nr_threads", |t| t.nr_threads = GaugeCount(140)),
     ];
 
     // Hand-paired expected scalar value for each Sum/Max
@@ -799,7 +831,7 @@ fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
     let mut leader = make_thread("server", "server-leader");
     leader.tid = 4242;
     leader.tgid = 4242;
-    leader.nr_threads = 3;
+    leader.nr_threads = GaugeCount(3);
 
     let mut follower_a = make_thread("server", "server-worker-1");
     follower_a.tid = 4243;
@@ -809,12 +841,12 @@ fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
     // contract obvious; relying on the Default would be
     // implicit and could mask a regression that flipped the
     // dedup direction (leader=0, followers=N).
-    follower_a.nr_threads = 0;
+    follower_a.nr_threads = GaugeCount(0);
 
     let mut follower_b = make_thread("server", "server-worker-2");
     follower_b.tid = 4244;
     follower_b.tgid = 4242;
-    follower_b.nr_threads = 0;
+    follower_b.nr_threads = GaugeCount(0);
 
     let def = HOST_STATE_METRICS
         .iter()

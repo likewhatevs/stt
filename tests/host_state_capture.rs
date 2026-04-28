@@ -90,12 +90,12 @@ fn host_state_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result
         .threads
         .iter()
         .filter(|t| {
-            t.run_time_ns > 0
-                || t.voluntary_csw > 0
-                || t.nonvoluntary_csw > 0
-                || t.nr_wakeups > 0
-                || t.timeslices > 0
-                || t.minflt > 0
+            t.run_time_ns.0 > 0
+                || t.voluntary_csw.0 > 0
+                || t.nonvoluntary_csw.0 > 0
+                || t.nr_wakeups.0 > 0
+                || t.timeslices.0 > 0
+                || t.minflt.0 > 0
         })
         .count();
 
