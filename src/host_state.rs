@@ -976,23 +976,42 @@ pub struct ThreadState {
     pub write_bytes: u64,
 }
 
-/// Per-cgroup enrichment counters attached to [`HostStateSnapshot`].
+/// Per-cgroup enrichment record attached to [`HostStateSnapshot`].
 ///
-/// Populated from the cgroup v2 filesystem at capture time:
-/// `cpu.stat` exposes `usage_usec`, `nr_throttled`,
-/// `throttled_usec`; `memory.current` is the instantaneous RSS
-/// of the cgroup; `<resource>.pressure` exposes Pressure Stall
-/// Information (PSI) per resource. These are
+/// Populated from the cgroup v2 filesystem at capture time. The
+/// shape mirrors the kernel's per-controller file layout:
+/// [`CgroupCpuStats`] holds the `cpu.*` files,
+/// [`CgroupMemoryStats`] holds the `memory.*` files,
+/// [`CgroupPidsStats`] holds the `pids.*` files, and [`Psi`]
+/// holds the `<resource>.pressure` files. These are
 /// aggregate-over-the-cgroup values — NOT summable from
 /// per-thread data — so the capture layer reads them directly
-/// from the cgroupfs rather than deriving.
+/// from cgroupfs rather than deriving.
+///
+/// Nested-struct shape (rather than a flat ~50-field struct)
+/// mirrors the kernel's controller-by-controller exposure: a
+/// reader who knows the kernel layout can map directly between
+/// cgroupfs files and Rust fields, and the merge policy in
+/// [`crate::host_state_compare::flatten_cgroup_stats`] applies
+/// per-domain (max for limits, min for floors, saturating_add
+/// for counters) without conflating across domains.
+///
+/// **Schema break (#61):** the previous flat shape (4 fields:
+/// `cpu_usage_usec`, `nr_throttled`, `throttled_usec`,
+/// `memory_current`) is gone. Snapshots written by older
+/// versions deserialize via serde's defaulting — old fields
+/// land on the new nested fields' zero defaults rather than
+/// migrating, so a baseline-vs-candidate compare against an
+/// old snapshot produces "every counter went from N to 0".
+/// Re-capture both sides with the current build to compare
+/// faithfully. Per the project's pre-1.0 disposable-sidecar
+/// policy this is intentional.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct CgroupStats {
-    pub cpu_usage_usec: u64,
-    pub nr_throttled: u64,
-    pub throttled_usec: u64,
-    pub memory_current: u64,
+    pub cpu: CgroupCpuStats,
+    pub memory: CgroupMemoryStats,
+    pub pids: CgroupPidsStats,
     /// Pressure Stall Information for this cgroup, per resource.
     /// Populated from `<cgroup>/cpu.pressure`,
     /// `<cgroup>/memory.pressure`, `<cgroup>/io.pressure`, and
@@ -1003,6 +1022,112 @@ pub struct CgroupStats {
     /// resource files are absent (older kernels missing
     /// irq.pressure).
     pub psi: Psi,
+}
+
+/// CPU controller state for one cgroup. Fields mirror the
+/// `cpu.*` cgroup v2 files exposed under
+/// `<cgroup>/cpu.stat`, `<cgroup>/cpu.max`,
+/// `<cgroup>/cpu.weight`, and `<cgroup>/cpu.weight.nice`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct CgroupCpuStats {
+    /// `usage_usec` from `cpu.stat`. Cumulative CPU time consumed
+    /// by tasks in this cgroup, in microseconds.
+    pub usage_usec: u64,
+    /// `nr_throttled` from `cpu.stat`. Cumulative count of
+    /// CFS-bandwidth throttling events that paused this cgroup.
+    pub nr_throttled: u64,
+    /// `throttled_usec` from `cpu.stat`. Cumulative wall-clock
+    /// time the cgroup spent throttled by CFS bandwidth.
+    pub throttled_usec: u64,
+    /// `cpu.max` quota in microseconds. `None` when the file is
+    /// absent (root cgroup) OR when the kernel emits the literal
+    /// "max" token (no CFS bandwidth cap configured for this
+    /// cgroup).
+    pub max_quota_us: Option<u64>,
+    /// `cpu.max` period in microseconds. Default 100_000 (100ms)
+    /// per the kernel default. Always present alongside the
+    /// quota half on a child cgroup; defaults to 100_000 when
+    /// the file is absent (root cgroup).
+    pub max_period_us: u64,
+    /// `cpu.weight` (1..=10_000, default 100). `None` when the
+    /// file is absent (root cgroup); the kernel does not allow
+    /// 0 as a value, so the absent-vs-zero distinction is
+    /// load-bearing.
+    pub weight: Option<u64>,
+    /// `cpu.weight.nice` (-20..=19, default 0). `None` when the
+    /// file is absent. Alias-domain for [`Self::weight`] —
+    /// the kernel writes both files in lockstep but they're
+    /// captured independently to surface any
+    /// kernel-version-specific divergence.
+    pub weight_nice: Option<i32>,
+}
+
+/// Memory controller state for one cgroup. Fields mirror the
+/// `memory.*` cgroup v2 files. `stat` and `events` are
+/// captured as flat key-value maps so the data model
+/// auto-extends when the kernel adds new keys (memory.stat
+/// has 71 keys on a recent kernel; the explicit list is
+/// scheduler-correctness-relevant but the map preserves
+/// regression-detection on lesser-known counters).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct CgroupMemoryStats {
+    /// `memory.current`, instantaneous RSS of the cgroup in
+    /// bytes.
+    pub current: u64,
+    /// `memory.max`, hard memory limit in bytes. `None` when
+    /// the file is absent (root cgroup) OR when the kernel
+    /// emits the literal "max" token (no hard cap).
+    pub max: Option<u64>,
+    /// `memory.high`, soft pressure limit in bytes. `None` when
+    /// absent or unlimited (same "max"-token semantics as
+    /// [`Self::max`]).
+    pub high: Option<u64>,
+    /// `memory.low`, best-effort protection floor in bytes.
+    /// `None` when the file is absent (no protection
+    /// configured); `Some(u64::MAX)` when the kernel emits the
+    /// literal `max` token (request maximum protection — every
+    /// byte under the cgroup is protected). Per the kernel's
+    /// cgroup v2 docs, memory under `low` is protected from
+    /// reclaim unless no unprotected memory remains. Note the
+    /// asymmetry vs. limits: `None` means "no floor" (semantic
+    /// opposite of "max"-as-no-cap on the limit fields above).
+    pub low: Option<u64>,
+    /// `memory.min`, hard protection floor in bytes. `None`
+    /// when absent (no floor). `Some(u64::MAX)` when the kernel
+    /// emits `max` (full protection). Stronger than `low` —
+    /// memory under `min` is never reclaimed even under
+    /// memory pressure.
+    pub min: Option<u64>,
+    /// `memory.stat` parsed as a key-value map. Keys mirror the
+    /// kernel-emitted strings (e.g. `anon`, `file`,
+    /// `workingset_refault_anon`, `pgfault`, `pgmajfault`,
+    /// `slab`, the active/inactive variants, etc.). Empty when
+    /// the file is absent.
+    pub stat: BTreeMap<String, u64>,
+    /// `memory.events` parsed as a key-value map. Typical keys:
+    /// `low`, `high`, `max`, `oom`, `oom_kill`,
+    /// `oom_group_kill`, `sock_throttled` (subset varies by
+    /// kernel version). Empty when the file is absent.
+    pub events: BTreeMap<String, u64>,
+}
+
+/// PIDs controller state for one cgroup. Fields mirror the
+/// `pids.*` cgroup v2 files. The pids controller is optional
+/// (must be enabled in `cgroup.subtree_control`); on hosts that
+/// don't enable it, both fields are `None`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct CgroupPidsStats {
+    /// `pids.current`, current task count in this cgroup.
+    /// `None` when the file is absent (pids controller not
+    /// enabled).
+    pub current: Option<u64>,
+    /// `pids.max`, hard task-count limit. `None` when the file
+    /// is absent OR when the kernel emits the literal "max"
+    /// token (no cap).
+    pub max: Option<u64>,
 }
 
 /// One Pressure Stall Information half-line: either the `some`
@@ -2214,10 +2339,106 @@ fn parse_cpu_stat(raw: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
     (usage, throttled, throttled_usec)
 }
 
+/// Parse a cgroup v2 key-value file (one `<key> <u64>` per
+/// line). Used for `memory.stat` and `memory.events`. Lines
+/// the parser cannot fully decompose into a key + u64 are
+/// silently skipped — a future kernel that introduces non-u64
+/// values won't break the parser, just elide the offending key.
+fn parse_kv_counters(raw: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for line in raw.lines() {
+        let mut parts = line.split_ascii_whitespace();
+        let Some(key) = parts.next() else { continue };
+        let Some(value) = parts.next() else { continue };
+        let Ok(parsed) = value.parse::<u64>() else {
+            continue;
+        };
+        out.insert(key.to_string(), parsed);
+    }
+    out
+}
+
+/// Parse a single-line LIMIT cgroup file (e.g. `memory.max`,
+/// `memory.high`, `pids.max`). The literal token `max` means
+/// "no limit" and yields `None`; a numeric value yields
+/// `Some(u64)`. Whitespace-only or malformed input also yields
+/// `None` (best-effort, matching the absent-counter contract).
+///
+/// Caller MUST NOT use this for FLOOR files (`memory.low`,
+/// `memory.min`) — for floors, the literal token `max` means
+/// "maximum protection", not "no floor", which is the semantic
+/// opposite. Use [`parse_floor_value`] there instead.
+fn parse_max_or_u64(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+/// Parse a single-line FLOOR cgroup file (`memory.low`,
+/// `memory.min`). The literal token `max` means
+/// "maximum protection" — yields `Some(u64::MAX)` rather than
+/// `None`, because FLOORS use `None` to mean "absent file"
+/// only. A numeric value yields `Some(u64)`; whitespace-only or
+/// malformed input yields `None` (absent-counter contract).
+///
+/// The semantic asymmetry vs. [`parse_max_or_u64`] is critical:
+/// for limits, "max" is the absence of a cap (collapse to
+/// `None`); for floors, "max" is a fully-protected floor (it
+/// must NOT collapse to "no floor"). [`merge_min_option`] then
+/// correctly picks `min(u64::MAX, 5G) = 5G` instead of None
+/// when one contributor has full protection and another has a
+/// concrete protection.
+fn parse_floor_value(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed == "max" {
+        return Some(u64::MAX);
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+/// Parse `cpu.max` (one line, two whitespace-separated tokens:
+/// `<quota|max> <period>`). Returns `(quota, period)` where
+/// `quota` is `None` for the literal `max` token (no CFS
+/// bandwidth cap) and `Some(usec)` otherwise; `period` defaults
+/// to the kernel default of 100_000 µs when missing or
+/// malformed.
+fn parse_cpu_max(raw: &str) -> (Option<u64>, u64) {
+    let mut parts = raw.split_ascii_whitespace();
+    let quota_token = parts.next();
+    let period_token = parts.next();
+    let quota = quota_token.and_then(parse_max_or_u64_str);
+    let period = period_token
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(CPU_MAX_DEFAULT_PERIOD_US);
+    (quota, period)
+}
+
+/// Helper for [`parse_cpu_max`]: route a single token through
+/// the same `max`-vs-u64 disambiguation as [`parse_max_or_u64`]
+/// without committing to a string-trimmed input shape.
+fn parse_max_or_u64_str(s: &str) -> Option<u64> {
+    if s == "max" {
+        return None;
+    }
+    s.parse::<u64>().ok()
+}
+
+/// Default CFS bandwidth period when `cpu.max` is absent or its
+/// period token is unreadable. Matches the kernel default
+/// returned by `default_bw_period_us()` at
+/// `kernel/sched/sched.h:441`; child cgroups inherit this when
+/// `cpu.max` is unset.
+const CPU_MAX_DEFAULT_PERIOD_US: u64 = 100_000;
+
 /// Populate a [`CgroupStats`] by reading the cgroup v2 files
 /// for `path` under `cgroup_root`. Missing files collapse to
-/// `0` via the struct's `Default`, matching the "absent = 0"
-/// contract the struct documents for allocated/deallocated_bytes.
+/// the struct's `Default` (zero / `None` per field semantics) —
+/// the root cgroup is missing most knob files, and child
+/// cgroups on hosts without `pids` enabled in
+/// `cgroup.subtree_control` are also expected to lack
+/// `pids.{current,max}`.
 fn read_cgroup_stats_at(cgroup_root: &Path, path: &str) -> CgroupStats {
     let relative = path.strip_prefix('/').unwrap_or(path);
     let dir = if relative.is_empty() {
@@ -2225,20 +2446,88 @@ fn read_cgroup_stats_at(cgroup_root: &Path, path: &str) -> CgroupStats {
     } else {
         cgroup_root.join(relative)
     };
+
     let (usage, throttled, throttled_usec) = fs::read_to_string(dir.join("cpu.stat"))
         .ok()
         .as_deref()
         .map(parse_cpu_stat)
         .unwrap_or((None, None, None));
-    let memory_current = fs::read_to_string(dir.join("memory.current"))
+    let (max_quota_us, max_period_us) = fs::read_to_string(dir.join("cpu.max"))
+        .ok()
+        .as_deref()
+        .map(parse_cpu_max)
+        .unwrap_or((None, CPU_MAX_DEFAULT_PERIOD_US));
+    let weight = fs::read_to_string(dir.join("cpu.weight"))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());
+    let weight_nice = fs::read_to_string(dir.join("cpu.weight.nice"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+
+    let memory_current = fs::read_to_string(dir.join("memory.current"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let memory_max = fs::read_to_string(dir.join("memory.max"))
+        .ok()
+        .as_deref()
+        .and_then(parse_max_or_u64);
+    let memory_high = fs::read_to_string(dir.join("memory.high"))
+        .ok()
+        .as_deref()
+        .and_then(parse_max_or_u64);
+    let memory_low = fs::read_to_string(dir.join("memory.low"))
+        .ok()
+        .as_deref()
+        .and_then(parse_floor_value);
+    let memory_min = fs::read_to_string(dir.join("memory.min"))
+        .ok()
+        .as_deref()
+        .and_then(parse_floor_value);
+    let memory_stat = fs::read_to_string(dir.join("memory.stat"))
+        .ok()
+        .as_deref()
+        .map(parse_kv_counters)
+        .unwrap_or_default();
+    let memory_events = fs::read_to_string(dir.join("memory.events"))
+        .ok()
+        .as_deref()
+        .map(parse_kv_counters)
+        .unwrap_or_default();
+
+    let pids_current = fs::read_to_string(dir.join("pids.current"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let pids_max = fs::read_to_string(dir.join("pids.max"))
+        .ok()
+        .as_deref()
+        .and_then(parse_max_or_u64);
+
     let psi = read_cgroup_psi_at(cgroup_root, path);
+
     CgroupStats {
-        cpu_usage_usec: usage.unwrap_or(0),
-        nr_throttled: throttled.unwrap_or(0),
-        throttled_usec: throttled_usec.unwrap_or(0),
-        memory_current: memory_current.unwrap_or(0),
+        cpu: CgroupCpuStats {
+            usage_usec: usage.unwrap_or(0),
+            nr_throttled: throttled.unwrap_or(0),
+            throttled_usec: throttled_usec.unwrap_or(0),
+            max_quota_us,
+            max_period_us,
+            weight,
+            weight_nice,
+        },
+        memory: CgroupMemoryStats {
+            current: memory_current,
+            max: memory_max,
+            high: memory_high,
+            low: memory_low,
+            min: memory_min,
+            stat: memory_stat,
+            events: memory_events,
+        },
+        pids: CgroupPidsStats {
+            current: pids_current,
+            max: pids_max,
+        },
         psi,
     }
 }
@@ -3370,16 +3659,12 @@ mod tests {
                 thread("proc_a", "worker_0", 1_000_000),
                 thread("proc_a", "worker_1", 2_000_000),
             ],
-            cgroup_stats: BTreeMap::from([(
-                "/".into(),
-                CgroupStats {
-                    cpu_usage_usec: 500,
-                    nr_throttled: 0,
-                    throttled_usec: 0,
-                    memory_current: 1 << 20,
-                    psi: Psi::default(),
-                },
-            )]),
+            cgroup_stats: BTreeMap::from([("/".into(), {
+                let mut cs = CgroupStats::default();
+                cs.cpu.usage_usec = 500;
+                cs.memory.current = 1 << 20;
+                cs
+            })]),
             probe_summary: None,
             parse_summary: None,
             psi: Psi::default(),
@@ -3390,7 +3675,7 @@ mod tests {
         assert_eq!(back.captured_at_unix_ns, 42);
         assert_eq!(back.threads.len(), 2);
         assert_eq!(back.threads[1].run_time_ns, 2_000_000);
-        assert_eq!(back.cgroup_stats["/"].cpu_usage_usec, 500);
+        assert_eq!(back.cgroup_stats["/"].cpu.usage_usec, 500);
     }
 
     #[test]
@@ -3878,6 +4163,208 @@ mod tests {
         assert_eq!(parse_cpu_list("5").unwrap(), vec![5]);
         assert_eq!(parse_cpu_list("0,2,4").unwrap(), vec![0, 2, 4]);
         assert_eq!(parse_cpu_list("0-2,4,6-7").unwrap(), vec![0, 1, 2, 4, 6, 7]);
+    }
+
+    /// `parse_kv_counters` reads cgroup v2 key-value files
+    /// (memory.stat, memory.events). Pins:
+    /// - well-formed multi-line input populates every key
+    /// - malformed lines silently elide the offending key (rest
+    ///   of the file still parses)
+    /// - empty input yields an empty map
+    /// - unknown key prefixes map verbatim (forward-compat with
+    ///   future kernel additions to memory.stat).
+    #[test]
+    fn parse_kv_counters_handles_well_formed_and_malformed_lines() {
+        let raw = "anon 12812288\n\
+                   file 12623872\n\
+                   pgfault 18\n\
+                   pgmajfault 4\n\
+                   workingset_refault_anon 0\n\
+                   workingset_refault_file 27198\n";
+        let m = parse_kv_counters(raw);
+        assert_eq!(m.get("anon"), Some(&12_812_288));
+        assert_eq!(m.get("file"), Some(&12_623_872));
+        assert_eq!(m.get("pgfault"), Some(&18));
+        assert_eq!(m.get("pgmajfault"), Some(&4));
+        assert_eq!(m.get("workingset_refault_anon"), Some(&0));
+        assert_eq!(m.get("workingset_refault_file"), Some(&27_198));
+        assert_eq!(m.len(), 6);
+
+        // Empty input → empty map.
+        assert!(parse_kv_counters("").is_empty());
+
+        // Malformed: missing value, non-u64 value, blank line —
+        // each silently dropped; well-formed neighbors persist.
+        let raw = "good 42\n\
+                   bad_no_value\n\
+                   bad_negative -5\n\
+                   bad_text foo\n\
+                   \n\
+                   recover 7\n";
+        let m = parse_kv_counters(raw);
+        assert_eq!(m.get("good"), Some(&42));
+        assert_eq!(m.get("recover"), Some(&7));
+        assert_eq!(m.len(), 2, "malformed lines must not pollute the map");
+    }
+
+    /// `parse_max_or_u64` distinguishes the kernel's literal
+    /// `max` token (no limit → `None`) from a concrete u64
+    /// (a configured cap). Whitespace-only and malformed input
+    /// collapses to `None` per the absent-counter contract.
+    #[test]
+    fn parse_max_or_u64_distinguishes_max_from_concrete_value() {
+        assert_eq!(parse_max_or_u64("max"), None, "literal max → no limit");
+        assert_eq!(
+            parse_max_or_u64("max\n"),
+            None,
+            "trailing newline tolerated"
+        );
+        assert_eq!(
+            parse_max_or_u64("9223372036854771712"),
+            Some(9_223_372_036_854_771_712)
+        );
+        assert_eq!(parse_max_or_u64("0"), Some(0));
+        assert_eq!(parse_max_or_u64(""), None, "empty input → no limit");
+        assert_eq!(parse_max_or_u64("   "), None, "whitespace-only → no limit");
+        assert_eq!(parse_max_or_u64("not_a_number"), None);
+        // Negative values are not a kernel-emitted shape but the
+        // parser tolerates them as malformed input → None.
+        assert_eq!(parse_max_or_u64("-1"), None);
+    }
+
+    /// `parse_floor_value` is the FLOOR counterpart of
+    /// [`parse_max_or_u64`]: literal "max" means "maximum
+    /// protection" → `Some(u64::MAX)` (NOT `None`). `None` is
+    /// reserved for absent-file / malformed input. The
+    /// asymmetry vs. limits is the BLOCKER fix from #61's
+    /// fix-round-1: `merge_min_option(Some(u64::MAX), Some(5G))`
+    /// then yields 5G instead of None — preserving the lower
+    /// concrete floor when one contributor has full protection.
+    #[test]
+    fn parse_floor_value_treats_max_as_full_protection() {
+        assert_eq!(
+            parse_floor_value("max"),
+            Some(u64::MAX),
+            "literal max → maximum protection (NOT no floor)"
+        );
+        assert_eq!(parse_floor_value("max\n"), Some(u64::MAX));
+        assert_eq!(parse_floor_value("0"), Some(0), "zero → no protection");
+        assert_eq!(parse_floor_value("1073741824"), Some(1_073_741_824));
+        assert_eq!(parse_floor_value(""), None, "empty → absent file");
+        assert_eq!(parse_floor_value("not_a_number"), None);
+    }
+
+    /// `parse_cpu_max` decodes the two-token `<quota|max> <period>`
+    /// format. `period` falls back to the kernel default
+    /// 100_000 µs when malformed.
+    #[test]
+    fn parse_cpu_max_handles_quota_period_pairs() {
+        // Concrete cap.
+        assert_eq!(parse_cpu_max("50000 100000"), (Some(50_000), 100_000));
+        // No cap (`max` token); period preserved.
+        assert_eq!(parse_cpu_max("max 100000"), (None, 100_000));
+        // Different period (50ms).
+        assert_eq!(parse_cpu_max("25000 50000"), (Some(25_000), 50_000));
+        // Missing period — period defaults to kernel default.
+        assert_eq!(parse_cpu_max("50000"), (Some(50_000), 100_000));
+        // Empty input — both default.
+        assert_eq!(parse_cpu_max(""), (None, 100_000));
+        // Malformed period falls back to the default.
+        assert_eq!(parse_cpu_max("50000 garbage"), (Some(50_000), 100_000));
+        // Trailing newline tolerated by split_ascii_whitespace.
+        assert_eq!(parse_cpu_max("max 100000\n"), (None, 100_000));
+    }
+
+    /// Stage a synthetic cgroup tree with every #61 file present
+    /// and verify [`read_cgroup_stats_at`] populates the nested
+    /// struct end-to-end. Pins file-naming, parse-routing, and
+    /// the absent-vs-no-limit distinction.
+    #[test]
+    fn read_cgroup_stats_at_populates_nested_controllers_end_to_end() {
+        let cgroup_root = tempfile::TempDir::new().unwrap();
+        let cg_dir = cgroup_root.path().join("app");
+        std::fs::create_dir_all(&cg_dir).unwrap();
+        std::fs::write(
+            cg_dir.join("cpu.stat"),
+            "usage_usec 12345\nnr_throttled 7\nthrottled_usec 8\n",
+        )
+        .unwrap();
+        std::fs::write(cg_dir.join("cpu.max"), "50000 100000\n").unwrap();
+        std::fs::write(cg_dir.join("cpu.weight"), "200\n").unwrap();
+        std::fs::write(cg_dir.join("cpu.weight.nice"), "-5\n").unwrap();
+        std::fs::write(cg_dir.join("memory.current"), "9999\n").unwrap();
+        std::fs::write(cg_dir.join("memory.max"), "max\n").unwrap();
+        std::fs::write(cg_dir.join("memory.high"), "1073741824\n").unwrap();
+        std::fs::write(cg_dir.join("memory.low"), "0\n").unwrap();
+        std::fs::write(cg_dir.join("memory.min"), "0\n").unwrap();
+        std::fs::write(
+            cg_dir.join("memory.stat"),
+            "anon 100\nfile 200\npgfault 18\nslab 50\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cg_dir.join("memory.events"),
+            "low 0\nhigh 1\nmax 0\noom 0\noom_kill 0\n",
+        )
+        .unwrap();
+        std::fs::write(cg_dir.join("pids.current"), "42\n").unwrap();
+        std::fs::write(cg_dir.join("pids.max"), "1024\n").unwrap();
+
+        let stats = read_cgroup_stats_at(cgroup_root.path(), "/app");
+
+        // CPU domain.
+        assert_eq!(stats.cpu.usage_usec, 12_345);
+        assert_eq!(stats.cpu.nr_throttled, 7);
+        assert_eq!(stats.cpu.throttled_usec, 8);
+        assert_eq!(stats.cpu.max_quota_us, Some(50_000));
+        assert_eq!(stats.cpu.max_period_us, 100_000);
+        assert_eq!(stats.cpu.weight, Some(200));
+        assert_eq!(stats.cpu.weight_nice, Some(-5));
+
+        // Memory domain.
+        assert_eq!(stats.memory.current, 9999);
+        assert_eq!(stats.memory.max, None, "literal max → no limit");
+        assert_eq!(stats.memory.high, Some(1_073_741_824));
+        assert_eq!(stats.memory.low, Some(0));
+        assert_eq!(stats.memory.min, Some(0));
+        assert_eq!(stats.memory.stat.get("anon"), Some(&100));
+        assert_eq!(stats.memory.stat.get("file"), Some(&200));
+        assert_eq!(stats.memory.stat.get("pgfault"), Some(&18));
+        assert_eq!(stats.memory.stat.get("slab"), Some(&50));
+        assert_eq!(stats.memory.events.get("oom_kill"), Some(&0));
+        assert_eq!(stats.memory.events.get("high"), Some(&1));
+
+        // PIDs domain.
+        assert_eq!(stats.pids.current, Some(42));
+        assert_eq!(stats.pids.max, Some(1024));
+    }
+
+    /// Root cgroup typically lacks every knob/limit file. Pins
+    /// the absent-vs-no-limit distinction: `Option<u64>` limits
+    /// stay `None` (file absent), counters stay 0 (Default),
+    /// and `max_period_us` defaults to the kernel default
+    /// rather than zero.
+    #[test]
+    fn read_cgroup_stats_at_root_cgroup_collapses_to_defaults() {
+        let cgroup_root = tempfile::TempDir::new().unwrap();
+        // No files at all under root — simulating a v2 mount
+        // root that only carries `cgroup.*` files (no domain
+        // controllers populated).
+        let stats = read_cgroup_stats_at(cgroup_root.path(), "/");
+        assert_eq!(stats.cpu.usage_usec, 0);
+        assert_eq!(stats.cpu.max_quota_us, None);
+        assert_eq!(
+            stats.cpu.max_period_us, CPU_MAX_DEFAULT_PERIOD_US,
+            "absent cpu.max → period defaults to kernel default"
+        );
+        assert_eq!(stats.cpu.weight, None);
+        assert_eq!(stats.memory.current, 0);
+        assert_eq!(stats.memory.max, None);
+        assert_eq!(stats.memory.high, None);
+        assert!(stats.memory.stat.is_empty());
+        assert!(stats.memory.events.is_empty());
+        assert_eq!(stats.pids.current, None);
+        assert_eq!(stats.pids.max, None);
     }
 
     #[test]
@@ -5556,10 +6043,13 @@ mod tests {
             .cgroup_stats
             .get("/ktstr.slice/worker0")
             .expect("non-empty cgroup string must seed the stats map");
-        assert_eq!(stats.cpu_usage_usec, 0, "stale cgroup → cpu_usage_usec 0");
-        assert_eq!(stats.nr_throttled, 0, "stale cgroup → nr_throttled 0");
-        assert_eq!(stats.throttled_usec, 0, "stale cgroup → throttled_usec 0");
-        assert_eq!(stats.memory_current, 0, "stale cgroup → memory_current 0");
+        assert_eq!(stats.cpu.usage_usec, 0, "stale cgroup → cpu_usage_usec 0");
+        assert_eq!(stats.cpu.nr_throttled, 0, "stale cgroup → nr_throttled 0");
+        assert_eq!(
+            stats.cpu.throttled_usec, 0,
+            "stale cgroup → throttled_usec 0"
+        );
+        assert_eq!(stats.memory.current, 0, "stale cgroup → memory_current 0");
     }
 
     /// `read_cgroup_at` returns `None` when the cgroup file is
@@ -5647,10 +6137,10 @@ mod tests {
         );
         write_memory_current(tmp.path(), "worker", "9999\n");
         let stats = read_cgroup_stats_at(tmp.path(), "/worker");
-        assert_eq!(stats.cpu_usage_usec, 12345);
-        assert_eq!(stats.nr_throttled, 7);
-        assert_eq!(stats.throttled_usec, 8);
-        assert_eq!(stats.memory_current, 9999);
+        assert_eq!(stats.cpu.usage_usec, 12345);
+        assert_eq!(stats.cpu.nr_throttled, 7);
+        assert_eq!(stats.cpu.throttled_usec, 8);
+        assert_eq!(stats.memory.current, 9999);
     }
 
     /// Case (b): `cpu.stat` only → CPU fields populated,
@@ -5664,11 +6154,11 @@ mod tests {
             "usage_usec 500\nnr_throttled 0\nthrottled_usec 0\n",
         );
         let stats = read_cgroup_stats_at(tmp.path(), "/cpu-only");
-        assert_eq!(stats.cpu_usage_usec, 500);
-        assert_eq!(stats.nr_throttled, 0);
-        assert_eq!(stats.throttled_usec, 0);
+        assert_eq!(stats.cpu.usage_usec, 500);
+        assert_eq!(stats.cpu.nr_throttled, 0);
+        assert_eq!(stats.cpu.throttled_usec, 0);
         assert_eq!(
-            stats.memory_current, 0,
+            stats.memory.current, 0,
             "missing memory.current must collapse to 0, not None",
         );
     }
@@ -5680,10 +6170,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_memory_current(tmp.path(), "mem-only", "2048\n");
         let stats = read_cgroup_stats_at(tmp.path(), "/mem-only");
-        assert_eq!(stats.cpu_usage_usec, 0);
-        assert_eq!(stats.nr_throttled, 0);
-        assert_eq!(stats.throttled_usec, 0);
-        assert_eq!(stats.memory_current, 2048);
+        assert_eq!(stats.cpu.usage_usec, 0);
+        assert_eq!(stats.cpu.nr_throttled, 0);
+        assert_eq!(stats.cpu.throttled_usec, 0);
+        assert_eq!(stats.memory.current, 2048);
     }
 
     /// Case (d): neither file present → every field zero.
@@ -5694,10 +6184,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("empty-cg")).unwrap();
         let stats = read_cgroup_stats_at(tmp.path(), "/empty-cg");
-        assert_eq!(stats.cpu_usage_usec, 0);
-        assert_eq!(stats.nr_throttled, 0);
-        assert_eq!(stats.throttled_usec, 0);
-        assert_eq!(stats.memory_current, 0);
+        assert_eq!(stats.cpu.usage_usec, 0);
+        assert_eq!(stats.cpu.nr_throttled, 0);
+        assert_eq!(stats.cpu.throttled_usec, 0);
+        assert_eq!(stats.memory.current, 0);
     }
 
     /// Case (e): `cpu.stat` present but missing `nr_throttled`
@@ -5714,9 +6204,9 @@ mod tests {
             "usage_usec 999\nthrottled_usec 111\n",
         );
         let stats = read_cgroup_stats_at(tmp.path(), "/partial");
-        assert_eq!(stats.cpu_usage_usec, 999);
-        assert_eq!(stats.nr_throttled, 0, "absent key collapses to 0");
-        assert_eq!(stats.throttled_usec, 111);
+        assert_eq!(stats.cpu.usage_usec, 999);
+        assert_eq!(stats.cpu.nr_throttled, 0, "absent key collapses to 0");
+        assert_eq!(stats.cpu.throttled_usec, 111);
     }
 
     // ------------------------------------------------------------
@@ -7007,7 +7497,7 @@ mod tests {
             .get("/../escape")
             .expect("non-empty cgroup string must seed the stats map");
         assert_eq!(
-            stats.cpu_usage_usec, 0,
+            stats.cpu.usage_usec, 0,
             "no matching cgroup dir under cgroup_root → all-zero stats; \
              a traversal that escaped the cgroup_root would have \
              non-zero values from the parent directory",

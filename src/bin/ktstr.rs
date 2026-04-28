@@ -859,13 +859,143 @@ fn write_show<W: std::fmt::Write>(
             for (key, s) in &stats {
                 ct.add_row(vec![
                     key.clone(),
-                    host_state_compare::format_scaled_u64(s.cpu_usage_usec, "µs"),
-                    host_state_compare::format_scaled_u64(s.nr_throttled, ""),
-                    host_state_compare::format_scaled_u64(s.throttled_usec, "µs"),
-                    host_state_compare::format_scaled_u64(s.memory_current, "B"),
+                    host_state_compare::format_scaled_u64(s.cpu.usage_usec, "µs"),
+                    host_state_compare::format_scaled_u64(s.cpu.nr_throttled, ""),
+                    host_state_compare::format_scaled_u64(s.cpu.throttled_usec, "µs"),
+                    host_state_compare::format_scaled_u64(s.memory.current, "B"),
                 ]);
             }
             writeln!(w, "{ct}")?;
+
+            // Per-cgroup limits / knobs sub-table — operator-set
+            // configuration that's typically static across a run
+            // but matters when comparing two snapshots that
+            // straddle a deployment. `cpu.max`, `cpu.weight`,
+            // `memory.max`, `memory.high`, `pids.current/max` per
+            // [`CgroupCpuStats`] / [`CgroupMemoryStats`] /
+            // [`CgroupPidsStats`]. Suppressed entirely when no
+            // cgroup in the bucket exposes any of these (root
+            // cgroup, or a host without pids/memory controllers
+            // enabled).
+            if stats.values().any(|s| {
+                s.cpu.max_quota_us.is_some()
+                    || s.cpu.weight.is_some()
+                    || s.memory.max.is_some()
+                    || s.memory.high.is_some()
+                    || s.pids.current.is_some()
+                    || s.pids.max.is_some()
+            }) {
+                writeln!(w)?;
+                writeln!(w, "## Cgroup limits / knobs")?;
+                let mut lt = cli::new_table();
+                lt.set_header(vec![
+                    "cgroup",
+                    "cpu.max",
+                    "cpu.weight",
+                    "memory.max",
+                    "memory.high",
+                    "pids.current",
+                    "pids.max",
+                ]);
+                for (key, s) in &stats {
+                    // Per-row gate: skip rows where every column
+                    // is unset (the cgroup has no caps, no
+                    // weight set, no pids accounting). Without
+                    // this, a system-wide table can render N
+                    // empty rows for every host-controller
+                    // cgroup that doesn't expose any of these.
+                    let row_has_data = s.cpu.max_quota_us.is_some()
+                        || s.cpu.weight.is_some()
+                        || s.memory.max.is_some()
+                        || s.memory.high.is_some()
+                        || s.pids.current.is_some()
+                        || s.pids.max.is_some();
+                    if !row_has_data {
+                        continue;
+                    }
+                    lt.add_row(vec![
+                        key.clone(),
+                        host_state_compare::format_cpu_max(s.cpu.max_quota_us, s.cpu.max_period_us),
+                        s.cpu
+                            .weight
+                            .map(|v| host_state_compare::format_scaled_u64(v, ""))
+                            .unwrap_or_else(|| "-".to_string()),
+                        host_state_compare::format_optional_limit(s.memory.max, "B"),
+                        host_state_compare::format_optional_limit(s.memory.high, "B"),
+                        s.pids
+                            .current
+                            .map(|v| host_state_compare::format_scaled_u64(v, ""))
+                            .unwrap_or_else(|| "-".to_string()),
+                        host_state_compare::format_optional_limit(s.pids.max, ""),
+                    ]);
+                }
+                writeln!(w, "{lt}")?;
+            }
+
+            // Per-cgroup memory.stat sub-table — kernel-emitted
+            // memory counters per cgroup. Up to 71 keys on a
+            // recent kernel. Renders as one row per (cgroup,
+            // key) pair to keep column width bounded; sorted by
+            // key for stable output. Suppressed when every
+            // bucketed cgroup has an empty `memory.stat` map.
+            // Show-side zero-suppression: a typical workload
+            // touches only a handful of memory.stat keys, so
+            // rendering all 71 rows × N cgroups creates a
+            // massive table dominated by zeros. Skip rows where
+            // the value is exactly 0; if every key in a cgroup
+            // is zero, that cgroup contributes no rows. The
+            // section still renders if any cgroup has any
+            // non-zero key. This trims output ~10x for typical
+            // runs.
+            if stats
+                .values()
+                .any(|s| s.memory.stat.values().any(|v| *v != 0))
+            {
+                writeln!(w)?;
+                writeln!(w, "## memory.stat")?;
+                let mut mt = cli::new_table();
+                mt.set_header(vec!["cgroup", "key", "value"]);
+                for (key, s) in &stats {
+                    for (stat_key, stat_value) in &s.memory.stat {
+                        if *stat_value == 0 {
+                            continue;
+                        }
+                        mt.add_row(vec![
+                            key.clone(),
+                            stat_key.clone(),
+                            host_state_compare::format_scaled_u64(*stat_value, ""),
+                        ]);
+                    }
+                }
+                writeln!(w, "{mt}")?;
+            }
+
+            // Per-cgroup memory.events sub-table — pressure-event
+            // counters (low / high / max / oom / oom_kill etc.).
+            // Same long-table layout as memory.stat with the
+            // same zero-row suppression.
+            if stats
+                .values()
+                .any(|s| s.memory.events.values().any(|v| *v != 0))
+            {
+                writeln!(w)?;
+                writeln!(w, "## memory.events")?;
+                let mut et = cli::new_table();
+                et.set_header(vec!["cgroup", "event", "count"]);
+                for (key, s) in &stats {
+                    for (event_key, event_value) in &s.memory.events {
+                        if *event_value == 0 {
+                            continue;
+                        }
+                        et.add_row(vec![
+                            key.clone(),
+                            event_key.clone(),
+                            host_state_compare::format_scaled_u64(*event_value, ""),
+                        ]);
+                    }
+                }
+                writeln!(w, "{et}")?;
+            }
 
             // Per-cgroup PSI sub-tables — one per resource.
             // Q8 ruling: per-resource sub-tables, all fields
@@ -1909,10 +2039,10 @@ mod tests {
         // from `host_state`). Build via Default + per-field
         // assignment instead.
         let mut cgs = ktstr::host_state::CgroupStats::default();
-        cgs.cpu_usage_usec = 1_500_000;
-        cgs.nr_throttled = 50;
-        cgs.throttled_usec = 200;
-        cgs.memory_current = one_gib;
+        cgs.cpu.usage_usec = 1_500_000;
+        cgs.cpu.nr_throttled = 50;
+        cgs.cpu.throttled_usec = 200;
+        cgs.memory.current = one_gib;
         snap.cgroup_stats.insert("/app".to_string(), cgs);
 
         let mut out = String::new();

@@ -26,7 +26,10 @@ use std::sync::LazyLock;
 use anyhow::Context;
 use regex::Regex;
 
-use crate::host_state::{CgroupStats, HostStateSnapshot, Psi, PsiHalf, PsiResource, ThreadState};
+use crate::host_state::{
+    CgroupCpuStats, CgroupMemoryStats, CgroupPidsStats, CgroupStats, HostStateSnapshot, Psi,
+    PsiHalf, PsiResource, ThreadState,
+};
 
 /// Grouping key for the host-state compare.
 ///
@@ -1845,19 +1848,46 @@ pub fn flatten_cgroup_stats(
     patterns: &[glob::Pattern],
     cgroup_key_map: Option<&BTreeMap<String, String>>,
 ) -> BTreeMap<String, CgroupStats> {
-    // When multiple input paths flatten to the same key, sum the
-    // cpu/throttle counters (cumulative) and keep the max of
-    // memory.current (instantaneous — summing overstates the
-    // instantaneous RSS of the shared bucket). This mirrors the
-    // per-thread aggregation: counters sum, instantaneous values
-    // take a representative scalar.
+    // When multiple input paths flatten to the same key, the
+    // merge is per-controller and per-field-class:
+    //
+    // - **Counters** (`usage_usec`, `nr_throttled`,
+    //   `throttled_usec`, `pids.current`, `memory.events` map
+    //   values, AND counter-shaped `memory.stat` keys
+    //   (workingset_*, pgfault, pgmajfault, pgsteal_*, etc.)):
+    //   saturating_add. Cumulative across the merged bucket.
+    // - **Instantaneous values / gauges** (`memory.current` AND
+    //   gauge-shaped `memory.stat` keys per
+    //   [`MEMORY_STAT_GAUGE_KEYS`]: anon, file, slab,
+    //   active_anon, etc.): max. Summing point-in-time pool
+    //   sizes overstates the merged-bucket gauge. Counter vs
+    //   gauge dispatch lives in [`merge_memory_stat`].
+    // - **Limits** (`memory.max`, `memory.high`, `pids.max`,
+    //   `cpu.max` quota, `cpu.weight`, `cpu.weight.nice`):
+    //   max-for-limits via [`merge_max_option`]. `None` ("no
+    //   limit") propagates when EITHER side is unbounded — the
+    //   merged bucket is unbounded if any contributor is, since
+    //   no synthesized cap reflects the actual kernel-enforced
+    //   reality.
+    // - **Floors** (`memory.low`, `memory.min`): min-for-floors
+    //   via [`merge_min_option`]. `None` ("no floor")
+    //   propagates when EITHER side has no floor — the merged
+    //   bucket is only as protected as its weakest contributor,
+    //   for the same reason. The literal "max" token (full
+    //   protection) parses to `Some(u64::MAX)` per
+    //   [`parse_floor_value`] and merges via min-for-floors,
+    //   correctly yielding the smaller concrete floor when one
+    //   contributor has full protection and another has a
+    //   numeric floor.
+    // - **PSI**: avg fields max-across, total_usec
+    //   saturating_add (per [`merge_psi`]).
     //
     // When `cgroup_key_map` is provided (auto-normalize is on),
     // each post-flatten path is further mapped to its final
-    // tightened key — so the enrichment table renders against the
-    // same labels as thread groups. When absent, the post-flatten
-    // path itself is the key (matches the legacy behavior with
-    // glob-only flatten).
+    // tightened key — so the enrichment table renders against
+    // the same labels as thread groups. When absent, the
+    // post-flatten path itself is the key (matches the legacy
+    // behavior with glob-only flatten).
     let mut out: BTreeMap<String, CgroupStats> = BTreeMap::new();
     for (path, cs) in stats {
         let post_flatten = flatten_cgroup_path(path, patterns);
@@ -1866,10 +1896,9 @@ pub fn flatten_cgroup_stats(
             None => post_flatten,
         };
         let agg = out.entry(key).or_default();
-        agg.cpu_usage_usec = agg.cpu_usage_usec.saturating_add(cs.cpu_usage_usec);
-        agg.nr_throttled = agg.nr_throttled.saturating_add(cs.nr_throttled);
-        agg.throttled_usec = agg.throttled_usec.saturating_add(cs.throttled_usec);
-        agg.memory_current = agg.memory_current.max(cs.memory_current);
+        merge_cgroup_cpu(&mut agg.cpu, &cs.cpu);
+        merge_cgroup_memory(&mut agg.memory, &cs.memory);
+        merge_cgroup_pids(&mut agg.pids, &cs.pids);
         agg.psi = merge_psi(agg.psi, cs.psi);
     }
     out
@@ -1906,6 +1935,184 @@ fn merge_psi_half(a: PsiHalf, b: PsiHalf) -> PsiHalf {
         avg60: a.avg60.max(b.avg60),
         avg300: a.avg300.max(b.avg300),
         total_usec: a.total_usec.saturating_add(b.total_usec),
+    }
+}
+
+/// Merge two [`CgroupCpuStats`]: counters use `saturating_add`,
+/// limits/knobs use the max-for-limits / max-for-weights rule
+/// from #61's Q4 ruling. Floors don't apply here (none in this
+/// domain). `period` takes the larger value as a stable
+/// fallback when contributors set different periods.
+fn merge_cgroup_cpu(agg: &mut CgroupCpuStats, src: &CgroupCpuStats) {
+    agg.usage_usec = agg.usage_usec.saturating_add(src.usage_usec);
+    agg.nr_throttled = agg.nr_throttled.saturating_add(src.nr_throttled);
+    agg.throttled_usec = agg.throttled_usec.saturating_add(src.throttled_usec);
+    agg.max_quota_us = merge_max_option(agg.max_quota_us, src.max_quota_us);
+    agg.max_period_us = agg.max_period_us.max(src.max_period_us);
+    // `weight` and `weight_nice` are aliases of the same kernel
+    // knob (`kernel/sched/core.c::sched_weight_to_nice` /
+    // `nice_to_weight`). Apply the SAME merge policy to both —
+    // earlier asymmetry between them was a phd-stats finding
+    // (F3). Use `merge_max_option` (None-poisons) for both:
+    // the merged bucket is "no weight configured" if any
+    // contributor is unconfigured.
+    agg.weight = merge_max_option(agg.weight, src.weight);
+    agg.weight_nice = match (agg.weight_nice, src.weight_nice) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        // Mirror merge_max_option's None-poisoning policy:
+        // None ∨ Some = None. Treats "absent file" as
+        // "unconfigured" — merged bucket inherits the
+        // unconfigured state.
+        (Some(_), None) | (None, Some(_)) | (None, None) => None,
+    };
+}
+
+/// Merge two [`CgroupMemoryStats`]. `current` is instantaneous
+/// RSS — `max` matches the existing memory_current policy.
+/// Limits (`max`, `high`) use max-for-limits, floors (`low`,
+/// `min`) use min-for-floors per Q4. `stat` is a heterogeneous
+/// map (counters + gauges) — see [`merge_memory_stat`] for the
+/// per-key policy. `events` is purely counter-shaped — sum
+/// per-key via [`merge_kv_counters`].
+fn merge_cgroup_memory(agg: &mut CgroupMemoryStats, src: &CgroupMemoryStats) {
+    agg.current = agg.current.max(src.current);
+    agg.max = merge_max_option(agg.max, src.max);
+    agg.high = merge_max_option(agg.high, src.high);
+    agg.low = merge_min_option(agg.low, src.low);
+    agg.min = merge_min_option(agg.min, src.min);
+    merge_memory_stat(&mut agg.stat, &src.stat);
+    merge_kv_counters(&mut agg.events, &src.events);
+}
+
+/// `memory.stat` keys whose values are INSTANTANEOUS GAUGES,
+/// not cumulative counters. The kernel emits these as the
+/// current (point-in-time) byte count for that pool — summing
+/// across cgroups overstates the merged-bucket gauge, so the
+/// merge takes max instead. Keys NOT in this list are
+/// counter-shaped (pgfault, pgmajfault, workingset_*,
+/// pgsteal_*, pgscan_*, pgrefill, etc.) and merge via
+/// `saturating_add`.
+///
+/// List sourced from inspecting the v2 `memory.stat` emission
+/// path in `mm/memcontrol.c` and the cgroup v2 documentation:
+/// these names denote pools (active resident bytes), not
+/// occurrences. Conservative — if a key is unknown, the merge
+/// defaults to sum (the existing kv-counter policy).
+const MEMORY_STAT_GAUGE_KEYS: &[&str] = &[
+    "anon",
+    "file",
+    "kernel",
+    "kernel_stack",
+    "pagetables",
+    "sec_pagetables",
+    "percpu",
+    "sock",
+    "vmalloc",
+    "shmem",
+    "zswap",
+    "zswapped",
+    "file_mapped",
+    "file_dirty",
+    "file_writeback",
+    "swapcached",
+    "anon_thp",
+    "file_thp",
+    "shmem_thp",
+    "inactive_anon",
+    "active_anon",
+    "inactive_file",
+    "active_file",
+    "unevictable",
+    "slab_reclaimable",
+    "slab_unreclaimable",
+    "slab",
+    "hugetlb",
+];
+
+/// Merge `memory.stat` maps with per-key policy: gauge keys
+/// (per [`MEMORY_STAT_GAUGE_KEYS`]) take max; counter keys
+/// take saturating_add. Gauges are point-in-time pool sizes
+/// (`anon`, `file`, `slab`, etc.) — summing across cgroups
+/// overstates the merged-bucket pool. Counter keys
+/// (workingset_refault_*, pgfault, pgmajfault, pgsteal_*,
+/// etc.) are cumulative event counts — additive across the
+/// merged bucket.
+fn merge_memory_stat(agg: &mut BTreeMap<String, u64>, src: &BTreeMap<String, u64>) {
+    for (key, value) in src {
+        let is_gauge = MEMORY_STAT_GAUGE_KEYS.contains(&key.as_str());
+        agg.entry(key.clone())
+            .and_modify(|v| {
+                *v = if is_gauge {
+                    (*v).max(*value)
+                } else {
+                    v.saturating_add(*value)
+                };
+            })
+            .or_insert(*value);
+    }
+}
+
+/// Merge two [`CgroupPidsStats`]. `current` is a point-in-time
+/// task count — the merged bucket's count is the sum across
+/// contributors at the moment of capture (each contributor's
+/// processes are disjoint by construction, so the sum is the
+/// total count). `max` is a limit (max-for-limits).
+fn merge_cgroup_pids(agg: &mut CgroupPidsStats, src: &CgroupPidsStats) {
+    agg.current = match (agg.current, src.current) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
+    };
+    agg.max = merge_max_option(agg.max, src.max);
+}
+
+/// Merge policy for `Option<u64>` LIMITS: take the max across
+/// contributors. `None` means "no limit" — propagating `None`
+/// when EITHER side is unbounded matches the kernel's actual
+/// behavior (the merged bucket is unbounded if any contributor
+/// is). When both sides have concrete values, max gives "the
+/// largest cap any contributor enforces".
+///
+/// Surface-symmetric with [`merge_min_option`] but the kernel
+/// semantics are OPPOSITE: limits use `None` to mean
+/// "unbounded" (any contributor unbounded ⇒ merged unbounded);
+/// floors use `None` to mean "no protection" (any contributor
+/// unprotected ⇒ merged unprotected). They share the same
+/// None-poisoning shape because both interpret missing as
+/// "the weakest contributor wins" in their respective
+/// directions.
+fn merge_max_option(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        // `None` = "no limit"; merged bucket is unbounded if
+        // either contributor is. Drop the concrete value rather
+        // than synthesize a bound that doesn't reflect reality.
+        (Some(_), None) | (None, Some(_)) => None,
+        (None, None) => None,
+    }
+}
+
+/// Merge policy for `Option<u64>` FLOORS (memory.low,
+/// memory.min): take the min across contributors. `None` means
+/// "no floor" (no protection); propagate `None` when either
+/// side has no floor — the merged bucket is only as protected
+/// as its weakest contributor.
+fn merge_min_option(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(_), None) | (None, Some(_)) => None,
+        (None, None) => None,
+    }
+}
+
+/// Per-key sum of two key-value counter maps. Keys present only
+/// on one side are copied verbatim; keys on both sides sum with
+/// saturating_add.
+fn merge_kv_counters(agg: &mut BTreeMap<String, u64>, src: &BTreeMap<String, u64>) {
+    for (key, value) in src {
+        agg.entry(key.clone())
+            .and_modify(|v| *v = v.saturating_add(*value))
+            .or_insert(*value);
     }
 }
 
@@ -2075,6 +2282,80 @@ pub fn format_scaled_u64(v: u64, unit: &'static str) -> String {
     } else {
         format!("{scaled:.3}{scaled_unit}")
     }
+}
+
+/// Render an `Option<u64>` cgroup limit as either `max` (no
+/// limit / kernel emitted the literal `max` token) or the
+/// auto-scaled value. Used for `memory.max`, `memory.high`,
+/// `memory.low`, `memory.min`, `pids.max`, `cpu.max` quota.
+/// Mirrors the kernel's own display: `cat memory.max` prints
+/// `max` when no cap is set, a u64 byte count otherwise.
+pub fn format_optional_limit(v: Option<u64>, unit: &'static str) -> String {
+    match v {
+        Some(n) => format_scaled_u64(n, unit),
+        None => "max".to_string(),
+    }
+}
+
+/// Render a `cpu.max` pair as `<quota>/<period>` where quota is
+/// either `max` (no cap) or the auto-scaled µs value. Period is
+/// always present (default 100_000 µs per
+/// `default_bw_period_us()` at `kernel/sched/sched.h:441`). The
+/// `<quota>/<period>` separator is THIS crate's display
+/// convention — the kernel itself emits raw integers in
+/// `cat cpu.max` (space-separated, no auto-scale); we
+/// auto-scale via [`format_scaled_u64`] for human-friendly
+/// output, which also widens the visual delimiter from the
+/// kernel's space to a slash.
+pub fn format_cpu_max(quota: Option<u64>, period_us: u64) -> String {
+    let q = match quota {
+        Some(q) => format_scaled_u64(q, "µs"),
+        None => "max".to_string(),
+    };
+    let p = format_scaled_u64(period_us, "µs");
+    format!("{q}/{p}")
+}
+
+/// Render a baseline → candidate cell for an `Option<u64>`
+/// LIMIT (e.g. `memory.max`, `memory.high`, `pids.max`). `None`
+/// reads as `max` (no limit) per [`format_optional_limit`]; a
+/// step from concrete to `max` between snapshots renders as
+/// `<value> → max`.
+pub fn cgroup_optional_limit_cell(
+    baseline: Option<u64>,
+    candidate: Option<u64>,
+    unit: &'static str,
+) -> String {
+    let bl = format_optional_limit(baseline, unit);
+    let cd = format_optional_limit(candidate, unit);
+    if baseline == candidate {
+        // No diff — render once. Avoids the `max → max` redundancy
+        // and keeps the limits column scannable when nothing
+        // changed.
+        return bl;
+    }
+    format!("{bl} → {cd}")
+}
+
+/// Render a baseline → candidate cell for `cpu.max`
+/// `(quota, period)` pairs. When both pairs are equal, renders
+/// once via [`format_cpu_max`]; otherwise renders as
+/// `<a> → <b>`. Mirrors [`cgroup_optional_limit_cell`]'s
+/// equality-collapse policy.
+pub fn cgroup_limits_cell(
+    baseline: Option<(Option<u64>, u64)>,
+    candidate: Option<(Option<u64>, u64)>,
+) -> String {
+    let render = |pair: Option<(Option<u64>, u64)>| match pair {
+        Some((q, p)) => format_cpu_max(q, p),
+        None => "-".to_string(),
+    };
+    let bl = render(baseline);
+    let cd = render(candidate);
+    if bl == cd {
+        return bl;
+    }
+    format!("{bl} → {cd}")
 }
 
 /// Format a per-row delta cell for [`write_diff`]. Routes the
@@ -2287,24 +2568,196 @@ pub fn write_diff<W: fmt::Write>(
             ct.add_row(vec![
                 key.to_string(),
                 cgroup_cell(
-                    a.map(|s| s.cpu_usage_usec),
-                    b.map(|s| s.cpu_usage_usec),
-                    "µs",
-                ),
-                cgroup_cell(a.map(|s| s.nr_throttled), b.map(|s| s.nr_throttled), ""),
-                cgroup_cell(
-                    a.map(|s| s.throttled_usec),
-                    b.map(|s| s.throttled_usec),
+                    a.map(|s| s.cpu.usage_usec),
+                    b.map(|s| s.cpu.usage_usec),
                     "µs",
                 ),
                 cgroup_cell(
-                    a.map(|s| s.memory_current),
-                    b.map(|s| s.memory_current),
+                    a.map(|s| s.cpu.nr_throttled),
+                    b.map(|s| s.cpu.nr_throttled),
+                    "",
+                ),
+                cgroup_cell(
+                    a.map(|s| s.cpu.throttled_usec),
+                    b.map(|s| s.cpu.throttled_usec),
+                    "µs",
+                ),
+                cgroup_cell(
+                    a.map(|s| s.memory.current),
+                    b.map(|s| s.memory.current),
                     "B",
                 ),
             ]);
         }
         writeln!(w, "{ct}")?;
+
+        // Per-cgroup limits / knobs sub-table — operator-set
+        // configuration: cpu.max, cpu.weight, memory.max,
+        // memory.high, pids.current/max. Cells render as
+        // baseline → candidate. `Option<u64>` limits show "max"
+        // when None per [`format_optional_limit`]. Suppressed
+        // when no cgroup in either snapshot exposes any of these
+        // (root cgroup, controllers not enabled, etc.).
+        let any_limits = all_keys.iter().any(|key| {
+            let has_limits = |s: &CgroupStats| {
+                s.cpu.max_quota_us.is_some()
+                    || s.cpu.weight.is_some()
+                    || s.memory.max.is_some()
+                    || s.memory.high.is_some()
+                    || s.pids.current.is_some()
+                    || s.pids.max.is_some()
+            };
+            diff.cgroup_stats_a.get(*key).is_some_and(has_limits)
+                || diff.cgroup_stats_b.get(*key).is_some_and(has_limits)
+        });
+        if any_limits {
+            writeln!(w)?;
+            writeln!(w, "## Cgroup limits / knobs")?;
+            let mut lt = crate::cli::new_table();
+            lt.set_header(vec![
+                "cgroup",
+                "cpu.max",
+                "cpu.weight",
+                "memory.max",
+                "memory.high",
+                "pids.current",
+                "pids.max",
+            ]);
+            for key in &all_keys {
+                let a = diff.cgroup_stats_a.get(*key);
+                let b = diff.cgroup_stats_b.get(*key);
+                // Per-row gate: skip rows where every column is
+                // unset on BOTH sides (the cgroup has no caps,
+                // no weight, no pids accounting on either
+                // baseline or candidate).
+                let row_has_data = |s: &CgroupStats| {
+                    s.cpu.max_quota_us.is_some()
+                        || s.cpu.weight.is_some()
+                        || s.memory.max.is_some()
+                        || s.memory.high.is_some()
+                        || s.pids.current.is_some()
+                        || s.pids.max.is_some()
+                };
+                if !a.is_some_and(row_has_data) && !b.is_some_and(row_has_data) {
+                    continue;
+                }
+                lt.add_row(vec![
+                    key.to_string(),
+                    cgroup_limits_cell(
+                        a.map(|s| (s.cpu.max_quota_us, s.cpu.max_period_us)),
+                        b.map(|s| (s.cpu.max_quota_us, s.cpu.max_period_us)),
+                    ),
+                    cgroup_cell(
+                        a.and_then(|s| s.cpu.weight),
+                        b.and_then(|s| s.cpu.weight),
+                        "",
+                    ),
+                    cgroup_optional_limit_cell(
+                        a.and_then(|s| s.memory.max),
+                        b.and_then(|s| s.memory.max),
+                        "B",
+                    ),
+                    cgroup_optional_limit_cell(
+                        a.and_then(|s| s.memory.high),
+                        b.and_then(|s| s.memory.high),
+                        "B",
+                    ),
+                    cgroup_cell(
+                        a.and_then(|s| s.pids.current),
+                        b.and_then(|s| s.pids.current),
+                        "",
+                    ),
+                    cgroup_optional_limit_cell(
+                        a.and_then(|s| s.pids.max),
+                        b.and_then(|s| s.pids.max),
+                        "",
+                    ),
+                ]);
+            }
+            writeln!(w, "{lt}")?;
+        }
+
+        // Per-cgroup memory.stat sub-table — kernel-emitted
+        // memory counters per cgroup. Up to 71 keys per cgroup.
+        // Long-table layout: one row per (cgroup, key) pair
+        // with baseline → candidate cells.
+        if all_keys.iter().any(|key| {
+            let has_stat = |s: &CgroupStats| !s.memory.stat.is_empty();
+            diff.cgroup_stats_a.get(*key).is_some_and(has_stat)
+                || diff.cgroup_stats_b.get(*key).is_some_and(has_stat)
+        }) {
+            writeln!(w)?;
+            writeln!(w, "## memory.stat")?;
+            let mut mt = crate::cli::new_table();
+            mt.set_header(vec!["cgroup", "key", "value"]);
+            for key in &all_keys {
+                let a = diff.cgroup_stats_a.get(*key);
+                let b = diff.cgroup_stats_b.get(*key);
+                let mut keys_union: std::collections::BTreeSet<&String> = a
+                    .map(|s| s.memory.stat.keys().collect())
+                    .unwrap_or_default();
+                if let Some(s) = b {
+                    keys_union.extend(s.memory.stat.keys());
+                }
+                for stat_key in keys_union {
+                    let av = a.and_then(|s| s.memory.stat.get(stat_key).copied());
+                    let bv = b.and_then(|s| s.memory.stat.get(stat_key).copied());
+                    // Compare-side zero-row suppression: skip
+                    // rows where baseline equals candidate. With
+                    // 71 keys × N cgroups the table is dominated
+                    // by unchanged values; surfacing only the
+                    // movers cuts output ~10x for typical runs.
+                    // Treats absent and explicit 0 as equal
+                    // (both render as "0" / "-").
+                    if av == bv {
+                        continue;
+                    }
+                    mt.add_row(vec![
+                        key.to_string(),
+                        stat_key.clone(),
+                        cgroup_cell(av, bv, ""),
+                    ]);
+                }
+            }
+            writeln!(w, "{mt}")?;
+        }
+
+        // Per-cgroup memory.events sub-table — pressure-event
+        // counters. Same long-table layout as memory.stat with
+        // the same baseline-vs-candidate zero-row suppression.
+        if all_keys.iter().any(|key| {
+            let has_events = |s: &CgroupStats| !s.memory.events.is_empty();
+            diff.cgroup_stats_a.get(*key).is_some_and(has_events)
+                || diff.cgroup_stats_b.get(*key).is_some_and(has_events)
+        }) {
+            writeln!(w)?;
+            writeln!(w, "## memory.events")?;
+            let mut et = crate::cli::new_table();
+            et.set_header(vec!["cgroup", "event", "count"]);
+            for key in &all_keys {
+                let a = diff.cgroup_stats_a.get(*key);
+                let b = diff.cgroup_stats_b.get(*key);
+                let mut keys_union: std::collections::BTreeSet<&String> = a
+                    .map(|s| s.memory.events.keys().collect())
+                    .unwrap_or_default();
+                if let Some(s) = b {
+                    keys_union.extend(s.memory.events.keys());
+                }
+                for event_key in keys_union {
+                    let av = a.and_then(|s| s.memory.events.get(event_key).copied());
+                    let bv = b.and_then(|s| s.memory.events.get(event_key).copied());
+                    if av == bv {
+                        continue;
+                    }
+                    et.add_row(vec![
+                        key.to_string(),
+                        event_key.clone(),
+                        cgroup_cell(av, bv, ""),
+                    ]);
+                }
+            }
+            writeln!(w, "{et}")?;
+        }
 
         // Per-cgroup PSI sub-tables — one per resource, each
         // with `some`+`full` rows × `avg10/60/300/total` columns.
@@ -2566,6 +3019,26 @@ mod tests {
         }
     }
 
+    /// Build a `CgroupStats` populated with the four primary
+    /// cpu / memory counter fields used in compare-pipeline
+    /// tests. Helper because the nested-struct shape makes
+    /// Default + per-field-assignment noisy at every test
+    /// fixture; this keeps call-site brevity at the four
+    /// counter values that drive most compare assertions.
+    fn simple_cgroup_stats(
+        cpu_usage_usec: u64,
+        nr_throttled: u64,
+        throttled_usec: u64,
+        memory_current: u64,
+    ) -> CgroupStats {
+        let mut cs = CgroupStats::default();
+        cs.cpu.usage_usec = cpu_usage_usec;
+        cs.cpu.nr_throttled = nr_throttled;
+        cs.cpu.throttled_usec = throttled_usec;
+        cs.memory.current = memory_current;
+        cs
+    }
+
     #[test]
     fn sum_aggregation_totals_across_group() {
         let mut a = make_thread("app", "w1");
@@ -2773,29 +3246,15 @@ mod tests {
         let mut ta = make_thread("app", "w1");
         ta.cgroup = "/app".into();
         let mut snap_a = snap_with(vec![ta]);
-        snap_a.cgroup_stats.insert(
-            "/app".into(),
-            CgroupStats {
-                cpu_usage_usec: 100,
-                nr_throttled: 1,
-                throttled_usec: 50,
-                memory_current: 1 << 20,
-                ..CgroupStats::default()
-            },
-        );
+        snap_a
+            .cgroup_stats
+            .insert("/app".into(), simple_cgroup_stats(100, 1, 50, 1 << 20));
         let mut tb = make_thread("app", "w1");
         tb.cgroup = "/app".into();
         let mut snap_b = snap_with(vec![tb]);
-        snap_b.cgroup_stats.insert(
-            "/app".into(),
-            CgroupStats {
-                cpu_usage_usec: 500,
-                nr_throttled: 3,
-                throttled_usec: 250,
-                memory_current: 2 << 20,
-                ..CgroupStats::default()
-            },
-        );
+        snap_b
+            .cgroup_stats
+            .insert("/app".into(), simple_cgroup_stats(500, 3, 250, 2 << 20));
         let opts = CompareOptions {
             group_by: GroupBy::Cgroup.into(),
             cgroup_flatten: vec![],
@@ -2804,8 +3263,8 @@ mod tests {
             sort_by: Vec::new(),
         };
         let diff = compare(&snap_a, &snap_b, &opts);
-        assert_eq!(diff.cgroup_stats_a["/app"].cpu_usage_usec, 100);
-        assert_eq!(diff.cgroup_stats_b["/app"].cpu_usage_usec, 500);
+        assert_eq!(diff.cgroup_stats_a["/app"].cpu.usage_usec, 100);
+        assert_eq!(diff.cgroup_stats_b["/app"].cpu.usage_usec, 500);
     }
 
     #[test]
@@ -3070,32 +3529,342 @@ mod tests {
         let mut stats = BTreeMap::new();
         stats.insert(
             "/kubepods/pod-a/workload".into(),
-            CgroupStats {
-                cpu_usage_usec: 100,
-                nr_throttled: 1,
-                throttled_usec: 10,
-                memory_current: 500,
-                ..CgroupStats::default()
-            },
+            simple_cgroup_stats(100, 1, 10, 500),
         );
         stats.insert(
             "/kubepods/pod-b/workload".into(),
-            CgroupStats {
-                cpu_usage_usec: 200,
-                nr_throttled: 2,
-                throttled_usec: 20,
-                memory_current: 800,
-                ..CgroupStats::default()
-            },
+            simple_cgroup_stats(200, 2, 20, 800),
         );
         let pats = compile_flatten_patterns(&["/kubepods/*/workload".into()]);
         let out = flatten_cgroup_stats(&stats, &pats, None);
         let agg = &out["/kubepods/*/workload"];
-        assert_eq!(agg.cpu_usage_usec, 300);
-        assert_eq!(agg.nr_throttled, 3);
-        assert_eq!(agg.throttled_usec, 30);
+        assert_eq!(agg.cpu.usage_usec, 300);
+        assert_eq!(agg.cpu.nr_throttled, 3);
+        assert_eq!(agg.cpu.throttled_usec, 30);
         // Instantaneous value: max, not sum.
-        assert_eq!(agg.memory_current, 800);
+        assert_eq!(agg.memory.current, 800);
+    }
+
+    /// `merge_max_option` policy: take the max across
+    /// contributors when both have a concrete cap; propagate
+    /// `None` when either side is unbounded (matches kernel
+    /// "no limit" semantics — the merged bucket is unbounded if
+    /// any contributor is).
+    #[test]
+    fn merge_max_option_propagates_no_limit() {
+        assert_eq!(merge_max_option(Some(100), Some(200)), Some(200));
+        assert_eq!(merge_max_option(Some(200), Some(100)), Some(200));
+        assert_eq!(merge_max_option(Some(50), Some(50)), Some(50));
+        // None ∨ Some = None (an unbounded contributor makes
+        // the merged bucket unbounded).
+        assert_eq!(merge_max_option(None, Some(100)), None);
+        assert_eq!(merge_max_option(Some(100), None), None);
+        assert_eq!(merge_max_option(None, None), None);
+    }
+
+    /// `merge_min_option` policy: take the min across
+    /// contributors when both have a concrete floor; propagate
+    /// `None` when either side has no floor (matches the floor
+    /// equivalent of the limit policy — merged bucket is only
+    /// as protected as its weakest contributor).
+    #[test]
+    fn merge_min_option_propagates_no_floor() {
+        assert_eq!(merge_min_option(Some(100), Some(200)), Some(100));
+        assert_eq!(merge_min_option(Some(200), Some(100)), Some(100));
+        assert_eq!(merge_min_option(None, Some(100)), None);
+        assert_eq!(merge_min_option(Some(100), None), None);
+        assert_eq!(merge_min_option(None, None), None);
+    }
+
+    /// `merge_kv_counters` per-key sum: keys present on both
+    /// sides sum; one-sided keys copy verbatim. Pure
+    /// counter-shaped policy — used for `memory.events` where
+    /// every key is a counter.
+    #[test]
+    fn merge_kv_counters_per_key_sum() {
+        let mut agg: BTreeMap<String, u64> = BTreeMap::new();
+        agg.insert("oom_kill".into(), 10);
+        agg.insert("high".into(), 20);
+        let mut src: BTreeMap<String, u64> = BTreeMap::new();
+        src.insert("oom_kill".into(), 5);
+        src.insert("low".into(), 7);
+        merge_kv_counters(&mut agg, &src);
+        assert_eq!(agg.get("oom_kill"), Some(&15), "common key sums");
+        assert_eq!(agg.get("high"), Some(&20), "agg-only key preserved");
+        assert_eq!(agg.get("low"), Some(&7), "src-only key copied");
+    }
+
+    /// `merge_memory_stat` per-key dispatch: gauge keys (per
+    /// [`MEMORY_STAT_GAUGE_KEYS`]) take max; counter keys take
+    /// saturating_add. Pins the BLOCKER fix from #61's
+    /// fix-round-1 — summing instantaneous pool sizes
+    /// (anon, file, slab) overstates the merged-bucket gauge.
+    #[test]
+    fn merge_memory_stat_dispatches_gauge_vs_counter() {
+        let mut agg: BTreeMap<String, u64> = BTreeMap::new();
+        agg.insert("anon".into(), 1_000_000);
+        agg.insert("file".into(), 500_000);
+        agg.insert("slab".into(), 800_000);
+        agg.insert("pgfault".into(), 100);
+        agg.insert("workingset_refault_anon".into(), 50);
+        let mut src: BTreeMap<String, u64> = BTreeMap::new();
+        src.insert("anon".into(), 2_000_000);
+        src.insert("file".into(), 100_000);
+        src.insert("slab".into(), 300_000);
+        src.insert("pgfault".into(), 25);
+        src.insert("workingset_refault_anon".into(), 10);
+        merge_memory_stat(&mut agg, &src);
+        // Gauges: max wins (NOT sum).
+        assert_eq!(agg.get("anon"), Some(&2_000_000), "anon is gauge → max");
+        assert_eq!(agg.get("file"), Some(&500_000), "file is gauge → max");
+        assert_eq!(agg.get("slab"), Some(&800_000), "slab is gauge → max");
+        // Counters: sum.
+        assert_eq!(agg.get("pgfault"), Some(&125), "pgfault is counter → sum");
+        assert_eq!(
+            agg.get("workingset_refault_anon"),
+            Some(&60),
+            "workingset_refault_anon is counter → sum"
+        );
+    }
+
+    /// End-to-end merge: two cgroups with distinct caps and
+    /// counters flatten to one bucket. Verifies the per-domain
+    /// merge policy holds across the full nested struct path.
+    #[test]
+    fn flatten_cgroup_stats_merges_limits_and_kv_maps() {
+        let mut a = CgroupStats::default();
+        a.cpu.usage_usec = 100;
+        a.cpu.max_quota_us = Some(50_000);
+        a.cpu.max_period_us = 100_000;
+        a.cpu.weight = Some(100);
+        a.memory.max = Some(1_000_000);
+        a.memory.high = Some(800_000);
+        a.memory.low = Some(400_000);
+        a.memory.stat.insert("anon".into(), 1000);
+        a.memory.events.insert("oom_kill".into(), 0);
+        a.pids.current = Some(10);
+        a.pids.max = Some(1024);
+
+        let mut b = CgroupStats::default();
+        b.cpu.usage_usec = 200;
+        b.cpu.max_quota_us = Some(80_000);
+        b.cpu.max_period_us = 100_000;
+        b.cpu.weight = Some(300);
+        b.memory.max = Some(2_000_000);
+        b.memory.high = Some(1_500_000);
+        b.memory.low = Some(200_000);
+        b.memory.stat.insert("anon".into(), 500);
+        b.memory.stat.insert("file".into(), 200);
+        b.memory.events.insert("oom_kill".into(), 1);
+        b.pids.current = Some(5);
+        b.pids.max = Some(2048);
+
+        let mut stats = BTreeMap::new();
+        stats.insert("/a".into(), a);
+        stats.insert("/b".into(), b);
+        let pats = compile_flatten_patterns(&["/{a,b}".into()]);
+        let out = flatten_cgroup_stats(&stats, &pats, None);
+        let agg = &out["/{a,b}"];
+
+        // CPU: counters sum, limits take max.
+        assert_eq!(agg.cpu.usage_usec, 300);
+        assert_eq!(agg.cpu.max_quota_us, Some(80_000));
+        assert_eq!(agg.cpu.weight, Some(300));
+
+        // Memory: limits max, floors min, stat-counters sum,
+        // stat-gauges max (per MEMORY_STAT_GAUGE_KEYS dispatch),
+        // events sum.
+        assert_eq!(agg.memory.max, Some(2_000_000));
+        assert_eq!(agg.memory.high, Some(1_500_000));
+        assert_eq!(agg.memory.low, Some(200_000));
+        // `anon` and `file` are gauges — max wins, not sum.
+        assert_eq!(agg.memory.stat.get("anon"), Some(&1000));
+        assert_eq!(agg.memory.stat.get("file"), Some(&200));
+        assert_eq!(agg.memory.events.get("oom_kill"), Some(&1));
+
+        // Pids: current sums, max takes max.
+        assert_eq!(agg.pids.current, Some(15));
+        assert_eq!(agg.pids.max, Some(2048));
+    }
+
+    /// Limit + floor No-limit propagation through flatten: when
+    /// one cgroup has memory.max=None (no cap) and another has
+    /// a concrete cap, the merged bucket inherits None.
+    #[test]
+    fn flatten_cgroup_stats_propagates_no_limit() {
+        let mut a = CgroupStats::default();
+        a.memory.max = None;
+        a.memory.low = None;
+        let mut b = CgroupStats::default();
+        b.memory.max = Some(1_000_000);
+        b.memory.low = Some(500_000);
+        let mut stats = BTreeMap::new();
+        stats.insert("/a".into(), a);
+        stats.insert("/b".into(), b);
+        let pats = compile_flatten_patterns(&["/{a,b}".into()]);
+        let out = flatten_cgroup_stats(&stats, &pats, None);
+        let agg = &out["/{a,b}"];
+        assert_eq!(agg.memory.max, None, "any unbounded → bucket unbounded");
+        assert_eq!(agg.memory.low, None, "any no-floor → bucket unprotected");
+    }
+
+    /// F14 per-row gate: a cgroup with counter data but no
+    /// caps / weight / pids accounting must NOT contribute a
+    /// row to the "## Cgroup limits / knobs" sub-table. The
+    /// cgroup-stats primary table still mentions it, but the
+    /// limits table is exclusive to cgroups exposing those
+    /// knobs.
+    #[test]
+    fn write_diff_limits_table_skips_cgroups_without_caps() {
+        let mut diff = HostStateDiff::default();
+        // /counters-only carries pure counter data — no
+        // cpu.max/weight, no memory.max/high, no pids.
+        diff.cgroup_stats_a.insert(
+            "/counters-only".into(),
+            simple_cgroup_stats(100, 0, 0, 1024),
+        );
+        diff.cgroup_stats_b.insert(
+            "/counters-only".into(),
+            simple_cgroup_stats(200, 0, 0, 2048),
+        );
+        // /capped sets a memory.max and a cpu.weight, so it
+        // SHOULD appear in the limits table.
+        let mut capped_a = CgroupStats::default();
+        capped_a.memory.max = Some(1 << 30);
+        capped_a.cpu.weight = Some(150);
+        let mut capped_b = CgroupStats::default();
+        capped_b.memory.max = Some(1 << 30);
+        capped_b.cpu.weight = Some(150);
+        diff.cgroup_stats_a.insert("/capped".into(), capped_a);
+        diff.cgroup_stats_b.insert("/capped".into(), capped_b);
+
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Cgroup,
+        )
+        .unwrap();
+
+        // Header is rendered (at least one cgroup carries
+        // limits data).
+        assert!(
+            out.contains("## Cgroup limits / knobs"),
+            "limits header missing:\n{out}",
+        );
+        // Find the section bounds — between the limits header
+        // and the next `##` header (or EOF).
+        let header_pos = out.find("## Cgroup limits / knobs").unwrap();
+        let after_header = &out[header_pos..];
+        let next_section = after_header
+            .find("\n## ")
+            .map(|p| p + 1)
+            .unwrap_or(after_header.len());
+        let limits_section = &after_header[..next_section];
+        // /capped appears (has caps), /counters-only does not.
+        assert!(
+            limits_section.contains("/capped"),
+            "capped cgroup should appear in limits table:\n{limits_section}",
+        );
+        assert!(
+            !limits_section.contains("/counters-only"),
+            "counters-only cgroup should NOT appear (no caps/weight/pids):\n{limits_section}",
+        );
+    }
+
+    /// F13 memory.stat unchanged-row suppression: a key that
+    /// carries the same value on both sides must NOT appear in
+    /// the rendered memory.stat sub-table; a key that changed
+    /// MUST appear. Pins the baseline-vs-candidate equality
+    /// gate that cuts output ~10x for typical runs.
+    #[test]
+    fn write_diff_memory_stat_skips_unchanged_rows() {
+        let mut diff = HostStateDiff::default();
+        let mut a = CgroupStats::default();
+        a.memory.stat.insert("pgfault".into(), 100);
+        a.memory.stat.insert("anon".into(), 1_000_000);
+        let mut b = CgroupStats::default();
+        b.memory.stat.insert("pgfault".into(), 250);
+        b.memory.stat.insert("anon".into(), 1_000_000);
+        diff.cgroup_stats_a.insert("/app".into(), a);
+        diff.cgroup_stats_b.insert("/app".into(), b);
+
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Cgroup,
+        )
+        .unwrap();
+
+        let header_pos = out
+            .find("## memory.stat")
+            .expect("memory.stat header missing");
+        let after_header = &out[header_pos..];
+        let next_section = after_header
+            .find("\n## ")
+            .map(|p| p + 1)
+            .unwrap_or(after_header.len());
+        let stat_section = &after_header[..next_section];
+        assert!(
+            stat_section.contains("pgfault"),
+            "changed key (pgfault: 100 → 250) must appear:\n{stat_section}",
+        );
+        assert!(
+            !stat_section.contains("anon"),
+            "unchanged gauge key (anon: 1M = 1M) must be suppressed:\n{stat_section}",
+        );
+    }
+
+    /// F13 memory.events unchanged-row suppression: same
+    /// pattern as memory.stat — only changed events surface.
+    #[test]
+    fn write_diff_memory_events_skips_unchanged_rows() {
+        let mut diff = HostStateDiff::default();
+        let mut a = CgroupStats::default();
+        a.memory.events.insert("low".into(), 5);
+        a.memory.events.insert("oom_kill".into(), 0);
+        let mut b = CgroupStats::default();
+        b.memory.events.insert("low".into(), 12);
+        b.memory.events.insert("oom_kill".into(), 0);
+        diff.cgroup_stats_a.insert("/app".into(), a);
+        diff.cgroup_stats_b.insert("/app".into(), b);
+
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Cgroup,
+        )
+        .unwrap();
+
+        let header_pos = out
+            .find("## memory.events")
+            .expect("memory.events header missing");
+        let after_header = &out[header_pos..];
+        let next_section = after_header
+            .find("\n## ")
+            .map(|p| p + 1)
+            .unwrap_or(after_header.len());
+        let events_section = &after_header[..next_section];
+        assert!(
+            events_section.contains("low"),
+            "changed event (low: 5 → 12) must appear:\n{events_section}",
+        );
+        // `oom_kill` 0→0 should be suppressed. Use a
+        // word-boundary check: `low` is a prefix of `low` but
+        // distinct from `oom_kill`, so just check the literal
+        // substring is absent.
+        assert!(
+            !events_section.contains("oom_kill"),
+            "unchanged event (oom_kill: 0 = 0) must be suppressed:\n{events_section}",
+        );
     }
 
     /// Malformed glob patterns are silently dropped by the
@@ -3373,26 +4142,10 @@ mod tests {
     #[test]
     fn write_diff_cgroup_enrichment_section_for_cgroup_mode() {
         let mut diff = HostStateDiff::default();
-        diff.cgroup_stats_a.insert(
-            "/app".into(),
-            CgroupStats {
-                cpu_usage_usec: 10,
-                nr_throttled: 0,
-                throttled_usec: 0,
-                memory_current: 100,
-                ..CgroupStats::default()
-            },
-        );
-        diff.cgroup_stats_b.insert(
-            "/app".into(),
-            CgroupStats {
-                cpu_usage_usec: 50,
-                nr_throttled: 0,
-                throttled_usec: 0,
-                memory_current: 200,
-                ..CgroupStats::default()
-            },
-        );
+        diff.cgroup_stats_a
+            .insert("/app".into(), simple_cgroup_stats(10, 0, 0, 100));
+        diff.cgroup_stats_b
+            .insert("/app".into(), simple_cgroup_stats(50, 0, 0, 200));
         let mut out = String::new();
         write_diff(
             &mut out,
@@ -3435,13 +4188,8 @@ mod tests {
         let mut diff = HostStateDiff::default();
         // Populate enrichment; renderer must ignore it under
         // GroupBy::Pcomm.
-        diff.cgroup_stats_a.insert(
-            "/app".into(),
-            CgroupStats {
-                cpu_usage_usec: 10,
-                ..CgroupStats::default()
-            },
-        );
+        diff.cgroup_stats_a
+            .insert("/app".into(), simple_cgroup_stats(10, 0, 0, 0));
         let mut out = String::new();
         write_diff(
             &mut out,
@@ -3728,20 +4476,10 @@ mod tests {
     #[test]
     fn write_diff_enrichment_handles_one_sided_cgroup_keys() {
         let mut diff = HostStateDiff::default();
-        diff.cgroup_stats_a.insert(
-            "/only-baseline".into(),
-            CgroupStats {
-                cpu_usage_usec: 111,
-                ..CgroupStats::default()
-            },
-        );
-        diff.cgroup_stats_b.insert(
-            "/only-candidate".into(),
-            CgroupStats {
-                cpu_usage_usec: 222,
-                ..CgroupStats::default()
-            },
-        );
+        diff.cgroup_stats_a
+            .insert("/only-baseline".into(), simple_cgroup_stats(111, 0, 0, 0));
+        diff.cgroup_stats_b
+            .insert("/only-candidate".into(), simple_cgroup_stats(222, 0, 0, 0));
         let mut out = String::new();
         write_diff(
             &mut out,
@@ -4125,32 +4863,14 @@ mod tests {
     #[test]
     fn flatten_cgroup_stats_with_no_patterns_preserves_keys() {
         let mut stats = BTreeMap::new();
-        stats.insert(
-            "/alpha".into(),
-            CgroupStats {
-                cpu_usage_usec: 10,
-                nr_throttled: 1,
-                throttled_usec: 5,
-                memory_current: 100,
-                ..CgroupStats::default()
-            },
-        );
-        stats.insert(
-            "/beta".into(),
-            CgroupStats {
-                cpu_usage_usec: 20,
-                nr_throttled: 2,
-                throttled_usec: 15,
-                memory_current: 200,
-                ..CgroupStats::default()
-            },
-        );
+        stats.insert("/alpha".into(), simple_cgroup_stats(10, 1, 5, 100));
+        stats.insert("/beta".into(), simple_cgroup_stats(20, 2, 15, 200));
         let out = flatten_cgroup_stats(&stats, &[], None);
         assert_eq!(out.len(), 2);
-        assert_eq!(out["/alpha"].cpu_usage_usec, 10);
-        assert_eq!(out["/alpha"].memory_current, 100);
-        assert_eq!(out["/beta"].cpu_usage_usec, 20);
-        assert_eq!(out["/beta"].memory_current, 200);
+        assert_eq!(out["/alpha"].cpu.usage_usec, 10);
+        assert_eq!(out["/alpha"].memory.current, 100);
+        assert_eq!(out["/beta"].cpu.usage_usec, 20);
+        assert_eq!(out["/beta"].memory.current, 200);
     }
 
     // ------------------------------------------------------------

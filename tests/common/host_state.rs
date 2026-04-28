@@ -54,7 +54,9 @@ pub fn snapshot(
 
 /// Build a `CgroupStats` entry from raw counter values. Same
 /// `#[non_exhaustive]` constraint as `snapshot` — populate via
-/// `Default::default()` + per-field assignment.
+/// `Default::default()` + per-field assignment. Reaches into
+/// the nested-controller shape introduced in #61: cpu counters
+/// land on the `cpu` sub-struct, memory.current on `memory`.
 #[allow(dead_code)]
 pub fn cgroup_stats_entry(
     cpu_usage_usec: u64,
@@ -63,9 +65,9 @@ pub fn cgroup_stats_entry(
     memory_current: u64,
 ) -> CgroupStats {
     let mut s = CgroupStats::default();
-    s.cpu_usage_usec = cpu_usage_usec;
-    s.nr_throttled = nr_throttled;
-    s.throttled_usec = throttled_usec;
-    s.memory_current = memory_current;
+    s.cpu.usage_usec = cpu_usage_usec;
+    s.cpu.nr_throttled = nr_throttled;
+    s.cpu.throttled_usec = throttled_usec;
+    s.memory.current = memory_current;
     s
 }
