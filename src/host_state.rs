@@ -3381,6 +3381,561 @@ mod tests {
     }
 
     // ------------------------------------------------------------
+    // Capture-pipeline error paths (Batch A + B)
+    //
+    // The synthetic-tree happy path is covered by
+    // capture_with_synthetic_tree_assembles_thread_state above.
+    // The tests below pin the pipeline's behavior against
+    // adversarial inputs:
+    // - missing/empty proc_root and tgid dirs (Batch A)
+    // - non-numeric junk under proc_root (Batch A)
+    // - capture_pid_with against pids that don't exist or are
+    //   ghost (Batch A + B)
+    // - selectively malformed/corrupted procfs files leaving
+    //   the matching ThreadState fields zero-defaulted (Batch B)
+    //
+    // Each test uses stage_synthetic_proc to lay down a known-
+    // good baseline, then mutates one specific axis. Assertions
+    // include observed value, expected value, and likely root
+    // cause so a regression points the reader at the failure
+    // mode without re-derivation.
+    // ------------------------------------------------------------
+
+    /// G1 — proc_root pointing at a directory that does NOT
+    /// exist must NOT panic. Pipeline collapses to an empty
+    /// snapshot via `iter_tgids_at`'s read_dir-fail-→-empty-Vec
+    /// guard. Defends against a future change that bubbled the
+    /// I/O error to the caller.
+    #[test]
+    fn capture_with_nonexistent_proc_root_produces_empty_snapshot() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        // A path inside a fresh tempdir that we never create —
+        // guaranteed to not exist within this test's scope.
+        // io::read_dir returns ENOENT, iter_tgids_at returns
+        // Vec::new(). Use false for use_syscall_affinity so the
+        // parallel probe phase is fully skipped.
+        let nonexistent = scratch.path().join("does-not-exist");
+        let snap = capture_with(&nonexistent, cgroup_tmp.path(), false);
+        assert!(
+            snap.threads.is_empty(),
+            "nonexistent proc_root must produce empty snapshot; got \
+             {} threads — iter_tgids_at must collapse ENOENT to empty",
+            snap.threads.len(),
+        );
+    }
+
+    /// G2 — tgid directory present but missing the inner
+    /// `task/` subdirectory. `iter_task_ids_at` returns an
+    /// empty vec, so the per-tid loop runs zero iterations and
+    /// the tgid contributes no threads. Pins that the missing
+    /// `task/` does not crash or fabricate a synthetic tid.
+    #[test]
+    fn capture_with_tgid_missing_task_dir_yields_no_threads_for_that_tgid() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+
+        // tgid 4242: has `task/` and one tid (live thread).
+        // tgid 4243: numeric directory but NO `task/` subdir.
+        let live_tgid: i32 = 4242;
+        let live_tid: i32 = 101;
+        stage_synthetic_proc(
+            proc_tmp.path(),
+            live_tgid,
+            live_tid,
+            "live-pcomm",
+            "live-comm",
+        );
+
+        let bare_tgid: i32 = 4243;
+        std::fs::create_dir_all(proc_tmp.path().join(bare_tgid.to_string())).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "tgid 4243 has no `task/` subdir → contributes zero threads; \
+             only live tgid 4242's tid should land. got {} threads, expected 1",
+            snap.threads.len(),
+        );
+        assert_eq!(snap.threads[0].tgid, live_tgid as u32);
+        assert_eq!(snap.threads[0].tid, live_tid as u32);
+    }
+
+    /// G3 — non-numeric directory entries under proc_root
+    /// (real procfs has `self`, `thread-self`, `sys`, `kpageflags`,
+    /// etc.) MUST be filtered by the parse-as-i32 step in
+    /// `iter_tgids_at`. Pins the filter so a future refactor
+    /// that loosened it (e.g. accepted any digit-prefix) does
+    /// not surface kernel pseudo-files as fake tgids.
+    #[test]
+    fn capture_with_non_numeric_proc_entries_are_filtered() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+
+        // Stage one valid numeric tgid plus several non-numeric
+        // names that mimic real procfs entries.
+        let live_tgid: i32 = 5151;
+        let live_tid: i32 = 5152;
+        stage_synthetic_proc(proc_tmp.path(), live_tgid, live_tid, "real", "real-thread");
+
+        for junk in &["self", "thread-self", "sys", "version", "12abc", "abc"] {
+            std::fs::create_dir_all(proc_tmp.path().join(junk)).unwrap();
+        }
+        // Negative or zero are filtered by `> 0` predicate.
+        std::fs::create_dir_all(proc_tmp.path().join("0")).unwrap();
+        std::fs::create_dir_all(proc_tmp.path().join("-1")).unwrap();
+
+        // Direct check on the parse filter — pins iter_tgids_at
+        // independently of the rest of the pipeline. Without this,
+        // a loosened parse that accepted "12" from "12abc" would
+        // still produce 1 thread downstream (the "12" dir has no
+        // task/ subdir → contributes zero threads regardless), so
+        // the snap.threads.len()==1 assertion alone wouldn't catch
+        // the regression.
+        assert_eq!(
+            iter_tgids_at(proc_tmp.path()),
+            vec![live_tgid],
+            "iter_tgids_at must return only the real numeric tgid; \
+             non-numeric and `0`/`-1` entries must be filtered by \
+             parse::<i32>().ok() + `> 0` predicates",
+        );
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "non-numeric proc_root entries (`self`, `12abc`, etc.) and \
+             `0`/`-1` must be filtered by iter_tgids_at; got {} threads, \
+             expected 1 (only the real tgid {live_tgid})",
+            snap.threads.len(),
+        );
+        assert_eq!(snap.threads[0].tgid, live_tgid as u32);
+    }
+
+    /// G7 — `capture_pid_with` against a pid whose `/proc/<pid>`
+    /// directory does not exist must NOT panic. `iter_task_ids_at`
+    /// returns empty, the loop iterates zero times, and the
+    /// snapshot's `threads` is empty. Pins that the per-pid
+    /// capture path tolerates the same exit-mid-capture race the
+    /// global path does.
+    #[test]
+    fn capture_pid_with_nonexistent_pid_produces_empty_snapshot() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        // pid 99999 is not staged — `proc_tmp/99999` does not exist.
+        let snap = capture_pid_with(proc_tmp.path(), cgroup_tmp.path(), 99999, false);
+        assert!(
+            snap.threads.is_empty(),
+            "capture_pid_with against nonexistent pid must produce empty \
+             snapshot; got {} threads — iter_task_ids_at must collapse \
+             ENOENT to empty",
+            snap.threads.len(),
+        );
+    }
+
+    /// G4a — corrupt the `stat` file so `parse_stat` returns
+    /// all-None defaults (write a single non-paren token, so
+    /// `rfind(')')` returns None and `parse_stat`
+    /// short-circuits to `StatFields::default()`). With `comm`
+    /// intact, the ghost-filter clause does NOT fire, so the
+    /// thread lands with stat-derived fields at zero (nice,
+    /// start_time, policy, processor, utime, stime) while
+    /// comm + status + io still populate from their intact
+    /// files.
+    #[test]
+    fn capture_with_corrupt_stat_file_zeroes_stat_fields_only() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 6161;
+        let tid: i32 = 6162;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        // Corrupt /proc/<tgid>/task/<tid>/stat — write a single
+        // non-paren token so rfind(')') fails.
+        let stat_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("stat");
+        std::fs::write(&stat_path, "garbage no parens here\n").unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "corrupt stat does not block thread landing — comm + status \
+             + io still populate; ghost filter only fires when comm AND \
+             start_time are both empty/zero. got {} threads",
+            snap.threads.len(),
+        );
+        let t = &snap.threads[0];
+        // stat-derived fields collapse to zero/default.
+        assert_eq!(
+            t.start_time_clock_ticks, 0,
+            "corrupt stat → start_time_clock_ticks default 0; got {}",
+            t.start_time_clock_ticks
+        );
+        assert_eq!(t.nice, 0, "corrupt stat → nice default 0; got {}", t.nice);
+        assert_eq!(
+            t.policy, "",
+            "corrupt stat → policy default empty; got {:?}",
+            t.policy
+        );
+        assert_eq!(t.utime_clock_ticks, 0);
+        assert_eq!(t.stime_clock_ticks, 0);
+        assert_eq!(t.processor, 0);
+        // status-derived fields still populate.
+        assert_eq!(
+            t.voluntary_csw, 42,
+            "status file is intact → voluntary_csw still populates"
+        );
+        // io-derived fields still populate.
+        assert_eq!(t.rchar, 100, "io file is intact → rchar still populates");
+    }
+
+    /// G4b — missing `schedstat` file (kernel without
+    /// CONFIG_SCHEDSTATS) leaves run_time_ns / wait_time_ns /
+    /// timeslices at zero. The thread still lands because
+    /// stat/comm are intact.
+    #[test]
+    fn capture_with_missing_schedstat_zeroes_schedstat_fields() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 7171;
+        let tid: i32 = 7172;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        // Remove /proc/<tgid>/task/<tid>/schedstat.
+        let schedstat_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("schedstat");
+        std::fs::remove_file(&schedstat_path).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "thread still lands with schedstat absent"
+        );
+        let t = &snap.threads[0];
+        assert_eq!(
+            t.run_time_ns, 0,
+            "missing schedstat → run_time_ns default 0; got {}",
+            t.run_time_ns
+        );
+        assert_eq!(t.wait_time_ns, 0);
+        assert_eq!(t.timeslices, 0);
+        // start_time still populates from intact stat.
+        assert_eq!(t.start_time_clock_ticks, 555_555);
+    }
+
+    /// G4c — malformed `status` file (random text, no recognized
+    /// keys) leaves status-derived fields (voluntary_csw,
+    /// nonvoluntary_csw, state, cpu_affinity) at default. With
+    /// `use_syscall_affinity=false`, cpu_affinity comes from
+    /// status only — so this also pins that absent
+    /// Cpus_allowed_list defaults to empty Vec, NOT to the
+    /// caller process's real affinity.
+    #[test]
+    fn capture_with_corrupt_status_zeroes_status_fields_and_empty_affinity() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 8181;
+        let tid: i32 = 8182;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        let status_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("status");
+        // No `:` separators → split_once(':') returns None for
+        // every line → no field populates.
+        std::fs::write(&status_path, "totally malformed garbage no colons here\n").unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(snap.threads.len(), 1);
+        let t = &snap.threads[0];
+        assert_eq!(
+            t.voluntary_csw, 0,
+            "corrupt status → voluntary_csw default 0; got {}",
+            t.voluntary_csw
+        );
+        assert_eq!(t.nonvoluntary_csw, 0);
+        assert_eq!(
+            t.state, '?',
+            "corrupt status → state collapses to '?' (capture-time \
+             unwrap_or('?')); got {:?}",
+            t.state
+        );
+        assert!(
+            t.cpu_affinity.is_empty(),
+            "use_syscall_affinity=false + corrupt status → cpu_affinity \
+             must be empty Vec, NOT inherit caller's real affinity; got {:?}",
+            t.cpu_affinity,
+        );
+    }
+
+    /// G4d — missing `io` file (CONFIG_TASK_IO_ACCOUNTING off
+    /// at kernel build) leaves all 6 byte counters at zero.
+    /// Pins that the capture continues without io data rather
+    /// than failing the whole snapshot.
+    #[test]
+    fn capture_with_missing_io_zeroes_io_fields() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 9191;
+        let tid: i32 = 9192;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        let io_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("io");
+        std::fs::remove_file(&io_path).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(snap.threads.len(), 1);
+        let t = &snap.threads[0];
+        assert_eq!(t.rchar, 0, "missing io → rchar default 0; got {}", t.rchar);
+        assert_eq!(t.wchar, 0);
+        assert_eq!(t.syscr, 0);
+        assert_eq!(t.syscw, 0);
+        assert_eq!(t.read_bytes, 0);
+        assert_eq!(t.write_bytes, 0);
+        // stat-derived fields still populate.
+        assert_eq!(t.start_time_clock_ticks, 555_555);
+    }
+
+    /// G4e — missing `sched` file leaves every sched-derived
+    /// field at zero (nr_wakeups family, *_sum, *_max,
+    /// migrations, ext_enabled). The thread still lands because
+    /// stat is intact.
+    #[test]
+    fn capture_with_missing_sched_zeroes_sched_fields() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 1010;
+        let tid: i32 = 1011;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        let sched_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("sched");
+        std::fs::remove_file(&sched_path).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(snap.threads.len(), 1);
+        let t = &snap.threads[0];
+        assert_eq!(
+            t.nr_wakeups, 0,
+            "missing sched → nr_wakeups default 0; got {}",
+            t.nr_wakeups
+        );
+        assert_eq!(t.nr_migrations, 0);
+        assert_eq!(t.wait_sum, 0);
+        assert_eq!(t.wait_max, 0);
+        assert_eq!(t.sleep_sum, 0);
+        assert_eq!(t.block_sum, 0);
+        assert_eq!(t.iowait_sum, 0);
+        assert_eq!(t.exec_max, 0);
+        assert_eq!(t.slice_max, 0);
+        assert!(
+            !t.ext_enabled,
+            "missing sched → ext.enabled key absent → ext_enabled false; \
+             got {}",
+            t.ext_enabled
+        );
+    }
+
+    /// G5 — selectively delete EVERY non-comm file under one tid
+    /// to simulate a partial mid-capture race (readdir saw the
+    /// dir, then the kernel completed exit cleanup before our
+    /// per-file reads). With comm intact, the thread still
+    /// lands but every counter is zero. Pins the absent-=-zero
+    /// contract under the worst plausible mid-capture race.
+    #[test]
+    fn capture_with_partial_mid_capture_race_lands_zero_thread() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 1212;
+        let tid: i32 = 1213;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "racy-pcomm", "racy-comm");
+        let task_dir = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string());
+        // Remove every per-tid file EXCEPT comm. comm is the
+        // ghost filter's anchor — keeping it preserves the
+        // thread's identity so the test exercises the
+        // counters-zero path rather than the ghost-drop path.
+        for f in &["stat", "schedstat", "status", "io", "sched", "cgroup"] {
+            std::fs::remove_file(task_dir.join(f)).unwrap();
+        }
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(snap.threads.len(), 1, "comm intact → thread still lands");
+        let t = &snap.threads[0];
+        assert_eq!(t.comm, "racy-comm", "comm survives the racy partial reads");
+        // Every counter zeros.
+        assert_eq!(t.start_time_clock_ticks, 0);
+        assert_eq!(t.nr_wakeups, 0);
+        assert_eq!(t.run_time_ns, 0);
+        assert_eq!(t.voluntary_csw, 0);
+        assert_eq!(t.rchar, 0);
+        assert_eq!(t.minflt, 0);
+        assert_eq!(t.cgroup, "");
+        assert!(
+            snap.cgroup_stats.is_empty(),
+            "all threads have empty cgroup → enrichment loop skips → \
+             cgroup_stats stays empty",
+        );
+    }
+
+    /// G6 — `capture_pid_with` ghost filter: a tid directory
+    /// under the target pid exists but carries zero readable
+    /// files (mid-capture exit). `capture_pid_with`'s
+    /// terminal ghost-filter check — same shape as the global
+    /// `capture_with` path's filter — must drop the
+    /// all-Default ThreadState. Pins the per-pid path's filter
+    /// independently of the global path.
+    #[test]
+    fn capture_pid_with_filters_ghost_threads() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 1313;
+        let live_tid: i32 = 1314;
+        let ghost_tid: i32 = 1315;
+
+        stage_synthetic_proc(proc_tmp.path(), tgid, live_tid, "p", "live");
+
+        // Ghost tid: directory exists but empty (no files).
+        let ghost_dir = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(ghost_tid.to_string());
+        std::fs::create_dir_all(&ghost_dir).unwrap();
+
+        let snap = capture_pid_with(proc_tmp.path(), cgroup_tmp.path(), tgid, false);
+
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "capture_pid_with must filter ghost tid {ghost_tid}; got {} \
+             threads, expected 1 (only live tid {live_tid})",
+            snap.threads.len(),
+        );
+        assert_eq!(snap.threads[0].tid, live_tid as u32);
+    }
+
+    /// G8 — malformed `Cpus_allowed_list:` value (a reversed
+    /// range like `5-3`) routes through `parse_cpu_list` which
+    /// returns `None`. With `use_syscall_affinity=false`, the
+    /// capture site has no fallback and `cpu_affinity` stays
+    /// at the default empty Vec. Pins that a malformed cpulist
+    /// does NOT crash the parse and does NOT silently fabricate
+    /// a partial range.
+    #[test]
+    fn capture_with_malformed_cpus_allowed_list_yields_empty_affinity() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 1414;
+        let tid: i32 = 1415;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+
+        let status_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("status");
+        // Reversed range — parse_cpu_list rejects (returns None).
+        let status = "Name:\tfoo\n\
+             State:\tR (running)\n\
+             voluntary_ctxt_switches:\t1\n\
+             nonvoluntary_ctxt_switches:\t1\n\
+             Cpus_allowed_list:\t5-3\n";
+        std::fs::write(&status_path, status).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(snap.threads.len(), 1);
+        let t = &snap.threads[0];
+        assert!(
+            t.cpu_affinity.is_empty(),
+            "malformed Cpus_allowed_list `5-3` → parse_cpu_list returns \
+             None → cpu_affinity defaults to empty Vec (NOT a partial \
+             range, NOT the caller's affinity); got {:?}",
+            t.cpu_affinity,
+        );
+        // Other status fields still populate (the malformed
+        // line failed only the cpulist arm of parse_status).
+        assert_eq!(
+            t.voluntary_csw, 1,
+            "malformed cpulist must NOT corrupt csw fields on the same \
+             status file — per-arm Option isolation"
+        );
+    }
+
+    /// G11 — huge `Cpus_allowed_list:` range (above the
+    /// MAX_CPU_RANGE_EXPANSION cap at 64 Ki CPUs) routes
+    /// through the `parse_cpu_list` cap and returns `None`.
+    /// Same observable effect as G8 (empty Vec) but pins a
+    /// distinct adversarial input — a hostile /proc with a
+    /// `0-4294967295` cpulist must NOT allocate gigabytes.
+    #[test]
+    fn capture_with_huge_cpu_range_in_status_yields_empty_affinity() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 1515;
+        let tid: i32 = 1516;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+
+        let status_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("status");
+        // u32::MAX-spanning range — well above the 64 Ki cap;
+        // parse_cpu_list rejects without expansion.
+        let status = "Cpus_allowed_list:\t0-4294967295\n\
+             voluntary_ctxt_switches:\t1\n\
+             nonvoluntary_ctxt_switches:\t1\n";
+        std::fs::write(&status_path, status).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(snap.threads.len(), 1);
+        let t = &snap.threads[0];
+        assert!(
+            t.cpu_affinity.is_empty(),
+            "huge cpulist range `0-4294967295` exceeds the 64 Ki \
+             expansion cap → parse_cpu_list returns None → cpu_affinity \
+             empty (NOT a 4-billion-element Vec, NOT a partial range); \
+             got {} elements",
+            t.cpu_affinity.len(),
+        );
+        // Per-arm isolation: the cap-rejected cpulist must NOT
+        // crash the rest of parse_status. csw fields on the same
+        // file still populate. Mirrors G8's isolation check.
+        assert_eq!(
+            t.voluntary_csw, 1,
+            "huge cpulist rejection must not break csw parsing on the \
+             same status file — per-arm Option isolation"
+        );
+    }
+
+    // ------------------------------------------------------------
     // H3 — read_cgroup_stats_at synthetic-tree coverage
     // ------------------------------------------------------------
 
