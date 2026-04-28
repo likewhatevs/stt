@@ -1118,6 +1118,44 @@ fn write_show<W: std::fmt::Write>(
         writeln!(w, "{st}")?;
     }
 
+    // Global sched_ext sysfs section. Suppressed when the
+    // snapshot's `sched_ext` field is None (CONFIG_SCHED_CLASS_EXT=n
+    // build, or sysfs directory absent). Single 5-row table
+    // mirroring the kernel's exposed scx_global_attrs[] surface.
+    if let Some(scx) = &snap.sched_ext {
+        writeln!(w)?;
+        writeln!(w, "## sched_ext")?;
+        let mut at = cli::new_table();
+        at.set_header(vec!["attr", "value"]);
+        // state cell: render "-" when the file was unreadable
+        // (empty string) so "no observation" stays visually
+        // distinct from an actual scx_enable_state_str[] value.
+        // Mirrors the compare-side rendering.
+        let state_cell = if scx.state.is_empty() {
+            "-".to_string()
+        } else {
+            scx.state.clone()
+        };
+        at.add_row(vec!["state".into(), state_cell]);
+        at.add_row(vec![
+            "switch_all".into(),
+            host_state_compare::format_scaled_u64(scx.switch_all, ""),
+        ]);
+        at.add_row(vec![
+            "nr_rejected".into(),
+            host_state_compare::format_scaled_u64(scx.nr_rejected, ""),
+        ]);
+        at.add_row(vec![
+            "hotplug_seq".into(),
+            host_state_compare::format_scaled_u64(scx.hotplug_seq, ""),
+        ]);
+        at.add_row(vec![
+            "enable_seq".into(),
+            host_state_compare::format_scaled_u64(scx.enable_seq, ""),
+        ]);
+        writeln!(w, "{at}")?;
+    }
+
     Ok(())
 }
 

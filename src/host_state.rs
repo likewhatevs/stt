@@ -168,6 +168,14 @@ pub struct HostStateSnapshot {
     /// absent. See [`Psi`] for the per-resource shape and the
     /// system-level cpu.full / irq.some caveats.
     pub psi: Psi,
+
+    /// Global sched_ext sysfs state from `/sys/kernel/sched_ext/`.
+    /// `None` when CONFIG_SCHED_CLASS_EXT is not built (no
+    /// `sched_ext` sysfs directory exists), or when the
+    /// directory itself is unreadable. See [`SchedExtSysfs`]
+    /// for the per-field shape and kernel cites. Populated
+    /// during the same capture pass as PSI.
+    pub sched_ext: Option<SchedExtSysfs>,
 }
 
 /// Per-snapshot probe outcome statistics. Curated projection of
@@ -1287,6 +1295,88 @@ pub struct Psi {
     pub irq: PsiResource,
 }
 
+/// Global sched_ext sysfs state, captured from
+/// `/sys/kernel/sched_ext/`. The kernel registers exactly five
+/// global attributes via `scx_global_attrs[]` at
+/// `kernel/sched/ext.c:4715-4722`; this struct mirrors them
+/// 1-to-1.
+///
+/// Per-scheduler attrs (`/sys/kernel/sched_ext/root/...`) are
+/// out of scope: those are scheduler-specific internals
+/// (queued/dispatched/ops-name) that come and go as schedulers
+/// load and unload, and answer different questions than the
+/// global counters here.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct SchedExtSysfs {
+    /// `state` — sched_ext class enable state. One of
+    /// `enabling`, `enabled`, `disabling`, `disabled` per
+    /// `scx_enable_state_str[]` at
+    /// `kernel/sched/ext_internal.h:1229-1234`. Emitted by
+    /// `scx_attr_state_show()` at
+    /// `kernel/sched/ext.c:4680-4684`. Defaults to empty string
+    /// when the file is unreadable; `disabled` when no scx
+    /// scheduler is currently loaded. The "is sched_ext active
+    /// during this capture?" answer.
+    pub state: String,
+
+    /// `switch_all` — boolean (rendered as 0/1) indicating
+    /// whether ALL scheduling classes have been switched to
+    /// scx (vs. only those tasks the BPF scheduler claims via
+    /// the per-task selection path). Emitted by
+    /// `scx_attr_switch_all_show()` at
+    /// `kernel/sched/ext.c:4687-4691` via
+    /// `READ_ONCE(scx_switching_all)`.
+    pub switch_all: u64,
+
+    /// `nr_rejected` — count of tasks rejected from
+    /// SCHED_EXT during init when `ops.init_task()` set
+    /// `p->disallow`. Increment at
+    /// `kernel/sched/ext.c:3531-3542`: when a task entering
+    /// SCHED_EXT has its policy reverted to SCHED_NORMAL
+    /// because the BPF scheduler asked the kernel to disallow
+    /// it, `atomic_long_inc(&scx_nr_rejected)` fires.
+    /// `atomic_long_read(&scx_nr_rejected)` is emitted by
+    /// `scx_attr_nr_rejected_show()` at
+    /// `kernel/sched/ext.c:4694-4698`.
+    ///
+    /// Resets to 0 on every scheduler load: `scx_enable()` at
+    /// `kernel/sched/ext.c:6646` does
+    /// `atomic_long_set(&scx_nr_rejected, 0)` before bringing
+    /// the new scheduler online. To detect a reload-driven
+    /// reset rather than a genuine cumulative drop, pair the
+    /// nr_rejected delta with [`Self::enable_seq`] — any
+    /// enable_seq movement across two snapshots invalidates
+    /// nr_rejected as a monotonic counter.
+    ///
+    /// Does NOT count runtime dispatch errors. The "did the
+    /// scheduler reject a dispatch operation at runtime?"
+    /// question is answered by per-scheduler debug data
+    /// (`/sys/kernel/sched_ext/root/...`), out of scope for
+    /// this global-attrs struct.
+    pub nr_rejected: u64,
+
+    /// `hotplug_seq` — per-CPU-hotplug-event sequence counter.
+    /// Atomic long incremented every time the kernel observes a
+    /// hotplug transition. Emitted by
+    /// `scx_attr_hotplug_seq_show()` at
+    /// `kernel/sched/ext.c:4701-4705`. Comparing two snapshots:
+    /// any delta indicates that a CPU online/offline event
+    /// happened during the interval, which can confound
+    /// per-CPU statistics.
+    pub hotplug_seq: u64,
+
+    /// `enable_seq` — per-scheduler-load sequence counter.
+    /// Atomic long incremented at
+    /// `kernel/sched/ext.c:6822` (`atomic_long_inc(&scx_enable_seq)`)
+    /// each time a scx scheduler is enabled. Comparing two
+    /// snapshots: any delta indicates a scheduler reload
+    /// happened during the interval — counter resets on the
+    /// scx side will surface here even if the per-thread data
+    /// looks continuous.
+    pub enable_seq: u64,
+}
+
 /// Parse one PSI file's contents. The kernel emits one or two
 /// lines (`some` then `full`), each formatted by `seq_printf` at
 /// `kernel/sched/psi.c:1284`. Lines are tokenized by whitespace;
@@ -1371,6 +1461,44 @@ fn read_host_psi_at(proc_root: &Path) -> Psi {
         io: read_psi_file_at(&pressure_dir.join("io")),
         irq: read_psi_file_at(&pressure_dir.join("irq")),
     }
+}
+
+/// Read global sched_ext sysfs state from
+/// `<sys_root>/kernel/sched_ext/`. Returns `None` when the
+/// directory itself is absent (CONFIG_SCHED_CLASS_EXT=n
+/// kernels never expose it). Per-file misses default the
+/// affected field to zero / empty string per the
+/// absent-counter contract — a future kernel that adds new
+/// global attrs (and that we haven't surfaced as fields yet)
+/// won't break the parser; old kernels missing one or more of
+/// the existing five collapse cleanly.
+fn read_sched_ext_sysfs_at(sys_root: &Path) -> Option<SchedExtSysfs> {
+    let dir = sys_root.join("kernel").join("sched_ext");
+    // No `tally` arg: directory presence (Option<SchedExtSysfs>)
+    // is THE not-built signal; per-attr misses collapse silently
+    // per the absent-counter contract.
+    if !dir.exists() {
+        return None;
+    }
+    Some(SchedExtSysfs {
+        state: fs::read_to_string(dir.join("state"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default(),
+        switch_all: read_sysfs_u64(&dir.join("switch_all")),
+        nr_rejected: read_sysfs_u64(&dir.join("nr_rejected")),
+        hotplug_seq: read_sysfs_u64(&dir.join("hotplug_seq")),
+        enable_seq: read_sysfs_u64(&dir.join("enable_seq")),
+    })
+}
+
+/// Read a single-line u64 sysfs file. Trims trailing newline,
+/// parses, defaults to 0 on read or parse failure (matches the
+/// absent-counter contract).
+fn read_sysfs_u64(path: &Path) -> u64 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Read per-cgroup PSI files (`<cgroup>/{cpu,memory,io,irq}.pressure`)
@@ -1504,6 +1632,13 @@ pub const DEFAULT_PROC_ROOT: &str = "/proc";
 
 /// Default cgroup v2 mount point.
 pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Default sysfs root. Tests pass a tempdir so they don't read
+/// the live `/sys` tree (which would produce nondeterministic
+/// `sched_ext` state depending on the host kernel config). The
+/// public capture entry points pass this constant to read the
+/// real sysfs tree at runtime.
+pub const DEFAULT_SYS_ROOT: &str = "/sys";
 
 fn task_file(proc_root: &Path, tgid: i32, tid: i32, leaf: &str) -> PathBuf {
     proc_root
@@ -3258,6 +3393,7 @@ fn emit_probe_summary(summary: &ProbeSummary) {
 fn capture_with(
     proc_root: &Path,
     cgroup_root: &Path,
+    sys_root: &Path,
     use_syscall_affinity: bool,
 ) -> HostStateSnapshot {
     let captured_at_unix_ns = std::time::SystemTime::now()
@@ -3572,6 +3708,7 @@ fn capture_with(
         }
     }
     let psi = read_host_psi_at(proc_root);
+    let sched_ext = read_sched_ext_sysfs_at(sys_root);
     HostStateSnapshot {
         captured_at_unix_ns,
         host,
@@ -3580,6 +3717,7 @@ fn capture_with(
         probe_summary,
         parse_summary,
         psi,
+        sched_ext,
     }
 }
 
@@ -3606,6 +3744,7 @@ pub fn capture() -> HostStateSnapshot {
     capture_with(
         Path::new(DEFAULT_PROC_ROOT),
         Path::new(DEFAULT_CGROUP_ROOT),
+        Path::new(DEFAULT_SYS_ROOT),
         true,
     )
 }
@@ -3629,6 +3768,7 @@ pub fn capture_pid(pid: i32) -> HostStateSnapshot {
     capture_pid_with(
         Path::new(DEFAULT_PROC_ROOT),
         Path::new(DEFAULT_CGROUP_ROOT),
+        Path::new(DEFAULT_SYS_ROOT),
         pid,
         true,
     )
@@ -3655,6 +3795,7 @@ pub fn capture_pid(pid: i32) -> HostStateSnapshot {
 fn capture_pid_with(
     proc_root: &Path,
     cgroup_root: &Path,
+    sys_root: &Path,
     pid: i32,
     use_syscall_affinity: bool,
 ) -> HostStateSnapshot {
@@ -3749,6 +3890,7 @@ fn capture_pid_with(
         }
     }
     let psi = read_host_psi_at(proc_root);
+    let sched_ext = read_sched_ext_sysfs_at(sys_root);
     HostStateSnapshot {
         captured_at_unix_ns,
         host,
@@ -3757,6 +3899,7 @@ fn capture_pid_with(
         probe_summary,
         parse_summary,
         psi,
+        sched_ext,
     }
 }
 
@@ -3809,6 +3952,7 @@ mod tests {
             probe_summary: None,
             parse_summary: None,
             psi: Psi::default(),
+            sched_ext: None,
         };
         let tmp = tempfile::NamedTempFile::new().unwrap();
         snap.write(tmp.path()).unwrap();
@@ -4441,6 +4585,62 @@ mod tests {
             2,
             "header line with `00:00` device pair must not produce a junk key; got {m:?}",
         );
+    }
+
+    /// Stage a synthetic `<sys_root>/kernel/sched_ext/` tree
+    /// with all 5 global attrs and verify
+    /// [`read_sched_ext_sysfs_at`] returns a fully populated
+    /// [`SchedExtSysfs`]. Pins each file's parse routing.
+    #[test]
+    fn read_sched_ext_sysfs_at_populates_all_five_attrs() {
+        let sys_root = tempfile::TempDir::new().unwrap();
+        let scx_dir = sys_root.path().join("kernel").join("sched_ext");
+        std::fs::create_dir_all(&scx_dir).unwrap();
+        std::fs::write(scx_dir.join("state"), "enabled\n").unwrap();
+        std::fs::write(scx_dir.join("switch_all"), "1\n").unwrap();
+        std::fs::write(scx_dir.join("nr_rejected"), "42\n").unwrap();
+        std::fs::write(scx_dir.join("hotplug_seq"), "315\n").unwrap();
+        std::fs::write(scx_dir.join("enable_seq"), "7\n").unwrap();
+        let scx = read_sched_ext_sysfs_at(sys_root.path())
+            .expect("populated sched_ext directory must yield Some");
+        assert_eq!(scx.state, "enabled");
+        assert_eq!(scx.switch_all, 1);
+        assert_eq!(scx.nr_rejected, 42);
+        assert_eq!(scx.hotplug_seq, 315);
+        assert_eq!(scx.enable_seq, 7);
+    }
+
+    /// Absent `<sys_root>/kernel/sched_ext/` directory yields
+    /// `None`. Pins the CONFIG_SCHED_CLASS_EXT=n / no-sysfs
+    /// path so a kernel without the feature collapses cleanly
+    /// into the snapshot's `sched_ext: None`.
+    #[test]
+    fn read_sched_ext_sysfs_at_absent_directory_yields_none() {
+        let sys_root = tempfile::TempDir::new().unwrap();
+        // Empty tempdir — no kernel/sched_ext/ subtree.
+        assert!(read_sched_ext_sysfs_at(sys_root.path()).is_none());
+    }
+
+    /// Per-file misses default to 0 / empty string. Pins the
+    /// absent-counter contract for a half-populated sched_ext
+    /// directory (older kernel that exposed only a subset of
+    /// the 5 attrs).
+    #[test]
+    fn read_sched_ext_sysfs_at_partial_files_default_zero() {
+        let sys_root = tempfile::TempDir::new().unwrap();
+        let scx_dir = sys_root.path().join("kernel").join("sched_ext");
+        std::fs::create_dir_all(&scx_dir).unwrap();
+        // Only state + nr_rejected populated; the other 3 files
+        // absent.
+        std::fs::write(scx_dir.join("state"), "disabled\n").unwrap();
+        std::fs::write(scx_dir.join("nr_rejected"), "100\n").unwrap();
+        let scx =
+            read_sched_ext_sysfs_at(sys_root.path()).expect("directory exists → returns Some");
+        assert_eq!(scx.state, "disabled");
+        assert_eq!(scx.nr_rejected, 100);
+        assert_eq!(scx.switch_all, 0, "absent file → default 0");
+        assert_eq!(scx.hotplug_seq, 0);
+        assert_eq!(scx.enable_seq, 0);
     }
 
     /// Stage a synthetic procfs tree with a leader-thread
@@ -5363,6 +5563,7 @@ mod tests {
     fn capture_with_filters_ghost_threads_with_empty_comm_and_zero_start() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 42;
         let live_tid: i32 = 101;
         let ghost_tid: i32 = 202;
@@ -5383,7 +5584,7 @@ mod tests {
             .join(ghost_tid.to_string());
         std::fs::create_dir_all(&ghost_dir).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
 
         // Exactly one thread — the live one. The ghost is gone.
         assert_eq!(
@@ -5407,12 +5608,13 @@ mod tests {
     fn capture_with_synthetic_tree_assembles_thread_state() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 42;
         let tid: i32 = 101;
 
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "pcomm-proc", "worker-thread");
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
 
         // Exactly one thread — the one we planted.
         assert_eq!(snap.threads.len(), 1, "synthetic proc has one tid");
@@ -5579,6 +5781,7 @@ mod tests {
     fn capture_with_empty_proc_root_produces_empty_snapshot() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
 
         // Stage `/proc/loadavg` so the parallelism-clamp read at
         // <proc_root>/loadavg succeeds rather than falling back to
@@ -5586,7 +5789,7 @@ mod tests {
         // subdirs, so `iter_tgids_at` returns Vec::new().
         std::fs::write(proc_tmp.path().join("loadavg"), "0.0 0.0 0.0 1/1 1\n").unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), true);
         assert!(
             snap.threads.is_empty(),
             "empty proc_root must produce empty snapshot; got {} threads",
@@ -5606,6 +5809,7 @@ mod tests {
     fn capture_with_inode_cache_collapses_duplicate_binaries() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
 
         // Required by the parallelism-clamp logic in capture_with.
         std::fs::write(proc_tmp.path().join("loadavg"), "0.0 0.0 0.0 1/1 1\n").unwrap();
@@ -5633,7 +5837,7 @@ mod tests {
             std::os::unix::fs::symlink(&shared_exe, &exe_link).unwrap();
         }
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), true);
 
         // Both threads still land in the snapshot — the failed
         // attach just leaves allocated_bytes at the absent-counter
@@ -5689,9 +5893,11 @@ mod tests {
         // guaranteed to not exist within this test's scope.
         // io::read_dir returns ENOENT, iter_tgids_at returns
         // Vec::new(). Use false for use_syscall_affinity so the
-        // parallel probe phase is fully skipped.
+        // parallel probe phase is fully skipped. Reuse the same
+        // nonexistent path for sys_root: this test exercises the
+        // ENOENT-collapses-cleanly invariant uniformly.
         let nonexistent = scratch.path().join("does-not-exist");
-        let snap = capture_with(&nonexistent, cgroup_tmp.path(), false);
+        let snap = capture_with(&nonexistent, cgroup_tmp.path(), &nonexistent, false);
         assert!(
             snap.threads.is_empty(),
             "nonexistent proc_root must produce empty snapshot; got \
@@ -5709,6 +5915,7 @@ mod tests {
     fn capture_with_tgid_missing_task_dir_yields_no_threads_for_that_tgid() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
 
         // tgid 4242: has `task/` and one tid (live thread).
         // tgid 4243: numeric directory but NO `task/` subdir.
@@ -5725,7 +5932,7 @@ mod tests {
         let bare_tgid: i32 = 4243;
         std::fs::create_dir_all(proc_tmp.path().join(bare_tgid.to_string())).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
 
         assert_eq!(
             snap.threads.len(),
@@ -5748,6 +5955,7 @@ mod tests {
     fn capture_with_non_numeric_proc_entries_are_filtered() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
 
         // Stage one valid numeric tgid plus several non-numeric
         // names that mimic real procfs entries.
@@ -5777,7 +5985,7 @@ mod tests {
              parse::<i32>().ok() + `> 0` predicates",
         );
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
 
         assert_eq!(
             snap.threads.len(),
@@ -5800,8 +6008,15 @@ mod tests {
     fn capture_pid_with_nonexistent_pid_produces_empty_snapshot() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         // pid 99999 is not staged — `proc_tmp/99999` does not exist.
-        let snap = capture_pid_with(proc_tmp.path(), cgroup_tmp.path(), 99999, false);
+        let snap = capture_pid_with(
+            proc_tmp.path(),
+            cgroup_tmp.path(),
+            sys_tmp.path(),
+            99999,
+            false,
+        );
         assert!(
             snap.threads.is_empty(),
             "capture_pid_with against nonexistent pid must produce empty \
@@ -5824,6 +6039,7 @@ mod tests {
     fn capture_with_corrupt_stat_file_zeroes_stat_fields_only() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 6161;
         let tid: i32 = 6162;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -5837,7 +6053,7 @@ mod tests {
             .join("stat");
         std::fs::write(&stat_path, "garbage no parens here\n").unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
 
         assert_eq!(
             snap.threads.len(),
@@ -5880,6 +6096,7 @@ mod tests {
     fn capture_with_missing_schedstat_zeroes_schedstat_fields() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 7171;
         let tid: i32 = 7172;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -5892,7 +6109,7 @@ mod tests {
             .join("schedstat");
         std::fs::remove_file(&schedstat_path).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(
             snap.threads.len(),
             1,
@@ -5921,6 +6138,7 @@ mod tests {
     fn capture_with_corrupt_status_zeroes_status_fields_and_empty_affinity() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 8181;
         let tid: i32 = 8182;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -5934,7 +6152,7 @@ mod tests {
         // every line → no field populates.
         std::fs::write(&status_path, "totally malformed garbage no colons here\n").unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
         assert_eq!(
@@ -5965,6 +6183,7 @@ mod tests {
     fn capture_with_missing_io_zeroes_io_fields() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 9191;
         let tid: i32 = 9192;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -5976,7 +6195,7 @@ mod tests {
             .join("io");
         std::fs::remove_file(&io_path).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
         assert_eq!(t.rchar, 0, "missing io → rchar default 0; got {}", t.rchar);
@@ -5997,6 +6216,7 @@ mod tests {
     fn capture_with_missing_sched_zeroes_sched_fields() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 1010;
         let tid: i32 = 1011;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -6008,7 +6228,7 @@ mod tests {
             .join("sched");
         std::fs::remove_file(&sched_path).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
         assert_eq!(
@@ -6042,6 +6262,7 @@ mod tests {
     fn capture_with_partial_mid_capture_race_lands_zero_thread() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 1212;
         let tid: i32 = 1213;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "racy-pcomm", "racy-comm");
@@ -6058,7 +6279,7 @@ mod tests {
             std::fs::remove_file(task_dir.join(f)).unwrap();
         }
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1, "comm intact → thread still lands");
         let t = &snap.threads[0];
         assert_eq!(t.comm, "racy-comm", "comm survives the racy partial reads");
@@ -6088,6 +6309,7 @@ mod tests {
     fn capture_pid_with_filters_ghost_threads() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 1313;
         let live_tid: i32 = 1314;
         let ghost_tid: i32 = 1315;
@@ -6102,7 +6324,13 @@ mod tests {
             .join(ghost_tid.to_string());
         std::fs::create_dir_all(&ghost_dir).unwrap();
 
-        let snap = capture_pid_with(proc_tmp.path(), cgroup_tmp.path(), tgid, false);
+        let snap = capture_pid_with(
+            proc_tmp.path(),
+            cgroup_tmp.path(),
+            sys_tmp.path(),
+            tgid,
+            false,
+        );
 
         assert_eq!(
             snap.threads.len(),
@@ -6125,6 +6353,7 @@ mod tests {
     fn capture_with_malformed_cpus_allowed_list_yields_empty_affinity() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 1414;
         let tid: i32 = 1415;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -6143,7 +6372,7 @@ mod tests {
              Cpus_allowed_list:\t5-3\n";
         std::fs::write(&status_path, status).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
         assert!(
@@ -6172,6 +6401,7 @@ mod tests {
     fn capture_with_huge_cpu_range_in_status_yields_empty_affinity() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 1515;
         let tid: i32 = 1516;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -6189,7 +6419,7 @@ mod tests {
              nonvoluntary_ctxt_switches:\t1\n";
         std::fs::write(&status_path, status).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
         assert!(
@@ -6221,6 +6451,7 @@ mod tests {
     fn capture_with_non_numeric_task_entries_are_filtered() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
 
         let live_tgid: i32 = 8181;
         let live_tid: i32 = 8182;
@@ -6245,7 +6476,7 @@ mod tests {
              parse::<i32>().ok() + `> 0` predicates",
         );
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(
             snap.threads.len(),
             1,
@@ -6267,6 +6498,7 @@ mod tests {
     fn capture_with_v1_only_cgroup_yields_empty_cgroup_string() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 9191;
         let tid: i32 = 9192;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -6285,7 +6517,7 @@ mod tests {
              3:blkio:/\n";
         std::fs::write(&cgroup_path, v1_only).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
 
         assert_eq!(
             snap.threads.len(),
@@ -6347,6 +6579,7 @@ mod tests {
     fn capture_with_stale_cgroup_path_yields_all_zero_stats() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 7373;
         let tid: i32 = 7374;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -6356,7 +6589,7 @@ mod tests {
         // read_cgroup_stats_at("/ktstr.slice/worker0"), which
         // resolves to a non-existent dir and returns all-zero stats.
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let stats = snap
             .cgroup_stats
@@ -7679,10 +7912,11 @@ mod tests {
     fn capture_with_synthetic_tree_yields_no_parse_summary() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 5090;
         let tid: i32 = 5091;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert!(
             snap.parse_summary.is_none(),
             "use_syscall_affinity=false must skip parse_summary; \
@@ -7704,12 +7938,13 @@ mod tests {
     fn capture_with_phase1_loadavg_missing_does_not_panic() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         // No loadavg file. iter_tgids_at returns Vec::new() so the
         // probe-attach loop iterates zero times — but the clamp
         // computation runs unconditionally inside the
         // use_syscall_affinity=true branch, exercising the
         // missing-file path.
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), true);
         assert!(
             snap.threads.is_empty(),
             "missing loadavg + empty proc_root → empty snapshot, \
@@ -7726,8 +7961,9 @@ mod tests {
     fn capture_with_phase1_loadavg_malformed_does_not_panic() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(proc_tmp.path().join("loadavg"), "not_a_number\n").unwrap();
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), true);
         assert!(
             snap.threads.is_empty(),
             "malformed loadavg → 0.0 default, empty proc_root → empty \
@@ -7745,6 +7981,7 @@ mod tests {
     fn capture_with_non_utf8_comm_treated_as_absent() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 6161;
         let tid: i32 = 6162;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -7758,7 +7995,7 @@ mod tests {
             .join("comm");
         std::fs::write(&comm_path, [0xFF, 0xFE]).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(
             snap.threads.len(),
             1,
@@ -7793,6 +8030,7 @@ mod tests {
     fn capture_with_cgroup_path_traversal_yields_zero_stats() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 6262;
         let tid: i32 = 6263;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -7805,7 +8043,7 @@ mod tests {
             .join("cgroup");
         std::fs::write(&cgroup_path, "0::/../escape\n").unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         assert_eq!(
             snap.threads[0].cgroup, "/../escape",
@@ -7832,6 +8070,7 @@ mod tests {
     fn capture_with_empty_cpus_allowed_yields_empty_affinity() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 6363;
         let tid: i32 = 6364;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -7846,7 +8085,7 @@ mod tests {
              nonvoluntary_ctxt_switches:\t1\n";
         std::fs::write(&status_path, status).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(snap.threads.len(), 1);
         let t = &snap.threads[0];
         assert!(
@@ -7874,6 +8113,7 @@ mod tests {
     fn capture_with_empty_comm_nonzero_start_time_keeps_thread() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 6464;
         let tid: i32 = 6465;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -7888,7 +8128,7 @@ mod tests {
             .join("comm");
         std::fs::write(&comm_path, "   \n").unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(
             snap.threads.len(),
             1,
@@ -7920,6 +8160,7 @@ mod tests {
     fn parse_summary_all_ghosts_yields_nonzero_tids_walked_zero_failures() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 7070;
         let n: u64 = 4;
         // Stage one tgid with N empty task dirs (no comm, no stat,
@@ -7935,7 +8176,7 @@ mod tests {
         // by capture_with_phase1_loadavg_missing_does_not_panic).
         std::fs::write(proc_tmp.path().join("loadavg"), "0.10 0.05 0.01 1/1 1\n").unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), true);
         assert!(
             snap.threads.is_empty(),
             "every tid is ghost-filtered → threads must be empty, got {}",
@@ -8139,13 +8380,14 @@ mod tests {
     fn capture_with_production_gate_populates_parse_summary() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 7100;
         let tid: i32 = 7101;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
         // loadavg lets the parallelism-clamp read resolve cleanly.
         std::fs::write(proc_tmp.path().join("loadavg"), "0.10 0.05 0.01 1/1 1\n").unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), true);
         assert!(
             snap.parse_summary.is_some(),
             "use_syscall_affinity=true must populate parse_summary on \
@@ -8166,6 +8408,7 @@ mod tests {
     fn capture_with_non_utf8_pcomm_treated_as_absent() {
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         let tgid: i32 = 7110;
         let tid: i32 = 7111;
         stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
@@ -8174,7 +8417,7 @@ mod tests {
         let pcomm_path = proc_tmp.path().join(tgid.to_string()).join("comm");
         std::fs::write(&pcomm_path, [0xFF, 0xFE]).unwrap();
 
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
         assert_eq!(
             snap.threads.len(),
             1,
@@ -8223,6 +8466,7 @@ mod tests {
 
         let proc_tmp = tempfile::TempDir::new().unwrap();
         let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let sys_tmp = tempfile::TempDir::new().unwrap();
         // Required by the parallelism-clamp logic in capture_with.
         std::fs::write(proc_tmp.path().join("loadavg"), "0.0 0.0 0.0 1/1 1\n").unwrap();
 
@@ -8264,7 +8508,7 @@ mod tests {
         // the hook so a panic during disarm (none expected) still
         // hits the silenced hook rather than the real one.
         PANIC_INJECT_TGID.store(panic_tgid, std::sync::atomic::Ordering::Release);
-        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), true);
         PANIC_INJECT_TGID.store(0, std::sync::atomic::Ordering::Release);
 
         std::panic::set_hook(saved_hook);

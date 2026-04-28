@@ -963,3 +963,120 @@ fn compare_smaps_rollup_suppresses_section_when_all_unchanged() {
         "section header must be suppressed when no key changed:\n{out}",
     );
 }
+
+/// End-to-end sched_ext compare. Both snapshots carry a populated
+/// SchedExtSysfs but with deltas across the counter fields. Pin
+/// the section renders + cells transition baseline → candidate
+/// for the moving values, including a state string change
+/// (disabled → enabled).
+#[test]
+fn compare_sched_ext_renders_section_with_state_and_counter_deltas() {
+    use ktstr::host_state::SchedExtSysfs;
+    use ktstr::host_state_compare::{CompareOptions, GroupBy, compare, write_diff};
+    use std::path::Path;
+
+    // Distinct values per field so the substring assertions on
+    // rendered cells unambiguously identify which row matched:
+    //   switch_all : 0 → 1 (+1)
+    //   nr_rejected: 0 → 7 (+7)
+    //   hotplug_seq: 100 unchanged → "100 → 100 (+0)"
+    //   enable_seq : 5 → 7 (+2)
+    // No two cells produce the same "a → b (+d)" substring.
+    let baseline_scx = {
+        let mut s = SchedExtSysfs::default();
+        s.state = "disabled".into();
+        s.switch_all = 0;
+        s.nr_rejected = 0;
+        s.hotplug_seq = 100;
+        s.enable_seq = 5;
+        s
+    };
+    let candidate_scx = {
+        let mut s = SchedExtSysfs::default();
+        s.state = "enabled".into();
+        s.switch_all = 1;
+        s.nr_rejected = 7;
+        s.hotplug_seq = 100;
+        s.enable_seq = 7;
+        s
+    };
+
+    let mut baseline = snapshot(vec![], BTreeMap::new());
+    baseline.sched_ext = Some(baseline_scx);
+    let mut candidate = snapshot(vec![], BTreeMap::new());
+    candidate.sched_ext = Some(candidate_scx);
+
+    let opts = CompareOptions::default();
+    let diff = compare(&baseline, &candidate, &opts);
+
+    let mut out = String::new();
+    write_diff(
+        &mut out,
+        &diff,
+        Path::new("a"),
+        Path::new("b"),
+        GroupBy::Pcomm,
+    )
+    .unwrap();
+
+    assert!(
+        out.contains("## sched_ext"),
+        "sched_ext section header missing:\n{out}",
+    );
+    // State change rendered with arrow.
+    assert!(
+        out.contains("disabled \u{2192} enabled"),
+        "state cell must render `disabled → enabled`:\n{out}",
+    );
+    // switch_all changed: 0 → 1 (+1).
+    assert!(
+        out.contains("0 \u{2192} 1 (+1)"),
+        "switch_all counter delta missing:\n{out}",
+    );
+    // nr_rejected counter delta rendered via cgroup_cell (0 → 7
+    // (+7)).
+    assert!(
+        out.contains("0 \u{2192} 7 (+7)"),
+        "nr_rejected counter delta missing:\n{out}",
+    );
+    // hotplug_seq unchanged: cgroup_cell renders `100 → 100 (+0)`.
+    assert!(
+        out.contains("100 \u{2192} 100 (+0)"),
+        "hotplug_seq unchanged cell missing:\n{out}",
+    );
+    // enable_seq changed: 5 → 7 (+2). Distinct from switch_all
+    // (0 → 1) so a substring match cannot collide.
+    assert!(
+        out.contains("5 \u{2192} 7 (+2)"),
+        "enable_seq counter delta missing:\n{out}",
+    );
+}
+
+/// Both sides None → section suppressed entirely. Pins the
+/// CONFIG_SCHED_CLASS_EXT=n-on-both-kernels path.
+#[test]
+fn compare_sched_ext_suppresses_section_when_both_sides_none() {
+    use ktstr::host_state_compare::{CompareOptions, GroupBy, compare, write_diff};
+    use std::path::Path;
+
+    let baseline = snapshot(vec![], BTreeMap::new());
+    let candidate = snapshot(vec![], BTreeMap::new());
+
+    let opts = CompareOptions::default();
+    let diff = compare(&baseline, &candidate, &opts);
+
+    let mut out = String::new();
+    write_diff(
+        &mut out,
+        &diff,
+        Path::new("a"),
+        Path::new("b"),
+        GroupBy::Pcomm,
+    )
+    .unwrap();
+
+    assert!(
+        !out.contains("## sched_ext"),
+        "section must be suppressed when both sides have no sched_ext:\n{out}",
+    );
+}

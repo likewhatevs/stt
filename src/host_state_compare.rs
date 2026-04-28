@@ -940,6 +940,12 @@ pub struct HostStateDiff {
     pub smaps_rollup_a: BTreeMap<String, BTreeMap<String, u64>>,
     /// Candidate per-process smaps_rollup maps, same shape.
     pub smaps_rollup_b: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Baseline global sched_ext sysfs snapshot. `None` when
+    /// the baseline kernel had no `/sys/kernel/sched_ext/`
+    /// directory (CONFIG_SCHED_CLASS_EXT=n build).
+    pub sched_ext_a: Option<crate::host_state::SchedExtSysfs>,
+    /// Candidate global sched_ext sysfs snapshot, same shape.
+    pub sched_ext_b: Option<crate::host_state::SchedExtSysfs>,
 }
 
 /// Compare two snapshots and produce a [`HostStateDiff`].
@@ -1077,6 +1083,9 @@ pub fn compare(
 
     diff.smaps_rollup_a = collect_smaps_rollup(baseline);
     diff.smaps_rollup_b = collect_smaps_rollup(candidate);
+
+    diff.sched_ext_a = baseline.sched_ext.clone();
+    diff.sched_ext_b = candidate.sched_ext.clone();
 
     diff
 }
@@ -2955,6 +2964,84 @@ pub fn write_diff<W: fmt::Write>(
         }
     }
 
+    // Global sched_ext sysfs compare. Suppressed when both
+    // sides are None (CONFIG_SCHED_CLASS_EXT=n on both kernels)
+    // OR when both sides are Some and every field is identical
+    // across baseline and candidate (no signal to surface). When
+    // exactly one side is Some, surface the configuration delta
+    // — that's a load-bearing signal that the host kernel
+    // changed between snapshots.
+    let scx_emit = match (&diff.sched_ext_a, &diff.sched_ext_b) {
+        (None, None) => false,
+        (Some(_), None) | (None, Some(_)) => true,
+        (Some(a), Some(b)) => {
+            a.state != b.state
+                || a.switch_all != b.switch_all
+                || a.nr_rejected != b.nr_rejected
+                || a.hotplug_seq != b.hotplug_seq
+                || a.enable_seq != b.enable_seq
+        }
+    };
+    if scx_emit {
+        writeln!(w)?;
+        writeln!(w, "## sched_ext")?;
+        let mut at = crate::cli::new_table();
+        at.set_header(vec!["attr", "value"]);
+        // state cell: render "-" for both absent (Option=None)
+        // AND for the empty-string-but-Some case (file
+        // unreadable but directory present). The "-" placeholder
+        // makes "no observation" visually distinct from a real
+        // sched_ext_state_str[] value.
+        fn state_cell_for(s: Option<&crate::host_state::SchedExtSysfs>) -> String {
+            match s {
+                None => "-".to_string(),
+                Some(scx) if scx.state.is_empty() => "-".to_string(),
+                Some(scx) => scx.state.clone(),
+            }
+        }
+        let state_a = state_cell_for(diff.sched_ext_a.as_ref());
+        let state_b = state_cell_for(diff.sched_ext_b.as_ref());
+        let state_cell = if state_a == state_b {
+            state_a
+        } else {
+            format!("{state_a} → {state_b}")
+        };
+        at.add_row(vec!["state".into(), state_cell]);
+        at.add_row(vec![
+            "switch_all".into(),
+            cgroup_cell(
+                diff.sched_ext_a.as_ref().map(|s| s.switch_all),
+                diff.sched_ext_b.as_ref().map(|s| s.switch_all),
+                "",
+            ),
+        ]);
+        at.add_row(vec![
+            "nr_rejected".into(),
+            cgroup_cell(
+                diff.sched_ext_a.as_ref().map(|s| s.nr_rejected),
+                diff.sched_ext_b.as_ref().map(|s| s.nr_rejected),
+                "",
+            ),
+        ]);
+        at.add_row(vec![
+            "hotplug_seq".into(),
+            cgroup_cell(
+                diff.sched_ext_a.as_ref().map(|s| s.hotplug_seq),
+                diff.sched_ext_b.as_ref().map(|s| s.hotplug_seq),
+                "",
+            ),
+        ]);
+        at.add_row(vec![
+            "enable_seq".into(),
+            cgroup_cell(
+                diff.sched_ext_a.as_ref().map(|s| s.enable_seq),
+                diff.sched_ext_b.as_ref().map(|s| s.enable_seq),
+                "",
+            ),
+        ]);
+        writeln!(w, "{at}")?;
+    }
+
     if !diff.only_baseline.is_empty() {
         writeln!(
             w,
@@ -3125,6 +3212,7 @@ mod tests {
             probe_summary: None,
             parse_summary: None,
             psi: crate::host_state::Psi::default(),
+            sched_ext: None,
         }
     }
 
@@ -3771,9 +3859,14 @@ mod tests {
         let mut stats = BTreeMap::new();
         stats.insert("/a".into(), a);
         stats.insert("/b".into(), b);
-        let pats = compile_flatten_patterns(&["/{a,b}".into()]);
+        // Glob crate (0.3.x) supports `*`, `?`, `[...]`, `**` —
+        // NOT brace expansion `{a,b}`. Use the `[ab]`
+        // character-class to collapse `/a` and `/b` onto one
+        // bucket; `flatten_cgroup_path` returns the pattern
+        // string itself as the canonical key.
+        let pats = compile_flatten_patterns(&["/[ab]".into()]);
         let out = flatten_cgroup_stats(&stats, &pats, None);
-        let agg = &out["/{a,b}"];
+        let agg = &out["/[ab]"];
 
         // CPU: counters sum, limits take max.
         assert_eq!(agg.cpu.usage_usec, 300);
@@ -3810,9 +3903,14 @@ mod tests {
         let mut stats = BTreeMap::new();
         stats.insert("/a".into(), a);
         stats.insert("/b".into(), b);
-        let pats = compile_flatten_patterns(&["/{a,b}".into()]);
+        // Glob crate (0.3.x) supports `*`, `?`, `[...]`, `**` —
+        // NOT brace expansion `{a,b}`. Use the `[ab]`
+        // character-class to collapse `/a` and `/b` onto one
+        // bucket; `flatten_cgroup_path` returns the pattern
+        // string itself as the canonical key.
+        let pats = compile_flatten_patterns(&["/[ab]".into()]);
         let out = flatten_cgroup_stats(&stats, &pats, None);
-        let agg = &out["/{a,b}"];
+        let agg = &out["/[ab]"];
         assert_eq!(agg.memory.max, None, "any unbounded → bucket unbounded");
         assert_eq!(agg.memory.low, None, "any no-floor → bucket unprotected");
     }
