@@ -325,6 +325,8 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
         sort_by: String::new(),
         display_format: ktstr::host_state_compare::DisplayFormat::Full,
         columns: String::new(),
+        sections: String::new(),
+        wrap: false,
     };
     // `run_compare` returns `anyhow::Result<i32>`. The contract
     // says the `i32` is always 0 for a successful load+compare,
@@ -384,6 +386,8 @@ fn run_compare_with_valid_sort_by_succeeds() {
         sort_by: "run_time_ns:DESC, wait_time_ns:asc".into(),
         display_format: ktstr::host_state_compare::DisplayFormat::Full,
         columns: String::new(),
+        sections: String::new(),
+        wrap: false,
     };
     let rc = run_compare(&args).expect("run_compare must accept a valid --sort-by spec end-to-end");
     assert_eq!(rc, 0, "run_compare must return Ok(0) on success");
@@ -422,6 +426,8 @@ fn run_compare_with_invalid_sort_by_returns_err() {
         sort_by: "not_a_real_metric".into(),
         display_format: ktstr::host_state_compare::DisplayFormat::Full,
         columns: String::new(),
+        sections: String::new(),
+        wrap: false,
     };
     let err = run_compare(&args).expect_err("invalid --sort-by must produce Err");
     let msg = format!("{err:#}");
@@ -572,6 +578,9 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("syscw", |t| t.syscw = MonotonicCount(134)),
         ("read_bytes", |t| t.read_bytes = Bytes(135)),
         ("write_bytes", |t| t.write_bytes = Bytes(136)),
+        ("cancelled_write_bytes", |t| {
+            t.cancelled_write_bytes = Bytes(141)
+        }),
         // Max rules — each gets a unique u64.
         ("wait_max", |t| t.wait_max = PeakNs(200)),
         ("sleep_max", |t| t.sleep_max = PeakNs(201)),
@@ -655,6 +664,7 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("syscw", 134),
         ("read_bytes", 135),
         ("write_bytes", 136),
+        ("cancelled_write_bytes", 141),
         ("delayacct_blkio_ticks", 137),
         ("nr_wakeups_passive", 138),
         ("core_forceidle_sum", 139),
@@ -834,9 +844,9 @@ fn host_state_metrics_accessors_read_every_variant() {
 /// returns `Aggregated::Max(3)` — proving Max reads through to
 /// the leader's value rather than to a follower's zero. A
 /// regression that
-///   - changed the registry rule back to `Sum` would surface
-///     here as `Aggregated::Sum(3)` (wrong variant; assertion
-///     fails on enum match), and
+///   - changed the registry rule back to `SumCount` would
+///     surface here as `Aggregated::Sum(3)` (wrong variant;
+///     assertion fails on enum match), and
 ///   - silently broke the registry accessor (e.g. swapping
 ///     `t.nr_threads` for some other field) would surface as a
 ///     `Max(0)` because the followers' zero would dominate the

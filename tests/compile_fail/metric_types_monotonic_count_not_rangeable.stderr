@@ -1,0 +1,22 @@
+error[E0277]: `MonotonicCount` is not Rangeable — Rangeable is reserved for bounded ordinals in this codebase
+ --> tests/compile_fail/metric_types_monotonic_count_not_rangeable.rs:9:25
+  |
+9 |     require_rangeable::<ktstr::metric_types::MonotonicCount>();
+  |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this metric type does not support range-across
+  |
+  = help: the trait `Rangeable` is not implemented for `MonotonicCount`
+  = note: Counters/peaks/gauges: use Summable::sum_across or Maxable::max_across; CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary reduction in host_state_compare
+help: the following other types implement trait `Rangeable`
+ --> src/metric_types.rs
+  |
+  | impl Rangeable for OrdinalI32 {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `OrdinalI32`
+  | impl Rangeable for OrdinalU32 {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `OrdinalU32`
+  | impl Rangeable for OrdinalU64 {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `OrdinalU64`
+note: required by a bound in `require_rangeable`
+ --> tests/compile_fail/metric_types_monotonic_count_not_rangeable.rs:6:25
+  |
+6 | fn require_rangeable<T: ktstr::metric_types::Rangeable>() {}
+  |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_rangeable`

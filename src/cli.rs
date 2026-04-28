@@ -4768,11 +4768,47 @@ pub fn stdout_color() -> bool {
 /// skips box-drawing characters and keeps whitespace-padded columns,
 /// matching the previous hand-rolled `format!("{:<30}…")` look while
 /// auto-measuring each column from actual cell contents.
+///
+/// `ContentArrangement::Disabled` is the default arrangement: columns
+/// expand to whatever each cell needs, even when the result spills
+/// past the terminal edge. Callers that want terminal-width-aware
+/// cell wrapping use [`new_wrapped_table`] (host-state compare/show
+/// reaches it via `--wrap`).
 pub fn new_table() -> comfy_table::Table {
     use comfy_table::{ContentArrangement, Table, presets::NOTHING};
     let mut t = Table::new();
     t.load_preset(NOTHING);
     t.set_content_arrangement(ContentArrangement::Disabled);
+    if !stdout_color() {
+        t.force_no_tty();
+    }
+    t
+}
+
+/// Variant of [`new_table`] that opts into comfy-table's
+/// terminal-width-aware [`comfy_table::ContentArrangement::Dynamic`]
+/// layout. Cells too wide for the available terminal width wrap
+/// inside the cell rather than pushing later columns past the edge,
+/// at the cost of taller rows. Used by `host-state compare` /
+/// `host-state show` under the `--wrap` flag; the existing
+/// fixed-column [`new_table`] stays the default for every other
+/// caller (locks, verifier, stats) so their output stays
+/// byte-stable for shell-pipeline consumers.
+///
+/// When stdout is not a TTY, comfy-table's terminal-width probe
+/// returns `None`. The `Dynamic` arrangement is documented to
+/// degrade to `Disabled` in that case; we additionally call
+/// [`comfy_table::Table::force_no_tty`] under the same
+/// `!stdout_color()` gate as [`new_table`], so a piped stdout that
+/// requested `--wrap` still suppresses ANSI escapes. The end-state
+/// behaviour under a non-TTY stdout is therefore equivalent to
+/// [`new_table`]'s — the wrap request is silently dropped rather
+/// than producing unbounded-wrap output without a width.
+pub fn new_wrapped_table() -> comfy_table::Table {
+    use comfy_table::{ContentArrangement, Table, presets::NOTHING};
+    let mut t = Table::new();
+    t.load_preset(NOTHING);
+    t.set_content_arrangement(ContentArrangement::Dynamic);
     if !stdout_color() {
         t.force_no_tty();
     }

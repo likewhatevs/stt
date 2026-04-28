@@ -224,7 +224,7 @@ pub enum AggRule {
     /// Sum across the group of a [`Bytes`] field. Used for
     /// IEC-binary-scaled byte counters (`allocated_bytes`,
     /// `deallocated_bytes`, `rchar`, `wchar`, `read_bytes`,
-    /// `write_bytes`).
+    /// `write_bytes`, `cancelled_write_bytes`).
     ///
     /// [`Bytes`]: crate::metric_types::Bytes
     SumBytes(fn(&ThreadState) -> crate::metric_types::Bytes),
@@ -430,11 +430,11 @@ pub struct HostStateMetricDef {
     /// - `"CONFIG_TASK_IO_ACCOUNTING"` — gates the per-task
     ///   I/O accounting fields exposed by `/proc/<tid>/io`
     ///   (`rchar`, `wchar`, `syscr`, `syscw`, `read_bytes`,
-    ///   `write_bytes`). The kernel emits all 6 fields under
-    ///   one `do_io_accounting` call, and CONFIG_TASK_IO_ACCOUNTING
-    ///   `depends on` CONFIG_TASK_XACCT in `init/Kconfig` — so
-    ///   from the procfs-reader perspective the file is
-    ///   all-or-nothing.
+    ///   `write_bytes`, `cancelled_write_bytes`). The kernel
+    ///   emits all 7 fields under one `do_io_accounting` call,
+    ///   and CONFIG_TASK_IO_ACCOUNTING `depends on`
+    ///   CONFIG_TASK_XACCT in `init/Kconfig` — so from the
+    ///   procfs-reader perspective the file is all-or-nothing.
     pub config_gates: &'static [&'static str],
     /// True for kernel counters that are exposed in `/proc`
     /// but never incremented anywhere in the kernel tree —
@@ -1124,6 +1124,28 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
         description: "Bytes that hit the storage device on write (post-writeback).",
+    },
+    // `cancelled_write_bytes` from `/proc/<tid>/io` 7th line.
+    // `task_io_account_cancelled_write` (kernel
+    // include/linux/task_io_accounting_ops.h:39-42) increments
+    // `current->ioac.cancelled_write_bytes` from
+    // `folio_account_cleaned` (mm/page-writeback.c:2628) when a
+    // dirty folio is reclaimed without writeback (truncate /
+    // inode invalidation), so the per-thread value records on
+    // the truncating task — not necessarily the original writer.
+    // Group-level Sum is meaningful (total cancelled-write
+    // bytes for the bucket); per-thread `write_bytes -
+    // cancelled_write_bytes` is NOT a derived metric because
+    // the two counters track distinct parties — see the field
+    // doc on ThreadState::cancelled_write_bytes.
+    HostStateMetricDef {
+        name: "cancelled_write_bytes",
+        unit: "B",
+        rule: AggRule::SumBytes(|t| t.cancelled_write_bytes),
+        sched_class: None,
+        config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
+        is_dead: false,
+        description: "Bytes the kernel deaccounted from a prior dirty-write because the page was reclaimed without writeback (truncate / inode invalidation); recorded on the truncating task, not the writer. Per-thread `write_bytes - cancelled_write_bytes` is NOT a valid derivation — see field doc.",
     },
 ];
 
@@ -2658,13 +2680,38 @@ pub fn build_groups(
 /// untyped scalar that [`Aggregated`] carries today; the
 /// unit-aware format dispatch will land in phase 4 and reads
 /// the registry's `unit` tag rather than the wrapper type, so
-/// `Aggregated` stays scalar-shaped after this phase. The
-/// `Sum*` / `Max*` reductions return their identity element
-/// for an empty iterator (zero) so downstream delta math stays
-/// well-defined when one side has no threads under the join
-/// key; the `Range*` and `Mode*` arms collapse the empty case
-/// to `(0, 0)` and `("", 0, 0)` respectively, matching the
-/// pre-phase-3 contract on the same code paths.
+/// `Aggregated` stays scalar-shaped after this phase.
+///
+/// # Empty-bucket contract
+///
+/// The trait-level shapes split empty handling differently
+/// from the dispatch-level shape:
+/// - [`Summable::sum_across`] returns the additive identity
+///   (zero) on an empty input — the trait surface itself
+///   collapses the empty case. The `Sum*` arms therefore feed
+///   straight into [`Aggregated::Sum`] without re-checking.
+/// - [`Maxable::max_across`] returns `Option<Self>` (`None`
+///   for empty) so callers can distinguish "no contributors"
+///   from "all contributors had zero." The dispatch in this
+///   function collapses `None` to `Aggregated::Max(0)` at the
+///   call boundary so the historical empty-bucket contract on
+///   this code path (zero rendered for empty groups) holds
+///   regardless of the trait's richer shape.
+/// - [`Rangeable::range_across`] returns
+///   `Option<Range<Self>>`; the dispatch collapses `None` to
+///   `Aggregated::OrdinalRange { min: 0, max: 0 }` at the call
+///   boundary.
+/// - [`Modeable::mode_across`] returns
+///   `Option<(Self, count, total)>`; the dispatch collapses
+///   `None` to `Aggregated::Mode { value: "", count: 0, total }`
+///   where `total` is the bucket size (which is non-zero only
+///   when threads exist but the iterator was emptied — for
+///   `aggregate`, total tracks the bucket size directly so the
+///   `None` arm always carries `total: threads.len()`).
+///
+/// Downstream delta math therefore sees a well-defined value
+/// at every join boundary regardless of which side of a
+/// compare carried zero threads under the bucket key.
 ///
 /// [`Summable`]: crate::metric_types::Summable
 /// [`Maxable`]: crate::metric_types::Maxable
@@ -2690,16 +2737,23 @@ pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
             Aggregated::Sum(s.0)
         }
         AggRule::MaxPeak(f) => {
+            // `max_across` returns `Option<Self>` so callers can
+            // distinguish "empty thread bucket" from "all
+            // contributors had zero." The historical empty-bucket
+            // contract on this code path was `Aggregated::Max(0)`;
+            // preserve it by collapsing `None` to the additive
+            // identity at the call boundary. Non-empty buckets
+            // produce a concrete max regardless of value.
             let m = crate::metric_types::PeakNs::max_across(threads.iter().map(|t| f(t)));
-            Aggregated::Max(m.0)
+            Aggregated::Max(m.map(|v| v.0).unwrap_or(0))
         }
         AggRule::MaxGaugeNs(f) => {
             let m = crate::metric_types::GaugeNs::max_across(threads.iter().map(|t| f(t)));
-            Aggregated::Max(m.0)
+            Aggregated::Max(m.map(|v| v.0).unwrap_or(0))
         }
         AggRule::MaxGaugeCount(f) => {
             let m = crate::metric_types::GaugeCount::max_across(threads.iter().map(|t| f(t)));
-            Aggregated::Max(m.0)
+            Aggregated::Max(m.map(|v| v.0).unwrap_or(0))
         }
         AggRule::RangeI32(f) => {
             match crate::metric_types::OrdinalI32::range_across(threads.iter().map(|t| f(t))) {
@@ -2707,20 +2761,30 @@ pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
                 // iterator — mirror the historical empty-group
                 // contract by collapsing to (0, 0) so the
                 // downstream midpoint and delta math sees a
-                // well-defined value at the join boundary.
-                Some((min, max)) => Aggregated::OrdinalRange {
-                    min: i64::from(min.0),
-                    max: i64::from(max.0),
-                },
+                // well-defined value at the join boundary. The
+                // `Some` arm carries a typed `Range<OrdinalI32>`
+                // wrapper that guarantees min ≤ max as a
+                // type-system invariant; `into_tuple()` extracts
+                // the pair without re-checking.
+                Some(r) => {
+                    let (min, max) = r.into_tuple();
+                    Aggregated::OrdinalRange {
+                        min: i64::from(min.0),
+                        max: i64::from(max.0),
+                    }
+                }
                 None => Aggregated::OrdinalRange { min: 0, max: 0 },
             }
         }
         AggRule::RangeU32(f) => {
             match crate::metric_types::OrdinalU32::range_across(threads.iter().map(|t| f(t))) {
-                Some((min, max)) => Aggregated::OrdinalRange {
-                    min: i64::from(min.0),
-                    max: i64::from(max.0),
-                },
+                Some(r) => {
+                    let (min, max) = r.into_tuple();
+                    Aggregated::OrdinalRange {
+                        min: i64::from(min.0),
+                        max: i64::from(max.0),
+                    }
+                }
                 None => Aggregated::OrdinalRange { min: 0, max: 0 },
             }
         }
@@ -3819,10 +3883,235 @@ pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Colum
     Ok(out)
 }
 
+/// One sub-table emitted by [`write_diff`] / `write_show`.
+/// `--sections` filters which sub-tables render — every section
+/// not in the filter is suppressed before its emission gate
+/// (zero-suppression, group-by-cgroup gating, etc.) runs, so a
+/// section that would otherwise emit when its data is present
+/// stays silent when omitted from the filter.
+///
+/// Variant order tracks the rendering order in [`write_diff`]
+/// and `write_show` so iteration over [`Section::ALL`] walks
+/// the table in the order the operator sees it. The
+/// [`Self::cli_name`] tokens are the spelling accepted by
+/// [`parse_sections`] — round-trip through that parser pins the
+/// vocabulary against drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Section {
+    /// Per-thread metric table — the primary rows produced by
+    /// `build_row` / `aggregate`. Always rendered first.
+    Primary,
+    /// `## Derived metrics` section emitted from
+    /// [`HOST_STATE_DERIVED_METRICS`].
+    Derived,
+    /// Cgroup-enrichment table (`cpu_usage_usec`,
+    /// `nr_throttled`, `throttled_usec`, `memory_current`).
+    /// Compare- and show-side both gate on `GroupBy::Cgroup`
+    /// plus a non-empty `cgroup_stats` map; the `--sections`
+    /// filter runs ahead of that gate.
+    CgroupStats,
+    /// `## Cgroup limits / knobs` table — operator-set
+    /// configuration (`cpu.max`, `cpu.weight`, `memory.max`,
+    /// `memory.high`, `pids.current`, `pids.max`).
+    Limits,
+    /// `## memory.stat` long-table — kernel-emitted memory
+    /// counters per cgroup.
+    MemoryStat,
+    /// `## memory.events` long-table — pressure-event counters
+    /// per cgroup.
+    MemoryEvents,
+    /// `## Pressure / <resource>` per-cgroup PSI sub-tables
+    /// (cpu / memory / io / irq).
+    Pressure,
+    /// `## Host pressure / <resource>` host-level PSI
+    /// sub-tables.
+    HostPressure,
+    /// `## smaps_rollup` per-process memory-mapping summary.
+    Smaps,
+    /// `## sched_ext` global sysfs section (`state`,
+    /// `switch_all`, `nr_rejected`, `hotplug_seq`,
+    /// `enable_seq`).
+    SchedExt,
+}
+
+impl Section {
+    /// Every variant in rendering order. Single source of
+    /// truth — `parse_sections` walks this slice to validate
+    /// names and the [`DisplayOptions::is_section_enabled`]
+    /// default-empty case treats it as "all on."
+    pub const ALL: &'static [Section] = &[
+        Section::Primary,
+        Section::Derived,
+        Section::CgroupStats,
+        Section::Limits,
+        Section::MemoryStat,
+        Section::MemoryEvents,
+        Section::Pressure,
+        Section::HostPressure,
+        Section::Smaps,
+        Section::SchedExt,
+    ];
+
+    /// Canonical CLI name. Round-trips through
+    /// [`parse_sections`].
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Section::Primary => "primary",
+            Section::Derived => "derived",
+            Section::CgroupStats => "cgroup-stats",
+            Section::Limits => "cgroup-limits",
+            Section::MemoryStat => "memory-stat",
+            Section::MemoryEvents => "memory-events",
+            Section::Pressure => "pressure",
+            Section::HostPressure => "host-pressure",
+            Section::Smaps => "smaps-rollup",
+            Section::SchedExt => "sched-ext",
+        }
+    }
+
+    /// Returns `true` when this section's data only exists
+    /// under [`GroupBy::Cgroup`] grouping. Five sections live
+    /// behind the cgroup outer-gate in `write_diff` /
+    /// `write_show`: [`CgroupStats`](Section::CgroupStats),
+    /// [`Limits`](Section::Limits),
+    /// [`MemoryStat`](Section::MemoryStat),
+    /// [`MemoryEvents`](Section::MemoryEvents), and
+    /// [`Pressure`](Section::Pressure). Naming any of them
+    /// under `--sections` while using a non-cgroup
+    /// `--group-by` would silently produce zero rows for that
+    /// section — the framework warns the operator instead via
+    /// [`warn_cgroup_only_sections_under_non_cgroup`].
+    pub fn requires_cgroup_grouping(self) -> bool {
+        matches!(
+            self,
+            Section::CgroupStats
+                | Section::Limits
+                | Section::MemoryStat
+                | Section::MemoryEvents
+                | Section::Pressure
+        )
+    }
+}
+
+/// Emit a stderr warning when an explicit `--sections` filter
+/// names a cgroup-only section while `--group-by` is not
+/// [`GroupBy::Cgroup`]. Without the warning, the section would
+/// silently render zero rows (its outer-gate suppresses it),
+/// leaving the operator wondering whether their snapshot lacked
+/// the data or their flag was misconfigured.
+///
+/// Only fires when the filter is explicitly populated — the
+/// default-empty case ("render every section that has data")
+/// is already self-correcting and emits no warning. Non-cgroup
+/// sections in the same explicit filter are not flagged; only
+/// the cgroup-only entries are called out.
+///
+/// Diagnostic shape per cgroup-only entry: one line of the
+/// form `section 'X' requires --group-by cgroup; omitted under
+/// --group-by Y`. The text is pinned by
+/// [`format_cgroup_only_section_warning`] so a wording drift
+/// surfaces in unit tests rather than at the operator's
+/// terminal.
+pub fn warn_cgroup_only_sections_under_non_cgroup(sections: &[Section], group_by: GroupBy) {
+    if sections.is_empty() || group_by == GroupBy::Cgroup {
+        return;
+    }
+    for section in sections {
+        if section.requires_cgroup_grouping() {
+            eprintln!("{}", format_cgroup_only_section_warning(*section, group_by));
+        }
+    }
+}
+
+/// Render the per-section "requires --group-by cgroup" warning
+/// text. Split from [`warn_cgroup_only_sections_under_non_cgroup`]
+/// so the wording can be unit-tested without capturing stderr.
+/// The `--group-by` axis is rendered via [`group_by_cli_name`]
+/// so the operator-facing label matches the clap value-enum
+/// spelling they typed (`pcomm` / `cgroup` / `comm` /
+/// `comm-exact`).
+pub(crate) fn format_cgroup_only_section_warning(section: Section, group_by: GroupBy) -> String {
+    format!(
+        "section '{}' requires --group-by cgroup; omitted under --group-by {}",
+        section.cli_name(),
+        group_by_cli_name(group_by),
+    )
+}
+
+/// Operator-facing spelling of a [`GroupBy`] variant — matches
+/// the clap value-enum tokens accepted on the CLI. Centralized
+/// here so the warning surface and any future diagnostic site
+/// share one source of truth.
+fn group_by_cli_name(group_by: GroupBy) -> &'static str {
+    match group_by {
+        GroupBy::Pcomm => "pcomm",
+        GroupBy::Cgroup => "cgroup",
+        GroupBy::Comm => "comm",
+        GroupBy::CommExact => "comm-exact",
+    }
+}
+
+/// Parse a CLI `--sections` spec into a typed [`Section`] vec.
+/// Format: comma-separated names matching [`Section::cli_name`].
+/// Whitespace around each name is trimmed. Empty input parses
+/// to an empty `Vec` — caller treats that as "every section
+/// renders" via [`DisplayOptions::is_section_enabled`].
+///
+/// Errors (mirrored from [`parse_columns`] so the two CLI
+/// surfaces report drift identically):
+/// - Unknown name (cite the offending token; list valid names).
+/// - Duplicate name across two entries.
+/// - Empty token between commas.
+pub fn parse_sections(spec: &str) -> anyhow::Result<Vec<Section>> {
+    if spec.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let valid_names = Section::ALL
+        .iter()
+        .map(|s| s.cli_name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out: Vec<Section> = Vec::new();
+    let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            anyhow::bail!(
+                "empty entry in --sections spec {spec:?}; \
+                 entries are comma-separated and must be non-empty"
+            );
+        }
+        let normalized = entry.to_ascii_lowercase();
+        let Some(section) = Section::ALL
+            .iter()
+            .copied()
+            .find(|s| s.cli_name() == normalized)
+        else {
+            anyhow::bail!(
+                "unknown section {entry:?} in --sections spec {spec:?}; \
+                 must be one of: {valid_names}",
+            );
+        };
+        if !seen.insert(section.cli_name()) {
+            anyhow::bail!(
+                "duplicate section {entry:?} in --sections spec {spec:?}; \
+                 each section may appear at most once"
+            );
+        }
+        out.push(section);
+    }
+    Ok(out)
+}
+
 /// Aggregate display options for the renderer. Plumbed as a
-/// single struct through [`write_diff`] / `write_show` so a
-/// future addition (`--wrap`, `--sections`) lands in one place
-/// without growing every signature.
+/// single struct through [`write_diff`] so a future addition
+/// lands in one place without growing every signature. The
+/// show-side entry (`write_show` in `src/bin/ktstr.rs`) keeps
+/// a flatter signature for historical reasons but mirrors the
+/// same field semantics — `--wrap` and `--sections` reach show
+/// via `wrap` / `sections` parameters that share the same
+/// helpers (`new_wrapped_table`, [`Section::cli_name`]).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct DisplayOptions {
@@ -3831,6 +4120,19 @@ pub struct DisplayOptions {
     /// User-supplied column override; empty Vec means "use the
     /// format's default column set." Set via [`parse_columns`].
     pub columns: Vec<Column>,
+    /// When `true`, tables render with comfy-table's
+    /// [`comfy_table::ContentArrangement::Dynamic`] layout
+    /// (terminal-width-aware cell wrapping). When `false`,
+    /// tables render with `ContentArrangement::Disabled` — the
+    /// prior shape, where columns can spill past the terminal
+    /// edge. Default `false` keeps existing operator workflows
+    /// untouched until the flag is opted into.
+    pub wrap: bool,
+    /// User-supplied section filter; empty Vec means "render
+    /// every section that has data" — the unfiltered default.
+    /// Non-empty restricts the rendered output to the listed
+    /// sections only. Set via [`parse_sections`].
+    pub sections: Vec<Section>,
 }
 
 impl DisplayOptions {
@@ -3853,6 +4155,32 @@ impl DisplayOptions {
             show_columns_default()
         } else {
             self.columns.clone()
+        }
+    }
+
+    /// Returns `true` when `section` should render under the
+    /// current filter. Empty `sections` means "every section
+    /// renders" (the default — no filter applied), matching
+    /// [`parse_sections`]'s empty-input semantic. Non-empty
+    /// `sections` restricts rendering to the named entries.
+    pub fn is_section_enabled(&self, section: Section) -> bool {
+        self.sections.is_empty() || self.sections.contains(&section)
+    }
+
+    /// Construct a comfy-table builder honouring the
+    /// [`wrap`](Self::wrap) flag: terminal-width-aware
+    /// `Dynamic` arrangement when `wrap` is true, otherwise the
+    /// existing borderless, disabled-arrangement layout via
+    /// [`crate::cli::new_table`]. Single source of truth so
+    /// every section in [`write_diff`] honours `--wrap` without
+    /// per-call-site `if` branching. The show-side renderer
+    /// (`write_show` in `src/bin/ktstr.rs`) calls the underlying
+    /// helpers directly through the same branch.
+    pub fn new_table(&self) -> comfy_table::Table {
+        if self.wrap {
+            crate::cli::new_wrapped_table()
+        } else {
+            crate::cli::new_table()
         }
     }
 }
@@ -4072,9 +4400,36 @@ pub struct HostStateCompareArgs {
     /// --display-format." Valid names: `group`, `threads`,
     /// `metric`, `baseline`, `candidate`, `delta`, `%`,
     /// `arrow`. Order in the spec is the rendered order.
-    /// Example: `--columns metric,delta,%`.
+    /// Example: `--columns metric,delta,%`. Applies to the
+    /// `primary` section's per-metric table only; secondary
+    /// tables (cgroup-stats, smaps-rollup, etc.) have fixed
+    /// column shapes and ignore this flag.
     #[arg(long, default_value = "")]
     pub columns: String,
+    /// Comma-separated section names to render. Empty (the
+    /// default) renders every section that has data. When
+    /// non-empty, restricts output to the listed sub-tables —
+    /// every section not named is suppressed before its
+    /// data-availability gate runs. Valid names: `primary`,
+    /// `derived`, `cgroup-stats`, `cgroup-limits`,
+    /// `memory-stat`, `memory-events`, `pressure`,
+    /// `host-pressure`, `smaps-rollup`, `sched-ext`. Useful for
+    /// narrowing a wide compare to one area of interest.
+    /// Example: `--sections primary,host-pressure`.
+    #[arg(long, default_value = "")]
+    pub sections: String,
+    /// Wrap table cells to fit the terminal width. Off by
+    /// default — wide tables can spill past the terminal edge,
+    /// matching the prior shell-pipeline-friendly layout. When
+    /// set, cells too wide for the available width wrap inside
+    /// the cell rather than overflowing, at the cost of taller
+    /// rows. The wrap kicks in only when stdout is a tty (the
+    /// terminal width is unknown otherwise); when piped to a
+    /// file or another command, the flag is silently dropped
+    /// and output stays unwrapped so awk/grep pipelines see
+    /// the same byte sequence as without the flag.
+    #[arg(long)]
+    pub wrap: bool,
 }
 
 /// Entry point for the compare CLI. Parses `--sort-by` first,
@@ -4097,9 +4452,21 @@ pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
         .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
     // Parse --columns alongside --sort-by so a malformed spec
     // surfaces before the snapshot loads. compare_side: true
-    // for the diff renderer.
+    // for the diff renderer. --sections shares the same
+    // fail-fast contract — an unknown section name should not
+    // pay for two snapshot loads before failing.
     let columns = parse_columns(&args.columns, true)
         .with_context(|| format!("parse --columns {:?}", args.columns))?;
+    let sections = parse_sections(&args.sections)
+        .with_context(|| format!("parse --sections {:?}", args.sections))?;
+
+    // Warn the operator if any explicitly-named section is
+    // cgroup-only but the requested grouping isn't cgroup —
+    // those sections would silently render zero rows under the
+    // outer GroupBy::Cgroup gate in `write_diff` otherwise.
+    // The warning fires before snapshot load so the operator
+    // sees it immediately, not after a long disk-I/O wait.
+    warn_cgroup_only_sections_under_non_cgroup(&sections, args.group_by);
 
     let baseline = HostStateSnapshot::load(&args.baseline)
         .with_context(|| format!("load baseline {}", args.baseline.display()))?;
@@ -4116,6 +4483,8 @@ pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
     let display = DisplayOptions {
         format: args.display_format,
         columns,
+        wrap: args.wrap,
+        sections,
     };
     let diff = compare(&baseline, &candidate, &opts);
     print_diff(
@@ -4311,9 +4680,13 @@ pub fn print_diff(
 /// propagate as [`std::fmt::Error`] — callers that write into an
 /// infallible sink (`String`) can unwrap or ignore.
 ///
-/// `display` controls per-row column layout: see
-/// [`DisplayFormat`] / [`Column`] / [`DisplayOptions`] for the
-/// resolution rules.
+/// `display` controls per-row column layout, terminal-width
+/// wrapping, and per-section filtering: see [`DisplayFormat`] /
+/// [`Column`] / [`Section`] / [`DisplayOptions`] for the
+/// resolution rules. Each sub-table emission below is gated on
+/// [`DisplayOptions::is_section_enabled`] before its
+/// data-availability check, so `--sections` always wins over
+/// the per-section zero-suppression heuristic.
 pub fn write_diff<W: fmt::Write>(
     w: &mut W,
     diff: &HostStateDiff,
@@ -4330,19 +4703,21 @@ pub fn write_diff<W: fmt::Write>(
     };
 
     let columns = display.resolved_compare_columns();
-    let mut table = crate::cli::new_table();
-    let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
-    table.set_header(header_row);
-    for row in &diff.rows {
-        let cells = render_diff_row_cells(row, &columns);
-        table.add_row(cells);
+    if display.is_section_enabled(Section::Primary) {
+        let mut table = display.new_table();
+        let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
+        table.set_header(header_row);
+        for row in &diff.rows {
+            let cells = render_diff_row_cells(row, &columns);
+            table.add_row(cells);
+        }
+        writeln!(w, "{table}")?;
     }
-    writeln!(w, "{table}")?;
 
-    if !diff.derived_rows.is_empty() {
+    if display.is_section_enabled(Section::Derived) && !diff.derived_rows.is_empty() {
         writeln!(w)?;
         writeln!(w, "## Derived metrics")?;
-        let mut dt = crate::cli::new_table();
+        let mut dt = display.new_table();
         let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
         dt.set_header(header_row);
         for row in &diff.derived_rows {
@@ -4355,46 +4730,57 @@ pub fn write_diff<W: fmt::Write>(
     if group_by == GroupBy::Cgroup
         && (!diff.cgroup_stats_a.is_empty() || !diff.cgroup_stats_b.is_empty())
     {
-        writeln!(w)?;
-        let mut ct = crate::cli::new_table();
-        ct.set_header(vec![
-            "cgroup",
-            "cpu_usage_usec",
-            "nr_throttled",
-            "throttled_usec",
-            "memory_current",
-        ]);
+        // CgroupStats / Limits / MemoryStat / MemoryEvents /
+        // Pressure all live behind the GroupBy::Cgroup gate
+        // because their data only exists when the diff was
+        // computed with cgroup grouping. The `--sections` filter
+        // is checked again per sub-table below so a user can
+        // request, e.g., `--sections pressure` and get only the
+        // PSI rollups even though the cgroup-stats prefix is
+        // present in the diff.
         let mut all_keys: std::collections::BTreeSet<&String> =
             diff.cgroup_stats_a.keys().collect();
         all_keys.extend(diff.cgroup_stats_b.keys());
-        for key in &all_keys {
-            let a = diff.cgroup_stats_a.get(*key);
-            let b = diff.cgroup_stats_b.get(*key);
-            ct.add_row(vec![
-                key.to_string(),
-                cgroup_cell(
-                    a.map(|s| s.cpu.usage_usec),
-                    b.map(|s| s.cpu.usage_usec),
-                    "µs",
-                ),
-                cgroup_cell(
-                    a.map(|s| s.cpu.nr_throttled),
-                    b.map(|s| s.cpu.nr_throttled),
-                    "",
-                ),
-                cgroup_cell(
-                    a.map(|s| s.cpu.throttled_usec),
-                    b.map(|s| s.cpu.throttled_usec),
-                    "µs",
-                ),
-                cgroup_cell(
-                    a.map(|s| s.memory.current),
-                    b.map(|s| s.memory.current),
-                    "B",
-                ),
+
+        if display.is_section_enabled(Section::CgroupStats) {
+            writeln!(w)?;
+            let mut ct = display.new_table();
+            ct.set_header(vec![
+                "cgroup",
+                "cpu_usage_usec",
+                "nr_throttled",
+                "throttled_usec",
+                "memory_current",
             ]);
+            for key in &all_keys {
+                let a = diff.cgroup_stats_a.get(*key);
+                let b = diff.cgroup_stats_b.get(*key);
+                ct.add_row(vec![
+                    key.to_string(),
+                    cgroup_cell(
+                        a.map(|s| s.cpu.usage_usec),
+                        b.map(|s| s.cpu.usage_usec),
+                        "µs",
+                    ),
+                    cgroup_cell(
+                        a.map(|s| s.cpu.nr_throttled),
+                        b.map(|s| s.cpu.nr_throttled),
+                        "",
+                    ),
+                    cgroup_cell(
+                        a.map(|s| s.cpu.throttled_usec),
+                        b.map(|s| s.cpu.throttled_usec),
+                        "µs",
+                    ),
+                    cgroup_cell(
+                        a.map(|s| s.memory.current),
+                        b.map(|s| s.memory.current),
+                        "B",
+                    ),
+                ]);
+            }
+            writeln!(w, "{ct}")?;
         }
-        writeln!(w, "{ct}")?;
 
         // Per-cgroup limits / knobs sub-table — operator-set
         // configuration: cpu.max, cpu.weight, memory.max,
@@ -4403,39 +4789,9 @@ pub fn write_diff<W: fmt::Write>(
         // when None per [`format_optional_limit`]. Suppressed
         // when no cgroup in either snapshot exposes any of these
         // (root cgroup, controllers not enabled, etc.).
-        let any_limits = all_keys.iter().any(|key| {
-            let has_limits = |s: &CgroupStats| {
-                s.cpu.max_quota_us.is_some()
-                    || s.cpu.weight.is_some()
-                    || s.memory.max.is_some()
-                    || s.memory.high.is_some()
-                    || s.pids.current.is_some()
-                    || s.pids.max.is_some()
-            };
-            diff.cgroup_stats_a.get(*key).is_some_and(has_limits)
-                || diff.cgroup_stats_b.get(*key).is_some_and(has_limits)
-        });
-        if any_limits {
-            writeln!(w)?;
-            writeln!(w, "## Cgroup limits / knobs")?;
-            let mut lt = crate::cli::new_table();
-            lt.set_header(vec![
-                "cgroup",
-                "cpu.max",
-                "cpu.weight",
-                "memory.max",
-                "memory.high",
-                "pids.current",
-                "pids.max",
-            ]);
-            for key in &all_keys {
-                let a = diff.cgroup_stats_a.get(*key);
-                let b = diff.cgroup_stats_b.get(*key);
-                // Per-row gate: skip rows where every column is
-                // unset on BOTH sides (the cgroup has no caps,
-                // no weight, no pids accounting on either
-                // baseline or candidate).
-                let row_has_data = |s: &CgroupStats| {
+        if display.is_section_enabled(Section::Limits) {
+            let any_limits = all_keys.iter().any(|key| {
+                let has_limits = |s: &CgroupStats| {
                     s.cpu.max_quota_us.is_some()
                         || s.cpu.weight.is_some()
                         || s.memory.max.is_some()
@@ -4443,57 +4799,91 @@ pub fn write_diff<W: fmt::Write>(
                         || s.pids.current.is_some()
                         || s.pids.max.is_some()
                 };
-                if !a.is_some_and(row_has_data) && !b.is_some_and(row_has_data) {
-                    continue;
-                }
-                lt.add_row(vec![
-                    key.to_string(),
-                    cgroup_limits_cell(
-                        a.map(|s| (s.cpu.max_quota_us, s.cpu.max_period_us)),
-                        b.map(|s| (s.cpu.max_quota_us, s.cpu.max_period_us)),
-                    ),
-                    cgroup_cell(
-                        a.and_then(|s| s.cpu.weight),
-                        b.and_then(|s| s.cpu.weight),
-                        "",
-                    ),
-                    cgroup_optional_limit_cell(
-                        a.and_then(|s| s.memory.max),
-                        b.and_then(|s| s.memory.max),
-                        "B",
-                    ),
-                    cgroup_optional_limit_cell(
-                        a.and_then(|s| s.memory.high),
-                        b.and_then(|s| s.memory.high),
-                        "B",
-                    ),
-                    cgroup_cell(
-                        a.and_then(|s| s.pids.current),
-                        b.and_then(|s| s.pids.current),
-                        "",
-                    ),
-                    cgroup_optional_limit_cell(
-                        a.and_then(|s| s.pids.max),
-                        b.and_then(|s| s.pids.max),
-                        "",
-                    ),
+                diff.cgroup_stats_a.get(*key).is_some_and(has_limits)
+                    || diff.cgroup_stats_b.get(*key).is_some_and(has_limits)
+            });
+            if any_limits {
+                writeln!(w)?;
+                writeln!(w, "## Cgroup limits / knobs")?;
+                let mut lt = display.new_table();
+                lt.set_header(vec![
+                    "cgroup",
+                    "cpu.max",
+                    "cpu.weight",
+                    "memory.max",
+                    "memory.high",
+                    "pids.current",
+                    "pids.max",
                 ]);
+                for key in &all_keys {
+                    let a = diff.cgroup_stats_a.get(*key);
+                    let b = diff.cgroup_stats_b.get(*key);
+                    // Per-row gate: skip rows where every column is
+                    // unset on BOTH sides (the cgroup has no caps,
+                    // no weight, no pids accounting on either
+                    // baseline or candidate).
+                    let row_has_data = |s: &CgroupStats| {
+                        s.cpu.max_quota_us.is_some()
+                            || s.cpu.weight.is_some()
+                            || s.memory.max.is_some()
+                            || s.memory.high.is_some()
+                            || s.pids.current.is_some()
+                            || s.pids.max.is_some()
+                    };
+                    if !a.is_some_and(row_has_data) && !b.is_some_and(row_has_data) {
+                        continue;
+                    }
+                    lt.add_row(vec![
+                        key.to_string(),
+                        cgroup_limits_cell(
+                            a.map(|s| (s.cpu.max_quota_us, s.cpu.max_period_us)),
+                            b.map(|s| (s.cpu.max_quota_us, s.cpu.max_period_us)),
+                        ),
+                        cgroup_cell(
+                            a.and_then(|s| s.cpu.weight),
+                            b.and_then(|s| s.cpu.weight),
+                            "",
+                        ),
+                        cgroup_optional_limit_cell(
+                            a.and_then(|s| s.memory.max),
+                            b.and_then(|s| s.memory.max),
+                            "B",
+                        ),
+                        cgroup_optional_limit_cell(
+                            a.and_then(|s| s.memory.high),
+                            b.and_then(|s| s.memory.high),
+                            "B",
+                        ),
+                        cgroup_cell(
+                            a.and_then(|s| s.pids.current),
+                            b.and_then(|s| s.pids.current),
+                            "",
+                        ),
+                        cgroup_optional_limit_cell(
+                            a.and_then(|s| s.pids.max),
+                            b.and_then(|s| s.pids.max),
+                            "",
+                        ),
+                    ]);
+                }
+                writeln!(w, "{lt}")?;
             }
-            writeln!(w, "{lt}")?;
         }
 
         // Per-cgroup memory.stat sub-table — kernel-emitted
         // memory counters per cgroup. Up to 71 keys per cgroup.
         // Long-table layout: one row per (cgroup, key) pair
         // with baseline → candidate cells.
-        if all_keys.iter().any(|key| {
-            let has_stat = |s: &CgroupStats| !s.memory.stat.is_empty();
-            diff.cgroup_stats_a.get(*key).is_some_and(has_stat)
-                || diff.cgroup_stats_b.get(*key).is_some_and(has_stat)
-        }) {
+        if display.is_section_enabled(Section::MemoryStat)
+            && all_keys.iter().any(|key| {
+                let has_stat = |s: &CgroupStats| !s.memory.stat.is_empty();
+                diff.cgroup_stats_a.get(*key).is_some_and(has_stat)
+                    || diff.cgroup_stats_b.get(*key).is_some_and(has_stat)
+            })
+        {
             writeln!(w)?;
             writeln!(w, "## memory.stat")?;
-            let mut mt = crate::cli::new_table();
+            let mut mt = display.new_table();
             mt.set_header(vec!["cgroup", "key", "value"]);
             for key in &all_keys {
                 let a = diff.cgroup_stats_a.get(*key);
@@ -4530,14 +4920,16 @@ pub fn write_diff<W: fmt::Write>(
         // Per-cgroup memory.events sub-table — pressure-event
         // counters. Same long-table layout as memory.stat with
         // the same baseline-vs-candidate zero-row suppression.
-        if all_keys.iter().any(|key| {
-            let has_events = |s: &CgroupStats| !s.memory.events.is_empty();
-            diff.cgroup_stats_a.get(*key).is_some_and(has_events)
-                || diff.cgroup_stats_b.get(*key).is_some_and(has_events)
-        }) {
+        if display.is_section_enabled(Section::MemoryEvents)
+            && all_keys.iter().any(|key| {
+                let has_events = |s: &CgroupStats| !s.memory.events.is_empty();
+                diff.cgroup_stats_a.get(*key).is_some_and(has_events)
+                    || diff.cgroup_stats_b.get(*key).is_some_and(has_events)
+            })
+        {
             writeln!(w)?;
             writeln!(w, "## memory.events")?;
-            let mut et = crate::cli::new_table();
+            let mut et = display.new_table();
             et.set_header(vec!["cgroup", "event", "count"]);
             for key in &all_keys {
                 let a = diff.cgroup_stats_a.get(*key);
@@ -4571,49 +4963,51 @@ pub fn write_diff<W: fmt::Write>(
         // values. Suppressed when every cell on both sides is
         // zero — synthetic fixtures and PSI-disabled hosts both
         // hit this case and there's nothing useful to render.
-        for (resource_name, accessor) in psi_resource_accessors() {
-            let any_data = all_keys.iter().any(|key| {
-                let a = diff.cgroup_stats_a.get(*key).map(|s| accessor(&s.psi));
-                let b = diff.cgroup_stats_b.get(*key).map(|s| accessor(&s.psi));
-                a.as_ref().is_some_and(psi_resource_has_data)
-                    || b.as_ref().is_some_and(psi_resource_has_data)
-            });
-            if !any_data {
-                continue;
+        if display.is_section_enabled(Section::Pressure) {
+            for (resource_name, accessor) in psi_resource_accessors() {
+                let any_data = all_keys.iter().any(|key| {
+                    let a = diff.cgroup_stats_a.get(*key).map(|s| accessor(&s.psi));
+                    let b = diff.cgroup_stats_b.get(*key).map(|s| accessor(&s.psi));
+                    a.as_ref().is_some_and(psi_resource_has_data)
+                        || b.as_ref().is_some_and(psi_resource_has_data)
+                });
+                if !any_data {
+                    continue;
+                }
+                writeln!(w)?;
+                writeln!(w, "## Pressure / {resource_name}")?;
+                let mut pt = display.new_table();
+                pt.set_header(vec!["cgroup", "row", "avg10", "avg60", "avg300", "total"]);
+                for key in &all_keys {
+                    let a = diff.cgroup_stats_a.get(*key).map(|s| accessor(&s.psi));
+                    let b = diff.cgroup_stats_b.get(*key).map(|s| accessor(&s.psi));
+                    pt.add_row(vec![
+                        key.to_string(),
+                        "some".into(),
+                        format_psi_avg_cell(a.map(|r| r.some.avg10), b.map(|r| r.some.avg10)),
+                        format_psi_avg_cell(a.map(|r| r.some.avg60), b.map(|r| r.some.avg60)),
+                        format_psi_avg_cell(a.map(|r| r.some.avg300), b.map(|r| r.some.avg300)),
+                        cgroup_cell(
+                            a.map(|r| r.some.total_usec),
+                            b.map(|r| r.some.total_usec),
+                            "µs",
+                        ),
+                    ]);
+                    pt.add_row(vec![
+                        key.to_string(),
+                        "full".into(),
+                        format_psi_avg_cell(a.map(|r| r.full.avg10), b.map(|r| r.full.avg10)),
+                        format_psi_avg_cell(a.map(|r| r.full.avg60), b.map(|r| r.full.avg60)),
+                        format_psi_avg_cell(a.map(|r| r.full.avg300), b.map(|r| r.full.avg300)),
+                        cgroup_cell(
+                            a.map(|r| r.full.total_usec),
+                            b.map(|r| r.full.total_usec),
+                            "µs",
+                        ),
+                    ]);
+                }
+                writeln!(w, "{pt}")?;
             }
-            writeln!(w)?;
-            writeln!(w, "## Pressure / {resource_name}")?;
-            let mut pt = crate::cli::new_table();
-            pt.set_header(vec!["cgroup", "row", "avg10", "avg60", "avg300", "total"]);
-            for key in &all_keys {
-                let a = diff.cgroup_stats_a.get(*key).map(|s| accessor(&s.psi));
-                let b = diff.cgroup_stats_b.get(*key).map(|s| accessor(&s.psi));
-                pt.add_row(vec![
-                    key.to_string(),
-                    "some".into(),
-                    format_psi_avg_cell(a.map(|r| r.some.avg10), b.map(|r| r.some.avg10)),
-                    format_psi_avg_cell(a.map(|r| r.some.avg60), b.map(|r| r.some.avg60)),
-                    format_psi_avg_cell(a.map(|r| r.some.avg300), b.map(|r| r.some.avg300)),
-                    cgroup_cell(
-                        a.map(|r| r.some.total_usec),
-                        b.map(|r| r.some.total_usec),
-                        "µs",
-                    ),
-                ]);
-                pt.add_row(vec![
-                    key.to_string(),
-                    "full".into(),
-                    format_psi_avg_cell(a.map(|r| r.full.avg10), b.map(|r| r.full.avg10)),
-                    format_psi_avg_cell(a.map(|r| r.full.avg60), b.map(|r| r.full.avg60)),
-                    format_psi_avg_cell(a.map(|r| r.full.avg300), b.map(|r| r.full.avg300)),
-                    cgroup_cell(
-                        a.map(|r| r.full.total_usec),
-                        b.map(|r| r.full.total_usec),
-                        "µs",
-                    ),
-                ]);
-            }
-            writeln!(w, "{pt}")?;
         }
     }
 
@@ -4622,7 +5016,9 @@ pub fn write_diff<W: fmt::Write>(
     // primary scheduler-health signal regardless of which axis
     // the user grouped per-thread metrics by. Suppressed when
     // both snapshots' host PSI is all-zero.
-    if psi_pair_has_data(&diff.host_psi_a, &diff.host_psi_b) {
+    if display.is_section_enabled(Section::HostPressure)
+        && psi_pair_has_data(&diff.host_psi_a, &diff.host_psi_b)
+    {
         for (resource_name, accessor) in psi_resource_accessors() {
             let a = accessor(&diff.host_psi_a);
             let b = accessor(&diff.host_psi_b);
@@ -4631,7 +5027,7 @@ pub fn write_diff<W: fmt::Write>(
             }
             writeln!(w)?;
             writeln!(w, "## Host pressure / {resource_name}")?;
-            let mut pt = crate::cli::new_table();
+            let mut pt = display.new_table();
             pt.set_header(vec!["row", "avg10", "avg60", "avg300", "total"]);
             pt.add_row(vec![
                 "some".into(),
@@ -4660,7 +5056,9 @@ pub fn write_diff<W: fmt::Write>(
     // skips rows where baseline equals candidate (treats
     // absent and 0 as equal). Mirrors the memory.stat compare
     // layout from #61.
-    if !diff.smaps_rollup_a.is_empty() || !diff.smaps_rollup_b.is_empty() {
+    if display.is_section_enabled(Section::Smaps)
+        && (!diff.smaps_rollup_a.is_empty() || !diff.smaps_rollup_b.is_empty())
+    {
         let mut process_keys: std::collections::BTreeSet<&String> =
             diff.smaps_rollup_a.keys().collect();
         process_keys.extend(diff.smaps_rollup_b.keys());
@@ -4685,7 +5083,7 @@ pub fn write_diff<W: fmt::Write>(
         if any_delta {
             writeln!(w)?;
             writeln!(w, "## smaps_rollup")?;
-            let mut st = crate::cli::new_table();
+            let mut st = display.new_table();
             st.set_header(vec!["process", "key", "value"]);
             for pkey in &process_keys {
                 let a = diff.smaps_rollup_a.get(*pkey);
@@ -4740,10 +5138,10 @@ pub fn write_diff<W: fmt::Write>(
                 || a.enable_seq != b.enable_seq
         }
     };
-    if scx_emit {
+    if display.is_section_enabled(Section::SchedExt) && scx_emit {
         writeln!(w)?;
         writeln!(w, "## sched_ext")?;
-        let mut at = crate::cli::new_table();
+        let mut at = display.new_table();
         at.set_header(vec!["attr", "value"]);
         // state cell: render "-" for both absent (Option=None)
         // AND for the empty-string-but-Some case (file
@@ -4946,10 +5344,8 @@ fn psi_resource_has_data(r: &PsiResource) -> bool {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
     use crate::metric_types::{
-        Bytes, CategoricalString, ClockTicks, CpuSet, GaugeCount, GaugeNs, MonotonicCount,
-        MonotonicNs, OrdinalI32, OrdinalU64, PeakNs,
+        Bytes, CategoricalString, CpuSet, MonotonicCount, MonotonicNs, OrdinalI32, PeakNs,
     };
 
     fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
@@ -5984,6 +6380,9 @@ mod tests {
             ("syscw", |t| t.syscw = MonotonicCount(1)),
             ("read_bytes", |t| t.read_bytes = Bytes(1)),
             ("write_bytes", |t| t.write_bytes = Bytes(1)),
+            ("cancelled_write_bytes", |t| {
+                t.cancelled_write_bytes = Bytes(1)
+            }),
         ];
         for (name, set) in cases {
             let mut t = make_thread("p", "w");
@@ -6287,7 +6686,7 @@ mod tests {
             ("majflt", None, &[], false),
             ("utime_clock_ticks", None, &[], false),
             ("stime_clock_ticks", None, &[], false),
-            // I/O — all 6 fields share CONFIG_TASK_IO_ACCOUNTING
+            // I/O — all 7 fields share CONFIG_TASK_IO_ACCOUNTING
             // (the kernel emits /proc/<tid>/io as a single block
             // under that gate; CONFIG_TASK_IO_ACCOUNTING `depends
             // on` CONFIG_TASK_XACCT in init/Kconfig).
@@ -6297,6 +6696,12 @@ mod tests {
             ("syscw", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
             ("read_bytes", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
             ("write_bytes", None, &["CONFIG_TASK_IO_ACCOUNTING"], false),
+            (
+                "cancelled_write_bytes",
+                None,
+                &["CONFIG_TASK_IO_ACCOUNTING"],
+                false,
+            ),
         ];
         // Set-equality: registry keys vs matrix keys.
         let registry_names: std::collections::BTreeSet<&str> =
@@ -6679,6 +7084,259 @@ mod tests {
                 "error must name arrow's mutual exclusivity for spec {spec:?}: {msg}"
             );
         }
+    }
+
+    // ------------------------------------------------------------
+    // parse_sections / Section / DisplayOptions::is_section_enabled
+    // ------------------------------------------------------------
+
+    /// Empty / whitespace-only `--sections` parses to an empty
+    /// `Vec` — caller treats that as "all sections render" via
+    /// [`DisplayOptions::is_section_enabled`]'s empty-input
+    /// short-circuit. Mirror of [`parse_columns_empty_returns_empty_vec`].
+    #[test]
+    fn parse_sections_empty_returns_empty_vec() {
+        let secs = parse_sections("").expect("empty parses");
+        assert!(secs.is_empty());
+        let secs = parse_sections("   ").expect("whitespace-only parses as empty");
+        assert!(secs.is_empty());
+    }
+
+    /// Round-trip every [`Section::ALL`] entry through its
+    /// [`Section::cli_name`] and back through [`parse_sections`].
+    /// Exhaustively pins the cli_name table and the parser's
+    /// recognition logic against drift — adding a new variant
+    /// without updating cli_name would surface here as a
+    /// nonexistent name in the comma-joined spec.
+    #[test]
+    fn parse_sections_round_trips_every_name() {
+        let spec = Section::ALL
+            .iter()
+            .map(|s| s.cli_name())
+            .collect::<Vec<_>>()
+            .join(",");
+        let parsed = parse_sections(&spec).expect("every cli_name must round-trip");
+        assert_eq!(
+            parsed,
+            Section::ALL.to_vec(),
+            "round-trip must preserve order and identity"
+        );
+    }
+
+    /// Unknown section name must surface a diagnostic that
+    /// names the offending token and lists every valid name —
+    /// the operator should be able to recover from the error
+    /// alone without reading the source.
+    #[test]
+    fn parse_sections_rejects_unknown_name() {
+        let err = parse_sections("not_a_section").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not_a_section"),
+            "error must cite the offending name: {msg}"
+        );
+        // Sample a couple of valid names so a future cli_name
+        // rename surfaces here too.
+        assert!(
+            msg.contains("primary"),
+            "error must list valid names: {msg}"
+        );
+        assert!(
+            msg.contains("host-pressure"),
+            "error must list valid names: {msg}"
+        );
+    }
+
+    /// Duplicate name across two entries must reject — same
+    /// section appearing twice carries no extra information and
+    /// signals a typo.
+    #[test]
+    fn parse_sections_rejects_duplicate() {
+        let err = parse_sections("primary,derived,primary").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate"),
+            "error must mention duplicates: {msg}"
+        );
+    }
+
+    /// Empty token between commas (`primary,,derived`) must
+    /// reject. Mirrors `parse_columns_rejects_empty_entry` —
+    /// surfacing the typo at parse time beats silently
+    /// dropping an empty slot.
+    #[test]
+    fn parse_sections_rejects_empty_entry() {
+        let err = parse_sections("primary,,derived").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty"), "error must mention empty: {msg}");
+    }
+
+    /// Multiple non-overlapping names parse in input order —
+    /// the resolved Vec preserves the operator-supplied
+    /// sequence rather than re-sorting into [`Section::ALL`]
+    /// order. Pins that the parser does not stealthily
+    /// reorder.
+    #[test]
+    fn parse_sections_accepts_multiple_in_input_order() {
+        let secs =
+            parse_sections("derived,primary,host-pressure").expect("multi-section spec parses");
+        assert_eq!(
+            secs,
+            vec![Section::Derived, Section::Primary, Section::HostPressure],
+            "input order must be preserved",
+        );
+    }
+
+    /// Whitespace around each entry is trimmed before lookup —
+    /// `--sections "primary , derived"` must parse identically
+    /// to `--sections primary,derived`. Pins the trim() call in
+    /// the parser body.
+    #[test]
+    fn parse_sections_trims_whitespace_around_entries() {
+        let secs =
+            parse_sections("  primary , derived  ").expect("whitespace-tolerant spec parses");
+        assert_eq!(secs, vec![Section::Primary, Section::Derived]);
+    }
+
+    /// [`Section::ALL`] must list every variant exactly once.
+    /// Walks ALL, round-trips each through `parse_sections`,
+    /// and enforces uniqueness via the parser's duplicate
+    /// rejection — a future variant added without an `ALL`
+    /// entry would fail the round-trip; a duplicate in `ALL`
+    /// would fail the BTreeSet uniqueness check below.
+    /// Pinning this invariant in the test surface lets
+    /// `parse_sections` stay the single source of truth and
+    /// catches drift between the enum and the constant.
+    #[test]
+    fn section_all_is_exhaustive_and_unique() {
+        let mut names: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+        for s in Section::ALL {
+            assert!(
+                names.insert(s.cli_name()),
+                "duplicate cli_name in Section::ALL: {}",
+                s.cli_name()
+            );
+            // Each name must round-trip individually so a
+            // future variant whose `cli_name` collides with
+            // another's is caught by the BTreeSet insert
+            // above, AND its absence from `parse_sections`'s
+            // recognition would surface here as a parse
+            // failure.
+            let parsed = parse_sections(s.cli_name())
+                .unwrap_or_else(|e| panic!("cli_name {} failed parse: {e:#}", s.cli_name()));
+            assert_eq!(parsed, vec![*s]);
+        }
+        assert_eq!(
+            names.len(),
+            Section::ALL.len(),
+            "ALL count must match the unique-names count",
+        );
+    }
+
+    /// Empty `sections` Vec on [`DisplayOptions`] means "every
+    /// section is enabled" — the no-filter default. Pins the
+    /// short-circuit in `is_section_enabled` so a regression
+    /// that flipped the empty case to "no section enabled"
+    /// surfaces here.
+    #[test]
+    fn is_section_enabled_empty_treats_all_as_on() {
+        let opts = DisplayOptions::default();
+        for s in Section::ALL {
+            assert!(
+                opts.is_section_enabled(*s),
+                "empty filter must enable {} (default = all-on)",
+                s.cli_name()
+            );
+        }
+    }
+
+    /// Non-empty `sections` Vec restricts rendering to the
+    /// listed entries — every variant not in the filter must
+    /// be disabled, every variant in the filter enabled. Pins
+    /// the `contains` membership check.
+    #[test]
+    fn is_section_enabled_non_empty_restricts_to_listed() {
+        let mut opts = DisplayOptions::default();
+        opts.sections = vec![Section::Primary, Section::HostPressure];
+        for s in Section::ALL {
+            let in_filter = matches!(s, Section::Primary | Section::HostPressure);
+            assert_eq!(
+                opts.is_section_enabled(*s),
+                in_filter,
+                "is_section_enabled({}) under {{Primary, HostPressure}} \
+                 must be {in_filter}",
+                s.cli_name(),
+            );
+        }
+    }
+
+    /// [`Section::requires_cgroup_grouping`] returns true for
+    /// the five sections behind the `GroupBy::Cgroup` outer
+    /// gate (`CgroupStats`, `Limits`, `MemoryStat`,
+    /// `MemoryEvents`, `Pressure`) and false for every other
+    /// variant. Pins the closed-set so a future variant
+    /// addition that lives behind the cgroup gate has to
+    /// update this match arm.
+    #[test]
+    fn section_requires_cgroup_grouping_classifies_correctly() {
+        for s in Section::ALL {
+            let expected = matches!(
+                s,
+                Section::CgroupStats
+                    | Section::Limits
+                    | Section::MemoryStat
+                    | Section::MemoryEvents
+                    | Section::Pressure
+            );
+            assert_eq!(
+                s.requires_cgroup_grouping(),
+                expected,
+                "Section::{s:?}.requires_cgroup_grouping() must be {expected}",
+            );
+        }
+    }
+
+    /// [`format_cgroup_only_section_warning`] renders a
+    /// diagnostic that names the offending section, the
+    /// `--group-by cgroup` requirement, AND the operator's
+    /// chosen group-by spelling. Pins all three load-bearing
+    /// elements of the warning text against drift.
+    #[test]
+    fn format_cgroup_only_section_warning_names_all_three_elements() {
+        let msg = format_cgroup_only_section_warning(Section::Pressure, GroupBy::Pcomm);
+        assert!(
+            msg.contains("'pressure'"),
+            "warning must quote the section cli_name: {msg}",
+        );
+        assert!(
+            msg.contains("--group-by cgroup"),
+            "warning must name the cgroup requirement: {msg}",
+        );
+        assert!(
+            msg.contains("pcomm"),
+            "warning must echo the operator's --group-by axis: {msg}",
+        );
+    }
+
+    /// [`format_cgroup_only_section_warning`] echoes the
+    /// `comm-exact` spelling (not `CommExact`) so the warning
+    /// matches the value-enum the operator typed at the CLI.
+    /// Pins [`group_by_cli_name`]'s mapping for the
+    /// hyphenated variant — clap's value-enum derive renames
+    /// `CommExact` to `comm-exact`, and a regression that
+    /// stringified the variant via `Debug` would surface
+    /// `CommExact` instead.
+    #[test]
+    fn format_cgroup_only_section_warning_uses_comm_exact_spelling() {
+        let msg = format_cgroup_only_section_warning(Section::CgroupStats, GroupBy::CommExact);
+        assert!(
+            msg.contains("comm-exact"),
+            "warning must use the clap value-enum spelling: {msg}",
+        );
+        assert!(
+            !msg.contains("CommExact"),
+            "warning must not surface the rust variant name: {msg}",
+        );
     }
 
     /// `--columns` overrides `--display-format`'s default.
@@ -8346,10 +9004,14 @@ mod tests {
     }
 
     /// `aggregate(MaxPeak, &[])` returns `Max(0)` via the
-    /// identity-element seed of `Maxable::max_across`. Mirrors the
-    /// empty-Sum contract so downstream delta math works the same
-    /// way for both rules when one side has no threads under the
-    /// join key.
+    /// dispatch's None-to-Max(0) collapse at the call boundary —
+    /// `Maxable::max_across` itself returns `Option<Self>`
+    /// (`None` on empty input), and the `MaxPeak` arm in
+    /// `aggregate()` collapses `None` to `Aggregated::Max(0)` so
+    /// the historical empty-bucket contract on this code path is
+    /// preserved. Mirrors the empty-Sum contract so downstream
+    /// delta math works the same way for both rules when one
+    /// side has no threads under the join key.
     #[test]
     fn aggregate_max_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
@@ -8361,8 +9023,10 @@ mod tests {
     }
 
     /// Single-thread group: `MaxPeak` returns the single thread's
-    /// value verbatim. Pins that the identity-element seed does
-    /// not override a real reading.
+    /// value verbatim. Pins that the dispatch's None-to-Max(0)
+    /// collapse does not override a real reading — the trait's
+    /// `Some(...)` arm fires for any non-empty input regardless
+    /// of value.
     #[test]
     fn aggregate_max_single_thread_returns_thread_value() {
         let mut t = make_thread("p", "w");

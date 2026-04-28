@@ -1,0 +1,33 @@
+error[E0277]: `GaugeNs` is not Summable — summing it would conflate semantic categories or temporal windows
+ --> tests/compile_fail/metric_types_gauge_ns_not_summable.rs:8:24
+  |
+8 |     require_summable::<ktstr::metric_types::GaugeNs>();
+  |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this metric type cannot be summed across a group
+  |
+  = help: the trait `Summable` is not implemented for `GaugeNs`
+  = note: PeakNs (lifetime high-water): use Maxable::max_across; GaugeNs/GaugeCount (instantaneous samples — different temporal window than the lifetime accumulators): use Maxable::max_across; OrdinalI32/OrdinalU32/OrdinalU64 (bounded scalars): use Rangeable::range_across; CategoricalString: use Modeable::mode_across; CpuSet: use the AffinitySummary reduction in host_state_compare; DeadCounter: kernel-side dead pointer — value is structurally zero; the registry must use a no-op aggregation arm (or omit the field) rather than sum across structural zeros
+help: the following other types implement trait `Summable`
+ --> src/metric_types.rs
+  |
+  |         impl Summable for $t {
+  |         ^^^^^^^^^^^^^^^^^^^^
+  |         |
+  |         `ClockTicks`
+  |         `MonotonicCount`
+  |         `MonotonicNs`
+  |         `ktstr::metric_types::Bytes`
+...
+  | impl_summable_only_u64!(MonotonicCount);
+  | --------------------------------------- in this macro invocation
+  | impl_summable_only_u64!(MonotonicNs);
+  | ------------------------------------ in this macro invocation
+  | impl_summable_only_u64!(ClockTicks);
+  | ----------------------------------- in this macro invocation
+  | impl_summable_only_u64!(Bytes);
+  | ------------------------------ in this macro invocation
+note: required by a bound in `require_summable`
+ --> tests/compile_fail/metric_types_gauge_ns_not_summable.rs:5:24
+  |
+5 | fn require_summable<T: ktstr::metric_types::Summable>() {}
+  |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_summable`
+  = note: this error originates in the macro `impl_summable_only_u64` (in Nightly builds, run with -Z macro-backtrace for more info)

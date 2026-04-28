@@ -54,22 +54,41 @@
 //! # Type-system enforcement
 //!
 //! Encoding the category into the type system surfaces
-//! category-mismatched aggregation as a compile error. Once the
-//! [`crate::host_state_compare::AggRule`] dispatch migrates to
-//! typed reductions in phase 3, a future registry entry that
-//! pairs a peak field with a sum reduction — e.g. `t.wait_max`
-//! (`PeakNs`) bound to a `Sum(...)` rule whose accessor returns
-//! a `Summable` value — will fail to compile rather than produce
-//! a meaningless `1×1s ⊕ 1000×1ms` aggregate. This module
-//! defines the newtypes and traits the migration consumes;
-//! AggRule itself still carries the legacy `fn(&ThreadState)
-//! -> u64` shape until phase 3 lands.
+//! category-mismatched aggregation as a compile error. The
+//! [`crate::host_state_compare::AggRule`] dispatch routes each
+//! variant through the typed newtype's reduction trait — `Sum*`
+//! through [`Summable::sum_across`], `Max*` through
+//! [`Maxable::max_across`], `Range*` through
+//! [`Rangeable::range_across`], and `Mode*` through
+//! [`Modeable::mode_across`] — so a registry entry that pairs a
+//! peak field with a sum reduction (e.g. `t.wait_max`
+//! ([`PeakNs`]) bound to a `Sum*` rule whose accessor returns a
+//! [`Summable`] value) fails to compile rather than producing a
+//! meaningless `1×1s ⊕ 1000×1ms` aggregate. This module defines
+//! the newtypes and traits the dispatch consumes.
 //!
 //! # The newtypes
 //!
 //! - [`MonotonicCount`] — pure counter (only ever goes up across a
 //!   thread's lifetime). Examples: `nr_wakeups`, `nr_migrations`,
 //!   `voluntary_csw`.
+//! - [`DeadCounter`] — same wire shape as [`MonotonicCount`] but
+//!   tagged for kernel counters whose update path is permanently
+//!   dead (the field exists in `task_struct` but no kernel writer
+//!   touches it on any current code path — `nr_wakeups_idle`,
+//!   `nr_migrations_cold`, `nr_wakeups_passive` all match this
+//!   shape today). Captured for parity with `/proc/<tid>/sched`
+//!   line numbers but does NOT implement any reduction trait
+//!   ([`Summable`] / [`Maxable`] / [`Rangeable`] / [`Modeable`])
+//!   — the value is structurally zero, so every reduction is
+//!   trivially zero and rendering it through any of the live
+//!   reductions implies "we measured a thing" when in fact we
+//!   measured a kernel-side dead pointer. The registry-level
+//!   accommodation (a no-op aggregation arm or registry removal)
+//!   is the migration batch's problem; this newtype's job is to
+//!   make the dead-counter status visible at the field
+//!   declaration so the migration can't accidentally pair it
+//!   with a [`Summable`]-bound `AggRule` variant.
 //! - [`MonotonicNs`] — cumulative-time counter, ns. Examples:
 //!   `run_time_ns`, `wait_sum`, `sleep_sum`, `block_sum`,
 //!   `iowait_sum`, `core_forceidle_sum`.
@@ -143,24 +162,40 @@
 //!   [`CpuSet`]. The trait is sealed via
 //!   [`sealed::SummableSealed`] so a downstream crate cannot add
 //!   `impl Summable for PeakNs` to bypass the category invariant.
-//! - [`Maxable`] — reduce by max. Implemented by every newtype
-//!   that has a meaningful "worst observed" reading: every
-//!   `Summable` (max-of-counter is "biggest single contributor")
-//!   plus [`PeakNs`] (max-of-peak is "worst peak any contributor
-//!   saw"), [`GaugeNs`] (max-of-gauge is "longest current
+//! - [`Maxable`] — reduce by max. Implemented by [`PeakNs`]
+//!   (max-of-peak is "worst peak any contributor saw across its
+//!   lifetime"), [`GaugeNs`] (max-of-gauge is "longest current
 //!   slice in the bucket"), and [`GaugeCount`] (max-of-count is
 //!   "biggest current count any contributor carried"). NOT
-//!   implemented by ordinals (those carry a `[min, max]` range,
-//!   not a single max), nor by [`CategoricalString`] (string max
-//!   has no useful semantic), nor by [`CpuSet`] (the affinity
-//!   reduction is a custom summary, not a bare max). Sealed via
+//!   implemented by [`Summable`] cumulative counters
+//!   ([`MonotonicCount`] / [`MonotonicNs`] / [`ClockTicks`] /
+//!   [`Bytes`]) — max-across-snapshots on a lifetime accumulator
+//!   reduces to "the last snapshot's value", which is mostly
+//!   noise relative to the lifetime-integrated quantity it
+//!   reports. NOT implemented by ordinals (those carry a
+//!   `[min, max]` range, not a single max), nor by
+//!   [`CategoricalString`] (string max has no useful semantic),
+//!   nor by [`CpuSet`] (the affinity reduction is a custom
+//!   summary, not a bare max). Sealed via
 //!   [`sealed::MaxableSealed`].
+//!
+//!   `max_across` returns `Option<Self>`: `None` for an empty
+//!   iterator (so callers can distinguish "no contributors" from
+//!   "all contributors had zero"), `Some(largest)` otherwise.
+//!   The parallel `Summable::try_sum_across` returns
+//!   `Option<Self>` with the same empty-iterator semantics. The
+//!   `try_` prefix (rather than `checked_`) avoids colliding
+//!   with the stdlib's overflow-detection naming convention —
+//!   this is an empty-iterator check, not an arithmetic check.
 //! - [`Modeable`] — reduce by mode (most-frequent value).
 //!   Implemented by [`CategoricalString`] only. Sealed via
 //!   [`sealed::ModeableSealed`].
 //! - [`Rangeable`] — reduce by `[min, max]`. Implemented by
 //!   [`OrdinalI32`], [`OrdinalU32`], and [`OrdinalU64`]. Sealed
-//!   via [`sealed::RangeableSealed`].
+//!   via [`sealed::RangeableSealed`]. `range_across` returns
+//!   `Option<Range<Self>>` — the [`Range`] newtype enforces
+//!   `min ≤ max` at construction so a downstream consumer cannot
+//!   observe a swapped pair.
 //!
 //! Reductions are exposed as **trait methods** on
 //! [`Summable`] / [`Maxable`] / [`Rangeable`] / [`Modeable`].
@@ -184,9 +219,9 @@
 //! - It is NOT a unit-of-measure system. There is no
 //!   `MonotonicNs * MonotonicNs = MonotonicNs²` — these wrappers
 //!   carry semantic category, not algebraic dimensionality.
-//! - It is NOT a runtime-typed value enum (that lives next to the
-//!   [`crate::host_state_compare::AggRule`] dispatch in phase 3).
-//!   This module only defines the building-block newtypes.
+//! - It is NOT a runtime-typed value enum (that lives next to
+//!   the [`crate::host_state_compare::AggRule`] dispatch). This
+//!   module only defines the building-block newtypes.
 
 use serde::{Deserialize, Serialize};
 
@@ -275,15 +310,65 @@ pub struct ClockTicks(pub u64);
 /// from thread birth.
 ///
 /// Examples: `allocated_bytes`, `deallocated_bytes`, `rchar`,
-/// `wchar`, `read_bytes`, `write_bytes`. Same lifetime-window
-/// contract as [`MonotonicNs`]; sum across a group, delta
-/// across snapshots.
+/// `wchar`, `read_bytes`, `write_bytes`, `cancelled_write_bytes`.
+/// Same lifetime-window contract as [`MonotonicNs`]; sum across
+/// a group, delta across snapshots.
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
 #[serde(transparent)]
 pub struct Bytes(pub u64);
+
+/// Kernel counter whose update path is permanently dead. The
+/// field exists in `task_struct` (and is exposed via
+/// `/proc/<tid>/sched`) but no kernel writer touches it on any
+/// current code path. Examples in
+/// `kernel/sched/debug.c::print_numa_stats`-adjacent dumps:
+/// `nr_wakeups_idle` (no `schedstat_inc(p->stats.nr_wakeups_idle)`
+/// call site exists in 6.16 or 7.1), `nr_migrations_cold` (no
+/// `schedstat_inc(p->stats.nr_migrations_cold)` call site),
+/// `nr_wakeups_passive` (no `schedstat_inc(p->stats.nr_wakeups_passive)`
+/// call site).
+///
+/// Wire format matches [`MonotonicCount`] (`u64`,
+/// `serde(transparent)`); the capture pipeline parses the same
+/// procfs lines and stores the same bits. The type-system
+/// difference is in the trait list: a [`MonotonicCount`] is
+/// [`Summable`] / [`Maxable`], while [`DeadCounter`] is neither.
+/// A registry entry that pairs a `DeadCounter` field with a
+/// [`Summable`]-bound `AggRule` variant fails to compile,
+/// flagging the dead status at the type level rather than
+/// surfacing as a "0 + 0 + 0" rendered cell.
+///
+/// # Migration affordance
+///
+/// A field can be flipped from [`MonotonicCount`] to
+/// [`DeadCounter`] without regenerating any `.hst.zst` snapshot
+/// files: the `repr(transparent)` + `serde(transparent)` wire
+/// format is structurally identical (a bare `u64`). Existing
+/// snapshots deserialize unchanged. The flip changes only the
+/// in-memory trait surface, which the registry consumes through
+/// `AggRule` accessors — adjusting those (or removing the
+/// field's registry entry entirely) is the only edit beyond the
+/// field type itself.
+///
+/// Defaults to zero. The reduction-trait omission is
+/// deliberate: all four reductions ([`Summable::sum_across`],
+/// [`Maxable::max_across`], [`Rangeable::range_across`],
+/// [`Modeable::mode_across`]) on a column of structural zeros
+/// trivially produce zero, but rendering that "zero" through a
+/// live reduction implies "we measured zero events" when the
+/// truth is "we measured a kernel-side dead pointer." Either
+/// add a no-op `AggRule` variant in the migration batch, or
+/// drop these fields from the registry entirely — both are the
+/// migration batch's call.
+#[repr(transparent)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct DeadCounter(pub u64);
 
 /// Lifetime high-water mark, nanoseconds. The kernel updates
 /// these as a max-against-prior in `update_stats_*` /
@@ -293,6 +378,38 @@ pub struct Bytes(pub u64);
 /// has accumulated since its birth. Group reduction takes max
 /// across contributors so the rendered cell surfaces the worst
 /// single window any thread experienced over its lifetime.
+///
+/// # Cross-thread vs cross-snapshot semantics
+///
+/// The Max reduction over a bucket of threads produces the
+/// worst single window observed across DIFFERENT tasks — task
+/// A's `wait_max` and task B's `wait_max` measure two distinct
+/// scheduling histories, and the bucket-level max picks
+/// whichever task experienced the worst case. The result
+/// belongs to that one worst task, not to the bucket as a
+/// whole; downstream consumers should read the rendered cell
+/// as "this bucket contained at least one task that saw N ns
+/// of wait" rather than "all tasks in this bucket saw at most
+/// N ns of wait" (which is the same shape, but a much weaker
+/// statement).
+///
+/// In COMPARE mode the per-thread `PeakNs` delta between two
+/// snapshots is `peak_after - peak_before` — the kernel only
+/// ever raises the field, so the delta is non-negative and
+/// represents the AMOUNT BY WHICH THE LIFETIME HIGH-WATER LINE
+/// ROSE during the (capture-A, capture-B) interval, NOT the
+/// magnitude of the worst event in that interval. A new
+/// scheduling window inside the interval only moves the
+/// high-water line if its own magnitude exceeds every prior
+/// window the task had ever experienced; if every interval
+/// event was strictly smaller than `peak_before`, the delta is
+/// zero even though events did occur. The delta is therefore
+/// not itself a PeakNs in the same sense as the lifetime
+/// reading — it is a difference of high-water marks. The
+/// bucket reduction takes max over those deltas, surfacing the
+/// worst rise across contributors during the interval; this
+/// can dramatically under-report transient bad windows that
+/// happened earlier in any contributor's lifetime.
 ///
 /// Summing peaks across threads is a category error — does not
 /// implement [`Summable`]. Implements [`Maxable`].
@@ -479,6 +596,7 @@ impl_u64_newtype_from!(MonotonicCount);
 impl_u64_newtype_from!(MonotonicNs);
 impl_u64_newtype_from!(ClockTicks);
 impl_u64_newtype_from!(Bytes);
+impl_u64_newtype_from!(DeadCounter);
 impl_u64_newtype_from!(PeakNs);
 impl_u64_newtype_from!(GaugeNs);
 impl_u64_newtype_from!(GaugeCount);
@@ -568,6 +686,7 @@ impl_display_passthrough!(MonotonicCount);
 impl_display_passthrough!(MonotonicNs);
 impl_display_passthrough!(ClockTicks);
 impl_display_passthrough!(Bytes);
+impl_display_passthrough!(DeadCounter);
 impl_display_passthrough!(PeakNs);
 impl_display_passthrough!(GaugeNs);
 impl_display_passthrough!(GaugeCount);
@@ -625,6 +744,21 @@ mod sealed {
 /// counters are non-negative u64s, the group total cannot exceed
 /// `u64::MAX`, and a hostile or corrupt reading that would push
 /// the sum past `u64::MAX` saturates rather than wrapping.
+///
+/// `sum_across` collapses an empty iterator to the additive
+/// identity (zero, via `Self::default()` shape — the four
+/// counter newtypes default to `Self(0)`). Callers that need
+/// to distinguish "no contributors" from "all contributors had
+/// zero" — for example, to suppress a derived ratio whose
+/// denominator bucket was empty rather than zero-valued — use
+/// [`try_sum_across`](Self::try_sum_across), which returns
+/// `None` for an empty iterator and `Some(total)` otherwise.
+/// The two methods report the same value on every non-empty
+/// input. The `try_` prefix (rather than `checked_`) avoids
+/// colliding with the stdlib's `checked_*` numeric methods,
+/// which detect arithmetic overflow — this method only flags
+/// an empty iterator (saturation happens unconditionally in
+/// `sum_across`).
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not Summable — summing it would conflate semantic categories \
                or temporal windows",
@@ -634,19 +768,44 @@ mod sealed {
             lifetime accumulators): use Maxable::max_across; \
             OrdinalI32/OrdinalU32/OrdinalU64 (bounded scalars): use Rangeable::range_across; \
             CategoricalString: use Modeable::mode_across; CpuSet: use the \
-            AffinitySummary reduction in host_state_compare"
+            AffinitySummary reduction in host_state_compare; \
+            DeadCounter: kernel-side dead pointer — value is structurally zero; the \
+            registry must use a no-op aggregation arm (or omit the field) rather than \
+            sum across structural zeros"
 )]
 pub trait Summable: sealed::SummableSealed + Sized + Copy {
+    /// Sum across the iterator, saturating at `u64::MAX`.
+    /// Empty input collapses to the additive identity (zero).
     fn sum_across(items: impl IntoIterator<Item = Self>) -> Self;
+
+    /// Same total as [`sum_across`](Self::sum_across) on every
+    /// non-empty input; returns `None` for an empty iterator so
+    /// callers can distinguish "no contributors" from "all
+    /// contributors summed to zero." Useful when a downstream
+    /// derived metric (e.g. a ratio) needs to suppress the
+    /// row entirely rather than render `0 / 0`.
+    ///
+    /// The `try_` prefix (rather than `checked_`) avoids
+    /// colliding with the stdlib's `checked_*` numeric methods,
+    /// which detect arithmetic overflow. This method only
+    /// flags an empty iterator — overflow handling is identical
+    /// to `sum_across` (saturating, unconditional).
+    fn try_sum_across(items: impl IntoIterator<Item = Self>) -> Option<Self> {
+        let mut it = items.into_iter();
+        // Relies on Self: Copy (Summable trait bound) so the
+        // next-and-chain pattern works without duplicating the
+        // first element — `it.next()?` consumes the first item
+        // for the empty check, and `iter::once(first)` re-emits
+        // the same value into the chain that feeds sum_across.
+        let first = it.next()?;
+        Some(Self::sum_across(std::iter::once(first).chain(it)))
+    }
 }
 
 /// Marker for newtypes that can be reduced by max across a
 /// group.
 ///
-/// Implemented by every [`Summable`] (max-of-counter answers
-/// "what's the biggest single thread-lifetime accumulator any
-/// contributor reported" — well-defined even for cumulative
-/// counters), plus [`PeakNs`] (max-of-peak is the worst
+/// Implemented by [`PeakNs`] (max-of-peak is the worst
 /// high-water mark any contributor saw across its lifetime),
 /// [`GaugeNs`] (max-of-gauge is the longest current value in
 /// the bucket — distinct temporal window: each gauge is a
@@ -654,6 +813,19 @@ pub trait Summable: sealed::SummableSealed + Sized + Copy {
 /// and [`GaugeCount`] (max-of-count is the biggest current
 /// value in the bucket — same gauge-window caveat).
 ///
+/// Deliberately NOT implemented by [`Summable`] cumulative
+/// counters ([`MonotonicCount`] / [`MonotonicNs`] /
+/// [`ClockTicks`] / [`Bytes`]): max-across-snapshots on a
+/// thread-lifetime accumulator reduces to "the value of the
+/// last snapshot," because each snapshot's reading dominates
+/// every prior reading by construction (the kernel only ever
+/// raises a lifetime counter). That gives a reduction whose
+/// "maximum" is the most-recent reading rather than a worst
+/// single window — useful as a sanity bound, but rendering it
+/// alongside per-thread peaks invites confusion. If a future
+/// metric truly needs the lifetime-integrated max of a
+/// cumulative counter, introduce a dedicated peak-of-counter
+/// newtype rather than re-adding `Maxable` to a Summable type.
 /// Deliberately NOT implemented by ordinals (those carry a
 /// `[min, max]` range, not a single max), nor by
 /// [`CategoricalString`] (string max has no useful semantic),
@@ -663,15 +835,29 @@ pub trait Summable: sealed::SummableSealed + Sized + Copy {
 /// Sealed via [`sealed::MaxableSealed`]: a downstream crate
 /// cannot write `impl Maxable for CategoricalString` because the
 /// sealed supertrait is private to this module.
+///
+/// `max_across` returns `Option<Self>`: `None` for an empty
+/// iterator (so callers can distinguish "no contributors" from
+/// "max was zero — the worst reading any contributor reported
+/// happened to be the additive identity"), `Some(largest)`
+/// otherwise. Aggregation callers that want to preserve the
+/// pre-Option contract collapse `None` to the type's
+/// `default()` value at the call site.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not Maxable — `max` is undefined for this category",
     label = "this metric type does not support max-across",
-    note = "OrdinalI32/OrdinalU32/OrdinalU64: use Rangeable::range_across; \
+    note = "MonotonicCount/MonotonicNs/ClockTicks/Bytes (Summable cumulative counters): \
+            use Summable::sum_across; max-across-snapshots on a lifetime accumulator \
+            reduces to the most-recent reading, not a worst window; \
+            OrdinalI32/OrdinalU32/OrdinalU64: use Rangeable::range_across; \
             CategoricalString: use Modeable::mode_across; CpuSet: use the \
-            AffinitySummary reduction in host_state_compare"
+            AffinitySummary reduction in host_state_compare; \
+            DeadCounter: kernel-side dead pointer — value is structurally zero; the \
+            registry must use a no-op aggregation arm (or omit the field) rather than \
+            max across structural zeros"
 )]
 pub trait Maxable: sealed::MaxableSealed + Sized + Copy + Ord {
-    fn max_across(items: impl IntoIterator<Item = Self>) -> Self;
+    fn max_across(items: impl IntoIterator<Item = Self>) -> Option<Self>;
 }
 
 /// Marker for newtypes reduced by mode (most-frequent value).
@@ -729,11 +915,99 @@ pub trait Modeable: sealed::ModeableSealed + Sized + Clone + Eq + Ord {
     }
 }
 
+/// Inclusive `[min, max]` interval over a [`Rangeable`] type.
+///
+/// The constructor enforces `min ≤ max`, so a `Range<T>` value
+/// in hand is a proof that the contained pair is well-ordered;
+/// downstream consumers can read [`min`](Self::min) /
+/// [`max`](Self::max) without re-checking. The invariant is
+/// checked at runtime in debug builds via `debug_assert!`.
+///
+/// Construction sites in this crate (the [`Rangeable::range_across`]
+/// reduction) walk the input iterator and produce a `Range`
+/// directly; misuse — calling `Range::new(b, a)` with `a < b` —
+/// is a programmer error and panics in debug, sneaks through in
+/// release (the wrapped pair is then `[max, min]`, so any caller
+/// reading [`min`](Self::min) gets the larger value). External
+/// callers constructing a `Range` from external bounds should
+/// pre-sort.
+///
+/// `Range<T>` deliberately omits `Ord` / `PartialOrd` /
+/// `Serialize` / `Deserialize`:
+/// - It is an in-memory aggregation result, not a wire-format
+///   boundary; the `aggregate()` dispatch destructures `Range`
+///   into the existing
+///   [`crate::host_state_compare::Aggregated::OrdinalRange`]
+///   variant (which carries `min: i64, max: i64`), so the typed
+///   invariant is enforced at the reduction boundary and the
+///   untyped tuple shape continues to cross every serialized
+///   boundary downstream.
+/// - Comparing two `Range` values to each other has no defined
+///   semantic — there is no obvious ordering on intervals — and
+///   adding `derive(Ord)` would bring [`std::cmp::Ord::min`] /
+///   [`std::cmp::Ord::max`] into scope on `Range<T>` and shadow
+///   the inherent accessors at every call site.
+///
+/// **Heads-up for future contributors**: if Ord/PartialOrd
+/// derives are ever added, expect breakage at every existing
+/// `.min()` / `.max()` call site — those resolve to the
+/// inherent methods today and will start resolving to the trait
+/// methods (different signature, different return type) the
+/// moment the derives are added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Range<T: PartialOrd> {
+    min: T,
+    max: T,
+}
+
+impl<T: PartialOrd> Range<T> {
+    /// Construct a `Range` from a `(min, max)` pair.
+    ///
+    /// `debug_assert!`s that `min ≤ max` — the [`Rangeable`]
+    /// reduction guarantees this by walking the input and
+    /// tracking min and max separately, so the assertion never
+    /// fires on internal call sites. External callers must
+    /// pre-sort.
+    pub fn new(min: T, max: T) -> Self {
+        debug_assert!(
+            min.partial_cmp(&max) != Some(std::cmp::Ordering::Greater),
+            "Range::new requires min <= max — got a min that compares strictly greater"
+        );
+        Self { min, max }
+    }
+
+    /// The lower bound of the interval.
+    pub fn min(&self) -> &T {
+        &self.min
+    }
+
+    /// The upper bound of the interval.
+    pub fn max(&self) -> &T {
+        &self.max
+    }
+
+    /// Consume the range and return the `(min, max)` tuple.
+    /// Useful at boundaries where the caller has its own
+    /// pair-shaped representation (e.g. the
+    /// [`crate::host_state_compare::Aggregated::OrdinalRange`]
+    /// variant).
+    pub fn into_tuple(self) -> (T, T) {
+        (self.min, self.max)
+    }
+}
+
 /// Marker for newtypes reduced by `[min, max]` range.
 /// Implemented by [`OrdinalI32`], [`OrdinalU32`], and
 /// [`OrdinalU64`].
 ///
-/// `range_across` returns `None` on an empty iterator.
+/// `range_across` returns `Option<Range<Self>>` — `None` for
+/// an empty iterator, `Some(Range)` otherwise. The wrapped
+/// `Range` value carries `min ≤ max` as a type-system invariant
+/// so downstream consumers (the format dispatch, derived
+/// metrics, the `Aggregated::OrdinalRange` boundary) cannot
+/// observe a swapped pair. The reduction tracks min and max
+/// separately while walking the input, so the constructor
+/// invariant is satisfied by construction.
 ///
 /// Sealed via [`sealed::RangeableSealed`]: a downstream crate
 /// cannot write `impl Rangeable for u64` because the sealed
@@ -746,7 +1020,7 @@ pub trait Modeable: sealed::ModeableSealed + Sized + Clone + Eq + Ord {
             reduction in host_state_compare"
 )]
 pub trait Rangeable: sealed::RangeableSealed + Sized + Copy + Ord {
-    fn range_across(items: impl IntoIterator<Item = Self>) -> Option<(Self, Self)> {
+    fn range_across(items: impl IntoIterator<Item = Self>) -> Option<Range<Self>> {
         let mut it = items.into_iter();
         let first = it.next()?;
         let mut min = first;
@@ -759,19 +1033,24 @@ pub trait Rangeable: sealed::RangeableSealed + Sized + Copy + Ord {
                 max = v;
             }
         }
-        Some((min, max))
+        Some(Range::new(min, max))
     }
 }
 
-// Macro for the four counter shapes — sum_across uses
-// saturating_add and max_across uses Ord-based max. Both share
-// the underlying u64 representation. The sealed supertrait impls
-// gate Summable / Maxable so external crates can't extend the
-// trait list outside this module.
-macro_rules! impl_summable_maxable_u64 {
+// Macro for the four cumulative-counter shapes (Summable only,
+// NOT Maxable — see the Maxable trait doc for the
+// last-snapshot-dominates-everything rationale). The sealed
+// supertrait impl gates Summable so external crates can't extend
+// the trait list outside this module.
+//
+// "only" in `impl_summable_only_u64` = Summable-only (i.e. NOT
+// also Maxable, the natural sibling) — see the Maxable trait
+// doc for why. Renaming to `impl_summable_not_maxable_u64`
+// would be more explicit but verbose; the macro body below
+// shows the trait surface in 3 lines.
+macro_rules! impl_summable_only_u64 {
     ($t:ident) => {
         impl sealed::SummableSealed for $t {}
-        impl sealed::MaxableSealed for $t {}
         impl Summable for $t {
             fn sum_across(items: impl IntoIterator<Item = Self>) -> Self {
                 let mut total: u64 = 0;
@@ -781,38 +1060,31 @@ macro_rules! impl_summable_maxable_u64 {
                 Self(total)
             }
         }
-        impl Maxable for $t {
-            fn max_across(items: impl IntoIterator<Item = Self>) -> Self {
-                let mut out = Self::default();
-                for v in items {
-                    if v > out {
-                        out = v;
-                    }
-                }
-                out
-            }
-        }
     };
 }
 
-impl_summable_maxable_u64!(MonotonicCount);
-impl_summable_maxable_u64!(MonotonicNs);
-impl_summable_maxable_u64!(ClockTicks);
-impl_summable_maxable_u64!(Bytes);
+impl_summable_only_u64!(MonotonicCount);
+impl_summable_only_u64!(MonotonicNs);
+impl_summable_only_u64!(ClockTicks);
+impl_summable_only_u64!(Bytes);
 
-// Peak / Gauge are Maxable but explicitly NOT Summable.
+// Peak / Gauge are Maxable, NOT Summable. `max_across` walks
+// the input and returns Option<Self> so the empty-iterator case
+// is distinguishable from "all contributors had zero".
 macro_rules! impl_maxable_only_u64 {
     ($t:ident) => {
         impl sealed::MaxableSealed for $t {}
         impl Maxable for $t {
-            fn max_across(items: impl IntoIterator<Item = Self>) -> Self {
-                let mut out = Self::default();
-                for v in items {
+            fn max_across(items: impl IntoIterator<Item = Self>) -> Option<Self> {
+                let mut it = items.into_iter();
+                let first = it.next()?;
+                let mut out = first;
+                for v in it {
                     if v > out {
                         out = v;
                     }
                 }
-                out
+                Some(out)
             }
         }
     };
@@ -988,7 +1260,7 @@ mod tests {
     /// is enforced by the [`sealed::SummableSealed`] supertrait
     /// and the omission of those `impl SummableSealed` lines.
     /// Adding any one would require an explicit edit to this
-    /// module's `impl_summable_maxable_u64!` invocations.
+    /// module's `impl_summable_only_u64!` invocations.
     #[test]
     fn summable_only_implemented_for_counters() {
         fn assert_summable<T: Summable>() {}
@@ -998,58 +1270,108 @@ mod tests {
         assert_summable::<Bytes>();
     }
 
+    #[test]
+    fn try_sum_across_empty_returns_none() {
+        let s = MonotonicCount::try_sum_across(std::iter::empty());
+        assert!(s.is_none());
+    }
+
+    #[test]
+    fn try_sum_across_non_empty_matches_sum_across() {
+        let xs = [MonotonicCount(10), MonotonicCount(20), MonotonicCount(30)];
+        let unchecked = MonotonicCount::sum_across(xs);
+        let tried = MonotonicCount::try_sum_across(xs).expect("non-empty");
+        assert_eq!(unchecked, tried);
+        assert_eq!(tried, MonotonicCount(60));
+    }
+
+    #[test]
+    fn try_sum_across_saturates_on_overflow() {
+        let xs = [MonotonicNs(u64::MAX), MonotonicNs(5)];
+        let s = MonotonicNs::try_sum_across(xs).expect("non-empty");
+        assert_eq!(s, MonotonicNs(u64::MAX));
+    }
+
+    /// Singleton input still produces `Some(value)` — proves
+    /// `try_sum_across` does not "consume the first element to
+    /// test for emptiness" in a way that would lose data.
+    #[test]
+    fn try_sum_across_singleton_returns_that_value() {
+        let s = MonotonicCount::try_sum_across([MonotonicCount(42)]).expect("non-empty");
+        assert_eq!(s, MonotonicCount(42));
+    }
+
+    /// Compile-time gate: `try_sum_across` is part of the
+    /// `Summable` trait surface, so every Summable type carries
+    /// the empty-aware variant for free.
+    #[test]
+    fn try_sum_across_available_on_every_summable() {
+        fn assert_try_sum<T: Summable>() {
+            let _ = T::try_sum_across(std::iter::empty());
+        }
+        assert_try_sum::<MonotonicCount>();
+        assert_try_sum::<MonotonicNs>();
+        assert_try_sum::<ClockTicks>();
+        assert_try_sum::<Bytes>();
+    }
+
     // -- Maxable --------------------------------------------------------------
 
     #[test]
     fn maxable_peak_ns_picks_largest() {
         let xs = [PeakNs(100), PeakNs(500), PeakNs(200)];
-        let m = PeakNs::max_across(xs);
+        let m = PeakNs::max_across(xs).expect("non-empty");
         assert_eq!(m, PeakNs(500));
     }
 
     #[test]
     fn maxable_gauge_ns_picks_largest() {
         let xs = [GaugeNs(7), GaugeNs(99), GaugeNs(50)];
-        let m = GaugeNs::max_across(xs);
+        let m = GaugeNs::max_across(xs).expect("non-empty");
         assert_eq!(m, GaugeNs(99));
     }
 
     #[test]
     fn maxable_gauge_count_picks_largest() {
         let xs = [GaugeCount(3), GaugeCount(11), GaugeCount(7)];
-        let m = GaugeCount::max_across(xs);
+        let m = GaugeCount::max_across(xs).expect("non-empty");
         assert_eq!(m, GaugeCount(11));
     }
 
     #[test]
-    fn maxable_summable_counter_picks_largest() {
-        let xs = [MonotonicCount(3), MonotonicCount(8), MonotonicCount(5)];
-        let m = MonotonicCount::max_across(xs);
-        assert_eq!(m, MonotonicCount(8));
-    }
-
-    #[test]
-    fn maxable_empty_iterator_returns_zero() {
+    fn maxable_empty_iterator_returns_none() {
         let m = PeakNs::max_across(std::iter::empty());
-        assert_eq!(m, PeakNs(0));
+        assert!(m.is_none());
     }
 
     #[test]
     fn maxable_singleton_returns_that_value() {
-        let m = PeakNs::max_across([PeakNs(42)]);
+        let m = PeakNs::max_across([PeakNs(42)]).expect("non-empty");
         assert_eq!(m, PeakNs(42));
     }
 
-    /// Compile-time gate: Maxable is implemented by every
-    /// newtype that has a "worst observed" reading. Static
-    /// assertions for the implementing types.
+    /// Singleton with the additive-identity value still produces
+    /// `Some(zero)` rather than `None` — pins the contract that
+    /// `None` exclusively signals "empty input," not "max happens
+    /// to be zero."
     #[test]
-    fn maxable_implemented_for_all_counter_and_peak_gauge() {
+    fn maxable_singleton_zero_returns_some_zero() {
+        let m = PeakNs::max_across([PeakNs(0)]).expect("non-empty");
+        assert_eq!(m, PeakNs(0));
+    }
+
+    /// Compile-time gate: Maxable is implemented by exactly the
+    /// peak / gauge family — `PeakNs`, `GaugeNs`, `GaugeCount`.
+    /// The four Summable cumulative counter newtypes are
+    /// deliberately NOT Maxable: a static `assert_maxable<T>()`
+    /// helper would refuse to compile against `MonotonicCount` /
+    /// `MonotonicNs` / `ClockTicks` / `Bytes`. The
+    /// `compile_fail_*` tests under `tests/compile_fail/` pin the
+    /// negative side empirically; this test pins the positive
+    /// side.
+    #[test]
+    fn maxable_implemented_for_peaks_and_gauges() {
         fn assert_maxable<T: Maxable>() {}
-        assert_maxable::<MonotonicCount>();
-        assert_maxable::<MonotonicNs>();
-        assert_maxable::<ClockTicks>();
-        assert_maxable::<Bytes>();
         assert_maxable::<PeakNs>();
         assert_maxable::<GaugeNs>();
         assert_maxable::<GaugeCount>();
@@ -1065,17 +1387,17 @@ mod tests {
             OrdinalI32(0),
             OrdinalI32(-20),
         ];
-        let (min, max) = OrdinalI32::range_across(xs).expect("non-empty");
-        assert_eq!(min, OrdinalI32(-20));
-        assert_eq!(max, OrdinalI32(10));
+        let r = OrdinalI32::range_across(xs).expect("non-empty");
+        assert_eq!(*r.min(), OrdinalI32(-20));
+        assert_eq!(*r.max(), OrdinalI32(10));
     }
 
     #[test]
     fn rangeable_ordinal_u32_finds_min_max() {
         let xs = [OrdinalU32(7), OrdinalU32(3), OrdinalU32(15)];
-        let (min, max) = OrdinalU32::range_across(xs).expect("non-empty");
-        assert_eq!(min, OrdinalU32(3));
-        assert_eq!(max, OrdinalU32(15));
+        let r = OrdinalU32::range_across(xs).expect("non-empty");
+        assert_eq!(*r.min(), OrdinalU32(3));
+        assert_eq!(*r.max(), OrdinalU32(15));
     }
 
     #[test]
@@ -1086,22 +1408,115 @@ mod tests {
             OrdinalU64(0),
             OrdinalU64(25),
         ];
-        let (min, max) = OrdinalU64::range_across(xs).expect("non-empty");
-        assert_eq!(min, OrdinalU64(0));
-        assert_eq!(max, OrdinalU64(99));
+        let r = OrdinalU64::range_across(xs).expect("non-empty");
+        assert_eq!(*r.min(), OrdinalU64(0));
+        assert_eq!(*r.max(), OrdinalU64(99));
     }
 
     #[test]
     fn rangeable_singleton_min_eq_max() {
-        let (min, max) = OrdinalI32::range_across([OrdinalI32(42)]).expect("non-empty");
-        assert_eq!(min, OrdinalI32(42));
-        assert_eq!(max, OrdinalI32(42));
+        let r = OrdinalI32::range_across([OrdinalI32(42)]).expect("non-empty");
+        assert_eq!(*r.min(), OrdinalI32(42));
+        assert_eq!(*r.max(), OrdinalI32(42));
     }
 
     #[test]
     fn rangeable_empty_iterator_returns_none() {
         let r = OrdinalI32::range_across(std::iter::empty());
         assert!(r.is_none());
+    }
+
+    /// `Range::new` enforces `min ≤ max` via `debug_assert!`, so
+    /// the type-system invariant matches the runtime check in
+    /// debug builds. Pins the constructor's debug-build behavior.
+    #[test]
+    #[should_panic(expected = "min <= max")]
+    fn range_new_debug_asserts_min_le_max_when_swapped() {
+        let _ = Range::new(OrdinalI32(10), OrdinalI32(5));
+    }
+
+    #[test]
+    fn range_new_min_eq_max_is_allowed() {
+        let r = Range::new(OrdinalI32(42), OrdinalI32(42));
+        assert_eq!(*r.min(), OrdinalI32(42));
+        assert_eq!(*r.max(), OrdinalI32(42));
+    }
+
+    #[test]
+    fn range_into_tuple_preserves_pair() {
+        let r = Range::new(OrdinalU32(3), OrdinalU32(15));
+        let (min, max) = r.into_tuple();
+        assert_eq!(min, OrdinalU32(3));
+        assert_eq!(max, OrdinalU32(15));
+    }
+
+    /// `range_across` always satisfies `min ≤ max` because it
+    /// tracks `min` and `max` separately while walking the input
+    /// — the constructor's `debug_assert!` never fires on the
+    /// reduction path. Pin this by exercising a worst-case
+    /// reverse-sorted input.
+    #[test]
+    fn range_across_preserves_min_le_max_on_reversed_input() {
+        let xs = [
+            OrdinalI32(99),
+            OrdinalI32(10),
+            OrdinalI32(0),
+            OrdinalI32(-20),
+        ];
+        let r = OrdinalI32::range_across(xs).expect("non-empty");
+        assert!(r.min() <= r.max());
+        assert_eq!(*r.min(), OrdinalI32(-20));
+        assert_eq!(*r.max(), OrdinalI32(99));
+    }
+
+    // -- DeadCounter ----------------------------------------------------------
+
+    #[test]
+    fn dead_counter_from_u64_roundtrips() {
+        let v: DeadCounter = 0u64.into();
+        assert_eq!(v.0, 0);
+        let back: u64 = v.into();
+        assert_eq!(back, 0);
+    }
+
+    /// Wire format for [`DeadCounter`] matches a bare `u64`,
+    /// identical to [`MonotonicCount`]. The type-system
+    /// difference is in the trait list (no Summable / Maxable /
+    /// Rangeable / Modeable impl), not in the wire bytes.
+    #[test]
+    fn dead_counter_serde_transparent() {
+        let v = DeadCounter(0);
+        let json = serde_json::to_string(&v).expect("serialize");
+        assert_eq!(json, "0");
+        let back: DeadCounter = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(v, back);
+
+        // Non-zero round-trip even though the kernel write path is
+        // dead — the wire format must be identical to MonotonicCount
+        // so the future migration can flip a field's wrapper without
+        // regenerating snapshot files.
+        let nonzero = DeadCounter(42);
+        let nonzero_json = serde_json::to_string(&nonzero).expect("serialize");
+        assert_eq!(nonzero_json, "42");
+        let nonzero_back: DeadCounter = serde_json::from_str(&nonzero_json).expect("deserialize");
+        assert_eq!(nonzero, nonzero_back);
+    }
+
+    #[test]
+    fn dead_counter_default_is_zero() {
+        assert_eq!(DeadCounter::default(), DeadCounter(0));
+    }
+
+    #[test]
+    fn dead_counter_repr_transparent_size() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<DeadCounter>(), size_of::<u64>());
+    }
+
+    #[test]
+    fn dead_counter_display_passthrough() {
+        assert_eq!(format!("{}", DeadCounter(0)), "0");
+        assert_eq!(format!("{}", DeadCounter(42)), "42");
     }
 
     // -- Modeable -------------------------------------------------------------
@@ -1177,6 +1592,10 @@ mod tests {
         let raw_bytes_json = serde_json::to_string(&raw_bytes).expect("serialize");
         assert_eq!(raw_bytes_json, "1048576");
 
+        let raw_dead = DeadCounter(7);
+        let raw_dead_json = serde_json::to_string(&raw_dead).expect("serialize");
+        assert_eq!(raw_dead_json, "7");
+
         let raw_peak = PeakNs(99);
         let raw_peak_json = serde_json::to_string(&raw_peak).expect("serialize");
         assert_eq!(raw_peak_json, "99");
@@ -1238,6 +1657,7 @@ mod tests {
         assert_eq!(size_of::<MonotonicNs>(), size_of::<u64>());
         assert_eq!(size_of::<ClockTicks>(), size_of::<u64>());
         assert_eq!(size_of::<Bytes>(), size_of::<u64>());
+        assert_eq!(size_of::<DeadCounter>(), size_of::<u64>());
         assert_eq!(size_of::<PeakNs>(), size_of::<u64>());
         assert_eq!(size_of::<GaugeNs>(), size_of::<u64>());
         assert_eq!(size_of::<GaugeCount>(), size_of::<u64>());
@@ -1255,6 +1675,7 @@ mod tests {
         assert_eq!(MonotonicNs::default(), MonotonicNs(0));
         assert_eq!(ClockTicks::default(), ClockTicks(0));
         assert_eq!(Bytes::default(), Bytes(0));
+        assert_eq!(DeadCounter::default(), DeadCounter(0));
         assert_eq!(PeakNs::default(), PeakNs(0));
         assert_eq!(GaugeNs::default(), GaugeNs(0));
         assert_eq!(GaugeCount::default(), GaugeCount(0));

@@ -306,9 +306,11 @@ impl HostStateProbeSummary {
 /// schedstats, IO, etc.) are trustworthy on a given host without
 /// scanning every thread for default values.
 ///
-/// The tally is read-level only — it counts failures of
-/// `fs::read_to_string` against `/proc/<tgid>/task/<tid>/<file>`,
-/// not per-field parse failures inside an otherwise-readable file.
+/// The read-failure tally ([`Self::read_failures`] /
+/// [`Self::read_failures_by_file`]) is read-level only — it
+/// counts failures of `fs::read_to_string` against
+/// `/proc/<tgid>/task/<tid>/<file>`, not per-field parse failures
+/// inside an otherwise-readable file.
 /// A present-but-malformed file (e.g. a corrupt `stat` whose
 /// `parse_stat` returns all-`None`) does NOT count: the file read
 /// succeeded so the tally stays at zero for that category, even
@@ -319,9 +321,17 @@ impl HostStateProbeSummary {
 /// or any other I/O-level error from the procfs reader. A snapshot
 /// with 1 K schedstat failures across 1 K tids implies a kernel
 /// build without `CONFIG_SCHEDSTATS`; 47 stat failures across 1 K
-/// tids implies mid-capture races. Per-field corruption surfaces
-/// elsewhere — as zero values on the affected `ThreadState`
-/// fields — and is intentionally outside this summary's scope.
+/// tids implies mid-capture races.
+///
+/// One parse-level signal IS surfaced separately:
+/// [`Self::negative_dotted_values`] counts the per-line cases in
+/// `/proc/<tid>/sched` where the kernel's PN_SCHEDSTAT format
+/// emitted a leading `-` — a rare but observable clock-skew /
+/// suspend-resume artifact that the parser otherwise folds
+/// silently to zero. Other forms of per-field corruption (
+/// non-numeric fractional, malformed key, …) stay outside this
+/// summary's scope and surface as zero values on the affected
+/// `ThreadState` fields.
 ///
 /// Per-file tokens in [`Self::read_failures_by_file`] are stable
 /// kebab-case identifiers downstream consumers match against. The
@@ -364,10 +374,10 @@ pub struct HostStateParseSummary {
     pub read_failures: u64,
     /// Per-file-kind failure tally, keyed by stable kebab tokens
     /// (`"stat"`, `"schedstat"`, `"io"`, `"status"`, `"sched"`,
-    /// `"cgroup"`). Empty map when the capture saw zero failures.
-    /// Keys present in the map have non-zero counts; absent keys
-    /// imply zero failures for that category, NOT "category
-    /// unknown".
+    /// `"cgroup"`, `"smaps_rollup"`). Empty map when the capture
+    /// saw zero failures. Keys present in the map have non-zero
+    /// counts; absent keys imply zero failures for that category,
+    /// NOT "category unknown".
     pub read_failures_by_file: BTreeMap<String, u64>,
     /// Tag string for the file kind with the most read failures
     /// across the snapshot. `None` when `read_failures == 0`.
@@ -387,6 +397,44 @@ pub struct HostStateParseSummary {
     /// `read_failures == 0` or when failures are spread across
     /// non-kconfig files.
     pub kernel_config_dominant: bool,
+    /// Number of `/proc/<tid>/sched` PN_SCHEDSTAT dotted-ns
+    /// values whose integer part read as negative (kernel emitted
+    /// a leading `-`, e.g. `-5.000000`). The capture-side parser
+    /// (`parsed_ns_from_dotted`) rejects negative integer parts —
+    /// a `u64` parse cannot accept the sign — and the call site
+    /// then `unwrap_or(0)`s the resulting `None` per the
+    /// best-effort capture contract. Without this counter the
+    /// silent fold to zero leaves operators with no visibility
+    /// into the rate at which schedstat values were silently
+    /// truncated.
+    ///
+    /// Counts per-field-occurrence, NOT per-thread: a single
+    /// tid that exposed five negative dotted fields contributes
+    /// `5` to this counter (e.g. one tid with negative `wait_sum`,
+    /// `sleep_max`, `block_sum`, `iowait_sum`, and `exec_max`
+    /// adds 5). The denominator for "fraction of tids affected"
+    /// is therefore NOT this field — pair with
+    /// [`Self::tids_walked`] only as an upper bound on
+    /// affected-tid count.
+    ///
+    /// Distinct from [`Self::read_failures`]: a negative dotted
+    /// value comes from a `sched` file that READ successfully —
+    /// it is a parse-level signal, not a read-level signal. The
+    /// field stays at zero on a clean host because the kernel
+    /// emits non-negative values on every well-behaved schedstat
+    /// path; non-zero values are most commonly the result of
+    /// clock-skew on suspend/resume where a `delta` calculation
+    /// against a stale baseline lands negative.
+    ///
+    /// Ghost-filter discipline: per-tid bumps are held pending
+    /// (alongside the read-failure bumps in
+    /// [`crate::host_state`]'s capture-side `ParseTally`), and
+    /// unwound via `discard_pending` when the surrounding tid is
+    /// rejected by the empty-comm + zero-start ghost filter so a
+    /// busy host with mid-capture exits doesn't inflate this
+    /// counter with bumps that correspond to threads the snapshot
+    /// doesn't even contain.
+    pub negative_dotted_values: u64,
 }
 
 impl HostStateParseSummary {
@@ -672,7 +720,13 @@ pub struct ThreadState {
     /// Wakeups attributed to the idle path; `/proc/<tid>/sched`
     /// `nr_wakeups_idle`. KNOWN DEAD COUNTER — never incremented
     /// in mainline (registered for parser-completeness).
-    /// `MonotonicCount`.
+    /// Currently typed `MonotonicCount` for parser uniformity;
+    /// migration to [`crate::metric_types::DeadCounter`] is queued
+    /// (it requires a no-op aggregation arm in `AggRule` and a
+    /// registry edit, both deliberately out of scope for this
+    /// batch). The newtype already exists with no reduction trait
+    /// impls so a future field-level flip will fail to compile
+    /// against any `Summable`-bound `AggRule` variant.
     pub nr_wakeups_idle: crate::metric_types::MonotonicCount,
     /// Wakeups onto this CPU (cache-affine wakeup
     /// fast-path). `/proc/<tid>/sched` `nr_wakeups_affine`,
@@ -703,7 +757,16 @@ pub struct ThreadState {
     /// Migrations skipped under cache-cold heuristic (the source
     /// CPU's cache was deemed too cold to warrant moving).
     /// `/proc/<tid>/sched` `nr_migrations_cold`, plain u64 via
-    /// `P_SCHEDSTAT`. Zero on kernels without `CONFIG_SCHEDSTATS`.
+    /// `P_SCHEDSTAT`. KNOWN DEAD COUNTER — no kernel writer
+    /// touches `p->stats.nr_migrations_cold` on any current
+    /// 6.16 / 7.1 code path; the field is preserved in
+    /// `task_struct` for `/proc/<tid>/sched` line-number
+    /// stability. Currently typed `MonotonicCount` for parser
+    /// uniformity; migration to
+    /// [`crate::metric_types::DeadCounter`] is queued (requires
+    /// a no-op aggregation arm in `AggRule` and a registry
+    /// edit, deliberately out of scope for this batch). Zero on
+    /// kernels without `CONFIG_SCHEDSTATS` regardless.
     pub nr_migrations_cold: crate::metric_types::MonotonicCount,
     /// Migrations forced by load balance (the load balancer
     /// migrated the task even though the local heuristic would
@@ -992,7 +1055,11 @@ pub struct ThreadState {
     /// compatibility with downstream kernels that may wire the
     /// increment. Always zero on mainline 6.x. Mirrors the
     /// existing `nr_wakeups_idle` and `nr_migrations_cold`
-    /// dead-counter precedent.
+    /// dead-counter precedent. Currently typed `MonotonicCount`
+    /// for parser uniformity; migration to
+    /// [`crate::metric_types::DeadCounter`] is queued (requires
+    /// a no-op aggregation arm in `AggRule` and a registry
+    /// edit, deliberately out of scope for this batch).
     pub nr_wakeups_passive: crate::metric_types::MonotonicCount,
     /// Cumulative time this task forced its SMT sibling idle for
     /// core-scheduling, in nanoseconds. `/proc/<tid>/sched`
@@ -1167,7 +1234,7 @@ pub struct ThreadState {
     // gate, and `CONFIG_TASK_IO_ACCOUNTING` `depends on`
     // `CONFIG_TASK_XACCT` in `init/Kconfig` — so from the
     // procfs-reader perspective the file either appears with all
-    // 6 fields or doesn't appear at all. The XACCT split that
+    // 7 fields or doesn't appear at all. The XACCT split that
     // sometimes shows up in kernel commentary describes the
     // increment-side path, not the procfs surface; for the
     // capture pipeline the relevant gate is `CONFIG_TASK_IO_ACCOUNTING`
@@ -1188,6 +1255,33 @@ pub struct ThreadState {
     /// Bytes that hit the storage device on write
     /// (post-writeback). Gated by `CONFIG_TASK_IO_ACCOUNTING`.
     pub write_bytes: crate::metric_types::Bytes,
+    /// Bytes the kernel deaccounted from a prior dirty-write
+    /// because the page was reclaimed without writeback (truncate,
+    /// inode invalidation). `/proc/<tid>/io` 7th line, gated by
+    /// `CONFIG_TASK_IO_ACCOUNTING`.
+    ///
+    /// `include/linux/task_io_accounting_ops.h:39-42`
+    /// (`task_io_account_cancelled_write`) increments
+    /// `current->ioac.cancelled_write_bytes` — i.e. the value
+    /// records on the task that triggers the deaccount
+    /// (the truncating / unmapping task), NOT the original
+    /// writer. Sole call site is `folio_account_cleaned`
+    /// (`mm/page-writeback.c:2628`), invoked when a dirty folio
+    /// is reclaimed without going through writeback.
+    ///
+    /// Operationally this is a "negative write" signal — bytes
+    /// the kernel previously charged to a thread's `wchar`
+    /// pipeline that never ended up on disk. Higher values mean
+    /// more wasted writeback intent. Per-thread interpretation
+    /// is asymmetric vs. [`Self::write_bytes`]: a thread's
+    /// `cancelled_write_bytes` does NOT correspond to its own
+    /// `write_bytes` — the writer and the canceller may be
+    /// distinct tasks. Group-level Sum across a registry-grouped
+    /// bucket is therefore meaningful (total bytes the bucket's
+    /// threads cancelled), but per-thread `actual_write_bytes
+    /// = write_bytes - cancelled_write_bytes` is NOT defined for
+    /// that reason — the two counters track different parties.
+    pub cancelled_write_bytes: crate::metric_types::Bytes,
 }
 
 impl Default for ThreadState {
@@ -1257,6 +1351,7 @@ impl Default for ThreadState {
             syscw: Default::default(),
             read_bytes: Default::default(),
             write_bytes: Default::default(),
+            cancelled_write_bytes: Default::default(),
         }
     }
 }
@@ -2122,6 +2217,7 @@ struct IoFields {
     syscw: Option<u64>,
     read_bytes: Option<u64>,
     write_bytes: Option<u64>,
+    cancelled_write_bytes: Option<u64>,
 }
 
 /// Parse `/proc/<tgid>/task/<tid>/io` (line-oriented
@@ -2140,6 +2236,7 @@ fn parse_io(raw: &str) -> IoFields {
             "syscw" => out.syscw = parsed,
             "read_bytes" => out.read_bytes = parsed,
             "write_bytes" => out.write_bytes = parsed,
+            "cancelled_write_bytes" => out.cancelled_write_bytes = parsed,
             _ => {}
         }
     }
@@ -2375,6 +2472,39 @@ struct SchedFields {
     ext_enabled: Option<bool>,
 }
 
+/// Outcome of [`parsed_ns_from_dotted`]. Distinguishes the two
+/// failure modes the caller may want to treat separately:
+/// [`Self::Negative`] (kernel emitted a value with a leading
+/// `-`, observable on clock-skew / suspend-resume hosts) is
+/// counted into [`HostStateParseSummary::negative_dotted_values`]
+/// so an operator can see that the snapshot's schedstat values
+/// are routinely negative-and-zeroed; [`Self::Malformed`]
+/// (non-numeric, empty, overflow) is the every-other failure
+/// mode and stays silent (the data source is ill-formed in a way
+/// the operator can't act on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseDottedNs {
+    /// Trimmed input started with `-` — the kernel's PN_SCHEDSTAT
+    /// `%Ld.%06ld` format emitted a negative integer part. The
+    /// `parse::<u64>()` rejection is by design (u64 cannot
+    /// represent the sign) but the SIGNAL is meaningful: a
+    /// negative schedstat field is rare and worth surfacing
+    /// rather than silently zeroing.
+    ///
+    /// Note: `-0.000000` would also route here, but is
+    /// unreachable from real kernel output — `SPLIT_NS(0)`
+    /// yields `(0, 0)` which `%Ld.%06ld` formats as
+    /// `0.000000` with no leading sign. The parser still
+    /// classifies the unreachable shape as `Negative` rather
+    /// than special-casing it; a fixture that synthesizes
+    /// `-0.000000` directly will land in this variant.
+    Negative,
+    /// Otherwise unparseable: non-numeric integer or fractional
+    /// part, empty input, or u64 overflow on the
+    /// `ms * 1_000_000 + ns_remainder` reconstruction.
+    Malformed,
+}
+
 /// Parse a `PN_SCHEDSTAT`-emitted dotted nanosecond value into
 /// full ns. The kernel formats schedstat fractional fields via
 /// `__PSN(S, F) SEQ_printf(m, "%-45s:%14Ld.%06ld\n", S, SPLIT_NS(F))`
@@ -2389,25 +2519,69 @@ struct SchedFields {
 /// becomes `.999000` (=999_000 ns). Truncates fractional widths
 /// >6 to the first 6 digits.
 ///
-/// Returns `None` for unparseable input (negative integer part,
-/// non-numeric, overflow). Negative integer parts (kernel emits
-/// `-5.000000` for a negative SPLIT_NS via `%Ld`) collapse to
-/// None at the SchedFields layer; the capture site
-/// `unwrap_or(0)`s these into the absent-counter zero per the
-/// best-effort capture contract.
+/// Returns [`Err(ParseDottedNs::Negative)`] when EITHER:
+/// - the trimmed integer part starts with `-` (kernel emitted
+///   `-5.000000` for a magnitude ≥ 1ms negative SPLIT_NS via
+///   `%Ld`), OR
+/// - the trimmed fractional part starts with `-` (kernel
+///   emitted `0.-000500` for a sub-millisecond negative
+///   SPLIT_NS — `%Ld` on the `(x / 1_000_000)` integer part
+///   yields `0` with no sign for x in `(-1_000_000, 0)`, and
+///   `%06ld` on the `(x % 1_000_000)` remainder yields the
+///   `-`). The sub-millisecond shape is the COMMON case for
+///   clock-skew bugs because most schedstat deltas land
+///   sub-millisecond — missing it would defeat the
+///   negative-detection contract on the bulk of real
+///   negatives.
+///
+/// The caller records the bump in the per-snapshot
+/// [`HostStateParseSummary::negative_dotted_values`] before
+/// folding to zero. Returns [`Err(ParseDottedNs::Malformed)`]
+/// for any other parse failure (non-numeric, empty, overflow);
+/// the caller folds to zero silently per the best-effort capture
+/// contract.
 ///
 /// The bare-integer (no dot) branch parses the value as raw ns
 /// — used for test fixtures and graceful degradation; the
 /// kernel's PN_SCHEDSTAT format always emits the dotted form.
-fn parsed_ns_from_dotted(value: &str) -> Option<u64> {
+/// Same negative-vs-malformed split applies to the bare-integer
+/// branch so a stray bare-integer negative is also tallied.
+fn parsed_ns_from_dotted(value: &str) -> Result<u64, ParseDottedNs> {
     if let Some((ms_str, ns_str)) = value.split_once('.') {
-        let ms = ms_str.trim().parse::<u64>().ok()?;
+        let ms_trimmed = ms_str.trim();
+        if ms_trimmed.starts_with('-') {
+            return Err(ParseDottedNs::Negative);
+        }
+        // Sub-millisecond negative: kernel `%06ld` on a negative
+        // remainder yields a leading `-` on the fractional side
+        // even when the integer side is `0`. `0.-000500` is the
+        // canonical shape for SPLIT_NS of a small (>-1ms)
+        // negative — the integer-only check above misses it,
+        // and it is the COMMON case for clock-skew bugs since
+        // most schedstat deltas land sub-millisecond. Check the
+        // fractional side BEFORE the chars().take(6) truncation
+        // would otherwise swallow a sign-only fractional like
+        // `-`.
+        if ns_str.trim_start().starts_with('-') {
+            return Err(ParseDottedNs::Negative);
+        }
+        let ms = ms_trimmed
+            .parse::<u64>()
+            .map_err(|_| ParseDottedNs::Malformed)?;
         let ns_part: String = ns_str.chars().take(6).collect();
         let padded = format!("{:0<6}", ns_part);
-        let ns = padded.parse::<u64>().ok()?;
-        ms.checked_mul(1_000_000)?.checked_add(ns)
+        let ns = padded
+            .parse::<u64>()
+            .map_err(|_| ParseDottedNs::Malformed)?;
+        ms.checked_mul(1_000_000)
+            .and_then(|x| x.checked_add(ns))
+            .ok_or(ParseDottedNs::Malformed)
     } else {
-        value.trim().parse::<u64>().ok()
+        let trimmed = value.trim();
+        if trimmed.starts_with('-') {
+            return Err(ParseDottedNs::Negative);
+        }
+        trimmed.parse::<u64>().map_err(|_| ParseDottedNs::Malformed)
     }
 }
 
@@ -2424,8 +2598,26 @@ fn parsed_ns_from_dotted(value: &str) -> Option<u64> {
 /// [`parsed_ns_from_dotted`]. P_SCHEDSTAT fields
 /// (`wait_count`, `iowait_count`, `nr_wakeups*`,
 /// `nr_migrations`) emit plain integers — parsed as `u64`.
-fn parse_sched(raw: &str) -> SchedFields {
+///
+/// `tally`, when supplied, records each negative dotted-ns parse
+/// outcome via [`ParseTally::record_negative_dotted`] so the
+/// per-snapshot summary surfaces the rate at which schedstat
+/// fields were silently zeroed. `&mut None` skips the recording —
+/// the synthetic-tree test path that doesn't carry a tally.
+fn parse_sched(raw: &str, tally: &mut Option<&mut ParseTally>) -> SchedFields {
     let mut out = SchedFields::default();
+    let mut parse_dotted = |value: &str| -> Option<u64> {
+        match parsed_ns_from_dotted(value) {
+            Ok(v) => Some(v),
+            Err(ParseDottedNs::Negative) => {
+                if let Some(t) = tally.as_mut() {
+                    t.record_negative_dotted();
+                }
+                None
+            }
+            Err(ParseDottedNs::Malformed) => None,
+        }
+    };
     for line in raw.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -2458,9 +2650,9 @@ fn parse_sched(raw: &str) -> SchedFields {
             "nr_failed_migrations_affine" => out.nr_failed_migrations_affine = parsed_u64(),
             "nr_failed_migrations_running" => out.nr_failed_migrations_running = parsed_u64(),
             "nr_failed_migrations_hot" => out.nr_failed_migrations_hot = parsed_u64(),
-            "wait_sum" => out.wait_sum = parsed_ns_from_dotted(value),
+            "wait_sum" => out.wait_sum = parse_dotted(value),
             "wait_count" => out.wait_count = parsed_u64(),
-            "wait_max" => out.wait_max = parsed_ns_from_dotted(value),
+            "wait_max" => out.wait_max = parse_dotted(value),
             // Kernel emits `sum_sleep_runtime` (see
             // `kernel/sched/debug.c` -> `proc_sched_show_task`); the
             // matching ThreadState field is named `sleep_sum` for
@@ -2468,26 +2660,26 @@ fn parse_sched(raw: &str) -> SchedFields {
             // The kernel does not emit a `sleep_count` counterpart;
             // `nr_wakeups` (matched above) covers the wake-side
             // event tally.
-            "sum_sleep_runtime" => out.sleep_sum = parsed_ns_from_dotted(value),
-            "sleep_max" => out.sleep_max = parsed_ns_from_dotted(value),
+            "sum_sleep_runtime" => out.sleep_sum = parse_dotted(value),
+            "sleep_max" => out.sleep_max = parse_dotted(value),
             // Kernel emits `sum_block_runtime`; the matching
             // ThreadState field is `block_sum` for symmetry with
             // the other `*_sum` fields. There is no `block_count`
             // counterpart from the kernel — the schedstat printout
             // pairs `wait_sum/wait_count` and `iowait_sum/iowait_count`
             // but `sum_block_runtime` has no per-event counter.
-            "sum_block_runtime" => out.block_sum = parsed_ns_from_dotted(value),
-            "block_max" => out.block_max = parsed_ns_from_dotted(value),
-            "iowait_sum" => out.iowait_sum = parsed_ns_from_dotted(value),
+            "sum_block_runtime" => out.block_sum = parse_dotted(value),
+            "block_max" => out.block_max = parse_dotted(value),
+            "iowait_sum" => out.iowait_sum = parse_dotted(value),
             "iowait_count" => out.iowait_count = parsed_u64(),
-            "exec_max" => out.exec_max = parsed_ns_from_dotted(value),
-            "slice_max" => out.slice_max = parsed_ns_from_dotted(value),
+            "exec_max" => out.exec_max = parse_dotted(value),
+            "slice_max" => out.slice_max = parse_dotted(value),
             // P_SCHEDSTAT plain integer; KNOWN dead counter on
             // mainline (ThreadState doc explains).
             "nr_wakeups_passive" => out.nr_wakeups_passive = parsed_u64(),
             // PN_SCHEDSTAT dotted ns; CONFIG_SCHED_CORE-gated. Same
             // ms.ns reconstruction as wait_sum / sleep_sum.
-            "core_forceidle_sum" => out.core_forceidle_sum = parsed_ns_from_dotted(value),
+            "core_forceidle_sum" => out.core_forceidle_sum = parse_dotted(value),
             // P plain integer in ns. The kernel emits this only
             // for fair-policy tasks (`fair_policy(p->policy)` at
             // debug.c:1363); for other policies the line is absent
@@ -2500,7 +2692,8 @@ fn parse_sched(raw: &str) -> SchedFields {
 }
 
 /// Read `<proc_root>/<tgid>/task/<tid>/sched` and parse fields.
-/// Records a `"sched"` failure into `tally` on read error.
+/// Records a `"sched"` failure into `tally` on read error, plus
+/// per-line negative-dotted-value bumps via `parse_sched`.
 fn read_sched_at_with_tally(
     proc_root: &Path,
     tgid: i32,
@@ -2508,7 +2701,7 @@ fn read_sched_at_with_tally(
     tally: &mut Option<&mut ParseTally>,
 ) -> SchedFields {
     match fs::read_to_string(task_file(proc_root, tgid, tid, "sched")) {
-        Ok(raw) => parse_sched(&raw),
+        Ok(raw) => parse_sched(&raw, tally),
         Err(_) => {
             if let Some(t) = tally.as_mut() {
                 t.record_failure("sched");
@@ -2983,6 +3176,7 @@ fn capture_thread_at_with_tally(
         syscw: MonotonicCount(io.syscw.unwrap_or(0)),
         read_bytes: Bytes(io.read_bytes.unwrap_or(0)),
         write_bytes: Bytes(io.write_bytes.unwrap_or(0)),
+        cancelled_write_bytes: Bytes(io.cancelled_write_bytes.unwrap_or(0)),
     }
 }
 
@@ -3103,6 +3297,19 @@ struct ParseTally {
     /// Per-tid pending bumps held until the caller commits or
     /// discards based on the ghost filter. Cleared between tids.
     pending_failures: Vec<&'static str>,
+    /// Committed total of negative dotted-ns values seen across
+    /// the snapshot. The kernel's PN_SCHEDSTAT path (`%Ld.%06ld`
+    /// in `kernel/sched/debug.c`) emits a leading `-` when a
+    /// schedstat field carries a negative integer part — rare but
+    /// observable on clock-skew / suspend-resume hosts. The
+    /// capture-side parser previously folded these into the
+    /// absent-counter zero silently; this tally surfaces the
+    /// rate so an operator can spot a host whose schedstat values
+    /// are routinely negative-and-zeroed.
+    negative_dotted_values: u64,
+    /// Per-tid pending negative-dotted bumps held until
+    /// commit / discard, mirroring [`Self::pending_failures`].
+    pending_negative_dotted: u64,
 }
 
 impl ParseTally {
@@ -3113,12 +3320,23 @@ impl ParseTally {
         self.pending_failures.push(file_kind);
     }
 
+    /// Record a negative dotted-ns value seen during sched parse
+    /// for the current tid. Held pending until
+    /// [`Self::commit_pending`] / [`Self::discard_pending`].
+    fn record_negative_dotted(&mut self) {
+        self.pending_negative_dotted = self.pending_negative_dotted.saturating_add(1);
+    }
+
     /// Commit the current tid's pending failures to the per-snapshot
     /// tally. Called when the tid lands in the snapshot.
     fn commit_pending(&mut self) {
         for kind in self.pending_failures.drain(..) {
             *self.failures_by_file.entry(kind).or_insert(0) += 1;
         }
+        self.negative_dotted_values = self
+            .negative_dotted_values
+            .saturating_add(self.pending_negative_dotted);
+        self.pending_negative_dotted = 0;
     }
 
     /// Discard the current tid's pending failures. Called when the
@@ -3127,6 +3345,7 @@ impl ParseTally {
     /// inflate the summary.
     fn discard_pending(&mut self) {
         self.pending_failures.clear();
+        self.pending_negative_dotted = 0;
     }
 
     /// Total failures across every file kind. Read-side mirror of
@@ -3178,6 +3397,7 @@ impl ParseTally {
             read_failures_by_file: by_file,
             dominant_read_failure: self.dominant_file().map(|t| t.to_string()),
             kernel_config_dominant: self.kernel_config_dominates(),
+            negative_dotted_values: self.negative_dotted_values,
         }
     }
 }
@@ -3334,6 +3554,40 @@ fn probe_thread_recording(
             (0, 0)
         }
     }
+}
+
+/// Emit the once-per-snapshot parse-summary line. Mirrors the
+/// [`emit_probe_summary`] discipline: one info-level line with the
+/// per-snapshot tally counts. Includes the dominant failure file
+/// kind when any read failures landed, the kernel-config
+/// remediation hint when `schedstat` / `io` dominate, and the
+/// negative-dotted-value count when the parser saw any
+/// schedstat fields with a leading `-`. The clauses are
+/// suppressed when their underlying signal is zero so a clean
+/// host emits a single short line.
+fn emit_parse_summary(tally: &ParseTally) {
+    let tids_walked = tally.tids_walked;
+    let read_failures = tally.total_failures();
+    let negative_dotted = tally.negative_dotted_values;
+    let dominant_clause = tally
+        .dominant_file()
+        .map(|tag| format!(" (dominant: {tag})"))
+        .unwrap_or_default();
+    let kconfig_clause = if tally.kernel_config_dominates() {
+        format!("; {PARSE_KCONFIG_HINT}")
+    } else {
+        String::new()
+    };
+    let negative_clause = if negative_dotted > 0 {
+        format!(", {negative_dotted} negative-dotted values")
+    } else {
+        String::new()
+    };
+    tracing::info!(
+        "host-state parse: {tids_walked} tids walked, \
+         {read_failures} read failures{negative_clause}\
+         {dominant_clause}{kconfig_clause}",
+    );
 }
 
 /// Emit the once-per-snapshot summary line. Includes the dominant
@@ -3711,6 +3965,7 @@ fn capture_with(
         None
     };
     let parse_summary = if use_syscall_affinity {
+        emit_parse_summary(&parse_tally);
         Some(parse_tally.to_public())
     } else {
         None
@@ -3893,6 +4148,7 @@ fn capture_pid_with(
         None
     };
     let parse_summary = if use_syscall_affinity {
+        emit_parse_summary(&parse_tally);
         Some(parse_tally.to_public())
     } else {
         None
@@ -3933,10 +4189,8 @@ pub fn capture_to(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
     use crate::metric_types::{
-        Bytes, CategoricalString, ClockTicks, CpuSet, GaugeCount, GaugeNs, MonotonicCount,
-        MonotonicNs, OrdinalI32, OrdinalU32, PeakNs,
+        Bytes, CategoricalString, CpuSet, MonotonicCount, MonotonicNs, OrdinalI32,
     };
     use tracing_test::traced_test;
 
@@ -4096,7 +4350,8 @@ mod tests {
             "syscr": 10,
             "syscw": 20,
             "read_bytes": 4096,
-            "write_bytes": 8192
+            "write_bytes": 8192,
+            "cancelled_write_bytes": 1024
         }"#;
         let t: ThreadState = serde_json::from_str(json).expect("deserialize");
         // One representative field per newtype family proves
@@ -4105,6 +4360,12 @@ mod tests {
         assert_eq!(t.timeslices, crate::metric_types::MonotonicCount(50));
         assert_eq!(t.utime_clock_ticks, crate::metric_types::ClockTicks(10));
         assert_eq!(t.allocated_bytes, crate::metric_types::Bytes(16_777_216));
+        assert_eq!(
+            t.cancelled_write_bytes,
+            crate::metric_types::Bytes(1024),
+            "cancelled_write_bytes round-trips through the JSON \
+             wire format alongside the other Bytes-typed fields",
+        );
         assert_eq!(t.wait_max, crate::metric_types::PeakNs(250_000));
         assert_eq!(t.fair_slice_ns, crate::metric_types::GaugeNs(250_000));
         assert_eq!(t.nr_threads, crate::metric_types::GaugeCount(4));
@@ -4131,6 +4392,18 @@ mod tests {
     fn nr_threads_field_pinned_to_gauge_count() {
         let t = ThreadState::default();
         let _: crate::metric_types::GaugeCount = t.nr_threads;
+    }
+
+    /// Type-pin: cancelled_write_bytes MUST be `Bytes`. A future
+    /// refactor that flipped it to a non-byte type (e.g. plain
+    /// `MonotonicCount`, dropping the IEC-binary auto-scale
+    /// ladder and the registry's `unit: "B"` rendering) would
+    /// break this single `let _: Bytes = ...;` assignment. The
+    /// test compiles only when the type is exactly `Bytes`.
+    #[test]
+    fn cancelled_write_bytes_field_pinned_to_bytes() {
+        let t = ThreadState::default();
+        let _: crate::metric_types::Bytes = t.cancelled_write_bytes;
     }
 
     #[test]
@@ -4327,7 +4600,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_io_extracts_all_six_fields() {
+    fn parse_io_extracts_all_seven_fields() {
         let raw = "rchar: 1\n\
                    wchar: 2\n\
                    syscr: 3\n\
@@ -4342,6 +4615,7 @@ mod tests {
         assert_eq!(f.syscw, Some(4));
         assert_eq!(f.read_bytes, Some(5));
         assert_eq!(f.write_bytes, Some(6));
+        assert_eq!(f.cancelled_write_bytes, Some(7));
     }
 
     #[test]
@@ -5100,7 +5374,7 @@ mod tests {
                    se.nr_migrations                    :     42\n\
                    se.statistics.nr_wakeups_local      :     600\n\
                    se.statistics.wait_sum              :     12345.678\n";
-        let f = parse_sched(raw);
+        let f = parse_sched(raw, &mut None);
         assert_eq!(f.nr_wakeups, Some(1000));
         assert_eq!(f.nr_migrations, Some(42));
         assert_eq!(f.nr_wakeups_local, Some(600));
@@ -5494,7 +5768,8 @@ mod tests {
              syscr: 10\n\
              syscw: 20\n\
              read_bytes: 4096\n\
-             write_bytes: 8192\n";
+             write_bytes: 8192\n\
+             cancelled_write_bytes: 512\n";
         fs::write(task_dir.join("io"), io).unwrap();
 
         // sched: every parse_sched-matched key, with the
@@ -5666,13 +5941,19 @@ mod tests {
         assert_eq!(t.nonvoluntary_csw, MonotonicCount(7));
         assert_eq!(t.cpu_affinity, CpuSet(vec![0, 1, 2, 3]));
 
-        // io — six cumulative counters.
+        // io — seven cumulative counters.
         assert_eq!(t.rchar, Bytes(100));
         assert_eq!(t.wchar, Bytes(200));
         assert_eq!(t.syscr, MonotonicCount(10));
         assert_eq!(t.syscw, MonotonicCount(20));
         assert_eq!(t.read_bytes, Bytes(4096));
         assert_eq!(t.write_bytes, Bytes(8192));
+        assert_eq!(
+            t.cancelled_write_bytes,
+            Bytes(512),
+            "cancelled_write_bytes round-trips from the 7th line of \
+             /proc/<tid>/io",
+        );
 
         // sched — every wakeup field, migrations (including the
         // five new failed/forced/cold/affine variants), the four
@@ -6240,6 +6521,7 @@ mod tests {
         assert_eq!(t.syscw, MonotonicCount(0));
         assert_eq!(t.read_bytes, Bytes(0));
         assert_eq!(t.write_bytes, Bytes(0));
+        assert_eq!(t.cancelled_write_bytes, Bytes(0));
         // stat-derived fields still populate.
         assert_eq!(t.start_time_clock_ticks, 555_555);
     }
@@ -6845,7 +7127,7 @@ mod tests {
              se.statistics.exec_max                         :        90\n\
              se.statistics.slice_max                        :       400\n\
              ext.enabled                                    :          1\n";
-        let s = parse_sched(raw);
+        let s = parse_sched(raw, &mut None);
         assert_eq!(s.nr_wakeups, Some(11));
         assert_eq!(s.nr_wakeups_local, Some(8));
         assert_eq!(s.nr_wakeups_remote, Some(3));
@@ -6894,9 +7176,9 @@ mod tests {
     /// the absent default. Pins the bool round-trip.
     #[test]
     fn parse_sched_ext_enabled_zero_and_absent() {
-        let zero = parse_sched("ext.enabled : 0\n");
+        let zero = parse_sched("ext.enabled : 0\n", &mut None);
         assert_eq!(zero.ext_enabled, Some(false));
-        let absent = parse_sched("nr_wakeups : 1\n");
+        let absent = parse_sched("nr_wakeups : 1\n", &mut None);
         assert_eq!(absent.ext_enabled, None);
     }
 
@@ -6910,7 +7192,7 @@ mod tests {
         // foo.enabled is not a real kernel key, but proves the
         // full-key gate: rsplit yields `enabled`, but the match
         // arm only fires on the exact key `ext.enabled`.
-        let s = parse_sched("foo.enabled : 1\n");
+        let s = parse_sched("foo.enabled : 1\n", &mut None);
         assert_eq!(s.ext_enabled, None);
     }
 
@@ -6925,7 +7207,7 @@ mod tests {
              sum_sleep_runtime                              :     678.9\n\
              sum_block_runtime                              :      42.1\n\
              iowait_sum                                     :       7.999\n";
-        let s = parse_sched(raw);
+        let s = parse_sched(raw, &mut None);
         // 1234.5 → .5 pads to .500000 (=500_000) + 1234ms = 1_234_500_000 ns
         assert_eq!(s.wait_sum, Some(1_234_500_000));
         // 678.9 → .9 pads to .900000 (=900_000) + 678ms = 678_900_000 ns
@@ -6941,15 +7223,249 @@ mod tests {
     /// `unwrap_or(0)`s these into the absent-counter zero per the
     /// best-effort capture contract, so a kernel that emits a
     /// negative SPLIT_NS (rare; can happen for clock skew on
-    /// suspend/resume) does not pollute downstream metrics.
+    /// suspend/resume) does not pollute downstream metrics. The
+    /// tally arg is `&mut None` here — the no-tally branch must
+    /// still produce None for the negative case so synthetic-tree
+    /// tests that don't carry a tally still observe the
+    /// pre-tally semantics.
     #[test]
     fn parse_sched_negative_value_returns_none() {
         let raw = "wait_sum                                       :   -5.0\n";
-        let s = parse_sched(raw);
+        let s = parse_sched(raw, &mut None);
         assert_eq!(
             s.wait_sum, None,
             "negative ms part fails u64 parse → None; downstream \
              unwrap_or(0) collapses this to absent-counter zero",
+        );
+    }
+
+    /// Negative dotted-ns value records into the [`ParseTally`]
+    /// when one is supplied — pinning the tally-bump path so a
+    /// regression that drops the per-line negative detection
+    /// surfaces here rather than silently zeroing schedstat
+    /// fields. Multiple negative lines bump independently;
+    /// non-negative lines on the same parse pass do NOT bump.
+    #[test]
+    fn parse_sched_negative_value_records_into_tally() {
+        let raw = "wait_sum                                       :   -5.0\n\
+                   sum_sleep_runtime                              :   12.5\n\
+                   sum_block_runtime                              :  -10.0\n";
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        let s = parse_sched(raw, &mut tally_opt);
+        assert_eq!(
+            s.wait_sum, None,
+            "negative wait_sum still reads None — the tally records \
+             but does not change the per-field outcome",
+        );
+        assert_eq!(
+            s.sleep_sum,
+            Some(12_500_000),
+            "non-negative neighbor still parses normally",
+        );
+        assert_eq!(s.block_sum, None, "negative block_sum reads None");
+        // 2 negative dotted values landed in pending. Commit
+        // through the Option-wrapped tally (NLL: while `tally_opt`
+        // holds &mut tally, direct access to `tally` would be
+        // a borrow-check error).
+        tally_opt.as_mut().unwrap().commit_pending();
+        // After this point, `tally_opt` is no longer used — NLL
+        // releases the inner borrow so `tally` is reborrowable.
+        let summary = tally.to_public();
+        assert_eq!(
+            summary.negative_dotted_values, 2,
+            "two negative dotted lines bumped the per-snapshot \
+             negative_dotted_values counter; non-negative neighbor \
+             did not contribute",
+        );
+    }
+
+    /// Ghost-filter discipline for the negative-dotted tally: a
+    /// tid whose pending bumps are unwound via
+    /// [`ParseTally::discard_pending`] must not contribute to
+    /// the per-snapshot
+    /// [`HostStateParseSummary::negative_dotted_values`]. Mirrors
+    /// the read-failure tally's discard semantics so the two
+    /// tally families stay symmetric under the ghost-filter
+    /// path.
+    #[test]
+    fn parse_tally_negative_dotted_discard_pending_unwinds_bumps() {
+        let raw = "wait_sum :   -5.0\n";
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        let _ = parse_sched(raw, &mut tally_opt);
+        // Pending bump landed; discard_pending must unwind it
+        // before commit so the ghost-filtered tid leaves no trace
+        // in the public surface. Same NLL-through-Option pattern
+        // as `parse_sched_negative_value_records_into_tally`.
+        tally_opt.as_mut().unwrap().discard_pending();
+        let summary = tally.to_public();
+        assert_eq!(
+            summary.negative_dotted_values, 0,
+            "discard_pending must unwind the negative-dotted \
+             pending bump so a ghost-filtered tid does not \
+             pollute the per-snapshot tally",
+        );
+    }
+
+    /// Tally accumulates across multiple commits (multi-tid path
+    /// — production captures invoke `parse_sched` once per tid
+    /// and `commit_pending` between them). Pin that negative
+    /// bumps from a SECOND tid land additively on top of the
+    /// first tid's contribution rather than replacing it. Total
+    /// after two commits is the sum of pending counts at each
+    /// commit.
+    #[test]
+    fn parse_tally_negative_dotted_accumulates_across_commits() {
+        let raw_a = "wait_sum : -1.0\n";
+        let raw_b = "wait_sum   : -2.0\n\
+                     sleep_max  : -3.0\n";
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        let _ = parse_sched(raw_a, &mut tally_opt);
+        // Commit tid A's 1 pending bump.
+        tally_opt.as_mut().unwrap().commit_pending();
+        // Now parse tid B's 2 pending bumps.
+        let _ = parse_sched(raw_b, &mut tally_opt);
+        tally_opt.as_mut().unwrap().commit_pending();
+        let summary = tally.to_public();
+        assert_eq!(
+            summary.negative_dotted_values, 3,
+            "1 commit + 2 commit = 3 total — multi-tid commits \
+             must add, not overwrite. got {}",
+            summary.negative_dotted_values,
+        );
+    }
+
+    /// All-positive dotted input MUST NOT bump the
+    /// `negative_dotted_values` counter. Pins that the negative
+    /// detection is gated on the leading `-`, not triggered by
+    /// any other parse path. Without this, a regression that
+    /// always-bumped (e.g. moving the bump out of the Err arm)
+    /// would let a clean host emit a non-zero count.
+    #[test]
+    fn parse_tally_negative_dotted_zero_for_positive_only_input() {
+        let raw = "wait_sum            : 100.5\n\
+                   sum_sleep_runtime   : 200\n\
+                   sum_block_runtime   : 0.999\n\
+                   wait_max            : 0\n\
+                   exec_max            : 7\n";
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        let _ = parse_sched(raw, &mut tally_opt);
+        tally_opt.as_mut().unwrap().commit_pending();
+        let summary = tally.to_public();
+        assert_eq!(
+            summary.negative_dotted_values, 0,
+            "all-positive dotted input must not bump the \
+             negative-dotted tally; got {}",
+            summary.negative_dotted_values,
+        );
+    }
+
+    /// Sub-millisecond negative SPLIT_NS shape: kernel emits
+    /// `0.-NNN` when the integer part is `(x / 1_000_000)` for
+    /// `x` in `(-1_000_000, 0)` — `%Ld` yields `0` (no sign
+    /// because integer division of a negative by 1M lands at
+    /// `0` not `-1`) and `%06ld` carries the negative
+    /// remainder. Without the fractional-side detection in
+    /// [`parsed_ns_from_dotted`] the integer-only check would
+    /// miss this shape entirely. Pin both the parser-level
+    /// detection and the tally-bump path.
+    #[test]
+    fn parsed_ns_from_dotted_sub_millisecond_negative_detected() {
+        // Direct parser-level shape.
+        assert_eq!(
+            parsed_ns_from_dotted("0.-000500"),
+            Err(ParseDottedNs::Negative),
+            "0.-NNN shape (sub-ms negative SPLIT_NS) MUST route \
+             through Negative — most schedstat negatives land \
+             sub-millisecond and would otherwise slip through",
+        );
+        assert_eq!(
+            parsed_ns_from_dotted("0.-1"),
+            Err(ParseDottedNs::Negative),
+            "single-digit sub-ms negative shape detected",
+        );
+        // End-to-end through parse_sched + tally.
+        let raw = "wait_sum : 0.-000500\n\
+                   sleep_max : 0.-1\n";
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        let s = parse_sched(raw, &mut tally_opt);
+        assert_eq!(
+            s.wait_sum, None,
+            "sub-ms negative wait_sum collapses to None",
+        );
+        assert_eq!(
+            s.sleep_max, None,
+            "sub-ms negative sleep_max collapses to None",
+        );
+        tally_opt.as_mut().unwrap().commit_pending();
+        let summary = tally.to_public();
+        assert_eq!(
+            summary.negative_dotted_values, 2,
+            "two sub-ms negatives both bump the tally — pins \
+             that the integer-only detection is NOT enough on \
+             its own",
+        );
+    }
+
+    /// Bare-integer (no-dot) negative value is also recorded —
+    /// the kernel's PN_SCHEDSTAT format always emits the dotted
+    /// form, but the `parsed_ns_from_dotted` function's bare
+    /// branch is exercised by the `slice` (P_SCHEDSTAT, no dot)
+    /// arm and by graceful degradation against fixtures that
+    /// drop the fractional part. A bare `-5` lands the same
+    /// `Negative` arm as `-5.0` so the tally treats both
+    /// identically.
+    ///
+    /// `wait_sum` itself is dotted-only in real kernel output,
+    /// but `parsed_ns_from_dotted`'s bare-integer fallback is
+    /// reachable via test fixtures that drop the dot — pinning
+    /// the bare-branch negative detection ensures the two
+    /// branches stay symmetric.
+    #[test]
+    fn parsed_ns_from_dotted_negative_bare_branch_records() {
+        // Direct call into the parser: bare-integer negative.
+        assert_eq!(
+            parsed_ns_from_dotted("-5"),
+            Err(ParseDottedNs::Negative),
+            "bare-integer negative routes through Negative",
+        );
+        // Dotted negative.
+        assert_eq!(
+            parsed_ns_from_dotted("-5.0"),
+            Err(ParseDottedNs::Negative),
+            "dotted negative routes through Negative",
+        );
+        // Non-numeric malformed.
+        assert_eq!(
+            parsed_ns_from_dotted("garbage"),
+            Err(ParseDottedNs::Malformed),
+            "non-numeric input routes through Malformed, not \
+             Negative — the tally must NOT bump on garbage",
+        );
+        assert_eq!(
+            parsed_ns_from_dotted("garbage.5"),
+            Err(ParseDottedNs::Malformed),
+            "non-numeric integer part with fractional routes \
+             through Malformed",
+        );
+        assert_eq!(
+            parsed_ns_from_dotted(""),
+            Err(ParseDottedNs::Malformed),
+            "empty input routes through Malformed",
+        );
+        assert_eq!(
+            parsed_ns_from_dotted("5"),
+            Ok(5),
+            "bare positive integer parses",
+        );
+        assert_eq!(
+            parsed_ns_from_dotted("5.500"),
+            Ok(5_500_000),
+            "positive dotted parses normally",
         );
     }
 
@@ -6971,7 +7487,7 @@ mod tests {
              nr_wakeups_idle                                :          4\n\
              nr_migrations_cold                             :         42\n\
              wait_max                                       :     999.5\n";
-        let s = parse_sched(raw);
+        let s = parse_sched(raw, &mut None);
         assert_eq!(s.nr_wakeups, Some(11));
         assert_eq!(s.nr_wakeups_local, Some(8));
         assert_eq!(s.nr_wakeups_remote, Some(3));
@@ -7000,7 +7516,7 @@ mod tests {
         let raw = "\
              stats.nr_wakeups                               :         42\n\
              some.other.prefix.nr_migrations                :          9\n";
-        let s = parse_sched(raw);
+        let s = parse_sched(raw, &mut None);
         assert_eq!(s.nr_wakeups, Some(42));
         assert_eq!(s.nr_migrations, Some(9));
     }
@@ -7014,7 +7530,7 @@ mod tests {
              nr_wakeups                                     :         11\n\
              fictional_new_kernel_stat                      :       9999\n\
              nr_migrations                                  :          9\n";
-        let s = parse_sched(raw);
+        let s = parse_sched(raw, &mut None);
         assert_eq!(s.nr_wakeups, Some(11));
         assert_eq!(s.nr_migrations, Some(9));
     }
@@ -7522,6 +8038,98 @@ mod tests {
         );
     }
 
+    /// Clean parse-summary emission: zero failures, zero negative
+    /// dotted values. Pins that no dominant-tag clause, no kconfig
+    /// hint, and no negative-clause render when the underlying
+    /// signals are zero. Mirrors the
+    /// `summary_emits_clean_line_when_no_failures` discipline for
+    /// the probe summary side.
+    ///
+    /// Test fn name uses `parse_summary_emits_*` rather than
+    /// `summary_emits_*` to keep the captured span text disjoint
+    /// from the asserted substrings (`tracing-test`'s
+    /// `logs_contain` matches the entire captured frame including
+    /// the span — same caveat the probe-summary emit tests
+    /// document).
+    #[traced_test]
+    #[test]
+    fn parse_summary_emits_clean_line_when_no_failures() {
+        let tally = ParseTally::default();
+        emit_parse_summary(&tally);
+        assert!(logs_contain("host-state parse:"));
+        assert!(logs_contain("0 tids walked"));
+        assert!(logs_contain("0 read failures"));
+        assert!(
+            !logs_contain("(dominant:"),
+            "no failures means the dominant clause is omitted",
+        );
+        assert!(
+            !logs_contain("hint:"),
+            "no failures means the kconfig hint is omitted",
+        );
+        assert!(
+            !logs_contain("negative-dotted"),
+            "zero negative-dotted values means the negative \
+             clause is omitted",
+        );
+    }
+
+    /// Negative-dotted clause renders when the tally carries any
+    /// negative bumps. Pins the `, N negative-dotted values`
+    /// substring so a regression that drops the clause when read
+    /// failures are zero (the emit's failure path) surfaces
+    /// here.
+    #[traced_test]
+    #[test]
+    fn parse_summary_emits_negative_dotted_clause_when_present() {
+        let mut tally = ParseTally {
+            tids_walked: 5,
+            ..ParseTally::default()
+        };
+        // Drive the negative-dotted counter through the public
+        // path: pending bumps + commit, mirroring the production
+        // capture pipeline.
+        tally.record_negative_dotted();
+        tally.record_negative_dotted();
+        tally.record_negative_dotted();
+        tally.commit_pending();
+        emit_parse_summary(&tally);
+        assert!(
+            logs_contain("3 negative-dotted values"),
+            "negative-dotted clause must surface the count when \
+             the tally is non-zero — the operator-visibility \
+             motivation depends on this rendering",
+        );
+        assert!(logs_contain("0 read failures"));
+    }
+
+    /// Kconfig hint renders alongside the dominant clause when
+    /// schedstat / io failures dominate. Pins both clauses
+    /// firing together so a refactor that conditioned them
+    /// independently surfaces here.
+    #[traced_test]
+    #[test]
+    fn parse_summary_emits_kconfig_hint_when_dominant() {
+        let mut tally = ParseTally {
+            tids_walked: 100,
+            ..ParseTally::default()
+        };
+        // 60 schedstat + 40 io = 100% kconfig share, well above
+        // the 50% gate.
+        for _ in 0..60 {
+            tally.record_failure("schedstat");
+        }
+        for _ in 0..40 {
+            tally.record_failure("io");
+        }
+        tally.commit_pending();
+        emit_parse_summary(&tally);
+        assert!(logs_contain("(dominant: schedstat)"));
+        assert!(logs_contain("hint:"));
+        assert!(logs_contain("CONFIG_SCHEDSTATS"));
+        assert!(logs_contain("CONFIG_TASK_IO_ACCOUNTING"));
+    }
+
     /// `try_attach_probe_for_tgid_at` against a known-bad pid (0,
     /// reserved by the kernel) emits a `tracing::warn!` event
     /// (not debug) because PidMissing is NOT the
@@ -7848,6 +8456,7 @@ mod tests {
             read_failures_by_file: by_file,
             dominant_read_failure: Some("schedstat".to_string()),
             kernel_config_dominant: true,
+            negative_dotted_values: 7,
         };
         let json = serde_json::to_string(&summary).unwrap();
         let back: HostStateParseSummary = serde_json::from_str(&json).unwrap();
@@ -7857,6 +8466,11 @@ mod tests {
         assert_eq!(back.read_failures_by_file.get("io"), Some(&50));
         assert_eq!(back.dominant_read_failure.as_deref(), Some("schedstat"));
         assert!(back.kernel_config_dominant);
+        assert_eq!(
+            back.negative_dotted_values, 7,
+            "negative_dotted_values surfaces in the public surface \
+             and round-trips through JSON",
+        );
     }
 
     /// `dominant_read_failure` picks the file kind with the most

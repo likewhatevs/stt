@@ -64,8 +64,12 @@ extension: `.hst.zst`).
   linked against jemalloc; glibc arena counters are opaque and
   read as zero rather than failing capture.
 - **I/O** — `rchar`, `wchar`, `syscr`, `syscw`, `read_bytes`,
-  `write_bytes` from `/proc/<tid>/io` (requires
-  `CONFIG_TASK_IO_ACCOUNTING`).
+  `write_bytes`, `cancelled_write_bytes` from `/proc/<tid>/io`
+  (requires `CONFIG_TASK_IO_ACCOUNTING`). Note that
+  `cancelled_write_bytes` records on the truncating task — not
+  the original writer — so it pairs with `write_bytes` as a
+  group-level signal but per-thread arithmetic between the two
+  is not meaningful.
 
 Every field is **cumulative-from-birth**, so the probe timing
 does not alter the output: two snapshots of the same thread at

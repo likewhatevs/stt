@@ -488,6 +488,30 @@ pub struct HostStateShowArgs {
     /// `--columns metric,value`.
     #[arg(long, default_value = "")]
     pub columns: String,
+    /// Comma-separated section names to render. Empty (the
+    /// default) renders every section that has data. When
+    /// non-empty, restricts output to the listed sub-tables —
+    /// every section not named is suppressed before its
+    /// data-availability gate runs. Valid names: `primary`,
+    /// `derived`, `cgroup-stats`, `cgroup-limits`,
+    /// `memory-stat`, `memory-events`, `pressure`,
+    /// `host-pressure`, `smaps-rollup`, `sched-ext`. Useful
+    /// for narrowing a wide show to one area of interest.
+    /// Example: `--sections primary,host-pressure`.
+    #[arg(long, default_value = "")]
+    pub sections: String,
+    /// Wrap table cells to fit the terminal width. Off by
+    /// default — wide tables can spill past the terminal edge,
+    /// matching the prior shell-pipeline-friendly layout. When
+    /// set, cells too wide for the available width wrap inside
+    /// the cell rather than overflowing, at the cost of taller
+    /// rows. The wrap kicks in only when stdout is a tty (the
+    /// terminal width is unknown otherwise); when piped to a
+    /// file or another command, the flag is silently dropped
+    /// and output stays unwrapped so awk/grep pipelines see
+    /// the same byte sequence as without the flag.
+    #[arg(long)]
+    pub wrap: bool,
 }
 
 /// RAII guard that cleans up an auto-generated cgroup directory on drop.
@@ -700,7 +724,9 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
     use anyhow::Context;
     // Parse `--sort-by` BEFORE the snapshot load so an operator
     // typo fails fast without paying for disk I/O. Mirrors
-    // run_compare's ordering for the same reason.
+    // run_compare's ordering for the same reason. `--columns`
+    // and `--sections` share the fail-fast contract — an invalid
+    // spec must surface before the snapshot read.
     let sort_by = host_state_compare::parse_sort_by(&args.sort_by)
         .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
     // `--columns` parses with compare_side=false so the
@@ -708,6 +734,17 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
     // rejected before any snapshot work begins.
     let columns = host_state_compare::parse_columns(&args.columns, false)
         .with_context(|| format!("parse --columns {:?}", args.columns))?;
+    let sections = host_state_compare::parse_sections(&args.sections)
+        .with_context(|| format!("parse --sections {:?}", args.sections))?;
+
+    // Mirror run_compare's pre-load warning: explicit
+    // `--sections cgroup-stats` (or any other cgroup-only
+    // section) under a non-cgroup `--group-by` would render
+    // zero rows for that section silently. Surface a
+    // diagnostic before the snapshot load so the operator sees
+    // it immediately.
+    host_state_compare::warn_cgroup_only_sections_under_non_cgroup(&sections, args.group_by);
+
     let snap = ktstr::host_state::HostStateSnapshot::load(&args.snapshot)
         .with_context(|| format!("load snapshot {}", args.snapshot.display()))?;
     let mut out = String::new();
@@ -721,6 +758,8 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
         args.no_cg_normalize,
         &sort_by,
         &columns,
+        &sections,
+        args.wrap,
     );
     print!("{out}");
     Ok(0)
@@ -732,6 +771,12 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
 /// rendering into a `String` buffer without shelling through
 /// stdout. Write errors propagate as [`std::fmt::Error`]; callers
 /// that write into an infallible sink (`String`) can ignore.
+///
+/// `sections` is a [`host_state_compare::Section`] filter — empty
+/// renders every section that has data, non-empty restricts to
+/// the named entries (mirrors `--sections` on `write_diff`).
+/// `wrap` chooses between `Disabled` (fixed-width, default) and
+/// `Dynamic` (terminal-width-aware) comfy-table arrangement.
 #[allow(clippy::too_many_arguments)]
 fn write_show<W: std::fmt::Write>(
     w: &mut W,
@@ -742,6 +787,8 @@ fn write_show<W: std::fmt::Write>(
     no_cg_normalize: bool,
     sort_by: &[host_state_compare::SortKey],
     columns: &[host_state_compare::Column],
+    sections: &[host_state_compare::Section],
+    wrap: bool,
 ) -> std::fmt::Result {
     let flatten = host_state_compare::compile_flatten_patterns(cgroup_flatten);
     // Single-snapshot cgroup key map. compare()'s
@@ -784,17 +831,16 @@ fn write_show<W: std::fmt::Write>(
     // `(group, threads, metric, value)`. DisplayOptions is
     // marked `#[non_exhaustive]` so we mutate the
     // default-constructed struct rather than a struct
-    // expression.
+    // expression. Plumbing wrap/sections through DisplayOptions
+    // means every section's table-builder call site below routes
+    // through `display_options.new_table()` (the wrap-aware
+    // helper) and every section emission gates on
+    // `display_options.is_section_enabled(...)`.
     let mut display_options = host_state_compare::DisplayOptions::default();
     display_options.columns = columns.to_vec();
+    display_options.sections = sections.to_vec();
+    display_options.wrap = wrap;
     let resolved_columns = display_options.resolved_show_columns();
-
-    let mut table = cli::new_table();
-    let header_row: Vec<&str> = resolved_columns
-        .iter()
-        .map(|c| c.header(group_header))
-        .collect();
-    table.set_header(header_row);
 
     // Iteration order: when `sort_by` is empty, fall through the
     // BTreeMap by-key order (alphabetical group key, registry order
@@ -806,6 +852,13 @@ fn write_show<W: std::fmt::Write>(
     // `Aggregated::numeric()` rather than `DiffRow.delta`. Within a
     // group, metrics still iterate `HOST_STATE_METRICS` so the
     // metric column lands in registry order regardless of sort.
+    //
+    // Computed once outside the section gates because every
+    // section that iterates groups (Primary + Derived) reuses
+    // it; computing inside the Primary `if` would either
+    // duplicate the work or leak the binding into a scope where
+    // a `--sections derived` invocation skips the Primary block
+    // entirely and then can't reach `group_order`.
     let group_order: Vec<&String> = if sort_by.is_empty() {
         groups.keys().collect()
     } else {
@@ -851,49 +904,61 @@ fn write_show<W: std::fmt::Write>(
         keys
     };
 
-    for key in &group_order {
-        let group = &groups[*key];
-        // Display key: pattern grouping under Comm uses grex to
-        // turn the join-key skeleton into a regex label; every
-        // other grouping renders the join key directly.
-        let display_key = if group_by == host_state_compare::GroupBy::Comm && !no_thread_normalize {
-            host_state_compare::pattern_display_label(key, &group.member_comms)
-        } else {
-            (*key).clone()
-        };
-        for metric in host_state_compare::HOST_STATE_METRICS {
-            let Some(agg) = group.metrics.get(metric.name) else {
-                continue;
-            };
-            let metric_name = host_state_compare::metric_display_name(metric).into_owned();
-            let value_cell = host_state_compare::format_value_cell(agg, metric.unit);
-            let cells: Vec<String> = resolved_columns
-                .iter()
-                .map(|c| match c {
-                    host_state_compare::Column::Group => display_key.clone(),
-                    host_state_compare::Column::Threads => group.thread_count.to_string(),
-                    host_state_compare::Column::Metric => metric_name.clone(),
-                    host_state_compare::Column::Value => value_cell.clone(),
-                    // Compare-only columns never reach here under
-                    // run_show: parse_columns(compare_side=false)
-                    // rejects them at CLI parse time. Surface a
-                    // `-` for direct API callers that hand-build a
-                    // mismatched column set.
-                    _ => "-".to_string(),
-                })
-                .collect();
-            table.add_row(cells);
+    if display_options.is_section_enabled(host_state_compare::Section::Primary) {
+        let mut table = display_options.new_table();
+        let header_row: Vec<&str> = resolved_columns
+            .iter()
+            .map(|c| c.header(group_header))
+            .collect();
+        table.set_header(header_row);
+
+        for key in &group_order {
+            let group = &groups[*key];
+            // Display key: pattern grouping under Comm uses grex to
+            // turn the join-key skeleton into a regex label; every
+            // other grouping renders the join key directly.
+            let display_key =
+                if group_by == host_state_compare::GroupBy::Comm && !no_thread_normalize {
+                    host_state_compare::pattern_display_label(key, &group.member_comms)
+                } else {
+                    (*key).clone()
+                };
+            for metric in host_state_compare::HOST_STATE_METRICS {
+                let Some(agg) = group.metrics.get(metric.name) else {
+                    continue;
+                };
+                let metric_name = host_state_compare::metric_display_name(metric).into_owned();
+                let value_cell = host_state_compare::format_value_cell(agg, metric.unit);
+                let cells: Vec<String> = resolved_columns
+                    .iter()
+                    .map(|c| match c {
+                        host_state_compare::Column::Group => display_key.clone(),
+                        host_state_compare::Column::Threads => group.thread_count.to_string(),
+                        host_state_compare::Column::Metric => metric_name.clone(),
+                        host_state_compare::Column::Value => value_cell.clone(),
+                        // Compare-only columns never reach here under
+                        // run_show: parse_columns(compare_side=false)
+                        // rejects them at CLI parse time. Surface a
+                        // `-` for direct API callers that hand-build a
+                        // mismatched column set.
+                        _ => "-".to_string(),
+                    })
+                    .collect();
+                table.add_row(cells);
+            }
         }
+        writeln!(w, "{table}")?;
     }
-    writeln!(w, "{table}")?;
 
     // Derived metrics: one row per (group, derivation) pair.
     // Mirrors the `## Derived metrics` section emitted by
     // host_state_compare::write_diff but adapted for the
     // single-snapshot show layout (no baseline/candidate split,
     // one value cell per row).
-    if !groups.is_empty() {
-        let mut dt = cli::new_table();
+    if display_options.is_section_enabled(host_state_compare::Section::Derived)
+        && !groups.is_empty()
+    {
+        let mut dt = display_options.new_table();
         let header_row: Vec<&str> = resolved_columns
             .iter()
             .map(|c| c.header(group_header))
@@ -936,7 +1001,10 @@ fn write_show<W: std::fmt::Write>(
     // Cgroup grouping carries cgroup_stats enrichment alongside
     // the per-thread aggregates. Render a second table when
     // present so the show output mirrors compare's two-table
-    // layout for `--group-by cgroup`.
+    // layout for `--group-by cgroup`. The `--sections` filter is
+    // re-checked per sub-table below so a user can request
+    // `--sections pressure` and get only the PSI rollups even
+    // though the cgroup-stats prefix is present in the snapshot.
     if group_by == host_state_compare::GroupBy::Cgroup && !snap.cgroup_stats.is_empty() {
         let stats = host_state_compare::flatten_cgroup_stats(
             &snap.cgroup_stats,
@@ -944,38 +1012,40 @@ fn write_show<W: std::fmt::Write>(
             cgroup_key_map.as_ref(),
         );
         if !stats.is_empty() {
-            writeln!(w)?;
-            let mut ct = cli::new_table();
-            ct.set_header(vec![
-                "cgroup",
-                "cpu_usage_usec",
-                "nr_throttled",
-                "throttled_usec",
-                "memory_current",
-            ]);
-            // Route every scalar through `format_scaled_u64` so
-            // the same auto-scale ladder that compare's enrichment
-            // table uses applies here too — `7.500GiB` instead of
-            // `8053063680`, `1.235s` instead of `1234567` µs.
-            // Compare's table renders a baseline→candidate→delta
-            // triple via `cgroup_cell`; show has a single snapshot
-            // so each cell stands alone — `format_scaled_u64`
-            // gives just the scaled value with no `→` arrow and
-            // no `(+0…)` zero-delta tail. Units mirror compare's
-            // call sites:
-            //   cpu_usage_usec, throttled_usec → "µs"
-            //   memory_current                  → "B"
-            //   nr_throttled                    → "" (unitless count)
-            for (key, s) in &stats {
-                ct.add_row(vec![
-                    key.clone(),
-                    host_state_compare::format_scaled_u64(s.cpu.usage_usec, "µs"),
-                    host_state_compare::format_scaled_u64(s.cpu.nr_throttled, ""),
-                    host_state_compare::format_scaled_u64(s.cpu.throttled_usec, "µs"),
-                    host_state_compare::format_scaled_u64(s.memory.current, "B"),
+            if display_options.is_section_enabled(host_state_compare::Section::CgroupStats) {
+                writeln!(w)?;
+                let mut ct = display_options.new_table();
+                ct.set_header(vec![
+                    "cgroup",
+                    "cpu_usage_usec",
+                    "nr_throttled",
+                    "throttled_usec",
+                    "memory_current",
                 ]);
+                // Route every scalar through `format_scaled_u64` so
+                // the same auto-scale ladder that compare's enrichment
+                // table uses applies here too — `7.500GiB` instead of
+                // `8053063680`, `1.235s` instead of `1234567` µs.
+                // Compare's table renders a baseline→candidate→delta
+                // triple via `cgroup_cell`; show has a single snapshot
+                // so each cell stands alone — `format_scaled_u64`
+                // gives just the scaled value with no `→` arrow and
+                // no `(+0…)` zero-delta tail. Units mirror compare's
+                // call sites:
+                //   cpu_usage_usec, throttled_usec → "µs"
+                //   memory_current                  → "B"
+                //   nr_throttled                    → "" (unitless count)
+                for (key, s) in &stats {
+                    ct.add_row(vec![
+                        key.clone(),
+                        host_state_compare::format_scaled_u64(s.cpu.usage_usec, "µs"),
+                        host_state_compare::format_scaled_u64(s.cpu.nr_throttled, ""),
+                        host_state_compare::format_scaled_u64(s.cpu.throttled_usec, "µs"),
+                        host_state_compare::format_scaled_u64(s.memory.current, "B"),
+                    ]);
+                }
+                writeln!(w, "{ct}")?;
             }
-            writeln!(w, "{ct}")?;
 
             // Per-cgroup limits / knobs sub-table — operator-set
             // configuration that's typically static across a run
@@ -987,17 +1057,19 @@ fn write_show<W: std::fmt::Write>(
             // cgroup in the bucket exposes any of these (root
             // cgroup, or a host without pids/memory controllers
             // enabled).
-            if stats.values().any(|s| {
-                s.cpu.max_quota_us.is_some()
-                    || s.cpu.weight.is_some()
-                    || s.memory.max.is_some()
-                    || s.memory.high.is_some()
-                    || s.pids.current.is_some()
-                    || s.pids.max.is_some()
-            }) {
+            if display_options.is_section_enabled(host_state_compare::Section::Limits)
+                && stats.values().any(|s| {
+                    s.cpu.max_quota_us.is_some()
+                        || s.cpu.weight.is_some()
+                        || s.memory.max.is_some()
+                        || s.memory.high.is_some()
+                        || s.pids.current.is_some()
+                        || s.pids.max.is_some()
+                })
+            {
                 writeln!(w)?;
                 writeln!(w, "## Cgroup limits / knobs")?;
-                let mut lt = cli::new_table();
+                let mut lt = display_options.new_table();
                 lt.set_header(vec![
                     "cgroup",
                     "cpu.max",
@@ -1057,13 +1129,14 @@ fn write_show<W: std::fmt::Write>(
             // section still renders if any cgroup has any
             // non-zero key. This trims output ~10x for typical
             // runs.
-            if stats
-                .values()
-                .any(|s| s.memory.stat.values().any(|v| *v != 0))
+            if display_options.is_section_enabled(host_state_compare::Section::MemoryStat)
+                && stats
+                    .values()
+                    .any(|s| s.memory.stat.values().any(|v| *v != 0))
             {
                 writeln!(w)?;
                 writeln!(w, "## memory.stat")?;
-                let mut mt = cli::new_table();
+                let mut mt = display_options.new_table();
                 mt.set_header(vec!["cgroup", "key", "value"]);
                 for (key, s) in &stats {
                     for (stat_key, stat_value) in &s.memory.stat {
@@ -1084,13 +1157,14 @@ fn write_show<W: std::fmt::Write>(
             // counters (low / high / max / oom / oom_kill etc.).
             // Same long-table layout as memory.stat with the
             // same zero-row suppression.
-            if stats
-                .values()
-                .any(|s| s.memory.events.values().any(|v| *v != 0))
+            if display_options.is_section_enabled(host_state_compare::Section::MemoryEvents)
+                && stats
+                    .values()
+                    .any(|s| s.memory.events.values().any(|v| *v != 0))
             {
                 writeln!(w)?;
                 writeln!(w, "## memory.events")?;
-                let mut et = cli::new_table();
+                let mut et = display_options.new_table();
                 et.set_header(vec!["cgroup", "event", "count"]);
                 for (key, s) in &stats {
                     for (event_key, event_value) in &s.memory.events {
@@ -1120,38 +1194,40 @@ fn write_show<W: std::fmt::Write>(
             // mirrors the compare-side write_diff path: skip a
             // resource sub-table when no cgroup in the bucket
             // has any non-zero data for it.
-            for (resource_name, accessor) in psi_resources() {
-                let any_data = stats.values().any(|s| {
-                    let r = accessor(&s.psi);
-                    psi_resource_has_data(&r)
-                });
-                if !any_data {
-                    continue;
+            if display_options.is_section_enabled(host_state_compare::Section::Pressure) {
+                for (resource_name, accessor) in psi_resources() {
+                    let any_data = stats.values().any(|s| {
+                        let r = accessor(&s.psi);
+                        psi_resource_has_data(&r)
+                    });
+                    if !any_data {
+                        continue;
+                    }
+                    writeln!(w)?;
+                    writeln!(w, "## Pressure / {resource_name}")?;
+                    let mut pt = display_options.new_table();
+                    pt.set_header(vec!["cgroup", "row", "avg10", "avg60", "avg300", "total"]);
+                    for (key, s) in &stats {
+                        let r = accessor(&s.psi);
+                        pt.add_row(vec![
+                            key.clone(),
+                            "some".into(),
+                            format_psi_avg(r.some.avg10),
+                            format_psi_avg(r.some.avg60),
+                            format_psi_avg(r.some.avg300),
+                            host_state_compare::format_scaled_u64(r.some.total_usec, "µs"),
+                        ]);
+                        pt.add_row(vec![
+                            key.clone(),
+                            "full".into(),
+                            format_psi_avg(r.full.avg10),
+                            format_psi_avg(r.full.avg60),
+                            format_psi_avg(r.full.avg300),
+                            host_state_compare::format_scaled_u64(r.full.total_usec, "µs"),
+                        ]);
+                    }
+                    writeln!(w, "{pt}")?;
                 }
-                writeln!(w)?;
-                writeln!(w, "## Pressure / {resource_name}")?;
-                let mut pt = cli::new_table();
-                pt.set_header(vec!["cgroup", "row", "avg10", "avg60", "avg300", "total"]);
-                for (key, s) in &stats {
-                    let r = accessor(&s.psi);
-                    pt.add_row(vec![
-                        key.clone(),
-                        "some".into(),
-                        format_psi_avg(r.some.avg10),
-                        format_psi_avg(r.some.avg60),
-                        format_psi_avg(r.some.avg300),
-                        host_state_compare::format_scaled_u64(r.some.total_usec, "µs"),
-                    ]);
-                    pt.add_row(vec![
-                        key.clone(),
-                        "full".into(),
-                        format_psi_avg(r.full.avg10),
-                        format_psi_avg(r.full.avg60),
-                        format_psi_avg(r.full.avg300),
-                        host_state_compare::format_scaled_u64(r.full.total_usec, "µs"),
-                    ]);
-                }
-                writeln!(w, "{pt}")?;
             }
         }
     }
@@ -1160,7 +1236,9 @@ fn write_show<W: std::fmt::Write>(
     // any resource has nonzero data. Renders as four per-resource
     // sub-tables (cpu / memory / io / irq) with a `some`+`full`
     // row each, matching the per-cgroup layout above.
-    if host_psi_has_data(&snap.psi) {
+    if display_options.is_section_enabled(host_state_compare::Section::HostPressure)
+        && host_psi_has_data(&snap.psi)
+    {
         for (resource_name, accessor) in psi_resources() {
             let r = accessor(&snap.psi);
             if !psi_resource_has_data(&r) {
@@ -1168,7 +1246,7 @@ fn write_show<W: std::fmt::Write>(
             }
             writeln!(w)?;
             writeln!(w, "## Host pressure / {resource_name}")?;
-            let mut pt = cli::new_table();
+            let mut pt = display_options.new_table();
             pt.set_header(vec!["row", "avg10", "avg60", "avg300", "total"]);
             pt.add_row(vec![
                 "some".into(),
@@ -1203,43 +1281,47 @@ fn write_show<W: std::fmt::Write>(
     // ShmemPmdMapped=0 etc. are noise rows. kB→B conversion
     // for the auto_scale "B" ladder lives in
     // [`ThreadState::smaps_rollup_bytes`].
-    let smaps_rows: Vec<(
-        &host_state::ThreadState,
-        &String,
-        ktstr::metric_types::Bytes,
-    )> = snap
-        .threads
-        .iter()
-        .filter(|t| !t.smaps_rollup_kb.is_empty())
-        .flat_map(|t| {
-            t.smaps_rollup_bytes()
-                .filter(|(_, b)| b.0 != 0)
-                .map(move |(k, b)| (t, k, b))
-        })
-        .collect();
-    if !smaps_rows.is_empty() {
-        writeln!(w)?;
-        writeln!(w, "## smaps_rollup")?;
-        let mut st = cli::new_table();
-        st.set_header(vec!["process", "key", "value"]);
-        for (t, key, bytes) in &smaps_rows {
-            st.add_row(vec![
-                format!("{}[{}]", t.pcomm, t.tgid),
-                (*key).clone(),
-                host_state_compare::format_scaled_u64(bytes.0, "B"),
-            ]);
+    if display_options.is_section_enabled(host_state_compare::Section::Smaps) {
+        let smaps_rows: Vec<(
+            &host_state::ThreadState,
+            &String,
+            ktstr::metric_types::Bytes,
+        )> = snap
+            .threads
+            .iter()
+            .filter(|t| !t.smaps_rollup_kb.is_empty())
+            .flat_map(|t| {
+                t.smaps_rollup_bytes()
+                    .filter(|(_, b)| b.0 != 0)
+                    .map(move |(k, b)| (t, k, b))
+            })
+            .collect();
+        if !smaps_rows.is_empty() {
+            writeln!(w)?;
+            writeln!(w, "## smaps_rollup")?;
+            let mut st = display_options.new_table();
+            st.set_header(vec!["process", "key", "value"]);
+            for (t, key, bytes) in &smaps_rows {
+                st.add_row(vec![
+                    format!("{}[{}]", t.pcomm, t.tgid),
+                    (*key).clone(),
+                    host_state_compare::format_scaled_u64(bytes.0, "B"),
+                ]);
+            }
+            writeln!(w, "{st}")?;
         }
-        writeln!(w, "{st}")?;
     }
 
     // Global sched_ext sysfs section. Suppressed when the
     // snapshot's `sched_ext` field is None (CONFIG_SCHED_CLASS_EXT=n
     // build, or sysfs directory absent). Single 5-row table
     // mirroring the kernel's exposed scx_global_attrs[] surface.
-    if let Some(scx) = &snap.sched_ext {
+    if display_options.is_section_enabled(host_state_compare::Section::SchedExt)
+        && let Some(scx) = &snap.sched_ext
+    {
         writeln!(w)?;
         writeln!(w, "## sched_ext")?;
-        let mut at = cli::new_table();
+        let mut at = display_options.new_table();
         at.set_header(vec!["attr", "value"]);
         // state cell: render "-" when the file was unreadable
         // (empty string) so "no observation" stays visually
@@ -2049,6 +2131,8 @@ mod tests {
             false,
             &[],
             &[],
+            &[],
+            false,
         )
         .expect("write_show into String must not fail");
 
@@ -2100,8 +2184,19 @@ mod tests {
             (host_state_compare::GroupBy::CommExact, "comm"),
         ] {
             let mut out = String::new();
-            write_show(&mut out, &snap, axis, &[], false, false, &[], &[])
-                .expect("write_show into String must not fail");
+            write_show(
+                &mut out,
+                &snap,
+                axis,
+                &[],
+                false,
+                false,
+                &[],
+                &[],
+                &[],
+                false,
+            )
+            .expect("write_show into String must not fail");
             assert!(
                 out.contains(expected_header),
                 "header for {axis:?} must contain `{expected_header}`, got: {out}",
@@ -2127,6 +2222,8 @@ mod tests {
             false,
             &[],
             &[],
+            &[],
+            false,
         )
         .expect("write_show into String must not fail on empty snapshot");
         assert!(
@@ -2184,6 +2281,8 @@ mod tests {
             false,
             &sort_by,
             &[],
+            &[],
+            false,
         )
         .expect("write_show into String must not fail");
 
@@ -2257,6 +2356,8 @@ mod tests {
             false,
             &[],
             &[],
+            &[],
+            false,
         )
         .expect("write_show into String must not fail");
 
@@ -2315,6 +2416,8 @@ mod tests {
             false,
             &[],
             &[],
+            &[],
+            false,
         )
         .expect("write_show into String must not fail");
         assert!(
@@ -2349,6 +2452,8 @@ mod tests {
             false,
             &[],
             &[],
+            &[],
+            false,
         )
         .expect("write_show into String must not fail");
         assert!(
@@ -2390,6 +2495,8 @@ mod tests {
             false,
             &[],
             &columns,
+            &[],
+            false,
         )
         .expect("write_show into String must not fail");
 
@@ -2438,6 +2545,8 @@ mod tests {
             false,
             &[],
             &[],
+            &[],
+            false,
         )
         .expect("write_show into String must not fail");
 
