@@ -8,6 +8,13 @@
 //! Cache entries are serialized as tar archives containing the kernel
 //! image, vmlinux (if present), and metadata.json, stored as a single
 //! blob per cache key in the GHA cache service.
+//!
+//! Tar payloads are zstd-compressed before upload and decompressed on
+//! download. Decompression is bounded by
+//! [`MAX_DECOMPRESSED_REMOTE_CACHE_BYTES`] to guard against a hostile
+//! zstd payload (zstd compresses pathologically well on repeated
+//! bytes, so a few-KiB blob can decompress to gigabytes). A blob that
+//! does not start with the zstd magic number is rejected.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -21,6 +28,26 @@ use crate::cache::{CacheDir, CacheEntry, KernelMetadata};
 /// provide a dedicated single-threaded runtime and call `block_on()`
 /// for each remote cache operation. Created lazily on first use;
 /// never created when remote cache is disabled.
+///
+/// # Serialization
+///
+/// `new_current_thread()` plus synchronous callers means every
+/// `block_on(op.read | op.write)` runs to completion on the calling
+/// thread before the next remote operation can start — there is no
+/// task scheduler driving multiple futures concurrently. Today's
+/// callers ([`remote_lookup`] and [`remote_store`]) issue exactly
+/// one I/O per invocation and the surrounding `cargo-ktstr` flow
+/// does not parallelise cache lookups, so the serial pattern is
+/// correct for the current workload. If a future caller needs
+/// concurrent remote ops (e.g. a parallel pre-fetch over many cache
+/// keys), this runtime configuration must change — either to a
+/// multi-thread runtime, or to a single explicit `block_on(async {
+/// join!(...) })` that drives futures concurrently within the
+/// current_thread runtime.
+///
+/// Calling `block_on` from inside an existing tokio async context
+/// panics — this runtime must only be entered from synchronous call
+/// sites.
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -42,17 +69,42 @@ pub fn is_enabled() -> bool {
             .is_some_and(|v| !v.is_empty())
 }
 
+/// Namespace string passed to opendal's `Ghac::version` builder.
+/// Two purposes:
+///
+/// 1. Isolates ktstr cache entries from other tools sharing the
+///    same GHA cache service.
+/// 2. Carries a `-vN` suffix so format changes invalidate stale
+///    entries without colliding with the previous wire shape.
+///
+/// **Bump the version suffix when the on-the-wire format changes
+/// in a way old readers cannot interpret.** Examples that require
+/// a bump:
+/// - Compression format change (e.g. zstd → zstd+dict, or zstd → lz4).
+/// - Removal of a fallback path readers used to depend on (e.g. the
+///   v2 bump went out alongside dropping the raw-tar fallback that
+///   pre-zstd entries relied on — see [`decompress_payload`]).
+/// - Tar layout change (filenames, structure, additional required
+///   members).
+/// - Metadata schema change that breaks deserialization of older
+///   entries.
+///
+/// Additive changes that older readers can still parse (e.g. a new
+/// optional field in metadata) do NOT require a bump.
+const REMOTE_CACHE_NAMESPACE: &str = "ktstr-v2";
+
 /// Create an opendal operator for the GHA cache service.
 ///
 /// Relies on opendal's Ghac service, which reads `ACTIONS_CACHE_URL`
 /// and `ACTIONS_RUNTIME_TOKEN` from the environment (set automatically
 /// by the GHA runner); ktstr itself does not touch either variable.
-/// The `version` field namespaces cache entries to avoid collisions
-/// with other tools using the same GHA cache.
+/// The `version` field is set to [`REMOTE_CACHE_NAMESPACE`] —
+/// namespaces ktstr entries against other tools sharing the cache
+/// AND invalidates stale entries when ktstr's wire format changes.
 fn create_operator() -> Result<opendal::Operator, String> {
     let builder = opendal::services::Ghac::default()
         .root("/")
-        .version("ktstr");
+        .version(REMOTE_CACHE_NAMESPACE);
 
     opendal::Operator::new(builder)
         .map_err(|e| format!("create ghac operator: {e}"))
@@ -62,6 +114,18 @@ fn create_operator() -> Result<opendal::Operator, String> {
 /// Zstd magic number (first 4 bytes of any zstd frame).
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
+/// Decompressed-size ceiling for [`decompress_payload`] zstd payloads.
+/// Bounds the allocation a malicious or corrupted zstd payload from
+/// the GHA cache service can force, since zstd compresses
+/// pathologically well on repeated bytes (a few-KiB compressed blob
+/// can decompress to gigabytes). 1 GiB covers any realistic cache
+/// entry — bzImage is ~15 MiB, stripped vmlinux ~45 MiB, an
+/// unstripped debug vmlinux with BTF can reach ~500 MiB — while
+/// bounding worst-case allocation against hostile zstd payloads.
+/// Public so a downstream consumer can size buffers against the
+/// same ceiling without hardcoding the value.
+pub const MAX_DECOMPRESSED_REMOTE_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Pack a cache entry directory into a tar archive in memory.
 ///
 /// The tar contains the kernel image, vmlinux (if present), and
@@ -69,9 +133,9 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// tar are relative filenames (no directory prefix).
 ///
 /// The tar is then compressed with zstd before upload.
-/// [`unpack_and_store`] detects the zstd magic number on download
-/// and decompresses transparently, falling back to raw tar for
-/// entries stored before compression was added.
+/// [`unpack_and_store`] verifies the zstd magic number on download
+/// and decompresses; a payload missing the magic is rejected
+/// (the on-the-wire format is zstd-only).
 fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, String> {
     let mut archive = tar::Builder::new(Vec::new());
 
@@ -138,15 +202,47 @@ fn pack_entry(entry_dir: &Path, metadata: &KernelMetadata) -> Result<Vec<u8>, St
     zstd::encode_all(tar_bytes.as_slice(), 3).map_err(|e| format!("zstd compress: {e}"))
 }
 
-/// Decompress data if it starts with the zstd magic number,
-/// otherwise return as-is (backward compatibility with
-/// uncompressed tar entries written before zstd was added).
-fn maybe_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
-        zstd::decode_all(data).map_err(|e| format!("zstd decompress: {e}"))
-    } else {
-        Ok(data.to_vec())
+/// Decompress a zstd-compressed cache blob. Rejects payloads that
+/// do not start with the zstd magic number — the on-the-wire format
+/// is zstd-only since the encoder ([`pack_entry`]) always compresses.
+/// The magic-number precondition catches truncated downloads (any
+/// payload < 4 bytes) and non-zstd content with a clearer error
+/// than the zstd library's "invalid header" diagnostic.
+///
+/// Bounded by [`MAX_DECOMPRESSED_REMOTE_CACHE_BYTES`] — a payload
+/// that would expand past that ceiling surfaces an error rather than
+/// allocating unbounded memory, guarding against a hostile zstd
+/// payload from the GHA cache service.
+fn decompress_payload(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() < 4 || data[..4] != ZSTD_MAGIC {
+        return Err("remote cache entry missing zstd magic".to_string());
     }
+    decompress_capped(data, MAX_DECOMPRESSED_REMOTE_CACHE_BYTES)
+        .map_err(|e| format!("zstd decompress: {e}"))
+}
+
+/// Decompress a zstd payload into a `Vec<u8>` capped at
+/// `max_decompressed` bytes — bombing out with an error if the
+/// payload would expand past the ceiling. Reads through
+/// `Read::take(cap + 1)` so a payload that decompresses to
+/// exactly `cap` bytes is accepted while one that produces
+/// `cap + 1` bytes (or more) is rejected — the +1 sentinel
+/// distinguishes "EOF coincided with the cap" from "more data
+/// behind the cap".
+fn decompress_capped(bytes: &[u8], max_decompressed: u64) -> Result<Vec<u8>, String> {
+    let decoder =
+        zstd::stream::read::Decoder::new(bytes).map_err(|e| format!("zstd decoder init: {e}"))?;
+    let mut out = Vec::new();
+    decoder
+        .take(max_decompressed.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| format!("zstd decompress read: {e}"))?;
+    if out.len() as u64 > max_decompressed {
+        return Err(format!(
+            "zstd-decompressed payload exceeds the {max_decompressed}-byte cap (decompression-bomb guard)",
+        ));
+    }
+    Ok(out)
 }
 
 /// Unpack a tar archive into a cache directory via CacheDir::store.
@@ -157,8 +253,10 @@ fn maybe_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 /// already stripped by the producer; `CacheDir::store` re-runs the
 /// strip pipeline (idempotent — the keep-list partition produces the
 /// same layout) and falls back to copying verbatim on error.
+///
+/// Decompression is bounded by [`MAX_DECOMPRESSED_REMOTE_CACHE_BYTES`].
 fn unpack_and_store(cache: &CacheDir, cache_key: &str, data: &[u8]) -> Result<CacheEntry, String> {
-    let tar_bytes = maybe_decompress(data)?;
+    let tar_bytes = decompress_payload(data)?;
     let mut archive = tar::Archive::new(tar_bytes.as_slice());
     let entries = archive
         .entries()
@@ -269,7 +367,7 @@ pub fn remote_lookup(cache: &CacheDir, cache_key: &str, cli_label: &str) -> Opti
             Some(entry)
         }
         Err(e) => {
-            eprintln!("{cli_label}: remote cache unpack warning: {e}");
+            eprintln!("{cli_label}: remote cache unpack warning ({cache_key}): {e}");
             None
         }
     }
@@ -430,7 +528,7 @@ mod tests {
         std::fs::write(entry.path.join(".config"), b"CONFIG_HZ=1000\n").unwrap();
 
         let packed = pack_entry(&entry.path, &entry.metadata).unwrap();
-        let tar_bytes = maybe_decompress(&packed).unwrap();
+        let tar_bytes = decompress_payload(&packed).unwrap();
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         let paths: Vec<String> = archive
             .entries()
@@ -459,7 +557,7 @@ mod tests {
 
         // pack_entry returns zstd-compressed data; decompress before
         // validating tar contents.
-        let tar_bytes = maybe_decompress(&packed).unwrap();
+        let tar_bytes = decompress_payload(&packed).unwrap();
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         let entries: Vec<_> = archive.entries().unwrap().collect();
         assert_eq!(entries.len(), 2);
@@ -484,10 +582,16 @@ mod tests {
         );
     }
 
+    /// Rejection test for a raw (non-zstd) tar blob — the
+    /// on-the-wire format is zstd-only, so a payload without the
+    /// magic is either corruption or hostile content and
+    /// `unpack_and_store` must surface a "zstd magic" diagnostic
+    /// rather than try to parse the bytes as tar. Replaces the
+    /// previous `remote_cache_unpack_handles_raw_tar` backward-compat
+    /// test (the raw-tar fallback was deleted as part of the
+    /// pre-1.0 cleanup).
     #[test]
-    fn remote_cache_unpack_handles_raw_tar() {
-        // Verify backward compatibility: unpack_and_store accepts
-        // uncompressed tar data (entries written before zstd was added).
+    fn remote_cache_unpack_rejects_raw_tar() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = CacheDir::with_root(tmp.path().join("cache"));
 
@@ -502,24 +606,38 @@ mod tests {
         archive
             .append_data(&mut header, "metadata.json", meta_bytes)
             .unwrap();
-
-        let img_data = b"fake kernel image";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(img_data.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "bzImage", img_data.as_slice())
-            .unwrap();
         let raw_tar = archive.into_inner().unwrap();
 
         // Raw tar should not start with zstd magic.
         assert!(raw_tar.len() < 4 || raw_tar[..4] != ZSTD_MAGIC);
 
-        let restored = unpack_and_store(&cache, "raw-tar-key", &raw_tar).unwrap();
-        assert_eq!(restored.key, "raw-tar-key");
-        let rmeta = &restored.metadata;
-        assert_eq!(rmeta.version.as_deref(), Some("6.14.2"));
+        let err = unpack_and_store(&cache, "raw-tar-key", &raw_tar).unwrap_err();
+        assert!(
+            err.contains("zstd magic"),
+            "non-zstd payload must be rejected with a `zstd magic` \
+             diagnostic from the precondition check, got: {err}",
+        );
+    }
+
+    /// Short-input boundary: payloads of 0..=3 bytes cannot carry
+    /// the 4-byte zstd magic sentinel, so the precondition check in
+    /// `decompress_payload` must reject all of them with the same
+    /// "zstd magic" diagnostic. Pins that the `data.len() < 4` half
+    /// of the guard fires independently of the magic-bytes
+    /// comparison, so a truncated download is rejected instead of
+    /// triggering an out-of-bounds slice or feeding an ill-formed
+    /// header to the zstd decoder.
+    #[test]
+    fn remote_cache_decompress_payload_rejects_short_inputs() {
+        for len in 0..=3 {
+            let bytes = vec![0u8; len];
+            let err = super::decompress_payload(&bytes).unwrap_err();
+            assert!(
+                err.contains("zstd magic"),
+                "{len}-byte payload must be rejected by the magic-number \
+                 precondition, got: {err}",
+            );
+        }
     }
 
     #[test]
@@ -536,7 +654,8 @@ mod tests {
         archive
             .append_data(&mut header, "bzImage", data.as_slice())
             .unwrap();
-        let packed = archive.into_inner().unwrap();
+        let raw_tar = archive.into_inner().unwrap();
+        let packed = zstd::encode_all(raw_tar.as_slice(), 3).unwrap();
 
         let result = unpack_and_store(&cache, "no-meta", &packed);
         assert!(result.is_err());
@@ -562,7 +681,8 @@ mod tests {
         archive
             .append_data(&mut header, "metadata.json", meta_bytes)
             .unwrap();
-        let packed = archive.into_inner().unwrap();
+        let raw_tar = archive.into_inner().unwrap();
+        let packed = zstd::encode_all(raw_tar.as_slice(), 3).unwrap();
 
         let result = unpack_and_store(&cache, "no-image", &packed);
         assert!(result.is_err());
@@ -685,6 +805,69 @@ mod tests {
             }
             if h == "a1b2c3d" && r == "v6.15-rc3"
         ));
+    }
+
+    /// Decompression-bomb guard: a zstd payload that decompresses
+    /// past the configured cap surfaces an error tagged with
+    /// "decompression-bomb guard" — `decompress_payload` must not
+    /// allocate past the ceiling. Test uses a small synthetic
+    /// payload (8 KiB of zeros, which compresses to a tiny blob
+    /// but decompresses to 8192 bytes) routed through the private
+    /// `decompress_capped` helper against a 1024-byte cap so the
+    /// test runs in microseconds rather than allocating a
+    /// production-sized buffer.
+    #[test]
+    fn remote_cache_decompress_capped_rejects_decompression_bomb() {
+        let payload = vec![0u8; 8192];
+        let compressed = zstd::encode_all(payload.as_slice(), 3).unwrap();
+        let cap: u64 = 1024;
+        let err = super::decompress_capped(&compressed, cap).unwrap_err();
+        assert!(
+            err.contains("decompression-bomb guard"),
+            "expected decompression-bomb guard error, got: {err}",
+        );
+    }
+
+    /// Boundary case: a payload whose decompressed length is
+    /// exactly `cap` bytes is accepted (the cap is inclusive).
+    /// Pins the `>` (not `>=`) discriminator at the cap boundary
+    /// so a future refactor that flips the comparison surfaces
+    /// here rather than turning a legal cache entry into a
+    /// false-positive bomb rejection.
+    #[test]
+    fn remote_cache_decompress_capped_accepts_payload_at_cap_boundary() {
+        let payload = b"hello world".to_vec();
+        let compressed = zstd::encode_all(payload.as_slice(), 3).unwrap();
+        let out = super::decompress_capped(&compressed, payload.len() as u64).unwrap();
+        assert_eq!(
+            out, payload,
+            "payload exactly at the cap must round-trip — \
+             cap is inclusive (`>` not `>=`)",
+        );
+    }
+
+    /// Pin the shape of [`super::REMOTE_CACHE_NAMESPACE`]: non-empty,
+    /// keeps the `ktstr-v` prefix that namespaces ktstr entries
+    /// against other tools sharing the GHA cache, and carries a
+    /// numeric version suffix that bumps invalidate stale entries.
+    /// Without this pin, a refactor that dropped the prefix would
+    /// silently start sharing the namespace with another tool, and
+    /// a bump that landed `ktstr-v2a` would still pass any
+    /// substring-only check while breaking the suffix-as-version
+    /// contract.
+    #[test]
+    fn remote_cache_namespace_has_version_suffix() {
+        let ns = super::REMOTE_CACHE_NAMESPACE;
+        assert!(!ns.is_empty(), "namespace must not be empty");
+        assert!(
+            ns.starts_with("ktstr-v"),
+            "namespace must keep `ktstr-v` prefix; got: {ns}",
+        );
+        let suffix = ns.strip_prefix("ktstr-v").unwrap();
+        assert!(
+            suffix.parse::<u32>().is_ok(),
+            "version suffix must be numeric; got: {suffix:?}",
+        );
     }
 
     use crate::test_support::test_helpers::EnvVarGuard;

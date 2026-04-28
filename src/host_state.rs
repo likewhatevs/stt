@@ -151,6 +151,14 @@ pub struct HostStateSnapshot {
     /// `Some(_)` carries the per-snapshot tally — see
     /// [`HostStateProbeSummary`] for the curated field set.
     pub probe_summary: Option<HostStateProbeSummary>,
+
+    /// Procfs-read failure statistics for the snapshot, when the
+    /// capture pass ran in production mode. Mirrors the
+    /// `probe_summary` discipline: `None` indicates synthetic-tree
+    /// tests skipped it (`use_syscall_affinity=false`); `Some(_)`
+    /// carries the per-snapshot read-level failure tally — see
+    /// [`HostStateParseSummary`].
+    pub parse_summary: Option<HostStateParseSummary>,
 }
 
 /// Per-snapshot probe outcome statistics. Curated projection of
@@ -273,6 +281,122 @@ impl HostStateProbeSummary {
         }
     }
 }
+
+/// Per-snapshot procfs read-failure statistics. Curated projection
+/// of the capture pipeline's internal read-tally — exposes per-file
+/// counters and a dominant-failure tag a downstream consumer needs
+/// to decide whether the snapshot's procfs-derived fields (CSW,
+/// schedstats, IO, etc.) are trustworthy on a given host without
+/// scanning every thread for default values.
+///
+/// The tally is read-level only — it counts failures of
+/// `fs::read_to_string` against `/proc/<tgid>/task/<tid>/<file>`,
+/// not per-field parse failures inside an otherwise-readable file.
+/// A present-but-malformed file (e.g. a corrupt `stat` whose
+/// `parse_stat` returns all-`None`) does NOT count: the file read
+/// succeeded so the tally stays at zero for that category, even
+/// though the per-field parsers fold every value to its absent-
+/// counter default. Read failures correspond to the kernel never
+/// having written the file (ENOENT / kernel without
+/// `CONFIG_SCHEDSTATS`), the file disappearing mid-capture (race),
+/// or any other I/O-level error from the procfs reader. A snapshot
+/// with 1 K schedstat failures across 1 K tids implies a kernel
+/// build without `CONFIG_SCHEDSTATS`; 47 stat failures across 1 K
+/// tids implies mid-capture races. Per-field corruption surfaces
+/// elsewhere — as zero values on the affected `ThreadState`
+/// fields — and is intentionally outside this summary's scope.
+///
+/// Per-file tokens in [`Self::read_failures_by_file`] are stable
+/// kebab-case identifiers downstream consumers match against. The
+/// recognized set: `"stat"`, `"schedstat"`, `"io"`, `"status"`,
+/// `"sched"`, `"cgroup"`. Adding a new procfs file to the capture
+/// adds a new key; the wire shape carries any token the capture
+/// emitted, so a consumer that only knows the existing set absorbs
+/// new keys without breaking.
+///
+/// Ghost-filtered tids do NOT contribute to `read_failures` /
+/// `read_failures_by_file` — their pending failure bumps are
+/// unwound via `discard_pending` when a thread ends up filtered
+/// out of `threads` (empty comm + zero start_time), so a busy
+/// host with mid-capture exits doesn't inflate the failure tallies
+/// with counts that would correspond to threads the snapshot
+/// doesn't even contain. `tids_walked` still counts every walk
+/// attempt regardless of the ghost filter outcome.
+///
+/// # Examples
+///
+/// ```no_run
+/// let snap = ktstr::host_state::capture();
+/// if let Some(ps) = &snap.parse_summary
+///     && let Some(hint) = ps.kernel_config_hint()
+/// {
+///     eprintln!("{hint}");
+/// }
+/// ```
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct HostStateParseSummary {
+    /// Total tids the capture pass attempted to read across every
+    /// tgid. Non-zero whenever the capture walked any tid; the
+    /// denominator a downstream consumer uses to compute "what
+    /// fraction of reads failed" without parsing the operator-
+    /// facing tracing line.
+    pub tids_walked: u64,
+    /// Total file-level read failures across all categories. Sum
+    /// of [`Self::read_failures_by_file`] values.
+    pub read_failures: u64,
+    /// Per-file-kind failure tally, keyed by stable kebab tokens
+    /// (`"stat"`, `"schedstat"`, `"io"`, `"status"`, `"sched"`,
+    /// `"cgroup"`). Empty map when the capture saw zero failures.
+    /// Keys present in the map have non-zero counts; absent keys
+    /// imply zero failures for that category, NOT "category
+    /// unknown".
+    pub read_failures_by_file: BTreeMap<String, u64>,
+    /// Tag string for the file kind with the most read failures
+    /// across the snapshot. `None` when `read_failures == 0`.
+    /// Stable kebab tokens (the same vocabulary
+    /// [`Self::read_failures_by_file`] keys against). Ties resolve
+    /// REVERSE-alphabetically so the output is deterministic — the
+    /// alphabetically-earlier tag wins (e.g. `"io"` beats
+    /// `"status"` when both count equal).
+    pub dominant_read_failure: Option<String>,
+    /// `true` when ≥ 50% of `read_failures` are concentrated in
+    /// kernel-config-gated files (`"schedstat"`, `"io"`). These
+    /// two files are absent on kernels built without
+    /// `CONFIG_SCHEDSTATS` / `CONFIG_TASK_IO_ACCOUNTING`
+    /// respectively, so a dominance signal here points the
+    /// operator at a kernel build/config issue rather than a
+    /// transient race or permission problem. `false` when
+    /// `read_failures == 0` or when failures are spread across
+    /// non-kconfig files.
+    pub kernel_config_dominant: bool,
+}
+
+impl HostStateParseSummary {
+    /// Operator-facing hint when kernel-config-gated file failures
+    /// dominate the snapshot. Returns `Some(&'static str)` naming
+    /// the two `CONFIG_*` knobs that gate the affected files
+    /// (`CONFIG_SCHEDSTATS` for `schedstat`, `CONFIG_TASK_IO_ACCOUNTING`
+    /// for `io`), or `None` when [`Self::kernel_config_dominant`]
+    /// is `false`. Lets a downstream consumer surface a remediation
+    /// pointer without parsing the log line or hand-rolling the
+    /// gate, mirroring the [`HostStateProbeSummary::remediation_hint`]
+    /// pattern.
+    pub fn kernel_config_hint(&self) -> Option<&'static str> {
+        if self.kernel_config_dominant {
+            Some(PARSE_KCONFIG_HINT)
+        } else {
+            None
+        }
+    }
+}
+
+/// Stable kernel-config remediation hint for parse summaries.
+/// Names the two procfs files that disappear on kernels built
+/// without the corresponding `CONFIG_*` knobs.
+const PARSE_KCONFIG_HINT: &str = "hint: schedstat / io read failures dominate — \
+                                  kernel may be built without CONFIG_SCHEDSTATS \
+                                  and/or CONFIG_TASK_IO_ACCOUNTING";
 
 /// Per-thread cumulative resource profile.
 ///
@@ -793,7 +917,7 @@ fn proc_file(proc_root: &Path, tgid: i32, leaf: &str) -> PathBuf {
 /// `"SCHED_UNKNOWN(<n>)"` rather than dropping the value so
 /// diff output still surfaces a novel policy from a future
 /// kernel.
-pub fn policy_name(policy: i32) -> String {
+fn policy_name(policy: i32) -> String {
     match policy {
         libc::SCHED_OTHER => "SCHED_OTHER".to_string(),
         libc::SCHED_FIFO => "SCHED_FIFO".to_string(),
@@ -812,7 +936,7 @@ pub fn policy_name(policy: i32) -> String {
 /// Enumerate every numeric directory under the procfs root
 /// (live tgids). Returns sorted ids so snapshot ordering is
 /// deterministic. Empty vec on read failure.
-pub fn iter_tgids_at(proc_root: &Path) -> Vec<i32> {
+fn iter_tgids_at(proc_root: &Path) -> Vec<i32> {
     let Ok(entries) = fs::read_dir(proc_root) else {
         return Vec::new();
     };
@@ -828,7 +952,7 @@ pub fn iter_tgids_at(proc_root: &Path) -> Vec<i32> {
 /// Enumerate tids under `<proc_root>/<tgid>/task`. Empty vec on
 /// read failure (process exited between enumeration and this
 /// call).
-pub fn iter_task_ids_at(proc_root: &Path, tgid: i32) -> Vec<i32> {
+fn iter_task_ids_at(proc_root: &Path, tgid: i32) -> Vec<i32> {
     let path = proc_root.join(tgid.to_string()).join("task");
     let Ok(entries) = fs::read_dir(&path) else {
         return Vec::new();
@@ -842,17 +966,9 @@ pub fn iter_task_ids_at(proc_root: &Path, tgid: i32) -> Vec<i32> {
     tids
 }
 
-pub fn iter_tgids() -> Vec<i32> {
-    iter_tgids_at(Path::new(DEFAULT_PROC_ROOT))
-}
-
-pub fn iter_task_ids(tgid: i32) -> Vec<i32> {
-    iter_task_ids_at(Path::new(DEFAULT_PROC_ROOT), tgid)
-}
-
 /// Read `<proc_root>/<tgid>/comm` trimmed. `None` on read
 /// failure or empty content.
-pub fn read_process_comm_at(proc_root: &Path, tgid: i32) -> Option<String> {
+fn read_process_comm_at(proc_root: &Path, tgid: i32) -> Option<String> {
     let raw = fs::read_to_string(proc_file(proc_root, tgid, "comm")).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -864,7 +980,7 @@ pub fn read_process_comm_at(proc_root: &Path, tgid: i32) -> Option<String> {
 
 /// Read `<proc_root>/<tgid>/task/<tid>/comm` trimmed. `None`
 /// on read failure or empty content.
-pub fn read_thread_comm_at(proc_root: &Path, tgid: i32, tid: i32) -> Option<String> {
+fn read_thread_comm_at(proc_root: &Path, tgid: i32, tid: i32) -> Option<String> {
     let raw = fs::read_to_string(task_file(proc_root, tgid, tid, "comm")).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -872,14 +988,6 @@ pub fn read_thread_comm_at(proc_root: &Path, tgid: i32, tid: i32) -> Option<Stri
     } else {
         Some(trimmed.to_string())
     }
-}
-
-pub fn read_process_comm(tgid: i32) -> Option<String> {
-    read_process_comm_at(Path::new(DEFAULT_PROC_ROOT), tgid)
-}
-
-pub fn read_thread_comm(tgid: i32, tid: i32) -> Option<String> {
-    read_thread_comm_at(Path::new(DEFAULT_PROC_ROOT), tgid, tid)
 }
 
 /// Selected fields parsed out of `/proc/<tgid>/task/<tid>/stat`.
@@ -939,10 +1047,25 @@ fn parse_stat(raw: &str) -> StatFields {
     }
 }
 
-fn read_stat_at(proc_root: &Path, tgid: i32, tid: i32) -> StatFields {
+/// Read `<proc_root>/<tgid>/task/<tid>/stat` and parse fields.
+/// Records a `"stat"` failure into `tally` on read error so the
+/// per-snapshot [`HostStateParseSummary`] surfaces the dominant
+/// procfs read-failure category. `tally: &mut None` skips the
+/// recording (the synthetic-tree test pattern).
+fn read_stat_at_with_tally(
+    proc_root: &Path,
+    tgid: i32,
+    tid: i32,
+    tally: &mut Option<&mut ParseTally>,
+) -> StatFields {
     match fs::read_to_string(task_file(proc_root, tgid, tid, "stat")) {
         Ok(raw) => parse_stat(&raw),
-        Err(_) => StatFields::default(),
+        Err(_) => {
+            if let Some(t) = tally.as_mut() {
+                t.record_failure("stat");
+            }
+            StatFields::default()
+        }
     }
 }
 
@@ -962,20 +1085,23 @@ fn parse_schedstat(raw: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
 
 /// Read `<proc_root>/<tgid>/task/<tid>/schedstat`. Three-tuple
 /// of `Option<u64>` — kernel without `CONFIG_SCHEDSTATS` yields
-/// all-`None`.
-pub fn read_schedstat_at(
+/// all-`None`. Records a `"schedstat"` failure on read error
+/// when a tally is supplied.
+fn read_schedstat_at_with_tally(
     proc_root: &Path,
     tgid: i32,
     tid: i32,
+    tally: &mut Option<&mut ParseTally>,
 ) -> (Option<u64>, Option<u64>, Option<u64>) {
     match fs::read_to_string(task_file(proc_root, tgid, tid, "schedstat")) {
         Ok(raw) => parse_schedstat(&raw),
-        Err(_) => (None, None, None),
+        Err(_) => {
+            if let Some(t) = tally.as_mut() {
+                t.record_failure("schedstat");
+            }
+            (None, None, None)
+        }
     }
-}
-
-pub fn read_schedstat(tgid: i32, tid: i32) -> (Option<u64>, Option<u64>, Option<u64>) {
-    read_schedstat_at(Path::new(DEFAULT_PROC_ROOT), tgid, tid)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1010,10 +1136,23 @@ fn parse_io(raw: &str) -> IoFields {
     out
 }
 
-fn read_io_at(proc_root: &Path, tgid: i32, tid: i32) -> IoFields {
+/// Read `<proc_root>/<tgid>/task/<tid>/io` and parse fields.
+/// Records an `"io"` failure into `tally` on read error (kernel
+/// without `CONFIG_TASK_IO_ACCOUNTING` or per-tid race).
+fn read_io_at_with_tally(
+    proc_root: &Path,
+    tgid: i32,
+    tid: i32,
+    tally: &mut Option<&mut ParseTally>,
+) -> IoFields {
     match fs::read_to_string(task_file(proc_root, tgid, tid, "io")) {
         Ok(raw) => parse_io(&raw),
-        Err(_) => IoFields::default(),
+        Err(_) => {
+            if let Some(t) = tally.as_mut() {
+                t.record_failure("io");
+            }
+            IoFields::default()
+        }
     }
 }
 
@@ -1070,10 +1209,22 @@ fn parse_status(raw: &str) -> StatusFields {
     out
 }
 
-fn read_status_at(proc_root: &Path, tgid: i32, tid: i32) -> StatusFields {
+/// Read `<proc_root>/<tgid>/task/<tid>/status` and parse fields.
+/// Records a `"status"` failure into `tally` on read error.
+fn read_status_at_with_tally(
+    proc_root: &Path,
+    tgid: i32,
+    tid: i32,
+    tally: &mut Option<&mut ParseTally>,
+) -> StatusFields {
     match fs::read_to_string(task_file(proc_root, tgid, tid, "status")) {
         Ok(raw) => parse_status(&raw),
-        Err(_) => StatusFields::default(),
+        Err(_) => {
+            if let Some(t) = tally.as_mut() {
+                t.record_failure("status");
+            }
+            StatusFields::default()
+        }
     }
 }
 
@@ -1094,7 +1245,7 @@ fn read_status_at(proc_root: &Path, tgid: i32, tid: i32) -> StatusFields {
 /// thousand; even `NR_CPUS=8192` builds stay inside this
 /// bound), so legitimate input is never rejected. See
 /// [`parse_cpu_list_rejects_huge_range`] for the regression pin.
-pub fn parse_cpu_list(s: &str) -> Option<Vec<u32>> {
+pub(crate) fn parse_cpu_list(s: &str) -> Option<Vec<u32>> {
     /// Upper bound on the number of CPUs a single `lo-hi` token
     /// can expand to. 64 Ki — orders of magnitude above any
     /// in-production `NR_CPUS` — leaves headroom for future
@@ -1187,7 +1338,7 @@ pub fn parse_cpu_list(s: &str) -> Option<Vec<u32>> {
 /// making the syscall path effectively useless on the very
 /// hosts where affinity data matters most (1000-plus-CPU NUMA
 /// boxes).
-pub fn read_affinity(tid: i32) -> Option<Vec<u32>> {
+pub(crate) fn read_affinity(tid: i32) -> Option<Vec<u32>> {
     let mut bits = AFFINITY_INITIAL_BITS;
     loop {
         let mut buffer = affinity_zeroed_buffer(bits);
@@ -1322,14 +1473,32 @@ fn extract_cpus_from_mask(buffer: &[libc::c_ulong], written_bytes: usize) -> Opt
 /// `hid:controllers:path`. The unified (v2) hierarchy is keyed
 /// `0::<path>`; mixed-mode hosts expose legacy v1 hierarchies
 /// alongside, which this reader skips. `None` on read failure
-/// or when no v2 line is present.
-pub fn read_cgroup_at(proc_root: &Path, tgid: i32, tid: i32) -> Option<String> {
-    let raw = fs::read_to_string(task_file(proc_root, tgid, tid, "cgroup")).ok()?;
-    parse_cgroup_v2(&raw)
+/// or when no v2 line is present. Test-only — production callers
+/// pipe through [`read_cgroup_at_with_tally`] so per-tid failures
+/// surface in `parse_summary`.
+#[cfg(test)]
+fn read_cgroup_at(proc_root: &Path, tgid: i32, tid: i32) -> Option<String> {
+    read_cgroup_at_with_tally(proc_root, tgid, tid, &mut None)
 }
 
-pub fn read_cgroup(tgid: i32, tid: i32) -> Option<String> {
-    read_cgroup_at(Path::new(DEFAULT_PROC_ROOT), tgid, tid)
+/// Tally-aware variant of [`read_cgroup_at`]. Records a `"cgroup"`
+/// failure on read error (file absent — typical when the tid
+/// exited mid-capture).
+fn read_cgroup_at_with_tally(
+    proc_root: &Path,
+    tgid: i32,
+    tid: i32,
+    tally: &mut Option<&mut ParseTally>,
+) -> Option<String> {
+    match fs::read_to_string(task_file(proc_root, tgid, tid, "cgroup")) {
+        Ok(raw) => parse_cgroup_v2(&raw),
+        Err(_) => {
+            if let Some(t) = tally.as_mut() {
+                t.record_failure("cgroup");
+            }
+            None
+        }
+    }
 }
 
 fn parse_cgroup_v2(raw: &str) -> Option<String> {
@@ -1487,10 +1656,22 @@ fn parse_sched(raw: &str) -> SchedFields {
     out
 }
 
-fn read_sched_at(proc_root: &Path, tgid: i32, tid: i32) -> SchedFields {
+/// Read `<proc_root>/<tgid>/task/<tid>/sched` and parse fields.
+/// Records a `"sched"` failure into `tally` on read error.
+fn read_sched_at_with_tally(
+    proc_root: &Path,
+    tgid: i32,
+    tid: i32,
+    tally: &mut Option<&mut ParseTally>,
+) -> SchedFields {
     match fs::read_to_string(task_file(proc_root, tgid, tid, "sched")) {
         Ok(raw) => parse_sched(&raw),
-        Err(_) => SchedFields::default(),
+        Err(_) => {
+            if let Some(t) = tally.as_mut() {
+                t.record_failure("sched");
+            }
+            SchedFields::default()
+        }
     }
 }
 
@@ -1519,7 +1700,7 @@ fn parse_cpu_stat(raw: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
 /// for `path` under `cgroup_root`. Missing files collapse to
 /// `0` via the struct's `Default`, matching the "absent = 0"
 /// contract the struct documents for allocated/deallocated_bytes.
-pub fn read_cgroup_stats_at(cgroup_root: &Path, path: &str) -> CgroupStats {
+fn read_cgroup_stats_at(cgroup_root: &Path, path: &str) -> CgroupStats {
     let relative = path.strip_prefix('/').unwrap_or(path);
     let dir = if relative.is_empty() {
         cgroup_root.to_path_buf()
@@ -1575,7 +1756,8 @@ pub fn read_cgroup_stats_at(cgroup_root: &Path, path: &str) -> CgroupStats {
 /// does not read the REAL affinity of the test process; production
 /// passes `true` and falls back to `Cpus_allowed_list:` when the
 /// syscall returns EPERM.
-pub fn capture_thread_at(
+#[cfg(test)]
+fn capture_thread_at(
     proc_root: &Path,
     tgid: i32,
     tid: i32,
@@ -1583,12 +1765,40 @@ pub fn capture_thread_at(
     comm: &str,
     use_syscall_affinity: bool,
 ) -> ThreadState {
-    let cgroup = read_cgroup_at(proc_root, tgid, tid).unwrap_or_default();
-    let stat = read_stat_at(proc_root, tgid, tid);
-    let (run_time_ns, wait_time_ns, timeslices) = read_schedstat_at(proc_root, tgid, tid);
-    let io = read_io_at(proc_root, tgid, tid);
-    let status = read_status_at(proc_root, tgid, tid);
-    let sched = read_sched_at(proc_root, tgid, tid);
+    capture_thread_at_with_tally(
+        proc_root,
+        tgid,
+        tid,
+        pcomm,
+        comm,
+        use_syscall_affinity,
+        &mut None,
+    )
+}
+
+/// Tally-aware variant of [`capture_thread_at`]. Threads a
+/// `&mut ParseTally` through every per-file reader so per-tid read
+/// failures land in the per-snapshot
+/// [`HostStateParseSummary`] when the capture pipeline runs in
+/// production mode (`use_syscall_affinity=true`). Synthetic-tree
+/// tests typically call [`capture_thread_at`] (no tally), matching
+/// the pre-#28 shape.
+fn capture_thread_at_with_tally(
+    proc_root: &Path,
+    tgid: i32,
+    tid: i32,
+    pcomm: &str,
+    comm: &str,
+    use_syscall_affinity: bool,
+    tally: &mut Option<&mut ParseTally>,
+) -> ThreadState {
+    let cgroup = read_cgroup_at_with_tally(proc_root, tgid, tid, tally).unwrap_or_default();
+    let stat = read_stat_at_with_tally(proc_root, tgid, tid, tally);
+    let (run_time_ns, wait_time_ns, timeslices) =
+        read_schedstat_at_with_tally(proc_root, tgid, tid, tally);
+    let io = read_io_at_with_tally(proc_root, tgid, tid, tally);
+    let status = read_status_at_with_tally(proc_root, tgid, tid, tally);
+    let sched = read_sched_at_with_tally(proc_root, tgid, tid, tally);
     let cpu_affinity = if use_syscall_affinity {
         read_affinity(tid)
             .or(status.cpus_allowed)
@@ -1744,6 +1954,108 @@ impl ProbeSummary {
             failed: self.failed,
             dominant_failure: self.dominant_tag().map(|t| t.to_string()),
             privilege_dominant: self.ptrace_dominates(),
+        }
+    }
+}
+
+/// Internal tally of procfs read-level failures, threaded through
+/// [`capture_thread_at_with_tally`] and projected to the public
+/// surface via [`Self::to_public`]. Mirrors the [`ProbeSummary`] /
+/// [`HostStateProbeSummary`] split: tracks per-tid context plus a
+/// per-file-kind failure map, then drops the implementation-detail
+/// shape (here the `&'static str` keys vs the public surface's
+/// `String` keys, which serde-derive cleanly).
+///
+/// `tids_walked` is incremented once per tid the capture pass
+/// attempts, regardless of whether the tid lands in the snapshot —
+/// the bump happens at the call site (before invoking
+/// `capture_thread_at_with_tally`), so a ghost-filtered tid still
+/// counts as walked. The per-tid `pending_failures` set lets the
+/// caller unwind a ghost-filtered tid's read-failure contributions
+/// before the summary is finalized — see [`Self::commit_pending`] /
+/// [`Self::discard_pending`].
+#[derive(Debug, Default)]
+struct ParseTally {
+    tids_walked: u64,
+    failures_by_file: BTreeMap<&'static str, u64>,
+    /// Per-tid pending bumps held until the caller commits or
+    /// discards based on the ghost filter. Cleared between tids.
+    pending_failures: Vec<&'static str>,
+}
+
+impl ParseTally {
+    /// Record a per-file read failure for the current tid. Held
+    /// pending until [`Self::commit_pending`] or
+    /// [`Self::discard_pending`] resolves the tid's outcome.
+    fn record_failure(&mut self, file_kind: &'static str) {
+        self.pending_failures.push(file_kind);
+    }
+
+    /// Commit the current tid's pending failures to the per-snapshot
+    /// tally. Called when the tid lands in the snapshot.
+    fn commit_pending(&mut self) {
+        for kind in self.pending_failures.drain(..) {
+            *self.failures_by_file.entry(kind).or_insert(0) += 1;
+        }
+    }
+
+    /// Discard the current tid's pending failures. Called when the
+    /// ghost filter rejects the tid — the bumps would correspond to
+    /// a thread the snapshot doesn't include, so they must not
+    /// inflate the summary.
+    fn discard_pending(&mut self) {
+        self.pending_failures.clear();
+    }
+
+    /// Total failures across every file kind. Read-side mirror of
+    /// the public surface's `read_failures` field.
+    fn total_failures(&self) -> u64 {
+        self.failures_by_file.values().sum()
+    }
+
+    /// Pick the file kind with the most failures. Ties resolve to
+    /// REVERSE-alphabetical order for determinism — the
+    /// alphabetically-EARLIER tag wins (mirrors
+    /// [`ProbeSummary::dominant_tag`]'s comparator).
+    fn dominant_file(&self) -> Option<&'static str> {
+        self.failures_by_file
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+            .map(|(tag, _)| *tag)
+    }
+
+    /// True when ≥ 50% of failures are in `schedstat` or `io` —
+    /// the two procfs files gated by `CONFIG_SCHEDSTATS` /
+    /// `CONFIG_TASK_IO_ACCOUNTING`. Mirrors
+    /// [`ProbeSummary::ptrace_dominates`]'s shape: dominance gate
+    /// at half-or-more, false when total is zero.
+    fn kernel_config_dominates(&self) -> bool {
+        let total = self.total_failures();
+        if total == 0 {
+            return false;
+        }
+        let kconfig: u64 = self
+            .failures_by_file
+            .iter()
+            .filter(|(t, _)| matches!(**t, "schedstat" | "io"))
+            .map(|(_, n)| *n)
+            .sum();
+        kconfig * 2 >= total
+    }
+
+    /// Project the internal tally to the curated public surface.
+    fn to_public(&self) -> HostStateParseSummary {
+        let read_failures = self.total_failures();
+        let mut by_file = BTreeMap::new();
+        for (k, v) in &self.failures_by_file {
+            by_file.insert((*k).to_string(), *v);
+        }
+        HostStateParseSummary {
+            tids_walked: self.tids_walked,
+            read_failures,
+            read_failures_by_file: by_file,
+            dominant_read_failure: self.dominant_file().map(|t| t.to_string()),
+            kernel_config_dominant: self.kernel_config_dominates(),
         }
     }
 }
@@ -1947,7 +2259,7 @@ fn emit_probe_summary(summary: &ProbeSummary) {
 /// Every other procfs-derived
 /// field populates normally — `capture_thread_at` runs
 /// unconditionally per tid regardless of probe outcome.
-pub fn capture_with(
+fn capture_with(
     proc_root: &Path,
     cgroup_root: &Path,
     use_syscall_affinity: bool,
@@ -2070,6 +2382,17 @@ pub fn capture_with(
     // `mut` is required because phase 2 below threads `&mut
     // summary` into `probe_thread_recording`.
     let mut summary = summary_mutex.into_inner().unwrap();
+    // Tally for procfs read-level failures, surfaced as
+    // `parse_summary` when the production path runs. Tests that
+    // pass `use_syscall_affinity=false` skip the assignment so
+    // the public field stays `None` — same discipline as
+    // `probe_summary`.
+    let mut parse_tally = ParseTally::default();
+    let mut tally_opt: Option<&mut ParseTally> = if use_syscall_affinity {
+        Some(&mut parse_tally)
+    } else {
+        None
+    };
 
     // Phase 2: sequential per-tid walk + ptrace reads.
     for tgid in &tgids {
@@ -2079,6 +2402,9 @@ pub fn capture_with(
             .get(&tgid)
             .and_then(|p: &Option<crate::host_thread_probe::JemallocProbe>| p.as_ref());
         for tid in iter_task_ids_at(proc_root, tgid) {
+            if let Some(t) = tally_opt.as_mut() {
+                t.tids_walked += 1;
+            }
             let comm = read_thread_comm_at(proc_root, tgid, tid).unwrap_or_default();
             let (allocated_bytes, deallocated_bytes) = probe
                 .map(|p| {
@@ -2093,8 +2419,15 @@ pub fn capture_with(
                     )
                 })
                 .unwrap_or((0, 0));
-            let mut t =
-                capture_thread_at(proc_root, tgid, tid, &pcomm, &comm, use_syscall_affinity);
+            let mut t = capture_thread_at_with_tally(
+                proc_root,
+                tgid,
+                tid,
+                &pcomm,
+                &comm,
+                use_syscall_affinity,
+                &mut tally_opt,
+            );
             t.allocated_bytes = allocated_bytes;
             t.deallocated_bytes = deallocated_bytes;
             // Ghost-thread filter: a tid that exited between the
@@ -2115,7 +2448,13 @@ pub fn capture_with(
             // intent without softening the "captures every live
             // thread" invariant.
             if t.comm.is_empty() && t.start_time_clock_ticks == 0 {
+                if let Some(t) = tally_opt.as_mut() {
+                    t.discard_pending();
+                }
                 continue;
+            }
+            if let Some(t) = tally_opt.as_mut() {
+                t.commit_pending();
             }
             threads.push(t);
         }
@@ -2123,6 +2462,11 @@ pub fn capture_with(
     let probe_summary = if use_syscall_affinity {
         emit_probe_summary(&summary);
         Some(summary.to_public())
+    } else {
+        None
+    };
+    let parse_summary = if use_syscall_affinity {
+        Some(parse_tally.to_public())
     } else {
         None
     };
@@ -2141,6 +2485,7 @@ pub fn capture_with(
         threads,
         cgroup_stats,
         probe_summary,
+        parse_summary,
     }
 }
 
@@ -2213,7 +2558,7 @@ pub fn capture_pid(pid: i32) -> HostStateSnapshot {
 /// `probe.as_ref().map(...).unwrap_or((0, 0))` short-circuits to
 /// the absent-counter default for the jemalloc fields, with every
 /// other procfs-derived field populated normally.
-pub fn capture_pid_with(
+fn capture_pid_with(
     proc_root: &Path,
     cgroup_root: &Path,
     pid: i32,
@@ -2242,7 +2587,16 @@ pub fn capture_pid_with(
         None
     };
     let mut threads: Vec<ThreadState> = Vec::new();
+    let mut parse_tally = ParseTally::default();
+    let mut tally_opt: Option<&mut ParseTally> = if use_syscall_affinity {
+        Some(&mut parse_tally)
+    } else {
+        None
+    };
     for tid in iter_task_ids_at(proc_root, pid) {
+        if let Some(t) = tally_opt.as_mut() {
+            t.tids_walked += 1;
+        }
         let comm = read_thread_comm_at(proc_root, pid, tid).unwrap_or_default();
         let (allocated_bytes, deallocated_bytes) = probe
             .as_ref()
@@ -2258,17 +2612,36 @@ pub fn capture_pid_with(
                 )
             })
             .unwrap_or((0, 0));
-        let mut t = capture_thread_at(proc_root, pid, tid, &pcomm, &comm, use_syscall_affinity);
+        let mut t = capture_thread_at_with_tally(
+            proc_root,
+            pid,
+            tid,
+            &pcomm,
+            &comm,
+            use_syscall_affinity,
+            &mut tally_opt,
+        );
         t.allocated_bytes = allocated_bytes;
         t.deallocated_bytes = deallocated_bytes;
         if t.comm.is_empty() && t.start_time_clock_ticks == 0 {
+            if let Some(t) = tally_opt.as_mut() {
+                t.discard_pending();
+            }
             continue;
+        }
+        if let Some(t) = tally_opt.as_mut() {
+            t.commit_pending();
         }
         threads.push(t);
     }
     let probe_summary = if use_syscall_affinity {
         emit_probe_summary(&summary);
         Some(summary.to_public())
+    } else {
+        None
+    };
+    let parse_summary = if use_syscall_affinity {
+        Some(parse_tally.to_public())
     } else {
         None
     };
@@ -2287,6 +2660,7 @@ pub fn capture_pid_with(
         threads,
         cgroup_stats,
         probe_summary,
+        parse_summary,
     }
 }
 
@@ -2340,6 +2714,7 @@ mod tests {
                 },
             )]),
             probe_summary: None,
+            parse_summary: None,
         };
         let tmp = tempfile::NamedTempFile::new().unwrap();
         snap.write(tmp.path()).unwrap();
@@ -2677,7 +3052,7 @@ mod tests {
 
     #[test]
     fn iter_tgids_includes_self() {
-        let tgids = iter_tgids();
+        let tgids = iter_tgids_at(Path::new(DEFAULT_PROC_ROOT));
         let pid = std::process::id() as i32;
         assert!(tgids.contains(&pid), "self pid {pid} not in /proc walk");
     }
@@ -2685,7 +3060,7 @@ mod tests {
     #[test]
     fn iter_task_ids_self_returns_at_least_main_tid() {
         let pid = std::process::id() as i32;
-        let tids = iter_task_ids(pid);
+        let tids = iter_task_ids_at(Path::new(DEFAULT_PROC_ROOT), pid);
         assert!(
             tids.contains(&pid),
             "main tid {pid} absent from /proc/self/task"
@@ -2695,7 +3070,8 @@ mod tests {
     #[test]
     fn read_process_comm_for_self_is_populated() {
         let pid = std::process::id() as i32;
-        let comm = read_process_comm(pid).expect("self comm must be readable");
+        let comm = read_process_comm_at(Path::new(DEFAULT_PROC_ROOT), pid)
+            .expect("self comm must be readable");
         assert!(!comm.is_empty());
     }
 
@@ -4103,6 +4479,219 @@ mod tests {
         );
     }
 
+    /// G9 — non-numeric directory entries under `<proc_root>/<tgid>/task/`
+    /// MUST be filtered by the parse-as-i32 step in
+    /// `iter_task_ids_at`. Mirrors G3 for the per-tgid `task/` subdir
+    /// (G3 covers `<proc_root>` itself). Real procfs has only numeric
+    /// task entries, but a hostile or malformed test fixture could
+    /// stage non-numeric names; the filter must drop them rather
+    /// than surface garbage tids.
+    #[test]
+    fn capture_with_non_numeric_task_entries_are_filtered() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+
+        let live_tgid: i32 = 8181;
+        let live_tid: i32 = 8182;
+        stage_synthetic_proc(proc_tmp.path(), live_tgid, live_tid, "real", "real-thread");
+
+        // Stage non-numeric entries alongside the real tid under
+        // <tgid>/task/. iter_task_ids_at must filter on parse::<i32>().
+        let task_dir = proc_tmp.path().join(live_tgid.to_string()).join("task");
+        for junk in &["status", "self", "12abc", "abc"] {
+            std::fs::create_dir_all(task_dir.join(junk)).unwrap();
+        }
+        std::fs::create_dir_all(task_dir.join("0")).unwrap();
+        std::fs::create_dir_all(task_dir.join("-1")).unwrap();
+
+        // Direct check on the parse filter — pins iter_task_ids_at
+        // independently of the rest of the pipeline.
+        assert_eq!(
+            iter_task_ids_at(proc_tmp.path(), live_tgid),
+            vec![live_tid],
+            "iter_task_ids_at must return only the real numeric tid; \
+             non-numeric and `0`/`-1` entries must be filtered by \
+             parse::<i32>().ok() + `> 0` predicates",
+        );
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "non-numeric `task/` entries must be filtered by \
+             iter_task_ids_at; got {} threads, expected 1",
+            snap.threads.len(),
+        );
+        assert_eq!(snap.threads[0].tid, live_tid as u32);
+    }
+
+    /// G10 — a tgid emitting a v1-only `cgroup` file (legacy
+    /// hierarchy entries, no `0::` unified line) lands the thread
+    /// with `cgroup` defaulting to "". The ghost filter does NOT
+    /// fire because comm + start_time are intact. The empty cgroup
+    /// is a legitimate observable signal — `capture_with`'s
+    /// cgroup_stats enrichment loop skips entries with empty
+    /// `cgroup` so no synthetic stats land for the missing path.
+    #[test]
+    fn capture_with_v1_only_cgroup_yields_empty_cgroup_string() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 9191;
+        let tid: i32 = 9192;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+
+        // Overwrite the cgroup file with only legacy v1 lines —
+        // parse_cgroup_v2 returns None, read_cgroup_at returns
+        // None, ThreadState.cgroup defaults to "".
+        let cgroup_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("cgroup");
+        let v1_only = "12:cpuset:/legacy/cpuset/path\n\
+             5:freezer:/legacy/freezer\n\
+             3:blkio:/\n";
+        std::fs::write(&cgroup_path, v1_only).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "v1-only cgroup does not block thread landing — comm + \
+             start_time are intact, ghost filter does not fire; \
+             got {} threads",
+            snap.threads.len(),
+        );
+        let t = &snap.threads[0];
+        assert_eq!(
+            t.cgroup, "",
+            "v1-only cgroup file → parse_cgroup_v2 returns None → \
+             ThreadState.cgroup defaults to empty; got {:?}",
+            t.cgroup,
+        );
+        // cgroup_stats enrichment skips empty-cgroup threads. The
+        // map must not carry an entry keyed on "" (would otherwise
+        // accumulate a meaningless aggregate row in the snapshot).
+        assert!(
+            !snap.cgroup_stats.contains_key(""),
+            "empty-cgroup thread must NOT seed an empty-key entry in \
+             cgroup_stats — the enrichment loop's `!is_empty()` guard \
+             pins the skip; got keys: {:?}",
+            snap.cgroup_stats.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// `capture_to` propagates write errors through anyhow with the
+    /// destination path in the context chain so an operator who
+    /// passed an unwritable target sees the path in the diagnostic
+    /// rather than a bare I/O error. Pins the `with_context` wrapper
+    /// at the public-API boundary; without it, the error message
+    /// loses the path and operators can't tell which target failed.
+    #[test]
+    fn capture_to_returns_err_on_unwritable_path() {
+        // A path under a directory that does not exist — std::fs::write
+        // returns ENOENT for the parent; capture_to's with_context
+        // wraps it with the destination path.
+        let scratch = tempfile::TempDir::new().unwrap();
+        let unwritable = scratch.path().join("missing-dir").join("snap.hst.zst");
+        let err = capture_to(&unwritable).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains(unwritable.to_string_lossy().as_ref()),
+            "error chain must name the unwritable target path; got: {chain}",
+        );
+    }
+
+    /// `read_cgroup_stats_at` reads from the path string verbatim;
+    /// when the path names a cgroup directory that does not exist
+    /// (the thread's cgroup string was captured but the cgroup has
+    /// since been rmdir'd, or the cgroup_root differs from the live
+    /// host), every cpu.stat / memory.current read fails with
+    /// ENOENT and the resulting `CgroupStats` is all-zero. Pins the
+    /// "absent = 0" contract for the enrichment loop's stale-string
+    /// race.
+    #[test]
+    fn capture_with_stale_cgroup_path_yields_all_zero_stats() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 7373;
+        let tid: i32 = 7374;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        // stage_synthetic_proc writes "0::/ktstr.slice/worker0" into
+        // the cgroup file but does NOT create the matching directory
+        // under cgroup_root. The enrichment loop calls
+        // read_cgroup_stats_at("/ktstr.slice/worker0"), which
+        // resolves to a non-existent dir and returns all-zero stats.
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(snap.threads.len(), 1);
+        let stats = snap
+            .cgroup_stats
+            .get("/ktstr.slice/worker0")
+            .expect("non-empty cgroup string must seed the stats map");
+        assert_eq!(stats.cpu_usage_usec, 0, "stale cgroup → cpu_usage_usec 0");
+        assert_eq!(stats.nr_throttled, 0, "stale cgroup → nr_throttled 0");
+        assert_eq!(stats.throttled_usec, 0, "stale cgroup → throttled_usec 0");
+        assert_eq!(stats.memory_current, 0, "stale cgroup → memory_current 0");
+    }
+
+    /// `read_cgroup_at` returns `None` when the cgroup file is
+    /// present but contains only v1 hierarchy lines (no `0::`
+    /// unified prefix). Pins the "v1-only → None" path of
+    /// `parse_cgroup_v2` from the file-read entry point — distinct
+    /// from `parse_cgroup_v2_none_when_only_legacy_present` which
+    /// pins the parse function in isolation.
+    #[test]
+    fn read_cgroup_at_v1_only_cgroup_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 4242;
+        let tid: i32 = 4243;
+        let task_dir = tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string());
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let v1_only = "12:cpuset:/legacy/cpuset/path\n\
+             5:freezer:/legacy/freezer\n";
+        std::fs::write(task_dir.join("cgroup"), v1_only).unwrap();
+
+        assert_eq!(
+            read_cgroup_at(tmp.path(), tgid, tid),
+            None,
+            "v1-only cgroup file → read_cgroup_at returns None (no 0:: line)",
+        );
+
+        // Symmetric missing-file branch: no cgroup file → None.
+        assert_eq!(
+            read_cgroup_at(tmp.path(), tgid, 9999),
+            None,
+            "missing cgroup file → read_cgroup_at returns None",
+        );
+    }
+
+    /// `parse_cgroup_v2` accepts the degenerate "/" root path. A
+    /// process cgrouped at the unified root emits "0::/" and the
+    /// parser returns Some("/"). Pins the boundary distinct from
+    /// `parse_cgroup_v2_empty_path_and_multiple_unified_lines`
+    /// (which covers "0::" with empty-string-after-prefix); this
+    /// test pins that "/" alone is treated as a valid path, not
+    /// folded into the empty-string rejection.
+    #[test]
+    fn parse_cgroup_v2_root_only_path_returns_slash() {
+        // Single "0::/" line — the trim + non-empty guard accepts
+        // "/" as a valid path.
+        assert_eq!(parse_cgroup_v2("0::/\n"), Some("/".to_string()));
+        // Same with trailing whitespace — trim absorbs it but "/"
+        // survives as the post-trim value.
+        assert_eq!(parse_cgroup_v2("0::/  \n"), Some("/".to_string()));
+        // Mixed alongside legacy v1 lines — unified picks "/".
+        let raw = "12:cpuset:/legacy/path\n0::/\n5:freezer:/legacy\n";
+        assert_eq!(parse_cgroup_v2(raw), Some("/".to_string()));
+    }
+
     // ------------------------------------------------------------
     // H3 — read_cgroup_stats_at synthetic-tree coverage
     // ------------------------------------------------------------
@@ -5032,6 +5621,837 @@ mod tests {
             !logs_contain("attach failed"),
             "jemalloc-not-found must NOT emit the warn 'attach failed' \
              event — that level is reserved for actionable failures",
+        );
+    }
+
+    // ------------------------------------------------------------
+    // T28 — HostStateParseSummary: per-file read-failure tally
+    // ------------------------------------------------------------
+
+    /// Stage a synthetic procfs tree for parse-summary tests:
+    /// a single live tgid + tid with `comm` and `stat` populated
+    /// so the ghost filter does NOT fire (start_time is parseable
+    /// from `stat`). The caller then deletes the specific
+    /// per-file targets they want to fail. `cgroup` and other
+    /// non-asserted files are populated so the surrounding reads
+    /// succeed and the tally only counts the targeted failures.
+    fn stage_minimal_proc_for_parse(root: &Path, tgid: i32, tid: i32) {
+        use std::fs;
+        let tgid_dir = root.join(tgid.to_string());
+        let task_dir = tgid_dir.join("task").join(tid.to_string());
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(tgid_dir.join("comm"), "p\n").unwrap();
+        fs::write(task_dir.join("comm"), "live\n").unwrap();
+        // Non-zero start_time keeps the ghost filter from firing
+        // even when other files vanish.
+        let stat_line = format!(
+            "{tid} (live) R 1 2 3 4 5 6 7 0 8 0 10 11 12 13 14 0 1 0 \
+             555555 100 200 300 400 500 600 700 800 900 1000 1100 \
+             1200 1300 1400 1500 1600 1700 1800 0\n"
+        );
+        fs::write(task_dir.join("stat"), stat_line).unwrap();
+        fs::write(task_dir.join("schedstat"), "0 0 0\n").unwrap();
+        fs::write(
+            task_dir.join("status"),
+            "voluntary_ctxt_switches:\t0\n\
+             nonvoluntary_ctxt_switches:\t0\n",
+        )
+        .unwrap();
+        fs::write(task_dir.join("io"), "rchar: 0\n").unwrap();
+        fs::write(task_dir.join("sched"), "").unwrap();
+        fs::write(task_dir.join("cgroup"), "0::/\n").unwrap();
+    }
+
+    /// Per-file-kind tally: deleting `schedstat` lands a single
+    /// `"schedstat"` failure in the summary's per-file map. Other
+    /// categories stay at zero (key absent from the map).
+    #[test]
+    fn parse_summary_records_schedstat_failure() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 5050;
+        let tid: i32 = 5051;
+        stage_minimal_proc_for_parse(proc_tmp.path(), tgid, tid);
+        // Delete schedstat so the read fails.
+        std::fs::remove_file(
+            proc_tmp
+                .path()
+                .join(tgid.to_string())
+                .join("task")
+                .join(tid.to_string())
+                .join("schedstat"),
+        )
+        .unwrap();
+
+        // capture_with(_, _, false) skips the production gate so
+        // parse_summary is None; use true and stage a /proc tree
+        // that the host_context probe absorbs without panicking.
+        // For the synthetic-tree pattern, stage a tally directly.
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        tally_opt.as_mut().unwrap().tids_walked += 1;
+        let _ = capture_thread_at_with_tally(
+            proc_tmp.path(),
+            tgid,
+            tid,
+            "p",
+            "live",
+            false,
+            &mut tally_opt,
+        );
+        tally_opt.as_mut().unwrap().commit_pending();
+
+        let summary = tally.to_public();
+        assert_eq!(summary.tids_walked, 1);
+        assert_eq!(summary.read_failures, 1);
+        assert_eq!(summary.read_failures_by_file.get("schedstat"), Some(&1));
+        assert!(!summary.read_failures_by_file.contains_key("stat"));
+        assert!(!summary.read_failures_by_file.contains_key("io"));
+    }
+
+    /// Per-file-kind tally: deleting `io` lands an `"io"` failure.
+    #[test]
+    fn parse_summary_records_io_failure() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 5060;
+        let tid: i32 = 5061;
+        stage_minimal_proc_for_parse(proc_tmp.path(), tgid, tid);
+        std::fs::remove_file(
+            proc_tmp
+                .path()
+                .join(tgid.to_string())
+                .join("task")
+                .join(tid.to_string())
+                .join("io"),
+        )
+        .unwrap();
+
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        tally_opt.as_mut().unwrap().tids_walked += 1;
+        let _ = capture_thread_at_with_tally(
+            proc_tmp.path(),
+            tgid,
+            tid,
+            "p",
+            "live",
+            false,
+            &mut tally_opt,
+        );
+        tally_opt.as_mut().unwrap().commit_pending();
+
+        let summary = tally.to_public();
+        assert_eq!(summary.read_failures_by_file.get("io"), Some(&1));
+    }
+
+    /// Per-file-kind tally: a fully populated synthetic /proc
+    /// (every reader succeeds) lands an empty map and zero
+    /// `read_failures`. Pins the "absent key = zero" contract.
+    #[test]
+    fn parse_summary_clean_proc_yields_empty_map() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 5070;
+        let tid: i32 = 5071;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        tally_opt.as_mut().unwrap().tids_walked += 1;
+        let _ = capture_thread_at_with_tally(
+            proc_tmp.path(),
+            tgid,
+            tid,
+            "p",
+            "live",
+            false,
+            &mut tally_opt,
+        );
+        tally_opt.as_mut().unwrap().commit_pending();
+
+        let summary = tally.to_public();
+        assert_eq!(summary.tids_walked, 1);
+        assert_eq!(summary.read_failures, 0);
+        assert!(
+            summary.read_failures_by_file.is_empty(),
+            "clean procfs must yield an empty map, got {:?}",
+            summary.read_failures_by_file,
+        );
+        assert!(summary.dominant_read_failure.is_none());
+        assert!(!summary.kernel_config_dominant);
+    }
+
+    /// Ghost filter discipline (T28.2): a tid that exits between
+    /// readdir and the per-file reads (every read fails with
+    /// ENOENT, comm is empty, ghost filter rejects the tid) must
+    /// NOT contribute to the parse-summary tally. Otherwise a
+    /// busy host with mid-capture exits would inflate
+    /// `read_failures` with bumps that correspond to threads the
+    /// snapshot doesn't even contain.
+    #[test]
+    fn parse_summary_excludes_ghost_filtered_tids() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 5080;
+        let tid: i32 = 5081;
+        // Stage only the empty task directory (no comm, no stat,
+        // no other files) so every read fails AND the ghost filter
+        // fires (empty comm + zero start_time).
+        let task_dir = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string());
+        std::fs::create_dir_all(&task_dir).unwrap();
+
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        tally_opt.as_mut().unwrap().tids_walked += 1;
+        let t =
+            capture_thread_at_with_tally(proc_tmp.path(), tgid, tid, "", "", false, &mut tally_opt);
+        // Ghost filter: empty comm + zero start_time → discard.
+        if t.comm.is_empty() && t.start_time_clock_ticks == 0 {
+            tally_opt.as_mut().unwrap().discard_pending();
+        } else {
+            tally_opt.as_mut().unwrap().commit_pending();
+        }
+
+        let summary = tally.to_public();
+        assert_eq!(
+            summary.read_failures, 0,
+            "ghost-filtered tid must NOT contribute to read_failures; \
+             got {} failures (the discard_pending unwind is broken)",
+            summary.read_failures,
+        );
+        assert!(summary.read_failures_by_file.is_empty());
+        // tids_walked still incremented — the tid was attempted.
+        assert_eq!(summary.tids_walked, 1);
+    }
+
+    /// Serde round-trip: a populated `HostStateParseSummary`
+    /// preserves every field through JSON.
+    #[test]
+    fn parse_summary_serde_round_trip() {
+        let mut by_file = BTreeMap::new();
+        by_file.insert("schedstat".to_string(), 100);
+        by_file.insert("io".to_string(), 50);
+        let summary = HostStateParseSummary {
+            tids_walked: 1000,
+            read_failures: 150,
+            read_failures_by_file: by_file,
+            dominant_read_failure: Some("schedstat".to_string()),
+            kernel_config_dominant: true,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: HostStateParseSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tids_walked, 1000);
+        assert_eq!(back.read_failures, 150);
+        assert_eq!(back.read_failures_by_file.get("schedstat"), Some(&100));
+        assert_eq!(back.read_failures_by_file.get("io"), Some(&50));
+        assert_eq!(back.dominant_read_failure.as_deref(), Some("schedstat"));
+        assert!(back.kernel_config_dominant);
+    }
+
+    /// `dominant_read_failure` picks the file kind with the most
+    /// failures. Ties resolve REVERSE-alphabetically (mirrors the
+    /// probe-summary comparator) — alphabetically-EARLIER tag
+    /// wins.
+    #[test]
+    fn parse_summary_dominant_picks_max_file_kind() {
+        let mut tally = ParseTally::default();
+        // schedstat: 10 failures, io: 5, status: 5. schedstat wins.
+        for _ in 0..10 {
+            tally.record_failure("schedstat");
+        }
+        for _ in 0..5 {
+            tally.record_failure("io");
+        }
+        for _ in 0..5 {
+            tally.record_failure("status");
+        }
+        tally.commit_pending();
+        let summary = tally.to_public();
+        assert_eq!(summary.dominant_read_failure.as_deref(), Some("schedstat"));
+
+        // Tie between io and status (same count) — io wins (earlier
+        // alphabetical, matches the reverse-alphabetical comparator).
+        let mut tally2 = ParseTally::default();
+        for _ in 0..3 {
+            tally2.record_failure("io");
+        }
+        for _ in 0..3 {
+            tally2.record_failure("status");
+        }
+        tally2.commit_pending();
+        let summary2 = tally2.to_public();
+        assert_eq!(
+            summary2.dominant_read_failure.as_deref(),
+            Some("io"),
+            "tie must resolve to alphabetically-earlier tag — \
+             `io` beats `status`",
+        );
+    }
+
+    /// `kernel_config_hint` returns Some(_) when ≥ 50% of failures
+    /// land in `schedstat`/`io`. Pins the gate equality at the
+    /// boundary.
+    #[test]
+    fn parse_summary_kernel_config_hint_gate() {
+        // 50/50 split: 5 schedstat + 5 status. Kconfig share = 50%.
+        let mut tally = ParseTally::default();
+        for _ in 0..5 {
+            tally.record_failure("schedstat");
+        }
+        for _ in 0..5 {
+            tally.record_failure("status");
+        }
+        tally.commit_pending();
+        let summary = tally.to_public();
+        assert!(
+            summary.kernel_config_dominant,
+            "50% kconfig share must hit the gate (>= 50% boundary inclusive)",
+        );
+        assert!(summary.kernel_config_hint().is_some());
+
+        // Below threshold: 1 schedstat, 9 status. Kconfig share 10%.
+        let mut tally2 = ParseTally::default();
+        tally2.record_failure("schedstat");
+        for _ in 0..9 {
+            tally2.record_failure("status");
+        }
+        tally2.commit_pending();
+        let summary2 = tally2.to_public();
+        assert!(!summary2.kernel_config_dominant);
+        assert!(summary2.kernel_config_hint().is_none());
+
+        // Zero failures: kconfig_dominant must be false (no failures
+        // to dominate), hint is None.
+        let summary3 = ParseTally::default().to_public();
+        assert!(!summary3.kernel_config_dominant);
+        assert!(summary3.kernel_config_hint().is_none());
+    }
+
+    /// `dominant_read_failure` is None when zero failures landed,
+    /// even though the tally was constructed.
+    #[test]
+    fn parse_summary_dominant_none_when_zero_failures() {
+        let summary = ParseTally::default().to_public();
+        assert_eq!(summary.read_failures, 0);
+        assert!(summary.dominant_read_failure.is_none());
+    }
+
+    /// `capture_with(_, _, false)` skips the production gate so
+    /// `parse_summary` stays `None` on the assembled snapshot —
+    /// mirrors the `probe_summary` discipline. Synthetic-tree
+    /// tests must not see a populated parse summary.
+    #[test]
+    fn capture_with_synthetic_tree_yields_no_parse_summary() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 5090;
+        let tid: i32 = 5091;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert!(
+            snap.parse_summary.is_none(),
+            "use_syscall_affinity=false must skip parse_summary; \
+             got Some — production-gate discipline is broken",
+        );
+    }
+
+    // ------------------------------------------------------------
+    // T43 — Additional capture-pipeline error-path tests
+    // ------------------------------------------------------------
+
+    /// Phase-1 loadavg missing: capture_with must not panic when
+    /// the parallelism-clamp `proc_root/loadavg` read fails. The
+    /// reader's `.ok().and_then(...).unwrap_or(0.0)` chain folds
+    /// the missing-file branch into the 0.0 default, so the
+    /// headroom calculation continues to clamp at
+    /// `[1, num_cpus/2 + 1]`. Pins the missing-loadavg branch.
+    #[test]
+    fn capture_with_phase1_loadavg_missing_does_not_panic() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        // No loadavg file. iter_tgids_at returns Vec::new() so the
+        // probe-attach loop iterates zero times — but the clamp
+        // computation runs unconditionally inside the
+        // use_syscall_affinity=true branch, exercising the
+        // missing-file path.
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        assert!(
+            snap.threads.is_empty(),
+            "missing loadavg + empty proc_root → empty snapshot, \
+             got {} threads",
+            snap.threads.len(),
+        );
+    }
+
+    /// Phase-1 loadavg malformed: a non-float first token must
+    /// fold into the 0.0 default via the `.parse::<f64>().ok()`
+    /// step. Pins that a hostile `proc_root/loadavg` cannot crash
+    /// the parallelism-clamp computation.
+    #[test]
+    fn capture_with_phase1_loadavg_malformed_does_not_panic() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(proc_tmp.path().join("loadavg"), "not_a_number\n").unwrap();
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        assert!(
+            snap.threads.is_empty(),
+            "malformed loadavg → 0.0 default, empty proc_root → empty \
+             snapshot; got {} threads",
+            snap.threads.len(),
+        );
+    }
+
+    /// Non-UTF-8 bytes in `comm`: `fs::read_to_string` returns Err
+    /// on invalid UTF-8, so [`read_thread_comm_at`] yields None
+    /// and the caller defaults to "". With `start_time` non-zero
+    /// (intact `stat`), the ghost filter does NOT fire and the
+    /// thread lands with empty comm.
+    #[test]
+    fn capture_with_non_utf8_comm_treated_as_absent() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 6161;
+        let tid: i32 = 6162;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        // Overwrite tid/comm with non-UTF-8 bytes (lone 0xFF, then
+        // 0xFE — never valid UTF-8 lead bytes).
+        let comm_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("comm");
+        std::fs::write(&comm_path, [0xFF, 0xFE]).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "non-UTF-8 comm folds to empty; ghost filter does NOT \
+             fire because start_time is intact; thread still lands. \
+             got {} threads",
+            snap.threads.len(),
+        );
+        assert_eq!(
+            snap.threads[0].comm, "",
+            "non-UTF-8 comm must collapse to empty (read_to_string \
+             returns Err on invalid UTF-8)",
+        );
+        assert_ne!(
+            snap.threads[0].start_time_clock_ticks, 0,
+            "start_time must be intact for the ghost filter NOT to fire",
+        );
+    }
+
+    /// Cgroup path traversal: a `0::/../escape` payload in the
+    /// per-tid cgroup file lands in `ThreadState.cgroup` verbatim
+    /// (no sanitization at parse time), and the cgroup_stats
+    /// enrichment loop calls `read_cgroup_stats_at` with the same
+    /// string. The current behaviour bounds the read inside the
+    /// configured `cgroup_root` via `Path::join` — which DOES NOT
+    /// reject `..` components. Pin that the path-traversal string
+    /// round-trips through the snapshot but does not surface
+    /// out-of-tree cgroup data: the stats land at the all-zero
+    /// default because no matching cgroup directory exists under
+    /// `cgroup_root`.
+    #[test]
+    fn capture_with_cgroup_path_traversal_yields_zero_stats() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 6262;
+        let tid: i32 = 6263;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        // Overwrite cgroup with a traversal string.
+        let cgroup_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("cgroup");
+        std::fs::write(&cgroup_path, "0::/../escape\n").unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(snap.threads.len(), 1);
+        assert_eq!(
+            snap.threads[0].cgroup, "/../escape",
+            "traversal string round-trips verbatim through ThreadState.cgroup",
+        );
+        let stats = snap
+            .cgroup_stats
+            .get("/../escape")
+            .expect("non-empty cgroup string must seed the stats map");
+        assert_eq!(
+            stats.cpu_usage_usec, 0,
+            "no matching cgroup dir under cgroup_root → all-zero stats; \
+             a traversal that escaped the cgroup_root would have \
+             non-zero values from the parent directory",
+        );
+    }
+
+    /// Empty `Cpus_allowed_list:` value: `parse_cpu_list("")`
+    /// returns None at the empty-input guard, so `cpu_affinity`
+    /// lands as the empty Vec. Same observable effect as a
+    /// malformed range (G8) but pins the empty-string branch
+    /// distinctly.
+    #[test]
+    fn capture_with_empty_cpus_allowed_yields_empty_affinity() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 6363;
+        let tid: i32 = 6364;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        let status_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("status");
+        let status = "Cpus_allowed_list:\t\n\
+             voluntary_ctxt_switches:\t1\n\
+             nonvoluntary_ctxt_switches:\t1\n";
+        std::fs::write(&status_path, status).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(snap.threads.len(), 1);
+        let t = &snap.threads[0];
+        assert!(
+            t.cpu_affinity.is_empty(),
+            "empty Cpus_allowed_list value → parse_cpu_list returns \
+             None at the empty-input guard → cpu_affinity empty; \
+             got {} elements",
+            t.cpu_affinity.len(),
+        );
+        assert_eq!(
+            t.voluntary_csw, 1,
+            "empty cpulist must not break csw parsing on the same \
+             status file",
+        );
+    }
+
+    /// Ghost filter AND-semantics: an empty `comm` paired with a
+    /// NON-zero `start_time_clock_ticks` does NOT fire the filter.
+    /// The clause requires BOTH conditions (see
+    /// `t.comm.is_empty() && t.start_time_clock_ticks == 0`). Pins
+    /// the AND so a future refactor that flipped to OR would
+    /// surface here rather than hiding legitimate threads with
+    /// transient empty comms.
+    #[test]
+    fn capture_with_empty_comm_nonzero_start_time_keeps_thread() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 6464;
+        let tid: i32 = 6465;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        // Overwrite comm with whitespace so read_thread_comm_at
+        // returns None → comm defaults to "". start_time stays
+        // intact at 555_555 (the value stage_synthetic_proc writes).
+        let comm_path = proc_tmp
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(tid.to_string())
+            .join("comm");
+        std::fs::write(&comm_path, "   \n").unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "empty comm + nonzero start_time MUST NOT fire ghost filter \
+             (AND-semantics requires both empty); got {} threads",
+            snap.threads.len(),
+        );
+        let t = &snap.threads[0];
+        assert_eq!(t.comm, "", "empty-comm thread surfaces with empty comm");
+        assert_ne!(
+            t.start_time_clock_ticks, 0,
+            "start_time must be non-zero so the AND-clause has a `false` half",
+        );
+    }
+
+    // ------------------------------------------------------------
+    // T45 — Additional parse_summary + capture-pipeline coverage
+    // ------------------------------------------------------------
+
+    /// W2: every tid is ghost-filtered. With N empty task dirs the
+    /// ghost filter rejects every tid, so each tid's pending failure
+    /// bumps unwind via `discard_pending`. `tids_walked` is bumped
+    /// at the call site BEFORE the discard, so it still reads N.
+    /// `read_failures` lands at zero (every bump unwound), the per-
+    /// file map is empty, and `dominant_read_failure` is None. Pins
+    /// the "tids_walked counts attempts; failure tallies count only
+    /// committed bumps" split end-to-end through `capture_with`.
+    #[test]
+    fn parse_summary_all_ghosts_yields_nonzero_tids_walked_zero_failures() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 7070;
+        let n: u64 = 4;
+        // Stage one tgid with N empty task dirs (no comm, no stat,
+        // no other files). Every read fails; ghost filter fires for
+        // every tid; every pending tally is unwound.
+        let tgid_dir = proc_tmp.path().join(tgid.to_string());
+        for k in 0..n {
+            let tid = (tgid as u64 + 1 + k) as i32;
+            std::fs::create_dir_all(tgid_dir.join("task").join(tid.to_string())).unwrap();
+        }
+        // Stage `loadavg` so the parallelism-clamp read in phase 1
+        // resolves cleanly (the missing-file fallback is exercised
+        // by capture_with_phase1_loadavg_missing_does_not_panic).
+        std::fs::write(proc_tmp.path().join("loadavg"), "0.10 0.05 0.01 1/1 1\n").unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        assert!(
+            snap.threads.is_empty(),
+            "every tid is ghost-filtered → threads must be empty, got {}",
+            snap.threads.len(),
+        );
+        let summary = snap
+            .parse_summary
+            .expect("use_syscall_affinity=true must populate parse_summary");
+        assert_eq!(
+            summary.tids_walked, n,
+            "tids_walked counts every walk attempt, not committed reads — \
+             got {}, want {n}",
+            summary.tids_walked,
+        );
+        assert_eq!(
+            summary.read_failures, 0,
+            "ghost-filtered tids' failures unwind via discard_pending — \
+             got {} failures, want 0",
+            summary.read_failures,
+        );
+        assert!(
+            summary.read_failures_by_file.is_empty(),
+            "no failure bucket survives the ghost-filter unwind, got {:?}",
+            summary.read_failures_by_file,
+        );
+        assert!(
+            summary.dominant_read_failure.is_none(),
+            "zero failures → dominant_read_failure is None, got {:?}",
+            summary.dominant_read_failure,
+        );
+        assert!(
+            !summary.kernel_config_dominant,
+            "zero failures → kernel_config_dominant is false, got true",
+        );
+    }
+
+    /// W3: pin which file-kind tokens count as kernel-config-gated.
+    /// `kernel_config_dominates` filters on `matches!(t, "schedstat"
+    /// | "io")`. Iterate every recognised kebab token solo (one
+    /// failure of that kind, no others) and assert the gate flips
+    /// the way the implementation says it should — schedstat/io
+    /// land 100% kconfig and the gate fires; stat/status/sched/cgroup
+    /// land 0% kconfig and the gate stays false. A future refactor
+    /// that added or removed a token from the kconfig set without
+    /// updating the docs would surface here.
+    #[test]
+    fn parse_summary_kernel_config_token_list_pinned() {
+        let kconfig_tokens: &[&'static str] = &["schedstat", "io"];
+        for tag in kconfig_tokens {
+            let mut tally = ParseTally::default();
+            tally.record_failure(tag);
+            tally.commit_pending();
+            let summary = tally.to_public();
+            assert!(
+                summary.kernel_config_dominant,
+                "solo `{tag}` failure must flip kernel_config_dominant true \
+                 (kconfig share = 100%); got false — token dropped from the \
+                 kconfig set",
+            );
+        }
+
+        let non_kconfig_tokens: &[&'static str] = &["stat", "status", "sched", "cgroup"];
+        for tag in non_kconfig_tokens {
+            let mut tally = ParseTally::default();
+            tally.record_failure(tag);
+            tally.commit_pending();
+            let summary = tally.to_public();
+            assert!(
+                !summary.kernel_config_dominant,
+                "solo `{tag}` failure must keep kernel_config_dominant false \
+                 (kconfig share = 0%); got true — token incorrectly added to \
+                 the kconfig set",
+            );
+        }
+    }
+
+    /// W5: tally aggregates across multiple tids. Stage 2 tids
+    /// where each fails a different file (one missing io, one
+    /// missing schedstat). Both bumps must commit (neither tid is
+    /// ghost-filtered) and the per-file map carries one entry per
+    /// failure kind with count 1, total `read_failures` = 2.
+    #[test]
+    fn parse_summary_aggregates_across_multiple_tids() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 7080;
+        let tid_a: i32 = 7081;
+        let tid_b: i32 = 7082;
+        stage_minimal_proc_for_parse(proc_tmp.path(), tgid, tid_a);
+        // Second tid under the same tgid: write a fresh task dir.
+        let tgid_dir = proc_tmp.path().join(tgid.to_string());
+        let task_b = tgid_dir.join("task").join(tid_b.to_string());
+        std::fs::create_dir_all(&task_b).unwrap();
+        std::fs::write(task_b.join("comm"), "live\n").unwrap();
+        let stat_line = format!(
+            "{tid_b} (live) R 1 2 3 4 5 6 7 0 8 0 10 11 12 13 14 0 1 0 \
+             555555 100 200 300 400 500 600 700 800 900 1000 1100 \
+             1200 1300 1400 1500 1600 1700 1800 0\n"
+        );
+        std::fs::write(task_b.join("stat"), stat_line).unwrap();
+        std::fs::write(task_b.join("schedstat"), "0 0 0\n").unwrap();
+        std::fs::write(
+            task_b.join("status"),
+            "voluntary_ctxt_switches:\t0\n\
+             nonvoluntary_ctxt_switches:\t0\n",
+        )
+        .unwrap();
+        std::fs::write(task_b.join("io"), "rchar: 0\n").unwrap();
+        std::fs::write(task_b.join("sched"), "").unwrap();
+        std::fs::write(task_b.join("cgroup"), "0::/\n").unwrap();
+
+        // tid_a: delete io. tid_b: delete schedstat.
+        std::fs::remove_file(tgid_dir.join("task").join(tid_a.to_string()).join("io")).unwrap();
+        std::fs::remove_file(task_b.join("schedstat")).unwrap();
+
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        for tid in [tid_a, tid_b] {
+            tally_opt.as_mut().unwrap().tids_walked += 1;
+            let _ = capture_thread_at_with_tally(
+                proc_tmp.path(),
+                tgid,
+                tid,
+                "p",
+                "live",
+                false,
+                &mut tally_opt,
+            );
+            tally_opt.as_mut().unwrap().commit_pending();
+        }
+        let summary = tally.to_public();
+        assert_eq!(summary.tids_walked, 2);
+        assert_eq!(
+            summary.read_failures, 2,
+            "two tids, one failure each → 2 total; got {}",
+            summary.read_failures,
+        );
+        assert_eq!(
+            summary.read_failures_by_file.get("io"),
+            Some(&1),
+            "tid_a missing io → io bucket = 1; got {:?}",
+            summary.read_failures_by_file.get("io"),
+        );
+        assert_eq!(
+            summary.read_failures_by_file.get("schedstat"),
+            Some(&1),
+            "tid_b missing schedstat → schedstat bucket = 1; got {:?}",
+            summary.read_failures_by_file.get("schedstat"),
+        );
+    }
+
+    /// W7: deleting cgroup lands a `"cgroup"` failure. Mirrors the
+    /// schedstat/io single-failure tests so the cgroup-read tally
+    /// path is exercised explicitly — `read_cgroup_at_with_tally`
+    /// is the only producer of the `"cgroup"` tag and a future
+    /// refactor that bypassed the tally would surface here.
+    #[test]
+    fn parse_summary_records_cgroup_failure() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 7090;
+        let tid: i32 = 7091;
+        stage_minimal_proc_for_parse(proc_tmp.path(), tgid, tid);
+        std::fs::remove_file(
+            proc_tmp
+                .path()
+                .join(tgid.to_string())
+                .join("task")
+                .join(tid.to_string())
+                .join("cgroup"),
+        )
+        .unwrap();
+
+        let mut tally = ParseTally::default();
+        let mut tally_opt: Option<&mut ParseTally> = Some(&mut tally);
+        tally_opt.as_mut().unwrap().tids_walked += 1;
+        let _ = capture_thread_at_with_tally(
+            proc_tmp.path(),
+            tgid,
+            tid,
+            "p",
+            "live",
+            false,
+            &mut tally_opt,
+        );
+        tally_opt.as_mut().unwrap().commit_pending();
+
+        let summary = tally.to_public();
+        assert_eq!(
+            summary.read_failures_by_file.get("cgroup"),
+            Some(&1),
+            "missing cgroup file → cgroup bucket = 1; got {:?}",
+            summary.read_failures_by_file.get("cgroup"),
+        );
+    }
+
+    /// W6: the production gate (`use_syscall_affinity=true`)
+    /// populates `parse_summary` end-to-end. Mirror of
+    /// `capture_with_synthetic_tree_yields_no_parse_summary` but
+    /// with the gate flipped — pins that the production-path
+    /// assignment is wired through.
+    #[test]
+    fn capture_with_production_gate_populates_parse_summary() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 7100;
+        let tid: i32 = 7101;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        // loadavg lets the parallelism-clamp read resolve cleanly.
+        std::fs::write(proc_tmp.path().join("loadavg"), "0.10 0.05 0.01 1/1 1\n").unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), true);
+        assert!(
+            snap.parse_summary.is_some(),
+            "use_syscall_affinity=true must populate parse_summary on \
+             the assembled snapshot — production-gate wiring is broken",
+        );
+    }
+
+    /// X2: non-UTF-8 bytes in `<tgid>/comm` (the pcomm path).
+    /// `read_process_comm_at` calls `fs::read_to_string`, which
+    /// returns Err on invalid UTF-8; `.ok()?` propagates None and
+    /// the caller defaults `pcomm` to "" via `.unwrap_or_default()`.
+    /// Pin that capture does not panic and the per-thread `pcomm`
+    /// surfaces empty. Mirror of
+    /// `capture_with_non_utf8_comm_treated_as_absent` but for the
+    /// process-level (`<tgid>/comm`) read rather than the per-tid
+    /// (`<tgid>/task/<tid>/comm`) read.
+    #[test]
+    fn capture_with_non_utf8_pcomm_treated_as_absent() {
+        let proc_tmp = tempfile::TempDir::new().unwrap();
+        let cgroup_tmp = tempfile::TempDir::new().unwrap();
+        let tgid: i32 = 7110;
+        let tid: i32 = 7111;
+        stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+        // Overwrite the pcomm path (`<tgid>/comm`) with non-UTF-8
+        // lead bytes (0xFF and 0xFE — never valid UTF-8 starts).
+        let pcomm_path = proc_tmp.path().join(tgid.to_string()).join("comm");
+        std::fs::write(&pcomm_path, [0xFF, 0xFE]).unwrap();
+
+        let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), false);
+        assert_eq!(
+            snap.threads.len(),
+            1,
+            "non-UTF-8 pcomm must not break the capture — the thread still \
+             lands; got {} threads",
+            snap.threads.len(),
+        );
+        assert_eq!(
+            snap.threads[0].pcomm, "",
+            "non-UTF-8 pcomm collapses to empty (read_to_string returns Err \
+             on invalid UTF-8 and unwrap_or_default → \"\")",
         );
     }
 }

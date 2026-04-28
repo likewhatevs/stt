@@ -142,7 +142,11 @@ use host_thread_probe::{
 /// range) trigger a version increment. This keeps the rolling
 /// enrichment cadence (per-thread comm, timestamp, error_kind, etc.)
 /// from generating spurious version churn.
-const SCHEMA_VERSION: u32 = 2;
+///
+/// Changelog:
+/// - v3: `error_kind` tokens migrated from snake_case to kebab-case
+///   to align with the library's `ProbeError::tag()` vocabulary.
+const SCHEMA_VERSION: u32 = 3;
 
 /// Capture the current wall-clock as Unix epoch seconds. `unwrap_or(0)`
 /// handles the impossible pre-epoch-clock case defensively — KVM
@@ -371,10 +375,14 @@ enum ThreadResult {
 }
 
 /// Structural classifier for per-thread probe failures. Mirrors the
-/// engine's [`host_thread_probe::ProbeError`] taxonomy with
-/// snake_case wire tokens that downstream consumers grep against.
+/// engine's [`host_thread_probe::ProbeError`] taxonomy 1:1 with the
+/// kebab-case wire tokens that downstream consumers grep against —
+/// the same vocabulary `ProbeError::tag()` already returns, the
+/// same vocabulary `FatalKind::tag()` emits, so a single token
+/// stream reaches every consumer regardless of which variant
+/// produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumIter)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 enum ThreadErrorKind {
     PtraceSeize,
     PtraceInterrupt,
@@ -385,37 +393,42 @@ enum ThreadErrorKind {
 }
 
 impl std::fmt::Display for ThreadErrorKind {
-    /// Renders the same snake_case tokens emitted by the
-    /// `#[serde(rename_all = "snake_case")]` JSON serialization.
+    /// Renders the same kebab-case tokens emitted by the
+    /// `#[serde(rename_all = "kebab-case")]` JSON serialization.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let token = match self {
-            Self::PtraceSeize => "ptrace_seize",
-            Self::PtraceInterrupt => "ptrace_interrupt",
+            Self::PtraceSeize => "ptrace-seize",
+            Self::PtraceInterrupt => "ptrace-interrupt",
             Self::Waitpid => "waitpid",
-            Self::GetRegset => "get_regset",
-            Self::ProcessVmReadv => "process_vm_readv",
-            Self::TlsArithmetic => "tls_arithmetic",
+            Self::GetRegset => "get-regset",
+            Self::ProcessVmReadv => "process-vm-readv",
+            Self::TlsArithmetic => "tls-arithmetic",
         };
         f.write_str(token)
     }
 }
 
 impl ThreadErrorKind {
-    /// Translate the engine's [`ProbeError`] tag taxonomy into the
-    /// wire-stable bin-side classifier. Lib `ProbeError::tag()`
-    /// returns kebab-case (`ptrace-seize`); bin emits snake_case
-    /// (`ptrace_seize`). Both vocabularies are anchored at this
-    /// translation site — tests in `thread_error_kind_*` pin the
-    /// snake_case wire shape.
+    /// Translate the engine's [`ProbeError`] taxonomy onto the
+    /// bin-side classifier via a variant-on-variant match for
+    /// compile-time exhaustiveness — `ProbeError` is source-shared
+    /// into this binary via `#[path = "../host_thread_probe.rs"]`,
+    /// so it counts as IN-CRATE and the `#[non_exhaustive]` marker
+    /// does not force a wildcard arm. A new ProbeError variant
+    /// fails the match here at compile time, which is exactly the
+    /// drift signal we want — the bin grows a matching
+    /// `ThreadErrorKind` variant in the same change rather than
+    /// silently aliasing the new error onto an existing one.
+    /// Tests in `thread_error_kind_*` cover the wire shape and the
+    /// variant-count parity invariant.
     fn from_probe_error(err: &ProbeError) -> Self {
-        match err.tag() {
-            "ptrace-seize" => Self::PtraceSeize,
-            "ptrace-interrupt" => Self::PtraceInterrupt,
-            "waitpid" => Self::Waitpid,
-            "get-regset" => Self::GetRegset,
-            "process-vm-readv" => Self::ProcessVmReadv,
-            "tls-arithmetic" => Self::TlsArithmetic,
-            _ => Self::ProcessVmReadv,
+        match err {
+            ProbeError::PtraceSeize(_) => Self::PtraceSeize,
+            ProbeError::PtraceInterrupt(_) => Self::PtraceInterrupt,
+            ProbeError::Waitpid(_) => Self::Waitpid,
+            ProbeError::GetRegset(_) => Self::GetRegset,
+            ProbeError::ProcessVmReadv(_) => Self::ProcessVmReadv,
+            ProbeError::TlsArithmetic(_) => Self::TlsArithmetic,
         }
     }
 }
@@ -660,21 +673,27 @@ impl FatalKind {
         }
     }
 
-    /// Translate the engine's [`AttachError`] tag taxonomy into the
-    /// bin-side `FatalKind`. Both vocabularies share kebab-case
-    /// tokens 1:1 for the seven AttachError variants.
+    /// Translate the engine's [`AttachError`] taxonomy into the
+    /// bin-side `FatalKind` via a variant-on-variant match for
+    /// compile-time exhaustiveness — `AttachError` is source-shared
+    /// into this binary via `#[path = "../host_thread_probe.rs"]`,
+    /// so the `#[non_exhaustive]` marker does not force a wildcard
+    /// arm. A new AttachError variant fails the match here at
+    /// compile time, which is the drift signal we want. Both
+    /// vocabularies share kebab-case tokens 1:1 for the seven
+    /// AttachError variants. `FatalKind::Other` is reserved as a
+    /// forward-compat sink; it currently has no producers —
+    /// `from_attach_error` can no longer route into it after the
+    /// exhaustive variant match refactor.
     fn from_attach_error(err: &AttachError) -> Self {
-        match err.tag() {
-            "pid-missing" => Self::PidMissing,
-            "readlink-failure" => Self::ReadlinkFailure,
-            "maps-read-failure" => Self::MapsReadFailure,
-            "jemalloc-not-found" => Self::JemallocNotFound,
-            "jemalloc-in-dso" => Self::JemallocInDso,
-            "arch-mismatch" => Self::ArchMismatch,
-            "dwarf-parse-failure" => Self::DwarfParseFailure,
-            // Future-proof: a new engine variant lands under
-            // `Other` until the bin grows a matching variant.
-            _ => Self::Other,
+        match err {
+            AttachError::PidMissing(_) => Self::PidMissing,
+            AttachError::ReadlinkFailure(_) => Self::ReadlinkFailure,
+            AttachError::MapsReadFailure(_) => Self::MapsReadFailure,
+            AttachError::JemallocNotFound(_) => Self::JemallocNotFound,
+            AttachError::JemallocInDso(_) => Self::JemallocInDso,
+            AttachError::ArchMismatch(_) => Self::ArchMismatch,
+            AttachError::DwarfParseFailure(_) => Self::DwarfParseFailure,
         }
     }
 }
@@ -1295,7 +1314,7 @@ mod tests {
         assert!(tids.windows(2).all(|w| w[0] <= w[1]), "tids must be sorted");
     }
 
-    /// JSON schema v2: success + error arms round-trip via serde.
+    /// JSON schema v3: success + error arms round-trip via serde.
     #[test]
     fn thread_result_json_shape() {
         let ok = ThreadResult::Ok {
@@ -1333,7 +1352,7 @@ mod tests {
             }],
         };
         let s = serde_json::to_string(&out).unwrap();
-        assert!(s.contains("\"schema_version\":2"));
+        assert!(s.contains("\"schema_version\":3"));
         assert!(s.contains("\"pid\":100"));
         assert!(s.contains("\"tool_version\":\"0.0.0\""));
         assert!(s.contains("\"started_at_unix_sec\":1700000000"));
@@ -1354,20 +1373,20 @@ mod tests {
         assert!(!s.contains("\"interval_ms\":null"));
     }
 
-    /// Canonical snake_case token for each `ThreadErrorKind`.
+    /// Canonical kebab-case token for each `ThreadErrorKind`.
     fn expected_error_kind_token(k: ThreadErrorKind) -> &'static str {
         match k {
-            ThreadErrorKind::PtraceSeize => "ptrace_seize",
-            ThreadErrorKind::PtraceInterrupt => "ptrace_interrupt",
+            ThreadErrorKind::PtraceSeize => "ptrace-seize",
+            ThreadErrorKind::PtraceInterrupt => "ptrace-interrupt",
             ThreadErrorKind::Waitpid => "waitpid",
-            ThreadErrorKind::GetRegset => "get_regset",
-            ThreadErrorKind::ProcessVmReadv => "process_vm_readv",
-            ThreadErrorKind::TlsArithmetic => "tls_arithmetic",
+            ThreadErrorKind::GetRegset => "get-regset",
+            ThreadErrorKind::ProcessVmReadv => "process-vm-readv",
+            ThreadErrorKind::TlsArithmetic => "tls-arithmetic",
         }
     }
 
     #[test]
-    fn thread_error_kind_snake_case_serialization() {
+    fn thread_error_kind_kebab_case_serialization() {
         use strum::IntoEnumIterator;
         for k in ThreadErrorKind::iter() {
             let s = serde_json::to_string(&k).unwrap();
@@ -1428,6 +1447,39 @@ mod tests {
                 expected_bin_kind,
             );
         }
+    }
+
+    /// Variant-count parity: `ThreadErrorKind` must carry exactly
+    /// the same number of variants as the engine's `ProbeError`.
+    /// `from_probe_error` is an exhaustive variant-on-variant match
+    /// (no wildcard, see its doc comment), so the compiler already
+    /// catches a NEW `ProbeError` variant landing without a matching
+    /// arm — but a NEW `ThreadErrorKind` variant added without a
+    /// corresponding engine variant would compile silently. This
+    /// test pins the inverse direction: a count divergence here
+    /// signals "bin grew an unmoored variant" or "engine deleted a
+    /// variant the bin still names" and forces the change to land
+    /// on both sides simultaneously. The constant `6` mirrors the
+    /// current ProbeError variant count (PtraceSeize,
+    /// PtraceInterrupt, Waitpid, GetRegset, ProcessVmReadv,
+    /// TlsArithmetic); both sides must update together.
+    #[test]
+    fn thread_error_kind_variant_count_matches_probe_error() {
+        use strum::IntoEnumIterator;
+        let bin_count = ThreadErrorKind::iter().count();
+        // Cases vec in `thread_error_kind_from_probe_error_pins_mapping`
+        // already exhausts ProbeError; this test pins the count
+        // independently so a new bin-side variant without a
+        // corresponding engine arm trips here even if someone
+        // forgets to extend the cases vec.
+        let engine_count = 6;
+        assert_eq!(
+            bin_count, engine_count,
+            "ThreadErrorKind must mirror ProbeError 1:1 — got {bin_count} \
+             bin variants vs {engine_count} engine variants. If \
+             ProbeError gained or lost a variant, update both sides \
+             in the same change.",
+        );
     }
 
     /// `FatalKind::from_attach_error` translates every engine
@@ -1928,7 +1980,7 @@ mod tests {
             ],
         };
         let s = serde_json::to_string(&out).unwrap();
-        assert!(s.contains("\"schema_version\":2"));
+        assert!(s.contains("\"schema_version\":3"));
         assert!(s.contains("\"pid\":777"));
         assert!(s.contains("\"started_at_unix_sec\":1699999999"));
         assert!(s.contains("\"interval_ms\":50"));

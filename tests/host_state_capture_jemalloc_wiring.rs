@@ -1,9 +1,9 @@
 //! Host-side end-to-end test for the jemalloc-counter wiring in
-//! [`ktstr::host_state::capture_with`].
+//! [`ktstr::host_state::capture_pid`].
 //!
 //! Spawns `ktstr-jemalloc-alloc-worker` as a child process on the
 //! host with a known allocation size, waits for the worker's
-//! pid-scoped ready marker, then runs `capture_with` against the
+//! pid-scoped ready marker, then runs `capture_pid` against the
 //! host's real `/proc` and confirms the worker's tid carries a
 //! populated `allocated_bytes` field. Distinct from the VM-backed
 //! `tests/host_state_capture.rs`, which only proves the procfs
@@ -24,7 +24,7 @@
 //! capability needed.
 //!
 //! Under `=2` or `=3`, or when running as a non-uid-matching user,
-//! the `attach_jemalloc` step inside `capture_with` returns an
+//! the `attach_jemalloc` step inside `capture_pid` returns an
 //! `AttachError` that the capture pipeline absorbs into the
 //! "absent counter = 0" contract, so the worker's tid would land
 //! with `allocated_bytes=0`. To distinguish "wiring failed" from
