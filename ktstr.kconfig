@@ -111,6 +111,17 @@ CONFIG_SCHEDSTATS=y
 # SCHED_MC: multi-core scheduling awareness. Affects task
 # placement across cores within a package.
 CONFIG_SCHED_MC=y
+# TASK_DELAY_ACCT: gates /proc/<tid>/stat field 42
+# (delayacct_blkio_ticks). Without this, the field is hard-coded 0
+# in delayacct_blkio_ticks() (include/linux/delayacct.h). Also
+# `select`s SCHED_INFO. Requires runtime opt-in via the `delayacct`
+# kernel cmdline parameter or sysctl kernel.task_delayacct=1
+# (delayacct_on starts at 0 in kernel/delayacct.c).
+# Depends on TASKSTATS, which depends on NET + MULTIUSER. TASKSTATS
+# defaults to n; declare it explicitly so merge_config does not
+# silently drop TASK_DELAY_ACCT.
+CONFIG_TASKSTATS=y
+CONFIG_TASK_DELAY_ACCT=y
 # Symbols for monitor kallsyms resolution.
 CONFIG_KALLSYMS_ALL=y
 # Embedded .config for CONFIG_HZ detection by ktstr monitor.
@@ -118,14 +129,28 @@ CONFIG_KALLSYMS_ALL=y
 CONFIG_IKCONFIG=y
 CONFIG_IKCONFIG_PROC=y
 
+# -- Accounting --
+# TASK_IO_ACCOUNTING: gates /proc/<tid>/io
+# (rchar/wchar/syscr/syscw/read_bytes/write_bytes/cancelled_write_bytes,
+# emitted by do_io_accounting() in fs/proc/base.c). The /proc/<tid>/io
+# file itself is registered under #ifdef CONFIG_TASK_IO_ACCOUNTING.
+# Depends on TASK_XACCT (which depends on TASKSTATS, declared above).
+CONFIG_TASK_XACCT=y
+CONFIG_TASK_IO_ACCOUNTING=y
+# PSI: standard pressure-stall infrastructure. Every major distro
+# ships PSI=y. Per-CPU state machines with deferred averaging —
+# minimal scheduling impact. Required for host-level and per-cgroup
+# pressure capture. Active by default when compiled in
+# (PSI_DEFAULT_DISABLED defaults to n); registers
+# /proc/pressure/{io,memory,cpu,irq} via psi_proc_init() and
+# exposes per-cgroup *.pressure files.
+CONFIG_PSI=y
+
 # -- Disabled (would alter scheduler behavior) --
 # LOCKDEP: 10-100x lock overhead. Non-representative timing.
 # Use for catching locking bugs, not for scheduler testing.
 # CONFIG_PROVE_LOCKING is not set
 # CONFIG_DEBUG_LOCKDEP is not set
-# PSI: per-enqueue/dequeue/switch overhead (cgroup hierarchy
-# walk). Active by default when compiled in. Opt in only.
-# CONFIG_PSI is not set
 # DEBUG_INFO_REDUCED: breaks BTF generation.
 # CONFIG_DEBUG_INFO_SPLIT is not set
 
