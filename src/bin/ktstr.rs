@@ -446,6 +446,18 @@ pub struct HostStateShowArgs {
     /// other grouping.
     #[arg(long)]
     pub no_cg_normalize: bool,
+    /// Multi-key sort spec for the rendered groups. Format mirrors
+    /// `ktstr host-state compare --sort-by`:
+    /// `metric1[:dir1],metric2[:dir2],...` where each `metric` is
+    /// one of the registered metric names and `dir` is `asc` or
+    /// `desc` (default `desc`). Show ranks groups by the tuple
+    /// of the named metric's *absolute aggregated value* (not a
+    /// delta — there is only one snapshot to inspect), descending
+    /// by default; rows within a group keep registry order. Empty
+    /// (the default) keeps the alphabetical group-key iteration.
+    /// Example: `--sort-by run_time_ns,wait_sum:asc`.
+    #[arg(long, default_value = "")]
+    pub sort_by: String,
 }
 
 /// RAII guard that cleans up an auto-generated cgroup directory on drop.
@@ -658,6 +670,8 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
     use anyhow::Context;
     let snap = ktstr::host_state::HostStateSnapshot::load(&args.snapshot)
         .with_context(|| format!("load snapshot {}", args.snapshot.display()))?;
+    let sort_by = host_state_compare::parse_sort_by(&args.sort_by)
+        .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
     let mut out = String::new();
     // Infallible: writing into a String cannot fail.
     let _ = write_show(
@@ -667,6 +681,7 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
         &args.cgroup_flatten,
         args.no_thread_normalize,
         args.no_cg_normalize,
+        &sort_by,
     );
     print!("{out}");
     Ok(0)
@@ -685,6 +700,7 @@ fn write_show<W: std::fmt::Write>(
     cgroup_flatten: &[String],
     no_thread_normalize: bool,
     no_cg_normalize: bool,
+    sort_by: &[host_state_compare::SortKey],
 ) -> std::fmt::Result {
     let flatten = host_state_compare::compile_flatten_patterns(cgroup_flatten);
     // Single-snapshot cgroup key map. compare()'s
@@ -725,12 +741,63 @@ fn write_show<W: std::fmt::Write>(
     let mut table = cli::new_table();
     table.set_header(vec![group_header, "threads", "metric", "value"]);
 
-    // Stable iteration order: BTreeMap on `groups` already orders
-    // by key; per-group rows iterate `HOST_STATE_METRICS` so the
-    // metric column also lands in registry order. No delta sort
-    // because there is no delta to sort by — show renders
-    // absolute aggregates, not differences.
-    for (key, group) in &groups {
+    // Iteration order: when `sort_by` is empty, fall through the
+    // BTreeMap by-key order (alphabetical group key, registry order
+    // metrics); when non-empty, rank groups by the tuple of named
+    // metrics' *absolute aggregated values* (no deltas — show has
+    // one snapshot, not two). Mirrors compare's
+    // `sort_diff_rows_by_keys` shape (per-key direction, lex order
+    // on the tuple, deterministic group_key tie-break) but on
+    // `Aggregated::numeric()` rather than `DiffRow.delta`. Within a
+    // group, metrics still iterate `HOST_STATE_METRICS` so the
+    // metric column lands in registry order regardless of sort.
+    let group_order: Vec<&String> = if sort_by.is_empty() {
+        groups.keys().collect()
+    } else {
+        let mut keys: Vec<&String> = groups.keys().collect();
+        // Per-group sort tuple: missing values (a metric absent from
+        // this group's `metrics` map, or one whose `Aggregated`
+        // returns `None` from `numeric()` — categorical Mode etc.)
+        // sink to the bottom for the requested direction, matching
+        // `sort_diff_rows_by_keys`'s NEG_INFINITY/INFINITY handling.
+        let group_tuple = |group_key: &str| -> Vec<f64> {
+            let group = groups.get(group_key);
+            sort_by
+                .iter()
+                .map(|k| {
+                    group
+                        .and_then(|g| g.metrics.get(k.metric))
+                        .and_then(|a| a.numeric())
+                        .unwrap_or(if k.descending {
+                            f64::NEG_INFINITY
+                        } else {
+                            f64::INFINITY
+                        })
+                })
+                .collect()
+        };
+        keys.sort_by(|a, b| {
+            let ta = group_tuple(a);
+            let tb = group_tuple(b);
+            for (i, key) in sort_by.iter().enumerate() {
+                let (va, vb) = (ta[i], tb[i]);
+                let ord = if key.descending {
+                    vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            // Final tie-break: ascending group_key for determinism.
+            a.cmp(b)
+        });
+        keys
+    };
+
+    for key in group_order {
+        let group = &groups[key];
         // Display key: pattern grouping under Comm uses grex to
         // turn the join-key skeleton into a regex label; every
         // other grouping renders the join key directly.
@@ -773,13 +840,26 @@ fn write_show<W: std::fmt::Write>(
                 "throttled_usec",
                 "memory_current",
             ]);
+            // Route every scalar through `format_scaled_u64` so
+            // the same auto-scale ladder that compare's enrichment
+            // table uses applies here too — `7.500GiB` instead of
+            // `8053063680`, `1.235s` instead of `1234567` µs.
+            // Compare's table renders a baseline→candidate→delta
+            // triple via `cgroup_cell`; show has a single snapshot
+            // so each cell stands alone — `format_scaled_u64`
+            // gives just the scaled value with no `→` arrow and
+            // no `(+0…)` zero-delta tail. Units mirror compare's
+            // call sites:
+            //   cpu_usage_usec, throttled_usec → "µs"
+            //   memory_current                  → "B"
+            //   nr_throttled                    → "" (unitless count)
             for (key, s) in &stats {
                 ct.add_row(vec![
                     key.clone(),
-                    s.cpu_usage_usec.to_string(),
-                    s.nr_throttled.to_string(),
-                    s.throttled_usec.to_string(),
-                    s.memory_current.to_string(),
+                    host_state_compare::format_scaled_u64(s.cpu_usage_usec, "µs"),
+                    host_state_compare::format_scaled_u64(s.nr_throttled, ""),
+                    host_state_compare::format_scaled_u64(s.throttled_usec, "µs"),
+                    host_state_compare::format_scaled_u64(s.memory_current, "B"),
                 ]);
             }
             writeln!(w, "{ct}")?;
@@ -1168,15 +1248,19 @@ mod tests {
                 assert!(args.cgroup_flatten.is_empty());
                 assert!(!args.no_thread_normalize);
                 assert!(!args.no_cg_normalize);
+                // `--sort-by` defaults to the empty string —
+                // empty-spec sentinel for "fall through to
+                // alphabetical iteration".
+                assert!(args.sort_by.is_empty());
             }
             _ => panic!("expected HostState/Show"),
         }
     }
 
     /// `--group-by`, `--cgroup-flatten`, `--no-thread-normalize`,
-    /// and `--no-cg-normalize` propagate from clap into the
-    /// `HostStateShowArgs` struct unchanged. Pins the parse shape
-    /// for every flag the show subcommand surfaces.
+    /// `--no-cg-normalize`, and `--sort-by` propagate from clap
+    /// into the `HostStateShowArgs` struct unchanged. Pins the
+    /// parse shape for every flag the show subcommand surfaces.
     #[test]
     fn parse_host_state_show_with_every_flag_succeeds() {
         let parsed = Cli::try_parse_from([
@@ -1190,6 +1274,8 @@ mod tests {
             "/kubepods/*/workload",
             "--no-thread-normalize",
             "--no-cg-normalize",
+            "--sort-by",
+            "run_time_ns:desc,wait_sum:asc",
         ])
         .unwrap_or_else(|e| panic!("{e}"));
         match parsed.command {
@@ -1203,8 +1289,104 @@ mod tests {
                 );
                 assert!(args.no_thread_normalize);
                 assert!(args.no_cg_normalize);
+                // `--sort-by` comes through verbatim — clap stores
+                // the raw spec; `parse_sort_by` is the parser layer
+                // and runs in `run_show`, not at clap parse time.
+                assert_eq!(args.sort_by, "run_time_ns:desc,wait_sum:asc");
             }
             _ => panic!("expected HostState/Show"),
+        }
+    }
+
+    /// `ktstr host-state show <path> --sort-by run_time_ns` parses
+    /// successfully with the spec stored verbatim on
+    /// `HostStateShowArgs::sort_by`. Single-key, default-direction
+    /// pin — the unmarked form ("--sort-by metric" without a `:dir`
+    /// suffix) routes through `parse_sort_by`'s `None` arm in
+    /// `run_show` and ranks descending.
+    #[test]
+    fn parse_host_state_show_sort_by_single_key_succeeds() {
+        let parsed = Cli::try_parse_from([
+            "ktstr",
+            "host-state",
+            "show",
+            "/tmp/snap.hst.zst",
+            "--sort-by",
+            "run_time_ns",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match parsed.command {
+            Command::HostState {
+                command: HostStateCommand::Show(args),
+            } => {
+                assert_eq!(args.sort_by, "run_time_ns");
+            }
+            _ => panic!("expected HostState/Show"),
+        }
+    }
+
+    // -- host-state compare CLI --sort-by clap-parse pins
+    //
+    // Mirror of the show-side parse tests above for the compare
+    // subcommand. Pins that the `--sort-by` flag clap-parses
+    // into `HostStateCompareArgs::sort_by` as a raw String
+    // (parsing through `parse_sort_by` happens later, in
+    // `run_compare`). A regression that drops the field or
+    // re-types it as `Vec<String>` (e.g. a misguided "make it
+    // repeatable" refactor) would surface here at parse time.
+    /// `ktstr host-state compare <a> <b>` with no `--sort-by`
+    /// must parse with `sort_by` defaulting to the empty string.
+    /// Positive-path pin for the default-sentinel contract.
+    #[test]
+    fn parse_host_state_compare_sort_by_defaults_to_empty() {
+        let parsed = Cli::try_parse_from([
+            "ktstr",
+            "host-state",
+            "compare",
+            "/tmp/a.hst.zst",
+            "/tmp/b.hst.zst",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match parsed.command {
+            Command::HostState {
+                command: HostStateCommand::Compare(args),
+            } => {
+                assert_eq!(args.baseline, std::path::PathBuf::from("/tmp/a.hst.zst"));
+                assert_eq!(args.candidate, std::path::PathBuf::from("/tmp/b.hst.zst"));
+                // `--sort-by` defaults to the empty string —
+                // parse_sort_by treats this as the "fall through
+                // to default delta_pct sort" sentinel.
+                assert!(args.sort_by.is_empty());
+            }
+            _ => panic!("expected HostState/Compare"),
+        }
+    }
+
+    /// `ktstr host-state compare <a> <b> --sort-by <spec>` parses
+    /// the spec verbatim into `HostStateCompareArgs::sort_by`.
+    /// Pins that clap stores the raw string — `parse_sort_by`'s
+    /// validation is deferred to `run_compare`, not parse time.
+    /// Use a multi-key spec with mixed directions to exercise
+    /// every parser feature reachable through clap.
+    #[test]
+    fn parse_host_state_compare_with_sort_by_succeeds() {
+        let parsed = Cli::try_parse_from([
+            "ktstr",
+            "host-state",
+            "compare",
+            "/tmp/a.hst.zst",
+            "/tmp/b.hst.zst",
+            "--sort-by",
+            "run_time_ns:desc,wait_time_ns:asc",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match parsed.command {
+            Command::HostState {
+                command: HostStateCommand::Compare(args),
+            } => {
+                assert_eq!(args.sort_by, "run_time_ns:desc,wait_time_ns:asc");
+            }
+            _ => panic!("expected HostState/Compare"),
         }
     }
 
@@ -1248,6 +1430,7 @@ mod tests {
             &[],
             false,
             false,
+            &[],
         )
         .expect("write_show into String must not fail");
 
@@ -1299,7 +1482,7 @@ mod tests {
             (host_state_compare::GroupBy::CommExact, "comm"),
         ] {
             let mut out = String::new();
-            write_show(&mut out, &snap, axis, &[], false, false)
+            write_show(&mut out, &snap, axis, &[], false, false, &[])
                 .expect("write_show into String must not fail");
             assert!(
                 out.contains(expected_header),
@@ -1324,6 +1507,7 @@ mod tests {
             &[],
             false,
             false,
+            &[],
         )
         .expect("write_show into String must not fail on empty snapshot");
         assert!(
@@ -1336,6 +1520,194 @@ mod tests {
         assert!(
             !out.contains("run_time_ns"),
             "no thread → no metric row; got run_time_ns surfaced: {out}",
+        );
+    }
+
+    /// `write_show` with a non-empty `sort_by` re-orders groups
+    /// by the named metric's *absolute aggregated value* in
+    /// descending order — pins the new sort path against
+    /// alphabetical-by-default. Three pcomm buckets (`alpha`,
+    /// `bravo`, `charlie`) carry distinct `run_time_ns` totals so
+    /// the bucket with the largest value lands first; that order
+    /// is the inverse of the alphabetical default, so a regression
+    /// dropping the sort path would surface here as the wrong
+    /// first-group cell.
+    #[test]
+    fn write_show_sort_by_orders_groups_by_metric_descending() {
+        let mut snap = ktstr::host_state::HostStateSnapshot::default();
+        let mut t_alpha = ktstr::host_state::ThreadState::default();
+        t_alpha.pcomm = "alpha".to_string();
+        t_alpha.comm = "alpha-w".to_string();
+        t_alpha.run_time_ns = 100;
+        let mut t_bravo = ktstr::host_state::ThreadState::default();
+        t_bravo.pcomm = "bravo".to_string();
+        t_bravo.comm = "bravo-w".to_string();
+        t_bravo.run_time_ns = 500;
+        let mut t_charlie = ktstr::host_state::ThreadState::default();
+        t_charlie.pcomm = "charlie".to_string();
+        t_charlie.comm = "charlie-w".to_string();
+        t_charlie.run_time_ns = 250;
+        snap.threads.push(t_alpha);
+        snap.threads.push(t_bravo);
+        snap.threads.push(t_charlie);
+
+        let sort_by = vec![host_state_compare::SortKey {
+            metric: "run_time_ns",
+            descending: true,
+        }];
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            host_state_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &sort_by,
+        )
+        .expect("write_show into String must not fail");
+
+        // The three group keys appear in descending run_time_ns
+        // order: bravo (500) → charlie (250) → alpha (100). The
+        // alphabetical default would place alpha first.
+        let bravo_at = out.find("bravo").expect("bravo must surface in output");
+        let charlie_at = out.find("charlie").expect("charlie must surface in output");
+        let alpha_at = out.find("alpha").expect("alpha must surface in output");
+        assert!(
+            bravo_at < charlie_at,
+            "sort_by run_time_ns:desc must place bravo (500) before charlie (250); \
+             alpha={alpha_at} bravo={bravo_at} charlie={charlie_at}\nout:\n{out}",
+        );
+        assert!(
+            charlie_at < alpha_at,
+            "sort_by run_time_ns:desc must place charlie (250) before alpha (100); \
+             alpha={alpha_at} bravo={bravo_at} charlie={charlie_at}\nout:\n{out}",
+        );
+    }
+
+    /// `write_show` cgroup-stats secondary table renders each
+    /// scalar via `format_scaled_u64` — single auto-scaled value
+    /// per cell, no `→` arrow, no `(+0)` zero-delta suffix that
+    /// the compare-side `cgroup_cell` helper carries when
+    /// rendering a baseline→candidate→delta triple. Pins the UX
+    /// fix that distinguishes show (single snapshot) from
+    /// compare (paired snapshots): a 7.5 GiB `memory_current`
+    /// row reads `7.500GiB`, not `7.500GiB → 7.500GiB (+0B)`.
+    #[test]
+    fn write_show_cgroup_stats_renders_single_value_no_delta() {
+        let mut snap = ktstr::host_state::HostStateSnapshot::default();
+        // Cgroup grouping requires at least one thread carrying
+        // the cgroup path so build_groups produces a bucket; the
+        // secondary table renders for every cgroup_stats key
+        // regardless, but the primary table needs a row to
+        // surround it (write_show returns Ok early only for an
+        // empty cgroup_stats map, not an empty groups map).
+        let mut t = ktstr::host_state::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        t.cgroup = "/app".to_string();
+        snap.threads.push(t);
+        // 1 GiB exactly under IEC binary auto-scale → "1.000GiB".
+        // 1_500_000 µs under the µs ladder → "1.500s". The other
+        // two scalars (50 unitless, 200 µs) sit below their
+        // respective ladders' first step (1e3 either way) so they
+        // render as bare integers via `format_scaled_u64`'s
+        // no-step-up path. This test asserts the GiB and s forms
+        // since those are the load-bearing auto-scaled rows.
+        let one_gib: u64 = 1024 * 1024 * 1024;
+        // `CgroupStats` is `#[non_exhaustive]`, so direct struct
+        // construction is rejected outside its defining module
+        // (the `ktstr` binary is a separate translation unit
+        // from `host_state`). Build via Default + per-field
+        // assignment instead.
+        let mut cgs = ktstr::host_state::CgroupStats::default();
+        cgs.cpu_usage_usec = 1_500_000;
+        cgs.nr_throttled = 50;
+        cgs.throttled_usec = 200;
+        cgs.memory_current = one_gib;
+        snap.cgroup_stats.insert("/app".to_string(), cgs);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            host_state_compare::GroupBy::Cgroup,
+            &[],
+            false,
+            false,
+            &[],
+        )
+        .expect("write_show into String must not fail");
+
+        // Each scaled scalar appears VERBATIM with no arrow or
+        // delta tail — distinguishes show's single-value cells
+        // from compare's `a → b (+d)` triples.
+        assert!(
+            out.contains("1.500s"),
+            "cpu_usage_usec 1_500_000 µs must scale to '1.500s', got:\n{out}",
+        );
+        assert!(
+            out.contains("1.000GiB"),
+            "memory_current 1 GiB must scale to '1.000GiB', got:\n{out}",
+        );
+        // The arrow form would be a regression — single-snapshot
+        // rendering must not pretend to carry a delta.
+        assert!(
+            !out.contains("→"),
+            "show cgroup-stats must not emit a `→` arrow \
+             (compare's two-value cell shape); got:\n{out}",
+        );
+        // `(+0` matches the regression signature — the
+        // `format_delta_cell` zero-delta tail (`(+0)`, `(+0B)`,
+        // `(+0µs)`) that compare's cgroup_cell emits when
+        // baseline equals candidate. Bare `(` would over-match
+        // any incidental paren in comfy_table output, so pin
+        // the `(+0` prefix exactly.
+        assert!(
+            !out.contains("(+0"),
+            "show cgroup-stats must not carry a `(+0…)` zero-delta tail; \
+             got:\n{out}",
+        );
+    }
+
+    /// `write_show` with an empty `sort_by` keeps the default
+    /// alphabetical iteration over the BTreeMap-keyed groups.
+    /// Mirror of the descending-sort test: same three buckets,
+    /// no flag set, expect ascending alphabetical order
+    /// regardless of the run_time_ns spread. Pins the
+    /// "fall-through to default" branch of `write_show`.
+    #[test]
+    fn write_show_empty_sort_by_keeps_alphabetical_default() {
+        let mut snap = ktstr::host_state::HostStateSnapshot::default();
+        let mut t_zulu = ktstr::host_state::ThreadState::default();
+        t_zulu.pcomm = "zulu".to_string();
+        t_zulu.comm = "zulu-w".to_string();
+        t_zulu.run_time_ns = 999;
+        let mut t_alpha = ktstr::host_state::ThreadState::default();
+        t_alpha.pcomm = "alpha".to_string();
+        t_alpha.comm = "alpha-w".to_string();
+        t_alpha.run_time_ns = 1;
+        snap.threads.push(t_zulu);
+        snap.threads.push(t_alpha);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            host_state_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+        )
+        .expect("write_show into String must not fail");
+
+        let alpha_at = out.find("alpha").expect("alpha must surface");
+        let zulu_at = out.find("zulu").expect("zulu must surface");
+        assert!(
+            alpha_at < zulu_at,
+            "empty sort_by must keep alphabetical order \
+             (alpha before zulu); alpha={alpha_at} zulu={zulu_at}\nout:\n{out}",
         );
     }
 }

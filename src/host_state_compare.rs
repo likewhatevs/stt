@@ -105,6 +105,38 @@ pub struct CompareOptions {
     /// or 3 substitutions). Explicit `cgroup_flatten` glob
     /// patterns still apply. Has no effect under other groupings.
     pub no_cg_normalize: bool,
+    /// Multi-key sort spec for the diff rows. When non-empty,
+    /// overrides the default `delta_pct desc` sort. Each
+    /// [`SortKey`] names one metric from
+    /// [`HOST_STATE_METRICS`] and a direction; groups rank by the
+    /// tuple (`metric_1_delta`, `metric_2_delta`, ...) under
+    /// lexicographic order with per-key direction. Within a
+    /// group, rows appear in registry order. The sort
+    /// composes with [`Self::group_by`]: groups are formed under
+    /// the chosen axis (pcomm / cgroup / comm / comm-exact) and
+    /// then ranked by their aggregated metric values, so the
+    /// same `sort_by` spec works under every grouping. See
+    /// [`parse_sort_by`] for the CLI string parser.
+    pub sort_by: Vec<SortKey>,
+}
+
+/// One key in a multi-key `--sort-by` spec. Names a metric from
+/// [`HOST_STATE_METRICS`] and the sort direction for that key.
+/// Direction defaults to descending (largest delta first) so the
+/// common operator request — "show me the biggest regressions
+/// first" — is the unmarked form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortKey {
+    /// Metric name. Holds one of the [`HOST_STATE_METRICS`]
+    /// entries' `name` fields verbatim — [`parse_sort_by`]
+    /// looks up the input string in the registry and stores the
+    /// matched `&'static str`, so this never carries an
+    /// allocation and equality with a registry name is a pointer
+    /// comparison.
+    pub metric: &'static str,
+    /// True for descending (largest first), false for ascending
+    /// (smallest first).
+    pub descending: bool,
 }
 
 /// Newtype wrapper around [`GroupBy`] that defaults to
@@ -616,6 +648,122 @@ impl DiffRow {
     }
 }
 
+/// Apply a multi-key sort to `rows` per `sort_keys`. Computes a
+/// per-group sort tuple by looking up the requested metrics'
+/// deltas from the existing rows, ranks groups lexicographically
+/// (with per-key direction), then orders rows by
+/// `(group_rank, metric_registry_idx)` so rows for a given
+/// group cluster together in registry order. Mirrors the default
+/// sort's stability guarantee (within a group, registry order is
+/// preserved; across groups, deterministic by tuple).
+///
+/// Missing values (a group has no row for the named metric, or
+/// the row's `delta` is `None` because the metric is categorical
+/// — even though [`parse_sort_by`] now rejects categorical
+/// metrics at the CLI boundary, a programmatic caller can still
+/// construct a [`SortKey`] over a Mode metric directly) are
+/// treated as `f64::NEG_INFINITY` for descending sort and
+/// `f64::INFINITY` for ascending sort — they sink to the bottom
+/// either way.
+///
+/// Caller must supply at least one sort key — an empty slice is a
+/// programming error (the empty-spec case is handled at the
+/// caller via the `sort_by.is_empty()` branch in
+/// [`compare`] / `write_show`).
+fn sort_diff_rows_by_keys(rows: &mut [DiffRow], sort_keys: &[SortKey]) {
+    debug_assert!(
+        !sort_keys.is_empty(),
+        "sort_diff_rows_by_keys called with empty sort_keys; \
+         caller must short-circuit before invoking the multi-key \
+         sort path",
+    );
+    use std::collections::{BTreeMap, BTreeSet};
+    // metric name → registry index (for stable within-group
+    // ordering after sort). Both sides are `&'static str` so this
+    // map is allocation-free at the key layer.
+    let metric_idx: BTreeMap<&'static str, usize> = HOST_STATE_METRICS
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name, i))
+        .collect();
+    // group_key → (metric_name → delta). The inner key is
+    // `&'static str` borrowed from `row.metric_name` (itself a
+    // `&'static str` pointing into `HOST_STATE_METRICS.name`),
+    // so no per-row allocation is needed for the metric axis.
+    let mut group_metrics: BTreeMap<String, BTreeMap<&'static str, f64>> = BTreeMap::new();
+    for row in rows.iter() {
+        if let Some(d) = row.delta {
+            group_metrics
+                .entry(row.group_key.clone())
+                .or_default()
+                .insert(row.metric_name, d);
+        }
+    }
+    // Unique group set: every key from group_metrics PLUS every
+    // group_key from `rows` that had no numeric delta (every row
+    // was Mode/etc). BTreeSet handles dedup-on-insert without a
+    // separate sort+dedup pass.
+    let mut unique_groups: BTreeSet<String> = group_metrics.keys().cloned().collect();
+    for row in rows.iter() {
+        unique_groups.insert(row.group_key.clone());
+    }
+    // Precompute (group_key, sort_tuple) pairs once. Avoids
+    // recomputing the tuple inside the comparator on every
+    // comparison; with N groups and a non-trivial tuple this
+    // saves O(N log N) tuple builds.
+    let mut groups_with_tuples: Vec<(String, Vec<f64>)> = unique_groups
+        .into_iter()
+        .map(|g| {
+            let metrics = group_metrics.get(&g);
+            let tuple: Vec<f64> = sort_keys
+                .iter()
+                .map(|k| {
+                    metrics
+                        .and_then(|m| m.get(k.metric).copied())
+                        .unwrap_or(if k.descending {
+                            f64::NEG_INFINITY
+                        } else {
+                            f64::INFINITY
+                        })
+                })
+                .collect();
+            (g, tuple)
+        })
+        .collect();
+    // Sort with the precomputed tuples: comparator does only
+    // O(sort_keys.len()) f64 comparisons per call, no map
+    // lookups.
+    groups_with_tuples.sort_by(|(ga, ta), (gb, tb)| {
+        for (i, key) in sort_keys.iter().enumerate() {
+            let (va, vb) = (ta[i], tb[i]);
+            let ord = if key.descending {
+                vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        // Final tie-break: ascending group_key for determinism.
+        ga.cmp(gb)
+    });
+    let group_ranks: BTreeMap<String, usize> = groups_with_tuples
+        .into_iter()
+        .enumerate()
+        .map(|(i, (g, _))| (g, i))
+        .collect();
+    rows.sort_by(|a, b| {
+        let ra = group_ranks.get(&a.group_key).copied().unwrap_or(usize::MAX);
+        let rb = group_ranks.get(&b.group_key).copied().unwrap_or(usize::MAX);
+        ra.cmp(&rb).then_with(|| {
+            let ia = metric_idx.get(a.metric_name).copied().unwrap_or(usize::MAX);
+            let ib = metric_idx.get(b.metric_name).copied().unwrap_or(usize::MAX);
+            ia.cmp(&ib)
+        })
+    });
+}
+
 /// Full comparison result.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -742,14 +890,21 @@ pub fn compare(
     diff.only_baseline.sort();
     diff.only_candidate.sort();
 
-    // Stable-sort by descending |delta_pct|, ties broken by
-    // ascending group_key + registry order of metric.
-    diff.rows.sort_by(|a, b| {
-        b.sort_key()
-            .partial_cmp(&a.sort_key())
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.group_key.cmp(&b.group_key))
-    });
+    if opts.sort_by.is_empty() {
+        // Default: stable-sort by descending |delta_pct|, ties
+        // broken by ascending group_key + registry order of
+        // metric.
+        diff.rows.sort_by(|a, b| {
+            b.sort_key()
+                .partial_cmp(&a.sort_key())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.group_key.cmp(&b.group_key))
+        });
+    } else {
+        // Multi-key sort: rank groups by tuple of named-metric
+        // deltas, sort rows by (group_rank, metric_registry_idx).
+        sort_diff_rows_by_keys(&mut diff.rows, &opts.sort_by);
+    }
 
     if group_by == GroupBy::Cgroup {
         diff.cgroup_stats_a =
@@ -1421,6 +1576,121 @@ pub fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
         .collect()
 }
 
+/// Parse a `--sort-by` CLI value into a list of [`SortKey`]s.
+/// Spec format: `metric1[:dir1],metric2[:dir2],...` where each
+/// `metric` is a name from [`HOST_STATE_METRICS`] and `dir` is
+/// `asc` or `desc` (case-insensitive — `:DESC`, `:Asc`, `:asc`
+/// all work). Direction defaults to `desc` (largest delta first
+/// — operator "show me the largest changes" default).
+///
+/// Whitespace around the metric name and around the direction
+/// is trimmed independently, so `wait_sum : desc` and
+/// `wait_sum:desc` produce identical [`SortKey`] values.
+///
+/// Each parsed [`SortKey`] stores the matched registry name as
+/// `&'static str` (not a copy of the user's input), so downstream
+/// equality with [`HostStateMetricDef::name`] is a pointer
+/// comparison and no per-key allocation outlives this call.
+///
+/// Sorts groups by their aggregated metric values under whatever
+/// `--group-by` axis is in effect. The same spec works under
+/// every grouping (pcomm / cgroup / comm / comm-exact) — group
+/// rank reflects the per-group aggregate (sum, max, etc. per
+/// the metric's [`AggRule`]) of the named metric.
+///
+/// Examples:
+/// - `"wait_sum"` → one key, descending.
+/// - `"wait_sum:asc"` → one key, ascending.
+/// - `"wait_sum:desc,run_time_ns:desc"` → two keys, both
+///   descending; lexicographic.
+/// - `""` → empty Vec (caller falls back to default sort).
+///
+/// Errors:
+/// - Unknown metric name (not in [`HOST_STATE_METRICS`]).
+/// - Categorical metric name (one whose [`AggRule`] is
+///   [`AggRule::Mode`] — string-valued, no scalar to sort by).
+///   The default sort already places mode rows last under the
+///   `delta_pct` ladder; sorting BY a mode metric would silently
+///   degrade to alphabetical group order.
+/// - Duplicate metric name across two entries (e.g.
+///   `--sort-by wait_sum,wait_sum`). The second key would never
+///   contribute to the lex ordering, so it's an operator typo
+///   rather than a meaningful spec.
+/// - Direction string other than `asc` / `desc`.
+/// - Empty token between commas (e.g. `"a,,b"`).
+pub fn parse_sort_by(spec: &str) -> anyhow::Result<Vec<SortKey>> {
+    if spec.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Build a `name → &'static HostStateMetricDef` index so the
+    // lookup returns the canonical registry pointer (for storing
+    // in SortKey) AND the AggRule (for the categorical-reject
+    // check).
+    let registry: std::collections::BTreeMap<&'static str, &'static HostStateMetricDef> =
+        HOST_STATE_METRICS.iter().map(|m| (m.name, m)).collect();
+    let mut out: Vec<SortKey> = Vec::new();
+    let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            anyhow::bail!(
+                "empty entry in --sort-by spec {spec:?}; \
+                 entries are comma-separated and must be non-empty"
+            );
+        }
+        let (metric, descending) = match entry.split_once(':') {
+            Some((m, dir)) => {
+                // Trim both sides (`"wait_sum : DESC"` → metric
+                // `"wait_sum"` and direction `"DESC"`) and lowercase
+                // the direction so `:DESC` / `:Asc` / `:asc` are
+                // accepted equivalently. Operator-typed CLI input
+                // is forgiving about case; the canonical form
+                // stored in [`SortKey`] is still derived from the
+                // matched ascii literal.
+                let dir_norm = dir.trim().to_ascii_lowercase();
+                match dir_norm.as_str() {
+                    "desc" => (m, true),
+                    "asc" => (m, false),
+                    _ => anyhow::bail!(
+                        "invalid direction {dir:?} in --sort-by entry \
+                         {entry:?}; expected `asc` or `desc`"
+                    ),
+                }
+            }
+            None => (entry, true),
+        };
+        let metric = metric.trim();
+        let Some(def) = registry.get(metric).copied() else {
+            // Sorted comma-separated list keeps the diagnostic
+            // copy-pasteable — operator can grep the names
+            // without parsing BTreeSet debug syntax.
+            let valid = registry.keys().copied().collect::<Vec<_>>().join(", ");
+            anyhow::bail!(
+                "unknown metric {metric:?} in --sort-by spec {spec:?}; \
+                 must be one of: {valid}",
+            );
+        };
+        if matches!(def.rule, AggRule::Mode(_)) {
+            anyhow::bail!(
+                "metric {metric:?} is categorical (no numeric value to sort by); \
+                 --sort-by accepts only metrics whose AggRule yields a scalar \
+                 (Sum, Max, OrdinalRange, or Affinity)"
+            );
+        }
+        if !seen.insert(def.name) {
+            anyhow::bail!(
+                "duplicate metric {metric:?} in --sort-by spec {spec:?}; \
+                 each metric may appear at most once across all sort keys"
+            );
+        }
+        out.push(SortKey {
+            metric: def.name,
+            descending,
+        });
+    }
+    Ok(out)
+}
+
 pub fn flatten_cgroup_stats(
     stats: &BTreeMap<String, CgroupStats>,
     patterns: &[glob::Pattern],
@@ -1495,9 +1765,13 @@ fn format_cpu_range(cpus: &[u32]) -> String {
 /// on its unit family. Returns the scaled value paired with the
 /// scaled unit string.
 ///
-/// The four supported unit families are:
+/// The five supported unit families are:
 /// - `"ns"`: ladder ns → µs (×1e3) → ms (×1e6) → s (×1e9). Decimal
 ///   prefixes — IEEE/SI time units, not binary.
+/// - `"µs"`: ladder µs → ms (×1e3) → s (×1e6). Decimal SI prefixes.
+///   The cgroup `cpu_usage_usec` and `throttled_usec` fields are
+///   reported by the kernel in microseconds; this family scales
+///   them up the same way the `"ns"` family scales nanoseconds.
 /// - `"B"`: ladder B → KiB → MiB → GiB. IEC binary prefixes
 ///   (×1024) for byte counts.
 /// - `"ticks"`: ladder ticks → Kticks (×1e3) → Mticks (×1e6).
@@ -1529,6 +1803,15 @@ fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
                 (value / 1e3, "µs")
             } else {
                 (value, "ns")
+            }
+        }
+        "µs" => {
+            if abs >= 1e6 {
+                (value / 1e6, "s")
+            } else if abs >= 1e3 {
+                (value / 1e3, "ms")
+            } else {
+                (value, "µs")
             }
         }
         "B" => {
@@ -1574,7 +1857,7 @@ fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
 /// Format a per-row baseline / candidate cell for [`write_diff`].
 /// Numeric aggregates ([`Aggregated::Sum`] / [`Aggregated::Max`])
 /// run through [`auto_scale`] so large values render in a
-/// readable magnitude (`1.234ms` instead of `1234567ns`). When
+/// readable magnitude (`1.235ms` instead of `1234567ns`). When
 /// the scaled unit equals the input unit (no step-up was
 /// triggered), the original integer value is rendered verbatim
 /// — this avoids polluting small numbers with a `.000` suffix.
@@ -1591,8 +1874,13 @@ pub fn format_value_cell(agg: &Aggregated, unit: &'static str) -> String {
 
 /// Auto-scale a `u64` value at the given unit and render it as a
 /// cell. Helper for [`format_value_cell`] — the Sum and Max arms
-/// share this exact logic.
-fn format_scaled_u64(v: u64, unit: &'static str) -> String {
+/// share this exact logic. Also used by the `host-state show`
+/// renderer for the cgroup-stats secondary table, where each
+/// scalar stands alone (no baseline/candidate pair to fold into
+/// a delta cell).
+///
+/// See [`cgroup_cell`] for the supported unit families and ladders.
+pub fn format_scaled_u64(v: u64, unit: &'static str) -> String {
     let (scaled, scaled_unit) = auto_scale(v as f64, unit);
     if scaled_unit == unit {
         // No step-up — render the original integer to preserve
@@ -1663,6 +1951,19 @@ pub struct HostStateCompareArgs {
     /// Has no effect under any other grouping.
     #[arg(long)]
     pub no_cg_normalize: bool,
+    /// Multi-key sort spec for the diff rows. Format:
+    /// `metric1[:dir1],metric2[:dir2],...` where each `metric` is
+    /// one of the registered metric names and `dir` is `asc` or
+    /// `desc` (default `desc`). Groups rank by the tuple
+    /// (`metric1_delta`, `metric2_delta`, ...) under lexicographic
+    /// order with per-key direction; rows within a group keep
+    /// registry order. Empty (the default) keeps the
+    /// "biggest |delta_pct|" sort. Example:
+    /// `--sort-by wait_sum:desc,run_time_ns:desc`.
+    ///
+    /// Parsed by [`parse_sort_by`] into [`CompareOptions::sort_by`].
+    #[arg(long, default_value = "")]
+    pub sort_by: String,
 }
 
 /// Entry point for the compare CLI. Loads both snapshots,
@@ -1675,11 +1976,15 @@ pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
     let candidate = HostStateSnapshot::load(&args.candidate)
         .with_context(|| format!("load candidate {}", args.candidate.display()))?;
 
+    let sort_by = parse_sort_by(&args.sort_by)
+        .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
+
     let opts = CompareOptions {
         group_by: args.group_by.into(),
         cgroup_flatten: args.cgroup_flatten.clone(),
         no_thread_normalize: args.no_thread_normalize,
         no_cg_normalize: args.no_cg_normalize,
+        sort_by,
     };
     let diff = compare(&baseline, &candidate, &opts);
     print_diff(&diff, &args.baseline, &args.candidate, args.group_by);
@@ -1786,10 +2091,22 @@ pub fn write_diff<W: fmt::Write>(
             let b = diff.cgroup_stats_b.get(key);
             ct.add_row(vec![
                 key.clone(),
-                cgroup_cell(a.map(|s| s.cpu_usage_usec), b.map(|s| s.cpu_usage_usec)),
-                cgroup_cell(a.map(|s| s.nr_throttled), b.map(|s| s.nr_throttled)),
-                cgroup_cell(a.map(|s| s.throttled_usec), b.map(|s| s.throttled_usec)),
-                cgroup_cell(a.map(|s| s.memory_current), b.map(|s| s.memory_current)),
+                cgroup_cell(
+                    a.map(|s| s.cpu_usage_usec),
+                    b.map(|s| s.cpu_usage_usec),
+                    "µs",
+                ),
+                cgroup_cell(a.map(|s| s.nr_throttled), b.map(|s| s.nr_throttled), ""),
+                cgroup_cell(
+                    a.map(|s| s.throttled_usec),
+                    b.map(|s| s.throttled_usec),
+                    "µs",
+                ),
+                cgroup_cell(
+                    a.map(|s| s.memory_current),
+                    b.map(|s| s.memory_current),
+                    "B",
+                ),
             ]);
         }
         writeln!(w, "{ct}")?;
@@ -1820,14 +2137,48 @@ pub fn write_diff<W: fmt::Write>(
     Ok(())
 }
 
-fn cgroup_cell(a: Option<u64>, b: Option<u64>) -> String {
-    match (a, b) {
-        (Some(a), Some(b)) => {
-            let d = b as i128 - a as i128;
-            format!("{a} → {b} ({d:+})")
+/// Render a `(baseline, candidate, delta)` cell for the
+/// cgroup-enrichment secondary table emitted under
+/// [`GroupBy::Cgroup`]. The `unit` parameter routes each scalar
+/// through `auto_scale` (private to this module) so a 7.5 GiB
+/// `memory_current` row reads
+/// `7.500GiB → 8.250GiB (+768.000MiB)` instead of
+/// `8053063680 → 8858370048 (+805306368)`. Each cell scales
+/// independently — baseline, candidate, and delta may pick
+/// different prefixes when their magnitudes cross thresholds.
+///
+/// The five supported unit families (mirrored from
+/// `auto_scale`'s table — re-stated here because the underlying
+/// helper is private):
+/// - `"ns"`: ladder ns → µs (×1e3) → ms (×1e6) → s (×1e9).
+///   Decimal SI prefixes for nanosecond timestamps.
+/// - `"µs"`: ladder µs → ms (×1e3) → s (×1e6). Decimal SI
+///   prefixes; matches the kernel's microsecond-reporting
+///   cgroup fields (`cpu_usage_usec`, `throttled_usec`).
+/// - `"B"`: ladder B → KiB → MiB → GiB. IEC binary prefixes
+///   (×1024) for byte counts (e.g. `memory_current`).
+/// - `"ticks"`: ladder ticks → Kticks (×1e3) → Mticks (×1e6).
+///   Decimal prefixes for clock-tick counts; the unit itself is
+///   opaque (kernel `USER_HZ` is host-dependent).
+/// - `""` (empty unit): ladder "" → K → M → G. Decimal prefixes
+///   for non-dimensional counters (`nr_throttled`, wakeup
+///   counts, etc.).
+pub fn cgroup_cell(baseline: Option<u64>, candidate: Option<u64>, unit: &'static str) -> String {
+    match (baseline, candidate) {
+        (Some(baseline), Some(candidate)) => {
+            let baseline_cell = format_scaled_u64(baseline, unit);
+            let candidate_cell = format_scaled_u64(candidate, unit);
+            let d = candidate as i128 - baseline as i128;
+            // Delta is signed; route via format_delta_cell so the
+            // sign is rendered explicitly and the auto-scale step
+            // applies. i128 → f64 cast is lossy at extreme
+            // magnitudes (>2^53) but cgroup counters on typical
+            // hosts stay well under that ceiling.
+            let delta_cell = format_delta_cell(d as f64, unit);
+            format!("{baseline_cell} → {candidate_cell} ({delta_cell})")
         }
-        (Some(a), None) => format!("{a} → -"),
-        (None, Some(b)) => format!("- → {b}"),
+        (Some(baseline), None) => format!("{} → -", format_scaled_u64(baseline, unit)),
+        (None, Some(candidate)) => format!("- → {}", format_scaled_u64(candidate, unit)),
         (None, None) => "-".to_string(),
     }
 }
@@ -2050,6 +2401,7 @@ mod tests {
             cgroup_flatten: vec!["/kubepods/*/workload".into()],
             no_thread_normalize: false,
             no_cg_normalize: false,
+            sort_by: Vec::new(),
         };
         let diff = compare(&snap_with(vec![ta]), &snap_with(vec![tb]), &opts);
         assert!(diff.only_baseline.is_empty(), "{:?}", diff.only_baseline);
@@ -2094,6 +2446,7 @@ mod tests {
             cgroup_flatten: vec![],
             no_thread_normalize: false,
             no_cg_normalize: false,
+            sort_by: Vec::new(),
         };
         let diff = compare(&snap_a, &snap_b, &opts);
         assert_eq!(diff.cgroup_stats_a["/app"].cpu_usage_usec, 100);
@@ -2290,6 +2643,7 @@ mod tests {
                 cgroup_flatten: vec![],
                 no_thread_normalize: false,
                 no_cg_normalize: false,
+                sort_by: Vec::new(),
             },
         );
         let row = diff
@@ -2693,9 +3047,28 @@ mod tests {
             out.contains("cpu_usage_usec"),
             "missing enrichment header:\n{out}"
         );
-        assert!(out.contains("10"), "missing baseline usec:\n{out}");
-        assert!(out.contains("50"), "missing candidate usec:\n{out}");
-        assert!(out.contains("+40"), "missing delta:\n{out}");
+        // Cell renders as a contiguous `baseline → candidate
+        // (delta)` triple via `cgroup_cell`. Both 10 µs and 50 µs
+        // are below the 1000-µs ms-step threshold, so they keep
+        // the base unit (`10µs`, `50µs`); delta +40 likewise.
+        // Asserting on the contiguous string (rather than three
+        // bare integer substrings) defends against a regression
+        // where one cell's render drifts — bare `out.contains("10")`
+        // would silently pass even if the µs cell were dropped
+        // entirely (the substring "10" appears in the larger
+        // surrounding format).
+        assert!(
+            out.contains("10µs → 50µs (+40µs)"),
+            "missing contiguous scaled triple `10µs → 50µs (+40µs)`:\n{out}",
+        );
+        // Memory_current went 100 → 200 — both below the 1024 KiB
+        // threshold so they render as bare bytes with the `B`
+        // unit. Pin the contiguous form here too so the byte
+        // family's no-step-up path is covered.
+        assert!(
+            out.contains("100B → 200B (+100B)"),
+            "missing contiguous scaled triple `100B → 200B (+100B)`:\n{out}",
+        );
     }
 
     #[test]
@@ -2825,7 +3198,10 @@ mod tests {
 
     // -- comparison coverage expansion --
 
-    /// Pin all four branches of `cgroup_cell` directly. Existing
+    /// Pin all four branches of `cgroup_cell` directly with the
+    /// dimensionless ("") unit so values render verbatim (no
+    /// scaling). Auto-scaling per-unit is exercised separately by
+    /// `cgroup_cell_renders_scaled_*`. Existing higher-level
     /// tests only exercise the (Some, Some) path transitively via
     /// `write_diff_cgroup_enrichment_section_for_cgroup_mode`; the
     /// other three branches (baseline-only, candidate-only,
@@ -2835,16 +3211,76 @@ mod tests {
     #[test]
     fn cgroup_cell_renders_all_four_branches() {
         // (Some, Some) → "a → b (+d)" where d = b - a (signed).
-        assert_eq!(cgroup_cell(Some(10), Some(42)), "10 → 42 (+32)");
+        assert_eq!(cgroup_cell(Some(10), Some(42), ""), "10 → 42 (+32)");
         // Negative delta uses the signed formatter to keep the
         // sign explicit.
-        assert_eq!(cgroup_cell(Some(50), Some(5)), "50 → 5 (-45)");
+        assert_eq!(cgroup_cell(Some(50), Some(5), ""), "50 → 5 (-45)");
         // (Some, None) → baseline value then en-dash placeholder.
-        assert_eq!(cgroup_cell(Some(7), None), "7 → -");
+        assert_eq!(cgroup_cell(Some(7), None, ""), "7 → -");
         // (None, Some) → leading en-dash placeholder.
-        assert_eq!(cgroup_cell(None, Some(99)), "- → 99");
+        assert_eq!(cgroup_cell(None, Some(99), ""), "- → 99");
         // (None, None) → single en-dash (both sides absent).
-        assert_eq!(cgroup_cell(None, None), "-");
+        assert_eq!(cgroup_cell(None, None, ""), "-");
+    }
+
+    /// Auto-scale on the cgroup_cell µs family: a cpu_usage_usec
+    /// row with raw values in the millions of microseconds (i.e.
+    /// seconds-of-CPU range) renders with `s` / `ms` prefixes
+    /// rather than raw 7-digit µs counts. Each cell scales
+    /// independently.
+    #[test]
+    fn cgroup_cell_scales_microseconds_to_ms_or_s() {
+        // 1_500_000 µs = 1.5 s; 3_000_000 µs = 3.0 s; delta 1.5 s.
+        assert_eq!(
+            cgroup_cell(Some(1_500_000), Some(3_000_000), "µs"),
+            "1.500s → 3.000s (+1.500s)",
+        );
+        // Below the ms threshold — no step-up; integer below the
+        // delta's short-circuit so the bare integer renders.
+        assert_eq!(
+            cgroup_cell(Some(500), Some(900), "µs"),
+            "500µs → 900µs (+400µs)",
+        );
+    }
+
+    /// Auto-scale on the cgroup_cell B family: a memory_current
+    /// row in the GiB range renders with the `GiB` prefix on each
+    /// scalar. Same IEC binary divisor (1024) as the per-thread
+    /// allocated_bytes / read_bytes columns.
+    #[test]
+    fn cgroup_cell_scales_bytes_to_iec_prefix() {
+        let one_gib: u64 = 1024 * 1024 * 1024;
+        let two_gib: u64 = 2 * one_gib;
+        assert_eq!(
+            cgroup_cell(Some(one_gib), Some(two_gib), "B"),
+            "1.000GiB → 2.000GiB (+1.000GiB)",
+        );
+    }
+
+    /// Auto-scale on the dimensionless cgroup_cell column
+    /// (`nr_throttled`): large counts render with `K` / `M` /
+    /// `G` SI prefixes per the empty-unit ladder. Exercises each
+    /// step of the ladder so a regression that flips any
+    /// threshold (1e3 / 1e6 / 1e9) surfaces here.
+    #[test]
+    fn cgroup_cell_scales_unitless_count_to_k_m_g() {
+        // K step: values in the 1e3..1e6 range pick up a `K`
+        // suffix and divide by 1e3.
+        assert_eq!(
+            cgroup_cell(Some(1_500), Some(2_500), ""),
+            "1.500K → 2.500K (+1.000K)",
+        );
+        // M step: values in the 1e6..1e9 range pick up `M` and
+        // divide by 1e6.
+        assert_eq!(
+            cgroup_cell(Some(1_500_000), Some(2_500_000), ""),
+            "1.500M → 2.500M (+1.000M)",
+        );
+        // G step: values >= 1e9 pick up `G` and divide by 1e9.
+        assert_eq!(
+            cgroup_cell(Some(1_500_000_000), Some(2_500_000_000), ""),
+            "1.500G → 2.500G (+1.000G)",
+        );
     }
 
     /// Enrichment renderer must union `cgroup_stats_a` and
@@ -2889,13 +3325,16 @@ mod tests {
         );
         // Each one-sided row emits the en-dash placeholder for
         // the absent side (per `cgroup_cell`'s Some/None branch).
+        // cpu_usage_usec carries the "µs" unit; 111 µs is below
+        // the ms threshold (1000), so it renders verbatim with
+        // the base unit suffix.
         assert!(
-            out.contains("111 → -"),
-            "baseline-only row missing '111 → -' cell:\n{out}",
+            out.contains("111µs → -"),
+            "baseline-only row missing '111µs → -' cell:\n{out}",
         );
         assert!(
-            out.contains("- → 222"),
-            "candidate-only row missing '- → 222' cell:\n{out}",
+            out.contains("- → 222µs"),
+            "candidate-only row missing '- → 222µs' cell:\n{out}",
         );
     }
 
@@ -3711,6 +4150,7 @@ mod tests {
                 cgroup_flatten: vec![],
                 no_thread_normalize: false,
                 no_cg_normalize: false,
+                sort_by: Vec::new(),
             },
         );
         let row = diff
@@ -3761,6 +4201,7 @@ mod tests {
                 cgroup_flatten: vec![],
                 no_thread_normalize: false,
                 no_cg_normalize: false,
+                sort_by: Vec::new(),
             },
         );
         let row = diff
@@ -4203,6 +4644,7 @@ mod tests {
                 cgroup_flatten: vec![],
                 no_thread_normalize: true,
                 no_cg_normalize: false,
+                sort_by: Vec::new(),
             },
         );
         // Two distinct buckets — no collapse to `worker-{N}`.
@@ -4320,6 +4762,7 @@ mod tests {
                 cgroup_flatten: vec![],
                 no_thread_normalize: false,
                 no_cg_normalize: false,
+                sort_by: Vec::new(),
             },
         );
 
@@ -4406,6 +4849,7 @@ mod tests {
                 cgroup_flatten: vec![],
                 no_thread_normalize: false,
                 no_cg_normalize: false,
+                sort_by: Vec::new(),
             },
         );
         let group_keys: std::collections::BTreeSet<String> =
@@ -4443,6 +4887,7 @@ mod tests {
                 cgroup_flatten: vec![],
                 no_thread_normalize: false,
                 no_cg_normalize: false,
+                sort_by: Vec::new(),
             },
         );
         let normalized_key = "/user.slice/user-{N}.slice/user@{I}.service/boot.scope";
@@ -4461,6 +4906,7 @@ mod tests {
                 cgroup_flatten: vec![],
                 no_thread_normalize: false,
                 no_cg_normalize: true,
+                sort_by: Vec::new(),
             },
         );
         assert!(
@@ -4735,5 +5181,959 @@ mod tests {
             .expect("stime_clock_ticks in registry");
         assert_eq!(utime.unit, "ticks");
         assert_eq!(stime.unit, "ticks");
+    }
+
+    // ------------------------------------------------------------
+    // parse_sort_by + multi-key sort tests (#17)
+    // ------------------------------------------------------------
+
+    /// Empty `--sort-by` value parses to an empty Vec — caller
+    /// then falls back to the default delta_pct sort.
+    #[test]
+    fn parse_sort_by_empty_returns_empty_vec() {
+        let keys = parse_sort_by("").expect("empty parses");
+        assert!(keys.is_empty());
+    }
+
+    /// Single field with no direction defaults to descending
+    /// (largest delta first, matching operator default).
+    #[test]
+    fn parse_sort_by_single_field_defaults_to_desc() {
+        let keys = parse_sort_by("wait_sum").expect("parse");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].metric, "wait_sum");
+        assert!(keys[0].descending);
+    }
+
+    /// Bare metric name surrounded by whitespace (no colon, no
+    /// direction) parses as a single descending key. Pins the
+    /// metric-side trim path on the `None` arm of the
+    /// `split_once(':')` match — `entry.trim()` runs first to
+    /// strip the entry-level whitespace, then the `None` arm
+    /// passes the trimmed string straight through. A regression
+    /// that dropped either trim layer would surface here as a
+    /// failed registry lookup on the literal `"  wait_sum  "`.
+    #[test]
+    fn parse_sort_by_bare_metric_with_whitespace_no_colon() {
+        let keys = parse_sort_by("  wait_sum  ").expect("bare-metric whitespace must parse");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].metric, "wait_sum");
+        assert!(keys[0].descending);
+    }
+
+    /// Explicit `:asc` and `:desc` directions parse correctly.
+    /// Mixed-direction multi-key spec round-trips fine.
+    #[test]
+    fn parse_sort_by_explicit_directions() {
+        let keys = parse_sort_by("wait_sum:asc,run_time_ns:desc").expect("parse");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].metric, "wait_sum");
+        assert!(!keys[0].descending);
+        assert_eq!(keys[1].metric, "run_time_ns");
+        assert!(keys[1].descending);
+    }
+
+    /// Whitespace is trimmed at every layer — entry-level
+    /// (between commas) AND inside the metric:direction split.
+    /// Both `  wait_sum:desc  ` and `wait_sum : desc` (spaces
+    /// around the `:`) parse to the same key because the metric
+    /// and direction are independently trimmed after
+    /// `split_once(':')`.
+    #[test]
+    fn parse_sort_by_trims_whitespace_between_entries() {
+        let keys = parse_sort_by("  wait_sum:desc  ,  run_time_ns:asc  ").expect("parse");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].metric, "wait_sum");
+        assert!(keys[0].descending);
+        assert_eq!(keys[1].metric, "run_time_ns");
+        assert!(!keys[1].descending);
+    }
+
+    /// Whitespace around the `:` separator is tolerated:
+    /// `wait_sum : desc` parses as if the spaces were absent.
+    /// Pin both metric- and direction-side trimming. A regression
+    /// that drops the direction-side trim would surface as an
+    /// "invalid direction \" desc\"" error.
+    #[test]
+    fn parse_sort_by_trims_whitespace_around_colon() {
+        let keys = parse_sort_by("wait_sum : desc").expect("trimmed colon parse");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].metric, "wait_sum");
+        assert!(keys[0].descending);
+        // Asymmetric whitespace is also fine.
+        let keys2 = parse_sort_by("run_time_ns:  asc  ").expect("trimmed asc-side parse");
+        assert_eq!(keys2.len(), 1);
+        assert_eq!(keys2[0].metric, "run_time_ns");
+        assert!(!keys2[0].descending);
+    }
+
+    /// Direction matching is case-insensitive: `:DESC`, `:Desc`,
+    /// `:Asc`, and `:ASC` all map to the canonical `desc` /
+    /// `asc` semantics. Pin the lowercase normalization so an
+    /// operator who typed in caps doesn't get an
+    /// "invalid direction" error.
+    #[test]
+    fn parse_sort_by_direction_is_case_insensitive() {
+        for spec in ["wait_sum:DESC", "wait_sum:Desc", "wait_sum:dEsC"] {
+            let keys = parse_sort_by(spec).unwrap_or_else(|e| panic!("{spec} must parse: {e}"));
+            assert_eq!(keys.len(), 1, "{spec}");
+            assert!(keys[0].descending, "{spec}");
+        }
+        for spec in ["wait_sum:ASC", "wait_sum:Asc", "wait_sum:aSc"] {
+            let keys = parse_sort_by(spec).unwrap_or_else(|e| panic!("{spec} must parse: {e}"));
+            assert_eq!(keys.len(), 1, "{spec}");
+            assert!(!keys[0].descending, "{spec}");
+        }
+    }
+
+    /// Unknown metric name is rejected with a parse error
+    /// citing the offending name.
+    #[test]
+    fn parse_sort_by_rejects_unknown_metric() {
+        let err = parse_sort_by("not_a_real_metric").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not_a_real_metric"),
+            "error must cite offending metric name, got: {msg}"
+        );
+        // Also pin the "must be one of" preamble + at least one
+        // canonical valid name so an operator who hits a typo
+        // can recover from the diagnostic alone (without reading
+        // the source). `parse_sort_by_unknown_metric_lists_valid_names_sorted`
+        // pins the alphabetical order; this lighter test just
+        // pins that the list rendering itself fired.
+        assert!(
+            msg.contains("must be one of"),
+            "error must include the 'must be one of' preamble that introduces the valid-name list, got: {msg}"
+        );
+        assert!(
+            msg.contains("run_time_ns"),
+            "error must list at least one canonical metric name from the registry, got: {msg}"
+        );
+    }
+
+    /// Invalid direction string (anything other than `asc` /
+    /// `desc`) is rejected with an actionable error.
+    #[test]
+    fn parse_sort_by_rejects_invalid_direction() {
+        let err = parse_sort_by("wait_sum:sideways").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sideways"),
+            "error must cite offending direction, got: {msg}"
+        );
+    }
+
+    /// Empty entry between commas (`a,,b`) is rejected.
+    #[test]
+    fn parse_sort_by_rejects_empty_entry() {
+        let err = parse_sort_by("wait_sum,,run_time_ns").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty entry"),
+            "error must mention empty entry, got: {msg}"
+        );
+    }
+
+    /// Trailing comma (`"wait_sum,"`) yields an empty token at
+    /// the tail and is rejected with the same diagnostic as
+    /// `"a,,b"`. Pins that `split(',')` semantics produce an
+    /// empty trailing entry rather than silently dropping it.
+    #[test]
+    fn parse_sort_by_rejects_trailing_comma() {
+        let err = parse_sort_by("wait_sum,").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty entry"),
+            "trailing comma must surface as empty-entry error, got: {msg}"
+        );
+    }
+
+    /// Leading comma (`",wait_sum"`) yields an empty token at
+    /// the head — same shape as the trailing-comma case. Pins
+    /// the symmetric behavior so an operator who pastes a stray
+    /// `,` at either end of the spec gets a consistent error.
+    #[test]
+    fn parse_sort_by_rejects_leading_comma() {
+        let err = parse_sort_by(",wait_sum").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty entry"),
+            "leading comma must surface as empty-entry error, got: {msg}"
+        );
+    }
+
+    /// Bare colon (`":"`) splits to an empty metric and the
+    /// empty string as direction. The empty direction matches
+    /// neither `desc` nor `asc`, so the bad-direction arm fires
+    /// citing the empty token. Pins this branch over the
+    /// alternative interpretation ("metric is empty") so the
+    /// diagnostic stays operator-actionable.
+    #[test]
+    fn parse_sort_by_rejects_bare_colon() {
+        let err = parse_sort_by(":").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid direction"),
+            "bare colon must surface as invalid-direction error, got: {msg}"
+        );
+    }
+
+    /// Metric name with trailing colon and no direction
+    /// (`"wait_sum:"`) splits to (`"wait_sum"`, `""`). The
+    /// empty direction is not `asc` or `desc`, so the
+    /// bad-direction arm fires. A regression that treated empty
+    /// direction as the default `desc` would silently accept
+    /// the typo.
+    #[test]
+    fn parse_sort_by_rejects_metric_colon_no_direction() {
+        let err = parse_sort_by("wait_sum:").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid direction"),
+            "metric-colon-no-direction must surface as invalid-direction error, got: {msg}"
+        );
+    }
+
+    /// A categorical metric (one whose [`AggRule`] is
+    /// [`AggRule::Mode`] — `policy`, `state`, `ext_enabled`)
+    /// has no scalar to sort by. `parse_sort_by` rejects it
+    /// at the CLI boundary so the operator gets an actionable
+    /// error rather than silent fall-through to alphabetical
+    /// group order. Pin the canonical `policy` entry from the
+    /// registry.
+    #[test]
+    fn parse_sort_by_rejects_categorical_metric() {
+        // Sanity: policy is currently registered with AggRule::Mode.
+        let policy_def = HOST_STATE_METRICS
+            .iter()
+            .find(|m| m.name == "policy")
+            .expect("policy must be in HOST_STATE_METRICS");
+        assert!(
+            matches!(policy_def.rule, AggRule::Mode(_)),
+            "test premise drift: policy is no longer Mode-aggregated; \
+             pick a different categorical metric for this test",
+        );
+        let err = parse_sort_by("policy").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("categorical"),
+            "categorical metric error must label the failure mode, got: {msg}"
+        );
+        assert!(
+            msg.contains("policy"),
+            "categorical metric error must name the offending metric, got: {msg}"
+        );
+    }
+
+    /// Duplicate metric name across two entries
+    /// (`--sort-by wait_sum,wait_sum` or `wait_sum:asc,wait_sum:desc`)
+    /// is rejected. The second key never contributes to the lex
+    /// ordering (the first key already disambiguated every
+    /// non-tied case, and the second key would tie identically
+    /// on the same metric), so it's an operator typo rather
+    /// than a meaningful spec.
+    #[test]
+    fn parse_sort_by_rejects_duplicate_metric() {
+        let err = parse_sort_by("wait_sum,wait_sum").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate"),
+            "duplicate-metric error must label the failure mode, got: {msg}"
+        );
+        assert!(
+            msg.contains("wait_sum"),
+            "duplicate-metric error must name the offending metric, got: {msg}"
+        );
+        // Different directions on the same metric still count
+        // as duplicate — the second entry can't change the
+        // ordering, so it's still a typo.
+        let err2 = parse_sort_by("wait_sum:asc,wait_sum:desc").unwrap_err();
+        let msg2 = format!("{err2:#}");
+        assert!(
+            msg2.contains("duplicate"),
+            "duplicate metric across different directions must still reject, got: {msg2}"
+        );
+    }
+
+    /// Unknown-metric error message lists the valid registry
+    /// entries as a sorted comma-separated list (not a
+    /// `BTreeSet` debug dump). Pins the operator-facing shape:
+    /// the diagnostic is copy-pasteable and the names appear in
+    /// alphabetical order so the operator can scan for the one
+    /// they meant.
+    #[test]
+    fn parse_sort_by_unknown_metric_lists_valid_names_sorted() {
+        let err = parse_sort_by("not_a_real_metric").unwrap_err();
+        let msg = format!("{err:#}");
+        // The list is comma-separated. Find two known-adjacent
+        // names from the sorted set and pin their relative
+        // order in the diagnostic.
+        // In alphabetical order, "nice" comes before
+        // "policy" and "policy" before "run_time_ns" (registry
+        // names live mostly under the `n…` / `p…` / `r…`
+        // namespaces). Pick a triple whose alphabetical order
+        // is unambiguous.
+        let nice_at = msg
+            .find("nice")
+            .expect("error must list 'nice' from the registry");
+        let policy_at = msg
+            .find("policy")
+            .expect("error must list 'policy' from the registry");
+        let run_time_at = msg
+            .find("run_time_ns")
+            .expect("error must list 'run_time_ns' from the registry");
+        assert!(
+            nice_at < policy_at,
+            "names must appear in alphabetical order: \
+             nice@{nice_at} < policy@{policy_at}\nmsg: {msg}",
+        );
+        assert!(
+            policy_at < run_time_at,
+            "names must appear in alphabetical order: \
+             policy@{policy_at} < run_time_ns@{run_time_at}\nmsg: {msg}",
+        );
+        // Format must be comma-separated, not BTreeSet debug
+        // (`{...}`). Pin the absence of the debug-set delimiters.
+        assert!(
+            !msg.contains("{\""),
+            "error must use comma-separated list, not BTreeSet debug dump:\n{msg}"
+        );
+    }
+
+    /// Multi-key sort spec preserves entry order in the
+    /// returned Vec (left-to-right). Pins the documented
+    /// "lexicographic in input order" contract — a reordering
+    /// regression would silently rank by the second key first.
+    #[test]
+    fn parse_sort_by_multi_key_preserves_order() {
+        // Three keys, distinct names — pick one each from the
+        // ns / unitless / count axes so the entries are visibly
+        // distinct.
+        let keys =
+            parse_sort_by("run_time_ns:desc,nr_wakeups:asc,wait_time_ns:desc").expect("parse");
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].metric, "run_time_ns");
+        assert!(keys[0].descending);
+        assert_eq!(keys[1].metric, "nr_wakeups");
+        assert!(!keys[1].descending);
+        assert_eq!(keys[2].metric, "wait_time_ns");
+        assert!(keys[2].descending);
+    }
+
+    /// Multi-key sort: groups rank by the requested metrics'
+    /// deltas in tuple order. Big regression on the FIRST key
+    /// dominates regardless of the second key.
+    ///
+    /// Exercises `sort_diff_rows_by_keys` directly on synthetic
+    /// `DiffRow` values rather than driving through `compare()`
+    /// — the function under test is the sort, not the diff
+    /// pipeline; building the diff via `compare(empty, full)`
+    /// would route every group into `only_baseline` /
+    /// `only_candidate` rather than producing the matched-group
+    /// rows the sort consumes.
+    #[test]
+    fn sort_diff_rows_by_keys_ranks_by_first_key_first() {
+        // Build synthetic rows: 3 groups × 2 metrics = 6 rows.
+        let mk_row = |group: &str, metric: &'static str, delta: f64| DiffRow {
+            group_key: group.into(),
+            thread_count_a: 1,
+            thread_count_b: 1,
+            metric_name: metric,
+            metric_unit: "",
+            baseline: Aggregated::Sum(0),
+            candidate: Aggregated::Sum(0),
+            delta: Some(delta),
+            delta_pct: None,
+            display_key: group.into(),
+        };
+        let mut rows = vec![
+            mk_row("A", "run_time_ns", 1000.0),
+            mk_row("A", "wait_sum", 100.0),
+            mk_row("B", "run_time_ns", 100.0),
+            mk_row("B", "wait_sum", 1000.0),
+            mk_row("C", "run_time_ns", 50.0),
+            mk_row("C", "wait_sum", 50.0),
+        ];
+        sort_diff_rows_by_keys(
+            &mut rows,
+            &[SortKey {
+                metric: "run_time_ns",
+                descending: true,
+            }],
+        );
+        let groups_in_order: Vec<&str> = rows.iter().map(|r| r.group_key.as_str()).collect();
+        // A has run_time_ns 1000 → first. B has 100 → second. C has 50 → third.
+        // Each group's two rows cluster together in registry
+        // order (run_time_ns before wait_sum).
+        assert_eq!(
+            groups_in_order,
+            vec!["A", "A", "B", "B", "C", "C"],
+            "groups should rank by run_time_ns delta desc",
+        );
+        // Within each group: run_time_ns row comes first
+        // (registry index lower than wait_sum).
+        let metrics_first_two: Vec<&str> = rows.iter().take(2).map(|r| r.metric_name).collect();
+        assert_eq!(metrics_first_two, vec!["run_time_ns", "wait_sum"]);
+    }
+
+    /// Multi-key sort tie-break: when the first key value is
+    /// equal across groups, the second key disambiguates. Two
+    /// groups with the same run_time_ns delta but different
+    /// wait_sum deltas: the one with the larger wait_sum delta
+    /// sorts first (under desc,desc).
+    #[test]
+    fn sort_diff_rows_by_keys_breaks_ties_with_second_key() {
+        let mk_row = |group: &str, metric: &'static str, delta: f64| DiffRow {
+            group_key: group.into(),
+            thread_count_a: 1,
+            thread_count_b: 1,
+            metric_name: metric,
+            metric_unit: "",
+            baseline: Aggregated::Sum(0),
+            candidate: Aggregated::Sum(0),
+            delta: Some(delta),
+            delta_pct: None,
+            display_key: group.into(),
+        };
+        let mut rows = vec![
+            // A and B tie on run_time_ns (both 500). Use wait_sum
+            // to break: A.wait_sum delta is 100, B.wait_sum delta
+            // is 200. Under desc,desc → B first.
+            mk_row("A", "run_time_ns", 500.0),
+            mk_row("A", "wait_sum", 100.0),
+            mk_row("B", "run_time_ns", 500.0),
+            mk_row("B", "wait_sum", 200.0),
+        ];
+        sort_diff_rows_by_keys(
+            &mut rows,
+            &[
+                SortKey {
+                    metric: "run_time_ns",
+                    descending: true,
+                },
+                SortKey {
+                    metric: "wait_sum",
+                    descending: true,
+                },
+            ],
+        );
+        let groups_in_order: Vec<&str> = rows.iter().map(|r| r.group_key.as_str()).collect();
+        assert_eq!(groups_in_order, vec!["B", "B", "A", "A"]);
+    }
+
+    /// Ascending direction reverses the sort. Group with the
+    /// SMALLEST delta should sort first under `:asc`.
+    #[test]
+    fn sort_diff_rows_by_keys_respects_ascending_direction() {
+        let mk_row = |group: &str, metric: &'static str, delta: f64| DiffRow {
+            group_key: group.into(),
+            thread_count_a: 1,
+            thread_count_b: 1,
+            metric_name: metric,
+            metric_unit: "",
+            baseline: Aggregated::Sum(0),
+            candidate: Aggregated::Sum(0),
+            delta: Some(delta),
+            delta_pct: None,
+            display_key: group.into(),
+        };
+        let mut rows = vec![
+            mk_row("A", "run_time_ns", 1000.0),
+            mk_row("B", "run_time_ns", 100.0),
+            mk_row("C", "run_time_ns", 500.0),
+        ];
+        sort_diff_rows_by_keys(
+            &mut rows,
+            &[SortKey {
+                metric: "run_time_ns",
+                descending: false, // asc
+            }],
+        );
+        let groups_in_order: Vec<&str> = rows.iter().map(|r| r.group_key.as_str()).collect();
+        // B (100) < C (500) < A (1000) under asc.
+        assert_eq!(groups_in_order, vec!["B", "C", "A"]);
+    }
+
+    /// End-to-end: `compare()` with a non-empty sort_by uses the
+    /// multi-key path. Pin that two groups with different
+    /// run_time_ns deltas surface in the operator-requested
+    /// order, regardless of which group has the larger
+    /// |delta_pct| (which would have won under the default sort).
+    #[test]
+    fn compare_uses_sort_by_when_set() {
+        let mut a_pre = make_thread("alpha", "w");
+        a_pre.run_time_ns = 1_000_000_000; // 1B baseline → big abs but tiny pct change
+        let mut a_post = make_thread("alpha", "w");
+        a_post.run_time_ns = 1_000_000_500; // +500 abs; +5e-5 % change
+        let mut b_pre = make_thread("bravo", "w");
+        b_pre.run_time_ns = 100;
+        let mut b_post = make_thread("bravo", "w");
+        b_post.run_time_ns = 200; // +100 abs; +100% change
+        // Default sort: bravo wins by |delta_pct|. With
+        // sort_by=run_time_ns:desc, alpha wins by absolute delta
+        // (500 > 100).
+        let diff = compare(
+            &snap_with(vec![a_pre, b_pre]),
+            &snap_with(vec![a_post, b_post]),
+            &CompareOptions {
+                group_by: GroupBy::Pcomm.into(),
+                cgroup_flatten: vec![],
+                no_thread_normalize: false,
+                no_cg_normalize: false,
+                sort_by: vec![SortKey {
+                    metric: "run_time_ns",
+                    descending: true,
+                }],
+            },
+        );
+        let run_rows: Vec<&DiffRow> = diff
+            .rows
+            .iter()
+            .filter(|r| r.metric_name == "run_time_ns")
+            .collect();
+        assert_eq!(
+            run_rows[0].group_key, "alpha",
+            "sort_by abs delta picks alpha"
+        );
+        assert_eq!(run_rows[1].group_key, "bravo");
+    }
+
+    /// Final tie-break: when every sort-key value matches across
+    /// groups, `sort_diff_rows_by_keys` falls through to ascending
+    /// `group_key` ordering for deterministic output. Pins the
+    /// last branch in the comparator (`a.cmp(b)`) — without it,
+    /// equal-delta groups would emerge in BTreeMap-iteration order
+    /// dependent on hash, which would produce flaky test output.
+    #[test]
+    fn sort_diff_rows_by_keys_falls_back_to_ascending_group_key_on_full_tie() {
+        let mk_row = |group: &str, metric: &'static str, delta: f64| DiffRow {
+            group_key: group.into(),
+            thread_count_a: 1,
+            thread_count_b: 1,
+            metric_name: metric,
+            metric_unit: "",
+            baseline: Aggregated::Sum(0),
+            candidate: Aggregated::Sum(0),
+            delta: Some(delta),
+            delta_pct: None,
+            display_key: group.into(),
+        };
+        // Three groups with IDENTICAL deltas — only the
+        // group_key tie-break can deterministically order them.
+        // Insert in reverse-alphabetical order so the test fails
+        // if the tie-break is dropped (BTreeMap iteration would
+        // already produce ascending — distinguishable only via
+        // explicit reverse-input ordering).
+        let mut rows = vec![
+            mk_row("charlie", "run_time_ns", 100.0),
+            mk_row("bravo", "run_time_ns", 100.0),
+            mk_row("alpha", "run_time_ns", 100.0),
+        ];
+        sort_diff_rows_by_keys(
+            &mut rows,
+            &[SortKey {
+                metric: "run_time_ns",
+                descending: true,
+            }],
+        );
+        let order: Vec<&str> = rows.iter().map(|r| r.group_key.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["alpha", "bravo", "charlie"],
+            "full sort-key tie must fall back to ascending group_key",
+        );
+    }
+
+    /// Missing-metric handling under descending direction:
+    /// when a group has no row for the named metric (or its
+    /// row's `delta` is `None`), `sort_diff_rows_by_keys`
+    /// substitutes `f64::NEG_INFINITY` so the group sinks to
+    /// the bottom under desc. Pin the documented contract — a
+    /// regression that used 0.0 (or panicked) would surface
+    /// here.
+    #[test]
+    fn sort_diff_rows_by_keys_missing_metric_sinks_under_desc() {
+        let mk_row = |group: &str, metric: &'static str, delta: Option<f64>| DiffRow {
+            group_key: group.into(),
+            thread_count_a: 1,
+            thread_count_b: 1,
+            metric_name: metric,
+            metric_unit: "",
+            baseline: Aggregated::Sum(0),
+            candidate: Aggregated::Sum(0),
+            delta,
+            delta_pct: None,
+            display_key: group.into(),
+        };
+        let mut rows = vec![
+            // alpha has a real run_time_ns delta.
+            mk_row("alpha", "run_time_ns", Some(100.0)),
+            // bravo has only a wait_time_ns row — its run_time_ns
+            // tuple value is missing → NEG_INFINITY under desc.
+            mk_row("bravo", "wait_time_ns", Some(999_999.0)),
+        ];
+        sort_diff_rows_by_keys(
+            &mut rows,
+            &[SortKey {
+                metric: "run_time_ns",
+                descending: true,
+            }],
+        );
+        // Recover unique group ordering.
+        let mut order: Vec<&str> = Vec::new();
+        for r in &rows {
+            if !order.contains(&r.group_key.as_str()) {
+                order.push(r.group_key.as_str());
+            }
+        }
+        assert_eq!(
+            order,
+            vec!["alpha", "bravo"],
+            "missing metric under desc must sink the group (NEG_INFINITY)",
+        );
+    }
+
+    /// Missing-metric handling under ascending direction:
+    /// when the named metric is missing, `sort_diff_rows_by_keys`
+    /// substitutes `f64::INFINITY` so the group sinks to the
+    /// bottom under asc. Mirror of the desc test — same shape,
+    /// inverted polarity. Together they pin both arms of the
+    /// `if k.descending` branch in the fallback.
+    #[test]
+    fn sort_diff_rows_by_keys_missing_metric_sinks_under_asc() {
+        let mk_row = |group: &str, metric: &'static str, delta: Option<f64>| DiffRow {
+            group_key: group.into(),
+            thread_count_a: 1,
+            thread_count_b: 1,
+            metric_name: metric,
+            metric_unit: "",
+            baseline: Aggregated::Sum(0),
+            candidate: Aggregated::Sum(0),
+            delta,
+            delta_pct: None,
+            display_key: group.into(),
+        };
+        let mut rows = vec![
+            // alpha has a real (positive) run_time_ns delta.
+            mk_row("alpha", "run_time_ns", Some(100.0)),
+            // bravo has only a wait_time_ns row — its run_time_ns
+            // tuple value is missing → INFINITY under asc.
+            mk_row("bravo", "wait_time_ns", Some(50.0)),
+        ];
+        sort_diff_rows_by_keys(
+            &mut rows,
+            &[SortKey {
+                metric: "run_time_ns",
+                descending: false,
+            }],
+        );
+        let mut order: Vec<&str> = Vec::new();
+        for r in &rows {
+            if !order.contains(&r.group_key.as_str()) {
+                order.push(r.group_key.as_str());
+            }
+        }
+        assert_eq!(
+            order,
+            vec!["alpha", "bravo"],
+            "missing metric under asc must sink the group (INFINITY)",
+        );
+    }
+
+    /// Categorical-only group: every row's `delta` is `None`
+    /// (the group's metric is Mode and delta math doesn't
+    /// apply), but the group still appears in `rows`.
+    /// `sort_diff_rows_by_keys` must surface the group with
+    /// the missing-metric fallback applied — no panic, no row
+    /// dropped. This guards the second loop in the function
+    /// that adds groups present in `rows` but absent from
+    /// `group_metrics`.
+    #[test]
+    fn sort_diff_rows_by_keys_categorical_only_group_does_not_panic() {
+        let mk_row = |group: &str, metric: &'static str| DiffRow {
+            group_key: group.into(),
+            thread_count_a: 1,
+            thread_count_b: 1,
+            metric_name: metric,
+            metric_unit: "",
+            baseline: Aggregated::Mode {
+                value: "SCHED_OTHER".into(),
+                count: 1,
+                total: 1,
+            },
+            candidate: Aggregated::Mode {
+                value: "SCHED_OTHER".into(),
+                count: 1,
+                total: 1,
+            },
+            // `Mode` rows carry `delta: None` because mode
+            // metrics have no scalar projection — see
+            // `Aggregated::numeric()`.
+            delta: None,
+            delta_pct: None,
+            display_key: group.into(),
+        };
+        let mut rows = vec![mk_row("alpha", "policy"), mk_row("bravo", "policy")];
+        // Sort by run_time_ns — neither group has it, both fall
+        // through to the missing-metric fallback. Final tie-break
+        // (`a.cmp(b)`) breaks the tie ascending.
+        sort_diff_rows_by_keys(
+            &mut rows,
+            &[SortKey {
+                metric: "run_time_ns",
+                descending: true,
+            }],
+        );
+        let order: Vec<&str> = rows.iter().map(|r| r.group_key.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["alpha", "bravo"],
+            "categorical-only groups must survive the sort and fall to ascending group_key",
+        );
+    }
+
+    /// Within a group, rows appear in `HOST_STATE_METRICS`
+    /// registry order regardless of input order or sort spec.
+    /// Pins the documented "rows within a group keep registry
+    /// order" contract — a regression that ordered metric rows
+    /// by `metric_name` lexicographically (or by sort_key
+    /// position) would produce non-deterministic per-bucket
+    /// layouts.
+    #[test]
+    fn sort_diff_rows_by_keys_within_group_uses_registry_order() {
+        let mk_row = |group: &str, metric: &'static str, delta: f64| DiffRow {
+            group_key: group.into(),
+            thread_count_a: 1,
+            thread_count_b: 1,
+            metric_name: metric,
+            metric_unit: "",
+            baseline: Aggregated::Sum(0),
+            candidate: Aggregated::Sum(0),
+            delta: Some(delta),
+            delta_pct: None,
+            display_key: group.into(),
+        };
+        // Use four metrics from the scheduling block in their
+        // registry order: run_time_ns (idx 6), wait_time_ns (7),
+        // timeslices (8), nr_wakeups (11). Insert in
+        // REVERSE-registry order so a regression that orders by
+        // input/sort-spec/lexicographic would surface as a
+        // visibly wrong metric_order assertion.
+        let mut rows = vec![
+            mk_row("alpha", "nr_wakeups", 4.0),
+            mk_row("alpha", "timeslices", 3.0),
+            mk_row("alpha", "wait_time_ns", 999.0),
+            mk_row("alpha", "run_time_ns", 1.0),
+        ];
+        sort_diff_rows_by_keys(
+            &mut rows,
+            &[SortKey {
+                // Sort by wait_time_ns to verify the metric
+                // rows still emerge in REGISTRY order, not
+                // sort-spec order (which would put wait_time_ns
+                // first).
+                metric: "wait_time_ns",
+                descending: true,
+            }],
+        );
+        let metric_order: Vec<&str> = rows.iter().map(|r| r.metric_name).collect();
+        assert_eq!(
+            metric_order,
+            vec!["run_time_ns", "wait_time_ns", "timeslices", "nr_wakeups"],
+            "within-group order must be registry, not sort-spec, order",
+        );
+    }
+
+    /// NaN-safe partial_cmp: a `delta` that's NaN must not
+    /// panic the sort. `partial_cmp` returns `None` for NaN,
+    /// which the comparator maps to `Ordering::Equal` so the
+    /// remaining keys (or the group_key tie-break) decide. Pin
+    /// that the function survives the NaN input — without the
+    /// `unwrap_or(Equal)` in both arms, the sort would panic on
+    /// the implicit `unwrap()` of an arithmetic NaN result.
+    #[test]
+    fn sort_diff_rows_by_keys_nan_delta_does_not_panic() {
+        let mk_row = |group: &str, metric: &'static str, delta: f64| DiffRow {
+            group_key: group.into(),
+            thread_count_a: 1,
+            thread_count_b: 1,
+            metric_name: metric,
+            metric_unit: "",
+            baseline: Aggregated::Sum(0),
+            candidate: Aggregated::Sum(0),
+            delta: Some(delta),
+            delta_pct: None,
+            display_key: group.into(),
+        };
+        let mut rows = vec![
+            mk_row("alpha", "run_time_ns", f64::NAN),
+            mk_row("bravo", "run_time_ns", 100.0),
+            mk_row("charlie", "run_time_ns", f64::NAN),
+        ];
+        // The function call must not panic; output ordering is
+        // unspecified for NaN-vs-NaN beyond the group_key
+        // tie-break, so we only assert that all three groups
+        // survive the sort.
+        sort_diff_rows_by_keys(
+            &mut rows,
+            &[SortKey {
+                metric: "run_time_ns",
+                descending: true,
+            }],
+        );
+        let mut groups: Vec<&str> = rows.iter().map(|r| r.group_key.as_str()).collect();
+        groups.sort();
+        groups.dedup();
+        assert_eq!(
+            groups,
+            vec!["alpha", "bravo", "charlie"],
+            "NaN delta must not drop or duplicate any group",
+        );
+    }
+
+    /// `compare()` with empty `sort_by` routes through the
+    /// default `delta_pct desc` sort, NOT `sort_diff_rows_by_keys`.
+    /// Pin the routing branch by exercising the same data
+    /// shape under both `sort_by: empty` and `sort_by: [...]`
+    /// and confirming they produce *different* orderings.
+    /// Together with `compare_uses_sort_by_when_set` (the
+    /// non-empty branch above), this pins both arms of the
+    /// `if opts.sort_by.is_empty()` check inside `compare()`.
+    #[test]
+    fn compare_uses_default_sort_when_sort_by_empty() {
+        // `alpha` has 1B baseline, +500 delta → tiny |delta_pct|.
+        // `bravo` has 100 baseline, +100 delta → +100% delta_pct.
+        // Default sort ranks by |delta_pct| desc → bravo first.
+        let mut a_pre = make_thread("alpha", "w");
+        a_pre.run_time_ns = 1_000_000_000;
+        let mut a_post = make_thread("alpha", "w");
+        a_post.run_time_ns = 1_000_000_500;
+        let mut b_pre = make_thread("bravo", "w");
+        b_pre.run_time_ns = 100;
+        let mut b_post = make_thread("bravo", "w");
+        b_post.run_time_ns = 200;
+
+        // Empty sort_by → default delta_pct desc.
+        let diff_default = compare(
+            &snap_with(vec![a_pre.clone(), b_pre.clone()]),
+            &snap_with(vec![a_post.clone(), b_post.clone()]),
+            &CompareOptions {
+                group_by: GroupBy::Pcomm.into(),
+                cgroup_flatten: vec![],
+                no_thread_normalize: false,
+                no_cg_normalize: false,
+                sort_by: Vec::new(),
+            },
+        );
+        let default_order: Vec<&str> = diff_default
+            .rows
+            .iter()
+            .filter(|r| r.metric_name == "run_time_ns")
+            .map(|r| r.group_key.as_str())
+            .collect();
+        assert_eq!(
+            default_order,
+            vec!["bravo", "alpha"],
+            "empty sort_by must use default delta_pct desc sort \
+             (bravo's +100% beats alpha's +5e-5 %)",
+        );
+
+        // Non-empty sort_by → multi-key. Picks alpha first by
+        // absolute delta (+500 > +100).
+        let diff_sort = compare(
+            &snap_with(vec![a_pre, b_pre]),
+            &snap_with(vec![a_post, b_post]),
+            &CompareOptions {
+                group_by: GroupBy::Pcomm.into(),
+                cgroup_flatten: vec![],
+                no_thread_normalize: false,
+                no_cg_normalize: false,
+                sort_by: vec![SortKey {
+                    metric: "run_time_ns",
+                    descending: true,
+                }],
+            },
+        );
+        let sort_order: Vec<&str> = diff_sort
+            .rows
+            .iter()
+            .filter(|r| r.metric_name == "run_time_ns")
+            .map(|r| r.group_key.as_str())
+            .collect();
+        assert_eq!(
+            sort_order,
+            vec!["alpha", "bravo"],
+            "non-empty sort_by must use multi-key path (alpha's +500 abs beats bravo's +100)",
+        );
+
+        // The two orderings differ — pins that the routing
+        // actually swaps paths, not just produces the same
+        // result by coincidence.
+        assert_ne!(
+            default_order, sort_order,
+            "empty vs non-empty sort_by must produce different orderings on this fixture",
+        );
+    }
+
+    /// Auto-scale edge case: zero values render as bare
+    /// `0<unit>` across all five unit families. Pin that the
+    /// `abs() >= threshold` chain short-circuits to "no
+    /// step-up" at zero and the integer fast-path renders
+    /// `0ns`, `0µs`, `0B`, `0ticks`, and `0` (the empty-unit
+    /// case). A regression that flipped the threshold to `>`
+    /// (so `abs >= 0` matches and the chain over-steps to the
+    /// largest unit) would surface here.
+    #[test]
+    fn format_scaled_u64_zero_renders_at_base_unit_for_all_families() {
+        assert_eq!(format_scaled_u64(0, "ns"), "0ns");
+        assert_eq!(format_scaled_u64(0, "µs"), "0µs");
+        assert_eq!(format_scaled_u64(0, "B"), "0B");
+        assert_eq!(format_scaled_u64(0, "ticks"), "0ticks");
+        // Empty unit: format prints just the integer with no
+        // suffix. This is the canonical unitless render path.
+        assert_eq!(format_scaled_u64(0, ""), "0");
+    }
+
+    /// `format_delta_cell` on a negative µs delta auto-scales
+    /// AND keeps the explicit minus sign. Pin both sides:
+    /// magnitude is reported in seconds (`-1.500s`, not
+    /// `-1500000µs`), and the leading `-` survives the scale
+    /// step.
+    #[test]
+    fn format_delta_cell_negative_microseconds_scales_to_seconds() {
+        let cell = format_delta_cell(-1_500_000.0, "µs");
+        assert_eq!(cell, "-1.500s");
+    }
+
+    /// `format_delta_cell` on a negative byte delta auto-scales
+    /// AND keeps the explicit minus sign. Pin the IEC binary
+    /// path on the negative side; the existing positive-byte
+    /// path is exercised by other tests but the negative-byte
+    /// branch was unpinned.
+    #[test]
+    fn format_delta_cell_negative_bytes_scales_to_gib() {
+        let two_gib_neg = -(2.0 * 1024.0 * 1024.0 * 1024.0);
+        let cell = format_delta_cell(two_gib_neg, "B");
+        assert_eq!(cell, "-2.000GiB");
+    }
+
+    /// Asymmetric threshold-crossing: each cell of a
+    /// `cgroup_cell` triple scales independently. A baseline
+    /// just below the µs→ms threshold renders as bare µs while
+    /// the candidate (just above) jumps to ms — and the delta
+    /// (their difference) picks its own scale based on its own
+    /// magnitude. Pin that the three cells don't bleed scales
+    /// into each other.
+    #[test]
+    fn cgroup_cell_each_cell_scales_independently() {
+        // Baseline 999 µs (below 1000-µs ms threshold) →
+        // renders as `999µs`. Candidate 2000 µs (above) → `2.000ms`.
+        // Delta +1001 µs (above) → `+1.001ms`.
+        let cell = cgroup_cell(Some(999), Some(2000), "µs");
+        assert_eq!(
+            cell, "999µs → 2.000ms (+1.001ms)",
+            "asymmetric scaling: each cell must pick its own prefix",
+        );
     }
 }

@@ -226,9 +226,17 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
         out.contains("cpu_usage_usec"),
         "missing enrichment header:\n{out}",
     );
-    assert!(out.contains("100"), "missing baseline cpu_usage:\n{out}");
-    assert!(out.contains("400"), "missing candidate cpu_usage:\n{out}");
-    assert!(out.contains("+300"), "missing cpu_usage delta:\n{out}");
+    // Pin the contiguous scaled triple `cgroup_cell` emits for
+    // cpu_usage_usec under the µs unit family. Both 100 and 400
+    // sit below the 1000-µs ms-step threshold so each cell keeps
+    // its base unit; delta +300 likewise. Bare `out.contains("100")`
+    // would silently pass even if the baseline cell were dropped
+    // entirely (the substring "100" appears elsewhere in the
+    // surrounding format).
+    assert!(
+        out.contains("100µs → 400µs (+300µs)"),
+        "missing contiguous scaled triple `100µs → 400µs (+300µs)`:\n{out}",
+    );
 }
 
 /// Unmatched groups on one side produce an `only_baseline` /
@@ -319,6 +327,7 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
         cgroup_flatten: vec![],
         no_thread_normalize: false,
         no_cg_normalize: false,
+        sort_by: String::new(),
     };
     // `run_compare` returns `anyhow::Result<i32>`. The contract
     // says the `i32` is always 0 for a successful load+compare,
@@ -330,5 +339,101 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
         "run_compare must return Ok(0) on a non-empty diff \
          (doc contract: 'a non-empty diff is data, not a failure'); \
          got Ok({rc})",
+    );
+}
+
+/// `run_compare` with a non-empty `--sort-by` spec routes
+/// through the multi-key sort path end-to-end: load → parse_sort_by
+/// → compare → print. Pin that the integration surface (not just
+/// the unit-level sort tested in `compare_uses_sort_by_when_set`)
+/// accepts the spec and returns `Ok(0)` without bubbling a
+/// parse error.
+#[test]
+fn run_compare_with_valid_sort_by_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let baseline_path = tmp.path().join("baseline.hst.zst");
+    let candidate_path = tmp.path().join("candidate.hst.zst");
+
+    // Two distinct buckets so the multi-key sort actually has
+    // groups to rank — single-bucket would short-circuit
+    // through degenerate ordering.
+    let mut a1 = make_thread("alpha", "w");
+    a1.run_time_ns = 1_000;
+    let mut a2 = make_thread("alpha", "w");
+    a2.run_time_ns = 2_000;
+    let mut b1 = make_thread("bravo", "w");
+    b1.run_time_ns = 100;
+    let mut b2 = make_thread("bravo", "w");
+    b2.run_time_ns = 500;
+
+    snapshot(vec![a1, b1], BTreeMap::new())
+        .write(&baseline_path)
+        .unwrap();
+    snapshot(vec![a2, b2], BTreeMap::new())
+        .write(&candidate_path)
+        .unwrap();
+
+    let args = HostStateCompareArgs {
+        baseline: baseline_path,
+        candidate: candidate_path,
+        group_by: GroupBy::Pcomm,
+        cgroup_flatten: vec![],
+        no_thread_normalize: false,
+        no_cg_normalize: false,
+        // Multi-key spec exercising every parser feature
+        // (case-insensitive direction, whitespace tolerance,
+        // mixed asc/desc) so a regression in any of those
+        // reaches the integration boundary.
+        sort_by: "run_time_ns:DESC, wait_time_ns:asc".into(),
+    };
+    let rc = run_compare(&args).expect("run_compare must accept a valid --sort-by spec end-to-end");
+    assert_eq!(rc, 0, "run_compare must return Ok(0) on success");
+}
+
+/// `run_compare` with an INVALID `--sort-by` spec returns `Err`
+/// (not a panic, not silent fallthrough). Pins that
+/// `parse_sort_by`'s rejection bubbles all the way out through
+/// `run_compare`'s `with_context` chain — operator who typos a
+/// metric name gets an actionable error rather than a confusing
+/// no-op sort.
+#[test]
+fn run_compare_with_invalid_sort_by_returns_err() {
+    let tmp = tempfile::tempdir().unwrap();
+    let baseline_path = tmp.path().join("baseline.hst.zst");
+    let candidate_path = tmp.path().join("candidate.hst.zst");
+
+    let ta = make_thread("p", "w");
+    let tb = make_thread("p", "w");
+    snapshot(vec![ta], BTreeMap::new())
+        .write(&baseline_path)
+        .unwrap();
+    snapshot(vec![tb], BTreeMap::new())
+        .write(&candidate_path)
+        .unwrap();
+
+    let args = HostStateCompareArgs {
+        baseline: baseline_path,
+        candidate: candidate_path,
+        group_by: GroupBy::Pcomm,
+        cgroup_flatten: vec![],
+        no_thread_normalize: false,
+        no_cg_normalize: false,
+        // Unknown metric name — must surface the parser error,
+        // not a silent best-effort sort.
+        sort_by: "not_a_real_metric".into(),
+    };
+    let err = run_compare(&args).expect_err("invalid --sort-by must produce Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("not_a_real_metric"),
+        "error must name the offending metric, got: {msg}",
+    );
+    // The `with_context` wrapper in `run_compare` adds the
+    // `parse --sort-by ...` preamble — pin that the integration
+    // path actually wraps the underlying anyhow error rather
+    // than leaking the bare parser bail.
+    assert!(
+        msg.contains("parse --sort-by"),
+        "error must carry the run_compare context preamble, got: {msg}",
     );
 }
