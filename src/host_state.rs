@@ -149,10 +149,11 @@ pub struct HostStateSnapshot {
 
 /// Per-snapshot probe outcome statistics. Curated projection of
 /// the capture pipeline's internal probe tally — exposes the
-/// counters and the dominant failure tag a downstream consumer
-/// needs to decide whether the snapshot's `allocated_bytes` /
-/// `deallocated_bytes` fields are trustworthy on a given host
-/// without parsing the operator-facing tracing line.
+/// counters, the dominant failure tag, and a `privilege_dominant`
+/// boolean a downstream consumer needs to decide whether the
+/// snapshot's `allocated_bytes` / `deallocated_bytes` fields are
+/// trustworthy on a given host without parsing the operator-
+/// facing tracing line.
 ///
 /// The internal probe taxonomy (the per-variant
 /// `host_thread_probe::AttachError` and `ProbeError` enums) is
@@ -162,11 +163,15 @@ pub struct HostStateSnapshot {
 /// (e.g. `"ptrace-seize"`, `"dwarf-parse-failure"`) that the
 /// capture pipeline already surfaces in its tracing summary; the
 /// stable token format is documented in the `ktstr host-state
-/// capture` CLI help.
+/// capture` CLI help. `privilege_dominant` mirrors the same gate
+/// that prints the EPERM remediation hint — true when ≥ 50% of
+/// `failed` is `ptrace-seize` or `ptrace-interrupt`.
 ///
 /// The four counters are zero when the probe pass reached zero
 /// tgids (e.g. an empty `proc_root`); `dominant_failure` is
-/// `None` when no actionable failures landed.
+/// `None` when no actionable failures landed; `privilege_dominant`
+/// is `false` when there are no failures or when other failure
+/// classes outweigh ptrace.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct HostStateProbeSummary {
@@ -201,6 +206,15 @@ pub struct HostStateProbeSummary {
     /// Examples: `"ptrace-seize"`, `"dwarf-parse-failure"`,
     /// `"jemalloc-in-dso"`.
     pub dominant_failure: Option<String>,
+    /// `true` when the ptrace-attach failure share crosses the
+    /// hint-trigger threshold (≥ 50% of `failed` is `ptrace-seize`
+    /// or `ptrace-interrupt`). Mirrors the same gate that prints
+    /// the EPERM remediation hint in the operator-facing tracing
+    /// summary, so a downstream consumer can reproduce that
+    /// signal without parsing the log line. `false` when
+    /// `failed == 0` (no failures to dominate) or when other
+    /// failure classes outweigh ptrace.
+    pub privilege_dominant: bool,
 }
 
 /// Per-thread cumulative resource profile.
@@ -1355,10 +1369,14 @@ impl ProbeSummary {
     /// Project the internal tally to the curated public surface.
     /// Drops the per-tag `attach_tag_counts` / `probe_tag_counts`
     /// maps (implementation detail) and surfaces only the
-    /// counters + dominant tag string. Mirrors the
-    /// actionable/non-actionable cut [`Self::dominant_tag`] uses,
-    /// so `dominant_failure` is `None` exactly when the snapshot
-    /// has zero actionable failures.
+    /// counters + dominant tag string + privilege-dominant
+    /// signal. Mirrors the actionable/non-actionable cut
+    /// [`Self::dominant_tag`] uses, so `dominant_failure` is
+    /// `None` exactly when the snapshot has zero actionable
+    /// failures. `privilege_dominant` mirrors
+    /// [`Self::ptrace_dominates`] so a downstream consumer can
+    /// reproduce the EPERM-hint trigger condition without
+    /// parsing the operator-facing tracing line.
     fn to_public(&self) -> HostStateProbeSummary {
         HostStateProbeSummary {
             tgids_walked: self.tgids_walked,
@@ -1366,6 +1384,7 @@ impl ProbeSummary {
             probed_ok: self.probed_ok,
             failed: self.failed,
             dominant_failure: self.dominant_tag().map(|t| t.to_string()),
+            privilege_dominant: self.ptrace_dominates(),
         }
     }
 }
@@ -3377,12 +3396,19 @@ mod tests {
             "dominant_tag picks the highest-count actionable tag, \
              projected as an owned String",
         );
+        // 1 ptrace-seize out of 3 failed (33%) is below the 50%
+        // hint-trigger threshold → privilege_dominant is false.
+        assert!(
+            !public.privilege_dominant,
+            "ptrace 1/3 < 50% → privilege_dominant false",
+        );
     }
 
     /// Zero-failure summary projects to `dominant_failure: None` —
     /// the absence-of-failure case must surface as None, not an
     /// empty string. Mirrors the internal `dominant_tag` returning
-    /// None when both tag maps are empty.
+    /// None when both tag maps are empty. `privilege_dominant`
+    /// must also be false (no failures to dominate).
     #[test]
     fn to_public_dominant_failure_is_none_when_no_failures() {
         let s = make_summary(0, &[("jemalloc-not-found", 12)], &[]);
@@ -3393,6 +3419,45 @@ mod tests {
             "no actionable failures means dominant_failure is None; \
              got {:?}",
             public.dominant_failure,
+        );
+        assert!(
+            !public.privilege_dominant,
+            "no failures means privilege_dominant is false",
+        );
+    }
+
+    /// Privilege-dominated snapshot projects
+    /// `privilege_dominant: true` so a downstream consumer can
+    /// reproduce the EPERM-hint trigger condition without parsing
+    /// the tracing summary. Mirrors the
+    /// `summary_emits_privilege_hint_when_ptrace_dominates`
+    /// emission test below.
+    #[test]
+    fn to_public_privilege_dominant_when_ptrace_crosses_threshold() {
+        // 4 failed total, all ptrace-seize → 100% ≥ 50% → true.
+        let s = make_summary(4, &[], &[("ptrace-seize", 4)]);
+        let public = s.to_public();
+        assert_eq!(public.failed, 4);
+        assert!(
+            public.privilege_dominant,
+            "ptrace 4/4 ≥ 50% → privilege_dominant true",
+        );
+
+        // 2 ptrace + 2 dwarf = 50% / 50% → boundary
+        // (`total_ptrace * 2 >= self.failed` accepts equality).
+        let s = make_summary(4, &[("dwarf-parse-failure", 2)], &[("ptrace-seize", 2)]);
+        let public = s.to_public();
+        assert!(
+            public.privilege_dominant,
+            "ptrace 2/4 = 50% boundary → privilege_dominant true (>= threshold)",
+        );
+
+        // 1 ptrace + 3 dwarf = 25% < 50% → false.
+        let s = make_summary(4, &[("dwarf-parse-failure", 3)], &[("ptrace-seize", 1)]);
+        let public = s.to_public();
+        assert!(
+            !public.privilege_dominant,
+            "ptrace 1/4 < 50% → privilege_dominant false",
         );
     }
 
