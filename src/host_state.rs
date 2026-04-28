@@ -426,15 +426,18 @@ const PARSE_KCONFIG_HINT: &str = "hint: schedstat / io read failures dominate �
 /// strictly AFTER every entry in `fs/proc/array.c::task_state_array`
 /// — `R` (82), `S` (83), `D` (68), `T` (84), `t` (116), `X`
 /// (88), `Z` (90), `P` (80), `I` (73) all have lower codepoints.
-/// [`crate::host_state_compare::aggregate`] breaks
-/// [`crate::host_state_compare::AggRule::Mode`] count-ties
-/// toward the LEX-SMALLEST candidate (the closure
-/// `a.1.cmp(&b.1).then(b.0.cmp(&a.0))` at the
-/// `aggregate(AggRule::Mode, ...)` call site), so a sentinel
-/// smaller than the real letters would HIJACK the tiebreak
-/// whenever a default-built thread sat alongside a real one in
-/// the same group. `'~'` is larger than all of them, so the
-/// real kernel letter always wins the tie.
+/// [`crate::host_state_compare::aggregate`] breaks the
+/// categorical-mode count-ties (rules
+/// [`crate::host_state_compare::AggRule::Mode`] /
+/// [`crate::host_state_compare::AggRule::ModeChar`] /
+/// [`crate::host_state_compare::AggRule::ModeBool`]) toward the
+/// LEX-SMALLEST candidate (the closure
+/// `a.1.cmp(&b.1).then(b.0.cmp(&a.0))` inside the
+/// `Modeable::mode_across` reduction), so a sentinel smaller
+/// than the real letters would HIJACK the tiebreak whenever a
+/// default-built thread sat alongside a real one in the same
+/// group. `'~'` is larger than all of them, so the real kernel
+/// letter always wins the tie.
 ///
 /// `'?'` (U+003F = 63) was the obvious-looking pick but is
 /// numerically SMALLER than every state letter the kernel
@@ -458,7 +461,7 @@ fn default_state_char() -> char {
 /// sentinel) instead of `'\0'` (the `char` Default). See the
 /// field doc on [`Self::state`] for why: `'\0'` lex-compares
 /// SMALLER than every real kernel state letter, which would
-/// poison [`crate::host_state_compare::AggRule::Mode`]
+/// poison [`crate::host_state_compare::AggRule::ModeChar`]
 /// tie-breaks toward "absent" whenever a default-constructed
 /// thread sat alongside a real one in a group.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -597,9 +600,9 @@ pub struct ThreadState {
     /// `'~'` (U+007E = 126) is chosen so it sorts AFTER every
     /// real kernel state letter — `R` (82), `S` (83), `D` (68),
     /// `T` (84), `t` (116), `X` (88), `Z` (90), `P` (80), `I`
-    /// (73). [`crate::host_state_compare::AggRule::Mode`] breaks
-    /// count-ties toward the LEX-SMALLEST candidate, so a
-    /// sentinel smaller than the real letters would silently
+    /// (73). [`crate::host_state_compare::AggRule::ModeChar`]
+    /// breaks count-ties toward the LEX-SMALLEST candidate, so
+    /// a sentinel smaller than the real letters would silently
     /// elect "absent" whenever a default-built thread sat
     /// alongside a real one in the same group. `'~'` being
     /// larger than all of them lets the real letter win the
@@ -623,7 +626,7 @@ pub struct ThreadState {
     /// Stays a bare `bool` — not wrapped in a categorical newtype
     /// — because it is the only bool-valued metric in the
     /// registry. The
-    /// [`crate::host_state_compare::AggRule::Mode`] accessor
+    /// [`crate::host_state_compare::AggRule::ModeBool`] dispatch
     /// coerces it to a `String` via `to_string()`/`Display` at
     /// the call site (see the
     /// [`crate::metric_types::CategoricalString`] doc note: if a
@@ -1105,12 +1108,13 @@ pub struct ThreadState {
     /// Capture-side dedup: the field is populated ONLY on the
     /// thread leader (tid == tgid) and zero for non-leader
     /// threads of the same process. The registry pairs this with
-    /// [`AggRule::Max`] (not Sum) so the rendered cell surfaces
-    /// "the largest process represented in this bucket"
-    /// regardless of grouping axis. Sum would be wrong under
-    /// `--group-by comm` and `--group-by cgroup` because non-
-    /// leader buckets get a 0 contribution from every member —
-    /// a bucket whose leader thread did NOT match the grouping
+    /// [`crate::host_state_compare::AggRule::MaxGaugeCount`] (not
+    /// Sum) so the rendered cell surfaces "the largest process
+    /// represented in this bucket" regardless of grouping axis.
+    /// Sum would be wrong under `--group-by comm` and
+    /// `--group-by cgroup` because non-leader buckets get a 0
+    /// contribution from every member — a bucket whose leader
+    /// thread did NOT match the grouping
     /// would render 0 even though processes are represented.
     /// Wrapped in [`crate::metric_types::GaugeCount`] so the
     /// type system rejects sum-style aggregation: a bucket with
@@ -2172,7 +2176,7 @@ struct StatusFields {
     /// `None` when the line is absent or blank — the capture site
     /// collapses to `'~'` (via `default_state_char`) which sorts
     /// strictly after every real kernel char in lex order, so
-    /// the [`crate::host_state_compare::AggRule::Mode`]
+    /// the [`crate::host_state_compare::AggRule::ModeChar`]
     /// lex-smallest-wins tiebreak picks a real letter when one
     /// is present.
     state: Option<char>,
@@ -2962,11 +2966,11 @@ fn capture_thread_at_with_tally(
         // value; populating it on every thread would let any
         // Sum-style aggregator multiply the count by itself
         // across the group. Leader-only population means the
-        // registry's `AggRule::Max` surfaces the largest process
-        // represented in the bucket — reading "the biggest
-        // process in this group" rather than "how many threads
-        // the kernel believes this group contains" (which is
-        // already covered by the row count).
+        // registry's `AggRule::MaxGaugeCount` surfaces the
+        // largest process represented in the bucket — reading
+        // "the biggest process in this group" rather than "how
+        // many threads the kernel believes this group contains"
+        // (which is already covered by the row count).
         nr_threads: GaugeCount(if tid == tgid {
             status.nr_threads.unwrap_or(0)
         } else {
@@ -4001,7 +4005,7 @@ mod tests {
             ..ThreadState::default()
         };
         let agg = aggregate(
-            AggRule::Mode(|t| t.state.to_string()),
+            AggRule::ModeChar(|t| t.state),
             &[&default_thread, &real_thread],
         );
         match agg {

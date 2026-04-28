@@ -173,32 +173,80 @@ impl From<GroupBy> for GroupByOrDefault {
 ///
 /// Encoded as an enum rather than a trait object so the registry
 /// table ([`HOST_STATE_METRICS`]) can live in static memory. Each
-/// variant carries the reader that extracts the per-thread value
+/// variant's accessor returns the typed
+/// [`crate::metric_types`] newtype that matches the reduction
 /// — the reader and rule are paired by construction so a new
-/// metric cannot register a sum rule against a string accessor.
+/// metric cannot register a peak field against a sum reducer
+/// (`SumNs(|t| t.wait_max)` fails to compile because `wait_max`
+/// is `PeakNs`, not `MonotonicNs`).
+///
+/// Each variant maps 1:1 to a marker trait in
+/// [`crate::metric_types`]: `Sum*` variants take a [`Summable`]
+/// type, `Max*` variants take a [`Maxable`] type that is NOT
+/// also `Summable` (counters use `Sum*` even though they
+/// implement both — registering a counter as `Max*` would mask
+/// the sum semantics with the per-contributor maximum), `Range*`
+/// variants take a [`Rangeable`] type, `Mode*` variants take a
+/// [`Modeable`] type or a primitive that the dispatch coerces to
+/// `String`, and [`AggRule::Affinity`] takes the dedicated
+/// [`crate::metric_types::CpuSet`] for the affinity-summary
+/// reduction.
+///
+/// [`Summable`]: crate::metric_types::Summable
+/// [`Maxable`]: crate::metric_types::Maxable
+/// [`Rangeable`]: crate::metric_types::Rangeable
+/// [`Modeable`]: crate::metric_types::Modeable
 #[derive(Debug, Clone, Copy)]
 pub enum AggRule {
-    /// Sum across the group. Used for cumulative counters
-    /// (run_time, faults, I/O). Delta is the signed difference
-    /// between candidate and baseline sums.
-    Sum(fn(&ThreadState) -> u64),
-    /// Maximum across the group. Three semantically-distinct
-    /// categories of per-thread value land here, all reduced via
-    /// max because none of them have a meaningful sum.
+    /// Sum across the group of a [`MonotonicCount`] field. Used
+    /// for unitless cumulative counters (`nr_wakeups`,
+    /// `voluntary_csw`, `minflt`, syscall counts, …). The
+    /// dispatch routes through
+    /// [`crate::metric_types::Summable::sum_across`] which uses
+    /// `saturating_add` per the no-wraparound contract.
     ///
-    /// **(a) Historical high-water (kernel `*_max` schedstats).**
-    /// Each thread already carries its own lifetime max-seen
-    /// value from the kernel's scheduler call sites (e.g.
-    /// `update_se` in `kernel/sched/fair.c` for `exec_max`; see
-    /// `struct sched_statistics` in `include/linux/sched.h`):
-    /// `wait_max`, `sleep_max`, `block_max`, `exec_max`,
-    /// `slice_max`. Group-level reduction takes the largest
-    /// across members so a row surfaces the worst single window
-    /// any thread in the group has ever experienced. Summing
-    /// per-thread maxes would conflate "one thread with a 1s
-    /// spike" with "1000 threads with 1ms spikes each".
+    /// [`MonotonicCount`]: crate::metric_types::MonotonicCount
+    SumCount(fn(&ThreadState) -> crate::metric_types::MonotonicCount),
+    /// Sum across the group of a [`MonotonicNs`] field. Used for
+    /// cumulative-time counters in nanoseconds (`run_time_ns`,
+    /// `wait_time_ns`, `wait_sum`, `sleep_sum`, `block_sum`,
+    /// `iowait_sum`, `core_forceidle_sum`).
     ///
-    /// **(b) Instantaneous gauges where summing is meaningless.**
+    /// [`MonotonicNs`]: crate::metric_types::MonotonicNs
+    SumNs(fn(&ThreadState) -> crate::metric_types::MonotonicNs),
+    /// Sum across the group of a [`ClockTicks`] field. Used for
+    /// USER_HZ-scaled cumulative time counters
+    /// (`utime_clock_ticks`, `stime_clock_ticks`,
+    /// `delayacct_blkio_ticks`).
+    ///
+    /// [`ClockTicks`]: crate::metric_types::ClockTicks
+    SumTicks(fn(&ThreadState) -> crate::metric_types::ClockTicks),
+    /// Sum across the group of a [`Bytes`] field. Used for
+    /// IEC-binary-scaled byte counters (`allocated_bytes`,
+    /// `deallocated_bytes`, `rchar`, `wchar`, `read_bytes`,
+    /// `write_bytes`).
+    ///
+    /// [`Bytes`]: crate::metric_types::Bytes
+    SumBytes(fn(&ThreadState) -> crate::metric_types::Bytes),
+    /// Maximum across the group of a [`PeakNs`] field — the
+    /// kernel `*_max` schedstats (`wait_max`, `sleep_max`,
+    /// `block_max`, `exec_max`, `slice_max`). Each thread
+    /// already carries its own lifetime max-seen value from the
+    /// kernel's scheduler call sites (e.g. `update_se` in
+    /// `kernel/sched/fair.c` for `exec_max`; see
+    /// `struct sched_statistics` in `include/linux/sched.h`).
+    /// Group-level reduction takes the largest across members so
+    /// a row surfaces the worst single window any thread in the
+    /// group has ever experienced. Summing per-thread maxes
+    /// would conflate "one thread with a 1s spike" with "1000
+    /// threads with 1ms spikes each" — `PeakNs` therefore does
+    /// NOT implement `Summable`, and trying to register one as
+    /// `SumNs` is a compile error.
+    ///
+    /// [`PeakNs`]: crate::metric_types::PeakNs
+    MaxPeak(fn(&ThreadState) -> crate::metric_types::PeakNs),
+    /// Maximum across the group of a [`GaugeNs`] field —
+    /// instantaneous-time gauges where summing is meaningless.
     /// `fair_slice_ns` is the per-thread CURRENT scheduler slice
     /// (stale under SCHED_EXT — see field doc) read at capture
     /// time, not a high-water value. Summing instantaneous
@@ -209,8 +257,11 @@ pub enum AggRule {
     /// thread in the bucket is running with", which IS the
     /// signal a user comparing two snapshots cares about.
     ///
-    /// **(c) Leader-deduped structural fields.** `nr_threads`
-    /// is populated only on the tgid leader (`tid == tgid`) and
+    /// [`GaugeNs`]: crate::metric_types::GaugeNs
+    MaxGaugeNs(fn(&ThreadState) -> crate::metric_types::GaugeNs),
+    /// Maximum across the group of a [`GaugeCount`] field —
+    /// leader-deduped structural counts. `nr_threads` is
+    /// populated only on the tgid leader (`tid == tgid`) and
     /// zero on every non-leader thread of the same process; see
     /// `capture_thread_at_with_tally`. Sum across a comm- or
     /// cgroup-bucketed group would render 0 for any bucket
@@ -223,22 +274,100 @@ pub enum AggRule {
     /// value adds new information rather than restating the row
     /// count.
     ///
-    /// Same `fn(&ThreadState) -> u64` shape as `Sum` so the
-    /// registry stays homogeneous.
-    Max(fn(&ThreadState) -> u64),
-    /// Ordinal integer, aggregated as the observed [min, max].
-    /// Delta uses the midpoint of each range as the scalar;
-    /// output prints both the range and the delta.
-    OrdinalRange(fn(&ThreadState) -> i64),
-    /// Categorical string, aggregated as the mode (most frequent)
-    /// value. Delta is textual: "same" if both modes agree,
-    /// "differs" otherwise — there is no arithmetic on a policy
-    /// name.
-    Mode(fn(&ThreadState) -> String),
-    /// CPU affinity set. Aggregated as num_cpus range across the
-    /// group plus a uniform-cpuset rendering when every thread
-    /// shared the same allowed set.
-    Affinity(fn(&ThreadState) -> Vec<u32>),
+    /// [`GaugeCount`]: crate::metric_types::GaugeCount
+    MaxGaugeCount(fn(&ThreadState) -> crate::metric_types::GaugeCount),
+    /// Ordinal i32, aggregated as the observed [min, max] range.
+    /// Used for signed-domain ordinals (`nice`, `priority`,
+    /// `processor`). Delta math uses the midpoint of each range
+    /// as the scalar; output prints both the range and the
+    /// delta. The dispatch routes through
+    /// [`crate::metric_types::Rangeable::range_across`] and
+    /// widens to `i64` for [`Aggregated::OrdinalRange`].
+    ///
+    /// [`OrdinalI32`]: crate::metric_types::OrdinalI32
+    RangeI32(fn(&ThreadState) -> crate::metric_types::OrdinalI32),
+    /// Ordinal u32, aggregated as the observed [min, max] range.
+    /// Used for unsigned-domain ordinals (`rt_priority`,
+    /// kernel-typed `unsigned int`). Same shape as
+    /// [`AggRule::RangeI32`] but the inner width matches the
+    /// kernel-side `unsigned int` declaration; the dispatch
+    /// widens the resulting `u32` to `i64` for
+    /// [`Aggregated::OrdinalRange`].
+    ///
+    /// [`OrdinalU32`]: crate::metric_types::OrdinalU32
+    RangeU32(fn(&ThreadState) -> crate::metric_types::OrdinalU32),
+    /// Categorical string, aggregated as the mode (most-frequent
+    /// value). Used for `policy` (string-valued
+    /// [`crate::metric_types::CategoricalString`]). Delta is
+    /// textual: "same" if both modes agree, "differs" otherwise
+    /// — there is no arithmetic on a policy name. The dispatch
+    /// routes through
+    /// [`crate::metric_types::Modeable::mode_across`].
+    Mode(fn(&ThreadState) -> crate::metric_types::CategoricalString),
+    /// Categorical char, aggregated as the mode. Used for
+    /// `state` (single-letter task state from
+    /// `/proc/<tid>/status`). The dispatch coerces the `char`
+    /// to a `String` via `to_string()` before reducing — `char`
+    /// itself is NOT [`Modeable`] (only
+    /// [`crate::metric_types::CategoricalString`] is), so this
+    /// variant exists to keep the registry's accessor type
+    /// matching the `ThreadState` field type without forcing the
+    /// field into a wrapper. If a second char-valued metric
+    /// appears, promote both fields to a dedicated
+    /// `CategoricalChar` wrapper rather than continuing the
+    /// ad-hoc coercion (mirrors the `CategoricalBool`
+    /// promotion guidance on [`AggRule::ModeBool`]).
+    ///
+    /// [`Modeable`]: crate::metric_types::Modeable
+    ModeChar(fn(&ThreadState) -> char),
+    /// Categorical bool, aggregated as the mode. Used for
+    /// `ext_enabled` (sched_ext class membership). Same shape as
+    /// [`AggRule::ModeChar`]: the dispatch coerces via
+    /// `to_string()` so `"true"`/`"false"` participate in the
+    /// mode reduction. If a second bool-valued metric appears,
+    /// promote both fields to a dedicated `CategoricalBool`
+    /// wrapper rather than continuing the ad-hoc coercion.
+    ///
+    /// Tiebreak skew (FA-2): the lex-smallest-wins tiebreak
+    /// inside `Modeable::mode_across` makes `"false"` (`'f'`,
+    /// 0x66) win an equal-count tie against `"true"` (`'t'`,
+    /// 0x74). This matches the legacy pre-phase-3 behavior —
+    /// the old `to_string()` coercion fed the same string pair
+    /// through the same lex-tiebreak — but is worth flagging
+    /// explicitly: a 50/50 sched_ext-on/off bucket renders
+    /// `false` as the mode rather than picking the more
+    /// "informative" `true`. Operators reading a `false` mode
+    /// in a heterogeneous bucket should check the `count/total`
+    /// fraction.
+    ModeBool(fn(&ThreadState) -> bool),
+    /// CPU affinity set, aggregated as the num_cpus range across
+    /// the group plus a uniform-cpuset rendering when every
+    /// thread shared the same allowed set. Used for
+    /// `cpu_affinity`. The accessor returns
+    /// [`crate::metric_types::CpuSet`]; the dispatch unwraps to
+    /// `Vec<u32>` for the [`AffinitySummary`] reduction.
+    ///
+    /// Unlike the `Sum*` / `Max*` / `Range*` / `Mode*` rules,
+    /// `Affinity` does NOT route through a
+    /// [`crate::metric_types`] trait method — its reduction
+    /// produces an [`AffinitySummary`] (num_cpus range +
+    /// uniform-cpuset flag), not a homogeneous `CpuSet`, so the
+    /// inline aggregator in [`aggregate`] walks the per-thread
+    /// `Vec<u32>` directly. A future `Affinable` trait could
+    /// fold the body into [`crate::metric_types`] but the
+    /// summary type is single-use today.
+    ///
+    /// Type-system bypass caveat (FA-1): the typed `AggRule`
+    /// shape catches "wrong wrapper" mistakes
+    /// (`SumNs(|t| t.wait_max)` fails to compile because
+    /// `wait_max` is `PeakNs`), but a closure body that
+    /// actively MISWRAPS the underlying field — e.g.
+    /// `SumNs(|t| MonotonicNs(t.wait_max.0))` — laundering a
+    /// peak through the sum wrapper still type-checks. Don't
+    /// do that. The wrapper category is load-bearing; the type
+    /// system catches the variant mismatch but cannot
+    /// inspect the inside of an arbitrary closure.
+    Affinity(fn(&ThreadState) -> crate::metric_types::CpuSet),
 }
 
 /// One metric exposed by the comparison pipeline.
@@ -332,11 +461,14 @@ pub struct HostStateMetricDef {
 /// short-form used in capture code; long-form display is the
 /// same — no translation layer.
 ///
-/// **PSI is intentionally not in this registry.** The accessor
-/// signature `fn(&ThreadState) -> u64` only matches per-thread
-/// data, while Pressure Stall Information is per-snapshot
-/// (host-level) and per-cgroup. PSI surfaces in dedicated
-/// secondary tables under "## Host pressure / ..." and "## Pressure / ..."
+/// **PSI is intentionally not in this registry.** Each
+/// [`AggRule`] variant's accessor takes `&ThreadState` and
+/// returns a [`crate::metric_types`] newtype (or a primitive
+/// the dispatch coerces via `to_string()` for `ModeChar` /
+/// `ModeBool`); only per-thread data fits that signature, while
+/// Pressure Stall Information is per-snapshot (host-level) and
+/// per-cgroup. PSI surfaces in dedicated secondary tables
+/// under "## Host pressure / ..." and "## Pressure / ..."
 /// headers, rendered by [`write_diff`] / `write_show` directly
 /// rather than via [`AggRule`]. See [`Psi`] / [`PsiResource`] /
 /// [`PsiHalf`] for the data model.
@@ -345,7 +477,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "policy",
         unit: "",
-        rule: AggRule::Mode(|t| t.policy.0.clone()),
+        rule: AggRule::Mode(|t| t.policy.clone()),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -354,7 +486,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nice",
         unit: "",
-        rule: AggRule::OrdinalRange(|t| t.nice.0 as i64),
+        rule: AggRule::RangeI32(|t| t.nice),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -369,7 +501,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "priority",
         unit: "",
-        rule: AggRule::OrdinalRange(|t| t.priority.0 as i64),
+        rule: AggRule::RangeI32(|t| t.priority),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -383,7 +515,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "rt_priority",
         unit: "",
-        rule: AggRule::OrdinalRange(|t| t.rt_priority.0 as i64),
+        rule: AggRule::RangeU32(|t| t.rt_priority),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -392,7 +524,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "cpu_affinity",
         unit: "",
-        rule: AggRule::Affinity(|t| t.cpu_affinity.0.clone()),
+        rule: AggRule::Affinity(|t| t.cpu_affinity.clone()),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -401,7 +533,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "processor",
         unit: "",
-        rule: AggRule::OrdinalRange(|t| t.processor.0 as i64),
+        rule: AggRule::RangeI32(|t| t.processor),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -410,7 +542,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "state",
         unit: "",
-        rule: AggRule::Mode(|t| t.state.to_string()),
+        rule: AggRule::ModeChar(|t| t.state),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -423,7 +555,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "ext_enabled",
         unit: "",
-        rule: AggRule::Mode(|t| t.ext_enabled.to_string()),
+        rule: AggRule::ModeBool(|t| t.ext_enabled),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_CLASS_EXT"],
         is_dead: false,
@@ -443,7 +575,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_threads",
         unit: "",
-        rule: AggRule::Max(|t| t.nr_threads.0),
+        rule: AggRule::MaxGaugeCount(|t| t.nr_threads),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -456,7 +588,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "run_time_ns",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.run_time_ns.0),
+        rule: AggRule::SumNs(|t| t.run_time_ns),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_INFO"],
         is_dead: false,
@@ -468,7 +600,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wait_time_ns",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.wait_time_ns.0),
+        rule: AggRule::SumNs(|t| t.wait_time_ns),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_INFO"],
         is_dead: false,
@@ -479,7 +611,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "timeslices",
         unit: "",
-        rule: AggRule::Sum(|t| t.timeslices.0),
+        rule: AggRule::SumCount(|t| t.timeslices),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_INFO"],
         is_dead: false,
@@ -488,7 +620,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "voluntary_csw",
         unit: "",
-        rule: AggRule::Sum(|t| t.voluntary_csw.0),
+        rule: AggRule::SumCount(|t| t.voluntary_csw),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -497,7 +629,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nonvoluntary_csw",
         unit: "",
-        rule: AggRule::Sum(|t| t.nonvoluntary_csw.0),
+        rule: AggRule::SumCount(|t| t.nonvoluntary_csw),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -512,7 +644,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups.0),
+        rule: AggRule::SumCount(|t| t.nr_wakeups),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -521,7 +653,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_local",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_local.0),
+        rule: AggRule::SumCount(|t| t.nr_wakeups_local),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -530,7 +662,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_remote",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_remote.0),
+        rule: AggRule::SumCount(|t| t.nr_wakeups_remote),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -539,7 +671,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_sync",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_sync.0),
+        rule: AggRule::SumCount(|t| t.nr_wakeups_sync),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -548,7 +680,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_migrate",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_migrate.0),
+        rule: AggRule::SumCount(|t| t.nr_wakeups_migrate),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -562,7 +694,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_idle",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_idle.0),
+        rule: AggRule::SumCount(|t| t.nr_wakeups_idle),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: true,
@@ -577,7 +709,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_passive",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_passive.0),
+        rule: AggRule::SumCount(|t| t.nr_wakeups_passive),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: true,
@@ -593,7 +725,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_affine",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_affine.0),
+        rule: AggRule::SumCount(|t| t.nr_wakeups_affine),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -602,7 +734,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_wakeups_affine_attempts",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_wakeups_affine_attempts.0),
+        rule: AggRule::SumCount(|t| t.nr_wakeups_affine_attempts),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -614,7 +746,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_migrations",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_migrations.0),
+        rule: AggRule::SumCount(|t| t.nr_migrations),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -627,7 +759,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_migrations_cold",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_migrations_cold.0),
+        rule: AggRule::SumCount(|t| t.nr_migrations_cold),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: true,
@@ -639,7 +771,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_forced_migrations",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_forced_migrations.0),
+        rule: AggRule::SumCount(|t| t.nr_forced_migrations),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -651,7 +783,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_failed_migrations_affine",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_failed_migrations_affine.0),
+        rule: AggRule::SumCount(|t| t.nr_failed_migrations_affine),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -660,7 +792,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_failed_migrations_running",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_failed_migrations_running.0),
+        rule: AggRule::SumCount(|t| t.nr_failed_migrations_running),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -669,7 +801,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "nr_failed_migrations_hot",
         unit: "",
-        rule: AggRule::Sum(|t| t.nr_failed_migrations_hot.0),
+        rule: AggRule::SumCount(|t| t.nr_failed_migrations_hot),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -689,7 +821,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wait_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.wait_sum.0),
+        rule: AggRule::SumNs(|t| t.wait_sum),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -698,7 +830,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wait_count",
         unit: "",
-        rule: AggRule::Sum(|t| t.wait_count.0),
+        rule: AggRule::SumCount(|t| t.wait_count),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -707,7 +839,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wait_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.wait_max.0),
+        rule: AggRule::MaxPeak(|t| t.wait_max),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -729,7 +861,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "sleep_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.sleep_sum.0),
+        rule: AggRule::SumNs(|t| t.sleep_sum),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -738,7 +870,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "sleep_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.sleep_max.0),
+        rule: AggRule::MaxPeak(|t| t.sleep_max),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -750,7 +882,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "block_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.block_sum.0),
+        rule: AggRule::SumNs(|t| t.block_sum),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -759,7 +891,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "block_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.block_max.0),
+        rule: AggRule::MaxPeak(|t| t.block_max),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -771,7 +903,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "iowait_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.iowait_sum.0),
+        rule: AggRule::SumNs(|t| t.iowait_sum),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -780,7 +912,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "iowait_count",
         unit: "",
-        rule: AggRule::Sum(|t| t.iowait_count.0),
+        rule: AggRule::SumCount(|t| t.iowait_count),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -801,7 +933,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "delayacct_blkio_ticks",
         unit: "ticks",
-        rule: AggRule::Sum(|t| t.delayacct_blkio_ticks.0),
+        rule: AggRule::SumTicks(|t| t.delayacct_blkio_ticks),
         sched_class: None,
         config_gates: &["CONFIG_TASK_DELAY_ACCT"],
         is_dead: false,
@@ -815,7 +947,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "exec_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.exec_max.0),
+        rule: AggRule::MaxPeak(|t| t.exec_max),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -828,7 +960,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "slice_max",
         unit: "ns",
-        rule: AggRule::Max(|t| t.slice_max.0),
+        rule: AggRule::MaxPeak(|t| t.slice_max),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -850,7 +982,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "core_forceidle_sum",
         unit: "ns",
-        rule: AggRule::Sum(|t| t.core_forceidle_sum.0),
+        rule: AggRule::SumNs(|t| t.core_forceidle_sum),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_CORE", "CONFIG_SCHEDSTATS"],
         is_dead: false,
@@ -871,7 +1003,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "fair_slice_ns",
         unit: "ns",
-        rule: AggRule::Max(|t| t.fair_slice_ns.0),
+        rule: AggRule::MaxGaugeNs(|t| t.fair_slice_ns),
         sched_class: Some("fair-policy"),
         config_gates: &[],
         is_dead: false,
@@ -881,7 +1013,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "allocated_bytes",
         unit: "B",
-        rule: AggRule::Sum(|t| t.allocated_bytes.0),
+        rule: AggRule::SumBytes(|t| t.allocated_bytes),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -890,7 +1022,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "deallocated_bytes",
         unit: "B",
-        rule: AggRule::Sum(|t| t.deallocated_bytes.0),
+        rule: AggRule::SumBytes(|t| t.deallocated_bytes),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -899,7 +1031,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "minflt",
         unit: "",
-        rule: AggRule::Sum(|t| t.minflt.0),
+        rule: AggRule::SumCount(|t| t.minflt),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -908,7 +1040,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "majflt",
         unit: "",
-        rule: AggRule::Sum(|t| t.majflt.0),
+        rule: AggRule::SumCount(|t| t.majflt),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -917,7 +1049,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "utime_clock_ticks",
         unit: "ticks",
-        rule: AggRule::Sum(|t| t.utime_clock_ticks.0),
+        rule: AggRule::SumTicks(|t| t.utime_clock_ticks),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -926,7 +1058,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "stime_clock_ticks",
         unit: "ticks",
-        rule: AggRule::Sum(|t| t.stime_clock_ticks.0),
+        rule: AggRule::SumTicks(|t| t.stime_clock_ticks),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
@@ -942,7 +1074,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "rchar",
         unit: "B",
-        rule: AggRule::Sum(|t| t.rchar.0),
+        rule: AggRule::SumBytes(|t| t.rchar),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -951,7 +1083,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "wchar",
         unit: "B",
-        rule: AggRule::Sum(|t| t.wchar.0),
+        rule: AggRule::SumBytes(|t| t.wchar),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -960,7 +1092,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "syscr",
         unit: "",
-        rule: AggRule::Sum(|t| t.syscr.0),
+        rule: AggRule::SumCount(|t| t.syscr),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -969,7 +1101,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "syscw",
         unit: "",
-        rule: AggRule::Sum(|t| t.syscw.0),
+        rule: AggRule::SumCount(|t| t.syscw),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -978,7 +1110,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "read_bytes",
         unit: "B",
-        rule: AggRule::Sum(|t| t.read_bytes.0),
+        rule: AggRule::SumBytes(|t| t.read_bytes),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -987,7 +1119,7 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     HostStateMetricDef {
         name: "write_bytes",
         unit: "B",
-        rule: AggRule::Sum(|t| t.write_bytes.0),
+        rule: AggRule::SumBytes(|t| t.write_bytes),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
         is_dead: false,
@@ -1262,20 +1394,46 @@ pub fn metric_display_name(metric: &HostStateMetricDef) -> Cow<'static, str> {
 ///
 /// Carries both a numeric projection (used for delta math and
 /// sort order) and a display form. Not every rule produces a
-/// numeric — [`AggRule::Mode`] aggregates a policy string, which
-/// has no scalar — so the numeric is optional and rows without
-/// one fall to the bottom of the default sort.
+/// numeric — the categorical rules
+/// ([`AggRule::Mode`] / [`AggRule::ModeChar`] /
+/// [`AggRule::ModeBool`]) aggregate to a string, which has no
+/// scalar — so the numeric is optional and rows without one
+/// fall to the bottom of the default sort.
 #[derive(Debug, Clone)]
 pub enum Aggregated {
+    /// Group-wide sum produced by the
+    /// [`AggRule::SumCount`] / [`AggRule::SumNs`] /
+    /// [`AggRule::SumTicks`] / [`AggRule::SumBytes`] rules. The
+    /// dispatch unwraps the typed newtype's inner `u64` after
+    /// the [`crate::metric_types::Summable::sum_across`]
+    /// reduction; storage stays u64 to preserve full precision
+    /// across the entire schedstats / byte / tick range with
+    /// no lossy cast at aggregation time. Phase 4 will read
+    /// the registry's `unit` tag (not the wrapper type) at
+    /// render time to pick the auto-scale ladder.
     Sum(u64),
-    /// Group-wide maximum produced by [`AggRule::Max`]. Distinct
-    /// variant from `Sum` so a downstream consumer that wants to
-    /// surface "the worst single thread" rather than "the
+    /// Group-wide maximum produced by the
+    /// [`AggRule::MaxPeak`] / [`AggRule::MaxGaugeNs`] /
+    /// [`AggRule::MaxGaugeCount`] rules. Distinct variant from
+    /// `Sum` so a downstream consumer that wants to surface
+    /// "the worst single thread" rather than "the
     /// summed-across-threads value" can match without name-
     /// matching against the metric registry. Storage is u64 to
     /// preserve full ns precision across the entire schedstats
     /// range (no `as f64` lossy cast at aggregation time).
     Max(u64),
+    /// Group-wide `[min, max]` interval produced by the
+    /// [`AggRule::RangeI32`] / [`AggRule::RangeU32`] rules.
+    /// Both bounds widen to `i64` at the dispatch boundary
+    /// (`i64::from(OrdinalI32.0)` / `i64::from(OrdinalU32.0)`)
+    /// — `OrdinalI32` carries a signed kernel-side range
+    /// (`nice` includes negative values) and `OrdinalU32` fits
+    /// into `i64` losslessly, so a single signed scalar
+    /// represents both ordinal widths without losing the sign
+    /// from `OrdinalI32` or wrapping the magnitude from
+    /// `OrdinalU32`. Delta math takes the midpoint
+    /// (`(min + max) / 2`) so a one-sided shift surfaces in
+    /// the rendered delta column.
     OrdinalRange {
         min: i64,
         max: i64,
@@ -1451,7 +1609,7 @@ impl DiffRow {
 /// the row's `delta` is `None` because the metric is categorical
 /// — even though [`parse_sort_by`] now rejects categorical
 /// metrics at the CLI boundary, a programmatic caller can still
-/// construct a [`SortKey`] over a Mode metric directly) are
+/// construct a [`SortKey`] over a `Mode*` metric directly) are
 /// treated as `f64::NEG_INFINITY` for descending sort and
 /// `f64::INFINITY` for ascending sort — they sink to the bottom
 /// either way.
@@ -2491,56 +2649,131 @@ pub fn build_groups(
 }
 
 /// Aggregate one metric across a slice of threads per its rule.
+///
+/// Each `Sum*` / `Max*` / `Range*` / `Mode*` arm dispatches
+/// through the trait method on the typed newtype defined in
+/// [`crate::metric_types`] — `sum_across` for [`Summable`],
+/// `max_across` for [`Maxable`], `range_across` for [`Rangeable`],
+/// `mode_across` for [`Modeable`] — then unwraps to the
+/// untyped scalar that [`Aggregated`] carries today; the
+/// unit-aware format dispatch will land in phase 4 and reads
+/// the registry's `unit` tag rather than the wrapper type, so
+/// `Aggregated` stays scalar-shaped after this phase. The
+/// `Sum*` / `Max*` reductions return their identity element
+/// for an empty iterator (zero) so downstream delta math stays
+/// well-defined when one side has no threads under the join
+/// key; the `Range*` and `Mode*` arms collapse the empty case
+/// to `(0, 0)` and `("", 0, 0)` respectively, matching the
+/// pre-phase-3 contract on the same code paths.
+///
+/// [`Summable`]: crate::metric_types::Summable
+/// [`Maxable`]: crate::metric_types::Maxable
+/// [`Rangeable`]: crate::metric_types::Rangeable
+/// [`Modeable`]: crate::metric_types::Modeable
 pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
+    use crate::metric_types::{CategoricalString, Maxable, Modeable, Rangeable, Summable};
     match rule {
-        AggRule::Sum(f) => {
-            let s = threads.iter().map(|t| f(t)).fold(0u64, u64::saturating_add);
-            Aggregated::Sum(s)
+        AggRule::SumCount(f) => {
+            let s = crate::metric_types::MonotonicCount::sum_across(threads.iter().map(|t| f(t)));
+            Aggregated::Sum(s.0)
         }
-        AggRule::Max(f) => {
-            // Empty-thread groups collapse to 0 to mirror the
-            // Sum-on-empty contract — both rules return the
-            // identity element of their reduction so downstream
-            // delta math stays well-defined when one side has no
-            // threads under the join key. The fold seed is also
-            // 0 for the non-empty case: every *_max field is u64
-            // (non-negative by type), so any kernel-emitted value
-            // satisfies `n >= 0` and `0.max(n) == n` — 0 is a
-            // correct lower bound that never wins against a real
-            // reading.
-            let m = threads.iter().map(|t| f(t)).fold(0u64, u64::max);
-            Aggregated::Max(m)
+        AggRule::SumNs(f) => {
+            let s = crate::metric_types::MonotonicNs::sum_across(threads.iter().map(|t| f(t)));
+            Aggregated::Sum(s.0)
         }
-        AggRule::OrdinalRange(f) => {
-            let mut it = threads.iter().map(|t| f(t));
-            let first = it.next().unwrap_or(0);
-            let (mut min, mut max) = (first, first);
-            for v in it {
-                if v < min {
-                    min = v;
-                }
-                if v > max {
-                    max = v;
-                }
+        AggRule::SumTicks(f) => {
+            let s = crate::metric_types::ClockTicks::sum_across(threads.iter().map(|t| f(t)));
+            Aggregated::Sum(s.0)
+        }
+        AggRule::SumBytes(f) => {
+            let s = crate::metric_types::Bytes::sum_across(threads.iter().map(|t| f(t)));
+            Aggregated::Sum(s.0)
+        }
+        AggRule::MaxPeak(f) => {
+            let m = crate::metric_types::PeakNs::max_across(threads.iter().map(|t| f(t)));
+            Aggregated::Max(m.0)
+        }
+        AggRule::MaxGaugeNs(f) => {
+            let m = crate::metric_types::GaugeNs::max_across(threads.iter().map(|t| f(t)));
+            Aggregated::Max(m.0)
+        }
+        AggRule::MaxGaugeCount(f) => {
+            let m = crate::metric_types::GaugeCount::max_across(threads.iter().map(|t| f(t)));
+            Aggregated::Max(m.0)
+        }
+        AggRule::RangeI32(f) => {
+            match crate::metric_types::OrdinalI32::range_across(threads.iter().map(|t| f(t))) {
+                // `range_across` returns `None` only on an empty
+                // iterator — mirror the historical empty-group
+                // contract by collapsing to (0, 0) so the
+                // downstream midpoint and delta math sees a
+                // well-defined value at the join boundary.
+                Some((min, max)) => Aggregated::OrdinalRange {
+                    min: i64::from(min.0),
+                    max: i64::from(max.0),
+                },
+                None => Aggregated::OrdinalRange { min: 0, max: 0 },
             }
-            Aggregated::OrdinalRange { min, max }
+        }
+        AggRule::RangeU32(f) => {
+            match crate::metric_types::OrdinalU32::range_across(threads.iter().map(|t| f(t))) {
+                Some((min, max)) => Aggregated::OrdinalRange {
+                    min: i64::from(min.0),
+                    max: i64::from(max.0),
+                },
+                None => Aggregated::OrdinalRange { min: 0, max: 0 },
+            }
         }
         AggRule::Mode(f) => {
             let total = threads.len();
-            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-            for t in threads {
-                *counts.entry(f(t)).or_default() += 1;
+            match CategoricalString::mode_across(threads.iter().map(|t| f(t))) {
+                Some((value, count, _total)) => Aggregated::Mode {
+                    value: value.0,
+                    count,
+                    total,
+                },
+                None => Aggregated::Mode {
+                    value: String::new(),
+                    count: 0,
+                    total,
+                },
             }
-            // Largest count wins; ties broken by lexicographic
-            // order so the output is deterministic.
-            let (value, count) = counts
-                .into_iter()
-                .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-                .unwrap_or_else(|| (String::new(), 0));
-            Aggregated::Mode {
-                value,
-                count,
-                total,
+        }
+        AggRule::ModeChar(f) => {
+            // `char` is not Modeable directly; coerce to the
+            // CategoricalString reduction so the lex-tiebreak
+            // contract is identical to other Mode variants.
+            let total = threads.len();
+            let strs = threads.iter().map(|t| CategoricalString(f(t).to_string()));
+            match CategoricalString::mode_across(strs) {
+                Some((value, count, _total)) => Aggregated::Mode {
+                    value: value.0,
+                    count,
+                    total,
+                },
+                None => Aggregated::Mode {
+                    value: String::new(),
+                    count: 0,
+                    total,
+                },
+            }
+        }
+        AggRule::ModeBool(f) => {
+            // Same coercion path as `ModeChar`. `to_string()`
+            // produces `"true"`/`"false"` per `bool::Display`.
+            let total = threads.len();
+            let strs = threads.iter().map(|t| CategoricalString(f(t).to_string()));
+            match CategoricalString::mode_across(strs) {
+                Some((value, count, _total)) => Aggregated::Mode {
+                    value: value.0,
+                    count,
+                    total,
+                },
+                None => Aggregated::Mode {
+                    value: String::new(),
+                    count: 0,
+                    total,
+                },
             }
         }
         AggRule::Affinity(f) => {
@@ -2548,7 +2781,7 @@ pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
             let mut min_cpus = usize::MAX;
             let mut max_cpus = 0usize;
             for t in threads {
-                let cpus = f(t);
+                let cpus = f(t).0;
                 min_cpus = min_cpus.min(cpus.len());
                 max_cpus = max_cpus.max(cpus.len());
                 if !seen.iter().any(|s| s == &cpus) {
@@ -2643,10 +2876,11 @@ pub fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
 /// - Unknown metric name (not in [`HOST_STATE_METRICS`] AND not
 ///   in [`HOST_STATE_DERIVED_METRICS`]).
 /// - Categorical metric name (one whose [`AggRule`] is
-///   [`AggRule::Mode`] — string-valued, no scalar to sort by).
-///   The default sort already places mode rows last under the
-///   `delta_pct` ladder; sorting BY a mode metric would silently
-///   degrade to alphabetical group order.
+///   [`AggRule::Mode`] / [`AggRule::ModeChar`] /
+///   [`AggRule::ModeBool`] — string- / char- / bool-valued, no
+///   scalar to sort by). The default sort already places mode
+///   rows last under the `delta_pct` ladder; sorting BY a mode
+///   metric would silently degrade to alphabetical group order.
 /// - Duplicate metric name across two entries (e.g.
 ///   `--sort-by wait_sum,wait_sum`). The second key would never
 ///   contribute to the lex ordering, so it's an operator typo
@@ -2702,11 +2936,14 @@ pub fn parse_sort_by(spec: &str) -> anyhow::Result<Vec<SortKey>> {
         // The categorical-reject check applies only to primary
         // metrics (derived metrics never go through AggRule).
         let resolved_name: Option<&'static str> = if let Some(def) = registry.get(metric).copied() {
-            if matches!(def.rule, AggRule::Mode(_)) {
+            if matches!(
+                def.rule,
+                AggRule::Mode(_) | AggRule::ModeChar(_) | AggRule::ModeBool(_),
+            ) {
                 anyhow::bail!(
                     "metric {metric:?} is categorical (no numeric value to sort by); \
                      --sort-by accepts only metrics whose AggRule yields a scalar \
-                     (Sum, Max, OrdinalRange, or Affinity)"
+                     (Sum*, Max*, Range*, or Affinity)"
                 );
             }
             Some(def.name)
@@ -4769,7 +5006,7 @@ mod tests {
         a.run_time_ns = MonotonicNs(1_000);
         let mut b = make_thread("app", "w2");
         b.run_time_ns = MonotonicNs(3_000);
-        let v = aggregate(AggRule::Sum(|t| t.run_time_ns.0), &[&a, &b]);
+        let v = aggregate(AggRule::SumNs(|t| t.run_time_ns), &[&a, &b]);
         match v {
             Aggregated::Sum(s) => assert_eq!(s, 4_000),
             other => panic!("expected Sum, got {other:?}"),
@@ -4782,7 +5019,7 @@ mod tests {
         a.run_time_ns = MonotonicNs(u64::MAX);
         let mut b = make_thread("app", "w2");
         b.run_time_ns = MonotonicNs(5);
-        let v = aggregate(AggRule::Sum(|t| t.run_time_ns.0), &[&a, &b]);
+        let v = aggregate(AggRule::SumNs(|t| t.run_time_ns), &[&a, &b]);
         match v {
             Aggregated::Sum(s) => assert_eq!(s, u64::MAX),
             other => panic!("expected Sum, got {other:?}"),
@@ -4795,7 +5032,7 @@ mod tests {
         a.nice = OrdinalI32(-5);
         let mut b = make_thread("app", "w2");
         b.nice = OrdinalI32(10);
-        let v = aggregate(AggRule::OrdinalRange(|t| t.nice.0 as i64), &[&a, &b]);
+        let v = aggregate(AggRule::RangeI32(|t| t.nice), &[&a, &b]);
         match v {
             Aggregated::OrdinalRange { min, max } => {
                 assert_eq!(min, -5);
@@ -4813,7 +5050,7 @@ mod tests {
         b.policy = "SCHED_OTHER".into();
         let mut c = make_thread("app", "w3");
         c.policy = "SCHED_FIFO".into();
-        let v = aggregate(AggRule::Mode(|t| t.policy.0.clone()), &[&a, &b, &c]);
+        let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &[&a, &b, &c]);
         match v {
             Aggregated::Mode {
                 value,
@@ -4832,7 +5069,7 @@ mod tests {
     fn affinity_uniform_preserves_cpuset() {
         let a = make_thread("app", "w1");
         let b = make_thread("app", "w2");
-        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.0.clone()), &[&a, &b]);
+        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.clone()), &[&a, &b]);
         match v {
             Aggregated::Affinity(s) => {
                 assert_eq!(s.min_cpus, 4);
@@ -4848,7 +5085,7 @@ mod tests {
         let a = make_thread("app", "w1");
         let mut b = make_thread("app", "w2");
         b.cpu_affinity = CpuSet(vec![4, 5]);
-        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.0.clone()), &[&a, &b]);
+        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.clone()), &[&a, &b]);
         match v {
             Aggregated::Affinity(s) => {
                 assert_eq!(s.min_cpus, 2);
@@ -5092,16 +5329,22 @@ mod tests {
         let snap = snap_with(vec![t]);
         let diff = compare(&snap, &snap, &CompareOptions::default());
         // `Aggregated::Mode { .. } => None` (line ~465) gates the
-        // delta — every metric registered with `AggRule::Mode`
-        // (policy, state, ext_enabled — see HOST_STATE_METRICS)
+        // delta — every metric registered with any `AggRule::Mode*`
+        // variant (`Mode` for policy, `ModeChar` for state,
+        // `ModeBool` for ext_enabled — see HOST_STATE_METRICS)
         // surfaces as None-delta even when both sides are
-        // identical, because Mode is categorical and has no
-        // numeric delta concept. Build the closed set from the
-        // registry so a future Mode-rule addition lands in this
-        // assertion automatically.
+        // identical, because Mode-family rules are categorical
+        // and have no numeric delta concept. Build the closed
+        // set from the registry so a future Mode*-rule addition
+        // lands in this assertion automatically.
         let mode_metrics: std::collections::BTreeSet<&str> = HOST_STATE_METRICS
             .iter()
-            .filter(|m| matches!(m.rule, AggRule::Mode(_)))
+            .filter(|m| {
+                matches!(
+                    m.rule,
+                    AggRule::Mode(_) | AggRule::ModeChar(_) | AggRule::ModeBool(_),
+                )
+            })
             .map(|m| m.name)
             .collect();
         for row in &diff.rows {
@@ -5667,8 +5910,11 @@ mod tests {
     /// Every `ThreadState` field that names a registered metric
     /// in the registry has a reachable accessor: sum one unit of
     /// that field through a single-thread aggregate and confirm
-    /// the Sum result is 1. Defends against a typo in a new
-    /// `AggRule::Sum` accessor pointing at the wrong field.
+    /// the Sum result is 1. Defends against a typo in any
+    /// `AggRule::Sum*` variant
+    /// ([`AggRule::SumCount`] / [`AggRule::SumNs`] /
+    /// [`AggRule::SumTicks`] / [`AggRule::SumBytes`]) accessor
+    /// pointing at the wrong field.
     ///
     /// The test is metric-registry-driven rather than field-
     /// driven because new metrics have to land through the
@@ -7348,7 +7594,7 @@ mod tests {
         a.policy = "SCHED_FIFO".into();
         let mut b = make_thread("app", "w2");
         b.policy = "SCHED_OTHER".into();
-        let v = aggregate(AggRule::Mode(|t| t.policy.0.clone()), &[&a, &b]);
+        let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &[&a, &b]);
         match v {
             Aggregated::Mode { value, count, .. } => {
                 assert_eq!(value, "SCHED_FIFO");
@@ -7366,7 +7612,7 @@ mod tests {
     #[test]
     fn affinity_aggregate_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.0.clone()), &empty);
+        let v = aggregate(AggRule::Affinity(|t| t.cpu_affinity.clone()), &empty);
         match v {
             Aggregated::Affinity(s) => {
                 assert_eq!(s.min_cpus, 0);
@@ -8026,7 +8272,7 @@ mod tests {
     #[test]
     fn aggregate_ordinal_range_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::OrdinalRange(|t| t.nice.0 as i64), &empty);
+        let v = aggregate(AggRule::RangeI32(|t| t.nice), &empty);
         match v {
             Aggregated::OrdinalRange { min, max } => {
                 assert_eq!(min, 0);
@@ -8037,12 +8283,12 @@ mod tests {
     }
 
     /// `aggregate(Mode, &[])` returns `Mode { value: "", count:
-    /// 0, total: 0 }` via the `unwrap_or_else((String::new(), 0))`
-    /// tail.
+    /// 0, total: 0 }` via the empty-iterator tail of
+    /// `Modeable::mode_across`.
     #[test]
     fn aggregate_mode_on_empty_threads_is_empty() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::Mode(|t| t.policy.0.clone()), &empty);
+        let v = aggregate(AggRule::Mode(|t| t.policy.clone()), &empty);
         match v {
             Aggregated::Mode {
                 value,
@@ -8057,13 +8303,14 @@ mod tests {
         }
     }
 
-    /// `aggregate(Sum, &[])` returns `Sum(0)` via the `fold(0u64,
-    /// ...)` accumulator. Completes empty-slice coverage across
-    /// the four reduction AggRules (Sum/Max/OrdinalRange/Mode).
+    /// `aggregate(SumNs, &[])` returns `Sum(0)` via the
+    /// identity-element seed of `Summable::sum_across`.
+    /// Completes empty-slice coverage across the reduction
+    /// families (Sum*/Max*/Range*/Mode*).
     #[test]
     fn aggregate_sum_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::Sum(|t| t.run_time_ns.0), &empty);
+        let v = aggregate(AggRule::SumNs(|t| t.run_time_ns), &empty);
         match v {
             Aggregated::Sum(s) => assert_eq!(s, 0),
             other => panic!("expected Sum, got {other:?}"),
@@ -8072,8 +8319,8 @@ mod tests {
 
     /// Three threads with different `wait_max` values aggregate to
     /// the GROUP MAX, not the sum. Pins the core semantic of
-    /// `AggRule::Max` — the kernel's `*_max` schedstats fields are
-    /// already per-thread maxes, and the group-level reduction
+    /// `AggRule::MaxPeak` — the kernel's `*_max` schedstats fields
+    /// are already per-thread maxes, and the group-level reduction
     /// should surface the worst single thread's worst window, not
     /// conflate a single 1s tail-latency spike with 1000 routine
     /// 1ms windows.
@@ -8085,7 +8332,7 @@ mod tests {
         a.wait_max = PeakNs(100);
         b.wait_max = PeakNs(999_999_999); // The clear group-wide tail.
         c.wait_max = PeakNs(50);
-        let v = aggregate(AggRule::Max(|t| t.wait_max.0), &[&a, &b, &c]);
+        let v = aggregate(AggRule::MaxPeak(|t| t.wait_max), &[&a, &b, &c]);
         match v {
             Aggregated::Max(m) => {
                 assert_eq!(
@@ -8098,29 +8345,29 @@ mod tests {
         }
     }
 
-    /// `aggregate(Max, &[])` returns `Max(0)` via the `fold(0u64,
-    /// u64::max)` accumulator. Mirrors the empty-Sum contract so
-    /// downstream delta math works the same way for both rules
-    /// when one side has no threads under the join key.
+    /// `aggregate(MaxPeak, &[])` returns `Max(0)` via the
+    /// identity-element seed of `Maxable::max_across`. Mirrors the
+    /// empty-Sum contract so downstream delta math works the same
+    /// way for both rules when one side has no threads under the
+    /// join key.
     #[test]
     fn aggregate_max_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
-        let v = aggregate(AggRule::Max(|t| t.wait_max.0), &empty);
+        let v = aggregate(AggRule::MaxPeak(|t| t.wait_max), &empty);
         match v {
             Aggregated::Max(m) => assert_eq!(m, 0),
             other => panic!("expected Max, got {other:?}"),
         }
     }
 
-    /// Single-thread group: `Max` returns the single thread's
-    /// value verbatim. Pins that the seed-0 fold does not
-    /// override a real reading (any kernel-emitted u64 is ≥ 0,
-    /// so `0.max(n) == n`).
+    /// Single-thread group: `MaxPeak` returns the single thread's
+    /// value verbatim. Pins that the identity-element seed does
+    /// not override a real reading.
     #[test]
     fn aggregate_max_single_thread_returns_thread_value() {
         let mut t = make_thread("p", "w");
         t.sleep_max = PeakNs(12_345_678_901);
-        let v = aggregate(AggRule::Max(|t| t.sleep_max.0), &[&t]);
+        let v = aggregate(AggRule::MaxPeak(|t| t.sleep_max), &[&t]);
         match v {
             Aggregated::Max(m) => assert_eq!(m, 12_345_678_901),
             other => panic!("expected Max, got {other:?}"),
@@ -9963,16 +10210,19 @@ mod tests {
         );
     }
 
-    /// A categorical metric (one whose [`AggRule`] is
-    /// [`AggRule::Mode`] — `policy`, `state`, `ext_enabled`)
-    /// has no scalar to sort by. `parse_sort_by` rejects it
-    /// at the CLI boundary so the operator gets an actionable
-    /// error rather than silent fall-through to alphabetical
-    /// group order. Pin the canonical `policy` entry from the
-    /// registry.
+    /// A categorical metric — one whose [`AggRule`] is any
+    /// `Mode*` variant: [`AggRule::Mode`] (`policy`, string),
+    /// [`AggRule::ModeChar`] (`state`, char), or
+    /// [`AggRule::ModeBool`] (`ext_enabled`, bool) — has no
+    /// scalar to sort by. `parse_sort_by` rejects it at the CLI
+    /// boundary so the operator gets an actionable error rather
+    /// than silent fall-through to alphabetical group order.
+    /// Pin the canonical `policy` entry from the registry.
     #[test]
     fn parse_sort_by_rejects_categorical_metric() {
-        // Sanity: policy is currently registered with AggRule::Mode.
+        // Sanity: policy is currently registered with AggRule::Mode
+        // (the CategoricalString variant — distinct from
+        // ModeChar/ModeBool).
         let policy_def = HOST_STATE_METRICS
             .iter()
             .find(|m| m.name == "policy")

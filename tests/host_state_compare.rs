@@ -684,7 +684,22 @@ fn host_state_metrics_accessors_read_every_variant() {
             .unwrap_or_else(|| panic!("metric {name} not in registry"));
         let agg = aggregate(def.rule, &[&t]);
         match (def.rule, &agg) {
-            (AggRule::Sum(_), Aggregated::Sum(v)) => {
+            // The phase-3 typed dispatch splits the historical
+            // `Sum`/`Max`/`OrdinalRange`/`Mode` into per-newtype
+            // variants (`SumCount`/`SumNs`/`SumTicks`/`SumBytes`,
+            // `MaxPeak`/`MaxGaugeNs`/`MaxGaugeCount`,
+            // `RangeI32`/`RangeU32`,
+            // `Mode`/`ModeChar`/`ModeBool`); the rule-side
+            // dispatch unwraps to the same `Aggregated` family
+            // here so this match groups them by the resulting
+            // `Aggregated` shape.
+            (
+                AggRule::SumCount(_)
+                | AggRule::SumNs(_)
+                | AggRule::SumTicks(_)
+                | AggRule::SumBytes(_),
+                Aggregated::Sum(v),
+            ) => {
                 let expected = *expected_scalar.get(name).unwrap_or_else(|| {
                     panic!("Sum metric {name} missing from expected_scalar table")
                 });
@@ -694,7 +709,10 @@ fn host_state_metrics_accessors_read_every_variant() {
                      got {v}, want {expected}",
                 );
             }
-            (AggRule::Max(_), Aggregated::Max(v)) => {
+            (
+                AggRule::MaxPeak(_) | AggRule::MaxGaugeNs(_) | AggRule::MaxGaugeCount(_),
+                Aggregated::Max(v),
+            ) => {
                 let expected = *expected_scalar.get(name).unwrap_or_else(|| {
                     panic!("Max metric {name} missing from expected_scalar table")
                 });
@@ -704,7 +722,10 @@ fn host_state_metrics_accessors_read_every_variant() {
                      got {v}, want {expected}",
                 );
             }
-            (AggRule::OrdinalRange(_), Aggregated::OrdinalRange { min, max }) => {
+            (
+                AggRule::RangeI32(_) | AggRule::RangeU32(_),
+                Aggregated::OrdinalRange { min, max },
+            ) => {
                 let expected: i64 = match *name {
                     "nice" => 7,
                     "processor" => 5,
@@ -722,7 +743,7 @@ fn host_state_metrics_accessors_read_every_variant() {
                 );
             }
             (
-                AggRule::Mode(_),
+                AggRule::Mode(_) | AggRule::ModeChar(_) | AggRule::ModeBool(_),
                 Aggregated::Mode {
                     value,
                     count,
@@ -803,9 +824,9 @@ fn host_state_metrics_accessors_read_every_variant() {
 /// [`ThreadState::nr_threads`] only when `tid == tgid` (the
 /// thread leader); every non-leader thread of the same tgid
 /// lands at zero. The registry pairs the field with
-/// [`AggRule::Max`] so the rendered cell answers "the largest
-/// process represented in this bucket" regardless of grouping
-/// axis — the row count already covers thread totals.
+/// [`AggRule::MaxGaugeCount`] so the rendered cell answers "the
+/// largest process represented in this bucket" regardless of
+/// grouping axis — the row count already covers thread totals.
 ///
 /// This test fixes the contract empirically: build three
 /// threads with the same tgid, populate `nr_threads = 3` ONLY
@@ -858,11 +879,13 @@ fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
     // aggregate call, with a clearer message than the variant
     // mismatch below.
     assert!(
-        matches!(def.rule, AggRule::Max(_)),
-        "nr_threads must be registered as AggRule::Max — Sum is \
-         wrong because non-leader threads contribute 0 (capture-\
-         side leader-dedup), so a comm/cgroup bucket whose leader \
-         lives elsewhere would render 0 under Sum",
+        matches!(def.rule, AggRule::MaxGaugeCount(_)),
+        "nr_threads must be registered as AggRule::MaxGaugeCount \
+         — any Sum* variant is wrong because non-leader threads \
+         contribute 0 (capture-side leader-dedup), so a \
+         comm/cgroup bucket whose leader lives elsewhere would \
+         render 0 under Sum; MaxPeak/MaxGaugeNs is wrong because \
+         the wrapper type would not match GaugeCount",
     );
 
     let agg = aggregate(def.rule, &[&leader, &follower_a, &follower_b]);
