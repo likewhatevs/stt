@@ -830,3 +830,136 @@ fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
         ),
     }
 }
+
+/// End-to-end smaps_rollup compare: stage two snapshots, each
+/// with a leader thread carrying a populated `smaps_rollup_kb`
+/// map. Run compare → write_diff and assert the rendered
+/// output carries the `## smaps_rollup` header AND the
+/// scaled-byte values for the keys that changed.
+///
+/// Pins the full pipeline: per-thread map → diff struct via
+/// `collect_smaps_rollup` → `pcomm[tgid]` keying → kB→B
+/// auto-scale → baseline → candidate cell rendering.
+#[test]
+fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
+    use ktstr::host_state_compare::{CompareOptions, GroupBy, compare, write_diff};
+    use std::path::Path;
+
+    // Baseline thread carries Pss = 1024 kB (= 1 MiB);
+    // candidate carries Pss = 2048 kB (= 2 MiB). Same tgid +
+    // pcomm so the row collapses to ONE process key
+    // `worker[4242]`.
+    let mut baseline_leader = make_thread("worker", "worker");
+    baseline_leader.tid = 4242;
+    baseline_leader.tgid = 4242;
+    baseline_leader.smaps_rollup_kb.insert("Rss".into(), 4096);
+    baseline_leader.smaps_rollup_kb.insert("Pss".into(), 1024);
+
+    let mut candidate_leader = make_thread("worker", "worker");
+    candidate_leader.tid = 4242;
+    candidate_leader.tgid = 4242;
+    candidate_leader.smaps_rollup_kb.insert("Rss".into(), 4096);
+    candidate_leader.smaps_rollup_kb.insert("Pss".into(), 2048);
+
+    let baseline = snapshot(vec![baseline_leader], BTreeMap::new());
+    let candidate = snapshot(vec![candidate_leader], BTreeMap::new());
+
+    let opts = CompareOptions::default();
+    let diff = compare(&baseline, &candidate, &opts);
+
+    // Diff struct carries the per-process maps in BYTES (not kB
+    // — the bytes conversion happens up-front in
+    // collect_smaps_rollup so the renderer gets to skip it).
+    assert_eq!(
+        diff.smaps_rollup_a
+            .get("worker[4242]")
+            .and_then(|m| m.get("Pss").copied()),
+        Some(1024 * 1024),
+        "baseline Pss kB-to-bytes conversion landed in diff",
+    );
+    assert_eq!(
+        diff.smaps_rollup_b
+            .get("worker[4242]")
+            .and_then(|m| m.get("Pss").copied()),
+        Some(2048 * 1024),
+        "candidate Pss kB-to-bytes conversion landed in diff",
+    );
+
+    let mut out = String::new();
+    write_diff(
+        &mut out,
+        &diff,
+        Path::new("a"),
+        Path::new("b"),
+        GroupBy::Pcomm,
+    )
+    .unwrap();
+
+    assert!(
+        out.contains("## smaps_rollup"),
+        "smaps_rollup section header missing:\n{out}",
+    );
+    assert!(
+        out.contains("worker[4242]"),
+        "process key missing from rendered table:\n{out}",
+    );
+    assert!(
+        out.contains("Pss"),
+        "Pss row (changed) must appear in rendered table:\n{out}",
+    );
+    // Pss changed: 1 MiB → 2 MiB. The auto_scale "B" ladder
+    // promotes a u64 byte count of 1 MiB or larger to MiB.
+    assert!(
+        out.contains("1.000MiB") && out.contains("2.000MiB"),
+        "expected baseline 1 MiB and candidate 2 MiB cells:\n{out}",
+    );
+    // Rss didn't change (4096 kB on both sides) — must NOT
+    // appear in the rendered table per the per-row gate.
+    let header_pos = out.find("## smaps_rollup").unwrap();
+    let after = &out[header_pos..];
+    let next_section = after.find("\n## ").map(|p| p + 1).unwrap_or(after.len());
+    let section = &after[..next_section];
+    assert!(
+        !section.contains("Rss"),
+        "unchanged key (Rss: 4096 kB on both) must be suppressed in section:\n{section}",
+    );
+}
+
+/// Section-gate test (F8): when every (process, key) pair has
+/// equal baseline and candidate values, the entire
+/// `## smaps_rollup` header is suppressed (not just per-row
+/// rows). Pins the `any_delta` precheck.
+#[test]
+fn compare_smaps_rollup_suppresses_section_when_all_unchanged() {
+    use ktstr::host_state_compare::{CompareOptions, GroupBy, compare, write_diff};
+    use std::path::Path;
+
+    let mut leader = make_thread("worker", "worker");
+    leader.tid = 4242;
+    leader.tgid = 4242;
+    leader.smaps_rollup_kb.insert("Rss".into(), 4096);
+    leader.smaps_rollup_kb.insert("Pss".into(), 1024);
+
+    // Baseline AND candidate both carry IDENTICAL smaps_rollup
+    // values — every (process, key) pair is unchanged.
+    let baseline = snapshot(vec![leader.clone()], BTreeMap::new());
+    let candidate = snapshot(vec![leader], BTreeMap::new());
+
+    let opts = CompareOptions::default();
+    let diff = compare(&baseline, &candidate, &opts);
+
+    let mut out = String::new();
+    write_diff(
+        &mut out,
+        &diff,
+        Path::new("a"),
+        Path::new("b"),
+        GroupBy::Pcomm,
+    )
+    .unwrap();
+
+    assert!(
+        !out.contains("## smaps_rollup"),
+        "section header must be suppressed when no key changed:\n{out}",
+    );
+}

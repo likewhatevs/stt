@@ -1078,6 +1078,46 @@ fn write_show<W: std::fmt::Write>(
         }
     }
 
+    // Per-process smaps_rollup sub-table — one row per
+    // (process, key) pair across the captured threads. Per-MM
+    // (process-wide), so each leader thread (tid == tgid)
+    // contributes a complete map; non-leader threads contribute
+    // an empty map (leader-dedup at capture). Renders as a
+    // long-table with `pcomm[tgid] | key | value` so the same
+    // process at different points in time is distinguishable
+    // from different processes sharing a pcomm. Suppressed when
+    // every captured thread has an empty map (older kernels,
+    // stripped permissions, synthetic fixtures). Skip
+    // zero-valued entries to keep output bounded — Pss for an
+    // unmapped process is meaningfully zero, but
+    // ShmemPmdMapped=0 etc. are noise rows. kB→B conversion
+    // for the auto_scale "B" ladder lives in
+    // [`ThreadState::smaps_rollup_bytes`].
+    let smaps_rows: Vec<(&host_state::ThreadState, &String, u64)> = snap
+        .threads
+        .iter()
+        .filter(|t| !t.smaps_rollup_kb.is_empty())
+        .flat_map(|t| {
+            t.smaps_rollup_bytes()
+                .filter(|(_, b)| *b != 0)
+                .map(move |(k, b)| (t, k, b))
+        })
+        .collect();
+    if !smaps_rows.is_empty() {
+        writeln!(w)?;
+        writeln!(w, "## smaps_rollup")?;
+        let mut st = cli::new_table();
+        st.set_header(vec!["process", "key", "value"]);
+        for (t, key, bytes) in &smaps_rows {
+            st.add_row(vec![
+                format!("{}[{}]", t.pcomm, t.tgid),
+                (*key).clone(),
+                host_state_compare::format_scaled_u64(*bytes, "B"),
+            ]);
+        }
+        writeln!(w, "{st}")?;
+    }
+
     Ok(())
 }
 

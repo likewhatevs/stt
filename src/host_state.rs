@@ -318,10 +318,10 @@ impl HostStateProbeSummary {
 /// Per-file tokens in [`Self::read_failures_by_file`] are stable
 /// kebab-case identifiers downstream consumers match against. The
 /// recognized set: `"stat"`, `"schedstat"`, `"io"`, `"status"`,
-/// `"sched"`, `"cgroup"`. Adding a new procfs file to the capture
-/// adds a new key; the wire shape carries any token the capture
-/// emitted, so a consumer that only knows the existing set absorbs
-/// new keys without breaking.
+/// `"sched"`, `"cgroup"`, `"smaps_rollup"`. Adding a new procfs
+/// file to the capture adds a new key; the wire shape carries
+/// any token the capture emitted, so a consumer that only knows
+/// the existing set absorbs new keys without breaking.
 ///
 /// Ghost-filtered tids do NOT contribute to `read_failures` /
 /// `read_failures_by_file` — their pending failure bumps are
@@ -967,6 +967,43 @@ pub struct ThreadState {
     /// would render 0 even though processes are represented.
     pub nr_threads: u64,
 
+    // -- /proc/<tid>/smaps_rollup (per-MM memory breakdown) --
+    /// Per-process memory breakdown from
+    /// `/proc/<tid>/smaps_rollup`, parsed as a key-value map
+    /// with values in kilobytes (the kernel's native unit on
+    /// this file — `__show_smap()` at `fs/proc/task_mmu.c:1330-1368`
+    /// emits every line as `Name: NN kB`).
+    ///
+    /// Stored as a [`BTreeMap`] for forward-compat with the
+    /// open key set: rollup mode (gated at task_mmu.c:1336)
+    /// emits 22 keys on a recent kernel — Rss, Pss, Pss_Dirty,
+    /// Pss_Anon, Pss_File, Pss_Shmem, Shared_Clean,
+    /// Shared_Dirty, Private_Clean, Private_Dirty, Referenced,
+    /// Anonymous, KSM, LazyFree, AnonHugePages,
+    /// ShmemPmdMapped, FilePmdMapped, Shared_Hugetlb,
+    /// Private_Hugetlb, Swap, SwapPss, Locked, plus the
+    /// `[rollup]` header which the parser elides. The map
+    /// preserves any future-kernel keys without a schema bump.
+    /// Pss is the most operationally valuable: proportional
+    /// share of shared pages — distinguishes "sole owner" from
+    /// "one of N sharing".
+    ///
+    /// Per-MM, not per-thread: every thread of the same tgid
+    /// shares one mm_struct, so all threads expose identical
+    /// values. Capture-side dedup populates ONLY the thread
+    /// leader (tid == tgid) and leaves non-leader threads at
+    /// the empty map. Mirrors [`Self::nr_threads`]'s
+    /// leader-dedup discipline. The capture cost is one
+    /// `read_to_string` per tgid (NOT per-tid) because
+    /// non-leaders short-circuit before opening the file.
+    ///
+    /// Empty when smaps_rollup is absent (older kernels
+    /// without `/proc/<pid>/smaps_rollup` support — added
+    /// upstream in 4.14) or unreadable (typical
+    /// permission-denied for /proc/1/smaps_rollup outside
+    /// CAP_SYS_PTRACE).
+    pub smaps_rollup_kb: BTreeMap<String, u64>,
+
     // -- I/O (/proc/<tid>/io, CONFIG_TASK_IO_ACCOUNTING) --
     pub rchar: u64,
     pub wchar: u64,
@@ -974,6 +1011,23 @@ pub struct ThreadState {
     pub syscw: u64,
     pub read_bytes: u64,
     pub write_bytes: u64,
+}
+
+impl ThreadState {
+    /// Iterate over [`Self::smaps_rollup_kb`] with values
+    /// converted from kilobytes to bytes via `saturating_mul(1024)`.
+    /// The kernel emits smaps_rollup values in kB; the
+    /// project's display layer auto-scales bytes via the
+    /// existing "B" → KiB → MiB → GiB ladder, so a single
+    /// helper centralizes the unit conversion at every render
+    /// site (write_show + write_diff). Saturating multiply
+    /// guards against pathological input from a malformed
+    /// snapshot file.
+    pub fn smaps_rollup_bytes(&self) -> impl Iterator<Item = (&String, u64)> {
+        self.smaps_rollup_kb
+            .iter()
+            .map(|(k, v)| (k, v.saturating_mul(1024)))
+    }
 }
 
 /// Per-cgroup enrichment record attached to [`HostStateSnapshot`].
@@ -2318,6 +2372,91 @@ fn read_sched_at_with_tally(
     }
 }
 
+/// Parse `/proc/<pid>/smaps_rollup` contents into a key→u64-kB
+/// map. Format per `__show_smap()` at
+/// `fs/proc/task_mmu.c:1330-1368`: each kv line is
+/// `<Name>:<whitespace><u64><whitespace>kB`. The kernel ALSO
+/// emits a `<addr_start>-<addr_end> ---p <off> XX:XX <inode> [rollup]`
+/// header line (built by `show_vma_header_prefix()` then
+/// `seq_puts(m, "[rollup]\n")` at `task_mmu.c:1500-1503`). That
+/// header CONTAINS a `:` (the device-major:minor pair `XX:XX`),
+/// so a naive `split_once(':')` would mis-extract a junk key
+/// (the whitespace-laden address range + flags + offset prefix)
+/// with value 0 (the minor-device integer parses as the first
+/// whitespace token of the value side). Real smaps_rollup keys
+/// are single-word identifiers (Rss, Pss, Pss_Dirty, etc.) that
+/// never contain whitespace or `-`; the address-range header
+/// always contains both. Reject any line whose pre-`:` segment
+/// carries either character.
+///
+/// Lines whose value field doesn't parse as u64 are silently
+/// dropped (best-effort, matching the absent-counter contract).
+fn parse_smaps_rollup(raw: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key_trimmed = key.trim();
+        // Header-line guard: real smaps_rollup keys never
+        // contain whitespace or `-`. Address-range headers
+        // (`<addr_start>-<addr_end> ---p <off> XX:XX <inode>
+        // [rollup]`) carry both.
+        if key_trimmed.contains(char::is_whitespace) || key_trimmed.contains('-') {
+            continue;
+        }
+        // Value field: whitespace-prefixed integer + " kB" suffix
+        // (or rarely no suffix on a future kernel addition). The
+        // first whitespace-token after trimming IS the integer;
+        // dropping the unit suffix happens for free via
+        // `split_ascii_whitespace().next()`.
+        let Some(n_str) = value.split_ascii_whitespace().next() else {
+            continue;
+        };
+        let Ok(n) = n_str.parse::<u64>() else {
+            continue;
+        };
+        out.insert(key_trimmed.to_string(), n);
+    }
+    out
+}
+
+/// Read `<proc_root>/<tgid>/task/<tid>/smaps_rollup` for the
+/// thread leader (tid == tgid) and parse it. Non-leader threads
+/// short-circuit to an empty map: the underlying mm_struct is
+/// shared per-tgid, so reading from any thread yields identical
+/// values, and capturing once per tgid avoids redundant
+/// per-thread work. Records a `"smaps_rollup"` failure into
+/// `tally` on read error.
+///
+/// Permission semantics: `/proc/<pid>/smaps_rollup` requires
+/// `CAP_SYS_PTRACE` for processes the caller doesn't own (PID 1
+/// being the canonical example). Read failure is treated as
+/// best-effort — empty map, tally bump, no panic. Older kernels
+/// (pre-4.14) lack the file entirely; same handling.
+fn read_smaps_rollup_at_with_tally(
+    proc_root: &Path,
+    tgid: i32,
+    tid: i32,
+    tally: &mut Option<&mut ParseTally>,
+) -> BTreeMap<String, u64> {
+    if tid != tgid {
+        // Leader-dedup: non-leader threads share the same
+        // mm_struct, so the file would yield identical values.
+        // Skip the read entirely.
+        return BTreeMap::new();
+    }
+    match fs::read_to_string(task_file(proc_root, tgid, tid, "smaps_rollup")) {
+        Ok(raw) => parse_smaps_rollup(&raw),
+        Err(_) => {
+            if let Some(t) = tally.as_mut() {
+                t.record_failure("smaps_rollup");
+            }
+            BTreeMap::new()
+        }
+    }
+}
+
 /// Parse cgroup v2 `cpu.stat`. Format is lines of `key value`
 /// (space-separated, not `key: value`).
 fn parse_cpu_stat(raw: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
@@ -2607,6 +2746,7 @@ fn capture_thread_at_with_tally(
     let io = read_io_at_with_tally(proc_root, tgid, tid, tally);
     let status = read_status_at_with_tally(proc_root, tgid, tid, tally);
     let sched = read_sched_at_with_tally(proc_root, tgid, tid, tally);
+    let smaps_rollup_kb = read_smaps_rollup_at_with_tally(proc_root, tgid, tid, tally);
     let cpu_affinity = if use_syscall_affinity {
         read_affinity(tid)
             .or(status.cpus_allowed)
@@ -2684,6 +2824,7 @@ fn capture_thread_at_with_tally(
         } else {
             0
         },
+        smaps_rollup_kb,
         rchar: io.rchar.unwrap_or(0),
         wchar: io.wchar.unwrap_or(0),
         syscr: io.syscr.unwrap_or(0),
@@ -4205,6 +4346,184 @@ mod tests {
         assert_eq!(m.get("good"), Some(&42));
         assert_eq!(m.get("recover"), Some(&7));
         assert_eq!(m.len(), 2, "malformed lines must not pollute the map");
+    }
+
+    /// `parse_smaps_rollup` reads cgroup-style `<key>: <u64> kB`
+    /// lines and returns a `BTreeMap<String, u64>` of kB
+    /// values. Pins:
+    /// - well-formed multi-line input populates every key
+    /// - the kernel's `<vma_range> [rollup]` header (no `:`)
+    ///   is silently skipped
+    /// - " kB" suffix is dropped via first-whitespace-token
+    ///   extraction (parser doesn't hard-code the unit; a
+    ///   future kernel that drops the suffix still parses)
+    /// - empty input yields an empty map
+    /// - lines whose value field doesn't parse as u64 are
+    ///   silently dropped (best-effort, matches the
+    ///   absent-counter contract).
+    #[test]
+    fn parse_smaps_rollup_extracts_kb_values_and_skips_header() {
+        let raw = "55796dced000-7ffe1f875000 ---p 00000000 00:00 0                          [rollup]\n\
+                   Rss:                2080 kB\n\
+                   Pss:                 209 kB\n\
+                   Pss_Dirty:           136 kB\n\
+                   Pss_Anon:            136 kB\n\
+                   Anonymous:           136 kB\n\
+                   Swap:                  0 kB\n\
+                   SwapPss:               0 kB\n\
+                   Locked:                0 kB\n";
+        let m = parse_smaps_rollup(raw);
+        assert_eq!(m.get("Rss"), Some(&2080), "Rss kB stripped to integer");
+        assert_eq!(m.get("Pss"), Some(&209));
+        assert_eq!(m.get("Pss_Dirty"), Some(&136));
+        assert_eq!(m.get("Pss_Anon"), Some(&136));
+        assert_eq!(m.get("Anonymous"), Some(&136));
+        assert_eq!(m.get("Swap"), Some(&0));
+        assert_eq!(m.get("SwapPss"), Some(&0));
+        assert_eq!(m.get("Locked"), Some(&0));
+        assert_eq!(
+            m.len(),
+            8,
+            "[rollup] header line is silently elided (no `:` separator)",
+        );
+    }
+
+    /// Empty file → empty map. Pins the absent-counter contract
+    /// for the "kernel pre-4.14 lacks smaps_rollup" path.
+    #[test]
+    fn parse_smaps_rollup_empty_input_yields_empty_map() {
+        assert!(parse_smaps_rollup("").is_empty());
+    }
+
+    /// Malformed value fields (non-u64) are silently dropped;
+    /// well-formed neighbors still parse. Pins the parser's
+    /// best-effort discipline so a future kernel that emits a
+    /// new key with an unexpected format doesn't break the
+    /// whole capture.
+    #[test]
+    fn parse_smaps_rollup_malformed_value_silently_dropped() {
+        let raw = "Rss:                100 kB\n\
+                   BogusKey:        not_a_number kB\n\
+                   Pss:                 50 kB\n";
+        let m = parse_smaps_rollup(raw);
+        assert_eq!(m.get("Rss"), Some(&100));
+        assert_eq!(m.get("Pss"), Some(&50), "well-formed neighbor still parses");
+        assert!(
+            !m.contains_key("BogusKey"),
+            "non-u64 value silently dropped"
+        );
+        assert_eq!(m.len(), 2);
+    }
+
+    /// The kernel's smaps_rollup header line carries a `:` in
+    /// the device-major:minor pair (`<addr_start>-<addr_end>
+    /// ---p <off> XX:XX <inode> [rollup]`). A naive
+    /// `split_once(':')` would mis-extract the long
+    /// whitespace-laden prefix as a "key" and parse the minor
+    /// device integer as the "value", producing a junk
+    /// 0-valued entry on every captured process. Pin the
+    /// header guard so a regression that drops the
+    /// whitespace-or-`-` rejection surfaces here.
+    #[test]
+    fn parse_smaps_rollup_skips_real_kernel_header_with_device_colon() {
+        let raw = "55796dced000-7ffe1f875000 ---p 00000000 00:00 0                          [rollup]\n\
+             Rss:                2080 kB\n\
+             Pss:                 209 kB\n";
+        let m = parse_smaps_rollup(raw);
+        // Real keys parsed.
+        assert_eq!(m.get("Rss"), Some(&2080));
+        assert_eq!(m.get("Pss"), Some(&209));
+        // No junk key from the header line — the pre-`:`
+        // segment of the header carries whitespace AND `-`,
+        // both rejected by the parser's header guard.
+        assert_eq!(
+            m.len(),
+            2,
+            "header line with `00:00` device pair must not produce a junk key; got {m:?}",
+        );
+    }
+
+    /// Stage a synthetic procfs tree with a leader-thread
+    /// (tid==tgid) carrying smaps_rollup, plus a follower
+    /// thread (tid != tgid). Verifies:
+    ///
+    /// - leader thread's read populates the map.
+    /// - follower thread's read returns an empty map without
+    ///   touching the file (no IO cost on per-tid walks).
+    ///
+    /// This is the leader-dedup contract that makes per-MM
+    /// data cheap to capture across thousands of threads.
+    #[test]
+    fn read_smaps_rollup_at_with_tally_dedups_to_leader_only() {
+        let proc_root = tempfile::TempDir::new().unwrap();
+        let tgid = 4242;
+        let leader_tid = 4242;
+        let follower_tid = 4243;
+
+        // Stage `<tgid>/task/<leader_tid>/smaps_rollup`.
+        let leader_dir = proc_root
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(leader_tid.to_string());
+        std::fs::create_dir_all(&leader_dir).unwrap();
+        std::fs::write(
+            leader_dir.join("smaps_rollup"),
+            "Rss:                2048 kB\n\
+             Pss:                 512 kB\n",
+        )
+        .unwrap();
+
+        // Stage `<tgid>/task/<follower_tid>/smaps_rollup` with a
+        // POISON value — if the reader incorrectly opened it for
+        // the follower it would read this and break the
+        // assertion below.
+        let follower_dir = proc_root
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(follower_tid.to_string());
+        std::fs::create_dir_all(&follower_dir).unwrap();
+        std::fs::write(
+            follower_dir.join("smaps_rollup"),
+            "Rss:                9999 kB\nPoison:           1 kB\n",
+        )
+        .unwrap();
+
+        // Leader: file is read, map is populated.
+        let m = read_smaps_rollup_at_with_tally(proc_root.path(), tgid, leader_tid, &mut None);
+        assert_eq!(m.get("Rss"), Some(&2048));
+        assert_eq!(m.get("Pss"), Some(&512));
+        assert_eq!(m.len(), 2);
+
+        // Follower: short-circuits to empty map BEFORE opening
+        // the file. Catches a regression that flipped the
+        // tid/tgid comparison or removed the dedup.
+        let m = read_smaps_rollup_at_with_tally(proc_root.path(), tgid, follower_tid, &mut None);
+        assert!(
+            m.is_empty(),
+            "follower thread must short-circuit to empty map; got {m:?}"
+        );
+    }
+
+    /// Absent smaps_rollup file yields an empty map (older
+    /// kernels pre-4.14 lack this file; CAP_SYS_PTRACE-denied
+    /// reads under typical operator runs collapse the same way).
+    /// Pins the read-failure path.
+    #[test]
+    fn read_smaps_rollup_at_with_tally_absent_file_yields_empty_map() {
+        let proc_root = tempfile::TempDir::new().unwrap();
+        let tgid = 4242;
+        let leader_tid = 4242;
+        let leader_dir = proc_root
+            .path()
+            .join(tgid.to_string())
+            .join("task")
+            .join(leader_tid.to_string());
+        std::fs::create_dir_all(&leader_dir).unwrap();
+        // No smaps_rollup file written — capture must not error.
+        let m = read_smaps_rollup_at_with_tally(proc_root.path(), tgid, leader_tid, &mut None);
+        assert!(m.is_empty(), "absent file → empty map; got {m:?}");
     }
 
     /// `parse_max_or_u64` distinguishes the kernel's literal

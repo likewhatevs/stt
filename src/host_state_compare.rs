@@ -930,6 +930,16 @@ pub struct HostStateDiff {
     pub host_psi_a: Psi,
     /// Candidate host-level PSI snapshot.
     pub host_psi_b: Psi,
+    /// Baseline per-process smaps_rollup maps, keyed by
+    /// `pcomm[tgid]` so the same process at different points in
+    /// time stays distinguishable even when pcomm collides
+    /// across processes (a long-lived `bash[4242]` doesn't
+    /// alias a recently-spawned `bash[99999]`). Populated from
+    /// the baseline snapshot's per-thread leader rows
+    /// (tid == tgid; see [`ThreadState::smaps_rollup_kb`]).
+    pub smaps_rollup_a: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Candidate per-process smaps_rollup maps, same shape.
+    pub smaps_rollup_b: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 /// Compare two snapshots and produce a [`HostStateDiff`].
@@ -1065,7 +1075,35 @@ pub fn compare(
     diff.host_psi_a = baseline.psi;
     diff.host_psi_b = candidate.psi;
 
+    diff.smaps_rollup_a = collect_smaps_rollup(baseline);
+    diff.smaps_rollup_b = collect_smaps_rollup(candidate);
+
     diff
+}
+
+/// Walk a snapshot's threads and pull non-empty smaps_rollup
+/// maps off the leader threads (tid == tgid; non-leader threads
+/// land at empty map per the leader-dedup contract). Keyed by
+/// `pcomm[tgid]` (square brackets never appear in pcomm, so the
+/// shape stays unambiguous even when a pcomm contains a dot
+/// like `node.js`). Values are converted from kB to bytes via
+/// [`ThreadState::smaps_rollup_bytes`] up-front, so the
+/// downstream renderer can pass cell values directly into the
+/// auto_scale "B" ladder without further unit math.
+fn collect_smaps_rollup(snap: &HostStateSnapshot) -> BTreeMap<String, BTreeMap<String, u64>> {
+    let mut out = BTreeMap::new();
+    for t in &snap.threads {
+        if t.smaps_rollup_kb.is_empty() {
+            continue;
+        }
+        let key = format!("{}[{}]", t.pcomm, t.tgid);
+        let bytes_map: BTreeMap<String, u64> = t
+            .smaps_rollup_bytes()
+            .map(|(k, b)| (k.clone(), b))
+            .collect();
+        out.insert(key, bytes_map);
+    }
+    out
 }
 
 /// Build the post-flatten-path → final-tightened-key map for
@@ -2843,6 +2881,77 @@ pub fn write_diff<W: fmt::Write>(
                 cgroup_cell(Some(a.full.total_usec), Some(b.full.total_usec), "µs"),
             ]);
             writeln!(w, "{pt}")?;
+        }
+    }
+
+    // Per-process smaps_rollup compare. Iterates the union of
+    // process keys across both snapshots; one row per
+    // (process, key) pair carrying baseline → candidate kB
+    // values rendered through the existing "B" auto-scale
+    // ladder after kB → bytes conversion. Suppressed when
+    // neither side has any smaps_rollup data; per-row gate
+    // skips rows where baseline equals candidate (treats
+    // absent and 0 as equal). Mirrors the memory.stat compare
+    // layout from #61.
+    if !diff.smaps_rollup_a.is_empty() || !diff.smaps_rollup_b.is_empty() {
+        let mut process_keys: std::collections::BTreeSet<&String> =
+            diff.smaps_rollup_a.keys().collect();
+        process_keys.extend(diff.smaps_rollup_b.keys());
+
+        // Pre-pass: any (process, key) pair with a non-equal
+        // delta? Suppresses the section header when nothing
+        // moved, even if both maps are populated.
+        let any_delta = process_keys.iter().any(|pkey| {
+            let a = diff.smaps_rollup_a.get(*pkey);
+            let b = diff.smaps_rollup_b.get(*pkey);
+            let mut keys: std::collections::BTreeSet<&String> =
+                a.map(|m| m.keys().collect()).unwrap_or_default();
+            if let Some(m) = b {
+                keys.extend(m.keys());
+            }
+            keys.iter().any(|k| {
+                let av = a.and_then(|m| m.get(*k).copied());
+                let bv = b.and_then(|m| m.get(*k).copied());
+                av != bv
+            })
+        });
+        if any_delta {
+            writeln!(w)?;
+            writeln!(w, "## smaps_rollup")?;
+            let mut st = crate::cli::new_table();
+            st.set_header(vec!["process", "key", "value"]);
+            for pkey in &process_keys {
+                let a = diff.smaps_rollup_a.get(*pkey);
+                let b = diff.smaps_rollup_b.get(*pkey);
+                let mut keys_union: std::collections::BTreeSet<&String> =
+                    a.map(|m| m.keys().collect()).unwrap_or_default();
+                if let Some(m) = b {
+                    keys_union.extend(m.keys());
+                }
+                for sk in keys_union {
+                    // Values are already bytes (per
+                    // collect_smaps_rollup) so the auto_scale
+                    // "B" ladder applies directly.
+                    let av = a.and_then(|m| m.get(sk).copied());
+                    let bv = b.and_then(|m| m.get(sk).copied());
+                    // Per-row gate: skip rows where the
+                    // `Option<u64>` baseline equals the
+                    // `Option<u64>` candidate. Two `None`s
+                    // (process or key absent on both sides) and
+                    // two equal `Some`s both compare equal under
+                    // `Option`'s derived `PartialEq`. A `None`
+                    // vs `Some` mismatch surfaces — reflects a
+                    // process that gained/lost smaps_rollup
+                    // visibility across the two snapshots,
+                    // which IS the kind of change the user
+                    // wants to see.
+                    if av == bv {
+                        continue;
+                    }
+                    st.add_row(vec![pkey.to_string(), sk.clone(), cgroup_cell(av, bv, "B")]);
+                }
+            }
+            writeln!(w, "{st}")?;
         }
     }
 
