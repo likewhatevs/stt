@@ -6909,7 +6909,11 @@ mod tests {
             .iter()
             .find(|r| r.metric_name == "affine_success_ratio")
             .expect("affine_success_ratio present");
-        assert_eq!(row.delta, Some(0.1));
+        let delta = row.delta.expect("delta present when both sides defined");
+        assert!(
+            (delta - 0.1).abs() < 1e-10,
+            "expected delta ~0.1 (0.6 - 0.5 in f64), got {delta}",
+        );
         assert!(
             row.delta_pct.is_none(),
             "ratio row must suppress delta_pct, got {:?}",
