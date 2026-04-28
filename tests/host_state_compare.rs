@@ -529,6 +529,32 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("block_max", |t| t.block_max = 202),
         ("exec_max", |t| t.exec_max = 203),
         ("slice_max", |t| t.slice_max = 204),
+        // /proc/<tid>/stat additions (parse_stat).
+        // priority: kernel-internal scheduler priority (signed,
+        // OrdinalRange).
+        ("priority", |t| t.priority = 25),
+        // rt_priority: bounded real-time priority (OrdinalRange
+        // — non-Sum because it's a bounded ordinal, not a
+        // counter).
+        ("rt_priority", |t| t.rt_priority = 50),
+        // delayacct_blkio_ticks: cumulative counter (Sum).
+        ("delayacct_blkio_ticks", |t| t.delayacct_blkio_ticks = 137),
+        // /proc/<tid>/sched additions (parse_sched).
+        // nr_wakeups_passive: counter (Sum) — known dead on
+        // mainline but registered for forward compat.
+        ("nr_wakeups_passive", |t| t.nr_wakeups_passive = 138),
+        // core_forceidle_sum: counter (Sum, ns).
+        ("core_forceidle_sum", |t| t.core_forceidle_sum = 139),
+        // fair_slice_ns: current scheduler slice (Max, ns) —
+        // distinct from slice_max which is the schedstat
+        // high-water. Name mirrors the kernel `fair_policy()`
+        // gate, which accepts SCHED_NORMAL/BATCH/EXT.
+        ("fair_slice_ns", |t| t.fair_slice_ns = 250),
+        // /proc/<tid>/status addition (parse_status).
+        // nr_threads: tgid thread count, leader-only dedup. Max
+        // surfaces "the largest process represented in this
+        // bucket"; the row count already covers thread totals.
+        ("nr_threads", |t| t.nr_threads = 140),
     ];
 
     // Hand-paired expected scalar value for each Sum/Max
@@ -574,12 +600,17 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("syscw", 134),
         ("read_bytes", 135),
         ("write_bytes", 136),
+        ("delayacct_blkio_ticks", 137),
+        ("nr_wakeups_passive", 138),
+        ("core_forceidle_sum", 139),
         // Max
         ("wait_max", 200),
         ("sleep_max", 201),
         ("block_max", 202),
         ("exec_max", 203),
         ("slice_max", 204),
+        ("fair_slice_ns", 250),
+        ("nr_threads", 140),
     ]
     .into_iter()
     .collect();
@@ -622,6 +653,8 @@ fn host_state_metrics_accessors_read_every_variant() {
                 let expected: i64 = match *name {
                     "nice" => 7,
                     "processor" => 5,
+                    "priority" => 25,
+                    "rt_priority" => 50,
                     _ => panic!("unexpected OrdinalRange metric {name}"),
                 };
                 assert_eq!(
@@ -707,4 +740,93 @@ fn host_state_metrics_accessors_read_every_variant() {
         "test cases must mirror HOST_STATE_METRICS exactly; \
          missing-from-cases or extra-in-cases delta surfaces here",
     );
+}
+
+/// Pin the `nr_threads` leader-dedup contract.
+///
+/// `capture_thread_at_with_tally` populates
+/// [`ThreadState::nr_threads`] only when `tid == tgid` (the
+/// thread leader); every non-leader thread of the same tgid
+/// lands at zero. The registry pairs the field with
+/// [`AggRule::Max`] so the rendered cell answers "the largest
+/// process represented in this bucket" regardless of grouping
+/// axis — the row count already covers thread totals.
+///
+/// This test fixes the contract empirically: build three
+/// threads with the same tgid, populate `nr_threads = 3` ONLY
+/// on the leader, and check that `aggregate` over the three
+/// returns `Aggregated::Max(3)` — proving Max reads through to
+/// the leader's value rather than to a follower's zero. A
+/// regression that
+///   - changed the registry rule back to `Sum` would surface
+///     here as `Aggregated::Sum(3)` (wrong variant; assertion
+///     fails on enum match), and
+///   - silently broke the registry accessor (e.g. swapping
+///     `t.nr_threads` for some other field) would surface as a
+///     `Max(0)` because the followers' zero would dominate the
+///     un-populated leader value.
+///
+/// The test is grouping-axis-independent: it calls `aggregate`
+/// directly against `[&leader, &follower_a, &follower_b]` so
+/// it pins the AGGREGATOR contract rather than the bucketing
+/// path. Bucketing-path coverage lives in the rendered-output
+/// integration tests.
+#[test]
+fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
+    let mut leader = make_thread("server", "server-leader");
+    leader.tid = 4242;
+    leader.tgid = 4242;
+    leader.nr_threads = 3;
+
+    let mut follower_a = make_thread("server", "server-worker-1");
+    follower_a.tid = 4243;
+    follower_a.tgid = 4242;
+    // Capture-side dedup: non-leader threads of the same tgid
+    // land at zero. Setting it explicitly here makes the
+    // contract obvious; relying on the Default would be
+    // implicit and could mask a regression that flipped the
+    // dedup direction (leader=0, followers=N).
+    follower_a.nr_threads = 0;
+
+    let mut follower_b = make_thread("server", "server-worker-2");
+    follower_b.tid = 4244;
+    follower_b.tgid = 4242;
+    follower_b.nr_threads = 0;
+
+    let def = HOST_STATE_METRICS
+        .iter()
+        .find(|m| m.name == "nr_threads")
+        .expect("nr_threads metric must be in HOST_STATE_METRICS");
+
+    // Sanity-pin the registry rule shape itself — a regression
+    // that flipped Max → Sum would surface here BEFORE the
+    // aggregate call, with a clearer message than the variant
+    // mismatch below.
+    assert!(
+        matches!(def.rule, AggRule::Max(_)),
+        "nr_threads must be registered as AggRule::Max — Sum is \
+         wrong because non-leader threads contribute 0 (capture-\
+         side leader-dedup), so a comm/cgroup bucket whose leader \
+         lives elsewhere would render 0 under Sum",
+    );
+
+    let agg = aggregate(def.rule, &[&leader, &follower_a, &follower_b]);
+
+    match agg {
+        Aggregated::Max(v) => {
+            assert_eq!(
+                v, 3,
+                "Max across [leader=3, follower=0, follower=0] must \
+                 read the leader's value (3); a result of 0 means the \
+                 followers' zeros displaced the leader OR the accessor \
+                 read the wrong field",
+            );
+        }
+        other => panic!(
+            "nr_threads aggregator returned wrong variant — \
+             expected Aggregated::Max(3), got {other:?}. A Sum-\
+             shaped aggregate would silently produce Sum(3) here, \
+             which is the regression this test guards against.",
+        ),
+    }
 }

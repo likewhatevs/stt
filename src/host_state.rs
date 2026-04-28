@@ -770,6 +770,193 @@ pub struct ThreadState {
     /// Same USER_HZ scaling and `_clock_ticks` suffix convention as
     /// [`Self::utime_clock_ticks`].
     pub stime_clock_ticks: u64,
+    /// Kernel-internal scheduler priority (signed). Distinct
+    /// from [`Self::nice`] — `priority` is the post-bias
+    /// scheduling priority (`task_prio(task)`) the scheduler
+    /// uses for ordering, while `nice` is the
+    /// userspace-presentable [-20, 19] preference.
+    /// `/proc/<tid>/stat` field 18, emitted via
+    /// `seq_put_decimal_ll(m, " ", task_prio(task))` at
+    /// `fs/proc/array.c:602`. Range per `task_prio()` at
+    /// `kernel/sched/syscalls.c:170`:
+    /// CFS / SCHED_OTHER tasks see `[0..39]` (nice [-20..19]
+    /// translated by `task_prio()` returning
+    /// `p->prio - MAX_RT_PRIO`); SCHED_FIFO / SCHED_RR tasks
+    /// see `[-2..-100]`; SCHED_DEADLINE tasks land at `-101`.
+    /// Default 0 when the stat read fails — collides with the
+    /// CFS nice-0 case, so a CFS task at default nice and an
+    /// absent stat line both render 0.
+    pub priority: i32,
+    /// Real-time scheduler priority. `/proc/<tid>/stat` field
+    /// 40, emitted via `seq_put_decimal_ull(m, " ", task->rt_priority)`
+    /// at `fs/proc/array.c:637`. Non-zero only when the task
+    /// runs SCHED_FIFO or SCHED_RR; CFS / SCHED_OTHER tasks
+    /// land at zero. Useful as a post-hoc filter to identify
+    /// real-time threads in a snapshot.
+    pub rt_priority: u64,
+    /// Cumulative blkio delay accrued by this thread, in
+    /// USER_HZ clock ticks. `/proc/<tid>/stat` field 42, emitted
+    /// via `seq_put_decimal_ull(m, " ", delayacct_blkio_ticks(task))`
+    /// at `fs/proc/array.c:639`. Counts wall-clock time the task
+    /// was blocked waiting on disk I/O — distinct from
+    /// [`Self::iowait_sum`] (which the kernel maintains under
+    /// schedstat) because this counter is the delayacct subsystem's
+    /// blkio bucket.
+    ///
+    /// Two-stage gating: (1) build-time
+    /// `CONFIG_TASK_DELAY_ACCT` — when not built, the
+    /// `static inline delayacct_blkio_ticks()` at
+    /// `include/linux/delayacct.h` returns 0 unconditionally;
+    /// (2) runtime toggle `delayacct_on` in `kernel/delayacct.c`
+    /// driven by either the `delayacct` boot param
+    /// (`__setup("delayacct", ...)` at `kernel/delayacct.c:48`)
+    /// or the `kernel.task_delayacct` sysctl (declared at
+    /// `kernel/delayacct.c:80`). When the runtime toggle is
+    /// off, the increment paths
+    /// (`delayacct_blkio_start`/`_end`) are gated behind
+    /// `static_branch_unlikely(&delayacct_key)` and become
+    /// no-ops, so the counter stays at zero even on a kernel
+    /// built with `CONFIG_TASK_DELAY_ACCT=y`. Same USER_HZ
+    /// scaling as [`Self::utime_clock_ticks`].
+    pub delayacct_blkio_ticks: u64,
+
+    // -- /proc/<tid>/sched additions (counters + ordinal + slice gauge) --
+    /// Wakeups onto an idle CPU via the passive-wakeup fast path.
+    /// `/proc/<tid>/sched` `nr_wakeups_passive`, plain u64 via
+    /// the `P_SCHEDSTAT(F)` macro that expands to
+    /// `schedstat_val(p->stats.F)` at `kernel/sched/debug.c:1274`
+    /// (the line emitting this specific counter is
+    /// `kernel/sched/debug.c:1314`). KNOWN DEAD COUNTER on
+    /// mainline — the kernel never increments
+    /// `task->stats.nr_wakeups_passive` anywhere under `kernel/`.
+    /// Captured for parser-completeness and forward
+    /// compatibility with downstream kernels that may wire the
+    /// increment. Always zero on mainline 6.x. Mirrors the
+    /// existing `nr_wakeups_idle` and `nr_migrations_cold`
+    /// dead-counter precedent.
+    pub nr_wakeups_passive: u64,
+    /// Cumulative time this task forced its SMT sibling idle for
+    /// core-scheduling, in nanoseconds. `/proc/<tid>/sched`
+    /// `core_forceidle_sum`, dotted ms.ns format via
+    /// `PN_SCHEDSTAT` (`kernel/sched/debug.c:1335`).
+    /// Reconstructed to full ns via the same
+    /// `parsed_ns_from_dotted` helper as `wait_sum` /
+    /// `sleep_sum` / `block_sum`.
+    ///
+    /// Increment occurs in `__account_forceidle_time()` at
+    /// `kernel/sched/cputime.c:244` (function defined at
+    /// `cputime.c:242`), called from
+    /// `__sched_core_account_forceidle()` in
+    /// `kernel/sched/core_sched.c:287` (function defined at
+    /// `core_sched.c:242`). The increment body is a plain
+    /// `__schedstat_add(p->stats.core_forceidle_sum, delta)` —
+    /// it is CLASS-AGNOSTIC. The caller iterates
+    /// `for_each_cpu(i, smt_mask)` and picks
+    /// `p = rq_i->core_pick ?: rq_i->curr` on each SMT sibling,
+    /// charging whichever task is running there regardless of
+    /// scheduling class. So a SCHED_EXT / DEADLINE / RR / FIFO
+    /// task on a core-scheduled SMT cohort CAN accrue forceidle
+    /// time the same way a CFS task can.
+    ///
+    /// Real gating is at the rq/build level, not per-task, and
+    /// the runtime gates apply IN SERIES rather than equating —
+    /// `sched_core_enabled(rq)` and `core_forceidle_count` are
+    /// independent conditions that BOTH have to fire:
+    ///
+    /// - **Build:** `CONFIG_SCHED_CORE` (file-level `#ifdef` in
+    ///   `kernel/sched/cputime.c` and
+    ///   `kernel/sched/core_sched.c`).
+    /// - **Build:** `CONFIG_SCHEDSTATS` (the caller's own
+    ///   `#ifdef CONFIG_SCHEDSTATS` at `core_sched.c:239`).
+    /// - **Runtime, scheduler-class entry:**
+    ///   `sched_core_enabled(rq)` is the FIRST gate — checked
+    ///   at `pick_next_task()` entry at `kernel/sched/core.c:6014`
+    ///   with an early `__pick_next_task()` return when false.
+    ///   No core-wide selection runs without this.
+    /// - **Runtime, transient counter:**
+    ///   `rq->core->core_forceidle_count > 0` is a SEPARATE
+    ///   subsequent gate — `pick_next_task()` only invokes
+    ///   `sched_core_account_forceidle(rq)` when this counter is
+    ///   non-zero (`kernel/sched/core.c:6059`); the
+    ///   `WARN_ON_ONCE(!rq->core->core_forceidle_count)` inside
+    ///   `__sched_core_account_forceidle()` at
+    ///   `kernel/sched/core_sched.c:252` reasserts the same
+    ///   precondition. The early-return at `core_sched.c:254`
+    ///   on `core_forceidle_start == 0` is then a third
+    ///   transient guard against accounting before
+    ///   forceidle has begun.
+    /// - **Runtime, occupancy:** non-zero
+    ///   `core_forceidle_occupation` (the `WARN_ON_ONCE` at
+    ///   `core_sched.c:263`).
+    ///
+    /// Kernels that fail any build gate, or rqs that fail any
+    /// runtime gate, see this counter at zero for every task.
+    /// Hosts where no SMT cohort has ever accumulated forceidle
+    /// also see zero across the board.
+    pub core_forceidle_sum: u64,
+    /// Per-thread `se.slice` in nanoseconds. For fair-class
+    /// tasks (SCHED_NORMAL / SCHED_BATCH) this is the
+    /// instantaneous slice CFS is currently running the task
+    /// with. For SCHED_EXT tasks the line is still emitted but
+    /// reflects stale `p->se.slice` state — ext-class
+    /// schedulers maintain slice in `p->scx.slice` and do not
+    /// update `p->se.slice`. Field name `fair_slice_ns` mirrors
+    /// the kernel emission gate `fair_policy(p->policy)`, not a
+    /// guarantee about which class actually populated the value.
+    ///
+    /// `/proc/<tid>/sched` `se.slice`, plain integer via
+    /// `P(se.slice)` at `kernel/sched/debug.c:1364`, gated by
+    /// `fair_policy(p->policy)` at `kernel/sched/debug.c:1363`.
+    /// `fair_policy()` is defined at `kernel/sched/sched.h:203`
+    /// as `normal_policy(policy) || policy == SCHED_BATCH`, and
+    /// `normal_policy()` at `sched.h:194` returns true for
+    /// SCHED_NORMAL AND, when `CONFIG_SCHED_CLASS_EXT` is
+    /// built, for SCHED_EXT. So the line IS emitted for
+    /// SCHED_EXT tasks on a sched_ext-enabled kernel — but the
+    /// value carries the staleness caveat above. The parser
+    /// cannot distinguish "ext-class hasn't refreshed
+    /// `p->se.slice` since the task left the fair class" from
+    /// "CFS task with a current slice that happens to equal the
+    /// last value": that ambiguity is the user's to resolve via
+    /// `policy` (also captured per-thread). Tasks under
+    /// SCHED_DEADLINE / SCHED_RR / SCHED_FIFO / SCHED_IDLE land
+    /// at the absent-line default of 0.
+    ///
+    /// This is a GAUGE (instantaneous current value), not a
+    /// counter or high-water mark. Distinct from
+    /// [`Self::slice_max`] which IS the schedstat lifetime
+    /// high-water — a thread that hasn't run for a long time
+    /// can have a stale `fair_slice_ns` value while `slice_max`
+    /// continues to reflect the historical worst. Aggregation
+    /// across a group uses `Max` so the rendered cell shows the
+    /// longest current slice any thread in the group is running
+    /// with — Sum would multiply a near-identical instantaneous
+    /// value across the group and obscure the signal (and would
+    /// also be semantically meaningless: instantaneous gauges
+    /// do not add).
+    pub fair_slice_ns: u64,
+
+    // -- /proc/<tid>/status (process-wide tgid count) --
+    /// Total threads in this task's tgid (process-wide thread
+    /// count, the `signal_struct->nr_threads` snapshot). Field
+    /// name mirrors the kernel struct member to avoid collision
+    /// with [`HostStateSnapshot::threads`] (the snapshot's own
+    /// `Vec<ThreadState>`). `/proc/<pid>/status` `Threads:` line
+    /// emitted at `fs/proc/array.c:290` via
+    /// `seq_put_decimal_ull(m, "Threads:\t", num_threads)`.
+    /// Identical for every thread of the same tgid.
+    ///
+    /// Capture-side dedup: the field is populated ONLY on the
+    /// thread leader (tid == tgid) and zero for non-leader
+    /// threads of the same process. The registry pairs this with
+    /// [`AggRule::Max`] (not Sum) so the rendered cell surfaces
+    /// "the largest process represented in this bucket"
+    /// regardless of grouping axis. Sum would be wrong under
+    /// `--group-by comm` and `--group-by cgroup` because non-
+    /// leader buckets get a 0 contribution from every member —
+    /// a bucket whose leader thread did NOT match the grouping
+    /// would render 0 even though processes are represented.
+    pub nr_threads: u64,
 
     // -- I/O (/proc/<tid>/io, CONFIG_TASK_IO_ACCOUNTING) --
     pub rchar: u64,
@@ -997,10 +1184,26 @@ struct StatFields {
     majflt: Option<u64>,
     utime_clock_ticks: Option<u64>,
     stime_clock_ticks: Option<u64>,
+    /// Field 18: kernel-internal priority (signed, distinct
+    /// from `nice`). `seq_put_decimal_ll(m, " ", priority)` at
+    /// `fs/proc/array.c:602`; the value is the post-bias
+    /// scheduler priority (`task_prio(task)`).
+    priority: Option<i32>,
     nice: Option<i32>,
     start_time_clock_ticks: Option<u64>,
     processor: Option<i32>,
+    /// Field 40: real-time priority. `seq_put_decimal_ull(m,
+    /// " ", task->rt_priority)` at `fs/proc/array.c:637`.
+    /// Unsigned per `task_struct::rt_priority` (unsigned int);
+    /// non-zero only when the task runs SCHED_FIFO / SCHED_RR.
+    rt_priority: Option<u64>,
     policy: Option<i32>,
+    /// Field 42: cumulative blkio delay in USER_HZ clock ticks.
+    /// `seq_put_decimal_ull(m, " ", delayacct_blkio_ticks(task))`
+    /// at `fs/proc/array.c:639`. Counts time the task was blocked
+    /// on disk I/O — non-zero only when CONFIG_TASK_DELAY_ACCT
+    /// is enabled and the task accrued blkio time.
+    delayacct_blkio_ticks: Option<u64>,
 }
 
 /// Pure parser for `/proc/<tgid>/task/<tid>/stat`. Per `proc(5)`,
@@ -1009,16 +1212,19 @@ struct StatFields {
 /// the LAST `)` in the line. Tail offsets (0-indexed from the
 /// token past the final `)`):
 ///
-/// | field | name      | tail index |
-/// |-------|-----------|------------|
-/// | 10    | minflt    | 7          |
-/// | 12    | majflt    | 9          |
-/// | 14    | utime     | 11         |
-/// | 15    | stime     | 12         |
-/// | 19    | nice      | 16         |
-/// | 22    | starttime | 19         |
-/// | 39    | processor | 36         |
-/// | 41    | policy    | 38         |
+/// | field | name                  | tail index |
+/// |-------|-----------------------|------------|
+/// | 10    | minflt                | 7          |
+/// | 12    | majflt                | 9          |
+/// | 14    | utime                 | 11         |
+/// | 15    | stime                 | 12         |
+/// | 18    | priority              | 15         |
+/// | 19    | nice                  | 16         |
+/// | 22    | starttime             | 19         |
+/// | 39    | processor             | 36         |
+/// | 40    | rt_priority           | 37         |
+/// | 41    | policy                | 38         |
+/// | 42    | delayacct_blkio_ticks | 39         |
 ///
 /// Missing fields return `None` individually so a short line
 /// (tid exited mid-read, stat truncated) degrades gracefully.
@@ -1040,10 +1246,13 @@ fn parse_stat(raw: &str) -> StatFields {
         majflt: get_u64(9),
         utime_clock_ticks: get_u64(11),
         stime_clock_ticks: get_u64(12),
+        priority: get_i32(15),
         nice: get_i32(16),
         start_time_clock_ticks: get_u64(19),
         processor: get_i32(36),
+        rt_priority: get_u64(37),
         policy: get_i32(38),
+        delayacct_blkio_ticks: get_u64(39),
     }
 }
 
@@ -1173,6 +1382,12 @@ struct StatusFields {
     /// round-trip — useful when the caller cannot hold a pid
     /// long enough for the syscall without a race.
     cpus_allowed: Option<Vec<u32>>,
+    /// `Threads:` value — `signal_struct->nr_threads` snapshot
+    /// per `fs/proc/array.c:290`. Identical across every thread
+    /// of the same tgid. The capture site dedups by populating
+    /// [`ThreadState::nr_threads`] only on tid == tgid threads
+    /// (see `capture_thread_at_with_tally`).
+    nr_threads: Option<u64>,
 }
 
 fn parse_status(raw: &str) -> StatusFields {
@@ -1202,6 +1417,13 @@ fn parse_status(raw: &str) -> StatusFields {
             }
             "Cpus_allowed_list" => {
                 out.cpus_allowed = parse_cpu_list(value);
+            }
+            // `Threads:\t<num_threads>\n` per
+            // `fs/proc/array.c:290`. Same value across every
+            // thread of the same tgid; capture-side dedup picks
+            // only the leader thread to avoid double-counting.
+            "Threads" => {
+                out.nr_threads = value.parse::<u64>().ok();
             }
             _ => {}
         }
@@ -1540,6 +1762,51 @@ struct SchedFields {
     iowait_count: Option<u64>,
     exec_max: Option<u64>,
     slice_max: Option<u64>,
+    /// `nr_wakeups_passive` from `/proc/<tid>/sched`, emitted via
+    /// `P_SCHEDSTAT(nr_wakeups_passive)` at
+    /// `kernel/sched/debug.c:1314`. Plain u64. KNOWN DEAD COUNTER:
+    /// the kernel never increments this anywhere under
+    /// `kernel/` on mainline (audited via tree-wide grep). Captured
+    /// for parser-completeness and forward compatibility — a future
+    /// kernel that wires the increment will surface immediately.
+    /// Emission is gated by the `if (schedstat_enabled())` block
+    /// at `kernel/sched/debug.c:1285` (the line lives inside that
+    /// `if`), so on a host with schedstat off at runtime
+    /// (`/proc/sys/kernel/sched_schedstats == 0`) the line is
+    /// absent and the parser arm never fires — leaving the field
+    /// at `None`.
+    nr_wakeups_passive: Option<u64>,
+    /// `core_forceidle_sum` from `/proc/<tid>/sched`, emitted via
+    /// `PN_SCHEDSTAT(core_forceidle_sum)` at
+    /// `kernel/sched/debug.c:1335`, build-gated on
+    /// `CONFIG_SCHED_CORE`. Emission additionally lives inside
+    /// the `if (schedstat_enabled())` block at
+    /// `kernel/sched/debug.c:1285`, so on a host with schedstat
+    /// off at runtime the line is absent and the parser arm
+    /// never fires — leaving the field at `None`.
+    /// Dotted ms.ns format like the other PN_SCHEDSTAT fields —
+    /// reconstructed to full ns via [`parsed_ns_from_dotted`]. Counts
+    /// time the task forced its SMT sibling idle for core-scheduling.
+    /// `None` on kernels without `CONFIG_SCHED_CORE`, on hosts
+    /// with schedstat disabled at runtime, or for tasks whose
+    /// SMT cohort never accumulated forceidle.
+    core_forceidle_sum: Option<u64>,
+    /// `se.slice` from `/proc/<tid>/sched`, emitted via
+    /// `P(se.slice)` at `kernel/sched/debug.c:1364`. Plain
+    /// `%lld` integer (NOT dotted ns; the `P` macro uses
+    /// `%lld`, not `PN`'s `%lld.%06ld`). Per-thread
+    /// `p->se.slice` in nanoseconds. For fair-class tasks
+    /// (SCHED_NORMAL / SCHED_BATCH) it is the instantaneous
+    /// slice CFS is currently running the task with; for
+    /// SCHED_EXT tasks it reflects stale `p->se.slice` state
+    /// because ext-class schedulers maintain slice in
+    /// `p->scx.slice` and do not refresh `p->se.slice`. The
+    /// kernel emits this line ONLY when `fair_policy(p->policy)`
+    /// holds, which (per `kernel/sched/sched.h:194,203`) is
+    /// true for SCHED_NORMAL, SCHED_BATCH, AND — under
+    /// `CONFIG_SCHED_CLASS_EXT` — SCHED_EXT. `None` for
+    /// SCHED_DEADLINE / SCHED_RR / SCHED_FIFO / SCHED_IDLE.
+    fair_slice_ns: Option<u64>,
     ext_enabled: Option<bool>,
 }
 
@@ -1650,6 +1917,17 @@ fn parse_sched(raw: &str) -> SchedFields {
             "iowait_count" => out.iowait_count = parsed_u64(),
             "exec_max" => out.exec_max = parsed_ns_from_dotted(value),
             "slice_max" => out.slice_max = parsed_ns_from_dotted(value),
+            // P_SCHEDSTAT plain integer; KNOWN dead counter on
+            // mainline (ThreadState doc explains).
+            "nr_wakeups_passive" => out.nr_wakeups_passive = parsed_u64(),
+            // PN_SCHEDSTAT dotted ns; CONFIG_SCHED_CORE-gated. Same
+            // ms.ns reconstruction as wait_sum / sleep_sum.
+            "core_forceidle_sum" => out.core_forceidle_sum = parsed_ns_from_dotted(value),
+            // P plain integer in ns. The kernel emits this only
+            // for fair-policy tasks (`fair_policy(p->policy)` at
+            // debug.c:1363); for other policies the line is absent
+            // and `parsed_u64()` collapses to None.
+            "slice" => out.fair_slice_ns = parsed_u64(),
             _ => {}
         }
     }
@@ -1854,6 +2132,27 @@ fn capture_thread_at_with_tally(
         majflt: stat.majflt.unwrap_or(0),
         utime_clock_ticks: stat.utime_clock_ticks.unwrap_or(0),
         stime_clock_ticks: stat.stime_clock_ticks.unwrap_or(0),
+        priority: stat.priority.unwrap_or(0),
+        rt_priority: stat.rt_priority.unwrap_or(0),
+        delayacct_blkio_ticks: stat.delayacct_blkio_ticks.unwrap_or(0),
+        nr_wakeups_passive: sched.nr_wakeups_passive.unwrap_or(0),
+        core_forceidle_sum: sched.core_forceidle_sum.unwrap_or(0),
+        fair_slice_ns: sched.fair_slice_ns.unwrap_or(0),
+        // Dedup `nr_threads` to only the thread leader. Every
+        // thread of the same tgid sees the same kernel-emitted
+        // value; populating it on every thread would let any
+        // Sum-style aggregator multiply the count by itself
+        // across the group. Leader-only population means the
+        // registry's `AggRule::Max` surfaces the largest process
+        // represented in the bucket — reading "the biggest
+        // process in this group" rather than "how many threads
+        // the kernel believes this group contains" (which is
+        // already covered by the row count).
+        nr_threads: if tid == tgid {
+            status.nr_threads.unwrap_or(0)
+        } else {
+            0
+        },
         rchar: io.rchar.unwrap_or(0),
         wchar: io.wchar.unwrap_or(0),
         syscr: io.syscr.unwrap_or(0),

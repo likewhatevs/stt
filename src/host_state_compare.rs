@@ -170,19 +170,49 @@ pub enum AggRule {
     /// (run_time, faults, I/O). Delta is the signed difference
     /// between candidate and baseline sums.
     Sum(fn(&ThreadState) -> u64),
-    /// Maximum across the group. Used for per-thread tail-latency
-    /// counters (the kernel's `*_max` schedstats fields:
-    /// `wait_max`, `sleep_max`, `block_max`, `exec_max`,
-    /// `slice_max`). Each thread already carries the per-thread
-    /// max-seen value from the kernel scheduler call sites (e.g.
+    /// Maximum across the group. Three semantically-distinct
+    /// categories of per-thread value land here, all reduced via
+    /// max because none of them have a meaningful sum.
+    ///
+    /// **(a) Historical high-water (kernel `*_max` schedstats).**
+    /// Each thread already carries its own lifetime max-seen
+    /// value from the kernel's scheduler call sites (e.g.
     /// `update_se` in `kernel/sched/fair.c` for `exec_max`; see
-    /// `struct sched_statistics` in `include/linux/sched.h`); the
-    /// group-level reduction takes the largest across members so a
-    /// row surfaces the worst single window any thread in the group
-    /// has ever experienced. Summing per-thread maxes would
-    /// conflate "one thread with a 1s spike" with "1000 threads with
-    /// 1ms spikes each". Same `fn(&ThreadState) -> u64` shape as
-    /// `Sum` so the registry stays homogeneous.
+    /// `struct sched_statistics` in `include/linux/sched.h`):
+    /// `wait_max`, `sleep_max`, `block_max`, `exec_max`,
+    /// `slice_max`. Group-level reduction takes the largest
+    /// across members so a row surfaces the worst single window
+    /// any thread in the group has ever experienced. Summing
+    /// per-thread maxes would conflate "one thread with a 1s
+    /// spike" with "1000 threads with 1ms spikes each".
+    ///
+    /// **(b) Instantaneous gauges where summing is meaningless.**
+    /// `fair_slice_ns` is the per-thread CURRENT scheduler slice
+    /// (stale under SCHED_EXT — see field doc) read at capture
+    /// time, not a high-water value. Summing instantaneous
+    /// gauges produces a number with no physical meaning — N
+    /// nearly-identical instantaneous values sum to `N * gauge`
+    /// regardless of group composition, drowning the signal.
+    /// Max instead surfaces "the longest current slice any
+    /// thread in the bucket is running with", which IS the
+    /// signal a user comparing two snapshots cares about.
+    ///
+    /// **(c) Leader-deduped structural fields.** `nr_threads`
+    /// is populated only on the tgid leader (`tid == tgid`) and
+    /// zero on every non-leader thread of the same process; see
+    /// `capture_thread_at_with_tally`. Sum across a comm- or
+    /// cgroup-bucketed group would render 0 for any bucket
+    /// whose leader fell elsewhere because non-leader members
+    /// each contribute 0. Max instead reads through to the
+    /// leader's value, surfacing "the largest process
+    /// represented in this bucket" regardless of which axis the
+    /// bucket is built around. The row count already covers
+    /// "how many threads are here", so the structural field's
+    /// value adds new information rather than restating the row
+    /// count.
+    ///
+    /// Same `fn(&ThreadState) -> u64` shape as `Sum` so the
+    /// registry stays homogeneous.
     Max(fn(&ThreadState) -> u64),
     /// Ordinal integer, aggregated as the observed [min, max].
     /// Delta uses the midpoint of each range as the scalar;
@@ -227,6 +257,27 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         unit: "",
         rule: AggRule::OrdinalRange(|t| t.nice as i64),
     },
+    // `task_prio()` value from `/proc/<tid>/stat` field 18.
+    // Per-thread ordinal — aggregate as OrdinalRange (mirrors
+    // `nice` directly above), not Sum. Kernel ranges per
+    // `task_prio()` at `kernel/sched/syscalls.c:170`:
+    // CFS=[0..39], RT=[-2..-100], DL=-101 — see the field
+    // doc on [`ThreadState::priority`].
+    HostStateMetricDef {
+        name: "priority",
+        unit: "",
+        rule: AggRule::OrdinalRange(|t| t.priority as i64),
+    },
+    // Real-time scheduler priority from `/proc/<tid>/stat`
+    // field 40. Bounded 0..99 in practice (SCHED_FIFO /
+    // SCHED_RR range); zero for CFS tasks. OrdinalRange to
+    // surface the spread across a group, like `nice` and
+    // `priority`.
+    HostStateMetricDef {
+        name: "rt_priority",
+        unit: "",
+        rule: AggRule::OrdinalRange(|t| t.rt_priority as i64),
+    },
     HostStateMetricDef {
         name: "cpu_affinity",
         unit: "",
@@ -246,6 +297,22 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "ext_enabled",
         unit: "",
         rule: AggRule::Mode(|t| t.ext_enabled.to_string()),
+    },
+    // Process-wide thread count (`signal_struct->nr_threads`)
+    // from `/proc/<tid>/status` `Threads:`. Capture-side
+    // populates only on tid == tgid threads (leader dedup), so
+    // every non-leader thread carries 0 — Sum across a group
+    // would render 0 for any bucket whose leader is not part of
+    // the bucket (e.g. `--group-by comm` puts non-leader threads
+    // in their own comm bucket). `Max` answers "largest process
+    // represented in this bucket"; the row count already covers
+    // "how many threads are here". Identity/structural rather
+    // than counter — placement here mirrors `state` and
+    // `ext_enabled` (per-thread snapshots, not deltas).
+    HostStateMetricDef {
+        name: "nr_threads",
+        unit: "",
+        rule: AggRule::Max(|t| t.nr_threads),
     },
     // scheduling
     HostStateMetricDef {
@@ -302,6 +369,17 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "nr_wakeups_idle",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_wakeups_idle),
+    },
+    // Wakeups via the passive fast-path. Mainline kernel never
+    // increments — captured for forward compatibility per the
+    // existing `nr_wakeups_idle` (directly above) and
+    // `nr_migrations_cold` dead-counter precedent. Sum across a
+    // group surfaces any future reactivation; today every cell
+    // renders 0.
+    HostStateMetricDef {
+        name: "nr_wakeups_passive",
+        unit: "",
+        rule: AggRule::Sum(|t| t.nr_wakeups_passive),
     },
     HostStateMetricDef {
         name: "nr_wakeups_affine",
@@ -394,6 +472,23 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         unit: "",
         rule: AggRule::Sum(|t| t.iowait_count),
     },
+    // Cumulative blkio delay in USER_HZ ticks from
+    // `/proc/<tid>/stat` field 42. Plain counter, matches
+    // `utime_clock_ticks` / `stime_clock_ticks` in unit and
+    // aggregation but lives next to `iowait_sum` /
+    // `iowait_count` because the `delayacct` path is the same
+    // wait-for-block-IO accounting, just expressed in ticks
+    // rather than ns. Two-stage gating (CONFIG_TASK_DELAY_ACCT
+    // build-time + `delayacct_on` runtime via `delayacct=` boot
+    // param or `kernel.task_delayacct` sysctl) — see
+    // [`ThreadState::delayacct_blkio_ticks`] for the call-graph
+    // detail. Sum with the "ticks" unit drives the
+    // ticks → Kticks → Mticks ladder under auto_scale.
+    HostStateMetricDef {
+        name: "delayacct_blkio_ticks",
+        unit: "ticks",
+        rule: AggRule::Sum(|t| t.delayacct_blkio_ticks),
+    },
     HostStateMetricDef {
         name: "exec_max",
         unit: "ns",
@@ -403,6 +498,41 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "slice_max",
         unit: "ns",
         rule: AggRule::Max(|t| t.slice_max),
+    },
+    // Cumulative core-scheduling forced-idle time, ns. Counter
+    // (Sum). Increment is class-agnostic: `__account_forceidle_time()`
+    // at `kernel/sched/cputime.c:244` does a plain
+    // `__schedstat_add(p->stats.core_forceidle_sum, delta)` on
+    // whichever task is running on each SMT sibling, called
+    // from `__sched_core_account_forceidle()` in
+    // `kernel/sched/core_sched.c:287`. Real gating is at
+    // build/rq level: CONFIG_SCHED_CORE + CONFIG_SCHEDSTATS +
+    // `core_forceidle_count > 0`. See [`ThreadState::core_forceidle_sum`]
+    // for the full caller chain.
+    // Auto_scale ns ladder takes ns → µs → ms → s. Lives next
+    // to `slice_max` because both relate to scheduler-decision
+    // moments rather than wait/sleep accumulation.
+    HostStateMetricDef {
+        name: "core_forceidle_sum",
+        unit: "ns",
+        rule: AggRule::Sum(|t| t.core_forceidle_sum),
+    },
+    // Current scheduler slice in ns (stale under SCHED_EXT —
+    // see field doc) from `/proc/<tid>/sched`'s `slice` line.
+    // Per-thread instantaneous gauge (NOT a high-water counter
+    // — `slice_max` directly above is the historical max).
+    // Aggregating across a group via Max surfaces the longest
+    // current slice any thread is running with — Sum would
+    // multiply a near-identical value across the group and
+    // obscure the signal. Name `fair_slice_ns` mirrors the
+    // kernel emission gate `fair_policy(p->policy)` at
+    // `kernel/sched/debug.c:1363`, which (per
+    // `kernel/sched/sched.h:194,203`) accepts SCHED_NORMAL,
+    // SCHED_BATCH, AND SCHED_EXT under CONFIG_SCHED_CLASS_EXT.
+    HostStateMetricDef {
+        name: "fair_slice_ns",
+        unit: "ns",
+        rule: AggRule::Max(|t| t.fair_slice_ns),
     },
     // memory
     HostStateMetricDef {
