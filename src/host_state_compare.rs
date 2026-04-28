@@ -247,6 +247,11 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         rule: AggRule::Sum(|t| t.nr_wakeups_affine),
     },
     HostStateMetricDef {
+        name: "nr_wakeups_affine_attempts",
+        unit: "",
+        rule: AggRule::Sum(|t| t.nr_wakeups_affine_attempts),
+    },
+    HostStateMetricDef {
         name: "nr_migrations",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_migrations),
@@ -1840,6 +1845,9 @@ mod tests {
             ("nr_wakeups_migrate", |t| t.nr_wakeups_migrate = 1),
             ("nr_wakeups_idle", |t| t.nr_wakeups_idle = 1),
             ("nr_wakeups_affine", |t| t.nr_wakeups_affine = 1),
+            ("nr_wakeups_affine_attempts", |t| {
+                t.nr_wakeups_affine_attempts = 1
+            }),
             ("nr_migrations", |t| t.nr_migrations = 1),
             ("nr_migrations_cold", |t| t.nr_migrations_cold = 1),
             ("nr_forced_migrations", |t| t.nr_forced_migrations = 1),

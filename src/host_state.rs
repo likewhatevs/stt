@@ -413,11 +413,26 @@ pub struct ThreadState {
     pub nr_wakeups_sync: u64,
     pub nr_wakeups_migrate: u64,
     pub nr_wakeups_idle: u64,
-    /// Wakeups onto the previous CPU (cache-affine wakeup
+    /// Wakeups onto this CPU (cache-affine wakeup
     /// fast-path). `/proc/<tid>/sched` `nr_wakeups_affine`,
     /// emitted via `P_SCHEDSTAT`. Plain u64. Zero on kernels
-    /// without `CONFIG_SCHEDSTATS`.
+    /// without `CONFIG_SCHEDSTATS`. Zero under sched_ext:
+    /// `wake_affine` is a CFS-only path.
     pub nr_wakeups_affine: u64,
+    /// Total invocations of the cache-affine wakeup heuristic
+    /// `wake_affine()` — denominator for the affine-wake success
+    /// ratio (`nr_wakeups_affine / nr_wakeups_affine_attempts`).
+    /// `/proc/<tid>/sched` `nr_wakeups_affine_attempts`, emitted
+    /// via `P_SCHEDSTAT` (plain u64). The kernel increments this
+    /// counter unconditionally on every `wake_affine()` call in
+    /// `kernel/sched/fair.c::wake_affine`, then increments
+    /// `nr_wakeups_affine` only when the heuristic chose this
+    /// CPU — so the ratio is the success rate of the cache-
+    /// affine fast-path. Zero on kernels without
+    /// `CONFIG_SCHEDSTATS`. Zero under sched_ext: `wake_affine`
+    /// is a CFS-only path and `kernel/sched/ext.c` does not
+    /// increment this counter.
+    pub nr_wakeups_affine_attempts: u64,
     pub nr_migrations: u64,
     /// Migrations skipped under cache-cold heuristic (the source
     /// CPU's cache was deemed too cold to warrant moving).
@@ -1296,6 +1311,7 @@ struct SchedFields {
     nr_wakeups_migrate: Option<u64>,
     nr_wakeups_idle: Option<u64>,
     nr_wakeups_affine: Option<u64>,
+    nr_wakeups_affine_attempts: Option<u64>,
     nr_migrations: Option<u64>,
     nr_migrations_cold: Option<u64>,
     nr_forced_migrations: Option<u64>,
@@ -1392,6 +1408,7 @@ fn parse_sched(raw: &str) -> SchedFields {
             "nr_wakeups_migrate" => out.nr_wakeups_migrate = parsed_u64(),
             "nr_wakeups_idle" => out.nr_wakeups_idle = parsed_u64(),
             "nr_wakeups_affine" => out.nr_wakeups_affine = parsed_u64(),
+            "nr_wakeups_affine_attempts" => out.nr_wakeups_affine_attempts = parsed_u64(),
             "nr_migrations" => out.nr_migrations = parsed_u64(),
             "nr_migrations_cold" => out.nr_migrations_cold = parsed_u64(),
             "nr_forced_migrations" => out.nr_forced_migrations = parsed_u64(),
@@ -1562,6 +1579,7 @@ pub fn capture_thread_at(
         nr_wakeups_migrate: sched.nr_wakeups_migrate.unwrap_or(0),
         nr_wakeups_idle: sched.nr_wakeups_idle.unwrap_or(0),
         nr_wakeups_affine: sched.nr_wakeups_affine.unwrap_or(0),
+        nr_wakeups_affine_attempts: sched.nr_wakeups_affine_attempts.unwrap_or(0),
         nr_migrations: sched.nr_migrations.unwrap_or(0),
         nr_migrations_cold: sched.nr_migrations_cold.unwrap_or(0),
         nr_forced_migrations: sched.nr_forced_migrations.unwrap_or(0),
@@ -3113,6 +3131,7 @@ mod tests {
              se.statistics.nr_wakeups_migrate               :          1\n\
              se.statistics.nr_wakeups_idle                  :          4\n\
              se.statistics.nr_wakeups_affine                :         12\n\
+             se.statistics.nr_wakeups_affine_attempts       :         20\n\
              nr_migrations                                  :          9\n\
              se.statistics.nr_migrations_cold               :          5\n\
              se.statistics.nr_forced_migrations             :          7\n\
@@ -3277,6 +3296,11 @@ mod tests {
         assert_eq!(t.nr_wakeups_migrate, 1);
         assert_eq!(t.nr_wakeups_idle, 4);
         assert_eq!(t.nr_wakeups_affine, 12);
+        assert_eq!(
+            t.nr_wakeups_affine_attempts, 20,
+            "denominator for the affine-wake success ratio \
+             (nr_wakeups_affine / nr_wakeups_affine_attempts = 12/20)",
+        );
         assert_eq!(t.nr_migrations, 9);
         assert_eq!(t.nr_migrations_cold, 5);
         assert_eq!(t.nr_forced_migrations, 7);
@@ -4122,6 +4146,7 @@ mod tests {
              se.statistics.nr_wakeups_remote                :          3\n\
              se.statistics.nr_wakeups_idle                  :          4\n\
              se.statistics.nr_wakeups_affine                :         12\n\
+             se.statistics.nr_wakeups_affine_attempts       :         20\n\
              nr_migrations                                  :          9\n\
              se.statistics.nr_migrations_cold               :          5\n\
              se.statistics.nr_forced_migrations             :          7\n\
@@ -4148,6 +4173,7 @@ mod tests {
         assert_eq!(s.nr_wakeups_migrate, Some(1));
         assert_eq!(s.nr_wakeups_idle, Some(4));
         assert_eq!(s.nr_wakeups_affine, Some(12));
+        assert_eq!(s.nr_wakeups_affine_attempts, Some(20));
         assert_eq!(s.nr_migrations, Some(9));
         assert_eq!(s.nr_migrations_cold, Some(5));
         assert_eq!(s.nr_forced_migrations, Some(7));
