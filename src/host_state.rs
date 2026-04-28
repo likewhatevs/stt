@@ -323,7 +323,46 @@ pub struct ThreadState {
     /// sets — see [`crate::host_state_compare::AffinitySummary`].
     pub cpu_affinity: Vec<u32>,
 
+    // -- task state (last-CPU, run-state) --
+    /// Last CPU the thread executed on. `/proc/<tid>/stat` field
+    /// 39 (`task_cpu(task)` in `fs/proc/array.c::do_task_stat`,
+    /// emitted via `seq_put_decimal_ll`). Signed for symmetry
+    /// with [`Self::nice`]; the kernel emits non-negative values
+    /// only — `task_cpu` (defined `unsigned int` in
+    /// `include/linux/sched.h`) zero-extends through the
+    /// `seq_put_decimal_ll` widening to `s64`. `0` is the
+    /// absent-value default (collisions with a legitimate CPU 0
+    /// are distinguished by inspecting `cpu_affinity`).
+    pub processor: i32,
+    /// Single-letter task state from `/proc/<tid>/status` `State:`
+    /// line. Real kernel chars are `R`, `S`, `D`, `T`, `t`, `X`,
+    /// `Z`, `P`, `I` (see `fs/proc/array.c::task_state_array`,
+    /// emitted via `get_task_state`). `'?'` is the absent-value
+    /// default — visually distinct from every real kernel char so
+    /// a downstream consumer can distinguish "no state read" from
+    /// a real value. When `'?'` appears in compare output, the
+    /// `/proc/<tid>/status` read failed (thread likely exited
+    /// mid-capture).
+    ///
+    /// `ThreadState::default()` produces `'\0'` (the `char`
+    /// default), NOT `'?'` — the `'?'` collapse only applies at
+    /// capture time inside [`capture_thread_at`] via
+    /// `unwrap_or('?')`. A test that constructs `ThreadState`
+    /// directly via `Default::default()` and inspects `state` will
+    /// see `'\0'`, not `'?'`.
+    pub state: char,
+
     // -- scheduling (cumulative; /proc/tid/sched, needs CONFIG_SCHED_DEBUG) --
+    // -- (sched_ext gate: ext.enabled requires CONFIG_SCHED_CLASS_EXT) --
+    /// `true` when the task is currently scheduled by sched_ext —
+    /// `/proc/<tid>/sched` `ext.enabled` line. The kernel emits
+    /// the literal key `ext.enabled` only when
+    /// `CONFIG_SCHED_CLASS_EXT` is enabled; on kernels without it
+    /// the field is absent and lands at the default `false`. When
+    /// `false` on a task expected under sched_ext, the task may
+    /// have been ejected (sched_ext fall-back to CFS on BPF error)
+    /// or never enrolled.
+    pub ext_enabled: bool,
     pub run_time_ns: u64,
     pub wait_time_ns: u64,
     pub timeslices: u64,
@@ -335,13 +374,55 @@ pub struct ThreadState {
     pub nr_wakeups_sync: u64,
     pub nr_wakeups_migrate: u64,
     pub nr_wakeups_idle: u64,
+    /// Wakeups onto the previous CPU (cache-affine wakeup
+    /// fast-path). `/proc/<tid>/sched` `nr_wakeups_affine`,
+    /// emitted via `P_SCHEDSTAT`. Plain u64. Zero on kernels
+    /// without `CONFIG_SCHEDSTATS`.
+    pub nr_wakeups_affine: u64,
     pub nr_migrations: u64,
+    /// Migrations skipped under cache-cold heuristic (the source
+    /// CPU's cache was deemed too cold to warrant moving).
+    /// `/proc/<tid>/sched` `nr_migrations_cold`, plain u64 via
+    /// `P_SCHEDSTAT`. Zero on kernels without `CONFIG_SCHEDSTATS`.
+    pub nr_migrations_cold: u64,
+    /// Migrations forced by load balance (the load balancer
+    /// migrated the task even though the local heuristic would
+    /// have skipped it). `/proc/<tid>/sched` `nr_forced_migrations`,
+    /// plain u64 via `P_SCHEDSTAT`. Zero on kernels without
+    /// `CONFIG_SCHEDSTATS`.
+    pub nr_forced_migrations: u64,
+    /// Failed migrations attributed to affinity mismatch — the
+    /// destination CPU was not in `cpus_allowed`. `/proc/<tid>/sched`
+    /// `nr_failed_migrations_affine`, plain u64 via `P_SCHEDSTAT`.
+    /// Zero on kernels without `CONFIG_SCHEDSTATS`.
+    pub nr_failed_migrations_affine: u64,
+    /// Failed migrations attributed to the task being currently
+    /// running on the source CPU. `/proc/<tid>/sched`
+    /// `nr_failed_migrations_running`, plain u64 via `P_SCHEDSTAT`.
+    /// Zero on kernels without `CONFIG_SCHEDSTATS`.
+    pub nr_failed_migrations_running: u64,
+    /// Failed migrations attributed to cache-hot heuristic — the
+    /// source CPU's cache was too hot to leave. `/proc/<tid>/sched`
+    /// `nr_failed_migrations_hot`, plain u64 via `P_SCHEDSTAT`.
+    /// Zero on kernels without `CONFIG_SCHEDSTATS`.
+    pub nr_failed_migrations_hot: u64,
     /// Total nanoseconds the task spent on the runqueue waiting
     /// to be picked. Populated from `/proc/<tid>/sched`'s
     /// `wait_sum` key — kernel emits via `PN_SCHEDSTAT` as
     /// `ms.ns_remainder`, reconstructed by the parser to full ns.
     pub wait_sum: u64,
     pub wait_count: u64,
+    /// Longest single runqueue-wait window the task ever
+    /// experienced, in nanoseconds. `/proc/<tid>/sched` `wait_max`
+    /// emitted via `PN_SCHEDSTAT` (`ms.ns_remainder`,
+    /// reconstructed to full ns by the parser). Tail-latency
+    /// signal that pairs with the `wait_sum` average. Zero on
+    /// kernels without `CONFIG_SCHEDSTATS`. Zero under sched_ext:
+    /// the kernel sets this counter via
+    /// `__update_stats_wait_end` from CFS/RT/DL enqueue paths
+    /// only — `kernel/sched/ext.c` does not call that helper, so
+    /// sched_ext-managed tasks never accumulate wait_max.
+    pub wait_max: u64,
     /// Total nanoseconds the task slept (voluntary block in
     /// `schedule()` — sleep syscalls, futex wait, etc.). Populated
     /// from `/proc/<tid>/sched`'s `sum_sleep_runtime` key (kernel
@@ -352,6 +433,14 @@ pub struct ThreadState {
     /// count separately from `nr_wakeups`, which already covers
     /// the wake-side tally.
     pub sleep_sum: u64,
+    /// Longest single sleep window in nanoseconds.
+    /// `/proc/<tid>/sched` `sleep_max` emitted via `PN_SCHEDSTAT`
+    /// (`ms.ns_remainder`, reconstructed by the parser). Zero on
+    /// kernels without `CONFIG_SCHEDSTATS`. Zero under sched_ext:
+    /// the kernel sets this counter via
+    /// `__update_stats_enqueue_sleeper` from CFS/RT/DL paths
+    /// only.
+    pub sleep_max: u64,
     /// Total nanoseconds blocked in the scheduler — every path
     /// that puts the task into `TASK_UNINTERRUPTIBLE` contributes:
     /// swap-in, page-fault resolution, disk I/O, plus
@@ -366,6 +455,15 @@ pub struct ThreadState {
     /// swap latency without further attribution. There is no
     /// `block_count` counterpart: the kernel does not emit one.
     pub block_sum: u64,
+    /// Longest single block window in nanoseconds.
+    /// `/proc/<tid>/sched` `block_max` emitted via `PN_SCHEDSTAT`
+    /// (`ms.ns_remainder`, reconstructed by the parser). Tail-
+    /// latency signal that pairs with the `block_sum` average.
+    /// Zero on kernels without `CONFIG_SCHEDSTATS`. Zero under
+    /// sched_ext: the kernel sets this counter via
+    /// `__update_stats_enqueue_sleeper` from CFS/RT/DL paths
+    /// only.
+    pub block_max: u64,
     /// Total nanoseconds in I/O wait specifically (subset of
     /// `block_sum`). Distinguishes disk-backed I/O delay from
     /// the full involuntary-block total — callers that want
@@ -376,6 +474,24 @@ pub struct ThreadState {
     /// reconstructs full ns).
     pub iowait_sum: u64,
     pub iowait_count: u64,
+    /// Longest single CPU-burst (run-without-preempt window) in
+    /// nanoseconds. `/proc/<tid>/sched` `exec_max` emitted via
+    /// `PN_SCHEDSTAT` (`ms.ns_remainder`, reconstructed by the
+    /// parser). Zero on kernels without `CONFIG_SCHEDSTATS`.
+    /// Updated for sched_ext tasks too: the kernel sets it in
+    /// `update_se` (`kernel/sched/fair.c`), which sched_ext
+    /// reaches via `update_curr_scx` → `update_curr_common`.
+    pub exec_max: u64,
+    /// Longest scheduling slice the task got before being
+    /// preempted, in nanoseconds. `/proc/<tid>/sched` `slice_max`
+    /// emitted via `PN_SCHEDSTAT` (`ms.ns_remainder`,
+    /// reconstructed by the parser). Zero on kernels without
+    /// `CONFIG_SCHEDSTATS`. Zero under sched_ext: the kernel sets
+    /// this counter only in `set_next_entity`
+    /// (`kernel/sched/fair.c`), a CFS-only path —
+    /// sched_ext-managed tasks never accumulate slice_max even
+    /// when CONFIG_SCHEDSTATS is enabled.
+    pub slice_max: u64,
 
     // -- jemalloc per-thread TSD counters (tsd_s.thread_allocated / thread_deallocated, via ptrace) --
     /// Bytes allocated by this thread over its lifetime — read
@@ -424,11 +540,26 @@ pub struct ThreadState {
     /// the target may continue to mutate during the read.
     pub deallocated_bytes: u64,
 
-    // -- procfs page fault fields (/proc/<tid>/stat fields 10, 12) --
+    // -- procfs /proc/<tid>/stat: page faults + CPU time (fields 10, 12, 14, 15) --
     /// Minor faults (no disk I/O). `/proc/tid/stat` field 10.
     pub minflt: u64,
     /// Major faults (backed by disk). `/proc/tid/stat` field 12.
     pub majflt: u64,
+    /// User-mode CPU time in USER_HZ clock ticks since thread
+    /// start. `/proc/<tid>/stat` field 14
+    /// (`nsec_to_clock_t(utime)` in `fs/proc/array.c::do_task_stat`).
+    /// USER_HZ-scaled like [`Self::start_time_clock_ticks`] —
+    /// cross-host comparison between x86_64 and aarch64 is
+    /// meaningful because USER_HZ is 100 on both, independent of
+    /// CONFIG_HZ. Suffix `_clock_ticks` mirrors the existing
+    /// `start_time_clock_ticks` precedent.
+    pub utime_clock_ticks: u64,
+    /// Kernel-mode CPU time in USER_HZ clock ticks since thread
+    /// start. `/proc/<tid>/stat` field 15
+    /// (`nsec_to_clock_t(stime)` in `fs/proc/array.c::do_task_stat`).
+    /// Same USER_HZ scaling and `_clock_ticks` suffix convention as
+    /// [`Self::utime_clock_ticks`].
+    pub stime_clock_ticks: u64,
 
     // -- I/O (/proc/tid/io, CONFIG_TASK_IO_ACCOUNTING) --
     pub rchar: u64,
@@ -628,8 +759,11 @@ pub fn read_thread_comm(tgid: i32, tid: i32) -> Option<String> {
 struct StatFields {
     minflt: Option<u64>,
     majflt: Option<u64>,
+    utime_clock_ticks: Option<u64>,
+    stime_clock_ticks: Option<u64>,
     nice: Option<i32>,
     start_time_clock_ticks: Option<u64>,
+    processor: Option<i32>,
     policy: Option<i32>,
 }
 
@@ -643,8 +777,11 @@ struct StatFields {
 /// |-------|-----------|------------|
 /// | 10    | minflt    | 7          |
 /// | 12    | majflt    | 9          |
+/// | 14    | utime     | 11         |
+/// | 15    | stime     | 12         |
 /// | 19    | nice      | 16         |
 /// | 22    | starttime | 19         |
+/// | 39    | processor | 36         |
 /// | 41    | policy    | 38         |
 ///
 /// Missing fields return `None` individually so a short line
@@ -665,8 +802,11 @@ fn parse_stat(raw: &str) -> StatFields {
     StatFields {
         minflt: get_u64(7),
         majflt: get_u64(9),
+        utime_clock_ticks: get_u64(11),
+        stime_clock_ticks: get_u64(12),
         nice: get_i32(16),
         start_time_clock_ticks: get_u64(19),
+        processor: get_i32(36),
         policy: get_i32(38),
     }
 }
@@ -753,6 +893,13 @@ fn read_io_at(proc_root: &Path, tgid: i32, tid: i32) -> IoFields {
 struct StatusFields {
     voluntary_csw: Option<u64>,
     nonvoluntary_csw: Option<u64>,
+    /// First non-whitespace character of the `State:` line value.
+    /// Real kernel chars are `R` / `S` / `D` / `T` / `t` / `X` /
+    /// `Z` / `P` / `I` (see `fs/proc/array.c::task_state_array`).
+    /// `None` when the line is absent or blank — the capture site
+    /// collapses to `'?'` which is visually distinct from every
+    /// real kernel char.
+    state: Option<char>,
     /// `Cpus_allowed_list:` as a parsed sorted vec. Kept separate
     /// from the `sched_getaffinity` reader because status-file
     /// reads attribute to the target task without a syscall
@@ -769,6 +916,17 @@ fn parse_status(raw: &str) -> StatusFields {
         };
         let value = value.trim();
         match key.trim() {
+            // Kernel emits `State:\t<C> (<long>)` where <C> is the
+            // single-letter code from `task_state_array`
+            // (R/S/D/T/t/X/Z/P/I — nine codes, including the
+            // off-by-default `P` parked state). First non-whitespace
+            // char of the trimmed value is the letter;
+            // `value.chars().next()` produces `None` only on a truly
+            // empty line (which the split_once guards against
+            // already).
+            "State" => {
+                out.state = value.chars().next();
+            }
             "voluntary_ctxt_switches" => {
                 out.voluntary_csw = value.parse::<u64>().ok();
             }
@@ -1066,13 +1224,25 @@ struct SchedFields {
     nr_wakeups_sync: Option<u64>,
     nr_wakeups_migrate: Option<u64>,
     nr_wakeups_idle: Option<u64>,
+    nr_wakeups_affine: Option<u64>,
     nr_migrations: Option<u64>,
+    nr_migrations_cold: Option<u64>,
+    nr_forced_migrations: Option<u64>,
+    nr_failed_migrations_affine: Option<u64>,
+    nr_failed_migrations_running: Option<u64>,
+    nr_failed_migrations_hot: Option<u64>,
     wait_sum: Option<u64>,
     wait_count: Option<u64>,
+    wait_max: Option<u64>,
     sleep_sum: Option<u64>,
+    sleep_max: Option<u64>,
     block_sum: Option<u64>,
+    block_max: Option<u64>,
     iowait_sum: Option<u64>,
     iowait_count: Option<u64>,
+    exec_max: Option<u64>,
+    slice_max: Option<u64>,
+    ext_enabled: Option<bool>,
 }
 
 /// Parse a `PN_SCHEDSTAT`-emitted dotted nanosecond value into
@@ -1132,8 +1302,17 @@ fn parse_sched(raw: &str) -> SchedFields {
         };
         let key = key.trim();
         let value = value.trim();
-        let short = key.rsplit('.').next().unwrap_or(key);
         let parsed_u64 = || value.parse::<u64>().ok();
+        // `ext.enabled` is the only key the kernel emits with a
+        // literal dot in the variable name (every other dot is a
+        // namespace prefix like `se.statistics.`). Match on the full
+        // key BEFORE the rsplit-on-dot fallback so a future kernel
+        // line ending in `.enabled` cannot collide.
+        if key == "ext.enabled" {
+            out.ext_enabled = value.parse::<u64>().ok().map(|n| n != 0);
+            continue;
+        }
+        let short = key.rsplit('.').next().unwrap_or(key);
         match short {
             "nr_wakeups" => out.nr_wakeups = parsed_u64(),
             "nr_wakeups_local" => out.nr_wakeups_local = parsed_u64(),
@@ -1141,9 +1320,16 @@ fn parse_sched(raw: &str) -> SchedFields {
             "nr_wakeups_sync" => out.nr_wakeups_sync = parsed_u64(),
             "nr_wakeups_migrate" => out.nr_wakeups_migrate = parsed_u64(),
             "nr_wakeups_idle" => out.nr_wakeups_idle = parsed_u64(),
+            "nr_wakeups_affine" => out.nr_wakeups_affine = parsed_u64(),
             "nr_migrations" => out.nr_migrations = parsed_u64(),
+            "nr_migrations_cold" => out.nr_migrations_cold = parsed_u64(),
+            "nr_forced_migrations" => out.nr_forced_migrations = parsed_u64(),
+            "nr_failed_migrations_affine" => out.nr_failed_migrations_affine = parsed_u64(),
+            "nr_failed_migrations_running" => out.nr_failed_migrations_running = parsed_u64(),
+            "nr_failed_migrations_hot" => out.nr_failed_migrations_hot = parsed_u64(),
             "wait_sum" => out.wait_sum = parsed_ns_from_dotted(value),
             "wait_count" => out.wait_count = parsed_u64(),
+            "wait_max" => out.wait_max = parsed_ns_from_dotted(value),
             // Kernel emits `sum_sleep_runtime` (see
             // `kernel/sched/debug.c` -> `proc_sched_show_task`); the
             // matching ThreadState field is named `sleep_sum` for
@@ -1152,6 +1338,7 @@ fn parse_sched(raw: &str) -> SchedFields {
             // `nr_wakeups` (matched above) covers the wake-side
             // event tally.
             "sum_sleep_runtime" => out.sleep_sum = parsed_ns_from_dotted(value),
+            "sleep_max" => out.sleep_max = parsed_ns_from_dotted(value),
             // Kernel emits `sum_block_runtime`; the matching
             // ThreadState field is `block_sum` for symmetry with
             // the other `*_sum` fields. There is no `block_count`
@@ -1159,8 +1346,11 @@ fn parse_sched(raw: &str) -> SchedFields {
             // pairs `wait_sum/wait_count` and `iowait_sum/iowait_count`
             // but `sum_block_runtime` has no per-event counter.
             "sum_block_runtime" => out.block_sum = parsed_ns_from_dotted(value),
+            "block_max" => out.block_max = parsed_ns_from_dotted(value),
             "iowait_sum" => out.iowait_sum = parsed_ns_from_dotted(value),
             "iowait_count" => out.iowait_count = parsed_u64(),
+            "exec_max" => out.exec_max = parsed_ns_from_dotted(value),
+            "slice_max" => out.slice_max = parsed_ns_from_dotted(value),
             _ => {}
         }
     }
@@ -1286,6 +1476,9 @@ pub fn capture_thread_at(
         policy: stat.policy.map(policy_name).unwrap_or_default(),
         nice: stat.nice.unwrap_or(0),
         cpu_affinity,
+        processor: stat.processor.unwrap_or(0),
+        state: status.state.unwrap_or('?'),
+        ext_enabled: sched.ext_enabled.unwrap_or(false),
         run_time_ns: run_time_ns.unwrap_or(0),
         wait_time_ns: wait_time_ns.unwrap_or(0),
         timeslices: timeslices.unwrap_or(0),
@@ -1297,17 +1490,30 @@ pub fn capture_thread_at(
         nr_wakeups_sync: sched.nr_wakeups_sync.unwrap_or(0),
         nr_wakeups_migrate: sched.nr_wakeups_migrate.unwrap_or(0),
         nr_wakeups_idle: sched.nr_wakeups_idle.unwrap_or(0),
+        nr_wakeups_affine: sched.nr_wakeups_affine.unwrap_or(0),
         nr_migrations: sched.nr_migrations.unwrap_or(0),
+        nr_migrations_cold: sched.nr_migrations_cold.unwrap_or(0),
+        nr_forced_migrations: sched.nr_forced_migrations.unwrap_or(0),
+        nr_failed_migrations_affine: sched.nr_failed_migrations_affine.unwrap_or(0),
+        nr_failed_migrations_running: sched.nr_failed_migrations_running.unwrap_or(0),
+        nr_failed_migrations_hot: sched.nr_failed_migrations_hot.unwrap_or(0),
         wait_sum: sched.wait_sum.unwrap_or(0),
         wait_count: sched.wait_count.unwrap_or(0),
+        wait_max: sched.wait_max.unwrap_or(0),
         sleep_sum: sched.sleep_sum.unwrap_or(0),
+        sleep_max: sched.sleep_max.unwrap_or(0),
         block_sum: sched.block_sum.unwrap_or(0),
+        block_max: sched.block_max.unwrap_or(0),
         iowait_sum: sched.iowait_sum.unwrap_or(0),
         iowait_count: sched.iowait_count.unwrap_or(0),
+        exec_max: sched.exec_max.unwrap_or(0),
+        slice_max: sched.slice_max.unwrap_or(0),
         allocated_bytes: 0,
         deallocated_bytes: 0,
         minflt: stat.minflt.unwrap_or(0),
         majflt: stat.majflt.unwrap_or(0),
+        utime_clock_ticks: stat.utime_clock_ticks.unwrap_or(0),
+        stime_clock_ticks: stat.stime_clock_ticks.unwrap_or(0),
         rchar: io.rchar.unwrap_or(0),
         wchar: io.wchar.unwrap_or(0),
         syscr: io.syscr.unwrap_or(0),
@@ -2028,11 +2234,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_stat_extracts_min_maj_nice_and_policy() {
-        // Fields 3..=41 — tail indices 0..=38.
+    fn parse_stat_extracts_all_known_fields() {
+        // Fields 3..=41 — tail indices 0..=38. Token at tail[i] = i.
         // minflt at tail[7] = 7; majflt at tail[9] = 9;
+        // utime at tail[11] = 11; stime at tail[12] = 12;
         // nice at tail[16] = 16; starttime at tail[19] = 19;
-        // policy at tail[38] = 38.
+        // processor at tail[36] = 36; policy at tail[38] = 38.
         let mut line = String::from("1 (n) ");
         for i in 0..=38 {
             line.push_str(&format!("{i} "));
@@ -2040,8 +2247,11 @@ mod tests {
         let f = parse_stat(&line);
         assert_eq!(f.minflt, Some(7));
         assert_eq!(f.majflt, Some(9));
+        assert_eq!(f.utime_clock_ticks, Some(11));
+        assert_eq!(f.stime_clock_ticks, Some(12));
         assert_eq!(f.nice, Some(16));
         assert_eq!(f.start_time_clock_ticks, Some(19));
+        assert_eq!(f.processor, Some(36));
         assert_eq!(f.policy, Some(38));
     }
 
@@ -2053,9 +2263,42 @@ mod tests {
         let f = parse_stat(line);
         assert_eq!(f.minflt, Some(7));
         assert_eq!(f.majflt, None);
+        assert_eq!(f.utime_clock_ticks, None);
+        assert_eq!(f.stime_clock_ticks, None);
         assert_eq!(f.nice, None);
         assert_eq!(f.start_time_clock_ticks, None);
+        assert_eq!(f.processor, None);
         assert_eq!(f.policy, None);
+    }
+
+    /// `processor` parses signed values via `get_i32`. The mainline
+    /// kernel never emits a negative value (`task_cpu` is
+    /// `unsigned int` per `include/linux/sched.h`, zero-extended
+    /// through `seq_put_decimal_ll`), but the parser accepts
+    /// negatives anyway — pinning that the type choice (`i32`)
+    /// does not silently drop a hypothetical out-of-band negative
+    /// to `None`. Defends against a regression that swapped
+    /// `get_i32` for `get_u64` and made the field reject any
+    /// negative token instead of carrying it through.
+    #[test]
+    fn parse_stat_processor_accepts_negative() {
+        // 36 zero-pad tokens, tail[36] = -1, then more padding to
+        // reach tail[38] for the policy field.
+        let mut line = String::from("1 (n) ");
+        for i in 0..36 {
+            line.push_str(&format!("{i} "));
+        }
+        line.push_str("-1 ");
+        line.push_str("0 ");
+        line.push_str("0 ");
+        let f = parse_stat(&line);
+        assert_eq!(
+            f.processor,
+            Some(-1),
+            "negative tokens must flow through as Some(-1) — pins \
+             the get_i32 vs get_u64 type choice, not kernel emit \
+             behavior (which never emits negative)",
+        );
     }
 
     #[test]
@@ -2095,13 +2338,44 @@ mod tests {
     #[test]
     fn parse_status_extracts_csw_and_affinity() {
         let raw = "Name:\tbash\n\
+                   State:\tS (sleeping)\n\
                    Cpus_allowed_list:\t0-3,5\n\
                    voluntary_ctxt_switches:\t100\n\
                    nonvoluntary_ctxt_switches:\t5\n";
         let f = parse_status(raw);
         assert_eq!(f.voluntary_csw, Some(100));
         assert_eq!(f.nonvoluntary_csw, Some(5));
+        assert_eq!(
+            f.state,
+            Some('S'),
+            "first non-whitespace char of `State:` value is the \
+             single-letter code (R/S/D/T/t/X/Z/P/I)",
+        );
         assert_eq!(f.cpus_allowed.as_deref(), Some(&[0u32, 1, 2, 3, 5][..]));
+    }
+
+    /// Every kernel-emitted state code parses correctly. Pins each
+    /// entry of `task_state_array` so a regression that lowercased
+    /// the match or stripped paren-content would surface. Codes
+    /// are from `fs/proc/array.c::task_state_array` — all NINE
+    /// entries (R/S/D/T/t/X/Z/P/I), including the off-by-default
+    /// `P (parked)` which only appears on kernels that schedule
+    /// parked tasks.
+    #[test]
+    fn parse_status_accepts_every_kernel_state_code() {
+        for code in ['R', 'S', 'D', 'T', 't', 'X', 'Z', 'P', 'I'] {
+            let raw = format!("State:\t{code} (label)\n");
+            assert_eq!(parse_status(&raw).state, Some(code));
+        }
+    }
+
+    /// Absent `State:` line lands as `None`; capture site collapses
+    /// to `'?'`. Pins the absent-default boundary.
+    #[test]
+    fn parse_status_absent_state_line_yields_none() {
+        let raw = "voluntary_ctxt_switches:\t1\n";
+        let f = parse_status(raw);
+        assert_eq!(f.state, None);
     }
 
     #[test]
@@ -2711,11 +2985,12 @@ mod tests {
         // schedstat: run_time_ns wait_time_ns timeslices
         fs::write(task_dir.join("schedstat"), "1000000 200000 50\n").unwrap();
 
-        // status: voluntary/nonvoluntary csw + Cpus_allowed_list.
+        // status: State + voluntary/nonvoluntary csw + Cpus_allowed_list.
         // parse_status matches the lowercase csw keys verbatim;
-        // only `Cpus_allowed_list` uses the capitalised leading
-        // char of the procfs file.
+        // `State` and `Cpus_allowed_list` use the capitalised
+        // leading char of the procfs file.
         let status = "Name:\tfoo\n\
+             State:\tR (running)\n\
              voluntary_ctxt_switches:\t42\n\
              nonvoluntary_ctxt_switches:\t7\n\
              Cpus_allowed_list:\t0-3\n";
@@ -2732,7 +3007,9 @@ mod tests {
 
         // sched: every parse_sched-matched key, with the
         // `se.statistics.` prefix for the wakeup family to
-        // exercise the rsplit('.') short-key logic.
+        // exercise the rsplit('.') short-key logic. `ext.enabled`
+        // is unprefixed (literal kernel key) and tests the
+        // full-key gate.
         let sched = "\
              se.statistics.nr_wakeups                       :         11\n\
              se.statistics.nr_wakeups_local                 :          8\n\
@@ -2740,13 +3017,25 @@ mod tests {
              se.statistics.nr_wakeups_sync                  :          2\n\
              se.statistics.nr_wakeups_migrate               :          1\n\
              se.statistics.nr_wakeups_idle                  :          4\n\
+             se.statistics.nr_wakeups_affine                :         12\n\
              nr_migrations                                  :          9\n\
+             se.statistics.nr_migrations_cold               :          5\n\
+             se.statistics.nr_forced_migrations             :          7\n\
+             se.statistics.nr_failed_migrations_affine      :          1\n\
+             se.statistics.nr_failed_migrations_running     :          2\n\
+             se.statistics.nr_failed_migrations_hot         :          3\n\
              wait_sum                                       :    5000.25\n\
              wait_count                                     :         15\n\
+             se.statistics.wait_max                         :     250.5\n\
              sum_sleep_runtime                              :    3200.50\n\
+             se.statistics.sleep_max                        :     180.25\n\
              sum_block_runtime                              :    1100.75\n\
+             se.statistics.block_max                        :      60.75\n\
              iowait_sum                                     :       77.0\n\
-             iowait_count                                   :         18\n";
+             iowait_count                                   :         18\n\
+             se.statistics.exec_max                         :      90.0\n\
+             se.statistics.slice_max                        :     400.5\n\
+             ext.enabled                                    :          1\n";
         fs::write(task_dir.join("sched"), sched).unwrap();
 
         // cgroup: v2-style single entry (0::path). read_cgroup_at
@@ -2836,21 +3125,40 @@ mod tests {
         assert_eq!(t.cgroup, "/ktstr.slice/worker0");
 
         // /proc/<tid>/stat fields parsed out of the paren-comm
-        // tail: nice, starttime, policy.
+        // tail: nice, utime, stime, starttime, processor, policy,
+        // minflt, majflt.
         assert_eq!(t.nice, -10);
         assert_eq!(t.start_time_clock_ticks, 555_555);
         assert_eq!(t.policy, "SCHED_OTHER");
         assert_eq!(t.minflt, 7777);
         assert_eq!(t.majflt, 8888);
+        assert_eq!(
+            t.utime_clock_ticks, 10,
+            "tail[11] of stat fixture lands at utime_clock_ticks",
+        );
+        assert_eq!(
+            t.stime_clock_ticks, 11,
+            "tail[12] of stat fixture lands at stime_clock_ticks",
+        );
+        assert_eq!(
+            t.processor, 1700,
+            "tail[36] of stat fixture (the 17th post-starttime \
+             token, value 100*17=1700) lands at processor",
+        );
 
         // schedstat — three-tuple of run/wait/slices.
         assert_eq!(t.run_time_ns, 1_000_000);
         assert_eq!(t.wait_time_ns, 200_000);
         assert_eq!(t.timeslices, 50);
 
-        // status — csw + Cpus_allowed_list. With
+        // status — state + csw + Cpus_allowed_list. With
         // `use_syscall_affinity=false`, the capture path reads
         // cpu_affinity from status only.
+        assert_eq!(
+            t.state, 'R',
+            "first non-whitespace char of `State:\tR (running)` is \
+             the single-letter code R",
+        );
         assert_eq!(t.voluntary_csw, 42);
         assert_eq!(t.nonvoluntary_csw, 7);
         assert_eq!(t.cpu_affinity, vec![0, 1, 2, 3]);
@@ -2863,16 +3171,23 @@ mod tests {
         assert_eq!(t.read_bytes, 4096);
         assert_eq!(t.write_bytes, 8192);
 
-        // sched — every wakeup field, migrations, and the four
-        // fractional-parse fields (wait_sum/sleep_sum/block_sum/
-        // iowait_sum).
+        // sched — every wakeup field, migrations (including the
+        // five new failed/forced/cold/affine variants), the four
+        // *_sum fractional-parse fields, the five *_max
+        // fractional-parse fields, and the ext.enabled bool.
         assert_eq!(t.nr_wakeups, 11);
         assert_eq!(t.nr_wakeups_local, 8);
         assert_eq!(t.nr_wakeups_remote, 3);
         assert_eq!(t.nr_wakeups_sync, 2);
         assert_eq!(t.nr_wakeups_migrate, 1);
         assert_eq!(t.nr_wakeups_idle, 4);
+        assert_eq!(t.nr_wakeups_affine, 12);
         assert_eq!(t.nr_migrations, 9);
+        assert_eq!(t.nr_migrations_cold, 5);
+        assert_eq!(t.nr_forced_migrations, 7);
+        assert_eq!(t.nr_failed_migrations_affine, 1);
+        assert_eq!(t.nr_failed_migrations_running, 2);
+        assert_eq!(t.nr_failed_migrations_hot, 3);
         // PN_SCHEDSTAT format is ms.ns_remainder. Reconstructed
         // ns = ms_part * 1_000_000 + zero-right-padded ns_part.
         // `5000.25` → `.25` pads to `.250000` (=250_000 ns) +
@@ -2884,9 +3199,17 @@ mod tests {
         );
         assert_eq!(t.wait_count, 15);
         assert_eq!(
+            t.wait_max, 250_500_000,
+            "PN_SCHEDSTAT 250.5 reconstructs to 250_500_000 ns",
+        );
+        assert_eq!(
             t.sleep_sum, 3_200_500_000,
             "PN_SCHEDSTAT 3200.50 reconstructs to 3_200_500_000 ns; \
              sleep_sum is populated from the kernel's `sum_sleep_runtime` key",
+        );
+        assert_eq!(
+            t.sleep_max, 180_250_000,
+            "PN_SCHEDSTAT 180.25 reconstructs to 180_250_000 ns",
         );
         assert_eq!(
             t.block_sum, 1_100_750_000,
@@ -2894,10 +3217,27 @@ mod tests {
              block_sum is populated from the kernel's `sum_block_runtime` key",
         );
         assert_eq!(
+            t.block_max, 60_750_000,
+            "PN_SCHEDSTAT 60.75 reconstructs to 60_750_000 ns",
+        );
+        assert_eq!(
             t.iowait_sum, 77_000_000,
             "PN_SCHEDSTAT 77.0 reconstructs to 77_000_000 ns",
         );
         assert_eq!(t.iowait_count, 18);
+        assert_eq!(
+            t.exec_max, 90_000_000,
+            "PN_SCHEDSTAT 90.0 reconstructs to 90_000_000 ns",
+        );
+        assert_eq!(
+            t.slice_max, 400_500_000,
+            "PN_SCHEDSTAT 400.5 reconstructs to 400_500_000 ns",
+        );
+        assert!(
+            t.ext_enabled,
+            "ext.enabled = 1 round-trips through the full-key gate \
+             to ThreadState::ext_enabled true",
+        );
 
         // jemalloc TSD counters: synthetic procfs has no real ELF
         // behind /proc/<tgid>/exe, so the probe attach is gated off
@@ -3123,7 +3463,7 @@ mod tests {
     /// — interpreted as plain ns counts — so the values pass
     /// through unchanged.
     #[test]
-    fn parse_sched_populates_all_thirteen_fields() {
+    fn parse_sched_populates_all_known_fields() {
         let raw = "\
              se.statistics.nr_wakeups                       :         11\n\
              se.statistics.nr_wakeups_sync                  :          2\n\
@@ -3131,13 +3471,25 @@ mod tests {
              se.statistics.nr_wakeups_migrate               :          1\n\
              se.statistics.nr_wakeups_remote                :          3\n\
              se.statistics.nr_wakeups_idle                  :          4\n\
+             se.statistics.nr_wakeups_affine                :         12\n\
              nr_migrations                                  :          9\n\
+             se.statistics.nr_migrations_cold               :          5\n\
+             se.statistics.nr_forced_migrations             :          7\n\
+             se.statistics.nr_failed_migrations_affine      :          1\n\
+             se.statistics.nr_failed_migrations_running     :          2\n\
+             se.statistics.nr_failed_migrations_hot         :          3\n\
              wait_sum                                       :       500\n\
              wait_count                                     :         15\n\
+             se.statistics.wait_max                         :       250\n\
              sum_sleep_runtime                              :       320\n\
+             se.statistics.sleep_max                        :       180\n\
              sum_block_runtime                              :       110\n\
+             se.statistics.block_max                        :        60\n\
              iowait_sum                                     :         77\n\
-             iowait_count                                   :         18\n";
+             iowait_count                                   :         18\n\
+             se.statistics.exec_max                         :        90\n\
+             se.statistics.slice_max                        :       400\n\
+             ext.enabled                                    :          1\n";
         let s = parse_sched(raw);
         assert_eq!(s.nr_wakeups, Some(11));
         assert_eq!(s.nr_wakeups_local, Some(8));
@@ -3145,21 +3497,65 @@ mod tests {
         assert_eq!(s.nr_wakeups_sync, Some(2));
         assert_eq!(s.nr_wakeups_migrate, Some(1));
         assert_eq!(s.nr_wakeups_idle, Some(4));
+        assert_eq!(s.nr_wakeups_affine, Some(12));
         assert_eq!(s.nr_migrations, Some(9));
+        assert_eq!(s.nr_migrations_cold, Some(5));
+        assert_eq!(s.nr_forced_migrations, Some(7));
+        assert_eq!(s.nr_failed_migrations_affine, Some(1));
+        assert_eq!(s.nr_failed_migrations_running, Some(2));
+        assert_eq!(s.nr_failed_migrations_hot, Some(3));
         assert_eq!(s.wait_sum, Some(500));
         assert_eq!(s.wait_count, Some(15));
+        assert_eq!(s.wait_max, Some(250));
         assert_eq!(
             s.sleep_sum,
             Some(320),
             "sleep_sum reads the kernel's `sum_sleep_runtime` key",
         );
+        assert_eq!(s.sleep_max, Some(180));
         assert_eq!(
             s.block_sum,
             Some(110),
             "block_sum reads the kernel's `sum_block_runtime` key",
         );
+        assert_eq!(s.block_max, Some(60));
         assert_eq!(s.iowait_sum, Some(77));
         assert_eq!(s.iowait_count, Some(18));
+        assert_eq!(s.exec_max, Some(90));
+        assert_eq!(s.slice_max, Some(400));
+        assert_eq!(
+            s.ext_enabled,
+            Some(true),
+            "ext.enabled = 1 → Some(true) — full-key match required \
+             because rsplit('.') would yield `enabled` and collide \
+             with any future field of that name",
+        );
+    }
+
+    /// `ext.enabled = 0` lands as `Some(false)` (CONFIG_SCHED_CLASS_EXT
+    /// kernel where the task is NOT on sched_ext); absent line lands
+    /// as `None` and the capture-site `unwrap_or(false)` collapses to
+    /// the absent default. Pins the bool round-trip.
+    #[test]
+    fn parse_sched_ext_enabled_zero_and_absent() {
+        let zero = parse_sched("ext.enabled : 0\n");
+        assert_eq!(zero.ext_enabled, Some(false));
+        let absent = parse_sched("nr_wakeups : 1\n");
+        assert_eq!(absent.ext_enabled, None);
+    }
+
+    /// Full-key match on `ext.enabled` MUST take precedence over the
+    /// rsplit-on-dot fallback. A line like `foo.enabled : 1` would
+    /// otherwise route through rsplit to `enabled`, collide with
+    /// `ext.enabled`, and incorrectly populate the bool. Pins the
+    /// guard.
+    #[test]
+    fn parse_sched_ext_enabled_no_collision_via_rsplit() {
+        // foo.enabled is not a real kernel key, but proves the
+        // full-key gate: rsplit yields `enabled`, but the match
+        // arm only fires on the exact key `ext.enabled`.
+        let s = parse_sched("foo.enabled : 1\n");
+        assert_eq!(s.ext_enabled, None);
     }
 
     /// Dotted PN_SCHEDSTAT fractional values reconstruct full ns
@@ -3204,7 +3600,10 @@ mod tests {
     /// Bare-key names (no `se.statistics.` prefix) must still
     /// populate — some kernels emit `nr_wakeups : N` at the top
     /// level. The parser's `rsplit('.').next()` treats a no-dot
-    /// string as the whole string.
+    /// string as the whole string. Coverage spans the wakeup
+    /// family, one of the new migration counters, and one of the
+    /// new *_max ns fields, to prove the bare-key path lights up
+    /// every parser arm shape (parsed_u64 + parsed_ns_from_dotted).
     #[test]
     fn parse_sched_bare_key_names_populate_same_fields() {
         let raw = "\
@@ -3213,7 +3612,9 @@ mod tests {
              nr_wakeups_remote                              :          3\n\
              nr_wakeups_sync                                :          2\n\
              nr_wakeups_migrate                             :          1\n\
-             nr_wakeups_idle                                :          4\n";
+             nr_wakeups_idle                                :          4\n\
+             nr_migrations_cold                             :         42\n\
+             wait_max                                       :     999.5\n";
         let s = parse_sched(raw);
         assert_eq!(s.nr_wakeups, Some(11));
         assert_eq!(s.nr_wakeups_local, Some(8));
@@ -3221,6 +3622,18 @@ mod tests {
         assert_eq!(s.nr_wakeups_sync, Some(2));
         assert_eq!(s.nr_wakeups_migrate, Some(1));
         assert_eq!(s.nr_wakeups_idle, Some(4));
+        assert_eq!(
+            s.nr_migrations_cold,
+            Some(42),
+            "bare-key `nr_migrations_cold` must populate via \
+             rsplit('.').next() returning the whole no-dot string",
+        );
+        assert_eq!(
+            s.wait_max,
+            Some(999_500_000),
+            "bare-key `wait_max` must populate via the \
+             parsed_ns_from_dotted path; 999.5 → 999_500_000 ns",
+        );
     }
 
     /// Future `stats.` or other prefix variants must also

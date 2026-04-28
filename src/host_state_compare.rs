@@ -156,6 +156,21 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         unit: "",
         rule: AggRule::Affinity(|t| t.cpu_affinity.clone()),
     },
+    HostStateMetricDef {
+        name: "processor",
+        unit: "",
+        rule: AggRule::OrdinalRange(|t| t.processor as i64),
+    },
+    HostStateMetricDef {
+        name: "state",
+        unit: "",
+        rule: AggRule::Mode(|t| t.state.to_string()),
+    },
+    HostStateMetricDef {
+        name: "ext_enabled",
+        unit: "",
+        rule: AggRule::Mode(|t| t.ext_enabled.to_string()),
+    },
     // scheduling
     HostStateMetricDef {
         name: "run_time_ns",
@@ -213,9 +228,39 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         rule: AggRule::Sum(|t| t.nr_wakeups_idle),
     },
     HostStateMetricDef {
+        name: "nr_wakeups_affine",
+        unit: "",
+        rule: AggRule::Sum(|t| t.nr_wakeups_affine),
+    },
+    HostStateMetricDef {
         name: "nr_migrations",
         unit: "",
         rule: AggRule::Sum(|t| t.nr_migrations),
+    },
+    HostStateMetricDef {
+        name: "nr_migrations_cold",
+        unit: "",
+        rule: AggRule::Sum(|t| t.nr_migrations_cold),
+    },
+    HostStateMetricDef {
+        name: "nr_forced_migrations",
+        unit: "",
+        rule: AggRule::Sum(|t| t.nr_forced_migrations),
+    },
+    HostStateMetricDef {
+        name: "nr_failed_migrations_affine",
+        unit: "",
+        rule: AggRule::Sum(|t| t.nr_failed_migrations_affine),
+    },
+    HostStateMetricDef {
+        name: "nr_failed_migrations_running",
+        unit: "",
+        rule: AggRule::Sum(|t| t.nr_failed_migrations_running),
+    },
+    HostStateMetricDef {
+        name: "nr_failed_migrations_hot",
+        unit: "",
+        rule: AggRule::Sum(|t| t.nr_failed_migrations_hot),
     },
     HostStateMetricDef {
         name: "wait_sum",
@@ -227,6 +272,14 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         unit: "",
         rule: AggRule::Sum(|t| t.wait_count),
     },
+    // `wait_max`, `sleep_max`, `block_max`, `exec_max`,
+    // `slice_max` (per-thread tail-latency *_max counters) are
+    // captured on `ThreadState` and serialized to the snapshot,
+    // but deliberately NOT registered here yet: `AggRule::Sum`
+    // would aggregate group-wide via summation, which is
+    // semantically wrong for a max-of-max signal. Re-add once
+    // `AggRule::Max` lands so the registry rule matches the
+    // kernel-side semantic.
     HostStateMetricDef {
         name: "sleep_sum",
         unit: "ns",
@@ -273,6 +326,16 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "majflt",
         unit: "",
         rule: AggRule::Sum(|t| t.majflt),
+    },
+    HostStateMetricDef {
+        name: "utime_clock_ticks",
+        unit: "",
+        rule: AggRule::Sum(|t| t.utime_clock_ticks),
+    },
+    HostStateMetricDef {
+        name: "stime_clock_ticks",
+        unit: "",
+        rule: AggRule::Sum(|t| t.stime_clock_ticks),
     },
     // I/O
     HostStateMetricDef {
