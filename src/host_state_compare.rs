@@ -108,6 +108,20 @@ pub enum AggRule {
     /// (run_time, faults, I/O). Delta is the signed difference
     /// between candidate and baseline sums.
     Sum(fn(&ThreadState) -> u64),
+    /// Maximum across the group. Used for per-thread tail-latency
+    /// counters (the kernel's `*_max` schedstats fields:
+    /// `wait_max`, `sleep_max`, `block_max`, `exec_max`,
+    /// `slice_max`). Each thread already carries the per-thread
+    /// max-seen value from the kernel scheduler call sites (e.g.
+    /// `update_se` in `kernel/sched/fair.c` for `exec_max`; see
+    /// `struct sched_statistics` in `include/linux/sched.h`); the
+    /// group-level reduction takes the largest across members so a
+    /// row surfaces the worst single window any thread in the group
+    /// has ever experienced. Summing per-thread maxes would
+    /// conflate "one thread with a 1s spike" with "1000 threads with
+    /// 1ms spikes each". Same `fn(&ThreadState) -> u64` shape as
+    /// `Sum` so the registry stays homogeneous.
+    Max(fn(&ThreadState) -> u64),
     /// Ordinal integer, aggregated as the observed [min, max].
     /// Delta uses the midpoint of each range as the scalar;
     /// output prints both the range and the delta.
@@ -272,18 +286,20 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         unit: "",
         rule: AggRule::Sum(|t| t.wait_count),
     },
-    // `wait_max`, `sleep_max`, `block_max`, `exec_max`,
-    // `slice_max` (per-thread tail-latency *_max counters) are
-    // captured on `ThreadState` and serialized to the snapshot,
-    // but deliberately NOT registered here yet: `AggRule::Sum`
-    // would aggregate group-wide via summation, which is
-    // semantically wrong for a max-of-max signal. Re-add once
-    // `AggRule::Max` lands so the registry rule matches the
-    // kernel-side semantic.
+    HostStateMetricDef {
+        name: "wait_max",
+        unit: "ns",
+        rule: AggRule::Max(|t| t.wait_max),
+    },
     HostStateMetricDef {
         name: "sleep_sum",
         unit: "ns",
         rule: AggRule::Sum(|t| t.sleep_sum),
+    },
+    HostStateMetricDef {
+        name: "sleep_max",
+        unit: "ns",
+        rule: AggRule::Max(|t| t.sleep_max),
     },
     // No `sleep_count` metric: the kernel does not emit that
     // counter — the wake-side tally is captured by `nr_wakeups`
@@ -292,6 +308,11 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "block_sum",
         unit: "ns",
         rule: AggRule::Sum(|t| t.block_sum),
+    },
+    HostStateMetricDef {
+        name: "block_max",
+        unit: "ns",
+        rule: AggRule::Max(|t| t.block_max),
     },
     // No `block_count` metric: the kernel emits no per-event
     // counter for `sum_block_runtime` (unlike `wait_sum/wait_count`
@@ -305,6 +326,16 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
         name: "iowait_count",
         unit: "",
         rule: AggRule::Sum(|t| t.iowait_count),
+    },
+    HostStateMetricDef {
+        name: "exec_max",
+        unit: "ns",
+        rule: AggRule::Max(|t| t.exec_max),
+    },
+    HostStateMetricDef {
+        name: "slice_max",
+        unit: "ns",
+        rule: AggRule::Max(|t| t.slice_max),
     },
     // memory
     HostStateMetricDef {
@@ -380,6 +411,14 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
 #[derive(Debug, Clone)]
 pub enum Aggregated {
     Sum(u64),
+    /// Group-wide maximum produced by [`AggRule::Max`]. Distinct
+    /// variant from `Sum` so a downstream consumer that wants to
+    /// surface "the worst single thread" rather than "the
+    /// summed-across-threads value" can match without name-
+    /// matching against the metric registry. Storage is u64 to
+    /// preserve full ns precision across the entire schedstats
+    /// range (no `as f64` lossy cast at aggregation time).
+    Max(u64),
     OrdinalRange {
         min: i64,
         max: i64,
@@ -412,6 +451,7 @@ impl Aggregated {
     pub fn numeric(&self) -> Option<f64> {
         match self {
             Aggregated::Sum(v) => Some(*v as f64),
+            Aggregated::Max(v) => Some(*v as f64),
             Aggregated::OrdinalRange { min, max } => {
                 // Midpoint: keeps a min→max shift on one end visible
                 // in the delta without privileging either bound.
@@ -432,6 +472,7 @@ impl fmt::Display for Aggregated {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Aggregated::Sum(v) => write!(f, "{v}"),
+            Aggregated::Max(v) => write!(f, "{v}"),
             Aggregated::OrdinalRange { min, max } => {
                 if min == max {
                     write!(f, "{min}")
@@ -878,6 +919,20 @@ pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
         AggRule::Sum(f) => {
             let s = threads.iter().map(|t| f(t)).fold(0u64, u64::saturating_add);
             Aggregated::Sum(s)
+        }
+        AggRule::Max(f) => {
+            // Empty-thread groups collapse to 0 to mirror the
+            // Sum-on-empty contract — both rules return the
+            // identity element of their reduction so downstream
+            // delta math stays well-defined when one side has no
+            // threads under the join key. The fold seed is also
+            // 0 for the non-empty case: every *_max field is u64
+            // (non-negative by type), so any kernel-emitted value
+            // satisfies `n >= 0` and `0.max(n) == n` — 0 is a
+            // correct lower bound that never wins against a real
+            // reading.
+            let m = threads.iter().map(|t| f(t)).fold(0u64, u64::max);
+            Aggregated::Max(m)
         }
         AggRule::OrdinalRange(f) => {
             let mut it = threads.iter().map(|t| f(t));
@@ -2398,7 +2453,7 @@ mod tests {
 
     /// `aggregate(Sum, &[])` returns `Sum(0)` via the `fold(0u64,
     /// ...)` accumulator. Completes empty-slice coverage across
-    /// all four AggRules.
+    /// the four reduction AggRules (Sum/Max/OrdinalRange/Mode).
     #[test]
     fn aggregate_sum_on_empty_threads_is_zero() {
         let empty: Vec<&ThreadState> = vec![];
@@ -2407,6 +2462,107 @@ mod tests {
             Aggregated::Sum(s) => assert_eq!(s, 0),
             other => panic!("expected Sum, got {other:?}"),
         }
+    }
+
+    /// Three threads with different `wait_max` values aggregate to
+    /// the GROUP MAX, not the sum. Pins the core semantic of
+    /// `AggRule::Max` — the kernel's `*_max` schedstats fields are
+    /// already per-thread maxes, and the group-level reduction
+    /// should surface the worst single thread's worst window, not
+    /// conflate a single 1s tail-latency spike with 1000 routine
+    /// 1ms windows.
+    #[test]
+    fn aggregate_max_picks_group_maximum_not_sum() {
+        let mut a = make_thread("p", "w");
+        let mut b = make_thread("p", "w");
+        let mut c = make_thread("p", "w");
+        a.wait_max = 100;
+        b.wait_max = 999_999_999; // The clear group-wide tail.
+        c.wait_max = 50;
+        let v = aggregate(AggRule::Max(|t| t.wait_max), &[&a, &b, &c]);
+        match v {
+            Aggregated::Max(m) => {
+                assert_eq!(
+                    m, 999_999_999,
+                    "Max must pick the largest value, not sum (sum \
+                     would be 1_000_000_149)"
+                );
+            }
+            other => panic!("expected Max, got {other:?}"),
+        }
+    }
+
+    /// `aggregate(Max, &[])` returns `Max(0)` via the `fold(0u64,
+    /// u64::max)` accumulator. Mirrors the empty-Sum contract so
+    /// downstream delta math works the same way for both rules
+    /// when one side has no threads under the join key.
+    #[test]
+    fn aggregate_max_on_empty_threads_is_zero() {
+        let empty: Vec<&ThreadState> = vec![];
+        let v = aggregate(AggRule::Max(|t| t.wait_max), &empty);
+        match v {
+            Aggregated::Max(m) => assert_eq!(m, 0),
+            other => panic!("expected Max, got {other:?}"),
+        }
+    }
+
+    /// Single-thread group: `Max` returns the single thread's
+    /// value verbatim. Pins that the seed-0 fold does not
+    /// override a real reading (any kernel-emitted u64 is ≥ 0,
+    /// so `0.max(n) == n`).
+    #[test]
+    fn aggregate_max_single_thread_returns_thread_value() {
+        let mut t = make_thread("p", "w");
+        t.sleep_max = 12_345_678_901;
+        let v = aggregate(AggRule::Max(|t| t.sleep_max), &[&t]);
+        match v {
+            Aggregated::Max(m) => assert_eq!(m, 12_345_678_901),
+            other => panic!("expected Max, got {other:?}"),
+        }
+    }
+
+    /// Each `*_max` metric in the registry reads the matching
+    /// per-thread field — guards against a copy-paste mistake
+    /// like `Max(|t| t.wait_max)` for the `block_max` slot.
+    /// Mirrors `sum_metric_accessors_read_expected_field` for
+    /// the Max family.
+    #[test]
+    fn max_metric_accessors_read_expected_field() {
+        type MetricSetter = fn(&mut ThreadState);
+        let cases: &[(&str, MetricSetter)] = &[
+            ("wait_max", |t| t.wait_max = 1),
+            ("sleep_max", |t| t.sleep_max = 1),
+            ("block_max", |t| t.block_max = 1),
+            ("exec_max", |t| t.exec_max = 1),
+            ("slice_max", |t| t.slice_max = 1),
+        ];
+        for (name, set) in cases {
+            let mut t = make_thread("p", "w");
+            set(&mut t);
+            let def = HOST_STATE_METRICS
+                .iter()
+                .find(|m| m.name == *name)
+                .unwrap_or_else(|| panic!("metric {name} not in registry"));
+            let agg = aggregate(def.rule, &[&t]);
+            match agg {
+                Aggregated::Max(v) => {
+                    assert_eq!(v, 1, "accessor for {name} did not read the {name} field")
+                }
+                other => panic!("expected Max for {name}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `Aggregated::Max` projects to f64 via `numeric()` so the
+    /// delta-math pipeline in `build_row` handles Max rows the
+    /// same way it handles Sum rows. Display renders the bare u64
+    /// (same shape as Sum). Pins both the numeric and Display
+    /// arms so a regression that dropped one of them surfaces.
+    #[test]
+    fn aggregated_max_numeric_and_display() {
+        let m = Aggregated::Max(7_500_000);
+        assert_eq!(m.numeric(), Some(7_500_000.0));
+        assert_eq!(format!("{m}"), "7500000");
     }
 
     /// `Aggregated::numeric` returns `None` for `Mode` — a
