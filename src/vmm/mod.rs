@@ -2249,6 +2249,18 @@ impl KtstrVm {
         //   lockdown=none        — permit /dev/mem and unrestricted BPF needed by the test runtime.
         //   sysctl.kernel.unprivileged_bpf_disabled=0 — allow BPF load from the test runtime.
         //   sysctl.kernel.sched_schedstats=1          — enable /proc/schedstat for workload reports.
+        //   sysctl.kernel.task_delayacct=1            — flip the delayacct runtime toggle on at
+        //                                              boot. CONFIG_TASK_DELAY_ACCT only enables
+        //                                              the build path; the increment paths
+        //                                              (delayacct_blkio_start/_end) are gated by
+        //                                              static_branch_unlikely(&delayacct_key) at
+        //                                              kernel/delayacct.c. Without this sysctl,
+        //                                              /proc/<tid>/stat field 42 stays zero on
+        //                                              every kernel built with delayacct=y but
+        //                                              boot-time off (the upstream default since
+        //                                              v5.14). Setting it on the cmdline removes
+        //                                              the runtime gate so capture's
+        //                                              delayacct_blkio_ticks reads the live value.
         let mut cmdline = concat!(
             "console=ttyS0 nomodules mitigations=off ",
             "no_timer_check clocksource=kvm-clock ",
@@ -2256,7 +2268,8 @@ impl KtstrVm {
             "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ",
             "pci=off reboot=k panic=-1 iomem=relaxed nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
-            "sysctl.kernel.sched_schedstats=1",
+            "sysctl.kernel.sched_schedstats=1 ",
+            "sysctl.kernel.task_delayacct=1",
         )
         .to_string();
         let verbose = std::env::var("KTSTR_VERBOSE")
@@ -3494,6 +3507,7 @@ impl KtstrVm {
             "panic=-1 iomem=relaxed nokaslr lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
+            "sysctl.kernel.task_delayacct=1 ",
             "kfence.sample_interval=0",
         )
         .to_string();

@@ -54,10 +54,12 @@ extension: `.hst.zst`).
 - **Scheduling counters** (cumulative, from `/proc/<tid>/sched`;
   requires `CONFIG_SCHED_DEBUG`) — `run_time_ns`, `wait_time_ns`,
   `timeslices`, `voluntary_csw`, `nonvoluntary_csw`, `nr_wakeups`
-  (plus `_local` / `_remote` / `_sync` / `_migrate` / `_idle`
-  splits), `nr_migrations`, `wait_sum` / `wait_count`,
-  `sleep_sum`, `block_sum` / `block_count`, `iowait_sum` /
-  `iowait_count`.
+  (plus `_local` / `_remote` / `_sync` / `_migrate` splits),
+  `nr_migrations`, `wait_sum` / `wait_count`, `voluntary_sleep_ns`
+  (capture-side normalized as `sum_sleep_runtime -
+  sum_block_runtime` so the kernel's sleep/block double-count
+  is stripped before the value reaches the snapshot),
+  `block_sum`, `iowait_sum` / `iowait_count`.
 - **Memory** — `minflt` / `majflt` from `/proc/<tid>/stat`.
   `allocated_bytes` / `deallocated_bytes` from the jemalloc
   per-thread-destructor TSD cache — populated only for processes

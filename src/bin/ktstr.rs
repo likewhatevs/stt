@@ -928,7 +928,7 @@ fn write_show<W: std::fmt::Write>(
                     continue;
                 };
                 let metric_name = host_state_compare::metric_display_name(metric).into_owned();
-                let value_cell = host_state_compare::format_value_cell(agg, metric.unit);
+                let value_cell = host_state_compare::format_value_cell(agg, metric.rule.ladder());
                 let cells: Vec<String> = resolved_columns
                     .iter()
                     .map(|c| match c {
@@ -977,7 +977,9 @@ fn write_show<W: std::fmt::Write>(
                 };
             for d in host_state_compare::HOST_STATE_DERIVED_METRICS {
                 let value_cell = match (d.compute)(&group.metrics) {
-                    Some(v) => host_state_compare::format_derived_value_cell(v, d.unit, d.is_ratio),
+                    Some(v) => {
+                        host_state_compare::format_derived_value_cell(v, d.ladder, d.is_ratio)
+                    }
                     None => "-".to_string(),
                 };
                 let cells: Vec<String> = resolved_columns
@@ -1038,10 +1040,22 @@ fn write_show<W: std::fmt::Write>(
                 for (key, s) in &stats {
                     ct.add_row(vec![
                         key.clone(),
-                        host_state_compare::format_scaled_u64(s.cpu.usage_usec, "µs"),
-                        host_state_compare::format_scaled_u64(s.cpu.nr_throttled, ""),
-                        host_state_compare::format_scaled_u64(s.cpu.throttled_usec, "µs"),
-                        host_state_compare::format_scaled_u64(s.memory.current, "B"),
+                        host_state_compare::format_scaled_u64(
+                            s.cpu.usage_usec,
+                            host_state_compare::ScaleLadder::Us,
+                        ),
+                        host_state_compare::format_scaled_u64(
+                            s.cpu.nr_throttled,
+                            host_state_compare::ScaleLadder::Unitless,
+                        ),
+                        host_state_compare::format_scaled_u64(
+                            s.cpu.throttled_usec,
+                            host_state_compare::ScaleLadder::Us,
+                        ),
+                        host_state_compare::format_scaled_u64(
+                            s.memory.current,
+                            host_state_compare::ScaleLadder::Bytes,
+                        ),
                     ]);
                 }
                 writeln!(w, "{ct}")?;
@@ -1100,15 +1114,34 @@ fn write_show<W: std::fmt::Write>(
                         host_state_compare::format_cpu_max(s.cpu.max_quota_us, s.cpu.max_period_us),
                         s.cpu
                             .weight
-                            .map(|v| host_state_compare::format_scaled_u64(v, ""))
+                            .map(|v| {
+                                host_state_compare::format_scaled_u64(
+                                    v,
+                                    host_state_compare::ScaleLadder::Unitless,
+                                )
+                            })
                             .unwrap_or_else(|| "-".to_string()),
-                        host_state_compare::format_optional_limit(s.memory.max, "B"),
-                        host_state_compare::format_optional_limit(s.memory.high, "B"),
+                        host_state_compare::format_optional_limit(
+                            s.memory.max,
+                            host_state_compare::ScaleLadder::Bytes,
+                        ),
+                        host_state_compare::format_optional_limit(
+                            s.memory.high,
+                            host_state_compare::ScaleLadder::Bytes,
+                        ),
                         s.pids
                             .current
-                            .map(|v| host_state_compare::format_scaled_u64(v, ""))
+                            .map(|v| {
+                                host_state_compare::format_scaled_u64(
+                                    v,
+                                    host_state_compare::ScaleLadder::Unitless,
+                                )
+                            })
                             .unwrap_or_else(|| "-".to_string()),
-                        host_state_compare::format_optional_limit(s.pids.max, ""),
+                        host_state_compare::format_optional_limit(
+                            s.pids.max,
+                            host_state_compare::ScaleLadder::Unitless,
+                        ),
                     ]);
                 }
                 writeln!(w, "{lt}")?;
@@ -1146,7 +1179,10 @@ fn write_show<W: std::fmt::Write>(
                         mt.add_row(vec![
                             key.clone(),
                             stat_key.clone(),
-                            host_state_compare::format_scaled_u64(*stat_value, ""),
+                            host_state_compare::format_scaled_u64(
+                                *stat_value,
+                                host_state_compare::ScaleLadder::Unitless,
+                            ),
                         ]);
                     }
                 }
@@ -1174,7 +1210,10 @@ fn write_show<W: std::fmt::Write>(
                         et.add_row(vec![
                             key.clone(),
                             event_key.clone(),
-                            host_state_compare::format_scaled_u64(*event_value, ""),
+                            host_state_compare::format_scaled_u64(
+                                *event_value,
+                                host_state_compare::ScaleLadder::Unitless,
+                            ),
                         ]);
                     }
                 }
@@ -1215,7 +1254,10 @@ fn write_show<W: std::fmt::Write>(
                             format_psi_avg(r.some.avg10),
                             format_psi_avg(r.some.avg60),
                             format_psi_avg(r.some.avg300),
-                            host_state_compare::format_scaled_u64(r.some.total_usec, "µs"),
+                            host_state_compare::format_scaled_u64(
+                                r.some.total_usec,
+                                host_state_compare::ScaleLadder::Us,
+                            ),
                         ]);
                         pt.add_row(vec![
                             key.clone(),
@@ -1223,7 +1265,10 @@ fn write_show<W: std::fmt::Write>(
                             format_psi_avg(r.full.avg10),
                             format_psi_avg(r.full.avg60),
                             format_psi_avg(r.full.avg300),
-                            host_state_compare::format_scaled_u64(r.full.total_usec, "µs"),
+                            host_state_compare::format_scaled_u64(
+                                r.full.total_usec,
+                                host_state_compare::ScaleLadder::Us,
+                            ),
                         ]);
                     }
                     writeln!(w, "{pt}")?;
@@ -1253,14 +1298,20 @@ fn write_show<W: std::fmt::Write>(
                 format_psi_avg(r.some.avg10),
                 format_psi_avg(r.some.avg60),
                 format_psi_avg(r.some.avg300),
-                host_state_compare::format_scaled_u64(r.some.total_usec, "µs"),
+                host_state_compare::format_scaled_u64(
+                    r.some.total_usec,
+                    host_state_compare::ScaleLadder::Us,
+                ),
             ]);
             pt.add_row(vec![
                 "full".into(),
                 format_psi_avg(r.full.avg10),
                 format_psi_avg(r.full.avg60),
                 format_psi_avg(r.full.avg300),
-                host_state_compare::format_scaled_u64(r.full.total_usec, "µs"),
+                host_state_compare::format_scaled_u64(
+                    r.full.total_usec,
+                    host_state_compare::ScaleLadder::Us,
+                ),
             ]);
             writeln!(w, "{pt}")?;
         }
@@ -1305,7 +1356,10 @@ fn write_show<W: std::fmt::Write>(
                 st.add_row(vec![
                     format!("{}[{}]", t.pcomm, t.tgid),
                     (*key).clone(),
-                    host_state_compare::format_scaled_u64(bytes.0, "B"),
+                    host_state_compare::format_scaled_u64(
+                        bytes.0,
+                        host_state_compare::ScaleLadder::Bytes,
+                    ),
                 ]);
             }
             writeln!(w, "{st}")?;
@@ -1335,19 +1389,31 @@ fn write_show<W: std::fmt::Write>(
         at.add_row(vec!["state".into(), state_cell]);
         at.add_row(vec![
             "switch_all".into(),
-            host_state_compare::format_scaled_u64(scx.switch_all, ""),
+            host_state_compare::format_scaled_u64(
+                scx.switch_all,
+                host_state_compare::ScaleLadder::Unitless,
+            ),
         ]);
         at.add_row(vec![
             "nr_rejected".into(),
-            host_state_compare::format_scaled_u64(scx.nr_rejected, ""),
+            host_state_compare::format_scaled_u64(
+                scx.nr_rejected,
+                host_state_compare::ScaleLadder::Unitless,
+            ),
         ]);
         at.add_row(vec![
             "hotplug_seq".into(),
-            host_state_compare::format_scaled_u64(scx.hotplug_seq, ""),
+            host_state_compare::format_scaled_u64(
+                scx.hotplug_seq,
+                host_state_compare::ScaleLadder::Unitless,
+            ),
         ]);
         at.add_row(vec![
             "enable_seq".into(),
-            host_state_compare::format_scaled_u64(scx.enable_seq, ""),
+            host_state_compare::format_scaled_u64(
+                scx.enable_seq,
+                host_state_compare::ScaleLadder::Unitless,
+            ),
         ]);
         writeln!(w, "{at}")?;
     }

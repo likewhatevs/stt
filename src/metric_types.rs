@@ -90,8 +90,8 @@
 //!   declaration so the migration can't accidentally pair it
 //!   with a [`Summable`]-bound `AggRule` variant.
 //! - [`MonotonicNs`] — cumulative-time counter, ns. Examples:
-//!   `run_time_ns`, `wait_sum`, `sleep_sum`, `block_sum`,
-//!   `iowait_sum`, `core_forceidle_sum`.
+//!   `run_time_ns`, `wait_sum`, `voluntary_sleep_ns`,
+//!   `block_sum`, `iowait_sum`, `core_forceidle_sum`.
 //! - [`PeakNs`] — lifetime high-water mark, ns. The kernel
 //!   updates these via `if (delta > stat->max) stat->max = delta`
 //!   inside `update_stats_*` wrappers (kernel/sched/stats.c) and
@@ -123,7 +123,7 @@
 //!   (also decimal SI, different unit) and bytes (IEC binary).
 //! - [`Bytes`] — byte counts. Examples: `allocated_bytes`,
 //!   `read_bytes`, `wchar`. Auto-scale ladder is IEC binary
-//!   (`B → KiB → MiB → GiB`).
+//!   (`B → KiB → MiB → GiB → TiB`).
 //! - [`OrdinalI32`] / [`OrdinalU32`] / [`OrdinalU64`] — bounded
 //!   scalar, range-aggregated (no sum). [`OrdinalI32`] examples:
 //!   `nice` ([-20, 19]), `priority`
@@ -256,7 +256,8 @@ pub struct MonotonicCount(pub u64);
 /// (ns → µs → ms → s).
 ///
 /// Examples: `run_time_ns`, `wait_time_ns`, `wait_sum`,
-/// `sleep_sum`, `block_sum`, `iowait_sum`, `core_forceidle_sum`.
+/// `voluntary_sleep_ns`, `block_sum`, `iowait_sum`,
+/// `core_forceidle_sum`.
 /// Cross-field ratios (e.g.
 /// `run_time_ns / (run_time_ns + wait_time_ns)`) are valid
 /// because every [`MonotonicNs`] field on
@@ -323,13 +324,19 @@ pub struct Bytes(pub u64);
 /// Kernel counter whose update path is permanently dead. The
 /// field exists in `task_struct` (and is exposed via
 /// `/proc/<tid>/sched`) but no kernel writer touches it on any
-/// current code path. Examples in
-/// `kernel/sched/debug.c::print_numa_stats`-adjacent dumps:
-/// `nr_wakeups_idle` (no `schedstat_inc(p->stats.nr_wakeups_idle)`
-/// call site exists in 6.16 or 7.1), `nr_migrations_cold` (no
-/// `schedstat_inc(p->stats.nr_migrations_cold)` call site),
-/// `nr_wakeups_passive` (no `schedstat_inc(p->stats.nr_wakeups_passive)`
-/// call site).
+/// current code path.
+///
+/// Examples that historically motivated this newtype:
+/// `nr_wakeups_idle`, `nr_migrations_cold`, `nr_wakeups_passive`
+/// — these fields were removed from
+/// [`crate::host_state::ThreadState`] because no kernel code
+/// path increments them on 6.16 or 7.1 (no
+/// `schedstat_inc(p->stats.nr_wakeups_idle)` /
+/// `nr_migrations_cold` / `nr_wakeups_passive` call site exists
+/// anywhere under `kernel/`). The newtype remains as
+/// infrastructure for future dead counters that get exposed in
+/// `/proc` before (or instead of) being wired up as live
+/// counters.
 ///
 /// Wire format matches [`MonotonicCount`] (`u64`,
 /// `serde(transparent)`); the capture pipeline parses the same

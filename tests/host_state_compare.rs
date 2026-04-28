@@ -531,9 +531,6 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("nr_wakeups_migrate", |t| {
             t.nr_wakeups_migrate = MonotonicCount(109)
         }),
-        ("nr_wakeups_idle", |t| {
-            t.nr_wakeups_idle = MonotonicCount(110)
-        }),
         ("nr_wakeups_affine", |t| {
             t.nr_wakeups_affine = MonotonicCount(111)
         }),
@@ -541,9 +538,6 @@ fn host_state_metrics_accessors_read_every_variant() {
             t.nr_wakeups_affine_attempts = MonotonicCount(112)
         }),
         ("nr_migrations", |t| t.nr_migrations = MonotonicCount(113)),
-        ("nr_migrations_cold", |t| {
-            t.nr_migrations_cold = MonotonicCount(114)
-        }),
         ("nr_forced_migrations", |t| {
             t.nr_forced_migrations = MonotonicCount(115)
         }),
@@ -558,7 +552,9 @@ fn host_state_metrics_accessors_read_every_variant() {
         }),
         ("wait_sum", |t| t.wait_sum = MonotonicNs(119)),
         ("wait_count", |t| t.wait_count = MonotonicCount(120)),
-        ("sleep_sum", |t| t.sleep_sum = MonotonicNs(121)),
+        ("voluntary_sleep_ns", |t| {
+            t.voluntary_sleep_ns = MonotonicNs(121)
+        }),
         ("block_sum", |t| t.block_sum = MonotonicNs(122)),
         ("iowait_sum", |t| t.iowait_sum = MonotonicNs(123)),
         ("iowait_count", |t| t.iowait_count = MonotonicCount(124)),
@@ -600,11 +596,6 @@ fn host_state_metrics_accessors_read_every_variant() {
             t.delayacct_blkio_ticks = ClockTicks(137)
         }),
         // /proc/<tid>/sched additions (parse_sched).
-        // nr_wakeups_passive: counter (Sum) — known dead on
-        // mainline but registered for forward compat.
-        ("nr_wakeups_passive", |t| {
-            t.nr_wakeups_passive = MonotonicCount(138)
-        }),
         // core_forceidle_sum: counter (Sum, ns).
         ("core_forceidle_sum", |t| {
             t.core_forceidle_sum = MonotonicNs(139)
@@ -637,18 +628,16 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("nr_wakeups_remote", 107),
         ("nr_wakeups_sync", 108),
         ("nr_wakeups_migrate", 109),
-        ("nr_wakeups_idle", 110),
         ("nr_wakeups_affine", 111),
         ("nr_wakeups_affine_attempts", 112),
         ("nr_migrations", 113),
-        ("nr_migrations_cold", 114),
         ("nr_forced_migrations", 115),
         ("nr_failed_migrations_affine", 116),
         ("nr_failed_migrations_running", 117),
         ("nr_failed_migrations_hot", 118),
         ("wait_sum", 119),
         ("wait_count", 120),
-        ("sleep_sum", 121),
+        ("voluntary_sleep_ns", 121),
         ("block_sum", 122),
         ("iowait_sum", 123),
         ("iowait_count", 124),
@@ -666,7 +655,6 @@ fn host_state_metrics_accessors_read_every_variant() {
         ("write_bytes", 136),
         ("cancelled_write_bytes", 141),
         ("delayacct_blkio_ticks", 137),
-        ("nr_wakeups_passive", 138),
         ("core_forceidle_sum", 139),
         // Max
         ("wait_max", 200),

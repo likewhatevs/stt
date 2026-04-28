@@ -1487,9 +1487,28 @@ mod tests {
 
     /// Non-git directories are treated as permanently dirty and
     /// produce `git_hash=None` — there is no commit to reference.
+    ///
+    /// `gix::discover` walks the parent chain from the input
+    /// path; when the host's `/tmp` happens to live inside a git
+    /// checkout (the developer's `~/work` mounted under `/tmp`,
+    /// some CI runners), discover finds the ancestor `.git`
+    /// before this test's tempdir asserts the "no repo" branch.
+    /// Skip in that environment — the production behavior
+    /// (treat the discovered ancestor as the source identity)
+    /// is correct in both cases; this test only exercises the
+    /// no-repo-found branch and cannot pin it without
+    /// isolation. Mirrors the `git CLI unavailable` skip
+    /// pattern above.
     #[test]
     fn local_source_non_git_is_dirty_without_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
+        if crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp.path()) {
+            skip!(
+                "tempdir {} resolves to an ancestor git repo; cannot pin non-git \
+                 path semantics in this environment",
+                tmp.path().display()
+            );
+        }
         std::fs::write(tmp.path().join("file.txt"), "no git here\n").unwrap();
 
         let acquired = local_source(tmp.path()).expect("local_source ok");
@@ -1520,6 +1539,21 @@ mod tests {
     fn local_unknown_keys_carry_distinct_per_path_salt() {
         let tmp_a = tempfile::TempDir::new().unwrap();
         let tmp_b = tempfile::TempDir::new().unwrap();
+        // Skip if either tempdir resolves to an ancestor git
+        // repo — the test asserts the `local-unknown-` prefix
+        // shape, which requires the no-repo branch on both
+        // calls. Same skip pattern as
+        // `local_source_non_git_is_dirty_without_hash`.
+        if crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp_a.path())
+            || crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp_b.path())
+        {
+            skip!(
+                "tempdir(s) {} / {} resolve to ancestor git repo; cannot pin \
+                 non-git salt semantics in this environment",
+                tmp_a.path().display(),
+                tmp_b.path().display(),
+            );
+        }
         std::fs::write(tmp_a.path().join("file"), b"a").unwrap();
         std::fs::write(tmp_b.path().join("file"), b"b").unwrap();
 
@@ -1549,6 +1583,18 @@ mod tests {
     #[test]
     fn local_unknown_key_stable_across_repeated_calls_on_same_path() {
         let tmp = tempfile::TempDir::new().unwrap();
+        // Skip if the tempdir resolves to an ancestor git repo —
+        // the test asserts the `local-unknown-` prefix shape, and
+        // an ancestor walk would yield a `local-{short_hash}-`
+        // key instead. Same pattern as the sibling non-git
+        // tests above.
+        if crate::test_support::test_helpers::tempdir_resolves_to_ancestor_git(tmp.path()) {
+            skip!(
+                "tempdir {} resolves to an ancestor git repo; cannot pin \
+                 deterministic non-git salt in this environment",
+                tmp.path().display()
+            );
+        }
         std::fs::write(tmp.path().join("file"), b"x").unwrap();
         let k1 = local_source(tmp.path()).unwrap().cache_key;
         let k2 = local_source(tmp.path()).unwrap().cache_key;

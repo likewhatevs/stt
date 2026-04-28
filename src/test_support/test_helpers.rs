@@ -80,6 +80,29 @@ pub(crate) fn isolated_cache_dir() -> IsolatedCacheDir {
     IsolatedCacheDir { _guard: guard, tmp }
 }
 
+/// True when `dir` resolves to a discoverable git repository
+/// via `gix::discover`'s upward walk. Useful for tests that
+/// need to distinguish "the operator pointed at a non-git
+/// tree" (where `gix::discover` returns Err) from "the
+/// operator's tempdir happens to be inside a host git checkout
+/// (e.g. `/tmp` under a developer's `~/work`)" — `gix::discover`
+/// walks parents unconditionally and finds the ancestor `.git`
+/// in the second case.
+///
+/// Production code is fine with the upward-walk semantics —
+/// an operator who points `--source` at a tempdir genuinely
+/// inside their checkout DOES want the checkout's HEAD as the
+/// source identity. The semantic only breaks for tests that
+/// MUST exercise the no-repo-found branch; those tests call
+/// this helper and skip when the host environment cannot
+/// provide isolation. The non-fatal skip is the right call:
+/// the production behavior is correct in both cases, the test
+/// is the artifact that cares about the ancestor-`.git`
+/// outcome.
+pub(crate) fn tempdir_resolves_to_ancestor_git(dir: &std::path::Path) -> bool {
+    gix::discover(dir).is_ok()
+}
+
 /// Shared `Topology` used by `evaluate_vm_result` tests: the
 /// 1-numa-1-llc-2-core-1-thread topology is unremarkable on every
 /// dimension monitor checks touch, so tests that exercise other

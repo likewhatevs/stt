@@ -717,17 +717,6 @@ pub struct ThreadState {
     /// `nr_wakeups_migrate`. Distinct from `nr_wakeups_remote`
     /// (waker CPU != target CPU). `MonotonicCount`.
     pub nr_wakeups_migrate: crate::metric_types::MonotonicCount,
-    /// Wakeups attributed to the idle path; `/proc/<tid>/sched`
-    /// `nr_wakeups_idle`. KNOWN DEAD COUNTER — never incremented
-    /// in mainline (registered for parser-completeness).
-    /// Currently typed `MonotonicCount` for parser uniformity;
-    /// migration to [`crate::metric_types::DeadCounter`] is queued
-    /// (it requires a no-op aggregation arm in `AggRule` and a
-    /// registry edit, both deliberately out of scope for this
-    /// batch). The newtype already exists with no reduction trait
-    /// impls so a future field-level flip will fail to compile
-    /// against any `Summable`-bound `AggRule` variant.
-    pub nr_wakeups_idle: crate::metric_types::MonotonicCount,
     /// Wakeups onto this CPU (cache-affine wakeup
     /// fast-path). `/proc/<tid>/sched` `nr_wakeups_affine`,
     /// emitted via `P_SCHEDSTAT`. Plain u64. Zero on kernels
@@ -754,20 +743,6 @@ pub struct ThreadState {
     /// regardless of `CONFIG_SCHEDSTATS` or scheduling class.
     /// `MonotonicCount`.
     pub nr_migrations: crate::metric_types::MonotonicCount,
-    /// Migrations skipped under cache-cold heuristic (the source
-    /// CPU's cache was deemed too cold to warrant moving).
-    /// `/proc/<tid>/sched` `nr_migrations_cold`, plain u64 via
-    /// `P_SCHEDSTAT`. KNOWN DEAD COUNTER — no kernel writer
-    /// touches `p->stats.nr_migrations_cold` on any current
-    /// 6.16 / 7.1 code path; the field is preserved in
-    /// `task_struct` for `/proc/<tid>/sched` line-number
-    /// stability. Currently typed `MonotonicCount` for parser
-    /// uniformity; migration to
-    /// [`crate::metric_types::DeadCounter`] is queued (requires
-    /// a no-op aggregation arm in `AggRule` and a registry
-    /// edit, deliberately out of scope for this batch). Zero on
-    /// kernels without `CONFIG_SCHEDSTATS` regardless.
-    pub nr_migrations_cold: crate::metric_types::MonotonicCount,
     /// Migrations forced by load balance (the load balancer
     /// migrated the task even though the local heuristic would
     /// have skipped it). `/proc/<tid>/sched` `nr_forced_migrations`,
@@ -819,28 +794,40 @@ pub struct ThreadState {
     /// `kernel/sched/ext.c` does not call that helper, so
     /// sched_ext-managed tasks never accumulate wait_max.
     pub wait_max: crate::metric_types::PeakNs,
-    /// Total nanoseconds the task spent off-CPU — voluntary
-    /// sleep (`TASK_INTERRUPTIBLE`) PLUS involuntary block
-    /// (`TASK_UNINTERRUPTIBLE`). Populated from
-    /// `/proc/<tid>/sched`'s `sum_sleep_runtime` key (kernel
-    /// emits `ms.ns_remainder` via `PN_SCHEDSTAT`; the parser
-    /// reconstructs full ns).
+    /// Pure voluntary sleep time, nanoseconds — `TASK_INTERRUPTIBLE`
+    /// off-CPU windows only, with the involuntary-block
+    /// component already subtracted at capture.
     ///
+    /// Computed at capture as `sum_sleep_runtime - sum_block_runtime`
+    /// (saturating; the read-skew window where block briefly
+    /// exceeds sleep collapses to zero). The kernel's
+    /// `sum_sleep_runtime` key (read via `PN_SCHEDSTAT` in
+    /// `/proc/<tid>/sched`) is the FULL off-CPU total because
     /// `__update_stats_enqueue_sleeper` (`kernel/sched/stats.c`)
-    /// adds the sleeper's elapsed wall-clock window to this
-    /// counter regardless of which sleep state the task was in,
-    /// so `sleep_sum` is the full off-CPU total. To recover pure
-    /// voluntary sleep, subtract [`Self::block_sum`]:
-    /// `voluntary_sleep = sleep_sum - block_sum`.
+    /// charges every sleeper window regardless of which sleep
+    /// state the task was in — voluntary sleep AND involuntary
+    /// block both contribute. Subtracting `sum_block_runtime`
+    /// at capture leaves the voluntary-sleep residual, which
+    /// is the operationally useful signal for "how much time
+    /// did this task spend on a syscall wait that wasn't a
+    /// kernel block."
     ///
-    /// There is no `sleep_count` counterpart: the kernel does
-    /// not emit one — the scheduler records the aggregate
-    /// runtime but not the sleep-event count separately from
-    /// `nr_wakeups`, which already covers the wake-side tally.
+    /// Capture-side normalization (rather than a derived
+    /// metric at compare time) means every consumer sees the
+    /// pre-normalized value without re-deriving — and the raw
+    /// kernel reading is intentionally NOT preserved in the
+    /// snapshot per the project's pre-1.0 disposable-sidecar
+    /// policy.
+    ///
+    /// There is no `voluntary_sleep_count` counterpart: the
+    /// kernel does not emit one — the scheduler records the
+    /// aggregate runtime but not the sleep-event count
+    /// separately from `nr_wakeups`, which already covers the
+    /// wake-side tally.
     /// Zero on kernels without `CONFIG_SCHEDSTATS`. Zero under
     /// sched_ext: `__update_stats_enqueue_sleeper` is called
     /// from CFS/RT/DL paths only.
-    pub sleep_sum: crate::metric_types::MonotonicNs,
+    pub voluntary_sleep_ns: crate::metric_types::MonotonicNs,
     /// Longest single sleep window in nanoseconds.
     /// `/proc/<tid>/sched` `sleep_max` emitted via `PN_SCHEDSTAT`
     /// (`ms.ns_remainder`, reconstructed by the parser). Zero on
@@ -1043,31 +1030,13 @@ pub struct ThreadState {
     pub delayacct_blkio_ticks: crate::metric_types::ClockTicks,
 
     // -- /proc/<tid>/sched additions (counters + ordinal + slice gauge) --
-    /// Wakeups onto an idle CPU via the passive-wakeup fast path.
-    /// `/proc/<tid>/sched` `nr_wakeups_passive`, plain u64 via
-    /// the `P_SCHEDSTAT(F)` macro that expands to
-    /// `schedstat_val(p->stats.F)` at `kernel/sched/debug.c:1274`
-    /// (the line emitting this specific counter is
-    /// `kernel/sched/debug.c:1314`). KNOWN DEAD COUNTER on
-    /// mainline — the kernel never increments
-    /// `task->stats.nr_wakeups_passive` anywhere under `kernel/`.
-    /// Captured for parser-completeness and forward
-    /// compatibility with downstream kernels that may wire the
-    /// increment. Always zero on mainline 6.x. Mirrors the
-    /// existing `nr_wakeups_idle` and `nr_migrations_cold`
-    /// dead-counter precedent. Currently typed `MonotonicCount`
-    /// for parser uniformity; migration to
-    /// [`crate::metric_types::DeadCounter`] is queued (requires
-    /// a no-op aggregation arm in `AggRule` and a registry
-    /// edit, deliberately out of scope for this batch).
-    pub nr_wakeups_passive: crate::metric_types::MonotonicCount,
     /// Cumulative time this task forced its SMT sibling idle for
     /// core-scheduling, in nanoseconds. `/proc/<tid>/sched`
     /// `core_forceidle_sum`, dotted ms.ns format via
     /// `PN_SCHEDSTAT` (`kernel/sched/debug.c:1335`).
     /// Reconstructed to full ns via the same
     /// `parsed_ns_from_dotted` helper as `wait_sum` /
-    /// `sleep_sum` / `block_sum`.
+    /// `block_sum`.
     ///
     /// Increment occurs in `__account_forceidle_time()` at
     /// `kernel/sched/cputime.c:244` (function defined at
@@ -1311,11 +1280,9 @@ impl Default for ThreadState {
             nr_wakeups_remote: Default::default(),
             nr_wakeups_sync: Default::default(),
             nr_wakeups_migrate: Default::default(),
-            nr_wakeups_idle: Default::default(),
             nr_wakeups_affine: Default::default(),
             nr_wakeups_affine_attempts: Default::default(),
             nr_migrations: Default::default(),
-            nr_migrations_cold: Default::default(),
             nr_forced_migrations: Default::default(),
             nr_failed_migrations_affine: Default::default(),
             nr_failed_migrations_running: Default::default(),
@@ -1323,7 +1290,7 @@ impl Default for ThreadState {
             wait_sum: Default::default(),
             wait_count: Default::default(),
             wait_max: Default::default(),
-            sleep_sum: Default::default(),
+            voluntary_sleep_ns: Default::default(),
             sleep_max: Default::default(),
             block_sum: Default::default(),
             block_max: Default::default(),
@@ -1340,7 +1307,6 @@ impl Default for ThreadState {
             priority: Default::default(),
             rt_priority: Default::default(),
             delayacct_blkio_ticks: Default::default(),
-            nr_wakeups_passive: Default::default(),
             core_forceidle_sum: Default::default(),
             fair_slice_ns: Default::default(),
             nr_threads: Default::default(),
@@ -2404,11 +2370,9 @@ struct SchedFields {
     nr_wakeups_remote: Option<u64>,
     nr_wakeups_sync: Option<u64>,
     nr_wakeups_migrate: Option<u64>,
-    nr_wakeups_idle: Option<u64>,
     nr_wakeups_affine: Option<u64>,
     nr_wakeups_affine_attempts: Option<u64>,
     nr_migrations: Option<u64>,
-    nr_migrations_cold: Option<u64>,
     nr_forced_migrations: Option<u64>,
     nr_failed_migrations_affine: Option<u64>,
     nr_failed_migrations_running: Option<u64>,
@@ -2424,20 +2388,6 @@ struct SchedFields {
     iowait_count: Option<u64>,
     exec_max: Option<u64>,
     slice_max: Option<u64>,
-    /// `nr_wakeups_passive` from `/proc/<tid>/sched`, emitted via
-    /// `P_SCHEDSTAT(nr_wakeups_passive)` at
-    /// `kernel/sched/debug.c:1314`. Plain u64. KNOWN DEAD COUNTER:
-    /// the kernel never increments this anywhere under
-    /// `kernel/` on mainline (audited via tree-wide grep). Captured
-    /// for parser-completeness and forward compatibility — a future
-    /// kernel that wires the increment will surface immediately.
-    /// Emission is gated by the `if (schedstat_enabled())` block
-    /// at `kernel/sched/debug.c:1285` (the line lives inside that
-    /// `if`), so on a host with schedstat off at runtime
-    /// (`/proc/sys/kernel/sched_schedstats == 0`) the line is
-    /// absent and the parser arm never fires — leaving the field
-    /// at `None`.
-    nr_wakeups_passive: Option<u64>,
     /// `core_forceidle_sum` from `/proc/<tid>/sched`, emitted via
     /// `PN_SCHEDSTAT(core_forceidle_sum)` at
     /// `kernel/sched/debug.c:1335`, build-gated on
@@ -2641,11 +2591,9 @@ fn parse_sched(raw: &str, tally: &mut Option<&mut ParseTally>) -> SchedFields {
             "nr_wakeups_remote" => out.nr_wakeups_remote = parsed_u64(),
             "nr_wakeups_sync" => out.nr_wakeups_sync = parsed_u64(),
             "nr_wakeups_migrate" => out.nr_wakeups_migrate = parsed_u64(),
-            "nr_wakeups_idle" => out.nr_wakeups_idle = parsed_u64(),
             "nr_wakeups_affine" => out.nr_wakeups_affine = parsed_u64(),
             "nr_wakeups_affine_attempts" => out.nr_wakeups_affine_attempts = parsed_u64(),
             "nr_migrations" => out.nr_migrations = parsed_u64(),
-            "nr_migrations_cold" => out.nr_migrations_cold = parsed_u64(),
             "nr_forced_migrations" => out.nr_forced_migrations = parsed_u64(),
             "nr_failed_migrations_affine" => out.nr_failed_migrations_affine = parsed_u64(),
             "nr_failed_migrations_running" => out.nr_failed_migrations_running = parsed_u64(),
@@ -2654,10 +2602,14 @@ fn parse_sched(raw: &str, tally: &mut Option<&mut ParseTally>) -> SchedFields {
             "wait_count" => out.wait_count = parsed_u64(),
             "wait_max" => out.wait_max = parse_dotted(value),
             // Kernel emits `sum_sleep_runtime` (see
-            // `kernel/sched/debug.c` -> `proc_sched_show_task`); the
-            // matching ThreadState field is named `sleep_sum` for
-            // symmetry with `wait_sum` / `block_sum` / `iowait_sum`.
-            // The kernel does not emit a `sleep_count` counterpart;
+            // `kernel/sched/debug.c` -> `proc_sched_show_task`).
+            // The raw value lands in `SchedFields::sleep_sum`; the
+            // capture site at `capture_thread_at_with_tally`
+            // subtracts `sum_block_runtime` to derive
+            // `ThreadState::voluntary_sleep_ns` — the kernel
+            // double-counts block under sum_sleep_runtime, so the
+            // raw value is not surfaced in ThreadState. The kernel
+            // does not emit a `sleep_count` counterpart;
             // `nr_wakeups` (matched above) covers the wake-side
             // event tally.
             "sum_sleep_runtime" => out.sleep_sum = parse_dotted(value),
@@ -2674,11 +2626,8 @@ fn parse_sched(raw: &str, tally: &mut Option<&mut ParseTally>) -> SchedFields {
             "iowait_count" => out.iowait_count = parsed_u64(),
             "exec_max" => out.exec_max = parse_dotted(value),
             "slice_max" => out.slice_max = parse_dotted(value),
-            // P_SCHEDSTAT plain integer; KNOWN dead counter on
-            // mainline (ThreadState doc explains).
-            "nr_wakeups_passive" => out.nr_wakeups_passive = parsed_u64(),
             // PN_SCHEDSTAT dotted ns; CONFIG_SCHED_CORE-gated. Same
-            // ms.ns reconstruction as wait_sum / sleep_sum.
+            // ms.ns reconstruction as wait_sum / block_sum.
             "core_forceidle_sum" => out.core_forceidle_sum = parse_dotted(value),
             // P plain integer in ns. The kernel emits this only
             // for fair-policy tasks (`fair_policy(p->policy)` at
@@ -3120,11 +3069,9 @@ fn capture_thread_at_with_tally(
         nr_wakeups_remote: MonotonicCount(sched.nr_wakeups_remote.unwrap_or(0)),
         nr_wakeups_sync: MonotonicCount(sched.nr_wakeups_sync.unwrap_or(0)),
         nr_wakeups_migrate: MonotonicCount(sched.nr_wakeups_migrate.unwrap_or(0)),
-        nr_wakeups_idle: MonotonicCount(sched.nr_wakeups_idle.unwrap_or(0)),
         nr_wakeups_affine: MonotonicCount(sched.nr_wakeups_affine.unwrap_or(0)),
         nr_wakeups_affine_attempts: MonotonicCount(sched.nr_wakeups_affine_attempts.unwrap_or(0)),
         nr_migrations: MonotonicCount(sched.nr_migrations.unwrap_or(0)),
-        nr_migrations_cold: MonotonicCount(sched.nr_migrations_cold.unwrap_or(0)),
         nr_forced_migrations: MonotonicCount(sched.nr_forced_migrations.unwrap_or(0)),
         nr_failed_migrations_affine: MonotonicCount(sched.nr_failed_migrations_affine.unwrap_or(0)),
         nr_failed_migrations_running: MonotonicCount(
@@ -3134,7 +3081,28 @@ fn capture_thread_at_with_tally(
         wait_sum: MonotonicNs(sched.wait_sum.unwrap_or(0)),
         wait_count: MonotonicCount(sched.wait_count.unwrap_or(0)),
         wait_max: PeakNs(sched.wait_max.unwrap_or(0)),
-        sleep_sum: MonotonicNs(sched.sleep_sum.unwrap_or(0)),
+        // Capture-time normalization: kernel's `sum_sleep_runtime`
+        // counts BOTH voluntary sleep AND involuntary block (see
+        // `__update_stats_enqueue_sleeper` at kernel/sched/stats.c).
+        // Subtracting the block component leaves pure voluntary
+        // sleep — the operationally useful signal — and avoids the
+        // need for a derived metric at compare time.
+        //
+        // `saturating_sub` is defense-in-depth: the kernel
+        // guarantees `sum_sleep_runtime ≥ sum_block_runtime` —
+        // `__update_stats_enqueue_sleeper` adds to
+        // `sum_sleep_runtime` BEFORE adding the same delta to
+        // `sum_block_runtime`, so a regular procfs read can
+        // never observe `block > sleep`. The saturate-to-zero
+        // path handles a hypothetical kernel change or bug that
+        // violates the invariant; under any in-tree kernel today
+        // the underflow never fires.
+        voluntary_sleep_ns: MonotonicNs(
+            sched
+                .sleep_sum
+                .unwrap_or(0)
+                .saturating_sub(sched.block_sum.unwrap_or(0)),
+        ),
         sleep_max: PeakNs(sched.sleep_max.unwrap_or(0)),
         block_sum: MonotonicNs(sched.block_sum.unwrap_or(0)),
         block_max: PeakNs(sched.block_max.unwrap_or(0)),
@@ -3151,7 +3119,6 @@ fn capture_thread_at_with_tally(
         priority: OrdinalI32(stat.priority.unwrap_or(0)),
         rt_priority: OrdinalU32(stat.rt_priority.unwrap_or(0)),
         delayacct_blkio_ticks: ClockTicks(stat.delayacct_blkio_ticks.unwrap_or(0)),
-        nr_wakeups_passive: MonotonicCount(sched.nr_wakeups_passive.unwrap_or(0)),
         core_forceidle_sum: MonotonicNs(sched.core_forceidle_sum.unwrap_or(0)),
         fair_slice_ns: GaugeNs(sched.fair_slice_ns.unwrap_or(0)),
         // Dedup `nr_threads` to only the thread leader. Every
@@ -4311,11 +4278,9 @@ mod tests {
             "nr_wakeups_remote": 30,
             "nr_wakeups_sync": 10,
             "nr_wakeups_migrate": 5,
-            "nr_wakeups_idle": 0,
             "nr_wakeups_affine": 60,
             "nr_wakeups_affine_attempts": 100,
             "nr_migrations": 8,
-            "nr_migrations_cold": 0,
             "nr_forced_migrations": 1,
             "nr_failed_migrations_affine": 0,
             "nr_failed_migrations_running": 0,
@@ -4323,7 +4288,7 @@ mod tests {
             "wait_sum": 5000000,
             "wait_count": 15,
             "wait_max": 250000,
-            "sleep_sum": 3200000,
+            "voluntary_sleep_ns": 3200000,
             "sleep_max": 180000,
             "block_sum": 1100000,
             "block_max": 60000,
@@ -4340,7 +4305,6 @@ mod tests {
             "priority": 25,
             "rt_priority": 99,
             "delayacct_blkio_ticks": 137,
-            "nr_wakeups_passive": 0,
             "core_forceidle_sum": 0,
             "fair_slice_ns": 250000,
             "nr_threads": 4,
@@ -5955,16 +5919,20 @@ mod tests {
              /proc/<tid>/io",
         );
 
-        // sched — every wakeup field, migrations (including the
-        // five new failed/forced/cold/affine variants), the four
-        // *_sum fractional-parse fields, the five *_max
-        // fractional-parse fields, and the ext.enabled bool.
+        // sched — every wakeup field, migrations (live counters
+        // only; the dead-counter fields nr_wakeups_idle /
+        // nr_migrations_cold / nr_wakeups_passive are no longer
+        // surfaced on ThreadState — the kernel never increments
+        // them so the registry was the wrong place for them; the
+        // synthetic fixture still emits the lines to exercise the
+        // parser's silent-drop on unknown keys), the four *_sum
+        // fractional-parse fields, the five *_max fractional-parse
+        // fields, and the ext.enabled bool.
         assert_eq!(t.nr_wakeups, MonotonicCount(11));
         assert_eq!(t.nr_wakeups_local, MonotonicCount(8));
         assert_eq!(t.nr_wakeups_remote, MonotonicCount(3));
         assert_eq!(t.nr_wakeups_sync, MonotonicCount(2));
         assert_eq!(t.nr_wakeups_migrate, MonotonicCount(1));
-        assert_eq!(t.nr_wakeups_idle, MonotonicCount(4));
         assert_eq!(t.nr_wakeups_affine, MonotonicCount(12));
         assert_eq!(
             t.nr_wakeups_affine_attempts,
@@ -5973,7 +5941,6 @@ mod tests {
              (nr_wakeups_affine / nr_wakeups_affine_attempts = 12/20)",
         );
         assert_eq!(t.nr_migrations, MonotonicCount(9));
-        assert_eq!(t.nr_migrations_cold, MonotonicCount(5));
         assert_eq!(t.nr_forced_migrations, MonotonicCount(7));
         assert_eq!(t.nr_failed_migrations_affine, MonotonicCount(1));
         assert_eq!(t.nr_failed_migrations_running, MonotonicCount(2));
@@ -5994,11 +5961,18 @@ mod tests {
             PeakNs(250_500_000),
             "PN_SCHEDSTAT 250.5 reconstructs to 250_500_000 ns",
         );
+        // voluntary_sleep_ns = sum_sleep_runtime - sum_block_runtime,
+        // computed at capture: 3_200_500_000 - 1_100_750_000 =
+        // 2_099_750_000 ns. The kernel's sum_sleep_runtime
+        // double-counts block under sleep, so the normalized
+        // voluntary-only residual is what surfaces on ThreadState.
         assert_eq!(
-            t.sleep_sum,
-            MonotonicNs(3_200_500_000),
-            "PN_SCHEDSTAT 3200.50 reconstructs to 3_200_500_000 ns; \
-             sleep_sum is populated from the kernel's `sum_sleep_runtime` key",
+            t.voluntary_sleep_ns,
+            MonotonicNs(2_099_750_000),
+            "voluntary_sleep_ns = sum_sleep_runtime (3_200_500_000) \
+             minus sum_block_runtime (1_100_750_000) = \
+             2_099_750_000 ns; capture-side normalization strips \
+             the kernel's sleep/block double-count",
         );
         assert_eq!(
             t.sleep_max,
@@ -6559,7 +6533,7 @@ mod tests {
         assert_eq!(t.nr_migrations, MonotonicCount(0));
         assert_eq!(t.wait_sum, MonotonicNs(0));
         assert_eq!(t.wait_max, PeakNs(0));
-        assert_eq!(t.sleep_sum, MonotonicNs(0));
+        assert_eq!(t.voluntary_sleep_ns, MonotonicNs(0));
         assert_eq!(t.block_sum, MonotonicNs(0));
         assert_eq!(t.iowait_sum, MonotonicNs(0));
         assert_eq!(t.exec_max, PeakNs(0));
@@ -7090,14 +7064,17 @@ mod tests {
     // H4 — parse_sched every-field coverage + parse fallbacks
     // ------------------------------------------------------------
 
-    /// Populated `/proc/<tid>/sched` with every one of the 13
-    /// fields parse_sched recognises. Ordering mixed (sync before
-    /// local, migrate before idle) so the test doesn't pin a
-    /// single-pass scan order that the helper doesn't actually
-    /// promise. Integer-only PN_SCHEDSTAT values (no fractional
-    /// part) parse via the no-dot branch of `parsed_ns_from_dotted`
-    /// — interpreted as plain ns counts — so the values pass
-    /// through unchanged.
+    /// Populated `/proc/<tid>/sched` with every field
+    /// parse_sched recognises. Ordering mixed (sync before
+    /// local) so the test doesn't pin a single-pass scan order
+    /// that the helper doesn't actually promise. Integer-only
+    /// PN_SCHEDSTAT values (no fractional part) parse via the
+    /// no-dot branch of `parsed_ns_from_dotted` — interpreted
+    /// as plain ns counts — so the values pass through
+    /// unchanged. The fixture also includes the dead-counter
+    /// lines (`nr_wakeups_idle`, `nr_migrations_cold`,
+    /// `nr_wakeups_passive`); the parser silently drops them
+    /// since they were dropped from the registry.
     #[test]
     fn parse_sched_populates_all_known_fields() {
         let raw = "\
@@ -7133,11 +7110,9 @@ mod tests {
         assert_eq!(s.nr_wakeups_remote, Some(3));
         assert_eq!(s.nr_wakeups_sync, Some(2));
         assert_eq!(s.nr_wakeups_migrate, Some(1));
-        assert_eq!(s.nr_wakeups_idle, Some(4));
         assert_eq!(s.nr_wakeups_affine, Some(12));
         assert_eq!(s.nr_wakeups_affine_attempts, Some(20));
         assert_eq!(s.nr_migrations, Some(9));
-        assert_eq!(s.nr_migrations_cold, Some(5));
         assert_eq!(s.nr_forced_migrations, Some(7));
         assert_eq!(s.nr_failed_migrations_affine, Some(1));
         assert_eq!(s.nr_failed_migrations_running, Some(2));
@@ -7148,7 +7123,9 @@ mod tests {
         assert_eq!(
             s.sleep_sum,
             Some(320),
-            "sleep_sum reads the kernel's `sum_sleep_runtime` key",
+            "sleep_sum (raw kernel sum_sleep_runtime) reads through \
+             SchedFields; the capture site subtracts block_sum to \
+             produce ThreadState::voluntary_sleep_ns",
         );
         assert_eq!(s.sleep_max, Some(180));
         assert_eq!(
@@ -7473,9 +7450,9 @@ mod tests {
     /// populate — some kernels emit `nr_wakeups : N` at the top
     /// level. The parser's `rsplit('.').next()` treats a no-dot
     /// string as the whole string. Coverage spans the wakeup
-    /// family, one of the new migration counters, and one of the
-    /// new *_max ns fields, to prove the bare-key path lights up
-    /// every parser arm shape (parsed_u64 + parsed_ns_from_dotted).
+    /// family, the migrations counter, and one of the *_max ns
+    /// fields, to prove the bare-key path lights up every parser
+    /// arm shape (parsed_u64 + parsed_ns_from_dotted).
     #[test]
     fn parse_sched_bare_key_names_populate_same_fields() {
         let raw = "\
@@ -7484,8 +7461,7 @@ mod tests {
              nr_wakeups_remote                              :          3\n\
              nr_wakeups_sync                                :          2\n\
              nr_wakeups_migrate                             :          1\n\
-             nr_wakeups_idle                                :          4\n\
-             nr_migrations_cold                             :         42\n\
+             nr_migrations                                  :         42\n\
              wait_max                                       :     999.5\n";
         let s = parse_sched(raw, &mut None);
         assert_eq!(s.nr_wakeups, Some(11));
@@ -7493,11 +7469,10 @@ mod tests {
         assert_eq!(s.nr_wakeups_remote, Some(3));
         assert_eq!(s.nr_wakeups_sync, Some(2));
         assert_eq!(s.nr_wakeups_migrate, Some(1));
-        assert_eq!(s.nr_wakeups_idle, Some(4));
         assert_eq!(
-            s.nr_migrations_cold,
+            s.nr_migrations,
             Some(42),
-            "bare-key `nr_migrations_cold` must populate via \
+            "bare-key `nr_migrations` must populate via \
              rsplit('.').next() returning the whole no-dot string",
         );
         assert_eq!(

@@ -209,8 +209,8 @@ pub enum AggRule {
     SumCount(fn(&ThreadState) -> crate::metric_types::MonotonicCount),
     /// Sum across the group of a [`MonotonicNs`] field. Used for
     /// cumulative-time counters in nanoseconds (`run_time_ns`,
-    /// `wait_time_ns`, `wait_sum`, `sleep_sum`, `block_sum`,
-    /// `iowait_sum`, `core_forceidle_sum`).
+    /// `wait_time_ns`, `wait_sum`, `voluntary_sleep_ns`,
+    /// `block_sum`, `iowait_sum`, `core_forceidle_sum`).
     ///
     /// [`MonotonicNs`]: crate::metric_types::MonotonicNs
     SumNs(fn(&ThreadState) -> crate::metric_types::MonotonicNs),
@@ -371,13 +371,17 @@ pub enum AggRule {
 }
 
 /// One metric exposed by the comparison pipeline.
+///
+/// The auto-scale ladder for the rendered cell is derived from
+/// [`AggRule::ladder`] at render time — there is no separate
+/// `unit` tag on the metric def. A registry entry that pairs an
+/// AggRule variant with a category-mismatched ladder fails at
+/// compile time (the ladder mapping is a closed match on the
+/// variant, not a free-form string).
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct HostStateMetricDef {
     pub name: &'static str,
-    /// Display unit appended to the numeric value in output
-    /// cells. Empty string means "unitless count".
-    pub unit: &'static str,
     pub rule: AggRule,
     /// Scheduler-class scope for the metric. `None` means
     /// class-agnostic — every task class accumulates the value
@@ -400,8 +404,8 @@ pub struct HostStateMetricDef {
     ///   (kernel/sched/stats.c:21), called from fair.c, rt.c,
     ///   deadline.c but NOT ext.c — i.e. CFS/RT/DL accumulate,
     ///   sched_ext bypasses. Examples: `wait_sum`, `wait_count`,
-    ///   `wait_max`, `sleep_sum`, `sleep_max`, `block_sum`,
-    ///   `block_max`, `iowait_sum`, `iowait_count`.
+    ///   `wait_max`, `voluntary_sleep_ns`, `sleep_max`,
+    ///   `block_sum`, `block_max`, `iowait_sum`, `iowait_count`.
     pub sched_class: Option<&'static str>,
     /// Kernel CONFIG options that gate the metric. `&[]` means
     /// no gating (always populated when the source path runs).
@@ -440,8 +444,16 @@ pub struct HostStateMetricDef {
     /// but never incremented anywhere in the kernel tree —
     /// always reads zero. Operators reading the rendered table
     /// see the `[dead]` flag and stop chasing the always-zero
-    /// cell. Examples: `nr_wakeups_idle`, `nr_wakeups_passive`,
-    /// `nr_migrations_cold`.
+    /// cell. The registry is currently empty of `is_dead: true`
+    /// entries: the previously-registered dead counters
+    /// (`nr_wakeups_idle`, `nr_wakeups_passive`,
+    /// `nr_migrations_cold`) were dropped from `ThreadState`
+    /// and the registry; the kernel still emits the lines so
+    /// the parser silently ignores them. The flag remains as
+    /// infrastructure: a future kernel that resurrects a dead
+    /// counter (or exposes a new always-zero one) registers
+    /// with `is_dead: true` and the `[dead]` rendering path
+    /// fires.
     pub is_dead: bool,
     /// One-line operator-facing description of what this metric
     /// counts. Surfaced by the `host-state metric-list`
@@ -476,7 +488,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // identity / structural (non-numeric aggregation)
     HostStateMetricDef {
         name: "policy",
-        unit: "",
         rule: AggRule::Mode(|t| t.policy.clone()),
         sched_class: None,
         config_gates: &[],
@@ -485,7 +496,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "nice",
-        unit: "",
         rule: AggRule::RangeI32(|t| t.nice),
         sched_class: None,
         config_gates: &[],
@@ -500,7 +510,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // doc on [`ThreadState::priority`].
     HostStateMetricDef {
         name: "priority",
-        unit: "",
         rule: AggRule::RangeI32(|t| t.priority),
         sched_class: None,
         config_gates: &[],
@@ -514,7 +523,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `priority`.
     HostStateMetricDef {
         name: "rt_priority",
-        unit: "",
         rule: AggRule::RangeU32(|t| t.rt_priority),
         sched_class: None,
         config_gates: &[],
@@ -523,7 +531,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "cpu_affinity",
-        unit: "",
         rule: AggRule::Affinity(|t| t.cpu_affinity.clone()),
         sched_class: None,
         config_gates: &[],
@@ -532,7 +539,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "processor",
-        unit: "",
         rule: AggRule::RangeI32(|t| t.processor),
         sched_class: None,
         config_gates: &[],
@@ -541,7 +547,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "state",
-        unit: "",
         rule: AggRule::ModeChar(|t| t.state),
         sched_class: None,
         config_gates: &[],
@@ -554,7 +559,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `false` uniformly across every thread.
     HostStateMetricDef {
         name: "ext_enabled",
-        unit: "",
         rule: AggRule::ModeBool(|t| t.ext_enabled),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_CLASS_EXT"],
@@ -574,7 +578,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `ext_enabled` (per-thread snapshots, not deltas).
     HostStateMetricDef {
         name: "nr_threads",
-        unit: "",
         rule: AggRule::MaxGaugeCount(|t| t.nr_threads),
         sched_class: None,
         config_gates: &[],
@@ -587,7 +590,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `proc_pid_schedstat` (fs/proc/base.c:511-523).
     HostStateMetricDef {
         name: "run_time_ns",
-        unit: "ns",
         rule: AggRule::SumNs(|t| t.run_time_ns),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_INFO"],
@@ -599,7 +601,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `proc_pid_schedstat` (fs/proc/base.c:511-523).
     HostStateMetricDef {
         name: "wait_time_ns",
-        unit: "ns",
         rule: AggRule::SumNs(|t| t.wait_time_ns),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_INFO"],
@@ -610,7 +611,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // same gate as `wait_time_ns`.
     HostStateMetricDef {
         name: "timeslices",
-        unit: "",
         rule: AggRule::SumCount(|t| t.timeslices),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_INFO"],
@@ -619,7 +619,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "voluntary_csw",
-        unit: "",
         rule: AggRule::SumCount(|t| t.voluntary_csw),
         sched_class: None,
         config_gates: &[],
@@ -628,7 +627,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "nonvoluntary_csw",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nonvoluntary_csw),
         sched_class: None,
         config_gates: &[],
@@ -643,7 +641,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // per `kernel/sched/stats.h:75-82`.
     HostStateMetricDef {
         name: "nr_wakeups",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_wakeups),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -652,7 +649,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "nr_wakeups_local",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_wakeups_local),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -661,7 +657,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "nr_wakeups_remote",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_wakeups_remote),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -670,7 +665,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "nr_wakeups_sync",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_wakeups_sync),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -679,41 +673,11 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "nr_wakeups_migrate",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_wakeups_migrate),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Wakeups where the task migrated to a different CPU than its prior one (WF_MIGRATED); distinct from nr_wakeups_remote (waker CPU != target CPU).",
-    },
-    // `nr_wakeups_idle` is exposed by `kernel/sched/debug.c:1315`
-    // (`P_SCHEDSTAT(nr_wakeups_idle)`) but is NEVER incremented
-    // anywhere in the kernel tree — see the kernel-field-
-    // semantics audit. Marked `is_dead` so operators don't waste
-    // time interpreting the always-zero cell.
-    HostStateMetricDef {
-        name: "nr_wakeups_idle",
-        unit: "",
-        rule: AggRule::SumCount(|t| t.nr_wakeups_idle),
-        sched_class: None,
-        config_gates: &["CONFIG_SCHEDSTATS"],
-        is_dead: true,
-        description: "Wakeups attributed to the idle path; never incremented in mainline.",
-    },
-    // Wakeups via the passive fast-path. Mainline kernel never
-    // increments — captured for forward compatibility per the
-    // existing `nr_wakeups_idle` (directly above) and
-    // `nr_migrations_cold` dead-counter precedent. Sum across a
-    // group surfaces any future reactivation; today every cell
-    // renders 0.
-    HostStateMetricDef {
-        name: "nr_wakeups_passive",
-        unit: "",
-        rule: AggRule::SumCount(|t| t.nr_wakeups_passive),
-        sched_class: None,
-        config_gates: &["CONFIG_SCHEDSTATS"],
-        is_dead: true,
-        description: "Wakeups via the passive fast-path; never incremented in mainline.",
     },
     // `nr_wakeups_affine`, `_attempts` are CFS-only —
     // `kernel/sched/fair.c::wake_affine` calls
@@ -724,7 +688,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // never accumulates them.
     HostStateMetricDef {
         name: "nr_wakeups_affine",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_wakeups_affine),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -733,7 +696,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "nr_wakeups_affine_attempts",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_wakeups_affine_attempts),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -745,32 +707,17 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // schedstat macro, no class gating. Always populated.
     HostStateMetricDef {
         name: "nr_migrations",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_migrations),
         sched_class: None,
         config_gates: &[],
         is_dead: false,
         description: "Cumulative cross-CPU migrations of the task.",
     },
-    // `nr_migrations_cold` is exposed by
-    // `kernel/sched/debug.c:1302` but NEVER incremented anywhere
-    // in mainline — dead counter, always zero. Marked `is_dead`
-    // so operators don't read meaning into the zero cell.
-    HostStateMetricDef {
-        name: "nr_migrations_cold",
-        unit: "",
-        rule: AggRule::SumCount(|t| t.nr_migrations_cold),
-        sched_class: None,
-        config_gates: &["CONFIG_SCHEDSTATS"],
-        is_dead: true,
-        description: "Migrations attributed to a cold cache; never incremented in mainline.",
-    },
     // `nr_forced_migrations` is set by
     // `kernel/sched/fair.c:9775` (`schedstat_inc`) inside
     // CFS-only load-balancing.
     HostStateMetricDef {
         name: "nr_forced_migrations",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_forced_migrations),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -782,7 +729,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // (lines 9701, 9735, 9761, 9942).
     HostStateMetricDef {
         name: "nr_failed_migrations_affine",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_failed_migrations_affine),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -791,7 +737,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "nr_failed_migrations_running",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_failed_migrations_running),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -800,7 +745,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "nr_failed_migrations_hot",
-        unit: "",
         rule: AggRule::SumCount(|t| t.nr_failed_migrations_hot),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -820,7 +764,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `kernel/sched/stats.h:75-82`.
     HostStateMetricDef {
         name: "wait_sum",
-        unit: "ns",
         rule: AggRule::SumNs(|t| t.wait_sum),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -829,7 +772,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "wait_count",
-        unit: "",
         rule: AggRule::SumCount(|t| t.wait_count),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -838,15 +780,14 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "wait_max",
-        unit: "ns",
         rule: AggRule::MaxPeak(|t| t.wait_max),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
         description: "Longest single runqueue-wait interval observed, ns.",
     },
-    // `sleep_sum` / `sleep_max` / `block_sum` / `block_max` /
-    // `iowait_sum` / `iowait_count` — written by
+    // `voluntary_sleep_ns` / `sleep_max` / `block_sum` /
+    // `block_max` / `iowait_sum` / `iowait_count` — written by
     // `__update_stats_enqueue_sleeper` (kernel/sched/stats.c:48),
     // which is called from `update_stats_enqueue_sleeper_fair`
     // (kernel/sched/fair.c:1452),
@@ -858,18 +799,20 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // counters stay at zero for SCHED_EXT tasks. Tagged `non-ext`.
     // Expanded to a no-op under !CONFIG_SCHEDSTATS via the
     // schedstat macros at `kernel/sched/stats.h:75-82`.
+    // `voluntary_sleep_ns` is the capture-side normalization of
+    // the kernel's `sum_sleep_runtime` — the raw value
+    // double-counts block under sleep, so capture subtracts
+    // `sum_block_runtime` before storing.
     HostStateMetricDef {
-        name: "sleep_sum",
-        unit: "ns",
-        rule: AggRule::SumNs(|t| t.sleep_sum),
+        name: "voluntary_sleep_ns",
+        rule: AggRule::SumNs(|t| t.voluntary_sleep_ns),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
         is_dead: false,
-        description: "Time off-CPU: voluntary sleep (TASK_INTERRUPTIBLE) PLUS involuntary block (TASK_UNINTERRUPTIBLE), ns; pure voluntary sleep = sleep_sum - block_sum.",
+        description: "Pure voluntary sleep time (TASK_INTERRUPTIBLE only), ns; capture-side normalized as sum_sleep_runtime - sum_block_runtime so the kernel's sleep/block double-count is stripped before delta math.",
     },
     HostStateMetricDef {
         name: "sleep_max",
-        unit: "ns",
         rule: AggRule::MaxPeak(|t| t.sleep_max),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -881,7 +824,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // already.
     HostStateMetricDef {
         name: "block_sum",
-        unit: "ns",
         rule: AggRule::SumNs(|t| t.block_sum),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -890,7 +832,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "block_max",
-        unit: "ns",
         rule: AggRule::MaxPeak(|t| t.block_max),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -902,7 +843,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // and `iowait_sum/iowait_count` pairs).
     HostStateMetricDef {
         name: "iowait_sum",
-        unit: "ns",
         rule: AggRule::SumNs(|t| t.iowait_sum),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -911,7 +851,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "iowait_count",
-        unit: "",
         rule: AggRule::SumCount(|t| t.iowait_count),
         sched_class: Some("non-ext"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -932,7 +871,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // ticks → Kticks → Mticks ladder under auto_scale.
     HostStateMetricDef {
         name: "delayacct_blkio_ticks",
-        unit: "ticks",
         rule: AggRule::SumTicks(|t| t.delayacct_blkio_ticks),
         sched_class: None,
         config_gates: &["CONFIG_TASK_DELAY_ACCT"],
@@ -946,7 +884,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // class-agnostic at runtime, gated only by CONFIG_SCHEDSTATS.
     HostStateMetricDef {
         name: "exec_max",
-        unit: "ns",
         rule: AggRule::MaxPeak(|t| t.exec_max),
         sched_class: None,
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -959,7 +896,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // live in CFS-class entry points.
     HostStateMetricDef {
         name: "slice_max",
-        unit: "ns",
         rule: AggRule::MaxPeak(|t| t.slice_max),
         sched_class: Some("cfs-only"),
         config_gates: &["CONFIG_SCHEDSTATS"],
@@ -981,7 +917,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // moments rather than wait/sleep accumulation.
     HostStateMetricDef {
         name: "core_forceidle_sum",
-        unit: "ns",
         rule: AggRule::SumNs(|t| t.core_forceidle_sum),
         sched_class: None,
         config_gates: &["CONFIG_SCHED_CORE", "CONFIG_SCHEDSTATS"],
@@ -1002,7 +937,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // SCHED_BATCH, AND SCHED_EXT under CONFIG_SCHED_CLASS_EXT.
     HostStateMetricDef {
         name: "fair_slice_ns",
-        unit: "ns",
         rule: AggRule::MaxGaugeNs(|t| t.fair_slice_ns),
         sched_class: Some("fair-policy"),
         config_gates: &[],
@@ -1012,7 +946,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // memory
     HostStateMetricDef {
         name: "allocated_bytes",
-        unit: "B",
         rule: AggRule::SumBytes(|t| t.allocated_bytes),
         sched_class: None,
         config_gates: &[],
@@ -1021,7 +954,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "deallocated_bytes",
-        unit: "B",
         rule: AggRule::SumBytes(|t| t.deallocated_bytes),
         sched_class: None,
         config_gates: &[],
@@ -1030,7 +962,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "minflt",
-        unit: "",
         rule: AggRule::SumCount(|t| t.minflt),
         sched_class: None,
         config_gates: &[],
@@ -1039,7 +970,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "majflt",
-        unit: "",
         rule: AggRule::SumCount(|t| t.majflt),
         sched_class: None,
         config_gates: &[],
@@ -1048,7 +978,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "utime_clock_ticks",
-        unit: "ticks",
         rule: AggRule::SumTicks(|t| t.utime_clock_ticks),
         sched_class: None,
         config_gates: &[],
@@ -1057,7 +986,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "stime_clock_ticks",
-        unit: "ticks",
         rule: AggRule::SumTicks(|t| t.stime_clock_ticks),
         sched_class: None,
         config_gates: &[],
@@ -1073,7 +1001,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // `CONFIG_TASK_IO_ACCOUNTING` gate.
     HostStateMetricDef {
         name: "rchar",
-        unit: "B",
         rule: AggRule::SumBytes(|t| t.rchar),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
@@ -1082,7 +1009,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "wchar",
-        unit: "B",
         rule: AggRule::SumBytes(|t| t.wchar),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
@@ -1091,7 +1017,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "syscr",
-        unit: "",
         rule: AggRule::SumCount(|t| t.syscr),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
@@ -1100,7 +1025,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "syscw",
-        unit: "",
         rule: AggRule::SumCount(|t| t.syscw),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
@@ -1109,7 +1033,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "read_bytes",
-        unit: "B",
         rule: AggRule::SumBytes(|t| t.read_bytes),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
@@ -1118,7 +1041,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     },
     HostStateMetricDef {
         name: "write_bytes",
-        unit: "B",
         rule: AggRule::SumBytes(|t| t.write_bytes),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
@@ -1140,7 +1062,6 @@ pub static HOST_STATE_METRICS: &[HostStateMetricDef] = &[
     // doc on ThreadState::cancelled_write_bytes.
     HostStateMetricDef {
         name: "cancelled_write_bytes",
-        unit: "B",
         rule: AggRule::SumBytes(|t| t.cancelled_write_bytes),
         sched_class: None,
         config_gates: &["CONFIG_TASK_IO_ACCOUNTING"],
@@ -1198,10 +1119,12 @@ impl DerivedValue {
 #[non_exhaustive]
 pub struct DerivedMetricDef {
     pub name: &'static str,
-    /// Display unit for the cell (`""` for ratios, `"ns"` for
-    /// time, `"B"` for bytes). Routes through the same
-    /// auto-scale ladder as the main table.
-    pub unit: &'static str,
+    /// Auto-scale ladder for the cell. [`ScaleLadder::None`] for
+    /// ratio rows (renders as a bare three-decimal scalar with
+    /// no suffix), [`ScaleLadder::Ns`] / [`ScaleLadder::Bytes`] /
+    /// etc. for unit-bearing derivations. The same closed-match
+    /// dispatch [`AggRule::ladder`] feeds.
+    pub ladder: ScaleLadder,
     /// Operator-facing one-line description; surfaced by the
     /// `host-state metric-list` subcommand.
     pub description: &'static str,
@@ -1273,7 +1196,7 @@ fn ratio_of_sum_compute(
 pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     DerivedMetricDef {
         name: "affine_success_ratio",
-        unit: "",
+        ladder: ScaleLadder::None,
         description: "wake_affine() success ratio: nr_wakeups_affine / nr_wakeups_affine_attempts.",
         inputs: &["nr_wakeups_affine", "nr_wakeups_affine_attempts"],
         is_ratio: true,
@@ -1281,32 +1204,21 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     },
     DerivedMetricDef {
         name: "avg_wait_ns",
-        unit: "ns",
+        ladder: ScaleLadder::Ns,
         description: "Average runqueue-wait duration: wait_sum / wait_count.",
         inputs: &["wait_sum", "wait_count"],
         is_ratio: false,
         compute: |m| ratio_compute(m, "wait_sum", "wait_count"),
     },
-    DerivedMetricDef {
-        name: "voluntary_sleep_sum",
-        unit: "ns",
-        description: "Pure voluntary sleep time: sleep_sum - block_sum (kernel double-counts block under sleep_sum).",
-        inputs: &["sleep_sum", "block_sum"],
-        is_ratio: false,
-        compute: |m| {
-            let total_sleep = input_scalar(m, "sleep_sum")?;
-            let block = input_scalar(m, "block_sum")?;
-            // sleep_sum >= block_sum invariant from the kernel's
-            // __update_stats_enqueue_sleeper double-add. A
-            // capture-side race (different read instants for the
-            // two fields) can produce sleep < block by a few ns;
-            // clamp at zero rather than surface negative.
-            Some(DerivedValue::Scalar((total_sleep - block).max(0.0)))
-        },
-    },
+    // `voluntary_sleep_sum` derived metric was removed when
+    // `voluntary_sleep_ns` became a first-class capture field.
+    // The kernel's `sum_sleep_runtime - sum_block_runtime`
+    // computation now happens at capture time inside
+    // `capture_thread_at_with_tally` so every consumer reads the
+    // pre-normalized value without re-deriving.
     DerivedMetricDef {
         name: "cpu_efficiency",
-        unit: "",
+        ladder: ScaleLadder::None,
         description: "Fraction of total scheduler-tracked time spent on-CPU: run_time_ns / (run_time_ns + wait_time_ns).",
         inputs: &["run_time_ns", "wait_time_ns"],
         is_ratio: true,
@@ -1314,7 +1226,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     },
     DerivedMetricDef {
         name: "avg_slice_ns",
-        unit: "ns",
+        ladder: ScaleLadder::Ns,
         description: "Average on-CPU slice length: run_time_ns / timeslices.",
         inputs: &["run_time_ns", "timeslices"],
         is_ratio: false,
@@ -1322,7 +1234,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     },
     DerivedMetricDef {
         name: "involuntary_csw_ratio",
-        unit: "",
+        ladder: ScaleLadder::None,
         description: "Fraction of context switches that were preemptions: nonvoluntary_csw / (voluntary_csw + nonvoluntary_csw).",
         inputs: &["nonvoluntary_csw", "voluntary_csw"],
         is_ratio: true,
@@ -1330,7 +1242,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     },
     DerivedMetricDef {
         name: "disk_io_fraction",
-        unit: "",
+        ladder: ScaleLadder::None,
         description: "Fraction of read syscall bytes that hit storage: read_bytes / rchar. Typically <= 1.0 but can exceed when readahead pulls more block-device bytes than the syscall requested.",
         inputs: &["read_bytes", "rchar"],
         is_ratio: true,
@@ -1338,7 +1250,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     },
     DerivedMetricDef {
         name: "live_heap_estimate",
-        unit: "B",
+        ladder: ScaleLadder::Bytes,
         description: "jemalloc live-heap estimate: allocated_bytes - deallocated_bytes (signed).",
         inputs: &["allocated_bytes", "deallocated_bytes"],
         is_ratio: false,
@@ -1350,7 +1262,7 @@ pub static HOST_STATE_DERIVED_METRICS: &[DerivedMetricDef] = &[
     },
     DerivedMetricDef {
         name: "avg_iowait_ns",
-        unit: "ns",
+        ladder: ScaleLadder::Ns,
         description: "Average iowait interval: iowait_sum / iowait_count.",
         inputs: &["iowait_sum", "iowait_count"],
         is_ratio: false,
@@ -1581,7 +1493,11 @@ pub struct DiffRow {
     pub thread_count_a: usize,
     pub thread_count_b: usize,
     pub metric_name: &'static str,
-    pub metric_unit: &'static str,
+    /// Auto-scale ladder for the row's value/delta cells. Sourced
+    /// from `metric.rule.ladder()` at build time so the format
+    /// dispatch stays a closed match (no string-keyed
+    /// pass-through branch).
+    pub metric_ladder: ScaleLadder,
     pub baseline: Aggregated,
     pub candidate: Aggregated,
     /// Signed candidate − baseline for numeric-capable rules.
@@ -1843,7 +1759,10 @@ pub struct DerivedRow {
     pub thread_count_a: usize,
     pub thread_count_b: usize,
     pub metric_name: &'static str,
-    pub metric_unit: &'static str,
+    /// Auto-scale ladder for the row's value/delta cells. Mirrors
+    /// [`DiffRow::metric_ladder`]; sourced from
+    /// [`DerivedMetricDef::ladder`] at build time.
+    pub metric_ladder: ScaleLadder,
     /// True when the derivation produces a ratio. Renderer
     /// suppresses the `%` column for ratio rows.
     pub is_ratio: bool,
@@ -1919,7 +1838,7 @@ fn build_derived_row(
         thread_count_a: n_a,
         thread_count_b: n_b,
         metric_name: def.name,
-        metric_unit: def.unit,
+        metric_ladder: def.ladder,
         is_ratio: def.is_ratio,
         baseline,
         candidate,
@@ -2209,7 +2128,7 @@ fn build_row(
         thread_count_a: n_a,
         thread_count_b: n_b,
         metric_name: metric.name,
-        metric_unit: metric.unit,
+        metric_ladder: metric.rule.ladder(),
         baseline: a,
         candidate: b,
         delta,
@@ -2717,8 +2636,47 @@ pub fn build_groups(
 /// [`Maxable`]: crate::metric_types::Maxable
 /// [`Rangeable`]: crate::metric_types::Rangeable
 /// [`Modeable`]: crate::metric_types::Modeable
+///
+/// Mode-arm dispatch helper used by `aggregate`. Routes a typed
+/// iterator of [`crate::metric_types::CategoricalString`] through
+/// `mode_across`, then projects the result onto
+/// [`Aggregated::Mode`] with the supplied `total` (the number of
+/// threads in the bucket). Empty buckets surface as
+/// `Aggregated::Mode { value: "", count: 0, total }` matching the
+/// historical empty-bucket contract — downstream delta math sees
+/// a well-defined value at the join boundary regardless of which
+/// side carried zero threads. Lifts the otherwise-identical
+/// match arms for [`AggRule::Mode`], [`AggRule::ModeChar`], and
+/// [`AggRule::ModeBool`] into one site so a future refactor that
+/// changes the empty-bucket contract or the `mode_across` return
+/// shape only edits one place.
+fn mode_aggregate(
+    total: usize,
+    items: impl IntoIterator<Item = crate::metric_types::CategoricalString>,
+) -> Aggregated {
+    use crate::metric_types::{CategoricalString, Modeable};
+    match CategoricalString::mode_across(items) {
+        Some((value, count, _total)) => Aggregated::Mode {
+            value: value.0,
+            count,
+            total,
+        },
+        None => Aggregated::Mode {
+            value: String::new(),
+            count: 0,
+            total,
+        },
+    }
+}
+
 pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
-    use crate::metric_types::{CategoricalString, Maxable, Modeable, Rangeable, Summable};
+    // `Modeable` is imported in `mode_aggregate`; the Mode arms
+    // route through that helper so the trait doesn't need to be
+    // in scope here. `CategoricalString` is still needed because
+    // the ModeChar / ModeBool arms construct one for the
+    // coercion path before passing the iterator to
+    // `mode_aggregate`.
+    use crate::metric_types::{CategoricalString, Maxable, Rangeable, Summable};
     match rule {
         AggRule::SumCount(f) => {
             let s = crate::metric_types::MonotonicCount::sum_across(threads.iter().map(|t| f(t)));
@@ -2788,58 +2746,20 @@ pub fn aggregate(rule: AggRule, threads: &[&ThreadState]) -> Aggregated {
                 None => Aggregated::OrdinalRange { min: 0, max: 0 },
             }
         }
-        AggRule::Mode(f) => {
-            let total = threads.len();
-            match CategoricalString::mode_across(threads.iter().map(|t| f(t))) {
-                Some((value, count, _total)) => Aggregated::Mode {
-                    value: value.0,
-                    count,
-                    total,
-                },
-                None => Aggregated::Mode {
-                    value: String::new(),
-                    count: 0,
-                    total,
-                },
-            }
-        }
-        AggRule::ModeChar(f) => {
+        AggRule::Mode(f) => mode_aggregate(threads.len(), threads.iter().map(|t| f(t))),
+        AggRule::ModeChar(f) => mode_aggregate(
+            threads.len(),
             // `char` is not Modeable directly; coerce to the
             // CategoricalString reduction so the lex-tiebreak
             // contract is identical to other Mode variants.
-            let total = threads.len();
-            let strs = threads.iter().map(|t| CategoricalString(f(t).to_string()));
-            match CategoricalString::mode_across(strs) {
-                Some((value, count, _total)) => Aggregated::Mode {
-                    value: value.0,
-                    count,
-                    total,
-                },
-                None => Aggregated::Mode {
-                    value: String::new(),
-                    count: 0,
-                    total,
-                },
-            }
-        }
-        AggRule::ModeBool(f) => {
+            threads.iter().map(|t| CategoricalString(f(t).to_string())),
+        ),
+        AggRule::ModeBool(f) => mode_aggregate(
+            threads.len(),
             // Same coercion path as `ModeChar`. `to_string()`
             // produces `"true"`/`"false"` per `bool::Display`.
-            let total = threads.len();
-            let strs = threads.iter().map(|t| CategoricalString(f(t).to_string()));
-            match CategoricalString::mode_across(strs) {
-                Some((value, count, _total)) => Aggregated::Mode {
-                    value: value.0,
-                    count,
-                    total,
-                },
-                None => Aggregated::Mode {
-                    value: String::new(),
-                    count: 0,
-                    total,
-                },
-            }
-        }
+            threads.iter().map(|t| CategoricalString(f(t).to_string())),
+        ),
         AggRule::Affinity(f) => {
             let mut seen: Vec<Vec<u32>> = Vec::new();
             let mut min_cpus = usize::MAX;
@@ -3381,40 +3301,137 @@ fn format_cpu_range(cpus: &[u32]) -> String {
     out
 }
 
+/// Closed enumeration of auto-scale ladders driven by phase 4
+/// format dispatch.
+///
+/// Picks the unit family up the type system rather than a free-form
+/// `&'static str` tag. Each [`AggRule`] variant maps to exactly one
+/// ladder via [`AggRule::ladder`]; each [`DerivedMetricDef`] entry
+/// carries a ladder via [`DerivedMetricDef::ladder`]; the cgroup-
+/// level render path passes a ladder directly. A registry typo or
+/// drift between accessor newtype and ladder choice fails to compile
+/// at the registry edit site rather than silently routing through
+/// an "unknown unit" pass-through arm at render time.
+///
+/// The six ladder variants and their step-up rules:
+/// - [`Ns`](Self::Ns): ns → µs (×1e3) → ms (×1e6) → s (×1e9).
+///   Decimal prefixes — SI time, not binary. Used for
+///   [`AggRule::SumNs`] (cumulative ns counters),
+///   [`AggRule::MaxPeak`] (lifetime ns high-water marks),
+///   [`AggRule::MaxGaugeNs`] (instantaneous ns gauges), and
+///   the `"ns"` derived-metric ladder.
+/// - [`Us`](Self::Us): µs → ms (×1e3) → s (×1e6). Decimal SI
+///   prefixes. The cgroup `cpu_usage_usec` and `throttled_usec`
+///   fields are reported by the kernel in microseconds; this
+///   ladder scales them up the same way the `Ns` ladder scales
+///   nanoseconds.
+/// - [`Bytes`](Self::Bytes): B → KiB → MiB → GiB → TiB. IEC binary
+///   prefixes (×1024) for byte counts. Used for
+///   [`AggRule::SumBytes`] and any byte-typed derived metric.
+/// - [`Ticks`](Self::Ticks): ticks → Kticks (×1e3) → Mticks (×1e6).
+///   Decimal prefixes for clock-tick counts
+///   (`utime_clock_ticks`, `stime_clock_ticks`,
+///   `delayacct_blkio_ticks`); the unit itself is opaque (the
+///   kernel's `USER_HZ` rate is host-dependent), so an SI prefix
+///   is the most we can promise.
+/// - [`Unitless`](Self::Unitless): "" → K → M → G. Decimal
+///   prefixes for non-dimensional counters (wakeups, migrations,
+///   csw, syscall counts). Used for [`AggRule::SumCount`] and
+///   [`AggRule::MaxGaugeCount`].
+/// - [`None`](Self::None): no ladder — values render as the bare
+///   integer with no unit suffix and no scaling. Used for
+///   [`AggRule::Mode`] / [`AggRule::ModeChar`] /
+///   [`AggRule::ModeBool`] (categorical strings),
+///   [`AggRule::RangeI32`] / [`AggRule::RangeU32`] (bounded
+///   ordinals), and [`AggRule::Affinity`] (cpuset summaries) —
+///   the [`Aggregated`] [`fmt::Display`] impl handles render for
+///   these directly.
+///
+/// The threshold for stepping up is `|value| >= next_scale`.
+/// Sign is preserved through scaling (negative deltas pass
+/// through). Zero stays at base unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScaleLadder {
+    Ns,
+    Us,
+    Bytes,
+    Ticks,
+    Unitless,
+    None,
+}
+
+impl ScaleLadder {
+    /// Base unit string for this ladder — what [`auto_scale`]
+    /// returns for a value at the bottom of the ladder. Used by
+    /// the format helpers to detect whether a value stepped up
+    /// (`auto_scale(v).1 != ladder.base_unit()` ⇒ stepped up,
+    /// render with the scaled unit; equal ⇒ no step-up, render
+    /// the bare integer with the base unit suffix).
+    pub fn base_unit(&self) -> &'static str {
+        match self {
+            ScaleLadder::Ns => "ns",
+            ScaleLadder::Us => "µs",
+            ScaleLadder::Bytes => "B",
+            ScaleLadder::Ticks => "ticks",
+            ScaleLadder::Unitless | ScaleLadder::None => "",
+        }
+    }
+}
+
+impl AggRule {
+    /// The auto-scale ladder for this rule's value cell.
+    ///
+    /// Closed match — adding a new [`AggRule`] variant requires
+    /// adding the ladder mapping here, which is the type-system
+    /// enforcement phase 4 introduces. The mapping is one-to-one
+    /// with the typed accessor newtype: [`AggRule::SumNs`] →
+    /// [`ScaleLadder::Ns`], [`AggRule::SumBytes`] →
+    /// [`ScaleLadder::Bytes`], etc.
+    pub fn ladder(&self) -> ScaleLadder {
+        match self {
+            // Cumulative counters — Sum reductions, ladder
+            // determined by the unit family of the typed
+            // accessor. SumCount and MaxGaugeCount both produce a
+            // unitless count; SumNs / MaxPeak / MaxGaugeNs all
+            // produce a ns value; SumTicks produces ticks;
+            // SumBytes produces bytes.
+            AggRule::SumCount(_) => ScaleLadder::Unitless,
+            AggRule::SumNs(_) => ScaleLadder::Ns,
+            AggRule::SumTicks(_) => ScaleLadder::Ticks,
+            AggRule::SumBytes(_) => ScaleLadder::Bytes,
+            AggRule::MaxPeak(_) => ScaleLadder::Ns,
+            AggRule::MaxGaugeNs(_) => ScaleLadder::Ns,
+            AggRule::MaxGaugeCount(_) => ScaleLadder::Unitless,
+            // Range / Mode / Affinity carry no ladder — the
+            // Aggregated Display impl handles render directly.
+            AggRule::RangeI32(_)
+            | AggRule::RangeU32(_)
+            | AggRule::Mode(_)
+            | AggRule::ModeChar(_)
+            | AggRule::ModeBool(_)
+            | AggRule::Affinity(_) => ScaleLadder::None,
+        }
+    }
+}
+
 /// Auto-scale a numeric value to a more readable magnitude based
-/// on its unit family. Returns the scaled value paired with the
-/// scaled unit string.
-///
-/// The five supported unit families are:
-/// - `"ns"`: ladder ns → µs (×1e3) → ms (×1e6) → s (×1e9). Decimal
-///   prefixes — IEEE/SI time units, not binary.
-/// - `"µs"`: ladder µs → ms (×1e3) → s (×1e6). Decimal SI prefixes.
-///   The cgroup `cpu_usage_usec` and `throttled_usec` fields are
-///   reported by the kernel in microseconds; this family scales
-///   them up the same way the `"ns"` family scales nanoseconds.
-/// - `"B"`: ladder B → KiB → MiB → GiB. IEC binary prefixes
-///   (×1024) for byte counts.
-/// - `"ticks"`: ladder ticks → Kticks (×1e3) → Mticks (×1e6).
-///   Decimal prefixes for clock-tick counts (`utime_clock_ticks`,
-///   `stime_clock_ticks`); the unit itself is opaque (the kernel's
-///   `USER_HZ` rate is host-dependent), so an SI prefix is the
-///   most we can promise.
-/// - `""` (empty unit, large unitless counts): ladder "" → K → M
-///   → G. Decimal prefixes for non-dimensional counters
-///   (wakeups, migrations, etc.).
-///
-/// The threshold for stepping up is `|value| >= next_scale`. Sign
-/// is preserved through scaling (negative deltas pass through).
-/// Zero stays at base unit. Unknown units are passed through
-/// unchanged so the caller's `&'static str` lifetime works
-/// without allocation.
+/// on its [`ScaleLadder`]. Returns the scaled value paired with
+/// the scaled unit string.
 ///
 /// This is render-only; the underlying numeric values used for
 /// sort order and delta math are untouched.
-fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
+///
+/// Phase 4: dispatches on a closed [`ScaleLadder`] enum rather
+/// than a free-form unit string. The mapping from
+/// [`AggRule`] / [`DerivedMetricDef`] / cgroup-render call site
+/// to [`ScaleLadder`] lives at the type level — see
+/// [`AggRule::ladder`] and [`DerivedMetricDef::ladder`] — so a
+/// registry typo can no longer fall through an `other =>
+/// pass-through` arm and silently render the unscaled value.
+fn auto_scale(value: f64, ladder: ScaleLadder) -> (f64, &'static str) {
     let abs = value.abs();
-    match unit {
-        "ns" => {
+    match ladder {
+        ScaleLadder::Ns => {
             if abs >= 1e9 {
                 (value / 1e9, "s")
             } else if abs >= 1e6 {
@@ -3425,7 +3442,7 @@ fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
                 (value, "ns")
             }
         }
-        "µs" => {
+        ScaleLadder::Us => {
             if abs >= 1e6 {
                 (value / 1e6, "s")
             } else if abs >= 1e3 {
@@ -3434,11 +3451,14 @@ fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
                 (value, "µs")
             }
         }
-        "B" => {
+        ScaleLadder::Bytes => {
             const KIB: f64 = 1024.0;
-            const MIB: f64 = 1024.0 * 1024.0;
-            const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-            if abs >= GIB {
+            const MIB: f64 = 1024.0 * KIB;
+            const GIB: f64 = 1024.0 * MIB;
+            const TIB: f64 = 1024.0 * GIB;
+            if abs >= TIB {
+                (value / TIB, "TiB")
+            } else if abs >= GIB {
                 (value / GIB, "GiB")
             } else if abs >= MIB {
                 (value / MIB, "MiB")
@@ -3448,7 +3468,7 @@ fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
                 (value, "B")
             }
         }
-        "ticks" => {
+        ScaleLadder::Ticks => {
             if abs >= 1e6 {
                 (value / 1e6, "Mticks")
             } else if abs >= 1e3 {
@@ -3457,7 +3477,7 @@ fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
                 (value, "ticks")
             }
         }
-        "" => {
+        ScaleLadder::Unitless => {
             if abs >= 1e9 {
                 (value / 1e9, "G")
             } else if abs >= 1e6 {
@@ -3468,9 +3488,7 @@ fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
                 (value, "")
             }
         }
-        // Unknown unit family — pass through so the caller's
-        // `&'static str` lifetime is preserved.
-        other => (value, other),
+        ScaleLadder::None => (value, ""),
     }
 }
 
@@ -3478,54 +3496,53 @@ fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
 /// Numeric aggregates ([`Aggregated::Sum`] / [`Aggregated::Max`])
 /// run through [`auto_scale`] so large values render in a
 /// readable magnitude (`1.235ms` instead of `1234567ns`). When
-/// the scaled unit equals the input unit (no step-up was
+/// the scaled unit equals the ladder's base unit (no step-up was
 /// triggered), the original integer value is rendered verbatim
 /// — this avoids polluting small numbers with a `.000` suffix.
 /// Non-numeric aggregates (`OrdinalRange`, `Mode`, `Affinity`)
 /// fall through to the [`Aggregated`] [`fmt::Display`] impl
-/// unchanged because no scaling applies.
-pub fn format_value_cell(agg: &Aggregated, unit: &'static str) -> String {
+/// unchanged because no scaling applies; the ladder is
+/// [`ScaleLadder::None`] for these and the suffix is empty.
+pub fn format_value_cell(agg: &Aggregated, ladder: ScaleLadder) -> String {
     match agg {
-        Aggregated::Sum(v) => format_scaled_u64(*v, unit),
-        Aggregated::Max(v) => format_scaled_u64(*v, unit),
-        _ => format!("{agg}{unit}"),
+        Aggregated::Sum(v) => format_scaled_u64(*v, ladder),
+        Aggregated::Max(v) => format_scaled_u64(*v, ladder),
+        _ => format!("{agg}{}", ladder.base_unit()),
     }
 }
 
-/// Auto-scale a `u64` value at the given unit and render it as a
-/// cell. Helper for [`format_value_cell`] — the Sum and Max arms
-/// share this exact logic. Also used by the `host-state show`
-/// renderer for the cgroup-stats secondary table, where each
-/// scalar stands alone (no baseline/candidate pair to fold into
-/// a delta cell).
-///
-/// See [`cgroup_cell`] for the supported unit families and ladders.
-pub fn format_scaled_u64(v: u64, unit: &'static str) -> String {
-    let (scaled, scaled_unit) = auto_scale(v as f64, unit);
-    if scaled_unit == unit {
+/// Auto-scale a `u64` value at the given ladder and render it as
+/// a cell. Helper for [`format_value_cell`] — the Sum and Max
+/// arms share this exact logic. Also used by the `host-state
+/// show` renderer for the cgroup-stats secondary table, where
+/// each scalar stands alone (no baseline/candidate pair to fold
+/// into a delta cell).
+pub fn format_scaled_u64(v: u64, ladder: ScaleLadder) -> String {
+    let (scaled, scaled_unit) = auto_scale(v as f64, ladder);
+    if scaled_unit == ladder.base_unit() {
         // No step-up — render the original integer to preserve
         // exact precision (auto_scale's f64 round-trip is
         // identity below the threshold, but the integer form is
         // shorter and avoids the `.000` suffix).
-        format!("{v}{unit}")
+        format!("{v}{}", ladder.base_unit())
     } else {
         format!("{scaled:.3}{scaled_unit}")
     }
 }
 
 /// Format a derived-metric value cell for the `## Derived metrics`
-/// table. Ratio rows (`is_ratio: true`, unit `""`) render with
-/// three decimals (`0.873`); ns / B / ticks units route through
-/// the same auto-scale ladder as the main table. Negative values
-/// (e.g. a negative `live_heap_estimate`) carry their explicit
-/// minus sign through the format.
-pub fn format_derived_value_cell(v: DerivedValue, unit: &'static str, is_ratio: bool) -> String {
+/// table. Ratio rows (`is_ratio: true`, [`ScaleLadder::None`])
+/// render with three decimals (`0.873`); ns / B / ticks ladders
+/// route through the same auto-scale ladder as the main table.
+/// Negative values (e.g. a negative `live_heap_estimate`) carry
+/// their explicit minus sign through the format.
+pub fn format_derived_value_cell(v: DerivedValue, ladder: ScaleLadder, is_ratio: bool) -> String {
     let value = v.as_f64();
     if is_ratio {
         return format!("{value:.3}");
     }
-    let (scaled, scaled_unit) = auto_scale(value, unit);
-    if scaled_unit == unit {
+    let (scaled, scaled_unit) = auto_scale(value, ladder);
+    if scaled_unit == ladder.base_unit() {
         // No ladder step-up — render two decimals to preserve
         // the fractional precision derived averages carry (e.g.
         // wait_sum=1234 ns / wait_count=10 = 123.40 ns). The
@@ -3533,7 +3550,7 @@ pub fn format_derived_value_cell(v: DerivedValue, unit: &'static str, is_ratio: 
         // strips fractions because its inputs ARE integers; the
         // derived path's inputs are `f64` divisions, so two
         // decimals keep the signal intact.
-        format!("{value:.2}{unit}")
+        format!("{value:.2}{}", ladder.base_unit())
     } else {
         format!("{scaled:.3}{scaled_unit}")
     }
@@ -3543,15 +3560,15 @@ pub fn format_derived_value_cell(v: DerivedValue, unit: &'static str, is_ratio: 
 /// [`format_derived_value_cell`] but always carries an explicit
 /// `+`/`-` sign so the operator can read directionality at a
 /// glance. Ratios render with three decimals (`+0.100` is +10pp);
-/// other units route through `auto_scale` and pick up the
+/// other ladders route through `auto_scale` and pick up the
 /// scaled unit suffix.
-pub fn format_derived_delta_cell(d: f64, unit: &'static str, is_ratio: bool) -> String {
+pub fn format_derived_delta_cell(d: f64, ladder: ScaleLadder, is_ratio: bool) -> String {
     if is_ratio {
         return format!("{d:+.3}");
     }
-    let (scaled, scaled_unit) = auto_scale(d, unit);
-    if scaled_unit == unit {
-        format!("{d:+.2}{unit}")
+    let (scaled, scaled_unit) = auto_scale(d, ladder);
+    if scaled_unit == ladder.base_unit() {
+        format!("{d:+.2}{}", ladder.base_unit())
     } else {
         format!("{scaled:+.3}{scaled_unit}")
     }
@@ -3563,9 +3580,9 @@ pub fn format_derived_delta_cell(d: f64, unit: &'static str, is_ratio: bool) -> 
 /// `memory.low`, `memory.min`, `pids.max`, `cpu.max` quota.
 /// Mirrors the kernel's own display: `cat memory.max` prints
 /// `max` when no cap is set, a u64 byte count otherwise.
-pub fn format_optional_limit(v: Option<u64>, unit: &'static str) -> String {
+pub fn format_optional_limit(v: Option<u64>, ladder: ScaleLadder) -> String {
     match v {
-        Some(n) => format_scaled_u64(n, unit),
+        Some(n) => format_scaled_u64(n, ladder),
         None => "max".to_string(),
     }
 }
@@ -3582,10 +3599,10 @@ pub fn format_optional_limit(v: Option<u64>, unit: &'static str) -> String {
 /// kernel's space to a slash.
 pub fn format_cpu_max(quota: Option<u64>, period_us: u64) -> String {
     let q = match quota {
-        Some(q) => format_scaled_u64(q, "µs"),
+        Some(q) => format_scaled_u64(q, ScaleLadder::Us),
         None => "max".to_string(),
     };
-    let p = format_scaled_u64(period_us, "µs");
+    let p = format_scaled_u64(period_us, ScaleLadder::Us);
     format!("{q}/{p}")
 }
 
@@ -3597,10 +3614,10 @@ pub fn format_cpu_max(quota: Option<u64>, period_us: u64) -> String {
 pub fn cgroup_optional_limit_cell(
     baseline: Option<u64>,
     candidate: Option<u64>,
-    unit: &'static str,
+    ladder: ScaleLadder,
 ) -> String {
-    let bl = format_optional_limit(baseline, unit);
-    let cd = format_optional_limit(candidate, unit);
+    let bl = format_optional_limit(baseline, ladder);
+    let cd = format_optional_limit(candidate, ladder);
     if baseline == candidate {
         // No diff — render once. Avoids the `max → max` redundancy
         // and keeps the limits column scannable when nothing
@@ -3634,14 +3651,15 @@ pub fn cgroup_limits_cell(
 /// Format a per-row delta cell for [`write_diff`]. Routes the
 /// signed numeric delta through [`auto_scale`] so a large delta
 /// renders in a readable magnitude with the matching prefix
-/// applied to the unit. Sign is preserved (rendered with `+` or
-/// `-`). When no step-up was triggered AND the delta is integer-
-/// valued, the cell renders as the bare signed integer to match
-/// [`format_value_cell`]'s short-circuit (so `+5ns` instead of
-/// `+5.000ns`); otherwise the scaled f64 renders with 3 decimals.
-fn format_delta_cell(delta: f64, unit: &'static str) -> String {
-    let (scaled, scaled_unit) = auto_scale(delta, unit);
-    if scaled_unit == unit && delta.fract() == 0.0 {
+/// applied to the ladder's base unit. Sign is preserved (rendered
+/// with `+` or `-`). When no step-up was triggered AND the delta
+/// is integer-valued, the cell renders as the bare signed integer
+/// to match [`format_value_cell`]'s short-circuit (so `+5ns`
+/// instead of `+5.000ns`); otherwise the scaled f64 renders with
+/// 3 decimals.
+fn format_delta_cell(delta: f64, ladder: ScaleLadder) -> String {
+    let (scaled, scaled_unit) = auto_scale(delta, ladder);
+    if scaled_unit == ladder.base_unit() && delta.fract() == 0.0 {
         format!("{:+}{scaled_unit}", delta as i64)
     } else {
         format!("{scaled:+.3}{scaled_unit}")
@@ -4195,12 +4213,12 @@ fn format_arrow_cell(
     baseline: &Aggregated,
     candidate: &Aggregated,
     delta: Option<f64>,
-    unit: &'static str,
+    ladder: ScaleLadder,
 ) -> String {
-    let baseline_cell = format_value_cell(baseline, unit);
-    let candidate_cell = format_value_cell(candidate, unit);
+    let baseline_cell = format_value_cell(baseline, ladder);
+    let candidate_cell = format_value_cell(candidate, ladder);
     let delta_clause = match delta {
-        Some(d) => format_delta_cell(d, unit),
+        Some(d) => format_delta_cell(d, ladder),
         None => match (baseline, candidate) {
             (Aggregated::Mode { value: a, .. }, Aggregated::Mode { value: b, .. }) => {
                 if a == b {
@@ -4222,15 +4240,15 @@ fn format_arrow_cell(
 /// auto-scale ladders.
 fn format_arrow_cell_derived(row: &DerivedRow) -> String {
     let baseline_cell = match row.baseline {
-        Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+        Some(v) => format_derived_value_cell(v, row.metric_ladder, row.is_ratio),
         None => "-".to_string(),
     };
     let candidate_cell = match row.candidate {
-        Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+        Some(v) => format_derived_value_cell(v, row.metric_ladder, row.is_ratio),
         None => "-".to_string(),
     };
     let delta_clause = match row.delta {
-        Some(d) => format_derived_delta_cell(d, row.metric_unit, row.is_ratio),
+        Some(d) => format_derived_delta_cell(d, row.metric_ladder, row.is_ratio),
         None => "-".to_string(),
     };
     format!("{baseline_cell} \u{2192} {candidate_cell} ({delta_clause})")
@@ -4263,10 +4281,10 @@ fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
             Column::Group => row.display_key.clone(),
             Column::Threads => render_threads_cell(row.thread_count_a, row.thread_count_b),
             Column::Metric => metric_cell.clone(),
-            Column::Baseline => format_value_cell(&row.baseline, row.metric_unit),
-            Column::Candidate => format_value_cell(&row.candidate, row.metric_unit),
+            Column::Baseline => format_value_cell(&row.baseline, row.metric_ladder),
+            Column::Candidate => format_value_cell(&row.candidate, row.metric_ladder),
             Column::Delta => match row.delta {
-                Some(d) => format_delta_cell(d, row.metric_unit),
+                Some(d) => format_delta_cell(d, row.metric_ladder),
                 None => match (&row.baseline, &row.candidate) {
                     (Aggregated::Mode { value: a, .. }, Aggregated::Mode { value: b, .. }) => {
                         if a == b {
@@ -4283,7 +4301,7 @@ fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
                 None => "-".to_string(),
             },
             Column::Arrow => {
-                format_arrow_cell(&row.baseline, &row.candidate, row.delta, row.metric_unit)
+                format_arrow_cell(&row.baseline, &row.candidate, row.delta, row.metric_ladder)
             }
             // Show-only columns. The compare-side parse_columns
             // gate rejects Value at CLI parse time, so reaching
@@ -4308,15 +4326,15 @@ fn render_derived_row_cells(row: &DerivedRow, columns: &[Column]) -> Vec<String>
             Column::Threads => render_threads_cell(row.thread_count_a, row.thread_count_b),
             Column::Metric => row.metric_name.to_string(),
             Column::Baseline => match row.baseline {
-                Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+                Some(v) => format_derived_value_cell(v, row.metric_ladder, row.is_ratio),
                 None => "-".to_string(),
             },
             Column::Candidate => match row.candidate {
-                Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+                Some(v) => format_derived_value_cell(v, row.metric_ladder, row.is_ratio),
                 None => "-".to_string(),
             },
             Column::Delta => match row.delta {
-                Some(d) => format_derived_delta_cell(d, row.metric_unit, row.is_ratio),
+                Some(d) => format_derived_delta_cell(d, row.metric_ladder, row.is_ratio),
                 None => "-".to_string(),
             },
             Column::Pct => match row.delta_pct {
@@ -4615,10 +4633,14 @@ pub fn write_metric_list<W: fmt::Write>(w: &mut W) -> fmt::Result {
     let mut dt = crate::cli::new_table();
     dt.set_header(vec!["metric", "unit", "inputs", "description"]);
     for d in HOST_STATE_DERIVED_METRICS {
-        let unit_cell = if d.unit.is_empty() {
+        // Phase 4: ladder is the source of truth — `ratio` and
+        // unit suffixes both fall out of `ScaleLadder::base_unit`
+        // (with an explicit override for ratio rows where
+        // is_ratio is true and the ladder is None).
+        let unit_cell = if d.is_ratio {
             "ratio".to_string()
         } else {
-            d.unit.to_string()
+            d.ladder.base_unit().to_string()
         };
         dt.add_row(vec![
             d.name.to_string(),
@@ -4760,22 +4782,22 @@ pub fn write_diff<W: fmt::Write>(
                     cgroup_cell(
                         a.map(|s| s.cpu.usage_usec),
                         b.map(|s| s.cpu.usage_usec),
-                        "µs",
+                        ScaleLadder::Us,
                     ),
                     cgroup_cell(
                         a.map(|s| s.cpu.nr_throttled),
                         b.map(|s| s.cpu.nr_throttled),
-                        "",
+                        ScaleLadder::Unitless,
                     ),
                     cgroup_cell(
                         a.map(|s| s.cpu.throttled_usec),
                         b.map(|s| s.cpu.throttled_usec),
-                        "µs",
+                        ScaleLadder::Us,
                     ),
                     cgroup_cell(
                         a.map(|s| s.memory.current),
                         b.map(|s| s.memory.current),
-                        "B",
+                        ScaleLadder::Bytes,
                     ),
                 ]);
             }
@@ -4842,27 +4864,27 @@ pub fn write_diff<W: fmt::Write>(
                         cgroup_cell(
                             a.and_then(|s| s.cpu.weight),
                             b.and_then(|s| s.cpu.weight),
-                            "",
+                            ScaleLadder::Unitless,
                         ),
                         cgroup_optional_limit_cell(
                             a.and_then(|s| s.memory.max),
                             b.and_then(|s| s.memory.max),
-                            "B",
+                            ScaleLadder::Bytes,
                         ),
                         cgroup_optional_limit_cell(
                             a.and_then(|s| s.memory.high),
                             b.and_then(|s| s.memory.high),
-                            "B",
+                            ScaleLadder::Bytes,
                         ),
                         cgroup_cell(
                             a.and_then(|s| s.pids.current),
                             b.and_then(|s| s.pids.current),
-                            "",
+                            ScaleLadder::Unitless,
                         ),
                         cgroup_optional_limit_cell(
                             a.and_then(|s| s.pids.max),
                             b.and_then(|s| s.pids.max),
-                            "",
+                            ScaleLadder::Unitless,
                         ),
                     ]);
                 }
@@ -4910,7 +4932,7 @@ pub fn write_diff<W: fmt::Write>(
                     mt.add_row(vec![
                         key.to_string(),
                         stat_key.clone(),
-                        cgroup_cell(av, bv, ""),
+                        cgroup_cell(av, bv, ScaleLadder::Unitless),
                     ]);
                 }
             }
@@ -4949,7 +4971,7 @@ pub fn write_diff<W: fmt::Write>(
                     et.add_row(vec![
                         key.to_string(),
                         event_key.clone(),
-                        cgroup_cell(av, bv, ""),
+                        cgroup_cell(av, bv, ScaleLadder::Unitless),
                     ]);
                 }
             }
@@ -4990,7 +5012,7 @@ pub fn write_diff<W: fmt::Write>(
                         cgroup_cell(
                             a.map(|r| r.some.total_usec),
                             b.map(|r| r.some.total_usec),
-                            "µs",
+                            ScaleLadder::Us,
                         ),
                     ]);
                     pt.add_row(vec![
@@ -5002,7 +5024,7 @@ pub fn write_diff<W: fmt::Write>(
                         cgroup_cell(
                             a.map(|r| r.full.total_usec),
                             b.map(|r| r.full.total_usec),
-                            "µs",
+                            ScaleLadder::Us,
                         ),
                     ]);
                 }
@@ -5034,14 +5056,22 @@ pub fn write_diff<W: fmt::Write>(
                 format_psi_avg_cell(Some(a.some.avg10), Some(b.some.avg10)),
                 format_psi_avg_cell(Some(a.some.avg60), Some(b.some.avg60)),
                 format_psi_avg_cell(Some(a.some.avg300), Some(b.some.avg300)),
-                cgroup_cell(Some(a.some.total_usec), Some(b.some.total_usec), "µs"),
+                cgroup_cell(
+                    Some(a.some.total_usec),
+                    Some(b.some.total_usec),
+                    ScaleLadder::Us,
+                ),
             ]);
             pt.add_row(vec![
                 "full".into(),
                 format_psi_avg_cell(Some(a.full.avg10), Some(b.full.avg10)),
                 format_psi_avg_cell(Some(a.full.avg60), Some(b.full.avg60)),
                 format_psi_avg_cell(Some(a.full.avg300), Some(b.full.avg300)),
-                cgroup_cell(Some(a.full.total_usec), Some(b.full.total_usec), "µs"),
+                cgroup_cell(
+                    Some(a.full.total_usec),
+                    Some(b.full.total_usec),
+                    ScaleLadder::Us,
+                ),
             ]);
             writeln!(w, "{pt}")?;
         }
@@ -5113,7 +5143,11 @@ pub fn write_diff<W: fmt::Write>(
                     if av == bv {
                         continue;
                     }
-                    st.add_row(vec![pkey.to_string(), sk.clone(), cgroup_cell(av, bv, "B")]);
+                    st.add_row(vec![
+                        pkey.to_string(),
+                        sk.clone(),
+                        cgroup_cell(av, bv, ScaleLadder::Bytes),
+                    ]);
                 }
             }
             writeln!(w, "{st}")?;
@@ -5168,7 +5202,7 @@ pub fn write_diff<W: fmt::Write>(
             cgroup_cell(
                 diff.sched_ext_a.as_ref().map(|s| s.switch_all),
                 diff.sched_ext_b.as_ref().map(|s| s.switch_all),
-                "",
+                ScaleLadder::Unitless,
             ),
         ]);
         at.add_row(vec![
@@ -5176,7 +5210,7 @@ pub fn write_diff<W: fmt::Write>(
             cgroup_cell(
                 diff.sched_ext_a.as_ref().map(|s| s.nr_rejected),
                 diff.sched_ext_b.as_ref().map(|s| s.nr_rejected),
-                "",
+                ScaleLadder::Unitless,
             ),
         ]);
         at.add_row(vec![
@@ -5184,7 +5218,7 @@ pub fn write_diff<W: fmt::Write>(
             cgroup_cell(
                 diff.sched_ext_a.as_ref().map(|s| s.hotplug_seq),
                 diff.sched_ext_b.as_ref().map(|s| s.hotplug_seq),
-                "",
+                ScaleLadder::Unitless,
             ),
         ]);
         at.add_row(vec![
@@ -5192,7 +5226,7 @@ pub fn write_diff<W: fmt::Write>(
             cgroup_cell(
                 diff.sched_ext_a.as_ref().map(|s| s.enable_seq),
                 diff.sched_ext_b.as_ref().map(|s| s.enable_seq),
-                "",
+                ScaleLadder::Unitless,
             ),
         ]);
         writeln!(w, "{at}")?;
@@ -5225,46 +5259,40 @@ pub fn write_diff<W: fmt::Write>(
 
 /// Render a `(baseline, candidate, delta)` cell for the
 /// cgroup-enrichment secondary table emitted under
-/// [`GroupBy::Cgroup`]. The `unit` parameter routes each scalar
-/// through `auto_scale` (private to this module) so a 7.5 GiB
-/// `memory_current` row reads
+/// [`GroupBy::Cgroup`]. The `ladder` parameter routes each
+/// scalar through `auto_scale` (private to this module) so a
+/// 7.5 GiB `memory_current` row reads
 /// `7.500GiB → 8.250GiB (+768.000MiB)` instead of
 /// `8053063680 → 8858370048 (+805306368)`. Each cell scales
 /// independently — baseline, candidate, and delta may pick
 /// different prefixes when their magnitudes cross thresholds.
 ///
-/// The five supported unit families (mirrored from
-/// `auto_scale`'s table — re-stated here because the underlying
-/// helper is private):
-/// - `"ns"`: ladder ns → µs (×1e3) → ms (×1e6) → s (×1e9).
-///   Decimal SI prefixes for nanosecond timestamps.
-/// - `"µs"`: ladder µs → ms (×1e3) → s (×1e6). Decimal SI
-///   prefixes; matches the kernel's microsecond-reporting
-///   cgroup fields (`cpu_usage_usec`, `throttled_usec`).
-/// - `"B"`: ladder B → KiB → MiB → GiB. IEC binary prefixes
-///   (×1024) for byte counts (e.g. `memory_current`).
-/// - `"ticks"`: ladder ticks → Kticks (×1e3) → Mticks (×1e6).
-///   Decimal prefixes for clock-tick counts; the unit itself is
-///   opaque (kernel `USER_HZ` is host-dependent).
-/// - `""` (empty unit): ladder "" → K → M → G. Decimal prefixes
-///   for non-dimensional counters (`nr_throttled`, wakeup
-///   counts, etc.).
-pub fn cgroup_cell(baseline: Option<u64>, candidate: Option<u64>, unit: &'static str) -> String {
+/// See [`ScaleLadder`] for the closed enumeration of supported
+/// ladder families and per-variant step-up rules. The variants
+/// most relevant to cgroup-render call sites:
+/// - [`ScaleLadder::Us`]: cgroup `cpu_usage_usec` /
+///   `throttled_usec` / PSI `total_usec`.
+/// - [`ScaleLadder::Bytes`]: `memory_current` / `memory.max` /
+///   `memory.high` (IEC binary, B → KiB → MiB → GiB → TiB).
+/// - [`ScaleLadder::Unitless`]: `nr_throttled` / `cpu.weight` /
+///   `pids.current` / sched_ext attribute counters (decimal
+///   SI, "" → K → M → G).
+pub fn cgroup_cell(baseline: Option<u64>, candidate: Option<u64>, ladder: ScaleLadder) -> String {
     match (baseline, candidate) {
         (Some(baseline), Some(candidate)) => {
-            let baseline_cell = format_scaled_u64(baseline, unit);
-            let candidate_cell = format_scaled_u64(candidate, unit);
+            let baseline_cell = format_scaled_u64(baseline, ladder);
+            let candidate_cell = format_scaled_u64(candidate, ladder);
             let d = candidate as i128 - baseline as i128;
             // Delta is signed; route via format_delta_cell so the
             // sign is rendered explicitly and the auto-scale step
             // applies. i128 → f64 cast is lossy at extreme
             // magnitudes (>2^53) but cgroup counters on typical
             // hosts stay well under that ceiling.
-            let delta_cell = format_delta_cell(d as f64, unit);
+            let delta_cell = format_delta_cell(d as f64, ladder);
             format!("{baseline_cell} → {candidate_cell} ({delta_cell})")
         }
-        (Some(baseline), None) => format!("{} → -", format_scaled_u64(baseline, unit)),
-        (None, Some(candidate)) => format!("- → {}", format_scaled_u64(candidate, unit)),
+        (Some(baseline), None) => format!("{} → -", format_scaled_u64(baseline, ladder)),
+        (None, Some(candidate)) => format!("- → {}", format_scaled_u64(candidate, ladder)),
         (None, None) => "-".to_string(),
     }
 }
@@ -6339,7 +6367,6 @@ mod tests {
             ("nr_wakeups_migrate", |t| {
                 t.nr_wakeups_migrate = MonotonicCount(1)
             }),
-            ("nr_wakeups_idle", |t| t.nr_wakeups_idle = MonotonicCount(1)),
             ("nr_wakeups_affine", |t| {
                 t.nr_wakeups_affine = MonotonicCount(1)
             }),
@@ -6347,9 +6374,6 @@ mod tests {
                 t.nr_wakeups_affine_attempts = MonotonicCount(1)
             }),
             ("nr_migrations", |t| t.nr_migrations = MonotonicCount(1)),
-            ("nr_migrations_cold", |t| {
-                t.nr_migrations_cold = MonotonicCount(1)
-            }),
             ("nr_forced_migrations", |t| {
                 t.nr_forced_migrations = MonotonicCount(1)
             }),
@@ -6364,7 +6388,9 @@ mod tests {
             }),
             ("wait_sum", |t| t.wait_sum = MonotonicNs(1)),
             ("wait_count", |t| t.wait_count = MonotonicCount(1)),
-            ("sleep_sum", |t| t.sleep_sum = MonotonicNs(1)),
+            ("voluntary_sleep_ns", |t| {
+                t.voluntary_sleep_ns = MonotonicNs(1)
+            }),
             ("block_sum", |t| t.block_sum = MonotonicNs(1)),
             ("iowait_sum", |t| t.iowait_sum = MonotonicNs(1)),
             ("iowait_count", |t| t.iowait_count = MonotonicCount(1)),
@@ -6531,36 +6557,51 @@ mod tests {
         }
     }
 
-    /// `[dead]` tag surfaces on every metric whose `is_dead`
-    /// flag is true — kernel-side never increments these.
-    /// Operators reading the rendered table see the `[dead]`
-    /// flag and stop chasing the always-zero cell. The tag
-    /// renders AFTER the sched_class slot and BEFORE the
-    /// config_gates run, so a fully-decorated dead counter reads
-    /// `nr_wakeups_idle [dead] [SCHEDSTATS]` (no sched_class on
-    /// these metrics post-refactor).
+    /// `[dead]` tag rendering remains in the metric-display
+    /// machinery even though the registry currently has no
+    /// `is_dead: true` entries (the previously-registered dead
+    /// counters were dropped). Pin the rendering on a synthetic
+    /// `HostStateMetricDef` so a regression that drops the
+    /// `[dead]` clause from `metric_display_name` surfaces here
+    /// rather than waiting for a future kernel quirk that
+    /// resurrects the tag.
     #[test]
-    fn metric_display_name_marks_dead_counters() {
-        for name in [
-            "nr_wakeups_idle",
-            "nr_migrations_cold",
-            "nr_wakeups_passive",
-        ] {
-            let m = lookup_metric(name);
-            assert!(m.is_dead, "{name} must have is_dead=true in registry");
-            let rendered = metric_display_name(m);
+    fn metric_display_name_marks_synthetic_dead_counter() {
+        // Synthetic registry entry with is_dead: true to drive
+        // the [dead] rendering branch. Not added to the live
+        // registry — the test owns the value.
+        let m = HostStateMetricDef {
+            name: "synthetic_dead",
+            rule: AggRule::SumCount(|_| crate::metric_types::MonotonicCount(0)),
+            sched_class: None,
+            config_gates: &["CONFIG_SCHEDSTATS"],
+            is_dead: true,
+            description: "synthetic dead-counter test fixture.",
+        };
+        let rendered = metric_display_name(&m);
+        assert_eq!(
+            rendered.as_ref(),
+            "synthetic_dead [dead] [SCHEDSTATS]",
+            "[dead] tag must render after sched_class slot and \
+             before the config_gates list — pinned at the \
+             synthetic-fixture level so a future registry add \
+             of an is_dead metric does not need to be edited \
+             here too",
+        );
+        // Live registry must NOT carry any is_dead: true entries
+        // until a kernel resurrects a dead counter or a new
+        // always-zero counter is captured. Detects accidental
+        // re-introduction.
+        for m in HOST_STATE_METRICS {
             assert!(
-                rendered.contains("[dead]"),
-                "{name} must carry the [dead] tag, got {rendered:?}",
+                !m.is_dead,
+                "{} unexpectedly carries is_dead: true — the \
+                 registry is currently empty of dead counters; \
+                 add the entry to the matrix-pin test below if \
+                 a new dead counter is intentional",
+                m.name,
             );
         }
-        // Pin the exact rendered form for nr_wakeups_idle so a
-        // future change to the tag-emission order produces a
-        // failing assertion (rather than a silent text drift).
-        assert_eq!(
-            metric_display_name(lookup_metric("nr_wakeups_idle")).as_ref(),
-            "nr_wakeups_idle [dead] [SCHEDSTATS]",
-        );
     }
 
     /// `non-ext` rendering: the schedstat sleep/wait family is
@@ -6610,8 +6651,6 @@ mod tests {
             ("nr_wakeups_remote", None, &["CONFIG_SCHEDSTATS"], false),
             ("nr_wakeups_sync", None, &["CONFIG_SCHEDSTATS"], false),
             ("nr_wakeups_migrate", None, &["CONFIG_SCHEDSTATS"], false),
-            ("nr_wakeups_idle", None, &["CONFIG_SCHEDSTATS"], true),
-            ("nr_wakeups_passive", None, &["CONFIG_SCHEDSTATS"], true),
             (
                 "nr_wakeups_affine",
                 Some("cfs-only"),
@@ -6625,7 +6664,6 @@ mod tests {
                 false,
             ),
             ("nr_migrations", None, &[], false),
-            ("nr_migrations_cold", None, &["CONFIG_SCHEDSTATS"], true),
             (
                 "nr_forced_migrations",
                 Some("cfs-only"),
@@ -6653,7 +6691,12 @@ mod tests {
             ("wait_sum", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
             ("wait_count", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
             ("wait_max", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
-            ("sleep_sum", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
+            (
+                "voluntary_sleep_ns",
+                Some("non-ext"),
+                &["CONFIG_SCHEDSTATS"],
+                false,
+            ),
             ("sleep_max", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
             ("block_sum", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
             ("block_max", Some("non-ext"), &["CONFIG_SCHEDSTATS"], false),
@@ -6838,35 +6881,14 @@ mod tests {
         );
     }
 
-    /// Integration test for `write_diff`: a dead-counter row
-    /// renders the `[dead]` tag in the metric cell. Pins the
-    /// is_dead → cell rendering plumbing.
-    #[test]
-    fn write_diff_renders_is_dead_metric_cell() {
-        let mut a = make_thread("p", "w");
-        a.nr_wakeups_idle = MonotonicCount(0);
-        let mut b = make_thread("p", "w");
-        b.nr_wakeups_idle = MonotonicCount(0);
-        let diff = compare(
-            &snap_with(vec![a]),
-            &snap_with(vec![b]),
-            &CompareOptions::default(),
-        );
-        let mut out = String::new();
-        write_diff(
-            &mut out,
-            &diff,
-            Path::new("a"),
-            Path::new("b"),
-            GroupBy::Pcomm,
-            &DisplayOptions::default(),
-        )
-        .unwrap();
-        assert!(
-            out.contains("nr_wakeups_idle [dead] [SCHEDSTATS]"),
-            "dead-counter cell missing from rendered table:\n{out}",
-        );
-    }
+    // The previous integration test
+    // `write_diff_renders_is_dead_metric_cell` was removed when
+    // the registry's dead counters (nr_wakeups_idle,
+    // nr_migrations_cold, nr_wakeups_passive) were dropped. The
+    // [dead] rendering path is still covered by
+    // `metric_display_name_marks_synthetic_dead_counter` (which
+    // drives the path from a synthetic registry entry without
+    // depending on a live registered metric).
 
     // ------------------------------------------------------------
     // DisplayFormat / Column / parse_columns (#55/#18)
@@ -7606,44 +7628,51 @@ mod tests {
         assert_eq!(row.baseline, Some(DerivedValue::Scalar(250.0)));
     }
 
-    /// `voluntary_sleep_sum` = sleep_sum - block_sum (kernel
-    /// double-counts block under sleep). Pin on 1000-300 = 700.
+    /// `voluntary_sleep_ns` is now a first-class capture field
+    /// — the normalization (`sum_sleep_runtime -
+    /// sum_block_runtime`) happens at capture time inside
+    /// `capture_thread_at_with_tally`, so the derived metric of
+    /// the same shape was removed. The compare/show path simply
+    /// sums `voluntary_sleep_ns` like any other Sum metric.
+    /// Pin a 1000ns thread renders as 1000ns through the
+    /// SumNs aggregation path.
     #[test]
-    fn derived_voluntary_sleep_sum_subtracts_block() {
+    fn voluntary_sleep_ns_sums_through_registry() {
         let mut t = make_thread("p", "w");
-        t.sleep_sum = MonotonicNs(1000);
-        t.block_sum = MonotonicNs(300);
+        t.voluntary_sleep_ns = MonotonicNs(1000);
         let diff = compare(
             &snap_with(vec![t.clone()]),
             &snap_with(vec![t]),
             &CompareOptions::default(),
         );
         let row = diff
-            .derived_rows
+            .rows
             .iter()
-            .find(|r| r.metric_name == "voluntary_sleep_sum")
-            .expect("voluntary_sleep_sum row present");
-        assert_eq!(row.baseline, Some(DerivedValue::Scalar(700.0)));
+            .find(|r| r.metric_name == "voluntary_sleep_ns")
+            .expect("voluntary_sleep_ns row in diff");
+        assert_eq!(
+            row.baseline.numeric(),
+            Some(1000.0),
+            "voluntary_sleep_ns flows through SumNs aggregation \
+             carrying the capture-side normalized value verbatim",
+        );
     }
 
-    /// `voluntary_sleep_sum` clamps to zero when sleep < block
-    /// (capture-time race between two distinct /proc reads).
+    /// Registry no longer exposes `voluntary_sleep_sum` as a
+    /// derived metric — the capture-side `voluntary_sleep_ns`
+    /// field replaced it. Pin the absence so a future
+    /// re-introduction surfaces here.
     #[test]
-    fn derived_voluntary_sleep_clamps_negative_to_zero() {
-        let mut t = make_thread("p", "w");
-        t.sleep_sum = MonotonicNs(100);
-        t.block_sum = MonotonicNs(200);
-        let diff = compare(
-            &snap_with(vec![t.clone()]),
-            &snap_with(vec![t]),
-            &CompareOptions::default(),
+    fn voluntary_sleep_sum_derived_metric_is_removed() {
+        let names: std::collections::BTreeSet<&'static str> =
+            HOST_STATE_DERIVED_METRICS.iter().map(|m| m.name).collect();
+        assert!(
+            !names.contains("voluntary_sleep_sum"),
+            "voluntary_sleep_sum derived metric must not exist — \
+             the normalization moved to capture-side \
+             `voluntary_sleep_ns` (see ThreadState field doc). \
+             Got derived metrics: {names:?}",
         );
-        let row = diff
-            .derived_rows
-            .iter()
-            .find(|r| r.metric_name == "voluntary_sleep_sum")
-            .expect("voluntary_sleep_sum row present");
-        assert_eq!(row.baseline, Some(DerivedValue::Scalar(0.0)));
     }
 
     /// `cpu_efficiency` = run / (run + wait). Pin on
@@ -8018,7 +8047,7 @@ mod tests {
     #[test]
     fn format_derived_value_cell_ratio_three_decimals() {
         let v = DerivedValue::Scalar(0.873_5);
-        let cell = format_derived_value_cell(v, "", true);
+        let cell = format_derived_value_cell(v, ScaleLadder::None, true);
         assert_eq!(cell, "0.874");
     }
 
@@ -8027,7 +8056,7 @@ mod tests {
     #[test]
     fn format_derived_value_cell_ns_auto_scales() {
         let v = DerivedValue::Scalar(2_500_000.0);
-        let cell = format_derived_value_cell(v, "ns", false);
+        let cell = format_derived_value_cell(v, ScaleLadder::Ns, false);
         // 2.5e6 ns → 2.500ms via the existing auto_scale ladder.
         assert_eq!(cell, "2.500ms");
     }
@@ -8041,7 +8070,7 @@ mod tests {
     #[test]
     fn format_derived_value_cell_ns_preserves_fractional_precision() {
         let v = DerivedValue::Scalar(123.4);
-        let cell = format_derived_value_cell(v, "ns", false);
+        let cell = format_derived_value_cell(v, ScaleLadder::Ns, false);
         assert_eq!(cell, "123.40ns");
     }
 
@@ -8052,7 +8081,7 @@ mod tests {
     fn format_derived_value_cell_negative_bytes_signed() {
         let two_kib_neg = -(2.0 * 1024.0);
         let v = DerivedValue::Scalar(two_kib_neg);
-        let cell = format_derived_value_cell(v, "B", false);
+        let cell = format_derived_value_cell(v, ScaleLadder::Bytes, false);
         assert_eq!(cell, "-2.000KiB");
     }
 
@@ -8061,7 +8090,7 @@ mod tests {
     /// sign carry on a ratio delta of +0.100 = +10pp.
     #[test]
     fn format_derived_delta_cell_ratio_carries_sign() {
-        let cell = format_derived_delta_cell(0.1, "", true);
+        let cell = format_derived_delta_cell(0.1, ScaleLadder::None, true);
         assert_eq!(cell, "+0.100");
     }
 
@@ -8606,16 +8635,22 @@ mod tests {
     #[test]
     fn cgroup_cell_renders_all_four_branches() {
         // (Some, Some) → "a → b (+d)" where d = b - a (signed).
-        assert_eq!(cgroup_cell(Some(10), Some(42), ""), "10 → 42 (+32)");
+        assert_eq!(
+            cgroup_cell(Some(10), Some(42), ScaleLadder::Unitless),
+            "10 → 42 (+32)"
+        );
         // Negative delta uses the signed formatter to keep the
         // sign explicit.
-        assert_eq!(cgroup_cell(Some(50), Some(5), ""), "50 → 5 (-45)");
+        assert_eq!(
+            cgroup_cell(Some(50), Some(5), ScaleLadder::Unitless),
+            "50 → 5 (-45)"
+        );
         // (Some, None) → baseline value then en-dash placeholder.
-        assert_eq!(cgroup_cell(Some(7), None, ""), "7 → -");
+        assert_eq!(cgroup_cell(Some(7), None, ScaleLadder::Unitless), "7 → -");
         // (None, Some) → leading en-dash placeholder.
-        assert_eq!(cgroup_cell(None, Some(99), ""), "- → 99");
+        assert_eq!(cgroup_cell(None, Some(99), ScaleLadder::Unitless), "- → 99");
         // (None, None) → single en-dash (both sides absent).
-        assert_eq!(cgroup_cell(None, None, ""), "-");
+        assert_eq!(cgroup_cell(None, None, ScaleLadder::Unitless), "-");
     }
 
     /// Pin all four branches of `format_psi_avg_cell`. Mirrors
@@ -8705,13 +8740,13 @@ mod tests {
     fn cgroup_cell_scales_microseconds_to_ms_or_s() {
         // 1_500_000 µs = 1.5 s; 3_000_000 µs = 3.0 s; delta 1.5 s.
         assert_eq!(
-            cgroup_cell(Some(1_500_000), Some(3_000_000), "µs"),
+            cgroup_cell(Some(1_500_000), Some(3_000_000), ScaleLadder::Us),
             "1.500s → 3.000s (+1.500s)",
         );
         // Below the ms threshold — no step-up; integer below the
         // delta's short-circuit so the bare integer renders.
         assert_eq!(
-            cgroup_cell(Some(500), Some(900), "µs"),
+            cgroup_cell(Some(500), Some(900), ScaleLadder::Us),
             "500µs → 900µs (+400µs)",
         );
     }
@@ -8725,7 +8760,7 @@ mod tests {
         let one_gib: u64 = 1024 * 1024 * 1024;
         let two_gib: u64 = 2 * one_gib;
         assert_eq!(
-            cgroup_cell(Some(one_gib), Some(two_gib), "B"),
+            cgroup_cell(Some(one_gib), Some(two_gib), ScaleLadder::Bytes),
             "1.000GiB → 2.000GiB (+1.000GiB)",
         );
     }
@@ -8740,18 +8775,22 @@ mod tests {
         // K step: values in the 1e3..1e6 range pick up a `K`
         // suffix and divide by 1e3.
         assert_eq!(
-            cgroup_cell(Some(1_500), Some(2_500), ""),
+            cgroup_cell(Some(1_500), Some(2_500), ScaleLadder::Unitless),
             "1.500K → 2.500K (+1.000K)",
         );
         // M step: values in the 1e6..1e9 range pick up `M` and
         // divide by 1e6.
         assert_eq!(
-            cgroup_cell(Some(1_500_000), Some(2_500_000), ""),
+            cgroup_cell(Some(1_500_000), Some(2_500_000), ScaleLadder::Unitless),
             "1.500M → 2.500M (+1.000M)",
         );
         // G step: values >= 1e9 pick up `G` and divide by 1e9.
         assert_eq!(
-            cgroup_cell(Some(1_500_000_000), Some(2_500_000_000), ""),
+            cgroup_cell(
+                Some(1_500_000_000),
+                Some(2_500_000_000),
+                ScaleLadder::Unitless
+            ),
             "1.500G → 2.500G (+1.000G)",
         );
     }
@@ -8958,6 +8997,78 @@ mod tests {
                 assert_eq!(total, 0);
             }
             other => panic!("expected Mode, got {other:?}"),
+        }
+    }
+
+    /// All three Mode-family arms — `Mode`, `ModeChar`,
+    /// `ModeBool` — route through the same `mode_aggregate`
+    /// helper. Drive each arm with a deterministic 3-thread
+    /// fixture and assert all three produce
+    /// `Aggregated::Mode { value, count, total }` with `total
+    /// == 3` and a count >= 1, pinning the helper's projection
+    /// shape (value+count+total triple from `mode_across`, then
+    /// total override from the supplied `threads.len()`).
+    #[test]
+    fn mode_aggregate_helper_dispatches_all_three_arms() {
+        use crate::metric_types::CategoricalString;
+        let mut t1 = make_thread("p", "w");
+        let mut t2 = make_thread("p", "w");
+        let mut t3 = make_thread("p", "w");
+        // Mode: policy field — three distinct values, lex-tie
+        // resolves to alphabetically-smallest unique winner.
+        t1.policy = CategoricalString::from("SCHED_OTHER");
+        t2.policy = CategoricalString::from("SCHED_OTHER");
+        t3.policy = CategoricalString::from("SCHED_FIFO");
+        // ModeChar: state is char.
+        t1.state = 'R';
+        t2.state = 'R';
+        t3.state = 'S';
+        // ModeBool: ext_enabled is bool.
+        t1.ext_enabled = true;
+        t2.ext_enabled = true;
+        t3.ext_enabled = false;
+        let threads: Vec<&ThreadState> = vec![&t1, &t2, &t3];
+
+        // Mode arm: SCHED_OTHER wins 2/3.
+        match aggregate(AggRule::Mode(|t| t.policy.clone()), &threads) {
+            Aggregated::Mode {
+                value,
+                count,
+                total,
+            } => {
+                assert_eq!(value, "SCHED_OTHER");
+                assert_eq!(count, 2);
+                assert_eq!(total, 3);
+            }
+            other => panic!("expected Mode for AggRule::Mode, got {other:?}"),
+        }
+        // ModeChar arm: 'R' wins 2/3 — coerced through
+        // CategoricalString::to_string() via the helper.
+        match aggregate(AggRule::ModeChar(|t| t.state), &threads) {
+            Aggregated::Mode {
+                value,
+                count,
+                total,
+            } => {
+                assert_eq!(value, "R");
+                assert_eq!(count, 2);
+                assert_eq!(total, 3);
+            }
+            other => panic!("expected Mode for AggRule::ModeChar, got {other:?}"),
+        }
+        // ModeBool arm: true wins 2/3 — coerced through
+        // bool::Display.
+        match aggregate(AggRule::ModeBool(|t| t.ext_enabled), &threads) {
+            Aggregated::Mode {
+                value,
+                count,
+                total,
+            } => {
+                assert_eq!(value, "true");
+                assert_eq!(count, 2);
+                assert_eq!(total, 3);
+            }
+            other => panic!("expected Mode for AggRule::ModeBool, got {other:?}"),
         }
     }
 
@@ -10389,22 +10500,22 @@ mod tests {
     /// to µs. Pins the threshold at exactly the prefix transition.
     #[test]
     fn auto_scale_ns_boundary_stays_at_base_below_threshold() {
-        assert_eq!(auto_scale(0.0, "ns"), (0.0, "ns"));
-        assert_eq!(auto_scale(999.0, "ns"), (999.0, "ns"));
-        assert_eq!(auto_scale(1000.0, "ns"), (1.0, "µs"));
+        assert_eq!(auto_scale(0.0, ScaleLadder::Ns), (0.0, "ns"));
+        assert_eq!(auto_scale(999.0, ScaleLadder::Ns), (999.0, "ns"));
+        assert_eq!(auto_scale(1000.0, ScaleLadder::Ns), (1.0, "µs"));
     }
 
     /// ns ladder: ns → µs (1e3) → ms (1e6) → s (1e9). Pins each
     /// step. Decimal SI prefixes (NOT IEC binary).
     #[test]
     fn auto_scale_ns_ladder_steps_up_at_powers_of_ten() {
-        let (v, u) = auto_scale(1_500.0, "ns");
+        let (v, u) = auto_scale(1_500.0, ScaleLadder::Ns);
         assert_eq!(u, "µs");
         assert!((v - 1.5).abs() < 1e-9);
-        let (v, u) = auto_scale(1_500_000.0, "ns");
+        let (v, u) = auto_scale(1_500_000.0, ScaleLadder::Ns);
         assert_eq!(u, "ms");
         assert!((v - 1.5).abs() < 1e-9);
-        let (v, u) = auto_scale(1_500_000_000.0, "ns");
+        let (v, u) = auto_scale(1_500_000_000.0, ScaleLadder::Ns);
         assert_eq!(u, "s");
         assert!((v - 1.5).abs() < 1e-9);
     }
@@ -10414,14 +10525,14 @@ mod tests {
     /// threshold and the divisor.
     #[test]
     fn auto_scale_byte_iec_ladder_uses_1024() {
-        assert_eq!(auto_scale(1023.0, "B"), (1023.0, "B"));
-        let (v, u) = auto_scale(1024.0, "B");
+        assert_eq!(auto_scale(1023.0, ScaleLadder::Bytes), (1023.0, "B"));
+        let (v, u) = auto_scale(1024.0, ScaleLadder::Bytes);
         assert_eq!(u, "KiB");
         assert!((v - 1.0).abs() < 1e-9);
-        let (v, u) = auto_scale(1024.0 * 1024.0, "B");
+        let (v, u) = auto_scale(1024.0 * 1024.0, ScaleLadder::Bytes);
         assert_eq!(u, "MiB");
         assert!((v - 1.0).abs() < 1e-9);
-        let (v, u) = auto_scale(1024.0 * 1024.0 * 1024.0, "B");
+        let (v, u) = auto_scale(1024.0 * 1024.0 * 1024.0, ScaleLadder::Bytes);
         assert_eq!(u, "GiB");
         assert!((v - 1.0).abs() < 1e-9);
     }
@@ -10430,11 +10541,11 @@ mod tests {
     /// Decimal prefixes — clock-tick rate is host-dependent.
     #[test]
     fn auto_scale_ticks_ladder_uses_decimal_prefixes() {
-        assert_eq!(auto_scale(999.0, "ticks"), (999.0, "ticks"));
-        let (v, u) = auto_scale(1_500.0, "ticks");
+        assert_eq!(auto_scale(999.0, ScaleLadder::Ticks), (999.0, "ticks"));
+        let (v, u) = auto_scale(1_500.0, ScaleLadder::Ticks);
         assert_eq!(u, "Kticks");
         assert!((v - 1.5).abs() < 1e-9);
-        let (v, u) = auto_scale(2_000_000.0, "ticks");
+        let (v, u) = auto_scale(2_000_000.0, ScaleLadder::Ticks);
         assert_eq!(u, "Mticks");
         assert!((v - 2.0).abs() < 1e-9);
     }
@@ -10444,14 +10555,14 @@ mod tests {
     /// migrations, etc.).
     #[test]
     fn auto_scale_unitless_ladder_uses_si_prefixes() {
-        assert_eq!(auto_scale(999.0, ""), (999.0, ""));
-        let (v, u) = auto_scale(1_500.0, "");
+        assert_eq!(auto_scale(999.0, ScaleLadder::Unitless), (999.0, ""));
+        let (v, u) = auto_scale(1_500.0, ScaleLadder::Unitless);
         assert_eq!(u, "K");
         assert!((v - 1.5).abs() < 1e-9);
-        let (v, u) = auto_scale(2_500_000.0, "");
+        let (v, u) = auto_scale(2_500_000.0, ScaleLadder::Unitless);
         assert_eq!(u, "M");
         assert!((v - 2.5).abs() < 1e-9);
-        let (v, u) = auto_scale(3_000_000_000.0, "");
+        let (v, u) = auto_scale(3_000_000_000.0, ScaleLadder::Unitless);
         assert_eq!(u, "G");
         assert!((v - 3.0).abs() < 1e-9);
     }
@@ -10461,39 +10572,47 @@ mod tests {
     /// `-2.000 ms` (NOT `+2 ms` or `2 ms`).
     #[test]
     fn auto_scale_preserves_sign_on_negative_input() {
-        let (v, u) = auto_scale(-2_000_000.0, "ns");
+        let (v, u) = auto_scale(-2_000_000.0, ScaleLadder::Ns);
         assert_eq!(u, "ms");
         assert!((v - (-2.0)).abs() < 1e-9);
-        let (v, u) = auto_scale(-5_000.0, "B");
+        let (v, u) = auto_scale(-5_000.0, ScaleLadder::Bytes);
         // -5000 < -1024 in absolute value, but value is signed.
         // |-5000| = 5000 ≥ 1024, so step to KiB.
         assert_eq!(u, "KiB");
         assert!((v - (-5000.0 / 1024.0)).abs() < 1e-9);
     }
 
-    /// Unknown unit families pass through unchanged so the
-    /// caller's `&'static str` lifetime is preserved without
-    /// allocation.
-    #[test]
-    fn auto_scale_unknown_unit_passes_through() {
-        assert_eq!(auto_scale(123.0, "Hz"), (123.0, "Hz"));
-        assert_eq!(auto_scale(1_000_000.0, "Hz"), (1_000_000.0, "Hz"));
-        assert_eq!(auto_scale(42.0, "bogus_unit"), (42.0, "bogus_unit"));
-    }
-
-    /// `format_value_cell` for a Sum aggregate with unit "ns":
+    /// Phase 4: the unknown-unit pass-through behavior was
+    /// removed when `auto_scale` migrated from a free-form
+    /// `&'static str` unit tag to the closed [`ScaleLadder`]
+    /// enum. A registry typo can no longer slip through an
+    /// `other => pass-through` arm at render time — every
+    /// ladder is named at the type level. The corresponding
+    /// `auto_scale_unknown_unit_passes_through` test
+    /// disappeared with that change.
+    ///
+    /// `format_value_cell` for a Sum aggregate with the Ns ladder:
     /// values below the µs threshold render as integers; values
     /// at/above the threshold render as scaled f64 with 3
     /// decimals.
     #[test]
     fn format_value_cell_renders_sum_at_appropriate_scale() {
         // Below threshold → integer + base unit, no decimals.
-        assert_eq!(format_value_cell(&Aggregated::Sum(50), "ns"), "50ns");
-        assert_eq!(format_value_cell(&Aggregated::Sum(999), "ns"), "999ns");
-        // At/above threshold → scaled f64 with 3 decimals.
-        assert_eq!(format_value_cell(&Aggregated::Sum(1_500), "ns"), "1.500µs",);
         assert_eq!(
-            format_value_cell(&Aggregated::Sum(2_000_000), "ns"),
+            format_value_cell(&Aggregated::Sum(50), ScaleLadder::Ns),
+            "50ns"
+        );
+        assert_eq!(
+            format_value_cell(&Aggregated::Sum(999), ScaleLadder::Ns),
+            "999ns"
+        );
+        // At/above threshold → scaled f64 with 3 decimals.
+        assert_eq!(
+            format_value_cell(&Aggregated::Sum(1_500), ScaleLadder::Ns),
+            "1.500µs",
+        );
+        assert_eq!(
+            format_value_cell(&Aggregated::Sum(2_000_000), ScaleLadder::Ns),
             "2.000ms",
         );
     }
@@ -10503,9 +10622,12 @@ mod tests {
     /// the *_sum fields).
     #[test]
     fn format_value_cell_renders_max_at_appropriate_scale() {
-        assert_eq!(format_value_cell(&Aggregated::Max(100), "ns"), "100ns");
         assert_eq!(
-            format_value_cell(&Aggregated::Max(7_500_000), "ns"),
+            format_value_cell(&Aggregated::Max(100), ScaleLadder::Ns),
+            "100ns"
+        );
+        assert_eq!(
+            format_value_cell(&Aggregated::Max(7_500_000), ScaleLadder::Ns),
             "7.500ms",
         );
     }
@@ -10521,9 +10643,9 @@ mod tests {
             count: 4,
             total: 4,
         };
-        assert_eq!(format_value_cell(&m, ""), "SCHED_OTHER");
+        assert_eq!(format_value_cell(&m, ScaleLadder::None), "SCHED_OTHER");
         let r = Aggregated::OrdinalRange { min: -5, max: 10 };
-        assert_eq!(format_value_cell(&r, ""), "-5..10");
+        assert_eq!(format_value_cell(&r, ScaleLadder::None), "-5..10");
     }
 
     /// `format_delta_cell` renders the signed delta with the
@@ -10537,19 +10659,19 @@ mod tests {
     fn format_delta_cell_renders_signed_scaled_value() {
         // Below threshold, integer delta — short-circuit to bare
         // signed integer.
-        assert_eq!(format_delta_cell(-50.0, "ns"), "-50ns");
-        assert_eq!(format_delta_cell(50.0, "ns"), "+50ns");
-        assert_eq!(format_delta_cell(0.0, "ns"), "+0ns");
+        assert_eq!(format_delta_cell(-50.0, ScaleLadder::Ns), "-50ns");
+        assert_eq!(format_delta_cell(50.0, ScaleLadder::Ns), "+50ns");
+        assert_eq!(format_delta_cell(0.0, ScaleLadder::Ns), "+0ns");
         // Below threshold, non-integer delta — keep 3 decimals so
         // sub-unit precision survives (rare in practice — counters
         // are u64-sourced — but possible after delta math on
         // ordinal-range midpoints).
-        assert_eq!(format_delta_cell(50.5, "ns"), "+50.500ns");
+        assert_eq!(format_delta_cell(50.5, ScaleLadder::Ns), "+50.500ns");
         // Above threshold — step up. Always 3 decimals because
         // the scale-up path can produce fractional values
         // (`2_000_001 / 1e6 = 2.000001`).
-        assert_eq!(format_delta_cell(2_000_000.0, "ns"), "+2.000ms");
-        assert_eq!(format_delta_cell(-2_000_000.0, "ns"), "-2.000ms");
+        assert_eq!(format_delta_cell(2_000_000.0, ScaleLadder::Ns), "+2.000ms");
+        assert_eq!(format_delta_cell(-2_000_000.0, ScaleLadder::Ns), "-2.000ms");
     }
 
     /// `compare`'s sort order is unaffected by render-time
@@ -10635,8 +10757,8 @@ mod tests {
             .iter()
             .find(|m| m.name == "stime_clock_ticks")
             .expect("stime_clock_ticks in registry");
-        assert_eq!(utime.unit, "ticks");
-        assert_eq!(stime.unit, "ticks");
+        assert_eq!(utime.rule.ladder(), ScaleLadder::Ticks);
+        assert_eq!(stime.rule.ladder(), ScaleLadder::Ticks);
     }
 
     // ------------------------------------------------------------
@@ -11022,7 +11144,7 @@ mod tests {
             thread_count_a: 1,
             thread_count_b: 1,
             metric_name: metric,
-            metric_unit: "",
+            metric_ladder: ScaleLadder::None,
             baseline: Aggregated::Sum(0),
             candidate: Aggregated::Sum(0),
             delta: Some(delta),
@@ -11072,7 +11194,7 @@ mod tests {
             thread_count_a: 1,
             thread_count_b: 1,
             metric_name: metric,
-            metric_unit: "",
+            metric_ladder: ScaleLadder::None,
             baseline: Aggregated::Sum(0),
             candidate: Aggregated::Sum(0),
             delta: Some(delta),
@@ -11115,7 +11237,7 @@ mod tests {
             thread_count_a: 1,
             thread_count_b: 1,
             metric_name: metric,
-            metric_unit: "",
+            metric_ladder: ScaleLadder::None,
             baseline: Aggregated::Sum(0),
             candidate: Aggregated::Sum(0),
             delta: Some(delta),
@@ -11197,7 +11319,7 @@ mod tests {
             thread_count_a: 1,
             thread_count_b: 1,
             metric_name: metric,
-            metric_unit: "",
+            metric_ladder: ScaleLadder::None,
             baseline: Aggregated::Sum(0),
             candidate: Aggregated::Sum(0),
             delta: Some(delta),
@@ -11245,7 +11367,7 @@ mod tests {
             thread_count_a: 1,
             thread_count_b: 1,
             metric_name: metric,
-            metric_unit: "",
+            metric_ladder: ScaleLadder::None,
             baseline: Aggregated::Sum(0),
             candidate: Aggregated::Sum(0),
             delta,
@@ -11294,7 +11416,7 @@ mod tests {
             thread_count_a: 1,
             thread_count_b: 1,
             metric_name: metric,
-            metric_unit: "",
+            metric_ladder: ScaleLadder::None,
             baseline: Aggregated::Sum(0),
             candidate: Aggregated::Sum(0),
             delta,
@@ -11344,7 +11466,7 @@ mod tests {
             thread_count_a: 1,
             thread_count_b: 1,
             metric_name: metric,
-            metric_unit: "",
+            metric_ladder: ScaleLadder::None,
             baseline: Aggregated::Mode {
                 value: "SCHED_OTHER".into(),
                 count: 1,
@@ -11396,7 +11518,7 @@ mod tests {
             thread_count_a: 1,
             thread_count_b: 1,
             metric_name: metric,
-            metric_unit: "",
+            metric_ladder: ScaleLadder::None,
             baseline: Aggregated::Sum(0),
             candidate: Aggregated::Sum(0),
             delta: Some(delta),
@@ -11449,7 +11571,7 @@ mod tests {
             thread_count_a: 1,
             thread_count_b: 1,
             metric_name: metric,
-            metric_unit: "",
+            metric_ladder: ScaleLadder::None,
             baseline: Aggregated::Sum(0),
             candidate: Aggregated::Sum(0),
             delta: Some(delta),
@@ -11577,13 +11699,13 @@ mod tests {
     /// largest unit) would surface here.
     #[test]
     fn format_scaled_u64_zero_renders_at_base_unit_for_all_families() {
-        assert_eq!(format_scaled_u64(0, "ns"), "0ns");
-        assert_eq!(format_scaled_u64(0, "µs"), "0µs");
-        assert_eq!(format_scaled_u64(0, "B"), "0B");
-        assert_eq!(format_scaled_u64(0, "ticks"), "0ticks");
+        assert_eq!(format_scaled_u64(0, ScaleLadder::Ns), "0ns");
+        assert_eq!(format_scaled_u64(0, ScaleLadder::Us), "0µs");
+        assert_eq!(format_scaled_u64(0, ScaleLadder::Bytes), "0B");
+        assert_eq!(format_scaled_u64(0, ScaleLadder::Ticks), "0ticks");
         // Empty unit: format prints just the integer with no
         // suffix. This is the canonical unitless render path.
-        assert_eq!(format_scaled_u64(0, ""), "0");
+        assert_eq!(format_scaled_u64(0, ScaleLadder::Unitless), "0");
     }
 
     /// `format_delta_cell` on a negative µs delta auto-scales
@@ -11593,7 +11715,7 @@ mod tests {
     /// step.
     #[test]
     fn format_delta_cell_negative_microseconds_scales_to_seconds() {
-        let cell = format_delta_cell(-1_500_000.0, "µs");
+        let cell = format_delta_cell(-1_500_000.0, ScaleLadder::Us);
         assert_eq!(cell, "-1.500s");
     }
 
@@ -11605,7 +11727,7 @@ mod tests {
     #[test]
     fn format_delta_cell_negative_bytes_scales_to_gib() {
         let two_gib_neg = -(2.0 * 1024.0 * 1024.0 * 1024.0);
-        let cell = format_delta_cell(two_gib_neg, "B");
+        let cell = format_delta_cell(two_gib_neg, ScaleLadder::Bytes);
         assert_eq!(cell, "-2.000GiB");
     }
 
@@ -11621,7 +11743,7 @@ mod tests {
         // Baseline 999 µs (below 1000-µs ms threshold) →
         // renders as `999µs`. Candidate 2000 µs (above) → `2.000ms`.
         // Delta +1001 µs (above) → `+1.001ms`.
-        let cell = cgroup_cell(Some(999), Some(2000), "µs");
+        let cell = cgroup_cell(Some(999), Some(2000), ScaleLadder::Us);
         assert_eq!(
             cell, "999µs → 2.000ms (+1.001ms)",
             "asymmetric scaling: each cell must pick its own prefix",

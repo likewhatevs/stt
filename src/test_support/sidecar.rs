@@ -6506,30 +6506,29 @@ mod tests {
         );
     }
 
-    /// Non-git directory: `gix::discover` walks the parent chain of
-    /// the tempdir all the way up; if a parent happens to be a git
-    /// repo (e.g. tests run from inside a checkout), `discover`
-    /// resolves to that ancestor. To pin the "no repo" branch we have
-    /// to break the parent walk, which is impossible from inside a
-    /// tempdir nested under a git checkout — the test instead asserts
-    /// that no repo is discoverable from the system temp root, which
-    /// is reliably outside any project repo.
+    /// Non-git directory: `detect_commit_at` calls
+    /// `gix::discover` which walks up from the input path
+    /// looking for a `.git` boundary. When the host's `/tmp`
+    /// happens to live inside a git checkout, discover finds
+    /// that ancestor `.git` and returns success — the
+    /// no-repo-found branch this test pins cannot fire in that
+    /// environment. Skip when the tempdir resolves to an
+    /// ancestor repo. Same skip pattern as the sibling
+    /// `local_source_non_git_*` tests in fetch.rs.
     #[test]
     fn detect_project_commit_non_git_returns_none() {
-        // Use a fresh tempdir directly under /tmp so no parent in the
-        // walk is itself a git repo. The TempDir's path is unique per
-        // run, so concurrent tests do not collide.
         let tmp = tempfile::TempDir::new_in(std::env::temp_dir()).unwrap();
-        // Sanity: discover from this path must fail before we trust
-        // the test's None expectation. If a future change makes
-        // /tmp/* sit inside a discoverable repo (extremely unlikely
-        // on POSIX hosts) the assert here surfaces the violation
-        // before the function-under-test assertion below.
-        assert!(
-            gix::discover(tmp.path()).is_err(),
-            "tempdir {} must not resolve to any ancestor git repo",
-            tmp.path().display()
-        );
+        if super::super::test_helpers::tempdir_resolves_to_ancestor_git(tmp.path()) {
+            // `skip!` lives at crate root via `#[macro_use]` on
+            // `mod test_macros` in lib.rs, so it is reachable
+            // from this nested test module without explicit
+            // import.
+            skip!(
+                "tempdir {} resolves to an ancestor git repo; cannot pin \
+                 non-git path semantics in this environment",
+                tmp.path().display()
+            );
+        }
         let result = super::detect_commit_at(tmp.path());
         assert!(
             result.is_none(),
