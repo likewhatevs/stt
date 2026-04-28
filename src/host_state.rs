@@ -173,6 +173,20 @@ pub struct HostStateSnapshot {
 /// is `false` when there are no failures or when ptrace failures
 /// are strictly less than half of `failed` (the `>= 50%` gate
 /// accepts equality at the boundary).
+///
+/// # Examples
+///
+/// ```no_run
+/// let snap = ktstr::host_state::capture();
+/// if let Some(ps) = &snap.probe_summary {
+///     if let Some(hint) = ps.remediation_hint() {
+///         eprintln!("{hint}");
+///     }
+///     if let Some(tag) = &ps.dominant_failure {
+///         eprintln!("dominant failure: {tag}");
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct HostStateProbeSummary {
@@ -233,6 +247,25 @@ pub struct HostStateProbeSummary {
     /// name a ptrace tag while `privilege_dominant` is `false`
     /// when ptrace failures are below the 50% threshold.
     pub privilege_dominant: bool,
+}
+
+impl HostStateProbeSummary {
+    /// Operator-facing remediation hint when ptrace failures
+    /// dominate the snapshot. Returns `Some(&'static str)` —
+    /// the same `PTRACE_EPERM_HINT` constant the capture
+    /// pipeline embeds in its tracing summary line (a one-liner
+    /// naming `cap_sys_ptrace` — the `setcap`-form spelling of
+    /// the capability — and `kernel.yama.ptrace_scope`), or
+    /// `None` when [`Self::privilege_dominant`] is false. Lets a
+    /// downstream consumer surface the same fix-it message
+    /// without parsing the log line or hand-rolling the gate.
+    pub fn remediation_hint(&self) -> Option<&'static str> {
+        if self.privilege_dominant {
+            Some(PTRACE_EPERM_HINT)
+        } else {
+            None
+        }
+    }
 }
 
 /// Per-thread cumulative resource profile.
@@ -4596,6 +4629,39 @@ mod tests {
             Some("ptrace-seize"),
             "dominant_failure names a ptrace tag while privilege_dominant \
              is false — converse of the independence claim",
+        );
+    }
+
+    /// `remediation_hint()` returns `Some` exactly when
+    /// `privilege_dominant` is true, and the returned text matches
+    /// the same `PTRACE_EPERM_HINT` constant the emission path
+    /// prints — so a downstream consumer surfaces the same fix-it
+    /// message the operator-facing tracing summary does. Pins both
+    /// the gate semantics and the text-equality contract.
+    #[test]
+    fn remediation_hint_returns_some_iff_privilege_dominant() {
+        // privilege_dominant=true → Some(PTRACE_EPERM_HINT).
+        let ps = HostStateProbeSummary {
+            privilege_dominant: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ps.remediation_hint(),
+            Some(PTRACE_EPERM_HINT),
+            "privilege_dominant=true must surface the same hint text \
+             the tracing summary prints",
+        );
+
+        // privilege_dominant=false → None.
+        let ps = HostStateProbeSummary::default();
+        assert!(
+            !ps.privilege_dominant,
+            "default privilege_dominant must be false (sanity)",
+        );
+        assert_eq!(
+            ps.remediation_hint(),
+            None,
+            "privilege_dominant=false → remediation_hint returns None",
         );
     }
 
