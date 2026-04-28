@@ -170,8 +170,9 @@ pub struct HostStateSnapshot {
 /// The four counters are zero when the probe pass reached zero
 /// tgids (e.g. an empty `proc_root`); `dominant_failure` is
 /// `None` when no actionable failures landed; `privilege_dominant`
-/// is `false` when there are no failures or when other failure
-/// classes outweigh ptrace.
+/// is `false` when there are no failures or when ptrace failures
+/// are strictly less than half of `failed` (the `>= 50%` gate
+/// accepts equality at the boundary).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct HostStateProbeSummary {
@@ -206,14 +207,31 @@ pub struct HostStateProbeSummary {
     /// Examples: `"ptrace-seize"`, `"dwarf-parse-failure"`,
     /// `"jemalloc-in-dso"`.
     pub dominant_failure: Option<String>,
-    /// `true` when the ptrace-attach failure share crosses the
+    /// `true` when the ptrace failure share crosses the
     /// hint-trigger threshold (≥ 50% of `failed` is `ptrace-seize`
     /// or `ptrace-interrupt`). Mirrors the same gate that prints
     /// the EPERM remediation hint in the operator-facing tracing
     /// summary, so a downstream consumer can reproduce that
-    /// signal without parsing the log line. `false` when
-    /// `failed == 0` (no failures to dominate) or when other
-    /// failure classes outweigh ptrace.
+    /// signal without parsing the log line. When `true`,
+    /// rerunning the capture binary with `CAP_SYS_PTRACE`
+    /// (e.g. `sudo setcap cap_sys_ptrace+eip $(which ktstr)`,
+    /// or run as root, or `sysctl kernel.yama.ptrace_scope=0`)
+    /// resolves most attach failures so jemalloc TSD attach
+    /// succeeds across foreign tgids. `false` when
+    /// `failed == 0` (no failures to dominate) or when ptrace
+    /// failures are strictly less than half of `failed` (the
+    /// `>= 50%` gate accepts equality at the boundary).
+    ///
+    /// Independent of [`Self::dominant_failure`]: ptrace failures
+    /// are tallied across both `ptrace-seize` and
+    /// `ptrace-interrupt` for the threshold, while
+    /// `dominant_failure` reports a single per-tag plurality.
+    /// When ptrace counts split across the two tags,
+    /// `privilege_dominant` may be `true` while
+    /// `dominant_failure` names a non-ptrace tag that won the
+    /// single-tag plurality. Conversely, `dominant_failure` may
+    /// name a ptrace tag while `privilege_dominant` is `false`
+    /// when ptrace failures are below the 50% threshold.
     pub privilege_dominant: bool,
 }
 
@@ -387,10 +405,13 @@ pub struct ThreadState {
     /// (PTRACE_SEIZE rejects self-attach). All four collapse to
     /// zero per the best-effort "absent = 0" capture contract.
     /// Snapshot-level diagnosis lives on
-    /// [`HostStateProbeSummary::dominant_failure`]
-    /// (via [`HostStateSnapshot::probe_summary`]); the per-tag
-    /// taxonomy is documented in the `ktstr host-state capture`
-    /// CLI help.
+    /// [`HostStateProbeSummary::dominant_failure`] (the per-tag
+    /// plurality) and
+    /// [`HostStateProbeSummary::privilege_dominant`] (the EPERM
+    /// remediation gate, true when ptrace tags account for ≥ 50%
+    /// of `failed`), reachable via
+    /// [`HostStateSnapshot::probe_summary`]; the per-tag taxonomy
+    /// is documented in the `ktstr host-state capture` CLI help.
     pub allocated_bytes: u64,
     /// Bytes freed by this thread over its lifetime — read from
     /// jemalloc's per-thread TSD u64 counter
@@ -1359,10 +1380,11 @@ impl ProbeSummary {
             .filter(|(t, _)| matches!(**t, "ptrace-seize" | "ptrace-interrupt"))
             .map(|(_, n)| *n)
             .sum();
-        // Half of failures or more attributable to ptrace-attach
-        // privilege — high enough that the hint is useful, low
-        // enough that a few EPERMs in an otherwise-clean run
-        // don't drown the summary.
+        // Half of failures or more attributable to ptrace
+        // privilege (ptrace-seize or ptrace-interrupt) — high
+        // enough that the hint is useful, low enough that a few
+        // EPERMs in an otherwise-clean run don't drown the
+        // summary.
         self.failed > 0 && total_ptrace * 2 >= self.failed
     }
 
@@ -1519,7 +1541,7 @@ fn probe_thread_recording(
 
 /// Emit the once-per-snapshot summary line. Includes the dominant
 /// failure tag when any failures landed and an EPERM remediation
-/// hint when ptrace-attach privilege failures dominate.
+/// hint when ptrace privilege failures dominate.
 fn emit_probe_summary(summary: &ProbeSummary) {
     let tgids_walked = summary.tgids_walked;
     let jemalloc_detected = summary.jemalloc_detected;
@@ -3407,8 +3429,11 @@ mod tests {
     /// Zero-failure summary projects to `dominant_failure: None` —
     /// the absence-of-failure case must surface as None, not an
     /// empty string. Mirrors the internal `dominant_tag` returning
-    /// None when both tag maps are empty. `privilege_dominant`
-    /// must also be false (no failures to dominate).
+    /// None when no actionable tags remain after the
+    /// non-actionable filter (the fixture seeds
+    /// `jemalloc-not-found`, which `dominant_tag` filters out).
+    /// `privilege_dominant` must also be false (no failures to
+    /// dominate).
     #[test]
     fn to_public_dominant_failure_is_none_when_no_failures() {
         let s = make_summary(0, &[("jemalloc-not-found", 12)], &[]);
@@ -3458,6 +3483,119 @@ mod tests {
         assert!(
             !public.privilege_dominant,
             "ptrace 1/4 < 50% → privilege_dominant false",
+        );
+    }
+
+    /// `privilege_dominant` covers the full ptrace tag set, the
+    /// smallest-`failed` corners of the threshold, and the default
+    /// shape of the public surface. Pins:
+    ///
+    /// 1. `ptrace-interrupt` alone trips the threshold — proves the
+    ///    `matches!` arm in `ptrace_dominates` covers both tags, not
+    ///    just `ptrace-seize`.
+    /// 2. `dwarf-parse-failure` (2) plus split ptrace tags
+    ///    (`ptrace-seize` 1 + `ptrace-interrupt` 1) out of 4 failed —
+    ///    proves `privilege_dominant` and `dominant_failure` are
+    ///    independent reductions and can DIVERGE: summed ptrace
+    ///    crosses the 50% gate (`privilege_dominant: true`) while
+    ///    `dominant_failure` names the non-ptrace tag that won the
+    ///    single-tag plurality (`dwarf-parse-failure`).
+    /// 3. `failed == 1` with one ptrace tag is the smallest input
+    ///    that flips the gate true (1*2 >= 1).
+    /// 4. `failed == 1` with one non-ptrace tag is the smallest
+    ///    input that keeps the gate false (0*2 < 1) — pins that
+    ///    `total_ptrace == 0` keeps the gate false even when
+    ///    `failed > 0`.
+    /// 5. `HostStateProbeSummary::default()` has
+    ///    `privilege_dominant: false` — pins
+    ///    `HostStateProbeSummary::default()` for callers that may
+    ///    use struct-update syntax.
+    /// 6. ptrace wins the single-tag plurality but stays below the
+    ///    50% threshold — the converse of bullet 2: `dominant_failure`
+    ///    names a ptrace tag while `privilege_dominant` is `false`.
+    ///    Pins the converse direction of the independence claim.
+    #[test]
+    fn to_public_privilege_dominant_ptrace_interrupt_and_edge_cases() {
+        // 1. ptrace-interrupt alone: 2/2 = 100% ≥ 50% → true.
+        let s = make_summary(2, &[], &[("ptrace-interrupt", 2)]);
+        let public = s.to_public();
+        assert!(
+            public.privilege_dominant,
+            "ptrace-interrupt 2/2 ≥ 50% → privilege_dominant true \
+             (matches! arm covers ptrace-interrupt as well as ptrace-seize)",
+        );
+
+        // 2. divergence: summed ptrace tags trip the privilege gate
+        //    while a non-ptrace tag wins the single-tag plurality.
+        //    dwarf-parse-failure (2) + ptrace-seize (1) + ptrace-interrupt (1)
+        //    out of 4 failed: total_ptrace = 2, 2*2 = 4 >= 4 →
+        //    privilege_dominant true; dominant_tag picks
+        //    dwarf-parse-failure as the highest single-tag count (2).
+        //    Pins that the two fields reduce independently.
+        let s = make_summary(
+            4,
+            &[("dwarf-parse-failure", 2)],
+            &[("ptrace-seize", 1), ("ptrace-interrupt", 1)],
+        );
+        let public = s.to_public();
+        assert!(
+            public.privilege_dominant,
+            "summed ptrace 2/4 ≥ 50% → privilege_dominant true",
+        );
+        assert_eq!(
+            public.dominant_failure.as_deref(),
+            Some("dwarf-parse-failure"),
+            "dominant_failure names the non-ptrace tag that won the \
+             single-tag plurality while privilege_dominant is true — \
+             proves the two fields are independent",
+        );
+
+        // 3. smallest true: failed == 1 with one ptrace tag.
+        let s = make_summary(1, &[], &[("ptrace-seize", 1)]);
+        let public = s.to_public();
+        assert!(
+            public.privilege_dominant,
+            "ptrace 1/1 ≥ 50% → privilege_dominant true at the \
+             smallest-failed boundary",
+        );
+
+        // 4. smallest false: failed == 1 with no ptrace tag. Guards
+        //    that `total_ptrace == 0` keeps the gate false even when
+        //    `failed > 0`.
+        let s = make_summary(1, &[("dwarf-parse-failure", 1)], &[]);
+        let public = s.to_public();
+        assert!(
+            !public.privilege_dominant,
+            "no ptrace tags with failed == 1 → privilege_dominant \
+             false (total_ptrace == 0 keeps the gate closed)",
+        );
+
+        // 5. default invariant: a freshly-defaulted summary must
+        //    not claim privilege dominance.
+        assert!(
+            !HostStateProbeSummary::default().privilege_dominant,
+            "HostStateProbeSummary::default().privilege_dominant \
+             must be false",
+        );
+
+        // 6. converse: ptrace wins the per-tag plurality but stays
+        //    below the 50% threshold → privilege_dominant false while
+        //    dominant_failure names the ptrace tag.
+        let s = make_summary(
+            10,
+            &[("dwarf-parse-failure", 3), ("jemalloc-in-dso", 3)],
+            &[("ptrace-seize", 4)],
+        );
+        let public = s.to_public();
+        assert!(
+            !public.privilege_dominant,
+            "ptrace 4/10 < 50% → privilege_dominant false",
+        );
+        assert_eq!(
+            public.dominant_failure.as_deref(),
+            Some("ptrace-seize"),
+            "dominant_failure names a ptrace tag while privilege_dominant \
+             is false — converse of the independence claim",
         );
     }
 
