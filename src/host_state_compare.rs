@@ -1839,14 +1839,31 @@ mod tests {
             ("nr_wakeups_sync", |t| t.nr_wakeups_sync = 1),
             ("nr_wakeups_migrate", |t| t.nr_wakeups_migrate = 1),
             ("nr_wakeups_idle", |t| t.nr_wakeups_idle = 1),
+            ("nr_wakeups_affine", |t| t.nr_wakeups_affine = 1),
             ("nr_migrations", |t| t.nr_migrations = 1),
+            ("nr_migrations_cold", |t| t.nr_migrations_cold = 1),
+            ("nr_forced_migrations", |t| t.nr_forced_migrations = 1),
+            ("nr_failed_migrations_affine", |t| {
+                t.nr_failed_migrations_affine = 1
+            }),
+            ("nr_failed_migrations_running", |t| {
+                t.nr_failed_migrations_running = 1
+            }),
+            ("nr_failed_migrations_hot", |t| {
+                t.nr_failed_migrations_hot = 1
+            }),
             ("wait_sum", |t| t.wait_sum = 1),
             ("wait_count", |t| t.wait_count = 1),
             ("sleep_sum", |t| t.sleep_sum = 1),
+            ("block_sum", |t| t.block_sum = 1),
+            ("iowait_sum", |t| t.iowait_sum = 1),
+            ("iowait_count", |t| t.iowait_count = 1),
             ("allocated_bytes", |t| t.allocated_bytes = 1),
             ("deallocated_bytes", |t| t.deallocated_bytes = 1),
             ("minflt", |t| t.minflt = 1),
             ("majflt", |t| t.majflt = 1),
+            ("utime_clock_ticks", |t| t.utime_clock_ticks = 1),
+            ("stime_clock_ticks", |t| t.stime_clock_ticks = 1),
             ("rchar", |t| t.rchar = 1),
             ("wchar", |t| t.wchar = 1),
             ("syscr", |t| t.syscr = 1),

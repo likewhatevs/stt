@@ -410,7 +410,20 @@ pub struct ThreadState {
     /// to be picked. Populated from `/proc/<tid>/sched`'s
     /// `wait_sum` key — kernel emits via `PN_SCHEDSTAT` as
     /// `ms.ns_remainder`, reconstructed by the parser to full ns.
+    /// Zero on kernels without `CONFIG_SCHEDSTATS`. Zero under
+    /// sched_ext: the kernel updates this counter via
+    /// `__update_stats_wait_end` (`kernel/sched/stats.c`), called
+    /// from CFS/RT/DL paths only — `kernel/sched/ext.c` does not
+    /// call that helper.
     pub wait_sum: u64,
+    /// Number of runqueue-wait windows the task accumulated —
+    /// the per-event tally that pairs with [`Self::wait_sum`].
+    /// Populated from `/proc/<tid>/sched`'s `wait_count` key
+    /// (kernel emits as `P_SCHEDSTAT`, plain u64). Zero on
+    /// kernels without `CONFIG_SCHEDSTATS`. Same write path as
+    /// `wait_sum` (`__update_stats_wait_end` in
+    /// `kernel/sched/stats.c`), so the same sched_ext caveat
+    /// applies: zero under sched_ext.
     pub wait_count: u64,
     /// Longest single runqueue-wait window the task ever
     /// experienced, in nanoseconds. `/proc/<tid>/sched` `wait_max`
@@ -419,8 +432,8 @@ pub struct ThreadState {
     /// signal that pairs with the `wait_sum` average. Zero on
     /// kernels without `CONFIG_SCHEDSTATS`. Zero under sched_ext:
     /// the kernel sets this counter via
-    /// `__update_stats_wait_end` from CFS/RT/DL enqueue paths
-    /// only — `kernel/sched/ext.c` does not call that helper, so
+    /// `__update_stats_wait_end` from CFS/RT/DL paths only —
+    /// `kernel/sched/ext.c` does not call that helper, so
     /// sched_ext-managed tasks never accumulate wait_max.
     pub wait_max: u64,
     /// Total nanoseconds the task slept (voluntary block in
@@ -431,7 +444,10 @@ pub struct ThreadState {
     /// counterpart: the kernel does not emit one — the scheduler
     /// records the aggregate runtime but not the sleep-event
     /// count separately from `nr_wakeups`, which already covers
-    /// the wake-side tally.
+    /// the wake-side tally. Zero on kernels without
+    /// `CONFIG_SCHEDSTATS`. Zero under sched_ext: the kernel
+    /// updates this counter via `__update_stats_enqueue_sleeper`
+    /// (`kernel/sched/stats.c`), called from CFS/RT/DL paths only.
     pub sleep_sum: u64,
     /// Longest single sleep window in nanoseconds.
     /// `/proc/<tid>/sched` `sleep_max` emitted via `PN_SCHEDSTAT`
@@ -454,6 +470,10 @@ pub struct ThreadState {
     /// the lock-family waits, so the delta cannot be read as
     /// swap latency without further attribution. There is no
     /// `block_count` counterpart: the kernel does not emit one.
+    /// Zero on kernels without `CONFIG_SCHEDSTATS`. Zero under
+    /// sched_ext: the kernel updates this counter via
+    /// `__update_stats_enqueue_sleeper` (`kernel/sched/stats.c`),
+    /// called from CFS/RT/DL paths only.
     pub block_sum: u64,
     /// Longest single block window in nanoseconds.
     /// `/proc/<tid>/sched` `block_max` emitted via `PN_SCHEDSTAT`
@@ -471,8 +491,20 @@ pub struct ThreadState {
     /// every blocked window read `block_sum`. Populated from
     /// `/proc/<tid>/sched`'s `iowait_sum` key (kernel emits
     /// `ms.ns_remainder` via `PN_SCHEDSTAT`; the parser
-    /// reconstructs full ns).
+    /// reconstructs full ns). Zero on kernels without
+    /// `CONFIG_SCHEDSTATS`. Zero under sched_ext: the kernel
+    /// updates this counter via `__update_stats_enqueue_sleeper`
+    /// (`kernel/sched/stats.c`), called from CFS/RT/DL paths
+    /// only.
     pub iowait_sum: u64,
+    /// Number of I/O-wait windows the task accumulated — the
+    /// per-event tally that pairs with [`Self::iowait_sum`].
+    /// Populated from `/proc/<tid>/sched`'s `iowait_count` key
+    /// (kernel emits as `P_SCHEDSTAT`, plain u64). Zero on
+    /// kernels without `CONFIG_SCHEDSTATS`. Same write path as
+    /// `iowait_sum` (`__update_stats_enqueue_sleeper` in
+    /// `kernel/sched/stats.c`), so the same sched_ext caveat
+    /// applies: zero under sched_ext.
     pub iowait_count: u64,
     /// Longest single CPU-burst (run-without-preempt window) in
     /// nanoseconds. `/proc/<tid>/sched` `exec_max` emitted via
@@ -4073,6 +4105,36 @@ mod tests {
         };
         emit_probe_summary(&summary);
         assert!(logs_contain("(dominant: ptrace-seize"));
+        assert!(logs_contain("hint:"));
+        assert!(logs_contain("$(which ktstr)"));
+        assert!(logs_contain("cap_sys_ptrace"));
+        assert!(logs_contain("yama.ptrace_scope"));
+    }
+
+    /// `ptrace-interrupt`-dominated snapshot also emits the
+    /// privilege hint. Pins the `matches!` arm in
+    /// `ProbeSummary::ptrace_dominates` covering both ptrace
+    /// tags, not just `ptrace-seize` — a regression that
+    /// narrowed the gate to `ptrace-seize` only would silently
+    /// drop the hint on hosts where the per-thread interrupt
+    /// step (rather than the initial seize) is the failure
+    /// mode (for example: yama scope=1 lets the seize succeed
+    /// against an opted-in target but blocks the per-tid
+    /// `PTRACE_INTERRUPT` step against threads created after
+    /// the opt-in window).
+    #[traced_test]
+    #[test]
+    fn summary_emits_privilege_hint_when_ptrace_interrupt_dominates() {
+        let summary = ProbeSummary {
+            tgids_walked: 4,
+            jemalloc_detected: 2,
+            probed_ok: 0,
+            failed: 4,
+            attach_tag_counts: BTreeMap::new(),
+            probe_tag_counts: [("ptrace-interrupt", 4u64)].into_iter().collect(),
+        };
+        emit_probe_summary(&summary);
+        assert!(logs_contain("(dominant: ptrace-interrupt"));
         assert!(logs_contain("hint:"));
         assert!(logs_contain("$(which ktstr)"));
         assert!(logs_contain("cap_sys_ptrace"));
