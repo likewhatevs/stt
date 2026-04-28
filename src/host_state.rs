@@ -683,11 +683,18 @@ impl HostStateSnapshot {
     /// snapshot is a legitimate edge case (host idle, capture
     /// filter excluded every thread) and the comparison engine
     /// handles it by emitting an empty diff.
+    ///
+    /// The decompression step is bounded by
+    /// [`MAX_DECOMPRESSED_SNAPSHOT_BYTES`] — a payload that
+    /// decompresses past that ceiling surfaces an error rather
+    /// than allocating unbounded memory, guarding against a
+    /// hostile zstd payload (zstd compresses pathologically well
+    /// on repeated bytes).
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         use anyhow::Context;
         let bytes = std::fs::read(path)
             .with_context(|| format!("read host-state snapshot from {}", path.display()))?;
-        let json = zstd::decode_all(bytes.as_slice())
+        let json = decompress_capped(&bytes, MAX_DECOMPRESSED_SNAPSHOT_BYTES)
             .with_context(|| format!("zstd decompress host-state snapshot {}", path.display()))?;
         let snap: HostStateSnapshot = serde_json::from_slice(&json).with_context(|| {
             format!(
@@ -718,12 +725,47 @@ impl HostStateSnapshot {
     }
 }
 
+/// Decompress a zstd payload into a `Vec<u8>` capped at
+/// `max_decompressed` bytes — bombing out with an error if the
+/// payload would expand past the ceiling. Reads through
+/// `Read::take(cap + 1)` so a payload that decompresses to
+/// exactly `cap` bytes is accepted while one that produces
+/// `cap + 1` bytes (or more) is rejected — the +1 sentinel
+/// distinguishes "EOF coincided with the cap" from "more data
+/// behind the cap".
+fn decompress_capped(bytes: &[u8], max_decompressed: u64) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let decoder = zstd::stream::read::Decoder::new(bytes)?;
+    let mut out = Vec::new();
+    decoder
+        .take(max_decompressed.saturating_add(1))
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > max_decompressed {
+        anyhow::bail!(
+            "zstd-decompressed payload exceeds the {}-byte cap (decompression-bomb guard)",
+            max_decompressed,
+        );
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------
 // Capture layer: procfs readers + host walk.
 // ---------------------------------------------------------------
 
 /// Canonical file extension for a serialized snapshot.
 pub const SNAPSHOT_EXTENSION: &str = "hst.zst";
+
+/// Decompressed-size ceiling for [`HostStateSnapshot::load`].
+/// Bounds the allocation a malicious or corrupted zstd payload
+/// can force, since zstd compresses pathologically well on
+/// repeated bytes (a few-KiB compressed blob can decompress to
+/// gigabytes). 256 MiB covers any realistic production snapshot
+/// (typical hosts run 1K-100K live threads) while bounding
+/// worst-case allocation against hostile zstd payloads.
+/// Public so a downstream consumer can size buffers against the
+/// same ceiling without hardcoding the value.
+pub const MAX_DECOMPRESSED_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default procfs root on Linux. The `_at` readers accept any
 /// `&Path` so tests stage a synthetic tree under a tempdir; the
@@ -2330,6 +2372,45 @@ mod tests {
         assert!(
             msg.contains("parse host-state"),
             "expected parse error in context chain, got: {msg}",
+        );
+    }
+
+    /// Decompression-bomb guard: a zstd payload that decompresses
+    /// past the configured cap surfaces an error tagged with
+    /// "decompression-bomb guard" — the loader must not allocate
+    /// past the ceiling. Test uses a small synthetic payload (8
+    /// KiB of zeros, which compresses to a tiny blob but
+    /// decompresses to 8192 bytes) against a 1024-byte cap so
+    /// the test runs in microseconds rather than allocating a
+    /// production-sized buffer.
+    #[test]
+    fn decompress_capped_rejects_decompression_bomb() {
+        let payload = vec![0u8; 8192];
+        let compressed = zstd::encode_all(payload.as_slice(), 3).unwrap();
+        let cap: u64 = 1024;
+        let err = super::decompress_capped(&compressed, cap).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("decompression-bomb guard"),
+            "expected decompression-bomb guard error, got: {msg}",
+        );
+    }
+
+    /// Boundary case: a payload whose decompressed length is
+    /// exactly `cap` bytes is accepted (the cap is inclusive).
+    /// Pins the `>` (not `>=`) discriminator at the cap boundary
+    /// so a future refactor that flips the comparison surfaces
+    /// here rather than turning a legal snapshot into a
+    /// false-positive bomb rejection.
+    #[test]
+    fn decompress_capped_accepts_payload_at_cap_boundary() {
+        let payload = b"hello world".to_vec();
+        let compressed = zstd::encode_all(payload.as_slice(), 3).unwrap();
+        let out = super::decompress_capped(&compressed, payload.len() as u64).unwrap();
+        assert_eq!(
+            out, payload,
+            "payload exactly at the cap must round-trip — \
+             cap is inclusive (`>` not `>=`)",
         );
     }
 
