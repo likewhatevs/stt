@@ -147,6 +147,17 @@ tikv-jemallocator = { version = "0.6", features = ["stats"] }
 # resident/mapped); without it the submodule is absent at compile
 # time. `arenas::narenas` is exposed unconditionally.
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+# Regex synthesis from a list of literal strings — used by
+# `host_state_compare` to render human-readable display labels for
+# pattern-aggregated thread-name groups (e.g. 4 threads named
+# `tokio-runtime-worker-0..3` collapse to a regex showing the
+# shared prefix + alternation). The internal join key stays as the
+# deterministic strip-trailing-digit prefix; grex is invoked at
+# render time only, on bucket-member literals (≥2 entries), to
+# produce a regex string operators can read or paste into tooling.
+# `default-features = false` drops the binary CLI surface (clap,
+# colored, indoc) so only the library trait is pulled in.
+grex = { version = "1.4", default-features = false }
 # SHA-1 listed as a direct dep solely to enable `asm` (SHA-NI on
 # x86_64) via Cargo feature unification on the transitive instance
 # pulled in by gix → gix-hash → sha1-checked → sha1. No call sites
