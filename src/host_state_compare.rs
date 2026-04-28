@@ -1966,18 +1966,29 @@ pub struct HostStateCompareArgs {
     pub sort_by: String,
 }
 
-/// Entry point for the compare CLI. Loads both snapshots,
-/// computes the diff, prints the table, and returns `0` on
-/// success. Exits non-zero only on I/O or parse errors; a
-/// non-empty diff is data, not a failure.
+/// Entry point for the compare CLI. Parses `--sort-by` first,
+/// then loads both snapshots, computes the diff, prints the
+/// table, and returns `0` on success. Exits non-zero only on
+/// I/O or parse errors; a non-empty diff is data, not a
+/// failure.
+///
+/// Order is deliberate: `parse_sort_by` runs before the
+/// snapshot loads so an operator typo in the spec (`--sort-by
+/// not_a_real_metric`) fails fast without waiting on disk I/O.
+/// Without this ordering the operator pays for two snapshot
+/// loads only to hit the parser error after — and an
+/// integration test driving a malformed spec against
+/// non-existent snapshot paths would surface the load failure
+/// instead of the parser failure (the path the test actually
+/// pins).
 pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
+    let sort_by = parse_sort_by(&args.sort_by)
+        .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
+
     let baseline = HostStateSnapshot::load(&args.baseline)
         .with_context(|| format!("load baseline {}", args.baseline.display()))?;
     let candidate = HostStateSnapshot::load(&args.candidate)
         .with_context(|| format!("load candidate {}", args.candidate.display()))?;
-
-    let sort_by = parse_sort_by(&args.sort_by)
-        .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
 
     let opts = CompareOptions {
         group_by: args.group_by.into(),

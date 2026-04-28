@@ -16,49 +16,23 @@
 //! downstream addition is a drop-in extension rather than a
 //! rewrite.
 
+// Shared host-state test helpers live under `tests/common/`
+// so the same `make_thread` / `snapshot` / `cgroup_stats_entry`
+// builders feed both this file and `tests/host_state_show.rs`
+// without duplicating bodies. The `mod common;` declaration
+// pulls the subdirectory in as a non-test module.
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ktstr::host_state::{CgroupStats, HostStateSnapshot, ThreadState};
+use ktstr::host_state::{HostStateSnapshot, ThreadState};
 use ktstr::host_state_compare::{
-    CompareOptions, GroupBy, HOST_STATE_METRICS, HostStateCompareArgs, compare, run_compare,
-    write_diff,
+    AggRule, Aggregated, CompareOptions, GroupBy, HOST_STATE_METRICS, HostStateCompareArgs,
+    aggregate, compare, run_compare, write_diff,
 };
 
-fn make_thread(pcomm: &str, comm: &str) -> ThreadState {
-    let mut t = ThreadState::default();
-    t.tid = 1;
-    t.tgid = 1;
-    t.pcomm = pcomm.into();
-    t.comm = comm.into();
-    t.cgroup = "/".into();
-    t.policy = "SCHED_OTHER".into();
-    t.cpu_affinity = vec![0, 1, 2, 3];
-    t
-}
-
-fn snapshot(
-    threads: Vec<ThreadState>,
-    cgroup_stats: BTreeMap<String, CgroupStats>,
-) -> HostStateSnapshot {
-    // `HostStateSnapshot` is `#[non_exhaustive]` so external
-    // consumers cannot use struct-literal construction. Start
-    // from `Default::default()` and mutate public fields — the
-    // pattern documented in `lib.rs` / [`ktstr::non_exhaustive`].
-    let mut snap = HostStateSnapshot::default();
-    snap.threads = threads;
-    snap.cgroup_stats = cgroup_stats;
-    snap
-}
-
-fn cgroup_stats(cpu: u64, throttled: u64, throttled_usec: u64, memory: u64) -> CgroupStats {
-    let mut s = CgroupStats::default();
-    s.cpu_usage_usec = cpu;
-    s.nr_throttled = throttled;
-    s.throttled_usec = throttled_usec;
-    s.memory_current = memory;
-    s
-}
+use common::host_state::{cgroup_stats_entry, make_thread, snapshot};
 
 fn compare_options(group_by: GroupBy, flatten: Vec<String>) -> CompareOptions {
     let mut opts = CompareOptions::default();
@@ -183,7 +157,7 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
     let mut cgroup_stats_a = BTreeMap::new();
     cgroup_stats_a.insert(
         "/kubepods/burstable/pod-AAA/container".into(),
-        cgroup_stats(100, 0, 0, 1 << 20),
+        cgroup_stats_entry(100, 0, 0, 1 << 20),
     );
 
     let mut tb = make_thread("app", "worker");
@@ -192,7 +166,7 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
     let mut cgroup_stats_b = BTreeMap::new();
     cgroup_stats_b.insert(
         "/kubepods/burstable/pod-BBB/container".into(),
-        cgroup_stats(400, 0, 0, 2 << 20),
+        cgroup_stats_entry(400, 0, 0, 2 << 20),
     );
 
     snapshot(vec![ta], cgroup_stats_a).write(&a_path).unwrap();
@@ -435,5 +409,302 @@ fn run_compare_with_invalid_sort_by_returns_err() {
     assert!(
         msg.contains("parse --sort-by"),
         "error must carry the run_compare context preamble, got: {msg}",
+    );
+}
+
+/// Exhaustive accessor pin for the entire HOST_STATE_METRICS
+/// registry: every entry, regardless of its [`AggRule`] variant
+/// (Sum, Max, OrdinalRange, Mode, Affinity), must read back
+/// the exact field its accessor closure names.
+///
+/// The unit-level test
+/// `sum_metric_accessors_read_expected_field` (in
+/// src/host_state_compare.rs) only covers Sum metrics. This
+/// integration-level pin extends the same idea to every variant
+/// AND verifies (via set-equality against the registry below)
+/// that no metric is missing from the local case table — the
+/// table cannot drift relative to the registry without
+/// surfacing.
+///
+/// Method per metric:
+/// 1. Construct a single `ThreadState` populated with a UNIQUE,
+///    distinguishable value for the metric's source field
+///    (each Sum/Max metric gets a different u64 so an accessor
+///    cross-wired to a sibling field reads the wrong value).
+/// 2. Call `aggregate(rule, &[&t])`.
+/// 3. Match the returned `Aggregated` variant against the rule
+///    family and assert the value flowed through the accessor.
+///
+/// For Mode metrics (`policy`, `state`, `ext_enabled`) we set
+/// the field to a distinct value and assert the mode is the
+/// populated value with count 1. For Affinity (`cpu_affinity`)
+/// we set a 5-element uniform cpuset distinct from
+/// `make_thread`'s default and assert the aggregate carries
+/// `min_cpus == max_cpus == 5` plus the `uniform` cpuset. For
+/// OrdinalRange (`nice`, `processor`) we set the value and
+/// assert both `min` and `max` equal it. For Sum and Max we
+/// set the field to a unique u64 and assert the returned
+/// scalar equals it.
+#[test]
+fn host_state_metrics_accessors_read_every_variant() {
+    // Every registry name in this list paired with a setter
+    // closure that populates the field the accessor reads.
+    // Each Sum/Max setter writes a UNIQUE value so an accessor
+    // cross-wired to a sibling field would read a value that
+    // doesn't match the assertion. Set-equality below catches
+    // missing or duplicate entries against the registry.
+    //
+    // Sum/Max value choice: each metric gets `100 + index_in_table`,
+    // hand-paired with the per-metric expected value below.
+    // We don't compute it programmatically because the closure
+    // can't see its index — but the constant-per-metric pattern
+    // means a future drift surfaces as a wrong-value assertion
+    // rather than a false pass.
+    type MetricSetter = fn(&mut ThreadState);
+    let cases: &[(&str, MetricSetter)] = &[
+        // Mode rules — distinct strings per metric.
+        ("policy", |t| t.policy = "SCHED_RR".into()),
+        ("state", |t| t.state = 'R'),
+        ("ext_enabled", |t| t.ext_enabled = true),
+        // OrdinalRange rules — distinct integers.
+        ("nice", |t| t.nice = 7),
+        ("processor", |t| t.processor = 5),
+        // Affinity rule — 5-element uniform cpuset distinct
+        // from `make_thread`'s default `vec![0, 1, 2, 3]`.
+        ("cpu_affinity", |t| {
+            t.cpu_affinity = vec![10, 11, 12, 13, 14]
+        }),
+        // Sum rules — each gets a unique u64. The expected
+        // value table below mirrors these so a swap between
+        // two accessors (run_time_ns ↔ wait_time_ns) would
+        // surface as a numeric mismatch citing the metric.
+        ("run_time_ns", |t| t.run_time_ns = 100),
+        ("wait_time_ns", |t| t.wait_time_ns = 101),
+        ("timeslices", |t| t.timeslices = 102),
+        ("voluntary_csw", |t| t.voluntary_csw = 103),
+        ("nonvoluntary_csw", |t| t.nonvoluntary_csw = 104),
+        ("nr_wakeups", |t| t.nr_wakeups = 105),
+        ("nr_wakeups_local", |t| t.nr_wakeups_local = 106),
+        ("nr_wakeups_remote", |t| t.nr_wakeups_remote = 107),
+        ("nr_wakeups_sync", |t| t.nr_wakeups_sync = 108),
+        ("nr_wakeups_migrate", |t| t.nr_wakeups_migrate = 109),
+        ("nr_wakeups_idle", |t| t.nr_wakeups_idle = 110),
+        ("nr_wakeups_affine", |t| t.nr_wakeups_affine = 111),
+        ("nr_wakeups_affine_attempts", |t| {
+            t.nr_wakeups_affine_attempts = 112
+        }),
+        ("nr_migrations", |t| t.nr_migrations = 113),
+        ("nr_migrations_cold", |t| t.nr_migrations_cold = 114),
+        ("nr_forced_migrations", |t| t.nr_forced_migrations = 115),
+        ("nr_failed_migrations_affine", |t| {
+            t.nr_failed_migrations_affine = 116
+        }),
+        ("nr_failed_migrations_running", |t| {
+            t.nr_failed_migrations_running = 117
+        }),
+        ("nr_failed_migrations_hot", |t| {
+            t.nr_failed_migrations_hot = 118
+        }),
+        ("wait_sum", |t| t.wait_sum = 119),
+        ("wait_count", |t| t.wait_count = 120),
+        ("sleep_sum", |t| t.sleep_sum = 121),
+        ("block_sum", |t| t.block_sum = 122),
+        ("iowait_sum", |t| t.iowait_sum = 123),
+        ("iowait_count", |t| t.iowait_count = 124),
+        ("allocated_bytes", |t| t.allocated_bytes = 125),
+        ("deallocated_bytes", |t| t.deallocated_bytes = 126),
+        ("minflt", |t| t.minflt = 127),
+        ("majflt", |t| t.majflt = 128),
+        ("utime_clock_ticks", |t| t.utime_clock_ticks = 129),
+        ("stime_clock_ticks", |t| t.stime_clock_ticks = 130),
+        ("rchar", |t| t.rchar = 131),
+        ("wchar", |t| t.wchar = 132),
+        ("syscr", |t| t.syscr = 133),
+        ("syscw", |t| t.syscw = 134),
+        ("read_bytes", |t| t.read_bytes = 135),
+        ("write_bytes", |t| t.write_bytes = 136),
+        // Max rules — each gets a unique u64.
+        ("wait_max", |t| t.wait_max = 200),
+        ("sleep_max", |t| t.sleep_max = 201),
+        ("block_max", |t| t.block_max = 202),
+        ("exec_max", |t| t.exec_max = 203),
+        ("slice_max", |t| t.slice_max = 204),
+    ];
+
+    // Hand-paired expected scalar value for each Sum/Max
+    // metric — must match the setter's u64 above. A drift
+    // between this map and the setter table surfaces as a
+    // wrong-value assertion failure naming the metric.
+    let expected_scalar: std::collections::BTreeMap<&str, u64> = [
+        // Sum
+        ("run_time_ns", 100),
+        ("wait_time_ns", 101),
+        ("timeslices", 102),
+        ("voluntary_csw", 103),
+        ("nonvoluntary_csw", 104),
+        ("nr_wakeups", 105),
+        ("nr_wakeups_local", 106),
+        ("nr_wakeups_remote", 107),
+        ("nr_wakeups_sync", 108),
+        ("nr_wakeups_migrate", 109),
+        ("nr_wakeups_idle", 110),
+        ("nr_wakeups_affine", 111),
+        ("nr_wakeups_affine_attempts", 112),
+        ("nr_migrations", 113),
+        ("nr_migrations_cold", 114),
+        ("nr_forced_migrations", 115),
+        ("nr_failed_migrations_affine", 116),
+        ("nr_failed_migrations_running", 117),
+        ("nr_failed_migrations_hot", 118),
+        ("wait_sum", 119),
+        ("wait_count", 120),
+        ("sleep_sum", 121),
+        ("block_sum", 122),
+        ("iowait_sum", 123),
+        ("iowait_count", 124),
+        ("allocated_bytes", 125),
+        ("deallocated_bytes", 126),
+        ("minflt", 127),
+        ("majflt", 128),
+        ("utime_clock_ticks", 129),
+        ("stime_clock_ticks", 130),
+        ("rchar", 131),
+        ("wchar", 132),
+        ("syscr", 133),
+        ("syscw", 134),
+        ("read_bytes", 135),
+        ("write_bytes", 136),
+        // Max
+        ("wait_max", 200),
+        ("sleep_max", 201),
+        ("block_max", 202),
+        ("exec_max", 203),
+        ("slice_max", 204),
+    ]
+    .into_iter()
+    .collect();
+
+    // Drive every case through aggregate() and assert the
+    // accessor surfaced the populated field. The match is
+    // structured per-variant so a regression that swapped a
+    // metric's rule (e.g. Sum → Max) would surface as a panic
+    // citing the metric name.
+    for (name, set) in cases {
+        let mut t = make_thread("p", "w");
+        set(&mut t);
+        let def = HOST_STATE_METRICS
+            .iter()
+            .find(|m| m.name == *name)
+            .unwrap_or_else(|| panic!("metric {name} not in registry"));
+        let agg = aggregate(def.rule, &[&t]);
+        match (def.rule, &agg) {
+            (AggRule::Sum(_), Aggregated::Sum(v)) => {
+                let expected = *expected_scalar.get(name).unwrap_or_else(|| {
+                    panic!("Sum metric {name} missing from expected_scalar table")
+                });
+                assert_eq!(
+                    *v, expected,
+                    "Sum accessor for {name} read the wrong field — \
+                     got {v}, want {expected}",
+                );
+            }
+            (AggRule::Max(_), Aggregated::Max(v)) => {
+                let expected = *expected_scalar.get(name).unwrap_or_else(|| {
+                    panic!("Max metric {name} missing from expected_scalar table")
+                });
+                assert_eq!(
+                    *v, expected,
+                    "Max accessor for {name} read the wrong field — \
+                     got {v}, want {expected}",
+                );
+            }
+            (AggRule::OrdinalRange(_), Aggregated::OrdinalRange { min, max }) => {
+                let expected: i64 = match *name {
+                    "nice" => 7,
+                    "processor" => 5,
+                    _ => panic!("unexpected OrdinalRange metric {name}"),
+                };
+                assert_eq!(
+                    *min, expected,
+                    "OrdinalRange min for {name} did not read the populated value",
+                );
+                assert_eq!(
+                    *max, expected,
+                    "OrdinalRange max for {name} did not read the populated value",
+                );
+            }
+            (
+                AggRule::Mode(_),
+                Aggregated::Mode {
+                    value,
+                    count,
+                    total,
+                },
+            ) => {
+                let expected: &str = match *name {
+                    "policy" => "SCHED_RR",
+                    "state" => "R",
+                    "ext_enabled" => "true",
+                    _ => panic!("unexpected Mode metric {name}"),
+                };
+                assert_eq!(
+                    value, expected,
+                    "Mode accessor for {name} did not read the populated value",
+                );
+                assert_eq!(
+                    *count, 1,
+                    "Mode count for single-thread aggregate must be 1"
+                );
+                assert_eq!(
+                    *total, 1,
+                    "Mode total for single-thread aggregate must be 1"
+                );
+            }
+            (AggRule::Affinity(_), Aggregated::Affinity(s)) => {
+                // The setter populates a 5-element cpuset
+                // (10..=14) — distinct from `make_thread`'s
+                // default 4-element default. A cross-wire to a
+                // different field would yield a different
+                // length OR cpuset.
+                assert_eq!(
+                    s.min_cpus, 5,
+                    "Affinity min_cpus did not match populated cpuset len (5)",
+                );
+                assert_eq!(
+                    s.max_cpus, 5,
+                    "Affinity max_cpus did not match populated cpuset len (5)",
+                );
+                let cpus = s
+                    .uniform
+                    .as_ref()
+                    .expect("single-thread Affinity must be uniform");
+                assert_eq!(cpus, &vec![10, 11, 12, 13, 14]);
+            }
+            (rule, agg) => {
+                panic!("rule/aggregate variant mismatch for {name}: rule={rule:?}, agg={agg:?}",)
+            }
+        }
+    }
+
+    // Exhaustiveness pin via SET-equality. count-equality
+    // (cases.len() == HOST_STATE_METRICS.len()) would silently
+    // pass on a duplicate test entry that displaced a missing
+    // metric. Building name sets and asserting equality
+    // catches both directions: a registry-added metric without
+    // a test entry, AND a test-entry typo that doesn't exist
+    // in the registry.
+    let case_names: std::collections::BTreeSet<&str> =
+        cases.iter().map(|(name, _)| *name).collect();
+    let registry_names: std::collections::BTreeSet<&str> =
+        HOST_STATE_METRICS.iter().map(|m| m.name).collect();
+    assert_eq!(
+        case_names.len(),
+        cases.len(),
+        "duplicate metric in test case table — set-vs-vec length mismatch",
+    );
+    assert_eq!(
+        case_names, registry_names,
+        "test cases must mirror HOST_STATE_METRICS exactly; \
+         missing-from-cases or extra-in-cases delta surfaces here",
     );
 }

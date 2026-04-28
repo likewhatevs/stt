@@ -668,10 +668,13 @@ fn run_completions(shell: clap_complete::Shell, binary: &str) {
 /// path.
 fn run_show(args: &HostStateShowArgs) -> Result<i32> {
     use anyhow::Context;
-    let snap = ktstr::host_state::HostStateSnapshot::load(&args.snapshot)
-        .with_context(|| format!("load snapshot {}", args.snapshot.display()))?;
+    // Parse `--sort-by` BEFORE the snapshot load so an operator
+    // typo fails fast without paying for disk I/O. Mirrors
+    // run_compare's ordering for the same reason.
     let sort_by = host_state_compare::parse_sort_by(&args.sort_by)
         .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
+    let snap = ktstr::host_state::HostStateSnapshot::load(&args.snapshot)
+        .with_context(|| format!("load snapshot {}", args.snapshot.display()))?;
     let mut out = String::new();
     // Infallible: writing into a String cannot fail.
     let _ = write_show(
@@ -1385,6 +1388,55 @@ mod tests {
                 command: HostStateCommand::Compare(args),
             } => {
                 assert_eq!(args.sort_by, "run_time_ns:desc,wait_time_ns:asc");
+            }
+            _ => panic!("expected HostState/Compare"),
+        }
+    }
+
+    /// `--group-by`, `--cgroup-flatten`, `--no-thread-normalize`,
+    /// `--no-cg-normalize`, and `--sort-by` propagate from clap
+    /// into the `HostStateCompareArgs` struct unchanged. Mirror
+    /// of `parse_host_state_show_with_every_flag_succeeds` for
+    /// the compare subcommand — pins the parse shape for every
+    /// flag the compare subcommand surfaces. A regression that
+    /// drops a flag from the clap struct or re-types a field
+    /// (e.g. `--sort-by` to `Vec<String>`) would surface here at
+    /// parse time before reaching `run_compare`.
+    #[test]
+    fn parse_host_state_compare_with_every_flag() {
+        let parsed = Cli::try_parse_from([
+            "ktstr",
+            "host-state",
+            "compare",
+            "/tmp/a.hst.zst",
+            "/tmp/b.hst.zst",
+            "--group-by",
+            "comm",
+            "--cgroup-flatten",
+            "/kubepods/*/workload",
+            "--no-thread-normalize",
+            "--no-cg-normalize",
+            "--sort-by",
+            "run_time_ns:desc,wait_sum:asc",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match parsed.command {
+            Command::HostState {
+                command: HostStateCommand::Compare(args),
+            } => {
+                assert_eq!(args.baseline, std::path::PathBuf::from("/tmp/a.hst.zst"));
+                assert_eq!(args.candidate, std::path::PathBuf::from("/tmp/b.hst.zst"));
+                assert_eq!(args.group_by, host_state_compare::GroupBy::Comm);
+                assert_eq!(
+                    args.cgroup_flatten,
+                    vec!["/kubepods/*/workload".to_string()]
+                );
+                assert!(args.no_thread_normalize);
+                assert!(args.no_cg_normalize);
+                // `--sort-by` comes through verbatim — clap stores
+                // the raw spec; `parse_sort_by` is the parser layer
+                // and runs in `run_compare`, not at clap parse time.
+                assert_eq!(args.sort_by, "run_time_ns:desc,wait_sum:asc");
             }
             _ => panic!("expected HostState/Compare"),
         }

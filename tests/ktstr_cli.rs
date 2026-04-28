@@ -640,3 +640,116 @@ fn ktstr_library_cpu_cap_env_with_bypass_errors() {
         .failure()
         .stderr(predicate::str::contains("resource contract"));
 }
+
+// -- host-state compare CLI surface pins --
+//
+// Mirror the `help_kernel_*` and `help_shell_*` shape pins for
+// the `host-state compare` subcommand: confirm `--help` lists
+// every operator-visible flag (including `--sort-by`), and
+// confirm the binary surfaces parser errors at runtime when an
+// invalid `--sort-by` spec lands. Defends against a regression
+// that drops the flag from the clap struct or breaks the
+// `parse_sort_by` error wrapping.
+
+/// `ktstr host-state compare --help` lists every documented
+/// flag in the `--help` output. Pins the operator-discovery
+/// path: a flag that's wired in clap but missing from `--help`
+/// would surface here. New flags must be added to the assertion
+/// list below.
+#[test]
+fn help_host_state_compare_lists_all_flags() {
+    ktstr()
+        .args(["host-state", "compare", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--group-by"))
+        .stdout(predicate::str::contains("--cgroup-flatten"))
+        .stdout(predicate::str::contains("--no-thread-normalize"))
+        .stdout(predicate::str::contains("--no-cg-normalize"))
+        .stdout(predicate::str::contains("--sort-by"));
+}
+
+/// `ktstr host-state compare --help` — the `--sort-by` help
+/// text uses the documented "metric" terminology (not "field")
+/// and lists the `asc`/`desc` direction syntax. Pins both the
+/// vocabulary cleanup AND the doc-link removal: the rendered
+/// help must NOT contain rustdoc bracket syntax like
+/// `[HOST_STATE_METRICS]` (operator-facing leakage).
+#[test]
+fn help_host_state_compare_sort_by_uses_metric_terminology() {
+    ktstr()
+        .args(["host-state", "compare", "--help"])
+        .assert()
+        .success()
+        // The help text describes the spec format using the
+        // `metric` terminology.
+        .stdout(predicate::str::contains("metric"))
+        // Both directions must be documented.
+        .stdout(predicate::str::contains("asc"))
+        .stdout(predicate::str::contains("desc"))
+        // Rustdoc bracket syntax must NOT appear in operator
+        // help text. If a future doc edit accidentally
+        // re-introduces `[HOST_STATE_METRICS]` (the registry
+        // identifier), this assertion would fire.
+        .stdout(predicate::str::contains("[HOST_STATE_METRICS]").not());
+}
+
+/// `ktstr host-state compare --help` — the `--sort-by` help
+/// text must NOT use the word "legacy". Pre-1.0 codebase has
+/// no legacy; the default-sort fallthrough is just "default".
+#[test]
+fn help_host_state_compare_sort_by_no_legacy_word() {
+    ktstr()
+        .args(["host-state", "compare", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("legacy").not());
+}
+
+/// `ktstr host-state compare <a> <b> --sort-by <bad-metric>`
+/// returns a non-zero exit and the diagnostic names the
+/// offending metric. The valid metric list also surfaces (the
+/// "must be one of: …" preamble) so an operator typo is
+/// recoverable from the error alone. Pins that
+/// `parse_sort_by`'s rejection bubbles all the way out through
+/// the binary surface.
+#[test]
+fn host_state_compare_invalid_sort_by_metric_errors() {
+    // Use `/dev/null` for both snapshot paths — the parse_sort_by
+    // error fires BEFORE snapshot loading, so we never reach the
+    // "missing snapshot" path.
+    ktstr()
+        .args([
+            "host-state",
+            "compare",
+            "/dev/null",
+            "/dev/null",
+            "--sort-by",
+            "not_a_real_metric",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not_a_real_metric"))
+        .stderr(predicate::str::contains("must be one of"));
+}
+
+/// `ktstr host-state compare <a> <b> --sort-by wait_sum:bogus`
+/// returns a non-zero exit with a diagnostic naming the bad
+/// direction. Pins the direction-side of the parser's error
+/// path (parallel to the bad-metric test above).
+#[test]
+fn host_state_compare_invalid_sort_by_direction_errors() {
+    ktstr()
+        .args([
+            "host-state",
+            "compare",
+            "/dev/null",
+            "/dev/null",
+            "--sort-by",
+            "wait_sum:bogus",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid direction"))
+        .stderr(predicate::str::contains("bogus"));
+}
