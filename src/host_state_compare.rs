@@ -768,7 +768,7 @@ pub fn compare(
 /// Layer-2 skeleton group. Returns the map keyed by post-flatten
 /// path; consumers ([`build_groups`], [`flatten_cgroup_stats`])
 /// look up the final key for any path they see.
-fn build_cgroup_key_map(
+pub fn build_cgroup_key_map(
     baseline: &HostStateSnapshot,
     candidate: &HostStateSnapshot,
     flatten: &[glob::Pattern],
@@ -1169,7 +1169,7 @@ fn cgroup_normalize_skeleton(path: &str) -> (String, String, Vec<String>) {
 /// Empty `members` returns `key` — defensive against synthetic
 /// inputs; production builds populate `member_comms` for every
 /// bucket.
-fn pattern_display_label(key: &str, members: &[String]) -> String {
+pub fn pattern_display_label(key: &str, members: &[String]) -> String {
     if members.len() < 2 {
         return key.to_string();
     }
@@ -1197,7 +1197,7 @@ fn pattern_counts_union(
     counts
 }
 
-fn build_groups(
+pub fn build_groups(
     snap: &HostStateSnapshot,
     group_by: GroupBy,
     flatten: &[glob::Pattern],
@@ -1415,13 +1415,13 @@ pub fn flatten_cgroup_path(path: &str, patterns: &[glob::Pattern]) -> String {
     path.to_string()
 }
 
-fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
+pub fn compile_flatten_patterns(raw: &[String]) -> Vec<glob::Pattern> {
     raw.iter()
         .filter_map(|s| glob::Pattern::new(s).ok())
         .collect()
 }
 
-fn flatten_cgroup_stats(
+pub fn flatten_cgroup_stats(
     stats: &BTreeMap<String, CgroupStats>,
     patterns: &[glob::Pattern],
     cgroup_key_map: Option<&BTreeMap<String, String>>,
@@ -1581,7 +1581,7 @@ fn auto_scale(value: f64, unit: &'static str) -> (f64, &'static str) {
 /// Non-numeric aggregates (`OrdinalRange`, `Mode`, `Affinity`)
 /// fall through to the [`Aggregated`] [`fmt::Display`] impl
 /// unchanged because no scaling applies.
-fn format_value_cell(agg: &Aggregated, unit: &'static str) -> String {
+pub fn format_value_cell(agg: &Aggregated, unit: &'static str) -> String {
     match agg {
         Aggregated::Sum(v) => format_scaled_u64(*v, unit),
         Aggregated::Max(v) => format_scaled_u64(*v, unit),
@@ -1609,10 +1609,17 @@ fn format_scaled_u64(v: u64, unit: &'static str) -> String {
 /// signed numeric delta through [`auto_scale`] so a large delta
 /// renders in a readable magnitude with the matching prefix
 /// applied to the unit. Sign is preserved (rendered with `+` or
-/// `-`).
+/// `-`). When no step-up was triggered AND the delta is integer-
+/// valued, the cell renders as the bare signed integer to match
+/// [`format_value_cell`]'s short-circuit (so `+5ns` instead of
+/// `+5.000ns`); otherwise the scaled f64 renders with 3 decimals.
 fn format_delta_cell(delta: f64, unit: &'static str) -> String {
     let (scaled, scaled_unit) = auto_scale(delta, unit);
-    format!("{scaled:+.3}{scaled_unit}")
+    if scaled_unit == unit && delta.fract() == 0.0 {
+        format!("{:+}{scaled_unit}", delta as i64)
+    } else {
+        format!("{scaled:+.3}{scaled_unit}")
+    }
 }
 
 /// Arguments for the `ktstr host-state compare` subcommand.
@@ -2735,9 +2742,11 @@ mod tests {
             GroupBy::Pcomm,
         )
         .unwrap();
-        // 50 - 100 = -50ns → renders with minus sign + unit.
+        // 50 - 100 = -50 ns → integer delta below the µs
+        // threshold → bare signed-integer render via
+        // `format_delta_cell`'s short-circuit (no `.000` noise).
         assert!(
-            out.contains("-50.000ns"),
+            out.contains("-50ns"),
             "missing signed delta with unit:\n{out}",
         );
         assert!(out.contains("-50.0%"), "missing signed pct:\n{out}");
@@ -4468,5 +4477,263 @@ mod tests {
             "literal candidate path missing under no_cg_normalize: only_candidate={:?}",
             diff_off.only_candidate,
         );
+    }
+
+    // ------------------------------------------------------------
+    // auto_scale + render-cell tests (#22): unit-aware magnitude
+    // scaling for ns / B / ticks / unitless cells.
+    // ------------------------------------------------------------
+
+    /// Boundary: 999 ns stays at the base unit; 1000 ns steps up
+    /// to µs. Pins the threshold at exactly the prefix transition.
+    #[test]
+    fn auto_scale_ns_boundary_stays_at_base_below_threshold() {
+        assert_eq!(auto_scale(0.0, "ns"), (0.0, "ns"));
+        assert_eq!(auto_scale(999.0, "ns"), (999.0, "ns"));
+        assert_eq!(auto_scale(1000.0, "ns"), (1.0, "µs"));
+    }
+
+    /// ns ladder: ns → µs (1e3) → ms (1e6) → s (1e9). Pins each
+    /// step. Decimal SI prefixes (NOT IEC binary).
+    #[test]
+    fn auto_scale_ns_ladder_steps_up_at_powers_of_ten() {
+        let (v, u) = auto_scale(1_500.0, "ns");
+        assert_eq!(u, "µs");
+        assert!((v - 1.5).abs() < 1e-9);
+        let (v, u) = auto_scale(1_500_000.0, "ns");
+        assert_eq!(u, "ms");
+        assert!((v - 1.5).abs() < 1e-9);
+        let (v, u) = auto_scale(1_500_000_000.0, "ns");
+        assert_eq!(u, "s");
+        assert!((v - 1.5).abs() < 1e-9);
+    }
+
+    /// Byte ladder uses IEC binary prefixes (×1024). 1024 B → 1
+    /// KiB, 1 MiB at 1024², 1 GiB at 1024³. Pin both the
+    /// threshold and the divisor.
+    #[test]
+    fn auto_scale_byte_iec_ladder_uses_1024() {
+        assert_eq!(auto_scale(1023.0, "B"), (1023.0, "B"));
+        let (v, u) = auto_scale(1024.0, "B");
+        assert_eq!(u, "KiB");
+        assert!((v - 1.0).abs() < 1e-9);
+        let (v, u) = auto_scale(1024.0 * 1024.0, "B");
+        assert_eq!(u, "MiB");
+        assert!((v - 1.0).abs() < 1e-9);
+        let (v, u) = auto_scale(1024.0 * 1024.0 * 1024.0, "B");
+        assert_eq!(u, "GiB");
+        assert!((v - 1.0).abs() < 1e-9);
+    }
+
+    /// Ticks ladder: ticks → Kticks (×1e3) → Mticks (×1e6).
+    /// Decimal prefixes — clock-tick rate is host-dependent.
+    #[test]
+    fn auto_scale_ticks_ladder_uses_decimal_prefixes() {
+        assert_eq!(auto_scale(999.0, "ticks"), (999.0, "ticks"));
+        let (v, u) = auto_scale(1_500.0, "ticks");
+        assert_eq!(u, "Kticks");
+        assert!((v - 1.5).abs() < 1e-9);
+        let (v, u) = auto_scale(2_000_000.0, "ticks");
+        assert_eq!(u, "Mticks");
+        assert!((v - 2.0).abs() < 1e-9);
+    }
+
+    /// Unitless (large counts) ladder: "" → K → M → G. Decimal
+    /// SI prefixes for non-dimensional counts (wakeups,
+    /// migrations, etc.).
+    #[test]
+    fn auto_scale_unitless_ladder_uses_si_prefixes() {
+        assert_eq!(auto_scale(999.0, ""), (999.0, ""));
+        let (v, u) = auto_scale(1_500.0, "");
+        assert_eq!(u, "K");
+        assert!((v - 1.5).abs() < 1e-9);
+        let (v, u) = auto_scale(2_500_000.0, "");
+        assert_eq!(u, "M");
+        assert!((v - 2.5).abs() < 1e-9);
+        let (v, u) = auto_scale(3_000_000_000.0, "");
+        assert_eq!(u, "G");
+        assert!((v - 3.0).abs() < 1e-9);
+    }
+
+    /// Negative values pass through scaling with sign preserved.
+    /// A delta cell with `-2,000,000 ns` should scale to
+    /// `-2.000 ms` (NOT `+2 ms` or `2 ms`).
+    #[test]
+    fn auto_scale_preserves_sign_on_negative_input() {
+        let (v, u) = auto_scale(-2_000_000.0, "ns");
+        assert_eq!(u, "ms");
+        assert!((v - (-2.0)).abs() < 1e-9);
+        let (v, u) = auto_scale(-5_000.0, "B");
+        // -5000 < -1024 in absolute value, but value is signed.
+        // |-5000| = 5000 ≥ 1024, so step to KiB.
+        assert_eq!(u, "KiB");
+        assert!((v - (-5000.0 / 1024.0)).abs() < 1e-9);
+    }
+
+    /// Unknown unit families pass through unchanged so the
+    /// caller's `&'static str` lifetime is preserved without
+    /// allocation.
+    #[test]
+    fn auto_scale_unknown_unit_passes_through() {
+        assert_eq!(auto_scale(123.0, "Hz"), (123.0, "Hz"));
+        assert_eq!(auto_scale(1_000_000.0, "Hz"), (1_000_000.0, "Hz"));
+        assert_eq!(auto_scale(42.0, "bogus_unit"), (42.0, "bogus_unit"));
+    }
+
+    /// `format_value_cell` for a Sum aggregate with unit "ns":
+    /// values below the µs threshold render as integers; values
+    /// at/above the threshold render as scaled f64 with 3
+    /// decimals.
+    #[test]
+    fn format_value_cell_renders_sum_at_appropriate_scale() {
+        // Below threshold → integer + base unit, no decimals.
+        assert_eq!(format_value_cell(&Aggregated::Sum(50), "ns"), "50ns");
+        assert_eq!(format_value_cell(&Aggregated::Sum(999), "ns"), "999ns");
+        // At/above threshold → scaled f64 with 3 decimals.
+        assert_eq!(format_value_cell(&Aggregated::Sum(1_500), "ns"), "1.500µs",);
+        assert_eq!(
+            format_value_cell(&Aggregated::Sum(2_000_000), "ns"),
+            "2.000ms",
+        );
+    }
+
+    /// `format_value_cell` for a Max aggregate: same scaling
+    /// behavior as Sum (the *_max kernel fields use ns just like
+    /// the *_sum fields).
+    #[test]
+    fn format_value_cell_renders_max_at_appropriate_scale() {
+        assert_eq!(format_value_cell(&Aggregated::Max(100), "ns"), "100ns");
+        assert_eq!(
+            format_value_cell(&Aggregated::Max(7_500_000), "ns"),
+            "7.500ms",
+        );
+    }
+
+    /// Non-numeric aggregates (Mode, OrdinalRange, Affinity) fall
+    /// through to the [`Aggregated`] [`fmt::Display`] impl
+    /// unchanged. No scaling because the values aren't scalar
+    /// counts.
+    #[test]
+    fn format_value_cell_passes_non_numeric_aggregates_through() {
+        let m = Aggregated::Mode {
+            value: "SCHED_OTHER".into(),
+            count: 4,
+            total: 4,
+        };
+        assert_eq!(format_value_cell(&m, ""), "SCHED_OTHER");
+        let r = Aggregated::OrdinalRange { min: -5, max: 10 };
+        assert_eq!(format_value_cell(&r, ""), "-5..10");
+    }
+
+    /// `format_delta_cell` renders the signed delta with the
+    /// scaled unit. Sign is preserved (with explicit `+` for
+    /// positive). When no step-up was triggered AND the delta is
+    /// integer-valued, the cell renders as a bare signed integer
+    /// (no `.000` noise) to match
+    /// [`format_value_cell`]'s short-circuit; otherwise 3-decimal
+    /// precision applies.
+    #[test]
+    fn format_delta_cell_renders_signed_scaled_value() {
+        // Below threshold, integer delta — short-circuit to bare
+        // signed integer.
+        assert_eq!(format_delta_cell(-50.0, "ns"), "-50ns");
+        assert_eq!(format_delta_cell(50.0, "ns"), "+50ns");
+        assert_eq!(format_delta_cell(0.0, "ns"), "+0ns");
+        // Below threshold, non-integer delta — keep 3 decimals so
+        // sub-unit precision survives (rare in practice — counters
+        // are u64-sourced — but possible after delta math on
+        // ordinal-range midpoints).
+        assert_eq!(format_delta_cell(50.5, "ns"), "+50.500ns");
+        // Above threshold — step up. Always 3 decimals because
+        // the scale-up path can produce fractional values
+        // (`2_000_001 / 1e6 = 2.000001`).
+        assert_eq!(format_delta_cell(2_000_000.0, "ns"), "+2.000ms");
+        assert_eq!(format_delta_cell(-2_000_000.0, "ns"), "-2.000ms");
+    }
+
+    /// `compare`'s sort order is unaffected by render-time
+    /// scaling: the underlying `delta_pct` and `delta` fields
+    /// hold the raw numeric values regardless of how cells are
+    /// rendered. Pin two rows whose deltas differ in scale (one
+    /// in ns range, one in ms-equivalent range) and verify sort
+    /// is by raw |delta_pct|, not by rendered string.
+    #[test]
+    fn auto_scale_does_not_affect_sort_order() {
+        let mut a_small = make_thread("small", "w");
+        a_small.run_time_ns = 100;
+        let mut a_big = make_thread("big", "w");
+        a_big.run_time_ns = 1_000_000;
+        let mut b_small = make_thread("small", "w");
+        b_small.run_time_ns = 110;
+        let mut b_big = make_thread("big", "w");
+        b_big.run_time_ns = 2_000_000;
+        let diff = compare(
+            &snap_with(vec![a_small, a_big]),
+            &snap_with(vec![b_small, b_big]),
+            &CompareOptions::default(),
+        );
+        // big: +100% (1M → 2M) vs small: +10% (100 → 110). Big
+        // should sort first regardless of which scale the cells
+        // render at.
+        let run_rows: Vec<&DiffRow> = diff
+            .rows
+            .iter()
+            .filter(|r| r.metric_name == "run_time_ns")
+            .collect();
+        assert_eq!(run_rows[0].group_key, "big");
+        assert_eq!(run_rows[1].group_key, "small");
+    }
+
+    /// Integration test: a snapshot pair whose run_time_ns sums
+    /// fall in the ms range renders as `*ms` cells via
+    /// [`write_diff`]. Pins that the new auto-scale call sites
+    /// at the baseline / candidate / delta cells take effect end-
+    /// to-end.
+    #[test]
+    fn write_diff_renders_auto_scaled_cells_for_ns_metric() {
+        let mut ta = make_thread("p", "w");
+        ta.run_time_ns = 5_000_000; // 5 ms
+        let mut tb = make_thread("p", "w");
+        tb.run_time_ns = 8_000_000; // 8 ms
+        let diff = compare(
+            &snap_with(vec![ta]),
+            &snap_with(vec![tb]),
+            &CompareOptions::default(),
+        );
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+        )
+        .unwrap();
+        // Baseline cell: 5 ms with the ms unit.
+        assert!(out.contains("5.000ms"), "missing baseline ms:\n{out}");
+        // Candidate cell.
+        assert!(out.contains("8.000ms"), "missing candidate ms:\n{out}");
+        // Delta cell: +3 ms.
+        assert!(out.contains("+3.000ms"), "missing delta ms:\n{out}");
+    }
+
+    /// Registry pin: the utime/stime clock-tick metrics carry
+    /// the `"ticks"` unit so they pick up the ticks ladder under
+    /// auto-scaling. Defends against a regression that flips
+    /// either entry's unit back to `""` (which would route them
+    /// through the unitless ladder and produce `K` / `M` /
+    /// `G`-prefix cells).
+    #[test]
+    fn registry_utime_stime_carry_ticks_unit() {
+        let utime = HOST_STATE_METRICS
+            .iter()
+            .find(|m| m.name == "utime_clock_ticks")
+            .expect("utime_clock_ticks in registry");
+        let stime = HOST_STATE_METRICS
+            .iter()
+            .find(|m| m.name == "stime_clock_ticks")
+            .expect("stime_clock_ticks in registry");
+        assert_eq!(utime.unit, "ticks");
+        assert_eq!(stime.unit, "ticks");
     }
 }

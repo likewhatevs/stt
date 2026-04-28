@@ -390,6 +390,62 @@ enum HostStateCommand {
     },
     /// Compare two snapshots and render a per-metric diff table.
     Compare(host_state_compare::HostStateCompareArgs),
+    /// Render one snapshot as a per-group, per-metric table.
+    ///
+    /// Same grouping axis as `compare` (`pcomm` default, `cgroup`,
+    /// `comm`, `comm-exact`) and the same per-metric aggregation
+    /// rules from [`host_state_compare::HOST_STATE_METRICS`], but
+    /// with no baseline/candidate split — every metric renders one
+    /// aggregated value per group rather than a delta against a
+    /// reference snapshot. Useful for inspecting a capture in
+    /// isolation: spot-check a process's per-thread CSW totals,
+    /// audit the cgroup distribution, find which thread-name
+    /// pattern has the highest run-time without comparing two
+    /// runs.
+    ///
+    /// Pattern normalization (`comm` token-based clustering and
+    /// `cgroup` Layer-1/2/3 path tightening) applies the same way
+    /// it does in `compare`; `--no-thread-normalize` and
+    /// `--no-cg-normalize` disable each axis. `--cgroup-flatten`
+    /// glob patterns also apply unchanged.
+    Show(HostStateShowArgs),
+}
+
+/// Arguments for the `ktstr host-state show` subcommand. Field
+/// shapes mirror [`host_state_compare::HostStateCompareArgs`] so a
+/// caller switching from compare to show keeps the same flag
+/// vocabulary; the only structural difference is the single
+/// positional path (one snapshot rather than baseline+candidate)
+/// and the absence of any delta/percentage flags — show renders
+/// one value per (group, metric) cell, no diff math.
+#[derive(Debug, clap::Args)]
+pub struct HostStateShowArgs {
+    /// Snapshot path (`.hst.zst`) from `ktstr host-state capture -o`.
+    pub snapshot: std::path::PathBuf,
+    /// Grouping key. Same semantics as
+    /// `ktstr host-state compare --group-by`. `pcomm` (default)
+    /// aggregates per process name; `cgroup` per cgroup path;
+    /// `comm` aggregates threads by NAME PATTERN under the
+    /// token-based normalizer; `comm-exact` is a synonym for
+    /// `comm --no-thread-normalize`.
+    #[arg(long, value_enum, default_value_t = host_state_compare::GroupBy::Pcomm)]
+    pub group_by: host_state_compare::GroupBy,
+    /// Glob patterns that collapse dynamic cgroup path segments —
+    /// same shape as
+    /// `ktstr host-state compare --cgroup-flatten`. Repeatable.
+    #[arg(long)]
+    pub cgroup_flatten: Vec<String>,
+    /// Disable token-based pattern normalization for the thread
+    /// axis (`--group-by comm`). Threads group by literal `comm`.
+    /// Has no effect under any other grouping.
+    #[arg(long)]
+    pub no_thread_normalize: bool,
+    /// Disable token-based pattern normalization for the cgroup
+    /// axis (`--group-by cgroup`). Cgroup paths group by literal
+    /// post-`--cgroup-flatten` path. Has no effect under any
+    /// other grouping.
+    #[arg(long)]
+    pub no_cg_normalize: bool,
 }
 
 /// RAII guard that cleans up an auto-generated cgroup directory on drop.
@@ -583,6 +639,154 @@ fn kernel_build_one(
 fn run_completions(shell: clap_complete::Shell, binary: &str) {
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, binary, &mut std::io::stdout());
+}
+
+/// Entry point for `ktstr host-state show <snapshot>`. Loads one
+/// snapshot, builds groups along the requested axis, aggregates
+/// every metric per
+/// [`host_state_compare::HOST_STATE_METRICS`], and renders the
+/// result as a `(group_key, threads, metric, value)` table on
+/// stdout. Exits non-zero only on I/O / parse errors; the
+/// rendered table is always considered successful output.
+///
+/// Reuses the grouping pipeline from
+/// [`host_state_compare`] so pattern normalization (`comm` Layer-2
+/// token clustering, `cgroup` Layer-1/2/3 tightening) and
+/// `--cgroup-flatten` glob handling stay identical to the compare
+/// path.
+fn run_show(args: &HostStateShowArgs) -> Result<i32> {
+    use anyhow::Context;
+    let snap = ktstr::host_state::HostStateSnapshot::load(&args.snapshot)
+        .with_context(|| format!("load snapshot {}", args.snapshot.display()))?;
+    let mut out = String::new();
+    // Infallible: writing into a String cannot fail.
+    let _ = write_show(
+        &mut out,
+        &snap,
+        args.group_by,
+        &args.cgroup_flatten,
+        args.no_thread_normalize,
+        args.no_cg_normalize,
+    );
+    print!("{out}");
+    Ok(0)
+}
+
+/// Render the per-group / per-metric show table into `w`. Mirrors
+/// [`host_state_compare::write_diff`]'s shape — the formatter
+/// layer is split from the I/O wrapper so unit tests can drive
+/// rendering into a `String` buffer without shelling through
+/// stdout. Write errors propagate as [`std::fmt::Error`]; callers
+/// that write into an infallible sink (`String`) can ignore.
+fn write_show<W: std::fmt::Write>(
+    w: &mut W,
+    snap: &ktstr::host_state::HostStateSnapshot,
+    group_by: host_state_compare::GroupBy,
+    cgroup_flatten: &[String],
+    no_thread_normalize: bool,
+    no_cg_normalize: bool,
+) -> std::fmt::Result {
+    let flatten = host_state_compare::compile_flatten_patterns(cgroup_flatten);
+    // Single-snapshot cgroup key map. compare()'s
+    // `build_cgroup_key_map` walks the union of paths from two
+    // snapshots; for show we feed the same snap on both arguments
+    // so the union iteration produces the same key set as a
+    // single-snap pass (the inner BTreeSet of paths dedups the
+    // duplicate insertions). Skipped under `--no-cg-normalize`
+    // and under any grouping other than Cgroup.
+    let cgroup_key_map = if group_by == host_state_compare::GroupBy::Cgroup && !no_cg_normalize {
+        Some(host_state_compare::build_cgroup_key_map(
+            snap, snap, &flatten,
+        ))
+    } else {
+        None
+    };
+    // Pattern counts: `build_groups` falls back to a per-snapshot
+    // local count when None, which is exactly the right behavior
+    // for a single-snapshot view (compare()'s union-over-baseline-
+    // and-candidate gate doesn't apply when there's only one
+    // snapshot to inspect).
+    let groups = host_state_compare::build_groups(
+        snap,
+        group_by,
+        &flatten,
+        None,
+        cgroup_key_map.as_ref(),
+        no_thread_normalize,
+    );
+
+    let group_header = match group_by {
+        host_state_compare::GroupBy::Pcomm => "pcomm",
+        host_state_compare::GroupBy::Cgroup => "cgroup",
+        host_state_compare::GroupBy::Comm => "comm-pattern",
+        host_state_compare::GroupBy::CommExact => "comm",
+    };
+
+    let mut table = cli::new_table();
+    table.set_header(vec![group_header, "threads", "metric", "value"]);
+
+    // Stable iteration order: BTreeMap on `groups` already orders
+    // by key; per-group rows iterate `HOST_STATE_METRICS` so the
+    // metric column also lands in registry order. No delta sort
+    // because there is no delta to sort by — show renders
+    // absolute aggregates, not differences.
+    for (key, group) in &groups {
+        // Display key: pattern grouping under Comm uses grex to
+        // turn the join-key skeleton into a regex label; every
+        // other grouping renders the join key directly.
+        let display_key = if group_by == host_state_compare::GroupBy::Comm && !no_thread_normalize {
+            host_state_compare::pattern_display_label(key, &group.member_comms)
+        } else {
+            key.clone()
+        };
+        for metric in host_state_compare::HOST_STATE_METRICS {
+            let Some(agg) = group.metrics.get(metric.name) else {
+                continue;
+            };
+            table.add_row(vec![
+                display_key.clone(),
+                group.thread_count.to_string(),
+                metric.name.to_string(),
+                host_state_compare::format_value_cell(agg, metric.unit),
+            ]);
+        }
+    }
+    writeln!(w, "{table}")?;
+
+    // Cgroup grouping carries cgroup_stats enrichment alongside
+    // the per-thread aggregates. Render a second table when
+    // present so the show output mirrors compare's two-table
+    // layout for `--group-by cgroup`.
+    if group_by == host_state_compare::GroupBy::Cgroup && !snap.cgroup_stats.is_empty() {
+        let stats = host_state_compare::flatten_cgroup_stats(
+            &snap.cgroup_stats,
+            &flatten,
+            cgroup_key_map.as_ref(),
+        );
+        if !stats.is_empty() {
+            writeln!(w)?;
+            let mut ct = cli::new_table();
+            ct.set_header(vec![
+                "cgroup",
+                "cpu_usage_usec",
+                "nr_throttled",
+                "throttled_usec",
+                "memory_current",
+            ]);
+            for (key, s) in &stats {
+                ct.add_row(vec![
+                    key.clone(),
+                    s.cpu_usage_usec.to_string(),
+                    s.nr_throttled.to_string(),
+                    s.throttled_usec.to_string(),
+                    s.memory_current.to_string(),
+                ]);
+            }
+            writeln!(w, "{ct}")?;
+        }
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -843,6 +1047,12 @@ fn main() -> Result<()> {
                     std::process::exit(code);
                 }
             }
+            HostStateCommand::Show(args) => {
+                let code = run_show(&args)?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
         },
 
         Command::Completions { shell, binary } => {
@@ -931,5 +1141,201 @@ mod tests {
             }
             _ => panic!("expected Shell"),
         }
+    }
+
+    // -- host-state show CLI tests
+    //
+    // Pin clap-parse shape on the `Show` variant + the rendered
+    // output of `write_show` against a synthetic snapshot. The
+    // CLI-parse tests guard against argument-vocabulary drift
+    // (matching the pattern compare's args use) and the
+    // write_show tests guard the rendered table against
+    // regressions in column count, header, and group-axis routing.
+
+    /// `ktstr host-state show <path>` with no flags must parse
+    /// into a Show variant carrying the positional path and
+    /// default GroupBy::Pcomm. Positive-path pin for argv shape.
+    #[test]
+    fn parse_host_state_show_positional_only_succeeds() {
+        let parsed = Cli::try_parse_from(["ktstr", "host-state", "show", "/tmp/snap.hst.zst"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        match parsed.command {
+            Command::HostState {
+                command: HostStateCommand::Show(args),
+            } => {
+                assert_eq!(args.snapshot, std::path::PathBuf::from("/tmp/snap.hst.zst"));
+                assert_eq!(args.group_by, host_state_compare::GroupBy::Pcomm);
+                assert!(args.cgroup_flatten.is_empty());
+                assert!(!args.no_thread_normalize);
+                assert!(!args.no_cg_normalize);
+            }
+            _ => panic!("expected HostState/Show"),
+        }
+    }
+
+    /// `--group-by`, `--cgroup-flatten`, `--no-thread-normalize`,
+    /// and `--no-cg-normalize` propagate from clap into the
+    /// `HostStateShowArgs` struct unchanged. Pins the parse shape
+    /// for every flag the show subcommand surfaces.
+    #[test]
+    fn parse_host_state_show_with_every_flag_succeeds() {
+        let parsed = Cli::try_parse_from([
+            "ktstr",
+            "host-state",
+            "show",
+            "/tmp/snap.hst.zst",
+            "--group-by",
+            "comm",
+            "--cgroup-flatten",
+            "/kubepods/*/workload",
+            "--no-thread-normalize",
+            "--no-cg-normalize",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        match parsed.command {
+            Command::HostState {
+                command: HostStateCommand::Show(args),
+            } => {
+                assert_eq!(args.group_by, host_state_compare::GroupBy::Comm);
+                assert_eq!(
+                    args.cgroup_flatten,
+                    vec!["/kubepods/*/workload".to_string()]
+                );
+                assert!(args.no_thread_normalize);
+                assert!(args.no_cg_normalize);
+            }
+            _ => panic!("expected HostState/Show"),
+        }
+    }
+
+    /// `write_show` on a two-thread synthetic snapshot under
+    /// `GroupBy::Pcomm` renders one row per metric per group with
+    /// header `pcomm | threads | metric | value`. Pins the column
+    /// vocabulary, the routing of GroupBy → header, and that
+    /// every row's "threads" column matches the bucket size. A
+    /// regression that swapped the Sum/Mode columns or dropped a
+    /// metric would surface here.
+    #[test]
+    fn write_show_renders_pcomm_grouping_with_expected_columns() {
+        let mut snap = ktstr::host_state::HostStateSnapshot::default();
+        // Two threads under the same pcomm so the bucket has
+        // size 2 — verifies the threads column reflects bucket
+        // size, not snapshot total. Use a unitless cumulative
+        // counter (`nr_wakeups`) for the value-cell pin so the
+        // assertion does not need to model `auto_scale`'s ladder
+        // step-up: with values 1000 + 2000 = 3000, an `"ns"`
+        // metric would render `3.000µs` (auto-scaled), but
+        // `nr_wakeups` is unitless and the empty-unit ladder
+        // (""→K→M→G) only steps up at 1e3, so `3000` (>= 1e3)
+        // would also scale to `3.000K`. Pick small values
+        // (1+2=3) so no scaling fires regardless of unit.
+        let mut t1 = ktstr::host_state::ThreadState::default();
+        t1.pcomm = "worker-proc".to_string();
+        t1.comm = "worker-0".to_string();
+        t1.nr_wakeups = 1;
+        let mut t2 = ktstr::host_state::ThreadState::default();
+        t2.pcomm = "worker-proc".to_string();
+        t2.comm = "worker-1".to_string();
+        t2.nr_wakeups = 2;
+        snap.threads.push(t1);
+        snap.threads.push(t2);
+
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            host_state_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+        )
+        .expect("write_show into String must not fail");
+
+        assert!(
+            out.contains("pcomm"),
+            "header must include `pcomm` for GroupBy::Pcomm, got: {out}",
+        );
+        assert!(
+            out.contains("threads"),
+            "header must include `threads` column, got: {out}",
+        );
+        assert!(
+            out.contains("metric"),
+            "header must include `metric` column, got: {out}",
+        );
+        assert!(
+            out.contains("value"),
+            "header must include `value` column, got: {out}",
+        );
+        assert!(
+            out.contains("worker-proc"),
+            "group key must surface in the rendered table, got: {out}",
+        );
+        assert!(
+            out.contains("nr_wakeups"),
+            "Sum metric `nr_wakeups` must render a row, got: {out}",
+        );
+        // Sum across the bucket: 1 + 2 = 3. `nr_wakeups` is
+        // unitless and below the 1e3 ladder step, so
+        // `format_value_cell` renders the integer verbatim.
+        assert!(
+            out.contains(" 3 "),
+            "summed nr_wakeups (1+2) must surface as 3 in a value cell, got: {out}",
+        );
+    }
+
+    /// Header switches based on the GroupBy axis — `comm-pattern`
+    /// for `GroupBy::Comm`, `comm` for `GroupBy::CommExact`,
+    /// `cgroup` for `GroupBy::Cgroup`, `pcomm` for the default.
+    /// Pins the routing in `write_show`'s match arm against
+    /// vocabulary drift between this and `host_state_compare`.
+    #[test]
+    fn write_show_header_switches_on_group_by() {
+        let snap = ktstr::host_state::HostStateSnapshot::default();
+        for (axis, expected_header) in [
+            (host_state_compare::GroupBy::Pcomm, "pcomm"),
+            (host_state_compare::GroupBy::Cgroup, "cgroup"),
+            (host_state_compare::GroupBy::Comm, "comm-pattern"),
+            (host_state_compare::GroupBy::CommExact, "comm"),
+        ] {
+            let mut out = String::new();
+            write_show(&mut out, &snap, axis, &[], false, false)
+                .expect("write_show into String must not fail");
+            assert!(
+                out.contains(expected_header),
+                "header for {axis:?} must contain `{expected_header}`, got: {out}",
+            );
+        }
+    }
+
+    /// Empty snapshot renders only the header row — `write_show`
+    /// must not panic on the zero-thread path. Pins that the
+    /// no-data case is well-behaved (compare's no-rows path is
+    /// driven by both-snapshot mismatch; show's only no-data
+    /// path is the single-snap one).
+    #[test]
+    fn write_show_empty_snapshot_renders_header_only() {
+        let snap = ktstr::host_state::HostStateSnapshot::default();
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            host_state_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+        )
+        .expect("write_show into String must not fail on empty snapshot");
+        assert!(
+            out.contains("pcomm"),
+            "empty snapshot must still emit the header, got: {out}",
+        );
+        // Run-time metric does not appear because no thread
+        // contributed it — the `for metric in HOST_STATE_METRICS`
+        // loop emits no rows when `groups` is empty.
+        assert!(
+            !out.contains("run_time_ns"),
+            "no thread → no metric row; got run_time_ns surfaced: {out}",
+        );
     }
 }

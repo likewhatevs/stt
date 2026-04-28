@@ -156,8 +156,10 @@ fn full_pipeline_with_disk_roundtrip() {
         out.contains("integration_proc"),
         "missing group key in output:\n{out}",
     );
+    // run_time_ns delta: +2_500_000 ns → auto-scaled to
+    // `+2.500ms` per the ns ladder in `auto_scale`.
     assert!(
-        out.contains("+2500000.000ns"),
+        out.contains("+2.500ms"),
         "missing run_time_ns delta in output:\n{out}",
     );
     assert!(
