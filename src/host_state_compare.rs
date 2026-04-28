@@ -3338,6 +3338,425 @@ fn format_delta_cell(delta: f64, unit: &'static str) -> String {
     }
 }
 
+/// Per-row display layout for [`write_diff`].
+///
+/// `Full` (default) emits the seven-column form
+/// `(group | threads | metric | baseline | candidate | delta | %)`.
+/// The remaining variants are compact shortcuts for common
+/// operator workflows; each resolves to a fixed [`Column`] set
+/// before the renderer runs. A `--columns` override on the same
+/// invocation wins over the format's default column set.
+///
+/// [`Arrow`] collapses baseline / candidate / delta into a
+/// single cell shaped `<baseline> -> <candidate> (<delta>)` so a
+/// narrow display still surfaces directionality. The arrow cell
+/// renderer mirrors [`cgroup_cell`]'s shape so the two stay
+/// visually consistent across primary and cgroup tables.
+///
+/// [`Arrow`]: DisplayFormat::Arrow
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[non_exhaustive]
+pub enum DisplayFormat {
+    /// Default — emit baseline, candidate, delta, and pct
+    /// columns alongside group / threads / metric.
+    #[default]
+    Full,
+    /// Drop baseline + candidate columns; keep delta + pct.
+    DeltaOnly,
+    /// Drop pct column; keep baseline + candidate + delta.
+    NoPct,
+    /// Single-cell `<baseline> -> <candidate> (<delta>)` form;
+    /// drop pct.
+    Arrow,
+    /// Drop baseline / candidate / delta; keep pct only.
+    PctOnly,
+}
+
+/// One column slot in the rendered diff/show table. The renderer
+/// iterates the resolved [`Column`] vec to build both the
+/// header row and each data row, dispatching cell construction
+/// per variant. Order in the slice is the rendered order — the
+/// renderer never re-sorts.
+///
+/// Column variants are uniform across compare and show even
+/// though show's [`Column::Baseline`], [`Column::Candidate`],
+/// [`Column::Delta`], [`Column::Pct`], [`Column::Arrow`] are
+/// meaningless for a single snapshot. The show entry point
+/// rejects those names at CLI parse time so an operator never
+/// reaches the renderer with a mismatched column set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Column {
+    /// The group-by axis label (rendered header is "pcomm",
+    /// "cgroup", "comm-pattern", or "comm" per `GroupBy`).
+    Group,
+    /// Thread-count cell (`N` when the count matches across
+    /// snapshots, `A->B` arrow form otherwise).
+    Threads,
+    /// Metric name with bracketed tag suffix.
+    Metric,
+    /// Baseline value (compare only).
+    Baseline,
+    /// Candidate value (compare only).
+    Candidate,
+    /// Signed delta (compare only).
+    Delta,
+    /// Percentage delta (compare only).
+    Pct,
+    /// Single-cell `<baseline> -> <candidate> (<delta>)`
+    /// (compare only). Mutually exclusive with
+    /// `Baseline`/`Candidate`/`Delta`/`Pct` — the arrow form
+    /// fuses them.
+    Arrow,
+    /// Aggregated value cell (show only).
+    Value,
+}
+
+impl Column {
+    /// Canonical CLI name. Round-trips through
+    /// [`parse_columns`].
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Column::Group => "group",
+            Column::Threads => "threads",
+            Column::Metric => "metric",
+            Column::Baseline => "baseline",
+            Column::Candidate => "candidate",
+            Column::Delta => "delta",
+            Column::Pct => "%",
+            Column::Arrow => "arrow",
+            Column::Value => "value",
+        }
+    }
+
+    /// Header cell text. The group axis carries a per-`GroupBy`
+    /// label (`pcomm`, `cgroup`, etc.); other columns echo
+    /// [`Self::cli_name`].
+    pub fn header(self, group_header: &'static str) -> &'static str {
+        match self {
+            Column::Group => group_header,
+            Column::Threads => "threads",
+            Column::Metric => "metric",
+            Column::Baseline => "baseline",
+            Column::Candidate => "candidate",
+            Column::Delta => "delta",
+            Column::Pct => "%",
+            Column::Arrow => "baseline \u{2192} candidate (delta)",
+            Column::Value => "value",
+        }
+    }
+}
+
+/// Resolve a [`DisplayFormat`] to its default column set
+/// (compare-side). Returns the full ordered column slice
+/// including the group / threads / metric prefix.
+fn compare_columns_for(format: DisplayFormat) -> Vec<Column> {
+    let mut cols = vec![Column::Group, Column::Threads, Column::Metric];
+    let trailing: &[Column] = match format {
+        DisplayFormat::Full => &[
+            Column::Baseline,
+            Column::Candidate,
+            Column::Delta,
+            Column::Pct,
+        ],
+        DisplayFormat::DeltaOnly => &[Column::Delta, Column::Pct],
+        DisplayFormat::NoPct => &[Column::Baseline, Column::Candidate, Column::Delta],
+        DisplayFormat::Arrow => &[Column::Arrow],
+        DisplayFormat::PctOnly => &[Column::Pct],
+    };
+    cols.extend_from_slice(trailing);
+    cols
+}
+
+/// Resolve the show-side default column set (no
+/// baseline/candidate/delta/pct — show is single-snapshot).
+fn show_columns_default() -> Vec<Column> {
+    vec![
+        Column::Group,
+        Column::Threads,
+        Column::Metric,
+        Column::Value,
+    ]
+}
+
+/// Parse a CLI `--columns` spec into a typed [`Column`] vec.
+/// Format: comma-separated names matching [`Column::cli_name`].
+/// Whitespace around each name is trimmed. Empty input parses
+/// to an empty Vec — caller falls back to the format default.
+///
+/// `compare_side` controls which subset is allowed:
+/// - `true` accepts every variant except [`Column::Value`]
+///   (show-only).
+/// - `false` accepts every variant except
+///   [`Column::Baseline`], [`Column::Candidate`],
+///   [`Column::Delta`], [`Column::Pct`], [`Column::Arrow`]
+///   (compare-only).
+///
+/// Errors:
+/// - Unknown name (cite the offending token; list valid names).
+/// - Wrong-side name (e.g. `value` on compare or `baseline`
+///   on show).
+/// - Duplicate name across two entries.
+/// - Empty token between commas.
+/// - `arrow` paired with any of `baseline`/`candidate`/`delta`/`%`
+///   (the arrow form fuses those columns into a single cell —
+///   pairing them would render the same data twice).
+pub fn parse_columns(spec: &str, compare_side: bool) -> anyhow::Result<Vec<Column>> {
+    if spec.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let allowed: &[Column] = if compare_side {
+        &[
+            Column::Group,
+            Column::Threads,
+            Column::Metric,
+            Column::Baseline,
+            Column::Candidate,
+            Column::Delta,
+            Column::Pct,
+            Column::Arrow,
+        ]
+    } else {
+        &[
+            Column::Group,
+            Column::Threads,
+            Column::Metric,
+            Column::Value,
+        ]
+    };
+    let valid_names = allowed
+        .iter()
+        .map(|c| c.cli_name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out: Vec<Column> = Vec::new();
+    let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            anyhow::bail!(
+                "empty entry in --columns spec {spec:?}; \
+                 entries are comma-separated and must be non-empty"
+            );
+        }
+        let normalized = entry.to_ascii_lowercase();
+        let Some(col) = allowed.iter().copied().find(|c| c.cli_name() == normalized) else {
+            anyhow::bail!(
+                "unknown column {entry:?} in --columns spec {spec:?}; \
+                 must be one of: {valid_names}",
+            );
+        };
+        if !seen.insert(col.cli_name()) {
+            anyhow::bail!(
+                "duplicate column {entry:?} in --columns spec {spec:?}; \
+                 each column may appear at most once"
+            );
+        }
+        out.push(col);
+    }
+    // Arrow fuses baseline/candidate/delta/% into a single cell;
+    // pairing arrow with any of those names asks the renderer to
+    // emit the same data twice. Reject at parse time.
+    let has_arrow = out.iter().any(|c| matches!(c, Column::Arrow));
+    let has_fused = out.iter().any(|c| {
+        matches!(
+            c,
+            Column::Baseline | Column::Candidate | Column::Delta | Column::Pct
+        )
+    });
+    if has_arrow && has_fused {
+        anyhow::bail!(
+            "column 'arrow' is mutually exclusive with baseline/candidate/delta/% \
+             — the arrow form fuses them into a single cell."
+        );
+    }
+    Ok(out)
+}
+
+/// Aggregate display options for the renderer. Plumbed as a
+/// single struct through [`write_diff`] / `write_show` so a
+/// future addition (`--wrap`, `--sections`) lands in one place
+/// without growing every signature.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct DisplayOptions {
+    /// Format shorthand. Default [`DisplayFormat::Full`].
+    pub format: DisplayFormat,
+    /// User-supplied column override; empty Vec means "use the
+    /// format's default column set." Set via [`parse_columns`].
+    pub columns: Vec<Column>,
+}
+
+impl DisplayOptions {
+    /// Resolved compare-side column set: `columns` if
+    /// non-empty, otherwise [`compare_columns_for`] over
+    /// `format`. `--columns` always wins over the format
+    /// shorthand (explicit > shorthand) per the design call.
+    pub fn resolved_compare_columns(&self) -> Vec<Column> {
+        if self.columns.is_empty() {
+            compare_columns_for(self.format)
+        } else {
+            self.columns.clone()
+        }
+    }
+
+    /// Resolved show-side column set: `columns` if non-empty,
+    /// otherwise [`show_columns_default`].
+    pub fn resolved_show_columns(&self) -> Vec<Column> {
+        if self.columns.is_empty() {
+            show_columns_default()
+        } else {
+            self.columns.clone()
+        }
+    }
+}
+
+/// Format the arrow cell `<baseline> -> <candidate> (<delta>)`
+/// for primary diff rows. Mirrors [`cgroup_cell`]'s shape so
+/// the visual style stays consistent across primary and cgroup
+/// tables. When `delta` is `None` (categorical Mode rule), the
+/// parenthetical drops to "same"/"differs"; for non-Mode rows
+/// without a numeric projection the parenthetical is "-".
+fn format_arrow_cell(
+    baseline: &Aggregated,
+    candidate: &Aggregated,
+    delta: Option<f64>,
+    unit: &'static str,
+) -> String {
+    let baseline_cell = format_value_cell(baseline, unit);
+    let candidate_cell = format_value_cell(candidate, unit);
+    let delta_clause = match delta {
+        Some(d) => format_delta_cell(d, unit),
+        None => match (baseline, candidate) {
+            (Aggregated::Mode { value: a, .. }, Aggregated::Mode { value: b, .. }) => {
+                if a == b {
+                    "same".to_string()
+                } else {
+                    "differs".to_string()
+                }
+            }
+            _ => "-".to_string(),
+        },
+    };
+    format!("{baseline_cell} \u{2192} {candidate_cell} ({delta_clause})")
+}
+
+/// Format the arrow cell for derived rows. Same shape as
+/// [`format_arrow_cell`] but pulls from typed
+/// [`DerivedValue`]s and routes through the derived
+/// formatters so ratios / ns / B units pick up their
+/// auto-scale ladders.
+fn format_arrow_cell_derived(row: &DerivedRow) -> String {
+    let baseline_cell = match row.baseline {
+        Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+        None => "-".to_string(),
+    };
+    let candidate_cell = match row.candidate {
+        Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+        None => "-".to_string(),
+    };
+    let delta_clause = match row.delta {
+        Some(d) => format_derived_delta_cell(d, row.metric_unit, row.is_ratio),
+        None => "-".to_string(),
+    };
+    format!("{baseline_cell} \u{2192} {candidate_cell} ({delta_clause})")
+}
+
+/// Helper: shared threads-cell rendering — the `N` form when
+/// counts match across snapshots, `A->B` arrow form otherwise.
+fn render_threads_cell(a: usize, b: usize) -> String {
+    if a == b {
+        a.to_string()
+    } else {
+        format!("{}\u{2192}{}", a, b)
+    }
+}
+
+/// Render a [`DiffRow`] into the column-by-column cell vector
+/// per the resolved [`Column`] set. Caller emits the resulting
+/// `Vec<String>` straight into a comfy_table row.
+fn render_diff_row_cells(row: &DiffRow, columns: &[Column]) -> Vec<String> {
+    let metric_cell = metric_display_name(
+        HOST_STATE_METRICS
+            .iter()
+            .find(|m| m.name == row.metric_name)
+            .expect("metric_name comes from HOST_STATE_METRICS via build_row"),
+    )
+    .into_owned();
+    let mut cells = Vec::with_capacity(columns.len());
+    for col in columns {
+        let cell = match col {
+            Column::Group => row.display_key.clone(),
+            Column::Threads => render_threads_cell(row.thread_count_a, row.thread_count_b),
+            Column::Metric => metric_cell.clone(),
+            Column::Baseline => format_value_cell(&row.baseline, row.metric_unit),
+            Column::Candidate => format_value_cell(&row.candidate, row.metric_unit),
+            Column::Delta => match row.delta {
+                Some(d) => format_delta_cell(d, row.metric_unit),
+                None => match (&row.baseline, &row.candidate) {
+                    (Aggregated::Mode { value: a, .. }, Aggregated::Mode { value: b, .. }) => {
+                        if a == b {
+                            "same".to_string()
+                        } else {
+                            "differs".to_string()
+                        }
+                    }
+                    _ => "-".to_string(),
+                },
+            },
+            Column::Pct => match row.delta_pct {
+                Some(p) => format!("{:+.1}%", p * 100.0),
+                None => "-".to_string(),
+            },
+            Column::Arrow => {
+                format_arrow_cell(&row.baseline, &row.candidate, row.delta, row.metric_unit)
+            }
+            // Show-only columns. The compare-side parse_columns
+            // gate rejects Value at CLI parse time, so reaching
+            // this arm requires constructing a column set
+            // directly through the Rust API. Surface a `-`
+            // rather than panic.
+            Column::Value => "-".to_string(),
+        };
+        cells.push(cell);
+    }
+    cells
+}
+
+/// Render a [`DerivedRow`] into the column-by-column cell
+/// vector. Mirrors [`render_diff_row_cells`] but routes
+/// numeric cells through the typed-derived formatters.
+fn render_derived_row_cells(row: &DerivedRow, columns: &[Column]) -> Vec<String> {
+    let mut cells = Vec::with_capacity(columns.len());
+    for col in columns {
+        let cell = match col {
+            Column::Group => row.display_key.clone(),
+            Column::Threads => render_threads_cell(row.thread_count_a, row.thread_count_b),
+            Column::Metric => row.metric_name.to_string(),
+            Column::Baseline => match row.baseline {
+                Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+                None => "-".to_string(),
+            },
+            Column::Candidate => match row.candidate {
+                Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
+                None => "-".to_string(),
+            },
+            Column::Delta => match row.delta {
+                Some(d) => format_derived_delta_cell(d, row.metric_unit, row.is_ratio),
+                None => "-".to_string(),
+            },
+            Column::Pct => match row.delta_pct {
+                Some(p) => format!("{:+.1}%", p * 100.0),
+                None => "-".to_string(),
+            },
+            Column::Arrow => format_arrow_cell_derived(row),
+            Column::Value => "-".to_string(),
+        };
+        cells.push(cell);
+    }
+    cells
+}
+
 /// Arguments for the `ktstr host-state compare` subcommand.
 #[derive(Debug, clap::Args)]
 pub struct HostStateCompareArgs {
@@ -3393,6 +3812,23 @@ pub struct HostStateCompareArgs {
     /// Parsed by [`parse_sort_by`] into [`CompareOptions::sort_by`].
     #[arg(long, default_value = "")]
     pub sort_by: String,
+    /// Per-row column layout. `full` (default) emits the
+    /// seven-column form; `delta-only` drops baseline +
+    /// candidate; `no-pct` drops the percentage column;
+    /// `arrow` collapses baseline / candidate / delta into a
+    /// single cell; `pct-only` keeps just the percentage.
+    /// `--columns` (below) overrides the format's default
+    /// column set when both are present.
+    #[arg(long, value_enum, default_value_t = DisplayFormat::Full)]
+    pub display_format: DisplayFormat,
+    /// Comma-separated column names to render. Empty (the
+    /// default) means "use the column set selected by
+    /// --display-format." Valid names: `group`, `threads`,
+    /// `metric`, `baseline`, `candidate`, `delta`, `%`,
+    /// `arrow`. Order in the spec is the rendered order.
+    /// Example: `--columns metric,delta,%`.
+    #[arg(long, default_value = "")]
+    pub columns: String,
 }
 
 /// Entry point for the compare CLI. Parses `--sort-by` first,
@@ -3413,6 +3849,11 @@ pub struct HostStateCompareArgs {
 pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
     let sort_by = parse_sort_by(&args.sort_by)
         .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
+    // Parse --columns alongside --sort-by so a malformed spec
+    // surfaces before the snapshot loads. compare_side: true
+    // for the diff renderer.
+    let columns = parse_columns(&args.columns, true)
+        .with_context(|| format!("parse --columns {:?}", args.columns))?;
 
     let baseline = HostStateSnapshot::load(&args.baseline)
         .with_context(|| format!("load baseline {}", args.baseline.display()))?;
@@ -3426,8 +3867,18 @@ pub fn run_compare(args: &HostStateCompareArgs) -> anyhow::Result<i32> {
         no_cg_normalize: args.no_cg_normalize,
         sort_by,
     };
+    let display = DisplayOptions {
+        format: args.display_format,
+        columns,
+    };
     let diff = compare(&baseline, &candidate, &opts);
-    print_diff(&diff, &args.baseline, &args.candidate, args.group_by);
+    print_diff(
+        &diff,
+        &args.baseline,
+        &args.candidate,
+        args.group_by,
+        &display,
+    );
     Ok(0)
 }
 
@@ -3593,10 +4044,18 @@ pub fn print_diff(
     baseline_path: &Path,
     candidate_path: &Path,
     group_by: GroupBy,
+    display: &DisplayOptions,
 ) {
     let mut out = String::new();
     // Infallible: writing into a String cannot fail.
-    let _ = write_diff(&mut out, diff, baseline_path, candidate_path, group_by);
+    let _ = write_diff(
+        &mut out,
+        diff,
+        baseline_path,
+        candidate_path,
+        group_by,
+        display,
+    );
     print!("{out}");
 }
 
@@ -3605,12 +4064,17 @@ pub fn print_diff(
 /// emit without shelling through stdout capture. Write errors
 /// propagate as [`std::fmt::Error`] — callers that write into an
 /// infallible sink (`String`) can unwrap or ignore.
+///
+/// `display` controls per-row column layout: see
+/// [`DisplayFormat`] / [`Column`] / [`DisplayOptions`] for the
+/// resolution rules.
 pub fn write_diff<W: fmt::Write>(
     w: &mut W,
     diff: &HostStateDiff,
     baseline_path: &Path,
     candidate_path: &Path,
     group_by: GroupBy,
+    display: &DisplayOptions,
 ) -> fmt::Result {
     let group_header = match group_by {
         GroupBy::Pcomm => "pcomm",
@@ -3619,58 +4083,13 @@ pub fn write_diff<W: fmt::Write>(
         GroupBy::CommExact => "comm",
     };
 
+    let columns = display.resolved_compare_columns();
     let mut table = crate::cli::new_table();
-    table.set_header(vec![
-        group_header,
-        "threads",
-        "metric",
-        "baseline",
-        "candidate",
-        "delta",
-        "%",
-    ]);
+    let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
+    table.set_header(header_row);
     for row in &diff.rows {
-        let delta_cell = match row.delta {
-            Some(d) => format_delta_cell(d, row.metric_unit),
-            None => match (&row.baseline, &row.candidate) {
-                (Aggregated::Mode { value: a, .. }, Aggregated::Mode { value: b, .. }) => {
-                    if a == b {
-                        "same".to_string()
-                    } else {
-                        "differs".to_string()
-                    }
-                }
-                _ => "-".to_string(),
-            },
-        };
-        let pct_cell = match row.delta_pct {
-            Some(p) => format!("{:+.1}%", p * 100.0),
-            None => "-".to_string(),
-        };
-        let threads_cell = if row.thread_count_a == row.thread_count_b {
-            row.thread_count_a.to_string()
-        } else {
-            format!("{}\u{2192}{}", row.thread_count_a, row.thread_count_b)
-        };
-        // Look up the metric def by name to render gating tags
-        // alongside the bare name. Every `DiffRow` is constructed
-        // by [`build_row`] from a `&'static HostStateMetricDef`,
-        // so the registry lookup always succeeds.
-        let metric_cell = metric_display_name(
-            HOST_STATE_METRICS
-                .iter()
-                .find(|m| m.name == row.metric_name)
-                .expect("metric_name comes from HOST_STATE_METRICS via build_row"),
-        );
-        table.add_row(vec![
-            row.display_key.clone(),
-            threads_cell,
-            metric_cell.into_owned(),
-            format_value_cell(&row.baseline, row.metric_unit),
-            format_value_cell(&row.candidate, row.metric_unit),
-            delta_cell,
-            pct_cell,
-        ]);
+        let cells = render_diff_row_cells(row, &columns);
+        table.add_row(cells);
     }
     writeln!(w, "{table}")?;
 
@@ -3678,46 +4097,11 @@ pub fn write_diff<W: fmt::Write>(
         writeln!(w)?;
         writeln!(w, "## Derived metrics")?;
         let mut dt = crate::cli::new_table();
-        dt.set_header(vec![
-            group_header,
-            "threads",
-            "metric",
-            "baseline",
-            "candidate",
-            "delta",
-            "%",
-        ]);
+        let header_row: Vec<&str> = columns.iter().map(|c| c.header(group_header)).collect();
+        dt.set_header(header_row);
         for row in &diff.derived_rows {
-            let threads_cell = if row.thread_count_a == row.thread_count_b {
-                row.thread_count_a.to_string()
-            } else {
-                format!("{}\u{2192}{}", row.thread_count_a, row.thread_count_b)
-            };
-            let baseline_cell = match row.baseline {
-                Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
-                None => "-".to_string(),
-            };
-            let candidate_cell = match row.candidate {
-                Some(v) => format_derived_value_cell(v, row.metric_unit, row.is_ratio),
-                None => "-".to_string(),
-            };
-            let delta_cell = match row.delta {
-                Some(d) => format_derived_delta_cell(d, row.metric_unit, row.is_ratio),
-                None => "-".to_string(),
-            };
-            let pct_cell = match row.delta_pct {
-                Some(p) => format!("{:+.1}%", p * 100.0),
-                None => "-".to_string(),
-            };
-            dt.add_row(vec![
-                row.display_key.clone(),
-                threads_cell,
-                row.metric_name.to_string(),
-                baseline_cell,
-                candidate_cell,
-                delta_cell,
-                pct_cell,
-            ]);
+            let cells = render_derived_row_cells(row, &columns);
+            dt.add_row(cells);
         }
         writeln!(w, "{dt}")?;
     }
@@ -4313,6 +4697,7 @@ fn psi_resource_has_data(r: &PsiResource) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -4824,6 +5209,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(
@@ -5128,6 +5514,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Cgroup,
+            &DisplayOptions::default(),
         )
         .unwrap();
 
@@ -5181,6 +5568,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Cgroup,
+            &DisplayOptions::default(),
         )
         .unwrap();
 
@@ -5224,6 +5612,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Cgroup,
+            &DisplayOptions::default(),
         )
         .unwrap();
 
@@ -5725,6 +6114,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(
@@ -5756,6 +6146,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(
@@ -5785,11 +6176,450 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(
             out.contains("nr_wakeups_idle [dead] [SCHEDSTATS]"),
             "dead-counter cell missing from rendered table:\n{out}",
+        );
+    }
+
+    // ------------------------------------------------------------
+    // DisplayFormat / Column / parse_columns (#55/#18)
+    // ------------------------------------------------------------
+
+    /// Build a one-thread snapshot pair where every column has
+    /// a meaningful value. Used by the display-format /
+    /// column-set tests below.
+    fn snap_pair_for_display() -> (HostStateSnapshot, HostStateSnapshot) {
+        let mut a = make_thread("p", "w");
+        a.run_time_ns = 100;
+        a.wait_count = 4;
+        a.wait_sum = 1000;
+        let mut b = make_thread("p", "w");
+        b.run_time_ns = 200;
+        b.wait_count = 4;
+        b.wait_sum = 2000;
+        (snap_with(vec![a]), snap_with(vec![b]))
+    }
+
+    /// Default DisplayFormat is `Full`. Pinned via `Default`
+    /// derive so a future enum reorder cannot silently shift
+    /// the default.
+    #[test]
+    fn display_format_default_is_full() {
+        assert_eq!(DisplayFormat::default(), DisplayFormat::Full);
+    }
+
+    /// Each variant of [`DisplayFormat`] resolves to a fixed
+    /// column set. Pin the resolved set per variant so a
+    /// future change that tweaks the trailing columns surfaces
+    /// here with a precise diff.
+    #[test]
+    fn compare_columns_for_resolves_per_variant() {
+        assert_eq!(
+            compare_columns_for(DisplayFormat::Full),
+            vec![
+                Column::Group,
+                Column::Threads,
+                Column::Metric,
+                Column::Baseline,
+                Column::Candidate,
+                Column::Delta,
+                Column::Pct,
+            ]
+        );
+        assert_eq!(
+            compare_columns_for(DisplayFormat::DeltaOnly),
+            vec![
+                Column::Group,
+                Column::Threads,
+                Column::Metric,
+                Column::Delta,
+                Column::Pct
+            ]
+        );
+        assert_eq!(
+            compare_columns_for(DisplayFormat::NoPct),
+            vec![
+                Column::Group,
+                Column::Threads,
+                Column::Metric,
+                Column::Baseline,
+                Column::Candidate,
+                Column::Delta,
+            ]
+        );
+        assert_eq!(
+            compare_columns_for(DisplayFormat::Arrow),
+            vec![
+                Column::Group,
+                Column::Threads,
+                Column::Metric,
+                Column::Arrow
+            ]
+        );
+        assert_eq!(
+            compare_columns_for(DisplayFormat::PctOnly),
+            vec![Column::Group, Column::Threads, Column::Metric, Column::Pct]
+        );
+    }
+
+    /// `Column::cli_name()` round-trips through
+    /// [`parse_columns`] for every compare-side allowed variant.
+    /// `arrow` is mutually exclusive with the
+    /// baseline/candidate/delta/% set it fuses, so it is
+    /// exercised by the dedicated arrow-only round-trip below.
+    #[test]
+    fn parse_columns_round_trips_compare_names() {
+        let spec = "group,threads,metric,baseline,candidate,delta,%";
+        let cols = parse_columns(spec, true).expect("valid compare spec");
+        assert_eq!(
+            cols,
+            vec![
+                Column::Group,
+                Column::Threads,
+                Column::Metric,
+                Column::Baseline,
+                Column::Candidate,
+                Column::Delta,
+                Column::Pct,
+            ]
+        );
+    }
+
+    /// Round-trip the `arrow` form on its own — the fused single
+    /// cell carries baseline/candidate/delta in one column and
+    /// must not be paired with any of those names.
+    #[test]
+    fn parse_columns_round_trips_arrow_form() {
+        let spec = "group,threads,metric,arrow";
+        let cols = parse_columns(spec, true).expect("valid arrow-form spec");
+        assert_eq!(
+            cols,
+            vec![
+                Column::Group,
+                Column::Threads,
+                Column::Metric,
+                Column::Arrow,
+            ]
+        );
+    }
+
+    /// Show-side `parse_columns` rejects compare-only column
+    /// names. The error message lists the show-side allowed
+    /// vocabulary so the operator can recover from the
+    /// diagnostic alone.
+    #[test]
+    fn parse_columns_rejects_compare_only_on_show_side() {
+        let err = parse_columns("baseline", false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("baseline"),
+            "error must cite the offending name: {msg}"
+        );
+        assert!(
+            msg.contains("group, threads, metric, value"),
+            "error must list the show-side allowed names: {msg}"
+        );
+    }
+
+    /// Compare-side `parse_columns` rejects `value` (show
+    /// only).
+    #[test]
+    fn parse_columns_rejects_show_only_on_compare_side() {
+        let err = parse_columns("value", true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("value"), "error must cite name: {msg}");
+    }
+
+    /// `parse_columns` rejects an unknown name with a list of
+    /// valid alternatives.
+    #[test]
+    fn parse_columns_rejects_unknown_name() {
+        let err = parse_columns("not_a_column", true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not_a_column"), "error must cite name: {msg}",);
+    }
+
+    /// `parse_columns` rejects duplicate names.
+    #[test]
+    fn parse_columns_rejects_duplicate() {
+        let err = parse_columns("metric,delta,metric", true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate"),
+            "error must mention duplicates: {msg}"
+        );
+    }
+
+    /// `parse_columns` rejects empty entries between commas.
+    #[test]
+    fn parse_columns_rejects_empty_entry() {
+        let err = parse_columns("metric,,delta", true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty"), "error must mention empty: {msg}");
+    }
+
+    /// Empty `--columns` parses to an empty Vec — caller falls
+    /// back to the format default.
+    #[test]
+    fn parse_columns_empty_returns_empty_vec() {
+        let cols = parse_columns("", true).expect("empty parses");
+        assert!(cols.is_empty());
+        let cols = parse_columns("   ", true).expect("whitespace-only parses as empty");
+        assert!(cols.is_empty());
+    }
+
+    /// Show-side `parse_columns` accepts the `metric,value`
+    /// pair — the show-only allowed vocabulary. Pins that the
+    /// show-side path actually parses both names rather than
+    /// silently rejecting `value` as if it were compare-only.
+    #[test]
+    fn parse_columns_accepts_show_side_metric_value() {
+        let cols = parse_columns("metric,value", false).expect("metric,value is show-side valid");
+        assert_eq!(cols, vec![Column::Metric, Column::Value]);
+    }
+
+    /// Compare-side `parse_columns` rejects `arrow` paired with
+    /// any of `baseline` / `candidate` / `delta` / `%`. Arrow
+    /// fuses those four into a single cell, so combining them
+    /// would render the same data twice. The error message
+    /// names the constraint so the operator can recover.
+    #[test]
+    fn parse_columns_rejects_arrow_with_fused_columns() {
+        for fused in &["baseline", "candidate", "delta", "%"] {
+            let spec = format!("arrow,{fused}");
+            let res = parse_columns(&spec, true);
+            let err = res
+                .err()
+                .unwrap_or_else(|| panic!("arrow+{fused} must be rejected"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("arrow") && msg.contains("mutually exclusive"),
+                "error must name arrow's mutual exclusivity for spec {spec:?}: {msg}"
+            );
+        }
+    }
+
+    /// `--columns` overrides `--display-format`'s default.
+    /// Resolved column set comes from `columns` when non-empty.
+    #[test]
+    fn columns_override_wins_over_display_format() {
+        let mut opts = DisplayOptions::default();
+        opts.format = DisplayFormat::Full;
+        opts.columns = vec![Column::Metric, Column::Delta];
+        let resolved = opts.resolved_compare_columns();
+        assert_eq!(resolved, vec![Column::Metric, Column::Delta]);
+    }
+
+    /// `DisplayFormat::DeltaOnly` end-to-end: rendered diff
+    /// table omits the `baseline` and `candidate` columns.
+    #[test]
+    fn write_diff_delta_only_omits_baseline_candidate_columns() {
+        let (a, b) = snap_pair_for_display();
+        let diff = compare(&a, &b, &CompareOptions::default());
+        let mut display = DisplayOptions::default();
+        display.format = DisplayFormat::DeltaOnly;
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+            &display,
+        )
+        .unwrap();
+        // Header must NOT contain "baseline" or "candidate".
+        let header_line = out.lines().next().unwrap_or("");
+        assert!(
+            !header_line.contains("baseline"),
+            "delta-only header must drop baseline column:\n{header_line}"
+        );
+        assert!(
+            !header_line.contains("candidate"),
+            "delta-only header must drop candidate column:\n{header_line}"
+        );
+        assert!(
+            header_line.contains("delta"),
+            "delta column must remain:\n{header_line}"
+        );
+    }
+
+    /// `DisplayFormat::NoPct` drops the `%` column.
+    #[test]
+    fn write_diff_no_pct_omits_pct_column() {
+        let (a, b) = snap_pair_for_display();
+        let diff = compare(&a, &b, &CompareOptions::default());
+        let mut display = DisplayOptions::default();
+        display.format = DisplayFormat::NoPct;
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+            &display,
+        )
+        .unwrap();
+        let header_line = out.lines().next().unwrap_or("");
+        // `%` is the literal column name; assert it is absent
+        // as a stand-alone token. The header is whitespace-padded
+        // by comfy_table; check there's no bare " % " run.
+        assert!(
+            !header_line.contains(" % "),
+            "no-pct header must drop percent column:\n{header_line}"
+        );
+    }
+
+    /// `DisplayFormat::Arrow` collapses baseline → candidate
+    /// (delta) into a single cell. Pin the cell carries the
+    /// arrow glyph and the parenthesized delta.
+    #[test]
+    fn write_diff_arrow_renders_combined_cell() {
+        let (a, b) = snap_pair_for_display();
+        let diff = compare(&a, &b, &CompareOptions::default());
+        let mut display = DisplayOptions::default();
+        display.format = DisplayFormat::Arrow;
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+            &display,
+        )
+        .unwrap();
+        // run_time_ns row with 100 -> 200 (+100). Auto-scale
+        // ladder leaves these as ns since they're below 1000.
+        // Should render `100ns -> 200ns (+100ns)`. The arrow
+        // glyph is U+2192.
+        assert!(
+            out.contains("\u{2192}"),
+            "arrow glyph must appear in output:\n{out}"
+        );
+        assert!(
+            out.contains("100ns") && out.contains("200ns"),
+            "baseline and candidate values must surface in arrow cell:\n{out}"
+        );
+        assert!(
+            out.contains("(+100ns)") || out.contains("(+100"),
+            "delta must appear in parens:\n{out}"
+        );
+    }
+
+    /// `DisplayFormat::Arrow` for derived rows: rendered
+    /// derived row also collapses to a single arrow cell.
+    #[test]
+    fn write_diff_arrow_renders_derived_arrow_cell() {
+        let (a, b) = snap_pair_for_display();
+        let diff = compare(&a, &b, &CompareOptions::default());
+        let mut display = DisplayOptions::default();
+        display.format = DisplayFormat::Arrow;
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+            &display,
+        )
+        .unwrap();
+        // The avg_wait_ns derived row shows up. wait_sum 1000/4
+        // = 250.00ns baseline; 2000/4 = 500.00ns candidate.
+        assert!(
+            out.contains("avg_wait_ns"),
+            "derived metric must appear in arrow rendering:\n{out}"
+        );
+        // Both values should appear in the arrow form.
+        assert!(
+            out.contains("250.00ns") || out.contains("250ns"),
+            "baseline derived value must appear in arrow cell:\n{out}"
+        );
+    }
+
+    /// `DisplayFormat::PctOnly` drops baseline / candidate /
+    /// delta — only the % column carries data.
+    #[test]
+    fn write_diff_pct_only_keeps_only_pct() {
+        let (a, b) = snap_pair_for_display();
+        let diff = compare(&a, &b, &CompareOptions::default());
+        let mut display = DisplayOptions::default();
+        display.format = DisplayFormat::PctOnly;
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+            &display,
+        )
+        .unwrap();
+        let header_line = out.lines().next().unwrap_or("");
+        assert!(
+            !header_line.contains("baseline"),
+            "pct-only header must drop baseline:\n{header_line}"
+        );
+        assert!(
+            !header_line.contains("candidate"),
+            "pct-only header must drop candidate:\n{header_line}"
+        );
+        assert!(
+            !header_line.contains("delta"),
+            "pct-only header must drop delta:\n{header_line}"
+        );
+        // The `%` column header is just the literal `%` glyph,
+        // which is hard to match unambiguously in a wide
+        // table. Pin the data instead — run_time_ns 100 → 200
+        // is +100% so the cell renders `+100.0%`.
+        assert!(
+            out.contains("+100.0%"),
+            "pct-only must render percent cell:\n{out}",
+        );
+    }
+
+    /// `--columns metric,delta` overrides `--display-format
+    /// full` and emits exactly those two columns plus their
+    /// labels.
+    #[test]
+    fn write_diff_columns_override_emits_only_selected_columns() {
+        let (a, b) = snap_pair_for_display();
+        let diff = compare(&a, &b, &CompareOptions::default());
+        let mut display = DisplayOptions::default();
+        display.format = DisplayFormat::Full; // would normally emit 7 columns
+        display.columns = vec![Column::Metric, Column::Delta];
+        let mut out = String::new();
+        write_diff(
+            &mut out,
+            &diff,
+            Path::new("a"),
+            Path::new("b"),
+            GroupBy::Pcomm,
+            &display,
+        )
+        .unwrap();
+        let header_line = out.lines().next().unwrap_or("");
+        assert!(
+            header_line.contains("metric"),
+            "metric column must appear:\n{header_line}"
+        );
+        assert!(
+            header_line.contains("delta"),
+            "delta column must appear:\n{header_line}"
+        );
+        assert!(
+            !header_line.contains("baseline"),
+            "baseline must NOT appear when --columns excludes it:\n{header_line}"
+        );
+        assert!(
+            !header_line.contains("candidate"),
+            "candidate must NOT appear when --columns excludes it:\n{header_line}"
         );
     }
 
@@ -6138,6 +6968,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(
@@ -6556,6 +7387,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         for h in [
@@ -6581,6 +7413,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Cgroup,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(out.contains("cgroup"));
@@ -6591,6 +7424,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Comm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(out.contains("comm"));
@@ -6612,6 +7446,7 @@ mod tests {
             Path::new("/tmp/a.hst.zst"),
             Path::new("/tmp/b.hst.zst"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(out.contains("only in baseline"));
@@ -6632,6 +7467,7 @@ mod tests {
             Path::new("/tmp/a.hst.zst"),
             Path::new("/tmp/b.hst.zst"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(out.contains("only in candidate"));
@@ -6653,6 +7489,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Cgroup,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(
@@ -6697,6 +7534,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(!out.contains("cpu_usage_usec"), "enrichment leaked:\n{out}");
@@ -6720,6 +7558,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         // 50 - 100 = -50 ns → integer delta below the µs
@@ -6750,6 +7589,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         assert!(out.contains("differs"), "missing 'differs' label:\n{out}");
@@ -6784,7 +7624,15 @@ mod tests {
 
         let diff = compare(&loaded_a, &loaded_b, &CompareOptions::default());
         let mut out = String::new();
-        write_diff(&mut out, &diff, tmp_a.path(), tmp_b.path(), GroupBy::Pcomm).unwrap();
+        write_diff(
+            &mut out,
+            &diff,
+            tmp_a.path(),
+            tmp_b.path(),
+            GroupBy::Pcomm,
+            &DisplayOptions::default(),
+        )
+        .unwrap();
 
         // Column headers present.
         assert!(out.contains("pcomm"));
@@ -6987,6 +7835,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Cgroup,
+            &DisplayOptions::default(),
         )
         .unwrap();
         // Both keys present.
@@ -8812,6 +9661,7 @@ mod tests {
             Path::new("a"),
             Path::new("b"),
             GroupBy::Pcomm,
+            &DisplayOptions::default(),
         )
         .unwrap();
         // Baseline cell: 5 ms with the ms unit.

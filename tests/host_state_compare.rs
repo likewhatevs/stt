@@ -28,8 +28,8 @@ use std::path::Path;
 
 use ktstr::host_state::{HostStateSnapshot, ThreadState};
 use ktstr::host_state_compare::{
-    AggRule, Aggregated, CompareOptions, GroupBy, HOST_STATE_METRICS, HostStateCompareArgs,
-    aggregate, compare, run_compare, write_diff,
+    AggRule, Aggregated, CompareOptions, DisplayOptions, GroupBy, HOST_STATE_METRICS,
+    HostStateCompareArgs, aggregate, compare, run_compare, write_diff,
 };
 
 use common::host_state::{cgroup_stats_entry, make_thread, snapshot};
@@ -113,6 +113,7 @@ fn full_pipeline_with_disk_roundtrip() {
         &baseline_path,
         &candidate_path,
         GroupBy::Pcomm,
+        &DisplayOptions::default(),
     )
     .unwrap();
     for col in [
@@ -193,7 +194,15 @@ fn cgroup_flatten_joins_pods_with_different_ids() {
     );
 
     let mut out = String::new();
-    write_diff(&mut out, &diff, &a_path, &b_path, GroupBy::Cgroup).unwrap();
+    write_diff(
+        &mut out,
+        &diff,
+        &a_path,
+        &b_path,
+        GroupBy::Cgroup,
+        &DisplayOptions::default(),
+    )
+    .unwrap();
     // Enrichment section renders under GroupBy::Cgroup and
     // carries the cgroup-level cpu.stat delta.
     assert!(
@@ -239,7 +248,15 @@ fn unmatched_groups_render_with_source_path() {
     assert_eq!(diff.only_candidate, vec!["only_b".to_string()]);
 
     let mut out = String::new();
-    write_diff(&mut out, &diff, &a_path, &b_path, GroupBy::Pcomm).unwrap();
+    write_diff(
+        &mut out,
+        &diff,
+        &a_path,
+        &b_path,
+        GroupBy::Pcomm,
+        &DisplayOptions::default(),
+    )
+    .unwrap();
     assert!(out.contains("only in baseline"));
     assert!(out.contains("only in candidate"));
     assert!(out.contains(Path::new(&a_path).file_name().unwrap().to_str().unwrap()));
@@ -302,6 +319,8 @@ fn run_compare_returns_ok_zero_regardless_of_diff_emptiness() {
         no_thread_normalize: false,
         no_cg_normalize: false,
         sort_by: String::new(),
+        display_format: ktstr::host_state_compare::DisplayFormat::Full,
+        columns: String::new(),
     };
     // `run_compare` returns `anyhow::Result<i32>`. The contract
     // says the `i32` is always 0 for a successful load+compare,
@@ -359,6 +378,8 @@ fn run_compare_with_valid_sort_by_succeeds() {
         // mixed asc/desc) so a regression in any of those
         // reaches the integration boundary.
         sort_by: "run_time_ns:DESC, wait_time_ns:asc".into(),
+        display_format: ktstr::host_state_compare::DisplayFormat::Full,
+        columns: String::new(),
     };
     let rc = run_compare(&args).expect("run_compare must accept a valid --sort-by spec end-to-end");
     assert_eq!(rc, 0, "run_compare must return Ok(0) on success");
@@ -395,6 +416,8 @@ fn run_compare_with_invalid_sort_by_returns_err() {
         // Unknown metric name — must surface the parser error,
         // not a silent best-effort sort.
         sort_by: "not_a_real_metric".into(),
+        display_format: ktstr::host_state_compare::DisplayFormat::Full,
+        columns: String::new(),
     };
     let err = run_compare(&args).expect_err("invalid --sort-by must produce Err");
     let msg = format!("{err:#}");
@@ -842,7 +865,7 @@ fn nr_threads_leader_dedup_aggregates_via_max_on_leader_value() {
 /// auto-scale → baseline → candidate cell rendering.
 #[test]
 fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
-    use ktstr::host_state_compare::{CompareOptions, GroupBy, compare, write_diff};
+    use ktstr::host_state_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
     use std::path::Path;
 
     // Baseline thread carries Pss = 1024 kB (= 1 MiB);
@@ -892,6 +915,7 @@ fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
         Path::new("a"),
         Path::new("b"),
         GroupBy::Pcomm,
+        &DisplayOptions::default(),
     )
     .unwrap();
 
@@ -931,7 +955,7 @@ fn compare_smaps_rollup_renders_header_and_scaled_byte_values() {
 /// rows). Pins the `any_delta` precheck.
 #[test]
 fn compare_smaps_rollup_suppresses_section_when_all_unchanged() {
-    use ktstr::host_state_compare::{CompareOptions, GroupBy, compare, write_diff};
+    use ktstr::host_state_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
     use std::path::Path;
 
     let mut leader = make_thread("worker", "worker");
@@ -955,6 +979,7 @@ fn compare_smaps_rollup_suppresses_section_when_all_unchanged() {
         Path::new("a"),
         Path::new("b"),
         GroupBy::Pcomm,
+        &DisplayOptions::default(),
     )
     .unwrap();
 
@@ -972,7 +997,7 @@ fn compare_smaps_rollup_suppresses_section_when_all_unchanged() {
 #[test]
 fn compare_sched_ext_renders_section_with_state_and_counter_deltas() {
     use ktstr::host_state::SchedExtSysfs;
-    use ktstr::host_state_compare::{CompareOptions, GroupBy, compare, write_diff};
+    use ktstr::host_state_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
     use std::path::Path;
 
     // Distinct values per field so the substring assertions on
@@ -1016,6 +1041,7 @@ fn compare_sched_ext_renders_section_with_state_and_counter_deltas() {
         Path::new("a"),
         Path::new("b"),
         GroupBy::Pcomm,
+        &DisplayOptions::default(),
     )
     .unwrap();
 
@@ -1056,7 +1082,7 @@ fn compare_sched_ext_renders_section_with_state_and_counter_deltas() {
 /// CONFIG_SCHED_CLASS_EXT=n-on-both-kernels path.
 #[test]
 fn compare_sched_ext_suppresses_section_when_both_sides_none() {
-    use ktstr::host_state_compare::{CompareOptions, GroupBy, compare, write_diff};
+    use ktstr::host_state_compare::{CompareOptions, DisplayOptions, GroupBy, compare, write_diff};
     use std::path::Path;
 
     let baseline = snapshot(vec![], BTreeMap::new());
@@ -1072,6 +1098,7 @@ fn compare_sched_ext_suppresses_section_when_both_sides_none() {
         Path::new("a"),
         Path::new("b"),
         GroupBy::Pcomm,
+        &DisplayOptions::default(),
     )
     .unwrap();
 

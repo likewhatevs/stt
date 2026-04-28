@@ -478,6 +478,16 @@ pub struct HostStateShowArgs {
     /// `--sort-by run_time_ns,wait_sum:asc`.
     #[arg(long, default_value = "")]
     pub sort_by: String,
+    /// Comma-separated column names to render. Empty (the
+    /// default) emits the full `(group | threads | metric |
+    /// value)` layout. Valid names: `group`, `threads`,
+    /// `metric`, `value`. Order in the spec is the rendered
+    /// order. Show is single-snapshot, so the
+    /// `baseline`/`candidate`/`delta`/`%`/`arrow` columns
+    /// (compare-only) are rejected at parse time. Example:
+    /// `--columns metric,value`.
+    #[arg(long, default_value = "")]
+    pub columns: String,
 }
 
 /// RAII guard that cleans up an auto-generated cgroup directory on drop.
@@ -693,6 +703,11 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
     // run_compare's ordering for the same reason.
     let sort_by = host_state_compare::parse_sort_by(&args.sort_by)
         .with_context(|| format!("parse --sort-by {:?}", args.sort_by))?;
+    // `--columns` parses with compare_side=false so the
+    // baseline/candidate/delta/% columns (compare-only) are
+    // rejected before any snapshot work begins.
+    let columns = host_state_compare::parse_columns(&args.columns, false)
+        .with_context(|| format!("parse --columns {:?}", args.columns))?;
     let snap = ktstr::host_state::HostStateSnapshot::load(&args.snapshot)
         .with_context(|| format!("load snapshot {}", args.snapshot.display()))?;
     let mut out = String::new();
@@ -705,6 +720,7 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
         args.no_thread_normalize,
         args.no_cg_normalize,
         &sort_by,
+        &columns,
     );
     print!("{out}");
     Ok(0)
@@ -716,6 +732,7 @@ fn run_show(args: &HostStateShowArgs) -> Result<i32> {
 /// rendering into a `String` buffer without shelling through
 /// stdout. Write errors propagate as [`std::fmt::Error`]; callers
 /// that write into an infallible sink (`String`) can ignore.
+#[allow(clippy::too_many_arguments)]
 fn write_show<W: std::fmt::Write>(
     w: &mut W,
     snap: &ktstr::host_state::HostStateSnapshot,
@@ -724,6 +741,7 @@ fn write_show<W: std::fmt::Write>(
     no_thread_normalize: bool,
     no_cg_normalize: bool,
     sort_by: &[host_state_compare::SortKey],
+    columns: &[host_state_compare::Column],
 ) -> std::fmt::Result {
     let flatten = host_state_compare::compile_flatten_patterns(cgroup_flatten);
     // Single-snapshot cgroup key map. compare()'s
@@ -761,8 +779,22 @@ fn write_show<W: std::fmt::Write>(
         host_state_compare::GroupBy::CommExact => "comm",
     };
 
+    // Resolve the column set: caller-supplied override wins,
+    // otherwise fall back to the show-side default
+    // `(group, threads, metric, value)`. DisplayOptions is
+    // marked `#[non_exhaustive]` so we mutate the
+    // default-constructed struct rather than a struct
+    // expression.
+    let mut display_options = host_state_compare::DisplayOptions::default();
+    display_options.columns = columns.to_vec();
+    let resolved_columns = display_options.resolved_show_columns();
+
     let mut table = cli::new_table();
-    table.set_header(vec![group_header, "threads", "metric", "value"]);
+    let header_row: Vec<&str> = resolved_columns
+        .iter()
+        .map(|c| c.header(group_header))
+        .collect();
+    table.set_header(header_row);
 
     // Iteration order: when `sort_by` is empty, fall through the
     // BTreeMap by-key order (alphabetical group key, registry order
@@ -833,12 +865,24 @@ fn write_show<W: std::fmt::Write>(
             let Some(agg) = group.metrics.get(metric.name) else {
                 continue;
             };
-            table.add_row(vec![
-                display_key.clone(),
-                group.thread_count.to_string(),
-                host_state_compare::metric_display_name(metric).into_owned(),
-                host_state_compare::format_value_cell(agg, metric.unit),
-            ]);
+            let metric_name = host_state_compare::metric_display_name(metric).into_owned();
+            let value_cell = host_state_compare::format_value_cell(agg, metric.unit);
+            let cells: Vec<String> = resolved_columns
+                .iter()
+                .map(|c| match c {
+                    host_state_compare::Column::Group => display_key.clone(),
+                    host_state_compare::Column::Threads => group.thread_count.to_string(),
+                    host_state_compare::Column::Metric => metric_name.clone(),
+                    host_state_compare::Column::Value => value_cell.clone(),
+                    // Compare-only columns never reach here under
+                    // run_show: parse_columns(compare_side=false)
+                    // rejects them at CLI parse time. Surface a
+                    // `-` for direct API callers that hand-build a
+                    // mismatched column set.
+                    _ => "-".to_string(),
+                })
+                .collect();
+            table.add_row(cells);
         }
     }
     writeln!(w, "{table}")?;
@@ -850,7 +894,11 @@ fn write_show<W: std::fmt::Write>(
     // one value cell per row).
     if !groups.is_empty() {
         let mut dt = cli::new_table();
-        dt.set_header(vec![group_header, "threads", "metric", "value"]);
+        let header_row: Vec<&str> = resolved_columns
+            .iter()
+            .map(|c| c.header(group_header))
+            .collect();
+        dt.set_header(header_row);
         // Iterate groups in the same order as the main table —
         // group_order has been computed once and applies to
         // every section emitted afterwards.
@@ -863,16 +911,21 @@ fn write_show<W: std::fmt::Write>(
                     (*key).clone()
                 };
             for d in host_state_compare::HOST_STATE_DERIVED_METRICS {
-                let cell = match (d.compute)(&group.metrics) {
+                let value_cell = match (d.compute)(&group.metrics) {
                     Some(v) => host_state_compare::format_derived_value_cell(v, d.unit, d.is_ratio),
                     None => "-".to_string(),
                 };
-                dt.add_row(vec![
-                    display_key.clone(),
-                    group.thread_count.to_string(),
-                    d.name.to_string(),
-                    cell,
-                ]);
+                let cells: Vec<String> = resolved_columns
+                    .iter()
+                    .map(|c| match c {
+                        host_state_compare::Column::Group => display_key.clone(),
+                        host_state_compare::Column::Threads => group.thread_count.to_string(),
+                        host_state_compare::Column::Metric => d.name.to_string(),
+                        host_state_compare::Column::Value => value_cell.clone(),
+                        _ => "-".to_string(),
+                    })
+                    .collect();
+                dt.add_row(cells);
             }
         }
         writeln!(w)?;
@@ -1990,6 +2043,7 @@ mod tests {
             false,
             false,
             &[],
+            &[],
         )
         .expect("write_show into String must not fail");
 
@@ -2041,7 +2095,7 @@ mod tests {
             (host_state_compare::GroupBy::CommExact, "comm"),
         ] {
             let mut out = String::new();
-            write_show(&mut out, &snap, axis, &[], false, false, &[])
+            write_show(&mut out, &snap, axis, &[], false, false, &[], &[])
                 .expect("write_show into String must not fail");
             assert!(
                 out.contains(expected_header),
@@ -2066,6 +2120,7 @@ mod tests {
             &[],
             false,
             false,
+            &[],
             &[],
         )
         .expect("write_show into String must not fail on empty snapshot");
@@ -2123,6 +2178,7 @@ mod tests {
             false,
             false,
             &sort_by,
+            &[],
         )
         .expect("write_show into String must not fail");
 
@@ -2195,6 +2251,7 @@ mod tests {
             false,
             false,
             &[],
+            &[],
         )
         .expect("write_show into String must not fail");
 
@@ -2252,6 +2309,7 @@ mod tests {
             false,
             false,
             &[],
+            &[],
         )
         .expect("write_show into String must not fail");
         assert!(
@@ -2285,6 +2343,7 @@ mod tests {
             false,
             false,
             &[],
+            &[],
         )
         .expect("write_show into String must not fail");
         assert!(
@@ -2294,6 +2353,53 @@ mod tests {
         assert!(
             out.contains("avg_slice_ns"),
             "missing avg_slice_ns row in derived section of show output:\n{out}",
+        );
+    }
+
+    /// `write_show` with `columns=[Metric, Value]` emits exactly
+    /// those two columns — the header must contain `metric` and
+    /// `value` but not `threads` (or any other compare-only
+    /// column name). Pins that the show-side `--columns` override
+    /// reaches the renderer and overrides the default
+    /// `(group, threads, metric, value)` set.
+    #[test]
+    fn write_show_columns_override_emits_only_selected_columns() {
+        let mut snap = ktstr::host_state::HostStateSnapshot::default();
+        let mut t = ktstr::host_state::ThreadState::default();
+        t.pcomm = "worker".to_string();
+        t.comm = "w".to_string();
+        t.nr_wakeups = 1;
+        snap.threads.push(t);
+
+        let columns = vec![
+            host_state_compare::Column::Metric,
+            host_state_compare::Column::Value,
+        ];
+        let mut out = String::new();
+        write_show(
+            &mut out,
+            &snap,
+            host_state_compare::GroupBy::Pcomm,
+            &[],
+            false,
+            false,
+            &[],
+            &columns,
+        )
+        .expect("write_show into String must not fail");
+
+        let header_line = out.lines().next().unwrap_or("");
+        assert!(
+            header_line.contains("metric"),
+            "metric column must appear in header: {header_line}",
+        );
+        assert!(
+            header_line.contains("value"),
+            "value column must appear in header: {header_line}",
+        );
+        assert!(
+            !header_line.contains("threads"),
+            "threads column must NOT appear when --columns excludes it: {header_line}",
         );
     }
 
@@ -2325,6 +2431,7 @@ mod tests {
             &[],
             false,
             false,
+            &[],
             &[],
         )
         .expect("write_show into String must not fail");
